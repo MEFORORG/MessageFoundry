@@ -259,13 +259,16 @@ _STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist: the backstop in
 
 def _refusal_dimse_status(kind: RefusalKind) -> int:
     """The C-STORE status an engine ingress refusal of ``kind`` is answered with (BACKLOG #2105),
-    in step with ``http_listener._refusal_status``. DIMSE has no "after an operator acts" status,
-    so a configuration refusal takes the re-send class rather than one a sender drops the object on
-    (BACKLOG #5102). ``assert_never``, so mypy refuses a new kind left unmapped."""
+    in step with ``http_listener._refusal_status``. A configuration refusal is the final class here
+    (BACKLOG #5102). On the SCP it can arise only on an inbound that declares a text
+    ``content_type``, which the wiring refuses at build, and such an inbound refuses every Part-10
+    object as the body's own fault even after an operator fixes the codec name, so Out of Resources
+    would have a sender re-send the object forever, leaving one ``ERROR`` row per attempt.
+    ``assert_never``, so mypy refuses a new kind left unmapped."""
     match kind:
-        case RefusalKind.TEMPORARY | RefusalKind.CONFIGURATION:
+        case RefusalKind.TEMPORARY:
             return _STATUS_OUT_OF_RESOURCES
-        case RefusalKind.PERMANENT | RefusalKind.OVERSIZE:
+        case RefusalKind.PERMANENT | RefusalKind.OVERSIZE | RefusalKind.CONFIGURATION:
             return _STATUS_CANNOT_UNDERSTAND
         case _:
             assert_never(kind)
@@ -2545,11 +2548,11 @@ class DicomScpSource(SourceConnector):
         The handler returns a receipt: the committed message id, or a refusal, when it then recorded
         ``ERROR`` and committed no ingress row. A refusal is a DIMSE failure, never Success (BACKLOG
         #1910), mapped in step with the HTTP listener's answer (BACKLOG #2105). A TEMPORARY refusal
-        may clear on a re-send, so it answers Out of Resources, as the HTTP listener answers ``503``;
-        so does a CONFIGURATION refusal, which clears once an operator acts (BACKLOG #5102,
-        :func:`_refusal_dimse_status`). A permanent or over-size one is Cannot Understand, the
-        status the decode-failure path already answers for an object the engine will not take: the
-        same object would be refused again. A
+        may clear on a re-send, so it answers Out of Resources, as the HTTP listener answers ``503``.
+        A permanent or over-size one is Cannot Understand, the status the decode-failure path
+        already answers for an object the engine will not take: the same object would be refused
+        again. So is a CONFIGURATION refusal, which no operator fix clears on the SCP (BACKLOG #5102,
+        :func:`_refusal_dimse_status`). A
         handler that RAISES, or does not answer in time, has committed nothing for a reason that may
         clear, such as a store that is down, so both answer Out of Resources and the sender re-sends
         (BACKLOG #2103)."""

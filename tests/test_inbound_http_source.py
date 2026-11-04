@@ -281,6 +281,48 @@ async def test_an_unusable_codec_name_is_503_and_a_bad_body_422_each_with_one_er
     assert fetched_row["n"] == 0, "a refused body reached the ingress stage"
 
 
+@pytest.mark.parametrize(
+    ("content_type", "status", "row_status", "error_prefix"),
+    [
+        pytest.param(ContentType.TEXT, 202, MessageStatus.RECEIVED, None, id="text_commits"),
+        pytest.param(
+            ContentType.HL7V2,
+            422,
+            MessageStatus.ERROR,
+            "[refusal kind: permanent] parse error",
+            id="hl7v2_refuses",
+        ),
+    ],
+)
+async def test_an_empty_body_under_an_unusable_codec_name_is_not_a_configuration_refusal(
+    store: MessageStore,
+    content_type: ContentType,
+    status: int,
+    row_status: MessageStatus,
+    error_prefix: str | None,
+) -> None:
+    """BACKLOG #5102, as ``RefusalKind.CONFIGURATION`` and ADR 0154's amendment of 2026-11-04 state
+    it: Python decodes empty bytes without looking the codec up, so an empty body passes the decode
+    under a codec name that refuses every other body, and meets what any empty body meets. A
+    ``text`` inbound commits it and answers ``202``; an ``hl7v2`` one refuses it as permanent, the
+    body's own fault. Neither is a configuration refusal."""
+    ic = build_inbound_connection("IB_HTTP", Http(port=0), router="r", content_type=content_type)
+    ic.spec.settings["encoding"] = "not-a-real-codec"  # past the load-time name check
+    src = await _start_source(store, ic)
+    try:
+        resp = await _http(src.sockport, body=b"")
+    finally:
+        await src.stop()
+    assert resp.status == status
+    cur = await store._db.execute("SELECT status, error FROM messages")
+    rows = list(await cur.fetchall())
+    assert [r["status"] for r in rows] == [row_status.value]
+    if error_prefix is None:
+        assert rows[0]["error"] is None
+    else:
+        assert str(rows[0]["error"]).startswith(error_prefix), rows[0]["error"]
+
+
 async def test_post_ingress_failure_does_not_change_http_status(store: MessageStore) -> None:
     """AC-3: the 202 is returned at ingress, BEFORE any routing/transform runs — no worker is draining
     here, so a downstream failure (which would happen later) cannot retroactively change the status."""

@@ -368,8 +368,10 @@ does with it, at least:
   replies, the answer is `AE`; a non-HL7 inbound gets no `AE`. **An `X12()` listener** records the
   row too, but sends no `AE`: it encodes its reply in the inbound's own charset, which fails.
 - **`Http()`** records the row and answers `503` with **no** `Retry-After`.
-- **A DICOM SCP** whose inbound declares a text `content_type` records the row and answers Out of
-  Resources (`0xA700`). One that keeps a binary type such as `dicom` never decodes.
+- **A DICOM SCP** never decodes: its inbound must declare a binary `content_type` such as `dicom`,
+  and one that declares a text type is refused when the config loads. Should a configuration
+  refusal reach the SCP all the same, it records the row and answers Cannot Understand (`0xC000`),
+  the final class, since a text type refuses every Part-10 object even once the name is fixed.
 - **A `File()` or remote-file source** records the row, which stores its input whole, and consumes
   the input; it does not hold the file for the fix.
 - **A `DatabasePoll()` or `Timer()` source** fails to build on such a name, so it never starts.

@@ -38,7 +38,9 @@ class RefusalKind(StrEnum):
     #: an operator changes it, so the body is not at fault, yet no re-send clears it on its own
     #: (BACKLOG #5102). At least an inbound codec name that sets up no decode (BACKLOG #2431). An
     #: empty body is not this kind: Python decodes empty bytes without looking the codec up, so it
-    #: reaches the later guards and is refused as the body's own fault. A
+    #: passes the decode and meets what any empty body meets. A ``text`` inbound commits it and
+    #: ``Http()`` answers ``202``; one whose later guards refuse an empty body, at least ``hl7v2``
+    #: and ``json``, refuses it as PERMANENT. A
     #: refusal that depends on the body, such as a backend that cannot stream refusing only a body
     #: over the streaming threshold, is not this kind. Told apart from TEMPORARY so that a source
     #: whose protocol can say so, at least ``Http()``, does not invite a re-send soon for an

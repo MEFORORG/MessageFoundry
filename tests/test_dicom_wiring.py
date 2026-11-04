@@ -82,6 +82,35 @@ def test_dicom_inbound_rejects_strict_validation() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "content_type",
+    [ct for ct in ContentType if not ct.is_binary],
+    ids=lambda ct: ct.value,
+)
+def test_dicom_inbound_refuses_a_text_content_type(content_type: ContentType) -> None:
+    """BACKLOG #5102, the Lander's hold on engine PR 2787: a text ``content_type`` decodes each
+    object as text, and a Part-10 object never decodes cleanly (binary lengths and NUL bytes), so
+    the SCP would refuse every object it receives. The default ``hl7v2`` is one of them, so an
+    inbound that forgets the type is refused too. Refused at build, naming the connection."""
+    with pytest.raises(WiringError) as exc:
+        build_inbound_connection(
+            "IB_DCM", DICOM(ae_title="MEFOR_SCP"), router="R", content_type=content_type
+        )
+    message = str(exc.value)
+    assert "'IB_DCM'" in message
+    assert repr(content_type.value) in message
+    assert 'content_type="dicom"' in message
+
+
+@pytest.mark.parametrize("content_type", [ContentType.DICOM, ContentType.BINARY])
+def test_dicom_inbound_accepts_a_binary_content_type(content_type: ContentType) -> None:
+    # Positive control for the refusal above: both binary types are base64-carried, never decoded.
+    ic = build_inbound_connection(
+        "IB_DCM", DICOM(ae_title="MEFOR_SCP"), router="R", content_type=content_type
+    )
+    assert ic.content_type is content_type
+
+
 def test_dicom_inbound_accepts_peer_ip_allowlist() -> None:
     ic = build_inbound_connection(
         "IB_DCM",

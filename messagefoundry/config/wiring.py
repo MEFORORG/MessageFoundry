@@ -4201,6 +4201,7 @@ def DICOM(
     """A **DICOM DIMSE** endpoint (ADR 0025). **Phase 1 (built): the inbound C-STORE SCP** — pair it
     with ``content_type="dicom"`` on ``inbound(...)`` so a received object is base64-carried (ADR 0028)
     and routed as a ``RawMessage`` a Router/Handler parses on demand via ``messagefoundry.parsing.dicom``.
+    A text ``content_type``, the default ``hl7v2`` included, is refused at load (BACKLOG #5102).
     Like ``X12``, the inbound takes **no** ``host`` (the bind interface is ``[inbound].bind_host``); it
     runs a ``pynetdicom`` AE C-STORE SCP **off the event loop**, commits each object durably to the
     ingress stage **before** returning C-STORE Success (commit-before-SUCCESS), accepts only the
@@ -7786,6 +7787,16 @@ def build_inbound_connection(
         raise WiringError(
             f"inbound connection {name!r}: validation.strict is HL7-specific and can't apply to a "
             f"{content_type.value!r} content_type — validate non-HL7 payloads in the Handler instead"
+        )
+    if spec.type is ConnectorType.DIMSE and not content_type.is_binary:
+        # A text type decodes each received object as text, and a Part-10 object never decodes
+        # cleanly (binary lengths and NUL bytes), so the SCP would refuse every object it receives,
+        # whatever the inbound's codec. Refused here, where check and dry-run see it, rather than
+        # as one ERROR row per object (BACKLOG #5102).
+        raise WiringError(
+            f"inbound connection {name!r}: a DICOM inbound needs a binary content_type, but it "
+            f"declares {content_type.value!r}, which decodes each object as text and so would "
+            'refuse every object received. Declare content_type="dicom".'
         )
     if spec.type in (ConnectorType.LOOPBACK, ConnectorType.PT):
         # An internal inbound (loopback re-ingress / pass-through, ADR 0013) has no socket and no

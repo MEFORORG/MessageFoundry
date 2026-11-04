@@ -31,8 +31,9 @@
   [Amendment 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary).
 - **Amended 2026-11-04 (BACKLOG #5102, #5101; Manager decision d20261104T003342588-cbb49e):** an
   operator-only fault at intake, at least an inbound codec name that sets up no decode, is a
-  **configuration** refusal: **`503` with no `Retry-After`** on `Http()`, Out of Resources
-  (`0xA700`) on the DICOM SCP, and `AE` on MLLP and TCP. The 2026-10-30 table and the 2026-11-01 note
+  **configuration** refusal: **`503` with no `Retry-After`** on `Http()` and `AE` on MLLP and TCP.
+  A DICOM inbound must declare a binary `content_type`, and the SCP answers one that reaches it
+  all the same Cannot Understand (`0xC000`). The 2026-10-30 table and the 2026-11-01 note
   keep their text, with a dated note in place. See
   [Amendment 2026-11-04](#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal).
 - **NOTE: what acceptance authorised, and what has since been built.** "Accepted" normally means *build may
@@ -1467,8 +1468,8 @@ sources answer it in step.
 
 *(Note 2026-11-04, BACKLOG #5101: the last row does not say what the code answers for two of its
 causes. A decode failure is permanent only when the inbound's codec name is usable; an inbound
-`encoding` that sets up no decode is a configuration refusal, `503` with no `Retry-After` and Out of
-Resources (`0xA700`), per the
+`encoding` that sets up no decode is a configuration refusal, `503` with no `Retry-After` and, on
+the DICOM SCP, Cannot Understand (`0xC000`), per the
 [amendment of 2026-11-04](#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal).
 A strict-validation timeout whose validate never began is temporary, per the
 [amendment of 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary)
@@ -1482,11 +1483,12 @@ No DICOM refusal is temporary today. A DICOM object takes the binary branch, whi
 size or a declared-type mismatch; the streaming detach is HL7 only. The SCP maps the kind in step so
 that a temporary refusal, should a binary path ever produce one, is answered as one.
 
-*(Note 2026-11-04, BACKLOG #5101: "A DICOM object takes the binary branch" holds only for an SCP
-whose inbound keeps a binary `content_type` such as `dicom`. An SCP whose inbound declares a text
-type decodes the object, as the 2026-11-04 note on the 2026-11-01 note below says, so a
-configuration refusal can reach it and is answered `0xA700`. For such an SCP, "no DICOM refusal is
-temporary today" was not checked.)*
+*(Note 2026-11-04, BACKLOG #5101, #5102: "A DICOM object takes the binary branch" did not hold
+when it was written for an SCP whose inbound declared a text `content_type`, which decoded the
+object, as the 2026-11-04 note on the 2026-11-01 note below says. It holds for any graph that loads
+now, since the wiring refuses a DICOM inbound whose `content_type` is not binary. An inbound built
+past that check could meet a configuration refusal, and the SCP answers it Cannot Understand
+(`0xC000`).)*
 
 `Retry-After` is 5 seconds, from the module constant `TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS` in
 [`transports/http_listener.py`](../../messagefoundry/transports/http_listener.py). Every answer to a
@@ -1548,15 +1550,16 @@ object is never decoded, so the SCP never sees it. A decode failure in a usable 
 permanent. A sender that honours `Retry-After` re-sends every 5 seconds until the name is fixed,
 leaving one `ERROR` row per attempt.)*
 
-*(Note 2026-11-04, BACKLOG #5101, #5102: at least four sentences of the note above no longer
-hold: that the decode failure is temporary, that `Http()` answers it with `Retry-After`, that a
-sender honouring `Retry-After` re-sends every 5 seconds, and that a DICOM object is never decoded.
-The codec name is a configuration refusal, `503` with no `Retry-After`, per the
+*(Note 2026-11-04, BACKLOG #5101, #5102: at least three sentences of the note above no longer
+hold: that the decode failure is temporary, that `Http()` answers it with `Retry-After`, and that a
+sender honouring `Retry-After` re-sends every 5 seconds. The codec name is a configuration refusal,
+`503` with no `Retry-After`, per the
 [amendment of 2026-11-04](#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal).
-And "a DICOM object is never decoded" holds only for an SCP whose inbound keeps a binary
-`content_type` such as `dicom`. The receipt handler decodes any body whose inbound declares a text
-type, and nothing found in the wiring refuses one on a DICOM inbound, so such an SCP would decode
-the object and answer this refusal Out of Resources (`0xA700`).)*
+"A DICOM object is never decoded" did not hold when it was written: the receipt handler decodes
+any body whose inbound declares a text type, and nothing in the wiring refused one on a DICOM
+inbound. It holds for any graph that loads now, since the wiring refuses a DICOM inbound whose
+`content_type` is not binary. An inbound built past that check would decode the object, and the SCP
+answers this refusal Cannot Understand (`0xC000`).)*
 
 ## Amendment 2026-11-03: a strict-validation timeout that never began is temporary
 
@@ -1674,8 +1677,9 @@ temporary and filed a separate kind as follow-up.
 **Why.** A temporary refusal tells a sender that the same body may be taken on a re-send soon, and
 `Http()` says so with `Retry-After`. An inbound codec name that sets up no decode is not that: it
 refuses every non-empty body, and nothing clears it but an operator editing the connection. (An
-empty body decodes under any name, since Python does not look the codec up for it, and is refused
-later as the body's own fault.) Told to come back
+empty body decodes under any name, since Python does not look the codec up for it, and then meets
+what any empty body meets: a `text` inbound commits it and `Http()` answers `202`, and one whose
+later guards refuse an empty body, at least `hl7v2` and `json`, refuses it as permanent.) Told to come back
 in 5 seconds, a sender re-sends every 5 seconds and leaves one `ERROR` row each time. A final
 answer is wrong too, since the body is not at fault, and a sender that drops it loses a body the
 engine would take once the name is fixed.
@@ -1692,7 +1696,7 @@ decoded-text, streaming-detach and strict-timeout arms. The parse and strict-fai
 
 | Refusal | Kind | `Http()` answers | DICOM C-STORE SCP answers | MLLP / TCP |
 | --- | --- | --- | --- | --- |
-| an inbound `encoding` that sets up no decode | configuration | `503` with no `Retry-After` | Out of Resources (`0xA700`) | `AE` |
+| an inbound `encoding` that sets up no decode | configuration | `503` with no `Retry-After` | Cannot Understand (`0xC000`), on an inbound built past the wiring's refusal only | `AE` |
 
 * **No `Retry-After`.** On the answer to a body the engine read and refused, `Retry-After` is the
   engine's only hint that a re-send soon will be taken, so leaving it out means the engine no longer
@@ -1703,11 +1707,19 @@ decoded-text, streaming-detach and strict-timeout arms. The parse and strict-fai
   engine's own `Rest()` outbound never read the header, so on an engine-to-engine hop it retries
   this `503` under its `RetryPolicy` and dead-letters the row after `max_attempts`, as for a
   temporary one.
-* **DICOM and MLLP keep the re-send class.** Neither protocol has a status that says "after an
-  operator acts", and their final classes tell a sender to drop the object or message. So on these
-  two a configuration refusal invites the same re-send a temporary one does; only `Http()` tells the
-  two apart on the wire. An `X12()` listener sends no `AE` for it, since its reply is encoded in the
-  inbound's own unusable charset.
+* **MLLP keeps the re-send class.** It has no code that says "after an operator acts", and its
+  final class tells a sender to drop the message. So on MLLP a configuration refusal invites the
+  same re-send a temporary one does; only `Http()` tells the two apart on the wire. An `X12()`
+  listener sends no `AE` for it, since its reply is encoded in the inbound's own unusable charset.
+* **A DICOM inbound must be binary, and the SCP answers the final class.** DIMSE has no "after an
+  operator acts" status either, but on the SCP this refusal arises only on an inbound that declares
+  a text `content_type`, and such an inbound refuses every Part-10 object as the body's own fault
+  even once the name is fixed, so the re-send class would have a sender re-send forever, one
+  `ERROR` row per attempt. The wiring (`build_inbound_connection`) therefore refuses a DICOM
+  inbound whose `content_type` is not binary when the config loads, and the SCP answers a
+  configuration refusal that reaches it all the same Cannot Understand (`0xC000`). This replaces
+  the first form of this amendment, which kept Out of Resources (`0xA700`) on the SCP; the Lander's
+  review of engine PR 2787 found the loop (Manager decision, batch 605 repair).
 * **The row says which.** The receipt path's `ERROR` row opens `[refusal kind: configuration]`.
 * **A backend that cannot stream stays permanent.** `StreamingAttachmentsUnsupported` is also the
   operator's choice of store, but it refuses only a body at or over the streaming threshold, and
@@ -1732,8 +1744,13 @@ built that (BACKLOG #5078); `_nak_code` now maps the detach arm's classes to MSA
 The tests: `tests/test_inbound_http_source.py` pins the `503` with no `Retry-After` behind a real
 listener, and the stored tag; `tests/test_ingress_refusal_kinds.py` pins the classifier, the
 kind-to-MSA-1 mapping, and the `Rest()` outbound retrying the `503`. `tests/test_dicom_scp.py` pins
-`0xA700` for a configuration receipt, but the receipt is one the test's own handler builds, so it
-does not show that an unusable codec name reaches the SCP as that kind.
+`0xC000` for a configuration receipt its own handler builds, and
+`tests/test_dicom_scp_disposition.py` drives an unusable codec name on a text inbound built past the
+wiring's refusal through a real runner and association, and pins `0xC000` with the `ERROR` row,
+and the same object refused as permanent once the name is fixed. `tests/test_dicom_wiring.py` pins
+the wiring's refusal of every text `content_type` on a DICOM inbound. `tests/test_inbound_http_source.py`
+also pins an empty body under an unusable name: committed with `202` on a `text` inbound, and
+refused as permanent on an `hl7v2` one.
 `tests/test_ingress_guard_parity.py` pins the stored tag on the receipt-path caller only, since the
 MLLP caller stores the reason with no tag, and pins the MLLP listener's `AE`. Its file-source test
 calls `FileSource._emit` and reads the one `ERROR` row; it drives neither `_scan_once` nor
