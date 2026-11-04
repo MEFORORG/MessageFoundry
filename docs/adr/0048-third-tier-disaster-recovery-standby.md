@@ -491,6 +491,11 @@ of activation. The engine owns only the feed-priority + selective-startup half; 
 > through and the unconditional sentence above was not true of the code. It is now: a seed declaring no store
 > row counts is itself the refusal. It cannot be a false refusal, because `messagefoundry restore` rejects a
 > config-only archive outright — an archive carrying no store is one no SQLite box could have been seeded from.
+>
+> *Amendment (vault BACKLOG #5233, 2026-11-04):* "outright" no longer holds of the command as a whole.
+> `messagefoundry restore <archive> --config-to <dir>` with no `--to` restores a config-only archive's config
+> bundle, and places no store. `--to` still refuses one, so the reasoning above stands: no store is restored
+> from a config-only archive, and no SQLite box can have been seeded from one.
 
 - **Cold — restore from #60 backups (the default and only built seed path).** The DR box is seeded from #60's
   scheduled, **encrypted** config + store backup (restore-verified). **RPO** = backup cadence (e.g. daily, the #60
