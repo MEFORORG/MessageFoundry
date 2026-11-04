@@ -2735,9 +2735,12 @@ class RevocationHopGuard:
         that cannot cross it (SDS-3.7). That text names a connection's flags, so a hop that is not
         a connection is not given it. Such a hop falls back to the default, which offers
         ``[tls].crl_file`` too and names a connection's flag, so one that hands over such a context
-        must pass its own sentence (BACKLOG #1498). On 2026-11-03 no caller of
-        :func:`relax_verify_expiry` was a hop that is not a connection; a census test in
-        ``tests/test_revocation_guard_remaining_hops.py`` fails on a new caller."""
+        must pass its own sentence (BACKLOG #1498). On 2026-11-03 every hop that reaches
+        :func:`relax_verify_expiry`, directly or through a builder such as REST's
+        ``_expiry_relaxed_opener``, was a connection that hands this method no context on its
+        relaxed hop. Two census tests in ``tests/test_revocation_guard_census.py`` fail on a new
+        site that reaches it by name, and on a hop that is not a connection or may hand the
+        relaxed context over."""
         expiry_relaxed = context is not None and skips_validity_period(context)
         return cls(
             host=host,

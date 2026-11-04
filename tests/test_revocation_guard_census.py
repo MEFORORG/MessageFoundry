@@ -35,6 +35,16 @@ renaming either link of the chain from the mount to the Vault guard failed
 :func:`test_every_guard_name_reaches_a_root`. So did a second def named ``refuse_an_unrevoked_hop``
 in another module, and renaming the Vault guard's ``_crossed_unrevoked`` call failed
 :func:`test_the_vault_root_decides_through_the_authority`.
+
+**The relaxed-hop handoff census** at the end of this file is a second list, of the sites that
+reach ``relax_verify_expiry`` (vault BACKLOG #5086). Measured when it was written, against
+in-memory copies of the package: FHIR handing its relaxed opener to the guard, MLLP handing its
+relaxed context, the FTPS guard wrapper handing its context on, and
+``refuse_unrevoked_verified_hop`` ignoring a ``None`` opener each failed
+:func:`test_every_relaxed_hop_is_a_connection_that_hands_its_guard_no_relaxed_context`, naming
+the hops. A new relaxed builder caller in ``rest.py``, and one in ``dicomweb.py`` reached through
+an import alias, each failed
+:func:`test_every_reach_of_relax_verify_expiry_is_a_listed_builder_hop_or_exemption`.
 """
 
 from __future__ import annotations
@@ -45,7 +55,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from messagefoundry.config.tls_policy import RevocationHopGuard
-from tests._ast_sites import callee_name, calls_to, find_funcs, named_func, parse_source
+from tests._ast_sites import (
+    call_sites,
+    callee_name,
+    calls_to,
+    find_funcs,
+    named_func,
+    parse_source,
+)
 
 _ROOT = Path(__file__).resolve().parents[1]
 _PACKAGE = _ROOT / "messagefoundry"
@@ -509,3 +526,363 @@ def test_every_builder_name_is_still_defined() -> None:
         f"{_SHARED_OPENER} is assigned at module level in {sorted(scan.opener_modules)}, "
         f"expected {sorted(expected)}"
     )
+
+
+# The relaxed-hop handoff census (vault BACKLOG #5086). ``relax_verify_expiry`` sets
+# ``X509_V_FLAG_NO_CHECK_TIME``, which OpenSSL applies to a CRL's validity window too, so a CRL on a
+# relaxed context is no revocation check. ``RevocationHopGuard.capture`` gives such a CRL no credit,
+# and each relaxed hop also hands its guard no context or opener at all (ADR 0173 §13). The tests
+# below find every reach of the function, through any builder that hands the relaxed context or
+# opener on, and read that handoff at each hop the reach ends in.
+
+_RELAX = "relax_verify_expiry"
+
+#: Sites that reach ``relax_verify_expiry``, directly or through another builder here, and hand the
+#: relaxed context or opener to their caller. Each calls no guard: one that did would be a hop.
+_RELAXING_BUILDERS = frozenset(
+    {
+        "messagefoundry/transports/dicom.py::_client_ssl_context",
+        "messagefoundry/transports/mllp.py::_mllp_ssl_context",
+        "messagefoundry/transports/remotefile.py::_FtpClient.__init__",
+        "messagefoundry/transports/remotefile.py::_ftps_ssl_context",
+        "messagefoundry/transports/remotefile.py::_make_client",
+        "messagefoundry/transports/rest.py::_expiry_relaxed_opener",
+        "messagefoundry/transports/soap.py::_client_cert_opener",
+    }
+)
+
+#: The hops: sites that take a relaxed context or opener from a builder above and run a guard.
+_RELAXED_HOPS = frozenset(
+    {
+        "messagefoundry/transports/dicom.py::DicomScuDestination.__init__",
+        "messagefoundry/transports/fhir.py::FhirDestination.__init__",
+        "messagefoundry/transports/mllp.py::MLLPDestination.__init__",
+        "messagefoundry/transports/remotefile.py::RemoteFileDestination.__init__",
+        "messagefoundry/transports/remotefile.py::RemoteFileSource.__init__",
+        "messagefoundry/transports/rest.py::RestDestination.__init__",
+        "messagefoundry/transports/soap.py::SoapDestination.__init__",
+    }
+)
+
+#: Sites that reach a builder above and build no relaxed client context. Each names the builder and
+#: the keyword that keeps it off its relaxing branch, checked as ``True`` at every call in the site.
+_NOT_RELAXED: dict[str, tuple[str, str]] = {
+    # The server branch of _mllp_ssl_context returns before its relax_verify_expiry call.
+    "messagefoundry/transports/mllp.py::MLLPSource.__init__": ("_mllp_ssl_context", "server"),
+    "messagefoundry/transports/http_listener.py::HttpSource.__init__": (
+        "_mllp_ssl_context",
+        "server",
+    ),
+}
+
+#: The bases a hop's class must name directly, so the hop is a connection.
+_CONNECTION_BASES = frozenset({"DestinationConnector", "SourceConnector"})
+
+_Def = ast.FunctionDef | ast.AsyncFunctionDef
+
+
+@dataclass(frozen=True, slots=True)
+class _Unit:
+    """The code a reach is charged to: a module-level function, a method (a nested def is charged
+    to it), a class body outside its methods, or a module's top-level statements."""
+
+    key: str
+    #: The name a caller reaches it by: the class for ``__init__`` or a class body, else the def's.
+    alias: str | None
+    node: ast.AST
+    #: The bases its class names, by bare name; empty outside a class.
+    bases: frozenset[str]
+
+
+def _units(rel: str, tree: ast.Module) -> list[_Unit]:
+    units: list[_Unit] = []
+
+    def walk(body: list[ast.stmt], prefix: str, cls: ast.ClassDef | None) -> None:
+        bases = frozenset(
+            name
+            for base in (cls.bases if cls else [])
+            if (name := base.id if isinstance(base, ast.Name) else getattr(base, "attr", None))
+        )
+        rest: list[ast.stmt] = []
+        for stmt in body:
+            if isinstance(stmt, ast.ClassDef):
+                walk(stmt.body, f"{prefix}{stmt.name}.", stmt)
+            elif isinstance(stmt, _Def):
+                alias = cls.name if cls is not None and stmt.name == "__init__" else stmt.name
+                units.append(_Unit(f"{rel}::{prefix}{stmt.name}", alias, stmt, bases))
+            else:
+                rest.append(stmt)
+        if rest:
+            key = f"{rel}::{prefix.rstrip('.') or '<module>'}"
+            body_alias = cls.name if cls is not None else None
+            units.append(_Unit(key, body_alias, ast.Module(body=rest, type_ignores=[]), bases))
+
+    walk(tree.body, "", None)
+    return units
+
+
+def _loads(node: ast.AST) -> set[str]:
+    """The names code under ``node`` reads, bare or as an attribute: a call and a value both count."""
+    return {
+        sub.id if isinstance(sub, ast.Name) else sub.attr
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Name | ast.Attribute) and isinstance(sub.ctx, ast.Load)
+    }
+
+
+def _guard_calls(node: ast.AST) -> list[ast.Call]:
+    return [sub for sub in ast.walk(node) if isinstance(sub, ast.Call) and _is_guard(sub)]
+
+
+def _relaxed_reach(sources: dict[str, str], stop: frozenset[str]) -> dict[str, _Unit]:
+    """Every unit in ``sources`` that reads ``relax_verify_expiry``, or reads the alias of a reached
+    unit that calls no guard, to a fixed point. A unit that calls a guard is a hop, and a unit in
+    ``stop`` is reviewed as building no relaxed context, so neither passes its alias on. A file is
+    parsed only once its text names something reached, so most of the package is never parsed."""
+    names = {_RELAX}
+    units: dict[str, list[_Unit]] = {}
+    reached: dict[str, _Unit] = {}
+    grew = True
+    while grew:
+        grew = False
+        for rel, source in sources.items():
+            if not any(name in source for name in names):
+                continue
+            if rel not in units:
+                tree = ast.parse(source)
+                units[rel] = _units(rel, tree)
+                # A name imported under another name is reached under that one too.
+                for imp in ast.walk(tree):
+                    if isinstance(imp, ast.ImportFrom):
+                        for alias in imp.names:
+                            if alias.asname and alias.name in names and alias.asname not in names:
+                                names.add(alias.asname)
+                                grew = True
+            for unit in units[rel]:
+                if unit.key in reached or not _loads(unit.node) & names:
+                    continue
+                reached[unit.key] = unit
+                grew = True
+                if unit.key not in stop and not _guard_calls(unit.node) and unit.alias:
+                    names.add(unit.alias)
+    return reached
+
+
+def _condition_parts(expr: ast.expr, assigned: dict[str, list[ast.expr]]) -> list[ast.expr]:
+    """``expr`` split on ``and``/``or``, a local name replaced by what the function assigns it, so
+    ``relaxed = skips_validity_period(ctx)`` is read where ``None if relaxed else ...`` uses it."""
+    if isinstance(expr, ast.BoolOp):
+        return [part for value in expr.values for part in _condition_parts(value, assigned)]
+    if isinstance(expr, ast.Name) and expr.id in assigned:
+        values = assigned.pop(expr.id)  # popped, so a name assigned from itself cannot loop
+        return [part for value in values for part in _condition_parts(value, assigned)]
+    return [expr]
+
+
+def _reads_relaxation(test: ast.expr, fn: ast.AST) -> bool:
+    """Whether ``test`` holds on a relaxed hop, read off its shape: some part asks
+    ``skips_validity_period`` or reads ``tls_allow_expired``, and no part is negated. The shape,
+    not the value: ``False and skips_validity_period(ctx)`` would pass, so review still reads it."""
+    assigned: dict[str, list[ast.expr]] = {}
+    for sub in ast.walk(fn):
+        if isinstance(sub, ast.Assign):
+            for target in sub.targets:
+                if isinstance(target, ast.Name):
+                    assigned.setdefault(target.id, []).append(sub.value)
+        elif isinstance(sub, ast.AnnAssign) and sub.value and isinstance(sub.target, ast.Name):
+            assigned.setdefault(sub.target.id, []).append(sub.value)
+    nodes = [sub for part in _condition_parts(test, assigned) for sub in ast.walk(part)]
+    if any(isinstance(sub, ast.UnaryOp) and isinstance(sub.op, ast.Not) for sub in nodes):
+        return False
+    return any(
+        (isinstance(sub, ast.Call) and callee_name(sub) == "skips_validity_period")
+        or (isinstance(sub, ast.Constant) and sub.value == "tls_allow_expired")
+        for sub in nodes
+    )
+
+
+def _is_none(value: ast.expr) -> bool:
+    return isinstance(value, ast.Constant) and value.value is None
+
+
+def _none_when_relaxed(value: ast.expr, fn: ast.AST) -> bool:
+    """``None``, or ``None if <relaxed> else ...``."""
+    return _is_none(value) or (
+        isinstance(value, ast.IfExp) and _is_none(value.body) and _reads_relaxation(value.test, fn)
+    )
+
+
+def _none_param(value: ast.expr) -> str | None:
+    """The parameter ``P`` when ``value`` is ``None if P is None else ...``, else ``None``."""
+    if not (isinstance(value, ast.IfExp) and _is_none(value.body)):
+        return None
+    test = value.test
+    if (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Is)
+        and _is_none(test.comparators[0])
+    ):
+        return test.left.id
+    return None
+
+
+def _keyword(call: ast.Call, name: str) -> ast.expr | None:
+    return next((kw.value for kw in call.keywords if kw.arg == name), None)
+
+
+def _is_capture(call: ast.Call) -> bool:
+    return callee_name(call) == "capture" and _is_guard(call)
+
+
+def _hands_no_context_when_relaxed(
+    call: ast.Call, fn: ast.AST, defs: dict[str, list[_Def]]
+) -> bool:
+    """Whether the guard call ``call``, made in ``fn``, hands ``RevocationHopGuard.capture`` no
+    context on a relaxed hop. A ``capture`` call is read where it is. A wrapper is read one level
+    down, in its one def: each ``capture`` there either decides on the relaxation itself, or passes
+    ``None if P is None else ...`` for a parameter ``P`` that ``call`` binds to ``None`` on a relaxed
+    hop. Any other shape is not read, so it counts as a fault."""
+    if _is_capture(call):
+        context = _keyword(call, "context")
+        return context is None or _none_when_relaxed(context, fn)
+    found = defs.get(str(callee_name(call)), [])
+    if len(found) != 1:
+        return False
+    wrapper = found[0]
+    params = [arg.arg for arg in (*wrapper.args.posonlyargs, *wrapper.args.args)]
+    bound: dict[str, ast.expr] = dict(zip(params, call.args, strict=False))
+    bound.update({kw.arg: kw.value for kw in call.keywords if kw.arg})
+    captures = [sub for sub in ast.walk(wrapper) if isinstance(sub, ast.Call) and _is_capture(sub)]
+    if not captures:
+        return False
+    for capture in captures:
+        context = _keyword(capture, "context")
+        if context is None or _none_when_relaxed(context, wrapper):
+            continue
+        param = _none_param(context)
+        arg = bound.get(param) if param is not None else None
+        if arg is None or not _none_when_relaxed(arg, fn):
+            return False
+    return True
+
+
+def _defs_named(sources: dict[str, str], names: set[str]) -> dict[str, list[_Def]]:
+    found: dict[str, list[_Def]] = {name: [] for name in names}
+    for source in sources.values():
+        for name in names:
+            if f"def {name}(" in source:
+                found[name].extend(find_funcs(parse_source(source), name))
+    return found
+
+
+def _handoff_faults(sources: dict[str, str], hops: list[_Unit]) -> list[str]:
+    """Every way a hop in ``hops`` fails: it runs no guard, its class is not a connection, or a
+    guard call names no connection or may hand the guard the relaxed context or opener."""
+    wrappers = {
+        str(callee_name(call))
+        for hop in hops
+        for call in _guard_calls(hop.node)
+        if not _is_capture(call)
+    }
+    defs = _defs_named(sources, wrappers)
+    faults: list[str] = []
+    for hop in hops:
+        calls = _guard_calls(hop.node)
+        if not calls:
+            faults.append(f"{hop.key}: runs no revocation guard")
+        if not hop.bases & _CONNECTION_BASES:
+            faults.append(f"{hop.key}: its class names neither of {sorted(_CONNECTION_BASES)}")
+        for call in calls:
+            where = f"{hop.key}: {ast.unparse(call.func)} at line {call.lineno}"
+            if not _hands_no_context_when_relaxed(call, hop.node, defs):
+                faults.append(f"{where} may hand the guard the relaxed context or opener")
+            connection = _keyword(call, "connection")
+            if connection is None or _is_none(connection):
+                faults.append(f"{where} names no connection")
+    return faults
+
+
+@functools.cache
+def _package_sources() -> dict[str, str]:
+    return {
+        path.relative_to(_ROOT).as_posix(): path.read_text(encoding="utf-8")
+        for path in sorted(_PACKAGE.rglob("*.py"))
+    }
+
+
+@functools.cache
+def _package_reach() -> dict[str, _Unit]:
+    return _relaxed_reach(_package_sources(), frozenset(_NOT_RELAXED))
+
+
+def test_every_reach_of_relax_verify_expiry_is_a_listed_builder_hop_or_exemption() -> None:
+    """Every site in ``messagefoundry/`` that reaches ``relax_verify_expiry``, directly or through a
+    builder that hands the relaxed context or opener on, is listed above. A new one fails here until
+    it is read and listed, and a listed one that no longer reaches it fails too. Matched by name,
+    an import alias included, so a context relaxed by another means is outside this census."""
+    reach = _package_reach()
+    expected = _RELAXING_BUILDERS | _RELAXED_HOPS | _NOT_RELAXED.keys()
+    assert sorted(reach.keys() - expected) == [], "unlisted reach of relax_verify_expiry"
+    assert sorted(expected - reach.keys()) == [], "listed sites that no longer reach it"
+    hops = sorted(key for key, unit in reach.items() if _guard_calls(unit.node))
+    assert hops == sorted(_RELAXED_HOPS), "a builder runs a guard, or a hop runs none"
+    for key, (builder, keyword) in _NOT_RELAXED.items():
+        calls = call_sites(reach[key].node, builder)
+        assert calls, f"{key} no longer calls {builder}"
+        for call in calls:
+            value = _keyword(call, keyword)
+            assert isinstance(value, ast.Constant) and value.value is True, (
+                f"{key}: {builder} at line {call.lineno} does not pass {keyword}=True"
+            )
+
+
+def test_every_relaxed_hop_is_a_connection_that_hands_its_guard_no_relaxed_context() -> None:
+    """Each hop above is the constructor of a class naming a connection base, and each of its guard
+    calls names a connection and hands ``RevocationHopGuard.capture`` no context on a relaxed hop,
+    read at the call or one wrapper down. ADR 0173 §4.3's note of 2026-11-03 and ``capture``'s
+    docstring rest on this. It reads the condition's shape, as :func:`_reads_relaxation` says."""
+    reach = _package_reach()
+    faults = _handoff_faults(_package_sources(), [reach[key] for key in sorted(_RELAXED_HOPS)])
+    assert not faults, faults
+
+
+_SYNTHETIC_HOP = """
+class Dest(DestinationConnector):
+    def __init__(self, config):
+        self._ssl = _relaxed(config.settings)
+        relaxed = skips_validity_period(self._ssl)
+        RevocationHopGuard.capture(
+            host="h", cell="c", description="d", attested=False, connection=config.name,
+            context=HANDOFF,
+        ).enforce_construction()
+
+
+def _relaxed(s):
+    ctx = ssl.create_default_context()
+    if s.get("tls_allow_expired"):
+        relax_verify_expiry(ctx, host="h")
+    return ctx
+"""
+
+
+def test_a_relaxed_hop_that_hands_its_guard_the_relaxed_context_is_flagged() -> None:
+    """The positive control. A synthetic hop that reaches ``relax_verify_expiry`` through a builder
+    and hands its guard the context is found and faulted, and so is one whose test is negated. The
+    same hop handing ``None if relaxed else ...`` is clean, so the fault comes from the handoff."""
+    for handoff, faulted in (
+        ("self._ssl", True),
+        ("None if not relaxed else self._ssl", True),
+        ("None if relaxed else self._ssl", False),
+    ):
+        sources = {"fake.py": _SYNTHETIC_HOP.replace("HANDOFF", handoff)}
+        reach = _relaxed_reach(sources, frozenset())
+        assert sorted(reach) == ["fake.py::Dest.__init__", "fake.py::_relaxed"], reach
+        faults = _handoff_faults(sources, [reach["fake.py::Dest.__init__"]])
+        assert bool(faults) is faulted, (handoff, faults)
+        if faulted:
+            assert faults == [
+                "fake.py::Dest.__init__: RevocationHopGuard.capture at line 6 may hand the guard "
+                "the relaxed context or opener"
+            ], faults

@@ -782,11 +782,18 @@ closing sentence says changed no disposition, this one changes the guard's: an o
 hop handed such a context is refused under an enforcing posture, and warned on an instance that does
 not enforce unless `MEFOR_TLS_REVOCATION_ATTESTED` is set, where the guard used to admit it on that
 CRL. No shipped call site's disposition moved,
-because on 2026-11-03 every caller of `relax_verify_expiry` handed the guard no context for the
-relaxed hop: the call sites the next sentence names, MLLP and the DICOM SCU since vault BACKLOG
-#2978. A new caller of `relax_verify_expiry` reopens that claim, and
-`test_every_caller_of_relax_verify_expiry_is_a_connection_whose_guard_call_was_read`
-(`tests/test_revocation_guard_remaining_hops.py`) fails on one. The rest of this paragraph is as of
+because on 2026-11-03 every hop that reaches `relax_verify_expiry` handed the guard no context for
+the relaxed hop: the call sites the next sentence names, MLLP and the DICOM SCU since vault BACKLOG
+#2978. Two tests in `tests/test_revocation_guard_census.py` pin that claim.
+`test_every_reach_of_relax_verify_expiry_is_a_listed_builder_hop_or_exemption` lists each site in
+`messagefoundry/` that reaches the function by name, an import alias included, directly or through
+a builder that hands the relaxed context or opener on, such as REST's `_expiry_relaxed_opener`,
+which SOAP and FHIR call too. It fails on a new site.
+`test_every_relaxed_hop_is_a_connection_that_hands_its_guard_no_relaxed_context` checks that each
+hop is a connection's constructor, and reads each of its guard calls, at the call or one wrapper
+down. It fails where a call may hand `capture()` the relaxed context or opener, or names no
+connection. It reads the condition's shape, not its value, and a context relaxed by other means
+than `relax_verify_expiry` is outside both tests. The rest of this paragraph is as of
 2026-10-30.)* The
 choice is made at each call site: at least `RestDestination.__init__` (`transports/rest.py`),
 `SoapDestination.__init__` (`soap.py`), `FhirDestination.__init__` (`fhir.py`), FTPS's
