@@ -926,11 +926,18 @@ class _StreamBudgetExceeded(Exception):
         self.alone = alone
 
 
+class _AttachmentWriteFailed(Exception):
+    """The store's ``put_attachment`` raised during a detach, a driver or cipher fault rather than a
+    refusal of the body: a TEMPORARY refusal (BACKLOG #1619). Propagating it instead left a retrying
+    source re-reading the same body for as long as a deterministic write fault lasted."""
+
+
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
 #: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
 #: by one alone. Not every raise: a body the separator read refuses (a registered fuzz known finding,
 #: ``fuzz/targets.py``) still escapes as a bare ``ValueError``.
 _DETACH_REFUSALS: tuple[type[Exception], ...] = (
+    _AttachmentWriteFailed,
     _StreamBudgetExceeded,
     StreamingAttachmentsUnsupported,
     DocRefError,
@@ -8121,6 +8128,9 @@ class RegistryRunner:
                 # backend, a malformed handle and an escaped document refuse the same body every time.
                 if isinstance(exc, _StreamBudgetExceeded):
                     kind = RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
+                elif isinstance(exc, _AttachmentWriteFailed):
+                    # The one other re-send: a store fault, not the body, may clear (#1619).
+                    kind = RefusalKind.TEMPORARY
                 else:
                     kind = RefusalKind.PERMANENT
                 return await self._refuse(
@@ -8213,8 +8223,9 @@ class RegistryRunner:
         :class:`~messagefoundry.store.StreamingAttachmentsUnsupported` on a backend without streaming
         support (SQL Server / Postgres in Phase 1a), and
         :class:`~messagefoundry.parsing.binary.EscapedDocumentError` when a document's ``OBX-5.5``
-        holds an HL7 escape (vault BACKLOG #2809) — each, as one of :data:`_DETACH_REFUSALS`, is turned
-        into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
+        holds an HL7 escape (vault BACKLOG #2809), and :class:`_AttachmentWriteFailed` when
+        ``put_attachment`` itself fails (BACKLOG #1619) — each, as one of :data:`_DETACH_REFUSALS`, is
+        turned into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
         size = len(text)
         budget = self._stream_inflight_budget
@@ -8257,7 +8268,23 @@ class RegistryRunner:
                 safe_ct = content_type
                 if not attachment_mime_agrees(content_type, b64_head(verbatim_b64)):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
-                ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
+                try:
+                    ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
+                except StreamingAttachmentsUnsupported:
+                    raise  # a refusal the caller already classifies
+                except Exception as exc:  # noqa: BLE001 - see below
+                    # Broad on purpose: the three backends' drivers and the store cipher share no
+                    # base class, and this scope holds the store call alone. Only the type is kept,
+                    # because a driver's text can quote the value it refused (BACKLOG #1661).
+                    # A document stored before this one stays at refcount 0 for the orphan sweep.
+                    fault = f"{type(exc).__module__}.{type(exc).__qualname__}"
+                    log.warning(
+                        "inbound %r: attachment write failed in the streaming detach (%s); the "
+                        "message is not accepted",
+                        ic.name,
+                        fault,
+                    )
+                    raise _AttachmentWriteFailed(f"attachment write failed ({fault})") from exc
                 await asyncio.to_thread(
                     message.set, "OBX-5.5", make_doc_ref(ref, safe_ct), occurrence=occ
                 )
@@ -8526,9 +8553,10 @@ class RegistryRunner:
         # documents VERBATIM into the attachment substrate BEFORE the ingress commit, so the pipeline
         # carries only the small skeleton + a `mfdoc:v1:ref:` handle. This runs AFTER the synchronous
         # header parse/validate (a malformed header already NAK'd above) and BEFORE the commit/ACK, so a
-        # detach failure is a synchronous ERROR + NAK: AE for budget/backpressure or an unsupported
-        # backend, AR for an escaped document (below) — the message is NEVER accepted-and-dropped, and
-        # no ACK is sent for a body we couldn't store.
+        # detach failure is a synchronous ERROR + NAK: AE for budget/backpressure, an unsupported
+        # backend or a failed attachment write, AR for an escaped document (below) — the message is
+        # NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store. A failed ERROR
+        # write propagates to the transport instead (BACKLOG #1608).
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
@@ -8537,8 +8565,9 @@ class RegistryRunner:
             except _DETACH_REFUSALS as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
-                # A budget or backend refusal may clear on a resend, so AE. An escaped document is the
-                # message itself and fails the same way every time, so AR (vault BACKLOG #2809).
+                # A budget, backend or attachment-write refusal may clear on a resend, so AE (#1619).
+                # An escaped document is the message itself and fails the same way every time, so AR
+                # (vault BACKLOG #2809).
                 if isinstance(exc, EscapedDocumentError):
                     nak_code, nak_text = "AR", "escaped document in OBX-5.5"
                 else:
