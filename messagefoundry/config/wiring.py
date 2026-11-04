@@ -8723,6 +8723,8 @@ def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> Con
     _require_config_dir(directory, strict=strict)
     try:
         _assert_safe_config_source(directory)
+    except ConfigDirMissing:
+        raise
     except OSError as exc:
         # Its walk raises what it cannot list, and a path it could not vet must not load. Outside
         # strict that is a refusal, not a raw error, which a reload would answer as a 500.
@@ -8752,9 +8754,8 @@ def _require_config_dir(directory: Path, *, strict: bool) -> None:
     away after the reload's own check still answers as missing (BACKLOG #3157). Any other fault
     is refused by :func:`_refuse_config_dir`. Listed, not ``is_dir``, which answers ``False`` for a
     share Windows cannot reach or a parent this account cannot traverse, and so would call either
-    one missing. A directory that lists while ``is_dir`` says no is a fault too, because
-    :func:`_assert_safe_config_source` vets nothing where ``is_dir`` says no, and what follows this
-    check runs the directory's modules."""
+    one missing. A directory that lists while ``is_dir`` says no is a fault too: the two calls
+    disagree about the one path whose modules what follows this check runs."""
     try:
         with os.scandir(directory):
             pass
@@ -8774,7 +8775,7 @@ def _require_config_dir(directory: Path, *, strict: bool) -> None:
         _refuse_config_dir(
             directory,
             PermissionError(
-                errno.EACCES, "config directory lists but is not vetted", str(directory)
+                errno.EACCES, "config directory lists but is_dir says no", str(directory)
             ),
             strict=strict,
         )
@@ -9644,13 +9645,22 @@ def _assert_safe_config_source(directory: Path) -> None:
     paths is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
     principal a write-class right, **or when its owner is neither the engine's own account nor an
     administrator** (the Windows counterpart of that foreign-uid arm, CONFIG-2) — no longer a silent
-    no-op delegated entirely to install-time ACLs (docs/SERVICE.md, DEPLOY-1)."""
-    if not directory.is_dir():
-        return
-    # Include _*.py: the loader skips them as top-level modules, but a sibling can import them, so a
-    # writable/foreign-owned helper is just as much an injection vector (review M-21).
+    no-op delegated entirely to install-time ACLs (docs/SERVICE.md, DEPLOY-1).
+
+    A directory it cannot list raises that ``OSError``, a missing one included, and each caller
+    refuses the load. It returned with nothing vetted where ``Path.is_dir`` said no, which it says
+    for a share Windows cannot reach (vault BACKLOG #5117)."""
+    try:
+        # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
+        # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
+        paths = config_source_trust_paths(directory)
+    except OSError as exc:
+        if is_missing_directory(exc):
+            # Moved away since the caller's own check: missing, as that check answers (#3157).
+            _require_config_dir(directory, strict=True)
+        raise
     _check_trusted_paths(
-        config_source_trust_paths(directory),
+        paths,
         lead=_CONFIG_SOURCE_LEAD,
         refuse=_refuse_unsafe_config_source,
         first_is_required=True,

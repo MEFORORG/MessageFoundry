@@ -8,9 +8,20 @@ the gate, which is what pays for the over- and under-flags pinned in the tests b
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
-from messagefoundry.checks import _check_raise_fstring, run_checks
+import pytest
+
+from messagefoundry.checks import (
+    CheckResult,
+    _check_accepts_candidate,
+    _check_handler_security,
+    _check_raise_fstring,
+    run_checks,
+)
+from messagefoundry.config import wiring
+from tests._share_fault import unlistable_dir
 
 
 def _write(path: Path, body: str) -> None:
@@ -192,3 +203,66 @@ def test_raise_fstring_flags_call_wrapped_interpolation(tmp_path: Path) -> None:
     assert result.ok is True and result.skipped is False
     assert "wrapped.py:2" in result.detail
     assert "wrapped.py:3" not in result.detail
+
+
+# --- vault BACKLOG #5117: a leg that cannot list the config dir says so --------------------------
+
+_LEGS = [_check_raise_fstring, _check_accepts_candidate, _check_handler_security]
+
+
+def _unlistable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(directory: Path) -> list[Path]:
+        raise PermissionError(13, "Permission denied", str(directory))
+
+    monkeypatch.setattr(wiring, "config_py_files", refuse)
+
+
+@pytest.mark.parametrize("check", _LEGS)
+def test_a_lint_leg_that_cannot_list_the_config_dir_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, check: Callable[[Path], CheckResult]
+) -> None:
+    """It established nothing, so it is skipped and names the fault; it is neither a crash of the
+    gate nor a clean scan of a directory it never listed."""
+    _write(tmp_path / "handlers.py", "X = 1\n")
+    _unlistable(monkeypatch)
+    result = check(tmp_path)
+    assert (result.ok, result.required, result.skipped) == (True, False, True)
+    assert result.detail.startswith("could not list the config dir")
+    assert "Permission denied" in result.detail
+
+
+def test_strict_handler_security_fails_a_config_dir_it_cannot_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The opt-in block mode is a gate, and a gate that vetted nothing must not pass."""
+    _write(tmp_path / "handlers.py", "X = 1\n")
+    _unlistable(monkeypatch)
+    result = _check_handler_security(tmp_path, strict=True)
+    assert result.blocking
+    assert result.detail.startswith("could not list the config dir")
+
+
+@pytest.mark.parametrize("check", _LEGS)
+def test_a_lint_leg_names_a_real_folder_it_cannot_list(
+    tmp_path: Path, check: Callable[[Path], CheckResult]
+) -> None:
+    """Not a clean scan, and not "not a config dir" either, which ``Path.is_dir`` answered for the
+    share Windows cannot reach."""
+    with unlistable_dir(tmp_path) as folder:
+        result = check(folder)
+    assert result.skipped and result.detail.startswith("could not list the config dir")
+
+
+def test_strict_handler_security_fails_a_real_folder_it_cannot_list(tmp_path: Path) -> None:
+    with unlistable_dir(tmp_path) as folder:
+        assert _check_handler_security(folder, strict=True).blocking
+
+
+@pytest.mark.parametrize("check", _LEGS)
+def test_a_lint_leg_still_skips_what_is_not_a_config_dir(
+    tmp_path: Path, check: Callable[[Path], CheckResult]
+) -> None:
+    _write(tmp_path / "cfg.py", "X = 1\n")
+    for target in (tmp_path / "absent", tmp_path / "cfg.py"):
+        result = check(target)
+        assert (result.ok, result.skipped, result.detail) == (True, True, "not a config dir")

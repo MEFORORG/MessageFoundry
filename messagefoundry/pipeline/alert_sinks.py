@@ -67,6 +67,7 @@ from messagefoundry.pipeline.alerts import (
     remote_debug_refused_detail,
     sandbox_worker_refused_detail,
 )
+from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
 from messagefoundry.transports.base import NegativeAckError
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
@@ -1703,13 +1704,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def store_restored(self, name: str, *, detail: str, last_audit_at: str) -> None:
         # BACKLOG #2614: the first start on a restored store revoked every session. The subject
         # stands in for "connection". `last_audit_at` rides whole because the reason column
-        # redacts a date; both are times, an age and a count, never a row's content.
+        # redacts a date. `rollback_notice` rides whole because the reason column keeps only
+        # `detail`, cut to about 200 characters (BACKLOG #5094); it reaches the webhook JSON and
+        # the default email body, and `detail` points at the CLI that prints it for the paths it
+        # does not reach. `detail` is fixed words, an age, a count and a time, `last_audit_at` a
+        # time and `rollback_notice` fixed text: never a row's content.
         self._emit(
             {
                 "type": "store_restored",
                 "connection": name,
                 "detail": detail,
                 "last_audit_at": last_audit_at,
+                "rollback_notice": RESTORE_ROLLBACK_NOTICE,
             }
         )
 
