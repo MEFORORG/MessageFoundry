@@ -2333,10 +2333,11 @@ class MLLPSource(SourceConnector):
 
         **Why AE.** It is this engine's code for "not accepted, and not because of what the message
         says". The runner answers ``AR`` for every refusal it treats as final and ``AE`` only for a
-        temporary one, at least a strict-validation timeout that fired before the validate began
-        and a streaming-detach budget held by concurrent detaches (BACKLOG #5078, owner ruling of
-        2026-11-03, decision log d20261104T032854299-7235a9, stamped in UTC). The strict outcomes
-        are tabled in ``docs/HL7-VALIDATION.md``, *Tier 2*; the detach classes are
+        temporary one, at least a strict-validation timeout whose validate had not begun when the
+        listener handled the timeout and a streaming-detach budget held by concurrent detaches
+        (BACKLOG #5078, owner ruling of 2026-11-03, decision log d20261104T032854299-7235a9,
+        stamped in UTC). The strict outcomes are tabled in ``docs/HL7-VALIDATION.md``, *Tier 2*;
+        the detach classes are
         ``_detach_refusal_kind`` in ``pipeline/wiring_runner.py``. A handler fault is the engine's
         own and says nothing about the body, so it takes the temporary code. The engine's own MLLP
         destination reads the same split: it retries ``AE`` and dead-letters ``AR`` at once. An
