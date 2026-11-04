@@ -2679,15 +2679,22 @@ def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
     # The hostname half is true only where the connection does not ALSO turn the name check off.
     # CORRECTED (ASVS 12.3.2 re-read, 2026-10-01): this said "chain, hostname and key usage are still
     # verified" for every listed hop, which was false on a hop that also set tls_check_hostname=false.
+    # CORRECTED 2026-11-03 (vault BACKLOG #5089): "chain ... still verified" over-stated too. The
+    # relaxation skips at least the other chain certificates' validity periods and a CRL's own window
+    # (relax_verify_expiry), so the line claims only the chain's signatures.
     unchecked = {name for name, _ in hostname_unchecked_hops(registry)}
     both = sorted(name for name, _ in relaxed if name in unchecked)
+    windows = (
+        "at least the validity periods of the intermediates and the trust anchor, and a CRL's own "
+        "validity window, go unchecked too"
+    )
     if not both:
-        still = "chain, hostname and key usage are still verified"
+        still = f"{windows}; the chain's signatures, the hostname and key usage are still verified"
     else:
         # "The others" only when there are some.
         still = (
-            "chain and key usage are still verified; the hostname is NOT on "
-            f"{', '.join(both)}, which also set tls_check_hostname=false (an env() value is "
+            f"{windows}; the chain's signatures and key usage are still verified; the hostname is "
+            f"NOT on {', '.join(both)}, which also set tls_check_hostname=false (an env() value is "
             "counted as false, because it cannot be read before it resolves)"
         )
         if len(both) < len(relaxed):

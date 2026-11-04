@@ -2541,8 +2541,9 @@ def MLLP(
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able, and is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
-    # OUTBOUND: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname
-    # too unless tls_check_hostname=False.
+    # OUTBOUND: honour an EXPIRED server cert (#129). The chain's signatures are still verified, and
+    # the hostname too unless tls_check_hostname=False; at least the other chain certificates' and a
+    # CRL's validity windows are not (relax_verify_expiry).
     tls_allow_expired: bool = False,
     tls_ciphers: str
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
@@ -2672,9 +2673,11 @@ def MLLP(
     exactly like LDAPS / SQL Server. TLS is TLS 1.2+ and composes with the ``[egress].allowed_mllp``
     allowlist (both enforced). ``tls_allow_expired=True`` (outbound, #129 / ADR 0094) is the **granular**
     alternative to ``tls_verify=False`` for the narrow real-world case of a partner whose server
-    certificate has lapsed: it honours an **expired** cert while STILL verifying the chain and hostname
-    (a wrong-host / untrusted-chain cert is still rejected), logs a WARN, and — because verification stays
-    ON — is NOT an insecure hop the #200 posture gate refuses. Default ``False`` = byte-identical.
+    certificate has lapsed: it honours an **expired** cert while STILL verifying the chain's signatures
+    and, unless ``tls_check_hostname=False``, the hostname (a wrong-host / untrusted-chain cert is
+    still rejected). At least the intermediates' and the trust anchor's validity periods, and a CRL's
+    own window, go unchecked too (``relax_verify_expiry``). It logs a WARN, and — because verification
+    stays ON — is NOT an insecure hop the #200 posture gate refuses. Default ``False`` = byte-identical.
 
     ``tls_ciphers`` (**both directions**, ADR 0188) is the opt-in OpenSSL cipher string for **this
     hop**, the per-connection sibling of ``[api].tls_ciphers``. Unset (the default) the listener and
@@ -3658,7 +3661,7 @@ def Rest(
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
-    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
+    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain signatures+hostname still verified, not validity windows; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -3764,7 +3767,7 @@ def FHIR(
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
-    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
+    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain signatures+hostname still verified, not validity windows; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -4062,7 +4065,7 @@ def DICOM(
     tls_crl_file: str
     | EnvRef
     | None = None,  # opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
-    tls_allow_expired: bool = False,  # OUTBOUND SCU: honour an EXPIRED PACS cert (chain+hostname still verified; #129)
+    tls_allow_expired: bool = False,  # OUTBOUND SCU: honour an EXPIRED PACS cert (chain signatures+hostname still verified, not validity windows; #129)
     tls_ciphers: str
     | EnvRef
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
@@ -4608,7 +4611,7 @@ def Soap(
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
-    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
+    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain signatures+hostname still verified, not validity windows; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -4853,7 +4856,8 @@ def Ftp(
     host: str | EnvRef,  # the FTP server (may be env())
     port: int | EnvRef = 21,
     tls: bool | EnvRef = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
-    # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
+    # FTPS: honour an EXPIRED server cert (#129). The chain's signatures are still verified (not the
+    # other chain certificates' or a CRL's validity windows; relax_verify_expiry), and the hostname too
     # unless a hand-built spec sets tls_check_hostname=False, which a credentialed hop may not.
     tls_allow_expired: bool = False,
     tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)

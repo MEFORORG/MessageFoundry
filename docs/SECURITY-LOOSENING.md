@@ -1545,8 +1545,11 @@ count is above `0` (vault BACKLOG #2613).
 - **What the engine refuses without it:** each hop verifies the peer's certificate, and its
   handshake checks no OCSP. So under `[security].enforcement = enforce` the build refuses an
   off-box relay with a login, or an off-box https webhook. Under `warn` it builds with a WARNING.
-  A host off a non-empty `smtp_allowed_hosts` or `webhook_allowed_hosts` allowlist is refused at
-  the build, at every posture and before this guard, so no attestation is asked for it.
+  Each holds on a host its own hop's allowlist admits: `[alerts].smtp_allowed_hosts` for the
+  relay, `[alerts].webhook_allowed_hosts` for the webhook. Which hosts a list admits, an unset or
+  empty one included, is stated once, in [PHI.md](PHI.md) rows 10 and 11. A host off a non-empty
+  list is refused at the build, at every posture and before this guard, so no attestation is
+  asked for it.
   A relay with no login takes no guard at all, so the `email` pair does nothing there.
 - **Which callers know the posture:** at least `serve`'s lifespan, the alerts test send, and the
   offline notifier that `provision-admin` and `admin reset-totp` build, which derives the
@@ -1794,8 +1797,13 @@ count is above `0` (vault BACKLOG #2613).
   which a CRL used to admit without the revocation WARNING, now logs that WARNING at each build, except at
   least when `MEFOR_TLS_REVOCATION_ATTESTED` is set, when the connection sets its own
   `tls_revocation_attested`, or on a loopback hop. CORRECTED 2026-10-30:
-  this said "No posture gate keys on it", which was false once the call sites handed the guard no
-  context or opener for such a hop, so it earns no CRL credit; `RevocationHopGuard.capture` is unchanged. The engine will tell you *which* connections have it set,
+  this said "No posture gate keys on it", which was false once the call sites stopped giving such a
+  hop CRL credit. At least MLLP, the DICOM C-STORE SCU and both FTPS directions pass
+  `RevocationHopGuard.capture` the context they dial with and `expiry_relaxed=True`, which drops
+  the credit whatever CRL the context loads (vault BACKLOG #5089); at least REST, SOAP and FHIR
+  hand the guard no context or opener (ADR 0173 §4.3 and §13). CORRECTED 2026-11-03: this said
+  `RevocationHopGuard.capture` was unchanged and that every call site handed the guard no context,
+  which stopped being true when `capture` gained that flag. The engine will tell you *which* connections have it set,
   for as long as they have it set; it has no notion of *until when*, so the removal date belongs in your
   own risk register. Where it is NOT reported is the same list as `cleartext_accepted` above —
   `messagefoundry security show` and a graphless `GET /security/posture` say so in `loosenings_scope`.

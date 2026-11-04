@@ -2117,7 +2117,9 @@ connecting** — a handshake can only reveal a cert that is still being presente
 
 **CRL files.** The same scan reads each configured CRL file and alerts when its `nextUpdate` is past
 or within `warn_days`. Past `nextUpdate`, every TLS handshake the CRL verifies fails, not only those of
-revoked certificates. The scan covers an inbound connection's `tls_crl_file`, labelled with the
+revoked certificates, except on a hop that sets `tls_allow_expired`: that flag skips the
+CRL's own validity window too, so a lapsed CRL passes there and still refuses a leaf it lists
+([`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md) says what the flag costs). The scan covers an inbound connection's `tls_crl_file`, labelled with the
 connection's name, and at least these settings, labelled with their dotted names (BACKLOG #299):
 `tls.crl_file`, `logging.forward_tls_crl_file`, `auth.oidc_tls_crl_file`, `auth.ad_tls_crl_file`,
 `store.ssl_crl_file` and `api.tls_client_crl_file`. To the notifier this is a `cert_expiry` event whose connection is the label
@@ -2443,7 +2445,8 @@ one that became unreadable. The other is a pass that could not group the rows by
 #2319). The outbound hops that resolve a trust anchor load `[tls].internal_ca_file`, or a
 connection's own `tls_ca_file`, whole, CRL blocks included. So does the syslog forwarder with
 `[logging].forward_tls_ca_file`. Once a CRL setting turns revocation checking on for that hop, those
-CRLs are checked too, and past `nextUpdate` one refuses every peer under its issuer. The expiry scan watches
+CRLs are checked too, and past `nextUpdate` one refuses every peer under its issuer, except on a hop
+that sets `tls_allow_expired`, as **CRL files** above says. The expiry scan watches
 each one in a row labelled `held-crl:` and the CA file's path. The reload does not apply a changed CA
 file, so a refreshed CRL inside one needs a restart, and the expiry alert's `detail` says so. A start does
 not judge a CA file's CRL, so the scan judges it first (BACKLOG #3176). It applies a CRL setting's

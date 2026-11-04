@@ -290,6 +290,30 @@ def test_a_listed_relay_is_still_judged_for_revocation() -> None:
         _notifier(ENFORCING, allowed_hosts=("other.example.test", "smtp.EXAMPLE.test"))
 
 
+@pytest.mark.parametrize("posture", [ENFORCING, NOT_ENFORCING], ids=["enforcing", "warn"])
+def test_both_smtp_builds_refuse_a_relay_outside_the_allowlist_at_either_posture(
+    posture: HopPosture,
+) -> None:
+    """The allowlist refusal holds on the security notifier as on the alert transport, and at
+    either posture: neither build reaches the revocation guard for such a relay, so no revocation
+    record names it (BACKLOG #5089, beside #5088's enforcing-only case above). The listed host is
+    the control: the same build is judged there."""
+    with _guard_log() as log:
+        for build in (_email, _notifier):
+            with pytest.raises(ValueError, match="smtp_allowed_hosts") as exc:
+                build(posture, allowed_hosts=("other.example.test",))
+            assert not isinstance(exc.value, InsecureHopRefused)
+    assert not log.has(_SMTP_CELL), log.state()
+    for build in (_email, _notifier):
+        if posture is ENFORCING:
+            with pytest.raises(InsecureHopRefused, match="revocation"):
+                build(posture, allowed_hosts=(RELAY.upper(),))
+        else:
+            with _guard_log() as listed:
+                build(posture, allowed_hosts=(RELAY.upper(),))
+            assert listed.has(_SMTP_CELL), listed.state()
+
+
 def test_an_smtp_login_on_loopback_still_crosses() -> None:
     _email(ENFORCING, host="127.0.0.1")
     _notifier(ENFORCING, host="localhost")
