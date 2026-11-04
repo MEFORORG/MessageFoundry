@@ -177,8 +177,8 @@ def test_a_cloud_file_is_checked_before_its_filter_is_let_serve_it(
 
 def _convert_to_junction(directory: Path, target: Path) -> None:
     """Turn the EMPTY ``directory`` into a junction to ``target`` in place, as
-    ``FSCTL_SET_REPARSE_POINT`` does, without renaming it. A hold shares write access, so this
-    succeeds on a held directory."""
+    ``FSCTL_SET_REPARSE_POINT`` does, without renaming it. That needs only write-attributes access,
+    which no share mode denies, so it succeeds on a held directory."""
     if sys.platform != "win32":  # narrows mypy; every test here is Windows-only
         return
     import struct
@@ -218,8 +218,8 @@ def _convert_to_junction(directory: Path, target: Path) -> None:
     )
     # IO_REPARSE_TAG_MOUNT_POINT, then the reparse data's length.
     buffer = struct.pack("<IHH", 0xA0000003, len(mount_point), 0) + mount_point
-    # GENERIC_WRITE, share all, OPEN_EXISTING, BACKUP_SEMANTICS | OPEN_REPARSE_POINT.
-    handle = k32.CreateFileW(str(directory), 0x40000000, 0x7, None, 3, 0x02200000, None)
+    # FILE_WRITE_ATTRIBUTES, share all, OPEN_EXISTING, BACKUP_SEMANTICS | OPEN_REPARSE_POINT.
+    handle = k32.CreateFileW(str(directory), 0x100, 0x7, None, 3, 0x02200000, None)
     if handle in (None, ctypes.c_void_p(-1).value):
         raise ctypes.WinError(ctypes.get_last_error())
     try:
@@ -286,6 +286,59 @@ def test_a_file_reached_through_a_directory_turned_junction_is_refused_before_it
     assert reopened == ["own.tar"], "a file outside the directory was opened through its filter"
     assert unproven == [dr_backup._OUTSIDE_REASON]
     assert own.read_bytes() == b""
+
+
+def test_a_cloud_file_renamed_away_before_its_filter_reopen_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file opened as itself, then renamed away before the reopen that lets its filter serve it,
+    still holds its bytes under the new name, so it is reported, not read as nothing to empty.
+
+    Red before the fix: the reopen's ``FileNotFoundError`` reached the open's own "nothing to empty"
+    arm, and the report came back empty."""
+    staging = tmp_path / "mefor-verify-own"
+    staging.mkdir()
+    cloud = staging / "cloud.tar"
+    cloud.write_bytes(_PLAINTEXT)
+
+    real_tag = file_mod._attribute_tag
+
+    def deduplicated(handle: int) -> tuple[int, int]:
+        attributes, tag = real_tag(handle)
+        if attributes & stat.FILE_ATTRIBUTE_DIRECTORY:
+            return attributes, tag
+        return attributes | stat.FILE_ATTRIBUTE_REPARSE_POINT, _DEDUP_TAG
+
+    real_create = file_mod._win_create
+
+    def rename_then_reopen(path: Path, access: int, share: int, flags: int) -> int:
+        if flags == 0 and Path(path) == cloud:  # the open that lets a filter act
+            os.rename(cloud, staging / "renamed.tar")
+        return real_create(path, access, share, flags)
+
+    monkeypatch.setattr(file_mod, "_attribute_tag", deduplicated)
+    monkeypatch.setattr(file_mod, "_win_create", rename_then_reopen)
+    unproven = dr_backup._empty_files_in_place(staging)
+    assert unproven == ["cloud.tar (changed while being emptied, not truncated)"]
+    assert (staging / "renamed.tar").read_bytes() == _PLAINTEXT
+
+
+def test_a_staging_root_that_is_a_junction_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The root refused as a link or junction is logged, as every other refusal of the walk is.
+
+    Red before the fix: it was reported as not listed with no log line saying why."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.dat").write_bytes(_OUTSIDE)
+    staging = tmp_path / "mefor-verify-own"
+    _junction(outside, staging)
+    with caplog.at_level(logging.WARNING, logger=dr_backup.__name__):
+        unproven = dr_backup._empty_files_in_place(staging)
+    assert unproven == ["mefor-verify-own/ (not listed)"]
+    assert (outside / "victim.dat").read_bytes() == _OUTSIDE
+    assert any("did not walk" in r.getMessage() for r in caplog.records)
 
 
 def _refuse_open(monkeypatch: pytest.MonkeyPatch, refused: Path, code: int) -> None:

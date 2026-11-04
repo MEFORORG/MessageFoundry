@@ -1924,17 +1924,28 @@ def _open_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> int
     refusing a reopen that reaches another file (``_Replaced``). Before a filter is let serve the
     file, the file opened as itself must have a final path under ``inside`` (``_Outside``) and pass
     :func:`_vet_for_truncate`, so a file reached outside the directory, through a directory turned
-    into a junction in place, is never served by its filter (BACKLOG #4992)."""
+    into a junction in place, is never served by its filter (BACKLOG #4992).
+
+    A name that is gone once the file was opened as itself, as when it is renamed away before the
+    reopen, raises ``_Replaced``, not ``FileNotFoundError``: the caller reads that as nothing to
+    empty, and the file still holds its bytes under another name."""
     if sys.platform == "win32":
         # GENERIC_READ | GENERIC_WRITE, what `open(..., "r+b")` asked for before.
         access = 0x80000000 | 0x40000000
+        opened: list[bool] = []
 
         def vet(fd: int) -> None:
+            opened.append(True)
             if inside is not None and not _win_final_path(_os_handle(fd)).startswith(inside):
                 raise _Outside("outside the directory")
             _vet_for_truncate(fd)
 
-        return _win_open_file(entry, access, vet=vet, fd_flags=os.O_RDWR)
+        try:
+            return _win_open_file(entry, access, vet=vet, fd_flags=os.O_RDWR)
+        except FileNotFoundError as exc:
+            if opened:
+                raise _Replaced("gone after it was opened") from exc
+            raise
     flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
     if dir_fd is None:
         return os.open(entry, flags)
@@ -2064,6 +2075,11 @@ def _win_hold_root(staging: Path, unproven: list[str]) -> tuple[list[int], str] 
         root = _win_hold_dirs(staging.parent, (staging.name,))
     except _Unconfined:
         unproven.append(f"{staging.name}/ (not listed)")
+        log.warning(
+            "DR staging: the truncate fail-safe did not walk %s, which is a link, a junction or not "
+            "a directory, so no file in it was emptied",
+            staging,
+        )
         return None
     except OSError as exc:
         _win_unlisted(unproven, staging, exc)
