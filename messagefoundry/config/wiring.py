@@ -2964,6 +2964,13 @@ def X12(
     )
 
 
+#: ``Http()``'s failed-attempt budget defaults, per minute (ADR 0154 D6): per peer, and across all
+#: peers. The MLLP listener's ``tls_client_subjects`` refusals are charged to the same budget at
+#: these figures (BACKLOG #4907), so the two read one pair of numbers.
+INTAKE_AUTH_RATE_LIMIT_DEFAULT = 10
+INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT = 60
+
+
 def Http(
     *,
     port: int | EnvRef,
@@ -3010,9 +3017,9 @@ def Http(
         "require", "allow"
     ] = "require",  # whether GET/HEAD probes need the credential too
     intake_auth_rate_limit: int
-    | None = 10,  # FAILED intake-auth attempts per minute per peer (0/None disables)
+    | None = INTAKE_AUTH_RATE_LIMIT_DEFAULT,  # FAILED intake-auth attempts per minute per peer (0/None disables)
     intake_auth_rate_limit_global: int
-    | None = 60,  # FAILED intake-auth attempts per minute across all peers
+    | None = INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,  # FAILED intake-auth attempts per minute across all peers
     # --- Synchronous captured-downstream reply (ADR 0154 D4) — reply_from's presence is the switch ---
     reply_from: str
     | None = None,  # names the outbound whose CAPTURED reply becomes this request's HTTP body

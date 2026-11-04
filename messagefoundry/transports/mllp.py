@@ -2020,6 +2020,9 @@ class MLLPSource(SourceConnector):
         #: Throttles the refused-sender WARNING as the admission throttles its refusals, so a sender
         #: that reconnects in a loop cannot write a line per connection (BACKLOG #4907).
         self._unlisted_log = RefusalLog()
+        #: The same throttle for the spent-budget line, kept apart so neither line hides the other
+        #: for an address inside one window.
+        self._budget_log = RefusalLog()
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         #: The pre-read admission shared with the raw-TCP, X12 and HTTP listeners (vault BACKLOG
@@ -2284,7 +2287,7 @@ class MLLPSource(SourceConnector):
         peer = peer_host or "unknown"
         limiter = self.intake_rate_limiter
         if limiter is not None and not limiter.check(peer):
-            if count := self._unlisted_log.note(peer):
+            if count := self._budget_log.note(peer):
                 logger.warning(
                     "MLLP listener %s: the sender at %s has spent its failed-attempt budget for "
                     "tls_client_subjects; closing the connection unread (%d refused so far)",
@@ -2653,6 +2656,15 @@ class MLLPSource(SourceConnector):
                 if admitted is None:
                     return  # closed unread: the sender keeps whatever it had not had read
                 handle, unlisted = admitted
+                # BACKLOG #4907: a listed sender is noted as authenticated at every frame, as the
+                # HTTP listener notes one at every request, so a partner that has held one
+                # connection for hours is still exempt from the budget's global arm when it
+                # reconnects. None while the allowlist is off or for a refused sender.
+                listed_limiter = (
+                    self.intake_rate_limiter
+                    if self._client_subjects is not None and not unlisted
+                    else None
+                )
                 if not unlisted:
                     established = True
                     await self._emit_event("established", peer_host=peer_host)
@@ -2698,6 +2710,8 @@ class MLLPSource(SourceConnector):
                         handler_dropped = False
                         for message in decoder.feed(chunk):
                             decoded += 1
+                            if listed_limiter is not None:
+                                listed_limiter.note_success(peer_host or "unknown")
                             try:
                                 # BACKLOG #1725 act 3: bounded per listener; see the method.
                                 reply = await self._handle_bounded(message, handle)
@@ -2733,9 +2747,11 @@ class MLLPSource(SourceConnector):
                         if unlisted and decoded:
                             # BACKLOG #4907: every frame this read completed was recorded above,
                             # then the connection closes. The certificate cannot change within
-                            # the session, so every later frame would be refused too; closing
-                            # bounds what a refused sender writes per connection to one read's
-                            # worth, and leaves anything it has not yet had read with the sender.
+                            # the session, so every later frame would be refused too. Closing
+                            # bounds what a refused sender has recorded per connection to the
+                            # frames of the first read that completes one, which can include a
+                            # frame begun in earlier reads (up to max_frame_bytes), and leaves
+                            # anything it has not yet had read with the sender.
                             handler_dropped = True
                         if handler_dropped:
                             failed = True  # handler_error or the sender refusal says why

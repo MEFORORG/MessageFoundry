@@ -96,6 +96,8 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
 )
 from messagefoundry.config.wiring import (
+    INTAKE_AUTH_RATE_LIMIT_DEFAULT,
+    INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,
     FhirLookupSpec,
     InboundConnection,
     OutboundConnection,
@@ -307,12 +309,6 @@ PROCESSED_FILE_LEDGER_KEEP_MAX = 100_000
 #: Peers whose successful authentication we remember, to exempt them from the GLOBAL failed-attempt
 #: arm (AC-19). Bounded so a churn of distinct source addresses cannot grow it without limit.
 _INTAKE_SUCCESS_KEEP_MAX = 10_000
-
-#: The failed-attempt budget an MLLP inbound's ``tls_client_subjects`` refusals are charged to
-#: (BACKLOG #4907): the ``Http()`` factory's ``intake_auth_rate_limit`` and
-#: ``intake_auth_rate_limit_global`` defaults, per minute, which a test pins to that signature.
-_SENDER_ALLOWLIST_RATE_LIMIT = 10
-_SENDER_ALLOWLIST_RATE_LIMIT_GLOBAL = 60
 
 
 class _IntakeRateLimiter:
@@ -2284,10 +2280,10 @@ class RegistryRunner:
         """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled.
 
         An MLLP inbound with ``tls_client_subjects`` (BACKLOG #4907) has no budget settings of its
-        own and gets the ``Http()`` factory's defaults, which a test pins to that signature."""
+        own and gets the ``Http()`` factory's defaults."""
         if self._sender_allowlist_enabled(ic):
             return _IntakeRateLimiter(
-                per_peer=_SENDER_ALLOWLIST_RATE_LIMIT, glob=_SENDER_ALLOWLIST_RATE_LIMIT_GLOBAL
+                per_peer=INTAKE_AUTH_RATE_LIMIT_DEFAULT, glob=INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT
             )
         if not self._intake_auth_enabled(ic):
             return None
@@ -4977,9 +4973,12 @@ class RegistryRunner:
         # the DICOM SCP before it accepts a new association, a poll source or timer at its tick.
         source.intake_gate = self._intake_gate
         # BACKLOG #4907: the refusal a listener hands a message from a sender whose verified
-        # certificate is not on its allowlist, injected onto every source the same runtime way. A
-        # source that keeps no allowlist never calls it, so every other inbound is byte-identical.
-        source.refuse_unlisted_sender = self._make_unlisted_sender_refusal(ic)
+        # certificate is not on its allowlist, injected the same runtime way. None unless this
+        # inbound keeps one, like the intake-auth seams above, so every other inbound is
+        # byte-identical.
+        source.refuse_unlisted_sender = (
+            self._make_unlisted_sender_refusal(ic) if self._sender_allowlist_enabled(ic) else None
+        )
         # Vault BACKLOG #2608: a poll source's refusals are stored whole, never as a head, because the
         # file it deletes or the row it marks was the only copy. Keyed on the transport's own declared
         # contract, not on a connector type (CLAUDE.md section 4).

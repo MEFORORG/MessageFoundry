@@ -36,6 +36,8 @@ from cryptography.x509.oid import NameOID
 from messagefoundry.config.models import ConnectorType, ContentType, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
+    INTAKE_AUTH_RATE_LIMIT_DEFAULT,
+    INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,
     MLLP,
     ConnectionSpec,
     Http,
@@ -46,11 +48,7 @@ from messagefoundry.config.wiring import (
     load_config,
 )
 from messagefoundry.mllpcodec import AckMode
-from messagefoundry.pipeline.wiring_runner import (
-    _SENDER_ALLOWLIST_RATE_LIMIT,
-    _SENDER_ALLOWLIST_RATE_LIMIT_GLOBAL,
-    RegistryRunner,
-)
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.transports.mllp import _SENDER_DENIED, _SENDER_RATE_LIMITED, MLLPSource
 from tests.test_api_tls import _NOW, _CaPair, _client_bundle, _dn, _new_ca, _pem, _self_signed
@@ -711,7 +709,7 @@ async def test_a_refusal_writes_the_audit_row_and_event_http_writes(
 
 
 async def test_a_refused_sender_that_reconnects_is_closed_unread_at_its_budget(
-    tmp_path: Path, store: MessageStore
+    tmp_path: Path, store: MessageStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The failed-attempt budget HTTP charges for ``auth_subject_denied``, reused: each refusal is
     charged to the peer's address, and once the budget is spent the address is closed unread,
@@ -726,11 +724,13 @@ async def test_a_refused_sender_that_reconnects_is_closed_unread_at_its_budget(
         events=events,
     )
     refused_bundle, listed_bundle = _bundle(tmp_path, other), _bundle(tmp_path, named)
+    budget = INTAKE_AUTH_RATE_LIMIT_DEFAULT
     try:
-        for attempt in range(_SENDER_ALLOWLIST_RATE_LIMIT):
-            got = await _send_from(source, refused_bundle, _frame(_ADT))
-            assert b"MSA|AR|" in got, (attempt, got)
-        over_budget = await _send_from(source, refused_bundle, _frame(_ADT))
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+            for attempt in range(budget):
+                got = await _send_from(source, refused_bundle, _frame(_ADT))
+                assert b"MSA|AR|" in got, (attempt, got)
+            over_budget = await _send_from(source, refused_bundle, _frame(_ADT))
         same_address_listed = await _send_from(source, listed_bundle, _frame(_ADT))
         other_address_listed = await _send_from(
             source, listed_bundle, _frame(_ADT), local_host="127.0.0.2"
@@ -744,13 +744,83 @@ async def test_a_refused_sender_that_reconnects_is_closed_unread_at_its_budget(
     # Nothing was read from the two closed-unread connections, so they left no row: the sender
     # keeps those messages, and none is accepted and dropped.
     assert statuses == sorted(
-        [MessageStatus.ERROR.value] * _SENDER_ALLOWLIST_RATE_LIMIT + [MessageStatus.RECEIVED.value]
+        [MessageStatus.ERROR.value] * budget + [MessageStatus.RECEIVED.value]
     ), statuses
     actions = [row["action"] for row in await _audits(store)]
-    assert actions.count("intake.auth_subject_denied") == _SENDER_ALLOWLIST_RATE_LIMIT
+    assert actions.count("intake.auth_subject_denied") == budget
     assert actions.count("intake.auth_rate_limited") == 2
     limited = [e for e in events if e[0] == "auth_rate_limited"]
     assert limited == [("auth_rate_limited", "127.0.0.1", _SENDER_RATE_LIMITED)] * 2
+    # Both lines are written for the one address inside one window: neither throttle hides the
+    # other's line.
+    logged = [r.getMessage() for r in caplog.records]
+    assert any("not on tls_client_subjects" in m for m in logged), logged
+    assert any("has spent its failed-attempt budget" in m for m in logged), logged
+
+
+class _Limiter:
+    """A failed-attempt budget that admits everyone and records each call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def check(self, peer: str) -> bool:
+        self.calls.append(("check", peer))
+        return True
+
+    def charge_failure(self, peer: str) -> None:
+        self.calls.append(("charge", peer))
+
+    def note_success(self, peer: str) -> None:
+        self.calls.append(("success", peer))
+
+
+async def test_a_listed_sender_is_noted_at_every_message_and_never_charged(
+    tmp_path: Path, store: MessageStore
+) -> None:
+    """ADR 0154 D6's two invariants on this listener: the budget is consulted before the subject is
+    compared, and a listed sender is never charged. It is noted as authenticated at the accept and
+    at every message, as HTTP notes a partner at every request, so one that has held a connection
+    for hours is still exempt from the global arm when it reconnects. The control is a refused
+    sender, which is charged and never noted."""
+    named, other = _ca("Partner CA"), _ca("Other CA")
+    source = await _wired(
+        _settings(tmp_path, [named[0], other[0]], {_issuer(named): [SUBJECT]}), store
+    )
+    limiter = _Limiter()
+    source.intake_rate_limiter = limiter
+    second = _ADT.replace("CTRL4907", "CTRL4908")
+    try:
+        got = await _send_raw_until(
+            source, _bundle(tmp_path, named), _frame(_ADT) + _frame(second), b"CTRL4908"
+        )
+        listed_calls = list(limiter.calls)
+        limiter.calls.clear()
+        await _send_from(source, _bundle(tmp_path, other), _frame(_ADT))
+    finally:
+        await source.stop()
+    assert b"MSA|AA|CTRL4907" in got and b"MSA|AA|CTRL4908" in got
+    assert listed_calls[0] == ("check", "127.0.0.1")
+    assert listed_calls[1:] == [("success", "127.0.0.1")] * 3, listed_calls
+    assert limiter.calls == [("check", "127.0.0.1"), ("charge", "127.0.0.1")]
+
+
+async def _send_raw_until(source: MLLPSource, bundle: Path, wire: bytes, until: bytes) -> bytes:
+    """Write ``wire`` presenting ``bundle`` and read until ``until`` has arrived in a whole frame."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_cert_chain(bundle)
+    reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport, ssl=ctx)
+    got = b""
+    try:
+        writer.write(wire)
+        await writer.drain()
+        while until not in got:
+            got += await asyncio.wait_for(reader.readuntil(b"\x1c\r"), 10.0)
+        return got
+    finally:
+        writer.close()
 
 
 def test_the_budget_is_the_http_factory_default_and_only_with_the_allowlist(
@@ -759,8 +829,8 @@ def test_the_budget_is_the_http_factory_default_and_only_with_the_allowlist(
     """The MLLP allowlist has no budget settings of its own; it takes ``Http()``'s defaults. An MLLP
     inbound without the allowlist gets no budget and no audit sink (the control)."""
     params = inspect.signature(Http).parameters
-    assert params["intake_auth_rate_limit"].default == _SENDER_ALLOWLIST_RATE_LIMIT
-    assert params["intake_auth_rate_limit_global"].default == _SENDER_ALLOWLIST_RATE_LIMIT_GLOBAL
+    assert params["intake_auth_rate_limit"].default == INTAKE_AUTH_RATE_LIMIT_DEFAULT
+    assert params["intake_auth_rate_limit_global"].default == INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT
     named = _ca("Partner CA")
     (tmp_path / "on").mkdir()
     (tmp_path / "off").mkdir()
@@ -772,6 +842,43 @@ def test_the_budget_is_the_http_factory_default_and_only_with_the_allowlist(
     runner, ic = _runner(store, off)
     assert runner._make_intake_rate_limiter(ic) is None
     assert runner._make_intake_audit_sink(ic) is None
+
+
+async def test_the_runner_wires_the_allowlist_seams_at_start(
+    tmp_path: Path, store: MessageStore
+) -> None:
+    """Through ``RegistryRunner.start``, not by hand: the refusal, the budget and the audit sink are
+    injected onto the started MLLP source with the allowlist, and a refused sender gets its ERROR
+    row, its ``AR`` and its audit row. The control, the same listener without the allowlist, gets
+    none of the three seams."""
+    named, other = _ca("Partner CA"), _ca("Other CA")
+    (tmp_path / "on").mkdir()
+    (tmp_path / "off").mkdir()
+    on = _settings(tmp_path / "on", [named[0], other[0]], {_issuer(named): [SUBJECT]})
+    off = _settings(tmp_path / "off", [named[0], other[0]], None)
+    runner, _ic = _runner(store, on)
+    await runner.start()
+    try:
+        source = runner._sources[_INBOUND]
+        assert isinstance(source, MLLPSource)
+        assert source.refuse_unlisted_sender is not None
+        assert source.intake_rate_limiter is not None
+        assert source.on_intake_audit is not None
+        got = await _send_from(source, _bundle(tmp_path, other), _frame(_ADT))
+    finally:
+        await asyncio.wait_for(runner.stop(), timeout=10.0)
+    assert b"MSA|AR|" in got
+    assert MessageStatus.ERROR.value in [r["status"] for r in await _rows(store)]
+    assert [a["action"] for a in await _audits(store)] == ["intake.auth_subject_denied"]
+    runner, _ic = _runner(store, off)
+    await runner.start()
+    try:
+        source = runner._sources[_INBOUND]
+        assert source.refuse_unlisted_sender is None
+        assert source.intake_rate_limiter is None
+        assert source.on_intake_audit is None
+    finally:
+        await asyncio.wait_for(runner.stop(), timeout=10.0)
 
 
 def test_the_allowlist_refuses_tls_renegotiation(tmp_path: Path) -> None:

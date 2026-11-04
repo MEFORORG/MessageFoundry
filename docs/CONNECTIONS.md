@@ -475,7 +475,8 @@ accepted and dropped.
   `handler_error` connection event and an ERROR log line, not as a row, which is the gap the
   `SourceConnector` docstring names for a sender that waits for no reply.
 
-The connection closes after that first read, because the certificate cannot change within the
+The connection closes after the first read that completes a message, which can include a message
+begun in earlier reads, up to `max_frame_bytes`, because the certificate cannot change within the
 session, and the listener refuses a TLS renegotiation, so a TLS 1.2 client cannot present another
 certificate after the check; anything the sender has not yet had read stays with it.
 
@@ -492,8 +493,8 @@ certificate after the check; anything the sender has not yet had read stays with
   is compared, whatever certificate it now presents, as the HTTP listener answers it `429`. That is
   written as an `intake.auth_rate_limited` audit row and an `auth_rate_limited` connection event,
   and leaves no message row, since nothing was read. A listed sender behind the same address is
-  closed too while the budget is spent; a listed sender that connected inside the window is exempt
-  from the 60-per-minute arm. The count is in process, so each engine shard keeps its own.
+  closed too while the budget is spent; a listed sender that connected or sent a message inside the
+  window is exempt from the 60-per-minute arm. The count is in process, so each engine shard keeps its own.
 
 The stored reason, the `AR`'s text and the WARNING log line are fixed text naming no certificate
 field, since a subject can name a person; the log line gives the connection name and peer address,
