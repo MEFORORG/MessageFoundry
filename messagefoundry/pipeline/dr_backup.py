@@ -80,6 +80,7 @@ from messagefoundry.store.backup_codec import (
 )
 from messagefoundry.store.base import (
     DbaDelegatedError,
+    StoreCipherConfigError,
     build_store_cipher,
     resolve_active_key,
     resolve_decrypt_keys,
@@ -94,6 +95,7 @@ from messagefoundry.store.cipher_cells import (
 )
 from messagefoundry.store.crypto import (
     StoreKeylessError,
+    _decode_key,
     store_data_key_id,
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
@@ -588,30 +590,34 @@ class BackupRunner:
         # age, so a sibling engine shard's live run survives it, and only by this account's owner:
         # `.mefor-staging` inherits whatever the destination grants, so another account could plant a
         # directory there for the teardown to run on (BACKLOG #2420). It runs first, keyed on the
-        # owner a new directory of this process gets, as `_process_owner` reads it. When that read
-        # answers, a volume a killed run filled is freed before this run needs room for its own
-        # directory, and a run whose open fails still sweeps. On Windows the read is itself a probe
-        # directory written in the OS temp dir: when that write fails, or a sibling's sweep removes
-        # the probe before its owner is read, it answers None, and both this sweep and the OS-temp
-        # sweep below are off for this run. The staging root is then swept only by the space check's
-        # probe below, when the run is short, and by this run's own directory's owner once it is
-        # open. Where the staging root gives a directory another owner, the space check below sweeps
-        # by that one too before it refuses. Off the loop, like the rest.
+        # owner a new directory in the staging root gets, learned from a bare probe directory made
+        # and removed there by `_probe_owner`. Never the process's own owner: on a share whose server
+        # sets the owner, a directory carrying that one may have been made by another principal
+        # (BACKLOG #4988). When the probe answers, a volume a killed run filled is freed before this
+        # run needs room for its own directory, and a run whose open fails still sweeps. When the
+        # probe write fails, or a sibling's sweep removes the probe before its owner is read, it
+        # answers None and this sweep is off; the space check below probes once more when the run is
+        # short, and this run's own directory's owner sweeps once it is open. Off the loop, like the
+        # rest.
         staging_root, secure = self._staging_root(dest_dir)
-        early_owner = await asyncio.to_thread(_process_owner)
-        if early_owner is not None:
-            await asyncio.to_thread(_sweep_owned, staging_root, early_owner, own=None)
+        root_owner = await asyncio.to_thread(_probe_owner, staging_root)
+        swept_by: list[object] = []
+        if root_owner is not None:
+            swept_by.append(root_owner)
+            await asyncio.to_thread(_sweep_owned, staging_root, root_owner, own=None)
         # A standalone verify stages in the OS temp dir, so a killed cold-seed on this engine leaves
-        # its decrypted copy there. Each backup sweeps it too, by the process's own owner: a verify
-        # this account ran there made its directory with that owner, whatever owner a share's server
-        # gives this run's staging directory.
-        await asyncio.to_thread(_sweep_os_temp, early_owner)
-        # After those sweeps, which free what dead runs left when they ran (both are off when the
-        # owner read above answered None), and before this run's directory is opened or any of its
-        # bytes is staged. It is not before every write: the owner probes, above on Windows and below
-        # on a short run, are bare directories written first. A run that cannot fit fails here with kind `space`, naming the volume, not half-way through
-        # a multi-GB write.
-        swept_by: list[object] = [] if early_owner is None else [early_owner]
+        # its decrypted copy there. Each backup sweeps it too, by the owner a new directory there
+        # gets, as `_process_owner` reads it: a verify this account ran there made its directory
+        # with that owner, whatever owner a share's server gives this run's staging directory. On
+        # Windows that read is a probe in the OS temp dir, and when it answers None this sweep is
+        # off for this run.
+        process_owner = await asyncio.to_thread(_process_owner)
+        await asyncio.to_thread(_sweep_os_temp, process_owner)
+        # After those sweeps, which free what dead runs left when they ran, and before this run's
+        # directory is opened or any of its bytes is staged. It is not before every write: the
+        # owner probes, above and below on a short run, are bare directories written first. A run
+        # that cannot fit fails here with kind `space`, naming the volume, not half-way through a
+        # multi-GB write.
         shortfall = await asyncio.to_thread(
             self._space_shortfall,
             staging_root,
@@ -619,18 +625,17 @@ class BackupRunner:
             config_only=config_only,
             config_dir=config_dir,
         )
-        if shortfall is not None:
-            # On a share whose server sets the owner, or where the early read failed, the early sweep
-            # missed what this account's killed run left, and it would refuse every later run until
-            # someone deleted it. Learn the owner a directory gets there from a bare probe, which is
-            # removed before this returns. Only when that owner is not one a sweep above already went
-            # by, sweep by it and check once more whatever the sweep counted: a leftover it emptied
-            # but could not remove is not counted, yet frees the space. No run directory is open yet, so a refusal still leaves no lock or marker.
-            # Residuals, at least: the probe is a write, so on a volume full to the last block
-            # `mkdtemp` can fail and the refusal stands; and a sibling shard's sweep can remove a
-            # live probe before its owner is read, which answers None and skips this sweep.
+        if shortfall is not None and root_owner is None:
+            # The early probe answered None, so the early sweep missed what this account's killed run
+            # left, and it would refuse every later run until someone deleted it. Probe once more,
+            # sweep by that owner, and check once more whatever the sweep counted: a leftover it
+            # emptied but could not remove is not counted, yet frees the space. No run directory is
+            # open yet, so a refusal still leaves no lock or marker. Residuals, at least: the probe
+            # is a write, so on a volume full to the last block `mkdtemp` can fail and the refusal
+            # stands; and a sibling shard's sweep can remove a live probe before its owner is read,
+            # which answers None and skips this sweep.
             probed = await asyncio.to_thread(_probe_owner, staging_root)
-            if probed is not None and probed not in swept_by:
+            if probed is not None:
                 swept_by.append(probed)
                 await asyncio.to_thread(_sweep_owned, staging_root, probed, own=None)
                 shortfall = await asyncio.to_thread(
@@ -678,7 +683,7 @@ class BackupRunner:
         staging_leftover: str | None = None
         try:
             # Swept again by this run's own directory's owner only where no sweep above went by it,
-            # such as a share whose server sets the owner, or where the early read failed.
+            # such as where every staging-root probe above answered None.
             own_owner = await asyncio.to_thread(_owner_of, work.path)
             if own_owner is None:
                 log.warning(
@@ -1296,12 +1301,10 @@ class BackupRunner:
 
     def _resolve_key(self) -> bytes | None:
         """The 32-byte store DEK via the ADR 0019 KeyProvider seam, or ``None`` (identity cipher)."""
-        import base64
-
         key_b64 = resolve_active_key(self._store_settings, posture=self._hop_posture)  # type: ignore[arg-type]
         if not key_b64:
             return None
-        return base64.b64decode(key_b64)
+        return _decode_store_key(key_b64)
 
     def _current_config_dir(self) -> Path | None:
         """The config dir this pass backs up: the constructor's value, or what its callable names
@@ -1721,9 +1724,8 @@ def _fd_walk(
     and every child is opened relative to its parent's with ``O_NOFOLLOW``. Unlike ``os.fwalk`` it
     reports every listing and open failure to ``onerror`` and walks on: a directory that will not list
     or open, or one swapped for a link after it was listed, is reported and is never the end of the
-    walk. One case is skipped silently: an entry whose ``is_dir`` raises is listed as a file, so if it
-    is a directory it is never walked, and the fail-safe's ``lstat`` of it then finds no regular file
-    and reports nothing."""
+    walk. An entry whose ``is_dir`` raises is listed as a file, so if it is a directory it is never
+    walked; the fail-safe's ``lstat`` of it then finds a directory and reports it (BACKLOG #4989)."""
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
         raise OSError("the descriptor walk runs only on POSIX")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -1886,6 +1888,12 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
         return None
     except OSError:
         return name
+    # A directory here is one the walk took for a file because reading its type raised, so nothing
+    # in it was walked or emptied: report it, or the teardown would call the tree clean and raise no
+    # cleanup alert while it may still hold plaintext (BACKLOG #4989). A junction, which Windows
+    # reports as a directory, names another path and is never walked, as the walk's filter has it.
+    if stat.S_ISDIR(st.st_mode) and not getattr(st, "st_reparse_tag", 0) & _WIN_NAME_SURROGATE:
+        return f"{name}/ (not walked)"
     # A link is never followed: truncating through one would empty a file outside the directory, and
     # the link itself holds no plaintext.
     if not stat.S_ISREG(st.st_mode):
@@ -2536,9 +2544,10 @@ def _process_owner() -> object | None:
     POSIX: the effective uid, which is a new directory's ``st_uid``. Windows: the owner of a probe
     directory made and removed in the OS temp dir, since a local NTFS directory takes the token's
     default owner wherever it is made. On a share whose server sets the owner this answer differs
-    from what a directory there gets, and the backup then sweeps by its own directory's owner too.
-    On Windows this is ``None`` when the probe cannot be made, or a sibling's sweep removes it before
-    its owner is read; the backup then skips its early staging-root sweep and its OS-temp sweep."""
+    from what a directory there gets, so the backup keys only its OS-temp sweep on it, and sweeps
+    its staging root by :func:`_probe_owner` of that root (BACKLOG #4988). On Windows this is
+    ``None`` when the probe cannot be made, or a sibling's sweep removes it before its owner is
+    read; the backup then skips its OS-temp sweep."""
     if sys.platform != "win32":
         return os.geteuid()
     return _probe_owner(None)
@@ -2605,7 +2614,8 @@ def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:
     candidate; nothing is swept if that owner cannot be read. It is required (BACKLOG #2420). A
     standalone verify passes it for the OS temp dir, which can be shared. A backup sweeps both the OS
     temp dir and its own staging root, whose `.mefor-staging` inherits what the destination grants,
-    with :func:`_sweep_owned` by the same rule, keyed on the process's own owner. Another account
+    with :func:`_sweep_owned` by the same rule, keyed on the owner a new directory in each gets.
+    Another account
     could plant a directory in either holding a lock file and a marker, and the teardown must never
     run on a tree it controls."""
     owner = _owner_of(owned_like)
@@ -2822,6 +2832,23 @@ def _verify_in_staging(
     )
 
 
+def _decode_store_key(key_b64: str) -> bytes:
+    """One base64 store key as the 32 bytes it names, by the rule ``open_store`` applies.
+
+    A key that is not strict base64 of 32 bytes raises :class:`StoreCipherConfigError`, which the
+    ``restore-verify`` and ``restore`` commands report as "could not start" and exit 2, and a backup
+    run records as a failed backup (BACKLOG #4878). Its text is the decoder's fixed sentence, and it is raised outside the handler,
+    so it carries no chain: for a key with a character that is not ASCII the decoder's own error
+    chains a ``UnicodeEncodeError`` that names that character and holds the whole key."""
+    try:
+        decoded = _decode_key(key_b64, "a store encryption key")
+    except ValueError as exc:
+        reason = str(exc)
+    else:
+        return bytes(decoded)
+    raise StoreCipherConfigError(reason)
+
+
 async def run_restore_verify(
     archive_path: str,
     *,
@@ -2839,8 +2866,6 @@ async def run_restore_verify(
     ``allow_unencrypted`` (``[backup].allow_unencrypted``, default off) mirrors the write-side fail-closed:
     with it off, a plaintext archive is refused (``KEY_MISMATCH``) when a store key is configured (ASVS
     5.2.3 downgrade guard)."""
-    import base64
-
     # The decrypt-capable keyring, NOT just the active key: a backup taken under a key that has since
     # been retired (a routine WP-5 rotation) must still verify, or ADR 0048's cold-seed activation would
     # falsely refuse a perfectly recoverable archive (AC-5: compare to the resolved key, incl. retired).
@@ -2848,7 +2873,7 @@ async def run_restore_verify(
     # (vault BACKLOG #2983). The engine's DR activation passes its own; the `restore-verify`
     # command holds none, and `None` counts as enforcing on that hop.
     keys = [
-        base64.b64decode(k)
+        _decode_store_key(k)
         for k in resolve_decrypt_keys(
             store_settings,  # type: ignore[arg-type]
             posture=posture,
@@ -3462,10 +3487,8 @@ async def run_restore(
     so the refusal's own remedy (*"set [backup].allow_unencrypted"*) named a setting this path does not
     read — a prescription an operator would have followed to no effect. The parameter is gone and the
     refusal now says the true thing: a plaintext archive restores only on a box with no store key."""
-    import base64
-
     keys = [
-        base64.b64decode(k)
+        _decode_store_key(k)
         for k in resolve_decrypt_keys(store_settings)  # type: ignore[arg-type]
     ]
     return await asyncio.to_thread(

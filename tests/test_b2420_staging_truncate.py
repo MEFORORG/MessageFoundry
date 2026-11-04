@@ -386,6 +386,23 @@ def _share_owner_for(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(dr_backup, "_owner_of", owner)
 
 
+def _first_root_probe_answers_none(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The early probe of ``data`` answers None, as when a sibling shard's sweep removes it before
+    its owner is read, so the early sweep is off and only the space check's probe sweeps (BACKLOG
+    #4988 moved the early sweep onto the staging root's probed owner)."""
+    real_probe = dr_backup._probe_owner
+    calls: list[Path] = []
+
+    def probe(root: Path | None) -> object | None:
+        if root is not None and Path(root).absolute() == data:
+            calls.append(root)
+            if len(calls) == 1:
+                return None
+        return real_probe(root)
+
+    monkeypatch.setattr(dr_backup, "_probe_owner", probe)
+
+
 def _recording_open(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     opened: list[Path] = []
     real_open = dr_backup._open_staging
@@ -401,16 +418,18 @@ def _recording_open(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
 async def test_a_killed_runs_leftover_on_a_server_owner_share_is_freed_before_space_refuses(
     tmp_path, monkeypatch
 ) -> None:
-    """On a share whose server sets the owner, the early sweep, keyed on the process's owner, misses
-    a killed run's large leftover. Before this, the free-space check then refused with `space`, and
-    every later backup did too until someone deleted it by hand. The check now sweeps by the owner a
-    probe directory there gets, and the run proceeds."""
+    """On a share whose server sets the owner, an early sweep that did not go by the owner a probe
+    there gets misses a killed run's large leftover; since BACKLOG #4988 that is one whose probe
+    answered None. Before this, the free-space check then refused with `space`, and every later
+    backup did too until someone deleted it by hand. The check now sweeps by the owner a probe
+    directory there gets, and the run proceeds."""
     import shutil
 
     store, runner = await _store_and_runner(tmp_path, monkeypatch)
     data = (tmp_path / "data").absolute()
     dead = _abandoned(data, "mefor-backup-")
     _share_owner_for(data, monkeypatch)
+    _first_root_probe_answers_none(data, monkeypatch)
 
     class _Usage:
         def __init__(self, free: int) -> None:
@@ -440,6 +459,7 @@ async def test_a_leftover_emptied_but_not_removed_by_the_probe_sweep_still_lets_
     dead = _abandoned(data, "mefor-backup-")
     heavy = dead / "archive.tar"
     _share_owner_for(data, monkeypatch)
+    _first_root_probe_answers_none(data, monkeypatch)
     real_teardown = dr_backup._teardown_staging
 
     def emptied_not_removed(path: Path) -> str | None:
