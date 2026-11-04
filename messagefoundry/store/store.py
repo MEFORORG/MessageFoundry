@@ -7087,6 +7087,8 @@ DECIDED (BACKLOG #5069): a ``None`` return stays allowed, because it is the call
 statement that this result changed nothing worth a row, which :func:`if_applied` relies on for an
 alert id that matched no row. What is refused, with :class:`TypeError` and before any write, is a
 missing audit: ``None`` or anything not callable in its place (:func:`require_operator_audit`).
+The one exception is an operator inject, which always writes a message, so its ``None`` return is
+refused too (BACKLOG #5071, :func:`require_ingress_audit`).
 
 It must be pure and quick: it runs inside the mutation's transaction, which holds the mutation's
 row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock is taken, so it must
@@ -7468,23 +7470,47 @@ def require_operator_audit(audit: object, mutation: str) -> None:
         )
 
 
-#: The message origins only an operator's action writes (vault BACKLOG #2615), derived from the
-#: ``operator_`` prefix so a new one is covered without an edit here. ``enqueue_ingress`` refuses
-#: one of these with no audit (BACKLOG #5071).
-OPERATOR_ORIGINS: Final = frozenset(m for m in MessageOrigin if m.value.startswith("operator_"))
+#: The message origins only an operator's action writes (vault BACKLOG #2615). ``enqueue_ingress``
+#: refuses one of these with no audit (BACKLOG #5071). Listed, not derived from a name, so a new
+#: origin is a decision: the test classifies every member as operator or not.
+OPERATOR_ORIGINS: Final = frozenset({MessageOrigin.OPERATOR_EDIT, MessageOrigin.OPERATOR_UPLOAD})
 
 
-def require_ingress_audit(audit: object, origin: MessageOrigin) -> None:
-    """``enqueue_ingress``'s refusal, before it writes anything (BACKLOG #5071): an operator
-    origin needs an audit, and an audit that is given must be callable. A live receipt keeps the
-    default ``partner`` origin and passes none.
+def require_ingress_audit(
+    audit: OperatorAudit[str] | None, origin: MessageOrigin
+) -> OperatorAudit[str] | None:
+    """``enqueue_ingress``'s refusal (BACKLOG #5071), and the audit it then runs.
 
-    The refusal keys on ``origin``, so it cannot see an operator's inject written with the default
-    ``partner`` origin; such a call writes neither the operator label nor an audit row. Typed
-    callers are held by :meth:`~messagefoundry.pipeline.Engine.inject_message`, whose ``audit`` is
-    required and which always writes ``operator_upload``."""
-    if audit is not None or origin in OPERATOR_ORIGINS:
-        require_operator_audit(audit, f"enqueue_ingress with origin {str(origin)!r}")
+    Before anything is written, an operator origin with no audit, or any audit that is not
+    callable, raises :class:`TypeError`. For an operator origin the audit returned must also build
+    a row: an inject always writes a message, so a ``None`` row raises inside the transaction and
+    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes none.
+
+    It keys on ``origin``, so it cannot see an operator's inject written with the default
+    ``partner`` origin: such a call writes neither the operator label nor an audit row. Nothing at
+    the type level holds a direct caller of the store either, since ``audit`` stays optional there.
+    The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its
+    ``audit`` and always writes ``operator_upload``."""
+    operator = origin in OPERATOR_ORIGINS
+    if (operator or audit is not None) and not callable(audit):
+        raise TypeError(
+            f"enqueue_ingress with origin {str(origin)!r} needs an operator audit, a callable that"
+            f" builds its audit row; got {type(audit).__name__} (BACKLOG #5071)"
+        )
+    if not operator or audit is None:
+        return audit
+    build = audit
+
+    def row_required(message_id: str) -> AuditAppend:
+        row = build(message_id)
+        if row is None:
+            raise TypeError(
+                "an operator inject's audit returned no row, and an inject always writes a"
+                " message, so it always records one (BACKLOG #5071)"
+            )
+        return row
+
+    return row_required
 
 
 def operator_audits[R](audit: OperatorAudit[R], result: R) -> tuple[AuditAppend, ...]:
@@ -11188,7 +11214,7 @@ class MessageStore:
         leaves the attachment at refcount 0 (no ACK → the sender resends; content-addressing dedups the
         resend and the startup ``sweep_orphan_attachments`` reclaims the orphan). Empty/None → the
         byte-identical no-detach path (no incref)."""
-        require_ingress_audit(audit, origin)  # BACKLOG #5071
+        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: one skeleton holds a de-duplicated document (two identical OBX-5.5 values

@@ -26,8 +26,10 @@ The account and approval writes' ``audits`` sequence is held the same way (BACKL
 
 from __future__ import annotations
 
+import ast
 import functools
 import inspect
+import textwrap
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Optional, Union
 
@@ -139,8 +141,14 @@ def _param_problem(where: str, name: str, param: inspect.Parameter | None) -> st
 
 def _passes_through(params: Mapping[str, inspect.Parameter]) -> bool:
     """A wrapper signature that forwards every argument unchanged: ``*args, **kwargs`` and at most
-    a leading ``self``. Such a decorator cannot default or drop ``audit``."""
-    kinds = [p.kind for n, p in params.items() if n != "self"]
+    one leading positional, the instance, whatever it is named. Such a decorator cannot default or
+    drop ``audit``."""
+    kinds = [p.kind for p in params.values()]
+    if kinds[:1] in (
+        [inspect.Parameter.POSITIONAL_ONLY],
+        [inspect.Parameter.POSITIONAL_OR_KEYWORD],
+    ):
+        kinds = kinds[1:]
     return kinds == [inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD]
 
 
@@ -362,15 +370,68 @@ def test_operator_audits_refuses_a_missing_audit_and_a_bad_return() -> None:
 
 
 def test_the_ingress_refusal_keys_on_an_operator_origin() -> None:
-    """``enqueue_ingress``'s refusal (BACKLOG #5071): an operator origin needs a callable audit; a
-    partner receipt needs none, and an audit it is given must still be callable."""
+    """``enqueue_ingress``'s refusal (BACKLOG #5071): an operator origin needs a callable audit
+    that builds a row; a partner receipt needs none, and an audit it is given must be callable."""
+    row = AuditAppend("test.inject", actor="test")
     for origin in (MessageOrigin.OPERATOR_UPLOAD, MessageOrigin.OPERATOR_EDIT):
-        with pytest.raises(TypeError, match="BACKLOG #5069"):
+        with pytest.raises(TypeError, match="BACKLOG #5071"):
             require_ingress_audit(None, origin)
-        require_ingress_audit(lambda _mid: None, origin)
-    require_ingress_audit(None, MessageOrigin.PARTNER)
-    require_ingress_audit(None, MessageOrigin.REINGRESS)
-    with pytest.raises(TypeError, match="BACKLOG #5069"):
-        require_ingress_audit("not-a-callable", MessageOrigin.PARTNER)
-    expected = {MessageOrigin.OPERATOR_EDIT, MessageOrigin.OPERATOR_UPLOAD}
-    assert expected == OPERATOR_ORIGINS
+        built = require_ingress_audit(lambda _mid: row, origin)
+        assert built is not None and built("m") is row
+        silent = require_ingress_audit(lambda _mid: None, origin)
+        assert silent is not None
+        with pytest.raises(TypeError, match="returned no row"):
+            silent("m")
+    assert require_ingress_audit(None, MessageOrigin.PARTNER) is None
+    assert require_ingress_audit(None, MessageOrigin.REINGRESS) is None
+
+    def partner_audit(_mid: str) -> None:
+        return None
+
+    # Not an operator origin, so a None row is not refused: the audit runs as given.
+    assert require_ingress_audit(partner_audit, MessageOrigin.PARTNER) is partner_audit
+    with pytest.raises(TypeError, match="BACKLOG #5071"):
+        require_ingress_audit("not-a-callable", MessageOrigin.PARTNER)  # type: ignore[arg-type]
+
+
+def test_every_origin_is_classified() -> None:
+    """``OPERATOR_ORIGINS`` is a listed set, so a new ``MessageOrigin`` must be put on one side
+    here: an operator origin the list missed would inject with no audit (BACKLOG #5071)."""
+    not_operator = {MessageOrigin.PARTNER, MessageOrigin.REINGRESS}
+    assert {MessageOrigin.OPERATOR_EDIT, MessageOrigin.OPERATOR_UPLOAD} == OPERATOR_ORIGINS
+    assert set(MessageOrigin) == OPERATOR_ORIGINS | not_operator
+
+
+#: Each backend's operator mutations, and the call each must make before anything else.
+_ENTRY_GUARDS = {
+    **dict.fromkeys(sorted(FLOOR[Store]), "require_operator_audit"),
+    "enqueue_ingress": "require_ingress_audit",
+}
+
+
+@pytest.mark.parametrize("cls", (MessageStore, PostgresStore, SqlServerStore))
+def test_each_mutation_refuses_before_its_first_statement(cls: type[Any]) -> None:
+    """The runtime refusal comes BEFORE any write (BACKLOG #5069, #5071). The contract cannot tell
+    that from the ``operator_audits`` backstop, which raises inside the transaction and rolls the
+    write back with the same message. So this reads each method's syntax tree: its first statement
+    after the docstring must call the guard, passing ``audit``."""
+    problems = []
+    for method, guard in _ENTRY_GUARDS.items():
+        tree = ast.parse(textwrap.dedent(inspect.getsource(inspect.unwrap(getattr(cls, method)))))
+        fn = tree.body[0]
+        assert isinstance(fn, ast.AsyncFunctionDef), f"{cls.__name__}.{method}"
+        body = fn.body
+        if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            body = body[1:]
+        first = body[0]
+        call = first.value if isinstance(first, (ast.Expr, ast.Assign)) else None
+        ok = (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == guard
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id == "audit"
+        )
+        if not ok:
+            problems.append(f"{cls.__name__}.{method} starts with {ast.unparse(first)!r}")
+    assert problems == []

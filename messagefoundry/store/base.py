@@ -380,12 +380,12 @@ class QueueStore(StoreLifecycle, Protocol):
 
         ``audit`` is for an operator's inject only (BACKLOG #2624): its row, built from the new
         message id, commits in the same transaction. A live receipt passes none. It stays optional
-        in the type because this one method is both paths. What holds the inject is, at least:
-        :meth:`~messagefoundry.pipeline.Engine.inject_message`, whose ``audit`` is required; and,
-        at runtime, a refusal of an operator ``origin`` (``operator_edit``, ``operator_upload``)
-        with no audit, a :class:`TypeError` raised before anything is written (BACKLOG #5071,
-        ``store.require_ingress_audit``). That refusal keys on ``origin``, so a direct caller that
-        injects with the default ``partner`` origin writes neither the operator label nor a row.
+        in the type because this one method is both paths, so nothing at the type level holds a
+        direct caller here. At runtime an operator ``origin`` (``operator_edit``,
+        ``operator_upload``) with no audit raises :class:`TypeError` before anything is written,
+        and so does an operator inject whose audit builds no row (BACKLOG #5071,
+        ``store.require_ingress_audit``, where the limit is stated: it keys on ``origin``). The
+        engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires one.
 
         ``origin`` and ``origin_actor`` fill the plain ``messages.origin`` pair (vault BACKLOG #2615).
         A live receipt keeps the default, ``partner``; an operator's inject names itself and the user."""

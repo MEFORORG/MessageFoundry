@@ -608,11 +608,21 @@ async def _assert_missing_audit_refused(store: Any, tag: str) -> None:
 
     inject_ch = f"IB_NI{tag}"
     for origin in (MessageOrigin.OPERATOR_UPLOAD, MessageOrigin.OPERATOR_EDIT):
-        with pytest.raises(TypeError, match="BACKLOG #5069"):
+        with pytest.raises(TypeError, match="BACKLOG #5071"):
             await store.enqueue_ingress(
                 channel_id=inject_ch, raw=_RAW, origin=origin, origin_actor="contract-op"
             )
-    with pytest.raises(TypeError, match="BACKLOG #5069"):
+        # An inject always writes a message, so an audit that builds no row is refused too; the
+        # raise comes inside the transaction and rolls the inject back.
+        with pytest.raises(TypeError, match="returned no row"):
+            await store.enqueue_ingress(
+                channel_id=inject_ch,
+                raw=_RAW,
+                audit=lambda _mid: None,
+                origin=origin,
+                origin_actor="contract-op",
+            )
+    with pytest.raises(TypeError, match="BACKLOG #5071"):
         await store.enqueue_ingress(channel_id=inject_ch, raw=_RAW, audit="not-a-callable")
     assert int(await store.count_messages(channel_id=inject_ch, allowed_channels=None)) == 0
     # Control: a live receipt, the partner default with no audit, is still accepted.
@@ -634,6 +644,9 @@ async def _assert_missing_audit_refused(store: Any, tag: str) -> None:
         await store.ack_alert_instance(alert_id, actor="contract-op", audit=None)
     got = await store.get_alert_instance(alert_id, allowed_channels=None)
     assert got is not None and (got.status, got.acked_by) == ("open", None)
+    # Leave no open alert behind on a shared server database.
+    resolved = AuditAppend(f"contract.alert_cleanup.{tag}", actor="contract-op")
+    assert await store.resolve_alert_instance(alert_id, audit=resolved) is True
     flag_conn = f"OB_NF{tag}"
     with pytest.raises(TypeError, match="BACKLOG #5069"):
         await store.set_connection_flag(flag_conn, "outbound", flagged=True, audit=None)

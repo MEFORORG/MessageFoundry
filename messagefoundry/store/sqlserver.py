@@ -6509,7 +6509,7 @@ class SqlServerStore:
         is inserted (Phase 3a). A missing ref fails loud → the whole ingress rolls back → no ACK for a
         body we couldn't reference (content-addressing dedups the sender's resend; the startup sweep
         reclaims the orphan). Empty/None → the byte-identical no-detach path."""
-        require_ingress_audit(audit, origin)  # BACKLOG #5071
+        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
