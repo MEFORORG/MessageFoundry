@@ -336,11 +336,16 @@ def _der(cert: x509.Certificate) -> bytes:
     return cert.public_bytes(serialization.Encoding.DER)
 
 
-def _openssl_loads(cadata: str) -> int:
-    """How many certificates OpenSSL's ``load_verify_locations(cadata=)`` loads from ``cadata``."""
+def _openssl_context(cadata: str) -> ssl.SSLContext:
+    """A context that has run OpenSSL's ``load_verify_locations(cadata=)`` over ``cadata``."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_verify_locations(cadata=cadata)
-    return int(ctx.cert_store_stats()["x509"])
+    return ctx
+
+
+def _openssl_loads(cadata: str) -> int:
+    """How many certificates OpenSSL's ``load_verify_locations(cadata=)`` loads from ``cadata``."""
+    return int(_openssl_context(cadata).cert_store_stats()["x509"])
 
 
 def _wrapped(der: bytes, label: str = "CERTIFICATE") -> bytes:
@@ -448,6 +453,11 @@ _AFTER = {
     "tab": ("\t", True),
     "crlf": ("\r", True),
     "control": ("\x0b", True),
+    # Bytes OpenSSL strips that cryptography refuses after a BEGIN marker: the index hands
+    # cryptography the line OpenSSL read, so these name their CA rather than count unreadable.
+    "nul": ("\x00", True),
+    "soh": ("\x01", True),
+    "us": ("\x1f", True),
     "space-text": (" x", False),
     "text": ("x", False),
 }
@@ -545,6 +555,83 @@ def test_a_block_whose_begin_line_is_commented_out_names_no_issuer(label: str) -
     assert "CN=Partner CA" in index.unmatched_keys(["CN=Partner CA"])
     leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), partner)[0])
     assert index.issuer_of(leaf) == ""
+
+
+def _loaded_subjects(cadata: str) -> set[str]:
+    """The subject of each CA certificate ``load_verify_locations(cadata=)`` loaded from
+    ``cadata``. ``get_ca_certs`` lists CAs only, so a pinned non-CA certificate is not counted."""
+    return {
+        x509.load_der_x509_certificate(der).subject.rfc4514_string()
+        for der in _openssl_context(cadata).get_ca_certs(binary_form=True)
+    }
+
+
+@pytest.mark.parametrize("outer", ["FOO", "X509 CRL"])
+@pytest.mark.parametrize("header", [False, True], ids=["bare", "header"])
+@pytest.mark.parametrize("inner", ["CERTIFICATE", "X509 CERTIFICATE"])
+def test_a_certificate_nested_in_another_block_is_not_indexed(
+    outer: str, header: bool, inner: str
+) -> None:
+    """OpenSSL reads every line of a block it does not load, up to that block's END line, and skips
+    them, so a CERTIFICATE block nested inside another label's block is never loaded. An END line
+    that does not open a line is part of the outer block's body to OpenSSL. The index must skip the
+    same body: reading the nested BEGIN, it would run to the next END of that label, past the outer
+    END, and ``cryptography`` would read the nested certificate from that text. A client sending the
+    nested CA as its intermediate verifies through the root OpenSSL did load, so the index would
+    name the nested CA, and a subject listed under it would be admitted (BACKLOG #4948)."""
+    good = _ca(_dn((NameOID.COMMON_NAME, "Good CA")))
+    evil = _ca(_dn((NameOID.COMMON_NAME, "Evil CA")), by=good)
+    end = f"-----END {inner}-----\n".encode("ascii")
+    nested = _labelled(evil[0], inner).removesuffix(end)
+    filler = b"aGVsbG8gd29ybGQ=\n"  # base64 for the outer block's own body
+    outer_block = (
+        f"-----BEGIN {outer}-----\n".encode("ascii")
+        + (b"X: y\n" if header else b"")
+        + nested
+        + b" "  # OpenSSL reads this END as body, not as the end of a block
+        + end
+        + b"\n"
+        + filler
+        + f"-----END {outer}-----\n".encode("ascii")
+    )
+    cadata = (outer_block + _labelled(good[0], inner)).decode("ascii")
+    assert _loaded_subjects(cadata) == {"CN=Good CA"}  # the premise: OpenSSL skips the nested CA
+    index = IssuerIndex(cadata)
+    assert index.unreadable == 0
+    assert index.unmatched_keys(["CN=Good CA"]) == {}  # control: what OpenSSL loaded is named
+    assert "CN=Evil CA" in index.unmatched_keys(["CN=Evil CA"])
+    leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), evil)[0])
+    assert index.issuer_of(leaf) == ""
+
+
+@pytest.mark.parametrize(
+    ("nested", "label"),
+    [
+        pytest.param(False, "CERTIFICATE", id="certificate"),
+        pytest.param(False, "X509 CERTIFICATE", id="legacy"),
+        pytest.param(False, "FOO", id="other-label"),
+        pytest.param(True, "FOO", id="other-label-over-a-certificate"),
+    ],
+)
+def test_a_begin_with_no_end_counts_the_rest_as_unreadable(nested: bool, label: str) -> None:
+    """A BEGIN marker with no END line of its label after it makes OpenSSL refuse the file. The
+    index must not silently stop reading there, as if the rest of the file held nothing: the rest
+    is counted as unreadable, so the start warning fires. A whole certificate block after an
+    unclosed other-label BEGIN is inside that block to OpenSSL, so the index must not name it
+    either (BACKLOG #4948)."""
+    good = _ca(_dn((NameOID.COMMON_NAME, "Good CA")))
+    evil = _ca(_dn((NameOID.COMMON_NAME, "Evil CA")))
+    if nested:  # an unclosed BEGIN, then a whole certificate block
+        rest = f"-----BEGIN {label}-----\n".encode("ascii") + _pem(evil[0])
+    else:  # a block cut off before its END line
+        rest = _labelled(evil[0], label).removesuffix(f"-----END {label}-----\n".encode("ascii"))
+    cadata = (_pem(good[0]) + rest).decode("ascii")
+    with pytest.raises(ssl.SSLError):  # the premise: OpenSSL refuses the file
+        _openssl_loads(cadata)
+    index = IssuerIndex(cadata)
+    assert index.unreadable > 0
+    assert index.unmatched_keys(["CN=Good CA"]) == {}  # control: the block before it is named
+    assert "CN=Evil CA" in index.unmatched_keys(["CN=Evil CA"])
 
 
 @pytest.mark.parametrize(

@@ -19,7 +19,6 @@ import datetime
 import ipaddress
 import logging
 import os
-import re
 import string
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -1664,6 +1663,11 @@ class IssuerIndex:
         self._subject_keys: dict[str, set[bytes]] = {}
         self.unreadable = 0
         for block in _pem_certificate_blocks(cadata.encode("ascii", "replace")):
+            if block is None:
+                # A BEGIN with no END of its label. OpenSSL refuses such a file, so a context that
+                # loaded these bytes disagrees with this model; count it rather than read nothing.
+                self.unreadable += 1
+                continue
             try:
                 cert = x509.load_pem_x509_certificate(block)
                 subject = cert.subject.rfc4514_string()
@@ -1728,11 +1732,8 @@ def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
 #: ``cryptography`` parses, at least: ``CERTIFICATE`` and the legacy ``X509 CERTIFICATE``, measured
 #: on OpenSSL 3.5.7 (BACKLOG #4948). Missing the legacy one left a CA the handshake trusts out of
 #: the index, so every partner under it would have been refused, with a start warning naming the
-#: wrong cause. The pattern is the BEGIN marker, then nothing but bytes at or below a space to the
-#: end of its line; group 1 is the label.
-_PEM_CERTIFICATE_BEGIN = re.compile(
-    rb"-----BEGIN ((?:X509 )?CERTIFICATE)-----[\x00-\x09\x0b-\x20]*(?:\n|\Z)"
-)
+#: wrong cause.
+_PEM_CERTIFICATE_LABELS = frozenset({b"CERTIFICATE", b"X509 CERTIFICATE"})
 
 #: OpenSSL reads a long line in pieces of this many bytes, and a marker opening a piece counts as
 #: opening a line: on OpenSSL 3.5.7 a BEGIN after 254, 508, 762 or 1016 bytes of text loads, and one
@@ -1741,33 +1742,53 @@ _PEM_CERTIFICATE_BEGIN = re.compile(
 #: purpose: it refuses such a file instead.
 _OPENSSL_LINE_PIECE = 254
 
+#: The bytes OpenSSL's PEM reader strips from the end of each line it reads: every byte at or below
+#: a space, the LF and CR included.
+_OPENSSL_STRIPPED = bytes(range(0x21))
 
-def _opens_line(pem: bytes, at: int) -> bool:
-    """Whether OpenSSL's PEM reader would see offset ``at`` of ``pem`` as the start of a line."""
-    return (at - pem.rfind(b"\n", 0, at) - 1) % _OPENSSL_LINE_PIECE == 0
 
-
-def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
-    """Each ``CERTIFICATE`` or ``X509 CERTIFICATE`` PEM block in ``pem``, in order, as OpenSSL's
-    reader would find it, at least on the shapes measured (BACKLOG #4948).
-
-    A block opens at a BEGIN marker that opens a line (:func:`_opens_line`) and is the whole line
-    but for trailing bytes at or below a space, so a marker in a comment opens none. It ends at the
-    first END marker of its own label that opens a line, whatever lies between: OpenSSL reads every
-    line up to its first END line as the body, and refuses the file when that END names another
-    label. A BEGIN with no such END ends the scan, since OpenSSL refuses that file too. At least one
-    loadable shape still differs: a block missing its END line before the next block, which OpenSSL
-    loads and the index counts as unreadable, so it names no issuer and warns."""
+def _pem_reader_lines(pem: bytes) -> Iterator[bytes]:
+    """Each line of ``pem`` as OpenSSL's PEM reader reads one: up to and including a LF, at most
+    :data:`_OPENSSL_LINE_PIECE` bytes, with its trailing bytes at or below a space stripped."""
     at = 0
-    while (begin := _PEM_CERTIFICATE_BEGIN.search(pem, at)) is not None:
-        if not _opens_line(pem, begin.start()):
-            at = begin.start() + 1
+    while at < len(pem):
+        stop = pem.find(b"\n", at, at + _OPENSSL_LINE_PIECE)
+        stop = at + _OPENSSL_LINE_PIECE if stop < 0 else stop + 1
+        yield pem[at:stop].rstrip(_OPENSSL_STRIPPED)
+        at = stop
+
+
+def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes | None]:
+    """Each ``CERTIFICATE`` or ``X509 CERTIFICATE`` PEM block in ``pem``, in order, as OpenSSL's
+    reader would find it, at least on the shapes measured (BACKLOG #4948). ``None`` stands for the
+    rest of the file when OpenSSL would refuse it there, and ends the scan.
+
+    Lines are read as :func:`_pem_reader_lines` reads them. A block of ANY label opens at a line that
+    starts ``-----BEGIN `` and ends ``-----``, so a marker in a comment opens none. It ends at the
+    next line starting ``-----END ``, whatever lies between: OpenSSL reads every line up to it as
+    the body. The body of a block under another label is skipped whole, as OpenSSL skips it, so a
+    certificate nested inside such a block is never read. An END line naming another label, or no
+    END line at all, makes OpenSSL refuse the file; the rest is then counted as unreadable rather
+    than read as nothing.
+
+    A certificate block is handed on rebuilt from the lines OpenSSL read, so ``cryptography`` sees
+    the bytes OpenSSL kept, not the bytes it stripped. At least one loadable shape still differs: a
+    block missing its END line before the next block, which OpenSSL loads and the index counts as
+    unreadable, so it names no issuer and warns."""
+    lines = _pem_reader_lines(pem)
+    for line in lines:
+        if not (line.startswith(b"-----BEGIN ") and line.endswith(b"-----")):
             continue
-        end = b"-----END " + begin[1] + b"-----"
-        stop = pem.find(end, begin.end())
-        while stop >= 0 and not _opens_line(pem, stop):
-            stop = pem.find(end, stop + 1)
-        if stop < 0:
+        label = line.removeprefix(b"-----BEGIN ").removesuffix(b"-----")
+        body: list[bytes] = []
+        for end in lines:
+            if end.startswith(b"-----END "):
+                break
+            body.append(end)
+        else:
+            end = b""  # no END line at all
+        if end != b"-----END " + label + b"-----":
+            yield None  # no END, or one of another label: OpenSSL refuses the file
             return
-        at = stop + len(end)
-        yield pem[begin.start() : at]
+        if label in _PEM_CERTIFICATE_LABELS:
+            yield b"\n".join([line, *body, end, b""])
