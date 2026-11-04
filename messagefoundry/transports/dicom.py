@@ -185,9 +185,11 @@ _ENGINE_SCP_ABORT_PAST_BYTES = 2 * _ENGINE_INGRESS_CEILING_BYTES
 
 #: The outbound SCU's default ``max_object_bytes`` (vault BACKLOG #4908). The SCU cannot read a
 #: peer's limit, and the engine's own SCP is the one peer whose limit it knows, so the default keeps
-#: the SCU out of that SCP's abort. A larger object is refused before the association, with no
-#: retry, unless the site raises or removes the cap. The SCP's own default,
-#: :data:`DEFAULT_MAX_OBJECT_BYTES`, does not move.
+#: the SCU out of the abort of an engine SCP at a cap of 16 MiB or more. One set lower aborts smaller
+#: objects. A larger object is refused before the association, with no retry, unless the site
+#: raises or removes the cap. This is also the SCU's default inflate bound for a deflated object, as
+#: ``max_object_bytes`` always was. The SCP's own default, :data:`DEFAULT_MAX_OBJECT_BYTES`, does
+#: not move.
 DEFAULT_SCU_MAX_OBJECT_BYTES = _ENGINE_SCP_ABORT_PAST_BYTES
 
 #: How many stores in a row of one object over :data:`_ENGINE_SCP_ABORT_PAST_BYTES` may end with no
@@ -2339,7 +2341,7 @@ class DicomScuDestination(DestinationConnector):
             transport="DICOM-SCU destination",
         )
         #: Unanswered stores in a row of each object over _ENGINE_SCP_ABORT_PAST_BYTES, keyed by SOP
-        #: instance UID and size; see _bound_unanswered. Sends run on worker threads, hence the lock.
+        #: instance UID and size; see _count_unanswered. Sends run on worker threads, hence the lock.
         self._unanswered: dict[tuple[str, int], int] = {}
         self._unanswered_lock = threading.Lock()
         self._max_pdu_size = count_setting(
@@ -2529,25 +2531,32 @@ class DicomScuDestination(DestinationConnector):
             ) from exc
         except Exception as exc:  # noqa: BLE001 - a genuine DIMSE/transport error mid-store is transient
             # No response either, so it counts toward the same bound as an empty status below.
-            self._bound_unanswered(sop_instance, len(object_bytes))
+            final = self._count_unanswered(sop_instance, len(object_bytes))
+            if final is not None:
+                raise final from exc
             raise DeliveryError(
                 f"DICOM C-STORE client (SCU) to {self._host}:{self._port} failed: {safe_exc(exc)}"
             ) from exc
         finally:
             assoc.release()
         if getattr(status_ds, "Status", None) is None:
-            self._bound_unanswered(sop_instance, len(object_bytes))
+            final = self._count_unanswered(sop_instance, len(object_bytes))
+            if final is not None:
+                raise final
+        else:
+            # Any status, a refusal included, means the peer answers this object: so the count,
+            # which is of unanswered ends in a row, starts again.
+            self._forget_unanswered(sop_instance, len(object_bytes))
         self._classify(status_ds, sop_class=sop_class, sop_instance=sop_instance)
-        # Answered with Success or a Warning, so the peer has the object: its count starts again.
-        self._forget_unanswered(sop_instance, len(object_bytes))
 
-    def _bound_unanswered(self, sop_instance: str, size: int) -> None:
+    def _count_unanswered(self, sop_instance: str, size: int) -> NegativeAckError | None:
         """Count one store of an object over :data:`_ENGINE_SCP_ABORT_PAST_BYTES` that ended with no
-        C-STORE response, and refuse it as final at :data:`_MAX_UNANSWERED_SENDS_OVER_CEILING`. The
-        lane would otherwise re-send it at its head until the retry policy ran out, or without end
-        under ``max_attempts=None``; a permanent refusal is dead-lettered whatever that policy says."""
+        C-STORE response, and return the final refusal at :data:`_MAX_UNANSWERED_SENDS_OVER_CEILING`.
+        The lane would otherwise re-send it at its head until the retry policy ran out, or without
+        end under ``max_attempts=None``; a permanent refusal is dead-lettered whatever that policy
+        says."""
         if size <= _ENGINE_SCP_ABORT_PAST_BYTES:
-            return
+            return None
         key = (sop_instance, size)
         with self._unanswered_lock:
             count = self._unanswered.pop(key, 0) + 1
@@ -2555,8 +2564,8 @@ class DicomScuDestination(DestinationConnector):
                 self._unanswered[key] = count  # re-inserted last, so the oldest is first out
                 if len(self._unanswered) > _UNANSWERED_REMEMBERED:
                     del self._unanswered[next(iter(self._unanswered))]
-                return
-        raise NegativeAckError(
+                return None
+        return NegativeAckError(
             f"DICOM C-STORE client (SCU) to {self._host}:{self._port}: an object of {size} bytes, "
             f"over the {_ENGINE_SCP_ABORT_PAST_BYTES} bytes an engine SCP holds before it aborts, "
             f"ended with no response {count} times in a row (no retry)",
@@ -2579,7 +2588,7 @@ class DicomScuDestination(DestinationConnector):
         if status is None:
             # An empty status dataset means the association aborted / timed out with no response —
             # transient (the peer may recover); the SCU re-sends. _c_store has already counted it
-            # against _bound_unanswered for an object over what an engine SCP holds.
+            # against _count_unanswered for an object over what an engine SCP holds.
             raise DeliveryError(
                 f"DICOM C-STORE client (SCU) to {self._host}:{self._port} got no response status "
                 "(aborted/timeout)"

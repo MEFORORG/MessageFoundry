@@ -184,18 +184,20 @@ async def test_the_scps_abort_is_bounded_only_for_an_object_over_the_ceiling(
 
 
 @contextmanager
-def _scp_that_aborts(answers: list[bool]) -> Iterator[int]:
+def _scp_that_aborts(answers: list[int | None]) -> Iterator[int]:
     """A plain pynetdicom SCP, not the engine's: its C-STORE handler pops ``answers`` and aborts the
-    association for ``False``, so the store ends with no response, or stores for ``True``."""
+    association for ``None``, so the store ends with no response, or answers that status."""
     from pydicom.uid import ExplicitVRLittleEndian
     from pynetdicom import AE, evt
 
     from tests._dicom_sample import BASIC_TEXT_SR
 
     def handle_store(event: Any) -> int:
-        if not answers.pop(0):
+        answer = answers.pop(0)
+        if answer is None:
             event.assoc.abort()
-        return 0x0000
+            return 0x0000
+        return answer
 
     ae = AE(ae_title="PACS_SCP")
     ae.add_supported_context(BASIC_TEXT_SR, ExplicitVRLittleEndian)
@@ -209,20 +211,30 @@ def _scp_that_aborts(answers: list[bool]) -> Iterator[int]:
         server.shutdown()
 
 
-async def test_an_answered_store_starts_the_count_again(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The count is of unanswered ends in a row. A peer that aborted twice and then stored the object
-    # leaves nothing behind that would end a later send of it early.
+@pytest.mark.parametrize(
+    ("answer", "outcome"),
+    [
+        pytest.param(0x0000, "stored", id="after-a-success"),
+        # Out of Resources is a transient refusal, but an answer: the peer is not aborting this.
+        pytest.param(0xA700, "re-send", id="after-an-out-of-resources-answer"),
+    ],
+)
+async def test_an_answered_store_starts_the_count_again(
+    monkeypatch: pytest.MonkeyPatch, answer: int, outcome: str
+) -> None:
+    # The count is of unanswered ends in a row. A peer that aborted twice and then answered the
+    # object leaves nothing behind that would end a later send of it early.
     _needs_dicom()
     from tests._dicom_sample import make_sr_part10
 
     data = make_sr_part10()
     monkeypatch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", len(data) - 1)
     limit = dicom_module._MAX_UNANSWERED_SENDS_OVER_CEILING
-    answers = [False] * (limit - 1) + [True] + [False] * limit
+    answers: list[int | None] = [None] * (limit - 1) + [answer] + [None] * limit
     with _scp_that_aborts(answers) as port:
         scu = _uncapped_scu(port, "PACS_SCP")
         outcomes = await _outcomes(scu, data, 2 * limit)
-    expected = ["re-send"] * (limit - 1) + ["stored"] + ["re-send"] * (limit - 1) + ["final"]
+    expected = ["re-send"] * (limit - 1) + [outcome] + ["re-send"] * (limit - 1) + ["final"]
     assert outcomes == expected
     assert scu._unanswered == {}
 
@@ -232,12 +244,26 @@ def test_each_object_keeps_its_own_count_and_one_at_the_ceiling_is_never_counted
     size = dicom_module._ENGINE_SCP_ABORT_PAST_BYTES + 1
     limit = dicom_module._MAX_UNANSWERED_SENDS_OVER_CEILING
     for _ in range(limit - 1):
-        scu._bound_unanswered("1.2.3", size)
-        scu._bound_unanswered("1.2.4", size)
-    with pytest.raises(NegativeAckError):
-        scu._bound_unanswered("1.2.3", size)
-    with pytest.raises(NegativeAckError):
-        scu._bound_unanswered("1.2.4", size)
+        assert scu._count_unanswered("1.2.3", size) is None
+        assert scu._count_unanswered("1.2.4", size) is None
+    for uid in ("1.2.3", "1.2.4"):
+        final = scu._count_unanswered(uid, size)
+        assert final is not None and final.permanent is True
     for _ in range(limit + 1):
-        scu._bound_unanswered("1.2.5", size - 1)
+        assert scu._count_unanswered("1.2.5", size - 1) is None
     assert scu._unanswered == {}
+
+
+def test_the_oldest_count_is_dropped_past_the_ones_remembered() -> None:
+    scu = _scu_from({"ae_title": "MEFOR_SCU", "host": "127.0.0.1", "max_object_bytes": None})
+    size = dicom_module._ENGINE_SCP_ABORT_PAST_BYTES + 1
+    remembered = dicom_module._UNANSWERED_REMEMBERED
+    for n in range(remembered + 1):
+        assert scu._count_unanswered(f"1.2.{n}", size) is None
+    assert len(scu._unanswered) == remembered
+    assert ("1.2.0", size) not in scu._unanswered
+    assert (f"1.2.{remembered}", size) in scu._unanswered
+    # A count taken again moves to the newest end, so the next one dropped is another object's.
+    assert scu._count_unanswered("1.2.1", size) is None
+    assert scu._count_unanswered(f"1.2.{remembered + 1}", size) is None
+    assert ("1.2.1", size) in scu._unanswered and ("1.2.2", size) not in scu._unanswered
