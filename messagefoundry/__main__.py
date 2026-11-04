@@ -2791,9 +2791,6 @@ def _serve(args: argparse.Namespace) -> int:
     # A no-op where the interpreter was started with remote debugging disabled, which is every
     # engine shard under `supervise`.
     install_remote_debug_guard()
-    # BACKLOG #3768: configure_logging runs only after the gates below, so until then a record no
-    # handler takes goes to `logging.lastResort`, which main() gave the filter chain before it
-    # parsed the arguments. The comments below that name the filtered lastResort rely on it.
 
     import uvicorn
 

@@ -127,7 +127,6 @@ def test_the_filtered_last_resort_redacts_what_no_handler_takes(
     """BACKLOG #3768: the CLI's ``lastResort`` for the window before its handlers. It redacts at
     WARNING on whatever ``sys.stderr`` is at the emit, from a logger that does not propagate too,
     and a record a handler takes never reaches it, so nothing is written twice."""
-    monkeypatch.setattr(logging, "lastResort", logging.lastResort)  # process-wide: put it back
     root = logging.getLogger()
     root.handlers.clear()  # a real CLI process's shape; the autouse fixture puts pytest's back
     resort = logging_setup.install_filtered_last_resort()
@@ -165,12 +164,9 @@ def test_the_filtered_last_resort_redacts_what_no_handler_takes(
     assert late.out.count("late") == 1 and "DOE^JANE" not in late.out, late.out
 
 
-def test_the_filtered_last_resort_leaves_a_configured_root_alone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_the_filtered_last_resort_leaves_a_configured_root_alone() -> None:
     """A host that configured logging first keeps the stdlib's ``lastResort``, as it keeps its
     handlers under ``run_cli``'s sink: the choice is process-wide, so it is the host's."""
-    monkeypatch.setattr(logging, "lastResort", logging.lastResort)
     before = logging.lastResort
     root = logging.getLogger()
     hosts = logging.NullHandler()

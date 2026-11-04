@@ -4102,15 +4102,15 @@ def test_main_really_consults_the_exemption(command: str, monkeypatch: pytest.Mo
     assert seen["handlers"] == [], f"main() installed a sink for exempt `{command}`"
 
 
-# --- BACKLOG #3768: `serve` filters the window before configure_logging -------------------------
+# --- BACKLOG #3768: main() filters the window before a subcommand's handlers ------------------
 #
 # `serve` is exempt from main()'s sink and installs its handlers only after its settings, key and
 # egress gates, so in that window a record no handler takes goes to `logging.lastResort`, which
 # main() replaced with the filtered one before it parsed. These
 # tests log in that window and read stderr. It is entered for real: `suppress_crash_dumps` is the
 # first call `_serve` makes after its imports, and a `--service-config` naming a directory refuses
-# the start before configure_logging runs. `lastResort` is process-wide, so each test puts back the
-# one it found.
+# the start before configure_logging runs. `lastResort` is process-wide; the conftest's
+# `root_logging_restored` puts back the one each test found.
 
 
 def _warn_in_serve_window(monkeypatch: pytest.MonkeyPatch, seen: dict[str, object]) -> None:
@@ -4119,7 +4119,6 @@ def _warn_in_serve_window(monkeypatch: pytest.MonkeyPatch, seen: dict[str, objec
     record on a logger whose own level lets INFO through."""
     import messagefoundry.crashdump as crashdump
 
-    monkeypatch.setattr(logging, "lastResort", logging.lastResort)
     warn = _phi_logging_probe(seen)
 
     def probe() -> None:
@@ -4227,15 +4226,24 @@ _CHILD_PROBE = (
 )
 
 
+def _child_window_probe(label: str) -> str:
+    """A child ``def _probe():`` that prints ``label``, the root handler count and the type of
+    ``logging.lastResort``, then logs the probe. The caller appends the body's last line."""
+    return (
+        "def _probe():\n"
+        "    resort = type(logging.lastResort).__name__\n"
+        f"    print({label!r}, len(logging.getLogger().handlers), resort, flush=True)\n"
+        + _CHILD_PROBE
+    )
+
+
 def _warn_while_parsing(tmp_path: Path, *, prefix: str = "") -> str:
     """A child body that logs the probe while main() builds its parser, before ``_serve`` runs,
     then lets ``serve`` refuse the directory ``--service-config`` and exit 2."""
     return (
-        prefix + "build = m._build_parser\n"
-        "def _probe():\n"
-        "    resort = type(logging.lastResort).__name__\n"
-        "    print('parsing', len(logging.getLogger().handlers), resort, flush=True)\n"
-        + _CHILD_PROBE
+        prefix
+        + "build = m._build_parser\n"
+        + _child_window_probe("parsing")
         + "    return build()\n"
         "m._build_parser = _probe\n"
         f"raise SystemExit(m.main(['serve', '--service-config', {str(tmp_path)!r}]))\n"
@@ -4277,11 +4285,7 @@ def test_a_real_supervise_process_redacts_a_warning_before_its_handlers(tmp_path
     _run_warning_driver(
         tmp_path,
         "warn_in_the_supervise_window.py",
-        "def _probe():\n"
-        "    resort = type(logging.lastResort).__name__\n"
-        "    print('window', len(logging.getLogger().handlers), resort, flush=True)\n"
-        + _CHILD_PROBE
-        + "    raise SystemExit(3)\n"
+        _child_window_probe("window") + "    raise SystemExit(3)\n"
         "m.install_remote_debug_guard = _probe\n"
         "raise SystemExit(m.main(['supervise']))\n",
         returncode=3,
@@ -4298,10 +4302,7 @@ def test_a_real_serve_process_redacts_a_warning_before_its_handlers(tmp_path: Pa
         tmp_path,
         "warn_in_the_serve_window.py",
         "import messagefoundry.crashdump as crashdump\n"
-        "def _probe():\n"
-        "    resort = type(logging.lastResort).__name__\n"
-        "    print('window', len(logging.getLogger().handlers), resort, flush=True)\n"
-        + _CHILD_PROBE
+        + _child_window_probe("window")
         + "crashdump.suppress_crash_dumps = _probe\n"
         f"raise SystemExit(m.main(['serve', '--service-config', {str(tmp_path)!r}]))\n",
         returncode=2,
