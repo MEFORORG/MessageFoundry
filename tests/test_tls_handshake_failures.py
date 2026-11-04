@@ -554,7 +554,7 @@ async def test_the_http_listener_records_a_failed_handshake(
 ) -> None:
     """On the stdlib loop the listener runs its own handshakes since BACKLOG #2479, and counts a
     failure with its peer. ``loop`` forces the path uvloop takes, where the context's hook counts
-    it and knows no peer."""
+    it and does not read the peer."""
     if runner == "loop":
         monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
     source, cert = _http_tls_source(tmp_path)

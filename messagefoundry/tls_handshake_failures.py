@@ -26,7 +26,7 @@ with ``do_handshake()``. Both treat any ``ssl.SSLError`` from it as a failed han
 exactly that set and re-raises unchanged, so the loop's own handling does not move. No server or
 protocol class is replaced.
 
-**What it cannot see, at least, stated so it is not over-read.**
+**What it does not see or read, at least, stated so it is not over-read.**
 
 * **The peer's address, which the hook does not read.** These reports name no peer, and a trailing
   report for several failures names none anyway. A TLS object holds two memory buffers and no
@@ -37,7 +37,12 @@ protocol class is replaced.
   state, so the hook uses neither. uvloop was not measured, since it has no Windows build. A route
   that reads no private state, and is not built: the loop is handed no context and the listener
   runs the handshake itself, as the MLLP and HTTP listeners do on the stdlib loop. For the API that
-  would be the engine's own HTTP protocol class, which serve already hands uvicorn.
+  would be the engine's own HTTP protocol class, which serve already hands uvicorn. It too would
+  name a peer on the stdlib loop only (``_upgrades_tls_itself`` in ``transports/mllp.py``), and it
+  has at least these costs. uvicorn sets the scheme in ``connection_made``, before an upgrade, so
+  ``effective_https`` would drop the cookie's Secure flag and ``__Host-`` prefix. The mTLS shim
+  reads the peer certificate in ``connection_made`` too. The listeners' upgrade writes private
+  stream state. ``_log_api_handshake_failures`` ignores the peer it is handed.
 * **A handshake past its bound, where the loop runs it. A known limit, declined by owner ruling
   2026-10-26 (vault BACKLOG #3785 item 7).** The loop aborts the transport and never calls
   ``do_handshake`` again, so nothing raises, and a peer that opens sockets and stays silent is not
