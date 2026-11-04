@@ -162,19 +162,22 @@ def _connections_remove(tmp_path: Path) -> tuple[Path, Edit]:
     [_security, _alerts, _codeset, _connections, _connections_remove],
     ids=["security", "alert", "codeset", "conn", "conn-remove"],
 )
-def test_a_refused_edit_leaves_a_crlf_file_byte_for_byte(
-    tmp_path: Path, make: Callable[[Path], tuple[Path, Edit]]
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+def test_a_refused_edit_leaves_the_file_byte_for_byte(
+    tmp_path: Path, make: Callable[[Path], tuple[Path, Edit]], ending: bytes
 ) -> None:
     """Vault BACKLOG #2944 item 3: after a REFUSED toggle, the old rollback rewrote a CRLF
     connections.toml as LF. The toggle no longer writes the file (the flag lives in the store), so
     this pins the same guarantee on at least these file-writing entry points (not alerts
-    ``remove_rule``). No platform skip, so it runs on the Windows test legs, where CRLF is usual."""
+    ``remove_rule``). Both endings, because a text-mode rewrite flips one ending on each OS (CRLF
+    to LF on POSIX, LF to CRLF on Windows). No platform skip, so it runs on the Windows test legs."""
     path, edit = make(tmp_path)
-    # Make every line CRLF: write_text gives LF on POSIX and CRLF on Windows; the CSV writer, CRLF.
-    path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    # Give every line `ending`: write_text and the CSV writer each pick their own.
+    path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", ending))
     before = path.read_bytes()
-    assert before.count(b"\r\n") == before.count(b"\n") > 0
-    # The match pins the refusal to validate time, not an earlier read or parse of the CRLF file.
+    lines = before.count(b"\n")
+    assert lines > 0 and before.count(b"\r\n") == (lines if ending == b"\r\n" else 0)
+    # The match pins the refusal to validate time, not an earlier read or parse of the file.
     with pytest.raises(ValueError, match="simulated load failure"):
         edit(_refuse)
     assert path.read_bytes() == before
