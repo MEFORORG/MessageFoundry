@@ -1278,6 +1278,64 @@ def test_the_accept_loop_yields_after_a_failed_accept_it_skips() -> None:
     asyncio.run(scenario())
 
 
+class _MappedWinError(OSError):
+    """An accept failure as CPython builds one on Windows from an error code it has no errno for:
+    errno EINVAL, with the real code in ``winerror``."""
+
+    def __init__(self, winerror: int) -> None:
+        super().__init__(errno.EINVAL, "synthetic Windows accept failure")
+        self._winerror = winerror
+
+    @property
+    def winerror(self) -> int:
+        return self._winerror
+
+
+def test_an_accept_fault_is_fatal_only_when_the_listening_socket_is_gone() -> None:
+    """A peer reset during AcceptEx (ERROR_NETNAME_DELETED, 64) arrives as EINVAL on Windows, and
+    must not stop the listener; WSAEINVAL, or EINVAL with no Windows code, means the socket is not
+    listening, and does."""
+    fatal = mllp_module._accept_fault_is_fatal
+    with socket.socket() as sock:
+        assert fatal(_MappedWinError(64), sock) is False
+        assert fatal(_MappedWinError(1236), sock) is False  # ERROR_CONNECTION_ABORTED
+        assert fatal(_MappedWinError(10022), sock) is True  # WSAEINVAL
+        assert fatal(_MappedWinError(10038), sock) is True  # WSAENOTSOCK
+        assert fatal(OSError(errno.EINVAL, "not listening"), sock) is True
+        assert fatal(OSError(errno.EBADF, "bad descriptor"), sock) is True
+        assert fatal(OSError(errno.ECONNABORTED, "peer gone"), sock) is False
+        assert fatal(OSError("no errno"), sock) is False
+    # Closed, whatever the error says.
+    assert fatal(OSError(errno.ECONNABORTED, "peer gone"), sock) is True
+
+
+def test_a_long_run_of_skipped_accepts_waits_and_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lasting fault the accept loop does not know would otherwise retry once per turn for as long
+    as it lasts, logged only at DEBUG. After a run of skips it waits the retry delay and warns."""
+    monkeypatch.setattr(mllp_module, "_ACCEPT_SKIP_RUN", 3)
+    monkeypatch.setattr(mllp_module, "_ACCEPT_RETRY_DELAY", 60.0)
+
+    async def scenario() -> None:
+        fake = _FailingAccept(errno.ECONNABORTED)
+        asyncio.get_running_loop().sock_accept = fake  # type: ignore[method-assign]
+        listening = socket.socket()
+        server = mllp_module._AcceptingServer([listening], lambda _conn: None, name="IB_TEST")
+        try:
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert fake.calls == 3, "the accept loop did not wait after its run of skips"
+            assert listening.fileno() != -1
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+        asyncio.run(scenario())
+    assert "IB_TEST accept failed, retrying in 60s" in caplog.text
+
+
 def test_the_accept_loop_stops_on_a_fault_of_its_listening_socket(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

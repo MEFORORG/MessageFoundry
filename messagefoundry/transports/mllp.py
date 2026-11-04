@@ -1650,15 +1650,30 @@ _ACCEPT_RETRY_DELAY = 1.0
 #: `_ACCEPT_RETRY_DELAY` before accepting again; the same set asyncio's own server pauses on.
 _ACCEPT_SHORTAGE = frozenset({errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM})
 
-#: The accept failures that mean the listening socket itself is unusable, closed or never listening,
-#: so every later accept would fail the same way: `_AcceptingServer` stops that socket's accept loop
-#: on one. Windows reports a socket fault under its WinSock number, so those are named too. Any
-#: failure in neither set belongs to the one connection, which is skipped.
-_ACCEPT_FATAL = frozenset(
-    code
-    for name in ("EBADF", "EINVAL", "ENOTSOCK", "WSAEBADF", "WSAEINVAL", "WSAENOTSOCK")
-    if (code := getattr(errno, name, None)) is not None
-)
+#: The errnos with which ``accept()`` reports that the listening socket itself is unusable, closed
+#: or not listening, so every later accept would fail the same way.
+_ACCEPT_FATAL_ERRNOS = frozenset({errno.EBADF, errno.EINVAL, errno.ENOTSOCK})
+
+#: The same three faults as Windows reports them: WSAEBADF, WSAEINVAL and WSAENOTSOCK. They are
+#: read from ``winerror``, because CPython maps every Windows error code it has no errno for to
+#: EINVAL, so a peer reset during AcceptEx (ERROR_NETNAME_DELETED, 64) arrives as EINVAL too.
+_ACCEPT_FATAL_WINERRORS = frozenset({10009, 10022, 10038})
+
+#: How many failed accepts in a row `_AcceptingServer` skips at once before it waits
+#: `_ACCEPT_RETRY_DELAY` and logs a WARNING, so a lasting fault it does not know cannot hold a core.
+_ACCEPT_SKIP_RUN = 100
+
+
+def _accept_fault_is_fatal(exc: OSError, sock: socket.socket) -> bool:
+    """Whether a failed accept on ``sock`` means the listening socket is gone, so its accept loop
+    stops, rather than a fault of the one connection it was accepting."""
+    if sock.fileno() == -1:
+        return True
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in _ACCEPT_FATAL_WINERRORS
+    return exc.errno in _ACCEPT_FATAL_ERRNOS
+
 
 #: What binding an address reports where its family is not enabled on the host, for example ``::1``
 #: with IPv6 disabled. ``asyncio.start_server`` skips such an address; so does `_bind_tcp`.
@@ -1773,25 +1788,28 @@ class _AcceptingServer:
         self, sock: socket.socket, on_socket: Callable[[socket.socket], None]
     ) -> None:
         loop = asyncio.get_running_loop()
+        skipped = 0  # failed accepts in a row since the last success or wait
         while True:
             try:
                 conn, _address = await loop.sock_accept(sock)
             except OSError as exc:
-                if exc.errno in _ACCEPT_FATAL or sock.fileno() == -1:
+                if _accept_fault_is_fatal(exc, sock):
                     raise  # the listening socket is gone; `_closer` closes and logs it
-                if exc.errno not in _ACCEPT_SHORTAGE:
+                skipped += 1
+                if exc.errno not in _ACCEPT_SHORTAGE and skipped < _ACCEPT_SKIP_RUN:
                     # This connection's own failure, the peer gone before the accept among them:
                     # skip it and keep accepting. A selector loop's sock_accept fails at once,
-                    # without yielding, so this yields a turn first: a run of such failures would
-                    # otherwise spin. asyncio's own server cannot spin there either: it tries at
-                    # most backlog + 1 accepts per wakeup of the selector, skipping a
-                    # ConnectionAbortedError, and raises any other failure but a shortage to the
-                    # loop's exception handler, which ends that wakeup.
+                    # without yielding, so this yields a turn first, or a run of such failures
+                    # would spin. asyncio's own servers are no model here: the selector one tries
+                    # at most backlog + 1 accepts per wakeup and hands any failure but a dropped
+                    # connection or a shortage to the loop's exception handler, and the Proactor
+                    # one closes its listening socket on any failed accept.
                     logger.debug(
                         "MLLP listener %s skipped a failed accept: %s", self._name, safe_exc(exc)
                     )
                     await asyncio.sleep(0)
                     continue
+                skipped = 0
                 logger.warning(
                     "MLLP listener %s accept failed, retrying in %gs: %s",
                     self._name,
@@ -1800,6 +1818,7 @@ class _AcceptingServer:
                 )
                 await asyncio.sleep(_ACCEPT_RETRY_DELAY)
                 continue
+            skipped = 0
             on_socket(conn)
             # A selector loop's accept completes at once while connections are queued, and an
             # await on a finished future does not yield; one turn per accept keeps a flood from
@@ -2225,7 +2244,8 @@ class MLLPSource(SourceConnector):
         ``connect_accepted_socket``, which closes the socket on any failure once its transport holds
         it, a cancellation by stop() included. A handshake failure is logged and counted as
         `_start_tls` does it, with the peer. A failure before the transport holds the socket is no
-        handshake failure: it is logged, not counted, and the socket is closed here.
+        handshake failure and is not counted: the task's done callback closes the socket, and an
+        ``OSError`` is logged here at WARNING, any other exception there at ERROR.
 
         A connection closed CLEANLY during the handshake completes the wait with a result rather
         than an error, as `_start_tls` describes, so the transport comes back closed and never
@@ -2256,10 +2276,12 @@ class MLLPSource(SourceConnector):
             assert task is not None  # always: `_on_tls_socket` runs this as a task
             self._handshakes.add(task)
             # Scheduled before the call, so it runs only once the call suspends. On the stdlib loops
-            # and uvloop alike, the first suspension is the wait on the handshake, by when the TLS
-            # layer's transport holds the socket and closes it however the call ends. A failure
-            # raised before it, such as the transport refusing the socket, leaves the socket in
-            # ``unwrapped``, still this listener's, and no handshake ran.
+            # (CPython 3.14 ``base_events._create_connection_transport``, read) and on uvloop (its
+            # ``Loop.connect_accepted_socket``, recalled, not re-read), the first suspension is the
+            # wait on the handshake, by when the TLS layer's transport holds the socket and closes
+            # it however the call ends. A failure raised before it, such as the transport refusing the socket,
+            # leaves the socket in ``unwrapped``, still this listener's, and no handshake ran. On a
+            # loop not read, this rests on that loop keeping the same order.
             disown = loop.call_soon(unwrapped.clear)
             try:
                 transport, _ = await loop.connect_accepted_socket(
