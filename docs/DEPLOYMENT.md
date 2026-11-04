@@ -478,9 +478,8 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    **rejected at load**, since it moved to `[security]` (ADR 0118). `[auth].enabled` and
    `[security].require_sign_in` are rejected at load too, as removed.
 
-   **Neither branch alone starts a stock instance.** On the shipped default (PHI +
-   `[security].enforcement = enforce`) each carries a second, *fail-closed* precondition — a refusal
-   (exit 2), not an advisory, and not covered by `--allow-insecure-bind`:
+   **Neither branch alone starts a stock instance.** Each carries a second, *fail-closed*
+   precondition — a refusal (exit 2), not an advisory, and not covered by `--allow-insecure-bind`:
    - **Both branches** also need `MEFOR_TLS_REVOCATION_ATTESTED=1`, on the rule
      [SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate) states. If you name a proxy that re-encrypts to
      your certificate in `[api].trusted_proxies`, you also need `[api].proxy_tls_min_version` and
@@ -489,8 +488,9 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
      (vault BACKLOG #3538).
    - **The terminator branch** also needs `[api].proxy_intra_service_auth`
      (`mtls` / `network` / `shared_secret`) **and** `[api].proxy_tls_min_version` (`1.2` / `1.3`) — the
-     engine can verify neither the proxy→engine internal hop nor the proxy's negotiated TLS floor, so it
-     requires you to declare both before an off-loopback PHI bind may start.
+     engine can verify neither the proxy→engine internal hop nor the proxy's negotiated TLS floor, so
+     under `[security].enforcement = enforce` it requires you to declare both before an off-loopback
+     bind may start.
 2. **Web console (`/ui`)** — an off-loopback `/ui` **requires** in-process TLS or a declared terminator;
    `--allow-insecure-bind` does **not** cover the browser surface. The console is also on-by-default for
    *loopback* binds only: an exposed instance serves the JSON API alone unless you ask for it explicitly

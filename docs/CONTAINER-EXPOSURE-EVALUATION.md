@@ -378,9 +378,8 @@ The console stays a **host-side process**; only its target URL changes.
 ## 7. Gaps / residuals to flag
 
 1. **In-engine TLS revocation is delegated (ADR 0002, accepted).** The in-process API-TLS and direct
-   MLLP-over-TLS paths fetch **no** OCSP or CRL, so unless a CRL is loaded on the hop, a
-   revoked-but-unexpired cert is not rejected by the engine itself (`harden_verify_flags` does strict
-   RFC 5280 *path* validation, not revocation). An **OCSP-must-staple** terminator + the org PKI
+   MLLP-over-TLS paths fetch **no** OCSP or CRL (`harden_verify_flags` does strict RFC 5280 *path*
+   validation, not revocation). An **OCSP-must-staple** terminator + the org PKI
    enforces revocation for the browser's hop. The API bind's rule is
    [SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate). Of the §2 topologies it
    applies to each one that binds off loopback with an operator certificate: (a), (b) separate proxy
