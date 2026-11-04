@@ -1238,9 +1238,11 @@ ceilings bound it, and they bound different things:
   such bodies in flight at once is uncapped until an operator sets this. A detach that would cross a
   positive budget is refused with backpressure, `ERROR`-ed rather than accepted-and-dropped.
 
-Permitted **types** on this path are whatever the inbound declared. Outside the handful of families
-with a leading magic signature, a detached document's type is accepted as sent
-(`messagefoundry/parsing/sniff.py`), so this stage is not a content gate and must not be read as one.
+Permitted **types** on this path are whatever the inbound declared. A detached document's OBX-5.2
+label is stored as `application/octet-stream` when the document contradicts a family with a leading
+magic signature (`messagefoundry/parsing/sniff.py`), or when some store backend could not hold the
+label: wider than 256 UTF-16 code units, or holding a NUL. No other test is made of the label, so
+this stage is not a content gate and must not be read as one.
 
 The **directory
 source's** handling of an untrusted drop directory is fixed policy (the HTTP uploaded-logs surface has

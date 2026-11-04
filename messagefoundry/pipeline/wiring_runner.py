@@ -233,6 +233,7 @@ from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import ConnectionEventWrite, OwnedLanes
+from messagefoundry.store.transit_attestation import utf16_units
 from messagefoundry.transports import (
     DeliveryError,
     DestinationConnector,
@@ -1076,6 +1077,28 @@ class _StreamBudgetExceeded(Exception):
         # The default keeps cls(*args), which pickle and copy rebuild an exception with, working.
         super().__init__(message)
         self.alone = alone
+
+
+#: The widest ``content_type`` every backend's ``attachment`` column holds, in UTF-16 code units:
+#: SQL Server's ``NVARCHAR(256)`` (SQLite and PostgreSQL use unbounded ``TEXT``). OBX-5.2 is
+#: sender-controlled, so a longer label would fail the write with error 2628 on every resend.
+_ATTACHMENT_CONTENT_TYPE_MAX = 256
+
+
+def _label_fits_every_backend(label: str) -> bool:
+    """Whether every backend's ``attachment.content_type`` takes ``label`` (BACKLOG #1619): no NUL,
+    which PostgreSQL ``TEXT`` refuses (an HL7 ``\\X00\\`` escape decodes to one), and no wider than
+    :data:`_ATTACHMENT_CONTENT_TYPE_MAX`. A label failing either would fail the write on every
+    resend. The length test comes first, so a long sender-controlled label is never copied to be
+    measured.
+
+    A lone surrogate is deliberately not tested. A label can hold one only when the decoded body
+    does, and the same character then stays in the skeleton, whose ingress write fails on it
+    whatever the label is. Downgrading it would only store an unreferenced attachment first, so
+    ``put_attachment``'s own encode fault propagates instead, writing nothing."""
+    if len(label) > _ATTACHMENT_CONTENT_TYPE_MAX or "\x00" in label:
+        return False
+    return utf16_units(label) <= _ATTACHMENT_CONTENT_TYPE_MAX
 
 
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
@@ -8369,7 +8392,8 @@ class RegistryRunner:
                 kind = RefusalKind.OVERSIZE if result.oversize else RefusalKind.PERMANENT
                 return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
-        # failure records ERROR + returns a refusal — never accepted-and-dropped.
+        # refusal records ERROR + returns a refusal — never accepted-and-dropped. Any other fault, a
+        # put_attachment fault among them (#1619), propagates with no row.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
@@ -8507,8 +8531,12 @@ class RegistryRunner:
                 # family (image/pdf/zip/xml/json) whose magic bytes the document contradicts, store the
                 # generic octet-stream so the download route can never serve a mislabelled active-content
                 # payload as its claimed inert type. Non-sniffable labels are kept as declared.
+                # A label some backend's column cannot hold is downgraded the same way (BACKLOG #1619),
+                # tested first so an over-long label is never copied by the MIME check.
                 safe_ct = content_type
-                if not attachment_mime_agrees(content_type, b64_head(verbatim_b64)):
+                if not _label_fits_every_backend(content_type) or not attachment_mime_agrees(
+                    content_type, b64_head(verbatim_b64)
+                ):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
                 ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
                 await asyncio.to_thread(
@@ -8777,8 +8805,9 @@ class RegistryRunner:
         # documents VERBATIM into the attachment substrate BEFORE the ingress commit, so the pipeline
         # carries only the small skeleton + a `mfdoc:v1:ref:` handle. This runs AFTER the synchronous
         # header parse/validate (a malformed header already NAK'd above) and BEFORE the commit/ACK, so a
-        # detach failure is a synchronous ERROR + NAK, in the receipt path's class (below) — the
-        # message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store.
+        # detach refusal is a synchronous ERROR + NAK, in the receipt path's class (below) — the
+        # message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store. Any
+        # other fault, a put_attachment fault among them (#1619), propagates to the transport.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
