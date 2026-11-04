@@ -58,7 +58,9 @@
 
   Each arm reads YES, NO, INVALID or INCONCLUSIVE. INVALID is a report showing a broken instrument:
   a user-scope blob refused as damaged (win32=13), a value that opened but did not match, or a
-  plain_sha256 that is not A1's; a YES needs that match. A NO is only the key-state refusal,
+  plain_sha256 that is not A1's; a YES needs that match. Each start records its blob's SHA-256
+  (user_blob_sha256), so a later win32=13 on the very blob A1 hashed is DPAPI refusing an intact
+  blob, and reads INCONCLUSIVE, not INVALID. A NO is only the key-state refusal,
   win32=-2146893813 (NTE_BAD_KEY_STATE), the code the foreign control gets: the CryptUnprotectData
   docs name no code for a lost key, so any other refusal (access denied, an RPC fault, 0) reads
   INCONCLUSIVE and names its code. A3 still reads its result when the profile
@@ -383,6 +385,8 @@ public static class Spike
         byte[] plain = File.ReadAllBytes(plainPath);
         lines.Add("plain_sha256=" + Sha256Hex(plain));
         byte[] userBlob = ReadOrNull(userPath);
+        // So the judge can tell a blob damaged on disk from DPAPI refusing an intact one.
+        if (userBlob != null) { lines.Add("user_blob_sha256=" + Sha256Hex(userBlob)); }
         lines.Add("user_unprotect=" + Open(userBlob, plain));
         lines.Add("machine_unprotect=" + Open(ReadOrNull(machinePath), plain));
         lines.Add("control_foreign=" + Open(ReadOrNull(Path.Combine(dir, "foreign.blob")), null));
@@ -525,8 +529,9 @@ function Show-ScmEvents {
     foreach ($e in $events) { "scm_event id=$($e.Id) time=$($e.TimeCreated.ToUniversalTime().ToString('o')) $(($e.Message -replace '\s+', ' ').Trim())" }
 }
 
-function Complete-Report([string]$Name, [int]$Seconds) {
+function Complete-Report([string]$Name, [int]$Seconds, [switch]$ScmEvents) {
     # Waits for the arm's report, then stops the service, which stays running once it has written.
+    # The SCM's events are printed where the report is missing, and after it too with -ScmEvents.
     $path = Join-Path $Work "report-$Name.txt"
     $deadline = (Get-Date).AddSeconds($Seconds)
     while (-not (Test-Path -LiteralPath $path) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
@@ -538,6 +543,7 @@ function Complete-Report([string]$Name, [int]$Seconds) {
         return
     }
     Show-File $path
+    if ($ScmEvents) { Show-ScmEvents }
 }
 
 function Step-Install {
@@ -629,9 +635,7 @@ function Step-BootReport {
     $svc = Get-Service -Name $ServiceName
     "service_after_boot=$($svc.Status) start_type=$($svc.StartType)"
     $name = (Get-Content -LiteralPath (Join-Path $Work 'arm.txt') -Raw).Trim()
-    Complete-Report $name $BootReportWaitSeconds
-    # Complete-Report already showed them where the report is missing.
-    if (Test-Path -LiteralPath (Join-Path $Work "report-$name.txt")) { Show-ScmEvents }
+    Complete-Report $name $BootReportWaitSeconds -ScmEvents
 }
 
 function Step-Report {
@@ -694,11 +698,11 @@ function Read-Report([string]$Dir, [string]$Name) {
     $r
 }
 
-function Get-Verdict($Report, [string]$Action, [string]$Extra, [string]$Plain) {
+function Get-Verdict($Report, [string]$Action, [string]$Extra, [string]$Plain, [string]$Blob = '') {
     # Returns @(verdict, why): YES, NO, INVALID (the report shows a broken instrument) or
     # INCONCLUSIVE. $Extra is a precondition of any answer, already judged: '' when it holds.
     # $Plain is report-A1's plain_sha256, which every unprotect start must carry ('' when A1
-    # gives none).
+    # gives none). $Blob is report-A1's user_blob_sha256 ('' when A1 gives none).
     if (-not $Report) { return @('INCONCLUSIVE', 'no report') }
     if ($Report['identity'] -ne $Account -or -not ([string]$Report['sid']).StartsWith('S-1-5-80-')) {
         return @('INCONCLUSIVE', "ran as $($Report['identity']) $($Report['sid']), not the virtual account")
@@ -716,7 +720,12 @@ function Get-Verdict($Report, [string]$Action, [string]$Extra, [string]$Plain) {
         return @('INVALID', "plain_sha256 $($Report['plain_sha256']) is not report-A1's $Plain")
     }
     $user = [string]$Report['user_unprotect']
-    # ERROR_INVALID_DATA is what the tampered control gets: a damaged blob, not a lost key.
+    # ERROR_INVALID_DATA is what the tampered control gets: a damaged blob, not a lost key. Unless
+    # the start read the very blob report-A1 hashed: then it is intact on disk and DPAPI refused
+    # it, with a code that names no lost key either, so it reads INCONCLUSIVE, not INVALID.
+    if ($user -eq 'FAIL win32=13' -and $Action -eq 'unprotect' -and $Blob -and $Report['user_blob_sha256'] -eq $Blob) {
+        return @('INCONCLUSIVE', "user_unprotect $user on the blob report-A1 hashed, unchanged: DPAPI refused an intact blob, not with the key-state refusal a NO needs")
+    }
     if ($user -eq 'FAIL win32=13' -or $user -eq 'OK mismatch') { return @('INVALID', "user_unprotect $user, a damaged blob or value") }
     if ($Extra) { return @('INCONCLUSIVE', $Extra) }
     if ($Action -eq 'unprotect' -and -not $Plain) { return @('INCONCLUSIVE', 'report-A1 gives no plain_sha256 to compare') }
@@ -798,11 +807,12 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
     if (-not $cross.StartsWith("admin_open=$NteBadKeyState ")) { $crossProblem = "crosscheck FAILED: '$cross'" }
     # Every later start must still hold A1's value; a different one means plain.bin changed.
     $plain = ''
-    if ($r['A1']) { $plain = [string]$r['A1']['plain_sha256'] }
+    $blob = ''
+    if ($r['A1']) { $plain = [string]$r['A1']['plain_sha256']; $blob = [string]$r['A1']['user_blob_sha256'] }
     $v = @{}
     $v['A1'] = Get-Verdict $r['A1'] 'protect' $crossProblem $plain
-    $v['A2'] = Get-Verdict $r['A2'] 'unprotect' $crossProblem $plain
-    $v['A3'] = Get-Verdict $r['A3'] 'unprotect' $crossProblem $plain
+    $v['A2'] = Get-Verdict $r['A2'] 'unprotect' $crossProblem $plain $blob
+    $v['A3'] = Get-Verdict $r['A3'] 'unprotect' $crossProblem $plain $blob
     # The pre-reboot arms pass when A1 to A3 open the blob. Read before the hold-back below, so an
     # A3 that opened passes even where the unload was not seen.
     $prePass = $v['A1'][0] -eq 'YES' -and $v['A2'][0] -eq 'YES' -and $v['A3'][0] -eq 'YES'
@@ -828,7 +838,7 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
             # A5 narrows against A4 only when both are from one boot.
             elseif ($a -eq 'A5' -and $r['A4'] -and $rel['A4-A5'] -ne 'same') { $extra = "report-A5 is not shown to be from the boot report-A4 is from: $($rel['A4-A5'])" }
             if ($crossProblem) { $extra = $crossProblem }
-            $v[$a] = Get-Verdict $r[$a] 'unprotect' $extra $plain
+            $v[$a] = Get-Verdict $r[$a] 'unprotect' $extra $plain $blob
         }
     } else {
         $notRun = @('NOT RUN', 'this route cannot reboot the VM inside a run')
@@ -977,17 +987,18 @@ function Invoke-GuestCall($Credential, [string]$What, [int]$Seconds, [hashtable]
     # as one failed attempt, and only the rig, which ends the run on it, words it as a STOP.
     if ($Seconds -le 0) { throw "no timeout is set for $What" }
     $job = Start-GuestJob $Credential $Call
-    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    # A monotonic clock: a host clock stepped forward mid-call would otherwise end it as hung.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     $errs = New-Object System.Collections.ArrayList
     try {
         while ($true) {
-            $left = [int][Math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalSeconds)
+            $left = [int][Math]::Ceiling($Seconds - $clock.Elapsed.TotalSeconds)
             $finished = Wait-Job -Job $job -Timeout ([Math]::Max(1, [Math]::Min(5, $left)))
             $more = $null
             Receive-Job -Job $job -ErrorAction SilentlyContinue -ErrorVariable more
             if ($more) { $errs.AddRange(@($more)) }
             if ($finished) { break }
-            if ([DateTime]::UtcNow -ge $deadline) {
+            if ($clock.Elapsed.TotalSeconds -ge $Seconds) {
                 $why = ''
                 if ($errs.Count) { $why = "; its first error: $($errs[0].Exception.Message)" }
                 throw [TimeoutException]::new("$What did not finish within $Seconds s$why")
@@ -1038,7 +1049,13 @@ function Copy-GuestReports($Credential, [string]$Reports, [string]$When, [int]$S
     foreach ($f in @($files)) {
         $leaf = [IO.Path]::GetFileName([string]$f.Name)
         if ($f.Error) { Write-Log "could not copy $leaf $($When): $($f.Error)"; continue }
-        [IO.File]::WriteAllBytes((Join-Path $dir $leaf), [byte[]]$f.Bytes)
+        # The guest wrote only *.txt names; any other leaf, '..' or '' among them, is not written.
+        if ($leaf -notmatch '^[A-Za-z0-9_-][A-Za-z0-9._-]*\.txt\z') { Write-Log "not copied $($When): the guest named a file '$leaf'"; continue }
+        # An empty file can arrive as $null; it is still a file, and a report the judge must see.
+        $bytes = [byte[]]@()
+        if ($null -ne $f.Bytes) { $bytes = [byte[]]$f.Bytes }
+        try { [IO.File]::WriteAllBytes((Join-Path $dir $leaf), $bytes) }
+        catch [System.Management.Automation.MethodInvocationException] { Write-Log "could not write $leaf $($When): $($_.Exception.InnerException.Message)" }
     }
 }
 
@@ -1064,8 +1081,15 @@ function Wait-Guest($Credential, $AskedAt, [int]$Seconds) {
         $beat = [string](Get-VM -Name $VMName).Heartbeat
         if ($beat -notlike 'Ok*') { Write-Log "waiting for the guest: heartbeat $beat"; Start-Sleep -Seconds 10; continue }
         try {
-            $up = [double](Get-GuestUptimeMs $Credential 'while waiting for the guest')
+            $raw = @(Get-GuestUptimeMs $Credential 'while waiting for the guest')
             if ($null -eq $AskedAt) { return }
+            # Exactly one number: [double] of no output is 0, which would pass for a fresh boot.
+            $up = 0.0
+            if ($raw.Count -ne 1 -or -not [double]::TryParse([string]$raw[0], [ref]$up)) {
+                Write-Log "waiting for the guest: the uptime read gave '$($raw -join ',')', not one number"
+                Start-Sleep -Seconds 10
+                continue
+            }
             $since = ([DateTime]::UtcNow - $AskedAt).TotalMilliseconds
             if ($up -ge 0 -and $up -lt $since) { Write-Log "guest back: uptime_ms=$up, $([long]$since) ms since the reboot was asked"; return }
             Write-Log "waiting for the guest: still the boot before, uptime_ms=$up, $([long]$since) ms since the reboot was asked"
@@ -1213,7 +1237,9 @@ function Invoke-Rig($Credential, $Snap, [string]$Reports) {
                 # After a hang the guest has just failed to answer, so the copy gets 60 s, not its
                 # full budget, before the revert; the uninstall, which the revert discards anyway,
                 # is skipped.
-                if ($hung) { Copy-GuestReports $Credential $Reports 'at the end' ([Math]::Min(60, $GuestCallSeconds['Copy'])) } else { Copy-GuestReports $Credential $Reports 'at the end' }
+                $copySeconds = $GuestCallSeconds['Copy']
+                if ($hung) { $copySeconds = [Math]::Min(60, $copySeconds) }
+                Copy-GuestReports $Credential $Reports 'at the end' $copySeconds
                 if ($hung) { Write-Log 'uninstall skipped: a guest call hung' } else { Invoke-Guest $Credential 'Uninstall' }
             } catch {
                 Write-Log "could not copy the reports or uninstall: $($_.Exception.Message)"

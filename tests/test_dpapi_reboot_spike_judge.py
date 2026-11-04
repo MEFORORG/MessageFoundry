@@ -320,6 +320,20 @@ SCENARIOS: dict[str, Scenario] = {
         crosscheck="admin_open=OPENED by REVTEST01\\Administrator exit=0",
     ),
     "a5_damaged": Scenario(_all(A5=_report("A5", user_unprotect="FAIL win32=13"))),
+    # win32=13 on the very blob report-A1 hashed: DPAPI refused an intact blob, which is not a
+    # broken instrument. The same code beside another hash is a damaged blob again.
+    "a5_13_intact_blob": Scenario(
+        _all(
+            A1=_report("A1", user_blob_sha256="ee" * 32),
+            A5=_report("A5", user_unprotect="FAIL win32=13", user_blob_sha256="ee" * 32),
+        )
+    ),
+    "a5_13_changed_blob": Scenario(
+        _all(
+            A1=_report("A1", user_blob_sha256="ee" * 32),
+            A5=_report("A5", user_unprotect="FAIL win32=13", user_blob_sha256="ff" * 32),
+        )
+    ),
     "a4_mismatch": Scenario(_all(A4=_report("A4", user_unprotect="OK mismatch"))),
     "a5_other_value": Scenario(_all(A5=_report("A5", plain_sha256="cd" * 32))),
     "a1_no_sha": Scenario(_all(A1=_report("A1", plain_sha256=""))),
@@ -493,6 +507,8 @@ _OVERALL: list[tuple[str, str]] = [
     ("payload_a3_refused_unloaded", "INCONCLUSIVE"),
     ("payload_a2_failed", "INCONCLUSIVE"),
     ("a3_no_report", "INCONCLUSIVE"),
+    ("a5_13_intact_blob", "INCONCLUSIVE"),
+    ("a5_13_changed_blob", "INVALID"),
 ]
 
 
@@ -625,6 +641,13 @@ def test_a_damaged_blob_or_value_is_invalid(
     assert _v(judged, scenario, arm) == "INVALID"
     assert why in judged[scenario][arm]
     assert f"{arm} INVALID" in judged[scenario]["VERDICT"]
+
+
+def test_an_intact_blob_refused_as_damaged_is_not_a_broken_instrument(judged: Judged) -> None:
+    assert _v(judged, "a5_13_intact_blob", "A5") == "INCONCLUSIVE"
+    assert "DPAPI refused an intact blob" in judged["a5_13_intact_blob"]["A5"]
+    # The control: another hash is still a damaged blob.
+    assert _v(judged, "a5_13_changed_blob", "A5") == "INVALID"
 
 
 def test_a_yes_needs_a1s_value(judged: Judged) -> None:
@@ -853,7 +876,8 @@ $script:reads = 0
 function Get-GuestUptimeMs {
     $script:reads++
     if ($script:credFails) { throw 'The credential is invalid.' }
-    if ($script:reads -le $script:uptimes.Count) { $script:uptimes[$script:reads - 1] } else { 999999999 }
+    # 'none' is a probe that completed with no output.
+    if ($script:reads -le $script:uptimes.Count) { $u = $script:uptimes[$script:reads - 1]; if ($u -ne 'none') { $u } } else { 999999999 }
 }
 function Stop-VM { if ($script:stopFails) { throw 'stop refused' } }
 function Restore-VMSnapshot { }
@@ -866,6 +890,10 @@ Wait-Guest $null $null 60
 $script:reads = 0; $script:uptimes = @(900000, 30000)
 Wait-Guest $null ([DateTime]::UtcNow.AddSeconds(-120)) 60
 "rebooted=reads=$script:reads"
+# A probe with no output is no reading, never a fresh boot: the second answer is the one.
+$script:reads = 0; $script:uptimes = @('none', 30000)
+Wait-Guest $null ([DateTime]::UtcNow.AddSeconds(-120)) 60
+"emptyread=reads=$script:reads"
 # A guest that never reboots never reads as back, nor does a tick count that wrapped negative.
 $script:reads = 0; $script:uptimes = @(-5)
 try { $null = Wait-Guest $null ([DateTime]::UtcNow.AddSeconds(-120)) 1; 'never=RETURNED' } catch { "never=$($_.Exception.Message) reads>1=$($script:reads -gt 1)" }
@@ -891,6 +919,7 @@ def test_host_reboot_wait_and_cleanup(tmp_path: Path) -> None:
     out = dict(line.split("=", 1) for line in lines)
     assert out["none"] == "reads=1"
     assert out["rebooted"] == "reads=2"
+    assert out["emptyread"] == "reads=2"
     assert out["never"].startswith("STOP     no PowerShell Direct answer"), out["never"]
     assert out["never"].endswith("reads>1=True"), out["never"]
     assert out["cred"].startswith("STOP     the VM credential was refused"), out["cred"]
@@ -993,6 +1022,10 @@ function Start-GuestJob($Credential, [hashtable]$Call) {
             # a file the guest could not read, which costs only itself.
             elseif ($label -eq 'copy') {
                 Start-ThreadJob {
+                    # A leaf that is no file name, refused without costing the files after it, and
+                    # an empty file whose bytes arrive as $null.
+                    [pscustomobject]@{ Name = '..'; Bytes = [byte[]](1); Error = '' }
+                    [pscustomobject]@{ Name = 'arm.txt'; Bytes = $null; Error = '' }
                     # '/', which GetFileName splits on Windows and Linux alike; on the host a '\' too.
                     [pscustomobject]@{ Name = '../report-A1.txt'; Bytes = [byte[]](104, 105); Error = '' }
                     [pscustomobject]@{ Name = 'crash-1.txt'; Bytes = $null; Error = 'in use' }
@@ -1033,6 +1066,7 @@ $OutDir = Join-Path $Arg 'pre'
 $script:behaviour = @{ 'step Start A2' = 'hang' }
 try { Invoke-HostRun; 'pre run=RETURNED' } catch { "pre run=$($_.Exception.Message)" }
 "pre leaf=$(Test-Path -LiteralPath (Join-Path (Join-Path $OutDir 'reports') 'report-A1.txt')) escaped=$(Test-Path -LiteralPath (Join-Path $OutDir 'report-A1.txt'))"
+"pre empty=$((Get-Item -LiteralPath (Join-Path (Join-Path $OutDir 'reports') 'arm.txt')).Length)"
 Show-Run 'pre'
 
 # A hang after the reboot, at A5.
@@ -1142,6 +1176,10 @@ def test_a_hang_still_releases_the_hvtest_lock(hang_lines: list[str]) -> None:
     # Only the leaf of the guest's file name is written, and a file the guest could not read is
     # logged and costs only itself.
     assert "pre leaf=True escaped=False" in hang_lines
+    assert "pre empty=0" in hang_lines
+    assert "not copied at the end: the guest named a file '..'" in _run_lines(
+        hang_lines, "pre", "log"
+    )
     assert "could not copy crash-1.txt at the end: in use" in _run_lines(hang_lines, "pre", "log")
     assert "could not copy crash-1.txt after A3: in use" in _run_lines(hang_lines, "post", "log")
 
