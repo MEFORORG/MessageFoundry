@@ -1405,6 +1405,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:via messagefoundry.pipeline.secret_rotation",
             "csprng:via messagefoundry.pipeline.secret_rotation",
             "mac:via messagefoundry.pipeline.secret_rotation",
+            # BACKLOG #4942: audit_chain_rolled names the active audit key by its one-way id
+            # (audit_active_key_id) to compare it with the chain's newest range. No key leaves it.
+            "hash:via messagefoundry.store.store",
         }
     ),
     "messagefoundry/pipeline/sandbox.py": frozenset({"csprng:secrets.token_hex"}),

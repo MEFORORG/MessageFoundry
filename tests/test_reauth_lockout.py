@@ -89,6 +89,7 @@ async def _local_user(store: MessageStore, username: str = "bob") -> None:
         email=None,
         password_hash=hash_password(GOOD),
         password_generated=False,
+        audits=(),
     )
 
 

@@ -32,6 +32,7 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.mllp import MLLPDestination
+from tests._claim_lock_helpers import claim_past_empty_yield
 
 DEST = "OB_ADT"
 
@@ -44,15 +45,9 @@ def _msg(n: int) -> str:
 # the SET LOCK_TIMEOUT 0 never-block path (ADR 0066 §9) — contract-legal (the pooled caller self-heals
 # on retry) but flaky for a single-shot assertion. Re-issue past a transient EMPTY-all; a genuinely
 # unclaimable head stays empty every pass and still fails after the cap (masks no real regression).
-# No-op on SQLite/Postgres, which never yield here. Mirrors _claim_heads in test_claim_fifo_heads.py.
+# No-op on SQLite/Postgres, which never yield here. tests/_claim_lock_helpers.py holds the loop.
 async def _claim_heads(store: Any, *args: Any, **kwargs: Any) -> Any:
-    res = await store.claim_fifo_heads(*args, **kwargs)
-    for _ in range(16):
-        if res.by_lane or res.rearm:
-            break
-        await asyncio.sleep(0.01)
-        res = await store.claim_fifo_heads(*args, **kwargs)
-    return res
+    return await claim_past_empty_yield(lambda: store.claim_fifo_heads(*args, **kwargs))
 
 
 # --- store fixture: SQLite always, SQL Server when MEFOR_TEST_SQLSERVER is set --------------------

@@ -92,7 +92,7 @@ from types import (
     TracebackType,
     WrapperDescriptorType,
 )
-from typing import Any
+from typing import Any, Final
 
 __all__ = [
     "RepeatedKeyError",
@@ -107,6 +107,7 @@ __all__ = [
     "redact_untrusted",
     "refuse_repeated_keys",
     "safe_error",
+    "REFUSAL_LOG_LIMIT",
     "safe_exc",
     "safe_name",
     "safe_text",
@@ -117,6 +118,17 @@ _REDACTED = "[redacted]"
 #: Max characters of a (redacted) exception message to keep — a raw HL7 body is long, so bound what
 #: reaches a stored ``last_error`` or a log line even after redaction.
 _DEFAULT_LIMIT = 200
+
+#: The ``limit`` to pass :func:`safe_exc` for a logged refusal whose text must survive whole: the
+#: config load's and the API's reload refusals. The default 200-character cut dropped the directory
+#: from a long config path, the fix from a long WiringError, and the clamped escape's text. 8192 is
+#: twice the 4096 that ``FilesystemPath`` allows a ``config_dir``, so any directory the API accepts
+#: fits with its message, and a multi-line WiringError fits too. It still bounds how much
+#: redaction-missed text one line carries and what each handler's filters re-scan on the event loop.
+#: :func:`safe_exc` redacts before the cut. The bound is on the text BEFORE ``scrub_log_argument``
+#: escapes it, so a run of control characters can still grow the line several times over. The cut
+#: keeps the head, so an error longer than this still loses its tail.
+REFUSAL_LOG_LIMIT: Final = 8192
 
 #: An HL7 **segment** span: a 3-char segment ID (``MSH``/``PID``/``OBX``/…) immediately followed by the
 #: field separator and field data to end-of-line. Catches a raw message (or fragment) embedded in an

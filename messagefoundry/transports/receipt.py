@@ -29,10 +29,11 @@ class RefusalKind(StrEnum):
     """Why the runner refused a body it read, as the sender needs to know it."""
 
     #: Engine-side, not about the body: the same body may be accepted on a re-send once the cause
-    #: clears. At least two are classed here: the streaming detach's in-flight budget, which clears
-    #: on its own, and an inbound codec name that sets up no decode (BACKLOG #2431), which clears
-    #: only when the operator fixes it. ADR 0154's 2026-10-30 amendment says why the strict-validation
-    #: timeout is not.
+    #: clears. At least three are classed here: the streaming detach's in-flight budget while other
+    #: detaches hold it, which clears on its own; a strict-validation timeout that fired before any
+    #: worker thread began the validate (BACKLOG #5078); and an inbound codec name that sets up no
+    #: decode (BACKLOG #2431), which clears only when the operator fixes it. A strict-validation
+    #: timeout whose validate began is PERMANENT; ADR 0154's amendment of 2026-11-03 says why.
     TEMPORARY = "temporary"
     #: About the body itself: a re-send of the same bytes is refused the same way.
     PERMANENT = "permanent"

@@ -128,6 +128,7 @@ from messagefoundry.netaddr import (
 from messagefoundry.parsing import (
     HL7PeekError,
     Peek,
+    ValidationResult,
     encode_batch,
     summarize,
     validate,
@@ -904,6 +905,125 @@ _STRICT_VALIDATE_TIMEOUT_SECONDS = STRICT_VALIDATE_TIMEOUT_SECONDS
 _strict_validate_timeout = strict_validate_timeout
 
 
+class _StrictValidateTimedOut(Exception):
+    """A listener's strict validate timed out with no result in hand when the timeout was handled (#89).
+
+    ``started`` says whether ``hl7apy`` had begun on the body when the timeout fired (BACKLOG #5078,
+    the ADR 0154 amendment of 2026-11-03). The timeout counts the wait for a worker thread as well
+    as the validate, so under load a body can time out before it is ever looked at. That body says
+    nothing about itself, and it left no thread behind, so it is answered as temporary (``503``, or
+    ``AE`` on MLLP). One that had started is final (``422``, or ``AR``; owner ruling of 2026-11-03,
+    decision log d20261104T032854299-7235a9, stamped in UTC): it
+    may be the slow body the timeout exists for, and its thread is still running. "Began" means a
+    worker ran the run's first line before the deadline (:class:`_StrictValidateRun`); a free thread
+    that the GIL or the OS did not schedule in time reads as not begun too, so the reason says only
+    that.
+
+    ``reason`` is value-free, only the numeric timeout, and goes to the stored ``ERROR`` row.
+    ``ack_text`` goes in an MLLP NAK's MSA-3 and is the same for both causes. The answer's class
+    (``503`` or ``AE`` versus ``422`` or ``AR``) still tells a sender which one it was, by design: a
+    sender cannot be told to re-send without being told the engine was busy."""
+
+    def __init__(self, timeout: float, *, started: bool) -> None:
+        self.started = started
+        #: The receipt path's class and the MLLP NAK's MSA-1, kept together so the two listeners
+        #: cannot split the timeout differently.
+        self.refusal_kind = RefusalKind.PERMANENT if started else RefusalKind.TEMPORARY
+        self.nak_code = "AR" if started else "AE"
+        self.ack_text = f"strict-validation timed out after {timeout}s"
+        self.reason = self.ack_text if started else f"{self.ack_text} before the validate began"
+        super().__init__(self.reason)
+
+
+class _StrictValidateRun:
+    """One strict validate on a worker thread, which records whether it began (BACKLOG #5078).
+
+    "Began" is decided when the timeout fires, not when the listener handles it. The run carries the
+    timeout's deadline, read from the event loop's clock just before the timeout's own timer is set
+    (:func:`_validate_strictly` says why that clock), and the worker compares ``time.monotonic()``
+    with it. A worker that reaches the run at or past it does not begin: it records
+    "not begun" and returns without validating. Without that, a worker that came free after the
+    deadline but before a busy event loop handled the timeout would begin, and the listener would
+    answer a body nobody had looked at inside the timeout as final.
+
+    The start and the listener's abandonment take one lock, so they cannot cross: either the worker
+    began first and :meth:`abandon` reports it started, or the listener gave up first and the worker
+    returns without validating. A run never started therefore leaves no ``hl7apy`` thread behind.
+
+    The result is kept under the same lock, and :meth:`abandon` hands back any result present when
+    the listener handles the timeout, for a run that began before the deadline: its result may have
+    reached a stalled event loop late, or it may have finished after the deadline but before the
+    timeout was handled. Either way the listener uses that result rather than refuse a body it has a
+    verdict for; only a run with no result at that point is a timeout."""
+
+    def __init__(self, deadline: float | None) -> None:
+        self._deadline = deadline
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._started = False
+        self._result: ValidationResult | None = None
+
+    def __call__(self, text: str, expected_version: str | None) -> ValidationResult | None:
+        with self._lock:
+            if self._abandoned or (
+                self._deadline is not None and time.monotonic() >= self._deadline
+            ):
+                return None
+            self._started = True
+        result = validate(text, expected_version=expected_version)
+        with self._lock:
+            self._result = result
+        return result
+
+    def abandon(self) -> tuple[bool, ValidationResult | None]:
+        """Stop a run that has not begun. Report whether it had, and its result if it finished."""
+        with self._lock:
+            self._abandoned = True
+            return self._started, self._result
+
+
+async def _validate_strictly(ic: InboundConnection, text: str) -> ValidationResult:
+    """The listener's strict validate, off the event loop under the inbound's timeout (#89, review
+    M-11). On expiry it uses the run's result if one is present when the timeout is handled, even
+    one that finished after the deadline, from a run that began before it; otherwise it raises
+    :class:`_StrictValidateTimedOut`, saying whether the validate began before the timeout fired.
+
+    ``wait_for`` frees the listener but cannot kill a worker that has begun (no thread cancellation
+    in CPython): that orphaned ``hl7apy`` validate holds its thread until it returns, accepted by
+    design (mirrors ``_run_lookup``), bounded by ``enforce_size_limits``' 16 MiB and segment caps
+    that fire before the slow parse."""
+    timeout = _strict_validate_timeout(ic)
+    # The same expression wait_for's own timer is set from, read just before it, so the run's deadline
+    # is the timer's or earlier. On asyncio's own loops loop.time() IS time.monotonic(), the clock the
+    # worker reads. On uvloop (CPython outside Windows) it is libuv's loop time, in milliseconds and
+    # updated by the loop rather than read fresh, so it can read behind time.monotonic(), and the
+    # timer is set from it; time.monotonic() + timeout there could be later than the timer. That the
+    # two share a base on uvloop, and libuv's sub-millisecond timer rounding, are read from the
+    # libraries' design, not measured: no uvloop runs on the Windows machine this was built on.
+    deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
+    run = _StrictValidateRun(deadline)
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(run, text, ic.validation.hl7_version), timeout
+        )
+    except TimeoutError:
+        started, result = run.abandon()
+    except BaseException:
+        # Cancelled (engine stop, connection teardown): nobody will await the result, so a run not
+        # yet begun must not begin.
+        run.abandon()
+        raise
+    else:
+        # None here is a run its worker reached past the deadline, delivered before the loop got to
+        # the timeout: it never began.
+        started = False
+    if result is not None:
+        return result  # a verdict is in hand, before the deadline or after it
+    # Raised outside the handler, so the TimeoutError is not on the chain and needs no suppressing.
+    assert timeout is not None  # only a run with a deadline returns None unabandoned
+    raise _StrictValidateTimedOut(timeout, started=started)
+
+
 # The generic MIME a detached document's stored content_type is downgraded to when the sender-declared
 # OBX-5.2 label contradicts the document's magic bytes (ASVS 1.3.4/5.2.2). Matches the download route's
 # _DEFAULT_ATTACHMENT_MIME so a mislabelled active-content payload is served as inert bytes either way.
@@ -936,6 +1056,20 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     DocRefError,
     EscapedDocumentError,
 )
+
+
+def _detach_refusal_kind(exc: Exception) -> RefusalKind:
+    """The class of one of :data:`_DETACH_REFUSALS`, which both listeners answer by (BACKLOG #5078).
+
+    Only the in-flight budget is the engine's own and clears as concurrent detaches finish, so only
+    it invites a re-send, and only when the body would fit the budget once they have: one larger
+    than the whole budget is over-size. An unsupported backend, a malformed handle and an escaped
+    document refuse the same body every time. The receipt path answers the class as is; MLLP answers
+    ``AE`` for TEMPORARY and ``AR`` for every final class (owner ruling of 2026-11-03, decision log
+    d20261104T032854299-7235a9, stamped in UTC)."""
+    if isinstance(exc, _StreamBudgetExceeded):
+        return RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
+    return RefusalKind.PERMANENT
 
 
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
@@ -8076,29 +8210,19 @@ class RegistryRunner:
                 ic.stream_threshold_bytes,
             )
         elif ic.validation.strict:
-            timeout = _strict_validate_timeout(ic)
             try:
-                # wait_for frees THIS listener path but cannot kill the to_thread worker (no thread
-                # cancellation in CPython) — the orphaned hl7apy validate leaks its thread until it
-                # returns, accepted-by-design (mirrors _run_lookup), bounded by enforce_size_limits'
-                # 16 MiB / segment caps that fire before the slow parse (#89).
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(validate, text, expected_version=ic.validation.hl7_version),
-                    timeout,
-                )
-            except TimeoutError:
-                # DoS backstop (#89): a pathological body made hl7apy spin past the budget. Dead-letter
-                # it instead of pinning intake. The message string is PHI-safe/value-free (only the
-                # numeric timeout). HTTP owns its own 202/4xx response — no HL7 ACK here.
+                result = await _validate_strictly(ic, text)
+            except _StrictValidateTimedOut as exc:
+                # DoS backstop (#89): dead-letter instead of pinning intake. HTTP owns its own
+                # 202/4xx response — no HL7 ACK here.
                 #
-                # PERMANENT, not temporary (BACKLOG #2105): a body that times out for its own content
-                # times out on every re-send, and each attempt orphans another hl7apy thread this path
-                # cannot kill, so inviting a retry would multiply the very load this timeout bounds. A
-                # timeout caused by load instead cannot be told apart from it here. ADR 0154's
-                # 2026-10-30 amendment records the cost and when it may be reclassified.
-                timed_out = f"strict-validation timed out after {timeout}s"
+                # A validate that had begun is PERMANENT (BACKLOG #2105; owner ruling of 2026-11-03): a
+                # body that times out for its own content times out on every re-send, and each
+                # attempt orphans another hl7apy thread this path cannot kill. One that never began
+                # (no worker thread ran it inside the timeout) tells nothing of the body and left no
+                # thread, so it is TEMPORARY (BACKLOG #5078; ADR 0154's amendment of 2026-11-03).
                 return await self._refuse(
-                    ic, raw, text, RefusalKind.PERMANENT, error=timed_out, peek=peek
+                    ic, raw, text, exc.refusal_kind, error=exc.reason, peek=peek
                 )
             if not result.ok:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
@@ -8115,19 +8239,11 @@ class RegistryRunner:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
             except _DETACH_REFUSALS as exc:
-                # Only the in-flight budget is the engine's own and clears as concurrent detaches
-                # finish, so only it invites a re-send, and only when the body would fit the budget
-                # once they have: one larger than the whole budget is over-size. An unsupported
-                # backend, a malformed handle and an escaped document refuse the same body every time.
-                if isinstance(exc, _StreamBudgetExceeded):
-                    kind = RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
-                else:
-                    kind = RefusalKind.PERMANENT
                 return await self._refuse(
                     ic,
                     raw,
                     text,
-                    kind,
+                    _detach_refusal_kind(exc),
                     error=f"streaming detach failed: {safe_exc(exc)}",
                     peek=peek,
                 )
@@ -8464,33 +8580,28 @@ class RegistryRunner:
         elif ic.validation.strict:
             # hl7apy validation is CPU-bound (full structure/cardinality parse) — run it off the event
             # loop so a strict feed can't stall every other listener, worker, and API call (review M-11).
-            timeout = _strict_validate_timeout(ic)
             try:
-                # wait_for frees THIS listener but cannot kill the to_thread worker (no thread
-                # cancellation in CPython) — the orphaned hl7apy validate leaks its thread until it
-                # returns, accepted-by-design (mirrors _run_lookup), bounded by enforce_size_limits'
-                # 16 MiB / segment caps that fire before the slow parse (#89).
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(validate, text, expected_version=ic.validation.hl7_version),
-                    timeout,
-                )
-            except TimeoutError:
-                # DoS backstop (#89): a pathological body made hl7apy spin past the budget. Dead-letter
-                # + NAK AE instead of pinning the listener. The stored/ACK string is PHI-safe/value-free
-                # (only the numeric timeout) — unlike the validation-error path below it quotes no field.
-                timed_out = f"strict-validation timed out after {timeout}s"
-                mid = await self._record_refused(ic, raw, text, error=timed_out, peek=peek)
+                result = await _validate_strictly(ic, text)
+            except _StrictValidateTimedOut as exc:
+                # DoS backstop (#89): dead-letter + NAK instead of pinning the listener. The stored/ACK
+                # string is PHI-safe/value-free (only the numeric timeout) — unlike the validation-error
+                # path below it quotes no field. The same split as the receipt path (owner ruling of
+                # 2026-11-03, BACKLOG #5078): a validate that had begun is final, AR, and one that
+                # never began is temporary, AE.
+                mid = await self._record_refused(ic, raw, text, error=exc.reason, peek=peek)
                 ack = (
-                    build_ack(peek, code="AE", text=timed_out, ack_mode=ack_mode) if reply else None
+                    build_ack(peek, code=exc.nak_code, text=exc.ack_text, ack_mode=ack_mode)
+                    if reply
+                    else None
                 )
                 if ack is not None and self._capture_ack_enabled(ic):
                     await self._capture_ack(
                         mid,
                         ic.name,
-                        ack_code="AE",
+                        ack_code=exc.nak_code,
                         ack_phase="strict",
                         ack_body=None,
-                        detail=timed_out,
+                        detail=exc.reason,
                     )
                 return ack
             if not result.ok:
@@ -8502,10 +8613,13 @@ class RegistryRunner:
                 # messages:view_summary on read, like every other stored error.
                 persisted = f"strict-validation failed: {safe_text(joined)}"
                 mid = await self._record_refused(ic, raw, text, error=persisted, peek=peek)
-                # The AE ACK goes back to the partner that SENT this message (their own data) and is
-                # transient (never persisted), so it may carry the fuller, bounded validation text.
+                # AR, not AE (BACKLOG #5078; owner ruling of 2026-11-03): every strict failure is final,
+                # as the receipt path answers it (422, or 413 for validate()'s own size cap), and an
+                # AE invited a sender, the engine's own MLLP outbound included, to retry it. The NAK
+                # goes back to the partner that SENT this message (their own data) and is transient
+                # (never persisted), so it may carry the fuller, bounded validation text.
                 ack = (
-                    build_ack(peek, code="AE", text=joined[:200], ack_mode=ack_mode)
+                    build_ack(peek, code="AR", text=joined[:200], ack_mode=ack_mode)
                     if reply
                     else None
                 )
@@ -8515,7 +8629,7 @@ class RegistryRunner:
                     await self._capture_ack(
                         mid,
                         ic.name,
-                        ack_code="AE",
+                        ack_code="AR",
                         ack_phase="strict",
                         ack_body=None,
                         detail=persisted,
@@ -8526,9 +8640,8 @@ class RegistryRunner:
         # documents VERBATIM into the attachment substrate BEFORE the ingress commit, so the pipeline
         # carries only the small skeleton + a `mfdoc:v1:ref:` handle. This runs AFTER the synchronous
         # header parse/validate (a malformed header already NAK'd above) and BEFORE the commit/ACK, so a
-        # detach failure is a synchronous ERROR + NAK: AE for budget/backpressure or an unsupported
-        # backend, AR for an escaped document (below) — the message is NEVER accepted-and-dropped, and
-        # no ACK is sent for a body we couldn't store.
+        # detach failure is a synchronous ERROR + NAK, in the receipt path's class (below) — the
+        # message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
@@ -8537,12 +8650,16 @@ class RegistryRunner:
             except _DETACH_REFUSALS as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
-                # A budget or backend refusal may clear on a resend, so AE. An escaped document is the
-                # message itself and fails the same way every time, so AR (vault BACKLOG #2809).
-                if isinstance(exc, EscapedDocumentError):
-                    nak_code, nak_text = "AR", "escaped document in OBX-5.5"
-                else:
-                    nak_code, nak_text = "AE", "streaming detach failed"
+                # The receipt path's class decides MSA-1 (BACKLOG #5078): AE only for a budget held by
+                # concurrent detaches, which a re-send may clear, and AR for every refusal the
+                # receipt path answers as final, a body alone over the whole budget, an unsupported
+                # backend, a malformed handle and an escaped document (vault BACKLOG #2809) alike.
+                nak_code = "AE" if _detach_refusal_kind(exc) is RefusalKind.TEMPORARY else "AR"
+                nak_text = (
+                    "escaped document in OBX-5.5"
+                    if isinstance(exc, EscapedDocumentError)
+                    else "streaming detach failed"
+                )
                 ack = (
                     build_ack(peek, code=nak_code, text=nak_text, ack_mode=ack_mode)
                     if reply

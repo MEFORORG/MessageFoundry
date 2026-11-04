@@ -13,7 +13,9 @@ import asyncio
 import io
 import json
 import logging
+import os
 import shutil
+import sys
 import tarfile
 import time
 from collections import namedtuple
@@ -23,7 +25,7 @@ import pytest
 
 from messagefoundry.config.settings import BackupSettings, StoreSettings
 from messagefoundry.pipeline.cluster import NullCoordinator
-from messagefoundry.pipeline.dr_backup import BackupError, BackupRunner, _day_key
+from messagefoundry.pipeline.dr_backup import BackupError, BackupResult, BackupRunner, _day_key
 from messagefoundry.store import MessageStore
 from messagefoundry.store.backup_codec import decrypt_stream, encrypt_stream, key_fingerprint
 from messagefoundry.store.crypto import generate_key, make_cipher
@@ -750,7 +752,7 @@ async def test_add_config_dir_skips_edit_candidates_and_the_lock(
 async def test_add_config_dir_excludes_symlink_out_of_dir(tmp_path, key_b64) -> None:
     # Security: `_add_config_dir` must add regular config files only. A symlink inside the config dir
     # pointing at a host file OUTSIDE the bundle would smuggle arbitrary host contents into the
-    # archive — it must be skipped (dr_backup.py:448 is_symlink guard + rglob(recurse_symlinks=False)).
+    # archive — it must be skipped (the is_symlink guard in _add_config_dir + _walk_unfollowed).
     store = await _store_with_rows(tmp_path / "msg.db", key_b64)
     cfg = tmp_path / "config"
     cfg.mkdir()
@@ -764,8 +766,8 @@ async def test_add_config_dir_excludes_symlink_out_of_dir(tmp_path, key_b64) -> 
     except (OSError, NotImplementedError):
         pytest.skip("symlink not permitted (Windows w/o Developer Mode/privilege)")
 
-    # A symlinked DIRECTORY that escapes the bundle too — rglob(recurse_symlinks=False) must not
-    # descend into it, so its contents never land in the archive.
+    # A symlinked DIRECTORY that escapes the bundle too — the walk must not descend into it, so its
+    # contents never land in the archive.
     host_dir = tmp_path / "host_dir"
     host_dir.mkdir()
     (host_dir / "buried.txt").write_text("SMUGGLED-SECRET-DIR")
@@ -796,6 +798,327 @@ async def test_add_config_dir_excludes_symlink_out_of_dir(tmp_path, key_b64) -> 
     # (3) The legitimate regular file IS present (the fix must not over-exclude real config files).
     assert "config/feed.py" in names
     await store.close()
+
+
+# --- config bundle: a junction or a symlinked directory adds nothing (vault BACKLOG #5221) ---
+
+
+def _config_with_a_linked_dir(tmp_path: Path, make_link) -> Path:
+    """A config dir holding a top-level file, a plain subfolder's file (the control), and two
+    directory links, made by ``make_link(target, link)``, to a host folder outside it: one at the
+    top and one below the plain subfolder, so a prune at the top level alone does not pass."""
+    cfg = tmp_path / "config"
+    (cfg / "sub").mkdir(parents=True)
+    (cfg / "feed.py").write_text("# router")
+    (cfg / "sub" / "plain.txt").write_text("plain subfolder file")
+    host = tmp_path / "host_dir"
+    host.mkdir()
+    (host / "buried.txt").write_text("SMUGGLED-THROUGH-A-DIRECTORY-LINK " * 40)
+    make_link(host, cfg / "linked")
+    make_link(host, cfg / "sub" / "nested")
+    return cfg
+
+
+def _make_junction(target: Path, link: Path) -> None:
+    if sys.platform != "win32":
+        pytest.skip("an NTFS junction is a Windows feature")
+    import _winapi
+
+    _winapi.CreateJunction(str(target), str(link))
+
+
+def _make_dir_symlink(target: Path, link: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("a directory symlink cannot be made here (Windows without the privilege)")
+
+
+async def _config_member_bytes(tmp_path: Path, key_b64: str, cfg: Path) -> tuple[list[str], bytes]:
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    try:
+        runner = BackupRunner(
+            store,
+            _settings(tmp_path / "b", key_b64),
+            store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+            config_dir=cfg,
+        )
+        result = await runner.run_once(now=1.0)
+        assert result is not None and result.verify is not None and result.verify.status == "PASS"
+        import base64
+
+        with open(result.archive_path, "rb") as src:
+            tar_bytes = _decrypt_to_bytes(src, base64.b64decode(key_b64))
+    finally:
+        await store.close()
+    return sorted(n for n in _member_names(tar_bytes) if n.startswith("config/")), tar_bytes
+
+
+@pytest.mark.parametrize(
+    "make_link", [_make_junction, _make_dir_symlink], ids=["junction", "symlink"]
+)
+async def test_a_directory_link_in_the_config_dir_adds_nothing(
+    tmp_path, key_b64, make_link, caplog
+) -> None:
+    """A junction answers False to ``is_symlink()``, and ``rglob`` and ``os.walk(followlinks=False)``
+    both descended it, so a host folder it named reached the archive and the space estimate. The
+    junction case fails on that walk; the symlink case is the same rule on the other link kind. The
+    plain subfolder's file is the control that the walk still descends a real folder."""
+    cfg = _config_with_a_linked_dir(tmp_path, make_link)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.dr_backup"):
+        names, tar_bytes = await _config_member_bytes(tmp_path, key_b64, cfg)
+    assert names == ["config/feed.py", "config/sub/plain.txt"]
+    assert b"SMUGGLED-THROUGH-A-DIRECTORY-LINK" not in tar_bytes
+    # The loader and the digest may read through a link, so passing one over is not silent.
+    left_out = [
+        r.getMessage()
+        for r in caplog.records
+        if "does not follow a directory link" in r.getMessage()
+    ]
+    assert len(left_out) == 1 and left_out[0].endswith("leaves out: linked, sub/nested")
+
+
+@pytest.mark.parametrize(
+    "make_link", [_make_junction, _make_dir_symlink], ids=["junction", "symlink"]
+)
+def test_the_space_estimate_does_not_count_a_directory_link(tmp_path, make_link) -> None:
+    """``_tree_size`` counts what the archive will carry: the two real files, the plain subfolder's
+    included, and nothing the link names."""
+    from messagefoundry.pipeline.dr_backup import _tree_size
+
+    cfg = _config_with_a_linked_dir(tmp_path, make_link)
+    real = (cfg / "feed.py").stat().st_size + (cfg / "sub" / "plain.txt").stat().st_size
+    assert _tree_size(cfg) == real
+
+
+@pytest.mark.parametrize(
+    ("tag", "is_link"),
+    [
+        (0xA0000003, True),  # IO_REPARSE_TAG_MOUNT_POINT: a junction or volume mount point
+        (0xA000000C, True),  # IO_REPARSE_TAG_SYMLINK
+        (0x9000001A, False),  # IO_REPARSE_TAG_CLOUD: a placeholder that names no other path
+        (0x80000013, False),  # IO_REPARSE_TAG_DEDUP
+    ],
+)
+def test_only_a_reparse_point_naming_another_path_is_a_directory_link(
+    tmp_path, monkeypatch, tag, is_link
+) -> None:
+    """A reparse point that names no other path is ordinary config, so a rule that prunes every
+    reparse point would drop a OneDrive or deduplicated folder from the bundle. The real folder,
+    read before the patch, is the control that an ordinary entry is not a link."""
+    import stat as stat_mod
+    from types import SimpleNamespace
+
+    from messagefoundry.pipeline import dr_backup as dr
+
+    assert dr._is_dir_link(str(tmp_path)) is False
+    fake = SimpleNamespace(
+        st_mode=stat_mod.S_IFDIR,
+        st_file_attributes=stat_mod.FILE_ATTRIBUTE_REPARSE_POINT,
+        st_reparse_tag=tag,
+    )
+    monkeypatch.setattr(os, "lstat", lambda _path: fake)
+    assert dr._is_dir_link(str(tmp_path)) is is_link
+
+
+def test_a_directory_whose_lstat_fails_is_pruned_from_the_config_walk(
+    tmp_path, monkeypatch
+) -> None:
+    """The config walk fails closed on an entry it cannot classify; the staging walk's default
+    leaves it to ``os.walk``, which reports what it cannot list."""
+    from messagefoundry.pipeline import dr_backup as dr
+
+    def refuse(_path: object) -> object:
+        raise PermissionError("synthetic")
+
+    monkeypatch.setattr(os, "lstat", refuse)
+    assert dr._is_dir_link(str(tmp_path), unreadable=True) is True
+    assert dr._is_dir_link(str(tmp_path)) is False
+
+
+# --- a config-only pass with no config publishes and prunes nothing (vault BACKLOG #5220) ---
+
+
+async def _prior_then_config_only(
+    tmp_path: Path, key_b64: str, *, config_dir: Path | None, **over: object
+) -> tuple[Path, Path, BackupResult | BackupError | None]:
+    """A good full archive at ``retention_keep = 1``, then a config-only pass over ``config_dir``.
+    Returns the destination, the prior archive, and the second pass's result or the exception it
+    raised."""
+    dest = tmp_path / "backups"
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    ss = _store_settings(tmp_path / "msg.db", key_b64)
+    try:
+        first = BackupRunner(
+            store, _settings(dest, key_b64, retention_keep=1), store_settings=ss, config_dir=None
+        )
+        good = await first.run_once(now=1000.0)
+        assert good is not None
+        second = BackupRunner(
+            store,
+            _settings(dest, key_b64, retention_keep=1, **over),
+            store_settings=ss,
+            config_dir=config_dir,
+        )
+        outcome: BackupResult | BackupError | None
+        try:
+            outcome = await second.run_once(now=2000.0, force_config_only=True)
+        except BackupError as exc:
+            outcome = exc
+    finally:
+        await store.close()
+    return dest, Path(good.archive_path), outcome
+
+
+def _config_holding_only(tmp_path: Path, shape: str) -> Path:
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    if shape == "symlink-only":
+        target = tmp_path / "outside.py"
+        target.write_text("# outside the bundle\n")
+        try:
+            (cfg / "feed.py").symlink_to(target)
+        except (OSError, NotImplementedError):
+            pytest.skip("a symlink cannot be made here (Windows without the privilege)")
+    elif shape == "one-file":
+        (cfg / "feed.py").write_text("# router")
+    return cfg
+
+
+@pytest.mark.parametrize("shape", ["empty", "symlink-only"])
+async def test_a_config_only_pass_whose_walk_adds_nothing_is_refused(
+    tmp_path, key_b64, shape
+) -> None:
+    """The walk lists the dir but adds no regular file. The archive would hold a manifest alone,
+    verify PASS, and at ``retention_keep = 1`` prune the last good archive."""
+    cfg = _config_holding_only(tmp_path, shape)
+    dest, prior, outcome = await _prior_then_config_only(tmp_path, key_b64, config_dir=cfg)
+    assert isinstance(outcome, BackupError) and outcome.kind == "snapshot"
+    assert "added no regular file" in str(outcome)
+    # Nothing published, nothing pruned, and no staging or failed copy left at the destination.
+    assert sorted(p.name for p in dest.iterdir()) == [prior.name]
+    # A SQLite store stages beside its own file, so the run's staging directory is looked for there.
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("mefor-backup-")] == []
+
+
+@pytest.mark.parametrize("case", ["include_config off", "no config dir"])
+async def test_a_config_only_pass_with_nothing_to_bundle_is_refused(
+    tmp_path, key_b64, case
+) -> None:
+    """``_inspect_config`` bundles nothing with ``include_config`` off or no config dir loaded,
+    and reports no error, so the earlier guard let either pass publish an empty archive."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("# router")
+    if case == "include_config off":
+        dest, prior, outcome = await _prior_then_config_only(
+            tmp_path, key_b64, config_dir=cfg, include_config=False
+        )
+        expected = "[backup].include_config is false"
+    else:
+        dest, prior, outcome = await _prior_then_config_only(tmp_path, key_b64, config_dir=None)
+        expected = "no config dir is loaded"
+    assert isinstance(outcome, BackupError) and outcome.kind == "snapshot"
+    assert expected in str(outcome)
+    assert sorted(p.name for p in dest.iterdir()) == [prior.name]
+
+
+async def test_a_config_only_pass_with_one_config_file_still_publishes(tmp_path, key_b64) -> None:
+    """The control: one regular file is enough to publish. Keep-N then prunes the prior as it does
+    after any published archive; whether a config-only archive should take a full archive's slot
+    is not this row's question."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("# router")
+    dest, prior, outcome = await _prior_then_config_only(tmp_path, key_b64, config_dir=cfg)
+    assert isinstance(outcome, BackupResult)
+    assert outcome.config_only and outcome.pruned == 1
+    assert sorted(p.name for p in dest.iterdir()) == [Path(outcome.archive_path).name]
+    assert not prior.exists()
+
+
+async def test_a_server_db_pass_whose_walk_adds_nothing_keeps_the_last_archive(
+    tmp_path, key_b64
+) -> None:
+    """The server-DB store is where every pass is config-only. Its staging lives under the
+    destination, so only the archives there are compared."""
+    from messagefoundry.config.settings import StoreBackend
+
+    dest = tmp_path / "backups"
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("# router")
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    try:
+        object.__setattr__(store, "backend", StoreBackend.POSTGRES)
+        runner = BackupRunner(
+            store,
+            _settings(dest, key_b64, retention_keep=1),
+            store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+            config_dir=cfg,
+        )
+        good = await runner.run_once(now=1000.0)
+        assert good is not None and good.config_only  # the control: a file is enough
+        (cfg / "feed.py").unlink()
+        with pytest.raises(BackupError, match="added no regular file") as exc:
+            await runner.run_once(now=2000.0)
+        assert exc.value.kind == "snapshot"
+    finally:
+        await store.close()
+    assert sorted(p.name for p in dest.glob("mefor-backup-*")) == [Path(good.archive_path).name]
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+def test_include_config_off_on_a_server_db_store_is_refused_at_load(backend) -> None:
+    """Every backup on a server-DB store is config-only, so with ``include_config = false`` each
+    would archive nothing; the settings refuse it where ``serve`` and ``check`` load them. The
+    controls: the same store with ``include_config`` on, or with the backup off, loads."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import ServiceSettings
+
+    store = {"backend": backend, "server": "db.invalid", "database": "mf", "username": "svc"}
+    backup = {"enabled": True, "destination": "D:/mefor-backups", "include_config": False}
+    with pytest.raises(ValidationError, match="include_config = false cannot be combined"):
+        ServiceSettings.model_validate({"store": store, "backup": backup})
+    ServiceSettings.model_validate({"store": store, "backup": {**backup, "include_config": True}})
+    ServiceSettings.model_validate({"store": store, "backup": {**backup, "enabled": False}})
+    # A SQLite store takes a full snapshot, so the same [backup] is not config-only there.
+    ServiceSettings.model_validate({"backup": backup})
+
+
+@pytest.mark.parametrize("shape", ["empty", "symlink-only", "one-file"])
+async def test_a_full_pass_records_whether_its_walk_added_a_config_file(
+    tmp_path, key_b64, shape
+) -> None:
+    """``config_bundled`` used to say only that the walk was asked to run, so a full pass over a
+    dir it added nothing from recorded true. The manifest, the result and the audit row now agree
+    on what the archive carries; the one-file dir is the control."""
+    import base64
+
+    from messagefoundry.pipeline.dr_backup import CONFIG_WALK_ADDED_NOTHING
+
+    cfg = _config_holding_only(tmp_path, shape)
+    store = await _store_with_rows(tmp_path / "msg.db", key_b64)
+    try:
+        result = await BackupRunner(
+            store,
+            _settings(tmp_path / "b", key_b64),
+            store_settings=_store_settings(tmp_path / "msg.db", key_b64),
+            config_dir=cfg,
+        ).run_once(now=1.0)
+        rows = [r for r in await store.list_audit(limit=10) if r["action"] == "dr_backup"]
+    finally:
+        await store.close()
+    assert result is not None and not result.config_only  # a full pass still succeeds
+    with open(result.archive_path, "rb") as src:
+        manifest = _manifest_from_tar_bytes(_decrypt_to_bytes(src, base64.b64decode(key_b64)))
+    (row,) = rows
+    detail = json.loads(row["detail"])
+    expected = (True, None) if shape == "one-file" else (False, CONFIG_WALK_ADDED_NOTHING)
+    assert (manifest["config_bundled"], manifest["config_bundle_error"]) == expected
+    assert (result.config_bundled, result.config_bundle_error) == expected
+    assert (detail["config_bundled"], detail["config_bundle_error"]) == expected
 
 
 # --- AC-9/AC-10: failure alerts + preserves the prior good archive -----------

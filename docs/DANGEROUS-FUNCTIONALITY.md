@@ -465,6 +465,12 @@ pure-Python equivalent:
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
   material in memory so it is not paged to disk, and to wipe it after use
 - File owner and permission checks: `config/wiring.py`, `auth/anchor_path.py`, `store/store.py`
+- Backup staging owner probe: `pipeline/dr_backup.py`, which on Windows creates the probe it learns
+  a staging root's owner from with `kernel32`'s `CreateFileW`, with a protected access list built by
+  `advapi32` attached and `CREATE_NEW`, and reads that probe's owner, a staging root's, and its own
+  lock file's from the open handle with `advapi32`'s `GetSecurityInfo`, never by path, so a rename
+  in the staging root cannot choose the owner a sweep goes by (BACKLOG #4988). POSIX needs no
+  `ctypes` for this; it reads `fstat` of each one's open descriptor
 - Key file creation: `restricted_file.py`, which on Windows calls `kernel32`'s `CreateFileW` with
   the file's access list attached and `CREATE_NEW`, so a file that holds a key is restricted in
   the call that creates it and an existing file or link is refused. It asks `advapi32` to build
@@ -488,14 +494,14 @@ pure-Python equivalent:
   `GetFinalPathNameByHandleW` to confirm where the file it opened really is (BACKLOG #2507, #2535).
   It then moves and deletes the file through that handle with `SetFileInformationByHandle`, so the
   act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path part
-  with `O_NOFOLLOW` and acts relative to the opened directory
-- Backup staging fail-safe: `pipeline/dr_backup.py`, which empties the files a failed backup left in
-  its staging directory. On Windows it opens each directory and file with `kernel32`'s `CreateFileW`
-  and `FILE_FLAG_OPEN_REPARSE_POINT`, so a link or junction is opened as itself,
-  `GetFileInformationByHandleEx` to refuse one, and `GetFinalPathNameByHandleW` to confirm the
-  object lies under the staging directory before it is truncated through that handle (BACKLOG
-  #2420). POSIX needs no `ctypes` for this; it opens each directory and file with `O_NOFOLLOW`
-  relative to its directory's descriptor
+  with `O_NOFOLLOW` and acts relative to the opened directory. The disaster-recovery backup's
+  staging fail-safe, which empties the files a failed backup left in its staging directory, calls
+  these same helpers on Windows rather than `ctypes` of its own. It holds each directory, opens each
+  file as itself, and refuses a link or junction. It confirms that file lies under the staging
+  directory before its filter serves it, except in the cases the backup staging row of
+  [PHI.md section 2](PHI.md#2-where-phi-lives--data-at-rest-inventory) names, where the filter
+  serves first. A deduplicated, cloud or tiered file is then truncated through a second open by
+  name, which must reach the same file (BACKLOG #2420, #4992)
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
   `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
 - Diagnostics: `crashdump.py`

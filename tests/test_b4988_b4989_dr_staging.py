@@ -460,21 +460,23 @@ def test_a_leaked_probe_file_is_swept_and_a_nonempty_one_is_kept(tmp_path) -> No
 
 def _staging_with_untyped_subdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A staging directory holding ``sub/inner.tar``, behind the seam for an ``is_dir`` that
-    raised: the walk lists ``sub`` among the files, and so never descends into it."""
+    raised: the walk lists ``sub`` among the files, and so never descends into it. The walk is
+    the descriptor walk on POSIX and the held walk on Windows (BACKLOG #4992)."""
     staging = tmp_path / "mefor-backup-own"
     (staging / "sub").mkdir(parents=True)
     (staging / "sub" / "inner.tar").write_bytes(b"synthetic plaintext")
-    real_walk = dr_backup._walk
+    seam = "_win_held_walk" if sys.platform == "win32" else "_walk"
+    real_walk = getattr(dr_backup, seam)
 
-    def walk(top: Path, **kwargs: Any) -> Iterator[Any]:
-        for step in real_walk(top, **kwargs):
+    def walk(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        for step in real_walk(*args, **kwargs):
             dirs, files = step[1], step[2]
             if "sub" in dirs:
                 dirs.remove("sub")  # in place, so neither walk descends
                 files.append("sub")
             yield step
 
-    monkeypatch.setattr(dr_backup, "_walk", walk)
+    monkeypatch.setattr(dr_backup, seam, walk)
     return staging
 
 

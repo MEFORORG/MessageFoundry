@@ -33,7 +33,12 @@ async def test_refused_bind_leaves_no_open_transaction(tmp_path: Path) -> None:
     try:
         for uid in ("holder", "loser", "bystander"):
             await store.create_user(
-                user_id=uid, username=uid, auth_provider="ad", now=1_000.0, password_generated=False
+                user_id=uid,
+                username=uid,
+                auth_provider="ad",
+                now=1_000.0,
+                password_generated=False,
+                audits=(),
             )
         await store.set_user_federated_subject("holder", ISSUER, SUBJECT, now=1_000.0)
 

@@ -282,6 +282,50 @@ async def test_verify_fails_when_the_manifest_expects_a_table_the_snapshot_does_
     await store.close()
 
 
+@pytest.mark.parametrize(
+    ("shape", "reason"),
+    [
+        ("empty", "records no row counts"),
+        ("missing", "records no row counts"),
+        ("disjoint", "share none with"),
+    ],
+)
+async def test_verify_fails_when_the_manifest_row_counts_compare_nothing(
+    tmp_path, shape: str, reason: str
+) -> None:
+    """BACKLOG #5056: the compare is keyed off the manifest's own tables, so a manifest recording
+    none, or none the snapshot has, compares nothing and used to verify PASS. A full archive's
+    manifest always lists its store's tables, so this shape is the #2186 empty stand-in or a
+    damaged manifest, and it must FAIL with a reason that says the compare read nothing."""
+    key_b64 = generate_key()
+    store, archive, ss = await _backup(tmp_path, key_b64)
+    try:
+        key = base64.b64decode(key_b64)
+
+        # The control: the untouched archive passes, so the FAIL below is the manifest edit alone.
+        good = await run_restore_verify(archive, store_settings=ss)
+        assert good.status == "PASS", good.reason
+
+        def _hollow_the_counts(manifest: dict[str, Any]) -> None:
+            if shape == "empty":
+                manifest["row_counts"] = {}
+            elif shape == "missing":
+                del manifest["row_counts"]
+            else:
+                manifest["row_counts"] = {"a_table_this_snapshot_does_not_have": 0}
+
+        hollow = tmp_path / f"no-counts-{shape}.mfbak"
+        _reseal_with_mutated_manifest(archive, key, hollow, _hollow_the_counts)
+
+        res = await run_restore_verify(str(hollow), store_settings=ss)
+        assert res.status == "FAIL", res.reason
+        assert res.integrity_ok is True
+        assert res.row_counts.get("messages", 0) >= 1  # the snapshot itself was counted
+        assert res.reason is not None and reason in res.reason
+    finally:
+        await store.close()
+
+
 async def test_full_restore_verify_opens_through_open_store(tmp_path) -> None:
     key_b64 = generate_key()
     store, archive, ss = await _backup(tmp_path, key_b64)
@@ -869,7 +913,7 @@ def test_plaintext_that_cannot_be_emptied_turns_a_pass_into_a_fail(
     monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
     monkeypatch.setattr(dr_backup, "_remove_tree", lambda path: False)
 
-    def open_refusing_writes(entry: Path, dir_fd: int | None) -> int:
+    def open_refusing_writes(entry: Path, dir_fd: int | None, inside: str | None) -> int:
         raise PermissionError(13, "synthetic sharing violation", str(entry))
 
     # The fail-safe's open for truncation (BACKLOG #2420), not the module's every open.
@@ -943,12 +987,12 @@ def test_a_directory_that_cannot_be_listed_is_not_reported_empty(tmp_path, monke
     staging.mkdir()
     (staging / "extracted_store.db").write_bytes(b"synthetic")
 
-    def walk_refusing(top, onerror=None, **kwargs):
-        assert onerror is not None
-        onerror(PermissionError(13, "synthetic listing refusal", str(top)))
-        return iter(())
+    def scandir_refusing(path):
+        raise PermissionError(13, "synthetic listing refusal", str(path))
 
-    monkeypatch.setattr(dr_backup, "_walk", walk_refusing)
+    # The listing both walks make: by descriptor on POSIX, and by held handle on Windows (BACKLOG
+    # #4992), which no longer goes through `_walk`.
+    monkeypatch.setattr(os, "scandir", scandir_refusing)
     unproven = dr_backup._empty_files_in_place(staging)
     assert unproven == ["mefor-verify-x/ (not listed)"]
 

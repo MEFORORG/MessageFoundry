@@ -34,6 +34,7 @@ from messagefoundry.transports.database import _build_odbc_dsn
 from tests.test_keywrap import _PASSPHRASE, _legacy_pem, _pkcs8
 
 _CONNECTION = "OB_DB_GEN"
+_MYSQL = "MySQL ODBC 9.1 Unicode Driver"
 
 
 class _Client(NamedTuple):
@@ -85,13 +86,15 @@ def _build(
     sslpassword: str | None = None,
     spelling: str = "sslcert",
     extra: dict[str, str] | None = None,
+    driver: str = _MYSQL,
 ) -> str:
-    params: dict[str, str] = {"SSLmode": "verify-full", spelling: cert, **(extra or {})}
+    # MySQL's own spelling: since BACKLOG #5035 a MySQL driver name refuses libpq's verify-full.
+    params: dict[str, str] = {"SSLmode": "VERIFY_IDENTITY", spelling: cert, **(extra or {})}
     if sslpassword is not None:
         params["sslpassword"] = sslpassword
     settings: dict[str, Any] = {
         "dialect": "generic",
-        "odbc_driver": "MySQL ODBC 9.1 Unicode Driver",
+        "odbc_driver": driver,
         "server": "db.synthetic.test",
         "odbc_params": params,
     }
@@ -337,9 +340,11 @@ def test_a_failed_read_is_judged_from_the_first_error_with_no_second_stat(
     assert path not in looked
 
 
-@pytest.mark.parametrize("mode", ["disable", "DISABLED"])
+@pytest.mark.parametrize(
+    ("mode", "driver"), [("disable", "PostgreSQL Unicode"), ("DISABLED", _MYSQL)]
+)
 def test_an_unreachable_sslca_the_driver_never_reads_does_not_fail_the_build(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, driver: str
 ) -> None:
     """Under a mode that turns TLS off the driver reads no CA (``generic_odbc_tls_off``), so a
     share that cannot be reached at build time is not a reason to refuse. Red with the
@@ -352,7 +357,8 @@ def test_an_unreachable_sslca_the_driver_never_reads_does_not_fail_the_build(
         raise error
 
     monkeypatch.setattr(database, "read_if_regular", failing)
-    assert f"sslca={path};" in _build(path, spelling="sslca", extra={"SSLmode": mode})
+    off = _build(path, spelling="sslca", extra={"SSLmode": mode}, driver=driver)
+    assert f"sslca={path};" in off
     with pytest.raises(ValueError, match="could not be read"):
         _build(path, spelling="sslca")
 
@@ -395,7 +401,7 @@ def test_a_padded_unreachable_sslca_is_refused_before_any_read(
     monkeypatch.setattr(database, "read_if_regular", failing)
     padded = path + "  "
     with pytest.raises(ValueError, match="must not be empty, blank, or start or end with a space"):
-        _build(padded, spelling="sslca", extra={"SSLmode": "disable"})
+        _build(padded, spelling="sslca", extra={"SSLmode": "DISABLED"})
     assert reads == []
 
 
@@ -425,7 +431,7 @@ def test_tls_off_leaves_only_an_unreached_sslca_to_the_driver(
 
     monkeypatch.setattr(database, "read_if_regular", failing)
     with pytest.raises(refusal, match="could not be read"):
-        _build(path, spelling=spelling, extra={"SSLmode": "disable"})
+        _build(path, spelling=spelling, extra={"SSLmode": "DISABLED"})
 
 
 def test_a_readable_sslca_is_still_checked_when_tls_is_off(tmp_path: Path) -> None:
@@ -433,7 +439,7 @@ def test_a_readable_sslca_is_still_checked_when_tls_is_off(tmp_path: Path) -> No
     read is checked as before, so an encrypted block in it is refused under ``disable`` too."""
     path = _write(tmp_path, b"-----BEGIN CERTIFICATE-----\nProc-Type: 4,ENCRYPTED\n", "ca.pem")
     with pytest.raises(ValueError, match="encryption header"):
-        _build(path, spelling="sslca", extra={"SSLmode": "disable"})
+        _build(path, spelling="sslca", extra={"SSLmode": "DISABLED"})
 
 
 def test_with_sslkey_set_sslcert_is_not_read(tmp_path: Path, client: _Client) -> None:

@@ -78,12 +78,14 @@ async def _keyed_store(data_dir: Path, key_b64: str) -> MessageStore:
     return store
 
 
-def _runner(store: MessageStore, data_dir: Path, dest: Path, key_b64: str) -> BackupRunner:
+def _runner(
+    store: MessageStore, data_dir: Path, dest: Path, key_b64: str, config_dir: Path | None = None
+) -> BackupRunner:
     return BackupRunner(
         store,
         BackupSettings(enabled=True, destination=str(dest)),
         store_settings=StoreSettings(path=str(data_dir / "msg.db"), encryption_key=key_b64),
-        config_dir=None,
+        config_dir=config_dir,
         instance="dev",
     )
 
@@ -200,14 +202,20 @@ def _server_db_settings(key_b64: str) -> StoreSettings:
 
 async def _archive(tmp_path: Path, *, config_only: bool) -> tuple[Path, str]:
     """A real `.mfbak` in its own directory, and the key it is sealed under. ``config_only`` is the
-    archive a server-DB store's backup writes."""
+    archive a server-DB store's backup writes, which must carry a config file to be written at all
+    (vault BACKLOG #5220)."""
     key = generate_key()
     data_dir = tmp_path / "source"
     store = await _keyed_store(data_dir, key)
+    config_dir: Path | None = None
+    if config_only:
+        config_dir = tmp_path / "source_config"
+        config_dir.mkdir()
+        (config_dir / "feed.py").write_text("# synthetic router\n")
     try:
-        result = await _runner(store, data_dir, tmp_path / "archives", key).run_once(
-            now=1.0, force_config_only=config_only
-        )
+        result = await _runner(
+            store, data_dir, tmp_path / "archives", key, config_dir=config_dir
+        ).run_once(now=1.0, force_config_only=config_only)
     finally:
         await store.close()
     assert result is not None and result.config_only is config_only
@@ -524,7 +532,7 @@ async def test_a_run_cancelled_during_the_build_is_cleaned_up_by_its_worker(
     release = threading.Event()
     real_build = BackupRunner._build_archive_blocking
 
-    def slow_build(self: BackupRunner, **kw: object) -> tuple[str, dict[str, int], int]:
+    def slow_build(self: BackupRunner, **kw: object) -> tuple[str, dict[str, int], int, int]:
         entered.set()
         assert release.wait(30), "the test never released the build"
         return real_build(self, **kw)  # type: ignore[arg-type]
@@ -796,6 +804,40 @@ async def test_a_failed_build_names_its_leftover_in_the_audited_error(
         await store.close()
     assert caught.value.kind == "write"
     assert str(caught.value).startswith(leftover)
+    (row,) = rows
+    assert "SYNTHETIC-DIR" in json.loads(row["detail"])["error"]
+
+
+async def test_a_refused_config_only_build_names_its_leftover_too(tmp_path, monkeypatch) -> None:
+    """The build's own refusal of a config-only pass whose walk adds nothing (vault BACKLOG #5220)
+    keeps its kind and leads with the leftover, as an OSError there does; a note would reach neither
+    the audit row nor the alert."""
+    import json
+
+    data_dir = tmp_path / "data"
+    key = generate_key()
+    store = await _keyed_store(data_dir, key)
+    empty = tmp_path / "empty_config"
+    empty.mkdir()
+    real_teardown = dr_backup._teardown_staging
+    leftover = "the plaintext staging directory SYNTHETIC-DIR could not be removed"
+
+    def teardown_fails(path: Path) -> str | None:
+        real_teardown(path)
+        return leftover
+
+    monkeypatch.setattr(dr_backup, "_teardown_staging", teardown_fails)
+    try:
+        with pytest.raises(BackupError) as caught:
+            await _runner(store, data_dir, tmp_path / "dest", key, config_dir=empty).run_once(
+                now=1.0, force_config_only=True
+            )
+        rows = [r for r in await store.list_audit(limit=10) if r["action"] == "dr_backup"]
+    finally:
+        await store.close()
+    assert caught.value.kind == "snapshot"
+    assert str(caught.value).startswith(leftover)
+    assert "added no regular file" in str(caught.value)
     (row,) = rows
     assert "SYNTHETIC-DIR" in json.loads(row["detail"])["error"]
 

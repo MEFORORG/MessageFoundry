@@ -26,6 +26,7 @@ async def _account(store: Any, user_id: str, username: str) -> None:
         password_hash="h",
         now=100.0,
         password_generated=False,
+        audits=(),
     )
 
 
