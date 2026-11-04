@@ -1525,13 +1525,15 @@ def _build_connection(
 # statement on every dialect.
 _SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$]*")
 
-# Line breaks other than LF. A `--` comment ends at an LF here, and one holding any of these before
-# that LF is refused (BACKLOG #5259), whatever lexer reads it: SQL lexers can disagree about which of
-# them end a line comment, and either guess lets a write through. Ending at a CR admits
-# `--x\r' <LF> DELETE ... --'`, where the quote swallows a DELETE that a lexer ending at the LF runs;
-# ending at the LF admits `--x\rDELETE`. A CR right before the LF is a CRLF ending and is not refused.
-# The set is Python's `str.splitlines` breaks less LF, a superset of what any lexer is likely to use.
-_SQL_OTHER_LINE_BREAKS = frozenset("\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+# Characters other than LF that a lexer may end a line comment at. A `--` comment ends at an LF here,
+# and one holding any of these before that LF is refused (BACKLOG #5259), whatever lexer reads it:
+# SQL lexers can disagree about which of them end a line comment, and either guess lets a write
+# through. Ending at a CR admits `--x\r' <LF> DELETE ... --'`, where the quote swallows a DELETE that
+# a lexer ending at the LF runs; ending at the LF admits `--x\rDELETE`. A CR right before the LF is a
+# CRLF ending and is not refused. The set holds at least Python's `str.splitlines` breaks less LF,
+# and NUL, at which MySQL's comment loop stops. Nothing proves it holds every character some lexer
+# ends a comment at; one outside it is a miss.
+_SQL_OTHER_LINE_BREAKS = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 
 # Write/authority keywords refused anywhere outside a string literal, a quoted identifier or a comment.
 # `INTO` is here because `SELECT ... INTO copy` writes a table while still opening with `SELECT`; the
@@ -1615,22 +1617,25 @@ def _scan_sql_tokens(
 
     ``mysql_comments`` picks the comment model (BACKLOG #5259). Off, it is the T-SQL one, which
     PostgreSQL shares: ``--`` always starts a comment, block comments nest, so the scan tracks depth,
-    and ``#`` is a sigil. On, it is MySQL's: ``--`` starts a comment only when whitespace or a control
-    character follows it (``5 --1`` is ``5 - -1``), ``#`` starts a comment, block comments do not
-    nest, and the body of a ``/*!`` or MariaDB ``/*M!`` comment, which MySQL runs, is scanned as code.
+    and ``#`` is a sigil. On, it is MySQL's: ``--`` starts a comment only when an ASCII space or
+    control character, DEL included, follows it (``5 --1`` is ``5 - -1``), and a non-ASCII character
+    after it is refused, since the connection's character set decides what that is; ``#`` starts a
+    comment, block comments do not nest, and the body of a ``/*!`` or MariaDB ``/*M!`` comment, which
+    MySQL runs, is scanned as code.
     :func:`_require_read_only` says which caller gets which. Quoting is the same in both.
 
     An unterminated literal or comment raises :class:`DbLookupError`: the rest of such a statement
     cannot be read, and guessing at it is how a shape-based gate gets bypassed. So does a line comment
-    holding a line break other than LF before the LF that ends it (:data:`_SQL_OTHER_LINE_BREAKS`
-    says why). So does a numeric literal with a word character glued to its end
+    holding a line break other than LF, or a NUL, before the LF that ends it
+    (:data:`_SQL_OTHER_LINE_BREAKS` says why). So does a numeric literal with a word character glued to its end
     (:data:`_SQL_NUMBER_RE`): SQL Server reads ``0xUPDATE`` as ``0x`` then ``UPDATE`` and
     ``1e1INTO`` as ``1e1`` then ``INTO``. Those refusals, and the split of a word at an internal
     sigil (:data:`_SQL_WORD_RE`), also catch valid reads, at least an Oracle ``1.5f``, a MySQL name
     that starts with a digit (``2024_orders``), a MySQL ``0b101``, a T-SQL ``#1tmp``, ``@1x`` or
     ``t#1x``, a ``:1st`` placeholder, a line comment in a statement with CR-only line endings, and a
     name such as ``update#n`` whose part before an internal ``#`` or ``@`` is a write keyword. The
-    MySQL model adds at least a ``--`` comment with no space after the dashes, a ``/*!`` body or a
+    MySQL model adds at least a ``--`` comment with no space after the dashes or with a non-ASCII
+    character right after them, a ``/*!`` body or a
     nested block comment's tail holding a write keyword or a lone quote, and a T-SQL ``#temp`` name
     whose line ends inside a multi-line quoted literal. It fails closed on purpose.
     ``subject`` names whose statement it is in that refusal."""
@@ -1642,17 +1647,22 @@ def _scan_sql_tokens(
         if ch.isspace():
             i += 1
             continue
-        # MySQL reads `--x` as two minus signs, so the rest of its line is code: it falls through to
-        # the one-character token below. Only an ASCII space or control character after the dashes
-        # makes a MySQL comment, since MySQL reads a non-ASCII space as part of a name.
-        if (
-            statement.startswith("--", i)
-            and not (mysql_comments and statement[i + 2 : i + 3] > " ")
-        ) or (mysql_comments and ch == "#"):
+        # MySQL makes `--` a comment only when a space or control character follows it, ASCII DEL
+        # included; `--x` is two minus signs, so the rest of its line is code and falls through to the
+        # one-character token below. Whether a non-ASCII character there is a space or a control
+        # depends on the connection's character set, which the gate cannot see, so that is refused.
+        after = statement[i + 2 : i + 3] if mysql_comments and statement.startswith("--", i) else ""
+        if after > "\x7f":
+            raise DbLookupError(f"{refusal}; a '--' is followed by a non-ASCII character")
+        if (statement.startswith("--", i) and not " " < after < "\x7f") or (
+            mysql_comments and ch == "#"
+        ):
             nl = statement.find("\n", i)
             end = n if nl == -1 else nl
             if not _SQL_OTHER_LINE_BREAKS.isdisjoint(statement[i:end].rstrip("\r")):
-                raise DbLookupError(f"{refusal}; a line comment holds a line break other than LF")
+                raise DbLookupError(
+                    f"{refusal}; a line comment holds a line break other than LF, or a NUL"
+                )
             i = end + 1
             continue
         if mysql_comments and statement.startswith(("/*!", "/*M!"), i):
@@ -1720,8 +1730,8 @@ def _require_read_only(
        ``EXEC``, plus DDL — :data:`_SQL_WRITE_KEYWORDS`) may appear outside a literal or a comment;
     3. nothing may follow a ``;`` (no chained second statement); a trailing one is fine.
 
-    Rule 2 also refuses a ``CALL`` word that follows an ODBC ``{`` escape opener (``{call p}``,
-    ``{?= call p(?)}``), anywhere in the statement, on every dialect. Rule 1 alone refused only a
+    Rule 2 also refuses a ``CALL`` word inside an open ODBC ``{`` escape (``{call p}``,
+    ``{?= call p(?)}``, ``{:r = call p}``), anywhere in the statement, on every dialect. Rule 1 alone refused only a
     leading one (BACKLOG #5259). On every dialect but ``sqlserver`` it refuses a bare ``CALL`` too,
     since MySQL and PostgreSQL run one; SQL Server has no ``CALL`` statement, so there a ``call``
     name is still admitted. Rule 1 also refuses a leading ``SELECT`` or ``WITH`` glued to a ``#``
@@ -1797,12 +1807,17 @@ def _check_read_only_tokens(
 
 
 def _follows_escape_opener(tokens: list[_SqlToken], index: int) -> bool:
-    """Whether ``tokens[index]`` follows an ODBC escape's ``{``, past the ``?=`` of a ``{?= call}``."""
+    """Whether ``tokens[index]`` sits inside an ODBC escape: the nearest brace before it is a ``{``.
+
+    Not only a ``{`` with ``?=`` between: ``db_lookup`` tests the statement before
+    :func:`_parse_named_params` turns a ``:name`` into ``?``, so ``{:r = call p}`` reaches the driver
+    as ``{? = call p}``. Any ``CALL`` inside an open ``{`` is refused, a false refusal of at least a
+    ``call`` name inside a ``{fn ...}`` escape included."""
     while index > 0:
         index -= 1
         kind, text, _ = tokens[index]
-        if kind != "other" or text not in ("?", "="):
-            return kind == "other" and text == "{"
+        if kind == "other" and text in ("{", "}"):
+            return text == "{"
     return False
 
 

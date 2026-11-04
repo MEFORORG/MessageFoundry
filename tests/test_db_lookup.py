@@ -623,6 +623,8 @@ _CALL_ESCAPES = [
     "SELECT 1 {?= call sp_x(?)}",
     "SELECT 1 { CALL sp_x }",
     "SELECT 1 {/* note */call sp_x}",
+    # db_lookup tests the text before `:r` becomes `?`, so the driver would get `{? = call ...}`.
+    "SELECT 1 {:r = call dbo.p}",
 ]
 
 
@@ -648,6 +650,8 @@ _LONE_LINE_BREAKS = [
     "SELECT 1 --x\x85DELETE FROM t",
     "SELECT 1 --x\u2028DELETE FROM t",
     "SELECT 1 --x\fDELETE FROM t",
+    # MySQL's comment loop stops at a NUL as well as at LF.
+    "SELECT 1 -- x\x00DELETE FROM t",
     # Ending the comment at the CR instead would admit this one: the quote would then swallow a
     # DELETE that a lexer ending the comment at the LF runs. So the gate refuses, never guesses.
     "SELECT 1 --x\r' \nDELETE FROM t --'",
@@ -694,6 +698,23 @@ def test_mysql_comment_forms_are_refused_on_the_generic_dialect(stmt: str) -> No
     the T-SQL comment model only."""
     with pytest.raises(DbLookupError, match="read-only SELECT/WITH"):
         database._require_read_only(stmt, dialect="generic")
+
+
+def test_the_mysql_scan_reads_dash_del_as_a_comment() -> None:
+    """MySQL's lexer counts DEL as a control character after `--`, so the MySQL scan must drop the
+    rest of the line. Red mutation: test only `<= " "` after the dashes, and DELETE is a token."""
+    tokens = database._scan_sql_tokens("SELECT 1 --\x7fDELETE\nFROM t", mysql_comments=True)
+    assert [t.text for t in tokens if t.kind == "word"] == ["SELECT", "FROM", "T"]
+
+
+def test_a_dash_before_a_non_ascii_character_is_refused_on_the_generic_dialect() -> None:
+    """Whether MySQL reads a non-ASCII character after `--` as a space depends on the connection's
+    character set, so the generic dialect refuses rather than guess. The sqlserver scan, with one
+    comment model, still reads it as a comment."""
+    stmt = "SELECT 1 --\xa0 INTO OUTFILE '/tmp/x'"
+    with pytest.raises(DbLookupError, match="followed by a non-ASCII character"):
+        database._require_read_only(stmt, dialect="generic")
+    database._require_read_only("SELECT 1 --\xe9 note\nFROM t")
 
 
 @pytest.mark.parametrize(
