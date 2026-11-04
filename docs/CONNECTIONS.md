@@ -361,11 +361,21 @@ An inbound connection's `encoding` is the charset the engine decodes each receiv
 `utf-8` when it is unset or `None`. It must be a literal string naming a usable text codec:
 `messagefoundry check` and `serve` refuse anything else when the config loads, an `env()` reference
 included, in Python config and `connections.toml` alike (BACKLOG #2431). A name that gets past that
-check, on a graph that skipped it, is a **configuration refusal** at run time: each body is recorded
-as an `ERROR` row, MLLP and TCP answer `AE`, `Http()` answers `503` with **no** `Retry-After`, and a
-DICOM SCP whose inbound declares a text `content_type` answers Out of Resources (`0xA700`). A
-`File()` or remote-file source records the row, which stores its input whole, and consumes the
-input. Bytes invalid in a usable charset are the body's own fault and final: `AR`, or `422`. Why:
+check, on a graph that skipped it, is a **configuration refusal** at run time. What each source
+does with it, at least:
+
+- **MLLP, TCP and X12 listeners** record each body as an `ERROR` row. Where the inbound sends HL7
+  replies, the answer is `AE`; an X12 or other non-HL7 inbound gets no `AE` from the engine.
+- **`Http()`** records the row and answers `503` with **no** `Retry-After`.
+- **A DICOM SCP** whose inbound declares a text `content_type` records the row and answers Out of
+  Resources (`0xA700`). One that keeps a binary type such as `dicom` never decodes.
+- **A `File()` or remote-file source**, for a name no codec answers to, records the row, which
+  stores its input whole, and consumes the input. A name that refuses every conversion, such as
+  `undefined`, fails before the hand-off instead: no row is written, the file stays in place, and
+  each scan logs a handler failure and tries again.
+- **A `DatabasePoll()` or `Timer()` source** fails to build on such a name, so it never starts.
+
+Bytes invalid in a usable charset are the body's own fault and final: `AR`, or `422`. Why:
 the [ADR 0154 amendment of 2026-11-04](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal)
 (BACKLOG #5102). Each inbound `encoding` row below points here.
 

@@ -1676,17 +1676,22 @@ engine would take once the name is fixed.
 body the inbound's own configuration refuses. At least an `IngressCodecUnusable` decode refusal is
 classed so. One function, `_guard_refusal_kind` in
 [`pipeline/wiring_runner.py`](../../messagefoundry/pipeline/wiring_runner.py), classes an ingress
-guard for both listeners, and one mapping, `_nak_code`, turns a kind into MSA-1, the detach arm's
-included.
+guard for both listeners, and one mapping, `_nak_code`, turns a kind into MSA-1 on the MLLP
+listener's arms whose refusal the receipt path classes by a shared function: at least the decode,
+decoded-text, streaming-detach and strict-timeout arms. The parse and strict-failure arms answer
+`AR` directly, as the receipt path's `413` or `422` for them is final too.
 
 | Refusal | Kind | `Http()` answers | DICOM C-STORE SCP answers | MLLP / TCP |
 | --- | --- | --- | --- | --- |
 | an inbound `encoding` that sets up no decode | configuration | `503` with no `Retry-After` | Out of Resources (`0xA700`) | `AE` |
 
-* **No `Retry-After`.** A `503` alone says "not now"; leaving the header out keeps any sender from
-  reading an operator fault as retry-soon. The engine's own `Rest()` outbound never read the header,
-  so on an engine-to-engine hop it retries this `503` under its `RetryPolicy` and dead-letters the
-  row after `max_attempts`, as for a temporary one.
+* **No `Retry-After`.** `Retry-After` is the engine's only hint that a re-send soon will be
+  taken, so leaving it out means the engine no longer invites one for an operator fault. It does
+  not stop a sender from re-sending: one that retries a `503` on its own schedule still does, at
+  its own pace, and may re-send sooner than 5 seconds, leaving one `ERROR` row each time. The
+  engine's own `Rest()` outbound never read the header, so on an engine-to-engine hop it retries
+  this `503` under its `RetryPolicy` and dead-letters the row after `max_attempts`, as for a
+  temporary one.
 * **DICOM and MLLP keep the re-send class.** Neither protocol has a status that says "after an
   operator acts", and their final classes tell a sender to drop the object or message.
 * **The row says which.** The receipt path's `ERROR` row opens `[refusal kind: configuration]`.
@@ -1694,17 +1699,21 @@ included.
   operator's choice of store, but it refuses only a body at or over the streaming threshold, and
   that same body every time, so it stays a final `422` and `AR`, as the 2026-10-30 table classes it.
 * **A poll source still consumes its input.** The file and remote-file sources reach this refusal
-  through the generic handler, whose answer cannot say "refused", so each records the `ERROR` row
-  and moves on as for every refusal; the timer and database sources fail to build on such a name.
-  A poll source's refused input is stored whole, since it is exempt from the refused-body
-  allowance. Holding the input instead would need a receipt contract on every poll source, and
-  config load already refuses the name, so only a graph that skipped that check reaches it.
+  through the generic handler, whose answer cannot say "refused", so for a name no codec answers to
+  each records the `ERROR` row and moves on as for every refusal; the timer and database sources
+  fail to build on such a name. A poll source's refused input is stored whole, since it is exempt
+  from the refused-body allowance. Holding the input instead would need a receipt contract on every
+  poll source, and config load already refuses the name, so only a graph that skipped that check
+  reaches it. A name that refuses every conversion, such as `undefined`, raises in the file and
+  remote-file sources' own batch split before the hand-off, so there no row is written and the file
+  stays in place, retried on every scan. What each source does is listed once in
+  [`docs/CONNECTIONS.md`](../CONNECTIONS.md#an-inbound-encoding-follows-one-rule-on-every-source).
 
 **MLLP's split for a streaming-detach budget is settled.** A body alone over the whole in-flight
 budget is over-size, answered `413` on the receipt path and `AR` on MLLP, and only a budget held by
 concurrent detaches answers `503` and `AE`. The batch 604 change under the
 [amendment of 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary)
-built that (BACKLOG #5078); `_nak_code` now maps every final class to `AR` in one place.
+built that (BACKLOG #5078); `_nak_code` now maps the detach arm's classes to MSA-1, as above.
 
 The tests: `tests/test_inbound_http_source.py` pins the `503` with no `Retry-After` behind a real
 listener, and the stored tag; `tests/test_ingress_refusal_kinds.py` pins the classifier, the
