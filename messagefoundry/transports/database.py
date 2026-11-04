@@ -350,18 +350,6 @@ _ODBC_PASSWORD_KEYS = frozenset({"pwd", "password"})
 # screens. A path keyword added to the list above belongs here too; a test holds this a subset.
 _ODBC_PATH_KEYS = frozenset({"sslca", "sslcapath", "sslcert", "sslkey"})
 
-# The ONLY keywords the engine counts as setting a generic hop's TLS mode, in the form
-# :func:`odbc_keyword_name` compares them in (BACKLOG #2483). A value on one of these is what counts
-# as the operator owning TLS. A key, certificate or CA file, or a cipher list, does not count.
-# docs/CONNECTIONS.md records what the drivers read so far do with one.
-#
-# Which of the two counts, and with which values, depends on the driver family the ``odbc_driver``
-# name places (:data:`_FAMILY_TLS_MODES`, BACKLOG #5053). psqlODBC's keyword parser and MySQL
-# Connector/ODBC's parameter page have no `encrypt`, so on those drivers `Encrypt=yes` counts as
-# nothing; only Microsoft's ODBC Driver for SQL Server is counted on it. A name the engine cannot
-# place has no keyword that counts. A test holds this set to the keywords that table names.
-_ODBC_TLS_MODE_KEYWORDS = frozenset({"sslmode", "encrypt"})
-
 # Names an odbc_params keyword as about TLS at all (anything ssl/tls/encrypt-ish). A name says nothing
 # about the hop, so presence is never ownership: this picks which keywords' values are read against
 # :data:`_ODBC_NO_TLS_VALUES`, and tells "no TLS keyword" from "no TLS mode" in the reason an operator
@@ -382,7 +370,7 @@ _ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
 #   Microsoft ODBC `Encrypt` : optional (version 18 documents it as a synonym for `no`)
 #
 # Since BACKLOG #5053 and #5035 a mode counts only on the keyword the driver family reads, and for
-# psqlODBC and MySQL only at one of that family's own spellings (_FAMILY_TLS_MODES), so this list's
+# psqlODBC and MySQL only at one of that family's own spellings (_DRIVER_FAMILIES), so this list's
 # open end matters only for `encrypt` on Microsoft's driver.
 #
 # KNOWN RESIDUAL, written down rather than implied: an ENCRYPTED-BUT-UNVERIFIED value — psqlODBC
@@ -431,7 +419,7 @@ def _is_tls_keyword(name: str) -> bool:
 
 
 def _sets_tls_mode(params: Mapping[str, Any], family: str) -> bool:
-    """True when the keyword ``family`` reads as its TLS mode (:data:`_FAMILY_TLS_MODES`) has a
+    """True when the keyword ``family`` reads as its TLS mode (:data:`_DRIVER_FAMILIES`) has a
     non-blank string value with no blank at either end, and, where that table lists the family's
     spellings, one of them exactly. Anything else sets nothing: the engine has no evidence of how
     the driver reads it, and :func:`_no_tls_label` cannot see a no-TLS word inside a list. Whether
@@ -449,9 +437,10 @@ def _sets_tls_mode(params: Mapping[str, Any], family: str) -> bool:
     Every key is read, not the first spelling of each, so the answer for a table that names a mode
     keyword twice in different case does not depend on key order. The build refuses such a table;
     the posture readers classify specs that were never built."""
-    keyword, spellings = _FAMILY_TLS_MODES[family]
+    entry = _DRIVER_FAMILIES[family]
+    spellings = entry.tls_spellings
     return any(
-        odbc_keyword_name(str(key)) == keyword
+        odbc_keyword_name(str(key)) == entry.tls_keyword
         and isinstance(value, str)
         and value.strip()
         and value == value.strip()
@@ -506,7 +495,7 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any], *, driver: object) ->
     the engine cannot place, so no keyword counts (BACKLOG #5053), a TLS keyword with no mode the
     family reads beside it, such as a lone ``sslcert``, a blank ``sslmode``, or ``Encrypt=yes`` on
     psqlODBC (BACKLOG #2483, #5053), or no TLS keyword at all. Only the keyword
-    :data:`_FAMILY_TLS_MODES` names for the family can clear a hop. Shares
+    :data:`_DRIVER_FAMILIES` names for the family can clear a hop. Shares
     :func:`generic_odbc_no_tls_params` with the construction reminder — see the comment above
     :data:`_ODBC_NO_TLS_VALUES` for why a value deny-list, and for the encrypted-but-unverified residual
     this deliberately does not classify. That deny-list reads every TLS keyword whatever the family,
@@ -648,40 +637,6 @@ def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     return text
 
 
-# The whole registered ``odbc_driver`` names, in lower case, of the three driver families the engine
-# can place (BACKLOG #2705, #5029, #5053). psqlODBC's include the bare ``PostgreSQL``, the section
-# name RHEL registers it under. Whole names, spacing included, on purpose: a vendor driver whose
-# name merely mentions a database, a library path, an odbcinst alias such as RHEL's bare ``MySQL``,
-# or another registered name that only folds to one of these is not placed. This is not a driver
-# allowlist: an unplaced name still builds, and only what the engine reads from it changes.
-_PSQLODBC_DRIVER_NAME = r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"
-_MYSQL_ODBC_DRIVER_NAME = r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"
-_MSODBC_DRIVER_NAME = r"odbc driver [0-9]+ for sql server"
-_DRIVER_FAMILY_NAMES = (
-    ("psqlodbc", re.compile(_PSQLODBC_DRIVER_NAME)),
-    ("mysql", re.compile(_MYSQL_ODBC_DRIVER_NAME)),
-    ("msodbc", re.compile(_MSODBC_DRIVER_NAME)),
-)
-
-
-def _driver_family(driver: object) -> str | None:
-    """The family ``driver``, an ``odbc_driver`` setting as written, names whole: ``"psqlodbc"``,
-    ``"mysql"`` or ``"msodbc"``, or ``None`` where the engine cannot place it. The name is read
-    trimmed and in any case, as :func:`_build_odbc_dsn` reads it, never the library it loads."""
-    name = str(driver or "").strip().lower()
-    return next((family for family, names in _DRIVER_FAMILY_NAMES if names.fullmatch(name)), None)
-
-
-# The ``odbc_driver`` names, in lower case, of the drivers whose password is always sent braced,
-# with the ODBC ``}}`` escape (BACKLOG #2705): psqlODBC's and MySQL Connector/ODBC's registered
-# names, measured on 2026-10-30 to read that escape, and Microsoft's ``ODBC Driver <n> for SQL
-# Server``, not probed then but relied on for the same escape by the SQL Server preset and the
-# store. The legacy name ``SQL Server`` is left out: on Linux it is commonly a FreeTDS alias, which
-# has not been measured. A name the families above do not place is unmeasured and does not match.
-_ODBC_BRACE_ESCAPE_DRIVERS = re.compile(
-    rf"{_PSQLODBC_DRIVER_NAME}|{_MYSQL_ODBC_DRIVER_NAME}|{_MSODBC_DRIVER_NAME}"
-)
-
 # The ``sslmode`` values psqlODBC reads: libpq's six modes, exactly, in lower case (BACKLOG #2705).
 # psqlODBC's source reads an ``SSLmode`` value by its first byte, and only a lower case one names a
 # mode, so ``Require``, ``VERIFY-FULL``, ``REQUIRED``, ``on`` or ``1`` would mean disable to it,
@@ -694,24 +649,70 @@ _LIBPQ_SSL_MODES = ("disable", "allow", "prefer", "require", "verify-ca", "verif
 # another case was not measured, so only the documented spelling is accepted.
 _MYSQL_SSL_MODES = ("DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY")
 
-# What each placed family reads as its TLS mode: the keyword, in the form
-# :func:`odbc_keyword_name` gives, and the values that count, or ``None`` where any usable value
-# counts and the deny-list alone judges it (BACKLOG #5053). Microsoft's ODBC Driver for SQL Server
-# reads ``Encrypt`` and no ``sslmode``; psqlODBC and MySQL Connector/ODBC read ``sslmode`` and no
-# ``Encrypt``. A family missing here, and an unplaced name, has no keyword that counts.
-_FAMILY_TLS_MODES: dict[str, tuple[str, frozenset[str] | None]] = {
-    "psqlodbc": ("sslmode", frozenset(_LIBPQ_SSL_MODES)),
-    "mysql": ("sslmode", frozenset(_MYSQL_SSL_MODES)),
-    "msodbc": ("encrypt", None),
+
+class _DriverFamily(NamedTuple):
+    """What the engine knows of one driver family, placed from the ``odbc_driver`` name."""
+
+    #: The whole registered names, in lower case.
+    names: re.Pattern[str]
+    #: The keyword the family reads as its TLS mode, in the form :func:`odbc_keyword_name` gives.
+    tls_keyword: str
+    #: The values of that keyword that count as a mode, or ``None`` where any usable value counts
+    #: and the deny-list alone judges it.
+    tls_spellings: frozenset[str] | None
+    #: The verifying mode a warning gives as its example, so it never names a spelling this
+    #: family would ignore (BACKLOG #5029).
+    tls_example: str
+
+
+# The three driver families the engine can place, by whole registered name in any case but spelled
+# with single spaces (BACKLOG #2705, #5029, #5053). psqlODBC's include the bare ``PostgreSQL``, the
+# section name RHEL registers it under. A vendor driver whose name merely mentions a database, a
+# library path, an odbcinst alias such as RHEL's bare ``MySQL``, or another registered name that
+# only folds to one of these is not placed. This is not a driver allowlist: an unplaced name still
+# builds, and only what the engine reads from it changes.
+#
+# psqlODBC's keyword parser and MySQL Connector/ODBC's parameter page have no ``encrypt``, and
+# Microsoft's ODBC Driver for SQL Server reads no ``sslmode``, so each family counts one keyword
+# (BACKLOG #5053). An unplaced name has no keyword that counts.
+#
+# The placed names are also the drivers whose password is always sent braced, with the ODBC ``}}``
+# escape (:func:`_odbc_password`, BACKLOG #2705): psqlODBC's and MySQL's measured on 2026-10-30 to
+# read that escape, and Microsoft's not probed then but relied on for the same escape by the SQL
+# Server preset and the store. The legacy name ``SQL Server`` is left out: on Linux it is commonly
+# a FreeTDS alias, which has not been measured.
+_DRIVER_FAMILIES: dict[str, _DriverFamily] = {
+    "psqlodbc": _DriverFamily(
+        re.compile(r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"),
+        "sslmode",
+        frozenset(_LIBPQ_SSL_MODES),
+        "SSLmode=verify-full",
+    ),
+    "mysql": _DriverFamily(
+        re.compile(r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"),
+        "sslmode",
+        frozenset(_MYSQL_SSL_MODES),
+        "SSLMODE=VERIFY_IDENTITY",
+    ),
+    "msodbc": _DriverFamily(
+        re.compile(r"odbc driver [0-9]+ for sql server"), "encrypt", None, "Encrypt=yes"
+    ),
 }
 
-# The example a warning gives of a verifying mode, per family, so it never names a spelling the
-# named driver would ignore (BACKLOG #5029).
-_FAMILY_TLS_EXAMPLE = {
-    "psqlodbc": "SSLmode=verify-full",
-    "mysql": "SSLMODE=VERIFY_IDENTITY",
-    "msodbc": "Encrypt=yes",
-}
+# The ONLY keywords the engine counts as setting a generic hop's TLS mode (BACKLOG #2483), each
+# only on the family that reads it. A key, certificate or CA file, or a cipher list, does not
+# count. docs/CONNECTIONS.md records what the drivers read so far do with one.
+_ODBC_TLS_MODE_KEYWORDS = frozenset(family.tls_keyword for family in _DRIVER_FAMILIES.values())
+
+
+def _driver_family(driver: object) -> str | None:
+    """The key in :data:`_DRIVER_FAMILIES` of the family ``driver``, an ``odbc_driver`` setting as
+    written, names whole, or ``None`` where the engine cannot place it. The name is read trimmed
+    and in any case, as :func:`_build_odbc_dsn` reads it, never the library it loads."""
+    name = str(driver or "").strip().lower()
+    return next(
+        (key for key, family in _DRIVER_FAMILIES.items() if family.names.fullmatch(name)), None
+    )
 
 
 def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) -> None:
@@ -734,24 +735,19 @@ def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) ->
     The MySQL list is joined with ``or``: two upper case words joined by a comma or a blank are a
     name run to the log redaction, which would blank them."""
     family = _driver_family(driver)
+    accepted = _MYSQL_SSL_MODES if family == "mysql" else _LIBPQ_SSL_MODES
+    if text in accepted:
+        return
     database = f"{hop_name_prefix(connection)}DATABASE"
     where = f"{database} odbc_params value for 'sslmode'"
     see = "(see Generic ODBC in docs/CONNECTIONS.md)"
     if family == "mysql":
-        if text in _MYSQL_SSL_MODES:
-            return
         mysql = " or ".join(_MYSQL_SSL_MODES)
         raise ValueError(f"{where} must be one of {mysql}, in upper case, for MySQL {see}")
-    if text in _LIBPQ_SSL_MODES:
-        return
     libpq = ", ".join(_LIBPQ_SSL_MODES)
-    if family == "psqlodbc":
-        raise ValueError(f"{where} must be one of {libpq}, in lower case {see}")
-    if family == "msodbc":
-        raise ValueError(
-            f"{where} must be one of {libpq}, in lower case; this driver reads Encrypt, not "
-            f"sslmode {see}"
-        )
+    if family is not None:
+        reads = "; this driver reads Encrypt, not sslmode" if family == "msodbc" else ""
+        raise ValueError(f"{where} must be one of {libpq}, in lower case{reads} {see}")
     if text.upper() in _MYSQL_SSL_MODES:
         raise ValueError(
             f"{database} 'sslmode' is a MySQL spelling, and the engine cannot place this "
@@ -766,7 +762,7 @@ def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) ->
 def _odbc_password(password: object, *, driver: str, connection: str | None) -> str:
     """``password`` as the generic connection string sends it, or a ValueError (BACKLOG #2705).
 
-    For a driver :data:`_ODBC_BRACE_ESCAPE_DRIVERS` names, it is ALWAYS braced, with the ``}}``
+    For a driver :func:`_driver_family` places, it is ALWAYS braced, with the ``}}``
     escape, whatever it holds. psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space and
     ``%XX`` a byte; ``dlg_specific.c``, ``decode_or_remove_braces``) and takes a braced one
     literally, so only the braced form sends the password as written.
@@ -781,7 +777,7 @@ def _odbc_password(password: object, *, driver: str, connection: str | None) -> 
     describes the value beyond saying the driver cannot carry it."""
     text = str(password)
     _refuse_unsafe_text(text, what="password", connection=connection, refused="")
-    if _ODBC_BRACE_ESCAPE_DRIVERS.fullmatch(driver.lower()):
+    if _driver_family(driver) is not None:
         return odbc_brace(text)
     if not any(ch in ";{}\"'" for ch in text) and text == text.strip():
         return text
@@ -1490,7 +1486,8 @@ def _warn_generic_tls_unenforced(
             where,
         )
         return
-    example = _FAMILY_TLS_EXAMPLE.get(_driver_family(driver) or "")
+    family = _driver_family(driver)
+    example = _DRIVER_FAMILIES[family].tls_example if family else None
     remedy = (
         f"via the driver's own keyword (e.g. {example})"
         if example

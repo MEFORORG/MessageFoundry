@@ -926,7 +926,7 @@ def test_an_sslmode_off_the_libpq_spellings_is_refused(
         assert "'sslmode' must be one of disable, allow" in message
         assert "verify-full, in lower case" in message
     else:
-        assert "cannot place this odbc_driver" in message or "the engine cannot place" in message
+        assert "the engine cannot place" in message
 
 
 @pytest.mark.parametrize("driver", ["PostgreSQL Unicode", "PostgreSQL", "/usr/lib/psqlodbcw.so"])

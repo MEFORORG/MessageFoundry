@@ -32,7 +32,6 @@ from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports import database as database_module
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.database import (
-    _FAMILY_TLS_MODES,
     _ODBC_NO_TLS_VALUES,
     _ODBC_PARAM_ALLOWLIST,
     _ODBC_TLS_MODE_KEYWORDS,
@@ -567,10 +566,10 @@ def test_the_no_mode_table_is_not_empty_and_every_mode_keyword_is_accepted() -> 
     assert _ODBC_TLS_MODE_KEYWORDS <= _ODBC_PARAM_ALLOWLIST
 
 
-def test_the_mode_keywords_are_the_ones_the_family_table_names() -> None:
-    # BACKLOG #5053: the set the no-mode table above subtracts is the set the family table counts,
-    # so a keyword a family is given later is never also read as a lone no-mode keyword.
-    assert {keyword for keyword, _ in _FAMILY_TLS_MODES.values()} == _ODBC_TLS_MODE_KEYWORDS
+def test_the_mode_keywords_are_the_two_the_families_read() -> None:
+    # BACKLOG #5053: the set is derived from the family table, so a derivation that went empty
+    # would leave the no-mode table above holding every TLS keyword and pass every test below.
+    assert {"sslmode", "encrypt"} == _ODBC_TLS_MODE_KEYWORDS
 
 
 @pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)

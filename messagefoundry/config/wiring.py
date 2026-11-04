@@ -6801,6 +6801,27 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
 POSSIBLY_GENERIC_DB_HOP = "possibly generic: dialect is an unresolved env() reference"
 
 
+#: What :func:`_db_setting` returns for an ``env()`` reference it cannot resolve.
+_UNRESOLVED = object()
+
+
+def _db_setting(
+    settings: Mapping[str, Any], key: str, default: object, env_values: Mapping[str, Any] | None
+) -> object:
+    """A DATABASE connection's ``key`` setting, an ``env()`` reference resolved as the build
+    resolves it with :func:`resolve_env_settings`, or :data:`_UNRESOLVED` when it cannot be: no
+    values, or a key the values do not hold and no default."""
+    value = settings.get(key, default)
+    if not isinstance(value, EnvRef):
+        return value
+    if env_values is None:
+        return _UNRESOLVED
+    try:
+        return resolve_env_settings({key: value}, env_values)[key]
+    except WiringError:
+        return _UNRESOLVED
+
+
 def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | None) -> str | None:
     """A DATABASE connection's dialect in lower case, or ``None`` when it is an ``env()`` reference
     this reader cannot resolve.
@@ -6809,16 +6830,8 @@ def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | Non
     values, so a reader handed those values resolves it the same way, default included. With no
     values, or a key the values do not hold and no default, the answer is ``None``: a reader must not
     guess an arm, since each arm reads the same settings differently."""
-    dialect = settings.get("dialect", "sqlserver")
-    if not isinstance(dialect, EnvRef):
-        return str(dialect).lower()
-    if env_values is None:
-        return None
-    try:
-        resolved = resolve_env_settings({"dialect": dialect}, env_values)
-    except WiringError:
-        return None
-    return str(resolved["dialect"]).lower()
+    dialect = _db_setting(settings, "dialect", "sqlserver", env_values)
+    return None if dialect is _UNRESOLVED else str(dialect).lower()
 
 
 def _db_driver(settings: Mapping[str, Any], env_values: Mapping[str, Any] | None) -> object:
@@ -6827,15 +6840,8 @@ def _db_driver(settings: Mapping[str, Any], env_values: Mapping[str, Any] | None
 
     The generic hop classifier reads the driver family from it (BACKLOG #5053), and ``None`` places
     no family, so an unresolved name is listed as at risk: the safe direction for an advisory list."""
-    driver = settings.get("odbc_driver")
-    if not isinstance(driver, EnvRef):
-        return driver
-    if env_values is None:
-        return None
-    try:
-        return resolve_env_settings({"odbc_driver": driver}, env_values)["odbc_driver"]
-    except WiringError:
-        return None
+    driver = _db_setting(settings, "odbc_driver", None, env_values)
+    return None if driver is _UNRESOLVED else driver
 
 
 def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
