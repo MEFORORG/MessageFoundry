@@ -31,6 +31,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.odbc_call_gate import install_call_gate
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from tests._claim_lock_helpers import (
     assert_skip_named,
@@ -165,14 +166,20 @@ async def test_t6_sqlserver_locked_head_blocks_not_skips(ss_store: Any) -> None:
     # (message_id, stage) so the U-lock lands on the actual head row (locking by `id`=message_id matches
     # no row, holds no lock, and the claim never contends — the bug this assertion now guards against).
     lock_conn = await ss_store._pool.acquire()
-    lock_cur = await lock_conn.cursor()
-    await lock_cur.execute("BEGIN TRAN")
-    await lock_cur.execute(
-        "SELECT id FROM queue WITH (UPDLOCK, ROWLOCK) WHERE message_id=? AND stage=?",
-        (head_id, Stage.INGRESS.value),
-    )
-    assert len(await lock_cur.fetchall()) == 1  # the U-lock MUST land on the head row
+    lock_cur: Any = None
     try:
+        # Everything after the acquire sits inside the try, so a failure while taking the lock still
+        # reaches the release rather than leaking the open transaction against the next test's
+        # cleanup DELETE (BACKLOG #4915). The call gate goes on before the first statement, so a
+        # discard in the release never frees a handle under one a cancellation left running.
+        install_call_gate(lock_conn)
+        lock_cur = await lock_conn.cursor()
+        await lock_cur.execute("BEGIN TRAN")
+        await lock_cur.execute(
+            "SELECT id FROM queue WITH (UPDLOCK, ROWLOCK) WHERE message_id=? AND stage=?",
+            (head_id, Stage.INGRESS.value),
+        )
+        assert len(await lock_cur.fetchall()) == 1  # the U-lock MUST land on the head row
         claim = asyncio.ensure_future(
             ss_store.claim_next_fifo_batch(channel, now=200.0, stage=Stage.INGRESS.value, limit=8)
         )
@@ -278,7 +285,7 @@ async def test_pooled_1a_pg_locked_head_lane_empty_never_blocks(pg_store: Any) -
             pg_store, Stage.INGRESS.value, [channel], now=200.0, per_lane_limit=8
         )
         assert res.by_lane == {} and res.rearm == frozenset()
-        assert_skip_named(res, channel, abort_ok=False)
+        assert_skip_named(res, channel, abort_ok=False, stage=Stage.INGRESS.value)
         rows = await _pg_lane_pending(pg_store, channel)
         assert all(
             r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows
@@ -307,7 +314,7 @@ async def test_pooled_1a_ss_locked_head_lane_empty_never_blocks(ss_store: Any) -
             ss_store, Stage.INGRESS.value, [channel], now=200.0, per_lane_limit=8
         )
         assert res.by_lane == {} and res.rearm == frozenset()
-        assert_skip_named(res, channel, abort_ok=True)
+        assert_skip_named(res, channel, abort_ok=True, stage=Stage.INGRESS.value)
         rows = await ss_lane_pending(ss_store, channel)
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
@@ -578,7 +585,8 @@ async def test_pooled_1f_pg_wedged_head_attempts_neutral(pg_store: Any) -> None:
                 pg_store, Stage.INGRESS.value, [channel], now=200.0 + i, per_lane_limit=8
             )
             assert res.by_lane == {}
-            assert_skip_named(res, channel, abort_ok=False)  # #1270: every pass, not just one
+            # #1270: every pass, not just one
+            assert_skip_named(res, channel, abort_ok=False, stage=Stage.INGRESS.value)
         rows = await _pg_lane_pending(pg_store, channel)
         assert [(r["status"], r["attempts"]) for r in rows] == [
             (OutboxStatus.PENDING.value, 0)
@@ -603,7 +611,8 @@ async def test_pooled_1f_ss_wedged_head_attempts_neutral(ss_store: Any) -> None:
                 ss_store, Stage.INGRESS.value, [channel], now=200.0 + i, per_lane_limit=8
             )
             assert res.by_lane == {}
-            assert_skip_named(res, channel, abort_ok=True)  # #1270: every pass, not just one
+            # #1270: every pass, not just one
+            assert_skip_named(res, channel, abort_ok=True, stage=Stage.INGRESS.value)
         rows = await ss_lane_pending(ss_store, channel)
         assert [(r["status"], r["attempts"]) for r in rows] == [(OutboxStatus.PENDING.value, 0)] * 3
     finally:

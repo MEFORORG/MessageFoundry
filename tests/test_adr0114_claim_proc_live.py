@@ -307,22 +307,22 @@ async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
             return r.lock_timeout is None or lane in r.head_skipped
 
         res = await claim_past_empty_yield(_claim, done=_read_the_marker)
+        aborts = sum(a.lock_timeout is not None for a in attempts)
+        if aborts:
+            # Say so in the warnings summary: a 1222 nobody sees is the defect class BACKLOG #1270
+            # is about, and a re-issue must not become one. Emitted BEFORE the assertions below
+            # (BACKLOG #4915), so a run that fails one of them still shows the aborts it saw.
+            warnings.warn(
+                f"the _v2 head-skip test saw {aborts} 1222 abort(s) in {len(attempts)} claim(s)",
+                stacklevel=1,
+            )
         assert all(a.by_lane == {} and a.rearm == frozenset() for a in attempts)
         assert _read_the_marker(res), (
             f"all {len(attempts)} claims aborted on 1222 without naming the lane"
             f" ({res.lock_timeout!r}), so the _v2 head-skip marker was never read and this test"
             " proved nothing about it"
         )
-        aborts = sum(a.lock_timeout is not None for a in attempts)
-        assert_skip_named(res, lane, abort_ok=False)
-        if aborts:
-            # Re-issued past, so say so in the warnings summary: a 1222 nobody sees is the defect
-            # class BACKLOG #1270 is about, and a re-issue must not become one.
-            warnings.warn(
-                f"the _v2 head-skip test saw {aborts} 1222 abort(s) in {len(attempts)} claim(s)"
-                " before the marker was read",
-                stacklevel=1,
-            )
+        assert_skip_named(res, lane, abort_ok=False, stage=Stage.INGRESS.value)
         rows = await ss_lane_pending(proc_store, lane)
         assert len(rows) == 3
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)

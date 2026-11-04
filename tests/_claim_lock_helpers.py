@@ -2,11 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Shared helpers for the live claim tests that hold a queue head's lock (BACKLOG #1270).
 
-Shared here rather than imported as a private name from one test module.
-``tests/test_batch_claim_locking.py`` built them for the pooled external-lock schedules, and
-``tests/test_adr0114_claim_proc_live.py`` uses them to lock a head and CALL the ``_v2`` claim proc.
+Shared here rather than imported as a private name from one test module. At least these use them:
+``tests/test_batch_claim_locking.py``, which built them for the pooled external-lock schedules, and
+``tests/test_adr0114_claim_proc_live.py``, which locks a head and CALLs the ``_v2`` claim proc.
 ``claim_past_empty_yield`` is the one copy of the EMPTY-all retry that several claim test files each
-carried (BACKLOG #4915)."""
+carried (BACKLOG #4915); grep for its importers rather than trust a list here."""
 
 from __future__ import annotations
 
@@ -111,7 +111,19 @@ async def ss_release_row_lock(ss_store: Any, conn: Any, cur: Any) -> None:
     """The other half of :func:`ss_hold_row_lock`, for each caller's ``finally``: roll the held
     transaction back and return the connection to the pool. If the rollback or the cursor close
     raises, or a cancellation lands in either, the connection is discarded instead, so the release
-    still happens and nothing reaches the pool with the lock held (BACKLOG #4915)."""
+    still happens and nothing reaches the pool with the lock held (BACKLOG #4915).
+
+    It installs the call gate first when the connection has none, so the discard above goes through
+    the gate rather than ``close_one_shot``, which would close the handles beside a statement still
+    running on an executor thread (BACKLOG #2049). That makes it safe on a connection a caller took
+    straight from the pool. It does NOT gate a call already running when it is installed, so a
+    caller that may be cancelled mid-statement gates its own connection before its first statement,
+    as :func:`ss_hold_row_lock` does. A ``cur`` of ``None`` means no statement ran, so no transaction
+    is open: the connection is discarded, the cheap safe answer on a path that already failed."""
+    install_call_gate(conn)
+    if cur is None:
+        await _ss_discard(ss_store, conn, cur)
+        return
     try:
         await cur.execute("ROLLBACK TRAN")
         await cur.close()
@@ -128,9 +140,13 @@ async def _ss_discard(ss_store: Any, conn: Any, cur: Any) -> None:
     the lock. On a gated connection the cursor and the connection go to the call gate, cursor first,
     and close once no pyodbc call is running on them, so a statement a cancellation left on an
     executor thread never has its handles freed under it, no cursor outlives its connection, and
-    nothing here waits on the close, so a cancellation arriving now is never swallowed. An ungated
-    connection (install_call_gate logs a real aioodbc one at ERROR) is closed through
-    ``close_one_shot`` instead, which does wait for its close. A failing path pays one reconnect."""
+    nothing here waits on the close, so a cancellation arriving now is never swallowed.
+
+    Both callers install the gate before they get here, so a connection reaching this ungated is
+    either a stand-in with no bound ``_execute`` or a real aioodbc one ``install_call_gate`` could not
+    wrap, which it logged at ERROR. That one is closed through ``close_one_shot`` instead, which
+    does wait for its close and does not serialize it against a running statement. A failing path
+    pays one reconnect."""
     try:
         if not abandon_one_shot(conn, cur):
             await close_one_shot(conn, cur)
@@ -186,18 +202,28 @@ async def claim_heads_no_block(store: Any, *args: Any, timeout: float = 10.0, **
         raise
 
 
-def assert_skip_named(res: Any, lane: str, *, abort_ok: bool) -> None:
+def assert_skip_named(res: Any, lane: str, *, abort_ok: bool, stage: str) -> None:
     """BACKLOG #1270: a lane EMPTY behind a held head must NAME its route, never read as "no work".
 
     The completed claim names the lane in ``head_skipped``. On SQL Server alone the whole attempt may
     instead abort on 1222 (``lock_timeout``), which names the route; ``abort_ok`` admits a HEAD-phase
-    abort, and only that. Most come before the fetch, read no row and name no lane, but the phase
-    stays HEAD through an OUTBOUND claim's ``delivered_keys`` probe, after the fetch, so the skip it
-    read may ride out: the lane, or nothing. A FINALIZE-phase abort always comes after the fetch, so
-    the lane must still be named (BACKLOG #4915). Either way a silent EMPTY fails here."""
+    abort, and only that. A FINALIZE-phase abort always comes after the fetch, so the lane must still
+    be named (BACKLOG #4915). Either way a silent EMPTY fails here.
+
+    WHICH LANES A HEAD-PHASE ABORT MAY NAME DEPENDS ON ``stage`` (BACKLOG #4915). At INGRESS and
+    ROUTED the abort comes before the fetch, reads no row, and must name none: a ``{lane}`` there is
+    the request list echoed back, the first-fix defect of BACKLOG #1270. Only an OUTBOUND claim stays
+    in the HEAD phase past its fetch, through the ``delivered_keys`` probe, so only there may the skip
+    it read ride out, and the lane is admitted beside nothing."""
     timeout = res.lock_timeout
     if abort_ok and timeout is not None and timeout.phase is ClaimAbortPhase.HEAD:
-        assert res.head_skipped in (frozenset(), frozenset({lane})), res.head_skipped
+        legal: set[frozenset[str]] = {frozenset()}
+        if stage == Stage.OUTBOUND.value:
+            legal.add(frozenset({lane}))
+        assert res.head_skipped in legal, (
+            f"a HEAD-phase 1222 at stage {stage!r} named {res.head_skipped!r}; it may name"
+            f" only {sorted(map(sorted, legal))!r}"
+        )
         return
     assert res.head_skipped == frozenset({lane}), (
         f"the locked head's lane came back EMPTY without being named: {res.head_skipped!r}"

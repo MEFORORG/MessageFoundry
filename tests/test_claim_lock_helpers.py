@@ -4,11 +4,14 @@
 
 The helpers run only on the hosted SQL Server legs, where a failure in their cleanup shows up as a
 hang in the NEXT test rather than in the one that failed. These stand-ins drive the failure paths a
-live server never offers on demand: a ROLLBACK that raises, and a cancellation while the lock is
-being taken. Each must still hand the connection back to the pool, and close the cursor before its
-connection. The stand-in raises before any gated pyodbc call is running, so the gate's deferred close
-behind a running statement is not driven here; ``tests/test_backlog2049_sqlserver_cancel_handle_free.py``
-drives that path."""
+live server never offers on demand: a ROLLBACK that raises, a cancellation while the lock is being
+taken, and a release on a connection nobody gated. Each must still hand the connection back to the
+pool, and close the cursor before its connection. The stand-in raises before any gated pyodbc call is
+running, so the gate's deferred close behind a running statement is not driven here;
+``tests/test_backlog2049_sqlserver_cancel_handle_free.py`` drives that path.
+
+``assert_skip_named`` is checked here too, with constructed claim results: a live server cannot be
+made to produce the wrong answer it must refuse."""
 
 from __future__ import annotations
 
@@ -17,8 +20,10 @@ from typing import Any
 
 import pytest
 
+import tests._claim_lock_helpers as helpers
 from messagefoundry.odbc_call_gate import call_gate
-from tests._claim_lock_helpers import ss_hold_row_lock, ss_release_row_lock
+from messagefoundry.store import ClaimAbortPhase, ClaimedHeads, ClaimLockTimeout, Stage
+from tests._claim_lock_helpers import assert_skip_named, ss_hold_row_lock, ss_release_row_lock
 
 
 class _RawCursor:
@@ -143,3 +148,90 @@ async def test_a_cancellation_while_taking_the_lock_still_releases() -> None:
     assert store._pool.released == [conn]
     assert conn._conn is None
     assert await _settled(closed, 2) == ["cursor", "conn"]
+
+
+async def test_a_release_on_a_connection_nobody_gated_still_discards_through_the_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T6 takes its connection straight from the pool, not through ``ss_hold_row_lock``. A release
+    that found it ungated used to discard through ``close_one_shot``, which closes the handles beside
+    a statement a cancellation may have left running: the BACKLOG #2049 native-crash shape. The
+    release now gates the connection first, so the discard goes to the gate (BACKLOG #4915)."""
+    store, conn, cur, closed = _rig("ROLLBACK", RuntimeError("connection broken"))
+    assert call_gate(conn) is None, "the rig must start ungated, or this proves nothing"
+
+    async def _refuse(*_: Any) -> None:
+        raise AssertionError("the discard took close_one_shot, so it ran outside the call gate")
+
+    monkeypatch.setattr(helpers, "close_one_shot", _refuse)
+    with pytest.raises(RuntimeError, match="connection broken"):
+        await ss_release_row_lock(store, conn, cur)
+    assert call_gate(conn) is not None
+    assert store._pool.released == [conn]
+    assert conn._conn is None
+    assert await _settled(closed, 2) == ["cursor", "conn"]
+
+
+async def test_a_release_with_no_cursor_discards_without_raising() -> None:
+    """A caller whose cursor was never made ran no statement, so it holds no transaction: the release
+    discards the connection, says nothing, and still hands it back to the pool."""
+    store, conn, _, closed = _rig(None, RuntimeError())
+    await ss_release_row_lock(store, conn, None)
+    assert store._pool.released == [conn]
+    assert conn._conn is None
+    assert await _settled(closed, 1) == ["conn"]
+
+
+def _aborted(phase: ClaimAbortPhase, named: frozenset[str]) -> ClaimedHeads:
+    return ClaimedHeads(
+        by_lane={},
+        rearm=frozenset(),
+        lock_timeout=ClaimLockTimeout(phase=phase, lanes_in_claim=1),
+        head_skipped=named,
+    )
+
+
+_LANE = "IB_SKIP"
+
+
+@pytest.mark.parametrize("stage", [Stage.INGRESS.value, Stage.ROUTED.value])
+def test_a_head_abort_before_the_fetch_may_not_echo_the_lane(stage: str) -> None:
+    """BACKLOG #4915. At INGRESS and ROUTED a HEAD-phase 1222 comes before the fetch and read no
+    row, so a ``{lane}`` there is the request list echoed back, the first-fix defect of BACKLOG
+    #1270. The first #4915 fix admitted it for every caller."""
+    assert_skip_named(
+        _aborted(ClaimAbortPhase.HEAD, frozenset()), _LANE, abort_ok=True, stage=stage
+    )
+    with pytest.raises(AssertionError, match="HEAD-phase 1222"):
+        assert_skip_named(
+            _aborted(ClaimAbortPhase.HEAD, frozenset({_LANE})), _LANE, abort_ok=True, stage=stage
+        )
+
+
+def test_an_outbound_head_abort_may_carry_the_skip_its_fetch_read() -> None:
+    """THE CONTROL for the test above: only an OUTBOUND claim stays in the HEAD phase past its fetch,
+    through the ``delivered_keys`` probe, so the lane it read may ride out. Nothing else may."""
+    outbound = Stage.OUTBOUND.value
+    for named in (frozenset(), frozenset({_LANE})):
+        assert_skip_named(
+            _aborted(ClaimAbortPhase.HEAD, named), _LANE, abort_ok=True, stage=outbound
+        )
+    with pytest.raises(AssertionError, match="HEAD-phase 1222"):
+        assert_skip_named(
+            _aborted(ClaimAbortPhase.HEAD, frozenset({_LANE, "IB_OTHER"})),
+            _LANE,
+            abort_ok=True,
+            stage=outbound,
+        )
+
+
+@pytest.mark.parametrize("stage", [Stage.INGRESS.value, Stage.OUTBOUND.value])
+def test_an_abort_is_admitted_only_when_asked_and_only_in_the_head_phase(stage: str) -> None:
+    """``abort_ok=False`` admits no abort, and a FINALIZE-phase abort came after the fetch, so in
+    both the lane must still be named."""
+    for phase, abort_ok in ((ClaimAbortPhase.HEAD, False), (ClaimAbortPhase.FINALIZE, True)):
+        with pytest.raises(AssertionError, match="without being named"):
+            assert_skip_named(_aborted(phase, frozenset()), _LANE, abort_ok=abort_ok, stage=stage)
+        assert_skip_named(
+            _aborted(phase, frozenset({_LANE})), _LANE, abort_ok=abort_ok, stage=stage
+        )
