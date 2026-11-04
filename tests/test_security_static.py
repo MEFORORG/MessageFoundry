@@ -57,9 +57,12 @@ invariants can't silently regress.
   ``parsing/xml/_deps.py``'s lazy loaders — is covered by its own clause
   (:data:`_XML_DEPS_CONSUMERS`) rather than left to the module-name matcher. Separately,
   ``transports/soap.py`` triages SOAP faults with regexes and ``str.find`` over the XML response
-  body. Its fault-code patterns, ``_FAULTCODE_RE``/``_CODEVALUE_RE``, match only a ``faultcode`` or
-  ``Value`` start tag's name, and ``_code_text`` takes the text after it. That is an ad-hoc
-  same-type extraction, deliberately out of the clause's scope, because it drives only
+  body. Its fault-code patterns, ``_FAULTCODE_RE``/``_CODEVALUE_RE``, each match a ``<``, optional
+  whitespace, an optional prefix of word characters, dots and hyphens ending in ``:``, and the name
+  ``faultcode`` or ``Value`` in any case with no word character after it. So they also match a
+  longer name that goes on with ``.`` or ``-``, such as ``<faultcode.detail>`` or ``<Value-x>``.
+  ``_code_text`` takes the text from the next ``>`` after the first match to the next ``</``. That
+  is an ad-hoc same-type extraction, deliberately out of the clause's scope, because it drives only
   retry-vs-dead-letter classification, never a security decision.
 """
 

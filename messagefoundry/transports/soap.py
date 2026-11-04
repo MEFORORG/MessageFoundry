@@ -878,16 +878,18 @@ class SoapDestination(DestinationConnector):
         unscrubbed text. BACKLOG #2827: both passes read up to the 16 MiB reply cap, so they run here
         rather than on the loop's thread, as the non-2xx scan inside _post already did.
 
-        THIS DOES NOT MAKE THE LOOP IMMUNE TO THE SCAN. On the default CPython build, each ``re``
-        search and ``str`` replace is one C call that holds the GIL until it returns, so the loop
-        waits while one runs, and can wait out several in turn while several worker threads scan.
-        What bounds each wait is the scan being linear: each call is one pass over at most the
-        16 MiB reply, and which call is longest depends on the reply's shape. On one 16-core desktop
-        (Ryzen 9 9950X, CPython 3.14.7, 2026-11-04, shared with other work), crafted replies took
-        about 2 to 2.6 s in ``_classify_soap`` alone, without the decode in _post or the capture
-        scrub. The longest single call, about 0.7 to 1.5 s, was a ``_FAULTCODE_RE`` or
-        ``_CODEVALUE_RE`` name scan over a reply that is one long run of ``<``. Those are that
-        machine's readings, not a bound on another."""
+        THIS DOES NOT MAKE THE LOOP IMMUNE TO THE SCAN. On the default CPython build, at least each
+        ``re`` search, each ``str.find``, each ``str`` replace and ``_code_text``'s slice copy of up
+        to 16 MiB is one C call that holds the GIL until it returns, so the loop waits while one
+        runs, and can wait out several in turn while several worker threads scan. What bounds each
+        wait is the scan being linear: each call is one pass over at most the 16 MiB reply, and
+        which call is longest depends on the reply's shape. On one 16-core desktop (Ryzen 9 9950X,
+        CPython 3.14.7, 2026-11-04, shared with other work), crafted replies took about 2 to 2.6 s
+        in ``_classify_soap`` alone, without the decode in _post or the capture scrub. The longest
+        single call, about 0.7 to 1.5 s, was a ``_FAULTCODE_RE`` or ``_CODEVALUE_RE`` name scan over
+        a reply of ``<Fault>`` followed by one long run of ``<``. On a bare run of ``<``,
+        ``_FAULT_RE`` finds nothing and the name scans never run. Those are that machine's readings,
+        not a bound on another."""
         body, status, headers = self._post(payload)
         failure = _classify_soap(status, body)
         # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any

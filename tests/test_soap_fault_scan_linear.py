@@ -104,15 +104,17 @@ def test_random_replies_yield_what_the_old_patterns_did() -> None:
 #: line and attempt rule as tests/test_ad_group_dn_only.py.
 _MAX_LINEAR_RATIO = 8.0
 
-#: Replies shaped to make the old tails rescan: many start tags, none of them closed. The last,
-#: ``long-prefixes``, names neither element, so it never reached the old tails; it is here for the
+#: Replies shaped to make the old tails rescan: many start tags, none of them closed. The last two
+#: name neither element, so they never reached the old tails. ``long-prefixes`` is here for the
 #: name regexes' ``[\w.\-]+:`` prefix class, which backtracks over each run that has no colon.
+#: ``lt-run`` is the shape measured in ``SoapDestination._post_and_classify``'s docstring.
 _PATHOLOGICAL_REPLIES: dict[str, Callable[[int], str]] = {
     "faultcode-start-tags": lambda k: "<soap:Fault>" + "<faultcode>" * (k // 11),
     "value-start-tags": lambda k: "<soap:Fault>" + "<soap:Value>" * (k // 12),
     "unterminated-faultcode-tags": lambda k: "<Fault>" + "<faultcode " * (k // 11),
     "unterminated-value-tags": lambda k: "<Fault>" + "<Value " * (k // 7),
     "long-prefixes": lambda k: "<Fault>" + ("<" + "a." * 50) * (k // 101),
+    "lt-run": lambda k: "<Fault>" + "<" * k,
 }
 
 
