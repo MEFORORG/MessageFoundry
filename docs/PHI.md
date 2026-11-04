@@ -2348,9 +2348,9 @@ both are described below:
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule names (a wrapped `LEE` or `ZOE`). Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. A bare `PV2` is a legal empty segment and passes, and the coverage report names it by segment id and line position, as in `PV2 at line 3 (line with no fields)` | Every line but a header of three or more split fields. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
-Each row holds on both anonymizers: the engine's `messagefoundry/anon/` and the tee's
-`tee/anon/`. The inputs known to make the two differ are listed once, in the list that starts
-**The two anonymizers still differ on some inputs**, below. That list says "at least these".
+Each row holds on both anonymizers, the engine's `messagefoundry/anon/` and the tee's
+`tee/anon/`, except on the inputs listed once in the list that starts **The two anonymizers
+still differ on some inputs**, below. That list says "at least these".
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
 a bare ten-digit phone number, an account number and a free-text note. A Z-segment is the common
@@ -2393,9 +2393,10 @@ names it. Any other id is shown as `(unknown segment)`, so `KIM|F` appears as
 - `LEE|` with only empty fields passes and is not reported at all.
 - A bare fragment that is a real segment id for the message's version, such as `ROL` or `CON`,
   passes as an empty segment. With no readable version in MSH-12, any id that some HL7 version
-  defines does. The coverage report records each such line by its segment id and its line
-  position in the output, as in `ROL at line 4 (line with no fields)`. That entry is not an
-  overlay key. Without the `require_full_coverage` switch described below, every such line
+  defines does. Each message's coverage report records each such line by its segment id and its
+  position, as in `ROL at line 4 (line with no fields)`. The position counts only lines that hold
+  something, so it names the same line in the capture and in the output. The run summary counts
+  such lines by segment id alone, as `ROL (line with no fields)`. Neither entry is an overlay key. Without the `require_full_coverage` switch described below, every such line
   passes, and the report is the only record of it (vault BACKLOG #3001).
 
 A bare Z-segment id, such as `ZPD` with no field separator, is refused unless a rule that

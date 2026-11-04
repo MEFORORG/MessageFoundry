@@ -167,9 +167,11 @@ UNKNOWN_SEGMENT = "(unknown segment)"
 #: separator whose whole text is an id the message's HL7 version defines or a rule names. That is
 #: a legal empty segment, but a wrapped line of free text that is exactly such an id looks the
 #: same, so the line gets a coverage record. The address is the segment id, the line's 1-based
-#: position and then this marker, as in ``PV2 at line 3 (line with no fields)``
-#: (:func:`_bare_line_address`). A long run keeps one entry per segment id and line position, so
-#: the tally is bounded by the longest message, never by the size of the dataset (BACKLOG #3001).
+#: position among the lines that hold something, and then this marker, as in
+#: ``PV2 at line 3 (line with no fields)`` (:func:`_bare_line_address`). The position counts no
+#: blank or whitespace-only line, so it is the same in a capture and in the output
+#: ``normalized_message`` makes of it. :class:`CoverageTally` folds the position away, so a
+#: long run keeps one entry per segment id (BACKLOG #3001).
 BARE_LINE = " (line with no fields)"
 
 
@@ -182,6 +184,11 @@ def _is_bare_line(address: str) -> bool:
     """True for a :func:`_bare_line_address`. No other address ends in :data:`BARE_LINE`: a
     field address ends in its field number."""
     return address.endswith(BARE_LINE)
+
+
+def _bare_line_segment(address: str) -> str:
+    """The segment id of a :func:`_bare_line_address`; the inverse of its first half."""
+    return address.split(" ", 1)[0]
 
 
 #: The segment ids each HL7 v2 version defines, as (version, ids added, ids removed) from the version
@@ -418,10 +425,10 @@ def unmapped_field_values(
     :func:`structural_phi_hits` refuses such a line outright. A line holding only whitespace or
     control characters (NUL padding, a trailing SUB) carries nothing and is skipped.
 
-    A bare line that passes gets one record: its segment id, its 1-based line number in ``text``
-    and :data:`BARE_LINE`, as in ``PV2 at line 3 (line with no fields)``, with an empty value. No
-    rule can rewrite it, so the record is there whatever ``mapped_paths``
-    holds, and :func:`leak_report` decides whether it counts as decided (BACKLOG #3001).
+    A bare line that passes gets one record: its segment id, its 1-based position among the lines
+    of ``text`` that hold something, and :data:`BARE_LINE`, as in
+    ``PV2 at line 3 (line with no fields)``, with an empty value. No rule can rewrite it, so the
+    record is there whatever ``mapped_paths`` holds, and :func:`leak_report` decides whether it counts as decided (BACKLOG #3001).
 
     A well-formed id that the header's MSH-12 version does not define, is not a Z-segment and no
     rule names is addressed as :data:`UNKNOWN_SEGMENT`: its fields are still checked, but the id
@@ -457,9 +464,13 @@ def _walk(
         version = _header_version(lines[header_at].split(field_sep), seps)
     naming = mapped_paths if named_by is None else named_by
     nameable = known_segments(version) | {path.split("-", 1)[0] for path in naming}
+    # The 1-based position of a line among those that hold something, as a bare line's record
+    # gives it. ``normalized_message`` drops the others, so a capture and its output agree.
+    position = 0
     for n, seg in enumerate(lines):
         if all(c.isspace() or not c.isprintable() for c in seg):
             continue
+        position += 1
         fields = seg.split(field_sep)
         seg_id = fields[0]
         is_msh = seg_id.upper() == "MSH"
@@ -481,7 +492,7 @@ def _walk(
         elif len(fields) == 1:
             # A bare id that passed is in ``nameable``, so it is safe to print. The value is
             # empty: the id is all the line holds, and an empty value trips no detector.
-            out.append((_bare_line_address(seg_id, n + 1), ""))
+            out.append((_bare_line_address(seg_id, position), ""))
             continue
         else:
             named = seg_id if seg_id in nameable or seg_id.startswith("Z") else UNKNOWN_SEGMENT
@@ -739,7 +750,9 @@ def leak_report(
                 {
                     address
                     for address, value in unmapped_field_values(text, decided, version=version)
-                    if not (_is_bare_line(address) and address.split(" ", 1)[0] in decided_segments)
+                    if not (
+                        _is_bare_line(address) and _bare_line_segment(address) in decided_segments
+                    )
                     and not _decided_by_shape(address, value, seps)
                 }
             )
@@ -841,6 +854,11 @@ UNMAPPED_SCOPE_NOTE = (
 )
 
 
+def _tally_key(address: str) -> str:
+    """``address`` as :class:`CoverageTally` counts it: a bare line by its segment id alone."""
+    return f"{_bare_line_segment(address)}{BARE_LINE}" if _is_bare_line(address) else address
+
+
 class CoverageTally:
     """The unmapped-field coverage across many messages, kept as counts rather than as reports so a
     long run holds one entry per distinct address. PHI-safe: addresses and counts, never a value.
@@ -861,8 +879,10 @@ class CoverageTally:
 
     def add(self, report: LeakReport) -> None:
         self.messages += 1
-        self.counts.update(report.unmapped_fields)
-        self.undecided.update(report.undecided_fields)
+        # A bare line's position is folded away: line 3 of one message and line 3 of the next
+        # are different lines, and the per-message report keeps the position (BACKLOG #3001).
+        self.counts.update(map(_tally_key, report.unmapped_fields))
+        self.undecided.update(map(_tally_key, report.undecided_fields))
         self.blanked.update(report.blanked_fields)
         self.denylist_live = self.denylist_live and denylist_is_live(report)
 
@@ -891,8 +911,8 @@ class CoverageTally:
             # carries never reaches an operator whose caller prints its own text (BACKLOG #3004).
             text += (
                 f" An entry that ends in '{BARE_LINE.strip()}' is a line holding only that "
-                "segment id, at the line number it gives. It is not an overlay key. A rule or a "
-                "keep on any field of that segment decides it."
+                "segment id. Each report names the line by its position. It is not an overlay "
+                "key. A rule or a keep on any field of that segment decides it."
             )
         if self.refused:
             text += (

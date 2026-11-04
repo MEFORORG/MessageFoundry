@@ -219,20 +219,26 @@ def test_the_refused_bare_lines_are_still_refused(
 
 @_NO_SCANNER
 @_SIDES
-def test_a_long_run_keeps_one_entry_per_segment_id_and_line(side: Any) -> None:
-    """The address holds the segment id and the line position and nothing else, so the tally is
-    bounded by the longest message, not by the number of messages."""
+def test_a_long_run_keeps_one_entry_per_segment_id(side: Any) -> None:
+    """Each report gives a bare line's position, and the tally folds it away: line 3 of one
+    message and line 3 of the next are different lines, so the tally keeps one entry per segment
+    id and does not grow with the dataset or the batch."""
     tally = side.leak.CoverageTally(full_coverage=True)
+    reports: list[Any] = []
+
+    def add(report: Any) -> None:
+        reports.append(report)
+        tally.add(report)
+
     for message in (_message("PV2"), _message("EVN|A01", "PV2"), _message("PV2", "PV2")):
-        side.anon.anonymize_checked(message, salt=_SALT, rules=_rules(side), on_report=tally.add)
-    assert tally.counts[_bare("PV2", 3)] == 2
-    assert tally.counts[_bare("PV2", 4)] == 2
-    assert tally.undecided[_bare("PV2", 3)] == 2
-    assert sorted(address for address in tally.counts if address.startswith("PV2")) == [
-        _bare("PV2", 3),
-        _bare("PV2", 4),
+        side.anon.anonymize_checked(message, salt=_SALT, rules=_rules(side), on_report=add)
+    assert _bare("PV2", 4) in reports[1].unmapped_fields
+    assert tally.counts[f"PV2{_NO_FIELDS}"] == 4
+    assert tally.undecided[f"PV2{_NO_FIELDS}"] == 4
+    assert [address for address in tally.counts if address.startswith("PV2")] == [
+        f"PV2{_NO_FIELDS}"
     ]
-    assert f"{_bare('PV2', 3)} x2" in tally.summary()
+    assert f"PV2{_NO_FIELDS} x4" in tally.summary()
 
 
 # --- parts 2 and 3: the header is one line, and its version judges every line ---------------------
@@ -369,8 +375,36 @@ def test_a_header_too_short_to_hold_a_version_is_refused(side: Any, message: str
 @_SIDES
 def test_a_three_field_header_is_still_the_header(side: Any) -> None:
     """The control for the case above: one more separator puts the header at the floor, so it
-    is skipped as a header, and a bare ``PV2`` behind it passes with its record."""
-    message = "\r".join((f"{_SHORT_MSH}|", _PID, "PV2"))
+    is skipped as a header and the message is emitted. Which bare line may stand behind such a
+    header, whose MSH-12 is still empty, is the any-version reading ``docs/PHI.md`` section 9
+    states, and this test does not pin it."""
+    message = "\r".join((f"{_SHORT_MSH}|", _PID))
     assert side.leak.has_unreachable_line(message) is False
-    assert side.leak.unmapped_field_values(message, set())[-1] == (_bare("PV2", 3), "")
+    addresses = [address for address, _ in side.leak.unmapped_field_values(message, set())]
+    assert addresses and not any(address.startswith(("(", "MSH-")) for address in addresses)
     side.anon.anonymize(message, salt=_SALT, rules=_rules(side))
+
+
+# --- the position counts only the lines that hold something ---------------------------------------
+
+
+@_NO_SCANNER
+@_SIDES
+def test_the_position_skips_blank_lines_so_a_capture_and_its_output_agree(side: Any) -> None:
+    """``normalized_message`` drops a blank or whitespace-only line before anything runs, so a
+    report built from the output would count lines the capture does not have. The position counts
+    only lines that hold something, so the capture and the output name the same line. Before
+    round two the walk counted every line, and the raw capture read ``PV2 at line 6``."""
+    capture = "\r".join((_msh("2.5"), "", _PID, "  ", "", "PV2"))
+    raw = [address for address, _ in side.leak.unmapped_field_values(capture, set())]
+    assert _bare("PV2", 3) in raw
+    out, report = _checked(side, capture, _rules(side))
+    assert out.split("\r")[2] == "PV2"
+    assert _bare("PV2", 3) in report.unmapped_fields
+
+
+@_SIDES
+def test_a_position_past_nine_is_the_number_itself(side: Any) -> None:
+    """The control for a two-digit position: the twelfth line is ``line 12``."""
+    message = _message(*(["EVN|A01"] * 9), "PV2")
+    assert side.leak.unmapped_field_values(message, set())[-1] == (_bare("PV2", 12), "")
