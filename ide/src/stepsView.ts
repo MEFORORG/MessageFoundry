@@ -5,13 +5,13 @@
 // action / lookup / control / send rows with parameter forms, and in-place read-only `code` rows for
 // anything outside the bounded grammar (the §4 degradation ladder — a line is never hidden).
 //
-// It gets its structure by shelling `messagefoundry lens parse <module.py> --json` (the L2 engine CLI) —
+// It gets its structure by shelling `messagefoundry-toolkit lens parse <module.py> --json` (the L2 toolkit CLI) —
 // it NEVER parses Python in TypeScript. On a whole-file parse refusal (or an exec-gated / unreadable
 // module) it steps aside to the plain text editor with a notice (the InterSystems fallback guardrail).
 //
 // EDITING (phase 3, ADR 0076 §5): recognized action/lookup/send rows expose ENABLED param inputs;
 // `code`/`control` rows stay read-only (they are not regenerable from a template — visibly disabled). On
-// a field change the webview posts the edit; the provider shells `messagefoundry lens rewrite - --edit
+// a field change the webview posts the edit; the provider shells `messagefoundry-toolkit lens rewrite - --edit
 // <json>` (the live buffer piped via stdin, NOT the on-disk file) and applies the byte-stable result
 // THROUGH the document via a `WorkspaceEdit` (so undo/redo + hot-exit work — never an out-of-band file
 // write). One edit at a time + an update-loop guard (EditLoopGuard); the projection still refreshes on

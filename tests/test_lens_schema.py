@@ -102,11 +102,11 @@ def test_ide_fixture_in_sync() -> None:
     # The committed IDE test fixture must equal the live derivation (structure only — formatting is
     # irrelevant since both are compared as parsed JSON). A signature change that outdates it fails here
     # instead of silently narrowing the IDE renderer tests. To fix a failure, regenerate:
-    #   python -m messagefoundry lens schema > ide/src/test/fixtures/lens-schema/op-schema.json
+    #   python -m messagefoundry_toolkit lens schema > ide/src/test/fixtures/lens-schema/op-schema.json
     committed = json.loads(_IDE_FIXTURE.read_text(encoding="utf-8"))
     assert committed == op_param_schema(), (
         "ide/src/test/fixtures/lens-schema/op-schema.json is stale — regenerate: "
-        "python -m messagefoundry lens schema > ide/src/test/fixtures/lens-schema/op-schema.json"
+        "python -m messagefoundry_toolkit lens schema > ide/src/test/fixtures/lens-schema/op-schema.json"
     )
 
 

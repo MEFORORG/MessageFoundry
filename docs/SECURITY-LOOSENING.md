@@ -2156,8 +2156,9 @@ count is above `0` (vault BACKLOG #2613).
   `-X disable-remote-debug` or `PYTHON_DISABLE_REMOTE_DEBUG=1`.
 - **`remote_debug_enabled`: the interface is on, and the engine refuses its scripts.** The
   `messagefoundry` command line installs an audit hook as it starts, before it parses its
-  arguments, so each of its commands has it. The tray (`messagefoundry-tray`) and the authoring
-  toolkit (`messagefoundry-toolkit`) start through their own entry points and install none.
+  arguments, so each of its commands has it. The authoring toolkit (`messagefoundry-toolkit`)
+  installs the same hook the same way, since its `impact` command runs config modules. The tray
+  (`messagefoundry-tray`) starts through its own entry point and installs none.
   The interpreter raises an event before it runs an injected script. The hook raises on that
   event, and the interpreter then drops the script. A refusal logs a WARNING with the script's
   file name. Under `serve` it is also audited and it raises an alert, as the next point says.

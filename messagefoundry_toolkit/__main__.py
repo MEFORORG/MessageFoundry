@@ -23,14 +23,23 @@ This module never imports ``messagefoundry.__main__``.
 
 from __future__ import annotations
 
-import argparse
-import sys
-from collections.abc import Callable
-from importlib import metadata
-from typing import Any
+from messagefoundry.remotedebug import install_remote_debug_guard
 
-from messagefoundry import __version__
-from messagefoundry.cli_common import (
+# The engine command's guard against an injected script (vault BACKLOG #2742), installed the same way
+# and for the same reason: `impact` loads and runs config modules, `lens rewrite` and
+# `import corepoint` read operator input, so the commands that left the engine's command keep the
+# hook they had there (ADR 0201 slice 4). Put nothing above this call but its import.
+install_remote_debug_guard()
+
+# E402 on each import below: they follow the install call above on purpose.
+import argparse  # noqa: E402
+import sys  # noqa: E402
+from collections.abc import Callable  # noqa: E402
+from importlib import metadata  # noqa: E402
+from typing import Any  # noqa: E402
+
+from messagefoundry import __version__  # noqa: E402
+from messagefoundry.cli_common import (  # noqa: E402
     Dispatch,
     HelpFormatter,
     _emit_error,
@@ -42,9 +51,10 @@ from messagefoundry.cli_common import (
     argv_wants_json,
     run_cli,
 )
-from messagefoundry.cli_surface import TOOLKIT_COMMAND
-from messagefoundry.console_streams import harden_console_streams
-from messagefoundry.terminal_text import escape_for_terminal
+from messagefoundry.cli_surface import TOOLKIT_COMMAND  # noqa: E402
+from messagefoundry.console_streams import harden_console_streams  # noqa: E402
+from messagefoundry.odbc_env import disable_driver_manager_pooling  # noqa: E402
+from messagefoundry.terminal_text import escape_for_terminal  # noqa: E402
 
 #: The two distributions whose versions must match (ADR 0201 section 1). The toolkit's distribution
 #: and command share one name, held in ``cli_surface`` so the engine's refusal names the same one.
@@ -56,6 +66,9 @@ def main(argv: list[str] | None = None) -> int:
     # FIRST STATEMENT, as in every console entry point (BACKLOG #1875):
     # tests/test_cp1252_console_safety.py reads it here. run_cli() hardens again, which is a no-op.
     harden_console_streams()
+    # A process property honoured only before pyodbc's first ODBC use, set as the engine's main()
+    # sets it (BACKLOG #2049): `impact` loads config modules, which may open a database.
+    disable_driver_manager_pooling()
     args = sys.argv[1:] if argv is None else argv
     mismatch = version_mismatch(metadata.version)
     if mismatch is not None:

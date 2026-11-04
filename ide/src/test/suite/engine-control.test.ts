@@ -153,12 +153,12 @@ suite("engine control — the bootstrap plan installs the right thing per platfo
     ]);
   });
 
-  test("POSIX + a config repo (no pyproject) ⇒ .venv + published-package install", () => {
+  test("POSIX + a config repo (no pyproject) ⇒ .venv + published engine and toolkit install", () => {
     const plan = buildBootstrapPlan({ hasPyproject: false, platform: "linux" });
     assert.strictEqual(plan.venvPython, "./.venv/bin/python");
     assert.deepStrictEqual(plan.steps, [
       "python -m venv .venv",
-      "./.venv/bin/python -m pip install messagefoundry",
+      "./.venv/bin/python -m pip install messagefoundry messagefoundry-toolkit",
     ]);
   });
 });

@@ -175,3 +175,22 @@ def test_python_dash_m_runs_the_toolkit_without_the_engine_cli_module() -> None:
     assert "messagefoundry-toolkit" in proc.stdout and "adr-analyze" in proc.stdout
     # --help exits 0. The last value is the control: the probe sees the modules the toolkit imports.
     assert "PROBE 0 False True" in proc.stderr, proc.stderr
+
+
+def test_the_toolkit_command_installs_the_remote_debug_guard_on_import() -> None:
+    """ADR 0201 slice 4 moved commands that run config modules (``impact``) and read operator input
+    (``lens rewrite``, ``import corepoint``) off the engine's command, which installs the guard
+    against an injected script at import (vault BACKLOG #2742). The toolkit's command must install
+    it too. A fresh process each, because this one has already imported the engine's command."""
+
+    def answers(imports: str) -> str:
+        probe = f"{imports}import messagefoundry.remotedebug as r;print(r._guard_answers())"
+        proc = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120, cwd=_REPO
+        )
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout.strip()
+
+    # Control: the guard module alone installs nothing, so a True below is the toolkit's doing.
+    assert answers("") == "False"
+    assert answers("import messagefoundry_toolkit.__main__;") == "True"

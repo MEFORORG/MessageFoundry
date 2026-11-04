@@ -230,7 +230,7 @@ three, and none of them is a guarantee:
 | `messagefoundry.auth` | Authn + RBAC core (no FastAPI): permissions/roles, `Identity`, password hashing, opaque session tokens, LDAP/Kerberos (`service.py`) — enforced by `api` |
 | `messagefoundry.generators` | Conformant synthetic HL7 generators (ADT, ORM, ORU, …) behind `messagefoundry-toolkit generate` |
 | `messagefoundry.service` | Local Windows service control (`messagefoundry service {install,start,stop,status}`; ADR 0088), wrapping the NSSM scripts |
-| `__main__.py`, `checks.py` | CLI entrypoint (`serve` / `generate` / `check` / `service`) + the `check` commit/CI gate |
+| `__main__.py`, `checks.py` | CLI entrypoint (`serve` / `check` / `service`; the authoring commands are `messagefoundry_toolkit/__main__.py`, ADR 0201) + the `check` commit/CI gate |
 
 Dependency direction is one-way: `pipeline` / `transports` / `parsing` / `store` / `config`
 never import `api`. The API depends on the engine; the clients (web console, harness) depend on the API

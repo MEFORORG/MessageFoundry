@@ -268,8 +268,9 @@ jobs:
   # audit the pinned engine + its resolved dependency closure against published advisories, so a CVE
   # disclosed against the version you're pinned to turns YOUR CI red — your remediation clock starts
   # automatically, without waiting to read an advisory email. Remediate by bumping the engine pin in
-  # requirements.txt to a release that fixed it; accept a triaged advisory by appending
-  # `--ignore-vuln <ID>` to each audit line that reports it (record why, per your own change control).
+  # requirements.txt to a release that fixed it, and the toolkit pin in requirements-dev.txt to the
+  # same version (the toolkit refuses to run beside another engine version); accept a triaged
+  # advisory by appending `--ignore-vuln <ID>` to each audit line that reports it (record why, per your own change control).
   # Declare any third-party package your Routers/Handlers import in requirements.txt too — pip-audit
   # then covers your Handler supply chain alongside the engine (ADR 0144 supply-chain gate; see
   # docs/security/SECURING-HANDLER-CONFIG-IN-CI.md).
@@ -466,7 +467,9 @@ matching manual verify-before-install recipe.
 A second supply-chain job, **`audit-pin`**, runs `pip-audit` against your pinned engine and its
 dependency closure, so a vulnerability **disclosed against the version you're pinned to** turns *your*
 CI red automatically — your remediation clock starts without waiting to read an advisory. Remediate by
-bumping the engine pin in `requirements.txt` to a release that fixed it (accept a triaged advisory by
+bumping the engine pin in `requirements.txt` to a release that fixed it, and the toolkit pin in
+`requirements-dev.txt` to the same version, since the toolkit refuses to run beside any other engine
+version (accept a triaged advisory by
 appending `--ignore-vuln <ID>` to each audit line that reports it, recorded per your own change control).
 It runs on **Windows**, the engine's only supported deployment platform: `pip-audit` skips a dependency
 whose environment marker does not match the runner, so a Linux runner never audits the engine's

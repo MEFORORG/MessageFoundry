@@ -170,7 +170,7 @@ def test_the_shipped_connection_names_all_pass_the_rule() -> None:
     # source line's opening quote to a later line's closing one and reports the text between them as
     # a connection name.
     factory = re.compile(r"\b(?:inbound|outbound)\(\s*\"([^\"\n]+)\"")
-    for root in ("samples", "harness", "tests", "messagefoundry"):
+    for root in ("samples", "harness", "tests", "messagefoundry", "messagefoundry_toolkit"):
         for py in (_REPO / root).rglob("*.py"):
             found.update(factory.findall(py.read_text(encoding="utf-8", errors="replace")))
     assert found >= set(HYPHENATED_SHIPPED_NAMES), "the sweep stopped finding known names"

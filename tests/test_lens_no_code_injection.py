@@ -405,7 +405,7 @@ def _cli(module: Path, edit: dict[str, Any], *flags: str) -> subprocess.Complete
         [
             sys.executable,
             "-m",
-            "messagefoundry",
+            "messagefoundry_toolkit",
             "lens",
             "rewrite",
             str(module),

@@ -452,10 +452,12 @@ def test_the_engine_description_gives_no_toolkit_command_as_an_example() -> None
     parser, _dispatch = cli_module._build_parser()
     description = parser.description or ""
     toolkit_rows = sorted(row for row, tier in cli_surface.CLI_TIERS.items() if tier == "toolkit")
+    # Controls first: there are rows to look for, and the description does give production rows
+    # as examples, so the search below is live.
+    assert len(toolkit_rows) >= 12, toolkit_rows
+    assert "messagefoundry validate" in description
     shown = [row for row in toolkit_rows if f"messagefoundry {row}" in description]
     assert shown == [], f"the engine's description gives toolkit rows as examples: {shown}"
-    # Control: the description does give production rows as examples, so the search is live.
-    assert "messagefoundry validate" in description
 
 
 @pytest.mark.parametrize("builder", ["engine", "toolkit"])
