@@ -92,6 +92,7 @@ from messagefoundry.store.base import (
     PROVISION_SCHEMA_COMMAND,
     UPLOAD_RESERVATION_STALE_AFTER,
     ConnectionFlagLockTimeout,
+    ReferenceKeyCollision,
     SchemaDdlLockTimeout,
     SchemaLockTimeout,
     SchemaNotProvisionedError,
@@ -923,12 +924,6 @@ _SQL_STATE_MERGE: Final[str] = (
 # The collation `_SCHEMA` gives state.namespace and state.[key] (BACKLOG #1588); a test pins that the
 # DDL names this one. The open-time report accepts any binary collation, not only this name.
 _STATE_KEY_COLLATION: Final[str] = "Latin1_General_100_BIN2"
-
-
-class ReferenceKeyCollision(ValueError):
-    """Two keys of one reference snapshot differ only by trailing spaces, which SQL Server compares
-    as equal (BACKLOG #4917). ``reference_sync`` logs only an error's class name, so the name is
-    the diagnosis an operator sees."""
 
 
 # BACKLOG #1628: how many times, and how far apart, the open-time RCSI check re-reads the state after
@@ -8563,7 +8558,8 @@ class SqlServerStore:
             {
                 str(r["collation_name"])
                 for r in rows
-                if not str(r["collation_name"]).upper().endswith(("_BIN2", "_BIN"))
+                # A token, not a suffix: Latin1_General_100_BIN2_UTF8 is binary too.
+                if not {"BIN", "BIN2"} & set(str(r["collation_name"]).upper().split("_"))
             }
         )
         if not found:

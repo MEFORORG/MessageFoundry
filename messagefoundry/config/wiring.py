@@ -4983,19 +4983,29 @@ class SetState:
             # NVARCHAR counts UTF-16 code units. ASCII is one unit per char, so the usual MRN-style
             # key skips the encode. A strict encode refuses a lone surrogate (U+D800..U+DFFF): no
             # backend stores one, and cell_aad's UTF-8 encode would raise it inside the handoff, a
-            # store error the runner retries rather than a content fault it dead-letters.
+            # store error the runner retries rather than a content fault it dead-letters. A key
+            # already over the limit in code points is refused unencoded: each is at least a unit,
+            # so a huge content-derived key costs no copy.
+            at_least = ""
             if text.isascii():
                 field_units = len(text)
+            elif len(text) > STATE_KEY_MAX_UNITS:
+                field_units, at_least = len(text), "at least "
             else:
+                lone_surrogate = False
                 try:
                     field_units = len(text.encode("utf-16-le")) // 2
                 except UnicodeEncodeError:
+                    # Raised outside the handler: the encode error's `.object` is the whole key, so
+                    # it must not ride the chain as __context__ (nor would `from None` stop that).
+                    lone_surrogate = True
+                if lone_surrogate:
                     raise StateKeyError(
                         f"SetState {name} must not contain a lone surrogate (U+D800..U+DFFF)"
-                    ) from None
+                    )
             if field_units > STATE_KEY_MAX_UNITS:
                 raise StateKeyError(
-                    f"SetState {name} is {field_units} UTF-16 code units; the limit is "
+                    f"SetState {name} is {at_least}{field_units} UTF-16 code units; the limit is "
                     f"{STATE_KEY_MAX_UNITS}"
                 )
             units += field_units

@@ -18,6 +18,7 @@ import pytest
 
 from messagefoundry.config.wiring import STATE_KEY_MAX_PAIR_UNITS, STATE_KEY_MAX_UNITS
 from messagefoundry.store import sqlserver as ss
+from messagefoundry.store.base import ReferenceKeyCollision
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.sqlserver import SqlServerStore
 
@@ -94,7 +95,13 @@ async def test_an_older_state_table_is_reported_and_not_repaired(
 
 
 @pytest.mark.parametrize(
-    "collation", ["Latin1_General_BIN2", "SQL_Latin1_General_CP1_BIN2", "Latin1_General_100_BIN"]
+    "collation",
+    [
+        "Latin1_General_BIN2",
+        "SQL_Latin1_General_CP850_BIN2",
+        "Latin1_General_100_BIN",
+        "Latin1_General_100_BIN2_UTF8",
+    ],
 )
 async def test_any_binary_collation_reports_nothing(collation: str) -> None:
     """A binary collation compares code points, so it cannot merge case variants."""
@@ -142,14 +149,14 @@ async def test_an_undecryptable_row_names_the_drifted_collation(
 
 def test_reference_keys_differing_only_by_trailing_spaces_are_refused() -> None:
     """``pk_reference`` pads trailing spaces, so these would raise a PK duplicate mid-transaction.
-    The guard refuses first, naming both keys by ordinal and hash, never by value."""
+    The guard refuses first, naming both keys by ordinal only: no value, and no hash of one."""
     store = object.__new__(SqlServerStore)
     for rows, first, later in (
         ({"MRN-1": 1, "MRN-1 ": 2}, 0, 1),
         ({"MRN-1  ": 1, "other": 2, "MRN-1 ": 3}, 0, 2),  # two padded keys, no bare one
         ({"MRN-1 ": 1, "other": 2, "MRN-1": 3}, 0, 2),  # the bare key comes later
     ):
-        with pytest.raises(ss.ReferenceKeyCollision, match="only by trailing spaces") as exc:
+        with pytest.raises(ReferenceKeyCollision, match="only by trailing spaces") as exc:
             store._guard_reference_widths("set", rows)
         text = str(exc.value)
         assert f"keys #{first} and #{later} differ" in text

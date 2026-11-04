@@ -3697,7 +3697,7 @@ async def test_reference_keys_differing_by_a_trailing_space_fail_guard(
     store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #4917: keys equal once trailing spaces are stripped are refused BEFORE the snapshot
-    transaction, by ordinal and hash, and the prior snapshot stays live. The control removes the
+    transaction, by ordinal only, and the prior snapshot stays live. The control removes the
     guard and shows ``pk_reference`` itself raising the duplicate mid-transaction, so the guard is
     not refusing a case the database would have accepted."""
     import pyodbc

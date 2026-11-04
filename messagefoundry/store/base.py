@@ -188,6 +188,14 @@ class DbaDelegatedError(RuntimeError):
     ``[backup].config_only_on_server_db``."""
 
 
+class ReferenceKeyCollision(ValueError):
+    """Two keys of one reference snapshot differ only by trailing spaces, which SQL Server compares
+    as equal (BACKLOG #4917), so its ``write_reference_snapshot`` refuses before the transaction.
+
+    The message holds the set name and the two keys' ordinals, never a key or a hash of one, so
+    ``reference_sync`` logs it whole where it logs any other source error by class name only."""
+
+
 class Row(Protocol):
     """A read result: key access + ``keys()`` (satisfied by ``aiosqlite.Row`` and ``dict``)."""
 

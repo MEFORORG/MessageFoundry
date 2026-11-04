@@ -159,7 +159,12 @@ def test_setstate_bounds_each_field_and_the_pair_in_utf16_units() -> None:
     for lone in (chr(0xD800), chr(0xDFFF), "MRN-" + chr(0xDC80)):
         with pytest.raises(StateKeyError, match="lone surrogate") as exc:
             SetState("ns", lone, 1)
-        assert "MRN" not in str(exc.value) and exc.value.__cause__ is None
+        assert "MRN" not in str(exc.value)
+        # Nothing chained: the encode error's `.object` is the whole key.
+        assert exc.value.__cause__ is None and exc.value.__context__ is None
+    # A non-ASCII key already over the limit in code points is refused without an encode.
+    with pytest.raises(StateKeyError, match="key is at least 300 UTF-16 code units"):
+        SetState("ns", "\u00e9" * 300, 1)
 
 
 def test_setstate_converts_a_too_deep_value_to_a_wiring_error() -> None:
