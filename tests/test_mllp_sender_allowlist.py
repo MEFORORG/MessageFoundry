@@ -3,8 +3,9 @@
 """The MLLP listener's expected-sender allowlist, ``tls_client_subjects`` (BACKLOG #4907).
 
 ``tls_ca_file`` alone admits any certificate its CAs ever signed. With ``tls_client_subjects`` set,
-a verified certificate with no listed name under the loaded CA whose key signed it is refused: its
-first message is recorded as an ``ERROR`` row BEFORE it is answered ``AR``, and the connection closes.
+a verified certificate with no listed name under the loaded CA whose key signed it is refused: each
+message its first read completes is recorded as an ``ERROR`` row BEFORE it is answered ``AR``, and
+the connection closes.
 
 These cases drive REAL TLS handshakes against a running :class:`MLLPSource`, with the runner's own
 inbound handler and refusal bound to a real SQLite store, because the claims are about what OpenSSL
@@ -42,6 +43,7 @@ from messagefoundry.config.wiring import (
     env,
     load_config,
 )
+from messagefoundry.mllpcodec import AckMode
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.transports.mllp import MLLPSource
@@ -130,7 +132,9 @@ async def store(tmp_path: Path):
 
 
 def _runner(
-    store: MessageStore, content_type: ContentType = ContentType.HL7V2
+    store: MessageStore,
+    content_type: ContentType = ContentType.HL7V2,
+    ack_mode: AckMode = AckMode.ORIGINAL,
 ) -> tuple[RegistryRunner, InboundConnection]:
     reg = Registry()
     reg.add_inbound(
@@ -139,6 +143,7 @@ def _runner(
             spec=ConnectionSpec(ConnectorType.FILE, {}),
             router="r",
             content_type=content_type,
+            ack_mode=ack_mode,
         )
     )
     reg.add_router("r", lambda m: [])  # no worker runs, so routing is never reached
@@ -147,11 +152,14 @@ def _runner(
 
 
 async def _wired(
-    settings: dict[str, Any], store: MessageStore, content_type: ContentType = ContentType.HL7V2
+    settings: dict[str, Any],
+    store: MessageStore,
+    content_type: ContentType = ContentType.HL7V2,
+    ack_mode: AckMode = AckMode.ORIGINAL,
 ) -> MLLPSource:
     """The listener started with the runner's handler and refusal, as ``_start_inbound`` wires them."""
-    runner, ic = _runner(store, content_type)
-    source = MLLPSource(Source(type=ConnectorType.MLLP, settings=settings))
+    runner, ic = _runner(store, content_type, ack_mode)
+    source = MLLPSource(Source(type=ConnectorType.MLLP, settings=settings, ack_mode=ack_mode))
     source.content_type = content_type
     source.refuse_unlisted_sender = runner._make_unlisted_sender_refusal(ic)
     await source.start(runner._make_handler(ic))
@@ -507,3 +515,90 @@ def test_connections_toml_desugars_the_table_through_the_factory(tmp_path: Path)
     (tmp_path / "bad").mkdir()
     with pytest.raises(WiringError, match="must be qualified"):
         load_config(_config(tmp_path / "bad", head.replace("NAMES", '"feed.partner.example"')))
+
+
+async def _send_raw(source: MLLPSource, bundle: Path, wire: bytes) -> bytes:
+    """Write ``wire`` in one go presenting ``bundle``, then read everything to EOF."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_cert_chain(bundle)
+    reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport, ssl=ctx)
+    try:
+        writer.write(wire)
+        await writer.drain()
+        return await asyncio.wait_for(reader.read(-1), 10.0)
+    finally:
+        writer.close()
+
+
+def _frame(body: str) -> bytes:
+    return b"\x0b" + body.encode("utf-8") + b"\x1c\r"
+
+
+async def test_every_frame_of_the_refused_read_is_recorded_and_answered(
+    tmp_path: Path, store: MessageStore
+) -> None:
+    """Two frames pipelined in one write: each is recorded as ERROR and answered AR before the
+    close, so a frame read behind the first is never read and dropped."""
+    named, other = _ca("Partner CA"), _ca("Other CA")
+    source = await _wired(
+        _settings(tmp_path, [named[0], other[0]], {_issuer(named): [SUBJECT]}), store
+    )
+    second = _ADT.replace("CTRL4907", "CTRL4908")
+    try:
+        got = await _send_raw(source, _bundle(tmp_path, other), _frame(_ADT) + _frame(second))
+    finally:
+        await source.stop()
+    assert b"MSA|AR|CTRL4907" in got and b"MSA|AR|CTRL4908" in got
+    statuses = [r["status"] for r in await _rows(store)]
+    assert statuses == [MessageStatus.ERROR.value, MessageStatus.ERROR.value], statuses
+
+
+async def test_an_hl7_inbound_with_acks_off_records_and_closes_with_no_reply(
+    tmp_path: Path, store: MessageStore
+) -> None:
+    named, other = _ca("Partner CA"), _ca("Other CA")
+    source = await _wired(
+        _settings(tmp_path, [named[0], other[0]], {_issuer(named): [SUBJECT]}),
+        store,
+        ack_mode=AckMode.NONE,
+    )
+    try:
+        got = await _send_raw(source, _bundle(tmp_path, other), _frame(_ADT))
+    finally:
+        await source.stop()
+    assert got == b""
+    assert [r["status"] for r in await _rows(store)] == [MessageStatus.ERROR.value]
+
+
+async def test_enhanced_mode_answers_cr(tmp_path: Path, store: MessageStore) -> None:
+    named, other = _ca("Partner CA"), _ca("Other CA")
+    source = await _wired(
+        _settings(tmp_path, [named[0], other[0]], {_issuer(named): [SUBJECT]}),
+        store,
+        ack_mode=AckMode.ENHANCED,
+    )
+    try:
+        got = await _send_raw(source, _bundle(tmp_path, other), _frame(_ADT))
+    finally:
+        await source.stop()
+    assert b"MSA|CR|CTRL4907" in got, got
+
+
+def test_an_outbound_that_sets_the_allowlist_is_refused(tmp_path: Path) -> None:
+    """A destination never reads the table, so an outbound that sets it is refused, not ignored."""
+    toml = """
+        [[outbound]]
+        name = "OB_ACME_ADT"
+        transport = "mllp"
+          [outbound.settings]
+          host = "downstream.example"
+          port = 2575
+          tls = true
+          tls_ca_file = "ca.pem"
+          [outbound.settings.tls_client_subjects]
+          "CN=Partner CA" = ["SAN:DNS:feed.partner.example"]
+    """
+    with pytest.raises(WiringError, match="tls_client_subjects names the senders an inbound"):
+        load_config(_config(tmp_path, toml))

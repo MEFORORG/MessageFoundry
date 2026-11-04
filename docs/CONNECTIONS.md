@@ -459,8 +459,9 @@ different keys; no sender is admitted under such a key. The HTTP listener's `int
 row above says the same, at more length.
 
 **What a refused sender gets.** The connection completes its TLS handshake, then the listener reads
-the sender's first message and hands it to the engine's refusal, which records it as an `ERROR` row
-before any reply is built. So the message is counted and logged, never accepted and dropped.
+from the sender and hands each message that read completed to the engine's refusal, which records
+it as an `ERROR` row before any reply is built. So each message read is counted and logged, never
+accepted and dropped.
 
 - On an HL7 v2 inbound with acknowledgements on, the sender then gets an `AR` (`CR` in enhanced
   mode) whose MSA-3 reads `sender not permitted`, and the connection closes. `AR`, not `AE`, because
@@ -471,12 +472,16 @@ before any reply is built. So the message is counted and logged, never accepted 
 - If the `ERROR` row cannot be written, no `AR` is sent. The sender gets the listener's `AE`, the
   one any inbound-handler fault gets, so it resends.
 
-One message per connection is read and recorded, because the certificate cannot change within the
-session; the connection caps bound how many connections a refused sender can hold. The stored
-reason, the `AR`'s text and the WARNING log line are fixed text naming no certificate field, since
-a subject can name a person; the log line gives the connection name and peer address. The body is
-stored under the inbound's refused-body allowance, like every other refusal. No `connection_event`
-is written for a refused sender, and no `audit_log` row.
+The connection closes after that first read, because the certificate cannot change within the
+session; anything the sender has not yet had read stays with it. The connection caps bound how
+many connections a refused sender can hold at once, but nothing yet bounds how often it may
+reconnect, and each connection records its own rows. The stored reason, the `AR`'s text and the
+WARNING log line are fixed text naming no certificate field, since a subject can name a person; the
+log line gives the connection name and peer address, at most once per address per minute, with a
+running count. The body is stored under the inbound's refused-body allowance, like every other
+refusal. The refusal itself writes no `connection_event` and no `audit_log` row, and a refused
+connection gets no `established` / `closed` pair; an event for another cause on that connection,
+such as `frame_oversize` or `handler_error`, is still written as on any connection.
 
 **What this does not cover yet.** The other listeners, and any further per-inbound form of the
 expected-sender assertion, are still open on BACKLOG #4907. The HTTP listener's own allowlist is

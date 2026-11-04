@@ -93,7 +93,7 @@ from messagefoundry.tls_handshake_failures import (
     HandshakeFailures,
     handshake_cause,
 )
-from messagefoundry.transports.admission import FrameClock, ListenerAdmission
+from messagefoundry.transports.admission import FrameClock, ListenerAdmission, RefusalLog
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -2006,6 +2006,9 @@ class MLLPSource(SourceConnector):
             self._issuer_of = _sender_issuer_lookup(
                 config.name or "", loaded_client_ca[0], self._client_subjects
             )
+        #: Throttles the refused-sender WARNING as the admission throttles its refusals, so a sender
+        #: that reconnects in a loop cannot write a line per connection (BACKLOG #4907).
+        self._unlisted_log = RefusalLog()
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         #: The pre-read admission shared with the raw-TCP, X12 and HTTP listeners (vault BACKLOG
@@ -2449,7 +2452,13 @@ class MLLPSource(SourceConnector):
         return None
 
     async def _answer_handler_failure(
-        self, message: bytes, exc: Exception, peer: object, peer_host: str | None
+        self,
+        message: bytes,
+        exc: Exception,
+        peer: object,
+        peer_host: str | None,
+        *,
+        closing: bool = False,
     ) -> tuple[bool, bytes | None]:
         """Log and record a handler fault. Returns whether a reply is owed, and the framed NAK.
 
@@ -2475,6 +2484,11 @@ class MLLPSource(SourceConnector):
             outcome = f"answering MSA-1 {_CODES[self.ack_mode]['AE']}, then closing the connection"
         elif owed:
             outcome = "no reply could be framed; closing the connection"
+        elif closing:
+            # BACKLOG #4907: a refused sender's connection closes after this read either way.
+            outcome = (
+                "this inbound sends no reply; the sender is refused, so closing the connection"
+            )
         else:
             outcome = "this inbound sends no reply; keeping the connection"
         logger.error(
@@ -2551,13 +2565,14 @@ class MLLPSource(SourceConnector):
                 handle: InboundHandler | None = (
                     self.refuse_unlisted_sender if unlisted else self._handler
                 )
-                if unlisted:
+                if unlisted and (count := self._unlisted_log.note(peer_host or "unknown")):
                     logger.warning(
                         "MLLP listener %s: the verified certificate of the sender at %s is not on "
-                        "tls_client_subjects under its issuing CA; its first message is recorded "
-                        "as ERROR and the connection closes",
+                        "tls_client_subjects under its issuing CA; the messages of its first read "
+                        "are recorded as ERROR and the connection closes (%d refused so far)",
                         self._pacing_name,
                         peer_host or "unknown",
+                        count,
                     )
                 if handle is None:
                     # Nothing can record a refused sender's message here (a source built outside
@@ -2616,9 +2631,13 @@ class MLLPSource(SourceConnector):
                                 # cleanly, which is not a framing fault. A store outage at the
                                 # ingress commit is one reachable case. NAK it, then close.
                                 owed, nak = await self._answer_handler_failure(
-                                    message, exc, writer.get_extra_info("peername"), peer_host
+                                    message,
+                                    exc,
+                                    writer.get_extra_info("peername"),
+                                    peer_host,
+                                    closing=unlisted,
                                 )
-                                if not owed and not unlisted:
+                                if not owed:
                                     continue  # no reply on this inbound: handle what follows
                                 if nak is not None:
                                     writer.write(nak)
@@ -2636,13 +2655,13 @@ class MLLPSource(SourceConnector):
                                     )
                                 )
                                 await self._drain_ack(writer)
-                            if unlisted:
-                                # BACKLOG #4907: one refused frame per connection. The
-                                # certificate cannot change within this session, so every later
-                                # frame would be refused too; closing bounds the ERROR rows a
-                                # refused sender can write to one per connection it opens.
-                                handler_dropped = True
-                                break
+                        if unlisted and decoded:
+                            # BACKLOG #4907: every frame this read completed was recorded above,
+                            # then the connection closes. The certificate cannot change within
+                            # the session, so every later frame would be refused too; closing
+                            # bounds what a refused sender writes per connection to one read's
+                            # worth, and leaves anything it has not yet had read with the sender.
+                            handler_dropped = True
                         if handler_dropped:
                             failed = True  # handler_error or the sender refusal says why
                             break

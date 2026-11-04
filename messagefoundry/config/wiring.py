@@ -2686,8 +2686,8 @@ def MLLP(
     sender to a name under the CA that issued it, in the same table ``Http``'s
     ``intake_client_subjects`` takes: ``{"CN=Acme CA,O=Acme": ["SAN:DNS:partner.example"]}``. A
     verified certificate with no listed name under the loaded CA whose key signed it is refused:
-    its first message is recorded as an ``ERROR`` row, then answered ``AR`` where the inbound
-    replies in HL7, and the connection closes. ``docs/CONNECTIONS.md`` states which names count
+    each message its first read completes is recorded as ``ERROR``, then answered ``AR`` where the
+    inbound replies in HL7, and the connection closes. ``docs/CONNECTIONS.md`` states which names count
     and how they match. It needs ``tls=True`` and ``tls_ca_file``; unset, nothing changes."""
     client_subjects = _mllp_client_subjects(tls_client_subjects, tls=tls, tls_ca_file=tls_ca_file)
     return ConnectionSpec(
@@ -7986,6 +7986,14 @@ def build_outbound_connection(
     refuse_capture_conflicts(
         spec.type, spec.settings, f"outbound connection {name!r}", batched=batch is not None
     )
+    if spec.settings.get("tls_client_subjects"):
+        # BACKLOG #4907: an inbound control. A destination never reads it, so an outbound that sets
+        # it would read as pinning the downstream server's identity while pinning nothing.
+        raise WiringError(
+            f"outbound connection {name!r}: tls_client_subjects names the senders an inbound "
+            "listener admits; a destination never reads it, so it is refused here. To pin the "
+            "downstream server, use tls_ca_file (and tls_ca_pin)."
+        )
     # ADR 0015: WS-* / mutual-TLS validity for SOAP, at `check`/dry-run time (no store). The url-scheme
     # checks (https required for a client cert, cleartext-credential refusal) need the resolved url and
     # run in SoapDestination.__init__; the structural ones below work on the unresolved spec (an EnvRef

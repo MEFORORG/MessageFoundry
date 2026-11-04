@@ -163,6 +163,7 @@ from messagefoundry.pipeline.ingress_guards import (
     check_declared_type,
     check_decoded,
     decode_body,
+    ingress_encoding,
     peek_max_bytes,
     reingress_size_error,
     streaming_over_threshold,
@@ -241,6 +242,7 @@ from messagefoundry.transports.admission import RefusalLog
 from messagefoundry.transports.base import (
     ENCODING_CODE,
     ConnectionEventSink,
+    InboundHandler,
     IntakeAuditSink,
     IntakeGate,
     IntakeRateLimiter,
@@ -945,6 +947,22 @@ _UNLISTED_SENDER_ERROR = (
     "allowlist under its issuing CA"
 )
 _UNLISTED_SENDER_NAK_TEXT = "sender not permitted"
+#: How far into a refused body the AR's header echo looks for the end of MSH, as the MLLP
+#: listener's own handler-fault NAK does, so a large refused body is never parsed whole to echo it.
+_UNLISTED_SENDER_HEADER_SCAN_BYTES = 4096
+
+
+def _header_segment(raw: bytes, encoding: str) -> str:
+    """The first segment of a refused body, decoded in the inbound's charset, for the AR's echo.
+
+    Bounded and lenient: an unreadable or missing MSH leaves ``build_ack`` to fall back to its own
+    header defaults, and nothing past the first segment break is read."""
+    prefix = raw[:_UNLISTED_SENDER_HEADER_SCAN_BYTES].lstrip()
+    breaks = [i for i in (prefix.find(b"\r"), prefix.find(b"\n")) if i >= 0]
+    try:
+        return prefix[: min(breaks, default=len(prefix))].decode(encoding, errors="replace")
+    except LookupError:
+        return ""
 
 
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
@@ -7906,7 +7924,7 @@ class RegistryRunner:
 
         return on_message
 
-    def _make_unlisted_sender_refusal(self, ic: InboundConnection):  # type: ignore[no-untyped-def]
+    def _make_unlisted_sender_refusal(self, ic: InboundConnection) -> InboundHandler:
         # BACKLOG #4907: the source's `refuse_unlisted_sender` seam, bound to this inbound.
         async def refuse(raw: bytes) -> str | None:
             return await self._refuse_unlisted_sender(ic, raw)
@@ -7939,7 +7957,12 @@ class RegistryRunner:
         )
         if not hl7v2 or ic.ack_mode is AckMode.NONE:
             return None
-        ack = build_ack(raw, code="AR", text=_UNLISTED_SENDER_NAK_TEXT, ack_mode=ic.ack_mode)
+        ack = build_ack(
+            _header_segment(raw, ingress_encoding(ic)),
+            code="AR",
+            text=_UNLISTED_SENDER_NAK_TEXT,
+            ack_mode=ic.ack_mode,
+        )
         if self._capture_ack_enabled(ic):
             await self._capture_ack(
                 mid,
