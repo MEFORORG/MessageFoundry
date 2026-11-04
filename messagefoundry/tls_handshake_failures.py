@@ -235,9 +235,8 @@ class HandshakeFailures:
         watch_loop_handshakes(ctx, self._note_loop_failure)
 
     def unwatch(self, ctx: ssl.SSLContext) -> None:
-        """Count nothing more on ``ctx`` through the loop: the listener runs its handshakes itself
-        now and counts them there. Left hooked, its context would count each failure twice, since
-        ``loop.start_tls`` builds its TLS object from the same context."""
+        """Count nothing more on ``ctx`` through the loop: the listener counts its failures itself.
+        Left hooked, its context would count each failure twice."""
         ctx.sslobject_class = ssl.SSLObject
 
     def _note_loop_failure(self, cause: str) -> None:

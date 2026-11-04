@@ -9,4 +9,4 @@
   loop that subclasses a stdlib loop now takes the same path as an unknown loop. The `Http()`
   listener is unchanged: it still upgrades TLS itself on any `asyncio.BaseEventLoop`, so its caps
   and `max_handshakes_per_host` still apply before the handshake there. See
-  [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #1606`, `BACKLOG #4552`)
+  [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #1606`, `vault BACKLOG #4552`)
