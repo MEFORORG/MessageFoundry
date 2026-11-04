@@ -161,14 +161,14 @@ def test_a_file_swapped_for_a_hard_link_after_its_check_is_not_truncated(
     swapped.write_bytes(b"synthetic")
     real_open = dr_backup._open_unfollowed
 
-    def swap_then_open(entry: Path, dir_fd: int | None) -> int:
+    def swap_then_open(entry: Path, dir_fd: int | None, inside: str | None) -> int:
         if entry.name == "swap.dat":
             os.unlink(swapped)
             try:
                 os.link(outside, swapped)
             except OSError as exc:  # pragma: no cover - a file system without hard links
                 pytest.skip(f"hard links unavailable here: {exc}")
-        return real_open(entry, dir_fd)
+        return real_open(entry, dir_fd, inside)
 
     monkeypatch.setattr(dr_backup, "_open_unfollowed", swap_then_open)
     unproven = dr_backup._empty_files_in_place(staging)
@@ -190,14 +190,14 @@ def test_a_file_swapped_for_a_symlink_after_its_check_is_not_truncated(
     swapped.write_bytes(b"synthetic")
     real_open = dr_backup._open_unfollowed
 
-    def swap_then_open(entry: Path, dir_fd: int | None) -> int:
+    def swap_then_open(entry: Path, dir_fd: int | None, inside: str | None) -> int:
         if entry.name == "swap.dat":
             os.unlink(swapped)
             try:
                 os.symlink(outside, swapped)
             except OSError as exc:  # pragma: no cover - Windows without the symlink privilege
                 pytest.skip(f"symlinks unavailable here: {exc}")
-        return real_open(entry, dir_fd)
+        return real_open(entry, dir_fd, inside)
 
     monkeypatch.setattr(dr_backup, "_open_unfollowed", swap_then_open)
     unproven = dr_backup._empty_files_in_place(staging)
@@ -221,11 +221,11 @@ def test_a_directory_swapped_for_a_link_after_its_listing_is_not_followed(
     (outside_dir / "victim.dat").write_bytes(_OUTSIDE)
     real_open = dr_backup._open_unfollowed
 
-    def swap_then_open(entry: Path, dir_fd: int | None) -> int:
+    def swap_then_open(entry: Path, dir_fd: int | None, inside: str | None) -> int:
         if entry.name == "own.tar":  # the root's file, emptied before the walk enters `sub`
             os.rename(staging / "sub", tmp_path / "moved")
             _link_dir(outside_dir, staging / "sub")
-        return real_open(entry, dir_fd)
+        return real_open(entry, dir_fd, inside)
 
     monkeypatch.setattr(dr_backup, "_open_unfollowed", swap_then_open)
     unproven = dr_backup._empty_files_in_place(staging)
@@ -273,7 +273,7 @@ def test_two_files_of_one_name_that_refuse_are_both_reported(tmp_path, monkeypat
         (staging / sub).mkdir(parents=True)
         (staging / sub / "extracted_store.db").write_bytes(b"synthetic plaintext")
 
-    def refuse(entry: Path, dir_fd: int | None) -> int:
+    def refuse(entry: Path, dir_fd: int | None, inside: str | None) -> int:
         raise PermissionError(13, "synthetic sharing violation", str(entry))
 
     monkeypatch.setattr(dr_backup, "_open_unfollowed", refuse)

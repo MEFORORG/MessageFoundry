@@ -869,7 +869,7 @@ def test_plaintext_that_cannot_be_emptied_turns_a_pass_into_a_fail(
     monkeypatch.setattr(dr_backup, "_STAGING_REMOVE_DELAYS", ())
     monkeypatch.setattr(dr_backup, "_remove_tree", lambda path: False)
 
-    def open_refusing_writes(entry: Path, dir_fd: int | None) -> int:
+    def open_refusing_writes(entry: Path, dir_fd: int | None, inside: str | None) -> int:
         raise PermissionError(13, "synthetic sharing violation", str(entry))
 
     # The fail-safe's open for truncation (BACKLOG #2420), not the module's every open.

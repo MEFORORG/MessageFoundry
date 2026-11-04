@@ -1842,6 +1842,11 @@ class _HardLinked(OSError):
     Never carries a name."""
 
 
+class _Outside(OSError):
+    """Windows: the file opened as itself has a final path outside the staging directory, so it is
+    not truncated and is reported as :data:`_OUTSIDE_REASON`. Never carries a name."""
+
+
 def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> str | None:
     """Truncate ``entry`` if it is a regular file with one link, checked on the handle that truncates
     it. ``None`` when it was emptied or holds nothing to empty, else what to report.
@@ -1873,16 +1878,15 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     if st.st_nlink > 1:
         return f"{name} (hard-linked, not truncated)"
     try:
-        fd = _open_unfollowed(entry, dir_fd)
+        fd = _open_unfollowed(entry, dir_fd, inside)
     except FileNotFoundError:
         return None
     except OSError as exc:
         return _not_truncated(name, exc)
     try:
-        if inside is not None and not _win_final_path(_os_handle(fd)).startswith(inside):
-            return _OUTSIDE_REASON
         # Checked on the handle that truncates: POSIX's only check, and on Windows the reopened
-        # handle of a file a filter serves (the handle opened as itself was checked before that).
+        # handle of a file a filter serves (the handle opened as itself was checked before that,
+        # inside test included, and the reopen must be that same file).
         _vet_for_truncate(fd)
         os.ftruncate(fd, 0)
     except OSError as exc:
@@ -1894,6 +1898,8 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
 
 def _not_truncated(name: str, exc: OSError) -> str:
     """What the fail-safe reports for the file ``name`` it did not truncate, by why."""
+    if isinstance(exc, _Outside):
+        return _OUTSIDE_REASON
     if isinstance(exc, _HardLinked):
         return f"{name} (hard-linked, not truncated)"
     if isinstance(exc, (_Unconfined, _Replaced)):
@@ -1903,9 +1909,10 @@ def _not_truncated(name: str, exc: OSError) -> str:
     return name
 
 
-def _open_unfollowed(entry: Path, dir_fd: int | None) -> int:
+def _open_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> int:
     """Open ``entry`` for writing without following a link at its last component, and return a
-    descriptor. A test seam.
+    descriptor. A test seam. ``dir_fd`` and ``inside`` are as :func:`_truncate_unfollowed` takes
+    them.
 
     POSIX opens ``entry.name`` relative to ``dir_fd`` (``entry`` itself without one) with
     ``O_NOFOLLOW``, so a link there fails with ``ELOOP``. ``O_NONBLOCK`` too, so a FIFO swapped in
@@ -1913,13 +1920,21 @@ def _open_unfollowed(entry: Path, dir_fd: int | None) -> int:
     also makes an open that breaks a file lease fail rather than wait, and that file is reported.
 
     Windows opens ``entry`` through ``transports/file.py``'s :func:`_win_open_file`, the file
-    connector's own open: as itself, refusing a link or junction there (``_Unconfined``), checked by
-    :func:`_vet_for_truncate` before a filter is let serve it, and refusing a reopen that reaches
-    another file (``_Replaced``)."""
+    connector's own open: as itself, refusing a link or junction there (``_Unconfined``), and
+    refusing a reopen that reaches another file (``_Replaced``). Before a filter is let serve the
+    file, the file opened as itself must have a final path under ``inside`` (``_Outside``) and pass
+    :func:`_vet_for_truncate`, so a file reached outside the directory, through a directory turned
+    into a junction in place, is never served by its filter (BACKLOG #4992)."""
     if sys.platform == "win32":
         # GENERIC_READ | GENERIC_WRITE, what `open(..., "r+b")` asked for before.
         access = 0x80000000 | 0x40000000
-        return _win_open_file(entry, access, vet=_vet_for_truncate, fd_flags=os.O_RDWR)
+
+        def vet(fd: int) -> None:
+            if inside is not None and not _win_final_path(_os_handle(fd)).startswith(inside):
+                raise _Outside("outside the directory")
+            _vet_for_truncate(fd)
+
+        return _win_open_file(entry, access, vet=vet, fd_flags=os.O_RDWR)
     flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
     if dir_fd is None:
         return os.open(entry, flags)

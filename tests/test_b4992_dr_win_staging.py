@@ -69,7 +69,7 @@ def test_a_directory_cannot_be_swapped_while_its_files_are_opened(
     renamed: list[bool] = []
     real_open = dr_backup._open_unfollowed
 
-    def swap_then_open(entry: Path, dir_fd: int | None) -> int:
+    def swap_then_open(entry: Path, dir_fd: int | None, inside: str | None) -> int:
         if entry.name == trigger and not renamed:
             try:
                 os.rename(victim, tmp_path / "moved")
@@ -78,7 +78,7 @@ def test_a_directory_cannot_be_swapped_while_its_files_are_opened(
             else:
                 _junction(lead, victim)
                 renamed.append(True)
-        return real_open(entry, dir_fd)
+        return real_open(entry, dir_fd, inside)
 
     monkeypatch.setattr(dr_backup, "_open_unfollowed", swap_then_open)
     unproven = dr_backup._empty_files_in_place(staging)
@@ -155,13 +155,13 @@ def test_a_cloud_file_is_checked_before_its_filter_is_let_serve_it(
 
     real_open = dr_backup._open_unfollowed
 
-    def link_then_open(entry: Path, dir_fd: int | None) -> int:
+    def link_then_open(entry: Path, dir_fd: int | None, inside: str | None) -> int:
         # After the lstat that would have refused it, the name becomes a second link to a file
         # outside the directory.
         if entry.name == swapped.name:
             os.unlink(swapped)
             os.link(outside, swapped)
-        return real_open(entry, dir_fd)
+        return real_open(entry, dir_fd, inside)
 
     monkeypatch.setattr(file_mod, "_attribute_tag", deduplicated)
     monkeypatch.setattr(file_mod, "_win_create", recording)
@@ -173,6 +173,119 @@ def test_a_cloud_file_is_checked_before_its_filter_is_let_serve_it(
     assert own.read_bytes() == b""
     # One per open, not one per check: the as-itself screen and the open, for each of two files.
     assert len(file_tag_reads) == 4
+
+
+def _convert_to_junction(directory: Path, target: Path) -> None:
+    """Turn the EMPTY ``directory`` into a junction to ``target`` in place, as
+    ``FSCTL_SET_REPARSE_POINT`` does, without renaming it. A hold shares write access, so this
+    succeeds on a held directory."""
+    if sys.platform != "win32":  # narrows mypy; every test here is Windows-only
+        return
+    import struct
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    k32.DeviceIoControl.restype = wintypes.BOOL
+    k32.DeviceIoControl.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    substitute = ("\\??\\" + str(target)).encode("utf-16-le")
+    printable = str(target).encode("utf-16-le")
+    mount_point = (
+        struct.pack("<HHHH", 0, len(substitute), len(substitute) + 2, len(printable))
+        + substitute
+        + b"\0\0"
+        + printable
+        + b"\0\0"
+    )
+    # IO_REPARSE_TAG_MOUNT_POINT, then the reparse data's length.
+    buffer = struct.pack("<IHH", 0xA0000003, len(mount_point), 0) + mount_point
+    # GENERIC_WRITE, share all, OPEN_EXISTING, BACKUP_SEMANTICS | OPEN_REPARSE_POINT.
+    handle = k32.CreateFileW(str(directory), 0x40000000, 0x7, None, 3, 0x02200000, None)
+    if handle in (None, ctypes.c_void_p(-1).value):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        returned = wintypes.DWORD()
+        data = ctypes.create_string_buffer(buffer)
+        if not k32.DeviceIoControl(
+            handle, 0x000900A4, data, len(buffer), None, 0, ctypes.byref(returned), None
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        k32.CloseHandle(handle)
+
+
+def test_a_file_reached_through_a_directory_turned_junction_is_refused_before_its_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A held empty directory can still be turned into a junction in place, and the listing then
+    follows it. A file reached that way must be refused as outside the directory on the handle
+    opened as itself, before the reopen that lets its filter serve it.
+
+    Every file here is made to look deduplicated. Red before the fix: the inside test ran after
+    ``_win_open_file`` returned, so the outside file was reopened through its filter first. The
+    control: the staging directory's own file is still reopened through its filter, and emptied."""
+    staging = tmp_path / "mefor-verify-own"
+    (staging / "sub").mkdir(parents=True)
+    own = staging / "own.tar"
+    own.write_bytes(_PLAINTEXT)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim.dat").write_bytes(_OUTSIDE)
+
+    real_tag = file_mod._attribute_tag
+
+    def deduplicated(handle: int) -> tuple[int, int]:
+        attributes, tag = real_tag(handle)
+        if attributes & stat.FILE_ATTRIBUTE_DIRECTORY:
+            return attributes, tag
+        return attributes | stat.FILE_ATTRIBUTE_REPARSE_POINT, _DEDUP_TAG
+
+    real_create = file_mod._win_create
+    reopened: list[str] = []
+
+    def recording(path: Path, access: int, share: int, flags: int) -> int:
+        if flags == 0:  # the open that lets a filter act
+            reopened.append(Path(path).name)
+        return real_create(path, access, share, flags)
+
+    real_scandir = os.scandir
+    converted: list[bool] = []
+
+    def converting(path: Any) -> Any:
+        # After `sub` is held and its final path checked, before it is listed.
+        if Path(path) == staging / "sub":
+            _convert_to_junction(staging / "sub", outside)
+            converted.append(True)
+        return real_scandir(path)
+
+    monkeypatch.setattr(file_mod, "_attribute_tag", deduplicated)
+    monkeypatch.setattr(file_mod, "_win_create", recording)
+    monkeypatch.setattr(os, "scandir", converting)
+    unproven = dr_backup._empty_files_in_place(staging)
+    assert converted == [True], "the held directory could not be turned into a junction"
+    assert (outside / "victim.dat").read_bytes() == _OUTSIDE
+    assert reopened == ["own.tar"], "a file outside the directory was opened through its filter"
+    assert unproven == [dr_backup._OUTSIDE_REASON]
+    assert own.read_bytes() == b""
 
 
 def _refuse_open(monkeypatch: pytest.MonkeyPatch, refused: Path, code: int) -> None:
