@@ -1,4 +1,4 @@
-- **A warning logged before a command's log handlers exist is now redacted, for every command.**
+- **A warning logged before a `messagefoundry` subcommand's log handlers exist is now redacted.**
   The PHI-filtered stand-in for the standard library's `logging.lastResort` used to be installed
   near the start of `serve` only. `main()` now installs it before it parses the arguments, so
   argument parsing and the start of `supervise` are covered too. A record logged while the modules

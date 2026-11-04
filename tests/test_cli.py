@@ -4024,6 +4024,8 @@ def test_backup_warning_is_redacted_through_the_real_argument_parser(
     subcommand body is replaced, so the record is deterministic."""
     seen: dict[str, object] = {}
     monkeypatch.setitem(cli_module._DISPATCH, "backup", _phi_logging_probe(seen))
+    # Off, so the redaction asserted below is the root sink's and not the filtered lastResort's.
+    monkeypatch.setattr(cli_module, "install_filtered_last_resort", lambda: None)
     argv = ["backup", "--db", str(tmp_path / "x.db"), "--destination", str(tmp_path / "out")]
     with _handlerless_root():
         assert main(argv) == 0
@@ -4044,6 +4046,8 @@ def test_every_subcommand_logs_through_the_phi_filter_chain(
     required arguments and this test is about what main() does around dispatch, not argparse."""
     seen: dict[str, object] = {}
     monkeypatch.setitem(cli_module._DISPATCH, command, _phi_logging_probe(seen))
+    # Off, so the redaction asserted below is the root sink's and not the filtered lastResort's.
+    monkeypatch.setattr(cli_module, "install_filtered_last_resort", lambda: None)
     monkeypatch.setattr(
         argparse.ArgumentParser,
         "parse_args",
@@ -4240,16 +4244,13 @@ def _child_window_probe(label: str) -> str:
     )
 
 
-def _warn_while_parsing(tmp_path: Path, *, prefix: str = "") -> str:
-    """A child body that logs the probe while main() builds its parser, before ``_serve`` runs,
-    then lets ``serve`` refuse the directory ``--service-config`` and exit 2."""
+def _warn_while_parsing(*, prefix: str = "") -> str:
+    """A child body that logs the probe while main() builds its parser for ``serve``, before
+    ``_serve`` runs, then exits 3 there, so nothing past the parse window is paid for."""
     return (
-        prefix
-        + "build = m._build_parser\n"
-        + _child_window_probe("parsing")
-        + "    return build()\n"
+        prefix + _child_window_probe("parsing") + "    raise SystemExit(3)\n"
         "m._build_parser = _probe\n"
-        f"raise SystemExit(m.main(['serve', '--service-config', {str(tmp_path)!r}]))\n"
+        "raise SystemExit(m.main(['serve']))\n"
     )
 
 
@@ -4261,8 +4262,8 @@ def test_a_real_serve_process_redacts_a_warning_while_it_parses_its_arguments(
     _run_warning_driver(
         tmp_path,
         "warn_while_parsing.py",
-        _warn_while_parsing(tmp_path),
-        returncode=2,
+        _warn_while_parsing(),
+        returncode=3,
         handlers_line="parsing 0 _FilteredLastResort",
     )
 
@@ -4274,8 +4275,8 @@ def test_a_real_serve_process_without_the_install_leaks_while_it_parses(tmp_path
     _run_warning_driver(
         tmp_path,
         "leak_while_parsing.py",
-        _warn_while_parsing(tmp_path, prefix="m.install_filtered_last_resort = lambda: None\n"),
-        returncode=2,
+        _warn_while_parsing(prefix="m.install_filtered_last_resort = lambda: None\n"),
+        returncode=3,
         handlers_line="parsing 0 _StderrHandler",
         leaks=True,
     )

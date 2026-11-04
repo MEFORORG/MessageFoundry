@@ -192,6 +192,29 @@ def test_the_filtered_last_resort_leaves_a_host_set_last_resort_alone(
     )
 
 
+def test_a_last_resort_a_host_set_before_the_import_is_kept_too(tmp_path: Path) -> None:
+    """The stdlib's own is read from ``logging``, not from ``lastResort`` at import, so a host
+    that set it to None before importing the engine keeps None. Run in a child, because this
+    process imported the module long ago."""
+    import subprocess
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import logging; logging.lastResort = None\n"
+            "from messagefoundry import logging_setup\n"
+            "print(logging_setup.install_filtered_last_resort(), logging.lastResort)\n",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.split() == ["None", "None"], proc.stdout
+
+
 def test_the_filtered_last_resort_refuses_a_stream_assignment() -> None:
     """BACKLOG #4716: assigning the stream raises, as it does on the stdlib's own ``lastResort``,
     rather than being dropped with the caller told nothing. ``setStream`` to the stream it already

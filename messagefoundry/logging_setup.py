@@ -2054,7 +2054,7 @@ def ensure_logger_sink(logger: logging.Logger) -> None:
     **Which processes still reach that shape.** When #1199 landed, every CLI subcommand but ``serve``
     and ``supervise`` did. Since BACKLOG #1441, ``__main__.main`` gives most subcommands a filtered
     stderr root handler before dispatch (``__main__._CONFIGURES_OWN_LOGGING`` names the exceptions
-    and how ``serve`` covers its window), so they normally find a handler and do not build one
+    and points at what covers their windows), so they normally find a handler and do not build one
     here. Any process that logs without going through ``main()`` still can. This used to say "only
     two call sites in the package install a root handler", which was an enumeration over a search
     that could not see a bare ``root.addHandler`` (the tray entrypoint has one). Read the install
@@ -2140,9 +2140,12 @@ def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
     return handler
 
 
-#: The standard library's own ``logging.lastResort``, read at import, so
-#: :func:`install_filtered_last_resort` can tell it from one a host set (BACKLOG #3768).
-_STDLIB_LAST_RESORT = logging.lastResort
+#: The standard library's own ``logging.lastResort``, so :func:`install_filtered_last_resort` can
+#: tell it from one a host set (BACKLOG #3768). ``logging`` keeps it as ``_defaultLastResort``;
+#: reading ``lastResort`` at import instead would take a host's choice made before that import.
+_STDLIB_LAST_RESORT: logging.Handler | None = getattr(
+    logging, "_defaultLastResort", logging.lastResort
+)
 
 
 class _FilteredLastResort(logging.StreamHandler[TextIO]):
@@ -2169,9 +2172,10 @@ class _FilteredLastResort(logging.StreamHandler[TextIO]):
 
 
 def install_filtered_last_resort() -> logging.Handler | None:
-    """Replace ``logging.lastResort`` with one carrying the PHI filter chain, and return it; return
-    None, and change nothing, where the root logger already has a handler or ``lastResort`` is not
-    the standard library's own (BACKLOG #3768).
+    """Replace ``logging.lastResort`` with one carrying the PHI filter chain, and return it (BACKLOG
+    #3768). Where it is already the filtered one, return that and build nothing. Return None, and
+    change nothing, where the root logger already has a handler or ``lastResort`` is neither the
+    filtered one nor the standard library's own.
 
     The standard library hands a record to ``logging.lastResort`` when no handler took it: no
     handler on the logger or any ancestor it propagates to. That handler prints ``WARNING`` and
