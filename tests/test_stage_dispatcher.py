@@ -11,7 +11,8 @@ Backend-parametrized exactly like ``tests/test_claim_fifo_heads.py`` (SQLite alw
 Postgres gated on ``MEFOR_TEST_*`` — the merge rider makes row 5 run on the live SS + PG CI legs), so
 the stub ``process_item`` performs the **real** head store write per outcome (RESOLVED leaves the
 claimed row INFLIGHT; RETRY ``mark_failed``s; STOP leaves the head INFLIGHT) — the SS/PG legs then
-exercise a faithful queue, not a fiction.
+exercise a faithful queue, not a fiction. A test whose every claim comes from ``_ClaimShim`` is
+parametrized to SQLite alone, since a server param would claim nothing from it (BACKLOG #4915).
 
 **Clock model (subtle, load-bearing).** The dispatcher drives ALL its time decisions off the injected
 :class:`ManualClock` — the claim's due-ness (it passes ``now=clock()`` to ``claim_fifo_heads``), the
@@ -343,8 +344,8 @@ class _ClaimShim:
     ``times`` intercepts more than one round-trip — needed to test anything whose unit IS the
     round-trip (BACKLOG #1270's log throttle). It defaults to 1, so every existing mode fires once.
 
-    ``real_claims`` counts the calls it passed to the real store. An arm that must run NO real claim
-    asserts it is 0, which fails if the intercept missed (BACKLOG #4915). ``_remaining`` could not
+    ``real_claims`` counts the calls it passed to the real store, for any lane. An arm that must run
+    NO real claim asserts it is 0, which fails if the intercept missed (BACKLOG #4915). ``_remaining`` could not
     say that: the first claim of a target lane always spends it, whatever ran after."""
 
     def __init__(
@@ -1214,7 +1215,9 @@ async def test_drain_refuses_an_idle_lane_with_work_and_no_contention(store: Any
         with pytest.raises(AssertionError, match="no claim contention this round"):
             await _drain_to_quiescence(d, store, [lane], mc, budget=1.0)
         assert stub.records == [] and d.claim_head_skips == 0 and d.claim_lock_timeouts == 0
-        assert shim.real_claims == 0, "a real claim ran, so the zeros above are not the shim's"
+        assert shim.real_claims == 0, (
+            "a claim reached the real store, so the zeros are not the shim's"
+        )
     finally:
         await d.stop()
 
@@ -1436,6 +1439,7 @@ async def test_a_lock_timeout_is_reported_once_while_a_genuinely_empty_claim_sta
         # The negative control the sweep-sited shortcut would fail: still stranded, still diagnosed.
         assert d.phase(lane_a) is _LanePhase.IDLE and d.phase(lane_b) is _LanePhase.IDLE
         assert d.busy_violations == 0
+        assert shim.real_claims == 0, "a claim reached the real store"
     finally:
         await d.stop()
 
@@ -1450,7 +1454,9 @@ async def test_a_lock_timeout_is_reported_once_while_a_genuinely_empty_claim_sta
             caplog.clear()
             d2.mark_ready("IB_NOTHING_HERE")
             assert await _wait_until(lambda: d2.empty_claims[0] > 0)
-        assert shim2.real_claims == 0, "the EMPTY did not come from the shim, so a real claim ran"
+        assert shim2.real_claims == 0, (
+            "a claim reached the real store, so the EMPTY is not the shim's"
+        )
         assert d2.claim_lock_timeouts == 0, (
             "an empty CLAIM was reported as a lock timeout — the counter no longer discriminates, so"
             " a non-zero value would stop meaning anything"
@@ -3010,12 +3016,14 @@ async def test_the_expiry_report_names_which_empty_route_has_evidence(store: Any
     stub = RecordingStub(store, mc.time)
     lane = "IB_ROUTE_1222"
     await _seed(store, lane, [100.0])
-    d = _make(_ClaimShim(store, lane, mode="lock_timeout_once"), stub, set(), clock=mc)
+    shim = _ClaimShim(store, lane, mode="lock_timeout_once")
+    d = _make(shim, stub, set(), clock=mc)
     await d.start()
     try:
         d.mark_ready(lane)
         assert await _wait_until(_aborts_reached(d, 1))
         await _settle()
+        assert shim.real_claims == 0, "a claim reached the real store"
         text = await _expiry_report(lane=lane)
         # Assert the COUNTERS line specifically, not merely the string somewhere in the dump. The
         # verdict's own route sentence quotes the number too, so a bare `in text` passes with the
@@ -3045,7 +3053,9 @@ async def test_the_expiry_report_names_which_empty_route_has_evidence(store: Any
     try:
         d2.mark_ready(lane2)  # no rows seeded, and the shim answers: a genuinely empty claim
         assert await _wait_until(lambda: d2.empty_claims[0] > 0)
-        assert shim2.real_claims == 0, "the EMPTY did not come from the shim, so a real claim ran"
+        assert shim2.real_claims == 0, (
+            "a claim reached the real store, so the EMPTY is not the shim's"
+        )
         assert d2.claim_lock_timeouts == 0
         text2 = await _expiry_report(lane=lane2)
         assert "claim_lock_timeouts=0" in _counters_line(text2)
@@ -3071,11 +3081,14 @@ async def test_the_expiry_report_names_which_empty_route_has_evidence(store: Any
     mc3 = ManualClock(1000.0)
     stub3 = RecordingStub(store, mc3.time)
     lane3 = "IB_ROUTE_HEADSKIP"
-    d3 = _make(_ClaimShim(store, lane3, mode="head_skip_once"), stub3, set(), clock=mc3)
+    shim3 = _ClaimShim(store, lane3, mode="head_skip_once")
+    d3 = _make(shim3, stub3, set(), clock=mc3)
     await d3.start()
     try:
         d3.mark_ready(lane3)
         assert await _wait_until(lambda: d3.claim_head_skips >= 1)
+        await _settle()
+        assert shim3.real_claims == 0, "a claim reached the real store"
         text3 = await _expiry_report(lane=lane3)
         counters3 = _counters_line(text3).split()  # whole tokens, so =1 cannot match =10
         assert "claim_head_skips=1" in counters3, (

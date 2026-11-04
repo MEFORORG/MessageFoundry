@@ -14,7 +14,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from messagefoundry.odbc_call_gate import install_call_gate
+from messagefoundry.odbc_call_gate import abandon_one_shot, close_one_shot, install_call_gate
 from messagefoundry.store import ClaimAbortPhase, ClaimedHeads, Stage
 
 # The cap and backoff of claim_past_empty_yield.
@@ -34,7 +34,8 @@ async def claim_past_empty_yield(
     """Run ``claim`` and re-issue it past a transient EMPTY-all, for a site asserting a NON-empty
     outcome. Returns as soon as ``done`` holds, by default once the claim did anything: a non-empty
     ``by_lane`` or ``rearm``. A site with another goal, such as a claim that did not abort on 1222,
-    passes its own ``done``; the result is the last attempt either way.
+    passes its own ``done``; the result is the last attempt either way. The argument below is for
+    the default ``done``.
 
     Why it is needed: ``claim_fifo_heads`` on SQL Server runs under ``SET LOCK_TIMEOUT 0`` (ADR 0066
     section 9, never-block), so a transient lock can fail the WHOLE claim closed to EMPTY-all, rolled
@@ -72,10 +73,11 @@ async def ss_hold_row_lock(ss_store: Any, message_id: str, stage: str) -> tuple[
     READPAST-skip this row via the PROVEN path (the uncommitted-INSERT fan-in test already exercises
     that skip on CI). All callers are INGRESS (channel_id lane)."""
     conn = await ss_store._pool.acquire()
-    # The store's own call gate (BACKLOG #2049), so the discard below can never free a handle under a
-    # statement a cancellation left running. Idempotent: a connection the store has lent is gated.
-    install_call_gate(conn)
+    cur: Any = None
     try:
+        # The store's own call gate (BACKLOG #2049), so a discard never frees a handle under a
+        # statement a cancellation left running. Idempotent: a connection the store has lent is gated.
+        install_call_gate(conn)
         cur = await conn.cursor()
         # Resolve the row's fifo-index coordinates first (a plain read via ix_queue_message); seq is
         # globally unique (IDENTITY), so (stage, channel_id, status, seq) pins exactly one row. Fully
@@ -100,18 +102,41 @@ async def ss_hold_row_lock(ss_store: Any, message_id: str, stage: str) -> tuple[
         # The callers' try/finally starts only once this returns, so a failure here must release
         # what it took itself: a leaked open transaction would hold its lock against the next
         # test's cleanup DELETE, which waits at the default LOCK_TIMEOUT -1.
-        #
-        # BaseException, so a cancellation is covered too (BACKLOG #4915). The connection is
-        # discarded with the store's own quarantine rather than rolled back and recycled: closing it
-        # ends the session, which rolls the transaction back server-side, and it needs no rollback
-        # or cursor close that could itself raise and skip the release, or run beside a statement a
-        # cancellation left on an executor thread. A failing path pays one reconnect.
-        try:
-            await ss_store._release_dirty(conn)
-        finally:
-            await ss_store._pool.release(conn)
+        await _ss_discard(ss_store, conn, cur)
         raise
     return conn, cur
+
+
+async def ss_release_row_lock(ss_store: Any, conn: Any, cur: Any) -> None:
+    """The other half of :func:`ss_hold_row_lock`, for each caller's ``finally``: roll the held
+    transaction back and return the connection to the pool. If the rollback or the cursor close
+    raises, or a cancellation lands in either, the connection is discarded instead, so the release
+    still happens and nothing reaches the pool with the lock held (BACKLOG #4915)."""
+    try:
+        await cur.execute("ROLLBACK TRAN")
+        await cur.close()
+    except BaseException:
+        await _ss_discard(ss_store, conn, cur)
+        raise
+    await ss_store._pool.release(conn)
+
+
+async def _ss_discard(ss_store: Any, conn: Any, cur: Any) -> None:
+    """Throw a held connection away rather than roll it back and recycle it (BACKLOG #4915).
+
+    Closing the connection ends the session, which rolls its transaction back server-side and frees
+    the lock. The cursor and the connection go to the call gate, cursor first, and close once no
+    pyodbc call is running on them, so a statement a cancellation left on an executor thread never
+    has its handles freed under it, and no cursor outlives its connection. Nothing here waits on the
+    close, so a cancellation arriving now is never swallowed. A failing path pays one reconnect.
+    A connection the gate could not wrap is closed directly instead, which install_call_gate has
+    already logged at ERROR."""
+    try:
+        if not abandon_one_shot(conn, cur):
+            await close_one_shot(conn, cur)
+    finally:
+        # A connection whose handle is gone reads closed, and the pool drops it instead of re-lending.
+        await ss_store._pool.release(conn)
 
 
 async def ss_lane_pending(ss_store: Any, channel: str) -> list[dict[str, Any]]:

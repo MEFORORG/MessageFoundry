@@ -34,13 +34,14 @@ import pytest
 from messagefoundry.config.settings import load_settings
 from messagefoundry.store import sqlserver as ss
 from messagefoundry.store.sqlserver import SqlServerStore
-from messagefoundry.store.store import OutboxStatus, Stage
+from messagefoundry.store.store import ClaimAbortPhase, OutboxStatus, Stage
 from tests._claim_lock_helpers import (
     assert_skip_named,
     claim_heads_no_block,
     claim_past_empty_yield,
     ss_hold_row_lock,
     ss_lane_pending,
+    ss_release_row_lock,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -264,6 +265,11 @@ async def test_ac11_no_match_parity_oversized_lane_lives(proc_store: SqlServerSt
     assert sum(len(v) for v in control.by_lane.values()) == 1
 
 
+def _head_phase_abort(res: Any) -> bool:
+    """A claim that aborted on 1222 before its fetch, so it read no row and no head-skip marker."""
+    return res.lock_timeout is not None and res.lock_timeout.phase is ClaimAbortPhase.HEAD
+
+
 async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
     proc_store: SqlServerStore,
 ) -> None:
@@ -276,11 +282,12 @@ async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
     The lock is taken on the fifo index key, the shape every real contender holds, so the READPAST
     probe skips it rather than waiting on it.
 
-    A whole-claim 1222 abort is the one other legal answer, but it names no lane and never reads the
-    marker, so a pass on it proves nothing about the ``_v2`` CALL. Each abort is a full rollback, so
-    the claim is re-issued past it, and the test FAILS if every attempt aborts (BACKLOG #4915). It used
-    to pass on that route with only a UserWarning. Any abort seen on the way still rides out as a
-    warning, so a re-issue never hides one."""
+    A HEAD-phase 1222 abort is the one other legal answer, but it comes before the fetch, names no
+    lane and never reads the marker, so a pass on it proves nothing about the ``_v2`` CALL. Each
+    abort is a full rollback, so the claim is re-issued past it, and the test FAILS if every attempt
+    aborts that way (BACKLOG #4915). It used to pass on that route with only a UserWarning. Any abort
+    seen on the way still rides out as a warning, so a re-issue never hides one. A FINALIZE-phase
+    abort comes after the fetch, so it read the marker and is judged by ``assert_skip_named``."""
     lane = "IB_V2_HEADSKIP"
     mids = [
         await proc_store.enqueue_ingress(channel_id=lane, raw=f"MSH|^~\\&|SKIP|{t}", now=t)
@@ -301,11 +308,11 @@ async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
             attempts.append(attempt)
             return attempt
 
-        res = await claim_past_empty_yield(_claim, done=lambda r: r.lock_timeout is None)
+        res = await claim_past_empty_yield(_claim, done=lambda r: not _head_phase_abort(r))
         assert all(a.by_lane == {} and a.rearm == frozenset() for a in attempts)
-        assert res.lock_timeout is None, (
-            f"all {len(attempts)} claims aborted on 1222 ({res.lock_timeout!r}), so the _v2"
-            " head-skip marker was never read and this test proved nothing about it"
+        assert not _head_phase_abort(res), (
+            f"all {len(attempts)} claims aborted on 1222 before their fetch ({res.lock_timeout!r}),"
+            " so the _v2 head-skip marker was never read and this test proved nothing about it"
         )
         aborts = len(attempts) - 1
         assert_skip_named(res, lane, abort_ok=False)
@@ -321,9 +328,7 @@ async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
         assert len(rows) == 3
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
-        await cur.execute("ROLLBACK TRAN")
-        await cur.close()
-        await proc_store._pool.release(conn)
+        await ss_release_row_lock(proc_store, conn, cur)
     assert proc_store.claim_proc_effective is True  # still the CALL path for the release half
     after = await _claim_until(proc_store, Stage.INGRESS.value, [lane], now=201.0, per_lane_limit=8)
     assert [it.message_id for it in after.by_lane[lane]] == mids  # N first, whole prefix

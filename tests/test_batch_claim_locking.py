@@ -38,6 +38,7 @@ from tests._claim_lock_helpers import (
     claim_past_empty_yield,
     ss_hold_row_lock,
     ss_lane_pending,
+    ss_release_row_lock,
 )
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
@@ -312,9 +313,7 @@ async def test_pooled_1a_ss_locked_head_lane_empty_never_blocks(ss_store: Any) -
         rows = await ss_lane_pending(ss_store, channel)
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
-        await cur.execute("ROLLBACK TRAN")
-        await cur.close()
-        await ss_store._pool.release(conn)
+        await ss_release_row_lock(ss_store, conn, cur)
     after = await _claim_heads_until(
         ss_store, Stage.INGRESS.value, [channel], now=201.0, per_lane_limit=8
     )
@@ -512,9 +511,7 @@ async def test_pooled_1c_ss_multilane_isolation(ss_store: Any) -> None:
         rows = await ss_lane_pending(ss_store, channel_a)
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
-        await cur.execute("ROLLBACK TRAN")
-        await cur.close()
-        await ss_store._pool.release(conn)
+        await ss_release_row_lock(ss_store, conn, cur)
 
 
 # --- 1e: mid-prefix gap — only the contiguous head prefix; gap-tail never UPDATEd
@@ -564,9 +561,7 @@ async def test_pooled_1e_ss_midprefix_gap_truncates_tail_untouched(ss_store: Any
         )
         assert all(r["status"] == OutboxStatus.PENDING.value and r["attempts"] == 0 for r in rows)
     finally:
-        await cur.execute("ROLLBACK TRAN")
-        await cur.close()
-        await ss_store._pool.release(conn)
+        await ss_release_row_lock(ss_store, conn, cur)
 
 
 # --- 1f: attempts-neutrality under a wedged head across repeated claim attempts
@@ -614,9 +609,7 @@ async def test_pooled_1f_ss_wedged_head_attempts_neutral(ss_store: Any) -> None:
         rows = await ss_lane_pending(ss_store, channel)
         assert [(r["status"], r["attempts"]) for r in rows] == [(OutboxStatus.PENDING.value, 0)] * 3
     finally:
-        await cur.execute("ROLLBACK TRAN")
-        await cur.close()
-        await ss_store._pool.release(conn)
+        await ss_release_row_lock(ss_store, conn, cur)
     after = await _claim_heads_until(
         ss_store, Stage.INGRESS.value, [channel], now=300.0, per_lane_limit=8
     )
