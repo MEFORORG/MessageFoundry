@@ -647,7 +647,7 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    that upload alone; and a relative `uploads_dir` read from a directory other than the one `serve`
    uses, where the run prints a note naming the path it read. Before retiring the prior key, confirm
    the volume is mounted and the path is the one `serve` uses. **A `serve` start does not stamp a
-   changed key while the rotation record names it (BACKLOG
+   changed key while the rotation record names it or cannot be read (BACKLOG
    #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` before either data pass
    (the store open can already have written under the key) and closes it only when a run completes,
    so a run killed or failed after that point leaves it open. When a start finds that the key in

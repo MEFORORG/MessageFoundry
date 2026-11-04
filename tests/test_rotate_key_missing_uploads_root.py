@@ -155,10 +155,11 @@ def test_rotate_key_refuses_a_nul_in_uploads_dir_with_exit_2(
     """End to end: the refusal's exit 2 with nothing written, not a ValueError at exit 1. An
     environment variable cannot hold a NUL, so the settings file carries it as a TOML escape.
 
-    The file is not named ``nul.toml``: Windows before 11, Server 2022 included, reads a DOS device
-    name followed by an extension as that device, so the write went to NUL and the run read an
-    empty file, no ``uploads_dir`` at all, and completed with exit 0 (BACKLOG #4940). The load is
-    checked first, so a file the settings do not read fails here rather than at the exit code."""
+    The file is not named ``nul.toml``. At least the windows-2022 runner reads a DOS device name
+    followed by an extension as that device, which Windows 11 and windows-2025 do not, so there
+    the write went to NUL and the run read an empty file, no ``uploads_dir`` at all, and completed
+    with exit 0 (BACKLOG #4940). The load is checked first, so a file the settings do not read
+    fails here rather than at the exit code."""
     db, uploads, key_a, key_b = rig
     _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=uploads)
     monkeypatch.delenv("MEFOR_STORE_UPLOADS_DIR")
@@ -166,8 +167,12 @@ def test_rotate_key_refuses_a_nul_in_uploads_dir_with_exit_2(
     cfg.write_text('[store]\nuploads_dir = "up\\u0000loads"\n', encoding="utf-8")
     assert load_settings(config_path=cfg).store.uploads_dir == "up\0loads"
     assert main(["rotate-key", "--service-config", str(cfg), "--db", str(db)]) == 2
-    assert "contains a NUL character" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "OK" not in captured.out
+    assert "contains a NUL character" in captured.err
     rows = asyncio.run(_rows(db, key_a))  # key A alone: nothing was re-encrypted
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+    assert rows[_DEK].last_rotated == _OLD_DATE
     assert ROTATION_RECORD_ID not in rows
 
 
