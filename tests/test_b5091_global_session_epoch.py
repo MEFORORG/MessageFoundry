@@ -269,6 +269,28 @@ async def test_the_revoke_refuses_a_store_with_no_global_epoch_row(
         await _mint(store, "b5091-gone")  # and so does a sign-in, never a bare TypeError
 
 
+async def test_the_per_account_revoke_ends_its_kept_session_with_no_global_epoch_row(
+    keyed: tuple[MessageStore, Path],
+) -> None:
+    """Follow-up to BACKLOG #4975: the per-account revoke reads the global epoch to check the
+    session it keeps. With that row missing nothing can be checked, so it ends the kept session
+    with the rest instead of rolling back, which would keep every one of them live. The control
+    is the same revoke with the row in place, which keeps the session."""
+    store, path = keyed
+    await _user(store, "b5091-row")
+    kept = await _mint(store, "b5091-row")
+    other = await _mint(store, "b5091-row")
+    result = await store.revoke_user_sessions("b5091-row", except_token_hash=hash_token(kept))
+    assert (result.count, result.kept, result.ended_kept) == (1, True, False)  # control
+    other = await _mint(store, "b5091-row")
+    await _sqlite_raw(path)("DELETE FROM global_session_epoch", ())
+    result = await store.revoke_user_sessions("b5091-row", except_token_hash=hash_token(kept))
+    assert (result.count, result.kept, result.ended_kept) == (2, False, True)
+    for token in (kept, other):
+        row = await store.get_session(hash_token(token))
+        assert row is not None and row.revoked_at is not None
+
+
 async def test_a_reopen_keeps_a_raised_global_epoch_and_seeds_a_missing_row(
     tmp_path: Path,
 ) -> None:

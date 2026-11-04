@@ -4743,11 +4743,15 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   raise read under the account's lock. The other is the global epoch: for the every-account revoke
   the value its raise replaced, and for the per-account revoke, which raises no global epoch, the
   value read in its own transaction, which it leaves on the session as it is. Where the account's
-  record fails its seal, its epoch cannot be raised and nothing is stamped. **A kept session the
-  revoke does not stamp is ended in the same transaction**, as the sweep ends the rest, and counted
-  with them: one behind on either epoch, as a missed session is, and one whose account's record
-  failed its seal. The revoke still ends the user's other sessions, current ones included. All
-  three stores do this. Because it is ended there, a declined session no longer holds a place
+  record fails its seal, its epoch cannot be raised and nothing is stamped; where the per-account
+  revoke finds the global epoch's row missing, nothing is checked against it and nothing is
+  stamped either, and the revoke goes on rather than roll back. **A kept session of an account
+  the revoke sweeps, which it does not stamp, is ended in the same transaction**, as the sweep
+  ends the rest, and counted with them: at least one behind on either epoch, as a missed session
+  is, and one whose account's record failed its seal. A kept session of another account, which
+  only a direct store call could name, is outside the per-account sweep and is left as it is.
+  The revoke still ends the user's other sessions, current ones included. All three stores do
+  this. Because it is ended there, a declined session no longer holds a place
   under the session cap, and presenting it again is refused as an ended session, not reported as a
   seal failure. **Each revoke reports whether it stamped the kept session, and whether it ended
   it, from the transaction that did so** (`RevokeResult` in `messagefoundry/store/store.py`), and
@@ -4764,8 +4768,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   fails its seal; `tests/test_b2614_revoke_all.py` the every-account revoke on a session behind on
   both epochs, on one behind on its account's epoch alone and on one whose account's record fails
   its seal; and `tests/test_b5091_global_session_epoch.py` both revokes on one behind on the global
-  epoch alone. Each declined case sits beside a control where the kept session is current and
-  stays live. Each runs on SQLite and on the server legs `.github/workflows/ci.yml` runs from
+  epoch alone, and on SQLite only, the per-account revoke with the global epoch's row missing.
+  Each declined case sits beside a control where the kept session is current and stays live. Each runs on SQLite and on the server legs `.github/workflows/ci.yml` runs from
   `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py`. Each of those three also
   checks the store's kept answer. `tests/test_session_seal.py` tests that the service's counts and
   audit scope follow that answer, and that a read failing after the revoke cannot change them, and

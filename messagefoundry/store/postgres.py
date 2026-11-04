@@ -1434,11 +1434,9 @@ _PG_REVOKE_ALL_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=$1, seal='' WHERE revoked_at IS NULL"
     " AND ($2::text IS NULL OR token_hash != $2)"
 )
-#: The `$n` twin of store.py's ``_END_DECLINED_KEPT_SESSION_SQL`` (follow-up to BACKLOG #4975).
-_PG_END_DECLINED_KEPT_SESSION_SQL: Final = (
-    "UPDATE sessions SET revoked_at=$1, seal='' WHERE token_hash=$2 AND user_id=$3"
-    " AND revoked_at IS NULL"
-)
+#: The `$n` twin of store.py's ``_END_DECLINED_KEPT_SESSION_SQL`` (follow-up to BACKLOG #4975):
+#: the per-account sweep narrowed to one token.
+_PG_END_DECLINED_KEPT_SESSION_SQL: Final = _PG_REVOKE_USER_SESSIONS_SQL + " AND token_hash=$3"
 #: Whether the account holds at least one passkey.
 _PG_WEBAUTHN_ANY_FOR_USER: Final = "SELECT 1 FROM webauthn_credentials WHERE user_id=$1 LIMIT 1"
 
@@ -10715,8 +10713,8 @@ class PostgresStore:
         (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
         runs first, so it takes the account row's lock before any session row is touched, the order
         ``create_session`` takes them in. The kept session is checked against the global epoch
-        too, read here without a lock clause as every reader of it is, and ended where it is
-        declined (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
+        too, read here without a lock clause as every reader of it is, and without refusing a
+        missing row (store.py's ``global_epoch_unmoved``), and ended where it is declined (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
         :meth:`_after_commit_txn`'s, for the reason it gives."""
         now = time.time() if now is None else now
         async with self._after_commit_txn() as conn:
@@ -10729,7 +10727,9 @@ class PostgresStore:
             )
             if except_token_hash is None:
                 return RevokeResult(_rowcount(status))
-            unmoved = global_epoch_unmoved(await self._global_session_epoch(conn))
+            unmoved = global_epoch_unmoved(
+                await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
+            )
             return await self._keep_or_end_session(
                 conn,
                 _rowcount(status),
@@ -10747,7 +10747,7 @@ class PostgresStore:
         if restamp.kept(await self._write_session(conn, token_hash, restamp)):
             return RevokeResult(revoked, kept=True)
         status = await conn.execute(
-            _PG_END_DECLINED_KEPT_SESSION_SQL, now, token_hash, restamp.user_id
+            _PG_END_DECLINED_KEPT_SESSION_SQL, now, restamp.user_id, token_hash
         )
         ended = _rowcount(status) == 1
         return RevokeResult(revoked + ended, kept=False, ended_kept=ended)

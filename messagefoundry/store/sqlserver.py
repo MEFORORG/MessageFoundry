@@ -724,12 +724,9 @@ _MSSQL_EXCEPT_TOKEN_HASH_SQL: Final = " AND token_hash != ?"
 _MSSQL_REVOKE_ALL_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash WHERE revoked_at IS NULL"
 )
-#: store.py's ``_END_DECLINED_KEPT_SESSION_SQL``, counted from ``OUTPUT`` as the sweeps are
-#: (follow-up to BACKLOG #4975).
-_MSSQL_END_DECLINED_KEPT_SESSION_SQL: Final = (
-    "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash"
-    " WHERE token_hash=? AND user_id=? AND revoked_at IS NULL"
-)
+#: store.py's ``_END_DECLINED_KEPT_SESSION_SQL``: the per-account sweep narrowed to one token,
+#: counted from ``OUTPUT`` as the sweeps are (follow-up to BACKLOG #4975).
+_MSSQL_END_DECLINED_KEPT_SESSION_SQL: Final = _MSSQL_REVOKE_USER_SESSIONS_SQL + " AND token_hash=?"
 #: Whether the account holds at least one passkey.
 _MSSQL_WEBAUTHN_ANY_FOR_USER: Final = (
     "SELECT TOP (1) 1 AS present FROM webauthn_credentials WHERE user_id=?"
@@ -13960,9 +13957,14 @@ class SqlServerStore:
     async def _global_session_epoch(self, cur: Any) -> int:
         """The store's global session epoch (BACKLOG #5091), read on ``cur`` inside an open
         transaction."""
+        return global_epoch_or_refuse(await self._global_session_epoch_value(cur))
+
+    async def _global_session_epoch_value(self, cur: Any) -> Any:
+        """The global session epoch's raw value, ``None`` where the row is missing, read as
+        :meth:`_global_session_epoch` reads it but not refused."""
         await cur.execute(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
         rows = await cur.fetchall()
-        return global_epoch_or_refuse(rows[0][0] if rows else None)
+        return rows[0][0] if rows else None
 
     async def _bump_session_epoch(self, cur: Any, user_id: str) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, on ``cur`` inside an open
@@ -15477,8 +15479,8 @@ class SqlServerStore:
         (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
         runs first, so it takes the account row's lock before any session row, the order
         ``create_session`` takes them in. The kept session is checked against the global epoch
-        too, read while the account row is held, as ``create_session`` reads it, and ended where
-        it is declined (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
+        too, read while the account row is held, as ``create_session`` reads it, without refusing a
+        missing row (store.py's ``global_epoch_unmoved``), and ended where it is declined (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
         :meth:`_acquire_after_commit`'s, for the reason it gives (BACKLOG #3023)."""
         now = time.time() if now is None else now
         async with self._acquire_after_commit() as conn, self._cursor(conn) as cur:
@@ -15491,12 +15493,14 @@ class SqlServerStore:
                         _MSSQL_REVOKE_USER_SESSIONS_SQL + _MSSQL_EXCEPT_TOKEN_HASH_SQL,
                         (now, user_id, except_token_hash),
                     )
-                result = RevokeResult(len(await cur.fetchall()))
-                if except_token_hash is not None:
-                    unmoved = global_epoch_unmoved(await self._global_session_epoch(cur))
+                revoked = len(await cur.fetchall())
+                if except_token_hash is None:
+                    result = RevokeResult(revoked)
+                else:
+                    unmoved = global_epoch_unmoved(await self._global_session_epoch_value(cur))
                     result = await self._keep_or_end_session(
                         cur,
-                        result.count,
+                        revoked,
                         except_token_hash,
                         KeptSessionRestamp(user_id, raised, unmoved),
                         now,
@@ -15516,7 +15520,7 @@ class SqlServerStore:
         ``OUTPUT`` rowset, as the sweep is (BACKLOG #2283)."""
         if restamp.kept(await self._write_session(cur, token_hash, restamp)):
             return RevokeResult(revoked, kept=True)
-        await cur.execute(_MSSQL_END_DECLINED_KEPT_SESSION_SQL, (now, token_hash, restamp.user_id))
+        await cur.execute(_MSSQL_END_DECLINED_KEPT_SESSION_SQL, (now, restamp.user_id, token_hash))
         ended = len(await cur.fetchall()) == 1
         return RevokeResult(revoked + ended, kept=False, ended_kept=ended)
 

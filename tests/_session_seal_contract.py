@@ -275,6 +275,8 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     raised = await store.get_user("seal-u3")
     assert raised is not None and raised.session_epoch == account.session_epoch + 1  # control
     fresh = await _mint(store, "seal-u3")
+    one_behind = await store.get_session(hash_token(fresh))  # one epoch behind after the control
+    assert one_behind is not None
     result = await store.revoke_user_sessions("seal-u3", except_token_hash=hash_token(fresh))
     assert (result.count, result.kept, result.ended_kept) == (0, True, False)  # control
     assert await service.identity_for_token(fresh) is not None
@@ -292,14 +294,15 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     for token in (fresh, behind):
         left = await store.get_session(hash_token(token))
         assert left is not None and left.revoked_at is not None
-    # A session one epoch behind is ended too: the guard compares to the epoch the raise
+    # A session exactly one epoch behind is ended too: the guard compares to the epoch the raise
     # replaced, not to the new epoch less one, which with no raise it would match.
-    await raw(
-        "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
-        (snapshot.seal, hash_token(behind)),
+    await raw(  # the control re-stamped the row, so its epoch goes back with its seal
+        "UPDATE sessions SET revoked_at=NULL, user_epoch=?, seal=? WHERE token_hash=?",
+        (one_behind.user_epoch, one_behind.seal, hash_token(fresh)),
     )
-    result = await store.revoke_user_sessions("seal-u3", except_token_hash=hash_token(behind))
+    assert one_behind.user_epoch == stamped.session_epoch - 1  # the account still unmoved
+    result = await store.revoke_user_sessions("seal-u3", except_token_hash=hash_token(fresh))
     assert (result.count, result.kept, result.ended_kept) == (1, False, True)
-    left = await store.get_session(hash_token(behind))
+    left = await store.get_session(hash_token(fresh))
     assert left is not None and left.revoked_at is not None
-    assert left.user_epoch == snapshot.user_epoch
+    assert left.user_epoch == one_behind.user_epoch
