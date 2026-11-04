@@ -2165,9 +2165,13 @@ def _detach(coro: Coroutine[Any, Any, None]) -> None:
     task.add_done_callback(_DETACHED_SETTLES.discard)
 
 
-#: How many connections each pool has held back behind a cancelled borrow (BACKLOG #2394): ones
-#: :func:`_return_when_settled` or an abandoned autocommit set keeps out of the pool until a driver
-#: call returns. Keyed by the aioodbc pool itself, never the :class:`_AutocommitPool` wrapper, so a
+#: How many connections each pool counts as held back. At least two kinds count. One is a
+#: connection held back behind a cancelled borrow (BACKLOG #2394): one :func:`_return_when_settled`
+#: or an abandoned autocommit set keeps out of the pool until a driver call returns, counted until
+#: it goes back. The other is a connection discarded after a failed rollback whose wake never came
+#: (BACKLOG #5010): a pool with no ``_wakeup``, or a wake that failed or was cancelled
+#: (:func:`_release`, :func:`_wake`). Nothing would then wake a ``wait_closed`` for the freed slot,
+#: so that count is never taken back. Keyed by the aioodbc pool itself, never the :class:`_AutocommitPool` wrapper, so a
 #: borrow and a close of one pool read one count whichever object each holds (:func:`_pool_key`).
 #: Weak, so a pool nothing else holds drops out. :func:`_close_pool_bounded` stops waiting at a bound
 #: only while this is above zero.
@@ -2196,7 +2200,7 @@ def _adjust_held(pool: Any, delta: int) -> None:
 
 
 def _hold_back(pool: Any) -> None:
-    """Count one more connection of ``pool`` held back behind a cancelled borrow."""
+    """Count one more connection of ``pool`` held back (:data:`_HELD_BACK` says which count)."""
     _adjust_held(pool, 1)
 
 
@@ -2206,7 +2210,7 @@ def _settle_held(pool: Any) -> None:
 
 
 def _holds_back(pool: Any) -> int:
-    """How many connections of ``pool`` are held back behind a cancelled borrow now."""
+    """How many connections of ``pool`` are counted as held back now (:data:`_HELD_BACK`)."""
     try:
         return _HELD_BACK.get(_pool_key(pool), 0)
     except TypeError:
@@ -2519,8 +2523,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     **``discard`` closes the connection instead of returning it open (BACKLOG #5010).** A caller
     whose own rollback failed passes it, since the transaction may still be open on a live session
     and the next borrower's commit would commit it. The handle is dropped here, before any await,
-    so no path below can lend the connection again; the same job that closes the cursor then closes
-    the handle, and the pool gets the connection back closed (:func:`_release`)."""
+    so no path below can lend the connection again; the job that closes the cursor then closes the
+    handle, and the pool gets the connection back closed (:func:`_release`). Where the executor is
+    shut down, no job runs, and the handle is left for pyodbc to close when it is collected."""
     cancelled = _unwinding_a_cancel()
     dropped = drop_handle(conn) if discard else None  # first: no await may come before it
     if cur is None and dropped is None:
@@ -2653,7 +2658,8 @@ def _close_dropped(raw: Any) -> None:
 
 async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = None) -> None:
     """Close ``pool``. Wait for its connections in use as an unbounded ``wait_closed`` would, but
-    stop waiting once a connection of it is held back behind a cancelled borrow (BACKLOG #2394).
+    stop waiting once a connection of it is counted as held back (BACKLOG #2394): behind a
+    cancelled borrow, or discarded with no wake to come (BACKLOG #5010; :data:`_HELD_BACK`).
 
     **The bound applies only while that count is above zero** (:func:`_holds_back`), read at the end
     of each tick of :data:`_POOL_CLOSE_TIMEOUT_S`: a close that starts with one held back waits one
@@ -2697,8 +2703,9 @@ async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = Non
     waited = loop.time() - started
     if held:
         logger.warning(
-            "%s pool did not close in %.1fs of waiting; %d connection(s) held behind a cancelled "
-            "call go back when that call returns, and the close goes on meanwhile",
+            "%s pool did not close in %.1fs of waiting; %d connection(s) counted as held back, "
+            "behind a cancelled call that goes back when it returns or discarded with no wake to "
+            "come, and the close goes on meanwhile",
             what,
             waited,
             held,
@@ -2943,13 +2950,11 @@ class DatabaseDestination(DestinationConnector):
                     )
                     if state is None:
                         raise  # the send's failure is no driver error: the rollback's propagates
-                    # Classified as it would be had the rollback passed, so a dropped link retries
-                    # rather than dead-letters as an internal error. A rollback failing with a
-                    # transient state says the link went, whatever the send's state read, so that
-                    # one wins. The cause is the error whose state names the class.
-                    rb_state = _sqlstate(rollback_exc)
-                    if rb_state and _is_transient(rb_state) and not _is_transient(state):
-                        raise _classify_db_error(rb_state, str(rollback_exc)) from rollback_exc
+                    # Classified by the send's own error, as it would be had the rollback passed,
+                    # never by the rollback's: the send's error is the best evidence of the
+                    # message's fate, and a transient rollback state overriding a permanent one
+                    # would retry a poison message for as long as the retry budget lasts. A
+                    # dead-letter can be replayed. The rollback's error stays the context.
                     raise _classify_db_error(state, str(exc)) from exc
                 if state is None:
                     raise  # not a DB driver error → an internal/code error, let the runner handle it

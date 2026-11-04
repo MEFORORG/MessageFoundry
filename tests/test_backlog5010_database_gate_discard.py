@@ -211,12 +211,15 @@ async def test_a_driver_error_whose_rollback_fails_is_classified_and_discarded(
     assert pool.free == [] and rig.conn.closed and "commit" not in rig.log, rig.log
 
 
-async def test_a_rollback_lost_to_the_link_makes_a_permanent_looking_failure_transient(
+async def test_a_permanent_send_state_stays_permanent_when_the_rollback_fails_transiently(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The statement fails with a permanent-looking state, then its rollback fails with 08S01. A
-    rollback lost to the link says the link went, so the failure retries rather than dead-letters,
-    the rollback's error is the cause, and the warning names it."""
+    """The statement fails with a permanent state, then its rollback fails with 08S01. The send is
+    classified by its own error, so it dead-letters rather than retries: a transient rollback state
+    overriding it would retry a poison message for the whole retry budget, and a dead-letter can be
+    replayed. The statement's error is the cause, the rollback's the context, and the warning names
+    the rollback's. This replaces review round two's test, which pinned the override the batch 604
+    Manager dropped."""
     rig.release.set()
     _aioodbc_serving(
         monkeypatch,
@@ -228,12 +231,14 @@ async def test_a_rollback_lost_to_the_link_makes_a_permanent_looking_failure_tra
     )
     with (
         caplog.at_level("WARNING", logger=_DB_LOG),
-        pytest.raises(DeliveryError, match="transient") as caught,
+        pytest.raises(NegativeAckError, match=r"\[23000\]") as caught,
     ):
         await _destination().send('{"a": 1}')
-    assert not isinstance(caught.value, NegativeAckError)
+    assert caught.value.permanent
     cause = caught.value.__cause__
-    assert isinstance(cause, RuntimeError) and cause.args[0] == "08S01", cause
+    assert isinstance(cause, RuntimeError) and cause.args[0] == "23000", cause
+    context = caught.value.__context__
+    assert isinstance(context, RuntimeError) and context.args[0] == "08S01", context
     assert rig.conn.closed and rig.pools[0].free == []
     assert "rollback after a failed send failed" in caplog.text and "08S01" in caplog.text
 
