@@ -3013,8 +3013,10 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
     So this stays ``required=False`` on purpose, and not because the arm is ungated. It has no posture
     to key on, so a refusal here would have to re-derive the gradient's loopback / attested / accepted
     arms from the graph — a second, silently different definition of a decision that already has one.
-    A hop with a usable mode value outside the no-TLS deny-list is not reported here at all (a blank,
-    padded or non-string mode value is): the engine cannot prove that value verifies
+    A hop with a usable mode value outside the no-TLS deny-list, on the keyword and at a spelling its
+    driver family reads, is not reported here at all (a blank, padded or non-string mode value is,
+    and so is any mode on a driver name the engine cannot place, BACKLOG #5053): the engine cannot
+    prove that value verifies
     anything, and refusing on that would be guess-based and would break legitimate drivers, exactly
     what ADR 0092 declined. SKIPs when the graph will not load, same convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, unverified_generic_db_hops
@@ -3047,7 +3049,9 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
         required=False,
         detail=(
             f"{len(hops)} generic-ODBC database connection(s) may cross in plaintext — {listed}; "
-            "set a verifying TLS mode in odbc_params (e.g. SSLmode=verify-full). An enforcing "
+            "set the verifying TLS mode the driver family reads in odbc_params, under the "
+            "driver's registered name (psqlODBC SSLmode=verify-full, MySQL "
+            "SSLMODE=VERIFY_IDENTITY, Microsoft's driver Encrypt=yes). An enforcing "
             "instance REFUSES these off-loopback at build-check unless the connection declares "
             # The spelling of config.tls_policy.HOP_ATTESTATION_LEVER, written out so this module
             # does not import a crypto module for a string (the crypto-inventory gate).
