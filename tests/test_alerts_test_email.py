@@ -184,8 +184,9 @@ async def test_test_email_no_alerts_settings_at_all(engine: Engine) -> None:
 
 
 async def test_test_email_host_outside_allowlist_fails_cleanly(engine: Engine) -> None:
-    # NB: no send_plain_email monkeypatch — the REAL function runs its allowlist check and raises
-    # ValueError before opening any socket, proving the sink's egress allowlist is enforced.
+    # NB: no send_plain_email monkeypatch — the REAL allowlist check raises ValueError before any
+    # socket opens, proving the sink's egress allowlist is enforced. Since BACKLOG #5088 it is the
+    # EmailTransport build that raises, so the test send fails the same way a live start would.
     alerts = _email_alerts(smtp_allowed_hosts=["other.example.com"])  # excludes smtp.example.com
     transport = httpx.ASGITransport(
         app=create_app(engine, allow_no_auth=True, alerts_settings=alerts)
@@ -196,7 +197,7 @@ async def test_test_email_host_outside_allowlist_fails_cleanly(engine: Engine) -
     body = r.json()
     assert body["configured"] is True
     assert body["success"] is False
-    assert body["detail"]
+    assert "smtp_allowed_hosts" in body["detail"]  # names the allowlist, not a relay fault
 
 
 # --- 5. RECIPIENT OVERRIDE ----------------------------------------------------

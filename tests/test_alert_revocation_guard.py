@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import datetime
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -231,12 +232,62 @@ def test_an_smtp_hop_with_no_login_takes_no_guard() -> None:
     assert not log.has(_SMTP_CELL), log.state()
 
 
-def test_a_relay_outside_the_allowlist_is_left_to_the_send_refusal() -> None:
-    """The egress allowlist refuses the host at every send, before any other work, so the guard
-    does not send the operator to fix revocation on a hop the policy forbids."""
-    transport = _email(ENFORCING, allowed_hosts=("other.example.test",))
-    with pytest.raises(ValueError, match="allowlist"):
-        asyncio.run(transport.send({"type": "connection_stopped", "connection": "OB_X"}))
+def test_a_relay_outside_the_allowlist_is_refused_at_the_build() -> None:
+    """BACKLOG #5088, a tightening: this relay used to build with no revocation judgement and
+    refuse at every send, so an enforcing instance started with a channel that sent nothing. The
+    build now refuses it on the allowlist, before the revocation guard, so the refusal names the
+    allowlist rather than sending the operator to attest a hop the egress policy forbids."""
+    with _guard_log() as log:
+        with pytest.raises(ValueError, match="smtp_allowed_hosts") as exc:
+            _email(ENFORCING, allowed_hosts=("other.example.test",))
+        assert not isinstance(exc.value, InsecureHopRefused)
+        with pytest.raises(ValueError, match="smtp_allowed_hosts") as exc:
+            _notifier(ENFORCING, allowed_hosts=("other.example.test",))
+        assert not isinstance(exc.value, InsecureHopRefused)
+    assert not log.has(_SMTP_CELL), log.state()  # refused before the guard, so nothing judged
+
+
+def test_a_relay_with_no_login_outside_the_allowlist_is_refused_at_the_build() -> None:
+    """A hop with no login takes no revocation guard, so the allowlist test must not sit behind
+    that guard's early return: it is the build's own check, whatever the login or TLS knobs say."""
+    for over in (
+        {"username": None, "password": None},
+        {"username": None, "password": None, "use_tls": False},
+        {"username": None, "password": None, "tls_verify": False},
+    ):
+        with pytest.raises(ValueError, match="smtp_allowed_hosts"):
+            _email(ENFORCING, allowed_hosts=("other.example.test",), **over)
+        with pytest.raises(ValueError, match="smtp_allowed_hosts"):
+            _notifier(ENFORCING, allowed_hosts=("other.example.test",), **over)
+
+
+def test_an_off_allowlist_relay_is_refused_before_its_password_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relay the egress policy forbids costs no secret-store read, and a store that is down
+    cannot hide the allowlist refusal behind its own error."""
+    from messagefoundry.pipeline import security_notify
+
+    for module in (alert_sinks, security_notify):
+        monkeypatch.setattr(module, "resolve_connector_secret", _raises(RuntimeError))
+    settings = AlertsSettings(
+        email_smtp_host=RELAY,
+        email_from="alerts@example.test",
+        email_to=["ops@example.test"],
+        smtp_allowed_hosts=["other.example.test"],
+    )
+    with pytest.raises(ValueError, match="smtp_allowed_hosts"):
+        notifier_from_settings(settings, posture=ENFORCING)
+    with pytest.raises(ValueError, match="smtp_allowed_hosts"):
+        security_notifier_from_settings(settings, posture=ENFORCING)
+
+
+def test_a_listed_relay_is_still_judged_for_revocation() -> None:
+    # The control for the two above: a relay the allowlist lists, in any case, reaches the guard.
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        _email(ENFORCING, allowed_hosts=("SMTP.example.test",))
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        _notifier(ENFORCING, allowed_hosts=("other.example.test", "smtp.EXAMPLE.test"))
 
 
 def test_an_smtp_login_on_loopback_still_crosses() -> None:
@@ -336,14 +387,123 @@ def test_a_direct_build_cannot_attest_without_a_recordable_reason(reason: str | 
     assert not isinstance(exc.value, InsecureHopRefused)
 
 
-def test_a_webhook_host_outside_the_allowlist_is_left_to_the_post_refusal() -> None:
-    """As for the SMTP relay: the allowlist refuses the host at every POST, so the guard does not
-    send the operator to attest a hop the egress policy forbids. A listed host is still judged."""
-    transport = WebhookTransport(WEBHOOK, allowed_hosts=("other.example.test",), posture=ENFORCING)
-    with pytest.raises(ValueError, match="webhook_allowed_hosts"):
-        transport._post({"type": "t", "connection": "c"})
+def test_a_webhook_host_outside_the_allowlist_is_refused_at_the_build() -> None:
+    """BACKLOG #5088, a tightening: this host used to build with no revocation judgement and refuse
+    at every POST. The build now refuses it on the allowlist, before the revocation guard. A listed
+    host is still judged."""
+    with (
+        _guard_log() as log,
+        pytest.raises(ValueError, match="webhook_allowed_hosts") as exc,
+    ):
+        WebhookTransport(WEBHOOK, allowed_hosts=("other.example.test",), posture=ENFORCING)
+    assert not isinstance(exc.value, InsecureHopRefused)
+    assert not log.has(_WEBHOOK_CELL), log.state()
+    # The path token, the webhook's credential, never reaches the refusal.
+    assert "/services/" not in str(exc.value) and "synthetic" not in str(exc.value)
     with pytest.raises(InsecureHopRefused, match="revocation"):
         WebhookTransport(WEBHOOK, allowed_hosts=("HOOKS.example.test",), posture=ENFORCING)
+
+
+def test_an_allowlist_naming_no_host_refuses_every_host() -> None:
+    """``[""]`` is a non-empty list that names no host. An empty host is never listed, so it refuses
+    every host, including a URL whose host is empty, rather than matching one."""
+    with pytest.raises(ValueError, match="webhook_allowed_hosts"):
+        WebhookTransport(WEBHOOK, allowed_hosts=("",), posture=ENFORCING)
+    with pytest.raises(ValueError, match="smtp_allowed_hosts"):
+        _email(ENFORCING, allowed_hosts=("",))
+    with pytest.raises(ValueError, match="smtp_allowed_hosts"):
+        _notifier(ENFORCING, allowed_hosts=("",))
+    assert not alert_sinks.alert_host_allowed("", ("",))
+    assert not alert_sinks.alert_host_allowed("hooks.example.test", ("",))
+    # An empty allowlist, which an environment value of "" splits to, still admits any host.
+    assert alert_sinks.alert_host_allowed("hooks.example.test", ())
+
+
+def test_a_webhook_url_naming_no_host_is_refused_for_its_url() -> None:
+    # The remedy is the URL, so the refusal must not send the operator to the allowlist.
+    with pytest.raises(ValueError, match="names no host") as exc:
+        WebhookTransport(
+            "https:///services/T/B/x", allowed_hosts=("hooks.example.test",), posture=ENFORCING
+        )
+    assert "webhook_allowed_hosts" not in str(exc.value)
+
+
+def test_a_refused_cleartext_webhook_never_logs_that_its_hop_was_permitted(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with pytest.raises(ValueError, match="webhook_allowed_hosts"):
+        WebhookTransport(
+            "http://hooks.other.test/x",
+            allowed_hosts=("hooks.example.test",),
+            posture=NOT_ENFORCING,
+        )
+    assert "plaintext http; permitted" not in caplog.text
+
+
+class _PassedTheAllowlist(Exception):
+    """Raised by a stub placed just past the send's allowlist test, so nothing is dialled."""
+
+
+_ALLOWLIST_CASES = [
+    pytest.param("hooks.example.test", (), id="empty-list"),
+    pytest.param("hooks.example.test", ("hooks.example.test",), id="listed"),
+    pytest.param("HOOKS.example.test", ("hooks.EXAMPLE.test",), id="listed-other-case"),
+    pytest.param("hooks.example.test", ("other.example.test",), id="unlisted"),
+    pytest.param("hooks.example.test", ("",), id="names-no-host"),
+    pytest.param("hooks.example.test", ("hooks.example.test.",), id="trailing-dot"),
+]
+
+
+@pytest.mark.parametrize(("host", "allowed"), _ALLOWLIST_CASES)
+def test_the_build_and_the_send_apply_one_allowlist_test(
+    monkeypatch: pytest.MonkeyPatch, host: str, allowed: tuple[str, ...]
+) -> None:
+    """BACKLOG #5088: the build and every send of each hop refuse exactly the hosts the shared
+    predicate refuses, so a host cannot build and then fail every send, or the reverse."""
+    admitted = alert_sinks.alert_host_allowed(host, allowed)
+    stub = _raises(_PassedTheAllowlist)
+    # Past the allowlist test, so nothing else decides: the guard, the envelope and the dial.
+    monkeypatch.setattr(alert_sinks, "_refuse_webhook_revocation", lambda *a, **k: None)
+    monkeypatch.setattr(alert_sinks, "_refuse_alert_smtp_revocation", lambda *a, **k: None)
+    monkeypatch.setattr(alert_sinks, "checked_envelope", stub)
+    monkeypatch.setattr(alert_sinks._NO_REDIRECT_OPENER, "open", stub)
+
+    def builds(build: Callable[[], object]) -> bool:
+        try:
+            build()
+        except ValueError:
+            return False
+        return True
+
+    url = f"https://{host}/hook"
+    webhook_built = builds(lambda: WebhookTransport(url, allowed_hosts=allowed, posture=ENFORCING))
+    sent = WebhookTransport(url, posture=ENFORCING)
+    sent.allowed_hosts = tuple(h.lower() for h in allowed)  # as __init__ stores them
+    with pytest.raises((ValueError, _PassedTheAllowlist)) as post:
+        sent._post({"type": "t", "connection": "c"})
+    assert webhook_built is admitted
+    assert isinstance(post.value, _PassedTheAllowlist) is admitted
+
+    with pytest.raises((ValueError, _PassedTheAllowlist)) as built:
+        _email(ENFORCING, host=host, allowed_hosts=allowed)
+    assert isinstance(built.value, _PassedTheAllowlist) is admitted  # the build's envelope check
+    with pytest.raises((ValueError, _PassedTheAllowlist)) as mailed:
+        alert_sinks.send_plain_email(
+            host=host,
+            port=587,
+            sender="alerts@example.test",
+            recipients=["ops@example.test"],
+            subject="s",
+            body="b",
+            allowed_hosts=allowed,
+        )
+    assert isinstance(mailed.value, _PassedTheAllowlist) is admitted
+    # No login, so the notifier's own revocation guard has nothing to judge here.
+    notifier_built = builds(
+        lambda: _notifier(ENFORCING, host=host, allowed_hosts=allowed, username=None, password=None)
+    )
+    assert notifier_built is admitted
 
 
 def test_a_truthy_non_bool_attestation_does_not_cross() -> None:

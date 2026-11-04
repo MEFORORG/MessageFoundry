@@ -337,7 +337,9 @@ from messagefoundry.store.store import (
     report_unsealed_role_records,
     report_unsealed_users,
     report_user_reseal,
+    require_ingress_audit,
     require_notify_email,
+    require_operator_audit,
     require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
@@ -4230,6 +4232,7 @@ class PostgresStore:
         skeleton row — the two-object commit's second half — AND its ``message_attachment`` linkage row is
         inserted (Phase 3a). A missing ref fails loud → the whole ingress rolls back → no ACK for a body
         we couldn't reference. Empty/None → the byte-identical no-detach path."""
+        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
@@ -7386,6 +7389,7 @@ class PostgresStore:
         docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
         A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580).
         ``audit``'s row commits with the replay (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             stuck_row = await conn.fetchrow(
@@ -7477,6 +7481,7 @@ class PostgresStore:
         SKIP-LOCKED/MVCC. Idempotency: the ``resend_log`` INSERT (ON CONFLICT DO NOTHING) runs FIRST and
         the outbound row is created only when it returned a row (ADR 0090 §4). ``audit``'s row
         commits with the resend, a duplicate included (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
@@ -7688,6 +7693,7 @@ class PostgresStore:
         (ADR 0013) the fresh INGRESS row lands at the channel's ingress tail — a new logged receipt, not
         re-inserted into any historical outbound-lane position, so no outbound writer-funnel applies.
         ``audit``'s row commits with the resubmit, a duplicate included (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
@@ -7848,6 +7854,7 @@ class PostgresStore:
         pass-through marker exclusion (:data:`_NOT_PT_MARKER`, BACKLOG #1580) is written twice for the
         same reason, and the same file pins it. ``audit``'s row commits with the replay, zero
         included (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             ids = await conn.fetch(
@@ -7905,6 +7912,7 @@ class PostgresStore:
         even while it is backing off and not yet due (ADR 0059). With a ``channel_id`` it is the
         oldest row from that producer, the lane head only when no other inbound feeds the
         destination. Returns the number cancelled."""
+        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         # `top_only` cancels the true FIFO head, so it orders by the claim's seq-only key alone (ADR
         # 0059). Not next_attempt_at first: mark_failed pushes a failed head's next_attempt_at past the
@@ -8506,7 +8514,7 @@ class PostgresStore:
         ]
 
     async def _append_operator_audit[R](
-        self, conn: Any, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+        self, conn: Any, written: AuditedWrite, audit: OperatorAudit[R], result: R
     ) -> None:
         """Append an operator mutation's audit row inside its transaction (BACKLOG #2624), so an
         append that fails rolls the mutation back. ``written`` tees the row once the commit lands.
@@ -8828,7 +8836,7 @@ class PostgresStore:
         approver: str,
         decided_at: float,
         seal_read: object,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
         #3638); the Store protocol states the contract. The row is read ``FOR UPDATE``, as
@@ -9267,7 +9275,7 @@ class PostgresStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -9453,7 +9461,7 @@ class PostgresStore:
         *,
         expected_username: str,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=$4` on the old name makes it a compare-and-set; AuthStore says
@@ -9744,7 +9752,7 @@ class PostgresStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG

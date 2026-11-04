@@ -26,10 +26,16 @@ with ``do_handshake()``. Both treat any ``ssl.SSLError`` from it as a failed han
 exactly that set and re-raises unchanged, so the loop's own handling does not move. No server or
 protocol class is replaced.
 
-**What it cannot see, at least, stated so it is not over-read.**
+**What it does not see or read, at least, stated so it is not over-read.**
 
-* **The peer's address.** A TLS object holds two memory buffers and no socket, so these reports
-  name no peer. A trailing report for several failures names none anyway.
+* **The peer's address, which the hook does not read.** These reports name no peer, and a trailing
+  report for several failures names none anyway. A TLS object holds two memory buffers and no
+  socket. Measured for vault BACKLOG #3302 on CPython 3.14.7 and uvicorn 0.54.0, with the stdlib
+  Proactor loop on Windows: inside ``do_handshake`` the address was reachable through private loop
+  state, at least through the caller's frame and through ``gc.get_referrers``, each to the loop
+  protocol's private ``_transport``. uvloop was not measured, since it has no Windows build.
+  Until the owner rules on #3302, the hook reads no private loop state to find the peer.
+  Whether to build a peer report is an open owner question (vault BACKLOG #3302).
 * **A handshake past its bound, where the loop runs it. A known limit, declined by owner ruling
   2026-10-26 (vault BACKLOG #3785 item 7).** The loop aborts the transport and never calls
   ``do_handshake`` again, so nothing raises, and a peer that opens sockets and stays silent is not
@@ -224,7 +230,7 @@ class HandshakeFailures:
             self._report_soon()
 
     def watch(self, ctx: ssl.SSLContext) -> None:
-        """Count each handshake the event loop fails on ``ctx``. The peer is not known there. The
+        """Count each handshake the event loop fails on ``ctx``. The peer is not read there. The
         hook holds this counter, never the listener, since this counter holds its listener only
         weakly. So ``ctx`` and the listener form no cycle."""
         watch_loop_handshakes(ctx, self._note_loop_failure)
