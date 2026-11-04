@@ -107,6 +107,22 @@ async def assert_revoke_all_contract(store: Any, raw: RawSql) -> None:
     assert await store.revoke_all_sessions(except_token_hash=hash_token(mint_token())) >= 1
     assert await service.identity_for_token(late) is None
 
+    # --- a kept session a sweep missed is not stamped back to validity (BACKLOG #4975) ----------
+    # Its restored sealed copy stands where a missed row would: live, sealed, an epoch behind.
+    missed = await _mint(store, alice)
+    snapshot = await store.get_session(hash_token(missed))
+    assert snapshot is not None
+    assert await store.revoke_all_sessions() >= 1
+    await raw(
+        "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
+        (snapshot.seal, hash_token(missed)),
+    )
+    await store.revoke_all_sessions(except_token_hash=hash_token(missed))
+    left = await store.get_session(hash_token(missed))
+    assert left is not None and left.revoked_at is None
+    assert left.user_epoch == snapshot.user_epoch  # not re-stamped with the new epoch
+    assert await service.identity_for_token(missed) is None
+
 
 @pytest.fixture
 async def keyed(tmp_path: Path) -> AsyncIterator[tuple[MessageStore, Path]]:

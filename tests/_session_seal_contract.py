@@ -226,3 +226,41 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     assert restored is not None and session_seal_ok(sealer, restored)  # the copy's seal holds...
     assert await service.identity_for_token(other) is None  # ...and its epoch is stale
     assert await service.identity_for_token(mine) is not None
+
+    # --- a kept session a sweep missed is not stamped back to validity (BACKLOG #4975) ----------
+    # Restoring a revoked row's sealed copy leaves it where a row the sweep missed stands: live,
+    # sealed, an epoch behind the account. The service is not asked about it before the revoke,
+    # because a refusal would end it.
+    missed = await _mint(store)
+    snapshot = await store.get_session(hash_token(missed))
+    assert snapshot is not None
+    current = await _mint(store)
+    assert await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(current)) >= 1
+    assert await service.identity_for_token(current) is not None  # control: a current one is kept
+    await raw(
+        "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
+        (snapshot.seal, hash_token(missed)),
+    )
+    await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(missed))
+    left = await store.get_session(hash_token(missed))
+    assert left is not None and left.revoked_at is None
+    assert left.user_epoch == snapshot.user_epoch  # not re-stamped with the new epoch
+    assert await service.identity_for_token(missed) is None
+    assert await service.identity_for_token(current) is None  # the revoke still ended the others
+
+    # --- nor when the account's own seal fails and its epoch cannot move ------------------------
+    # The guard compares to the epoch the raise replaced, not to the new epoch less one: with no
+    # raise, a session one epoch behind would match that and be stamped current.
+    behind = await _mint(store)
+    snapshot = await store.get_session(hash_token(behind))
+    assert snapshot is not None
+    await store.revoke_user_sessions("seal-u1")
+    await raw(
+        "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
+        (snapshot.seal, hash_token(behind)),
+    )
+    await raw("UPDATE users SET display_name=? WHERE id=?", ("Bent", "seal-u1"))
+    await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(behind))
+    left = await store.get_session(hash_token(behind))
+    assert left is not None and left.revoked_at is None
+    assert left.user_epoch == snapshot.user_epoch
