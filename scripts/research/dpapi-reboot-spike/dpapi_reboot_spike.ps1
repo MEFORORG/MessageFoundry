@@ -89,29 +89,32 @@
   It prints the DPAPI-REBOOT lines at the end and leaves them, the transcript and the raw reports
   in the out folder it names.
 
-  RESULTS. The code that ran is commit b7948f2bfcb9ad2ebfdf6fc9b10b07b6051aa98c; the commit that
-  adds this block changes nothing else. -Mode Payload, run from MEFORDEV01 through hvtest
-  (Invoke-HvTest.ps1 at vault f71a97426) on REVTEST01 at post-move-mefor-lab-2026-10-17, results
-  stamp 20261104T065830Z; hvtest printed "end: pass, exit 0: entry exit 0", every stage ok.
-  Verbatim lines from the VM's dpapi-reboot-spike.txt, a selection, unedited but for one master key's file name, given as <guid>:
+  RESULTS. The code that ran is commit cde90392a04760c5a0170ad35a23b2dea760eea8; the commit that
+  adds this block changes nothing below this header. -Mode Payload, run from MEFORDEV01 through
+  hvtest (Invoke-HvTest.ps1 at vault f71a97426) on REVTEST01 at post-move-mefor-lab-2026-10-17,
+  results stamp 20261104T073536Z; hvtest printed "end: pass, exit 0: entry exit 0", every stage ok.
+  Verbatim lines from the VM's dpapi-reboot-spike.txt, a selection, unedited but for one master
+  key's file name, given as <guid>:
     guest=REVTEST01 os=Microsoft Windows Server 2022 Datacenter version=10.0.20348 build=20348
     caller=REVTEST01\Administrator powershell=7.6.7
     registration=ObjectName NT SERVICE\MeforDpapiReboot, ServiceSidType 3 (restricted), RequiredPrivileges SeChangeNotifyPrivilege, Start 2 (auto)
+    boot_id=5
     masterkey=NO FOLDER C:\Windows\ServiceProfiles\MeforDpapiReboot\AppData\Roaming\Microsoft\Protect\S-1-5-80-4122042409-3321711707-2963677527-2474584594-1716172443
     masterkey_count=2
-    masterkey=<guid> bytes=468 written=2026-11-04T06:58:55.7223139Z
+    masterkey=<guid> bytes=468 written=2026-11-04T07:36:01.3489345Z
     profile-A3 loaded_before_start=True profile=C:\Windows\ServiceProfiles\MeforDpapiReboot
     profile=kept, still loaded: C:\Windows\ServiceProfiles\MeforDpapiReboot
     DPAPI-REBOOT crosscheck, the administrator opens the service's user-scope blob: admin_open=FAIL win32=-2146893813 by REVTEST01\Administrator exit=0
     DPAPI-REBOOT A1 first start, protect and unprotect in user scope: YES (user_unprotect OK match; controls HELD: foreign FAIL win32=-2146893813, tampered FAIL win32=13, machine OK match)
     DPAPI-REBOOT A2 after a service restart: YES (user_unprotect OK match; controls HELD: foreign FAIL win32=-2146893813, tampered FAIL win32=13, machine OK match)
-    DPAPI-REBOOT A3 after the profile was unloaded: INCONCLUSIVE (the profile was not seen unloaded before the start; controls HELD: foreign FAIL win32=-2146893813, tampered FAIL win32=13, machine OK match)
+    DPAPI-REBOOT A3 after the profile was unloaded: INCONCLUSIVE (the profile was not seen unloaded before the start)
     DPAPI-REBOOT A4 after a reboot, the SCM start at boot: NOT RUN (this route cannot reboot the VM inside a run)
     DPAPI-REBOOT A5 after a reboot, a demand start: NOT RUN (this route cannot reboot the VM inside a run)
     DPAPI-REBOOT VERDICT: NOT RUN
-  Notes, not raw lines. The first masterkey line is A1's, before its protect; the next two are A2's,
-  and A3's read the same. profile-A3 was read after A3's step waited 300 s with the service stopped.
-  Two runs of earlier drafts of this file (05:46 and 06:03 UTC) gave the same A1 to A5 answers.
+  Notes, not raw lines. boot_id=5 was the same in A1, A2 and A3. The first masterkey line is A1's,
+  before its protect; the next two are A2's, and A3's read the same. profile-A3 was read after A3's
+  step waited 300 s with the service stopped. Three runs of earlier drafts of this file (05:46,
+  06:03 and 06:58 UTC) gave the same A1 to A5 answers.
   What that shows. User-scope DPAPI works under the restricted virtual account, and the blob is
   bound to it both ways: the service cannot open the administrator's blob, nor the administrator
   the service's (-2146893813 is 0x8009000B, NTE_BAD_KEY_STATE). It survives a restart. The virtual
