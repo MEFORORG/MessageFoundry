@@ -642,19 +642,23 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    held too (BACKLOG #4942, #4936).** `rotate-key` rolls a keyed audit chain only after both data
    passes, so on a store with a keyed chain a start that finds a changed key and a chain not yet
    rolled to it opens the rotation record for that key itself, writes no stamp, and logs a WARNING.
-   That covers a start between setting the new key and the first run, a run killed inside the store
+   A record already open for another key is kept rather than replaced, and still holds that key
+   when it comes back, since a run may have rolled the chain to it with an upload still under the
+   prior key. That covers a start between setting the new key and the first run, a run killed inside the store
    open before it opened the record, and a key changed by hand; each is held until a run completes.
    A key changed with no record still stamps on a store with no keyed chain to ask, such as one
    whose audit rows open with no genesis row naming its key, so there a stamp proves only a changed
-   key. Still, do not start `serve` on the new key alone before a run's roll succeeds: the chain's
+   key. On such a store, do not start `serve` between setting a new key and running `rotate-key`:
+   that stamp stands however the run ends. On any store, do not start `serve` on the new key alone before a run's roll succeeds: the chain's
    current range is then under a key it does not hold, so it keys new audit rows under the new key,
    those rows never verify inside that range, and no later `rotate-key` can roll the chain.
    **A roll that refuses for good holds the key for good (BACKLOG #4934, #4935).** The roll verifies
    the whole chain first, so a chain `audit-verify` reports broken, or one whose rows open with no
-   genesis row, refuses under every key, a new one included, and the record stays open. The
-   refusal names the way out: `[secret_rotation].store_key_last_rotated`, set to the date of a run
-   that re-sealed the data with no skip, or `[secret_rotation].enforce_store_key_expiry = false`,
-   which lifts only the start refusal and is a named security loosening.
+   genesis row, refuses under every key, a new one included, and the record stays open. On a run
+   that changed the key, that refusal names at least two ways out:
+   `[secret_rotation].store_key_last_rotated`, set to the date of a run that re-sealed the data with
+   no skip, and `[secret_rotation].enforce_store_key_expiry = false`, which lifts only the start
+   refusal and is a named security loosening.
    **After a run whose roll succeeded on a keyed audit chain, moving it to a new key, you cannot go
    back to the prior key (owner ruling 2026-10-30, BACKLOG #3737).** A skip does not stop the roll,
    so an engine started on the new key alone keeps a chain that verifies. A key opens one audit

@@ -8,15 +8,16 @@ indefinitely with no in-engine signal. :class:`SecretRotationRunner` is a small 
 periodically compares each tracked secret's **last-rotated date** against its **max age** and raises a
 ``secret_rotation_due`` alert when it is overdue or within ``[secret_rotation].warn_days`` of due.
 
-**Live-by-default (ASVS 13.3.4, BACKLOG #282).** The DEK is tracked without operator action: a keyed
-start :func:`reconcile_rotation_meta` persists a NON-SECRET stamp (the DEK's one-way key-id + a
+**Live-by-default (ASVS 13.3.4, BACKLOG #282).** The DEK is tracked without operator action: at a
+keyed start, :func:`reconcile_rotation_meta` persists a NON-SECRET stamp (the DEK's one-way key-id + a
 *tracked-since* floor date) in store meta, and the runner falls back to it when
-``store_key_last_rotated`` is unset. Not unconditionally: a start writes no stamp for a key the
-rotation record holds, and opens that record itself for a changed key the keyed audit chain has not
-been rolled to (BACKLOG #3737, #4942). The reconcile says when a stamp is written. The enumeration is widened beyond the DEK: each configured secret
-class the engine holds is fingerprinted with a **KEYED MAC** (HMAC under a per-row random key — never a
-salted hash) and the key and MAC are sealed together as a **store-cipher cell** in store meta, so a
-reader without the store key has nothing to test a guess of a low-entropy secret against (BACKLOG
+``store_key_last_rotated`` is unset. Not at every start: a start writes no stamp for a key the
+rotation record holds, nor for a changed key the keyed audit chain has not been rolled to, for which
+it opens that record itself unless one stands open for another key (BACKLOG #3737, #4942). The
+reconcile says when a stamp is written. The enumeration is widened beyond the DEK: each configured
+secret class the engine holds is fingerprinted with a **KEYED MAC** (HMAC under a per-row random
+key — never a salted hash) and the key and MAC are sealed together as a **store-cipher cell** in
+store meta, so a reader without the store key has nothing to test a guess of a low-entropy secret against (BACKLOG
 #3472, ADR 0213). When the secret no longer matches its cell the clock is reset (rotation
 **auto-detected**, never operator-attested). ``rotate-key`` re-seals each cell under the new store
 key, so a store key rotation never reads as a rotation of every other secret, and a cell the engine
@@ -54,7 +55,7 @@ import secrets
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeGuard
 
 from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.settings import CONNECTOR_SECRET_EXPIRY_CLASS
@@ -258,6 +259,11 @@ ROTATION_RECORD_ID = "rotate-key:incomplete"
 _ROTATION_RECORD_CLOSED = ""
 
 
+def _record_open(record: SecretRotationMetaRow | None) -> TypeGuard[SecretRotationMetaRow]:
+    """Whether the rotation record ``record`` stands open, naming some key or unreadable."""
+    return record is not None and record.fingerprint != _ROTATION_RECORD_CLOSED
+
+
 def dek_changed(prior: SecretRotationMetaRow | None, fingerprint: str) -> bool | None:
     """Whether the DEK ``fingerprint`` differs from the stored stamp ``prior``, by
     :func:`fingerprint_changed`, which also says what ``None`` means. A store with no stamp yet
@@ -267,11 +273,17 @@ def dek_changed(prior: SecretRotationMetaRow | None, fingerprint: str) -> bool |
     return True if prior is None else fingerprint_changed(prior.fingerprint, fingerprint)
 
 
-async def open_rotation_record(meta_store: SecretRotationMetaStore, key_id: str, day: str) -> None:
+async def open_rotation_record(
+    meta_store: SecretRotationMetaStore, key_id: str, day: str, *, keep_another: bool = False
+) -> bool:
     """Record that ``rotate-key`` is moving this store to the DEK ``key_id``, before either data
     pass, so a crash or a failed step in one leaves the record standing (BACKLOG #3737). The store
     open has run by then and can already have written under the key. A ``serve`` start calls it too,
-    for a changed key the keyed audit chain has not rolled to (BACKLOG #4942).
+    for a changed key the keyed audit chain has not rolled to (BACKLOG #4942), with ``keep_another``:
+    it then writes nothing over a record open for another key. That record holds its own key, which a
+    run may have rolled the chain to with an upload still under the prior key, so replacing it would
+    let a later start on that key stamp it. ``rotate-key`` replaces it, keeping its dates, because the
+    run then re-seals what the record stood for.
 
     Skipped when the stored stamp already names ``key_id``, so there is nothing for
     :func:`reconcile_rotation_meta` to withhold. That is a run with the key already in use, or one a
@@ -283,21 +295,28 @@ async def open_rotation_record(meta_store: SecretRotationMetaStore, key_id: str,
     a store with no stamp reads the key's age from them, and a run that only starts must not make
     that age young again. They are copied as text, so a date that does not parse stays one, and
     :func:`_kept_dates` reads it as an undetermined age. Only a closed or absent record takes
-    ``day``."""
+    ``day``.
+
+    Returns whether the record stands open naming ``key_id`` after the call: ``False`` for a run
+    with the key already in use and for a record kept for another key. ``rotate-key`` reads it to
+    tell a real key change from a same-key run (BACKLOG #4934, #4935)."""
     fingerprint = dek_fingerprint(key_id)
     rows = await meta_store.get_secret_rotation_meta()
     record = rows.get(ROTATION_RECORD_ID)
-    if dek_changed(rows.get(_DEK_CLASS_ID), fingerprint) is False or (
-        record is not None and record.fingerprint == fingerprint
-    ):
-        return
-    held = None if record is None or record.fingerprint == _ROTATION_RECORD_CLOSED else record
+    if dek_changed(rows.get(_DEK_CLASS_ID), fingerprint) is False:
+        return False
+    if record is not None and record.fingerprint == fingerprint:
+        return True
+    held = record if _record_open(record) else None
+    if keep_another and held is not None:
+        return False
     await meta_store.upsert_secret_rotation_meta(
         ROTATION_RECORD_ID,
         fingerprint=fingerprint,
         tracked_since=day if held is None else held.tracked_since,
         last_rotated=day if held is None else held.last_rotated,
     )
+    return True
 
 
 async def close_rotation_record(meta_store: SecretRotationMetaStore, day: str) -> None:
@@ -305,7 +324,7 @@ async def close_rotation_record(meta_store: SecretRotationMetaStore, day: str) -
     #3737). The row is blanked, not deleted: the store protocol has no delete, and a blank reads as
     no rotation in progress. Writes nothing where none is open."""
     record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
-    if record is not None and record.fingerprint != _ROTATION_RECORD_CLOSED:
+    if _record_open(record):
         await meta_store.upsert_secret_rotation_meta(
             ROTATION_RECORD_ID,
             fingerprint=_ROTATION_RECORD_CLOSED,
@@ -324,6 +343,17 @@ _OPENED_AT_START = (
     "its error says whether a re-run can clear that, and the way out where none can."
 )
 
+#: The WARNING a start logs when it held a key and kept a record open for another key (BACKLOG
+#: #4942): see :func:`open_rotation_record`'s ``keep_another``.
+_HELD_FOR_ANOTHER_RECORD = (
+    "secret rotation: the store key in use differs from its stamp, or has none, and the audit "
+    "chain has not been rolled to it, while the rotation record stands open for another store key "
+    "that no `messagefoundry rotate-key` run has completed on. That record was kept, this key's "
+    "rotation date was not stamped and its age was not reset. Stop the engine and run "
+    "`messagefoundry rotate-key`, with every prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, "
+    "until it exits 0."
+)
+
 
 def _rotation_hold(record: SecretRotationMetaRow | None, fingerprint: str) -> str | None:
     """Why the rotation record says the DEK ``fingerprint`` must not be stamped, as the line to log,
@@ -331,8 +361,10 @@ def _rotation_hold(record: SecretRotationMetaRow | None, fingerprint: str) -> st
 
     It holds for a record naming this key. It also holds for a record that cannot be read, because
     this function fails toward NOT stamping: an unstamped key over-reports its age, and a false stamp
-    is what would lift an overdue refusal. A record naming another key does not hold: the key in use
-    was changed by hand, so it stamps as any such change does."""
+    is what would lift an overdue refusal. A record naming another key does not hold here: the key
+    in use was changed by hand. Where the keyed audit chain has not rolled to that key,
+    :func:`reconcile_rotation_meta` holds it anyway and keeps the record (BACKLOG #4942); elsewhere
+    it stamps as any such change does."""
     if record is None or record.fingerprint == _ROTATION_RECORD_CLOSED:
         return None
     # A key id has one length, so one of any other length is a damaged record, not another key.
@@ -555,9 +587,10 @@ async def reconcile_rotation_meta(
     store: ``rotate-key`` rolls a keyed chain only after both data passes, so ``False`` means no run
     got that far on this key. That covers a start before the first run, a run killed before it
     opened the record, inside the store open, and a key changed by hand. The start opens the record
-    for the key, as ``rotate-key`` would, and is held by it. A DEK changed with no record stamps only
-    where ``audit_rolled`` is not ``False``: ``None``, a store with no keyed chain to ask, such as one
-    whose rows open with no genesis row, or ``True``, a chain already rolled to the key. So on a store
+    for the key, as ``rotate-key`` would, and is held by it. Where the record stands open for another
+    key the start keeps it and is held all the same, so that key stays held when it comes back. A
+    DEK changed with no record stamps only where ``audit_rolled`` is not ``False``: ``None``, a
+    store with no keyed chain to ask, such as one whose rows open with no genesis row, or ``True``, a chain already rolled to the key. So on a store
     with a keyed chain a stamp says a run rolled the chain to the key, and elsewhere it proves only a
     changed key.
 
@@ -615,9 +648,13 @@ async def reconcile_rotation_meta(
             # that completes finds it and closes it, and a later start reads the same dates.
             # Re-read for those dates, which `dated` below takes when there is no stamp, and to see
             # that it wrote: a writer between the two reads can have stamped the key first.
-            await open_rotation_record(meta_store, dek_key_id, today.isoformat())
+            # A record open for another key is kept, and this key is held all the same.
+            await open_rotation_record(meta_store, dek_key_id, today.isoformat(), keep_another=True)
             record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
-            hold = _OPENED_AT_START if _rotation_hold(record, fingerprint) else None
+            if _rotation_hold(record, fingerprint):
+                hold = _OPENED_AT_START
+            elif _record_open(record):
+                hold = _HELD_FOR_ANOTHER_RECORD
         # With no stamp yet, a held key's age runs from the record, whose dates a re-run keeps, so
         # it is never younger than the run that opened it. A floor of today would restart at every
         # start, and a key held that way could never go overdue.

@@ -10525,6 +10525,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.store import audit_roll_refused_for_good
     from messagefoundry.uploads import ResealResult, UploadStore
 
     cli: dict[str, dict[str, object]] = {}
@@ -10602,7 +10603,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
+    async def run() -> tuple[int, ResealResult, tuple[bool, str], bool]:
         import datetime
 
         from messagefoundry.pipeline.secret_rotation import (
@@ -10622,8 +10623,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
             key_id = store.cipher_info().active_key_id
             # BACKLOG #3737: before either data pass, so a kill or an abort in one leaves it open too.
             # The store open above can already have written under this key.
+            # Whether it names this key: a run with the key already in use opens none.
+            record_named = False
             if isinstance(store, SecretRotationMetaStore) and key_id:
-                await open_rotation_record(store, key_id, today)
+                record_named = await open_rotation_record(store, key_id, today)
             count = await store.reencrypt_to_active()
             # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
             # had no rotation of any kind — a rotation re-sealed every database cell and left every
@@ -10693,7 +10696,12 @@ def _rotate_key(args: argparse.Namespace) -> int:
                             last_rotated=today,
                         )
                 await close_rotation_record(store, today)
-            return count, uploads, rolled
+            # BACKLOG #4934, #4935: some chains no run can roll, under any key, a new one
+            # included, and the rotation record then holds a changed key's stamp for good. Name a
+            # way out only then: a same-key run opened no record and has no age to fix, and a
+            # refusal a re-run or a restored key clears has its own remedy in the roll's error.
+            way_out = record_named and not rolled[0] and audit_roll_refused_for_good(rolled[1])
+            return count, uploads, rolled, way_out
         finally:
             await store.close()
 
@@ -10707,7 +10715,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         *_key_unresolved(),
     )
     try:
-        count, uploads, (rolled_ok, rolled_msg) = run_guarded(run())
+        count, uploads, (rolled_ok, rolled_msg), name_way_out = run_guarded(run())
     except CipherError as exc:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
@@ -10805,22 +10813,19 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "without this error.",
             file=sys.stderr,
         )
-        # BACKLOG #4934, #4935: some chains no run can roll, under any key, a new one included, and
-        # the rotation record then holds the key's stamp for good. Name the way out here, where the
-        # operator meets it, rather than leave a re-run that can only fail again.
-        print(
-            "Where `messagefoundry audit-verify` reports this chain broken, or this error says it "
-            "does not open with a genesis row naming its key, no run will roll it, under any key, "
-            "a new one included, because the roll verifies the whole chain first. A start on the "
-            "new key alone before a roll is one way to break it. The rotation record then stays "
-            "open, so no serve start stamps this key, and its age runs from the prior rotation "
-            "date, or from the date the record opened where there is none. The ways out are "
-            "[secret_rotation].store_key_last_rotated, set to the date of a run that re-sealed "
-            "the data with no skip, which then dates this key at every start until you change "
-            "it, or [secret_rotation].enforce_store_key_expiry = false, which lifts only the "
-            "start refusal and is a named security loosening.",
-            file=sys.stderr,
-        )
+        if name_way_out:  # BACKLOG #4934, #4935, decided in run()
+            print(
+                "note: no run will roll this audit chain, under any key, a new one included, "
+                "because the roll verifies the whole chain first. A start on the new key alone "
+                "before a roll is one way to break it. The rotation record stays open, so no serve "
+                "start stamps this key, and its age runs from the prior rotation date, or from the "
+                "date the record opened where there is none. The ways out include at least "
+                "[secret_rotation].store_key_last_rotated, set to the date of a run that re-sealed "
+                "the data with no skip, which then dates this key at every start until you change "
+                "it, and [secret_rotation].enforce_store_key_expiry = false, which lifts only the "
+                "start refusal and is a named security loosening.",
+                file=sys.stderr,
+            )
         return 1
     print(f"{'OK' if complete else 'note'}: {rolled_msg}")
     if uploads.skipped:
