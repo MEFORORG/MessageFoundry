@@ -3968,7 +3968,9 @@ def _handlerless_root() -> Iterator[logging.Logger]:
     handlers to the root logger at the start of each test phase, so a fixture that strips them in
     setup would watch them come back for the call (the same measurement
     ``tests/test_audit_offbox_tee.py::_handlerless_process`` records). Both the handler list and the
-    level are restored on the way out, which also removes whatever main() installed."""
+    level are restored on the way out, which also removes the root handler main() installed. The
+    ``logging.lastResort`` main() replaces is put back by the conftest's ``root_logging_restored``,
+    not here."""
     root = logging.getLogger()
     saved_handlers, saved_level = list(root.handlers), root.level
     root.handlers.clear()
@@ -4071,8 +4073,9 @@ def test_the_logging_exemption_covers_only_subcommands_that_configure_their_own(
     cannot be used as a way to skip the chain.
 
     What this does NOT prove is that the call comes before the subcommand's first log record. It
-    does not for ``serve``, whose pre-configure window ``_CONFIGURES_OWN_LOGGING`` describes. The
-    ``serve`` startup-sink tests below cover that window (BACKLOG #3768)."""
+    does not for ``serve`` or ``supervise``, whose pre-configure windows
+    ``_CONFIGURES_OWN_LOGGING`` describes. The child-process tests below cover them (BACKLOG
+    #3768, #4716)."""
     assert cli_module._CONFIGURES_OWN_LOGGING == _SELF_CONFIGURING
     # Both controls read THIS test: it calls `_calls`, and it names configure_logging only in its
     # docstring and a message string, which must not count as a call.
@@ -4278,18 +4281,38 @@ def test_a_real_serve_process_without_the_install_leaks_while_it_parses(tmp_path
     )
 
 
+def _warn_in_supervise_window(*, prefix: str = "") -> str:
+    """A child body whose probe stands in for ``supervise``'s remote-debug guard, the first thing
+    it runs before its own ``configure_logging``, then exits 3 before anything is supervised."""
+    return (
+        prefix + _child_window_probe("window") + "    raise SystemExit(3)\n"
+        "m.install_remote_debug_guard = _probe\n"
+        "raise SystemExit(m.main(['supervise']))\n"
+    )
+
+
 def test_a_real_supervise_process_redacts_a_warning_before_its_handlers(tmp_path: Path) -> None:
-    """BACKLOG #4716: ``supervise`` logs before its own ``configure_logging`` too, from its
-    remote-debug guard on, and that window now meets the filtered ``lastResort``. The probe stands
-    in for the guard, then exits 3 before anything is supervised."""
+    """BACKLOG #4716: ``supervise`` logs before its own ``configure_logging`` too, and that window
+    now meets the filtered ``lastResort``."""
     _run_warning_driver(
         tmp_path,
         "warn_in_the_supervise_window.py",
-        _child_window_probe("window") + "    raise SystemExit(3)\n"
-        "m.install_remote_debug_guard = _probe\n"
-        "raise SystemExit(m.main(['supervise']))\n",
+        _warn_in_supervise_window(),
         returncode=3,
         handlers_line="window 0 _FilteredLastResort",
+    )
+
+
+def test_a_real_supervise_process_without_the_install_leaks(tmp_path: Path) -> None:
+    """The control for the test above: with the install taken out, the same WARNING meets the
+    stdlib's own ``lastResort`` and the synthetic segment reaches stderr whole."""
+    _run_warning_driver(
+        tmp_path,
+        "leak_in_the_supervise_window.py",
+        _warn_in_supervise_window(prefix="m.install_filtered_last_resort = lambda: None\n"),
+        returncode=3,
+        handlers_line="window 0 _StderrHandler",
+        leaks=True,
     )
 
 

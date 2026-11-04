@@ -831,7 +831,8 @@ def _refuse_forward_revocation(forward: SyslogForward, ctx: ssl.SSLContext) -> N
     **Known limit, recorded rather than left for the next reader to find.** The WARN arm on a
     non-enforcing instance logs *after* ``configure_logging`` has set the root level, so it is
     filtered out at ``[logging].level`` above WARNING -- unlike its #200 sibling, which logs before
-    that and survives on ``serve``'s filtered ``lastResort`` (:func:`install_filtered_last_resort`).
+    that and survives on the filtered ``lastResort`` ``main()`` installs
+    (:func:`install_filtered_last_resort`).
     The REFUSE arm is unaffected (it raises).
     Measured 2026-09-22 at ``WARNING`` and ``ERROR``.
 
@@ -2139,6 +2140,11 @@ def configure_stderr_logging(level: int = logging.WARNING) -> logging.Handler:
     return handler
 
 
+#: The standard library's own ``logging.lastResort``, read at import, so
+#: :func:`install_filtered_last_resort` can tell it from one a host set (BACKLOG #3768).
+_STDLIB_LAST_RESORT = logging.lastResort
+
+
 class _FilteredLastResort(logging.StreamHandler[TextIO]):
     """The standard library's ``logging.lastResort`` with the PHI filter chain added.
 
@@ -2164,31 +2170,33 @@ class _FilteredLastResort(logging.StreamHandler[TextIO]):
 
 def install_filtered_last_resort() -> logging.Handler | None:
     """Replace ``logging.lastResort`` with one carrying the PHI filter chain, and return it; return
-    None, and change nothing, where the root logger already has a handler (BACKLOG #3768).
+    None, and change nothing, where the root logger already has a handler or ``lastResort`` is not
+    the standard library's own (BACKLOG #3768).
 
     The standard library hands a record to ``logging.lastResort`` when no handler took it: no
     handler on the logger or any ancestor it propagates to. That handler prints ``WARNING`` and
     above to stderr with no filter, and under NSSM that stderr is ``service.err.log``.
     ``__main__.main`` calls this before it parses the arguments, for every subcommand. ``serve``
-    is why: it calls :func:`configure_logging` only after its settings, key and egress gates run
-    (``__main__._serve``), and until then its root has no handler. Records keep the level gate,
-    the stream and the rule for when they arrive; each is now redacted and scrubbed, and carries
-    the text formatter's prefix. A record a handler took never reaches it, so nothing is written
-    twice.
+    and ``supervise`` are why: each calls :func:`configure_logging` only part-way through
+    (``__main__._serve``, ``__main__._supervise``), and until then its root has no handler.
+    Records keep the level gate, the stream and the rule for when they arrive; each is now
+    redacted and scrubbed, and carries the text formatter's prefix. A record a handler took never
+    reaches it, so nothing is written twice.
 
     Left in place for the life of the process, it still takes a record no handler takes after
     :func:`configure_logging` has run, such as one from a logger that does not propagate and has
-    no handler. It prints that record to stderr only, in the text format: the record never reaches
-    the configured handlers, ``[logging].file`` or the forwarder, and ``[logging].format = "json"``
-    does not apply to it, before or after :func:`configure_logging`.
+    no handler, and prints it to stderr only, in the text format.
 
-    **Only on an empty root**, as ``run_cli``'s sink: ``lastResort`` is process-wide, and a host
-    that configured logging first, such as an embedding host or pytest's capture, owns that
-    choice and keeps the stdlib's. Records logged before the call, at module import, meet the
-    stdlib's own; ``docs/PHI.md`` section 7 row 1 states that window."""
+    **Only on an empty root and the stdlib's own** ``lastResort``, as ``run_cli``'s sink: the
+    choice is process-wide, and a host that configured logging first, such as an embedding host
+    or pytest's capture, or that set ``lastResort`` itself, even to None, owns it. What this
+    leaves unfiltered, the module-import window first, is stated once, in ``docs/PHI.md``
+    section 7 row 1."""
     if logging.getLogger().handlers:
         return None
     if not isinstance(logging.lastResort, _FilteredLastResort):
+        if logging.lastResort is not _STDLIB_LAST_RESORT:
+            return None
         logging.lastResort = _FilteredLastResort()
     return logging.lastResort
 

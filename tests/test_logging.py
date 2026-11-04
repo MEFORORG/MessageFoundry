@@ -175,6 +175,23 @@ def test_the_filtered_last_resort_leaves_a_configured_root_alone() -> None:
     assert logging.lastResort is before and root.handlers == [hosts]
 
 
+@pytest.mark.parametrize("hosts", [None, logging.NullHandler()], ids=["none", "own-handler"])
+def test_the_filtered_last_resort_leaves_a_host_set_last_resort_alone(
+    hosts: logging.Handler | None,
+) -> None:
+    """A host that set ``lastResort`` itself, to None or to its own handler, keeps it, on an empty
+    root too. The conftest's restore puts the stdlib's back after this test."""
+    root = logging.getLogger()
+    root.handlers.clear()
+    logging.lastResort = hosts
+    assert logging_setup.install_filtered_last_resort() is None
+    assert logging.lastResort is hosts
+    logging.lastResort = logging_setup._STDLIB_LAST_RESORT  # the control: the stdlib's is replaced
+    assert isinstance(
+        logging_setup.install_filtered_last_resort(), logging_setup._FilteredLastResort
+    )
+
+
 def test_the_filtered_last_resort_refuses_a_stream_assignment() -> None:
     """BACKLOG #4716: assigning the stream raises, as it does on the stdlib's own ``lastResort``,
     rather than being dropped with the caller told nothing. ``setStream`` to the stream it already
