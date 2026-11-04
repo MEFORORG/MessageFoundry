@@ -4720,8 +4720,10 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   replaced, read under the account's lock. A missed session carries an older one, so it is left
   as it is and refused when next presented. Where the account's record fails its seal the epoch
   cannot be raised, and nothing is stamped. The request still ends the user's other sessions,
-  current ones included. All three stores make this check, and the session-seal and revoke-all
-  contracts test it on each store's test leg.
+  current ones included. All three stores make this check. The session-seal contract tests the
+  per-account revoke on the SQLite leg and on both server legs. The revoke-all contract tests the
+  every-account revoke on SQLite only: its server cases are gated on `MEFOR_TEST_POSTGRES` and
+  `MEFOR_TEST_SQLSERVER`, and no CI leg runs that file with either set.
   **At least three things are also wrong about a refused one.** Its ending is reported as a seal
   failure: a WARNING, an `integrity.authority_seal_failed` audit row and an `integrity_drift`
   alert. The report is rate-limited per session, and the alert goes through the alert notifier's
