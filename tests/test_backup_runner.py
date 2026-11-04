@@ -20,7 +20,6 @@ import tarfile
 import time
 from collections import namedtuple
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -30,6 +29,7 @@ from messagefoundry.pipeline.dr_backup import BackupError, BackupResult, BackupR
 from messagefoundry.store import MessageStore
 from messagefoundry.store.backup_codec import decrypt_stream, encrypt_stream, key_fingerprint
 from messagefoundry.store.crypto import generate_key, make_cipher
+from tests.test_config_fingerprint import _unlistable
 
 # --- fakes -------------------------------------------------------------------
 
@@ -1189,16 +1189,8 @@ async def test_a_folder_the_walk_cannot_list_is_recorded(
     (cfg / "fixtures").mkdir(parents=True)
     (cfg / "feed.py").write_text("# router")
     (cfg / "fixtures" / "a01.hl7").write_text("MSH|^~\\&|")
-    unlistable = cfg / "fixtures"
-    real_scandir = os.scandir
-
-    def scandir(path: Any = ".") -> object:
-        # Anything but a name, such as the descriptor a staging walk lists by, goes through.
-        if not listable and isinstance(path, str | os.PathLike) and Path(path) == unlistable:
-            raise PermissionError(13, "synthetic", os.fspath(path))
-        return real_scandir(path)
-
-    monkeypatch.setattr(os, "scandir", scandir)
+    if not listable:
+        _unlistable(monkeypatch, cfg / "fixtures")
     result, manifest, detail, names = await _full_pass_record(tmp_path, key_b64, cfg)
     if listable:
         assert names == ["config/feed.py", "config/fixtures/a01.hl7"]
@@ -1206,6 +1198,56 @@ async def test_a_folder_the_walk_cannot_list_is_recorded(
     else:
         assert names == ["config/feed.py"]
         assert _skipped_everywhere(result, manifest, detail) == ["fixtures"]
+
+
+@pytest.mark.parametrize(
+    ("fault", "named"),
+    [(PermissionError, True), (FileNotFoundError, False)],
+    ids=["denied", "gone"],
+)
+async def test_a_file_whose_stat_fails_is_named_unless_it_is_gone(
+    tmp_path, key_b64, monkeypatch, fault, named
+) -> None:
+    """A file the walk listed and cannot stat is not in the archive, so it is named. One gone
+    since the listing, such as an editor's save probe, is no longer config, so naming it would
+    make the record cry wolf on a routine pass."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("# router")
+    (cfg / "probe.tmp").write_text("x")
+    real_lstat = Path.lstat
+
+    def lstat(self: Path) -> os.stat_result:
+        if self.name == "probe.tmp":
+            raise fault(2, "synthetic", str(self))
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    result, manifest, detail, names = await _full_pass_record(tmp_path, key_b64, cfg)
+    assert names == ["config/feed.py"]
+    assert _skipped_everywhere(result, manifest, detail) == (["probe.tmp"] if named else [])
+
+
+async def test_the_skipped_list_is_capped_and_counted(tmp_path, key_b64, monkeypatch) -> None:
+    """An uncapped list could push the manifest past the read cap, and then the archive, store
+    snapshot included, is one verify and restore refuse. The count keeps the total."""
+    from messagefoundry.pipeline import dr_backup as dr
+
+    monkeypatch.setattr(dr, "_MAX_SKIPPED_RECORDED", 2)
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("# router")
+    target = tmp_path / "outside.py"
+    target.write_text("# outside the bundle\n")
+    try:
+        for name in ("a.py", "b.py", "c.py"):
+            (cfg / name).symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("a symlink cannot be made here (Windows without the privilege)")
+    result, manifest, detail, _names = await _full_pass_record(tmp_path, key_b64, cfg)
+    assert _skipped_everywhere(result, manifest, detail) == ["a.py", "b.py"]
+    counts = (result.config_skipped_count, manifest["config_skipped_count"])
+    assert counts == (3, 3) and detail["config_skipped_count"] == 3
 
 
 def _lose_config_after_its_inspection(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:

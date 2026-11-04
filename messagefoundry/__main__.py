@@ -11093,6 +11093,10 @@ def _backup(args: argparse.Namespace) -> int:
         "snapshot_method": result.snapshot_method,
         "key_id": result.key_id,
         "config_fingerprint": result.config_fingerprint,
+        # With `config_skipped_files` below, what says whether the archive holds every config file
+        # the walk listed (vault BACKLOG #5233).
+        "config_bundled": result.config_bundled,
+        "config_bundle_error": result.config_bundle_error,
         "snapshot_sha256": result.snapshot_sha256,
         "row_counts": result.row_counts,
         "verify": result.verify.status if result.verify is not None else "skipped",
@@ -11104,6 +11108,7 @@ def _backup(args: argparse.Namespace) -> int:
         payload["config_unreadable_files"] = list(result.config_unreadable_files)
     if result.config_skipped_files:  # vault BACKLOG #5233: what the archive does not carry
         payload["config_skipped_files"] = list(result.config_skipped_files)
+        payload["config_skipped_count"] = result.config_skipped_count
     if args.json:
         _print_json(payload, compact=True)
     else:
@@ -11112,18 +11117,23 @@ def _backup(args: argparse.Namespace) -> int:
             f"  encrypted={result.encrypted} config_only={result.config_only} key_id={result.key_id}"
         )
         print(f"  verify={payload['verify']} row_counts={result.row_counts} pruned={result.pruned}")
+        print(
+            f"  config_bundled={result.config_bundled} "
+            f"config_bundle_error={result.config_bundle_error}"
+        )
         if result.staging_leftover is not None:
             print(f"WARNING: {result.staging_leftover}", file=sys.stderr)
         from messagefoundry.config.fingerprint import describe_left_out
         from messagefoundry.controlchars import scrub_log_argument
 
-        for what, files in (
-            ("fingerprint", result.config_unreadable_files),
-            ("bundle", result.config_skipped_files),
+        for what, files, total in (
+            ("fingerprint", result.config_unreadable_files, len(result.config_unreadable_files)),
+            ("bundle", result.config_skipped_files, result.config_skipped_count),
         ):
             if files:
                 left_out = scrub_log_argument(describe_left_out(files))
-                print(f"WARNING: the config {what} left out {left_out}", file=sys.stderr)
+                more = f" ({total} in all)" if total > len(files) else ""
+                print(f"WARNING: the config {what} left out {left_out}{more}", file=sys.stderr)
     return 0
 
 

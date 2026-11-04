@@ -7045,9 +7045,8 @@ class BackupSettings(_Section):
     # the store write lock for the copy (BACKLOG #1937). See ADR 0049 §"New store surface".
     snapshot_method: str = "vacuum_into"
     # Bundle the loaded --config dir into the archive, so the cold seed can carry the store + the config
-    # that interprets it without assuming the DR box can reach the org git repo (ADR 0048). It holds
-    # every config file the walk listed only when the manifest's `config_bundled` is true and its
-    # `config_skipped_files` is empty (vault BACKLOG #5233).
+    # that interprets it without assuming the DR box can reach the org git repo (ADR 0048). When it
+    # holds every config file is in the include_config row of docs/CONFIGURATION.md (vault #5233).
     include_config: bool = True
     # Run the lightweight restore-verify after every backup (open + integrity_check + row-count). On by
     # default — a backup nobody has opened is a backup that silently doesn't restore.

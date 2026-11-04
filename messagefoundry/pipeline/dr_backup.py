@@ -217,9 +217,10 @@ _MAX_RESTORE_PLAINTEXT_BYTES = 2 * _MAX_RESTORE_MEMBER_BYTES
 #: set plus one row count per table in the snapshot's own schema (BACKLOG #1722; every table, not a
 #: hand-picked sample — see :func:`_count_tables`). It is not a bound on what the writer can
 #: produce: ``config_unreadable_files`` holds one relative path per file or folder the config
-#: digest left out, uncapped (vault BACKLOG #3765), and ``config_skipped_files`` one per file or
-#: folder the archive walk passed over, uncapped (vault BACKLOG #5233). Lists long enough to pass
-#: this cap write an archive this read refuses, so a verify reports FAIL and a restore refuses it.
+#: digest left out, uncapped (vault BACKLOG #3765). A list long enough to pass this cap writes an
+#: archive this read refuses, so a verify reports FAIL and a restore refuses it.
+#: ``config_skipped_files`` is capped at :data:`_MAX_SKIPPED_RECORDED` for that reason (vault
+#: BACKLOG #5233).
 _MAX_MANIFEST_BYTES = 1024 * 1024  # 1 MiB
 
 
@@ -296,16 +297,23 @@ class BackupResult:
     #: What ``config_fingerprint`` left out as unreadable (vault BACKLOG #3765): it covers the rest.
     #: :meth:`BackupRunner._inspect_config` says what reaches it on a bundled pass.
     config_unreadable_files: tuple[str, ...] = ()
-    #: What the archive walk passed over (vault BACKLOG #5233): see
-    #: :meth:`BackupRunner._add_config_dir`. The archive holds every config file the walk listed
-    #: only when ``config_bundled`` is true and this is empty.
+    #: What the archive walk passed over (vault BACKLOG #5233), at most
+    #: :data:`_MAX_SKIPPED_RECORDED` of them, and how many there were in all. What they mean for
+    #: the archive is in the ``include_config`` row of ``docs/CONFIGURATION.md``.
     config_skipped_files: tuple[str, ...] = ()
+    config_skipped_count: int = 0
 
 
 #: The ``config_bundle_error`` a pass records when its config walk added no regular file, as for an
 #: empty dir or one holding only links (vault BACKLOG #5220). Every other value there is an exception
 #: class name, so this one is spelled so it cannot be read as one.
 CONFIG_WALK_ADDED_NOTHING = "no-regular-file"
+
+#: How many of the paths the archive walk passed over a pass records by name (vault BACKLOG
+#: #5233); the record also carries the total. A config dir can hold any number of links, such as
+#: a linked package tree, and an uncapped list long enough to pass :data:`_MAX_MANIFEST_BYTES`
+#: would make the whole archive, store snapshot included, one that verify and restore refuse.
+_MAX_SKIPPED_RECORDED = 1000
 
 
 @dataclass(frozen=True)
@@ -319,21 +327,25 @@ class _ConfigBundle:
     #: The files and folders ``fingerprint`` left out, so a reader does not take it for the digest
     #: of the whole bundle (vault BACKLOG #3765).
     left_out: tuple[str, ...] = ()
-    #: What the archive walk passed over, set by :meth:`after_walk` (vault BACKLOG #5233).
+    #: What the archive walk passed over, the first :data:`_MAX_SKIPPED_RECORDED` of them, and how
+    #: many in all; set by :meth:`after_walk` (vault BACKLOG #5233).
     skipped: tuple[str, ...] = ()
+    skipped_count: int = 0
 
     def after_walk(self, added: int, skipped: tuple[str, ...]) -> _ConfigBundle:
         """This bundle as the record states it once the walk has run, with what the walk passed
         over: a bundled pass whose walk added no regular file carries no config, so it is recorded
         as not bundled, with :data:`CONFIG_WALK_ADDED_NOTHING` as its error (vault BACKLOG
         #5220)."""
+        walked = replace(self, skipped=skipped[:_MAX_SKIPPED_RECORDED], skipped_count=len(skipped))
         if self.bundled and added == 0:
-            return replace(self, skipped=skipped, bundled=False, error=CONFIG_WALK_ADDED_NOTHING)
-        return replace(self, skipped=skipped)
+            return replace(walked, bundled=False, error=CONFIG_WALK_ADDED_NOTHING)
+        return walked
 
     def manifest_fields(self) -> dict[str, object]:
-        """The fields the manifest and the ``dr_backup`` audit row both carry. PHI-free: a
-        directory path, a digest, an exception class name and relative config file names."""
+        """The fields the manifest and the ``dr_backup`` audit row both carry: a directory path, a
+        digest, an exception class name, and relative paths from the operator's config dir. No
+        message content, but a path carries whatever name the operator gave the file."""
         return {
             "config_fingerprint": self.fingerprint,
             "config_bundled": self.bundled,
@@ -342,6 +354,7 @@ class _ConfigBundle:
             "config_bundle_error": self.error,
             "config_unreadable_files": list(self.left_out),
             "config_skipped_files": list(self.skipped),
+            "config_skipped_count": self.skipped_count,
         }
 
 
@@ -844,6 +857,7 @@ class BackupRunner:
             config_bundle_error=bundle.error,
             config_unreadable_files=bundle.left_out,
             config_skipped_files=bundle.skipped,
+            config_skipped_count=bundle.skipped_count,
         )
 
     async def _verify_and_publish(
@@ -1200,11 +1214,14 @@ class BackupRunner:
         #5220), and what it passed over, so the archive records what it does not carry (vault
         BACKLOG #5233): sorted paths relative to ``base``, ``.`` for ``base`` itself, as
         :func:`~messagefoundry.config.fingerprint.describe_left_out` reads them. That names at
-        least each file it did not add as a regular file (a symlink, a file whose stat fails, a
-        socket, a path swapped for something else before its add), each directory link it pruned,
-        and each folder it could not list. The editor artifacts and the backup's own staging above
-        are not config, and are not named. A file below a pruned link or an unlisted folder is not
-        named on its own; the link or the folder is."""
+        least each file it did not add as a regular file (a symlink, a file whose stat fails for any
+        reason but absence, a socket, a hardlink to a file already added, which ``tar`` stores as a
+        link member, a path swapped for something else before its add), each directory link it
+        pruned, and each folder it could not list. A file gone by its stat is no longer config, and
+        is not named. Nor is a lock file, or a candidate or staging folder the walk lists as a
+        plain folder; one that is a link or whose ``lstat`` fails is pruned as a link, and named. A
+        file below a pruned link or an unlisted folder is not named on its own; the link or the
+        folder is."""
         pruned: list[str] = []
         unlisted: list[str] = []
         found: list[Path] = []
@@ -1232,7 +1249,14 @@ class BackupRunner:
             rel = path.relative_to(base)
             if _is_config_edit_artifact(rel):
                 continue
-            if path.is_symlink() or not path.is_file():
+            try:
+                regular = stat.S_ISREG(path.lstat().st_mode)
+            except FileNotFoundError:
+                # Gone since the listing, such as an editor's save probe: no longer config.
+                continue
+            except OSError:
+                regular = False
+            if not regular:
                 passed_over.add(rel.as_posix())
                 continue
             before = len(tar.getmembers())
@@ -1248,10 +1272,12 @@ class BackupRunner:
             from messagefoundry.config.fingerprint import describe_left_out
 
             log.warning(
-                "DR backup: the config bundle of %s leaves out what it could not list or add as a "
-                "regular file: %s",
+                "DR backup: the config bundle of %s leaves out %d path(s) it could not list or add "
+                "as a regular file, first %d by name: %s",
                 base,
-                scrub_log_argument(describe_left_out(sorted(passed_over))),
+                len(passed_over),
+                min(len(passed_over), _MAX_SKIPPED_RECORDED),
+                scrub_log_argument(describe_left_out(sorted(passed_over)[:_MAX_SKIPPED_RECORDED])),
             )
         return added, tuple(sorted(passed_over | set(links)))
 
@@ -1371,6 +1397,7 @@ class BackupRunner:
             "config_bundle_error": result.config_bundle_error,
             "config_unreadable_files": list(result.config_unreadable_files),
             "config_skipped_files": list(result.config_skipped_files),
+            "config_skipped_count": result.config_skipped_count,
             "snapshot_sha256": result.snapshot_sha256,
             "row_counts": result.row_counts,
             "verify": verify.status if verify is not None else "skipped",
