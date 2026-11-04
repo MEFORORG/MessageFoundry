@@ -2854,7 +2854,12 @@ class Engine:
                     raise OSError(errno.EINVAL, "a value file link leads to a device path", text)
                 text = plain
             target = Path(text)
-            hop = target if target.is_absolute() else hop.parent / target
+            # A relative target names a path from the real folder holding the link. Joined as
+            # text to a folder reached through a directory link, Win32 collapses its ``..``
+            # before following that link and names a decoy folder, so each hop's folder is
+            # resolved first.
+            hop = target if target.is_absolute() else Path(os.path.realpath(hop.parent)) / target
+            hop = Path(os.path.realpath(hop.parent)) / hop.name
             folders.append(hop.parent)
         folders.append(Path(os.path.realpath(value_file)).parent)
         return list(dict.fromkeys(folders))

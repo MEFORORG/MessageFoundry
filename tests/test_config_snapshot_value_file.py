@@ -506,6 +506,36 @@ def test_every_folder_along_a_link_chain_is_vetted_before_the_read(
         assert os.path.normcase(os.path.realpath(folder)) in vetted
 
 
+def test_a_relative_link_reached_through_a_directory_link_vets_the_real_folder(
+    tmp_path: Path,
+) -> None:
+    """A relative link target names a folder against the real folder holding the link. Joined as
+    text to a folder reached through a directory link, its ``..`` collapses on Windows to a decoy
+    folder beside that directory link, so the intermediate real folder would go unvetted."""
+    real = tmp_path / "real" / "c"
+    real.mkdir(parents=True)
+    hop_dir = tmp_path / "real" / "x"
+    hop_dir.mkdir()
+    final = tmp_path / "final" / "values.toml"
+    final.parent.mkdir()
+    final.write_bytes(_APPROVED.encode())
+    decoy = tmp_path / "a" / "x"
+    decoy.mkdir(parents=True)
+    (decoy / "g.toml").write_bytes(_APPROVED.encode())
+    linked = tmp_path / "a" / "b"
+    try:
+        linked.symlink_to(real, target_is_directory=True)
+        (real / "f.toml").symlink_to(Path("..") / "x" / "g.toml")
+        (hop_dir / "g.toml").symlink_to(final)
+    except OSError:
+        pytest.skip("this account cannot create a link")
+    folders = {
+        os.path.normcase(os.path.realpath(f)) for f in Engine._value_file_folders(linked / "f.toml")
+    }
+    assert os.path.normcase(os.path.realpath(hop_dir)) in folders
+    assert os.path.normcase(os.path.realpath(decoy)) not in folders
+
+
 @pytest.mark.skipif(os.path.normcase("A") == "A", reason="Windows names files without case")
 @pytest.mark.parametrize("outside", [True, False])
 def test_a_held_value_file_removed_under_another_case_is_gone_not_none(
