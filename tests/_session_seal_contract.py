@@ -58,6 +58,7 @@ _SEALED_CHANGES: tuple[tuple[str, Any], ...] = (
     ("auth_mechanism", "oidc"),
     ("idp_auth_time", 1.0),
     ("user_epoch", 7),
+    ("global_epoch", 7),  # BACKLOG #5091
 )
 
 
@@ -116,10 +117,14 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     ended = await store.get_session(hash_token(unsealed))
     assert ended is not None and ended.revoked_at is not None  # refused, then ended
     # A valid seal copied from another row does not carry over: it covers that row's token hash.
+    # The copy carries global_epoch too (BACKLOG #5091), a sealed column: without it, on a store
+    # whose global epoch is above 0, the copy would differ in that column as well, and the seal's
+    # refusal would not show that it binds the token hash.
     copied = mint_token()
     await raw(
         "INSERT INTO sessions (token_hash, user_id, created_at, expires_at, last_used_at,"
-        " client, reauth_at, auth_mechanism, user_epoch, seal) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        " client, reauth_at, auth_mechanism, user_epoch, global_epoch, seal)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (
             hash_token(copied),
             row.user_id,
@@ -130,6 +135,7 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
             row.reauth_at,
             row.auth_mechanism,
             row.user_epoch,
+            row.global_epoch,
             row.seal,
         ),
     )
