@@ -3750,7 +3750,10 @@ def _restore_blocking(
     leads it (:class:`_StoreMemberGuard`), and after the decrypt in any case, by the store member
     itself: its store is the restore. One whose manifest does not mark it config-only is refused
     there too. One whose manifest marks it config-only while it carries a store is refused as
-    malformed on both routes, so neither sends the operator to the other."""
+    malformed on both routes once the manifest is read. Where its store leads the tar, the guard
+    on the config-only route refuses it before the manifest is read and sends the operator to
+    ``--to``, which then refuses it as malformed, so the two routes end in that refusal rather
+    than sending the operator back and forth."""
     import sqlite3
 
     from messagefoundry.store.store import (
