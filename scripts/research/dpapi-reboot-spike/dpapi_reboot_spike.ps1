@@ -105,17 +105,20 @@
   no firewall rule.
 
   OWNER COMMAND (MEFORHV01, PowerShell 7 started with Run as administrator). It is pinned to
-  b6f720a8bba787628ea38b9dca47d255353b816f, the commit whose code below this header is this
+  b8ad8d8587c3be84c67738570a82f478272aa79f, the commit whose code below this header is this
   file's; the commit that pins it here changes only this header. It is fetched by SHA, so it
   still works after the branch is merged and deleted:
 
-    if ([Environment]::MachineName -ne 'MEFORHV01') { Write-Host "STOP     this must run on MEFORHV01, but this is $([Environment]::MachineName); nothing ran" } else { $d = Join-Path $env:TEMP ('dpapi-reboot-' + [guid]::NewGuid().ToString('N')); $null = New-Item -ItemType Directory -Path $d; $repo = Join-Path $HOME 'mfsrc'; git -C $repo fetch origin 'b6f720a8bba787628ea38b9dca47d255353b816f'; $f = Join-Path $d 'dpapi_reboot_spike.ps1'; git -C $repo show 'b6f720a8bba787628ea38b9dca47d255353b816f:scripts/research/dpapi-reboot-spike/dpapi_reboot_spike.ps1' > $f; if ((Get-Item -LiteralPath $f).Length -lt 1000) { Write-Host 'STOP     the script did not arrive; nothing ran' } else { pwsh -NoProfile -ExecutionPolicy Bypass -File $f -Mode Host -OutDir (Join-Path $d 'out') } }
+    if ([Environment]::MachineName -ne 'MEFORHV01') { Write-Host "STOP     this must run on MEFORHV01, but this is $([Environment]::MachineName); nothing ran" } else { $d = Join-Path $env:TEMP ('dpapi-reboot-' + [guid]::NewGuid().ToString('N')); $null = New-Item -ItemType Directory -Path $d; $repo = Join-Path $HOME 'mfsrc'; git -C $repo fetch origin 'b8ad8d8587c3be84c67738570a82f478272aa79f'; $f = Join-Path $d 'dpapi_reboot_spike.ps1'; git -C $repo show 'b8ad8d8587c3be84c67738570a82f478272aa79f:scripts/research/dpapi-reboot-spike/dpapi_reboot_spike.ps1' > $f; if ((Get-Item -LiteralPath $f).Length -lt 1000) { Write-Host 'STOP     the script did not arrive; nothing ran' } else { pwsh -NoProfile -ExecutionPolicy Bypass -File $f -Mode Host -OutDir (Join-Path $d 'out') } }
 
   It prints the DPAPI-REBOOT lines at the end and leaves them, the transcript and the raw reports
   in the out folder it names.
 
-  RESULTS. The code that ran is commit b6f720a8bba787628ea38b9dca47d255353b816f, the commit the
-  owner command pins; the commit that adds this block changes nothing below this header. -Mode
+  RESULTS. The code that ran is commit b6f720a8bba787628ea38b9dca47d255353b816f, an earlier pin of
+  this file, not the one the owner command pins now. The later code grades only the key-state
+  refusal as NO and bounds the Host-mode guest calls; every FAIL in the lines below is that refusal
+  or the tampered control's win32=13, so the later judge reads them the same. No run of the later
+  code is recorded here. -Mode
   Payload, run from MEFORDEV01 through hvtest (Invoke-HvTest.ps1 at vault 27cf79f8d, its hvtest
   folder the same as vault origin/main 5387351d2) on REVTEST01 at post-move-mefor-lab-2026-10-17,
   results stamp 20261104T095749Z; hvtest printed "end: pass, exit 0: entry exit 0", every stage
