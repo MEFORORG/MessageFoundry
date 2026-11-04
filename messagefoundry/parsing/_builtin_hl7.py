@@ -882,8 +882,11 @@ def escape_leaf(value: str, seps: tuple[str, str, str, str, str]) -> str:
 
 @lru_cache(maxsize=32)
 def _leaf_escaped_chars(seps: tuple[str, str, str, str, str]) -> tuple[str, ...]:
-    """Every character :func:`escape_leaf` rewrites under ``seps``: the keys of its table."""
-    return tuple(chr(code) for code in _leaf_escape_table(seps))
+    """Every character :func:`escape_leaf` rewrites under ``seps``: the keys of its table. The
+    delimiters come first, so a value holding one, the likelier refusal, is found on an early
+    pass rather than after one full pass per control character."""
+    keys = [chr(code) for code in _leaf_escape_table(seps)]
+    return tuple(sorted(keys, key=lambda ch: ch not in seps))
 
 
 def escape_leaf_alters(value: str, seps: tuple[str, str, str, str, str]) -> bool:

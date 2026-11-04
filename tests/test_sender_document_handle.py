@@ -1696,16 +1696,16 @@ _SEPARATOR_SETS: list[tuple[str, str, str, str, str]] = [
     ("|", "A", "1", "/", "="),
     ("|", "^", "~", "\x01", "&"),
     ("\x1f", "^", "~", "\\", "&"),
-    ("§", "^", "¶", "\\", "&"),
-    ("|", "+", "~", "!", "一"),
+    ("\u00a7", "^", "\u00b6", "\\", "&"),
+    ("|", "+", "~", "!", "\u4e00"),
 ]
 
 #: Non-ASCII characters the equivalence is also checked on: Latin-1 controls and letters, CJK,
 #: and a character outside the Basic Multilingual Plane.
 _NON_ASCII_SAMPLE = [chr(cp) for cp in (0x80, 0x85, 0x9F, 0xA0, 0xA7, 0xB6, 0xE9, 0xFF)] + [
-    "Δ",
-    "一",
-    "﻿",
+    "\u0394",
+    "\u4e00",
+    "\ufeff",
     "\U0001f600",
 ]
 
@@ -1724,7 +1724,7 @@ def test_the_splice_check_agrees_with_the_escape_on_every_character(
         "",
         _EVERY_BASE64_CHARACTER,
         "Q" * 50 + separators[4] + "R" * 50,
-        "plain text 一\U0001f600",
+        "plain text \u4e00\U0001f600",
         "".join(separators),
         "\t" * 3 + "x",
         "AB" + separators[3] + "E" + separators[3],
@@ -1767,6 +1767,8 @@ def test_the_detach_scan_refuses_a_body_whose_header_names_no_delimiters() -> No
     with pytest.raises(UnreadableDelimitersError) as caught:
         next(scan)
     assert "^~" not in str(caught.value)
+    # The separator read's refusal quotes MSH-1 and MSH-2; none of it rides on the chain.
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 async def test_a_streaming_body_whose_header_names_no_delimiters_is_refused_before_the_ack(

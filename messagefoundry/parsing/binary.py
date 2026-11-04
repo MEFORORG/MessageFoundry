@@ -601,7 +601,8 @@ def iter_obx_documents(
     the marker and splice checks scan it in place. What each read holds beside the value is the
     copy of its field that the read splits, dropped when the read returns. Holding every value
     until the scan ends would make the peak the sum of the documents."""
-    if message.count_segments("OBX") and not _delimiters_readable(message):
+    obx_count = message.count_segments("OBX")
+    if obx_count and not _delimiters_readable(message):
         # Every OBX-5.5 read below would raise a plain ValueError, which no listener records;
         # named here, it is a refusal both of them answer (BACKLOG #5099).
         raise UnreadableDelimitersError(
@@ -612,7 +613,7 @@ def iter_obx_documents(
     documents: list[int] = []
     value_holds_marker = False
     altered: int | None = None
-    for occ in range(1, message.count_segments("OBX") + 1):
+    for occ in range(1, obx_count + 1):
         is_ed, detachable, holds_marker, alters = _scan_obx(message, occ, min_b64_len)
         if is_ed:
             occurrences.append(occ)
@@ -621,7 +622,8 @@ def iter_obx_documents(
             value_holds_marker = value_holds_marker or holds_marker
             if alters and altered is None:
                 altered = occ
-    # The OBX reads above already raised on delimiters that cannot be read, so this read cannot.
+    # The guard before the loop refused delimiters that cannot be read wherever an OBX exists,
+    # and a document needs one, so this read cannot raise.
     if documents and _delimits_with_base64(message._encoding_chars()):
         raise Base64DelimiterError(
             "a delimiter of the body is a base64 character, so a detached document could not be "
@@ -713,8 +715,8 @@ def _received_holds_marker(message: Message, received: str) -> bool:
         separators = message._encoding_chars()
     except ValueError:
         # Fail closed: a body whose separators cannot be read cannot be checked for the escaped
-        # form, so it is refused rather than detached unchecked. The OBX reads before this call
-        # already raise on such a header, so the branch only guards a reorder.
+        # form, so it is refused rather than detached unchecked. iter_obx_documents refuses such
+        # a header before its first OBX read, so the branch only guards a reorder.
         return True
     return _holds_marker(received, separators)
 

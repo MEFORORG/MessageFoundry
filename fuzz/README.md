@@ -278,8 +278,9 @@ consequences differ:
   not the `BinaryCarriageError` that function documents. `strip_documents` is not affected.
 
 On either shape `iter_obx_documents` no longer lets the `ValueError` out: a body with an OBX whose
-MSH-1 and MSH-2 name no delimiters is its named refusal, `UnreadableDelimitersError`, which the
-over-threshold ingress detach records as `ERROR` (BACKLOG #5099).
+MSH-1 and MSH-2 name no delimiters is its named refusal, `UnreadableDelimitersError` (BACKLOG
+#5099). Only the first shape reaches the over-threshold ingress detach, which records it as
+`ERROR`; the listener's parse refuses the second before any detach.
 
 Each carve-out swallows an error only when it is a bare `ValueError` with that message AND the input
 has that entry's shape; tests plant a different `ValueError` on each reproducer, and the engine's
