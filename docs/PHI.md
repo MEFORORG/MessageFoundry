@@ -319,8 +319,9 @@ path** (no separate at-rest tier):
   INFO+, egress-allowlisted, and TLS off-loopback. Logs/errors carry only **routing-safe identifiers**
   (SOPClassUID / Modality / UIDs / AE title), never the dataset or element values. That rule covers
   third-party library loggers too, such as pynetdicom's and pydicom's, and a peer-sent value either
-  library refuses or flags as non-conformant is never logged verbatim (owner ruling 2026-11-03,
-  BACKLOG #5081). (Pixel data can carry
+  library refuses or flags as non-conformant must never be logged verbatim (owner ruling 2026-11-03,
+  BACKLOG #5081). Which of those libraries' lines the SCP redacts, and what it does not cover, is in
+  [DICOM.md](DICOM.md) section 5. (Pixel data can carry
   *burned-in* PHI, but **pixel-data handling is out of scope.**)
 - **Base64-carried binary bodies `[BUILT]` (ADR 0028).** A base64-encoded body is **still PHI** —
   encoding is not obfuscation — so the never-log rules (§7) apply unchanged. Base64 inflates size by

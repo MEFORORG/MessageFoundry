@@ -296,10 +296,14 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
 - **PHI.** A DICOM object is PHI (header + pixel data). It is stored through the encrypting store, **never logged
   at INFO+**, and egress-allowlisted. Every log/error line carries only **routing-safe identifiers** (SOP
   class/instance UID, AE title, peer host) or a redacted URL — never the dataset, an element value, or pixel data.
-  That holds for pynetdicom's and pydicom's own loggers too (owner ruling 2026-11-03, BACKLOG #5081). A UID or
-  AE title a peer sent that either library refuses or flags as non-conformant is not a routing-safe identifier:
-  the line stays, with the element's name and the reason, and the value reads `[redacted]`. The SCP reads each
-  command set once before pynetdicom does, and the lines that read writes are not written a second time.
+  The rule holds for pynetdicom's and pydicom's own loggers too (owner ruling 2026-11-03, BACKLOG #5081). A
+  UID or AE title a peer sent that either library refuses or flags as non-conformant is not a routing-safe
+  identifier. The SCP redacts it from at least these lines, which stay with the element's name and the reason
+  while the value reads `[redacted]`: pynetdicom's non-conformant and refused value lines, pydicom's invalid value
+  line, and the UID and AE title fields of pynetdicom's DEBUG dumps of an association request and a DIMSE
+  message. A line of another shape passes whole, so a pynetdicom or pydicom upgrade must re-read them. The SCP
+  reads each association request and command set once before pynetdicom does, and the lines that read writes are
+  written only where pynetdicom will not read the same bytes again.
   pydicom also raises each of its lines as a `UserWarning`, which would carry the value to stderr. A warnings
   filter, installed at import and again at each SCP start, ignores that copy; a host that resets the process's
   warnings filters after that brings the copy back. The engine's

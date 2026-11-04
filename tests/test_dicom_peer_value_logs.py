@@ -101,9 +101,29 @@ def _filter_removed() -> Iterator[None]:
             "Invalid value for VR AE: [redacted]",
         ),
         (
+            # pydicom joins its length and value messages into one line when a value fails both.
+            "pydicom",
+            "The value length (75) exceeds the maximum length of 64 allowed for VR UI. Invalid "
+            f"value for VR UI: '{_PLANTED}'. Please see <https://dicom.nema.org/x> for allowed "
+            "values for each VR.",
+            "The value length (75) exceeds the maximum length of 64 allowed for VR UI. Invalid "
+            "value for VR UI: [redacted]. Please see <https://dicom.nema.org/x> for allowed "
+            "values for each VR.",
+        ),
+        (
+            "pynetdicom._handlers",
+            f"Their Implementation Class UID:    {_PLANTED}",
+            "Their Implementation Class UID:    [redacted]",
+        ),
+        (
+            "pynetdicom._handlers",
+            f"      ={_PLANTED}",
+            "      =[redacted]",
+        ),
+        (
             # A line of a known kind whose end the filter does not know loses all after the head.
             "pynetdicom.utils",
-            f"Non-conformant 'Affected SOP Instance UID' value {_PLANTED} (a wording not seen yet)",
+            f"Non-conformant 'Affected SOP Instance UID' value '{_PLANTED}' (a wording not seen)",
             "Non-conformant 'Affected SOP Instance UID' value [redacted]",
         ),
         (
@@ -123,6 +143,9 @@ def _filter_removed() -> Iterator[None]:
         "refused-with-a-quote",
         "pydicom",
         "pydicom-bare",
+        "pydicom-joined",
+        "association-dump",
+        "transfer-syntax",
         "unknown-end",
         "handler-uid",
         "handler-ae",
@@ -144,6 +167,13 @@ def test_a_flagged_value_is_redacted_and_the_line_kept(
         ("pynetdicom._handlers", "Move Originator               : MODALITY1"),
         ("pydicom", "The value length (76) exceeds the maximum length of 64 allowed for VR UI."),
         ("pynetdicom.dimse_messages", "Non-conformant VM 2 for 'AffectedSOPInstanceUID'"),
+        # A line that names no value keeps its reason.
+        (
+            "pynetdicom.utils",
+            "Invalid 'Calling AE Title' value - must not consist entirely of spaces",
+        ),
+        ("pynetdicom._handlers", "    Abstract Syntax: =Verification SOP Class"),
+        ("pynetdicom._handlers", "      =Implicit VR Little Endian"),
     ],
 )
 def test_a_conformant_value_and_a_line_with_no_value_pass_unchanged(
@@ -180,7 +210,8 @@ def test_the_pre_read_writes_its_lines_once_redacted_when_the_message_ends_there
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     # A refused value ends the association, so pynetdicom never reads it: this copy is the only one.
-    refused = "1.2.3." + "9" * 70
+    # Over 64 characters and not a valid UID either, so pydicom joins both its messages in one line.
+    refused = "1.02." + "9" * 70
     with caplog.at_level(logging.DEBUG):
         assert (
             dicom_module._read_command_set(_c_store_command(instance_uid=refused.encode())) is None
@@ -303,3 +334,72 @@ def test_the_engines_own_lines_name_an_object_uid_only_when_it_is_conformant(
     value: str | None, logged: str
 ) -> None:
     assert dicom_module._loggable_uid(value) == logged
+
+
+def test_the_engines_uid_check_writes_no_line_of_its_own(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.DEBUG), warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert dicom_module._loggable_uid("1.02." + "9" * 70) == "[redacted]"
+    assert caplog.records == [] and caught == [], caplog.text
+
+
+def test_pydicoms_joined_line_is_still_its_two_messages() -> None:
+    """Read against pydicom 3.0.2: the shape the joined test case above stands for."""
+    import inspect
+
+    from pydicom import valuerep
+
+    joined = inspect.getsource(valuerep.validate_length_and_type_and_regex)
+    assert 'msg = " ".join([msg1, msg2]).strip()' in joined
+
+
+#: A non-conformant implementation class UID the length of pynetdicom's own, so that it replaces
+#: that UID in a captured request without changing a length field.
+_PLANTED_IMPLEMENTATION = "1.02.999." + "9" * 23
+
+
+async def _associate_planted(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    from pynetdicom import PYNETDICOM_IMPLEMENTATION_UID
+
+    from tests.test_dicom_scp_pre_association import (
+        _ASSOCIATE_AC,
+        _a_real_association_request,
+        _stall,
+    )
+
+    request = await asyncio.to_thread(_a_real_association_request)
+    own = PYNETDICOM_IMPLEMENTATION_UID.encode("ascii")
+    assert len(own) == len(_PLANTED_IMPLEMENTATION) and request.count(own) == 1
+    planted = request.replace(own, _PLANTED_IMPLEMENTATION.encode("ascii"))
+    async with _running_scp({"timeout_seconds": 30.0}) as scp:
+        with caplog.at_level(logging.DEBUG):
+            sock = await asyncio.to_thread(_stall, scp.sockport, planted)
+            try:
+                sock.settimeout(5.0)
+                assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
+            finally:
+                sock.close()
+    return list(caplog.records)
+
+
+def _implementation_lines(records: list[logging.LogRecord]) -> list[str]:
+    return [
+        r.getMessage()
+        for r in records
+        if r.name == "pynetdicom.utils" and "'Implementation Class UID'" in r.getMessage()
+    ]
+
+
+async def test_the_association_request_check_writes_no_second_copy_and_no_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    filtered = await _associate_planted(caplog)
+    caplog.clear()
+    with _filter_removed():  # CONTROL: the same capture sees the value, and the pre-read's copy
+        unfiltered = await _associate_planted(caplog)
+    assert any(_PLANTED_IMPLEMENTATION in r.getMessage() for r in unfiltered)
+    assert filtered
+    assert not [r.getMessage() for r in filtered if _PLANTED_IMPLEMENTATION in r.getMessage()]
+    assert _implementation_lines(unfiltered), "CONTROL: the planted UID was flagged"
+    # The check decodes the request as the DUL does, so it wrote as many copies as the DUL writes.
+    assert 2 * len(_implementation_lines(filtered)) == len(_implementation_lines(unfiltered))

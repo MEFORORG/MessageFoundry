@@ -413,31 +413,36 @@ _SERVED_COMMANDS = frozenset({0x0001, 0x0030})
 #: <repr>.`` from ``valuerep.validate_regex``, with a pointer to PS3.5 after it when a data element
 #: is read. A peer's value can hold a quote or that fixed text, so each value is greedy and runs up
 #: to the last fixed text that can follow it, and the last pattern for each logger takes all of a
-#: line of that kind whose end it does not know. ``pynetdicom._handlers`` writes ``<label>   :
-#: <value>`` at DEBUG for each C-STORE and C-ECHO it receives or sends; a pattern with a ``label``
-#: group keeps a value that passes :func:`_kept`, since a real UID or AE title may be logged.
+#: line of that kind whose end it does not know. pydicom can write its line after another one in
+#: the same message, so its head starts anywhere. ``pynetdicom._handlers`` writes ``<label> :
+#: <value>`` at DEBUG for each association request and DIMSE message it receives or sends; a
+#: pattern with a ``label`` group keeps a value that passes :func:`_kept`, since a real UID or AE
+#: title may be logged. At least these shapes; a line of another shape passes whole.
 _PEER_VALUE_LINES: dict[str, tuple[re.Pattern[str], ...]] = {
     "pynetdicom.utils": (
         re.compile(r"^(?P<head>Non-conformant '[^']*' value ')(?P<value>.*)(?P<tail>')$", re.S),
         re.compile(r"^(?P<head>Invalid '[^']*' value ')(?P<value>.*)(?P<tail>' - [^']*)$", re.S),
         re.compile(
-            r"^(?P<head>(?:Non-conformant|Invalid) '[^']*' value )(?P<value>.+)(?P<tail>)$", re.S
+            r"^(?P<head>(?:Non-conformant|Invalid) '[^']*' value )(?P<value>'.*)(?P<tail>)$", re.S
         ),
     ),
     "pydicom": (
         re.compile(
-            r"^(?P<head>Invalid value for VR [A-Z]{2}: )(?P<value>.*)"
+            r"^(?P<head>.*?Invalid value for VR [A-Z]{2}: )(?P<value>.*)"
             r"(?P<tail>\. Please see <[^>]*> for allowed values for each VR\.)$",
             re.S,
         ),
-        re.compile(r"^(?P<head>Invalid value for VR [A-Z]{2}: )(?P<value>.+)(?P<tail>)$", re.S),
+        re.compile(r"^(?P<head>.*?Invalid value for VR [A-Z]{2}: )(?P<value>.+)(?P<tail>)$", re.S),
     ),
     "pynetdicom._handlers": (
         re.compile(
-            r"^(?P<head>(?P<label>Affected SOP Class UID|Affected SOP Instance UID|Move Originator)"
-            r" +: )(?P<value>.*)(?P<tail>)$",
+            r"^(?P<head> *(?P<label>Affected SOP Class UID|Affected SOP Instance UID|Move Originator"
+            r"|Requested SOP Class UID|Their Implementation Class UID|Application Context Name"
+            r"|Abstract Syntax|SOP Class|Service Class) *: *=?)(?P<value>.*)(?P<tail>)$",
             re.S,
         ),
+        # A transfer syntax, alone on its line under its context.
+        re.compile(r"^(?P<head>(?P<label>) +=)(?P<value>.*)(?P<tail>)$", re.S),
     ),
 }
 
@@ -454,7 +459,7 @@ _FILTERED_LOGGERS = (
 #: The start of the ``UserWarning`` pydicom's ``warn_and_log`` raises beside its log line, with the
 #: same value in it. It is ignored; the log line, redacted, still says what was wrong. Unignored, it
 #: goes to stderr, which the Windows service writes to a file.
-_PYDICOM_INVALID_VALUE_WARNING = r"Invalid value for VR [A-Z]{2}: "
+_PYDICOM_INVALID_VALUE_WARNING = r".*Invalid value for VR [A-Z]{2}: "
 
 #: ``held`` is a list only inside :func:`_logs_held` on this thread, and every record the filter
 #: sees on the thread then goes into it instead of the log.
@@ -470,10 +475,12 @@ def _kept(label: str, value: str) -> bool:
             from pynetdicom import _config as netdicom_config
 
             return bool(netdicom_config.VALIDATORS["AE"](value)[0])
-        if label == "Affected SOP Class UID" and value in _uid_names():
-            return True
-        return _loggable_uid(value) == value
-    except Exception:  # noqa: BLE001 - a third-party check on a peer's text; redact rather than raise
+        # A class or syntax is logged by its name; an instance UID never is.
+        named = not label.endswith("Instance UID") and value in _uid_names()
+        return named or _loggable_uid(value) == value
+    except Exception as exc:  # noqa: BLE001 - a third-party check on a peer's text; redact, not raise
+        # The engine's own logger, which no filter here holds or reads.
+        logger.debug("A DICOM log value was redacted, its check failed: %s", type(exc).__name__)
         return False
 
 
@@ -481,10 +488,12 @@ def _loggable_uid(value: Any) -> str:
     """A UID the engine's own log lines may name: the value when it is a conformant UID, or empty,
     else :data:`_REDACTED` (owner ruling 2026-11-03). A real UID may be logged; a value pydicom flags
     as it reads it may not."""
+    from pydicom.config import IGNORE
     from pydicom.uid import UID
 
     text = str(value or "")
-    return text if not text or UID(text).is_valid else _REDACTED
+    # IGNORE: building the UID must not write pydicom's own line for it again.
+    return text if not text or UID(text, validation_mode=IGNORE).is_valid else _REDACTED
 
 
 @functools.cache
@@ -506,8 +515,14 @@ class _PeerValueFilter(logging.Filter):
         if held is not None:
             held.append(record)
             return False
-        text = record.getMessage()
-        for pattern in _PEER_VALUE_LINES.get(record.name, ()):
+        patterns = _PEER_VALUE_LINES.get(record.name, ())
+        if not patterns:
+            return True
+        try:
+            text = record.getMessage()
+        except (TypeError, ValueError):  # bad %-args: the handler reports it, as it would anyway
+            return True
+        for pattern in patterns:
             matched = pattern.match(text)
             if matched is None:
                 continue
@@ -535,6 +550,12 @@ def _redact_flagged_peer_values() -> None:
 
 
 _redact_flagged_peer_values()
+
+
+def _write_held(held: list[logging.LogRecord]) -> None:
+    """Write records :func:`_logs_held` held, through the filter, which now redacts them."""
+    for record in held:
+        logging.getLogger(record.name).handle(record)
 
 
 @contextlib.contextmanager
@@ -571,11 +592,11 @@ def _read_command_set(command_set: bytes) -> tuple[int, bool, bool] | None:
     ``message_to_primitive`` itself logs a WARNING for an element with more than one value; and
     pydicom logs a WARNING for a value it finds invalid as it reads one. So the lines written here
     are held (:func:`_logs_held`), on this thread alone, since pynetdicom logs from other threads at
-    the same time. They are written once the read is done only when it returns ``None``, where the
-    association ends and pynetdicom never reads the message. Otherwise pynetdicom writes its own as
-    it reads the message, so one the association ends on before then for another reason, such as a
-    command the SCP does not serve or a data set past its bound, has none of them; the end's own
-    line says why it ended. :class:`_PeerValueFilter` redacts the peer's value from each line (vault
+    the same time. They are written once the read is done only where the caller then ends the
+    association: when it returns ``None``, a command the SCP does not serve, or a request that is
+    not valid. Otherwise pynetdicom writes its own as it reads the message, so one the association
+    ends on later for another reason, such as a data set past its bound or the message deadline,
+    has none of them; the end's own line says why it ended. :class:`_PeerValueFilter` redacts the peer's value from each line (vault
     BACKLOG #5081)."""
     from pynetdicom.dimse_messages import _MESSAGE_TYPES, DIMSEMessage
     from pynetdicom.dsutils import decode
@@ -595,9 +616,10 @@ def _read_command_set(command_set: bytes) -> tuple[int, bool, bool] | None:
         except Exception as exc:  # noqa: BLE001 - a third-party parser on a peer's bytes
             # The type alone: a setter's message holds the value it refused.
             logger.debug("A DICOM command set did not decode: %s", type(exc).__name__)
-    if read is None:  # pynetdicom will not read this message, so these are the only copy
-        for record in held:
-            logging.getLogger(record.name).handle(record)
+    # The caller ends the association on each of these, so pynetdicom will not read the message,
+    # and these are the only copy.
+    if read is None or read[0] not in _SERVED_COMMANDS or not read[2]:
+        _write_held(held)
     return read
 
 
@@ -1007,7 +1029,15 @@ def _admitting_server_class() -> type[Any]:
             read, is logged as a refusal, throttled per address."""
             try:
                 first_pdu = self._read_first_pdu(sock)
-                self._check_association_request(sock, first_pdu)
+                # The checks decode the request as the DUL will, so their pynetdicom lines are held,
+                # and written only where the request is refused and the DUL never decodes it.
+                held: list[logging.LogRecord] = []
+                try:
+                    with _logs_held() as held:
+                        self._check_association_request(sock, first_pdu)
+                except BaseException:
+                    _write_held(held)
+                    raise
                 # A request that sets bit 0 and other version bits as well is a version-1 request,
                 # but pynetdicom's AE-6 compares the whole field to 1 and would reject it. So the
                 # copy pynetdicom reads names version 1 alone. Nothing else in it changes.
@@ -1181,7 +1211,7 @@ def _admitting_server_class() -> type[Any]:
                 pdu.decode(first_pdu)
                 primitive = pdu.to_primitive()
             except Exception as exc:  # noqa: BLE001 - a third-party parser on a peer's bytes
-                logger.debug("DICOM association request did not decode: %s", safe_exc(exc))
+                logger.debug("DICOM association request did not decode: %s", type(exc).__name__)
                 abort = A_ABORT_RQ()
                 abort.source, abort.reason_diagnostic = 0x00, 0x00
                 self._answer(sock, abort.encode())
@@ -1204,7 +1234,7 @@ def _admitting_server_class() -> type[Any]:
                 }
                 negotiate(primitive.presentation_context_definition_list, self.contexts, roles)
             except Exception as exc:  # noqa: BLE001 - a third-party step on a peer's request
-                logger.debug("DICOM association request did not negotiate: %s", safe_exc(exc))
+                logger.debug("DICOM association request did not negotiate: %s", type(exc).__name__)
                 self._reject(sock, _RJ_DOES_NOT_NEGOTIATE)
                 raise _RefusedPeer("its association request does not negotiate") from exc
 
