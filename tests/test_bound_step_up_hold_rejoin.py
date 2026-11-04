@@ -231,7 +231,7 @@ async def test_a_renamed_requesters_repeated_purge_joins_their_one_hold(
         # The directory renames op; the same session now resolves to the new name.
         op = await engine.store.get_user_by_username("op")
         assert op is not None
-        assert await engine.store.set_user_username(op.id, "op2", expected_username="op")
+        assert await engine.store.set_user_username(op.id, "op2", expected_username="op", audits=())
         me = await c.get("/auth/me", headers=_auth(token))
         assert me.status_code == 200 and me.json()["username"] == "op2", me.text
 

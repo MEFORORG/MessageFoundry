@@ -3302,7 +3302,10 @@ jobs:
           # DERIVES that set from the suites' own imports and fails if one stops being admitted.
           # It reads only the DIRECT imports of the test files the steps name. It does not follow the
           # tests.* helpers they import, so a source reached only through a helper is NOT checked
-          # (measured 2026-10-15: at least auth/tokens, reached via tests/_session_seal_contract.py).
+          # unless a gated suite also imports it directly. auth/tokens was such a source (measured
+          # 2026-10-15, via tests/_session_seal_contract.py); test_postgres_store.py now imports it
+          # directly and the auth arm admits it. Other helper-only sources were not censused, so assume
+          # at least some remain unchecked.
           # Import-reachability is a PROXY for
           # "asserts against": it is what a machine can check, and it is deliberately wider than the
           # assertion set rather than narrower.
@@ -3328,14 +3331,17 @@ jobs:
           # PR 2335; they reached it earlier through tests/_session_seal_contract.py, unchecked.
           # Vault BACKLOG #2223: the SQL Server store open runs the pin checks in pki.py and in
           # auth/trust_anchors.py and auth/anchor_path.py, and test_sqlserver_store.py imports pki.
-          # tests/_claim_lock_helpers.py holds the lock-and-claim helpers test_batch_claim_locking.py
-          # and test_adr0114_claim_proc_live.py both run (BACKLOG #1270).
+          # tests/_claim_lock_helpers.py holds the lock-and-claim helpers that at least
+          # test_batch_claim_locking.py and test_adr0114_claim_proc_live.py run (BACKLOG #1270).
           # tests/_keyed_reopen_contract.py is the keyed-reopen body both server legs run, and its cell
           # list comes from tests/test_store_cipher_sweep_parity.py's _written_cells (BACKLOG #1723).
           # messagefoundry/connection_events.py is the kind vocabulary every server store's writer checks.
+          # messagefoundry/odbc_call_gate.py is the call gate tests/_claim_lock_helpers.py installs and
+          # discards through on the SQL Server legs (BACKLOG #4915). It, odbc_env.py and odbc_dsn.py
+          # are at least three leaf modules store/sqlserver.py imports from outside store/.
           # ci/python-version is the interpreter every one of these legs runs, so a patch bump
           # must meet them on its own PR rather than first on the nightly after the merge.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/connection_events|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/_claim_lock_helpers\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_finalize_race_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/_keyed_reopen_contract\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/__main__|messagefoundry/pki|messagefoundry/api/(__init__|app|approvals)|messagefoundry/auth/(service|tokens|trust_anchors|anchor_path)|messagefoundry/parsing/(__init__|binary|message|peek|x12/)|messagefoundry/pipeline/(__init__|alerts|cluster|config_convergence|dr|leader_tasks|phase_timing|sharding|stage_dispatcher|wiring_runner)|messagefoundry/connection_events|messagefoundry/odbc_(call_gate|env|dsn)|messagefoundry/content_type|messagefoundry/uploads|messagefoundry/config/(models|response|settings|wiring)|messagefoundry/transports/(__init__|base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner|store_privilege|uploads_shard_quota)|tests/_live_scratch\.py|tests/_claim_lock_helpers\.py|tests/audit_chain_cases\.py|tests/_replay_settle_contract\.py|tests/_finalize_race_contract\.py|tests/_pending_approval_store_contract\.py|tests/_ad_group_map_store_contract\.py|tests/_keyed_reopen_contract\.py|tests/test_store_cipher_sweep_parity\.py|tests/test_transit_bound_attestation_server_backends\.py|ci/python-version|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"

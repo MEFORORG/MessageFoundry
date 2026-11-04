@@ -430,8 +430,8 @@ def _validate(profile: ConnScaleProfile, where: str) -> None:
     # that made two multi-arm would produce >2 arms per (sweep_mode, count) cell and each
     # comparison's single-axis keying would silently collapse them. Fusion + statement-batching are
     # pooled/SQL-Server-only and don't compose (ADR 0075), so the supported shape is EXACTLY ONE multi-
-    # arm boolean axis paired with claim_modes = ["pooled"] (or a multi-arm claim_modes A/B alone). Fail
-    # loud if more than one axis is multi-arm.
+    # arm boolean axis paired with claim_modes = ["pooled"], or a multi-arm claim_modes A/B alone, or
+    # a sandbox_modes A/B alone (BACKLOG #3132). Fail loud if more than one axis is multi-arm.
     multi_arm = profile.ab_axes()
     if len(multi_arm) > 1:
         raise ConnScaleProfileError(

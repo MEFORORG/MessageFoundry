@@ -186,6 +186,11 @@ GRAMMAR_BOUND_CONTAINERS: dict[tuple[str, str], tuple[Any, dict[str, Any]]] = {
             "tls_ca_file": "ca.pem",
         },
     ),
+    # BACKLOG #4907: the same table on the MLLP listener, which needs mTLS for it.
+    ("MLLP", "tls_client_subjects"): (
+        {"CN=Probe CA": ["CN:x-probe"]},
+        {"tls": True, "tls_cert_file": "server.pem", "tls_ca_file": "ca.pem"},
+    ),
 }
 
 
@@ -425,6 +430,10 @@ HANDLED_CONTAINERS: dict[str, str] = {
         "issuing-CA DNs mapped to certificate subject names that may submit (vault BACKLOG #2287) -- "
         "topology, not a secret (ADR 0154 D6): both are in every handshake's certificates, and "
         "masking them would hide the access-control decision from the operator who audits it"
+    ),
+    "tls_client_subjects": (
+        "the MLLP listener's expected senders, issuing-CA DNs mapped to certificate subject names "
+        "(BACKLOG #4907) -- topology, not a secret, for the reason intake_client_subjects gives"
     ),
 }
 

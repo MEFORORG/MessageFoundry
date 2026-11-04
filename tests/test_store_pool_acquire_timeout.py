@@ -339,6 +339,7 @@ class _SessionConn(_Conn):
             "revoked_at": None,
             "client": None,
             "user_epoch": 0,
+            "global_epoch": 0,
             "seal": "",
         }
 
@@ -410,13 +411,14 @@ class _MssqlSessionCursor:
                     "revoked_at",
                     "client",
                     "user_epoch",
+                    "global_epoch",
                     "seal",
                 )
             ]
 
     async def fetchall(self) -> list[Any]:
         if self._last.startswith("SELECT * FROM sessions"):
-            return [("a" * 64, "u", 1.0, 9e9, 1.0, None, None, 0, "")]
+            return [("a" * 64, "u", 1.0, 9e9, 1.0, None, None, 0, 0, "")]
         if self._last.startswith("SELECT session_epoch"):
             return [(0,)]
         return [("b" * 64,), ("c" * 64,)]

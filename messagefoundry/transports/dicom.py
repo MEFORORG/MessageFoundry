@@ -71,6 +71,7 @@ import ssl
 import threading
 import time
 import warnings
+import zlib
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import BytesIO
@@ -79,7 +80,6 @@ from typing import Any, ClassVar, NamedTuple, cast
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import (
-    EXPIRY_RELAXED_WAYS_ACROSS,
     RevocationHopGuard,
     TrustAnchorPolicy,
     apply_connection_tls_ciphers,
@@ -151,6 +151,7 @@ __all__ = [
     "DicomScpSource",
     "DicomScuDestination",
     "DEFAULT_MAX_OBJECT_BYTES",
+    "DEFAULT_SCU_MAX_OBJECT_BYTES",
     "DEFAULT_MAX_ASSOCIATIONS_PER_SECOND",
 ]
 
@@ -166,7 +167,7 @@ logger = logging.getLogger(__name__)
 #: Overridable via DICOM(max_object_bytes=...).
 #:
 #: **The SCP never honours more than** :data:`_ENGINE_INGRESS_CEILING_BYTES`, whatever is configured
-#: here (BACKLOG #1910). This default still reaches the outbound SCU unchanged.
+#: here (BACKLOG #1910). The outbound SCU has its own default, :data:`DEFAULT_SCU_MAX_OBJECT_BYTES`.
 DEFAULT_MAX_OBJECT_BYTES = 128 * 1024 * 1024
 
 #: The largest object the engine's binary ingress will commit. The pipeline records anything larger as
@@ -177,6 +178,58 @@ DEFAULT_MAX_OBJECT_BYTES = 128 * 1024 * 1024
 #: than imported from the pipeline because transports never import pipeline, and a test pins the two
 #: equal.
 _ENGINE_INGRESS_CEILING_BYTES = DEFAULT_MAX_MESSAGE_BYTES
+
+#: The most an engine SCP holds of one object before it ends the association with an A-ABORT and no
+#: status: twice its largest effective cap (owner ruling B462-R3). Every engine SCP aborts an object
+#: past this, whatever its own setting; at or under it, one left at a cap of 16 MiB answers a status,
+#: the final ``0xC010`` above 16 MiB.
+_ENGINE_SCP_ABORT_PAST_BYTES = 2 * _ENGINE_INGRESS_CEILING_BYTES
+
+#: The outbound SCU's default ``max_object_bytes`` (vault BACKLOG #4908). The SCU cannot read a
+#: peer's limit, and the engine's own SCP is the one peer whose limit it knows, so the default keeps
+#: the SCU out of the abort of an engine SCP at a cap of 16 MiB or more. One set lower aborts smaller
+#: objects. A larger object is refused before the association, with no retry, unless the site
+#: raises or removes the cap. This is also the SCU's default inflate bound for a deflated object, as
+#: ``max_object_bytes`` always was. The SCP's own default, :data:`DEFAULT_MAX_OBJECT_BYTES`, does
+#: not move.
+DEFAULT_SCU_MAX_OBJECT_BYTES = _ENGINE_SCP_ABORT_PAST_BYTES
+
+#: How many stores in a row of one object over :data:`_ENGINE_SCP_ABORT_PAST_BYTES` may end with no
+#: C-STORE response before the SCU refuses it as final (vault BACKLOG #4908). The SCU cannot tell an
+#: engine SCP's abort from any other: it is the A-ABORT pynetdicom's own ``abort()`` sends, and a
+#: sender still writing the object often meets a reset in its place. So every unanswered end of such
+#: an object counts, a timeout included, and a few sends are left for a peer that takes objects this
+#: large and failed once for another reason. An unanswered end of a smaller object stays transient.
+_MAX_UNANSWERED_SENDS_OVER_CEILING = 3
+
+#: How many objects' unanswered counts the SCU remembers; the oldest is dropped past this, which only
+#: lets that object start again. A FIFO lane re-sends its head, so one entry is its usual case, but an
+#: unordered lane rotates every failing object it holds, so the bound has to exceed how many objects
+#: over the ceiling one lane could hold pending at once. Defeating it takes more than 65,536 of them
+#: pending, over 2 TiB of payload in the store. Each entry is a key of about 90 bits and a small
+#: count, about 76 bytes (the dict's 40, plus the key's int), so a map just filled holds about 5 MiB.
+#: Evicting and re-inserting at the bound grows the dict's table: measured with ``tracemalloc`` on
+#: Python 3.14, about 7.3 MiB held, and a peak near 12.3 MiB while the table resizes.
+_UNANSWERED_REMEMBERED = 65_536
+
+
+def _unanswered_key(object_bytes: bytes) -> int | None:
+    """The key :meth:`DicomScuDestination._count_unanswered` counts an object under, or ``None`` for
+    one at or under :data:`_ENGINE_SCP_ABORT_PAST_BYTES`, which is never counted. The object's
+    length, its CRC-32 and its Adler-32, all over every byte, so a re-send of the same outbound row
+    always meets its own count. Identical bytes share one count, whichever rows carry them. Two
+    objects that differ, two with no SOP instance UID included, share one only when both checksums
+    collide at one length: by chance about one in 2**64, but neither checksum resists a sender
+    crafting a collision, and the cost of one is that one object goes final early. Not a security
+    use, so not a crypto primitive.
+
+    Every caller runs on a worker thread (``asyncio.to_thread``). zlib releases the GIL while it
+    checksums a buffer this large, so the event loop keeps running; ``hash()`` of the object, the
+    key before, held the GIL, and so stalled the loop, for every byte of it (vault BACKLOG #4908)."""
+    if len(object_bytes) <= _ENGINE_SCP_ABORT_PAST_BYTES:
+        return None
+    return (len(object_bytes) << 64) | (zlib.crc32(object_bytes) << 32) | zlib.adler32(object_bytes)
+
 
 #: Association-rate pacing for the SCP ships OFF, for exactly the reason
 #: :data:`messagefoundry.transports.mllp.DEFAULT_MAX_MESSAGES_PER_SECOND` ships off (ruled 2026-08-11,
@@ -1924,9 +1977,9 @@ class DicomScpSource(SourceConnector):
         self._ae: Any = None
         self._server: Any = None
         # BACKLOG #1962: say so when an operator's own setting is clamped. It runs after the last
-        # refusal above, so a connection that never builds logs nothing about its limits. The factory
-        # always passes the shipped default, so that value cannot be told from an explicit one. It
-        # stays silent, because a warning on every default SCP would teach operators to ignore this.
+        # refusal above, so a connection that never builds logs nothing about its limits. It stays
+        # silent on 128 MiB, the shipped default an SCP left unset reads, whether or not it was also
+        # set explicitly, because a warning on every default SCP would teach operators to ignore it.
         if configured != self._max_object_bytes and configured != DEFAULT_MAX_OBJECT_BYTES:
             logger.warning(
                 "DICOM server (SCP) %r: max_object_bytes %s is above the engine's binary ingress ceiling of "
@@ -2610,7 +2663,9 @@ def _client_ssl_context(
     harden_cipher_suites(ctx, connector=connector)  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of the peer's server cert (ASVS 12.1.4)
     # #129 (ADR 0094): opt-in granular expiry-only relaxation — honour an expired downstream PACS cert
-    # while STILL validating chain + hostname (verification stays ON; default off = byte-identical).
+    # while STILL validating the chain's signatures, the hostname and key usage. At least the
+    # intermediates' and the trust anchor's validity periods, and a CRL's own window, go unchecked too
+    # (vault BACKLOG #5089). Verification stays ON; default off = byte-identical.
     if s.get("tls_allow_expired"):
         relax_verify_expiry(ctx, host=str(s.get("host", "")))
     return ctx
@@ -2653,12 +2708,18 @@ class DicomScuDestination(DestinationConnector):
         called = s.get("called_ae_title")
         # pynetdicom's accept-any token when the peer AE title is left unset.
         self._called_ae_title = str(called) if called else "ANY-SCP"
+        # The SCU's default, not the SCP's: DICOM() writes no value it was not given (vault BACKLOG
+        # #4908), so a factory-built SCU arrives here without one too.
         self._max_object_bytes: int | None = positive_cap(
-            s.get("max_object_bytes", DEFAULT_MAX_OBJECT_BYTES),
+            s.get("max_object_bytes", DEFAULT_SCU_MAX_OBJECT_BYTES),
             int,
             knob="max_object_bytes",
             transport="DICOM-SCU destination",
         )
+        #: Unanswered stores in a row of each object over _ENGINE_SCP_ABORT_PAST_BYTES, keyed by
+        #: _unanswered_key; see _count_unanswered. Sends run on worker threads, hence the lock.
+        self._unanswered: dict[int, int] = {}
+        self._unanswered_lock = threading.Lock()
         self._max_pdu_size = count_setting(
             s.get("max_pdu_size", 16384), knob="max_pdu_size", transport="DICOM-SCU destination"
         )
@@ -2713,21 +2774,22 @@ class DicomScuDestination(DestinationConnector):
         # it never reached keeps it. Disjoint from the cleartext guard above, which is taken only
         # when TLS is off.
         #
-        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so it
-        # is handed to the guard as no context: see skips_validity_period (vault BACKLOG #2978, ADR
-        # 0173 §13). The owner's 2026-10-05 ruling names MLLP; its reach to this hop is the batch 191
-        # Manager's reading of "one rule everywhere".
+        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so
+        # the guard is told with expiry_relaxed: see skips_validity_period (vault BACKLOG #2978 and
+        # #5089, ADR 0173 §13). The owner's 2026-10-05 ruling names MLLP; its reach to this hop is
+        # the batch 191 Manager's reading of "one rule everywhere".
         if self._ssl is not None:
-            expiry_relaxed = skips_validity_period(self._ssl)
             RevocationHopGuard.capture(
                 host=self._host,
                 cell="DICOM C-STORE client (SCU) over TLS",
-                description="verified DICOM-over-TLS association (no revocation check)",
+                # The relaxed record says itself what the hop lacks; see the MLLP destination.
+                description="verified DICOM-over-TLS association"
+                + ("" if skips_validity_period(self._ssl) else " (no revocation check)"),
                 attested=config.tls_revocation_attested,
                 attested_reason=config.tls_revocation_attested_reason,
                 connection=config.name,
-                context=None if expiry_relaxed else self._ssl,
-                ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
+                context=self._ssl,
+                expiry_relaxed=skips_validity_period(self._ssl),
             ).enforce_construction()
 
     async def send(
@@ -2771,6 +2833,18 @@ class DicomScuDestination(DestinationConnector):
         )
 
     def _c_store(self, object_bytes: bytes) -> None:
+        """Blocking: :meth:`_store_object`, then drop the object's unanswered count on any permanent
+        refusal. The runner dead-letters that row, or holds it on a lane-stopping fault, so a count
+        left behind would only shorten a later send of it (vault BACKLOG #4908). The final
+        ``unanswered-over-ceiling`` refusal has already dropped its own."""
+        try:
+            self._store_object(object_bytes)
+        except NegativeAckError as exc:
+            if exc.permanent:
+                self._forget_object(object_bytes)
+            raise
+
+    def _store_object(self, object_bytes: bytes) -> None:
         """Blocking: parse → associate → C-STORE → classify. Runs on a worker thread (``to_thread``),
         never the loop. ``load_dcmread`` is called first (outside the try) so a missing ``[dicom]`` extra
         surfaces as a deploy ``RuntimeError`` (internal error), not a per-message data ``ERROR``.
@@ -2847,12 +2921,82 @@ class DicomScuDestination(DestinationConnector):
                 permanent=True,
             ) from exc
         except Exception as exc:  # noqa: BLE001 - a genuine DIMSE/transport error mid-store is transient
+            # No response either, so it counts toward the same bound as an empty status below.
+            final = self._count_unanswered(_unanswered_key(object_bytes), len(object_bytes))
+            if final is not None:
+                raise final from exc
             raise DeliveryError(
                 f"DICOM C-STORE client (SCU) to {self._host}:{self._port} failed: {safe_exc(exc)}"
             ) from exc
         finally:
             assoc.release()
+        if getattr(status_ds, "Status", None) is None:
+            final = self._count_unanswered(_unanswered_key(object_bytes), len(object_bytes))
+            if final is not None:
+                raise final
+        else:
+            # Any status, a refusal included, means the peer answers this object: so the count,
+            # which is of unanswered ends in a row, starts again.
+            self._forget_object(object_bytes)
         self._classify(status_ds, sop_class=logged_class, sop_instance=sop_instance)
+
+    def _count_unanswered(self, key: int | None, size: int) -> NegativeAckError | None:
+        """Count one store of an object over :data:`_ENGINE_SCP_ABORT_PAST_BYTES` that ended with no
+        C-STORE response, and return the final refusal at :data:`_MAX_UNANSWERED_SENDS_OVER_CEILING`.
+        ``key`` is :func:`_unanswered_key`'s, ``None`` for an object that is never counted. The lane
+        would otherwise re-send it at its head until the retry policy ran out, or without end under
+        ``max_attempts=None``; a permanent refusal is dead-lettered whatever that policy says. The
+        refusal names no cause: the SCU cannot tell a peer's abort from its own DIMSE timeout. The
+        caller computes ``key`` only once a store has ended unanswered, and :meth:`_forget_object`
+        only while some count is held, so a store answered with nothing counted computes none."""
+        if key is None:
+            return None
+        with self._unanswered_lock:
+            count = self._unanswered.pop(key, 0) + 1
+            if count < _MAX_UNANSWERED_SENDS_OVER_CEILING:
+                self._unanswered[key] = count  # re-inserted last, so the oldest is first out
+                if len(self._unanswered) > _UNANSWERED_REMEMBERED:
+                    del self._unanswered[next(iter(self._unanswered))]
+                return None
+        return NegativeAckError(
+            f"DICOM C-STORE client (SCU) to {self._host}:{self._port}: an object of {size} bytes, "
+            f"over {_ENGINE_SCP_ABORT_PAST_BYTES} bytes, ended with no response (an abort, a "
+            f"timeout or an error raised mid-store) {count} times in a row (no retry)",
+            code="unanswered-over-ceiling",
+            permanent=True,
+        )
+
+    def _forget_unanswered(self, key: int | None) -> None:
+        """Drop an object's unanswered count once a store of it is answered, or once its row leaves
+        the lane. A ``None`` key, an object never counted, skips the lock."""
+        if key is None:
+            return
+        with self._unanswered_lock:
+            self._unanswered.pop(key, None)
+
+    def _forget_object(self, object_bytes: bytes) -> None:
+        """:meth:`_forget_unanswered` for ``object_bytes``, computing its key only when a count could
+        be held for it."""
+        if len(object_bytes) <= _ENGINE_SCP_ABORT_PAST_BYTES or not self._unanswered:
+            return
+        self._forget_unanswered(_unanswered_key(object_bytes))
+
+    async def forget_payload(self, payload: str) -> None:
+        """Drop the unanswered count of a row the delivery worker dead-lettered at its retry cap, so
+        a replay of it gets every send :data:`_MAX_UNANSWERED_SENDS_OVER_CEILING` allows rather than
+        what the count had left (vault BACKLOG #4908). Nothing to drop is the usual case, so that is
+        checked before the object is decoded and keyed, which then runs off the event loop."""
+        with self._unanswered_lock:
+            if not self._unanswered:
+                return
+        await asyncio.to_thread(self._forget_payload_sync, payload)
+
+    def _forget_payload_sync(self, payload: str) -> None:
+        try:
+            object_bytes = recover_dicom_object_bytes(payload, label="DICOM C-STORE client (SCU)")
+        except NegativeAckError:
+            return  # a body no send could carry was never counted
+        self._forget_object(object_bytes)
 
     def _classify(self, status_ds: Any, *, sop_class: str, sop_instance: str) -> None:
         """Map the C-STORE response status onto the retry model. PHI-safe: only the status + routing
@@ -2860,7 +3004,8 @@ class DicomScuDestination(DestinationConnector):
         status = getattr(status_ds, "Status", None)
         if status is None:
             # An empty status dataset means the association aborted / timed out with no response —
-            # transient (the peer may recover); the SCU re-sends.
+            # transient (the peer may recover); the SCU re-sends. _c_store has already counted it
+            # against _count_unanswered for an object over what an engine SCP holds.
             raise DeliveryError(
                 f"DICOM C-STORE client (SCU) to {self._host}:{self._port} got no response status "
                 "(aborted/timeout)"

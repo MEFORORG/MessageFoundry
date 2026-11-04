@@ -356,10 +356,12 @@ def _take_windows_path(
     read: _WinPathSecurity,
     self_sid: str | None,
     by_name: dict[str, _WinPathSecurity] | None = None,
+    moves_away: tuple[Path, _WinPathSecurity] | None = None,
 ) -> list[Path]:
     """Route load_config down the Windows branch with fake readers; return the paths read.
 
-    ``read`` answers every path unless ``by_name`` names that path's file name."""
+    ``read`` answers every path unless ``by_name`` names that path's file name. ``moves_away``
+    renames that path to ``<name>.moved`` as it is read, and answers it with that read."""
     import messagefoundry.config.wiring as wiring
 
     seen: list[Path] = []
@@ -367,6 +369,9 @@ def _take_windows_path(
 
     def _read_path(path: Path) -> _WinPathSecurity:
         seen.append(path)
+        if moves_away is not None and path == moves_away[0] and path.exists():
+            path.rename(path.with_name(f"{path.name}.moved"))
+            return moves_away[1]
         return overrides.get(path.name, read)
 
     probes = _WinConfigSourceProbes(
@@ -529,6 +534,143 @@ def test_config_directory_not_found_still_refuses(
     )
     with pytest.raises(WiringError, match=r"\(Win32 error 2\)"):
         load_config(tmp_path)
+
+
+@pytest.mark.parametrize("gone", [2, 3])  # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+def test_config_directory_moved_away_before_its_read_is_missing(
+    gone: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory moved away between the walk's listing and this read: missing, as the load's
+    own check of it answers, so a reload audits it ``not_found``, not a source it could not vet
+    (vault BACKLOG #5248 item 1). The test above is the control: still there, it refuses."""
+    from messagefoundry.config.fingerprint import ConfigDirMissing
+
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    _write_cfg(cfg)
+    seen = _take_windows_path(
+        monkeypatch, _CLEAN_READ, _SELF, moves_away=(cfg, _WinPathSecurity(status=gone))
+    )
+    with pytest.raises(ConfigDirMissing, match="config directory not found"):
+        load_config(cfg)
+    assert seen == [cfg] and (tmp_path / "cfg.moved").is_dir()
+
+
+def test_a_refusal_stands_when_its_directory_then_stops_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source refused by its access check, whose directory then stops listing, as a share lost
+    during the reads does: the refusal stands, so a listing fault never replaces the one answer
+    that names what was refused (vault BACKLOG #5248). Only a refusal from the directory's own read
+    finding it gone, or its share unreachable, is re-answered."""
+    from messagefoundry.config.wiring import ConfigDirUnlistable
+    from tests._share_fault import _share_fault
+
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    seen = _take_windows_path(
+        monkeypatch, _CLEAN_READ, _SELF, by_name={"cfg.py": _EVERYONE_WRITE_READ}
+    )
+    real_scandir = os.scandir
+
+    def _scandir(target: Any) -> Any:
+        listed_dir = isinstance(target, (str, os.PathLike)) and Path(target) == tmp_path
+        if listed_dir and tmp_path / "cfg.py" in seen:
+            raise _share_fault(53)
+        return real_scandir(target)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+    with pytest.raises(WiringError, match=_EVERYONE) as refused:
+        load_config(tmp_path)
+    assert not isinstance(refused.value, ConfigDirUnlistable)
+    # Without these, a refusal raised before the directory stopped listing would pass for the
+    # wrong reason. A policy refusal is never judged again, so nothing lists it after the refusal;
+    # the listing is tried here to show it had stopped by then.
+    assert seen == [tmp_path, tmp_path / "cfg.py"]
+    with pytest.raises(OSError) as relisted:
+        os.scandir(tmp_path)
+    assert getattr(relisted.value, "winerror", None) == 53
+
+
+# A policy refusal of the directory itself, one per arm: a write grant to Everyone, and an owner
+# that is neither the engine's account nor an administrator.
+_POLICY_REFUSALS: dict[str, tuple[_WinPathSecurity, str]] = {
+    "writable by others": (_EVERYONE_WRITE_READ, _EVERYONE),
+    "foreign owner": (
+        _WinPathSecurity(owner_sid=_FOREIGN, aces=((_ALLOW, _FULL, _SELF),)),
+        "neither the account the engine runs as nor an administrator",
+    ),
+}
+
+
+@pytest.mark.parametrize("arm", sorted(_POLICY_REFUSALS))
+def test_a_policy_refusal_stands_when_its_directory_then_moves_away(
+    arm: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check refused the directory on its policy, and the directory then moved away. The
+    refusal stands: only a refusal that itself came from the directory being gone may be answered
+    as missing, so a reload audits this ``invalid_config``, not ``not_found`` (vault BACKLOG
+    #5248). Before, any refusal was judged again by listing the directory."""
+    from messagefoundry.config.fingerprint import ConfigDirMissing
+
+    read, expected = _POLICY_REFUSALS[arm]
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    _write_cfg(cfg)
+    _take_windows_path(monkeypatch, _CLEAN_READ, _SELF, moves_away=(cfg, read))
+    with pytest.raises(WiringError, match=expected) as refused:
+        load_config(cfg)
+    assert not isinstance(refused.value, ConfigDirMissing)
+    assert (tmp_path / "cfg.moved").is_dir(), "the directory never moved, so nothing was measured"
+
+
+@pytest.mark.parametrize("unreached", [53, 67])  # ERROR_BAD_NETPATH, ERROR_BAD_NET_NAME
+def test_a_directory_whose_share_is_lost_at_its_access_read_is_unreadable(
+    unreached: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directory's own owner and DACL read failed because its share could not be reached, and
+    the directory no longer lists: the load cannot read the directory, so it refuses with
+    ``ConfigDirUnlistable`` and a reload audits ``unreadable``, as a share lost at the walk's
+    listing is (#3535, vault BACKLOG #5248). Before, it was a source the check could not vet."""
+    from messagefoundry.config.wiring import ConfigDirUnlistable
+    from tests._share_fault import _share_fault
+
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    seen = _take_windows_path(
+        monkeypatch, _CLEAN_READ, _SELF, by_name={tmp_path.name: _WinPathSecurity(status=unreached)}
+    )
+    real_scandir = os.scandir
+
+    def _scandir(target: Any) -> Any:
+        if isinstance(target, (str, os.PathLike)) and Path(target) == tmp_path and seen:
+            raise _share_fault(unreached)
+        return real_scandir(target)
+
+    monkeypatch.setattr(os, "scandir", _scandir)
+    with pytest.raises(ConfigDirUnlistable, match="could not read"):
+        load_config(tmp_path)
+    assert seen == [tmp_path]
+
+
+def test_a_share_read_fault_on_a_directory_that_still_lists_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: the read said the share could not be reached, but the
+    directory still lists. Nothing shows the share is gone, so the read failure refuses as a source
+    the check could not vet, not as a directory the load cannot read."""
+    from messagefoundry.config.wiring import ConfigDirUnlistable
+
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    _write_cfg(tmp_path)
+    _take_windows_path(
+        monkeypatch, _CLEAN_READ, _SELF, by_name={tmp_path.name: _WinPathSecurity(status=53)}
+    )
+    with pytest.raises(WiringError, match=r"\(Win32 error 53\)") as refused:
+        load_config(tmp_path)
+    assert not isinstance(refused.value, ConfigDirUnlistable)
 
 
 # ---- Tier 2: Windows-gated integration via icacls ---------------------------

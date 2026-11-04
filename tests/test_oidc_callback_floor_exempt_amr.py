@@ -353,6 +353,7 @@ async def _renamed_onto(
         auth_provider=provider,
         directory_object_id=object_id,
         password_generated=False,
+        audits=(),
     )
 
 

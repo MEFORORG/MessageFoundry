@@ -868,7 +868,7 @@ async def test_strict_validation_timeout_dead_letters_and_naks(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # #89 DoS backstop: a strict validate that outruns the per-connection strict_timeout_s must
-    # dead-letter the message (disposition ERROR, PHI-safe/value-free string) and NAK AE — instead of
+    # dead-letter the message (disposition ERROR, PHI-safe/value-free string) and NAK — instead of
     # pinning the listener behind a hung hl7apy parse. We monkeypatch the MODULE-LOCAL `validate` that
     # wiring_runner imported (NOT messagefoundry.parsing.validate.validate), so the runner's off-loop
     # call hits our blocking stand-in. It runs on a worker thread (via to_thread), so a plain
@@ -890,7 +890,7 @@ async def test_strict_validation_timeout_dead_letters_and_naks(
     runner = await _run(reg, store)
     try:
         port = runner._sources["mllp_in"].sockport  # type: ignore[attr-defined]
-        with pytest.raises(DeliveryError, match="negative ACK"):  # the AE NAK
+        with pytest.raises(DeliveryError, match="negative ACK"):  # AR, or AE if never begun
             await _mllp_client(port).send(ADT)
         await _until_message(store, MessageStatus.ERROR.value, channel_id="mllp_in")
     finally:

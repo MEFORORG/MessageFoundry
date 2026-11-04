@@ -383,6 +383,7 @@ async def test_an_edited_row_on_a_keyed_store_breaks_no_tie(tmp_path: Path) -> N
             auth_provider=AuthProvider.AD.value,
             directory_object_id=str(_GUID_V),
             password_generated=False,
+            audits=(),
         )
         assert await service._stored_directory_object_id("victor") == str(_GUID_V)
 
