@@ -200,7 +200,7 @@ def test_a_padded_sec_fetch_site_is_refused_by_the_check_itself() -> None:
             webconsole_auth.assert_same_origin(request("POST", value))
         assert refused.value.status_code == 403, value
         assert refused.value.detail == _UNRECOGNISED, (value, refused.value.detail)
-        # A GET keeps its earlier rule: only cross-site and same-site are refused there.
+        # On a GET an unrecognised value counts as absent (B291-R1), and with no Origin it passes.
         webconsole_auth.assert_same_origin(request("GET", value))
     for value in ("same-origin", "none"):
         webconsole_auth.assert_same_origin(request("POST", value))
@@ -211,30 +211,54 @@ def test_a_padded_sec_fetch_site_is_refused_by_the_check_itself() -> None:
         assert (refused.value.status_code, refused.value.detail) == (403, _CROSS_SITE), value
 
 
-def test_a_get_with_any_sec_fetch_site_line_deliberately_does_not_read_origin() -> None:
-    """DELIBERATE, and narrowing it is an owner call. On a GET, a present ``Sec-Fetch-Site`` line
-    settles the request, an empty or unknown one included, and ``Origin`` is never read. So a GET
-    with such a line and a FOREIGN ``Origin`` is not refused. That is the ``origin/main`` rule,
-    which owner rulings R4 and R4b of 2026-09-28 keep for the sign-in GETs.
+def test_a_get_with_an_empty_or_unknown_sec_fetch_site_is_decided_by_origin() -> None:
+    """B291-R1 of the vault file ``OWNER-RULINGS-2026-10-17-BATCH291.md`` (vault BACKLOG #3316):
+    on a GET, an empty or unknown ``Sec-Fetch-Site`` counts as absent, and ``Origin`` decides. So
+    such a GET with a FOREIGN ``Origin`` is refused as a cross-origin request, and with a matching
+    or no ``Origin`` it passes. Before the ruling any present line settled a GET and ``Origin`` was
+    never read, so the refusals here fail with that rule restored.
 
     Put to the function directly: over HTTP the fetch-metadata middleware and the route's own
     checks sit around it, and this pins what ``assert_same_origin`` itself does.
 
-    Controls: the same foreign ``Origin`` with NO ``Sec-Fetch-Site`` line is refused on a GET, and
-    the same headers on a POST are refused, so the passes are this rule and not a dead check."""
+    Controls: a GET carrying one of the four named values is still settled by it, a foreign
+    ``Origin`` beside it changing nothing, so the refusals are the narrowing and not a check that
+    now reads ``Origin`` on every GET. A GET with neither header passes (rulings R4 and R4b)."""
 
     def request(method: str, headers: dict[str, str]) -> Any:
-        return origin_check_request(method, {"host": "t", "origin": EVIL_ORIGIN, **headers})
+        return origin_check_request(method, {"host": "t", **headers})
 
-    # Which branch refuses the POST differs: an empty line is absence, so Origin decides; an
-    # unknown value is refused before Origin is read.
-    for value, branch in (("", _CROSS_ORIGIN), ("x", _UNRECOGNISED)):
-        webconsole_auth.assert_same_origin(request("GET", {"sec-fetch-site": value}))
+    # The table's own values for the two narrowed states: empty, an unknown token, another case,
+    # padding, and two lines an intermediary folded into one comma-joined value.
+    for value in (*_TABLE_SITES["empty"], *_TABLE_SITES["any other value"]):
+        assert value is not None
         with pytest.raises(HTTPException) as refused:
-            webconsole_auth.assert_same_origin(request("POST", {"sec-fetch-site": value}))
+            webconsole_auth.assert_same_origin(
+                request("GET", {"sec-fetch-site": value, "origin": EVIL_ORIGIN})
+            )
+        assert (refused.value.status_code, refused.value.detail) == (403, _CROSS_ORIGIN), value
+        webconsole_auth.assert_same_origin(
+            request("GET", {"sec-fetch-site": value, "origin": "http://t"})
+        )
+        webconsole_auth.assert_same_origin(request("GET", {"sec-fetch-site": value}))
+    # control: a named value settles a GET, so a foreign Origin beside it is not read
+    for value in ("same-origin", "none"):
+        webconsole_auth.assert_same_origin(
+            request("GET", {"sec-fetch-site": value, "origin": EVIL_ORIGIN})
+        )
+    # Writes are unchanged, and which branch refuses one is pinned: an empty line is absence, so
+    # Origin decides; an unknown value is refused before Origin is read.
+    for value, branch in (("", _CROSS_ORIGIN), ("x", _UNRECOGNISED)):
+        with pytest.raises(HTTPException) as refused:
+            webconsole_auth.assert_same_origin(
+                request("POST", {"sec-fetch-site": value, "origin": EVIL_ORIGIN})
+            )
         assert (refused.value.status_code, refused.value.detail) == (403, branch), value
+    # control: a GET with neither header passes (R4, R4b); absent Sec-Fetch-Site and a foreign
+    # Origin is refused by the same branch as the narrowed values above
+    webconsole_auth.assert_same_origin(request("GET", {}))
     with pytest.raises(HTTPException) as refused:
-        webconsole_auth.assert_same_origin(request("GET", {}))
+        webconsole_auth.assert_same_origin(request("GET", {"origin": EVIL_ORIGIN}))
     assert (refused.value.status_code, refused.value.detail) == (403, _CROSS_ORIGIN)
 
 
