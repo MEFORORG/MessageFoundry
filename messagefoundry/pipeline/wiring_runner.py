@@ -8608,8 +8608,9 @@ class RegistryRunner:
                     # A document's own value, which the splice would escape, not a marker.
                     nak_code, nak_text = "AR", "OBX-5.5 document holds a delimiter or control"
                 elif isinstance(exc, UnreadableDelimitersError):
-                    # The header, not a document: no OBX-5.5 of this body can be read.
-                    nak_code, nak_text = "AR", "no MSH, or MSH-2 shorter than four characters"
+                    # The header, not a document: no OBX-5.5 of this body can be read. No comma:
+                    # the ACK echoes a sender's own delimiters, and a comma is a plausible one.
+                    nak_code, nak_text = "AR", "no MSH or MSH-2 shorter than four characters"
                 elif isinstance(exc, Base64DelimiterError):
                     # Checked before its base class: the body's delimiters, not a marker.
                     nak_code, nak_text = "AR", "document under base64 delimiters"

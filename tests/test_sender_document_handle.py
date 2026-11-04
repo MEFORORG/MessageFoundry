@@ -1787,6 +1787,24 @@ def test_the_retention_strip_skips_a_body_whose_header_names_no_delimiters() -> 
     assert documents == 1 and stripped != readable
 
 
+def test_the_retention_strip_contains_any_fault_in_the_separator_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unlike the detach, which lets a ``ValueError`` subclass from the separator read out, the
+    retention strip contains it, as it contains a parse failure: one row must not end the pass."""
+    from messagefoundry.parsing.binary import strip_documents
+
+    class _Fault(ValueError):
+        pass
+
+    def _raise(_self: Message) -> tuple[str, str, str, str, str]:
+        raise _Fault("not the header")
+
+    body = _hl7(_b64(2000))
+    monkeypatch.setattr(Message, "_encoding_chars", _raise)
+    assert strip_documents(body, pruned_at=0.0) == (body, 0, 0)
+
+
 def test_another_fault_in_the_separator_read_is_not_blamed_on_the_header(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1826,7 +1844,7 @@ async def test_a_streaming_body_whose_header_names_no_delimiters_is_refused_befo
     receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
 
     assert _ack_code(ack) == "AR"
-    assert ack is not None and "no MSH, or MSH-2 shorter than four characters" in ack
+    assert ack is not None and "no MSH or MSH-2 shorter than four characters" in ack
     assert receipt.refusal is RefusalKind.PERMANENT
     rows = await _rows(store, ic.name)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2

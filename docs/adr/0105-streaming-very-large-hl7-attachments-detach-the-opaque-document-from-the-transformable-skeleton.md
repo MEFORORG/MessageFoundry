@@ -258,9 +258,10 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   pre-send `encoding_characters` / `hl7_raw_separators` failures — so the row takes the normal
   ERROR/retry/dead-letter path and **the connector never receives an un-hydrated handle** (which would
   deliver `mfdoc:v1:ref:…` into the partner's `OBX-5.5` = silent corruption).
-- **Which re-attach failures are permanent (vault BACKLOG #2809, added 2026-11-01).** Two are
-  refused permanently: the payload does not parse as HL7, or its separators cannot be read because
-  it has no `MSH` or its first `MSH`'s `MSH-2` is shorter than four characters. Either raises `UnreattachableDocumentError`, which `_hydrate_payload` turns into a
+- **Which re-attach failures are permanent (vault BACKLOG #2809, added 2026-11-01).** At least two
+  are refused permanently: the payload does not parse as HL7, or it holds the raw handle marker and
+  its separators cannot be read because it has no `MSH` or its first `MSH`'s `MSH-2` is shorter
+  than four characters (with no raw marker, such a payload is carried as it is). Either raises `UnreattachableDocumentError`, which `_hydrate_payload` turns into a
   permanent `NegativeAckError` (code `reattach`), so that row dead-letters alone, under either
   `internal_error` policy. On a batched outbound that member is dead-lettered alone and the rest of the
   batch goes out, provided every other member hydrates. A stored

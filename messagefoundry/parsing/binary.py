@@ -174,8 +174,9 @@ class NonVerbatimDocumentError(ValueError):
 
 class UnreadableDelimitersError(ValueError):
     """A received body has an OBX, and ``Message._encoding_chars`` cannot read its delimiters: it
-    has no MSH, or its first MSH's MSH-2 is shorter than four characters (BACKLOG #5099). The
-    parser always reads MSH-1 as one character, so it is never the cause on a received body.
+    has no MSH, or its first MSH's MSH-2 is shorter than four characters (BACKLOG #5099). Where a
+    received body has an MSH, the parser reads its MSH-1 as one character, so MSH-1 is never the
+    cause there; with no MSH, MSH-1 and MSH-2 both read empty.
     Every ``OBX-5.5`` read raises on such a body, so the ingress detach refuses it by this name,
     before anything is stored and before the ACK, rather than letting a plain ``ValueError`` out
     that no listener records. The text names no byte of the body."""
@@ -846,10 +847,14 @@ def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int,
     except Exception:
         # A malformed body that merely looked like HL7 — never crash a retention pass on it.
         return raw, 0, 0
-    if not _delimiters_readable(message):
+    try:
+        message._encoding_chars()
+    except ValueError:
         # No MSH, or an MSH-2 shorter than four characters: every OBX read would raise, and the
         # retention pass calls this with no try, so one such stored row would abort the pass on
         # every run. Its document stays, as any body this strip cannot read does (BACKLOG #5099).
+        # Any ValueError, not only the bare one _delimiters_readable answers for: the detach lets
+        # another fault out, but a retention pass must contain it as it contains a parse failure.
         return raw, 0, 0
     stripped, reclaimed = strip_documents_in_hl7(message, pruned_at=pruned_at, min_bytes=min_bytes)
     if stripped == 0:

@@ -136,10 +136,11 @@ STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
 
 #: The stored reason for an HL7 body refused because it holds the document handle marker under
 #: delimiters that are a base64 character, or that cannot be read because it has no MSH or its
-#: MSH-2 is shorter than four characters (BACKLOG #5099). It names no byte of the body.
+#: MSH-2 is shorter than four characters (BACKLOG #5099). It names no byte of the body, and stays
+#: short enough that the stored error, which truncates a longer text, keeps all of it.
 DOC_REF_MARKER_REFUSED_REASON = (
-    "document handle refused: the body holds the handle marker, and a delimiter is a base64 "
-    "character, or the body has no MSH or an MSH-2 shorter than four characters"
+    "document handle refused: the body holds the handle marker under delimiters that are a "
+    "base64 character or unreadable"
 )
 
 

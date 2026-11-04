@@ -680,8 +680,11 @@ def _binary_carriage(data: bytes) -> None:
     if is_doc_ref(text):
         with contextlib.suppress(DocRefError):
             parse_doc_ref(text)
-    # A carriage value never reaches the HL7 path, so this call needs no carve-out.
+    # A carriage value never reaches the HL7 path, so this call needs no carve-out. Nor does the
+    # bare call: strip_documents returns a body whose separators cannot be read unchanged
+    # (BACKLOG #5099), so no known finding covers it and any raise escapes.
     strip_documents(CARRIAGE_MARKER + text, pruned_at=0.0)
+    strip_documents(text, pruned_at=0.0)
     try:
         _strip_and_scan_hl7(text)
     except ValueError as exc:
@@ -690,8 +693,7 @@ def _binary_carriage(data: bytes) -> None:
 
 
 def _strip_and_scan_hl7(text: str) -> None:
-    """The HL7 half of :func:`_binary_carriage`: the retention strip, the detach scan, the extract."""
-    strip_documents(text, pruned_at=0.0)
+    """The HL7 half of :func:`_binary_carriage`: the detach scan and the extract."""
     try:
         message = Message.parse(text)
     except HL7PeekError:
