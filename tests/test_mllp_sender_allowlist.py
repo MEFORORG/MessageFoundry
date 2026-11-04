@@ -54,6 +54,7 @@ from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _IntakeRateLimiter
 from messagefoundry.pki import san_othernames_intact
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.transports import mllp as mllp_module
 from messagefoundry.transports.mllp import _SENDER_DENIED, _SENDER_RATE_LIMITED, MLLPSource
 from tests.test_api_tls import (
     _NOW,
@@ -67,6 +68,7 @@ from tests.test_api_tls import (
     _upn,
 )
 from tests.test_connections_file import _config
+from tests.test_mllp_tls import tls_path  # noqa: F401  -- a pytest fixture, used by name below
 
 _INBOUND = "IB_ACME_ADT"
 #: A subject that reads like a person, so the leak assertions below look for something specific.
@@ -158,6 +160,14 @@ async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "engine.db")
     yield s
     await s.close()
+
+
+def _assert_tls_path(source: MLLPSource, tls_path: str) -> None:  # noqa: F811
+    """The control for the ``tls_path`` fixture, which runs a case both ways the listener admits a
+    socket before its handshake (BACKLOG #1606): the listener runs the path the case names, so the
+    sender check is shown behind the listener's own accept loop too."""
+    accept_loop = isinstance(source._server, mllp_module._AcceptingServer)
+    assert accept_loop == (tls_path == "accept_loop"), (tls_path, source._server)
 
 
 def _runner(
@@ -262,13 +272,17 @@ async def _rows(store: MessageStore) -> list[dict[str, Any]]:
 
 
 async def test_a_listed_sender_is_accepted_and_another_ca_issuing_its_name_is_refused(
-    tmp_path: Path, store: MessageStore, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+    tls_path: str,  # noqa: F811
 ) -> None:
     """The two-CA case: both chains verify at the TLS layer, and only the issuer differs."""
     named, other = _ca("Partner CA"), _ca("Other CA")
     source = await _wired(
         _settings(tmp_path, [named[0], other[0]], {_issuer(named): [SUBJECT]}), store
     )
+    _assert_tls_path(source, tls_path)
     try:
         # Control: the listed name from the CA it is listed under is accepted (AA) and committed.
         reply, _ = await _exchange(source, _bundle(tmp_path, named))
@@ -292,10 +306,13 @@ async def test_a_listed_sender_is_accepted_and_another_ca_issuing_its_name_is_re
 
 
 async def test_an_unlisted_name_from_the_listed_ca_is_refused(
-    tmp_path: Path, store: MessageStore
+    tmp_path: Path,
+    store: MessageStore,
+    tls_path: str,  # noqa: F811
 ) -> None:
     named = _ca("Partner CA")
     source = await _wired(_settings(tmp_path, [named[0]], {_issuer(named): [SUBJECT]}), store)
+    _assert_tls_path(source, tls_path)
     try:
         reply, rest = await _exchange(source, _bundle(tmp_path, named, cn="someone.else.example"))
         # Control on the same listener: the listed name is accepted.
@@ -1051,7 +1068,11 @@ async def test_a_refusal_writes_the_audit_row_and_event_http_writes(
 
 
 async def test_a_refused_sender_that_reconnects_is_closed_unread_at_its_budget(
-    tmp_path: Path, store: MessageStore, caplog: pytest.LogCaptureFixture, long_window: None
+    tmp_path: Path,
+    store: MessageStore,
+    caplog: pytest.LogCaptureFixture,
+    long_window: None,
+    tls_path: str,  # noqa: F811
 ) -> None:
     """The failed-attempt budget HTTP charges for ``auth_subject_denied``, reused: each refusal is
     charged to the peer's address, and once the budget is spent the address is closed unread,
@@ -1066,6 +1087,7 @@ async def test_a_refused_sender_that_reconnects_is_closed_unread_at_its_budget(
         events=events,
     )
     _assert_long_window(source)
+    _assert_tls_path(source, tls_path)
     refused_bundle, listed_bundle = _bundle(tmp_path, other), _bundle(tmp_path, named)
     budget = INTAKE_AUTH_RATE_LIMIT_DEFAULT
     try:
