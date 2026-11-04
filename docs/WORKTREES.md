@@ -917,8 +917,9 @@ prose, even when it also sends mail:
     <!-- lander-ledger-ask rows=#3844,#3025 file=1 -->
 
 `rows` names rows whose banner is owed; `file` counts new rows to file. Either may be left out.
-Under ledger ruling R2 a merged PR files at most one row, so an ask made since 2026-11-04 reads
-`file=1` at most; how the script reads a larger count is in its docstring.
+Under ledger ruling R2 (`CLAUDE.md` section 5) an ask made since 2026-11-04 should say `file=1` at
+most. The script's docstring says how it reads a larger count, and why two `file=1` asks on one PR
+stay `OWED`.
 Without the marker the report falls back to a prose read that can miss an ask; what it reads, and
 what it cannot see, are in the script's docstring. Tests:
 [`tests/test_owed_ledger_acts.py`](../tests/test_owed_ledger_acts.py).

@@ -35,16 +35,16 @@
     (ledger ruling R8, owner-signed 2026-11-04, in session: "Sign R1-R9"). R8 returns a batch whose
     holder has shown no seat goal, commit or PR activity for 72 hours to FREE, and its claims with
     it. The holder is the seat that took the batch, which is not always the worktree a claim names.
-    No tool applies R8 yet. Until one does, the drafting Manager's reading, recorded beside the
-    signed text and not part of the signature, has the seat taking the batch read the holder's seat
-    record and recent commits first, then release each claim through the path for another
-    worktree's claim, `-Release` with `-Force`, which records the release as the next paragraph says.
-    That record has no field for a reason, so it does not show that R8 was the ground. Before
-    releasing, read the holder's PR activity too: it is R8's third signal, though that reading names
-    only the seat record and commits. This script still expires nothing by itself: it does not
-    measure the 72 hours or tell a batch's claim from any other. Its refusals name R8 only in the
-    directory-only state; where a session is, or may be, in the claim's worktree, they still say to
-    ask it first. CLAUDE.md section 5 cites the signed text, under R5.
+    No tool applies R8 yet (2026-11-04). Until one does, the drafting Manager's reading, recorded
+    beside the signed text and not part of the signature, has the seat taking a released batch read
+    the holder's seat record and recent commits first. R8's signed test also names PR activity, so
+    read the holder's PR activity too; the reading names only the other two. The reading then has
+    that seat release each claim through the path for another worktree's claim, `-Release` with
+    `-Force`, which records the release as the next paragraph says. That record has no field for a
+    reason, so it does not show that R8 was the ground. This script still expires nothing by
+    itself: it does not measure the 72 hours or tell a batch's claim from any other. Its refusals
+    name R8 only in the directory-only state; where a session is, or may be, in the claim's
+    worktree, they still say to ask it first. CLAUDE.md section 5 cites the signed text, under R5.
 
     EVERY RELEASE IS RECORDED, `-Force` included, as one JSON line appended to
     <git-common-dir>/mefor-coord/claims/.history: at least the key, the releasing worktree and branch,
@@ -193,7 +193,8 @@ function Write-DivergenceNote([Parameter(Mandatory)][string]$Subject) {
     Write-Host "        so the $Subject" -ForegroundColor Yellow
 }
 
-# LEDGER RULING R8, stated once in the header and pointed at from the two directory-only refusals.
+# LEDGER RULING R8, explained once in the header and pointed at from the two directory-only refusals;
+# the note quotes only R8's signed sentence and leaves the rest to the header.
 # It is framed as an OWNER RULING so that it reads as the owner having said so, which those refusals
 # already count, and not as a third reason. Only there, because only there has this host positively
 # placed no session in the claim's worktree: 'occupied' has one and says to ask it, 'present' and
@@ -202,10 +203,11 @@ function Write-DivergenceNote([Parameter(Mandatory)][string]$Subject) {
 # nothing here can tell a batch's claim from another or read R8's three signals. Only what R8 signs
 # sits under the OWNER RULING label; who releases, and how, is the Manager's reading and says so.
 function Write-R8Note {
-    Write-Host "  OWNER RULING R8 (ledger, 2026-11-04): a batch whose holder has shown no seat goal, commit"
-    Write-Host "  or PR activity for 72 hours is released to FREE, and its claims with it."
+    Write-Host "  OWNER RULING R8 (ledger, 2026-11-04) covers a batch's claims and nothing else: a batch"
+    Write-Host "  whose holder has shown no seat goal, commit or PR activity for 72 hours is released to"
+    Write-Host "  FREE, and its claims with it."
     Write-Host "  Not part of the ruling: one worktree's last commit is not R8's test, and the Manager's"
-    Write-Host "  reading has the seat taking the batch release the claims. The header of"
+    Write-Host "  reading has the seat taking a released batch release its claims. The header of"
     Write-Host "  scripts\coord\claim.ps1 says how."
 }
 
