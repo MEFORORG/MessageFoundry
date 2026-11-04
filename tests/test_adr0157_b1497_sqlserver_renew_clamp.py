@@ -484,11 +484,12 @@ async def test_a_failed_rollback_logs_no_stored_value_or_traceback_at_warning(
     assert any(r.levelno == logging.DEBUG and r.exc_info for r in caplog.records)
 
 
-async def test_the_discard_runs_before_the_warning_is_built(
+async def test_a_faulting_sqlstate_read_neither_skips_the_discard_nor_replaces_the_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Nothing the WARNING computes can skip the discard: with the SQLSTATE read raising, the
-    connection whose rollback failed is still out of the pool."""
+    """Nothing the WARNING computes can skip the discard or stand in for the caller's error: with
+    the SQLSTATE read raising, the connection whose rollback failed is still out of the pool, and
+    the write's own error is the one raised."""
     import messagefoundry.store.sqlserver as sqlserver
 
     def _refuse(_exc: BaseException) -> str | None:
@@ -498,9 +499,30 @@ async def test_the_discard_runs_before_the_warning_is_built(
     conn = _Conn()
     conn.fail = _duplicate_key()
     conn.rollback_fail = _truncation()
-    with pytest.raises(LookupError):
+    with pytest.raises(_DriverError, match="2627"):
         await _store(conn)._execute("INSERT INTO t VALUES (?)", ("x",))
     assert conn.closed is True
+
+
+async def test_a_rollback_past_its_bound_logs_no_stored_value_or_traceback_at_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The bound's own branch, on the clamped claim: the WARNING names the timeout and carries no
+    traceback, whose chain would hold the claim's driver text."""
+    conn = _Conn()
+    conn.rollback_hangs = True
+    conn.fail = _duplicate_key()
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.store.sqlserver"),
+        pytest.raises(_DriverError),
+    ):
+        await _store(conn)._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=1.0)
+    assert conn.closed is True
+    for record in caplog.records:
+        assert record.exc_info is None and record.exc_text is None, record.getMessage()
+        assert _DUPLICATED_ID not in record.getMessage(), record.getMessage()
+    (discard,) = [r for r in caplog.records if "discarding the connection" in r.getMessage()]
+    assert "(TimeoutError, SQLSTATE None)" in discard.getMessage()
 
 
 async def test_a_rollback_that_succeeds_still_recycles_the_connection() -> None:

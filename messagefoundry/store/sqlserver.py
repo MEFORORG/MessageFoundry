@@ -477,11 +477,13 @@ def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
     try:
         closer = asyncio.get_running_loop().run_in_executor(None, _raw_closer(conn, raw))
     except RuntimeError:  # the executor is shut down; see the docstring
+        # No traceback at WARNING: a discard runs inside the failed call's except arm, so one would
+        # chain that call's driver error, whose text can quote stored values (BACKLOG #5066).
         log.warning(
             "sqlserver: could not schedule the close of a discarded connection; it is out of the"
-            " pool and closes when collected",
-            exc_info=True,
+            " pool and closes when collected"
         )
+        log.debug("sqlserver: the refused close's traceback", exc_info=True)
         return None
     closer.add_done_callback(_drain_detached_close)
     return closer
@@ -5447,14 +5449,19 @@ class SqlServerStore:
             async with nullcontext() if within is None else asyncio.timeout(within):
                 await conn.rollback()
         except Exception as exc:  # noqa: BLE001 - every driver fault, and the bound; the caller re-raises
-            # Detach before logging, so nothing the log line computes can skip the discard.
-            # Its future is deliberately not awaited; see the docstring.
+            # Detach first, and read the SQLSTATE guarded, so the log line can neither skip the
+            # discard nor replace the caller's error. Its future is deliberately not awaited; see
+            # the docstring.
             _detach_connection(conn)
+            try:
+                state = driver_sqlstate(exc)
+            except Exception:  # noqa: BLE001 - a diagnostic read; the caller's error must propagate
+                state = None
             log.warning(
                 "sqlserver: rollback after a failed transaction failed or ran past its bound"
                 " (%s, SQLSTATE %s); discarding the connection",
                 type(exc).__name__,
-                driver_sqlstate(exc),
+                state,
             )
             log.debug("sqlserver: the failed rollback's traceback", exc_info=True)
 
