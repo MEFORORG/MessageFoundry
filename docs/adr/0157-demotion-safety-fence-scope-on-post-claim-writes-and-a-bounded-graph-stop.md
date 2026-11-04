@@ -1327,9 +1327,24 @@ At least these, read 2026-10-26:
   at the stop check leaves the row unmarked, and the next poll reads it again. The test reads only
   the statement's shape, so a poll it does not catch can still claim at the select;
   `docs/CONNECTIONS.md`, *Database source*, names at least the shapes it misses.
+
+  *Amended 2026-11-03 (BACKLOG #4685):* an uncancelled `stop()` now has a bound of its own. It
+  waits `POLL_STOP_GRACE_S` (5 s, `transports/base.py`, the figure `FileSource.stop()` uses) for
+  the poll task, then cuts it, logs a WARNING, and joins and closes the pool as a cancelled stop
+  does, bounded by `_CUT_JOIN_TIMEOUT_S` and `_POOL_CLOSE_TIMEOUT_S`. It never cuts the handler
+  call: while the task is inside one it keeps waiting a grace at a time, and the grace restarts
+  when the call ends, so that wait is only as bounded as the store. A mark it cuts leaves its
+  committed row unmarked, a duplicate. The cancel path above is unchanged.
 - **RemoteFile, Timer.** `stop()` joins the poll task with `gather` and no timeout. When cut, that
   `gather` cancels the poll task. Before the grace, only the serial loop's one in-flight stop could
   be cut like this. Now any of them can, but only after the grace or a second cancel.
+
+  *Amended 2026-11-03 (BACKLOG #4685):* RemoteFile's `stop()` now mirrors `FileSource.stop()`. It
+  waits `POLL_STOP_GRACE_S` for the poll task, then cancels it and logs a WARNING, and it never
+  cancels the task inside a store call: a hand-off, or a leave-mode ledger read, write or prune.
+  When cut, it no longer cancels the poll task inside a store call either; the task exits at its
+  next stop check. Timer is unchanged, and has no bound by design: its only awaits are the stop
+  signal and the hand-off, so a bound could only ever cut a store call.
 - **Loopback, PassThrough.** `stop()` returns at once.
 
 ### Tests
@@ -1372,7 +1387,9 @@ At least these were found in review and are left as they were, because the seria
 too: a stop that fails on every attempt keeps every later `start()` from building the graph; a
 re-raised stop failure skips `stop()`'s settle of a prior demotion's abandoned stops;
 an uncancelled Database `stop()`, and RemoteFile and Timer `stop()`, still join their poll task
-with no bound of their own; and
+with no bound of their own (*amended 2026-11-03, BACKLOG #4685:* Database and RemoteFile are now
+bounded outside a store call, and Timer needs no bound; see *What this relies on, per connector*);
+and
 a stop failure in `start()`'s failed-start unwind replaces the start error, which survives only as
 `__context__`. Also as the serial loop did: when `Engine.stop()`'s own `registry_runner.stop()`
 re-raises a stop failure, nothing retries it, so the drain side is never torn down,
