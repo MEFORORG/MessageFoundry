@@ -8391,7 +8391,7 @@ class RegistryRunner:
                 return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
         # refusal records ERROR + returns a refusal — never accepted-and-dropped. Any other fault, a
-        # put_attachment fault among them (#1619), propagates with no row, so the input is kept.
+        # put_attachment fault among them (#1619), propagates with no row.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
