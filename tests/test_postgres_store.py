@@ -23,6 +23,7 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -56,6 +57,7 @@ from tests._keyed_reopen_contract import (
     server_keyed_reopen_report,
 )
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
+from tests._keyless_blank_contract import keyed_cipher
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -1364,7 +1366,6 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
 
     The shared body is the one the SQL Server suite runs. The probe reads ``pg_locks``: a lock
     request not yet granted whose blocker, per ``pg_blocking_pids``, is the bind's backend."""
-    from typing import Any
 
     from tests._federated_unbind_store_contract import (
         _assert_bind_and_user_delete_take_one_lock_order,
@@ -5711,9 +5712,10 @@ async def test_keyless_blank_contract(store, case) -> None:
 
     key = generate_key()
 
-    async def open_keyed() -> PostgresStore:
+    async def open_keyed(**kw: Any) -> PostgresStore:
         return await PostgresStore.open(
-            load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
+            load_settings(environ=os.environ).store,
+            cipher=keyed_cipher(make_cipher, key, **kw),
         )
 
     raw, fetch = _raw_adapters(store)

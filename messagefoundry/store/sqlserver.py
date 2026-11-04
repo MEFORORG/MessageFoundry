@@ -208,6 +208,7 @@ from messagefoundry.store.store import (
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
+    REINGRESS_ARTIFACT_MISSING,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     VIEWED_EVENT,
@@ -4100,7 +4101,7 @@ class SqlServerStore:
         every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
         ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
         (the queue payload's routing tag, BACKLOG #2593); ``blank_where`` names the blank values that
-        are real rows, which only a surface with no marker and no ciphertext seals (BACKLOG #3495).
+        are real rows (BACKLOG #3495), sealed as the SQLite twin says (BACKLOG #4994).
         Every identifier is a code constant and is bracket-quoted (``key`` is a T-SQL reserved word);
         only the marker pattern is a parameter.
 
@@ -4120,7 +4121,8 @@ class SqlServerStore:
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(count_sql, like)
         blanks = 0
-        if blank_where is not None and not keyed:
+        # A blank on a sealed surface is sealed only under the opt-out (BACKLOG #4994).
+        if blank_where is not None and (not keyed or not strict):
             blanks = await self._count_unmarked(
                 f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {blank_where}"
             )
@@ -4130,8 +4132,9 @@ class SqlServerStore:
             if is_sealed:
                 # As on SQLite: a peer may have sealed the rows between the count and the probe,
                 # so count again rather than report its legitimate seal as a plant. A blank here
-                # stays refused.
-                blanks = 0
+                # stays refused, unless the opt-out is on.
+                if strict:
+                    blanks = 0
                 pending = await self._count_unmarked(count_sql, like)
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
@@ -4172,10 +4175,8 @@ class SqlServerStore:
                     if left:
                         report_sealed_surface(log, self._cipher, table, column, left)
                     return 0
-                # The opt-out reseals plaintext, never a blank on a surface a peer keyed.
-                seal_where = (
-                    f"({pending_where}) OR ({blank_where})" if blanks and claimed else pending_where
-                )
+                # Without the opt-out, `blanks` is non-zero only on a surface this open claimed.
+                seal_where = f"({pending_where}) OR ({blank_where})" if blanks else pending_where
                 while True:
                     # autocommit is off, so every statement below shares one transaction, and this
                     # connection sees its own uncommitted UPDATEs: a sealed row stops matching.
@@ -8289,16 +8290,15 @@ class SqlServerStore:
                     (origin_msg_id, dest, seq),
                 )
                 art = await cur.fetchone()
-                # A missing row is a corrupt reference. A NULL body means retention erased the reply
-                # (BACKLOG #1560; the SQLite twin says how a token reaches here). `#eligible` is
+                # A NULL body means retention erased the reply (BACKLOG #1560; the SQLite twin says how a token reaches here). `#eligible` is
                 # materialized once, so a replay can commit between that read and the erasure. It
                 # must never become a child message. A missing row is damage, not an erasure, so
                 # that token is not blanked: its sealed reference is the evidence.
                 if art is None:
                     return await _consume_dead(
                         "ingress_handoff(missing-artifact)",
-                        "re-ingress work-row reference is corrupt/unparseable",
-                        "re-ingress ref corrupt",
+                        REINGRESS_ARTIFACT_MISSING,
+                        "re-ingress reply missing",
                     )
                 if art[0] is None:
                     return await _consume_dead(
@@ -8523,7 +8523,7 @@ class SqlServerStore:
         )
         return (
             self._cipher.decrypt(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
-            if (art and art["body"])
+            if (art and art["body"] is not None)
             else ""
         )
 
@@ -9565,7 +9565,9 @@ class SqlServerStore:
     ) -> int:
         """Blank the payload of dead rows updated before ``older_than`` (retention). Keeps the
         dead row + 'dead' status (counts/disposition) but frees the body and ``last_error``;
-        idempotent, because a row left with neither no longer matches.
+        idempotent, because a row left with neither no longer matches. Returns the number of dead
+        rows whose body it blanked; a row already blank that only loses its ``last_error`` is not
+        counted (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -9584,13 +9586,21 @@ class SqlServerStore:
         )
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # DATALENGTH, not `<> ''`: T-SQL pads trailing spaces before comparing, so a
+                # whitespace-only body would otherwise read as blank and survive uncounted.
                 await cur.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=? AND (payload <> '' OR last_error IS NOT NULL)"
-                    f" AND updated_at < {cutoff_sql}",
+                    f" WHERE status=? AND DATALENGTH(payload) > 0 AND updated_at < {cutoff_sql}",
                     (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 purged = cur.rowcount
+                # As on SQLite: a row already blank only loses its `last_error`, and is not counted
+                # (BACKLOG #4996).
+                await cur.execute(
+                    "UPDATE queue SET last_error=NULL WHERE status=? AND DATALENGTH(payload) = 0"
+                    f" AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                    (OutboxStatus.DEAD.value, *cutoff_params),
+                )
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
                 # it can no longer be replayed. If that was the message's LAST replayable row (per the
                 # negated live-holder predicate), release its streaming attachment here — the deferred half

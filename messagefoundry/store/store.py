@@ -967,6 +967,10 @@ _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 #: The ``last_error`` of a re-ingress token whose ``response`` artifact retention erased (BACKLOG
 #: #1560). The server backends import it for their own ``ingress_handoff``.
 REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
+#: The ``last_error`` of a re-ingress token whose ``response`` row is gone altogether. Retention keeps
+#: the row, so this is damage rather than an erasure, and the reference itself opened: named apart
+#: from a reference that did not, so an operator knows which row to look for (BACKLOG #4996).
+REINGRESS_ARTIFACT_MISSING: Final = "re-ingress reply row is missing"
 
 #: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
 #: drift apart. Used by :meth:`_attachment_still_referenced_sql`, which reached this predicate first:
@@ -9416,8 +9420,8 @@ class MessageStore:
         surface that holds no ciphertext, looks exactly like legacy plaintext, so that open seals
         it. On a surface that already holds ciphertext the data check refuses it instead. A value
         written into a marked surface by a later KEYLESS run of the same store, or by hand, is
-        refused even if the table had emptied out; the opt-out below seals it for one open, a blank
-        queue row excepted (see the blank rule below). A read-only open writes no marker. A store restored from a file copy keeps
+        refused even if the table had emptied out; the opt-out below seals it for one open, a live
+        blank queue row included (see the blank rule below). A read-only open writes no marker. A store restored from a file copy keeps
         the copy's markers. ``rotate-key`` changes no marker, because a surface stays keyed under any
         key. The uploaded-file store (``uploads.py``) is a directory, not a table, and has no marker.
 
@@ -9441,9 +9445,11 @@ class MessageStore:
           :data:`_REPLAYABLE_BODY` and the claim both treat it as erased.
         - Live, on a sealed surface: refused at the claim, dead-lettered and alerted. Nothing a keyed
           writer does leaves one, so it is what a plant looks like, and sealing it here would launder
-          the plant. That is why this exception reads the sealed state and not the row. The limit: an
-          empty body written by a keyless run of a store that was keyed before reads the same way,
-          and it is refused too, under the opt-out as well.
+          the plant. That is why this exception reads the sealed state and not the row. An empty
+          body written by a keyless run of a store that was keyed before reads the same way. The
+          opt-out is the operator's word that such values are legitimate, so under it this open
+          seals that blank as it seals the run's plaintext, and the row is delivered (BACKLOG #4994).
+          A row the claim already dead-lettered stays blank and is not replayable.
 
         **Each surface seals in ONE transaction.** A crash part-way through a first keyed open would
         otherwise leave a surface half-sealed, and the next open would read that as sealed and refuse
@@ -9547,9 +9553,10 @@ class MessageStore:
         ``key_cols`` (default: ``aad_cols``) are what the UPDATE targets. ``aad_of``, when given,
         builds the AAD from the selected row instead of ``cell_aad(table, column, *aad_cols)`` (the
         queue payload's routing tag, BACKLOG #2593). ``blank_where``, when given, names the blank
-        values that are real rows (BACKLOG #3495, :meth:`_encrypt_existing_rows`). They are sealed
-        only on a surface with no marker and no ciphertext, under the opt-out too, and they count as
-        something to seal, so the marker can never be written over them unsealed. All identifiers
+        values that are real rows (BACKLOG #3495, :meth:`_encrypt_existing_rows`). Without the
+        opt-out they are sealed only by the open that writes the marker on a surface holding no
+        ciphertext; under it, on any surface (BACKLOG #4994). They count as something to seal, so
+        this open never writes the marker over them and leaves them blank. All identifiers
         are code constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a
         parameter.
 
@@ -9578,15 +9585,18 @@ class MessageStore:
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(table, pending_where, like)
         blanks = 0
-        if blank_where is not None and not keyed:
+        # A blank on a sealed surface is sealed only under the opt-out (BACKLOG #4994).
+        if blank_where is not None and (not keyed or not strict):
             blanks = await self._count_unmarked(table, blank_where)
         is_sealed = keyed
         if (blanks or (pending and strict)) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
             if is_sealed:
                 # A peer may have sealed the rows between the count and the probe; count again so
-                # its legitimate seal is not reported as a plant. A blank here stays refused.
-                blanks = 0
+                # its legitimate seal is not reported as a plant. A blank here stays refused,
+                # unless the opt-out is on.
+                if strict:
+                    blanks = 0
                 pending = await self._count_unmarked(table, pending_where, like)
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
@@ -9612,10 +9622,8 @@ class MessageStore:
                 if left:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
-            # The opt-out reseals plaintext, never a blank on a surface another process keyed.
-            seal_where = (
-                f"({pending_where}) OR ({blank_where})" if blanks and claimed else pending_where
-            )
+            # Without the opt-out, `blanks` is non-zero only on a surface this open just claimed.
+            seal_where = f"({pending_where}) OR ({blank_where})" if blanks else pending_where
             while True:
                 # The same connection sees its own uncommitted UPDATEs, so a sealed row stops
                 # matching NOT LIKE and the loop terminates inside the one transaction.
@@ -12779,7 +12787,8 @@ class MessageStore:
         it is dead-lettered and consumed like a corrupt reference, and the failure is audited. A token
         whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
         produces no child and cannot be replayed. One whose ``response`` row is missing is damage: it
-        is dead-lettered as a corrupt reference and keeps its reference as the evidence."""
+        is dead-lettered under :data:`REINGRESS_ARTIFACT_MISSING` and keeps its reference as the
+        evidence."""
         tag_failures: list[CellTagError] = []
         try:
             return await self._ingress_handoff_txn(
@@ -12876,9 +12885,7 @@ class MessageStore:
             )
             art = await cur.fetchone()
             if art is None:
-                return await _consume_dead(
-                    "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
-                )
+                return await _consume_dead(REINGRESS_ARTIFACT_MISSING, "re-ingress reply missing")
             if art["body"] is None:
                 return await _consume_dead(
                     REINGRESS_ARTIFACT_ERASED, "re-ingress reply erased", erased=True
@@ -18550,7 +18557,8 @@ class MessageStore:
         replayable (re-queueing its stored ``payload``) until purged. Keeps the row + ``dead`` status
         (counts/disposition intact) and blanks ``payload`` + ``last_error``; after this the row can no
         longer be meaningfully replayed (its body is gone — the intended retention trade-off).
-        Idempotent (guards on a non-blank payload); returns the number of dead rows purged.
+        Idempotent: a re-run matches no row. Returns the number of dead rows whose body it blanked; a
+        row that was already blank and only loses its ``last_error`` is not counted (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7). A router raise dead-letters the
         ``ingress`` row and a handler raise the ``routed`` row
@@ -18601,8 +18609,15 @@ class MessageStore:
             )
             cur = await self._db.execute(
                 "UPDATE queue SET payload='', last_error=NULL "
-                "WHERE status=? AND (payload <> '' OR last_error IS NOT NULL) "
-                f"AND updated_at < {cutoff_sql}",
+                f"WHERE status=? AND payload <> '' AND updated_at < {cutoff_sql}",
+                (OutboxStatus.DEAD.value, *cutoff_params),
+            )
+            purged = int(cur.rowcount)
+            # A row already blank only loses its `last_error`: no body is purged, so it is left out
+            # of the count the retention audit records (BACKLOG #4996).
+            await self._db.execute(
+                "UPDATE queue SET last_error=NULL WHERE status=? AND payload = '' "
+                f"AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
                 (OutboxStatus.DEAD.value, *cutoff_params),
             )
             # #149 Phase 3a: a dead row just lost its payload + body_ref, so it can no longer be
@@ -18626,7 +18641,7 @@ class MessageStore:
                 ),
             )
             await self._commit()
-            return int(cur.rowcount)
+            return purged
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries last written before ``older_than`` (ADR 0005 retention).

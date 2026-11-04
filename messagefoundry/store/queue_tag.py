@@ -183,9 +183,11 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     if payload == "" and (cipher.encrypts or body_ref is not None):
         # A keyed writer seals every body, an empty one included, and a ref row always holds its
         # reference. Blank is what retention leaves, so it is never a cell to deliver. A keyless
-        # writer's live empty body is sealed by the first keyed open (BACKLOG #3495), so a blank that
-        # reaches this line on a keyed store is an erasure, a plant, or an empty body from a keyless
-        # run of an already keyed store. Nothing tells those apart, so all three are refused.
+        # writer's live empty body is sealed by the first keyed open (BACKLOG #3495), or by a keyed
+        # open under [store].allow_unmarked_ciphertext (BACKLOG #4994), so a blank that reaches this
+        # line on a keyed store is an erasure, a plant, or an empty body from a keyless run of an
+        # already keyed store that no open under the opt-out sealed. Nothing tells those apart, so
+        # all three are refused.
         raise QueueTagError("integrity: the queue row holds no sealed payload")
     try:
         opened = cipher.decrypt(payload, aad=queue_row_aad(row))

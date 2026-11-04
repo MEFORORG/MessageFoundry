@@ -245,12 +245,50 @@ async def assert_purge_concurrent_with_replay_keeps_the_invariant(
             assert message is not None and message["raw"] == REPLY, first
 
 
+async def assert_purge_concurrent_with_replay_of_a_delivery_row_keeps_the_invariant(
+    store: Any, fetch: RawFetch, _raw: RawSql
+) -> None:
+    """The body purge and a replay of a delivered OUTBOUND row raced, in both start orders (BACKLOG
+    #4996, from #1560's acceptance). Either may win, and a server backend may pick one as the loser of
+    a lock race. What may never happen is the torn state: a ``pending`` row with an erased body,
+    which would put a zero-byte frame on the wire and record it as a send."""
+    for first in ("replay", "purge"):
+        mid = await store.enqueue_message(
+            channel_id="IB_REAL",
+            raw=RAW,
+            deliveries=[(f"OB_D_{first}", BODY)],
+            control_id=f"ER-DLV-{first}",
+            now=0.0,
+        )
+        [item] = await store.claim_ready(destination_name=f"OB_D_{first}", now=0.0)
+        await store.mark_done(item.id, now=0.0)
+        replay = store.replay(mid, now=60 * DAY, audit=no_operator_audit)
+        purge = store.purge_message_bodies(older_than=10 * DAY, now=60 * DAY)
+        ordered = (replay, purge) if first == "replay" else (purge, replay)
+        outcomes = await asyncio.gather(*ordered, return_exceptions=True)
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException) and not _lost_a_lock_race(outcome):
+                raise outcome
+        requeued, purged = outcomes if first == "replay" else outcomes[::-1]
+
+        row = await token_row(fetch, str(item.id))
+        assert not (row["status"] == OutboxStatus.PENDING.value and row["payload"] == ""), first
+        if row["status"] == OutboxStatus.PENDING.value:
+            assert requeued == 1, first  # the replay won, so the purge skipped the live message
+        else:
+            assert row["status"] == OutboxStatus.DONE.value, (first, row["status"])
+            assert requeued != 1, first
+            if not isinstance(purged, BaseException):
+                assert row["payload"] == "", first  # the purge won and erased the body
+
+
 async def assert_missing_artifact_row_is_a_corrupt_reference(
     store: Any, fetch: RawFetch, raw: RawSql
 ) -> None:
     """Retention keeps the ``response`` row and NULLs its body, so a row that is gone is damage, not
-    an erasure. It dead-letters as a corrupt reference and is NOT blanked: its sealed reference is
-    the evidence of which row went missing. A later replay re-queues it into the same dead end once,
+    an erasure. It dead-letters under its own error, apart from a reference that did not open
+    (BACKLOG #4996), and is NOT blanked: its sealed reference is the evidence of which row went
+    missing. A later replay re-queues it into the same dead end once,
     and the worker does not loop on it."""
     mid, token = await dead_token(store, now=0.0, control="ER-MISSING")
     assert await store.replay(mid, now=1.0, audit=no_operator_audit) == 1
@@ -263,7 +301,8 @@ async def assert_missing_artifact_row_is_a_corrupt_reference(
     assert row["status"] == OutboxStatus.DEAD.value and row["payload"] == reference != ""
     assert await status_of(store, mid) == MessageStatus.ERROR.value
     events = await store.events_for(mid)
-    assert [e for e in events if e["event"] == "dead" and "corrupt" in str(e["detail"])]
+    dead = [str(e["detail"]) for e in events if e["event"] == "dead"]
+    assert any("missing" in d for d in dead) and not any("corrupt" in d for d in dead), dead
     assert await children(fetch) == []
 
     # One dead end per replay, not a loop.
@@ -286,7 +325,9 @@ async def assert_dead_letter_purge_clears_the_blanked_token(
     assert (await fetch(errors, (token,)))[0]["last_error"] is not None
     assert await status_of(store, mid) == MessageStatus.ERROR.value
 
-    assert await store.purge_dead_letters(older_than=10 * DAY, now=50 * DAY) == 1
+    # The token held no body by now, so clearing its error purges no body: the count the retention
+    # audit records leaves it out (BACKLOG #4996). The cleared error is the witness that it ran.
+    assert await store.purge_dead_letters(older_than=10 * DAY, now=50 * DAY) == 0
 
     assert (await fetch(errors, (token,)))[0]["last_error"] is None
     row = await token_row(fetch, token)
@@ -301,6 +342,10 @@ CASES = [
     pytest.param(assert_mixed_message_recovers_only_what_remains, id="mixed"),
     pytest.param(assert_erased_after_replay_is_dead_lettered, id="erased_after_replay"),
     pytest.param(assert_purge_concurrent_with_replay_keeps_the_invariant, id="concurrent"),
+    pytest.param(
+        assert_purge_concurrent_with_replay_of_a_delivery_row_keeps_the_invariant,
+        id="concurrent_delivery",
+    ),
     pytest.param(assert_missing_artifact_row_is_a_corrupt_reference, id="missing_artifact"),
     pytest.param(assert_dead_letter_purge_clears_the_blanked_token, id="dead_letter_purge"),
 ]

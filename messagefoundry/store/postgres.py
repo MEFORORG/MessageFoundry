@@ -213,6 +213,7 @@ from messagefoundry.store.store import (
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
+    REINGRESS_ARTIFACT_MISSING,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     VIEWED_EVENT,
@@ -3268,7 +3269,7 @@ class PostgresStore:
         every batch and commit once. ``aad_cols`` rebuild the cell AAD; ``key_cols`` (default:
         ``aad_cols``) are what the UPDATE targets; ``aad_of`` builds the AAD from the row instead
         (the queue payload's routing tag, BACKLOG #2593); ``blank_where`` names the blank values that
-        are real rows, which only a surface with no marker and no ciphertext seals (BACKLOG #3495).
+        are real rows (BACKLOG #3495), sealed as the SQLite twin says (BACKLOG #4994).
         Identifiers are code constants; only the marker pattern is a parameter.
 
         The state read and the reservation run on their own pooled connections BEFORE the seal's
@@ -3283,7 +3284,8 @@ class PostgresStore:
         keyed = await self._surface_keyed(table, column)
         pending = int(await self._fetchval(count_sql, like) or 0)
         blanks = 0
-        if blank_where is not None and not keyed:
+        # A blank on a sealed surface is sealed only under the opt-out (BACKLOG #4994).
+        if blank_where is not None and (not keyed or not strict):
             blanks = int(
                 await self._fetchval(f"SELECT COUNT(*) FROM {table} WHERE {blank_where}") or 0
             )
@@ -3293,8 +3295,9 @@ class PostgresStore:
             if is_sealed:
                 # As on SQLite: a peer may have sealed the rows between the count and the probe,
                 # so count again rather than report its legitimate seal as a plant. A blank here
-                # stays refused.
-                blanks = 0
+                # stays refused, unless the opt-out is on.
+                if strict:
+                    blanks = 0
                 pending = int(await self._fetchval(count_sql, like) or 0)
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
@@ -3318,12 +3321,8 @@ class PostgresStore:
                 if left:
                     report_sealed_surface(log, self._cipher, table, column, left)
                 return 0
-            # The opt-out reseals plaintext, never a blank on a surface a peer keyed.
-            seal_where = (
-                f"({pending_where}) OR ({blank_where})"
-                if blanks and claimed is not None
-                else pending_where
-            )
+            # Without the opt-out, `blanks` is non-zero only on a surface this open just claimed.
+            seal_where = f"({pending_where}) OR ({blank_where})" if blanks else pending_where
             while True:
                 rows = await conn.fetch(
                     f"SELECT {select_cols}, {column} AS v FROM {table}"
@@ -5618,8 +5617,7 @@ class PostgresStore:
                         dest,
                         seq,
                     )
-                    # A missing row is a corrupt reference. A NULL body means retention erased the
-                    # reply (BACKLOG #1560): a replay that re-pended this token after the purge's
+                    # A NULL body means retention erased the reply (BACKLOG #1560): a replay that re-pended this token after the purge's
                     # snapshot made the purge's token blank skip it, while the same statement still
                     # erased the reply. This branch is the only control for that, and the reply
                     # must never become a child message. A missing row is damage, not an erasure,
@@ -5627,8 +5625,8 @@ class PostgresStore:
                     if art is None:
                         return await _consume_dead(
                             "ingress_handoff(missing-artifact)",
-                            "re-ingress work-row reference is corrupt/unparseable",
-                            "re-ingress ref corrupt",
+                            REINGRESS_ARTIFACT_MISSING,
+                            "re-ingress reply missing",
                         )
                     if art["body"] is None:
                         return await _consume_dead(
@@ -11069,7 +11067,8 @@ class PostgresStore:
     ) -> int:
         """Null the bodies of dead-lettered rows last updated before ``older_than`` (their own
         retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
-        Ported, not stubbed. Returns the number of dead rows purged.
+        Ported, not stubbed. Returns the number of dead rows whose body it blanked; a row already
+        blank that only loses its ``last_error`` is not counted (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -11093,12 +11092,19 @@ class PostgresStore:
             async with conn.transaction():
                 result = await conn.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=$1 AND (payload <> '' OR last_error IS NOT NULL)"
-                    f" AND updated_at < {cutoff_sql}",
+                    f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )
                 purged = _rowcount(result)
+                # As on SQLite: a row already blank only loses its `last_error`, and is not counted
+                # (BACKLOG #4996).
+                await conn.execute(
+                    "UPDATE queue SET last_error=NULL WHERE status=$1 AND payload = ''"
+                    f" AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                    OutboxStatus.DEAD.value,
+                    *cutoff_params,
+                )
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
                 # it can no longer be replayed. If that was the message's LAST replayable row, release its
                 # streaming attachment here — the deferred half of the per-MESSAGE dead-row split with

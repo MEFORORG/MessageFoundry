@@ -47,6 +47,7 @@ from tests._keyed_reopen_contract import (
     server_keyed_reopen_report,
 )
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
+from tests._keyless_blank_contract import keyed_cipher
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -6300,9 +6301,10 @@ async def test_keyless_blank_contract(store, case) -> None:
 
     key = generate_key()
 
-    async def open_keyed() -> SqlServerStore:
+    async def open_keyed(**kw: Any) -> SqlServerStore:
         return await SqlServerStore.open(
-            load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
+            load_settings(environ=os.environ).store,
+            cipher=keyed_cipher(make_cipher, key, **kw),
         )
 
     raw, fetch = _raw_adapters(store)

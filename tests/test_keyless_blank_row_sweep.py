@@ -55,8 +55,8 @@ async def test_keyless_blank_contract(case: Any, tmp_path: pathlib.Path) -> None
     db = tmp_path / "blank.db"
     key = generate_key()
 
-    async def open_keyed() -> MessageStore:
-        return await MessageStore.open(db, cipher=make_cipher(key, write_v2=True))
+    async def open_keyed(**kw: Any) -> MessageStore:
+        return await MessageStore.open(db, cipher=contract.keyed_cipher(make_cipher, key, **kw))
 
     fetch, raw = _adapters(db)
     keyless = await MessageStore.open(db)
@@ -120,25 +120,44 @@ def _failing_on_queue_payload(seal: Any) -> Any:
     return wrapped
 
 
-async def test_the_opt_out_seals_a_blank_only_on_an_unsealed_surface(
+async def test_the_opt_out_seals_a_live_blank_on_a_sealed_surface_too(
     tmp_path: pathlib.Path,
 ) -> None:
-    """``allow_unmarked_ciphertext`` reseals PLAINTEXT on a keyed surface. It does not extend to a
-    blank, which carries no value to rescue and is what a plant looks like. On an unsealed surface
-    the blank is sealed as it is without the opt-out."""
+    """``allow_unmarked_ciphertext`` reseals the plaintext a keyless run left on a keyed surface, and
+    since BACKLOG #4994 the run's live empty body with it, marker present or not. Without the opt-out
+    the same blank stays blank. This test used to pin the opposite: that the opt-out left it."""
     db = tmp_path / "optout.db"
     mid = await _blank_row_at_rest(db)
     fetch, raw = _adapters(db)
     key = generate_key()
 
-    store = await MessageStore.open(db, cipher=make_cipher(key, write_v2=True, allow_unmarked=True))
-    await store.close()
-    assert str((await contract.row_of(fetch, mid))["payload"]).startswith(MARKER_PREFIX)
+    async def reopen(*, allow_unmarked: bool) -> str:
+        store = await MessageStore.open(
+            db, cipher=make_cipher(key, write_v2=True, allow_unmarked=allow_unmarked)
+        )
+        await store.close()
+        return str((await contract.row_of(fetch, mid))["payload"])
 
+    assert (await reopen(allow_unmarked=True)).startswith(MARKER_PREFIX)  # unsealed surface
     await raw("UPDATE queue SET payload='' WHERE message_id=?", (mid,))
-    store = await MessageStore.open(db, cipher=make_cipher(key, write_v2=True, allow_unmarked=True))
-    await store.close()
-    assert (await contract.row_of(fetch, mid))["payload"] == ""
+    assert await reopen(allow_unmarked=False) == ""  # the control: refused without the opt-out
+    assert (await reopen(allow_unmarked=True)).startswith(MARKER_PREFIX)  # marker present
+
+    # The marker row gone, a witness's ciphertext the only signal the surface is sealed.
+    store = await MessageStore.open(db, cipher=make_cipher(key, write_v2=True))
+    try:
+        await contract.outbound(store, "OB_KB_WITNESS", contract.BODY)
+    finally:
+        await store.close()
+    await raw("UPDATE queue SET payload='' WHERE message_id=?", (mid,))
+    await raw(
+        "DELETE FROM keyed_surface WHERE surface_table=? AND surface_column=?", ("queue", "payload")
+    )
+    assert await reopen(allow_unmarked=False) == ""  # the control
+    await raw(
+        "DELETE FROM keyed_surface WHERE surface_table=? AND surface_column=?", ("queue", "payload")
+    )
+    assert (await reopen(allow_unmarked=True)).startswith(MARKER_PREFIX)
 
 
 async def test_the_seal_reserves_the_blanks_on_the_invocation_bound(
