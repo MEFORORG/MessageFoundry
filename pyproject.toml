@@ -5,8 +5,8 @@
 # which hold `id-token: write` and publish what the backend emits. The pin picks one immutable release.
 # It does NOT stop the fetch, check a hash, or pin hatchling's own dependencies; BACKLOG #1546 records
 # that residual and the `--no-isolation` form that would close it. Dependabot's uv updater bumps THIS
-# table and none of the three under packaging/, so a Dependabot hatchling bump reds the lockstep test
-# until those three are moved by hand in the same PR. Read the backend's changes, not only its version:
+# table and none of the tables under packaging/, so a Dependabot hatchling bump reds the lockstep test
+# until every one of those is moved by hand in the same PR. Read the backend's changes, not only its version:
 # 1.32.4 writes core-metadata `Version:` in the spelling the version root was TYPED in, where 1.32.0
 # wrote the PEP 440 canonical form. The release.yml version gates compare PEP 440 versions, so none
 # reds on that, but prose that says the backend canonicalises `Version:` (at least in release.yml,
