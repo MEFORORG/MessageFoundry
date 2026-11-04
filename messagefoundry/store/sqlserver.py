@@ -922,7 +922,10 @@ _SQL_STATE_MERGE: Final[str] = (
     " VALUES (?,?,?,?,?);"
 )
 # The collation `_SCHEMA` gives state.namespace and state.[key] (BACKLOG #1588); a test pins that the
-# DDL names this one. The open-time report accepts any binary collation, not only this name.
+# DDL names this one. The open-time report accepts any binary collation, not only this name. The DDL
+# keeps the literal, as every other BIN2 column in `_SCHEMA` does, so that test compares two separate
+# spellings; interpolating this constant would leave the text and `_schema_hash` unchanged but would
+# make the test compare the constant with itself.
 _STATE_KEY_COLLATION: Final[str] = "Latin1_General_100_BIN2"
 
 
@@ -8567,8 +8570,8 @@ class SqlServerStore:
         collation = ", ".join(found)
         log.warning(
             "sqlserver: the state table's namespace/key columns use collation %s, not a binary one"
-            " such as %s. The table predates BACKLOG #1588, so keys differing only in case or accent"
-            " may have been merged"
+            " such as the %s the shipped DDL names. Keys this collation compares as equal, such as"
+            " ones differing only in case under a case-insensitive collation, may have been merged"
             " into one row; the engine does not repair them. Remedy, which loses every state row:"
             " drop the state table and delete the schema_meta row, so the next open (or"
             " provision-schema) re-runs the DDL batch and creates the table again",
@@ -8678,8 +8681,8 @@ class SqlServerStore:
         It also refuses two keys equal once trailing U+0020 is stripped (BACKLOG #4917):
         ``pk_reference`` pads them (the ``state`` comment in ``_SCHEMA`` says why), so the second
         INSERT would raise a PK duplicate mid-transaction, every interval. It raises
-        :class:`ReferenceKeyCollision`, named by ordinal only, because ``reference_sync`` logs the
-        class name and never the message."""
+        :class:`ReferenceKeyCollision`, naming the keys by ordinal only, because ``reference_sync``
+        logs that class's message whole, where it logs any other source error by class name only."""
         if len(name.encode("utf-16-le")) // 2 > 256:
             raise ValueError(
                 f"reference set name exceeds NVARCHAR(256) "

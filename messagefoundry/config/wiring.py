@@ -4966,7 +4966,9 @@ class SetState:
         # Validate at construction so a non-serializable value fails in the author's handler (with a
         # clear message) rather than deep inside the store's INSERT during a handoff. namespace/key
         # are the composite PK and must be non-empty strings.
-        # Every message names the field only: namespace, key and value may be PHI.
+        # Every message names the field and the rule, plus the length in UTF-16 code units for a
+        # length refusal and json's reason for a value refusal, never the text: namespace, key and
+        # value may be PHI.
         # Each key rule below is refused on EVERY backend, though only one backend needs it, so a
         # feed behaves the same wherever it runs (BACKLOG #1588, #4917).
         units = 0
