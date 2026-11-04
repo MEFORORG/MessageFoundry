@@ -2012,11 +2012,13 @@ Two limits follow from this:
   `DBQ` is refused. Whether that driver also reads `SERVER` has not been tested. The engine cannot see which keyword
   a driver reads. It places three families documented to read `SERVER`, by the registered names
   [*The `SSLmode` spelling*](#the-sslmode-spelling) lists: psqlODBC, MySQL Connector/ODBC and
-  Microsoft's `ODBC Driver <n> for SQL Server`. No driver was run to confirm it (BACKLOG #2705),
-  and a placed family is the documentation's claim, not proof that either check binds the
-  address the driver dials. For any other `odbc_driver` name, building the connection logs a
-  WARNING naming the connection, not the driver, and `messagefoundry check`'s advisory
-  `generic-db-server` line lists the connection with its `server` (BACKLOG #5163). Neither refuses
+  Microsoft's `ODBC Driver <n> for SQL Server`. In the 2026-10-30 probes under BACKLOG #2705,
+  psqlODBC 18.00.0005 connected, and MySQL Connector/ODBC was run, through engine-built strings
+  that name the host only in `SERVER`, which is consistent with that. No run was designed to test
+  whether `SERVER` is read, and Microsoft's driver was not run. A placed family is the
+  documentation's claim, not proof that either check binds the address the driver dials. For
+  any other `odbc_driver` name, building the connection logs a WARNING naming the connection,
+  not the driver, and `messagefoundry check`'s advisory `generic-db-server` line lists the connection with its `server` (BACKLOG #5163). Neither refuses
   the connection. To clear it, name psqlODBC or MySQL Connector/ODBC by its registered name, or
   reach that database another way than the generic dialect. For SQL Server that is
   `dialect="sqlserver"` with Microsoft's driver, since on the generic dialect Microsoft's driver

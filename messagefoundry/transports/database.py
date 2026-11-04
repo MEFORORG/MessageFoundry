@@ -723,9 +723,9 @@ class _DriverFamily(NamedTuple):
     #: keyword never brings an unmeasured escape with it.
     brace_escape: bool
     #: Whether the family's own documentation names ``SERVER`` as the keyword for its target host
-    #: (:func:`odbc_driver_reads_server`, BACKLOG #5163). Documented, never measured. Its own field,
-    #: with no default, so a family placed later for its TLS keyword says whether it reads
-    #: ``SERVER`` rather than inheriting it.
+    #: (:func:`odbc_driver_reads_server`, BACKLOG #5163). Documented; no run was designed to test
+    #: it. Its own field, with no default, so a family placed later for its TLS keyword says
+    #: whether it reads ``SERVER`` rather than inheriting it.
     reads_server: bool
     #: Whether the driver reads ``SERVER=host,port`` as one host and its port, and ignores
     #: ``PORT``: Microsoft's driver alone (:func:`~messagefoundry.transports.db_endpoint.generic_hop_endpoint`,
@@ -752,11 +752,14 @@ class _DriverFamily(NamedTuple):
 # Linux it is commonly a FreeTDS alias, which has not been measured.
 #
 # Each family is documented to read ``SERVER`` as its target host (``reads_server``, BACKLOG
-# #5163), read from its own source on 2026-11-03 and never run: psqlODBC's ``dlg_specific.h``
-# defines ``SPEC_SERVER`` as the connection-string keyword ``server``; MySQL Connector/ODBC's
+# #5163), read from its own source on 2026-11-03: psqlODBC's ``dlg_specific.h`` defines
+# ``SPEC_SERVER`` as the connection-string keyword ``server``; MySQL Connector/ODBC's
 # *Connector/ODBC Connection Parameters* page lists ``server`` as the host name of the server; and
-# Microsoft's *ODBC DSN and Connection String Keywords* page lists ``Server``. Any other name gets
-# the warning :func:`_warn_generic_server_unread` logs.
+# Microsoft's *ODBC DSN and Connection String Keywords* page lists ``Server``. The 2026-10-30
+# probes (BACKLOG #2705) connected psqlODBC 18.00.0005, and ran MySQL Connector/ODBC, through
+# engine-built strings that name the host only in ``SERVER``, which is consistent with that; no
+# run was designed to test it, and Microsoft's driver was not run. Any other name gets the warning
+# :func:`_warn_generic_server_unread` logs.
 _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
     "psqlodbc": _DriverFamily(
         re.compile(r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"),

@@ -3098,8 +3098,8 @@ def _check_generic_db_server(config_dir: str | Path) -> CheckResult:
             required=False,
             detail=(
                 "no generic-ODBC database connection names a driver the engine cannot place as "
-                "reading SERVER; the families it places are documented to read it, and no driver "
-                "was run to confirm that"
+                "reading SERVER; the families it places are documented to read it, and no run was "
+                "designed to test that"
             ),
         )
     listed = "; ".join(f"{name}: {reason}" for name, reason in hops)

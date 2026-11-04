@@ -130,9 +130,9 @@ def test_the_warning_survives_the_log_scrub(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_every_placed_family_records_whether_it_reads_server() -> None:
-    """The documented record, per family: each of the three is documented to read ``SERVER`` and
-    none was run. A family added to the table must be added here, which is the review the field's
-    missing default asks for."""
+    """The documented record, per family: each of the three is documented to read ``SERVER``,
+    and no run was designed to test it. A family added to the table must be added here, which is
+    the review the field's missing default asks for."""
     assert {key: family.reads_server for key, family in _DRIVER_FAMILIES.items()} == {
         "psqlodbc": True,
         "mysql": True,

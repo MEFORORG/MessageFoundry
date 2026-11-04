@@ -5,6 +5,8 @@
   its TLS mode (BACKLOG #5053), never for this. Building a generic-dialect hop whose `odbc_driver` is not a
   psqlODBC, MySQL Connector/ODBC or Microsoft registered name now also logs a WARNING naming the
   connection, and `messagefoundry check` has an advisory `generic-db-server` line listing every
-  such hop, inbound and outbound. The three families are documented to read `SERVER`; no driver
-  was run to confirm it. Nothing is refused. See *Accepted `odbc_params` keywords* in
-  [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #5163`)
+  such hop, inbound and outbound. The three families are documented to read `SERVER`. In the
+  2026-10-30 probes under BACKLOG #2705, psqlODBC connected, and MySQL Connector/ODBC was run,
+  through strings that name the host only in `SERVER`, which is consistent with that; no run was
+  designed to test it, and Microsoft's driver was not run. Nothing is refused. See *Accepted
+  `odbc_params` keywords* in [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #5163`)
