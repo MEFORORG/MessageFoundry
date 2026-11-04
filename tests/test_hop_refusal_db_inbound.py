@@ -686,9 +686,8 @@ def test_generic_verifying_keyword_is_not_gated() -> None:
         # BACKLOG #5053: psqlODBC has no Encrypt keyword, so this set no TLS at all.
         ("PostgreSQL Unicode", {"Encrypt": "yes"}),
         ("MySQL ODBC 8.0 Unicode Driver", {"Encrypt": "yes"}),
-        # BACKLOG #5053, #5029: a name the engine cannot place, so no keyword counts.
-        ("/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so", {"SSLmode": "verify-full"}),
-        ("MySQL", {"SSLmode": "verify-full"}),
+        # A name the engine cannot place is refused at build since BACKLOG #5041, attested or
+        # not: tests/test_generic_odbc_driver_allowlist.py holds those cases.
     ],
 )
 @pytest.mark.parametrize(("connector", "config"), _GENERIC_CONNECTORS)

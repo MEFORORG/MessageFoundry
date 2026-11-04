@@ -133,8 +133,10 @@ from messagefoundry.transports.base import (
     resolve_poll_ceiling,
 )
 from messagefoundry.transports.db_endpoint import (
+    GENERIC_DRIVER_REFUSAL,
     SQLSERVER_DEFAULT_DRIVER,
     SQLSERVER_DEFAULT_PORT,
+    generic_driver_family,
     generic_hop_endpoint,
     is_remote_spelling,
     odbc_keyword_name,
@@ -717,10 +719,10 @@ _MYSQL_SSL_MODES = ("DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_ID
 
 
 class _DriverFamily(NamedTuple):
-    """What the engine knows of one driver family, placed from the ``odbc_driver`` name."""
+    """What the engine knows of one driver family on the generic driver allowlist
+    (:data:`~messagefoundry.transports.db_endpoint.GENERIC_DRIVER_FAMILIES`), placed from the
+    ``odbc_driver`` name."""
 
-    #: The whole registered names, in lower case.
-    names: re.Pattern[str]
     #: The keyword the family reads as its TLS mode, in the form :func:`odbc_keyword_name` gives.
     tls_keyword: str
     #: The values of that keyword that count as a mode, or ``None`` where any usable value counts
@@ -735,68 +737,44 @@ class _DriverFamily(NamedTuple):
     #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
     #: keyword never brings an unmeasured escape with it.
     brace_escape: bool
-    #: Whether the family's own documentation names ``SERVER`` as the keyword for its target host
-    #: (:func:`odbc_driver_reads_server`, BACKLOG #5163). Documented; no run was designed to test
-    #: it. Its own field, with no default, so a family placed later for its TLS keyword says
-    #: whether it reads ``SERVER`` rather than inheriting it.
-    reads_server: bool
     #: Whether the driver reads ``SERVER=host,port`` as one host and its port, and ignores
     #: ``PORT``: Microsoft's driver alone (:func:`~messagefoundry.transports.db_endpoint.generic_hop_endpoint`,
     #: BACKLOG #4874).
     reads_comma_port: bool = False
 
 
-# The three driver families the engine can place, by whole registered name in any case but spelled
-# with single spaces (BACKLOG #2705, #5029, #5053). psqlODBC's include the bare ``PostgreSQL``, the
-# section name RHEL registers it under. A vendor driver whose name merely mentions a database, a
-# library path, an odbcinst alias such as RHEL's bare ``MySQL``, or another registered name that
-# only folds to one of these is not placed. An unplaced name still builds, but no TLS mode counts
-# on it, so on an enforcing instance its hop is refused off-loopback unless it is attested: a
-# change to these patterns is a change to that control, and is reviewed as one.
+# What the engine knows of each family on the generic driver allowlist, keyed as
+# ``GENERIC_DRIVER_FAMILIES`` keys it (BACKLOG #2705, #5029, #5053, #5041). The allowlist, its names
+# and why each family is on it are stated once, in ``transports.db_endpoint``; the build refuses any
+# other name, so every hop that is built places one of these. A change here is a change to the TLS
+# gate and the password rule, and is reviewed as one.
 #
 # psqlODBC's keyword parser and MySQL Connector/ODBC's parameter page have no ``encrypt``, and
 # Microsoft's ODBC Driver for SQL Server reads no ``sslmode``, so each family counts one keyword
-# (BACKLOG #5053). An unplaced name has no keyword that counts.
+# (BACKLOG #5053).
 #
 # The escape list is the families with ``brace_escape`` set, whose password is always sent braced
 # with the ODBC ``}}`` escape (:func:`_odbc_password`, BACKLOG #2705): psqlODBC and MySQL, measured
 # on 2026-10-30 to read that escape, and Microsoft's, not probed then but relied on for the same
-# escape by the SQL Server preset and the store. The legacy name ``SQL Server`` is left out: on
-# Linux it is commonly a FreeTDS alias, which has not been measured.
-#
-# Each family is documented to read ``SERVER`` as its target host (``reads_server``, BACKLOG
-# #5163), read from its own source on 2026-11-03: psqlODBC's ``dlg_specific.h`` defines
-# ``SPEC_SERVER`` as the connection-string keyword ``server``; MySQL Connector/ODBC's
-# *Connector/ODBC Connection Parameters* page lists ``server`` as the host name of the server; and
-# Microsoft's *ODBC DSN and Connection String Keywords* page lists ``Server``. The 2026-10-30
-# probes (BACKLOG #2705) connected psqlODBC 18.00.0005, and ran MySQL Connector/ODBC, through
-# engine-built strings that name the host only in ``SERVER``, which is consistent with that; no
-# run was designed to test it, and Microsoft's driver was not run. Any other name gets the warning
-# :func:`_warn_generic_server_unread` logs.
+# escape by the SQL Server preset and the store.
 _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
     "psqlodbc": _DriverFamily(
-        re.compile(r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"),
         "sslmode",
         frozenset(_LIBPQ_SSL_MODES),
         ("SSLmode", "verify-full"),
         brace_escape=True,
-        reads_server=True,
     ),
     "mysql": _DriverFamily(
-        re.compile(r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"),
         "sslmode",
         frozenset(_MYSQL_SSL_MODES),
         ("SSLMODE", "VERIFY_IDENTITY"),
         brace_escape=True,
-        reads_server=True,
     ),
     "msodbc": _DriverFamily(
-        re.compile(r"odbc driver [0-9]+ for sql server"),
         "encrypt",
         None,
         ("Encrypt", "yes"),
         brace_escape=True,
-        reads_server=True,
         reads_comma_port=True,
     ),
 }
@@ -806,77 +784,31 @@ _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
 # count. docs/CONNECTIONS.md records what the drivers read so far do with one.
 _ODBC_TLS_MODE_KEYWORDS = frozenset(family.tls_keyword for family in _DRIVER_FAMILIES.values())
 
-
-def _driver_family(driver: object) -> str | None:
-    """The key in :data:`_DRIVER_FAMILIES` of the family ``driver``, an ``odbc_driver`` setting as
-    written, names whole, or ``None`` where the engine cannot place it. The name is read trimmed
-    and in any case, as :func:`_build_odbc_dsn` reads it, never the library it loads."""
-    name = str(driver or "").strip().lower()
-    return next(
-        (key for key, family in _DRIVER_FAMILIES.items() if family.names.fullmatch(name)), None
-    )
+#: The one classifier of a generic ``odbc_driver`` name, shared with the ``[egress].allowed_db``
+#: check (BACKLOG #5041): the key in :data:`_DRIVER_FAMILIES` of the family the name places, or
+#: ``None`` for a name off the allowlist. The name is read trimmed and in any case, as
+#: :func:`_build_odbc_dsn` reads it, never the library it loads.
+_driver_family = generic_driver_family
 
 
-#: Why a generic hop's ``odbc_driver`` is reported as possibly not reading ``SERVER`` (BACKLOG
-#: #5163). The one wording the construction warning and ``messagefoundry check`` share.
-SERVER_UNREAD_REASON = (
-    "odbc_driver names no driver family documented to read SERVER as its target, so the host "
-    "checks on server, at least [egress].allowed_db and the on-box test of the cleartext-hop guard, "
-    "do not bind this hop if the driver takes its target from another keyword"
-)
-#: What to do about :data:`SERVER_UNREAD_REASON`, shared by the warning and the check line.
-#: Microsoft's driver is not offered: on this dialect it ignores ``PORT``, and its own remedy is
-#: ``dialect="sqlserver"`` (:func:`~messagefoundry.transports.db_endpoint.generic_hop_endpoint`).
-SERVER_UNREAD_REMEDY = (
-    "name psqlODBC or MySQL Connector/ODBC by its registered name, use dialect sqlserver with "
-    "Microsoft's driver for SQL Server, or reach this database another way (see Generic ODBC in "
-    "docs/CONNECTIONS.md)"
-)
+def _refuse_unread_sslmode(text: str, *, family: str, connection: str | None) -> None:
+    """A ValueError when an ``sslmode`` value is not one the driver family ``family`` reads,
+    exactly (BACKLOG #2705, #5029, #5035). The keyword is matched in any case, as the build matches
+    every keyword; the value is not.
 
-
-def odbc_driver_reads_server(driver: object) -> bool:
-    """Whether ``driver``, an ``odbc_driver`` setting as written, places a family
-    :data:`_DRIVER_FAMILIES` records as documented to read ``SERVER`` as its target (BACKLOG
-    #5163). ``False`` is not a finding that the driver ignores ``SERVER``, only that the engine
-    cannot place it. Why that matters to ``[egress].allowed_db`` is stated once, in
-    docs/CONNECTIONS.md, *Accepted odbc_params keywords*. ``True`` is the documentation's claim,
-    not proof that the check binds the address the driver dials. Pure."""
-    family = _driver_family(driver)
-    return family is not None and _DRIVER_FAMILIES[family].reads_server
-
-
-def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) -> None:
-    """A ValueError when an ``sslmode`` value is not one the named driver family reads, exactly
-    (BACKLOG #2705, #5029, #5035). The keyword is matched in any case, as the build matches every
-    keyword; the value is not.
-
-    The rule depends on the family :func:`_driver_family` places from the ``odbc_driver`` name.
-    MySQL Connector/ODBC takes only :data:`_MYSQL_SSL_MODES`. psqlODBC, and any name the engine
-    cannot place, take only :data:`_LIBPQ_SSL_MODES`, as before. Microsoft's driver reads no
-    ``sslmode``, so on that name any value is refused and the refusal says to set ``Encrypt``.
-
-    For a name it cannot place, the refusal advises no value at all, whatever was given: it says
-    the family could not be placed and names the registered names that place psqlODBC and MySQL.
-    Offering libpq's list there would steer a MySQL driver under another name, such as RHEL's bare
-    ``MySQL``, to a value that builds and that MySQL ignores (BACKLOG #5029). A libpq value on such
-    a name still builds, for psqlODBC under a library path, but
-    :func:`generic_odbc_tls_unenforced` counts no mode on it, so the hop stays gated. Each refusal
-    leads with what an operator needs, as a stored failure keeps about its first 200 characters,
-    and none quotes the value given.
+    ``family`` is the key :func:`_driver_family` places from the ``odbc_driver`` name; the build
+    refuses a name it places in none before this runs (BACKLOG #5041). MySQL Connector/ODBC takes
+    only :data:`_MYSQL_SSL_MODES`, and psqlODBC only :data:`_LIBPQ_SSL_MODES`. Microsoft's driver
+    reads no ``sslmode``, so on that name any value is refused and the refusal says to set
+    ``Encrypt``. Each refusal leads with what an operator needs, as a stored failure keeps about
+    its first 200 characters, and none quotes the value given.
 
     The MySQL list is joined with ``or``: two upper case words joined by a comma or a blank are a
     name run to the log redaction, which would blank them."""
-    family = _driver_family(driver)
-    entry = _DRIVER_FAMILIES[family] if family is not None else None
-    # The table decides, as it does for the gate: a placed family takes its own sslmode spellings,
-    # or none when it reads another keyword; an unplaced name takes libpq's.
-    if entry is None:
-        accepted: frozenset[str] = frozenset(_LIBPQ_SSL_MODES)
-    elif entry.tls_keyword == "sslmode" and entry.tls_spellings is not None:
-        accepted = entry.tls_spellings
-    else:
-        accepted = frozenset()
-    if text in accepted:
+    entry = _DRIVER_FAMILIES[family]
+    # The table decides, as it does for the gate: a family takes its own sslmode spellings, or
+    # none when it reads another keyword.
+    if entry.tls_keyword == "sslmode" and text in (entry.tls_spellings or ()):
         return
     database = f"{hop_name_prefix(connection)}DATABASE"
     where = f"{database} odbc_params value for 'sslmode'"
@@ -889,14 +821,8 @@ def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) ->
     if family == "mysql":
         mysql = " or ".join(_MYSQL_SSL_MODES)
         raise ValueError(f"{where} must be one of {mysql}, in upper case, for MySQL {see}")
-    if family is not None:
-        libpq = ", ".join(_LIBPQ_SSL_MODES)
-        raise ValueError(f"{where} must be one of {libpq}, in lower case {see}")
-    raise ValueError(
-        f"{database} cannot place the odbc_driver family; name it PostgreSQL Unicode or ANSI, "
-        f"or MySQL ODBC <version> Unicode or ANSI Driver, as registered, and no 'sslmode' counts "
-        f"until then {see}"
-    )
+    libpq = ", ".join(_LIBPQ_SSL_MODES)
+    raise ValueError(f"{where} must be one of {libpq}, in lower case {see}")
 
 
 def _odbc_password(password: object, *, driver: str, connection: str | None) -> str:
@@ -1487,11 +1413,12 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     (vault BACKLOG #2577, BACKLOG #2705; docs/CONNECTIONS.md, *Accepted ``odbc_params`` keywords*). An ``odbc_params`` keyword
     must be on :data:`_ODBC_PARAM_ALLOWLIST`, and a credential keyword that is sent on its own short list, or
     the build is refused with the keyword and the connection named. An ``odbc_params`` keyword given
-    twice is refused. A driver may take its target under a keyword other than ``SERVER``; the
-    engine cannot see that, and warns (:func:`_warn_generic_server_unread`, BACKLOG #5163) for any
-    name it cannot place as a family documented to read ``SERVER``. The egress check runs outside
-    this builder, at least in ``build_source`` and ``build_destination`` (``transports.base``).
-    This builder sends ``server`` as written.
+    twice is refused. A driver may take its target under a keyword other than ``SERVER``, which
+    the engine cannot see, so ``odbc_driver`` must name a family on the generic driver allowlist,
+    each documented to read ``SERVER``, or the build is refused (BACKLOG #5041; the list and its
+    evidence are in :data:`~messagefoundry.transports.db_endpoint.GENERIC_DRIVER_FAMILIES`). The
+    egress check runs outside this builder, at least in ``build_source`` and ``build_destination``
+    (``transports.base``), and refuses the same names. This builder sends ``server`` as written.
 
     Every value must be printable ASCII (STORE-5 injection guard). ``database``, ``username`` and
     every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
@@ -1535,6 +1462,11 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     # The driver name stays braced: names hold spaces and parentheses, and no probe found a driver
     # manager that reads a braced DRIVER wrongly. The delimiters are still refused, not escaped.
     _refuse_unsafe_text(driver, what="odbc_driver", connection=connection, refused=";{}")
+    # BACKLOG #5041: before anything reads the driver for its family, so every check below sees a
+    # family on the allowlist.
+    family = _driver_family(driver)
+    if family is None:
+        raise ValueError(f"{where}DATABASE generic dialect; {GENERIC_DRIVER_REFUSAL}")
     parts = [f"DRIVER={odbc_brace(driver)}", f"SERVER={server}"]
     if s.get("database"):
         database = _odbc_literal(s["database"], what="database", connection=connection)
@@ -1591,7 +1523,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             value, what=f"odbc_params value for '{name}'", connection=connection
         )
         if name == "sslmode":
-            _refuse_unread_sslmode(literal, driver=driver, connection=connection)
+            _refuse_unread_sslmode(literal, family=family, connection=connection)
         parts.append(f"{k}={literal}")
     # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
     # Each file keyword is judged once, here, and every check below reads that judgement.
@@ -1600,26 +1532,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
     _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
     _warn_generic_tls_unenforced(params, driver=driver, connection=connection)
-    _warn_generic_server_unread(driver, connection=connection)
     return ";".join(parts) + ";"
-
-
-def _warn_generic_server_unread(driver: str, *, connection: str | None = None) -> None:
-    """A WARNING when :func:`odbc_driver_reads_server` cannot place ``driver`` (BACKLOG #5163).
-
-    Visibility, not a control: it never gates or changes the connection. Refusing such a name is
-    BACKLOG #5041's driver allow-list, not this. ``messagefoundry check``'s advisory
-    ``generic-db-server`` line reports the same hops from the graph, through the same predicate.
-    The connection is named with :func:`hop_name_prefix`, whose ``;`` keeps the log scrub from
-    reading a keyword and what follows it as a credential pair."""
-    if odbc_driver_reads_server(driver):
-        return
-    logger.warning(
-        "%sDATABASE generic dialect; %s; %s",
-        hop_name_prefix(connection),
-        SERVER_UNREAD_REASON,
-        SERVER_UNREAD_REMEDY,
-    )
 
 
 def _warn_generic_tls_unenforced(

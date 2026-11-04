@@ -9,4 +9,6 @@
   2026-10-30 probes under BACKLOG #2705, psqlODBC connected, and MySQL Connector/ODBC was run,
   through strings that name the host only in `SERVER`, which is consistent with that; no run was
   designed to test it, and Microsoft's driver was not run. Nothing is refused. See *Accepted
-  `odbc_params` keywords* in [CONNECTIONS.md](../docs/CONNECTIONS.md). (`BACKLOG #5163`)
+  `odbc_params` keywords* in [CONNECTIONS.md](../docs/CONNECTIONS.md). Superseded before release
+  by BACKLOG #5041, which refuses such a name at build; that entry says what replaced the
+  WARNING and the line. (`BACKLOG #5163`)
