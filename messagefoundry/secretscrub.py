@@ -947,13 +947,15 @@ _MEMBER_EXTRA_WORDS = ("token",)
 #
 # * a word that holds one of :data:`_MEMBER_KEEP_WORDS` anywhere inside it, the label and anchor
 #   words of the credential passes, the query filter, the support bundle and the PHI pass, stays
-#   whole when a ":", "=" or "#" follows the word (after an optional quote and spaces), and so does
-#   a word holding a scheme word or "MRN" when a space follows it. The whole word stays, not only
-#   the anchor, so ``a1qkey=`` keeps ``a1qkey``. Anywhere else it is masked, so a password such as
-#   ``Passw0rd!2024`` or a token holding ``sig`` is masked like any other;
+#   whole when a ":" or "=" follows the word (after an optional quote and spaces), or a "#" and
+#   the word ends in "MRN", and so does a word ending in a scheme word or "MRN" when a space
+#   follows it. The whole word stays, not only the anchor, so ``a1qkey=`` keeps ``a1qkey``.
+#   Anywhere else it is masked, so a password such as ``Passw0rd!2024`` or a token holding ``sig``
+#   is masked like any other;
 # * a percent-encoded HL7 separator, a DICOM tag ``(gggg,eeee)``, the ``nonnumeric port: `` opener
 #   of the PHI pass's userinfo backstop, and the support bundle's ``mfb64:v1:`` marker stay whole,
-#   and after that marker a masked word keeps the character where the marker's base64 run ended;
+#   a word stops where the opener or the marker starts, and after the marker a masked word keeps
+#   the character where the marker's base64 run ended;
 # * a three-character segment ID before a "|" stays, and a prefix glued on by "." or "-" is masked;
 # * a word inside a base64 run of 24 or more characters becomes ``redacted`` four times, so the run
 #   stays as long as the bundle's sweep needs.
@@ -966,7 +968,7 @@ _MEMBER_EXTRA_WORDS = ("token",)
 #
 # THE COST, at least these. The value's spaces and punctuation print, so a reader sees that a
 # password held a space, a "," and an "&", and how many words. A word that holds a kept word
-# anywhere inside it prints whole when a ":", "=" or "#" follows it, such as the ``pass`` of
+# anywhere inside it prints whole when a ":" or "=" follows it, such as the ``pass`` of
 # ``pass=word`` or the ``a1qkey`` of ``a1qkey=``, and so does a three-character segment ID before a
 # "|". Each of those printed on ``origin/main`` too, which hid at most the first word. After a
 # ``mfb64:v1:`` marker, a "_", "." or "-" in a masked word prints. Redacting a record ONCE, so a
@@ -1086,13 +1088,14 @@ _MEMBER_KEEP = re.compile(
 #: PHI pass's userinfo opener, the support bundle's ``mfb64:v1:`` marker and a DICOM tag.
 #:
 #: The marker is spelled as ``support/redact.py`` ``_MFB64`` spells it, case and all, and a word
-#: ends where one starts, so a word glued on before it (``amfb64:v1:``) cannot take its head.
-#: Masking the marker's ``v1`` printed, on a chain line the bundle read back, the body
+#: ends where the marker or the userinfo opener starts, so a word glued on before either
+#: (``amfb64:v1:``, ``xnonnumeric port: ``) cannot take its head: neither reader has a word
+#: boundary. Masking the marker's ``v1`` printed, on a chain line the bundle read back, the body
 #: ``origin/main`` hid (BACKLOG #5030). :func:`_mask_member_value` also keeps where the marker's
 #: base64 run ends; :data:`_MEMBER_B64_RUN` says why.
 _MEMBER_VALUE_UNIT = re.compile(
     r"<redacted>|\[(?:REDACTED|redacted)\]|%(?:7[CcEe]|5[Ee]|26)|nonnumeric port: |mfb64:v1:"
-    r"|\([0-9A-Fa-f]{4}, ?[0-9A-Fa-f]{4}\)|((?:(?!mfb64:v1:)[\w.\-])++)"
+    r"|\([0-9A-Fa-f]{4}, ?[0-9A-Fa-f]{4}\)|((?:(?!mfb64:v1:|nonnumeric port: )[\w.\-])++)"
 )
 #: The bundle marker, and the base64 alphabet ``_MFB64`` reads after it. ``_MFB64`` has no word
 #: boundary and stops at the first character outside that alphabet. A word holds ``_``, ``.``,
@@ -1105,13 +1108,17 @@ _MEMBER_B64_MARKER = "mfb64:v1:"
 _MEMBER_B64_RUN = re.compile(r"[A-Za-z0-9+/=]*+")
 _MEMBER_B64_STOP = re.compile(r"[^A-Za-z0-9+/=]")
 #: What must follow a word that holds a kept word anywhere inside it for the mask to keep the whole
-#: word: an optional quote, spaces, and a ":", "=" or "#". Read in the whole text, past the value's
-#: end, since a value that opens with a quote ends at the quote that closes a JSON key
-#: (``;Token="name": ...``).
-_MEMBER_LABEL_TAIL = re.compile(r"""['"]?[ \t]*+[:=#]""")
+#: word: an optional quote, spaces, and a ":" or "=", or a "#" (group 1) after a word ending in MRN. Read in the whole text, past
+#: the value's end, since a value that opens with a quote ends at the quote that closes a JSON key
+#: (``;Token="name": ...``). A "#" keeps only a word that ends in ``mrn``
+#: (:data:`_MEMBER_MRN_WORD`), since the PHI pass's MRN label is the only reader of a "#" after a
+#: word; ``Passw0rd#2024`` printed ``Passw0rd`` while any kept word kept a word before a "#".
+_MEMBER_LABEL_TAIL = re.compile(r"""['"]?[ \t]*+([:=#])""")
+_MEMBER_MRN_WORD = re.compile(r"(?i)mrn\Z")
 #: Kept words a later pass reads before a space instead: the bearer passes' scheme words and the PHI
-#: pass's MRN label.
-_MEMBER_SPACED_WORD = re.compile(r"(?i)bearer|basic|digest|mrn")
+#: pass's MRN label. Each reads the word at the END of a word, so only a word that ends in one is
+#: kept; a substring search kept ``Basic123`` of a passphrase.
+_MEMBER_SPACED_WORD = re.compile(r"(?i)(?:bearer|basic|digest|mrn)\Z")
 #: A word that ends in an HL7 segment ID at a word boundary, as ``redaction._HL7_SEGMENT`` reads it
 #: before its "|". Group 1 is the ID.
 _MEMBER_SEGMENT_ID = re.compile(r"(?:\A|[.\-])([A-Z][A-Z0-9]{2})\Z")
@@ -1128,8 +1135,9 @@ def _kept_word(text: str, word: str, end: int) -> bool:
     word, so the mask must leave it."""
     if _MEMBER_KEEP.search(word) is None:
         return False
-    if _MEMBER_LABEL_TAIL.match(text, end) is not None:
-        return True
+    tail = _MEMBER_LABEL_TAIL.match(text, end)
+    if tail is not None:
+        return tail.group(1) != "#" or _MEMBER_MRN_WORD.search(word) is not None
     return text[end : end + 1].isspace() and _MEMBER_SPACED_WORD.search(word) is not None
 
 

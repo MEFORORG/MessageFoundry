@@ -198,18 +198,22 @@ _SHAPES_A_SECOND_PASS_PRINTED = (
 #: longer held the marker its ``_MFB64`` sweep reads; the same with a word glued on before the
 #: marker, which ``_MFB64`` reads too, having no word boundary; the same once more; a word masked
 #: whole after a marker, whose "_" had ended the marker's base64 run, so the bundle's match ran on
-#: over the next marker's head; and a JSON key the mask took, whose value the PHI pass reads across
-#: a line break the control-character filter wrote as text.
+#: over the next marker's head; a JSON key the mask took, whose value the PHI pass reads across a
+#: line break the control-character filter wrote as text; and the PHI pass's userinfo opener with a
+#: word glued on before it, which a review measured on six paths.
 _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED = (
     "connect failed;xpass=mfb64:v1:a1qkey= tail",
     "connect failed;xpass=amfb64:v1:b2qkey= tail",
     "%26;sslpassword=mfb64:v1:c3qkey=\t{password=ABC|",
     ";xpass=mfb64:v1:x_mfb64:v1:d4qkey= tail",
     ';xpass="family": \ne5q',
+    "&<redacted>19800505;xpass=xnonnumeric port: '\nc3q%5E.@hpassword=MEFOR_X=",
 )
 
 _NEVER = re.compile(r"(?!)")
 _UNIT = secretscrub._MEMBER_VALUE_UNIT.pattern
+#: The word alternative, which stops where the bundle marker or the userinfo opener starts.
+_WORD = r"(?:(?!mfb64:v1:|nonnumeric port: )[\w.\-])++"
 
 
 def _keep_without(*words: str) -> re.Pattern[str]:
@@ -276,14 +280,20 @@ _RULE_CONTROLS = (
     (
         "bundle marker",
         "_MEMBER_VALUE_UNIT",
-        re.compile(_UNIT.replace("|mfb64:v1:", "").replace(r"(?:(?!mfb64:v1:)[\w.\-])++", r"[\w.\-]++")),
+        re.compile(_UNIT.replace("|mfb64:v1:", "").replace(_WORD, r"(?:(?!nonnumeric port: )[\w.\-])++")),
         _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[0],
     ),
     (
         "bundle marker after a glued word",
         "_MEMBER_VALUE_UNIT",
-        re.compile(_UNIT.replace(r"(?:(?!mfb64:v1:)[\w.\-])++", r"[\w.\-]++")),
+        re.compile(_UNIT.replace(_WORD, r"(?:(?!nonnumeric port: )[\w.\-])++")),
         _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[1],
+    ),
+    (
+        "userinfo opener after a glued word",
+        "_MEMBER_VALUE_UNIT",
+        re.compile(_UNIT.replace(_WORD, r"(?:(?!mfb64:v1:)[\w.\-])++")),
+        _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[5],
     ),
     (
         "end of the marker's base64 run",
@@ -568,6 +578,11 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
         (";xpass=amfb64:v1:a1q", ";xpass=redactedmfb64:v1:redacted"),
         (";xpass=mfb64:v1:a1q_b2q.c3q", ";xpass=mfb64:v1:redacted_redacted"),
         (";xpass=a1q_b2q", ";xpass=redacted"),
+        # A "#" keeps only a word ending in MRN, and a space only a word ending in a scheme word.
+        (";sslpassword=Passw0rd#2024;", ";sslpassword=redacted#redacted;"),
+        (";xpass=x_MRN#5;", ";xpass=x_MRN#redacted;"),
+        (";sslpassword=Basic123 zz;", ";sslpassword=redacted redacted;"),
+        (";sslpassword=xnonnumeric port: ", ";sslpassword=redactednonnumeric port: "),
         # A base64 run stays long enough for the bundle's sweep.
         (";xpass=a1q QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", ";xpass=redacted " + "redacted" * 4),
         # A kept word only stays where a later pass reads it: here it is a password or a token.
