@@ -27,8 +27,9 @@ The EXPECTED shape is read from the DDL text itself, because no scratch database
 it on as the SQLite check does: the columns of every ``CREATE TABLE`` and every ``ALTER TABLE``, and
 every named ``CREATE INDEX`` with its table, key columns, uniqueness and whether it has a ``WHERE``.
 Statements are read in order, so a later ``DROP`` or rename changes what an earlier one created. A key
-column that is an expression reads as ``<expr>``, on both sides, followed by any operator class or
-collation the live read prints after it; ``(col)`` reads as ``col``.
+column that is an expression reads as ``<expr>``, on both sides, followed by any operator class the
+live read prints after it; an expression's collation is not compared, and a key that names one
+raises. ``(col)`` reads as ``col``.
 
 Given a backend, each column is also read for its type, its nullability, whether the server numbers it
 (``SERIAL``, ``IDENTITY``, a PostgreSQL ``DEFAULT nextval(...)``) and, on SQL Server, a ``COLLATE``
@@ -684,10 +685,12 @@ def _declared_key(text: str) -> str:
     elif inner != key and re.search(r"\bCOLLATE\b", inner, re.I):
         # PostgreSQL stores ((col COLLATE x)) as the column with an index collation.
         raise ValueError(f"index key {text!r} carries options the live-schema check cannot compare")
-    elif (end := _expression_end(key)) is not None and key[end:].strip():
-        # An expression with an operator class or a collation after it, such as
-        # lower(a) text_pattern_ops: the live read prints those only where they are not the
-        # expression's defaults, which the DDL text cannot say.
+    elif (end := _expression_end(key)) is not None and (
+        key[end:].strip() or re.search(r"\bCOLLATE\b", key, re.I)
+    ):
+        # An expression with an operator class after it, such as lower(a) text_pattern_ops,
+        # which the live read prints only where it is not the type's default, or with a
+        # collation anywhere in it, which the live read does not compare for an expression.
         raise ValueError(f"index key {text!r} carries options the live-schema check cannot compare")
     key += direction
     if _NULLS_ORDER.search(key) or (_PLAIN_KEY.match(key) is None and _EXPR_KEY.match(key) is None):
@@ -956,8 +959,8 @@ class _Reader:
                 if len(ways) > 1:
                     listed = " and ".join(sorted(s.describe() for s in ways))
                     raise ValueError(
-                        f"column {table}.{name} is built two ways, as {listed}: a guarded ADD or"
-                        " ALTER COLUMN and the CREATE TABLE disagree"
+                        f"column {table}.{name} is built two ways, as {listed}: a guarded ADD,"
+                        " an ALTER COLUMN or a second CREATE TABLE disagrees with the first"
                     )
                 if ways:
                     one[name] = next(iter(ways))

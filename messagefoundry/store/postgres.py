@@ -1311,8 +1311,10 @@ _LIVE_COLUMNS_SQL = (
 # pg_get_indexdef with a column number prints that key column alone, its name or the expression, and
 # none of its options, so a collation other than the column's, an operator class that is not its
 # type's default, and a NULLS order other than the direction's default are added after it (BACKLOG
-# #5062). The DDL reader refuses all three, so a live key carrying one compares unequal. Each vector
-# is zero-based, so key k is at k - 1. The two name arrays are zipped with
+# #5062). The DDL reader refuses all three, so a live key carrying one compares unequal. A collation
+# is added only after a column (indkey nonzero): an expression's own collation lives in indexprs,
+# which SQL cannot read, so one is not compared rather than printed for an expression whose natural
+# collation it is. Each vector is zero-based, so key k is at k - 1. The two name arrays are zipped with
 # ROWS FROM and one unnest each: the parser rewrites a multi-argument unnest in FROM into that form
 # only when the name is unqualified, so pg_catalog.unnest($1, $2) finds no such function.
 _LIVE_INDEXES_SQL = (
@@ -1322,6 +1324,7 @@ _LIVE_INDEXES_SQL = (
     " ARRAY(SELECT pg_catalog.pg_get_indexdef(i.indexrelid, k, true)"
     "   || COALESCE((SELECT ' COLLATE ' || pg_catalog.quote_ident(co.collname::text)"
     "     FROM pg_catalog.pg_collation co WHERE co.oid = i.indcollation[k - 1] AND co.oid <> 100"
+    "     AND i.indkey[k - 1] <> 0"
     "     AND co.oid IS DISTINCT FROM (SELECT ka.attcollation FROM pg_catalog.pg_attribute ka"
     "       WHERE ka.attrelid = i.indrelid AND ka.attnum = i.indkey[k - 1])), '')"
     "   || COALESCE((SELECT ' ' || oc.opcname::text FROM pg_catalog.pg_opclass oc"

@@ -83,8 +83,16 @@ def test_a_marker_from_before_the_live_schema_check_takes_the_slow_path() -> Non
     assert hashlib.sha256(pg_before.encode()).hexdigest() != postgres._schema_hash()
     unchecked = "\n".join(sqlserver._SCHEMA)  # the hash input before the check revision joined it
     assert hashlib.sha256(unchecked.encode()).hexdigest() != sqlserver._schema_hash()
+    # The control: each hash is exactly its batch plus the current revision, so the marker one
+    # revision back can differ only by that revision, and dropping it from the input fails here.
+    pg_input = pg_before + f"\nschema_check_rev={rev}"
+    assert hashlib.sha256(pg_input.encode()).hexdigest() == postgres._schema_hash()
+    ms_input = unchecked + f"\nschema_check_rev={rev}"
+    assert hashlib.sha256(ms_input.encode()).hexdigest() == sqlserver._schema_hash()
     previous = "\n".join(sqlserver._SCHEMA) + f"\nschema_check_rev={rev - 1}"
     assert hashlib.sha256(previous.encode()).hexdigest() != sqlserver._schema_hash()
+    pg_previous = pg_before + f"\nschema_check_rev={rev - 1}"
+    assert hashlib.sha256(pg_previous.encode()).hexdigest() != postgres._schema_hash()
 
 
 def test_sqlserver_schema_hash_tracks_the_check_revision(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1418,10 +1418,24 @@ def test_drop_index_concurrently_if_exists_drops_the_index() -> None:
 
 
 @pytest.mark.parametrize(
-    "key", ["lower(a) text_pattern_ops", '(a || b) COLLATE "C"', "lower(a) text_pattern_ops DESC"]
+    "key",
+    [
+        "lower(a) text_pattern_ops",
+        '(a || b) COLLATE "C"',
+        "lower(a) text_pattern_ops DESC",
+        'lower(a COLLATE "C")',
+    ],
 )
 def test_an_expression_key_with_an_operator_class_or_collation_raises(key: str) -> None:
-    """The live read prints an expression's operator class and collation, so the declared side
-    cannot read one as the bare ``<expr>``."""
+    """The live read prints an expression's operator class, so the declared side cannot read one as
+    the bare ``<expr>``; an expression's collation is not compared, so a key naming one raises."""
     with pytest.raises(ValueError, match="options"):
         declared_schema((f"CREATE INDEX ix ON t ({key})",))
+
+
+def test_the_live_read_adds_a_collation_after_a_column_key_only() -> None:
+    """An expression's natural collation lives in indexprs, which the read cannot see, so printing
+    every non-default one would refuse a correct expression index."""
+    from messagefoundry.store import postgres
+
+    assert "AND i.indkey[k - 1] <> 0" in postgres._LIVE_INDEXES_SQL
