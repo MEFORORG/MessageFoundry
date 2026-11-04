@@ -422,6 +422,11 @@ class WalkCause(str):
         cause.kind = kind
         return cause
 
+    def __getnewargs__(self) -> tuple[str, str]:  # type: ignore[override]
+        # copy, deepcopy, pickle and dataclasses.asdict rebuild a str subclass from these; str's
+        # own answer omits the required kind, and a ChainFinding's reason holds one of these.
+        return str(self), self.kind
+
     @classmethod
     def plain(cls, text: str) -> WalkCause:
         """A cause whose ``text`` is a fixed sentence that names no path, so it is its own kind."""
@@ -489,7 +494,8 @@ def windows_chain(
     path, which re-reads a shared prefix but keeps the walk simple. The hop limit ends a cycle.
 
     ``drive_target`` answers the folder a ``subst`` drive letter stands for, in any form
-    :func:`_strip_win_prefix` reads (:func:`subst_target`), or ``None`` for a real volume. Such a
+    :func:`_strip_win_prefix` reads (:func:`subst_target`), or ``None`` for a real volume, and
+    raises ``OSError`` when it cannot tell, which ends the walk with a cause. Such a
     letter is spliced in like a link, because its ``X:\\`` is not a volume root: the folders above
     the substituted one can still be renamed. ``volume_cause`` answers why a volume cannot be
     judged, and is asked before anything on that volume is read. So a mapped network drive costs no
@@ -508,7 +514,10 @@ def windows_chain(
     if _drive_relative(full):
         return [], WalkCause.plain(_DRIVE_RELATIVE)
     if not ntpath.isabs(full) and not full.startswith("\\\\"):
-        full = ntpath.join(cwd() if callable(cwd) else cwd, full)
+        # A working directory may itself carry a \\?\ prefix, which the loop below would refuse.
+        full = _strip_win_prefix(ntpath.join(cwd() if callable(cwd) else cwd, full))
+        if full is None:
+            return [], WalkCause.plain(_DEVICE_PATH)
     chain: list[tuple[str, str]] = []
     seen: set[str] = set()
 
@@ -524,17 +533,24 @@ def windows_chain(
         if norm.startswith("\\\\.\\") or (
             norm.startswith("\\\\?\\") and norm[4:11].lower() != "volume{"
         ):
-            # Only a device prefix written with forward slashes (``//?/S:/x``, ``//./C:/x``) reaches
-            # here, since normpath turns them into backslashes after _strip_win_prefix has looked.
-            # Read as a share or a drive, it skipped the subst lookup or answered "share" for a
-            # local device path, so it is a cause instead (vault BACKLOG #5197 review).
+            # A device prefix written with forward slashes (``//?/S:/x``, ``//./C:/x``), which
+            # normpath turns into backslashes after _strip_win_prefix has looked. Read as a share
+            # or a drive, it skipped the subst lookup or answered "share" for a local device path,
+            # so it is a cause instead, a ``//./Volume{`` spelling too (vault BACKLOG #5197 review).
             return chain, WalkCause.plain(_DEVICE_PATH)
         if norm.startswith("\\\\") and not norm.startswith("\\\\?\\"):
             return chain, WalkCause.plain(SHARE_CAUSE)
         drive, rest = ntpath.splitdrive(norm)
         if not drive:
             return chain, WalkCause.plain("the path has no drive or volume")
-        substituted = drive_target(drive) if len(drive) == 2 else None
+        try:
+            substituted = drive_target(drive) if len(drive) == 2 else None
+        except OSError as exc:
+            # A subst drive that could not be read would hide the folders above its target.
+            return chain, WalkCause(
+                f"the drive {drive} could not be read: {exc.strerror or exc}",
+                f"a drive could not be read: {exc.strerror or type(exc).__name__}",
+            )
         if substituted is not None:
             hops += 1
             if hops > MAX_LINK_HOPS:
@@ -1206,10 +1222,15 @@ def windows_host_readers() -> WinHost:
         return unresolved(members, "the enumeration did not finish in 64 pages")
 
     def drive_target(drive: str) -> str | None:
-        """The folder a ``subst`` drive stands for, whole, or ``None`` (:func:`subst_target`)."""
+        """The folder a ``subst`` drive stands for, whole, or ``None`` (:func:`subst_target`). A
+        failed query other than "no such device" raises ``OSError``: read as a real volume, a subst
+        drive it could not read would hide the folders above its target from the walk."""
         buf = ctypes.create_unicode_buffer(1024)
         if not kernel32.QueryDosDeviceW(drive, buf, len(buf)):
-            return None
+            error = ctypes.get_last_error()
+            if error == 2:  # ERROR_FILE_NOT_FOUND: no device at that letter
+                return None
+            raise OSError(f"the drive {drive} could not be read: {win_error(error)}")
         return subst_target(buf.value)
 
     cache: list[tuple[frozenset[str], bool]] = []

@@ -1760,17 +1760,23 @@ def database_ca_anchor_spec(
     A value the build refuses as a boolean or as text (``_odbc_literal``), a padded one included,
     raises ``ValueError`` too, in every ``sslmode``, before either spelling is walked or statted:
     no spelling of it is a file a driver is handed, and checking the trimmed one would clear a
-    value the build never sends (vault BACKLOG #5197 item 8)."""
+    value the build never sends (vault BACKLOG #5197 item 8). An empty value names no file and
+    answers ``None``, left to the build's refusal, which names the keyword."""
     value = _generic_odbc_param(settings, "sslca")
     if value is None:
         return None
     from messagefoundry.transports.database import (
         _odbc_literal,
+        _sent_text,
         driver_file_spellings,
         file_keyword_verdicts,
         names_another_host,
     )
 
+    if not _sent_text(value):
+        # An empty value names no file. The build refuses it naming the keyword, where a refusal
+        # here would be reported against tls_ca_file (lane_ca_setting reads it as unset).
+        return None
     if isinstance(value, bool):
         # The build refuses a boolean before it reads the text, so ``True`` is never a file a
         # driver is handed, and the lane check must not walk or stat the relative path "True".

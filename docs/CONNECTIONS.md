@@ -1860,11 +1860,12 @@ When the connection is built, the engine refuses a value that starts with two se
 with a device prefix, such as a share spelling. That part is enforced on every platform. On
 Windows the engine also runs a best-effort check of the path, and refuses the value when that
 check finds the path leads to another host, or cannot finish reading the trimmed path. Both
-refusals apply in every SSL mode. At least these spellings count as paths the check cannot finish
-(vault BACKLOG #5197): a link whose target is rooted with no drive (`\RPC Control\...`,
-`/Device/...`), a drive-relative spelling (`C:ca.pem`, `D:link\ca.pem`), and a name in the path
-that ends in a space or a dot, a device prefix written with forward slashes (`//?/C:/ca.pem`),
-and a stream name after a link. A `subst` drive onto a share counts as leading to another host.
+refusals apply in every SSL mode. At least these count as paths the check cannot finish (vault
+BACKLOG #5197): a link whose target is rooted with no drive (`\RPC Control\...`, `/Device/...`);
+a drive-relative spelling (`C:ca.pem`, `D:link\ca.pem`); a name in the path that ends in a space
+or a dot; a link whose target starts with a device prefix written with forward slashes
+(`//?/S:/ca.pem`); a stream name after a link; and a `subst` drive whose target cannot be read.
+A `subst` drive onto a share counts as leading to another host.
 When the check cannot finish, a WARNING names the kind of cause, never the path; the path is
 logged at DEBUG only. The value is judged as the text the build sends, so `0` is checked as the
 path `0`. The check is defence in depth, not a guarantee. It misses at least: links to some

@@ -12,7 +12,9 @@ Synthetic paths and host names only.
 
 from __future__ import annotations
 
+import copy
 import logging
+import pickle
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -348,3 +350,41 @@ def test_review_the_lane_check_refuses_a_boolean_sslca(
     }
     with pytest.raises(ValueError, match="must not be a boolean"):
         ta.database_ca_anchor_spec("OB_DB_GEN", settings)
+
+
+def test_review_a_walk_cause_survives_copy_and_pickle() -> None:
+    """A ChainFinding's reason holds a WalkCause, and asdict deep-copies it. Red: str's own
+    ``__getnewargs__`` left out the required kind, so each raised TypeError."""
+    cause = anchor_path.WalkCause(r"text naming C:\x", "kind")
+    for clone in (copy.copy(cause), copy.deepcopy(cause), pickle.loads(pickle.dumps(cause))):
+        assert clone == cause and clone.kind == "kind"
+
+
+def test_review_a_working_directory_with_a_device_prefix_is_still_walked() -> None:
+    """A relative path joined to a ``\\\\?\\C:\\...`` working directory is read as ``C:\\...``,
+    not refused as a forward-slash device spelling."""
+    assert _walk("ca.pem", cwd=r"\\?\C:\work") is False
+
+
+def test_review_a_drive_target_that_cannot_be_read_ends_the_anchor_walk() -> None:
+    """The anchor walk's reader raises for a query it could not read, and the walk answers a cause
+    rather than reading the letter as a real volume."""
+
+    def unread(_drive: str) -> str | None:
+        raise OSError("the drive S: could not be read")
+
+    _chain, cause = windows_chain(r"S:\ca.pem", r"C:\work", _probe(), drive_target=unread)
+    assert cause is not None and "could not be read" in cause.kind
+    assert _walk(r"S:\ca.pem") is False  # the control: no subst, a real volume
+
+
+def test_review_an_empty_sslca_is_left_to_the_build() -> None:
+    """An empty value names no file, so the lane check answers no anchor rather than a refusal
+    that lane_ca_setting would report against tls_ca_file."""
+    settings: dict[str, Any] = {
+        "dialect": "generic",
+        "odbc_driver": "MySQL ODBC 9.1 Unicode Driver",
+        "server": "db.synthetic.test",
+        "odbc_params": {"SSLMODE": "VERIFY_IDENTITY", "SSLCA": ""},
+    }
+    assert ta.database_ca_anchor_spec("OB_DB_GEN", settings) is None
