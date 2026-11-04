@@ -845,7 +845,8 @@ class StageDispatcher:
     def _reap(tasks: set[asyncio.Task[None]]) -> None:
         """Retrieve every drained serializer's exception.
 
-        ``_on_lane_task_done`` returns early once ``_stop`` is set, and ``stop()``'s
+        ``_on_lane_task_done`` retrieves it too, but a serializer whose callback has not run by
+        the time quiesce returns is not covered there, and ``stop()``'s
         ``gather(return_exceptions=True)`` cannot cover a serializer that already popped itself out of
         ``_lane_tasks`` — so without this a raised serializer logs "exception was never retrieved" at
         GC, hiding a real failover-time crash behind a garbage-collection message.
@@ -1472,18 +1473,22 @@ class StageDispatcher:
         exc = task.exception()
         if exc is None:
             return
-        if self._stop.is_set():
-            self._stranded_on_stop.add(lane)
-            log.warning(
-                "StageDispatcher %s lane %s serializer died during a stop holding %d claimed row(s); "
-                "they stay in flight until the next start",
-                self._stage.value,
-                lane,
-                len(ids),
-            )
-            return
         st = self._states.get(lane)
-        if st is None or st.phase is not _LanePhase.PROCESSING or lane in self._lane_tasks:
+        holding = (
+            st is not None and st.phase is _LanePhase.PROCESSING and lane not in self._lane_tasks
+        )
+        if self._stop.is_set():
+            if st is not None and holding:  # its rows stay INFLIGHT, so quiesce must know
+                self._stranded_on_stop.add(lane)
+                log.warning(
+                    "StageDispatcher %s lane %s serializer died during a stop holding %d claimed "
+                    "row(s); they stay in flight until the next start",
+                    self._stage.value,
+                    lane,
+                    len(ids) + len(st.held_extra_ids),
+                )
+            return
+        if st is None or not holding:
             log.error(
                 "StageDispatcher %s lane %s serializer task crashed (state may be inconsistent)",
                 self._stage.value,
@@ -1500,14 +1505,15 @@ class StageDispatcher:
             "to re-pend them before the lane claims again",
             self._stage.value,
             lane,
-            len(ids),
+            len(ids) + len(st.held_extra_ids),
             count_label=IN_THIS_RUN,
         )
         deaths = st.serializer_deaths.count
-        if (
-            deaths == self._infra_fault_stop_after
-            and not st.lane_stuck_alerted
-            and not self._recovery_meets_bound(lane, st, ids)
+        # At the bound, unless the recovery about to run alerts itself; past it, whenever nothing
+        # has alerted yet, since a recovery expected to alert may have died before it could.
+        bound = self._infra_fault_stop_after
+        if not st.lane_stuck_alerted and (
+            deaths > bound or (deaths == bound and not self._recovery_meets_bound(lane, st, ids))
         ):
             st.lane_stuck_alerted = True
             try:
@@ -1515,7 +1521,8 @@ class StageDispatcher:
                     lane,
                     detail=(
                         f"{self._stage.value} serializer died {deaths} times with no serializer "
-                        f"surviving its body between, the last holding {len(ids)} claimed row(s)"
+                        f"surviving its body between, the last holding "
+                        f"{len(ids) + len(st.held_extra_ids)} claimed row(s)"
                     ),
                 )
             except Exception:  # noqa: BLE001 — an alert failure must not stop the respawn
@@ -1663,7 +1670,7 @@ class StageDispatcher:
                         "again before it stops",
                         self._stage.value,
                         lane,
-                        claimed,
+                        claimed + (len(st_r.held_extra_ids) if st_r is not None else 0),
                     ),
                 )
             outcome, head_ids, tail_ids = self._dead_serializer_outcome(lane, recover_ids)

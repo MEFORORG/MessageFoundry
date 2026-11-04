@@ -511,7 +511,8 @@ async def test_the_death_page_does_not_duplicate_the_recoverys_own_bound(
     """R3-4. A run of ``infra_fault_stop_after`` deaths pages ``lane_stuck`` once, from the
     supervisor, when the deaths alone reach the bound. When the recovery about to run is the
     zero-progress fault that brings the streak to that bound, its own STOP or page is the alert,
-    and the supervisor sends none: before the repair both fired in the same cycle."""
+    and the supervisor sends none: before the repair both fired in the same cycle. If that
+    recovery dies before it can alert, the next death pages, and only once."""
     pages: list[str] = []
     sink = SimpleNamespace(lane_stuck=lambda lane, *, detail: pages.append(lane))
     dispatcher, st = _processing_dispatcher(db, alert_sink=sink, infra_fault_stop_after=3)
@@ -524,16 +525,21 @@ async def test_the_death_page_does_not_duplicate_the_recoverys_own_bound(
     async def die() -> None:
         raise _Kill("injected kill")
 
-    for _ in range(3):
-        dead = asyncio.ensure_future(die())
-        with pytest.raises(_Kill):
-            await dead
-        dispatcher._on_lane_task_done("IB", ["r1"], fence, dead)
+    async def deaths(n: int) -> None:
+        for _ in range(n):
+            dead = asyncio.ensure_future(die())
+            with pytest.raises(_Kill):
+                await dead
+            dispatcher._on_lane_task_done("IB", ["r1"], fence, dead)
+
+    await deaths(3)
     assert st.serializer_deaths.count == 3
     if streak == 0:
         assert pages == ["IB"] and st.lane_stuck_alerted
     else:
         assert pages == [] and not st.lane_stuck_alerted
+    await deaths(2)  # the recoveries expected to alert died first
+    assert pages == ["IB"] and st.lane_stuck_alerted
 
 
 async def test_a_replacement_for_a_serializer_that_died_in_its_transition_counts_the_streak_once(
@@ -615,3 +621,58 @@ async def test_a_batch_killed_by_a_base_exception_hands_its_extras_on(
     else:
         assert noted == [("OB", coalesced)]
     assert await db.inflight_by_lane(stage=Stage.OUTBOUND.value) == {"OB": (3, 2.0)}
+
+
+async def _dead_task() -> asyncio.Task[None]:
+    async def die() -> None:
+        raise _Kill("injected kill")
+
+    task = asyncio.ensure_future(die())
+    with pytest.raises(_Kill):
+        await task
+    return task
+
+
+async def test_only_a_serializer_still_holding_its_lane_at_a_stop_is_counted_against_quiesce(
+    db: MessageStore,
+) -> None:
+    """A serializer that dies during a stop after its terminal transition moved the lane out of
+    PROCESSING holds nothing, so it is not counted against quiesce; one still PROCESSING is."""
+    dispatcher, st = _processing_dispatcher(db)
+    dispatcher._stop.set()
+    st.phase = _LanePhase.PARKED
+    dispatcher._on_lane_task_done("IB", ["r1"], _leading(), await _dead_task())
+    assert dispatcher._stranded_on_stop == set()
+    st.phase = _LanePhase.PROCESSING
+    dispatcher._on_lane_task_done("IB", ["r1"], _leading(), await _dead_task())
+    assert dispatcher._stranded_on_stop == {"IB"}
+
+
+async def test_a_dropped_lane_record_reports_a_strand_only_for_a_worker_that_died(
+    db: MessageStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A worker that returned handed its rows back, whatever its record still lists, so dropping
+    the record of a lane this node will not run says nothing; a dead worker's rows are reported.
+    A replacement that first runs after the stop reports the rows it inherited too."""
+    caplog.set_level(logging.WARNING, logger="messagefoundry.pipeline.wiring_runner")
+    runner = RegistryRunner(_registry(tmp_path), db, egress=EgressSettings(deny_by_default=False))
+
+    async def ret() -> None:
+        return None
+
+    returned = asyncio.ensure_future(ret())
+    await returned
+    runner._lane_claims[("delivery", "OB")] = _LaneClaims(["r1"])
+    runner._drop_lane_claims("delivery", "OB", returned)
+    assert "stay in flight" not in caplog.text
+    runner._lane_claims[("delivery", "OB")] = _LaneClaims(["r1"])
+    runner._drop_lane_claims("delivery", "OB", await _dead_task())
+    assert caplog.text.count("stay in flight until the next start") == 1
+
+    runner._stop.set()
+
+    async def run(name: str, *, claims: _LaneClaims) -> None:
+        raise AssertionError("no worker runs after a stop")
+
+    await runner._recover_then_run("router", "IB", _LaneClaims(["r1"], _leading()), run)
+    assert caplog.text.count("stay in flight until the next start") == 2

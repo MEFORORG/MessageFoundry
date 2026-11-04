@@ -545,6 +545,14 @@ class _LaneClaims:
         )
 
 
+def _died(task: asyncio.Task[None] | None) -> bool:
+    """Whether ``task`` is a per-lane worker that DIED: done, not cancelled, and raised (BACKLOG
+    #4607). Only such a worker leaves rows a replacement must re-pend."""
+    return (
+        task is not None and task.done() and not task.cancelled() and task.exception() is not None
+    )
+
+
 class _WorkerFaultLog:
     """One per-lane worker's backoff on the log lines its loop writes for an UNEXPECTED error
     (BACKLOG #1844).
@@ -6590,7 +6598,7 @@ class RegistryRunner:
         placement, so start/reconcile/respawn all inherit the gate while the connector stays built
         (status, DR parking and the dead-letter sweeps keep keying off the full outbound map)."""
         if not self._per_lane_delivery(name):
-            self._drop_lane_claims("delivery", name)
+            self._drop_lane_claims("delivery", name, self._workers.get(name))
             return
         out = self._dispatchers.get(Stage.OUTBOUND)
         held = None if out is None else out.phase(name)
@@ -6633,7 +6641,7 @@ class RegistryRunner:
                 name,
                 held,
             )
-            self._drop_lane_claims("delivery", name)
+            self._drop_lane_claims("delivery", name, self._workers.get(name))
             return
         if not self._owns_destination(name):
             log.info(
@@ -6643,7 +6651,7 @@ class RegistryRunner:
                 self._destination_owner(name),
                 self.registry.shard_id,
             )
-            self._drop_lane_claims("delivery", name)
+            self._drop_lane_claims("delivery", name, self._workers.get(name))
             return
         task = self._start_lane_worker(
             "delivery", name, self._delivery_worker, self._workers.get(name)
@@ -6815,13 +6823,7 @@ class RegistryRunner:
         dies before its re-pend lands passes the same rows on again."""
         key = (kind, name)
         old = self._lane_claims.get(key)
-        died = (
-            prev is not None
-            and prev.done()
-            and not prev.cancelled()
-            and prev.exception() is not None
-        )
-        if died and old is not None:
+        if _died(prev) and old is not None:
             claims = _LaneClaims(ids=list(old.ids), fence=old.fence, deaths=old.deaths)
         else:
             claims = _LaneClaims()
@@ -6860,6 +6862,7 @@ class RegistryRunner:
         it, which keeps per-lane FIFO. The death log shows it, and ``lane_stuck`` pages it once a
         run reaches ``infra_fault_stop_after`` deaths."""
         if self._stop.is_set():
+            self._log_left_in_flight(kind, name, claims.ids)
             return
         abandon = self._hold_abandon(kind, name)
         if claims.deaths.count >= 2:
@@ -6947,10 +6950,12 @@ class RegistryRunner:
                 len(ids),
             )
 
-    def _drop_lane_claims(self, kind: str, name: str) -> None:
-        """Forget the claims record of a lane this node will not run a worker on (BACKLOG #4607)."""
+    def _drop_lane_claims(self, kind: str, name: str, prev: asyncio.Task[None] | None) -> None:
+        """Forget the claims record of a lane this node will not run a worker on (BACKLOG #4607),
+        saying so when its last worker ``prev`` died holding rows. A worker that returned handed
+        its rows back, whatever its record still lists."""
         claims = self._lane_claims.pop((kind, name), None)
-        if claims is not None:
+        if claims is not None and _died(prev):
             self._log_left_in_flight(kind, name, claims.ids)
 
     def _hold_abandon(self, kind: str, name: str) -> Callable[[], bool]:
