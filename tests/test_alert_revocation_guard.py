@@ -419,6 +419,28 @@ def test_an_allowlist_naming_no_host_refuses_every_host() -> None:
     assert alert_sinks.alert_host_allowed("hooks.example.test", ())
 
 
+def test_a_webhook_url_naming_no_host_is_refused_for_its_url() -> None:
+    # The remedy is the URL, so the refusal must not send the operator to the allowlist.
+    with pytest.raises(ValueError, match="names no host") as exc:
+        WebhookTransport(
+            "https:///services/T/B/x", allowed_hosts=("hooks.example.test",), posture=ENFORCING
+        )
+    assert "webhook_allowed_hosts" not in str(exc.value)
+
+
+def test_a_refused_cleartext_webhook_never_logs_that_its_hop_was_permitted(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with pytest.raises(ValueError, match="webhook_allowed_hosts"):
+        WebhookTransport(
+            "http://hooks.other.test/x",
+            allowed_hosts=("hooks.example.test",),
+            posture=NOT_ENFORCING,
+        )
+    assert "plaintext http; permitted" not in caplog.text
+
+
 class _PassedTheAllowlist(Exception):
     """Raised by a stub placed just past the send's allowlist test, so nothing is dialled."""
 

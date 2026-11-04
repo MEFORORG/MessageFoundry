@@ -4402,28 +4402,27 @@ def _serve(args: argparse.Namespace) -> int:
     # lives here and not in an AlertsSettings validator, so `messagefoundry check` does not catch it.
     from messagefoundry.pipeline.alert_sinks import alert_host_allowed
 
-    security_channel_configured = bool(
+    security_channel_ready = bool(
         settings.auth.notify_security_events
         and settings.alerts.email_smtp_host
         and settings.alerts.email_from
     )
-    smtp_relay_off_allowlist = security_channel_configured and not alert_host_allowed(
+    if security_channel_ready and not alert_host_allowed(
         settings.alerts.email_smtp_host or "", settings.alerts.smtp_allowed_hosts
-    )
-    security_channel_ready = security_channel_configured and not smtp_relay_off_allowlist
-    if smtp_relay_off_allowlist:
+    ):
         # At every enforcement level and despite the waiver: the lifespan builds the security
         # notifier on exactly this condition, and that build refuses the relay, so a start let
         # through here would fail later, after the store opened. Refused here instead, naming the
         # allowlist, so an operator is never told to configure an SMTP relay that is configured.
+        # The setting is named, never its value.
         print(
             "error: the out-of-band security-notification channel cannot send; refusing to start "
-            f"(ASVS 6.3.5/6.3.7). [alerts].email_smtp_host {settings.alerts.email_smtp_host!r} is "
-            "not in [alerts].smtp_allowed_hosts, so the security notifier refuses to build and "
-            "every notice to that relay would be refused. List the relay in "
-            "[alerts].smtp_allowed_hosts, or point [alerts].email_smtp_host at a host it lists. "
-            "[security].enforcement = warn and [alerts].security_notifications_required=false "
-            "do not admit it.",
+            "(ASVS 6.3.5/6.3.7). [alerts].email_smtp_host is not in [alerts].smtp_allowed_hosts, "
+            "so the security notifier refuses to build and every notice to that relay would be "
+            "refused. List the relay in [alerts].smtp_allowed_hosts, or point "
+            "[alerts].email_smtp_host at a host it lists. [security].enforcement = warn and "
+            "[alerts].security_notifications_required=false do not admit it; to rely on the "
+            "pull-only feed instead, set that waiver and turn [auth].notify_security_events off.",
             file=sys.stderr,
         )
         return 2

@@ -432,6 +432,10 @@ def _refuse_off_allowlist_webhook(url: str, allowed_hosts: Sequence[str]) -> Non
     Run at the build and at every POST. Names the host, never the URL: the path carries the
     webhook's token (BACKLOG #1793)."""
     host = urllib.parse.urlsplit(url).hostname or ""  # urlsplit lower-cases the host
+    if not host and allowed_hosts:
+        # The remedy is the URL, not the allowlist, so say that. With no allowlist the https
+        # revocation guard's hop_url_host refuses the same URL at the build.
+        raise ValueError("[alerts].webhook_url names no host")
     if not alert_host_allowed(host, allowed_hosts):
         raise ValueError(
             f"[alerts].webhook_url host {host!r} is not in [alerts].webhook_allowed_hosts"
@@ -626,6 +630,11 @@ class WebhookTransport:
                 "(dev/trusted-network only; the escape has no effect while enforcing, the default, "
                 "or with no posture) — use https"
             )
+        # BACKLOG #5088: the allowlist _post applies, here at the build, so a host it would refuse
+        # at every POST refuses the start instead. Before the permitted-cleartext WARNING, so a
+        # refused URL never logs that its hop was permitted, and before the revocation guard, which
+        # reads no allowlist, so that guard never judges a host the egress policy forbids.
+        _refuse_off_allowlist_webhook(url, allowed_hosts)
         if scheme == "http":
             log.warning(
                 "webhook target uses plaintext http; permitted only because %s is set on an instance "
@@ -637,10 +646,6 @@ class WebhookTransport:
         # the URL is operator config and the sole header is a fixed ``Content-Type``, so nothing is
         # added between here and the wire.
         enforce_outbound_length_limits(url, {"Content-Type": "application/json"})
-        # BACKLOG #5088: the allowlist _post applies, here at the build, so a host it would refuse
-        # at every POST refuses the start instead. Before the revocation guard, which reads no
-        # allowlist, so that guard never judges a host the egress policy forbids.
-        _refuse_off_allowlist_webhook(url, allowed_hosts)
         # BACKLOG #2193 slice (d): last, so a URL another check refuses never logs a crossing.
         _refuse_webhook_revocation(
             url,
@@ -792,8 +797,9 @@ def send_plain_email(
     # recipient override and a per-user notice address are held to it too. MAIL FROM and RCPT TO are
     # passed explicitly below rather than derived from a parse of the headers (vault BACKLOG #2870).
     envelope = checked_envelope(ALERTS_SMTP_CELL, sender, recipients)
-    # Built AFTER the allowlist check, deliberately: tests/test_alerts_test_email.py runs the REAL
-    # function and depends on a disallowed host raising before ANY other work happens.
+    # Built AFTER the allowlist check, deliberately, so a disallowed host raises before ANY other
+    # work happens. The builds refuse it first since BACKLOG #5088, so this is the send's own
+    # copy of that order, which test_the_build_and_the_send_apply_one_allowlist_test pins.
     tls_context = (
         _alerts_smtp_context(
             host=host,
@@ -2433,8 +2439,9 @@ def notifier_from_settings(
     ``[tls].crl_file`` reaches the hop. For those guards ``None`` with none stamped counts as
     enforcing (ADR 0173 section 12)."""
     if alerts.email_smtp_host and alerts.email_from and alerts.email_to:
-        # BACKLOG #5088: before the password is read, so a relay the allowlist forbids costs no
-        # secret-store read, and a store that is down cannot hide this refusal. The build repeats it.
+        # BACKLOG #5088: before the SMTP password is read, so a relay the allowlist forbids costs no
+        # secret-store read for it, and a store that is down cannot hide the relay's refusal. The
+        # build repeats it. The webhook reads no secret, so its check stays in its build.
         _refuse_off_allowlist_smtp_host(alerts.email_smtp_host, alerts.smtp_allowed_hosts)
     smtp_password = resolve_connector_secret(
         secret_provider,
