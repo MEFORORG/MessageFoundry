@@ -1076,6 +1076,12 @@ fleet, so never take them*.
   korus branch, `lander/filed-findings-ruling`, carried this ruling that day and was not yet
   merged.
 
+  **AMENDED 2026-11-04, added after the move (ledger ruling R2, owner-signed in session: *"Sign
+  R1-R9"*).** R2 amends the rulings of 2026-10-12 and 2026-10-31 ("merge, file rows") in their
+  filing mechanics only: a merged PR now files at most one row. `CLAUDE.md` section 5 states the new
+  mechanics once, at the end of its merge bullet, so read them there. The signed text is the vault's
+  `docs/LEDGER-INFLOW-RULINGS.md`, from vault PR 2818 (open on 2026-11-04).
+
 - **A PR's merge state is a join over clocks, and the join is the part you must not miss.**
   `gh pr view <N> --json mergeStateStatus` is the starting read, never the verdict: it reports
   `BEHIND` or `DIRTY` in preference to `BLOCKED`, so it hides one blocking reason behind another.

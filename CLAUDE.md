@@ -513,6 +513,14 @@ Manager keep their exemption: they never use `AskUserQuestion`, and put an owner
 table instead. A Builder still gets one turn: it puts an owner question in its report, never in
 `AskUserQuestion`.
 
+**No new process machinery until 2026-12-02 (ledger ruling R5, owner-signed 2026-11-04, in session:
+*"Sign R1-R9"*).** For the four weeks from that signature to 2026-12-02, no seat adds a new gate,
+hook, required context, seat or method rule, except a fix for a red `main` or a security control.
+Existing machinery is still repaired, and review effort is not touched. Carrying R1-R9 themselves
+into the tree is not new machinery; that is the drafting Manager's reading, recorded beside the
+signed text and not part of the signature. The freeze lapses on 2026-12-02. The signed text is the
+vault's `docs/LEDGER-INFLOW-RULINGS.md`, from vault PR 2818 (open on 2026-11-04).
+
 The brief is disposable. The BACKLOG item is the record.
 
 No seat may rely on a notice arriving -- the Manager finds state by asking. `stalled-prs.yml` reports
@@ -709,6 +717,13 @@ Manager's watch reached the cloud session 29 seconds after its question.
   that weakens a control, so it goes to the owner under the 2026-10-12 ruling, and the PR waits
   for that ruling. A finding the Lander cannot classify goes to the owner (decision
   d20261029T165623191-578690).
+  **Ledger ruling R2 (owner-signed 2026-11-04, in session: *"Sign R1-R9"*) changes how the findings
+  are filed, and nothing else in this bullet.** A merged PR files at most one row, holding all its
+  open findings as numbered items. Its deferred scope becomes steps on the row it cites, or is
+  briefed to that row's next Builder, and becomes a new row only when the PR cites none. A finding
+  about code the PR did not touch goes into the one open row for that module, as an item. The merge
+  permission, and what goes to the owner, are unchanged. The signed text is the vault's
+  `docs/LEDGER-INFLOW-RULINGS.md`, from vault PR 2818 (open on 2026-11-04).
 - **A PR's merge state is a join over clocks.** `mergeStateStatus` is the starting read, never the
   verdict, because it hides one blocking reason behind another. Gate on `mergeable == CONFLICTING`
   first: a PR that conflicts after its checks ran keeps them passing but stale. Korus
