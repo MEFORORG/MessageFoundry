@@ -1278,14 +1278,12 @@ class BackupRunner:
             # check above does not count as a file, nor one tar skipped, such as a socket.
             members = tar.getmembers()
             last = members[-1] if len(members) > before else None
+            # A second name of a file this walk already added is carried too, so it is not passed
+            # over: tar stores it as a link member naming that one, and a restore writes it as a
+            # copy of that file's bytes (`_extract_config_members`) (vault BACKLOG #5233).
             if last is not None and last.isreg():
                 regular_names.add(last.name)
-            elif last is not None and last.islnk() and last.linkname in regular_names:
-                # A second name of a file this walk already added: tar stores it as a link member
-                # naming that one, and a restore writes it as a copy of that file's bytes
-                # (`_extract_config_members`), so the archive carries it (vault BACKLOG #5233).
-                pass
-            else:
+            elif not (last is not None and last.islnk() and last.linkname in regular_names):
                 passed_over.add(rel.as_posix())
         if passed_over:
             from messagefoundry.config.fingerprint import describe_left_out
