@@ -8862,6 +8862,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         keyless_opt_out_refusal,
     )
     from messagefoundry.last_resort import run_guarded
+    from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.base import KeylessAuditChainRefused, open_store
 
     cli: dict[str, dict[str, object]] = {}
@@ -9003,7 +9004,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # Either way the store could not be opened, so exit 2, as the keyless checks beside it
         # exit (BACKLOG #2124, a seat decision under owner delegation 2026-10-08, not an owner
         # ruling).
-        _emit_error(f"{_sentence(exc)} Nothing was written", as_json=args.json)
+        # Through codec_safe_str, as every open refusal this command prints (#2532, #5067).
+        _emit_error(f"{_sentence(codec_safe_str(exc))} Nothing was written", as_json=args.json)
         return 2
     except KeylessAuditChainRefused as exc:  # #1916: could not start, as the write below exits
         _emit_error(str(exc), as_json=args.json)
@@ -9094,12 +9096,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except _PasswordEntryRefused as exc:
             return _emit_error(str(exc), as_json=args.json)
 
+    # Set just before the service's write, which stores the seed (BACKLOG #5067).
+    write_started = False
+
     def after_the_key(text: str) -> str:
         """``text`` for a refusal of the write's open or of its keyless checks, raised before the
         write wrote anything but after the key was shown (BACKLOG #5067). It then names the entry
         the operator may have added, as ``admin-reset-totp`` does, or the app keeps an entry for a
-        seed that was never stored. Unchanged under ``--no-totp``: no key was shown."""
-        if totp_secret is None:
+        seed that was never stored. Unchanged under ``--no-totp``: no key was shown. Unchanged too
+        once the write has started, whatever class reached the arm: the seed may then be stored,
+        and deleting the entry would leave the Administrator without its factor."""
+        if totp_secret is None or write_started:
             return text
         return (
             f"{_sentence(text)} If you added the entry this run showed to the authenticator app, "
@@ -9107,6 +9114,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
+        nonlocal write_started
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         try:
             store = await open_store(
@@ -9147,6 +9155,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             if security_notifier is not None:
                 security_notifier.start()
             try:
+                write_started = True
                 outcome = await service.provision_first_administrator(
                     username=args.username,
                     password=password,
@@ -9210,8 +9219,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         _emit_error(after_the_key(_provision_open_refusal(exc, settings.store)), as_json=args.json)
         return 2
     except _ProvisionWriteOpenRefused as exc:
-        # The pre-check's key or cipher arm, at the write's open after the key was shown: exit 2,
-        # and the shown key's entry has no seed (#5067). Printed from the cause, codec-safe.
+        # A key or cipher refusal of the write's open, after the key was shown, which the
+        # pre-check exits 2 on too: the shown key's entry has no seed (#5067). Printed from the
+        # cause, codec-safe.
         cause = exc.__cause__ or exc
         _emit_error(
             after_the_key(_provision_open_refusal(cause, settings.store)), as_json=args.json

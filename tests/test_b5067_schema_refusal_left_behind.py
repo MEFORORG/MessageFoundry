@@ -217,6 +217,59 @@ def test_provision_admin_key_refusal_at_the_write_open_names_the_entry(
     assert "Traceback" not in out, out
 
 
+def test_provision_admin_names_no_entry_once_the_write_has_started(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refusal the write's arms catch, raised once the service's write has started, names no
+    entry: the seed may then be stored, and deleting the entry would leave the Administrator
+    without its factor. A real SQLite store, so the open succeeds and the write is reached.
+
+    Mutation: drop ``write_started`` from ``after_the_key``; the hint is then printed."""
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.config.tls_policy import InsecureHopRefused
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        raise InsecureHopRefused("synthetic hop refusal inside the write")
+
+    monkeypatch.setattr(AuthService, "provision_first_administrator", refusing)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
+    argv = [
+        "provision-admin",
+        "--username",
+        "site-admin",
+        "--email",
+        "ops@example.invalid",
+        "--db",
+        str(shell / "provision.db"),
+    ]
+    out = _run(argv, capsys)
+    assert "synthetic hop refusal inside the write" in out, out
+    assert _UNUSED_ENTRY not in out, out
+
+
+def test_provision_admin_pre_check_cipher_refusal_quotes_no_key_byte(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The pre-check's key or cipher arm prints through ``codec_safe_str`` too (BACKLOG #2532).
+
+    Mutation: print ``_sentence(exc)`` again in that arm; the byte is then quoted."""
+    from messagefoundry.store import base
+    from messagefoundry.store.crypto import CipherError
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        try:
+            b"\xe9".decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise CipherError(exc) from exc
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(base, "open_store", refusing)
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert "xe9" not in out.lower(), out
+    assert "Nothing was written" in out, out
+
+
 def test_provision_admin_names_the_os_user_before_the_key_is_shown(
     shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -217,3 +217,27 @@ def test_a_codec_error_from_the_context_builder_is_not_wrapped(
     assert "xe9" not in codec_safe_str(caught.value).lower()
     # The control: the text a wrap would have carried does name the byte.
     assert "xe9" in codec_safe_str(StoreTlsRefused(str(caught.value))).lower()
+
+
+def test_a_value_error_raised_from_a_codec_error_is_not_wrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CRL judge re-raises a ``ValueError`` with the text of the one it caught, so a codec
+    error there arrives as a ``ValueError`` raised from it. That propagates unwrapped too.
+
+    Mutation: test only the top-level class in ``_build_ssl``; the wrap then names the byte."""
+    from messagefoundry.config.tls_policy import HopPosture
+    from messagefoundry.store import postgres
+
+    def judging(_settings: object) -> object:
+        try:
+            b"\xe9".decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"[store].ssl_crl_file: {exc}") from exc
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(postgres, "_verifying_context", judging)
+    with pytest.raises(ValueError) as caught:
+        postgres._build_ssl(_pg(), posture=HopPosture(enforcing=True))
+    assert not isinstance(caught.value, StoreTlsRefused)
+    assert isinstance(caught.value.__cause__, UnicodeDecodeError)

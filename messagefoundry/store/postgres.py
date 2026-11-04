@@ -1574,11 +1574,13 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
         # an OSError that is also a ValueError, such as a CRL staging copy that failed: that is a
         # fault of the host, not a verdict on the settings, and keeps its own type. Nor an OSError
         # alone, such as a CRL file the engine may not read, which this does not catch (a pin file
-        # it may not read arrives as a ValueError naming the setting, and is typed). Nor a UnicodeError: `str()` of one names the byte it
-        # met, and wrapped in a plain message `codec_safe_str` could no longer tell it from any
-        # other text (BACKLOG #2532), so it propagates as it did before. The pool's per-connection
-        # rebuild calls the builder directly, so a refusal there is not typed.
-        if isinstance(exc, (InsecureHopRefused, OSError, UnicodeError)):
+        # it may not read arrives as a ValueError naming the setting, and is typed). Nor a
+        # UnicodeError, or a ValueError raised from one, as the CRL judge re-raises one with its
+        # text: `str()` of one names the byte it met, and wrapped in a plain message
+        # `codec_safe_str` could no longer tell it from any other text (BACKLOG #2532), so it
+        # propagates as it did before. The pool's per-connection rebuild calls the builder
+        # directly, so a refusal there is not typed.
+        if isinstance(exc, (InsecureHopRefused, OSError)) or _from_a_codec_error(exc):
             raise
         raise StoreTlsRefused(str(exc)) from exc
     # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
@@ -1588,6 +1590,19 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # so the verdict reached here holds for every connection the pool opens.
     _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
     return ctx
+
+
+def _from_a_codec_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a ``UnicodeError``, or was raised from or while handling one, along
+    its ``__cause__`` and ``__context__`` links. A link already seen ends the walk."""
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        if isinstance(link, UnicodeError):
+            return True
+        seen.add(id(link))
+        link = link.__cause__ if link.__cause__ is not None else link.__context__
+    return False
 
 
 def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
