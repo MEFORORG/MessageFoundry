@@ -3743,7 +3743,8 @@ class DatabaseSource(SourceConnector):
         above. A cut ends only the await: a mark already running on its driver thread can still
         commit there. A row whose mark does not commit re-emits on the next start, the duplicate a
         failed mark makes.
-        **A hand-off is never cut**; :class:`PollStopGuard` says how long stop() then waits.
+        **This bound never cuts a hand-off**; :class:`PollStopGuard` says how long stop() then
+        waits. A cancelled stop() can, as above.
 
         **An ordinary stop() the poll task finished in time waits for the pool as before, unless a
         borrow was cancelled.** It waits for an in-flight call without a bound, but stops at

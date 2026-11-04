@@ -2977,7 +2977,7 @@ class RemoteFileSource(SourceConnector):
                 if mtime is None:
                     self._log_undetectable_skip(name, size, forms[0])
                 continue
-            if self._stop.is_set():
+            if forms is not None and self._stop.is_set():
                 break  # a stop met during the ledger read: retrieve nothing the bound must then cut
             if not self._settled(name, size, mtime):
                 # BACKLOG #2071: first sighting, or the listed size or mtime changed since the last poll.
