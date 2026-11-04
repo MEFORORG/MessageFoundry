@@ -645,6 +645,21 @@ def test_a_label_is_compared_up_to_a_nul_as_openssl_compares_it() -> None:
     assert index.unmatched_keys(["CN=Odd CA", "CN=Good CA"]) == {}
 
 
+def test_a_body_line_is_read_up_to_a_nul_as_openssl_keeps_it() -> None:
+    """OpenSSL keeps each body line up to its first NUL, so a CA whose base64 lines carry a NUL and
+    junk after them still loads. The index must read the same text, or that CA would be counted
+    unreadable and every partner under it refused (BACKLOG #4948)."""
+    odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
+    good = _ca(_dn((NameOID.COMMON_NAME, "Good CA")))
+    lines = _pem(odd[0]).split(b"\n")
+    lines[1] += b"\x00junk"
+    cadata = (b"\n".join(lines) + _pem(good[0])).decode("ascii")
+    assert _loaded_subjects(cadata) == {"CN=Odd CA", "CN=Good CA"}  # the premise
+    index = IssuerIndex(cadata)
+    assert index.unreadable == 0
+    assert index.unmatched_keys(["CN=Odd CA", "CN=Good CA"]) == {}
+
+
 @pytest.mark.parametrize(
     ("nested", "label"),
     [

@@ -1664,10 +1664,11 @@ class IssuerIndex:
         self.unreadable = 0
         for block in _pem_certificate_blocks(cadata.encode("ascii", "replace")):
             if block is None:
-                # A BEGIN with no END of its label. OpenSSL refuses such a file, so a context that
-                # loaded these bytes disagrees with this model; count it rather than read nothing.
+                # A BEGIN with no END line, or an END of another label, and the scan has ended.
+                # OpenSSL refuses such a file, so a context that loaded these bytes disagrees with
+                # this model; count it rather than read nothing.
                 self.unreadable += 1
-                continue
+                break
             try:
                 cert = x509.load_pem_x509_certificate(block)
                 subject = cert.subject.rfc4514_string()
@@ -1751,9 +1752,12 @@ def _pem_reader_lines(pem: bytes) -> Iterator[bytes]:
     """Each line of ``pem`` as OpenSSL's PEM reader reads one: up to and including a LF, at most
     :data:`_OPENSSL_LINE_PIECE` bytes, with its trailing bytes at or below a space stripped.
 
-    A piece that strips to nothing right after a full piece with no LF is not yielded: OpenSSL
-    reads it as the end of that long line, not as a blank line (``prev_partial_line_read``), so a
-    base64 line wrapped at a piece boundary does not gain a blank line inside its block."""
+    A piece that strips to nothing right after a full piece with no LF is not yielded: in a block's
+    body OpenSSL reads it as the end of that long line, not as a blank line
+    (``prev_partial_line_read``), so a base64 line wrapped at a piece boundary does not gain a blank
+    line inside its block. OpenSSL starts each body afresh, so after an overlong BEGIN line that
+    piece IS a blank line to it; dropping it there matters only to the silent-stop shapes
+    :func:`_pem_certificate_blocks` names."""
     at, partial = 0, False
     while at < len(pem):
         stop = pem.find(b"\n", at, at + _OPENSSL_LINE_PIECE)
@@ -1782,9 +1786,11 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes | None]:
     the bytes OpenSSL kept, not the bytes it stripped. At least two loadable shapes still differ.
     One fails closed: a block missing its END line before the next block, which OpenSSL loads and
     the index counts as unreadable, so it names no issuer and warns. The other fails OPEN, and this
-    scan does not close it: OpenSSL silently stops loading the file at a block of any label whose
-    body decodes to no data, such as an empty block, or that has a data line over 64 characters
-    after a header, while this scan reads on and names the CAs after it."""
+    scan does not close it: OpenSSL silently stops loading the file at some blocks of any label,
+    while this scan reads on and names the CAs after them. Measured on OpenSSL 3.5.7, those include
+    at least a block whose body decodes to no data (such as an empty block, or one whose only
+    lines follow a ``Name: value`` header line with no blank line after it), and a block whose body
+    opens with a blank line and holds a data line over 64 characters."""
     lines = _pem_reader_lines(pem)
     for line in lines:
         if not (line.startswith(b"-----BEGIN ") and line.endswith(b"-----")):
@@ -1797,7 +1803,7 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes | None]:
             if end.startswith(b"-----END "):
                 break
             if keep:
-                body.append(end)
+                body.append(end.partition(b"\0")[0])  # OpenSSL keeps a body line up to a NUL
         else:
             end = b""  # no END line at all
         if end != b"-----END " + label + b"-----":
