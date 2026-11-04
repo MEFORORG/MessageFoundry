@@ -1208,6 +1208,7 @@ async def test_an_mfa_reset_clears_a_directory_accounts_known_address_record() -
             auth_provider="ad",
             password_hash=None,
             password_generated=False,
+            audits=(),
         )
         await store.remember_login_address("id-dir", "10.1.1.1", now=time.time())
         assert await store.list_known_login_addresses("id-dir", since=0.0) == ["10.1.1.1"]

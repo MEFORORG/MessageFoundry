@@ -671,9 +671,16 @@ def _split_or_refuse(
     """``urlsplit(url)``, or a refusal that names ``setting`` and nothing of the URL.
 
     Raised after the handler ends: urlsplit's NFKC ValueError quotes the whole netloc, password and
-    all, and ``from None`` would leave it on ``__context__`` (#1796)."""
+    all, and ``from None`` would leave it on ``__context__`` (#1796).
+
+    Split uncached (vault BACKLOG #5287). At least :func:`url_scheme` and
+    :func:`refuse_url_credentials` call this on a URL that may hold a credential, and a cached split
+    would make a refused password a key in urllib's process-wide cache. The uncached function is
+    the same code, so it raises the same NFKC ValueError. This keeps only this split from adding
+    the key: a reader that splits the same value cached first, such as the egress gate's query
+    credential warning on an endpoint ``url``, still adds one."""
     try:
-        parsed: urllib.parse.SplitResult | None = urllib.parse.urlsplit(url)
+        parsed: urllib.parse.SplitResult | None = _UNCACHED_URLSPLIT(url)
     except ValueError:
         parsed = None
     if parsed is None:
@@ -2069,8 +2076,10 @@ class ProxyConfig:
             return LoopbackDirectProxyHandler()  # reads getproxies() (+ system no_proxy) fresh
         # A credential is here only because it passed the posture-keyed guard in
         # proxy_auth_handler_from_settings, so the handler may let that caller-set header across a
-        # cleartext proxy leg: the one exception bounded_read.ProxyCredentialsRefusedError states
-        # (vault BACKLOG #3416). An unverified TLS leg is refused regardless.
+        # cleartext proxy leg or a TLS leg that fully verifies the proxy: the one exception
+        # bounded_read.ProxyCredentialsRefusedError states (vault BACKLOG #3416). On that TLS leg
+        # every other credential is refused (vault BACKLOG #4909). An unverified TLS leg is
+        # refused regardless.
         return LoopbackDirectProxyHandler(
             dict(self.proxies),
             caller_header_admitted=admitted and bool(self.auth_header or self.digest),
@@ -2218,8 +2227,9 @@ def proxy_auth_handler_from_settings(
     CONNECT tunnel; digest-over-CONNECT is unsupported). NTLM/Windows → **refused** (deferred, ADR 0126).
     So the credential is judged as crossing in cleartext whatever the proxy's scheme, by the ONE
     posture-keyed authority (:func:`_enforce_shipped_hop`), REGARDLESS of destination
-    scheme (vault BACKLOG #3416). A credential that passes it may cross the cleartext proxy leg at
-    send, the one exception ``bounded_read.ProxyCredentialsRefusedError`` states. Unlike the
+    scheme (vault BACKLOG #3416). A credential that passes it may cross the proxy leg at send, a
+    cleartext one or a TLS one that fully verifies the proxy: the one exception
+    ``bounded_read.ProxyCredentialsRefusedError`` states. Unlike the
     destination's own credentials (:func:`refuse_cleartext_credential_hop`, vault BACKLOG #3533
     item 4), this leg can be declared, with ``cleartext_accepted`` and a reason alone.
     ``docs/CONNECTIONS.md`` states the owner's rulings on this credential (vault BACKLOG #3007)."""
@@ -2358,8 +2368,8 @@ def proxy_url_sends_userinfo(proxy_url: object) -> bool:
         return False
     try:
         # Uncached, so the [egress].proxy_url load check, which asks this, adds no key to
-        # urlsplit's process-wide cache (vault BACKLOG #3454). The build path does not gain that
-        # from this read: proxy_config_from_settings reads the scheme through url_scheme first.
+        # urlsplit's process-wide cache (vault BACKLOG #3454). The build's url_scheme read before
+        # this is uncached too; _split_or_refuse says why.
         if _UNCACHED_URLSPLIT(proxy).scheme.lower() not in ("http", "https"):
             return False
         # The parser ProxyHandler.proxy_open runs; a test pins the pairing.

@@ -53,6 +53,7 @@ async def test_create_get_and_list_users() -> None:
             password_hash="hash",
             now=1000.0,
             password_generated=False,
+            audits=(),
         )
         assert await store.count_users() == 1
         u = await store.get_user_by_username("alice")
@@ -70,7 +71,12 @@ async def test_role_assignment_replace_and_resolution() -> None:
     try:
         await _seed_roles(store)
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="local", now=1.0, password_generated=False
+            user_id="u1",
+            username="alice",
+            auth_provider="local",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
         await store.set_user_roles("u1", ["operator", "viewer"], assigned_by="admin", now=2.0)
         assert set(await store.get_user_role_ids("u1")) == {"operator", "viewer"}
@@ -92,6 +98,7 @@ async def test_security_events_for_user_scopes_to_actor() -> None:
             auth_provider="local",
             password_generated=False,
             now=1.0,
+            audits=(),
         )
         await store.record_audit("auth.login_success", actor="alice", detail="1")
         await store.record_audit("auth.login_failed", actor="bob", detail="b")  # other actor
@@ -149,7 +156,12 @@ async def test_login_failure_lockout_and_success_reset() -> None:
     store = await _store()
     try:
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="local", now=1.0, password_generated=False
+            user_id="u1",
+            username="alice",
+            auth_provider="local",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
         await store.record_login_failure("u1", failed_attempts=3, locked_until=500.0, now=10.0)
         u = await store.get_user("u1")
@@ -207,7 +219,12 @@ async def test_sessions_lifecycle_and_purge() -> None:
     store = await _store()
     try:
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="local", now=1.0, password_generated=False
+            user_id="u1",
+            username="alice",
+            auth_provider="local",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
         await store.create_session(
             token_hash="abc", user_id="u1", expires_at=1000.0, client="console", now=10.0
@@ -232,7 +249,12 @@ async def test_delete_user_cascades_roles_and_sessions() -> None:
     try:
         await _seed_roles(store)
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="local", now=1.0, password_generated=False
+            user_id="u1",
+            username="alice",
+            auth_provider="local",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
         await store.set_user_roles("u1", ["viewer"], now=2.0)
         await store.create_session(token_hash="t", user_id="u1", expires_at=1000.0, now=2.0)
@@ -266,9 +288,10 @@ async def test_create_user_seeds_the_notification_address_from_the_one_it_is_giv
             auth_provider="local",
             email="a@example.org",
             password_generated=False,
+            audits=(),
         )
         await store.create_user(
-            user_id="u2", username="bob", auth_provider="local", password_generated=False
+            user_id="u2", username="bob", auth_provider="local", password_generated=False, audits=()
         )
         await store.create_user(
             user_id="u3",
@@ -276,6 +299,7 @@ async def test_create_user_seeds_the_notification_address_from_the_one_it_is_giv
             auth_provider="local",
             email="   ",
             password_generated=False,
+            audits=(),
         )
         alice = await store.get_user("u1")
         assert alice is not None
@@ -304,15 +328,18 @@ async def test_the_directory_sync_write_cannot_move_the_notification_address() -
             auth_provider="ad",
             email="a@corp.example",
             password_generated=False,
+            audits=(),
         )
         # The directory now says something else. This is exactly the shape of a repoint.
-        await store.update_user_profile("u1", display_name="Alice A", email="attacker@evil.example")
+        await store.update_user_profile(
+            "u1", display_name="Alice A", email="attacker@evil.example", audits=()
+        )
         user = await store.get_user("u1")
         assert user is not None
         assert user.email == "attacker@evil.example"  # the mirror follows the directory
         assert user.notify_email == "a@corp.example"  # the notification target does not
         # An absent directory attribute is the same story: it clears the mirror, never the target.
-        await store.update_user_profile("u1", display_name="Alice A", email=None)
+        await store.update_user_profile("u1", display_name="Alice A", email=None, audits=())
         user = await store.get_user("u1")
         assert user is not None and user.email is None
         assert user.notify_email == "a@corp.example"
@@ -333,6 +360,7 @@ async def test_the_notification_address_is_repointable_but_not_erasable() -> Non
             auth_provider="local",
             email="a@example.org",
             password_generated=False,
+            audits=(),
         )
         await store.set_user_notify_email("u1", email="new@example.org")
         user = await store.get_user("u1")
@@ -367,9 +395,10 @@ async def test_the_schema_upgrade_seeds_the_new_column_on_a_pre_split_database(
             auth_provider="local",
             email="a@example.org",
             password_generated=False,
+            audits=(),
         )
         await store.create_user(
-            user_id="u2", username="bob", auth_provider="local", password_generated=False
+            user_id="u2", username="bob", auth_provider="local", password_generated=False, audits=()
         )
     finally:
         await store.close()
@@ -544,6 +573,7 @@ async def test_the_directory_id_column_upgrade_carries_no_backfill_and_reruns_cl
             auth_provider="ad",
             directory_object_id=BOUND_GUID,
             password_generated=False,
+            audits=(),
         )
     finally:
         await store.close()
@@ -576,6 +606,7 @@ async def test_the_directory_id_column_upgrade_carries_no_backfill_and_reruns_cl
                 auth_provider="ad",
                 directory_object_id=guid,
                 password_generated=False,
+                audits=(),
             )
             found = await store.get_user_by_directory_object_id(guid)
             assert found is not None and found.id == f"u-rebind-{pass_no}"
@@ -658,7 +689,12 @@ async def test_a_half_bound_row_is_not_unbound_to_the_session_guard() -> None:
     store = await _store()
     try:
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="ad", now=1.0, password_generated=False
+            user_id="u1",
+            username="alice",
+            auth_provider="ad",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
         unbound: tuple[None, None] = (None, None)
         assert await store.create_session(
@@ -698,7 +734,12 @@ async def test_the_guard_reads_the_binding_while_holding_the_sqlite_writer_lock(
     store = await _store()
     try:
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="ad", now=1.0, password_generated=False
+            user_id="u1",
+            username="alice",
+            auth_provider="ad",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
         await store.set_user_federated_subject("u1", "https://idp.example", "S-1-a", now=1.0)
 
@@ -768,7 +809,12 @@ async def test_an_unbind_clears_a_half_row_rather_than_calling_it_nothing_to_rem
     store = await _store()
     try:
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="ad", now=1.0, password_generated=False
+            user_id="u1",
+            username="alice",
+            auth_provider="ad",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
         # Straight to the column, because the typed setter cannot spell a half binding.
         await store._db.execute("UPDATE users SET oidc_issuer=? WHERE id=?", ("https://idp", "u1"))
@@ -807,7 +853,12 @@ async def test_a_failed_revocation_leaves_the_binding_in_place(
     store = await _store()
     try:
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="ad", now=1.0, password_generated=False
+            user_id="u1",
+            username="alice",
+            auth_provider="ad",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
         await store.set_user_federated_subject("u1", "https://idp.example", "S-1-a", now=1.0)
         await store.create_session(token_hash="t1", user_id="u1", expires_at=9e9, now=1.0)

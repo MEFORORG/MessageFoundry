@@ -1009,8 +1009,9 @@ async def test_a_postgres_flag_statement_that_waits_out_the_bound_is_refused() -
 
 def test_the_flag_lock_bound_sits_under_the_engine_bound() -> None:
     """The store's bound on the flag statement's lock wait is under the engine's bound on the whole
-    store call, so a toggle held by a foreign lock reaches its caller as the store's own refusal,
-    and the session holding the audit lock ends its wait before the engine stops waiting."""
+    store call, so a toggle that gets the audit lock at once and is then held by a foreign lock
+    reaches its caller as the store's own refusal. This compares the two constants only; a toggle
+    that first queued for the audit lock can still meet the engine's bound first."""
     assert 0 < CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS < CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS
 
 

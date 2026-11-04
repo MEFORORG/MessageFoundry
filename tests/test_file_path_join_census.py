@@ -589,6 +589,12 @@ SITES: dict[str, Site] = {
         1, OPERATOR, _CONFIG_FIXED
     ),
     "messagefoundry/config/snapshot.py::_list_folders": Site(1, OPERATOR, _CONFIG_FIXED),
+    "messagefoundry/config/snapshot.py::config_py_files": Site(
+        1,
+        REVIEWED,
+        "The operator's config directory joined to the names its own listing of that directory "
+        "returned, which a glob joined the same way before (vault BACKLOG #5117).",
+    ),
     "messagefoundry/config/snapshot.py::read_config_snapshot": Site(
         2,
         REVIEWED,
@@ -660,7 +666,11 @@ SITES: dict[str, Site] = {
         1, INTERNAL, "A fixed lock name in the spool directory."
     ),
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._add_config_dir": Site(
-        1, OPERATOR, "Parents of files found walking the operator's config directory."
+        2,
+        OPERATOR,
+        "Names found walking the operator's config directory (each directory is checked for "
+        "staging, each file is added); the walk prunes a link or a junction it reads (BACKLOG "
+        "#5221).",
     ),
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._build_archive_blocking": Site(
         1, INTERNAL, "A fixed name in a work directory this module made."
@@ -680,7 +690,7 @@ SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed probe name in the operator's backup destination."
     ),
     "messagefoundry/pipeline/dr_backup.py::_empty_files_in_place": Site(
-        4,
+        3,
         INTERNAL,
         "Names from walking a staging directory this module made, never through a link; each "
         "file is then opened without following one (BACKLOG #2420).",
@@ -730,6 +740,13 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/pipeline/dr_backup.py::_verify_in_staging": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_walk_unfollowed": Site(
+        1,
+        OPERATOR,
+        "A directory name os.walk listed under the operator's config directory, joined to lstat "
+        "it for a link or a junction and, when pruned, named in the caller's WARNING (BACKLOG "
+        "#5221).",
     ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."

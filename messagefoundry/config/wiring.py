@@ -179,6 +179,7 @@ __all__ = [
     "Registry",
     "WiringError",
     "PortConflictError",
+    "StateKeyError",
     "API_LISTENER_LABEL",
     "inbound_binding_conflicts",
     "resolved_encoding_problems",
@@ -235,6 +236,14 @@ class PortConflictError(WiringError):
     to 422, ``messagefoundry check`` still reports it, and the runner's ADR 0031 per-connection
     isolation still records the offending inbound as failed (the engine comes up DEGRADED rather than
     aborting). Callers that care can still catch the conflict specifically."""
+
+
+class StateKeyError(WiringError):
+    """A :class:`SetState` ``namespace`` or ``key`` that some store backend could not hold exactly.
+
+    A subclass of :class:`WiringError`, so a Handler fault still reaches every existing handler of
+    that error unchanged. The message names the field and the rule, never the text: a state key is
+    often an MRN."""
 
 
 @dataclass(frozen=True)
@@ -2933,6 +2942,8 @@ def Http(
     max_header_bytes: int | None = 64 * 1024,  # cap the request line + headers (header-flood guard)
     max_connections_per_host: int
     | None = None,  # cap clients from ONE peer address; OFF by default
+    max_handshakes_per_host: int
+    | None = 32,  # cap ONE peer address's sockets still in their TLS handshake (on by default)
     # Message-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported. Defaults to OFF for the ruled
     # reason in MLLP(). Scoped to the LISTENER, not the connection: this connector answers one
     # request per connection, so a per-connection bucket would pace nothing at all.
@@ -3005,7 +3016,10 @@ def Http(
     ``max_connections_per_host`` caps concurrent sockets from one peer address and **ships off** here
     (vault BACKLOG #2606): behind a reverse proxy every partner arrives from one address, so a cap
     would become the listener's whole capacity. Set one only where the listener sees real client
-    addresses.
+    addresses. ``max_handshakes_per_host`` (32) **ships on**: it caps only the sockets one address
+    holds a connection slot with while still in their TLS handshake, which happens where the engine
+    runs on a stdlib event loop with ``tls=True`` (vault BACKLOG #4888). See ``docs/DEPLOYMENT.md``
+    for the L4 load-balancer case.
 
     **Message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast this listener
     takes messages in; ``message_burst`` is how large a burst passes before the sustained rate applies
@@ -3085,6 +3099,7 @@ def Http(
         "max_body_bytes": max_body_bytes,
         "max_header_bytes": max_header_bytes,
         "max_connections_per_host": max_connections_per_host,
+        "max_handshakes_per_host": max_handshakes_per_host,
         "max_messages_per_second": max_messages_per_second,
         "message_burst": message_burst,
         "tls": tls,
@@ -4444,14 +4459,21 @@ def DatabasePoll(
     """A SQL database polling **source** (inbound, ADR 0003 §3; SQL Server via the ``[sqlserver]`` extra +
     ODBC Driver 18 — **production / supported**). Every ``poll_seconds`` it runs ``poll_statement`` (a ``SELECT``),
     hands each row to the bound router as a body, then runs ``mark_statement`` (bound from the row's
-    columns) so the row isn't re-read — the File source's *process-then-mark-done* shape. At-least-once:
-    a crash before the mark re-emits the row, so the downstream pipeline **must tolerate duplicates**.
+    columns) so the row isn't re-read — the File source's *process-then-mark-done* shape.
+    At-least-once with a poll that does not write and a mark that takes out only the row handed off:
+    a crash before the mark re-emits the row, so the downstream pipeline **must tolerate
+    duplicates**.
 
     Lead pattern is a status column: ``poll_statement='SELECT id, payload FROM mf_inbox WHERE status=\\'NEW\\''``
-    + ``mark_statement='UPDATE mf_inbox SET status=\\'DONE\\' WHERE id=:id'`` (a ``DELETE`` or a
-    high-water-mark ``UPDATE`` work through the same ``mark_statement``). ``body_column`` unset → the
-    whole row as a JSON object (pair with ``content_type=json``); set → that one column's value verbatim
-    (e.g. a column holding an HL7 message → ``content_type=hl7v2``). Put secrets (``password``) in
+    + ``mark_statement='UPDATE mf_inbox SET status=\\'DONE\\' WHERE id=:id'`` (a ``DELETE`` keyed
+    the same way also works as the ``mark_statement``). ``body_column`` unset → the whole row as a
+    JSON object (pair with ``content_type=json``); set → that one column's value verbatim (e.g. a
+    column holding an HL7 message → ``content_type=hl7v2``). With a ``mark_statement``, a handler
+    failure stops that poll at the failed row, so a row that fails every time holds back the rows
+    behind it (BACKLOG #4921). A high-water-mark ``UPDATE`` also runs as a ``mark_statement``, but
+    even with that stop it is not at-least-once: it can leave a row that was never handed off behind
+    its cursor. The *Database source* section of docs/CONNECTIONS.md says what one needs and names
+    some of the cases where it loses a row even then (BACKLOG #4958). Put secrets (``password``) in
     ``env()``; TLS is on by default (on the SQL Server preset, weakening it is refused unless the
     ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
     ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.
@@ -4468,18 +4490,22 @@ def DatabasePoll(
     keywords via ``odbc_params``, and configure TLS through the driver's own keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
     ``username``/``password`` (under ``odbc_user_key``/``odbc_password_key``, default ``UID``/``PWD``).
 
-    A ``poll_statement`` that could write is refused: a literal one here, when declared (as
-    ``generic`` while the dialect is an ``env()`` value), and every
+    At least a ``poll_statement`` of a writing shape is refused: a literal one here, when declared
+    (as ``generic`` while the dialect is an ``env()`` value), and every
     one, an ``env()`` value included, when the source is built (BACKLOG #2178;
-    ``transports.database._read_only_poll_refusal`` says what and why)."""
+    ``transports.database._read_only_poll_refusal`` says what and why). Not every writing poll is
+    refused: at least a ``SELECT`` that calls a function which writes, and a T-SQL second statement
+    with no ``;`` whose verb the test does not list, pass."""
     _reject_envref_odbc_params(odbc_params)
     # Refused at declaration, as DatabaseRef's statement is (BACKLOG #2617), because
     # `messagefoundry check` builds connectors only with a messagefoundry.toml. An empty statement is
     # a missing setting, which construction refuses. Imported here: messagefoundry.transports imports
     # this module at its top level.
-    # A dialect that is not a literal (an env() ref) is tested as generic, the permissive superset:
-    # it refuses every write the strict test does and admits only the INSERT(/TRUNCATE( calls, which
-    # the build re-tests with the resolved dialect. So no dialect is guessed into a false refusal.
+    # A dialect that is not a literal (an env() ref) is tested as generic: it refuses every write the
+    # sqlserver test does, admitting more only for the INSERT(/TRUNCATE( calls, which the build
+    # re-tests with the resolved dialect. It is not a pure superset (BACKLOG #5259): its MySQL comment
+    # scan and its bare-CALL refusal can refuse a read that a resolved sqlserver dialect would admit,
+    # at least a `--x` comment holding a write keyword. That false refusal fails closed.
     if isinstance(poll_statement, str) and poll_statement:
         from messagefoundry.transports.database import _read_only_poll_refusal
 
@@ -4936,6 +4962,14 @@ class Send:
 #: :func:`messagefoundry.config.state.state_get` returns on a hit.
 StateValue = str | int | float | bool | None | list[Any] | dict[str, Any]
 
+#: The longest :class:`SetState` ``namespace`` or ``key``, in UTF-16 code units: SQL Server's
+#: ``state`` columns are ``NVARCHAR(256)``, and a longer bind would fail the handoff there.
+STATE_KEY_MAX_UNITS: Final = 256
+#: The longest ``namespace`` plus ``key``, in UTF-16 code units. ``pk_state`` is SQL Server's
+#: clustered primary key, whose key is capped at 900 bytes, two per code unit. Two full-width
+#: ``NVARCHAR(256)`` columns would be 1024 bytes, so this pair cap, not the column width, binds.
+STATE_KEY_MAX_PAIR_UNITS: Final = 450
+
 
 @dataclass(frozen=True)
 class SetState:
@@ -4956,20 +4990,63 @@ class SetState:
         # Validate at construction so a non-serializable value fails in the author's handler (with a
         # clear message) rather than deep inside the store's INSERT during a handoff. namespace/key
         # are the composite PK and must be non-empty strings.
-        # Every message names the field only: namespace, key and value may be PHI.
+        # Every message names the field and the rule, plus the length in UTF-16 code units for a
+        # length refusal and json's reason for a value refusal, never the text: namespace, key and
+        # value may be PHI.
+        # Each key rule below is refused on EVERY backend, though only one backend needs it, so a
+        # feed behaves the same wherever it runs (BACKLOG #1588, #4917).
+        units = 0
         for name, text in (("namespace", self.namespace), ("key", self.key)):
             if not isinstance(text, str) or not text:
-                raise WiringError(f"SetState {name} must be a non-empty string")
-            # BACKLOG #1588: SQL Server pads trailing U+0020 in `=` and the primary key under every
-            # collation, BIN2 included, so 'k' and 'k ' would be one stored row there and two cache
-            # entries. Refused on every backend so a feed behaves the same wherever it runs.
+                raise StateKeyError(f"SetState {name} must be a non-empty string")
+            # SQL Server pads trailing U+0020 (the `state` DDL comment in store/sqlserver.py), so
+            # 'k' and 'k ' would be one stored row there and two cache entries.
             if text.endswith(" "):
-                raise WiringError(f"SetState {name} must not end with a space")
+                raise StateKeyError(f"SetState {name} must not end with a space")
+            # Postgres TEXT cannot hold U+0000, so the handoff INSERT would fail there.
+            if "\x00" in text:
+                raise StateKeyError(f"SetState {name} must not contain U+0000 (NUL)")
+            # NVARCHAR counts UTF-16 code units. ASCII is one unit per char, so the usual MRN-style
+            # key skips the encode. A strict encode refuses a lone surrogate (U+D800..U+DFFF): no
+            # backend stores one, and cell_aad's UTF-8 encode would raise it inside the handoff, a
+            # store error the runner retries rather than a content fault it dead-letters. A key
+            # already over the limit in code points is refused unencoded: each is at least a unit,
+            # so a huge content-derived key costs no copy.
+            at_least = ""
+            if text.isascii():
+                field_units = len(text)
+            elif len(text) > STATE_KEY_MAX_UNITS:
+                field_units, at_least = len(text), "at least "
+            else:
+                lone_surrogate = False
+                try:
+                    field_units = len(text.encode("utf-16-le")) // 2
+                except UnicodeEncodeError:
+                    # Raised outside the handler: the encode error's `.object` is the whole key, so
+                    # it must not ride the chain as __context__ (nor would `from None` stop that).
+                    lone_surrogate = True
+                if lone_surrogate:
+                    raise StateKeyError(
+                        f"SetState {name} must not contain a lone surrogate (U+D800..U+DFFF)"
+                    )
+            if field_units > STATE_KEY_MAX_UNITS:
+                raise StateKeyError(
+                    f"SetState {name} is {at_least}{field_units} UTF-16 code units; the limit is "
+                    f"{STATE_KEY_MAX_UNITS}"
+                )
+            units += field_units
+        if units > STATE_KEY_MAX_PAIR_UNITS:
+            raise StateKeyError(
+                f"SetState namespace and key together are {units} UTF-16 code units; the limit is "
+                f"{STATE_KEY_MAX_PAIR_UNITS}"
+            )
         import json
 
         try:
             json.dumps(self.value)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RecursionError) as exc:
+            # RecursionError: a value nested past the interpreter's depth. Converted like the others
+            # so the Handler sees the documented WiringError, not a bare interpreter fault.
             reason = str(exc)
         else:
             return
@@ -8833,6 +8910,8 @@ def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> Con
     _require_config_dir(directory, strict=strict)
     try:
         _assert_safe_config_source(directory)
+    except ConfigDirMissing:
+        raise
     except OSError as exc:
         # Its walk raises what it cannot list, and a path it could not vet must not load. Outside
         # strict that is a refusal, not a raw error, which a reload would answer as a 500.
@@ -8862,9 +8941,8 @@ def _require_config_dir(directory: Path, *, strict: bool) -> None:
     away after the reload's own check still answers as missing (BACKLOG #3157). Any other fault
     is refused by :func:`_refuse_config_dir`. Listed, not ``is_dir``, which answers ``False`` for a
     share Windows cannot reach or a parent this account cannot traverse, and so would call either
-    one missing. A directory that lists while ``is_dir`` says no is a fault too, because
-    :func:`_assert_safe_config_source` vets nothing where ``is_dir`` says no, and what follows this
-    check runs the directory's modules."""
+    one missing. A directory that lists while ``is_dir`` says no is a fault too: the two calls
+    disagree about the one path whose modules what follows this check runs."""
     try:
         with os.scandir(directory):
             pass
@@ -8884,7 +8962,7 @@ def _require_config_dir(directory: Path, *, strict: bool) -> None:
         _refuse_config_dir(
             directory,
             PermissionError(
-                errno.EACCES, "config directory lists but is not vetted", str(directory)
+                errno.EACCES, "config directory lists but is_dir says no", str(directory)
             ),
             strict=strict,
         )
@@ -9754,13 +9832,22 @@ def _assert_safe_config_source(directory: Path) -> None:
     paths is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
     principal a write-class right, **or when its owner is neither the engine's own account nor an
     administrator** (the Windows counterpart of that foreign-uid arm, CONFIG-2) — no longer a silent
-    no-op delegated entirely to install-time ACLs (docs/SERVICE.md, DEPLOY-1)."""
-    if not directory.is_dir():
-        return
-    # Include _*.py: the loader skips them as top-level modules, but a sibling can import them, so a
-    # writable/foreign-owned helper is just as much an injection vector (review M-21).
+    no-op delegated entirely to install-time ACLs (docs/SERVICE.md, DEPLOY-1).
+
+    A directory it cannot list raises that ``OSError``, a missing one included, and each caller
+    refuses the load. It returned with nothing vetted where ``Path.is_dir`` said no, which it says
+    for a share Windows cannot reach (vault BACKLOG #5117)."""
+    try:
+        # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
+        # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
+        paths = config_source_trust_paths(directory)
+    except OSError as exc:
+        if is_missing_directory(exc):
+            # Moved away since the caller's own check: missing, as that check answers (#3157).
+            _require_config_dir(directory, strict=True)
+        raise
     _check_trusted_paths(
-        config_source_trust_paths(directory),
+        paths,
         lead=_CONFIG_SOURCE_LEAD,
         refuse=_refuse_unsafe_config_source,
         first_is_required=True,

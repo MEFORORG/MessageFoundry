@@ -40,6 +40,7 @@ async def test_an_older_store_gains_the_column_and_an_existing_row_reads_null(
             auth_provider="ad",
             directory_object_id="guid-jdoe",
             password_generated=False,
+            audits=(),
         )
         await store.create_session(
             token_hash="a" * 64,

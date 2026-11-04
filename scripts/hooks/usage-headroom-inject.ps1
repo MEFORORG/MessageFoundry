@@ -102,7 +102,9 @@
 
       The pool the Steward would name for this session, chosen the way watch.py main() chooses it.
       A claude-desktop session is named first by the desktop app's own record for this session id
-      (claude-code-sessions/<accountUuid>/<orgUuid>/local_*.json). Without a record, a session with a
+      (claude-code-sessions/<accountUuid>/<orgUuid>/local_*.json), searched as watch.py's
+      _session_records() searches: under %APPDATA%\Claude and under every ~/.claude-desktop-* root,
+      each root once, the newest 400 records across all of them. Without a record, a session with a
       pinned CLAUDE_CONFIG_DIR is named by that root's login record, after watch.py's self-check. An
       SDK session is named by the login record, after the same self-check, which watch.py skips there.
       watch.py's last resort for a Desktop session still without an org is the app's CURRENT account,
@@ -110,8 +112,12 @@
       than guess. The key is `organizationUuid`, or `acct:<accountUuid>` without one (SDK only), and
       an entry that does not show every identity field this session has is refused.
 
+      The key is read exactly. watch.py also caches a contradicted read under `<key>|contradicted`,
+      for the session that read alone; nothing here walks `pools`, so that entry is never served.
+
       Still a second copy of watch.py's rules, in another language. Nothing ties the two, so a change
-      to watch.py's _is_fresh, _desktop_pool or CACHE_VERSION must be carried here by hand.
+      to at least watch.py's _is_fresh, TTL_OK, _desktop_pool, _session_records, SCAN_LIMIT,
+      _cli_pool_selfcheck or CACHE_VERSION must be carried here by hand.
 
       No grade. The Steward's `state` field is a severity label, not a stop order (korus
       roles/STEWARD.md 3b), and usage.ps1's thresholds were set for statusLine readings. The
@@ -174,6 +180,9 @@ param(
     # The desktop app's session records. Unset in production (%APPDATA%\Claude\claude-code-sessions);
     # set by tests.
     [string]$DesktopSessionsDir,
+    # The directory whose .claude-desktop-*\claude-code-sessions roots are searched too. Unset in
+    # production ($HOME, which follows USERPROFILE as watch.py's expanduser does); set by tests.
+    [string]$DesktopHomeDir,
     # Where the last-printed state lives. Unset in production (<local coord root>\usage-headroom); set by
     # tests. Under -StateDir with this unset, every firing prints in full.
     [string]$DedupDir
@@ -382,12 +391,12 @@ function Format-Number([string]$Pattern, [double]$Value) {
 # delegation 2026-10-08, not an owner ruling). The header says why each refusal below exists. Returns
 # the lines to print, or nothing when the fallback does not apply.
 #
-# UNDER -StateDir IT RUNS ONLY WHEN ALL THREE INPUTS ARE NAMED. A caller that named a state directory
-# is a test or a by-hand probe, and falling through to the real ~/.claude or %APPDATA% files there
-# would read a live account's numbers into a fixture run.
+# UNDER -StateDir IT RUNS ONLY WHEN ALL FOUR INPUTS ARE NAMED. A caller that named a state directory
+# is a test or a by-hand probe, and falling through to the real ~/.claude, ~/.claude-desktop-* or
+# %APPDATA% files there would read a live account's numbers into a fixture run.
 function Get-StewardFallback {
     if (-not (Test-NoStatusLineClient)) { return @() }
-    if ($StateDir -and -not ($StewardStatusFile -and $LoginRecord -and $DesktopSessionsDir)) { return @() }
+    if ($StateDir -and -not ($StewardStatusFile -and $LoginRecord -and $DesktopSessionsDir -and $DesktopHomeDir)) { return @() }
 
     # WHERE THE STEWARD WRITES, resolved the way watch.py resolves DIR: MEFOR_USAGE_DIR, else the config
     # root's mefor-usage; and when that directory holds no usage-now.py, the directory beside watch.py,
@@ -412,6 +421,7 @@ function Get-StewardFallback {
     }
     $sessionsDir = $DesktopSessionsDir
     if (-not $sessionsDir -and $env:APPDATA) { $sessionsDir = Join-Path (Join-Path ([string]$env:APPDATA) "Claude") "claude-code-sessions" }
+    $homeDir = if ($DesktopHomeDir) { $DesktopHomeDir } else { [string]$HOME }
 
     $lines = @("  fallback source: the Steward's status.json at " + (Get-Folded $statusPath) +
         ". This is NOT a statusLine reading. It carries its own age and the Steward's own TTL.")
@@ -426,7 +436,7 @@ function Get-StewardFallback {
         return Unknown ("its schema version is '" + (Get-Folded $doc.version 20) + "', and this hook reads only version 3")
     }
 
-    $who = Resolve-StewardPool $loginPath $sessionsDir
+    $who = Resolve-StewardPool $loginPath $sessionsDir $homeDir
     if ($who.why) { return Unknown $who.why }
     $org = $who.org
     $acct = $who.acct
@@ -491,11 +501,11 @@ function Get-StewardFallback {
 
 # WHICH POOL THE STEWARD WOULD NAME FOR THIS SESSION, in watch.py main()'s order. Returns @{org; acct;
 # how}, or @{why} when no pool can be named. The header says why each branch is what it is.
-function Resolve-StewardPool([string]$LoginPath, [string]$SessionsDir) {
+function Resolve-StewardPool([string]$LoginPath, [string]$SessionsDir, [string]$HomeDir) {
     $global = ", so only the desktop app's current account is left, which is a global signal and not this session's"
     $desktop = Test-DesktopEntrypoint
     if ($desktop) {
-        $rec = Find-DesktopSessionRecord $SessionsDir
+        $rec = Find-DesktopSessionRecord $SessionsDir $HomeDir
         if ($rec) { return $rec }
         if (-not $env:CLAUDE_CONFIG_DIR) {
             return @{ why = "the desktop app has no record of this session and no config root is pinned$global" }
@@ -521,15 +531,47 @@ function Resolve-StewardPool([string]$LoginPath, [string]$SessionsDir) {
     return @{ org = $org; acct = $acct; how = "this config root's login record" }
 }
 
-# watch.py _desktop_pool: the record whose cliSessionId is this session's id, newest first, at most 400
-# records. Its two parent directories ARE the identity. The raw text is searched before any parse, so
-# a scan that finds nothing parses nothing.
-function Find-DesktopSessionRecord([string]$Dir) {
+# watch.py _session_records: every local_*.json two levels under each root, newest first, at most 400
+# across all roots together. The roots are $Dir (the app-wide %APPDATA%\Claude\claude-code-sessions)
+# and every <home>\.claude-desktop-*\claude-code-sessions. Measured by watch.py on 2026-11-02, the
+# app-wide directory no longer exists and the records live per account, so scanning it alone found no
+# record for any session. Each root is scanned once, keyed as watch.py keys it, normcase(abspath): the
+# full path, without a trailing separator, in lower case. A root that is absent is skipped.
+function Get-DesktopSessionRecordFiles([string]$Dir, [string]$HomeDir) {
+    $roots = [System.Collections.Generic.List[string]]::new()
+    if ($Dir) { $roots.Add($Dir) }
+    if ($HomeDir -and (Test-Path -LiteralPath $HomeDir -PathType Container)) {
+        # -Force here and below because Python's glob skips a dot-named item, never one with the Hidden
+        # attribute. Sorted ordinally, as watch.py's sorted() sorts its roots.
+        $found = [string[]]@(Get-ChildItem -LiteralPath $HomeDir -Directory -Force -Filter ".claude-desktop-*" |
+            ForEach-Object { Join-Path $_.FullName "claude-code-sessions" })
+        [Array]::Sort($found, [StringComparer]::Ordinal)
+        foreach ($r in $found) { $roots.Add($r) }
+    }
+    # The key is built here rather than through _hookinput.ps1's ConvertTo-CcxNormPath, because this
+    # fallback runs whether or not that helper file is present.
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $files = foreach ($root in $roots) {
+        try { $key = [System.IO.Path]::TrimEndingDirectorySeparator([System.IO.Path]::GetFullPath($root)).ToLowerInvariant() } catch { continue }
+        if (-not $seen.Add($key)) { continue }
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        # watch.py's glob is */*/local_*.json: each * skips a name that starts with a dot, and the last
+        # part matches a directory too, which counts toward the cap and is skipped when read below.
+        Get-ChildItem -LiteralPath $root -Directory -Force | Where-Object { -not $_.Name.StartsWith(".") } |
+            Get-ChildItem -Directory -Force | Where-Object { -not $_.Name.StartsWith(".") } |
+            Get-ChildItem -Filter "local_*.json" -Force
+    }
+    # -Stable, because watch.py's list.sort is stable: a tie keeps root order, then listing order.
+    return @($files | Sort-Object LastWriteTimeUtc -Descending -Stable | Select-Object -First 400)
+}
+
+# watch.py _desktop_pool: the record whose cliSessionId is this session's id, among the records above.
+# Its two parent directories ARE the identity. The raw text is searched before any parse, so a scan
+# that finds nothing parses nothing.
+function Find-DesktopSessionRecord([string]$Dir, [string]$HomeDir) {
     $sid = if ($SessionId) { $SessionId } else { [string]$env:CLAUDE_SESSION_ID }
-    if (-not $sid -or -not $Dir -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return $null }
-    $files = @(Get-ChildItem -LiteralPath $Dir -Directory | Get-ChildItem -Directory |
-        Get-ChildItem -Filter "local_*.json" -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 400)
-    foreach ($f in $files) {
+    if (-not $sid) { return $null }
+    foreach ($f in (Get-DesktopSessionRecordFiles $Dir $HomeDir)) {
         $raw = $null
         try { $raw = [System.IO.File]::ReadAllText($f.FullName) } catch { continue }
         if (-not $raw -or -not $raw.Contains($sid)) { continue }

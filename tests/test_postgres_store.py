@@ -1013,6 +1013,7 @@ async def test_security_events_for_user_scopes_to_actor(store) -> None:
         auth_provider="local",
         password_generated=False,
         now=1.0,
+        audits=(),
     )
     await store.record_audit("auth.login_success", actor="alice", detail="1")
     await store.record_audit("auth.login_failed", actor="bob", detail="b")  # other actor
@@ -1035,6 +1036,7 @@ async def test_auth_users_roles_sessions(store) -> None:
         password_hash="hash",
         now=1000.0,
         password_generated=False,
+        audits=(),
     )
     assert await store.count_users() == 1
     user = await store.get_user_by_username("alice")
@@ -1470,6 +1472,7 @@ async def test_channel_scope_source_roundtrip_and_upgrade(store) -> None:
         auth_provider="ad",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
     got = await store.get_user("scope-src")
@@ -1508,7 +1511,12 @@ async def test_the_scope_write_compare_and_sets_on_its_source(store) -> None:
     from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
 
     await store.create_user(
-        user_id="cas-src", username="cas-src", auth_provider="ad", now=1.0, password_generated=False
+        user_id="cas-src",
+        username="cas-src",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+        audits=(),
     )
     cas = store.set_user_channel_scope_if_source
     assert (await store.get_user("cas-src")).channel_scope_source is None
@@ -1566,6 +1574,7 @@ async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
         directory_object_id=BOUND_GUID,
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     found = await store.get_user_by_directory_object_id(BOUND_GUID)
     assert found is not None and found.id == "dir-upgrade"
@@ -1610,6 +1619,7 @@ async def test_session_idp_auth_time_column_upgrade_is_idempotent(store) -> None
         directory_object_id="guid-idp-upgrade",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_session(
         token_hash="i" * 64,
@@ -1646,6 +1656,7 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_session(
         token_hash="s1", user_id="u2", expires_at=9_999.0, client="10.1.1.1", now=1.0
@@ -1684,6 +1695,7 @@ async def test_set_password_claim_stamp_round_trip(store) -> None:
         password_hash="h0",
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
     # Precondition: the INSERT does not list the column, so a stamp seen later came from set_password.
     seeded = await store.get_user("u3")
@@ -1777,11 +1789,16 @@ async def test_staged_pipeline_processes_to_delivered(store) -> None:
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
 
-async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
+@pytest.mark.parametrize("verbosity", ["all", "errors", "off"])
+async def test_mark_done_writes_reply_dropped_with_the_delivery(store, verbosity: str) -> None:
     """BACKLOG #3462: the Postgres twin of the SQLite test of the same name. ``reply_dropped``
     rides the DONE flip beside ``delivered``. Controls: a vanished row writes nothing and returns
     False, and a plain ``mark_done`` writes no ``reply_dropped``. Events are read through
-    ``events_for``, which decrypts ``detail``."""
+    ``events_for``, which decrypts ``detail``. Parametrized over the event verbosity as the
+    SQLite test is (BACKLOG #4917): ``delivered`` is thinned below ``all`` and ``reply_dropped``
+    is not. Set on the fixture's store, since each backend reads it at write time."""
+    store._message_events = verbosity
+    delivered = [("delivered", "OB1", None)] if verbosity == "all" else []
     detail = "HTTP 200; reply body over the 64-byte bound"
 
     async def _to_outbound(now: float):
@@ -1808,7 +1825,7 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
     mid, out = await _to_outbound(100.0)
     assert await store.mark_done(out.id, now=110.0, reply_dropped=detail) is True
     after_drop = await store.events_for(mid)
-    assert _tail(after_drop) == [("delivered", "OB1", None), ("reply_dropped", "OB1", detail)]
+    assert _tail(after_drop) == [*delivered, ("reply_dropped", "OB1", detail)]
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
     async def _dropped_anywhere():
@@ -1826,7 +1843,7 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
 
     plain, other = await _to_outbound(120.0)
     assert await store.mark_done(other.id, now=130.0) is True
-    assert _tail(await store.events_for(plain)) == [("delivered", "OB1", None)]
+    assert _tail(await store.events_for(plain)) == delivered
     assert await _dropped_anywhere() == 1
 
 
@@ -4280,7 +4297,12 @@ async def test_a_v032_preset_table_is_migrated_by_provision_schema_pg(store) -> 
 
     for uid, uname in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
         await store.create_user(
-            user_id=uid, username=uname, auth_provider="local", now=1.0, password_generated=False
+            user_id=uid,
+            username=uname,
+            auth_provider="local",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
     try:
         for pid, owner, name, now in (
@@ -5060,7 +5082,11 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
         # BACKLOG #3510: a user row, so the leg proves the sealed record and its TOTP secret come
         # through the rotation too, not only the message cells.
         await seed.create_user(
-            user_id="u-rot", username="rot", auth_provider="local", password_generated=False
+            user_id="u-rot",
+            username="rot",
+            auth_provider="local",
+            password_generated=False,
+            audits=(),
         )
         await seed.set_totp_secret("u-rot", secret=_ROTATED_TOTP_SECRET)
     finally:
@@ -5488,6 +5514,82 @@ async def test_session_seal_contract(store) -> None:
             )
         await assert_session_seal_contract(keyed, raw)
         assert_session_columns({str(r["column_name"]) for r in rows})
+    finally:
+        await keyed.close()
+
+
+async def test_every_account_revoke_contracts(store) -> None:
+    """BACKLOG #5091 and #2614: the global session epoch's contract, a revoke racing sign-ins, and
+    the every-account revoke's own contract, on a keyed handle. Run here because the leg runs this
+    file and not ``tests/test_b5091_global_session_epoch.py`` or ``tests/test_b2614_revoke_all.py``.
+    The fixture truncates the session and user tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._session_seal_contract import dollar_placeholders
+    from tests.test_b2614_revoke_all import assert_revoke_all_contract
+    from tests.test_b5091_global_session_epoch import (
+        assert_global_epoch_contract,
+        assert_revoke_all_races_sign_ins,
+    )
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        await assert_global_epoch_contract(keyed, raw)
+        await assert_revoke_all_races_sign_ins(keyed)
+        await assert_revoke_all_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_a_sign_in_committing_inside_an_every_account_revoke_ends_with_it(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5091, the interleaving the gap was: an account is created and signs in, on another
+    connection, after the revoke read the account list and ran its sweep and before it commits.
+    The sweep cannot see that session and the account loop never raised its epoch, so before the
+    global epoch it stayed live. It now carries the global epoch the revoke is replacing. The hook
+    is the kept session's epoch read, which runs between the sweep and the commit."""
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.auth.tokens import hash_token
+    from messagefoundry.config.settings import AuthSettings, load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests.test_b2614_revoke_all import _mint, _user
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+        service = AuthService(keyed, AuthSettings())
+        run = uuid4().hex[:8]
+        owner, late = f"b5091-o-{run}", f"b5091-l-{run}"
+        await _user(keyed, owner)
+        kept = await _mint(keyed, owner)
+        minted: list[str] = []
+        original = keyed._session_epoch
+
+        async def between_sweep_and_commit(conn: object, user_id: str) -> int:
+            if not minted:
+                await _user(keyed, late)
+                minted.append(await _mint(keyed, late))
+            return await original(conn, user_id)
+
+        monkeypatch.setattr(keyed, "_session_epoch", between_sweep_and_commit)
+        await keyed.revoke_all_sessions(except_token_hash=hash_token(kept))
+        monkeypatch.undo()
+        assert minted, "the hook did not run inside the revoke"
+        row = await keyed.get_session(hash_token(minted[0]))
+        assert row is not None and row.revoked_at is None  # the sweep missed it...
+        assert await service.identity_for_token(minted[0]) is None  # ...and it ends anyway
+        assert await service.identity_for_token(kept) is not None
+        after = await _mint(keyed, late)
+        assert await service.identity_for_token(after) is not None  # control: a later sign-in
     finally:
         await keyed.close()
 

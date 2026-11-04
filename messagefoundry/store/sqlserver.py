@@ -92,6 +92,7 @@ from messagefoundry.store.base import (
     PROVISION_SCHEMA_COMMAND,
     UPLOAD_RESERVATION_STALE_AFTER,
     ConnectionFlagLockTimeout,
+    ReferenceKeyCollision,
     SchemaDdlLockTimeout,
     SchemaLockTimeout,
     SchemaNotProvisionedError,
@@ -204,12 +205,14 @@ from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
     AUDIT_KEY_EPOCH_ACTION,
+    GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
+    USER_READ_SQL,
     VIEWED_EVENT,
     AdMap,
     AdMapChange,
@@ -306,6 +309,7 @@ from messagefoundry.store.store import (
     first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
+    global_epoch_or_refuse,
     held_approval_tombstone,
     if_applied,
     judge_totp,
@@ -334,7 +338,9 @@ from messagefoundry.store.store import (
     report_unsealed_role_records,
     report_unsealed_users,
     report_user_reseal,
+    require_ingress_audit,
     require_notify_email,
+    require_operator_audit,
     require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
@@ -693,7 +699,7 @@ def _mssql_session_cap_keep_sql(split_mfa_pending: bool) -> str:
 _MSSQL_SESSION_RESEAL: Final = (
     "UPDATE sessions SET token_hash=?, user_id=?, created_at=?, expires_at=?, revoked_at=?,"
     " client=?, reauth_at=?, mfa_verified_at=?, auth_mechanism=?, idp_auth_time=?, user_epoch=?,"
-    " seal=? OUTPUT inserted.token_hash WHERE token_hash=? AND seal=?"
+    " global_epoch=?, seal=? OUTPUT inserted.token_hash WHERE token_hash=? AND seal=?"
 )
 #: The whole-account session sweep, counted from ``OUTPUT``: revoke and blank the seal (BACKLOG
 #: #2592). Each caller raises the account's session epoch in the same transaction.
@@ -920,6 +926,12 @@ _SQL_STATE_MERGE: Final[str] = (
     " WHEN NOT MATCHED THEN INSERT (namespace, [key], value, set_at, message_id)"
     " VALUES (?,?,?,?,?);"
 )
+# The collation `_SCHEMA` gives state.namespace and state.[key] (BACKLOG #1588); a test pins that the
+# DDL names this one. The open-time report accepts any binary collation, not only this name. The DDL
+# keeps the literal, as every other BIN2 column in `_SCHEMA` does, so that test compares two separate
+# spellings; interpolating this constant would leave the text and `_schema_hash` unchanged but would
+# make the test compare the constant with itself.
+_STATE_KEY_COLLATION: Final[str] = "Latin1_General_100_BIN2"
 
 
 # BACKLOG #1628: how many times, and how far apart, the open-time RCSI check re-reads the state after
@@ -2120,6 +2132,10 @@ _SCHEMA: list[str] = [
     # MERGE matched another spelling and kept it, while the value was sealed to the incoming one, so a
     # keyed reopen failed closed. BIN2 does NOT fix trailing spaces: `=` and the PK pad them under
     # every collation, so 'k' and 'k ' would still be one row. SetState refuses a trailing space instead.
+    # This is the one statement of that padding fact for the state and reference tables; the other
+    # comments point here. The CREATE runs only where `state` is absent, so an older table keeps its
+    # collation: _report_state_key_collation says so at open (BACKLOG #4917). pk_state is clustered,
+    # so its key is capped at 900 bytes: SetState bounds the pair (STATE_KEY_MAX_PAIR_UNITS).
     """IF OBJECT_ID('state','U') IS NULL CREATE TABLE state (
         namespace NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
         [key] NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL, value NVARCHAR(MAX) NOT NULL,
@@ -2136,8 +2152,8 @@ _SCHEMA: list[str] = [
     # binary collation (BIN2) makes key equality case- and accent-exact like SQLite/Postgres: under a
     # case-insensitive database default, externally-sourced keys differing only by case would raise a
     # PK duplicate MID-transaction — a perpetual per-interval sync-failure alert. BIN2 does NOT fix a
-    # trailing space: `=` and the PK pad it under every collation, BIN2 included, so keys differing only
-    # by trailing spaces still collide here. value is ciphertext at rest (snapshot values may carry PHI).
+    # trailing space (the `state` comment above says why), so _guard_reference_widths refuses keys
+    # that differ only by one. value is ciphertext at rest (snapshot values may carry PHI).
     # reference_version.name/version carry the same collation so the active-snapshot LEFT JOIN can
     # never hit a cross-column collation conflict.
     """IF OBJECT_ID('reference','U') IS NULL CREATE TABLE reference (
@@ -2200,6 +2216,16 @@ _SCHEMA: list[str] = [
         id INT NOT NULL PRIMARY KEY CHECK (id = 1),
         salt VARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
         created_at FLOAT NOT NULL)""",
+    # The store's global session epoch (BACKLOG #5091) -- see the SQLite `_SCHEMA`, and
+    # GLOBAL_SESSION_EPOCH_SQL in store.py for what it decides. One row, seeded here under the
+    # batch's exclusive applock, at 0 whenever this batch runs, which an ordinary open skips while
+    # the schema_meta marker matches (ADR 0064). docs/SECURITY.md, *Limits of the session sweep*,
+    # says what runs it and what a deleted row costs until then. Non-secret: a counter.
+    """IF OBJECT_ID('global_session_epoch','U') IS NULL CREATE TABLE global_session_epoch (
+        id INT NOT NULL PRIMARY KEY CHECK (id = 1),
+        epoch INT NOT NULL DEFAULT 0)""",
+    """IF NOT EXISTS (SELECT 1 FROM global_session_epoch WHERE id = 1)
+        INSERT INTO global_session_epoch (id, epoch) VALUES (1, 0)""",
     # The keyed-surface marker (BACKLOG #3383) -- see the SQLite `_SCHEMA` and
     # `MessageStore._encrypt_existing_rows` for when a row is written and what it decides. One row per
     # cipher-covered (table, column); never deleted by the engine. BIN2 so the code-constant names
@@ -2463,6 +2489,7 @@ _SCHEMA: list[str] = [
         revoked_at FLOAT NULL, client NVARCHAR(256) NULL, reauth_at FLOAT NULL,
         mfa_verified_at FLOAT NULL, auth_mechanism NVARCHAR(32) NULL,
         idp_auth_time FLOAT NULL, user_epoch INT NOT NULL DEFAULT 0,
+        global_epoch INT NOT NULL DEFAULT 0,
         seal NVARCHAR(128) NOT NULL DEFAULT N'')""",
     """IF COL_LENGTH('sessions','reauth_at') IS NULL
         ALTER TABLE sessions ADD reauth_at FLOAT NULL""",
@@ -2483,6 +2510,10 @@ _SCHEMA: list[str] = [
         ALTER TABLE sessions ADD user_epoch INT NOT NULL DEFAULT 0""",
     """IF COL_LENGTH('sessions','seal') IS NULL
         ALTER TABLE sessions ADD seal NVARCHAR(128) NOT NULL DEFAULT N''""",
+    # BACKLOG #5091: the global epoch a session was minted under. An existing row gets 0, which its
+    # seal never covered, so a keyed store refuses it.
+    """IF COL_LENGTH('sessions','global_epoch') IS NULL
+        ALTER TABLE sessions ADD global_epoch INT NOT NULL DEFAULT 0""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_user','IndexID') IS NULL
         CREATE INDEX ix_sessions_user ON sessions(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_expires','IndexID') IS NULL
@@ -3841,6 +3872,9 @@ class SqlServerStore:
         store._read_only = read_only
         try:
             await store._ensure_schema(create=create, read_only=read_only)
+            # Right after the schema, so a later open step that fails still leaves the report
+            # logged; read-only included, since it reads metadata only (BACKLOG #4917).
+            folded = await store._report_state_key_collation()
             if store._fifo_claim_proc:
                 # ADR 0114 sub-lever A startup gate (AC-7): verify the deployed procs (existence +
                 # body hash + compat) — a miss degrades LOUDLY to the shipped batch, never a failed
@@ -3873,7 +3907,8 @@ class SqlServerStore:
             await load_audit_chain(store, read_only=read_only)
             if not read_only:
                 # A read-only handle loads no cache, as on SQLite: each decrypts every cell (#1780).
-                await store._load_state_cache()  # ADR 0005 read-through cache warm-up
+                # ADR 0005 read-through cache warm-up
+                await store._load_state_cache_noting(folded)
                 await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
         except Exception:
             # Don't leak the pool if first-open initialization fails (M-6). The executor is released
@@ -6507,6 +6542,7 @@ class SqlServerStore:
         is inserted (Phase 3a). A missing ref fails loud → the whole ingress rolls back → no ACK for a
         body we couldn't reference (content-addressing dedups the sender's resend; the startup sweep
         reclaims the orphan). Empty/None → the byte-identical no-detach path."""
+        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
@@ -7960,13 +7996,20 @@ class SqlServerStore:
 
         The flag statement runs under ``SET LOCK_TIMEOUT``, at
         :data:`~messagefoundry.store.base.CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`, because it holds the
-        applock while it waits. Without it a foreign lock on ``connection_flag`` would hold every
-        audit append until the driver's query timeout, and for ever at ``command_timeout = 0``.
+        applock while it waits. The setting bounds each lock wait, not the statement, so a statement
+        that meets two locks can pass it. Without it a foreign lock on ``connection_flag`` would hold
+        every audit append until the driver's query timeout, and for ever at ``command_timeout = 0``;
+        the retry re-runs a query timeout, so at the 30 s default one call could make up to
+        ``_CIPHER_MERGE_ATTEMPTS``, five, waits of 30 s each, the applock freed only between them.
+        The engine's cancel at its own bound ends the retry, but not the attempt in flight.
         Error 1222 is treated as a failed applock wait: it raises
         :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, not retried, and the
         transaction rolls back. The setting is session-scoped and survives a rollback, so it is put
-        back to -1 right after the statement, or after the rollback on a failure, so a pooled
-        connection never carries it into other work."""
+        back to -1 right after the statement, after a retry's rollback, or after the rollback on a
+        failure, so neither a re-take of the applock nor a pooled connection's other work runs under
+        it. Where a non-zero ``command_timeout`` is at or under the bound, that fires first as
+        HYT00, which the retry re-runs as it would without the bound, and each attempt then holds
+        the applock for up to that timeout."""
         now = time.time() if now is None else now
         bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
         if flagged:
@@ -8014,9 +8057,14 @@ class SqlServerStore:
                         bounded = False
 
                     async def release() -> None:
-                        nonlocal locked
+                        nonlocal locked, bounded
                         await conn.rollback()
                         locked = False
+                        if bounded:
+                            # The rollback does not undo the SET, and the re-take's opener and
+                            # applock must wait under their own bounds, not this one.
+                            await cur.execute(_LOCK_TIMEOUT_RESET)
+                            bounded = False
 
                     await _retry_idempotent_merge(write_flag, on_retry=release, statement=statement)
                     await self._append_operator_audit(cur, written, if_applied(audit), True)
@@ -8024,7 +8072,8 @@ class SqlServerStore:
             except Exception:
                 # The transaction may hold the audit applock and an audit row (BACKLOG #2624).
                 await self._rollback_or_discard(conn)
-                if bounded:
+                # A connection that discard took out of the pool closes with its session.
+                if bounded and not getattr(conn, "closed", False):
                     await self._reset_lock_timeout(conn, after="a failed connection flag write")
                 raise
 
@@ -8520,6 +8569,38 @@ class SqlServerStore:
         resolves cross-message; ``transform_handoff`` refreshes it post-commit."""
         return MappingProxyType(self._state_cache)
 
+    async def _report_state_key_collation(self) -> str | None:
+        """Log a WARNING for a ``state`` table whose key columns are not binary (BACKLOG #4917; the
+        ``state`` comment in ``_SCHEMA`` says how one arises). Repairs nothing, and the open goes
+        on. Returns the collation found, or ``None`` when both are BIN2 or the table is absent."""
+        rows = await self._fetchall(
+            "SELECT name, collation_name FROM sys.columns"
+            " WHERE object_id = OBJECT_ID('state') AND name IN ('namespace', 'key')"
+        )
+        # Any binary collation compares code points, as the cache does; only a linguistic one folds.
+        found = sorted(
+            {
+                str(r["collation_name"])
+                for r in rows
+                # A token, not a suffix: Latin1_General_100_BIN2_UTF8 is binary too.
+                if not {"BIN", "BIN2"} & set(str(r["collation_name"]).upper().split("_"))
+            }
+        )
+        if not found:
+            return None
+        collation = ", ".join(found)
+        log.warning(
+            "sqlserver: the state table's namespace/key columns use collation %s, not a binary one"
+            " such as the %s the shipped DDL names. Keys this collation compares as equal, such as"
+            " ones differing only in case under a case-insensitive collation, may have been merged"
+            " into one row; the engine does not repair them. Remedy, which loses every state row:"
+            " drop the state table and delete the schema_meta row, so the next open (or"
+            " provision-schema) re-runs the DDL batch and creates the table again",
+            collation,
+            _STATE_KEY_COLLATION,
+        )
+        return collation
+
     async def _load_state_cache(self) -> None:
         """Warm the transform-state read-through cache from the ``state`` table at open (ADR 0005)."""
         rows = await self._fetchall("SELECT namespace, [key], value FROM state")
@@ -8537,6 +8618,20 @@ class SqlServerStore:
                 table="state",
             )
         self._state_cache = cache
+
+    async def _load_state_cache_noting(self, folded_collation: str | None) -> None:
+        """:meth:`_load_state_cache`, with a note on a ``CipherError`` naming the folding collation
+        :meth:`_report_state_key_collation` found, a possible cause (BACKLOG #4917)."""
+        try:
+            await self._load_state_cache()
+        except CipherError as exc:
+            if folded_collation is not None:
+                exc.add_note(
+                    f"the state table's key columns use collation {folded_collation}, not a"
+                    " binary one, so this row may have been merged across a case or accent variant"
+                    " and sealed to the other spelling (BACKLOG #1588, #4917)"
+                )
+            raise
 
     async def _load_reference_cache(self) -> None:
         """Populate the in-memory reference cache from the ACTIVE snapshot of each set (ADR 0006).
@@ -8602,12 +8697,21 @@ class SqlServerStore:
         (NVARCHAR's unit — a naive ``len()`` counts code points and passes astral-plane keys straight
         into that truncation). The error NEVER carries a raw key: keys may be PHI for a patient-keyed
         set (CLAUDE.md §9), so it names the set + the key's ordinal, code-unit length, and a truncated
-        hash only."""
+        hash only.
+
+        It also refuses two keys equal once trailing U+0020 is stripped (BACKLOG #4917):
+        ``pk_reference`` pads them (the ``state`` comment in ``_SCHEMA`` says why), so the second
+        INSERT would raise a PK duplicate mid-transaction, every interval. It raises
+        :class:`ReferenceKeyCollision`, naming the keys by ordinal only, because ``reference_sync``
+        logs that class's message whole, where it logs any other source error by class name only."""
         if len(name.encode("utf-16-le")) // 2 > 256:
             raise ValueError(
                 f"reference set name exceeds NVARCHAR(256) "
                 f"({len(name.encode('utf-16-le')) // 2} UTF-16 code units); refusing the snapshot"
             )
+        # Only a key ending in a space can pad onto another, so only those are stripped and held:
+        # usually none, so a large set costs one endswith per key, not a second dict of every key.
+        padded: dict[str, int] = {}  # stripped form of a space-ending key -> its ordinal
         for ordinal, key in enumerate(rows):
             units = len(key.encode("utf-16-le")) // 2
             if units > 450:
@@ -8617,6 +8721,22 @@ class SqlServerStore:
                     f"({units} UTF-16 code units, sha256:{digest}); refusing the snapshot "
                     "(key value withheld: reference keys may be PHI)"
                 )
+            if not key.endswith(" "):
+                continue
+            stripped = key.rstrip(" ")
+            first = padded.get(stripped)
+            if first is None and stripped in rows:
+                first = next(i for i, k in enumerate(rows) if k == stripped)
+            if first is not None:
+                later, first = max(ordinal, first), min(ordinal, first)
+                # No digest: an MRN-shaped key is guessable from a short unsalted hash, and the two
+                # ordinals already find the rows in the source.
+                raise ReferenceKeyCollision(
+                    f"reference set {name!r}: keys #{first} and #{later} differ only by trailing"
+                    " spaces, which SQL Server compares as equal; refusing the snapshot (key"
+                    " values withheld: reference keys may be PHI)"
+                )
+            padded[stripped] = ordinal
 
     async def write_reference_snapshot(
         self, *, name: str, version: str, rows: Mapping[str, Any]
@@ -11586,6 +11706,7 @@ class SqlServerStore:
         docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
         A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580).
         ``audit``'s row commits with the replay (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -11709,6 +11830,7 @@ class SqlServerStore:
         ``INSERT … WHERE NOT EXISTS`` + ``rowcount`` is the atomic gate; the outbound row is created only
         when it made a row (ADR 0090 §4). ``audit``'s row commits with the resend, a duplicate included
         (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -11982,6 +12104,7 @@ class SqlServerStore:
         EXISTS`` + ``rowcount`` gate (keyed to ``(origin, "@reingress:<channel>")``) admits exactly one;
         the deterministic content-addressed child id is the partial-rollback defense. ``audit``'s row
         commits with the resubmit, a duplicate included (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -12158,6 +12281,7 @@ class SqlServerStore:
         message from ``ERROR`` to ``ROUTED`` with nothing re-queued. It binds no parameter, so it does
         not disturb the positional ``?`` order ``params`` depends on. The pass-through marker exclusion
         (:data:`_NOT_PT_MARKER`, BACKLOG #1580) rides the same ``clause`` for the same reason."""
+        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})", f"({_NOT_PT_MARKER})"]
         params: list[Any] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
@@ -12212,6 +12336,7 @@ class SqlServerStore:
         now: float | None = None,
         audit: OperatorAudit[int],
     ) -> int:
+        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "destination_name=?", "status=?"]
         params: list[Any] = [Stage.OUTBOUND.value, destination_name, OutboxStatus.PENDING.value]
@@ -13498,7 +13623,7 @@ class SqlServerStore:
         approver: str,
         decided_at: float,
         seal_read: object,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
         #3638); the Store protocol states the contract. Locks as :meth:`decide_pending_approval`
@@ -13721,7 +13846,7 @@ class SqlServerStore:
         ]
 
     async def _append_operator_audit[R](
-        self, cur: Any, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+        self, cur: Any, written: AuditedWrite, audit: OperatorAudit[R], result: R
     ) -> None:
         """Append an operator mutation's audit row before its commit (BACKLOG #2624), so an append
         that fails rolls the mutation back. The caller's first statement opened the transaction the
@@ -13751,7 +13876,7 @@ class SqlServerStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -13777,7 +13902,7 @@ class SqlServerStore:
         )
 
     async def get_user(self, user_id: str) -> UserRecord | None:
-        d = await self._fetchone("SELECT * FROM users WHERE id=?", (user_id,))
+        d = await self._fetchone(f"{USER_READ_SQL} WHERE id=?", (user_id,))
         return UserRecord.from_mapping(d) if d else None
 
     async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
@@ -13914,6 +14039,13 @@ class SqlServerStore:
                 raise
         return count
 
+    async def _global_session_epoch(self, cur: Any) -> int:
+        """The store's global session epoch (BACKLOG #5091), read on ``cur`` inside an open
+        transaction."""
+        await cur.execute(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
+        rows = await cur.fetchall()
+        return global_epoch_or_refuse(rows[0][0] if rows else None)
+
     async def _bump_session_epoch(self, cur: Any, user_id: str) -> None:
         """Raise the account's session epoch through the write helper, on ``cur`` inside an open
         transaction (BACKLOG #2592); store.py's ``MessageStore._bump_session_epoch`` says why a
@@ -13960,7 +14092,7 @@ class SqlServerStore:
         return int(row["n"]) if row else 0
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
-        d = await self._fetchone("SELECT * FROM users WHERE username=?", (username,))
+        d = await self._fetchone(f"{USER_READ_SQL} WHERE username=?", (username,))
         return UserRecord.from_mapping(d) if d else None
 
     async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
@@ -13971,7 +14103,7 @@ class SqlServerStore:
         # The normaliser in auth/ldap.py emits ONE case, so that divergence is not reachable through
         # the login path -- it is recorded because the byte-exact comparison SQLite and Postgres
         # perform is the property a reader would assume.
-        d = await self._fetchone("SELECT * FROM users WHERE directory_object_id=?", (object_id,))
+        d = await self._fetchone(f"{USER_READ_SQL} WHERE directory_object_id=?", (object_id,))
         return UserRecord.from_mapping(d) if d else None
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
@@ -13982,12 +14114,12 @@ class SqlServerStore:
         # byte-exact comparison SQLite and Postgres perform. The BIN2 remedy this file applies to
         # `reference_sets.[key]` is the fix if that divergence ever needs closing.
         d = await self._fetchone(
-            "SELECT * FROM users WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
+            f"{USER_READ_SQL} WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
         )
         return UserRecord.from_mapping(d) if d else None
 
     async def list_users(self) -> list[UserRecord]:
-        rows = await self._fetchall("SELECT * FROM users ORDER BY username")
+        rows = await self._fetchall(f"{USER_READ_SQL} ORDER BY username")
         return [UserRecord.from_mapping(d) for d in rows]
 
     async def count_users(self) -> int:
@@ -14228,6 +14360,7 @@ class SqlServerStore:
                     SessionRecord.from_mapping(session[0]) if session else None,
                     record,
                     await self._account_passkeys(cur, cred.user_id),
+                    global_epoch=await self._global_session_epoch(cur),
                 ):
                     await conn.rollback()  # only read; this releases the lock
                     return False
@@ -14382,7 +14515,7 @@ class SqlServerStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
@@ -14846,7 +14979,7 @@ class SqlServerStore:
         *,
         expected_username: str,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says
@@ -15227,6 +15360,10 @@ class SqlServerStore:
                     auth_mechanism=auth_mechanism,
                     idp_auth_time=idp_auth_time,
                     user_epoch=0 if not rows else int(rows[0][2]),
+                    # BACKLOG #5091: its own statement, after the row lock, for the reason
+                    # postgres.py's create_session gives; revoke_all_sessions says why it cannot
+                    # close a cycle.
+                    global_epoch=await self._global_session_epoch(cur),
                 )
                 record = seal_session(self._row_sealer, record)
                 await cur.execute(_SESSION_INSERT, session_insert_params(record))
@@ -15466,9 +15603,26 @@ class SqlServerStore:
         """Revoke the sessions it finds but ``except_token_hash`` (BACKLOG #2614); see
         :meth:`AuthStore.revoke_all_sessions`.
 
-        Raises the session epoch of at most the accounts its read of the account list returns,
-        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
-        what it may miss."""
+        Raises the epoch of each account its read of the account list returns, ends the sessions
+        it finds, then raises the store's global session epoch (BACKLOG #5091), which ends every
+        session minted before it whatever account it belongs to, and re-seals the kept session
+        under both new epochs; docs/SECURITY.md, *Limits of the session sweep*, says what that
+        leaves.
+
+        LOCK ORDER. The global row is the LAST lock this takes, so it never waits on another lock
+        while holding that row. Taken first, as on Postgres, it would close a cycle wherever the
+        database runs without READ_COMMITTED_SNAPSHOT, which the opener only warns about: a sign-in
+        holding an account row (``create_session``'s HOLDLOCK) reads the global epoch and waits on
+        this X lock, while the loop below waits on that account row. That shape, a lock held while
+        waiting on a lock the other side holds, is the class the reverted ``UPDLOCK, HOLDLOCK``
+        read of the account list fell into against ``delete_user`` (engine PR 2679). After the
+        raise the only wait left is the kept session's row, and no other path holds that row while
+        it waits on an account row or on the global one: each path that touches both takes the
+        account row first, and this transaction already holds it. Every reader of the global row
+        takes no hint, so under READ_COMMITTED_SNAPSHOT it never waits, and without it holds its
+        shared lock only for the read. A session minted between the sweep and the commit read the
+        old value, so it ends when this commits. Read from the code and not run against a server
+        that has READ_COMMITTED_SNAPSHOT off."""
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -15483,6 +15637,12 @@ class SqlServerStore:
                         (now, except_token_hash),
                     )
                 revoked = len(await cur.fetchall())
+                await cur.execute(
+                    "UPDATE global_session_epoch SET epoch = epoch + 1"
+                    " OUTPUT inserted.epoch WHERE id = 1"
+                )
+                raised = await cur.fetchall()
+                current = global_epoch_or_refuse(raised[0][0] if raised else None)
                 if except_token_hash is not None:
                     await cur.execute(
                         "SELECT s.user_id, u.session_epoch FROM sessions s"
@@ -15493,7 +15653,9 @@ class SqlServerStore:
                     if kept:
                         epoch = int(kept[0][1])
                         await self._write_session(
-                            cur, except_token_hash, lambda s: replace(s, user_epoch=epoch)
+                            cur,
+                            except_token_hash,
+                            lambda s: replace(s, user_epoch=epoch, global_epoch=current),
                         )
                 await self._commit(conn)
             except Exception:

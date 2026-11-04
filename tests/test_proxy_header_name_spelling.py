@@ -554,7 +554,8 @@ def _https_proxy_for_http_only(
     proxy: _WireProxy, *, admitted: bool
 ) -> urllib.request.OpenerDirector:
     """Only ``http`` is proxied, to a proxy written ``https://``, on a context that fully
-    verifies. That is the one leg that reaches a proxy over TLS first."""
+    verifies. That is one leg that reaches a proxy over TLS first; a bypass list naming the
+    proxy's own host is another."""
     handler = LoopbackDirectProxyHandler(
         {"http": f"https://{proxy.address}"}, caller_header_admitted=admitted
     )
@@ -566,7 +567,8 @@ def _https_proxy_for_http_only(
 def test_an_oddly_spelled_header_does_not_cross_a_verified_tls_leg(
     name: str, admitted: bool
 ) -> None:
-    """The plain name may cross this leg, because the proxy takes it as its own. A proxy is not
+    """The plain name an admission covers may cross this leg, because the proxy takes it as its
+    own (vault BACKLOG #4909 refuses an unadmitted one). A proxy is not
     sure to take any other spelling that way, and could pass it on to the ``http`` destination."""
     with _WireProxy() as proxy:
         opener = _https_proxy_for_http_only(proxy, admitted=admitted)
@@ -574,10 +576,31 @@ def test_an_oddly_spelled_header_does_not_cross_a_verified_tls_leg(
     assert proxy.connections == 0
 
 
-def test_control_the_plain_name_crosses_a_verified_tls_leg() -> None:
+def test_an_unadmitted_plain_name_does_not_cross_a_verified_tls_leg() -> None:
+    """The plain name no connection admitted, on the TLS leg to a proxy written ``https://``.
+    It crossed before vault BACKLOG #4909 and is refused before the dial now. That this caller-set
+    header is refused is the Lander's proposed scope on #4909, unruled; the decision record
+    names an environment credential only. The control is the same leg with no header."""
     with _WireProxy() as proxy:
         opener = _https_proxy_for_http_only(proxy, admitted=False)
+        _refused(opener, _request(_NAME, _HTTP_TARGET), "#4909")
+    assert proxy.connections == 0
+
+    with _WireProxy() as proxy:
+        opener = _https_proxy_for_http_only(proxy, admitted=False)
+        _open_and_discard(opener, urllib.request.Request(_HTTP_TARGET))
+    assert proxy.connections == 1
+    assert proxy.tls_first == 1
+    assert proxy.cleartext == []
+
+
+def test_control_an_admitted_plain_name_still_crosses_a_verified_tls_leg() -> None:
+    """The one exception stands on this leg: a header its connection admitted reaches the proxy,
+    TLS first, on a context that fully verifies it (vault BACKLOG #4909 leaves it alone)."""
+    with _WireProxy() as proxy:
+        opener = _https_proxy_for_http_only(proxy, admitted=True)
         _open_and_discard(opener, _request(_NAME, _HTTP_TARGET))
+    assert proxy.connections == 1
     assert proxy.tls_first == 1
     assert proxy.cleartext == []
 
@@ -1104,7 +1127,7 @@ class _Retitled(str):
     ],
 )
 def test_a_str_subclass_is_never_taken_as_the_plain_spelling(leg: str, admitted: bool) -> None:
-    """The plain spelling may cross a verified TLS leg, and an admission covers it, because
+    """The plain spelling may cross a verified TLS leg where an admission covers it, because
     urllib sends it as the proxy's own header. That is known of a ``str`` only. A subclass
     answers ``title()`` itself, so it is judged like any other spelling, and refused."""
     with _WireProxy() as peer:
@@ -1345,7 +1368,8 @@ def test_a_value_urllib_stores_under_a_judged_name_is_judged_as_a_new_header() -
     its first key, so a header set again keeps its name object and holds a new value.
 
     urllib does that while a request is opened. The first proxy here is written ``https://``
-    with a credential, so its check lets the caller's admitted header go to it over TLS.
+    with a credential. Its check lets the caller's admitted header pass on this first pass, and
+    marks the request for the TLS-leg refusal (vault BACKLOG #4909).
     urllib then stores that proxy's own credential under the caller's name object, and hands
     the request to the second proxy, which is cleartext. A verdict found by the name alone
     would be the caller's, which the admission covers, and the first proxy's credential would

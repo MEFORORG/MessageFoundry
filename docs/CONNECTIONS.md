@@ -635,9 +635,13 @@ example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
 - **Synchronous request/response on the *outbound* (ADR 0016).** With `capture_response`/`reingress_to`
   the destination blocks for the returned interchange and classifies a **TA1** interchange ack:
   **TA1\*A** → accepted; **TA1\*R** → permanent reject → **dead-letter**; **TA1\*E** →
-  accepted-with-warning (delivered, **not** retried, logged). An empty TA1-04, or one outside that
-  code set, is accepted too, and its captured `detail` is a fixed phrase, never the partner's text;
-  only a TA1-04 of `A` records `TA1*A` (BACKLOG #2984). **A TA1 is acted on only when its
+  accepted-with-warning (delivered, **not** retried, logged). TA1-04 is compared after trimming
+  surrounding whitespace and ignoring case, so a padded `R ` still dead-letters. An empty TA1-04, or
+  one outside that code set, is accepted too, not retried, because a retry could re-send an
+  interchange the partner accepted. It is logged at WARNING. That line names the code only by a
+  fixed phrase, beside the host, port and TA1-01 control number, and its captured `detail` is the
+  same fixed phrase; neither carries the TA1-04 text. Only a TA1-04 of `A` records `TA1*A` (BACKLOG
+  #2984, #5018). **A TA1 is acted on only when its
   TA1-01 names the ISA13 just sent.** Both are compared as nine-digit control numbers, and a shorter
   all-digit TA1-01 is zero-padded. If the sent ISA13 is not nine digits, only an exact echo matches;
   a blank one matches nothing. If the sent payload has no readable ISA there is nothing to
@@ -684,6 +688,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `max_connections` | `256` | cap on concurrent clients (connection-flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
 | `max_connections_per_host` | **off** | cap on concurrent connections from **one peer address**, answered `503` with an `at_capacity` event whose reason reads `max_connections_per_host` (vault BACKLOG #2606); a `tls = true` listener on the stdlib loop closes the socket unanswered instead, as the pre-ingress refusals below say. **Ships off, unlike MLLP/TCP/X12**: this connector answers one request per connection, so behind a reverse proxy every partner arrives from one address and any cap would be the listener's whole capacity. Set one only where the listener sees real client addresses. |
+| `max_handshakes_per_host` | `32` | cap on sockets from **one peer address** that hold a connection slot while **still in their TLS handshake** (vault BACKLOG #4888). It bites only on a `tls = true` listener on the stdlib loop, the one path where a handshake holds a slot; there the socket is closed unanswered with an `at_capacity` event whose reason reads `max_handshakes_per_host`. A socket leaves the count when its handshake ends, so it caps how many requests one address can **start** at once, not how many it holds once their handshakes are done. **Ships on**; `None`/`0` = off. Why, what it does not bound, and the L4 load-balancer case: [DEPLOYMENT.md](DEPLOYMENT.md#per-address-listener-caps-behind-the-vip). |
 | `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` is refused `413` **before a body byte is read** (OOM guard). `None`/`0` = unlimited, and the connection logs a `WARNING` naming the setting each time it is built (BACKLOG #2749). |
 | `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). This one cap can't be switched off: unset or `None` takes the 64 KiB default, and `0` (or `"0"`) is refused at load rather than silently becoming the default (BACKLOG #1872). |
 | `max_messages_per_second` | **off** | sustained message-rate ceiling for the **whole listener** (ASVS 2.4.1 / 15.2.2, BACKLOG #1114 — the MLLP pacer, ported). Over budget the connector **waits before reading the request**, so the partner is back-pressured and then served in full — **nothing is dropped, refused or answered differently**, and the wait sits outside `receive_timeout` so a paced partner is never handed a `408` for a delay the engine imposed. **Listener-wide, not per-connection**, unlike MLLP/TCP/X12: this connector answers one request per connection, so a per-connection bucket would be charged once and thrown away, bounding nothing. A `GET`/`HEAD` probe waits behind an outstanding debt but **charges nothing**, and neither does a request refused before its body reaches the engine. Only a body the engine reads and records spends budget, including one it then refuses with a `422`, so a peer that submits nothing cannot starve one that does. Unset = no bound, deliberately: a guessed rate throttles real traffic, so the number has to come from your own feed profile. |
@@ -1481,6 +1486,20 @@ poll/write shape against a remote server, selected by an internal `protocol` set
     `_FtpClient.publish` states why. The check costs one more directory listing per delivery.
 
   With `overwrite = true`, nothing changes: the rename replaces any entry of the same name.
+- **An error names the server's reply code, never its reply text (BACKLOG #5026).** A refusal can
+  quote the path it refused, and on an upload that path ends in a name rendered from message
+  fields, so the reply text never reaches `last_error`, the alert detail or the log. An FTP or FTPS
+  error reads like `FTP rejected the operation: reply 550 (file unavailable, such as not found or no
+  access)`: the code and a fixed meaning for at least the common codes, and the code alone for any
+  other. An SFTP error names the exception's type and errno, such as `SFTP path not found:
+  FileNotFoundError, errno 2 (ENOENT)`. paramiko keeps three SFTP statuses apart: no such file, as
+  that `FileNotFoundError`; permission denied, as `SFTP operation failed: PermissionError, errno 13
+  (EACCES)`; and end of file, as `SFTP connection closed: EOFError`. It raises any other status as
+  an `OSError` carrying the server's text alone, so that reads as a bare `SFTP operation failed:
+  OSError`. A TLS failure names OpenSSL's reason and, for a certificate
+  check, its verify message, which are this engine's own wording. To see the server's own wording,
+  read the server's log. One exception: an SFTP connect refusal keeps paramiko's text, and
+  `_SftpClient._connect` says why. `_RemoteError` in `transports/remotefile.py` states the rule.
 - **Mostly the same file policy as `File(...)`.** A remote source is one of the *directory sources* the
   [file handling & quarantine policy](#file-handling--quarantine-policy-asvs-511) above governs — the
   content-type-aware magic-byte sniff (a drop whose leading bytes contradict its declared `content_type` is
@@ -1618,16 +1637,18 @@ text carried the password into `last_error`. Put credentials in `basic_user`/`ba
 `bearer_token` (or the `oauth2_*`/`smart_*` settings), each via `env()`. `proxy_url` is not covered
 by this rule. It has its own, below.
 
-**Engine openers refuse a web-proxy credential on the legs where it could be read on the way,
-with one exception (vault BACKLOG #2572, #3410, #3416, #3417, #3418).** That covers a user and password in a proxy URL
-and a `proxy_user` and `proxy_password` pair. The proxy may come from `proxy_url`, from
-`HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
-FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
-broker. The error names no part of the proxy URL. Which legs are refused, and the one exception
-for a `proxy_user` credential its connection admitted when it was built, which covers cleartext
-legs only, are stated once, on
-[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py), with an example of
-a leg it lets through and what it does not check.
+**The engine's urllib openers refuse a web-proxy credential on the legs where it could be read on
+the way, and on a TLS leg that fully verifies the proxy, with one exception (vault BACKLOG #2572,
+#3410, #3416, #3417, #3418, #4909).** The rule reads a user and password in a proxy URL and a
+`proxy_user` and `proxy_password` pair. The exception is that pair, once its connection admitted
+it when it was built: it crosses a cleartext leg and a verified TLS leg alike. The proxy may come
+from `proxy_url`, from `HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That
+covers at least REST, SOAP, FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook,
+the OIDC legs and the AI broker. The error names no part of the proxy URL. Which legs are refused,
+on what ground, and what the rule does not check are stated once, on
+[`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py). **The
+requests-based Vault/OpenBao hop is not one of these openers**; what it would still send to an
+`https://` proxy is stated under `[egress]` in [CONFIGURATION.md](CONFIGURATION.md).
 
 **No declaration lifts a credential written in a proxy URL, and `proxy_user` has one declared way
 (owner rulings of 2026-10-05 and 2026-10-30, vault BACKLOG #3007).** R1 of the vault's
@@ -1725,6 +1746,7 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `database` | — | database name — **required** for `dialect="sqlserver"`; optional for `"generic"` |
 | `statement` | — (required) | parameterized SQL / proc call with `:name` placeholders, e.g. `INSERT INTO obs (mrn, val) VALUES (:mrn, :val)` |
 | `dialect` | `sqlserver` | `sqlserver` preset · `generic` ODBC (see [*Generic ODBC*](#generic-odbc-postgresql--mysql)) |
+| `odbc_driver` | `ODBC Driver 18 for SQL Server` | the ODBC driver name. On the SQL Server preset it must name a Microsoft SQL Server driver, or the connection is refused (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
 | `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only**. On `dialect="generic"` this setting is **not read at all**: that arm emits `username`/`password` under `odbc_user_key`/`odbc_password_key`, so writing `auth="integrated"` there still produces a static login. `messagefoundry check`'s advisory `static-credentials` line names every DATABASE hop on an unchanging credential (ASVS 13.2.1), including that case — see [*Static database credentials*](#static-database-credentials) |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
 | `port` | `1433` | server port, on the **SQL Server preset only**. On `dialect="generic"` it is **not read**: give the port as the `PORT` keyword in `odbc_params` (see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)) |
@@ -1806,8 +1828,59 @@ dialects send it differently (vault BACKLOG #2704):
 | `generic` | The `PORT` keyword in `odbc_params`, the only port the generic connection string sends. The `port` setting is ignored, because that string never carries it. |
 
 **The check compares the port the connection string sends, not the port the driver opens.** A
-driver that ignores `PORT`, or a preset driver that does not read `,<port>` in `SERVER`, connects
-to its own default port, and the check cannot see that. Check that your driver reads the keyword.
+driver that ignores `PORT` connects to its own default port, and the check cannot see that. Check
+that your driver reads the keyword. The preset refuses a driver name that is not Microsoft's, as
+below.
+
+**On the `sqlserver` preset, some drivers and `server` values are refused** when the connection
+string is built and by the egress check (BACKLOG #4873). This holds for every factory that builds
+the preset, at least `Database`, `DatabasePoll`, `DatabaseLookup` and `DatabaseRef`. The egress
+check reads the refusal only for a host an `[egress].allowed_db` entry names. It refuses any other
+host as unlisted. Under the audited opt-out with an empty list, the build alone refuses. When
+each runs:
+
+- For `Database`, `DatabasePoll` and `DatabaseLookup`, both run when the engine starts or
+  reloads. They also run in `messagefoundry check` where its build leg runs, with a
+  `messagefoundry.toml` or `MEFOR_AI_ENVIRONMENT`.
+- For a `DatabaseRef`, both run at each sync, and the first sync runs at start. The build also
+  runs at a reload, a dry run included, and in that `messagefoundry check` leg, once its `env()`
+  values resolve. So each case below still fails there. The egress check runs only at sync.
+
+The preset sends `SERVER=<server>,<port>`, and the port pin and the host match assume the driver
+reads `,<port>` as the port and the text before it as one host. psqlODBC does not: it passes
+`SERVER` to libpq, which reads a comma as a list of hosts. There the port would be read as a
+second host name, which can resolve as a numeric address, and a comma in `server` could name any
+host.
+
+- The `odbc_driver` must be one of Microsoft's ODBC Driver or SQL Server Native Client names,
+  whole, in any case: `ODBC Driver <n> for SQL Server` or `SQL Server Native Client <n>`. Here
+  `<n>` is a version such as `18`, `13.1` or `11.0`.
+- Blanks are read as written: one space between words, none at either end, and no tab or other
+  control character. The driver manager looks a name up as written, and another spelling can be
+  a separate alias. The whole text must be ASCII, a path's directories included, so a library
+  under a folder with a non-ASCII name is refused.
+- A path is accepted when its file name, in any case, is the Microsoft ODBC Driver library:
+  `libmsodbcsql-18.so`, `libmsodbcsql.18.dylib` or `msodbcsql18.dll`, with a version suffix
+  allowed, and either separator before the version on Linux and macOS. A bare file name with no
+  directory is accepted too, and the loader then finds it on its own search path. A path that opens with two separators or a device prefix, such as a UNC path or
+  `\??\UNC\`, or holds `://` is refused, since it can name a library on another host.
+- The preset's `odbc_driver` may hold no `;`, `{`, `}` or `=`, anywhere in a path included. The
+  driver is sent braced, but whether every driver manager reads the brace escape there is
+  unmeasured, and an unread one would let the rest of the path add keywords to the connection
+  string.
+- Any other name is refused. That is at least a mixed name such as `PostgreSQL via SQL Server
+  gateway`, a vendor driver that names SQL Server, FreeTDS, and the bare legacy `SQL Server`. On
+  Linux that last name is commonly a FreeTDS alias. FreeTDS reads `,<port>` as the port. But
+  nothing shows it reads the preset's TLS keywords, `Encrypt` and `TrustServerCertificate`. A hop
+  the engine reports as verifying TLS could then not verify.
+- For another driver, use `dialect="generic"` on `Database` or `DatabasePoll`. `DatabaseLookup`
+  and `DatabaseRef` take only a Microsoft driver.
+- `server` must hold no comma, since the preset adds its own `,<port>`. Put the port in `port`.
+- `server` must hold no `\`. The preset always sends a port, so an instance name there is not what
+  the driver dials; a driver that reads the instance in place of the port, as FreeTDS does, would
+  dial a port the check never compared. Set `port` to the instance's port.
+
+As on the generic dialect, the engine reads the driver name, not the library it loads.
 
 An entry with no port admits its host at any port. On the generic dialect the egress check
 **refuses** at least these cases for a listed host, at load like every other miss:
@@ -1822,8 +1895,9 @@ An entry with no port admits its host at any port. On the generic dialect the eg
 - The `odbc_driver` name is not one the engine knows reads `PORT`, and the entry pins a port.
   The engine knows a name holding `postgres`, `psqlodbc`, `mysql` or `mariadb`, in any case,
   unless it also holds `msodbcsql` or `sql server`: those mark a SQL Server driver, which ignores
-  `PORT`, so use `dialect="sqlserver"`. The default `ODBC Driver 18 for SQL Server` is one. A
-  host-only entry still admits any driver.
+  `PORT`. For a name the preset accepts, use
+  `dialect="sqlserver"`. The default `ODBC Driver 18 for SQL Server` is one. A host-only entry
+  still admits any driver.
 
 The check reads the driver **name** as written, an odbcinst alias or a library path included, and
 cannot see which library that name loads. A name that misdescribes its driver, such as a path
@@ -1833,7 +1907,7 @@ A `host:port` or `[v6]:port` `server` is never a listed host: an entry splits at
 so no entry can name it, and it is refused as unlisted.
 
 `db_lookup` and `DatabaseRef` always build the SQL Server preset, so their `port` setting is the
-port compared.
+port compared, and the preset's driver rule above applies to them.
 
 ##### Accepted `odbc_params` keywords
 
@@ -2140,7 +2214,7 @@ in-process layers are defence in depth and neither is authority:
 
 | Layer | What it does | What it cannot do |
 |---|---|---|
-| Statement gate (`_require_read_only`) | refuses a statement that does not open with `SELECT`/`WITH`, or that carries a write/`EXEC`/DDL keyword outside a literal or comment, or that chains a second statement. It also refuses a number with a letter or one of `_$#@` glued to its end, because SQL Server reads a write such as `1e1INTO copy` or `0xUPDATE` as a number then a keyword | it reads text. A write executed on a linked server through a pass-through literal is opaque to it. It fails closed on some valid reads, at least a word glued to a number, a name or a keyword (`#1tmp`, `@1x`, `:1st`, `x=1AND y=2`, `TOP 10PERCENT`, MySQL `2024_orders`, Oracle `1.5f`) and a scalar `INSERT(...)` or `TRUNCATE(...)` call, an ODBC `{fn TRUNCATE(...)}` escape included |
+| Statement gate (`_require_read_only`) | refuses a statement that does not open with `SELECT`/`WITH`, or that carries a write/`EXEC`/DDL keyword or an ODBC `{call ...}` escape outside a literal or comment, or that chains a second statement after a `;`. A keyword glued to a following `#` or `@` (`INTO#x`) is still a keyword to it, and a `--` comment holding a line break other than LF, or a NUL, before its LF is refused. It also refuses a number with a letter or one of `_$#@` glued to its end, because SQL Server reads a write such as `1e1INTO copy` or `0xUPDATE` as a number then a keyword | it reads text. A write executed on a linked server through a pass-through literal is opaque to it, and it passes at least a `SELECT` calling a function that writes, and a T-SQL second statement with no `;` whose verb it does not list. It fails closed on some valid reads, at least a word glued to a number, a name or a keyword (`#1tmp`, `@1x`, `:1st`, `x=1AND y=2`, `TOP 10PERCENT`, MySQL `2024_orders`, Oracle `1.5f`), a name such as `update#n` or `t#1x`, a `--` comment in a statement with CR-only line endings, a scalar `INSERT(...)` or `TRUNCATE(...)` call, an ODBC `{fn TRUNCATE(...)}` escape included, and an unquoted name spelled like a refused keyword (at least a column `receive`; quote it the way the database quotes a name) |
 | `ApplicationIntent=ReadOnly` on the DSN | advertises read-only intent | read at least by an Always On availability group, where read-only routing sends it to a **readable secondary** and a primary set to `ALLOW_CONNECTIONS = READ_WRITE` refuses it, and by Azure SQL read scale-out, which sends it to a read-only replica; where nothing reads it, it changes nothing |
 
 Lookup pools are opened **autocommit**, so a write that got past the statement gate would commit rather
@@ -2183,8 +2257,9 @@ A `DatabaseRef(...)` reference sync reads a partner database too, so it gets the
 
 - **The statement gate.** The `statement` goes through the same `_require_read_only` test as a
   `db_lookup` statement: it must open with `SELECT` or `WITH`, carry no write, `EXEC` or DDL keyword
-  outside a literal or comment, and chain no second statement. **A stored procedure is therefore
-  refused**; read the procedure's tables or a view with a `SELECT` instead. A literal statement is
+  or ODBC `{call ...}` escape outside a literal or comment, wherever it sits, and chain no second statement.
+  An unquoted column named `receive` is refused with them; quote it as `[receive]`.
+  **A stored procedure is therefore refused**; read the procedure's tables or a view with a `SELECT` instead. A literal statement is
   tested when the `DatabaseRef(...)` is declared, so loading the config fails on every path (`serve`,
   `messagefoundry check`, dry-run, reload). An `env()` statement is tested by the build check once
   resolved. Every sync tests the statement again, as does the build check for a reference source
@@ -2357,7 +2432,7 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 |---------|---------|---------|
 | `server` | — (required) | SQL Server host. Use `env()` for a DEV/PROD-specific host. |
 | `database` | — (required) | database name |
-| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id`. **It must not write.** It runs on an autocommit connection, so a poll that claims rows, such as `UPDATE ... RETURNING`, would mark rows it never hands off: at least those past `poll_max_rows`, a row whose hand-off failed, and those left behind a stop. So a statement that fails the read-only test for the poll's dialect is refused at build, and a literal one already when `DatabasePoll` is declared (BACKLOG #2178). At least a write keyword, `EXEC` or `{CALL ...}`, a second statement and a `FOR UPDATE` locking read are refused. The test reads only the statement's shape, so at least a `SELECT` that calls a function which writes, and a T-SQL second statement with no `;` whose verb the test does not list, pass it. It can refuse a valid read on any dialect: at least a `MERGE` join hint (`OPTION (MERGE JOIN)`, `INNER MERGE JOIN`) is refused on the default `sqlserver` dialect too, and so is a word glued to a number (see *Give `db_lookup` a read-only login* for the list). Only on `dialect='generic'` is MySQL's scalar `INSERT(...)` or `TRUNCATE(...)` admitted, and only with the `(` as the very next character (`TRUNCATE (1.2, 2)`, valid MySQL, is refused); the `db_lookup` test, always on the SQL Server preset, refuses it. While `dialect` is an `env()` value, the declaration tests the poll as `generic` and the build tests it again with the resolved dialect. The test models T-SQL quoting, so on a `dialect='generic'` poll it can also refuse a valid read (at least a MySQL backslash escape such as `'it\'s'`, or a `#` comment containing a write keyword) and can miss a write hidden in a MySQL backslash escape or a PostgreSQL dollar quote. A stored-procedure poll is refused even when the procedure only reads, because the test cannot see its body. With a `mark_statement` the login must be able to write, so keep the poll free of writes yourself; a feed with no `mark_statement` can use a read-only login. Mark rows with `mark_statement`. |
+| `poll_statement` | — (required) | the `SELECT` of the next batch, e.g. `SELECT id, payload FROM mf_inbox WHERE status='NEW' ORDER BY id`. **It must not write.** It runs on an autocommit connection, so a poll that claims rows, such as `UPDATE ... RETURNING`, would mark rows it never hands off: at least those past `poll_max_rows`, a row whose hand-off failed, and those left behind a stop. So a statement that fails the read-only test for the poll's dialect is refused at build, and a literal one already when `DatabasePoll` is declared (BACKLOG #2178). At least a write keyword, `EXEC` or `{CALL ...}`, a second statement and a `FOR UPDATE` locking read are refused, a write keyword or `EXEC` glued to a following `#` or `@` (`INTO#x`) and a `{CALL ...}` escape after the `SELECT`, or in the ODBC `--(*vendor(...),product(ODBC) call ... *)--` form, included (BACKLOG #5259). A `--` comment that holds a line break other than LF, or a NUL, before its LF, such as a lone CR, is refused on every dialect, because lexers disagree about where it ends. The test reads only the statement's shape, so at least a `SELECT` that calls a function which writes, and a T-SQL second statement with no `;` whose verb the test does not list, pass it. It can refuse a valid read on any dialect: at least a `MERGE` join hint (`OPTION (MERGE JOIN)`, `INNER MERGE JOIN`) is refused on the default `sqlserver` dialect too, and so is a word glued to a number (see *Give `db_lookup` a read-only login* for the list), a name such as `update#n` whose part before an internal `#` or `@` is a write keyword, a `--` comment in a statement with CR-only line endings, and an unquoted column named `receive` (quote it the way the database quotes a name). Only on `dialect='generic'` is MySQL's scalar `INSERT(...)` or `TRUNCATE(...)` admitted, and only with the `(` as the very next character (`TRUNCATE (1.2, 2)`, valid MySQL, is refused); the `db_lookup` test, always on the SQL Server preset, refuses it. While `dialect` is an `env()` value, the declaration tests the poll as `generic` and the build tests it again with the resolved dialect, so the declaration can refuse a read that the resolved `sqlserver` dialect would admit, at least a `--` comment with no space after the dashes that holds a write keyword. On every dialect but `sqlserver` the test scans the statement twice and refuses it if either scan does: once with the T-SQL comment model, which PostgreSQL shares, and once with MySQL's, where `#` starts a comment, `--` starts one only when whitespace follows, block comments do not nest, and a `/*! ... */` or `/*M! ... */` comment is refused, because a server may run its body or read it as a plain comment. It also refuses a bare `CALL` there. The test models T-SQL quoting, so on a `dialect='generic'` poll it can also refuse a valid read (at least a MySQL backslash escape such as `'it\'s'`, a `#` comment containing a write keyword, a `--` comment with no space after the dashes or with a non-ASCII character right after them, any `/*!` or `/*M!` comment (`/*!40001 SQL_NO_CACHE */` included), a nested block comment's tail holding a write keyword or a lone quote, a column named `call` or an unquoted column named `begin`, and a T-SQL `#temp` name whose line ends inside a multi-line literal) and can miss at least a write hidden in a MySQL backslash escape, a PostgreSQL `E'...'` escape or a PostgreSQL dollar quote, or behind a line comment that a lexer ends at a character the test does not know. A stored-procedure poll is refused even when the procedure only reads, because the test cannot see its body. With a `mark_statement` the login must be able to write, so keep the poll free of writes yourself; a feed with no `mark_statement` can use a read-only login. Mark rows with `mark_statement`. |
 | `mark_statement` | — | run **per row after** the handler succeeds, with `:name` params bound from the row, e.g. `UPDATE mf_inbox SET status='DONE' WHERE id=:id`. Omit only for a genuinely read-only/idempotent feed. |
 | `body_column` | — | unset → the **whole row** as a JSON object `{column: value}` (pair with `content_type=json`); set → that **one column's value verbatim** (e.g. a column holding an HL7 message → `content_type=hl7v2`) |
 | `poll_seconds` | `5.0` | interval between polls, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774) |
@@ -2366,19 +2441,54 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 | `dialect` / `odbc_driver` / `odbc_params` / `odbc_user_key` / `odbc_password_key` | `sqlserver` / … | same as `Database(...)` — `dialect="generic"` polls an OS-installed ODBC driver (PostgreSQL / MySQL); see [*Generic ODBC*](#generic-odbc-postgresql--mysql) |
 | `auth` / `username` / `password` / `port` / `encrypt` / `trust_server_certificate` / `connect_timeout` / `app_name` / `pool_max` | — | identical to the `Database(...)` destination above |
 
-**Mark mechanism — your choice via `mark_statement`.** A **status column** (lead pattern:
-`SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue** (`DELETE … WHERE
-id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor) all work — the connector
-just runs whatever statement you declare, bound from the row.
+**Mark mechanism — your choice via `mark_statement`.** You can mark with a **status column** (lead
+pattern: `SELECT … WHERE status='NEW'` + `UPDATE … SET status='DONE'`), a **delete-from-queue**
+(`DELETE … WHERE id=:id`), or a **high-water-mark** cursor (an `UPDATE` advancing a stored cursor); the
+connector just runs whatever statement you declare, bound from the row. They are not equally safe. A
+high-water mark can leave a row that was never handed off behind its cursor, even with the poll's
+stop at a failed row (BACKLOG #4921). It does at least in the cases *Reliability* below names, and in
+two more with no handler failure at all. Over a cursor column with ties and a `>` predicate, a row
+not yet handed off that shares its cursor value with a row already marked is never selected, such as
+one that falls just past the `poll_max_rows` cut. And a row that commits after a row with a higher cursor value was
+already polled and marked is never selected either, as concurrent inserts into an identity or
+sequence column can do. The engine never reads a row lost those two ways, so nothing records it.
+Unless the feed can afford such a loss, mark with a status column or a delete-from-queue whose
+`WHERE` matches only the row handed off, by a unique key.
 
 **Reliability — at-least-once, tolerate duplicates.** A crash (or a `mark_statement` failure) after the
 handler ingested a row but before the mark commits re-emits that row next poll, so the **downstream
 pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefly down) leaves the row
 **unmarked** so it retries — never marked-and-dropped. At least two shapes break that: a
 `poll_statement` that writes (see the `poll_statement` row above), and a high-water-mark
-`mark_statement`. After a handler failure the poller goes on to the next row, and that row's mark
-advances the cursor past the failed one, so the failed row is never read again. Where that matters,
-mark with a status column or a delete-from-queue. A `poll_statement` the read-only test refuses never
+`mark_statement` over a `poll_statement` that does not return rows in cursor order, or over a
+cursor column that is not unique (below). A high-water mark loses a row in further cases, in cursor
+order too; *Mark mechanism* above names them.
+**With a `mark_statement`, a handler failure also stops the
+poll at that row** (BACKLOG #4921): no later row of the same poll is handed off or marked, and the
+next poll starts again from what is still unmarked. With no `mark_statement` the poll goes on: no
+mark can move past the failed row, so stopping would not make a later poll any likelier to read it. That keeps a high-water-mark `mark_statement` from moving the cursor past
+a row whose handler failed, **provided `poll_statement` returns rows in cursor order** (`ORDER BY` the cursor
+column): a later row's mark would otherwise do so, and the poll would never select the failed row
+again. Without that order, a row with a higher key handed off earlier in the same poll has already
+moved the cursor past it. On a cursor column with ties, such as a timestamp, a failed row that
+shares its cursor value with a row handed off before it in the same poll is lost even in cursor
+order: that row's mark sets the cursor to the shared value, and a `>` predicate never selects the
+failed row again. **The trade-off is head-of-line blocking.** A row whose handler fails on
+every attempt, such as one whose value a server store rejects as too long, holds back every row
+`poll_statement` returns after it, on every poll and whatever the mark shape, a status column or a
+delete-from-queue included; with an `ORDER BY` that is the whole feed. Each failure logs a WARNING
+and, when connection events are captured, emits a `handler_error` connection event. With a
+`mark_statement` that is at most one event per poll, since the poll stops at the failure; with none
+it is one per failing row. Its reason renders the error the way the log line does: a driver error as its type, SQLSTATE and
+native error number, without its message, and any other error as the scrubbed, bounded text of
+`safe_exc`, which is a bound rather than a guarantee that no value survives. Repair or remove that
+row to release the feed.
+**The stop closes only the handler-failure path, not high-water-mark loss outright.** A row the
+source cannot decode is different, and so is a body the configured `encoding` cannot carry; neither
+reaches the handler. Each is skipped rather than stopped at (see
+[per-tick poll ceilings](#per-tick-poll-ceilings)), so with a high-water mark a later row's mark
+still moves the cursor past it, and its `row_undecodable` event is the record of it.
+A `poll_statement` the read-only test refuses never
 reaches the poller: the connection is refused when declared or built (BACKLOG #2178). A poll error at
 run time is **logged, not fatal** — a statement the database rejects or a dropped connection never
 kills the poller; it retries next interval.
@@ -4000,8 +4110,8 @@ Facts that are easy to get wrong, stated plainly first:
   **MLLP, raw-TCP, X12 and HTTP** listeners emit an ADR 0021 `at_capacity` (and
   `peer_not_allowlisted`) connection_event; the **DICOM** listener refuses identically but emits **no
   connection event at all** — `transports/dicom.py` contains zero `_emit_event` call sites. X12 sat
-  in that silent set until BACKLOG #1665 and no longer does: it now records the same seven kinds as
-  its raw-TCP twin, so an X12 refusal at either gate is no longer evidence-free.
+  in that silent set until BACKLOG #1665 and no longer does: it now records the same kinds as its
+  raw-TCP twin, so an X12 refusal at either gate is no longer evidence-free.
   The slow-loris guard is the **separate**
   `receive_timeout` (default 60 s), not `max_connections`; the HTTP listener additionally answers a
   synchronous `408` when a request read exceeds it.
@@ -4048,6 +4158,10 @@ Facts that are easy to get wrong, stated plainly first:
   listeners took the same key and default from vault BACKLOG #2606. **The HTTP listener has the key
   but it ships OFF**: it answers one request per connection, so behind a reverse proxy any per-host
   cap would be its whole capacity. Set it there only where the listener sees real client addresses.
+  The HTTP listener does ship `max_handshakes_per_host` (32) **on**. It counts only the sockets one
+  address holds while their TLS handshake runs, with `tls = true` on the stdlib loop, and refuses
+  the same pre-ingress way with that reason on its `at_capacity` event (vault BACKLOG #4888; see
+  its `Http()` row and [DEPLOYMENT.md](DEPLOYMENT.md#per-address-listener-caps-behind-the-vip)).
   The DICOM SCP has no such key. Its own per-host cap is a constant, and it counts only connections
   with no association yet; see its paragraph below.
 - **An allowlist refusal is logged at most once per address per minute.** On the MLLP, raw-TCP, X12
@@ -4282,9 +4396,11 @@ the poll does not fetch is still in the table, unmarked. The next tick takes it.
 the [`poll_statement`](#database-source--databasepoll) row. On `DatabasePoll(...)`
 a later tick reaches the rest only if `mark_statement` takes each handled row out of what
 `poll_statement` selects; without that, a poll can select the same rows every time. Even with it, at
-least one case would defeat the deferral: 64 or more rows that cannot become a body, sorting ahead of
-the rest, end every poll at the skip cap described below, so the rows behind them would never be
-reached. With a `poll_statement` that does not write, nothing is quarantined, errored, or
+least two cases would defeat the deferral: 64 or more rows that cannot become a body, sorting ahead of
+the rest, end every poll at the skip cap described below, and one row whose handler fails every time
+stops every poll at that row (BACKLOG #4921, the head-of-line trade-off in the
+[Database source](#database-source--databasepoll) section), so in either case the rows behind would
+never be reached. With a `poll_statement` that does not write, nothing is quarantined, errored, or
 accepted-and-dropped, so the count-and-log invariant is untouched: an item that was never read was
 never received, and there is no disposition to record. A poll that writes and passes the read-only
 test would break that: at least the rows it marked past the ceiling would be accepted-and-dropped.
@@ -4326,7 +4442,8 @@ to prevent.
 **A database row that cannot become a body does not spend it either, and the two sources reach that
 by different routes.** A file source charges on **completion**, so it simply does not count an item it
 left in place. The database ceiling is charged at the **fetch**, for the memory reason above, so the
-row has to be decoded under the open cursor and replaced from the same cursor — the shortfall is
+row has to be decoded, and its body encoded in the configured `encoding` (BACKLOG #4921), under the
+open cursor and replaced from the same cursor — the shortfall is
 re-fetched, never the whole result set. Do not read this as parity of mechanism; what the two share is
 that a budget can only be charged by something that makes progress. Two bounds keep the replacement
 from becoming a log flood: a `body_column` that names no column `poll_statement` selects is **static**
@@ -4346,7 +4463,7 @@ reading this page already applies to a file the scan never opened.
 | Raw TCP listener (inbound) | `max_connections` default 256 concurrent clients, plus `max_connections_per_host` default 32 from any one peer address (vault BACKLOG #2606) | accepted then immediately refused and closed with an `at_capacity` connection_event | as MLLP |
 | X12 listener (inbound) | `max_connections` default 256 concurrent clients, plus `max_connections_per_host` default 32 from any one peer address (vault BACKLOG #2606) | connection accepted, then immediately refused and closed at the application layer; the active-client counter is not incremented. An ADR 0021 `at_capacity` connection_event is emitted, as on the raw-TCP listener (BACKLOG #1665); an allow-list refusal emits `peer_not_allowlisted` and a WARNING log, throttled to one per address per 60 s | as MLLP |
 | Raw TCP / X12 destination | as MLLP destination — one delivery per outbound lane | a lane waits for a processing slot; a fresh connection is dialled per delivery | transient failure re-queues into the retry path |
-| HTTP web-service listener (inbound) | `max_connections` default 256; `max_connections_per_host` available but **off** by default (vault BACKLOG #2606); `max_header_bytes` 64 KiB and `max_body_bytes` 16 MiB bound one request | at capacity the connection is accepted then refused and closed (`at_capacity`); an over-declared `Content-Length` is refused before buffering; a slow read gets a synchronous `408` | the partner retries; slots free on completion or `receive_timeout`, and with `tls = true` on the stdlib loop also when a handshake fails or runs past its 10 s bound (BACKLOG #2479) |
+| HTTP web-service listener (inbound) | `max_connections` default 256; `max_connections_per_host` available but **off** by default (vault BACKLOG #2606); `max_handshakes_per_host` default 32 sockets from one peer address still in their TLS handshake, with `tls = true` on the stdlib loop only (vault BACKLOG #4888); `max_header_bytes` 64 KiB and `max_body_bytes` 16 MiB bound one request | at capacity the connection is accepted then refused and closed (`at_capacity`); an over-declared `Content-Length` is refused before buffering; a slow read gets a synchronous `408` | the partner retries; slots free on completion or `receive_timeout`, and with `tls = true` on the stdlib loop also when a handshake fails or runs past its 10 s bound (BACKLOG #2479) |
 | File endpoint — local filesystem | one poll worker per inbound connection; one delivery lane per outbound | no connection limit exists — the bounds are the poll interval `poll_seconds` (default 1.0), `max_file_bytes` (16 MiB) and `poll_max_files` (500 files per scan, [deferring the rest to the next scan](#per-tick-poll-ceilings)) | an oversize or unreadable file is skipped/errored and left for the operator; the next poll continues |
 | File endpoint — UNC / SMB share | as local File, plus one dedicated impersonation worker thread per endpoint | the OS redirector queues; no engine-side cap | an SMB failure surfaces as a transient delivery/poll error and re-queues |
 | SFTP (remote-file) | one session per poll or per delivery — no session pool | sessions are serialized by the lane budget; there is no server-side connection cap the engine enforces; one poll takes at most `poll_max_files` (500) files and [defers the rest](#per-tick-poll-ceilings) | a refused/limited server surfaces as a transient error and re-queues per `RetryPolicy` |
@@ -4394,10 +4511,10 @@ reading this page already applies to a file the scan never opened.
 |---|---|---|---|---|
 | MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds how long a frame may take to complete, on the clock the `receive_timeout` bullet under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) describes, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against. With `tls = true`, a new connection has a fixed 10 s to finish its TLS handshake or the listener aborts it, and a connection the listener closes has a fixed 5 s for the TLS close exchange (on stop, the socket is closed as soon as its close notice is sent, except under uvloop, below). On the stdlib event loop (always on Windows), `source_ip_allowlist`, `max_connections` and `max_connections_per_host` apply **before** the handshake (BACKLOG #1606): the listener accepts plain TCP, refuses or admits the socket exactly as a plaintext listener does, and only then starts TLS. So a socket still in its handshake holds a real slot, and a peer outside the allowlist never gets a handshake. **Under uvloop the loop still runs the handshake, and all three apply only after it**, so there the handshake bound limits how long such a socket lives, not how many a peer can open. The engine runs on uvloop wherever it is installed, which the engine's own `uvloop` dependency does for CPython outside Windows. Neither TLS bound is operator-configurable: both are engine-fixed work with nothing partner-sized in them | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace; stop also closes a socket still in its TLS handshake. Under uvloop, whose server offers no `close_clients()`, stop leaves such a socket to the 10 s bound and refuses it unread if it finishes the handshake after stop began, and stop can also wait up to the 5 s close-exchange bound for a peer that does not answer its close notice | a TLS handshake over its bound, or one that fails, is aborted; on the standard asyncio loop with a DEBUG line, giving its slot back, and under uvloop before any slot is taken. A failed one is recorded as a throttled `tls_handshake_failed` connection event on any loop; [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) says what it counts and when it names the peer (vault BACKLOG #2613, #3302); a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
-| Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame on the same clock as MLLP's (vault BACKLOG #2606 and #2847), which is what reaches a peer that trickles bytes; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset` | n/a |
-| X12 listener (inbound) | `receive_timeout` 60 s; `max_frame_seconds` 60 s bounds how long one interchange may take to complete, on the same clock as MLLP's (vault BACKLOG #2606); `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries. This listener emits the same seven kinds as the raw-TCP row above (BACKLOG #1665) | n/a |
+| Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame on the same clock as MLLP's (vault BACKLOG #2606 and #2847), which is what reaches a peer that trickles bytes; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is `handler_error`, never `framing_error`. An HL7 inbound with acknowledgements on records it at once and closes with no reply, so its sender resends. Any other holds the frame and retries until it is recorded or the listener stops, and records `handler_error` only for a fault that outlasts several attempts or one a stop ends; a fault an earlier retry clears logs WARNING lines and no event. A stop during the hold gets one last attempt; if that fails too, or stop cancels it, the held frame and every frame behind it on that connection are lost. The held frames are only in memory, so the process dying during the hold loses them too. The `hold_and_retry` docstring in [`transports/base.py`](../messagefoundry/transports/base.py) states how (BACKLOG #5022) | n/a |
+| X12 listener (inbound) | `receive_timeout` 60 s; `max_frame_seconds` 60 s bounds how long one interchange may take to complete, on the same clock as MLLP's (vault BACKLOG #2606); `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries; a fault inside the inbound handler is handled as on the raw-TCP row above. This listener emits the same kinds as the raw-TCP row above (BACKLOG #1665, #5022) | n/a |
 | Raw TCP / X12 destination | `connect_timeout` 10 s, `timeout_seconds` 30 s | a fresh connection per delivery, closed in `finally` | transient vs permanent classification as MLLP | `RetryPolicy` |
-| HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408`. With `tls = true`, the MLLP listener row's fixed 10 s handshake bound applies, and so does its admission order on each event loop (BACKLOG #2479): on the stdlib loop `source_ip_allowlist`, `max_connections` and `max_connections_per_host` act **before** the handshake, and a socket they refuse there is closed with no answer, since a TLS client cannot read a plaintext `403` or `503`. The TLS close exchange keeps asyncio's 30 s default here, since a `reply_from` answer can be partner-sized | handler `finally` closes the connection with a shutdown grace; stop also closes a socket still in its TLS handshake on the stdlib loop | an over-size body is refused before buffering; a TLS handshake over its bound, or one that fails, is aborted, as on the MLLP row | n/a |
+| HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408`. With `tls = true`, the MLLP listener row's fixed 10 s handshake bound applies, and so does its admission order on each event loop (BACKLOG #2479): on the stdlib loop at least `source_ip_allowlist`, `max_connections`, `max_connections_per_host` and `max_handshakes_per_host` act **before** the handshake, and a socket they refuse there is closed with no answer, since a TLS client cannot read a plaintext `403` or `503`. The TLS close exchange keeps asyncio's 30 s default here, since a `reply_from` answer can be partner-sized | handler `finally` closes the connection with a shutdown grace; stop also closes a socket still in its TLS handshake on the stdlib loop | an over-size body is refused before buffering; a TLS handshake over its bound, or one that fails, is aborted, as on the MLLP row | n/a |
 | File endpoint — local filesystem | **none** — filesystem I/O is unbounded by design | file handles are context-managed; the source file is moved/deleted/left per `after_read` | an unreadable/oversize file is skipped or moved to `error_subdir` | `RetryPolicy` on the outbound write |
 | File endpoint — UNC / SMB share | **none engine-owned** — bounded only by the OS SMB redirector | the impersonation token is reverted (`RevertToSelf`) and the worker thread is per-endpoint isolated | a share failure surfaces as a transient poll/delivery error | `RetryPolicy` |
 | SFTP (remote-file) | 30 s on the TCP connect, the SSH banner exchange and authentication (`timeout`, `banner_timeout` and `auth_timeout` on `paramiko.SSHClient.connect`), plus 120 s on opening the SFTP session (BACKLOG #1936), on **each read** from the established SFTP channel, and on each step of an upload that stops making progress (BACKLOG #2082). All are hard-coded in `transports/remotefile.py`; `Sftp()` exposes no timeout argument, so none is operator-configurable. The bounds are **not complete**: the "Timeouts are per-connector, not universal" paragraph under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) says what each covers and where a gap is left | the `paramiko` session is closed in `finally` per poll or delivery | **Delivery:** at connect, a rejected host key is **permanent**, and an authentication refusal is permanent and flagged as a credential fault. A banner, key-exchange or authentication timeout, a connection dropped before the key exchange completes, and an `OSError`/`EOFError` are transient (BACKLOG #1999; the bullet under [Remote file](#remote-file--sftp--ftp) says where the rules are stated). After connect, a missing remote path is permanent, and at least the session-open and read timeouts are transient. With `validate_directory` on, the pre-upload directory check re-raises any failure but a credential refusal as transient, these included. A write that stops making progress for 120 s (`SFTP_WRITE_STALL_SECONDS`, per step, BACKLOG #2082), an `EOFError` and a helper thread that cannot start are transient; a `paramiko.SFTPError` is permanent. **Source:** the poller does not act on that split; a failed connect, listing or retrieve is logged and tried again on the next poll | `RetryPolicy` |
