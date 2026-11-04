@@ -192,6 +192,22 @@ _SHAPES_A_SECOND_PASS_PRINTED = (
     "&b2qf6q;AccessToken=%5E,QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB/secret: xprivate_key=",
 )
 
+#: Lines a seeded run of the differential below found printing a value ``origin/main`` hid, once
+#: its corpus held the support bundle's ``mfb64:v1:`` marker and the PHI pass's JSON keys (BACKLOG
+#: #5030). In order: the mask took the marker's ``v1``, so a chain line the bundle read back no
+#: longer held the marker its ``_MFB64`` sweep reads; the same with a word glued on before the
+#: marker, which ``_MFB64`` reads too, having no word boundary; the same once more; a word masked
+#: whole after a marker, whose "_" had ended the marker's base64 run, so the bundle's match ran on
+#: over the next marker's head; and a JSON key the mask took, whose value the PHI pass reads across
+#: a line break the control-character filter wrote as text.
+_SHAPES_A_MARKER_OR_JSON_KEY_PRINTED = (
+    "connect failed;xpass=mfb64:v1:a1qkey= tail",
+    "connect failed;xpass=amfb64:v1:b2qkey= tail",
+    "%26;sslpassword=mfb64:v1:c3qkey=\t{password=ABC|",
+    ";xpass=mfb64:v1:x_mfb64:v1:d4qkey= tail",
+    ';xpass="family": \ne5q',
+)
+
 _NEVER = re.compile(r"(?!)")
 _UNIT = secretscrub._MEMBER_VALUE_UNIT.pattern
 
@@ -257,11 +273,38 @@ _RULE_CONTROLS = (
         re.compile(_UNIT.replace("|%(?:7[CcEe]|5[Ee]|26)", "")),
         ".d4q%26\n;xpass=%5E",
     ),
+    (
+        "bundle marker",
+        "_MEMBER_VALUE_UNIT",
+        re.compile(_UNIT.replace("|mfb64:v1:", "").replace(r"(?:(?!mfb64:v1:)[\w.\-])++", r"[\w.\-]++")),
+        _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[0],
+    ),
+    (
+        "bundle marker after a glued word",
+        "_MEMBER_VALUE_UNIT",
+        re.compile(_UNIT.replace(r"(?:(?!mfb64:v1:)[\w.\-])++", r"[\w.\-]++")),
+        _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[1],
+    ),
+    (
+        "end of the marker's base64 run",
+        "_MEMBER_B64_STOP",
+        _NEVER,
+        _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[3],
+    ),
+    (
+        "kept PHI JSON key words",
+        "_MEMBER_KEEP",
+        _keep_without("family", "given", "birthdate", "identifier", "telecom"),
+        _SHAPES_A_MARKER_OR_JSON_KEY_PRINTED[4],
+    ),
 )  # fmt: skip
 
 #: Fragments for the seeded differential below: the labels and separators of every pass, the
-#: HL7, DICOM and userinfo shapes a later PHI pass reads, and planted values ``<letter><digit>q``.
+#: HL7, DICOM and userinfo shapes a later PHI pass reads, the bundle's ``mfb64:v1:`` marker whole,
+#: glued and broken, and planted values ``<letter><digit>q``.
 _DIFFERENTIAL_PIECES = (
+    "mfb64:v1:", "amfb64:v1:", "x_mfb64:v1:", "mfb64:", ":v1:", "mfb64:v2:", "MFB64:v1:", "key=",
+    '"family": ',
     ";PWD=", ";sslpassword=", ";xpass=", ";AccessToken=", ";Token=", "password=", "password'=",
     'password":', "secret=", "secret: ", "api_token=", "token=", "private_key=", "encryption_key={",
     "MEFOR_X=", "postgres://svc:", "@db", "%2Cpassword=", "Bearer ", "?code=", "&state=",
@@ -270,6 +313,29 @@ _DIFFERENTIAL_PIECES = (
     "\t", "%7C", "%5E", "%26", "|", "^", "/", "a1q", "b2q", "c3q", "d4q", "e5q", "f6q",
     "[REDACTED]", "<redacted>",
 )  # fmt: skip
+
+
+#: A second seeded block, each line a member key and then a value of these pieces: the bundle
+#: marker whole and glued, kept words over planted values, a PHI JSON key, and the characters that
+#: end a base64 run or a line. The random block above holds the marker too rarely to find a defect
+#: in it: with each of the marker unit, the glued-word stop, the run end and the JSON key words
+#: switched off in turn, its 1,500 lines found none, and these 400 found 33, 30, 2 and 2 lines.
+_MEMBER_LED_KEYS = (";PWD=", ";sslpassword=", ";xpass=", ";AccessToken=")
+_MEMBER_LED_OPENERS = ("", "", "", '"family": ')
+_MEMBER_LED_PIECES = (
+    "mfb64:v1:", "amfb64:v1:", "x_mfb64:v1:", "a1qkey=", "b2qtoken=", "c3q", "_", ".", "+", "/",
+    "=", " ", "\n", '"family": ', "\x0c", "d4q",
+)  # fmt: skip
+
+
+def _member_led_lines() -> list[str]:
+    rng = random.Random(4)
+    return [
+        rng.choice(_MEMBER_LED_KEYS)
+        + rng.choice(_MEMBER_LED_OPENERS)
+        + "".join(rng.choice(_MEMBER_LED_PIECES) for _ in range(rng.randint(2, 7)))
+        for _ in range(400)
+    ]
 
 
 class _Capture(logging.Handler):
@@ -345,22 +411,49 @@ def test_a_second_or_third_redaction_prints_nothing_the_baseline_hid(
     """A differential over every redaction path: each planted value printed WITH the member pass is
     printed without it too, on one pass and on two or three. A draft that replaced the whole value
     passed the one-pass half of this and failed the rest (the shapes above, and 124 to 145 random
-    lines of 320,000 on each later path). The commit records the full measurement."""
+    lines of 320,000 on each later path), and a mask that took the bundle marker's ``v1`` failed
+    it on a chain line the bundle read back.
+
+    This is a sample, not a proof: a pass says these lines print nothing the baseline hid. The
+    commit records a larger seeded run of the same differential, which is a fuzz result too."""
     rng = random.Random(5030)
     lines = [
         *_SHAPES_THE_FIRST_DRAFT_PRINTED,
         *_SHAPES_A_SECOND_PASS_PRINTED,
+        *_SHAPES_A_MARKER_OR_JSON_KEY_PRINTED,
         *(shape for *_, shape in _RULE_CONTROLS),
         *(
             "".join(rng.choice(_DIFFERENTIAL_PIECES) for _ in range(rng.randint(3, 14)))
             for _ in range(1500)
         ),
+        *_member_led_lines(),
     ]
     with_member = [_every_redaction_path(line) for line in lines]
     with monkeypatch.context() as patched:
         _without_member_pass(patched)
         baseline = [_every_redaction_path(line) for line in lines]
     assert _printed_where_the_baseline_hid(lines, with_member, baseline) == []
+
+
+def test_a_bundle_marker_in_a_member_value_is_still_read_by_the_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The line a review found: the mask wrote ``mfb64:redacted:``, so a chain line the bundle read
+    back printed ``QUJDkey``, which ``origin/main`` hid there. On every path, the body prints only
+    where the baseline prints it too, and every path through the bundle hides it."""
+    line = "connect failed;xpass=mfb64:v1:QUJDkey= tail"
+    paths = _every_redaction_path(line)
+    with monkeypatch.context() as patched:
+        _without_member_pass(patched)
+        baseline = _every_redaction_path(line)
+    assert [
+        p for p, out in paths.items() if "QUJDkey" in out and "QUJDkey" not in baseline[p]
+    ] == []
+    through_the_bundle = [
+        p for p in paths if "bundle" in p or p.startswith(("redact_log_line", "store path"))
+    ]
+    assert len(through_the_bundle) == 5
+    assert [p for p in through_the_bundle if "QUJDkey" in paths[p]] == [], paths
 
 
 def test_the_differential_fails_on_the_whole_value_draft(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -436,6 +529,11 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
         "redaction glued credential words": redaction._GLUED_CREDENTIAL_WORDS,
         "redaction DICOM label words": redaction._DICOM_LABEL_WORDS,
         "redaction widened key words": redaction._WIDENED_KEY_WORDS,
+        "redaction JSON key words": tuple(
+            redaction._PHI_LEAF_KEYS
+            | redaction._PHI_STRUCTURE_ONLY_KEYS
+            | redaction._PHI_VALUE_KEYS
+        ),
         "redaction MRN": ("mrn",),
         "bundle scheme words": ("bearer", "basic", "digest", "mfb64"),
     }
@@ -465,6 +563,11 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
         (";xpass=x.PID|1||", ";xpass=redacted.PID|redacted||"),
         (";xpass=(0010,1000)c3q", ";xpass=(0010,1000)redacted"),
         (";xpass=nonnumeric port: 'd4q@h'", ";xpass=nonnumeric port: 'd4q@h'"),
+        # The bundle marker stays, glued or not, and the "_" that ended its base64 run stays.
+        (";xpass=mfb64:v1:a1q b2q", ";xpass=mfb64:v1:redacted redacted"),
+        (";xpass=amfb64:v1:a1q", ";xpass=redactedmfb64:v1:redacted"),
+        (";xpass=mfb64:v1:a1q_b2q.c3q", ";xpass=mfb64:v1:redacted_redacted"),
+        (";xpass=a1q_b2q", ";xpass=redacted"),
         # A base64 run stays long enough for the bundle's sweep.
         (";xpass=a1q QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", ";xpass=redacted " + "redacted" * 4),
         # A kept word only stays where a later pass reads it: here it is a password or a token.
