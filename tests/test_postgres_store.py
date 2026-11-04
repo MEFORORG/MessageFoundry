@@ -5236,7 +5236,7 @@ async def test_over_max_message_bytes_naks_ar_pg(store) -> None:
     assert await _attachment_count(store) == 0
 
 
-async def test_stream_inflight_budget_naks_ae_pg(store) -> None:
+async def test_stream_inflight_budget_naks_ar_pg(store) -> None:
     b64 = _big_b64(2000)
     raw = _hl7_with_doc(b64)
     ic = _streaming_ic(threshold=500)
@@ -5249,7 +5249,8 @@ async def test_stream_inflight_budget_naks_ae_pg(store) -> None:
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
-    assert _stream_ack_code(ack) == "AE"  # detach refused (backpressure) → NAK AE
+    # The body alone is over the whole budget, so no re-send could fit: final, AR (BACKLOG #5078).
+    assert _stream_ack_code(ack) == "AR"
     row = await _only_message(store)
     assert row["status"] == MessageStatus.ERROR.value
     assert "streaming detach failed" in row["error"]

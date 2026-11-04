@@ -22,11 +22,11 @@
   **`413`** on every over-size path, and any other **`422`**, each naming the `ERROR` row as
   `refused_message_id`. D5's note and **AC-8** keep their text, with a dated note in place. See
   [Amendment 2026-10-30, refusal kinds](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).
-- **Amended 2026-11-03 (BACKLOG #5078; owner ruling 2026-11-04, decision log
-  d20261104T032854299-7235a9):** a strict-validation timeout whose validate never began, because no
+- **Amended 2026-11-03 (BACKLOG #5078; owner ruling of 2026-11-03, decision log
+  d20261104T032854299-7235a9, stamped in UTC):** a strict-validation timeout whose validate never began, because no
   worker thread came free or ran it inside the timeout, is **temporary** (`503` with `Retry-After`,
   `AE` on MLLP); one that began is **final** (`422`, `AR` on MLLP). Every strict-validation failure
-  answers `AR` on MLLP.
+  answers `AR` on MLLP, and so does every streaming-detach refusal the receipt path answers as final.
   The 2026-10-30 amendment keeps its text, with a dated note in place. See
   [Amendment 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary).
 - **NOTE: what acceptance authorised, and what has since been built.** "Accepted" normally means *build may
@@ -1492,7 +1492,7 @@ It may be reclassified only if a discriminator is later measured that tells a bo
 a retry from one which would time out again.
 *(Amended 2026-11-03, BACKLOG #5078: one such discriminator is now measured and built, for the case
 where the validate never began. That case is temporary; a timeout whose validate began stays
-permanent, as above, and the owner accepted that on 2026-11-04. See the
+permanent, as above, and the owner accepted that on 2026-11-03. See the
 [amendment of 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary).)*
 
 **One code for over-size.** A body over the listener's `max_body_bytes` already answered `413`, before
@@ -1531,7 +1531,8 @@ leaving one `ERROR` row per attempt.)*
 
 **Who decided.** BACKLOG #5078 asked for a measured discriminator or an owner acceptance of the final
 `422`. The batch 604 Manager had the discriminator below built and measured. The owner ruled on
-2026-11-04, in the Manager's session (decision log d20261104T032854299-7235a9), on the rest:
+2026-11-03, in the Manager's session (decision log d20261104T032854299-7235a9, whose stamp is in
+UTC), on the rest:
 
 1. MLLP's MSA-1 follows the engine convention, `AR` for a final refusal and `AE` for one a re-send
    may clear, so a strict-validation content failure answers `AR`.
@@ -1577,7 +1578,7 @@ timeout's `AE` as retryable. The kind-to-status mapping (`503`, `422`) is
 The lock protocol itself is pinned by a direct test of `_StrictValidateRun`; the receipt-path arms
 cannot see it, because cancelling the executor future already skips a queued job.
 
-**What the discriminator does not see, which the owner ruling of 2026-11-04 accepts as final.** The
+**What the discriminator does not see, which the owner ruling of 2026-11-03 accepts as final.** The
 cost the 2026-10-30 amendment recorded is narrowed, not removed: a valid body in either case below is
 refused as final, and a sender, the engine's own outbounds included, does not re-send it.
 
@@ -1599,6 +1600,16 @@ fault, and a body alone can reach its defensive catch-all (a plain `IndexError` 
 MSH-2 run into MSH-3, pinned in `tests/test_strict_refusal_classes.py`). The engine's own MLLP outbound
 dead-letters `AR` at once and retries `AE`. Why the engine's `AR` and `AE` depart from the HL7 v2
 letter is stated once, in `messagefoundry/CLAUDE.md`, *ACK/NAK*.
+
+**The streaming detach follows the same rule.** Ruling 1 reaches every refusal the engine treats as
+final, not only strict validation's. The MLLP listener's detach arm answered `AE` for every detach
+refusal but an escaped document, while the receipt path classes a body alone over the whole in-flight
+budget as over-size and a backend that cannot stream or a malformed document handle as permanent
+(the 2026-10-30 classification table above). Both listeners now take the class from one function,
+`_detach_refusal_kind` in `pipeline/wiring_runner.py`, and MLLP answers `AE` only for a budget held by
+concurrent detaches (temporary, `503`) and `AR` for every final class. The tests in
+`tests/test_ingress_document_detach.py` drive each final case end to end from the engine's own MLLP
+outbound, which reads its `AR` as permanent, with the held budget's `AE` as the control.
 
 **What else is unchanged.** Strict validation's own size cap stays the engine default, 16 MiB,
 whatever the inbound's `max_message_bytes`. `docs/HL7-VALIDATION.md` says so for operators. The dry

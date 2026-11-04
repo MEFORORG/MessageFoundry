@@ -2,7 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Strict validation's refusals are classed alike on MLLP and on the receipt path (BACKLOG #5078).
 
-The matrix, owner ruling 2026-11-04 (decision log d20261104T032854299-7235a9). MLLP follows the
+The matrix, owner ruling of 2026-11-03 (decision log d20261104T032854299-7235a9, stamped in UTC).
+MLLP follows the
 engine convention, AR for a final refusal and AE for one a re-send may clear:
 
 =====================================  ===============  ================
@@ -233,7 +234,7 @@ def one_worker(monkeypatch: pytest.MonkeyPatch) -> Iterator[_OneWorker]:
 async def test_a_timeout_that_began_is_final_to_the_engines_mllp_outbound(
     store: MessageStore, tmp_path: Path, one_worker: _OneWorker
 ) -> None:
-    """Owner ruling 2026-11-04: a timeout whose validate began is final on MLLP too. The worker is
+    """Owner ruling of 2026-11-03: a timeout whose validate began is final on MLLP too. The worker is
     free, so the validate begins and hangs past the timeout. A 1 s timeout, so a thread slow to be
     scheduled under GIL contention still begins inside it. Mutation: answer every timeout AE, as
     before the ruling. Red: AE, not permanent."""

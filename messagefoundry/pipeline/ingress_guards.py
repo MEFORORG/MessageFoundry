@@ -35,7 +35,8 @@ the next paragraph. And the live guards after it.
 
 **The strict-validation timeout is mirrored by measurement.** The listener runs ``hl7apy`` off the
 event loop under :func:`strict_validate_timeout` and records ``ERROR`` on expiry. What the sender
-hears depends on whether the validate began (BACKLOG #5078, owner ruling 2026-11-04): one that began
+hears depends on whether the validate began (BACKLOG #5078, owner ruling of 2026-11-03, decision
+log d20261104T032854299-7235a9, stamped in UTC): one that began
 is final, an ``AR`` from ``_handle_inbound`` for a source that takes a reply (MLLP, TCP) and a
 permanent refusal from ``_handle_inbound_http``, which the HTTP listener answers ``422``; one that
 never began (no worker thread ran it inside the timeout) is temporary, an ``AE`` or a ``503``. The

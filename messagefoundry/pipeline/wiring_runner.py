@@ -912,7 +912,8 @@ class _StrictValidateTimedOut(Exception):
     the ADR 0154 amendment of 2026-11-03). The timeout counts the wait for a worker thread as well
     as the validate, so under load a body can time out before it is ever looked at. That body says
     nothing about itself, and it left no thread behind, so it is answered as temporary (``503``, or
-    ``AE`` on MLLP). One that had started is final (``422``, or ``AR``; owner ruling 2026-11-04): it
+    ``AE`` on MLLP). One that had started is final (``422``, or ``AR``; owner ruling of 2026-11-03,
+    decision log d20261104T032854299-7235a9, stamped in UTC): it
     may be the slow body the timeout exists for, and its thread is still running. "Began" means the
     worker ran the run's first line; a free thread that the GIL or the OS did not schedule in time
     reads as not begun too, so the reason says only that.
@@ -1030,6 +1031,20 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     DocRefError,
     EscapedDocumentError,
 )
+
+
+def _detach_refusal_kind(exc: Exception) -> RefusalKind:
+    """The class of one of :data:`_DETACH_REFUSALS`, which both listeners answer by (BACKLOG #5078).
+
+    Only the in-flight budget is the engine's own and clears as concurrent detaches finish, so only
+    it invites a re-send, and only when the body would fit the budget once they have: one larger
+    than the whole budget is over-size. An unsupported backend, a malformed handle and an escaped
+    document refuse the same body every time. The receipt path answers the class as is; MLLP answers
+    ``AE`` for TEMPORARY and ``AR`` for every final class (owner ruling of 2026-11-03, decision log
+    d20261104T032854299-7235a9, stamped in UTC)."""
+    if isinstance(exc, _StreamBudgetExceeded):
+        return RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
+    return RefusalKind.PERMANENT
 
 
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
@@ -8176,7 +8191,7 @@ class RegistryRunner:
                 # DoS backstop (#89): dead-letter instead of pinning intake. HTTP owns its own
                 # 202/4xx response — no HL7 ACK here.
                 #
-                # A validate that had begun is PERMANENT (BACKLOG #2105; owner ruling 2026-11-04): a
+                # A validate that had begun is PERMANENT (BACKLOG #2105; owner ruling of 2026-11-03): a
                 # body that times out for its own content times out on every re-send, and each
                 # attempt orphans another hl7apy thread this path cannot kill. One that never began
                 # (no worker thread ran it inside the timeout) tells nothing of the body and left no
@@ -8199,19 +8214,11 @@ class RegistryRunner:
             try:
                 skeleton, attachment_refs = await self._detach_documents(ic, text)
             except _DETACH_REFUSALS as exc:
-                # Only the in-flight budget is the engine's own and clears as concurrent detaches
-                # finish, so only it invites a re-send, and only when the body would fit the budget
-                # once they have: one larger than the whole budget is over-size. An unsupported
-                # backend, a malformed handle and an escaped document refuse the same body every time.
-                if isinstance(exc, _StreamBudgetExceeded):
-                    kind = RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
-                else:
-                    kind = RefusalKind.PERMANENT
                 return await self._refuse(
                     ic,
                     raw,
                     text,
-                    kind,
+                    _detach_refusal_kind(exc),
                     error=f"streaming detach failed: {safe_exc(exc)}",
                     peek=peek,
                 )
@@ -8553,8 +8560,8 @@ class RegistryRunner:
             except _StrictValidateTimedOut as exc:
                 # DoS backstop (#89): dead-letter + NAK instead of pinning the listener. The stored/ACK
                 # string is PHI-safe/value-free (only the numeric timeout) — unlike the validation-error
-                # path below it quotes no field. The same split as the receipt path (owner ruling
-                # 2026-11-04, BACKLOG #5078): a validate that had begun is final, AR, and one that
+                # path below it quotes no field. The same split as the receipt path (owner ruling of
+                # 2026-11-03, BACKLOG #5078): a validate that had begun is final, AR, and one that
                 # never began is temporary, AE.
                 mid = await self._record_refused(ic, raw, text, error=exc.reason, peek=peek)
                 ack = (
@@ -8581,7 +8588,7 @@ class RegistryRunner:
                 # messages:view_summary on read, like every other stored error.
                 persisted = f"strict-validation failed: {safe_text(joined)}"
                 mid = await self._record_refused(ic, raw, text, error=persisted, peek=peek)
-                # AR, not AE (BACKLOG #5078; owner ruling 2026-11-04): every strict failure is final,
+                # AR, not AE (BACKLOG #5078; owner ruling of 2026-11-03): every strict failure is final,
                 # as the receipt path answers it (422, or 413 for validate()'s own size cap), and an
                 # AE invited a sender, the engine's own MLLP outbound included, to retry it. The NAK
                 # goes back to the partner that SENT this message (their own data) and is transient
@@ -8608,9 +8615,8 @@ class RegistryRunner:
         # documents VERBATIM into the attachment substrate BEFORE the ingress commit, so the pipeline
         # carries only the small skeleton + a `mfdoc:v1:ref:` handle. This runs AFTER the synchronous
         # header parse/validate (a malformed header already NAK'd above) and BEFORE the commit/ACK, so a
-        # detach failure is a synchronous ERROR + NAK: AE for budget/backpressure or an unsupported
-        # backend, AR for an escaped document (below) — the message is NEVER accepted-and-dropped, and
-        # no ACK is sent for a body we couldn't store.
+        # detach failure is a synchronous ERROR + NAK, in the receipt path's class (below) — the
+        # message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
@@ -8619,12 +8625,16 @@ class RegistryRunner:
             except _DETACH_REFUSALS as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
-                # A budget or backend refusal may clear on a resend, so AE. An escaped document is the
-                # message itself and fails the same way every time, so AR (vault BACKLOG #2809).
-                if isinstance(exc, EscapedDocumentError):
-                    nak_code, nak_text = "AR", "escaped document in OBX-5.5"
-                else:
-                    nak_code, nak_text = "AE", "streaming detach failed"
+                # The receipt path's class decides MSA-1 (BACKLOG #5078): AE only for a budget held by
+                # concurrent detaches, which a re-send may clear, and AR for every refusal the
+                # receipt path answers as final, a body alone over the whole budget, an unsupported
+                # backend, a malformed handle and an escaped document (vault BACKLOG #2809) alike.
+                nak_code = "AE" if _detach_refusal_kind(exc) is RefusalKind.TEMPORARY else "AR"
+                nak_text = (
+                    "escaped document in OBX-5.5"
+                    if isinstance(exc, EscapedDocumentError)
+                    else "streaming detach failed"
+                )
                 ack = (
                     build_ack(peek, code=nak_code, text=nak_text, ack_mode=ack_mode)
                     if reply

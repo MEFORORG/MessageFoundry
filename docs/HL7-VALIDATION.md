@@ -38,7 +38,8 @@ silent autodetection. Enable strict when: the downstream system is intolerant of
 the feed is contractually conformant, or correctness outweighs throughput. Leave it off for a tolerant
 archival/forwarding feed.
 
-What the sender hears (BACKLOG #5078, owner ruling 2026-11-04):
+What the sender hears (BACKLOG #5078, owner ruling of 2026-11-03, decision log
+d20261104T032854299-7235a9, stamped in UTC):
 
 | Strict outcome | MLLP / TCP | `Http()` |
 |---|---|---|
