@@ -211,7 +211,7 @@ then speaks plain HTTP to the proxy, and you browse to the proxy's address. Secu
 job. So `serve` refuses to start there until you set
 `[api].plaintext_upstream_hop_acknowledged = true`. On any other bind host it refuses the plain HTTP
 hop even then. With your own certificate the hop is TLS instead, and the proxy must speak https to
-the engine. See [docs/SECURITY.md](docs/SECURITY.md).
+the engine; off loopback that bind also needs `MEFOR_TLS_REVOCATION_ATTESTED=1`. See [docs/SECURITY.md](docs/SECURITY.md).
 
 Then open the admin console in a browser (install the web console alongside the engine with
 `pip install -e packaging/messagefoundry-webconsole`; it is on by default for a loopback bind, so

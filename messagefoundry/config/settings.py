@@ -1777,8 +1777,9 @@ class ApiSettings(_Section):
     # In Posture-B the proxy terminates browser TLS. Off loopback the proxy→engine hop then runs over
     # the engine's own TLS (BACKLOG #4636 refuses a plaintext one there, and the revocation gate then
     # applies to that bind), but the engine still cannot tell its peer is the proxy. The ENGINE
-    # cannot observe the proxy's negotiated TLS/KEX or authenticate the internal hop for itself, so an off-loopback Posture-B bind under enforce must not start on trust
-    # alone. These are operator ATTESTATIONS made FAIL-CLOSED (mirroring MEFOR_TLS_REVOCATION_ATTESTED): the serve gate
+    # cannot observe the proxy's negotiated TLS/KEX or authenticate the internal hop for itself, so
+    # an off-loopback Posture-B bind under enforce must not start on trust alone. These are operator
+    # ATTESTATIONS made FAIL-CLOSED (mirroring MEFOR_TLS_REVOCATION_ATTESTED): the serve gate
     # REFUSES an off-loopback Posture-B bind under [security].enforcement=enforce unless both are
     # affirmatively declared, and WARNS on a loopback bind or under enforcement = warn. No instance
     # stays quiet: every instance carries patient data since BACKLOG #1279 (ADR 0186), so the gate

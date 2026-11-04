@@ -135,9 +135,9 @@ bind host is all that matters.
 
 | Topology | Bind address in container (`[security].listen_address`) | API gate outcome | Required config |
 |---|---|---|---|
-| (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`); sign-in is always on (vault BACKLOG #2719) |
+| (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`), plus `MEFOR_TLS_REVOCATION_ATTESTED=1` (ADR 0078); sign-in is always on (vault BACKLOG #2719) |
 | (b) same-pod sidecar | `127.0.0.1` (loopback) | **gate not triggered** (`is_loopback`) | `trusted_proxies=[127.0.0.1]` (for correct client IP) **and** `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055); no in-process cert needed |
-| (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) **and** an operator `tls_cert_file`, so the engine serves that hop over TLS (a plaintext hop off loopback is **refused**, in every mode, acknowledged or not, BACKLOG #4636); on a PHI instance also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b — **refused** without them) |
+| (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) **and** an operator `tls_cert_file`, so the engine serves that hop over TLS (a plaintext hop off loopback is **refused**, in every mode, acknowledged or not, BACKLOG #4636); on a PHI instance also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b — **refused** without them); and `MEFOR_TLS_REVOCATION_ATTESTED=1`, because that bind is in-process TLS (BACKLOG #4636) |
 | (c) loopback publish, no shared netns | `0.0.0.0` (forced — see §1) | same as (a)/(b-separate); `127.0.0.1` bind would be unreachable | same as (a) or (b-separate) |
 
 MLLP gate (`check_mllp_tls_exposure`), per inbound's resolved host (`[inbound].bind_host`, typically

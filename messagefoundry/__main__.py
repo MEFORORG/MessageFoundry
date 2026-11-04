@@ -3510,20 +3510,26 @@ def _serve(args: argparse.Namespace) -> int:
     # accepted: stdlib `ssl` performs no OCSP/CRL fetch and the engine deliberately attempts none (on-
     # prem, offline-by-default; CLAUDE.md §2). So refuse fail-closed unless the operator attests
     # (MEFOR_TLS_REVOCATION_ATTESTED=1) that its PKI enforces revocation; a declared terminator does
-    # not exempt the bind (BACKLOG #4636, the predicate's docstring says why). Layered AFTER the §0 exposed-bind ladder above (extend-never-weaken), like the keyless-store /
-    # open-egress / MFA-at-exposure gates.
+    # not exempt the bind (BACKLOG #4636, the predicate's docstring says why). Layered AFTER the §0
+    # exposed-bind ladder above (extend-never-weaken), like the keyless-store / open-egress /
+    # MFA-at-exposure gates.
     if in_process_tls_revocation_refused(
         tls_enabled=settings.api.tls_enabled,
         is_loopback=settings.api.is_loopback,
         attested=tls_revocation_attested(),
     ):
+        terminator_note = (
+            "The declared [api].tls_terminated_upstream does not exempt this bind: the engine still "
+            "terminates the proxy-to-engine hop's TLS itself (BACKLOG #4636). "
+            if settings.api.tls_terminated_upstream
+            else ""
+        )
         print(
             "error: refusing to serve the API with in-process TLS on non-loopback host "
             f"{settings.api.host!r}: the engine terminates TLS itself but performs NO certificate "
             "revocation check (stdlib ssl has no OCSP/CRL fetch; the engine is offline-by-default), so "
-            "a revoked-but-unexpired certificate would still be accepted (ASVS 12.1.4). A declared "
-            "[api].tls_terminated_upstream does not exempt this bind: behind one, the engine still "
-            "terminates the proxy-to-engine hop's TLS itself (BACKLOG #4636). Set "
+            "a revoked-but-unexpired certificate would still be accepted (ASVS 12.1.4). "
+            f"{terminator_note}Set "
             "MEFOR_TLS_REVOCATION_ATTESTED=1 to attest that your PKI enforces revocation for the "
             "certificates this engine serves and accepts, or bind the engine to loopback "
             "([security].local_access_only, [security].listen_address or serve --host) behind a "

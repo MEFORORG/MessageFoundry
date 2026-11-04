@@ -354,8 +354,10 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 - **What you lose:** the API + web console become reachable from the network, not just this host.
 - **When acceptable:** a real remote-operations need, on a trusted/segmented network, with TLS.
 - **Compensating controls:** keep `require_encryption_for_remote = true` (TLS required); front with a
-  revocation-checking reverse proxy (`[api].tls_terminated_upstream` + `trusted_proxies`); a managed admin
-  host / mTLS (OFF-LOOPBACK-DEPLOYMENT.md).
+  revocation-checking reverse proxy (`[api].tls_terminated_upstream` + `trusted_proxies`) for the
+  browser's hop. Off box that does not stand in for revocation of the engine's own certificate: the
+  bind still needs `MEFOR_TLS_REVOCATION_ATTESTED=1` (BACKLOG #4636). A managed admin host / mTLS
+  (OFF-LOOPBACK-DEPLOYMENT.md).
 - **Still refused:** an off-box bind with no operator certificate, with or without a declared
   TLS-terminating proxy (BACKLOG #4636).
   The engine's self-signed placeholder does not count. Under the default `enforce`, nothing lifts this.

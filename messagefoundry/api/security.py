@@ -1589,11 +1589,11 @@ def enforce_phi_read_hop(request: Request) -> None:
             "(no loopback bind, in-process TLS, or declared TLS-terminating proxy), so PHI is not "
             "emitted over it (posture-keyed refusal, #200/ADR 0092). Configure [api].tls_cert_file "
             "(with [api].tls_terminated_upstream + trusted_proxies beside it behind a proxy that "
-            "re-encrypts to the engine), or bind the engine to loopback "
+            "re-encrypts to the engine; off loopback that bind also needs "
+            "MEFOR_TLS_REVOCATION_ATTESTED=1, ADR 0078), or bind the engine to loopback "
             "([security].local_access_only, [security].listen_address or serve --host) behind a "
-            "TLS-terminating proxy on the same "
-            "machine; serve accepts a plaintext proxy hop only there "
-            "(BACKLOG #4636).",
+            "TLS-terminating proxy on the same machine; serve accepts a plaintext proxy hop only "
+            "there (BACKLOG #4636).",
         )
 
 

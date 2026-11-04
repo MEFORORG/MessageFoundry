@@ -110,6 +110,8 @@ def test_serve_refuses_inprocess_tls_offloopback_without_attestation(
     assert "in-process TLS on non-loopback" in err
     assert "12.1.4" in err
     assert "MEFOR_TLS_REVOCATION_ATTESTED=1" in err
+    # No terminator is declared here, so the message must not tell the operator about one.
+    assert "does not exempt this bind" not in err
 
 
 def test_serve_inprocess_tls_offloopback_attested_starts(
@@ -177,9 +179,9 @@ def test_serve_proxy_terminated_offloopback_needs_the_attestation(
 ) -> None:
     # AC-3, as BACKLOG #4636 amended it: a declared TLS-terminating proxy (tls_terminated_upstream +
     # trusted_proxies) no longer exempts an off-loopback bind from the revocation gate. Off loopback
-    # the engine terminates the proxy hop's TLS itself on the operator certificate, which the
-    # proxy's own revocation checks do not cover, so it is refused without the attestation and
-    # starts with it.
+    # the engine terminates the proxy hop's TLS itself on the operator certificate, and the
+    # declaration does not attest that the proxy checks that certificate's revocation, so it is
+    # refused without the attestation and starts with it.
     monkeypatch.chdir(tmp_path)
     if attested:
         monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")

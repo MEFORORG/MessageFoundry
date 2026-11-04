@@ -123,8 +123,9 @@ OCSP-must-staple issuer, or a trust store that consults CRLs. If you cannot make
 honestly, **use Option B instead, with the engine on loopback**: a revocation-checking proxy on the
 same machine in front of a loopback bind never reaches the gate. Option B off loopback does not
 avoid it, because the engine then terminates TLS on its own certificate (BACKLOG #4636). The
-attestation is blanket and process-wide — it also clears the outbound
-revocation refusals on this engine's verifying TLS connectors, so read
+attestation is blanket and process-wide. It does not cross an enforcing outbound revocation
+refusal (BACKLOG #299), but on a non-enforcing instance it turns every outbound verifying hop's
+revocation warning into a silent allow, so read
 [`DEPLOYMENT.md`](DEPLOYMENT.md) § *Revocation-guard behavior* before setting it
 ([ADR 0078](adr/0078-certificate-revocation-posture.md)).
 
@@ -148,7 +149,8 @@ hop on `[api].tls_cert_file`, so it needs the attestation as Option A does (BACK
 This block keeps the engine on loopback, with the proxy on the same machine: that is the only bind
 on which `serve` accepts the plaintext proxy-to-engine hop (BACKLOG #4636). For a proxy on another
 machine, set `local_access_only = false` and a `listen_address`, add `[api].tls_cert_file`, drop the
-acknowledgement, and point the proxy at https.
+acknowledgement, point the proxy at https, and set `MEFOR_TLS_REVOCATION_ATTESTED=1` in the service
+environment.
 
 ```toml
 [security]

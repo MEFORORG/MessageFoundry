@@ -311,8 +311,9 @@ residuals tracked in ADR 0078.
 *(Note 2026-11-04: a declared proxy is no longer a proof form off loopback, BACKLOG #4636. `serve`
 now refuses a plaintext proxy-to-engine hop on a non-loopback bind, so a proxy in front of one
 re-encrypts to an operator certificate the engine serves itself, and that bind needs
-`MEFOR_TLS_REVOCATION_ATTESTED=1`. Only a loopback bind behind a same-machine proxy still starts
-without it. ADR 0078's notes of the same date carry the change; this paragraph keeps its original
+`MEFOR_TLS_REVOCATION_ATTESTED=1`. At least any loopback bind, a same-machine proxy in front or
+not, still starts without it, and so does an off-loopback bind with no operator certificate, which
+only `[security].enforcement = warn` with the insecure-bind escape starts. ADR 0078's notes of the same date carry the change; this paragraph keeps its original
 wording.)*
 
 ## Options considered

@@ -90,6 +90,10 @@ explicit operator opt-out.
 4. **Default = fail-closed.** Absent both proof forms, the in-process off-loopback TLS bind is
    **refused**. This is the secure default; the opt-out below is the escape.
 
+   *(Note 2026-11-04, BACKLOG #4636: "proven in front" in decision 3, "both proof forms" here and
+   "neither a declared TLS-terminating proxy nor" in AC-1 now read as the attestation alone, as the
+   note under decision 2 says. A declared proxy no longer clears an off-loopback bind.)*
+
 5. **Compensating controls (already built).** The SChannel asymmetry means the SQL Server store path
    already gets OS-managed revocation. The [`pipeline/cert_expiry.py`](../../messagefoundry/pipeline/cert_expiry.py)
    `CertExpiryRunner` alerts on an expiring/expired `[api]` or connection cert, pushing operators
