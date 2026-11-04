@@ -2104,8 +2104,13 @@ async def _release(pool: Any, conn: Any) -> None:
     found it with no driver handle (:func:`_driver_connection`); each frees a slot, so each wakes.
     ``closed`` is read before the release, because aioodbc closes an open connection released into
     a closing pool and wakes the pool itself then. Only a literal ``True`` counts, so a stand-in
-    whose ``closed`` is some other object is not read as closed. A failed wake is logged, not
-    raised: this runs in callers' ``finally`` blocks, and must not mask their outcome."""
+    whose ``closed`` is some other object is not read as closed.
+
+    **A wake that fails or is cancelled counts as holding a connection back, for good**, as a pool
+    with no ``_wakeup`` does in :func:`_wake`: nothing else will wake a ``wait_closed`` already
+    asleep on the freed slot, so the count lets :func:`_close_pool_bounded` stop at its bound. A
+    failed wake is logged, not raised, since this runs in callers' ``finally`` blocks and must not
+    mask their outcome; a cancellation still propagates."""
     discarded = getattr(conn, "closed", False) is True
     await pool.release(conn)
     if not discarded:
@@ -2113,11 +2118,15 @@ async def _release(pool: Any, conn: Any) -> None:
     try:
         await _wake(pool)
     except Exception as exc:  # noqa: BLE001 - the release succeeded; nobody is left to raise to
+        _hold_back(pool)
         logger.warning(
             "DATABASE: waking the pool for a closed connection failed; a waiting borrower waits "
-            "until its acquire_timeout: %s",
+            "until its acquire_timeout, and a close of the pool stops at its bound: %s",
             _safe_db_error(exc),
         )
+    except BaseException:
+        _hold_back(pool)
+        raise
 
 
 async def _wake(pool: Any) -> None:
@@ -2592,7 +2601,8 @@ def _close_after_a_cancel(conn: Any, raw_cur: Any) -> None:
     committed the cancelled INSERT with its own, a row the engine counts as not sent and whose
     retry would write it again. It is dropped and closed here, still inside the gate,
     and the return that follows hands the pool a closed connection, which :func:`_release` wakes
-    the pool for."""
+    the pool for. The close need not end the server's session; :func:`_close_dropped` says what
+    that leaves."""
     _close_raw_cursor(raw_cur)
     raw = getattr(conn, "_conn", None)
     if raw is None:
@@ -2620,8 +2630,15 @@ def _close_and_discard(raw_cur: Any, raw: Any) -> None:
 def _close_dropped(raw: Any) -> None:
     """On a worker thread, with no other pyodbc call running on its connection: close a driver
     connection :func:`~messagefoundry.odbc_call_gate.drop_handle` took off it; ``None`` is a no-op.
-    pyodbc's close rolls back what is still open (DB-API), and a server whose session ends drops
-    the transaction whatever the close says. A failed close is logged, not raised."""
+
+    **What the discard guarantees, and what it does not.** No later borrower can commit on this
+    connection, so no later send commits the abandoned INSERT with its own: that is the BACKLOG
+    #5010 fix. It does not guarantee the server drops the transaction. pyodbc's close rolls back
+    before it disconnects, but here a rollback has just failed; per ODBC a disconnect with an open
+    transaction fails, and pyodbc ignores both failures, so the session, with its transaction and
+    locks, can stay open until the server ends it (ADR 0159, the 2026-10-30 residual). A retry on
+    a fresh connection can wait on those locks, and this connector sets no statement timeout. A
+    close that does raise is logged, not raised; pyodbc's own close is not expected to."""
     if raw is None:
         return
     try:
@@ -2921,14 +2938,19 @@ class DatabaseDestination(DestinationConnector):
                     discard = True
                     logger.warning(
                         "DATABASE: rollback after a failed send failed; the connection is "
-                        "discarded rather than returned to its pool"
+                        "discarded rather than returned to its pool: %s",
+                        _safe_db_error(rollback_exc),
                     )
                     if state is None:
                         raise  # the send's failure is no driver error: the rollback's propagates
                     # Classified as it would be had the rollback passed, so a dropped link retries
-                    # rather than dead-letters as an internal error. The discard keeps the retry
-                    # from meeting the open INSERT; the rollback's error is the cause.
-                    raise _classify_db_error(state, str(exc)) from rollback_exc
+                    # rather than dead-letters as an internal error. A rollback failing with a
+                    # transient state says the link went, whatever the send's state read, so that
+                    # one wins. The cause is the error whose state names the class.
+                    rb_state = _sqlstate(rollback_exc)
+                    if rb_state and _is_transient(rb_state) and not _is_transient(state):
+                        raise _classify_db_error(rb_state, str(rollback_exc)) from rollback_exc
+                    raise _classify_db_error(state, str(exc)) from exc
                 if state is None:
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
                 raise _classify_db_error(state, str(exc)) from exc

@@ -554,7 +554,8 @@ the next reader does not re-derive the wrong precedent from the same comment.
     beside it. A failed rollback is logged and the connection still goes back: dropping its handle
     would leave a waiting borrower or `wait_closed` unwoken, since aioodbc wakes neither for a
     closed connection. The rollback runs only on a gated connection; on an ungated one it would run
-    beside the statement.
+    beside the statement. **SUPERSEDED by the BACKLOG #5010 note below:** a failed rollback now
+    discards the connection.
   - **Otherwise it returns the connection rather than detach it, unlike `_release_dirty`.** aioodbc
     wakes no waiting borrower when a closed connection is released, so a detached connection could
     leave that borrower waiting out its `acquire_timeout`. That is engine PR 2593's reason for
@@ -610,6 +611,20 @@ the next reader does not re-derive the wrong precedent from the same comment.
   - A cursor with no raw handle gets no rollback on a cancel.
 
   Pinned offline by `tests/test_backlog2394_database_gate.py`.
+
+  **NOTE 2026-11-03 (BACKLOG #5010): a failed rollback discards the connection.** The bullet above
+  that returns it is superseded, in both places a rollback can fail: after a cancelled statement
+  (`_close_after_a_cancel`) and after a failed send (`DatabaseDestination.send`). Returned open, on
+  a session still alive, the abandoned INSERT stayed open for the next send's commit to commit with
+  its own. The handle is dropped before any await and closed inside the gate, and the closed
+  connection goes back to the pool through `_release`, which wakes it through aioodbc 0.5.0's
+  `Pool._wakeup`, so the wake that aioodbc's own release withholds for a closed connection still
+  happens. A pool with no `_wakeup`, or a wake that fails or is cancelled, counts as holding a
+  connection back for good, so its close stops at the bound. The residual recorded above for the
+  store holds here too: the close after a failed rollback can leave the session, with its
+  transaction and locks, open until the server ends it. The discard guarantees only that no later
+  commit on this connection commits the INSERT. Pinned offline by
+  `tests/test_backlog5010_database_gate_discard.py`.
 
 ## Acceptance Criteria
 

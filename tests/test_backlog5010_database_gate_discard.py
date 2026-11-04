@@ -150,23 +150,39 @@ async def test_a_send_whose_rollback_fails_discards_its_connection(
     assert "rollback after a failed send failed" in caplog.text
 
 
-class _LinkLostCursor(RawCursor):
-    """A cursor whose failing statement raises as a pyodbc driver error, SQLSTATE first."""
+class _DriverErrorCursor(RawCursor):
+    """A cursor whose failing statement raises as a pyodbc driver error, SQLSTATE first, with the
+    state its connection names."""
 
     def execute(self, sql: str, *params: object) -> RawCursor:
         try:
             return super().execute(sql, *params)
         except RuntimeError as exc:
-            raise RuntimeError("08S01", "[08S01] communication link failure") from exc
+            state = getattr(self._conn, "statement_state", "08S01")
+            raise RuntimeError(state, f"[{state}] stand-in driver error") from exc
 
 
 class _LinkLostRollbackRefused(_RollbackRefused):
-    """The statement fails with a driver error, and its rollback is refused too."""
+    """The statement fails with a dropped-link driver error, and its rollback is refused too, with
+    no SQLSTATE."""
+
+    statement_state = "08S01"
 
     def cursor(self) -> RawCursor:
-        cur = _LinkLostCursor(self)
+        cur = _DriverErrorCursor(self)
         self.cursors.append(cur)
         return cur
+
+
+class _RejectedThenLinkLost(_LinkLostRollbackRefused):
+    """The statement fails with a permanent-looking state, then the rollback fails because the
+    link went (08S01)."""
+
+    statement_state = "23000"
+
+    def rollback(self) -> None:
+        self.note("rollback:link-lost")
+        raise RuntimeError("08S01", "[08S01] communication link failure")
 
 
 async def test_a_driver_error_whose_rollback_fails_is_classified_and_discarded(
@@ -174,8 +190,8 @@ async def test_a_driver_error_whose_rollback_fails_is_classified_and_discarded(
 ) -> None:
     """The INSERT fails with a driver error and the rollback fails after it. The send's failure is
     classified as it would be had the rollback passed (a dropped link, so a transient retry), with
-    the rollback's error as its cause, and the connection is discarded, so the retry cannot meet
-    the open INSERT. Red before this round: the raw rollback error reached the runner's
+    the statement's error as its cause, and the connection is discarded, so no later commit on it
+    meets the open INSERT. Red before this round: the raw rollback error reached the runner's
     internal-error arm, which dead-letters by default."""
     rig.release.set()
     _aioodbc_serving(
@@ -189,9 +205,37 @@ async def test_a_driver_error_whose_rollback_fails_is_classified_and_discarded(
     with pytest.raises(DeliveryError, match="transient") as caught:
         await _destination().send('{"a": 1}')
     assert not isinstance(caught.value, NegativeAckError)
-    assert str(caught.value.__cause__) == "refused by the stand-in server"
+    cause = caught.value.__cause__
+    assert isinstance(cause, RuntimeError) and cause.args[0] == "08S01", cause
     pool = rig.pools[0]
     assert pool.free == [] and rig.conn.closed and "commit" not in rig.log, rig.log
+
+
+async def test_a_rollback_lost_to_the_link_makes_a_permanent_looking_failure_transient(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The statement fails with a permanent-looking state, then its rollback fails with 08S01. A
+    rollback lost to the link says the link went, so the failure retries rather than dead-letters,
+    the rollback's error is the cause, and the warning names it."""
+    rig.release.set()
+    _aioodbc_serving(
+        monkeypatch,
+        rig,
+        pool_type=_WakingPool,
+        raw_type=_RejectedThenLinkLost,
+        blocks=never,
+        fails=frozenset({_INSERT}),
+    )
+    with (
+        caplog.at_level("WARNING", logger=_DB_LOG),
+        pytest.raises(DeliveryError, match="transient") as caught,
+    ):
+        await _destination().send('{"a": 1}')
+    assert not isinstance(caught.value, NegativeAckError)
+    cause = caught.value.__cause__
+    assert isinstance(cause, RuntimeError) and cause.args[0] == "08S01", cause
+    assert rig.conn.closed and rig.pools[0].free == []
+    assert "rollback after a failed send failed" in caplog.text and "08S01" in caplog.text
 
 
 async def test_a_failed_wake_is_logged_and_only_a_closed_connection_wakes(
@@ -227,6 +271,28 @@ async def test_a_failed_wake_is_logged_and_only_a_closed_connection_wakes(
         await database._release(pool, odd)
     assert pool.released == [closed, odd] and pool.wakes == 1
     assert "waking the pool for a closed connection failed" in caplog.text
+    # Nothing else will wake a wait_closed on the freed slot, so its close must stop at the bound.
+    assert database._holds_back(pool) == 1
+
+
+async def test_a_cancelled_wake_holds_back_and_propagates() -> None:
+    """A cancellation inside the wake still leaves a ``wait_closed`` unwoken, so it counts as held
+    back too, and the cancellation is not swallowed."""
+
+    class _Pool:
+        async def release(self, conn: object) -> None:
+            return None
+
+        async def _wakeup(self) -> None:
+            raise asyncio.CancelledError
+
+    class _Closed:
+        closed = True
+
+    pool = _Pool()
+    with pytest.raises(asyncio.CancelledError):
+        await database._release(pool, _Closed())
+    assert database._holds_back(pool) == 1
 
 
 async def test_a_failed_send_whose_rollback_succeeds_keeps_its_connection(

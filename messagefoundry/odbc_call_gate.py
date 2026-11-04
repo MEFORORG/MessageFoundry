@@ -21,8 +21,10 @@ can use them without importing the store.
 Standard library only: nothing here imports aioodbc or pyodbc. It recognises an aioodbc connection
 by its bound ``_execute`` method, and reaches its raw handles through ``_conn``, ``_executor`` and a
 cursor's ``_impl``, as aioodbc 0.5.0 names them. ``pyproject.toml`` pins aioodbc to that release
-for this reason (BACKLOG #5005). A cursor's ``_impl`` is read here only, in :func:`raw_cursor`, so
-the DATABASE connector and the store's pooled cursor read it one way. Where a real aioodbc object
+for this reason (BACKLOG #5005). For the call gate, a cursor's ``_impl`` is read only in
+:func:`raw_cursor`, so the DATABASE connector and the store's pooled cursor read it one way. Other
+readers outside the gate remain, at least the store's ``_sync_setinputsizes`` (ADR 0114), so a move
+of the pin still greps the engine for the name. Where a real aioodbc object
 lacks a name the gate needs, ERROR is logged once per process for each type, not on every borrow.
 """
 
