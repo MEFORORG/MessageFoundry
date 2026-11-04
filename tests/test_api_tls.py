@@ -2648,16 +2648,22 @@ def test_a_ca_reissued_under_the_same_key_is_one_issuer(tmp_path: Path) -> None:
     assert view[VERIFIED_ISSUER_KEY] == "CN=Acme CA"
 
 
+@pytest.mark.parametrize("label", ["CERTIFICATE", "X509 CERTIFICATE"])
 def test_serve_context_carries_the_issuer_index_and_warns_about_dead_keys(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, label: str
 ) -> None:
     # The shim reads the index off the real API context. If the builder stopped attaching it, every
     # mapped certificate would be denied while every shim test (which attaches it by hand) stayed
-    # green; and a key naming no loaded CA would deny with nothing in the log.
+    # green; and a key naming no loaded CA would deny with nothing in the log. The context loads a
+    # CA under the legacy X509 CERTIFICATE label too, so the index must hold it (BACKLOG #4948).
     cert, key = _self_signed(tmp_path)
     ca = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     ca_file = tmp_path / "client-ca.pem"
-    ca_file.write_bytes(_pem(ca[0]))
+    ca_file.write_bytes(
+        _pem(ca[0])
+        .replace(b"BEGIN CERTIFICATE", f"BEGIN {label}".encode("ascii"))
+        .replace(b"END CERTIFICATE", f"END {label}".encode("ascii"))
+    )
     uid = "0123456789abcdef0123456789abcdef"
     api = ApiSettings(
         tls_cert_file=str(cert),

@@ -1664,11 +1664,15 @@ def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
     return True
 
 
-#: The BEGIN marker of each PEM label ``load_verify_locations(cadata=)`` loads a certificate from:
-#: ``CERTIFICATE`` and the legacy ``X509 CERTIFICATE`` (BACKLOG #4948). The measurement, and the
-#: labels it skips, are in ``tests/test_inbound_http_intake_issuer.py``, which asks OpenSSL label by
-#: label. Group 1 is the label, which picks the matching END marker.
-_CERTIFICATE_BEGIN = re.compile(rb"-----BEGIN ((?:X509 )?CERTIFICATE)-----")
+#: A BEGIN line ``load_verify_locations(cadata=)`` loads a certificate from: the whole line, after
+#: OpenSSL strips trailing bytes at or below a space, is the marker of ``CERTIFICATE`` or the legacy
+#: ``X509 CERTIFICATE`` (BACKLOG #4948). ``tests/test_inbound_http_intake_issuer.py`` asks OpenSSL
+#: shape by shape: the labels it skips, a marker after text, a lone CR or a space, and text after the
+#: marker. A line ends at an LF alone, as in OpenSSL's reader. Group 1 is the label, which picks the
+#: matching END marker. ``cadata`` is ASCII, so no byte order mark can precede a marker here.
+_CERTIFICATE_BEGIN = re.compile(
+    rb"^-----BEGIN ((?:X509 )?CERTIFICATE)-----[\x00-\x09\x0b-\x20]*$", re.MULTILINE
+)
 
 
 def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
@@ -1677,16 +1681,16 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
     A block the context loads but this skipped would hold a CA the handshake trusts and the index
     never names, so every partner under it would be denied and the start warning would name the wrong
     cause. A block this read but the context skipped would let a client-sent copy of that CA count as
-    loaded. So a block counts under a label :data:`_CERTIFICATE_BEGIN` matches, and only where its
-    BEGIN marker starts a line, the rule :func:`_crl_blocks` records. Like that reader this models
-    OpenSSL rather than being it: a marker 254 bytes into a line was measured to load, and is skipped
-    here, which denies rather than admits. A block read here that ``cryptography`` cannot parse is
-    counted in :attr:`IssuerIndex.unreadable` instead, which fails closed with a warning."""
+    loaded. So a block counts only from a BEGIN line :data:`_CERTIFICATE_BEGIN` matches.
+
+    This models OpenSSL's reader rather than being it. At least one shape was measured where the two
+    disagree: OpenSSL reads a long line in 254-byte pieces, so a marker starting the second piece
+    loads, and here it is skipped, which denies rather than admits. A BEGIN line with no END after it
+    ends the scan; the context was measured to refuse such text, so no listener runs on it. A block
+    read here that ``cryptography`` cannot parse is counted in :attr:`IssuerIndex.unreadable`, which
+    fails closed with a warning."""
     at = 0
     while (begin := _CERTIFICATE_BEGIN.search(pem, at)) is not None:
-        if not _begins_line(pem, begin.start()):
-            at = begin.end()
-            continue
         end = b"-----END " + begin[1] + b"-----"
         stop = pem.find(end, begin.end())
         if stop < 0:

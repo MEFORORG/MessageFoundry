@@ -304,12 +304,15 @@ def test_an_unparsable_certificate_in_the_trust_store_is_warned_about(
     assert not caplog.records
 
 
-def _probe(label: str, prefix: str) -> tuple[int, bool]:
+def _probe(label: str, *, prefix: str = "", suffix: str = "", head: str = "") -> tuple[int, bool]:
     """How many certificates ``cadata=`` loads from a plain CA plus a probe CA written under
-    ``label`` after ``prefix`` on its BEGIN line, and whether the index reads the probe."""
+    ``label``, with ``prefix`` before and ``suffix`` after the marker on the probe's BEGIN line and
+    ``head`` above both blocks, and whether the index reads the probe."""
     plain = _ca(_dn((NameOID.COMMON_NAME, "Plain CA")))
     probe = _ca(_dn((NameOID.COMMON_NAME, "Probe CA")))
-    cadata = _pem(plain[0]).decode("ascii") + prefix + _labelled(probe[0], label).decode("ascii")
+    marker = f"-----BEGIN {label}-----"
+    block = _labelled(probe[0], label).decode("ascii").replace(marker, marker + suffix, 1)
+    cadata = head + _pem(plain[0]).decode("ascii") + prefix + block
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_verify_locations(cadata=cadata)
     index = _client_issuer_index("IB_PARTNER", cadata, {})
@@ -341,9 +344,40 @@ def test_the_index_reads_the_same_blocks_the_context_loads(label: str, prefix: s
     handshake trusts that the index skips denies every partner under it; a CA the index reads that
     the handshake never loaded could be named for a leaf whose chain ran through a client-sent copy
     of it. So each shape is asked of OpenSSL here, not assumed."""
-    loaded, indexed = _probe(label, prefix)
+    loaded, indexed = _probe(label, prefix=prefix)
     assert loaded in (1, 2), loaded
     assert indexed == (loaded == 2), (label, prefix, loaded)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "head"),
+    [
+        pytest.param("  ", "", id="trailing-spaces"),
+        pytest.param("\t", "", id="trailing-tab"),
+        pytest.param("\r", "", id="crlf"),
+        pytest.param("\x0b", "", id="trailing-control"),
+        pytest.param(" Comment: issuing CA\n", "", id="header-text-after"),
+        pytest.param("x", "", id="text-after"),
+        pytest.param("\rjunk", "", id="lone-cr-then-text"),
+        pytest.param("", "-----BEGIN X509 CERTIFICATE----- also accepted\n", id="legacy-comment"),
+        pytest.param("", "-----BEGIN CERTIFICATE----- blocks follow\n", id="plain-comment"),
+    ],
+)
+@pytest.mark.parametrize("label", ["CERTIFICATE", "X509 CERTIFICATE"])
+def test_the_index_reads_a_begin_line_only_where_the_context_does(
+    label: str, suffix: str, head: str
+) -> None:
+    """The rest of the BEGIN line, and a comment line naming a marker, agree too (BACKLOG #4948).
+
+    Measured on CPython 3.14.7 / OpenSSL 3.5.7: OpenSSL strips trailing bytes at or below a space,
+    then reads a BEGIN line only where the marker is the whole line, so it loads a probe after
+    trailing spaces, a tab, a CR or a control byte, and skips one with text after its marker. A
+    comment line that opens with a marker and goes on with text is skipped too, and the blocks below
+    it still load. An index that read text after a marker would name a CA the context skipped; one
+    that took a comment line for a block would lose the CA below it, or every CA after it."""
+    loaded, indexed = _probe(label, suffix=suffix, head=head)
+    assert loaded in (1, 2), loaded
+    assert indexed == (loaded == 2), (label, suffix, head, loaded)
 
 
 def test_a_marker_254_bytes_into_a_line_is_skipped_though_the_context_loads_it() -> None:
@@ -351,7 +385,7 @@ def test_a_marker_254_bytes_into_a_line_is_skipped_though_the_context_loads_it()
     OpenSSL reads a long line in 254-byte pieces, so a BEGIN marker starting the second piece loads.
     The index models a line, not those pieces, so it skips that CA: every partner under it is
     denied, never admitted. ``pki._pem_certificate_blocks`` records the same trade."""
-    assert _probe("CERTIFICATE", "y" * 254) == (2, False)
+    assert _probe("CERTIFICATE", prefix="y" * 254) == (2, False)
 
 
 @pytest.mark.parametrize(
