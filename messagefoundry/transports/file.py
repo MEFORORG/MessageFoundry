@@ -2942,8 +2942,8 @@ def _win_open_file(
 
     ``vet``, where given, is called with the descriptor of the file opened as itself, after the tag
     check and before that second open, and raises to refuse the file, so a file it refuses is never
-    served by its filter (BACKLOG #4992). The second open still goes by name: a file renamed into
-    that name between the two opens is served by ITS filter before the identity compare refuses it."""
+    served by its filter (BACKLOG #4992). The second open still goes by name, so a file renamed into
+    that name between the two opens is served by its own filter before the identity compare."""
     fd = _fd_for(_win_create(path, access, _SHARE_ALL, _FLAG_OPEN_REPARSE_POINT), fd_flags)
     try:
         attributes, tag = _attribute_tag(_os_handle(fd))
@@ -2965,12 +2965,12 @@ def _win_open_file(
     return fd
 
 
-def _win_lstat(path: Path) -> os.stat_result:
-    """Windows: ``os.fstat`` of the object at ``path`` opened as itself, for attributes only.
+def _win_lstat(path: Path) -> tuple[os.stat_result, int]:
+    """Windows: ``os.fstat`` of the object at ``path`` opened as itself, for attributes only, and its
+    reparse tag, which ``os.fstat`` does not report (a file symlink reads as a regular file there).
 
     ``os.lstat`` opens a reparse point that names no path (a cloud, deduplicated or tiered file)
-    through its filter, as ``os.stat`` does. This never does, so a caller can screen such a file
-    before anything lets a filter act on it (BACKLOG #4992)."""
+    through its filter, as ``os.stat`` does. This never does (BACKLOG #4992)."""
     fd = _fd_for(
         _win_create(
             path,
@@ -2980,7 +2980,8 @@ def _win_lstat(path: Path) -> os.stat_result:
         )
     )
     try:
-        return os.fstat(fd)
+        attributes, tag = _attribute_tag(_os_handle(fd))
+        return os.fstat(fd), tag if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT else 0
     finally:
         os.close(fd)
 

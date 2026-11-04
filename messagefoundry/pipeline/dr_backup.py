@@ -1855,7 +1855,9 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
             st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
         elif sys.platform == "win32":
             # Not `os.lstat`, which opens a cloud, deduplicated or tiered file through its filter.
-            st = _win_lstat(entry)
+            st, tag = _win_lstat(entry)
+            if tag & _NAME_SURROGATE:
+                return None  # a link, skipped as below; `os.fstat` calls a file symlink regular
         else:
             st = os.lstat(entry)
     except FileNotFoundError:
@@ -1944,9 +1946,8 @@ def _vet_for_truncate(fd: int) -> None:
 
     On Windows :func:`_win_open_file` calls this on the file opened as itself, before it lets a
     filter serve a reparse point that names no path, and the screen before that open is
-    :func:`_win_lstat`, not ``os.lstat``. So no filter recalls or hydrates a file refused here
-    (BACKLOG #4992), except one renamed into its name between that check and the reopen, which
-    :func:`_win_open_file` then refuses only after its filter served it."""
+    :func:`_win_lstat`, not ``os.lstat`` (BACKLOG #4992). What still reaches a filter first is
+    listed in docs/PHI.md section 2's staging row."""
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):
         raise _Unconfined("not a regular file")

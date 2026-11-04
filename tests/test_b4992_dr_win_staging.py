@@ -125,7 +125,7 @@ def test_a_cloud_file_is_checked_before_its_filter_is_let_serve_it(
     file with one link, so a hard link to someone else's cloud file is refused unopened.
 
     Every file here is made to look deduplicated. The control: the staging directory's own file is
-    still reopened through its filter, and emptied. The attribute tag is read once per file."""
+    still reopened through its filter, and emptied. The attribute tag is read once per open."""
     staging = tmp_path / "mefor-verify-own"
     staging.mkdir()
     own = staging / "own.tar"
@@ -171,7 +171,8 @@ def test_a_cloud_file_is_checked_before_its_filter_is_let_serve_it(
     assert outside.read_bytes() == _OUTSIDE
     assert reopened == ["own.tar"], "a file the check refuses was opened through its filter"
     assert own.read_bytes() == b""
-    assert len(file_tag_reads) == 2  # one per file, not one per check
+    # One per open, not one per check: the as-itself screen and the open, for each of two files.
+    assert len(file_tag_reads) == 4
 
 
 def _refuse_open(monkeypatch: pytest.MonkeyPatch, refused: Path, code: int) -> None:
@@ -247,3 +248,21 @@ def test_a_failed_final_path_query_still_reads_as_the_volume(
     assert (staging / "extracted_store.db").read_bytes() == _PLAINTEXT
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("cannot report a file's final path" in m for m in warnings)
+
+
+def test_a_link_already_in_the_directory_is_skipped_not_reported(tmp_path: Path) -> None:
+    """A link holds no plaintext, so the fail-safe skips it without a report, as ``os.lstat`` let it.
+    The screen that replaced ``os.lstat`` reads the reparse tag itself: ``os.fstat`` on a symlink
+    opened as itself calls it a regular file, and the link was then reported as a swap."""
+    staging = tmp_path / "mefor-verify-own"
+    staging.mkdir()
+    outside = tmp_path / "outside.dat"
+    outside.write_bytes(_OUTSIDE)
+    (staging / "own.tar").write_bytes(_PLAINTEXT)
+    try:
+        (staging / "link.dat").symlink_to(outside)
+    except OSError as exc:  # pragma: no cover - Windows without the symlink privilege
+        pytest.skip(f"symlinks unavailable here: {exc}")
+    assert dr_backup._empty_files_in_place(staging) == []
+    assert outside.read_bytes() == _OUTSIDE
+    assert (staging / "own.tar").read_bytes() == b""
