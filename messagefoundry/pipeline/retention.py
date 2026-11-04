@@ -46,7 +46,7 @@ from messagefoundry.parsing.compression import CompressionError, gzip_compress, 
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.redaction import safe_exc
-from messagefoundry.store import Store, StripResult
+from messagefoundry.store import DeadLetterPurge, Store, StripResult
 from messagefoundry.transports.base import (
     ArchiveGuard,
     ProcessedArchive,
@@ -258,6 +258,10 @@ class RetentionPass:
     # Resolved operator-alert instances pruned this pass (#56, ADR 0044) — metadata-only, on the same
     # window as connection events. Never an open/acknowledged instance.
     alert_instances_purged: int = 0
+    # Dead rows whose `last_error` the dead-letter purge nulled this pass (BACKLOG #4996), a row whose
+    # body it blanked included. `dead_purged` counts bodies only, so a pass whose sole change was
+    # clearing error text, which may carry PHI, still needs this to count as audited work.
+    dead_errors_cleared: int = 0
     # Application log FILES deleted this pass (#120): app-log files past the `app_log_days` window
     # removed from `[logging].log_dir`. Metadata only (mtime) — file content is never read. 0 when the
     # window/log_dir is unset (byte-identical audit for a deployment that doesn't use it).
@@ -315,6 +319,7 @@ class RetentionPass:
         return (
             self.messages_purged > 0
             or self.dead_purged > 0
+            or self.dead_errors_cleared > 0
             or self.state_purged > 0
             or self.conn_events_purged > 0
             or self.documents_messages_stripped > 0
@@ -593,9 +598,9 @@ class RetentionRunner:
                 now=now,
                 connection_cutoffs=self._cutoff_map(now, msg_days_overrides),
             )
-        dead_purged = 0
+        dead = DeadLetterPurge()
         if not _deadline_hit() and (s.dead_letter_days > 0 or dead_days_overrides):
-            dead_purged = await self._store.purge_dead_letters(
+            dead = await self._store.purge_dead_letters(
                 older_than=self._global_cutoff(now, s.dead_letter_days),
                 now=now,
                 connection_cutoffs=self._cutoff_map(now, dead_days_overrides),
@@ -785,7 +790,8 @@ class RetentionRunner:
 
         result = RetentionPass(
             messages_purged=messages_purged,
-            dead_purged=dead_purged,
+            dead_purged=dead.bodies,
+            dead_errors_cleared=dead.errors_cleared,
             state_purged=state_purged,
             conn_events_purged=conn_events_purged,
             wal_checkpointed=wal_checkpointed,
@@ -1361,6 +1367,7 @@ class RetentionRunner:
                 "messages_purged": result.messages_purged,
                 "dead_letter_days": self._settings.dead_letter_days,
                 "dead_purged": result.dead_purged,
+                "dead_errors_cleared": result.dead_errors_cleared,
                 "state_max_age_days": self._settings.state_max_age_days,
                 "state_purged": result.state_purged,
                 "connection_event_retention_hours": self._settings.connection_event_retention_hours,

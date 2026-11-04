@@ -242,7 +242,7 @@ async def test_purge_dead_letters_releases_shared_body(store: MessageStore) -> N
         assert it is not None
         await store.dead_letter_now(it.id, "permanent reject", now=11.0)
     purged = await store.purge_dead_letters(older_than=10_000.0, now=10_000.0)
-    assert purged == 2
+    assert purged.bodies == 2
     assert await _shared_count(store) == 0  # both dead referrers released → GC'd
 
 
