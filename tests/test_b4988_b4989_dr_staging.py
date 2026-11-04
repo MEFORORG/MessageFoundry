@@ -6,7 +6,8 @@
 whose server sets the owner, a directory there carrying the process's owner may have been made by
 another principal, and the sweep would have removed it, while docs/PHI.md said every sweep takes
 only what a new directory of the run's account gets. The early sweep now goes by the owner a probe
-in the staging root gets, read on POSIX through the descriptor that created it. When the probe
+in the staging root gets, read through the descriptor that created it (``fstat`` on POSIX,
+``GetSecurityInfo`` on its handle on Windows). When the probe
 cannot be created, as on a full volume, it goes by the process's owner only where the staging root
 itself carries that owner.
 
@@ -18,6 +19,7 @@ Every test uses synthetic bytes only. Severity is conditional (CLAUDE.md section
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import logging
 import os
@@ -98,34 +100,20 @@ async def test_a_failed_probe_on_a_share_does_not_fall_back_to_the_process_owner
 
 
 def _probe_creation_fails_in(data: Path, monkeypatch: pytest.MonkeyPatch) -> list[Path]:
-    """Creating an owner probe in ``data`` fails with ENOSPC, as on a volume a killed run filled:
-    ``mkstemp`` is the POSIX probe, ``mkdtemp`` the Windows one. Returns the refused attempts."""
+    """Creating an owner probe in ``data`` fails with ENOSPC, as on a volume a killed run filled.
+    Returns the refused attempts."""
     refused: list[Path] = []
-    real_mkstemp = tempfile.mkstemp
-    real_mkdtemp = tempfile.mkdtemp
+    real_probe = dr_backup._owner_probe
 
-    def refuses(prefix: Any, where: Any) -> bool:
-        if (
-            prefix == dr_backup._OWNER_PROBE_PREFIX
-            and where is not None
-            and Path(where).absolute() == data
-        ):
-            refused.append(Path(where))
-            return True
-        return False
-
-    def mkstemp(*args: Any, **kwargs: Any) -> Any:
-        if refuses(kwargs.get("prefix"), kwargs.get("dir")):
+    @contextlib.contextmanager
+    def probe(root: Path | None) -> Iterator[tuple[int, Path]]:
+        if root is not None and Path(root).absolute() == data:
+            refused.append(Path(root))
             raise OSError(errno.ENOSPC, "No space left on device")
-        return real_mkstemp(*args, **kwargs)
+        with real_probe(root) as made:
+            yield made
 
-    def mkdtemp(*args: Any, **kwargs: Any) -> Any:
-        if refuses(kwargs.get("prefix"), kwargs.get("dir")):
-            raise OSError(errno.ENOSPC, "No space left on device")
-        return real_mkdtemp(*args, **kwargs)
-
-    monkeypatch.setattr(tempfile, "mkstemp", mkstemp)
-    monkeypatch.setattr(tempfile, "mkdtemp", mkdtemp)
+    monkeypatch.setattr(dr_backup, "_owner_probe", probe)
     return refused
 
 
@@ -199,6 +187,88 @@ def test_the_probe_owner_comes_from_the_descriptor_not_a_later_path_read(
     # The descriptor read the object the probe created, not what the name held afterwards.
     assert seen == created
     assert (root / "moved-away").stat().st_ino == created[0]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the handle-read probe is the Windows half")
+def test_the_windows_probe_owner_comes_from_the_handle_not_a_later_path_read(
+    tmp_path, monkeypatch
+) -> None:
+    """The Windows mirror of the descriptor test above. An account that can rename entries in the
+    staging root moves the probe away right after it is created and puts its own file at the
+    probe's name. The owner still comes from ``GetSecurityInfo`` on the handle that created the
+    probe, a path read of the name, which here would answer the swapped object's owner, is never
+    made, and closing the handle deletes the probe the engine made, not the swapped-in file."""
+    root = tmp_path / "root"
+    root.mkdir()
+    real_probe = dr_backup._owner_probe
+    real_owner = dr_backup._owner_of
+    created: list[int] = []
+    expected: list[object | None] = []
+    swapped: list[Path] = []
+
+    @contextlib.contextmanager
+    def swapping_probe(where: Path | None) -> Iterator[tuple[int, Path]]:
+        with real_probe(where) as (fd, name):
+            created.append(os.fstat(fd).st_ino)
+            moved = root / "moved-away"
+            os.rename(name, moved)
+            expected.append(real_owner(moved))
+            name.write_bytes(b"")  # the swapped-in object, at the probe's name
+            swapped.append(name)
+            yield fd, name
+
+    def path_read(path: Path) -> object | None:
+        return "swapped-owner"
+
+    seen: list[int] = []
+    real_fd_owner = dr_backup._owner_of_fd
+
+    def fd_owner(fd: int, opened_as: Path) -> object | None:
+        seen.append(os.fstat(fd).st_ino)
+        return real_fd_owner(fd, opened_as)
+
+    monkeypatch.setattr(dr_backup, "_owner_probe", swapping_probe)
+    monkeypatch.setattr(dr_backup, "_owner_of", path_read)
+    monkeypatch.setattr(dr_backup, "_owner_of_fd", fd_owner)
+    got = dr_backup._probe_owner(root)
+    assert expected[0] is not None  # the control: the real owner could be read
+    assert got == expected[0]
+    assert got != "swapped-owner"
+    # The handle read the object the probe created, not what the name held afterwards.
+    assert seen == created
+    # Closing the handle deleted the engine's own probe where the rename put it, and left the
+    # swapped-in file at the probe's name alone.
+    assert not (root / "moved-away").exists()
+    assert swapped[0].exists()
+
+
+def test_the_fallback_reads_the_staging_roots_owner_from_a_descriptor(
+    tmp_path, monkeypatch
+) -> None:
+    """``_fallback_root_owner`` reads the root's owner from a descriptor it opened, never by path:
+    a path read here answers another owner, and the gate still passes on the real one. The
+    control: a root carrying another owner fails the gate."""
+    root = tmp_path / "root"
+    root.mkdir()
+    owner = dr_backup._owner_of(root)
+    assert owner is not None
+    monkeypatch.setattr(dr_backup, "_owner_of", lambda path: "path-read-owner")
+    assert dr_backup._fallback_root_owner(root, owner) == owner
+    assert dr_backup._fallback_root_owner(root, "another-owner") is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows opens a link root as itself")
+def test_the_windows_fallback_refuses_a_junction_root(tmp_path) -> None:
+    """A staging root that is a junction is opened as itself and refused, as ``_owner_of`` refuses
+    one, so the fallback never reads its target's owner."""
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    _link_dir(target, link)
+    owner = dr_backup._owner_of(target)
+    assert owner is not None
+    assert dr_backup._fallback_root_owner(target, owner) == owner  # the control
+    assert dr_backup._fallback_root_owner(link, owner) is None
 
 
 def test_a_leaked_probe_file_is_swept_and_a_nonempty_one_is_kept(tmp_path) -> None:

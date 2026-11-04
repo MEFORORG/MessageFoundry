@@ -591,8 +591,8 @@ class BackupRunner:
         # `.mefor-staging` inherits whatever the destination grants, so another account could plant a
         # directory there for the teardown to run on (BACKLOG #2420). It runs first, keyed on the
         # owner a new entry in the staging root gets, learned by `_probe_owner` from a probe it creates
-        # and removes there, and on POSIX reads through the descriptor it created, so a rename in the
-        # staging root cannot choose it. Never the process's own owner as such: on a share whose
+        # and removes there, and reads through the descriptor it created, so a rename in the staging
+        # root cannot choose it. Never the process's own owner as such: on a share whose
         # server sets the owner, a directory carrying that one may have been made by another
         # principal (BACKLOG #4988). The probe is a write, so on a volume it cannot be created on,
         # such as one a killed run filled, `_fallback_root_owner` keys the sweep on the process's
@@ -2052,6 +2052,81 @@ def _win_attribute_tag(fd: int) -> tuple[int, int]:
     return info[0], info[1]
 
 
+@functools.cache
+def _win_security_api() -> tuple[Any, Any]:
+    """``advapi32`` and ``kernel32`` with the prototypes :func:`_win_owner_of_handle` uses."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows security API runs only on Windows")
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    pvoid_p = ctypes.POINTER(ctypes.c_void_p)
+    advapi32.GetSecurityInfo.restype = wintypes.DWORD
+    advapi32.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+    ]
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.c_void_p,
+    ]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    return advapi32, kernel32
+
+
+def _win_owner_of_handle(handle: int) -> object | None:
+    """The owner SID of the object open as ``handle``, read with ``GetSecurityInfo`` on the handle,
+    never by path, in the form :func:`_owner_of` reports (SDDL, aliases resolved), so the two compare.
+    ``None`` when it cannot be read. The handle needs ``READ_CONTROL``."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows security API runs only on Windows")
+    from ctypes import wintypes
+
+    from messagefoundry.store.store import _SDDL_OWNER, _resolve_sid
+
+    advapi32, kernel32 = _win_security_api()
+    owner_info = 0x00000001  # OWNER_SECURITY_INFORMATION
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetSecurityInfo(
+        handle,
+        1,  # SE_FILE_OBJECT
+        owner_info,
+        None,
+        None,
+        None,
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0:
+        return None
+    try:
+        text = wintypes.LPWSTR()
+        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor, 1, owner_info, ctypes.byref(text), None
+        ):
+            return None
+        try:
+            sddl = text.value
+        finally:
+            kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+    finally:
+        kernel32.LocalFree(descriptor)
+    found = _SDDL_OWNER.search(sddl) if sddl else None
+    return _resolve_sid(found.group(1)) if found else None
+
+
 def _names_another_path(fd: int) -> bool:
     """Whether the object open on ``fd`` is a Windows reparse point that names another path: a
     symbolic link or a junction opened as itself. Always ``False`` on POSIX, where ``O_NOFOLLOW``
@@ -2175,9 +2250,9 @@ def _discard_verify_staging(staging: Path) -> str | None:
 _BACKUP_STAGING_PREFIX = "mefor-backup-"
 _VERIFY_STAGING_PREFIX = "mefor-verify-"
 _SWEPT_PREFIXES = (_BACKUP_STAGING_PREFIX, _VERIFY_STAGING_PREFIX)
-#: The probe :func:`_probe_owner` makes to learn the owner a new entry gets: an empty file on POSIX,
-#: a bare directory on Windows. Never a staging directory; a leaked one is empty, and the sweep
-#: removes it, a directory by ``rmdir`` alone and a file only while it is empty.
+#: The probe :func:`_probe_owner` makes to learn the owner a new entry gets: an empty file. Never a
+#: staging directory; a leaked one is empty, and the sweep removes it only while it is empty. The
+#: sweep also removes an empty probe-named directory by ``rmdir`` alone.
 _OWNER_PROBE_PREFIX = "mefor-owner-probe-"
 
 #: The server-DB staging root, a dot-prefixed directory under the backup destination.
@@ -2545,57 +2620,35 @@ def _process_owner() -> object | None:
     without creating one in the staging root. ``None`` when it cannot be read.
 
     POSIX: the effective uid, which is a new directory's ``st_uid``. Windows: the owner of a probe
-    directory made and removed in the OS temp dir, since a local NTFS directory takes the token's
+    file made in the OS temp dir by :func:`_probe_owner`, since a local NTFS entry takes the token's
     default owner wherever it is made. On a share whose server sets the owner this answer differs
     from what a directory there gets, so the backup keys its OS-temp sweep on it, and sweeps its
     staging root by :func:`_probe_owner` of that root, or by this answer only as
     :func:`_fallback_root_owner` allows (BACKLOG #4988). On Windows this is ``None`` when the probe
-    cannot be made, or a sibling's sweep removes it before its owner is read; the backup then skips
-    its OS-temp sweep."""
+    cannot be made; the backup then skips its OS-temp sweep."""
     if sys.platform != "win32":
         return os.geteuid()
     return _probe_owner(None)
 
 
-def _probe_owner(root: Path | None) -> object | None:
-    """The owner a new entry this process makes under ``root`` gets, as :func:`_owner_of` reports
-    it, learned from a ``mefor-owner-probe-*`` entry made there and removed again. ``root`` ``None``
-    is the OS temp dir. ``None`` when the probe cannot be created or its owner read; nothing is
-    created when ``root`` does not exist.
+@contextlib.contextmanager
+def _owner_probe(root: Path | None) -> Iterator[tuple[int, Path]]:
+    """Create an empty ``mefor-owner-probe-*`` file under ``root`` (the OS temp dir when ``None``)
+    with ``O_CREAT | O_EXCL``, yield its descriptor and path, and remove it on exit. A test seam.
+    Raises ``OSError`` on entry when it cannot be created.
 
-    POSIX: an empty file created with ``O_CREAT | O_EXCL`` (``mkstemp``), whose owner is read with
-    ``fstat`` on the descriptor that created it, never by path, so an account that can rename
-    entries in ``root`` cannot swap another object in at its name and choose the answer; nor can a
-    sibling engine shard's sweep removing it first. An empty file needs no data block, so it can
-    often be created on a volume full to the last block, though not on one out of inodes
-    (BACKLOG #4988).
-
-    Windows: a bare directory, whose owner is read by path, so there such an account can still swap
-    its own directory in at the probe's name, and a sibling engine shard's sweep removing the probe
-    before its owner is read answers ``None``.
-
-    The probe holds no lock and no marker, so it is never a staging directory. One whose removal
-    fails is left empty, and the next sweep of that root by its owner removes it
-    (:func:`_sweep_owned`)."""
+    POSIX: ``mkstemp``, removed on exit only while its name still names the object it created:
+    after a rename swap the name holds someone else's object, which is theirs to remove. Windows:
+    ``NamedTemporaryFile``, opened with ``O_TEMPORARY``, so the file is deleted when its handle
+    closes, wherever a rename has put it by then, and nothing is ever removed by its name."""
     if sys.platform == "win32":
-        try:
-            probe = Path(tempfile.mkdtemp(prefix=_OWNER_PROBE_PREFIX, dir=root))
-        except OSError:
-            return None
-        try:
-            return _owner_of(probe)
-        finally:
-            with contextlib.suppress(OSError):
-                probe.rmdir()
+        with tempfile.NamedTemporaryFile(prefix=_OWNER_PROBE_PREFIX, dir=root) as probe:
+            yield probe.fileno(), Path(probe.name)
+        return
+    fd, name = tempfile.mkstemp(prefix=_OWNER_PROBE_PREFIX, dir=root)
     try:
-        fd, name = tempfile.mkstemp(prefix=_OWNER_PROBE_PREFIX, dir=root)
-    except OSError:
-        return None
-    try:
-        return _owner_of_fd(fd, Path(name))
+        yield fd, Path(name)
     finally:
-        # Removed only while its name still names the object it created: after a rename swap the
-        # name holds someone else's object, which is theirs to remove.
         with contextlib.suppress(OSError):
             made, named = os.fstat(fd), os.lstat(name)
             if (made.st_dev, made.st_ino) == (named.st_dev, named.st_ino):
@@ -2603,18 +2656,62 @@ def _probe_owner(root: Path | None) -> object | None:
         os.close(fd)
 
 
+def _probe_owner(root: Path | None) -> object | None:
+    """The owner a new entry this process makes under ``root`` gets, as :func:`_owner_of` reports
+    it, learned from a ``mefor-owner-probe-*`` file made there (:func:`_owner_probe`) and removed
+    again. ``root`` ``None`` is the OS temp dir. ``None`` when the probe cannot be created or its
+    owner read; nothing is created when ``root`` does not exist.
+
+    The owner is read from the descriptor that created the probe (:func:`_owner_of_fd`): ``fstat`` on
+    POSIX, ``GetSecurityInfo`` on its handle on Windows. It is never read by path, so an account that
+    can rename entries in ``root`` cannot swap another object in at its name and choose the answer;
+    nor can a sibling engine shard's sweep removing it first. An empty file needs no data block, so
+    it can often be created on a volume full to the last block, though not on one out of inodes or
+    MFT records (BACKLOG #4988).
+
+    The probe holds no lock and no marker, so it is never a staging directory. One whose removal
+    fails is left empty, and the next sweep of that root by its owner removes it
+    (:func:`_sweep_owned`)."""
+    # `_owner_of_fd` never raises, so an `OSError` here is the probe's creation or its removal.
+    try:
+        with _owner_probe(root) as (fd, name):
+            return _owner_of_fd(fd, name)
+    except OSError:
+        return None
+
+
 def _owner_of_fd(fd: int, opened_as: Path) -> object | None:
-    """The owner of the object open as ``fd``, read with ``fstat`` on the descriptor, never by path.
-    POSIX only; ``None`` when it cannot be read.
+    """The owner of the object open as ``fd``, read from the descriptor, never by path: ``fstat`` on
+    POSIX, ``GetSecurityInfo`` on its handle on Windows, in the form :func:`_owner_of` reports.
+    ``None`` when it cannot be read.
 
     ``opened_as`` is the path ``fd`` was opened at. It is never read here: it is the seam a test's
     stand-in for a share whose server sets the owner keys on, as it keys :func:`_owner_of` on a
     path."""
     del opened_as
+    if sys.platform == "win32":
+        import msvcrt
+
+        try:
+            return _win_owner_of_handle(msvcrt.get_osfhandle(fd))
+        except OSError:
+            return None
     try:
         return os.fstat(fd).st_uid
     except OSError:
         return None
+
+
+def _open_for_owner(root: Path) -> int:
+    """Open the directory ``root`` for :func:`_owner_of_fd` and return a descriptor. POSIX follows a
+    link, as the sweep and the staging open do. Windows opens a link or junction as itself, with
+    ``READ_CONTROL`` and ``FILE_READ_ATTRIBUTES``, so the caller can refuse it."""
+    if sys.platform == "win32":
+        # READ_CONTROL | FILE_READ_ATTRIBUTES; FILE_FLAG_BACKUP_SEMANTICS so a directory opens at all.
+        return _win_open(
+            root, 0x00020000 | 0x00000080, 0x02000000 | _WIN_OPEN_REPARSE_POINT, os.O_RDONLY
+        )
+    return os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
 
 
 def _fallback_root_owner(root: Path, process: object | None) -> object | None:
@@ -2629,11 +2726,11 @@ def _fallback_root_owner(root: Path, process: object | None) -> object | None:
     and no directory carrying the process's own owner, which another principal may have made there,
     is swept by it. Where a new entry gets the process's owner, a root this account made carries it,
     so the sweep frees a killed run's leftover before the space check, as it did before the probe.
-    On POSIX the root is opened, following a link as the sweep and the staging open do, and read
-    with ``fstat``; on Windows it is read by path. What it leaves open: a staging root another
-    principal made on such a share, carrying the process's owner, passes the gate; and a root
-    another account owns, such as a data dir the root account made, fails it, so there the early sweep is off
-    on a volume no probe can be created on."""
+    The root is opened (:func:`_open_for_owner`) and its owner read from that descriptor; on Windows
+    a link or junction root is refused, as :func:`_owner_of` refuses one. What it leaves open: a
+    staging root another principal made on such a share, carrying the process's owner, passes the
+    gate; and a root another account owns, such as a data dir the root account made, fails it, so
+    there the early sweep is off on a volume no probe can be created on."""
     if not os.path.isdir(root):
         return None
     log.warning(
@@ -2641,14 +2738,16 @@ def _fallback_root_owner(root: Path, process: object | None) -> object | None:
     )
     if process is None:
         return None
-    if sys.platform == "win32":
-        return process if _owner_of(root) == process else None
     try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        fd = _open_for_owner(root)
     except OSError:
         return None
     try:
+        if _names_another_path(fd):
+            return None
         return process if _owner_of_fd(fd, root) == process else None
+    except OSError:
+        return None
     finally:
         os.close(fd)
 
@@ -2720,7 +2819,7 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
         path = Path(entry.path)
         try:
             if probe and entry.is_file(follow_symlinks=False):
-                # A POSIX probe file `_probe_owner` failed to remove. Only an empty one with this
+                # A probe file `_probe_owner` failed to remove. Only an empty one with this
                 # owner goes, and `unlink` removes the name itself, never what a link names.
                 st = entry.stat(follow_symlinks=False)
                 if st.st_size == 0 and _owner_of(path) == owner:
@@ -2734,7 +2833,7 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
         if path == own:
             continue  # this run's own directory, held live
         if probe:
-            # A probe `_probe_owner` failed to remove. `rmdir` alone, which refuses a directory that
+            # A probe-named directory. `rmdir` alone, which refuses a directory that
             # holds anything and never follows a link, so nothing but an empty directory goes.
             if _owner_of(path) == owner:
                 with contextlib.suppress(OSError):
