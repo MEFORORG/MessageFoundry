@@ -3278,8 +3278,8 @@ role. The refusal writes no roles; the next reconciliation pass, when it runs, o
 re-syncs them. Otherwise it behaves as the refusals above, audited with the outcome
 `directory_roles_demoted`. Channel scope is not compared on these legs. When the AD group-to-role
 map fails its seal, no role can be judged, so these legs and the IdP step-up leg below refuse an
-account that holds a role with `directory_role_map_unsealed` instead. That is not a demotion: nothing
-changed in the directory, a new sign-in reads the same map, and the fix is an administrator saving
+account that holds a role with `directory_role_map_unsealed` instead. That is not a demotion:
+nothing changed in the directory, a new sign-in reads the same map, and the fix is an administrator saving
 the map again. So it is never told to sign out.
 
 **The caller is told which fix clears the refusal, and not its cause (BACKLOG #3082).** The precise
@@ -3295,9 +3295,10 @@ password re-bind makes the role test too (below), so it gives a demoted account 
 text names a group, a role or a directory detail.
 
 **The IdP step-up leg makes the same role test (BACKLOG #2154).** `complete_oidc_step_up` already
-looks the account up by its directory object id. It now maps the groups that lookup returns to
-roles, and refuses when a stored role is not among them. It refuses only; the session stays as it
-was, with no window and no grant, and no roles are written. The `auth.reauth` row carries
+looks the account up by its directory object id. It now judges the groups that lookup returns by
+the test stated in the paragraph above that opens "Both legs also refuse a present account that
+lost a role in the directory". It refuses only; the session stays as it was, with no window and
+no grant, and no roles are written. The `auth.reauth` row carries
 `reason=directory_roles_demoted`, and the refusal tells the operator to sign in again, which
 takes the roles the current groups grant.
 Channel scope is not compared on this leg either.
