@@ -630,7 +630,24 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    delete, lift a quota with a negative size, or fail every save. `rotate-key` stamps the key's rotation date only when the key
    actually changed, so running it with the same key to seal uploads does not reset the key-age
    clock. It also writes no stamp, and exits non-zero, when it skipped an upload or its audit-chain
-   step did not complete (BACKLOG #3181). **A `serve` start does not stamp that key either (BACKLOG
+   step did not complete (BACKLOG #3181). **It refuses a configured `uploads_dir` it cannot list
+   before it writes anything (BACKLOG #4940),** with exit 2, because a volume that is not mounted
+   reads the same as one with no uploads, and its uploads may still be under the prior key. One that
+   its uploads pass cannot list, after that check passed, aborts the run with exit 1 before the
+   audit chain step: that is not a skip, so the chain does not roll, nothing is stamped and the
+   rotation record stays open. The directory is created on the first upload, so a site that has
+   never stored one creates it, empty, and re-runs. **Create it readable only by the account the
+   engine runs as:** the engine creates the directory with mode 0700 where the OS honours that, and
+   never tightens one that is already there. **It refuses only a path it cannot list: it cannot
+   tell a directory it can list from the one that holds the uploads.** When `uploads_dir` names a listable directory other than that
+   one, it re-seals only what that directory holds, then prints OK, stamps the key and closes the
+   rotation record while the real uploads may still be under the prior key. At least these reach
+   that: a volume that is not mounted over an empty mount point, which reads as no uploads; a
+   directory an upload created at that path while the volume was not mounted, where it re-seals
+   that upload alone; and a relative `uploads_dir` read from a directory other than the one `serve`
+   uses, where the run prints a note naming the path it read. Before retiring the prior key, confirm
+   the volume is mounted and the path is the one `serve` uses. **A `serve` start does not stamp a
+   changed key while the rotation record names it or cannot be read (BACKLOG
    #3737).** `rotate-key` opens a rotation record in `secret_rotation_meta` before either data pass
    (the store open can already have written under the key) and closes it only when a run completes,
    so a run killed or failed after that point leaves it open. When a start finds that the key in
