@@ -470,13 +470,15 @@ def test_a_dicom_tls_association_is_refused_when_it_checks_no_revocation() -> No
     assert "connection 'OB_PACS';" in str(exc.value)
 
 
-def _attested_guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHopGuard:
+def _attested_guard(
+    context: ssl.SSLContext | None, *, attested: bool = True, **over: Any
+) -> RevocationHopGuard:
     return RevocationHopGuard.capture(
         host=REMOTE,
         cell="test",
         description="verified TLS egress (no revocation check)",
-        attested=True,
-        attested_reason=REASON,
+        attested=attested,
+        attested_reason=REASON if attested else None,
         context=context,
         posture=ENFORCING,
         connection="OB_TEST",
@@ -504,14 +506,30 @@ def test_an_attested_hop_that_really_checks_a_crl_logs_no_crossing() -> None:
 
 def test_a_crl_on_a_context_that_skips_time_validity_keeps_the_crossing_line() -> None:
     """``NO_CHECK_TIME`` lets a CRL past ``nextUpdate`` through, so that CRL is not a check that may
-    silence the line. The flag leaves ``crl_checked`` True and the disposition ALLOW, both unmoved:
-    the condition cannot be ``self.crl_checked``, which is what this arm tells apart."""
+    silence the line. ``crl_checked`` is False on it (vault BACKLOG #5086), so the hop crosses on
+    its attestation, ALLOW, and keeps the line."""
     guard = _attested_guard(_crl_context(skip_validity=True))
-    assert guard.crl_checked is True
+    assert guard.crl_checked is False
     assert guard.disposition() is HopDisposition.ALLOW
     with _guard_log() as log:
         guard.enforce_construction()
     assert "crossed without certificate revocation checking" in log.audit, log.state()
+
+
+def test_an_unattested_crl_on_a_context_that_skips_time_validity_is_refused() -> None:
+    """A CRL past ``nextUpdate`` passes a ``NO_CHECK_TIME`` context at the handshake, so that CRL
+    is no revocation check and must not cross an enforcing hop on its own (vault BACKLOG #5086,
+    owner ruling 2026-11-03). Before that ruling the disposition read the bare CRL flag, so this
+    guard was ALLOWed with no attestation and no line. The keep-time CRL is the control: it is a
+    check, and it still crosses."""
+    relaxed = _attested_guard(_crl_context(skip_validity=True), attested=False)
+    assert relaxed.crl_checked is False
+    assert relaxed.disposition() is HopDisposition.REFUSE
+    with pytest.raises(InsecureHopRefused, match="revocation"):
+        relaxed.enforce_construction()
+    kept = _attested_guard(_crl_context(skip_validity=False), attested=False)
+    assert kept.disposition() is HopDisposition.ALLOW
+    kept.enforce_construction()
 
 
 def test_the_line_names_the_connection_flag_unless_the_hop_passes_its_own_declaration() -> None:
@@ -534,8 +552,8 @@ def test_an_attested_hop_with_a_crl_records_a_crossing_only_where_the_crl_is_no_
     ``X509_V_FLAG_NO_CHECK_TIME``, so a CRL past ``nextUpdate`` passes that context
     (``test_a_lapsed_crl_passes_a_context_that_skips_validity_checks``), and the line stays. The
     relaxed SCU hands the guard no context (ADR 0173 §13), so it crosses on its attestation, not its
-    CRL, and this half does not reach ``crl_is_a_check``; the guard-level test above pins that
-    field. This limb moves a log line, never a disposition."""
+    CRL, and this half does not reach the time-validity read in ``capture``; the guard-level tests
+    above pin it. This limb moves a log line, never a disposition."""
     with active_hop_posture(ENFORCING), _guard_log() as checked:
         kept = DicomScuDestination(_scu(REMOTE, attested=True, policy=_crl_policy(bare_crl)))
     assert context_checks_revocation(kept._ssl) is True
@@ -1129,7 +1147,7 @@ def _assert_refused_for_the_relaxation(
     built: list[ssl.SSLContext], exc: pytest.ExceptionInfo[InsecureHopRefused], connection: str
 ) -> None:
     # The CRL did reach the context the hop built, so this is the relaxation's refusal and not a CRL
-    # that never arrived: a guard that read that context's CRL flag would have admitted it.
+    # that never arrived: a guard that credited that context's bare CRL flag would have admitted it.
     assert len(built) == 1
     assert context_checks_revocation(built[0]) is True
     assert skips_validity_period(built[0]) is True

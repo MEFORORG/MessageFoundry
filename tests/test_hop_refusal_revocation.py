@@ -228,7 +228,6 @@ def test_the_authority_takes_no_egress_terminator_input() -> None:
         "posture",
         "blanket_attested",
         "crl_checked",
-        "crl_is_a_check",
         "ways_across",
         "attested_reason",
         "connection",

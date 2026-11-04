@@ -934,11 +934,13 @@ def skips_validity_period(ctx: ssl.SSLContext) -> bool:
 
     OpenSSL applies that flag to a CRL's validity window as well as the certificate's, so a CRL past
     ``nextUpdate`` is accepted at the handshake on such a context. A CRL there is therefore no
-    evidence of a revocation check that may relax a :class:`RevocationHopGuard` refusal. The MLLP
-    destination and the DICOM SCU ask this of the context they dial with and, on True, hand the
-    guard no context and name :data:`EXPIRY_RELAXED_WAYS_ACROSS` (vault BACKLOG #2978, ADR 0173
-    §13). The REST family (vault BACKLOG #2188) and FTPS (vault BACKLOG #2193) reach the same answer
-    from the ``tls_allow_expired`` setting instead, and of those only FTPS names that remedy."""
+    evidence of a revocation check that may relax a :class:`RevocationHopGuard` refusal, and
+    :meth:`RevocationHopGuard.capture` asks this of any context it is handed, leaving
+    ``crl_checked`` False on True (vault BACKLOG #5086). The MLLP destination and the DICOM SCU
+    also ask it of the context they dial with and, on True, hand the guard no context and name
+    :data:`EXPIRY_RELAXED_WAYS_ACROSS` (vault BACKLOG #2978, ADR 0173 §13). The REST family (vault
+    BACKLOG #2188) and FTPS (vault BACKLOG #2193) reach the same answer from the
+    ``tls_allow_expired`` setting instead, and of those only FTPS names that remedy."""
     return bool(ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME)
 
 
@@ -2540,6 +2542,8 @@ def revocation_hop_disposition(
        rather than declared away. The caller derives it from that context (see
        :meth:`RevocationHopGuard.capture`), never from the presence of a ``[tls].crl_file`` setting: a
        configured CRL that a given hop's handshake never consults must not silence that hop's guard.
+       Nor may a CRL on a context that skips time validity (:func:`skips_validity_period`), which
+       accepts that CRL past ``nextUpdate``; ``capture`` passes False for one (vault BACKLOG #5086).
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
        **this hop**, per-connection (``tls_revocation_attested``).
     #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing hop with unchecked revocation.
@@ -2642,13 +2646,14 @@ class RevocationHopGuard:
     #: Held SEPARATELY from the per-connection ``attested`` (BACKLOG #299) — folding the two into one
     #: field is exactly what let one env var cross every enforcing hop in the instance.
     blanket_attested: bool = False
-    #: Whether this hop's OWN context loads a CRL and sets ``VERIFY_CRL_CHECK_LEAF`` — derived from the
-    #: context in :meth:`capture`, never from a global setting.
+    #: Whether this hop's OWN context checks a CRL that is a real revocation check: it sets
+    #: ``VERIFY_CRL_CHECK_LEAF`` (:func:`context_checks_revocation`) and does not skip time validity
+    #: (:func:`skips_validity_period`), which would let a CRL past ``nextUpdate`` through. Derived
+    #: from the context in :meth:`capture`, never from a global setting. It is the one field that
+    #: decides both the disposition's CRL arm and whether the attested crossing is logged, at
+    #: :meth:`enforce_construction` and the AI broker's own arm (vault BACKLOG #5086, owner ruling
+    #: 2026-11-03).
     crl_checked: bool = False
-    #: Whether that CRL is a real check: :attr:`crl_checked`, on a context that does not skip time
-    #: validity (:func:`skips_validity_period`). It decides whether the attested crossing is
-    #: logged, at :meth:`enforce_construction` and the AI broker's own arm; no disposition reads it.
-    crl_is_a_check: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
     #: ``tls_revocation_attested`` — **the connection flag is inapplicable to every non-connection
@@ -2717,7 +2722,6 @@ class RevocationHopGuard:
 
         ``declaration`` is the setting :attr:`declaration` says it is; omitted, the record names a
         connection's flag."""
-        crl_checked = context_checks_revocation(context)
         return cls(
             host=host,
             cell=cell,
@@ -2725,8 +2729,7 @@ class RevocationHopGuard:
             attested=attested,
             posture=posture if posture is not None else current_hop_posture(),
             blanket_attested=tls_revocation_attested(),
-            crl_checked=crl_checked,
-            crl_is_a_check=crl_checked
+            crl_checked=context_checks_revocation(context)
             and not (context is not None and skips_validity_period(context)),
             ways_across=ways_across,
             attested_reason=attested_reason,
@@ -2777,13 +2780,8 @@ class RevocationHopGuard:
         # Audit an attestation that SUPPRESSED a would-be production-PHI refusal: the operator should
         # see the hop crossed with no revocation check, on their attestation. A hop whose CRL is a
         # real check crossed on that check, so this line would be a false record there and it is
-        # excluded. `crl_is_a_check`, never `crl_checked`: a context that skips time validity carries
-        # the CRL flag and accepts a lapsed CRL, so a guard handed one keeps this line. Its
-        # disposition is ALLOW on that CRL flag, which this line does not move. Nothing here refuses
-        # such a CRL: each caller makes the choice at its own call site, passing no context on a
-        # tls_allow_expired hop. At least the REST, SOAP and FHIR destinations, FTPS
-        # (_guard_ftps_revocation), MLLP and the DICOM SCU do (ADR 0173 §4.3 and §13), so those
-        # hops cross on the attestation and keep the line for that reason.
+        # excluded. `crl_checked` is the one field the disposition read too, so a CRL on a context
+        # that skips time validity, which it leaves False, keeps this line (see the field).
         # blanket_attested is not here: under an enforcing posture it can no longer produce an ALLOW
         # (BACKLOG #299), and under a non-enforcing one `posture.enforcing` already excludes the line.
         if (
@@ -2791,7 +2789,7 @@ class RevocationHopGuard:
             and self.attested
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
-            and not self.crl_is_a_check
+            and not self.crl_checked
         ):
             log_attested_crossing(
                 logger,

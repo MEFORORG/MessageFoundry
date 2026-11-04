@@ -259,9 +259,11 @@ def _refuse_an_unrevoked_ai_hop(
     )
     if disposition is HopDisposition.ALLOW:
         # Not when the context's CRL is a real check: that hop crossed on it, not on the
-        # attestation, and the line would be a false record. No CRL reaches it today; a later CRL
-        # lever must revisit this arm and the refusal's lever text together.
-        crossed_on_attestation = attested and enforcing and not on_box and not guard.crl_is_a_check
+        # attestation, and the line would be a false record. `crl_checked` is the same one field
+        # the disposition read, False for a CRL on a context that skips time validity (vault
+        # BACKLOG #5086). No CRL reaches it today; a later CRL lever must revisit this arm and the
+        # refusal's lever text together.
+        crossed_on_attestation = attested and enforcing and not on_box and not guard.crl_checked
         if crossed_on_attestation and _first_crossing("attested", host):
             log_attested_crossing(
                 logger,

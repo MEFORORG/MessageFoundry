@@ -769,7 +769,12 @@ real check. A hop with `tls_allow_expired`, a CRL and the attestation keeps the 
 MLLP and the DICOM SCU (since §13), the REST, SOAP and FHIR hops (§4.3 above) and the FTPS hops
 (§7.1's note of 2026-10-28 on the inbound FTPS poll, and §13) hand the guard no context there, so such a hop crosses on its attestation alone. **The guard's own
 disposition does not apply that reading:** it still admits a context that skips time validity on
-that context's CRL, with no attestation, so the rule rests on each caller passing no context. The
+that context's CRL, with no attestation, so the rule rests on each caller passing no context.
+*(Note 2026-11-03: no longer so. `crl_is_a_check` is gone, and `capture()` sets `crl_checked` with
+its meaning, so the disposition and the line read one field: a CRL on a context that skips time
+validity earns no credit, and such a hop is refused under an enforcing posture unless attested
+(vault BACKLOG #5086, owner ruling 2026-11-03). The call sites below still pass no context there,
+which now changes no disposition and is how they pick the remedy they name.)* The
 choice is made at each call site: at least `RestDestination.__init__` (`transports/rest.py`),
 `SoapDestination.__init__` (`soap.py`), `FhirDestination.__init__` (`fhir.py`), FTPS's
 `_guard_ftps_revocation` (`remotefile.py`), and the MLLP and SCU sites §13 names.
@@ -1503,7 +1508,10 @@ on first deployment, with no attestation.
 - **Where the flag is read:** at the two call sites, off the context the hop dials with
   (`skips_validity_period`), as `context_checks_revocation` reads the CRL flag. The guard and
   `context_checks_revocation` are unchanged. REST, SOAP, FHIR and FTPS read the setting at their call
-  sites; on these hops the setting and the flag are set together.
+  sites; on these hops the setting and the flag are set together. *(Note 2026-11-03: the guard
+  changed since. `RevocationHopGuard.capture` reads `skips_validity_period` off any context it is
+  handed too, and gives that context's CRL no credit (vault BACKLOG #5086), so these call sites are
+  no longer the only place the flag is read. `context_checks_revocation` is still unchanged.)*
 - The attested crossing still logs its audit line: with no CRL credit, the attestation is what
   crosses the hop.
 - On an instance that does not enforce, these hops used to cross on the CRL without the revocation
@@ -1521,7 +1529,9 @@ on first deployment, with no attestation.
   §4.3's CORRECTED 2026-10-30 paragraph records a different condition, `crl_is_a_check`, which
   keeps the line for a context that skips time validity. Its effect matches that fix for every
   shipped caller, because each passes no context when its context skips time validity, so the line
-  is silenced where the CRL is a real check.)*
+  is silenced where the CRL is a real check.)* *(Note 2026-11-03: `crl_is_a_check` is gone; that
+  condition is now `crl_checked` itself, which the disposition reads too, so the match no longer
+  rests on each caller (vault BACKLOG #5086).)*
 
 Pinned by `tests/test_revocation_guard_remaining_hops.py`, beside the FTPS arm of the same rule:
 refused with a CRL on the relaxed context, admitted and audited on the attestation with no CRL
