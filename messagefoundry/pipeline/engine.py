@@ -2840,7 +2840,7 @@ class Engine:
                 "read whole, so a released reload is refused. Any other reload reads the "
                 "directory again and refuses any file the load reads that it cannot read, every "
                 "*.py module and helper included; only the environments folder and its files "
-                "are left out",
+                "are left out, and the environment value file is read from disk",
                 scrub_log_argument(str(path)),
                 safe_exc(exc),
             )

@@ -95,6 +95,15 @@ def test_the_snapshot_holds_the_bytes_it_read_and_answers_them_after_an_edit(
     assert not snapshot.covers_environment_file(value_file.with_name("prod.toml"))
 
 
+def test_a_snapshot_s_repr_does_not_carry_the_value_file_s_bytes(tmp_path: Path) -> None:
+    # A value file can hold credentials, and a repr can reach a log or a traceback.
+    cfg, value_file = _layout(tmp_path, 'PASSWORD = "s3cret-value-file-bytes"\n')
+    snapshot = with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=True)
+    assert snapshot.environment_file(value_file) is not None  # control: the bytes are held
+    assert "s3cret-value-file-bytes" not in repr(snapshot)
+    assert "s3cret-value-file-bytes" not in str(snapshot)
+
+
 def test_a_folder_named_like_the_value_file_is_no_value_file_as_a_start_judges_it(
     tmp_path: Path,
 ) -> None:

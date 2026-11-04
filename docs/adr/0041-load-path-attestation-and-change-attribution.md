@@ -127,7 +127,10 @@ the config directory's `environments/` folder: the file name and not the path, s
 independent of where the bundle sits. A reload reads it into the snapshot it loads, after vetting
 the file and its folder, and the provider parses those bytes, so a dual-control release checks and
 applies the same value bytes. A start still reads its values when the engine is built, so the start
-digest reads the file again afterwards and can name later bytes. The DR backup digest describes
+digest reads the file again afterwards and can name later bytes. Every engine shard and cluster
+node is assumed to read the same value file, as it shares the config directory; outside that
+directory only the active environment's file is folded, so nodes on different `--env` names
+compare as a config change. The DR backup digest describes
 the archive and does not fold it. A sandbox worker is not sent it: it resolves no value. The `v3`
 text above is kept as the record of what was decided on its date.
 

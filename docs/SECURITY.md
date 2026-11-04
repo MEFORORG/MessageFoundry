@@ -2531,7 +2531,13 @@ from disk instead. The digest covers `serve`'s environment value file wherever
 `[environments].base_dir` puts it: in the config directory's `environments/` folder, or elsewhere,
 where the release reads it into the snapshot after vetting the file and its folder. `serve` parses
 it from the same snapshot, so an edit to it during the load does not apply, and a value file
-created or removed since the snapshot is refused. Otherwise, at least where an embedded engine has
+created or removed since the snapshot is refused. Every engine shard and cluster node shares one
+config directory by contract, and so must read the same value file. A node whose value file
+differs pages `config_changed` on its starts, because a start compares its digest with the
+store's newest one, whichever node wrote it. It also refuses as `digest_mismatch` a hold filed
+through another node, as the cluster limit below says. In the `environments/` folder every
+`*.toml` is folded; outside it, only the active environment's file is, so there nodes started
+with different `--env` names have different digests too. Otherwise, at least where an embedded engine has
 another value provider, the
 release reads the values from disk and then takes the digest again, which refuses a change made in
 between to a file the digest covers. If the digest differs, nothing loads and nothing swaps. The running graph keeps
@@ -2617,6 +2623,11 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   at release unless the edit is reverted, and then it can be released;
 - in a cluster, the release compares the digest with the disk of the node that handles the approve,
   which may not be the node that took it;
+- a start's `config_loaded` digest may name value-file bytes the start did not apply. A start
+  resolves its environment values when the engine is built, and its digest reads the value file
+  later: in the load's snapshot where the file is in the `environments/` folder, and from disk
+  again where it is outside it. So an edit in between is in the digest and not in the running
+  values;
 - a restart, a cluster convergence reload, a DR activation and a sandbox worker respawn check no
   approved digest. Whether a restart under dual control refuses an unapproved digest is an open
   owner question.

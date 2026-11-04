@@ -3032,7 +3032,11 @@ async def _compare_start_config(
     comparison itself when one was made.
 
     Keyed on the store, not on a node: every engine shard and cluster node shares one config
-    directory by contract, and a node id changes on every restart. The baseline is the newest
+    directory by contract, and reads the same environment value file, and a node id changes on
+    every restart. A node whose value file differs pages ``config_changed`` on its starts, and a
+    release through it refuses as ``digest_mismatch`` a hold filed through another node. Outside
+    the config directory only the active environment's value file is folded, so nodes on
+    different ``--env`` names differ too (vault BACKLOG #2596). The baseline is the newest
     ``config_loaded`` or ``config_reload`` row the start can use: it passes
     over a row whose detail is not a JSON object (at WARNING, since only the engine writes these
     rows) and a row marked :data:`_BASELINE_UNCHECKED`, and falls back to the next older one.

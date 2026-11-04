@@ -158,8 +158,9 @@ def _plain_name(part: str) -> bool:
 def _check_rel(rel: object) -> str:
     """``rel`` when it is a relative path a snapshot can hold, else ``ValueError``. A snapshot can
     arrive from another process (the sandbox boot frame), so its names are checked, not trusted:
-    a module at the top level, ``connections.toml``, or one file in ``codesets/`` or
-    ``environments/``, each part a plain name on this platform (:func:`_plain_name`). Nothing here
+    a module at the top level, ``connections.toml``, one file in ``codesets/`` or
+    ``environments/``, or the value file :func:`with_value_file` reads, as
+    ``@value-file/<name>``, each part a plain name on this platform (:func:`_plain_name`). Nothing here
     is ever opened, but a module's name is joined to the snapshot's directory and looked up again
     by that path's ``name``, so a part that is not a plain name could select another file's bytes.
     Every name :func:`read_config_snapshot` lists on a platform passes there."""
@@ -196,7 +197,9 @@ class ConfigSnapshot:
     covered and never loaded, like ``environments/``, and ``None`` when there is no such file."""
 
     directory: Path
-    files: Mapping[str, bytes]
+    # Out of the repr: a value file can hold credentials, and a snapshot's repr can reach a log or
+    # a traceback (vault BACKLOG #2596).
+    files: Mapping[str, bytes] = field(repr=False)
     unreadable: tuple[str, ...] = ()
     value_file: Path | None = None
     _modules: tuple[str, ...] = field(init=False, repr=False)
