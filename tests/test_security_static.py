@@ -62,8 +62,9 @@ invariants can't silently regress.
   ``faultcode`` or ``Value`` in any case with no word character after it. So they also match a
   longer name that goes on with ``.`` or ``-``, such as ``<faultcode.detail>`` or ``<Value-x>``.
   ``_code_text`` takes the text from the next ``>`` after the first match to the next ``</``. That
-  is an ad-hoc same-type extraction, deliberately out of the clause's scope, because it drives only
-  retry-vs-dead-letter classification, never a security decision.
+  is an ad-hoc same-type extraction, deliberately out of the clause's scope, because it drives the
+  delivery's disposition and never a security decision. At least: retry versus dead-letter, and on a
+  capturing connection whether the captured reply's outcome is ``rejected`` or ``accepted``.
 """
 
 from __future__ import annotations

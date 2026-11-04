@@ -136,8 +136,8 @@ is a new message envelope), not a purity violation. (The idempotency footgun thi
 
 #### 2a. Envelope assembly mechanism — stdlib string templating, no XML parser (Q4)
 
-*(Corrected 2026-11-04: this heading, the "regex-only" premise and the import sentence below are
-narrower than they read now; the correction at the end of the next paragraph says what holds.)*
+*(Corrected 2026-11-04: this heading, the "regex-only" premise and the import sentence below claim
+more than is true now; the correction at the end of the next paragraph says what holds.)*
 
 This is **load-bearing** because the codebase is **regex-only and imports no XML parser** today
 *(corrected 2026-11-04, see below)*:
@@ -153,8 +153,10 @@ themselves.)* There is no `xml.etree` / `ElementTree` / `lxml` / `defusedxml` im
 "no XML parser" are no longer true of the codebase. The engine imports XML parsers, and
 `tests/test_security_static.py` keeps the allowlist of where. `transports/soap.py` is on it: it imports
 `xml.sax` for the one hardened, non-resolving parse of the Handler `<Body>` fragment that the third
-bullet below describes, `_assert_well_formed_fragment`. What still holds is narrower: the SOAP envelope
-is assembled, and its response classified, with no parser, and "that posture" below means only that.
+bullet below describes, `_assert_well_formed_fragment`, which `_wrap_envelope` runs on every WS-* send.
+What still holds is narrower: the SOAP envelope is built by string concatenation, never from a parsed
+tree; the fragment check is the send path's only parse, and it keeps no tree; and the response is
+classified with no parser. "That posture" below means only that.
 For these 2026-11-04 corrections, the XML parser imports under `messagefoundry/` and the `soap.py`
 symbols this section names were re-read; the rest of this section is as accepted and was not
 re-read.)* We keep that posture:
