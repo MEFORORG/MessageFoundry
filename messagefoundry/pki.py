@@ -21,7 +21,8 @@ import logging
 import os
 import ssl
 import string
-from collections.abc import Iterable, Iterator, Set
+from collections import Counter
+from collections.abc import Iterable, Iterator, Mapping, Set
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -1659,8 +1660,8 @@ class IssuerIndex:
     never counts. A self-signed client certificate loaded as an anchor issued itself, so it names
     itself, whether or not it is marked as a CA.
 
-    The index holds exactly the CA certificates OpenSSL loads from ``cadata``, and as many others,
-    or the build raises ``ValueError`` naming ``label`` (BACKLOG #4948). :func:`_pem_certificate_blocks` finds them, but
+    The index holds exactly the CA certificates OpenSSL loads from ``cadata``, and a count of others
+    OpenSSL's count can match, or the build raises ``ValueError`` naming ``label`` (BACKLOG #4948). :func:`_pem_certificate_blocks` finds them, but
     it models OpenSSL's PEM reader and is not that reader, so the result is then checked against
     OpenSSL itself (:func:`_refuse_unless_openssl_loads`). A CA the index named but OpenSSL never
     loaded could be named for a leaf whose chain ran through a client-sent copy of it; a CA OpenSSL
@@ -1669,13 +1670,16 @@ class IssuerIndex:
     refuses too, as the index could not say whether OpenSSL holds it."""
 
     def __init__(self, cadata: str, *, label: str = "the client CA file") -> None:
-        seen: set[bytes] = set()  # de-duplicates a certificate listed twice
+        copies: Counter[bytes] = Counter()  # a certificate listed twice is one anchor
         self._by_subject_name: dict[x509.Name, list[_Anchor]] = {}
-        # Distinct KEYS per rendered subject. A re-issued CA certificate with the same key, or a root
-        # beside its own cross-certificate, is one signer and not ambiguous; two keys under one name
-        # are, because the map names only the name.
+        # Distinct KEYS per rendered subject, of the certificates issuer_of can name. A re-issued CA
+        # certificate with the same key, or a root beside its own cross-certificate, is one signer
+        # and not ambiguous; two keys under one name are, because the map names only the name.
         self._subject_keys: dict[str, set[bytes]] = {}
-        read: list[tuple[x509.Certificate, str, bytes]] = []
+        # Subjects whose keys include a self-signed certificate OpenSSL reads as no CA, so
+        # unmatched_keys does not call it a CA.
+        self._pinned_subjects: set[str] = set()
+        read: list[tuple[x509.Certificate, str, bytes, bytes]] = []
         blocks = _pem_certificate_blocks(cadata.encode("ascii", "replace"))
         for position, block in enumerate(blocks, start=1):
             try:
@@ -1691,22 +1695,27 @@ class IssuerIndex:
                     "mTLS issuer map, though the TLS library may load it, so the map could not "
                     "hold what the handshake trusts. Remove or re-issue that certificate"
                 ) from exc
-            if der in seen:
-                continue  # the same certificate twice is one anchor
-            seen.add(der)
-            read.append((cert, subject, der))
-            self._subject_keys.setdefault(subject, set()).add(key)
-        cas = _refuse_unless_openssl_loads(cadata, seen, label=label)
-        for cert, subject, der in read:
+            copies[der] += 1
+            if copies[der] == 1:
+                read.append((cert, subject, der, key))
+        cas = _refuse_unless_openssl_loads(cadata, copies, label=label)
+        for cert, subject, der, key in read:
             anchor = _Anchor(cert, subject, der, ca=der in cas)
             self._by_subject_name.setdefault(cert.subject, []).append(anchor)
+            # One OpenSSL reads as no CA signs nothing it verifies, so issuer_of names it only as
+            # itself, when it signs itself. One that does not is named for no leaf, and is no
+            # same-DN twin (BACKLOG #4948).
+            if anchor.ca or _directly_issued(cert, cert):
+                self._subject_keys.setdefault(subject, set()).add(key)
+                if not anchor.ca:
+                    self._pinned_subjects.add(subject)
 
     def issuer_of(self, leaf_der: bytes) -> str:
         """The subject of the one loaded CA that directly issued ``leaf_der``, or ``""``.
 
-        ``""`` when no loaded CA issued it, when it does not parse, or when another loaded CA with a
-        DIFFERENT key shares the issuing CA's subject: the map is keyed by name, so it could not tell
-        the two apart. A loaded certificate OpenSSL reads as no CA names only a leaf that is that
+        ``""`` when no loaded CA issued it, when it does not parse, or when another loaded CA, or a
+        self-signed certificate pinned as itself, with a DIFFERENT key shares the issuing CA's
+        subject: the map is keyed by name, so it could not tell the two apart. A loaded certificate OpenSSL reads as no CA names only a leaf that is that
         certificate. Never raises."""
         try:
             leaf = x509.load_der_x509_certificate(leaf_der)
@@ -1731,8 +1740,13 @@ class IssuerIndex:
             if count == 0:
                 problems[key] = "names no CA certificate loaded from [api].tls_client_ca_file"
             elif count > 1:
+                signers = (
+                    "certificates, CAs or self-signed certificates pinned as themselves,"
+                    if key in self._pinned_subjects
+                    else "CA certificates"
+                )
                 problems[key] = (
-                    f"names {count} loaded CA certificates with the same subject and different keys, "
+                    f"names {count} loaded {signers} with the same subject and different keys, "
                     "so they cannot be told apart and no certificate maps under it"
                 )
         return problems
@@ -1746,10 +1760,13 @@ def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
     return True
 
 
-def _refuse_unless_openssl_loads(cadata: str, indexed: Set[bytes], *, label: str) -> set[bytes]:
+def _refuse_unless_openssl_loads(
+    cadata: str, indexed: Mapping[bytes, int], *, label: str
+) -> set[bytes]:
     """The CA certificates OpenSSL's ``load_verify_locations(cadata=)`` loads from ``cadata``, as
-    DER, or ``ValueError`` unless ``indexed`` holds exactly those, and as many other certificates as
-    it loads (BACKLOG #4948). This is the authority; the PEM scan only proposes.
+    DER, or ``ValueError`` unless ``indexed``, each certificate the index read with how many
+    copies of it it read, holds exactly those, and a count of other certificates OpenSSL's count can
+    match (BACKLOG #4948). This is the authority; the PEM scan only proposes.
 
     Asked of a scratch context, as ``config.tls_policy.crl_scratch_context`` asks one about a CRL
     file, so the live context is never written to. ``get_ca_certs`` lists every CA certificate the
@@ -1758,9 +1775,10 @@ def _refuse_unless_openssl_loads(cadata: str, indexed: Set[bytes], *, label: str
     another CA with its DN and a third between them), and a second copy signs nothing a first does
     not. A certificate the index holds that is not in that list must be one OpenSSL reads as no CA,
     asked of a context holding only those, or it would be a CA the index read and OpenSSL never
-    loaded. OpenSSL lists no other certificate, so those are compared only by count, and a copy of
-    one kept twice refuses. A count that balances over two different such certificates is not
-    caught here, so :meth:`IssuerIndex.issuer_of` lets one name only a leaf that is itself."""
+    loaded. OpenSSL lists no other certificate, so those are compared only by count, and as it may
+    keep one listed twice once or twice, its count must lie between the distinct ones read and
+    every copy read. A count that balances over two different such certificates is not caught
+    here, so :meth:`IssuerIndex.issuer_of` lets one name only a leaf that is itself."""
     scratch = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)  # loads no roots
     try:
         scratch.load_verify_locations(cadata=cadata)
@@ -1772,9 +1790,10 @@ def _refuse_unless_openssl_loads(cadata: str, indexed: Set[bytes], *, label: str
         ) from exc
     listed = scratch.get_ca_certs(binary_form=True)
     cas = set(listed)
-    others = indexed - cas
+    others = indexed.keys() - cas
+    other_copies = sum(indexed[der] for der in others)
     loaded_others = scratch.cert_store_stats()["x509"] - len(listed)
-    if missed := len(cas - indexed):
+    if missed := len(cas - indexed.keys()):
         problem = (
             f"loads {missed} CA certificate(s) from this file that the mTLS issuer map did not "
             "read. Write each certificate as a plain PEM block"
@@ -1792,10 +1811,10 @@ def _refuse_unless_openssl_loads(cadata: str, indexed: Set[bytes], *, label: str
                 f"cannot load {len(reads) - reads.count(False)} certificate(s) the mTLS issuer map "
                 "read from this file. Remove or re-issue them"
             )
-    elif loaded_others != len(others):
+    elif not len(others) <= loaded_others <= other_copies:
         problem = (
             f"loads {loaded_others} certificate(s) that are not CAs from this file, where the "
-            f"mTLS issuer map read {len(others)}. List each certificate once, and remove any empty "
+            f"mTLS issuer map read {len(others)} ({other_copies} with copies). Remove any empty "
             "or non-certificate PEM block"
         )
     else:

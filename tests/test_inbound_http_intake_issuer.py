@@ -20,6 +20,7 @@ import asyncio
 import datetime
 import logging
 import ssl
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -782,12 +783,14 @@ def test_the_check_refuses_a_ca_openssl_did_not_load_when_the_count_balances() -
     cadata = ssl.DER_cert_to_PEM_cert(root) + _pem(pinned).decode("ascii")
     assert _openssl_context(cadata).cert_store_stats() == {"x509": 2, "crl": 0, "x509_ca": 1}
     with pytest.raises(ValueError, match=r"does not load 1 CA certificate\(s\)"):
-        pki._refuse_unless_openssl_loads(cadata, {root, phantom}, label="x")
+        pki._refuse_unless_openssl_loads(cadata, Counter([root, phantom]), label="x")
     with pytest.raises(ValueError, match=r"loads 1 CA certificate\(s\) .* did not read"):
-        pki._refuse_unless_openssl_loads(cadata, {_der(pinned)}, label="x")
+        pki._refuse_unless_openssl_loads(cadata, Counter([_der(pinned)]), label="x")
     with pytest.raises(ValueError, match=r"loads 1 certificate\(s\) that are not CAs"):
-        pki._refuse_unless_openssl_loads(cadata, {root}, label="x")
-    assert pki._refuse_unless_openssl_loads(cadata, {root, _der(pinned)}, label="x") == {root}
+        pki._refuse_unless_openssl_loads(cadata, Counter([root]), label="x")
+    assert pki._refuse_unless_openssl_loads(cadata, Counter([root, _der(pinned)]), label="x") == {
+        root
+    }
 
 
 def test_a_certificate_openssl_reads_as_no_ca_names_only_itself() -> None:
@@ -815,6 +818,127 @@ def test_a_certificate_openssl_reads_as_no_ca_names_only_itself() -> None:
     index = IssuerIndex(_pem(pinned).decode("ascii"))
     assert index.issuer_of(_der(pinned)) == "CN=Pinned"  # control: it names itself
     assert index.issuer_of(_der(other)) == ""
+
+
+def _issued_no_ca(dn: x509.Name, by: _CaPair) -> x509.Certificate:
+    """A certificate for ``dn`` that ``by`` signed, marked ``CA:FALSE``. It signs nothing OpenSSL
+    verifies, and it does not sign itself, so the index never names it as itself. Its key
+    identifier is set, as a real certificate's is, so OpenSSL does not try it as a leaf's issuer."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.UTC)
+    return (
+        x509.CertificateBuilder()
+        .subject_name(dn)
+        .issuer_name(by[0].subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .sign(by[1], hashes.SHA256())
+    )
+
+
+@pytest.mark.parametrize("other", ["ca", "pinned"])
+def test_a_pinned_certificate_listed_twice_beside_one_with_its_subject_builds(other: str) -> None:
+    """A self-signed pinned certificate listed twice, after another certificate with its subject
+    and a CA between them. OpenSSL 3.5.7 keeps both copies of the pinned one, so a check counting
+    what OpenSSL holds against the distinct certificates the index read refused a file the shipped
+    code built (BACKLOG #4948). The two certificates still share a subject under different keys,
+    and each could be named, so the name stays ambiguous."""
+    pinned = _pinned("Acme Svc")
+    twin = (
+        _pinned("Acme Svc") if other == "pinned" else _ca(_dn((NameOID.COMMON_NAME, "Acme Svc")))[0]
+    )
+    mid = _ca(_dn((NameOID.COMMON_NAME, "Mid CA")))[0]
+    cadata = (_pem(twin) + _pem(mid) + _pem(pinned) + _pem(pinned)).decode("ascii")
+    assert _openssl_loads(cadata) == 4  # the premise: OpenSSL keeps the second copy
+    index = IssuerIndex(cadata)
+    assert index.unmatched_keys(["CN=Mid CA"]) == {}
+    assert index.issuer_of(_der(pinned)) == ""  # the two stay ambiguous
+    reason = index.unmatched_keys(["CN=Acme Svc"])["CN=Acme Svc"]
+    assert reason.startswith("names 2 loaded certificates"), reason
+    assert "pinned" in reason, reason  # a pinned certificate is not called a CA
+    # Control: listed once, OpenSSL holds one copy and the file builds as before.
+    once = (_pem(twin) + _pem(mid) + _pem(pinned)).decode("ascii")
+    assert _openssl_loads(once) == 3
+    assert IssuerIndex(once).issuer_of(_der(pinned)) == ""
+
+
+def test_the_count_of_certificates_that_are_no_ca_is_still_bounded() -> None:
+    """Driven at the check itself: OpenSSL may hold a certificate listed twice once or twice, so
+    the count it holds may lie between the distinct certificates the index read and every copy it
+    read. Outside that, the start still refuses (BACKLOG #4948)."""
+    root = _der(_ca(_dn((NameOID.COMMON_NAME, "Root CA")))[0])
+    pinned = _der(_pinned("Pinned"))
+    cadata = ssl.DER_cert_to_PEM_cert(root) + ssl.DER_cert_to_PEM_cert(pinned)
+    assert _openssl_loads(cadata) == 2  # the premise: one copy of each
+    # The index read the pinned certificate twice, and OpenSSL holds it once: within the bound.
+    assert pki._refuse_unless_openssl_loads(cadata, Counter([root, pinned, pinned]), label="x") == {
+        root
+    }
+    # The index read one certificate that is no CA, and OpenSSL holds none: below the bound.
+    alone = ssl.DER_cert_to_PEM_cert(root)
+    with pytest.raises(ValueError, match=r"loads 0 certificate\(s\) that are not CAs"):
+        pki._refuse_unless_openssl_loads(alone, Counter([root, pinned, pinned]), label="x")
+    # OpenSSL holds one certificate that is no CA, and the index read none: above the bound.
+    with pytest.raises(ValueError, match=r"loads 1 certificate\(s\) that are not CAs"):
+        pki._refuse_unless_openssl_loads(cadata, Counter([root]), label="x")
+
+
+def test_an_issuer_key_naming_only_a_certificate_that_is_no_ca_is_warned_about(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A key naming only a loaded certificate OpenSSL reads as no CA, which does not sign itself,
+    can never match: such a certificate issues nothing, and is named only as itself. The key would
+    deny every certificate under it with nothing in the log, so it is warned about at start
+    (BACKLOG #4948). A self-signed pinned certificate names itself, so its key is not."""
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    service = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Partner Svc")), root)
+    pinned = _pinned("Pinned")
+    subjects = {k: [SUBJECT] for k in ("CN=Root CA", "CN=Partner Svc", "CN=Pinned")}
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+        source = _source(tmp_path, [root[0], service, pinned], subjects)
+    warned = [r.getMessage() for r in caplog.records]
+    assert any("'CN=Partner Svc'" in m and "names no CA" in m for m in warned), warned
+    assert not any("'CN=Root CA'" in m or "'CN=Pinned'" in m for m in warned), warned  # controls
+    assert source._issuer_index is not None
+    reason = source._issuer_index.unmatched_keys(["CN=Partner Svc"])["CN=Partner Svc"]
+    assert reason.startswith("names no CA certificate"), reason
+    # It is named under the CA that issued it, never under its own subject.
+    assert source._issuer_index.issuer_of(_der(service)) == "CN=Root CA"
+
+
+async def test_a_certificate_that_is_no_ca_sharing_a_cas_subject_is_no_twin(
+    tmp_path: Path,
+) -> None:
+    """A loaded certificate OpenSSL reads as no CA, and that does not sign itself, shares a CA's
+    subject under another key. It can never be named, so it is not a twin of that CA, and a leaf
+    the CA signed is admitted under its subject. In the shipped code its key counted toward the
+    same-DN ambiguity, so every certificate under the CA was refused (BACKLOG #4948): this
+    LOOSENS a deny. A self-signed pinned certificate in its place could be named, as itself, so
+    there the name stays ambiguous and the leaf is refused, as before."""
+    acme = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root)
+    (tmp_path / "namesake").mkdir()
+    source = await _started(
+        _source(tmp_path / "namesake", [acme[0], namesake], {"CN=Acme CA": [SUBJECT]})
+    )
+    try:
+        assert source._issuer_index is not None
+        assert source._issuer_index.unmatched_keys(["CN=Acme CA"]) == {}
+        assert await _admitted(source, _bundle(tmp_path, acme)) == 202
+    finally:
+        await source.stop()
+    # Control: a self-signed pinned certificate with the CA's subject keeps the name ambiguous.
+    leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), acme)[0])
+    index = IssuerIndex((_pem(acme[0]) + _pem(_pinned("Acme CA"))).decode("ascii"))
+    assert index.issuer_of(leaf) == ""
+    assert "pinned" in index.unmatched_keys(["CN=Acme CA"])["CN=Acme CA"]
+    # Control: with the CA alone, the same leaf is named.
+    assert IssuerIndex(_pem(acme[0]).decode("ascii")).issuer_of(leaf) == "CN=Acme CA"
 
 
 @pytest.mark.parametrize(
