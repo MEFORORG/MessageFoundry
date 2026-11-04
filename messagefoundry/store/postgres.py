@@ -1567,12 +1567,16 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # missing server (a Postgres config that would fail elsewhere) never trips the revocation refusal.
     try:
         ctx = _verifying_context(settings)
-    except InsecureHopRefused:
-        raise
     except ValueError as exc:
-        # BACKLOG #5000: the context builder refuses the hop's own TLS settings (the pin file, the
-        # CRL file and its dates, the suites) with a ValueError. Typed here, at the open, so every
-        # refusal it makes, now or later, is could not start rather than the CLI floor's exit 1.
+        # BACKLOG #5000: the context builder refuses the hop's own TLS settings with a ValueError,
+        # at least for the pin file, the CRL file and its dates, and the suites. Typed here, at the
+        # open only, so such a refusal is could not start rather than the CLI floor's exit 1. Not
+        # an OSError that is also a ValueError, such as a CRL staging copy that failed: that is a
+        # fault of the host, not a verdict on the settings, and keeps its own type. Nor an OSError
+        # alone, such as a CRL file the engine may not read, which this does not catch. The pool's
+        # per-connection rebuild calls the builder directly, so a refusal there is not typed.
+        if isinstance(exc, (InsecureHopRefused, OSError)):
+            raise
         raise StoreTlsRefused(str(exc)) from exc
     # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
     # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
@@ -1599,8 +1603,8 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
         except OSError as exc:
             # A missing file raises a bare FileNotFoundError with no path. Name the setting, since the
             # pool re-reads this file on every new connection and it can vanish after the load check.
-            # Typed as the store's TLS refusal, so a command reports it as could not start (#5000).
-            raise StoreTlsRefused(
+            # A ValueError: `_build_ssl` types it at the open (#5000); a pool connect leaves it be.
+            raise ValueError(
                 f"[store].ssl_root_cert ({settings.ssl_root_cert!r}) could not be read: {exc}"
             ) from exc
         connector = "Postgres store (pinned CA)"

@@ -168,7 +168,7 @@ def test_each_refusal_is_typed_and_still_a_value_error(tmp_path: Path) -> None:
     PostgreSQL pin file gone since the settings load and a CRL file that cannot be judged, refused
     by the context builder ``_build_ssl`` calls at the open."""
     from messagefoundry.config.tls_policy import HopPosture
-    from messagefoundry.store.postgres import _build_ssl, _verifying_context
+    from messagefoundry.store.postgres import _build_ssl
     from messagefoundry.store.sqlserver import check_pinned_certificate, connection_string
 
     assert issubclass(StoreTlsRefused, InsecureHopRefused)
@@ -183,7 +183,6 @@ def test_each_refusal_is_typed_and_still_a_value_error(tmp_path: Path) -> None:
         lambda: _build_ssl(_pg(trust_server_certificate=True), posture=enforcing),
         lambda: connection_string(_ss(trust_server_certificate=True), posture=enforcing),
         lambda: check_pinned_certificate(_ss(ssl_root_cert=pin), posture=enforcing),
-        lambda: _verifying_context(gone),
         lambda: _build_ssl(gone, posture=enforcing),
         # Any refusal the context builder makes is typed at the open, a CRL that cannot be judged
         # among them.

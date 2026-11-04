@@ -37,7 +37,6 @@ _UNUSED_ENTRY = "If you added the entry this run showed to the authenticator app
 #: ``(backend, schema_management)`` -> whether the refusal names the database setting.
 _STORES = {
     ("sqlserver", "auto"): True,
-    ("sqlserver", "external"): False,
     ("postgres", "auto"): False,
 }
 
@@ -231,53 +230,6 @@ def test_any_other_open_refusal_keeps_its_text() -> None:
     wrapped = _StoreOpenRefused("short")
     wrapped.__cause__ = _refusal("sqlserver")
     assert _RCSI in (_open_refusal_left_behind(wrapped, store) or "")
-
-
-def test_provision_admin_service_refusal_at_the_write_names_the_entry(
-    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The service's own refusal at the write, after the key was shown. Some follow a partial
-    write, so the text says the run did not finish, never that the seed was not stored. Exit 1,
-    this command's refusal, as before.
-
-    Mutation: print ``str(exc)`` alone again in the ``FirstAdministratorRefused`` arm."""
-    from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
-    from messagefoundry.config.settings import StoreBackend
-    from messagefoundry.store import base
-
-    async def opening(*_args: object, create: bool = False, **_kwargs: object) -> object:
-        if not create:
-            raise base.StoreNotFoundError.server_schema(StoreBackend.SQLSERVER, "mefor")
-        return _OpenedStore()
-
-    class _OpenedStore:
-        path = "127.0.0.1/mefor"
-
-        def cipher_info(self) -> object:
-            return types.SimpleNamespace(encrypts=True)
-
-        def audit_append_refusal(self) -> None:
-            return None
-
-        async def get_user_by_username(self, _username: str) -> None:
-            return None
-
-        async def close(self) -> None:
-            return None
-
-    async def refused(*_args: object, **_kwargs: object) -> object:
-        raise FirstAdministratorRefused("synthetic service refusal")
-
-    _refused_at_the_write(monkeypatch, "sqlserver", RuntimeError("unused"))
-    monkeypatch.setattr(base, "open_store", opening)
-    monkeypatch.setattr(AuthService, "provision_first_administrator", refused)
-    code = main(_provision(_settings(shell, "sqlserver", "auto")))
-    captured = capsys.readouterr()
-    out = captured.out + captured.err
-    assert code == 1, out
-    assert "synthetic service refusal" in out, out
-    assert _UNUSED_ENTRY in out and "this run did not finish" in out, out
-    assert "its seed was never stored" not in out, out
 
 
 def test_provision_admin_open_refusal_quotes_no_key_byte(

@@ -8675,8 +8675,11 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     """What a refused store open left behind, when that is more than "nothing was written"
     (BACKLOG #5067), or ``None`` when nothing was.
 
-    ``None`` for every refusal but one. A server store whose live schema falls short of this
-    build's DDL batch (``ServerSchemaMismatchError``, BACKLOG #1720), raised itself or as the cause
+    ``None`` for every refusal but the schema one below; the callers then say "nothing was
+    written", meaning no row. Not every other refusal comes before the database is touched: at
+    least a keyless-chain refusal on a server store comes after a full open, which under ``auto``
+    has run the same option switches and committed the schema, and this does not describe that.
+    A server store whose live schema falls short of this build's DDL batch (``ServerSchemaMismatchError``, BACKLOG #1720), raised itself or as the cause
     of a :class:`_StoreOpenRefused`, is refused after the open has touched the database. The open
     rolls its batch back and writes no schema marker. But on SQL Server under
     ``[store].schema_management = auto`` a writable open first switches the database's
@@ -9076,19 +9079,16 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     actor = f"cli:{getpass.getuser()}"
 
-    def after_the_key(text: str, *, unwritten: bool = True) -> str:
-        """``text`` for a refusal at the write, after the key was shown (BACKLOG #5067). It then
-        names the entry the operator may have added, as ``admin-reset-totp`` does, or the app
-        keeps an entry this run will never use. ``unwritten`` for a refusal raised before the write
-        wrote anything, whose seed was never stored. The service's own refusals can follow a
-        partial write that a later run repairs with a new key, so they say only that the run did
-        not finish. Unchanged under ``--no-totp``: no key was shown."""
+    def after_the_key(text: str) -> str:
+        """``text`` for a refusal of the write's open or of its keyless checks, raised before the
+        write wrote anything but after the key was shown (BACKLOG #5067). It then names the entry
+        the operator may have added, as ``admin-reset-totp`` does, or the app keeps an entry for a
+        seed that was never stored. Unchanged under ``--no-totp``: no key was shown."""
         if totp_secret is None:
             return text
-        why = "its seed was never stored" if unwritten else "this run did not finish"
         return (
             f"{_sentence(text)} If you added the entry this run showed to the authenticator app, "
-            f"delete it: {why}, and a run that succeeds shows a new key."
+            "delete it: its seed was never stored, and a run that succeeds shows a new key."
         )
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
@@ -9176,8 +9176,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
     try:
         outcome, store_path = run_guarded(run())
     except FirstAdministratorRefused as exc:
-        # The service's refusal, after the key was shown; some follow a partial write (#5067).
-        return _emit_error(after_the_key(str(exc), unwritten=False), as_json=args.json)
+        # The service's own text says what to do with the entry it showed, where that is known: a
+        # refusal can follow a grant that may have landed (#5067 leaves these as they are).
+        return _emit_error(str(exc), as_json=args.json)
     except (_KeylessProvisionRefused, KeylessAuditChainRefused, _UnauditableWrite) as exc:
         # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it.
         # Each is raised before the write, so the shown key's entry has no seed (#5067).
@@ -10269,8 +10270,8 @@ def _audit_verify(args: argparse.Namespace) -> int:
     try:
         verdict = run_guarded(run())
     # #1916; #1780: a server database with no store; #2725: no key; #2532: a store hop the posture
-    # refuses; #5000: a weakened hop or a SQL Server pin the store refuses. Could not start, never
-    # the broken chain's 1.
+    # refuses; #5000: the hop's own TLS settings the open refuses (`StoreTlsRefused` lists them).
+    # Could not start, never the broken chain's 1.
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
@@ -12558,10 +12559,10 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     one can raise a class caught here was not traced, so read "before a row" as the intent for at
     least the key and the store hop. A malformed key is
     caught as ``StoreCipherConfigError`` and an unrevoked hop as ``InsecureHopRefused``, never as
-    the bare ``ValueError`` the open raises for other reasons too. A weakened-TLS refusal, on
-    either server backend, and a SQL Server pin refusal are ``StoreTlsRefused``, an
-    ``InsecureHopRefused``, so they are caught here too (BACKLOG #5000). They were bare, and
-    reached the dispatch floor's 1.
+    the bare ``ValueError`` the open raises for other reasons too. A refusal of the hop's own TLS
+    settings, at least a weakened hop and a SQL Server pin (``StoreTlsRefused`` lists them), is an
+    ``InsecureHopRefused``, so it is caught here too (BACKLOG #5000). Each was bare, and reached
+    the dispatch floor's 1.
 
     The text goes through ``codec_safe_str``, never ``str(exc)``: a key source's codec error quotes
     a byte of what it decoded, and every caller prints this text.
