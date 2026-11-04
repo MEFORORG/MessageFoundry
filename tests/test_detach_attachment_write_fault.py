@@ -40,6 +40,7 @@ from messagefoundry.store.crypto import CipherError
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.receipt import RefusalKind
 from tests.test_database_transport import _src, _SrcConn, _SrcCursor, _SrcPool
+from tests.test_ingress_document_detach import _ack_code
 from tests.test_tcp_x12_handler_failure import _ThenEof
 from tests.test_x12_connection_events import _drive, _kinds, _Peer, _tcp
 
@@ -184,15 +185,6 @@ async def _attachment_types(store: MessageStore) -> list[str]:
     return [str(r[0]) for r in await cur.fetchall()]
 
 
-def _msa_code(ack: str | None) -> str | None:
-    if ack is None:
-        return None
-    for seg in ack.replace("\n", "\r").split("\r"):
-        if seg.startswith("MSA|"):
-            return seg.split("|")[1]
-    return None
-
-
 # --- every put_attachment fault propagates with no row --------------------------------------------
 
 
@@ -222,7 +214,7 @@ async def test_control_the_same_body_is_accepted_when_the_write_succeeds(
 
     ack = await runner._handle_inbound(ic, _doc_hl7().encode("utf-8"))
 
-    assert _msa_code(ack) == "AA"
+    assert _ack_code(ack) == "AA"
     assert [r["status"] for r in await _rows(store)] == [MessageStatus.RECEIVED.value]
     assert await _attachment_types(store) == ["Application"]
 
@@ -231,11 +223,13 @@ async def test_a_receipt_source_lets_the_fault_propagate(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner, ic = _runner(store, ConnectorType.HTTP)
-    monkeypatch.setattr(store, "put_attachment", _FaultingPut(store, fault=_locked))
+    put = _FaultingPut(store, fault=_locked)
+    monkeypatch.setattr(store, "put_attachment", put)
 
     with pytest.raises(sqlite3.OperationalError):
         await runner._handle_inbound_http(ic, _doc_hl7().encode("utf-8"))
 
+    assert put.calls == 1, "the injection never fired"
     assert await _rows(store) == []
 
 
@@ -342,7 +336,7 @@ async def test_control_a_refused_body_on_that_inbound_charges_the_allowance(
 
     ack = await runner._handle_inbound(ic, body)
 
-    assert _msa_code(ack) == "AR"
+    assert _ack_code(ack) == "AR"
     assert [r["status"] for r in await _rows(store)] == [MessageStatus.ERROR.value]
     assert not allowance.try_charge(ic.name, _ALLOWANCE.allowance_bytes)
 
@@ -372,7 +366,7 @@ async def test_a_label_no_backend_column_takes_is_downgraded_before_the_write(
 
     ack = await runner._handle_inbound(ic, _doc_hl7(type_of_data=label).encode("utf-8"))
 
-    assert _msa_code(ack) == "AA"
+    assert _ack_code(ack) == "AA"
     assert await _attachment_types(store) == [stored]
     (row,) = await _rows(store)
     assert f":{stored}" in row["raw"]  # the skeleton's handle names the same type
@@ -380,22 +374,40 @@ async def test_a_label_no_backend_column_takes_is_downgraded_before_the_write(
 
 @pytest.mark.parametrize(
     ("label", "fits"),
-    [("Application", True), ("Ap\udcffp", False), ("Ap\x00p", False), ("X" * 300, False)],
-    ids=["plain", "lone-surrogate", "nul", "long"],
+    [("Application", True), ("Ap\x00p", False), ("X" * 300, False), ("Ap\udcffp", True)],
+    ids=["plain", "nul", "long", "lone-surrogate-not-tested"],
 )
 def test_the_label_rule_names_what_no_backend_column_takes(label: str, fits: bool) -> None:
-    # Read directly for the lone surrogate: a UTF-7 inbound can decode one into OBX-5.2, but the same
-    # character then stays in the skeleton, whose ingress write fails on it whatever the label is.
     assert wiring_runner._label_fits_every_backend(label) is fits
 
 
-def test_the_content_type_bound_is_the_sql_server_column_width() -> None:
-    # The bound copies the store's DDL, so a change to the column must move it too.
-    from messagefoundry.store import sqlserver
+async def test_a_lone_surrogate_label_propagates_and_stores_nothing(store: MessageStore) -> None:
+    # A UTF-7 inbound decodes "+2D8-" in OBX-5.2 to a lone surrogate, which stays in the skeleton too,
+    # so the ingress write would fail on it whatever the label. The label is not downgraded, so the
+    # real put_attachment fails first and no unreferenced attachment is left behind.
+    runner, ic, allowance = _utf7_runner(store)
 
-    source = Path(sqlserver.__file__).read_text(encoding="utf-8")
+    with pytest.raises(UnicodeEncodeError):
+        await runner._handle_inbound(ic, _doc_hl7(type_of_data="Ap+2D8-p").encode("ascii"))
+
+    assert await _rows(store) == []
+    assert await _attachment_types(store) == []
+    assert runner._stream_inflight_bytes == 0
+    assert allowance.try_charge(ic.name, _ALLOWANCE.allowance_bytes)
+
+
+def test_the_content_type_bound_is_the_narrowest_backend_column() -> None:
+    # The bound copies the stores' DDL, so a change to any backend's column must move it too.
+    from messagefoundry.store import postgres, sqlserver
+    from messagefoundry.store import store as sqlite_store
+
+    def ddl(path: str) -> str:
+        return Path(path).read_text(encoding="utf-8")
+
     width = wiring_runner._ATTACHMENT_CONTENT_TYPE_MAX
-    assert f"content_type NVARCHAR({width}) NOT NULL" in source
+    assert f"content_type NVARCHAR({width}) NOT NULL" in ddl(sqlserver.__file__)
+    assert "content_type TEXT NOT NULL" in ddl(postgres.__file__)
+    assert "content_type TEXT NOT NULL" in ddl(sqlite_store.__file__)
 
 
 # --- what each retrying source does with the propagated fault ------------------------------------

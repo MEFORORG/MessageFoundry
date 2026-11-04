@@ -233,6 +233,7 @@ from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.sealed_cache import point_in_time
 from messagefoundry.store.store import ConnectionEventWrite, OwnedLanes
+from messagefoundry.store.transit_attestation import utf16_units
 from messagefoundry.transports import (
     DeliveryError,
     DestinationConnector,
@@ -1086,19 +1087,18 @@ _ATTACHMENT_CONTENT_TYPE_MAX = 256
 
 def _label_fits_every_backend(label: str) -> bool:
     """Whether every backend's ``attachment.content_type`` takes ``label`` (BACKLOG #1619): no NUL,
-    which PostgreSQL ``TEXT`` refuses (an HL7 ``\\X00\\`` escape decodes to one), no lone surrogate,
-    which no backend's driver can encode, and no wider than :data:`_ATTACHMENT_CONTENT_TYPE_MAX`. A
-    label failing any of these would fail the write on every resend. The length test comes first,
-    so a long sender-controlled label is never copied to be measured."""
+    which PostgreSQL ``TEXT`` refuses (an HL7 ``\\X00\\`` escape decodes to one), and no wider than
+    :data:`_ATTACHMENT_CONTENT_TYPE_MAX`. A label failing either would fail the write on every
+    resend. The length test comes first, so a long sender-controlled label is never copied to be
+    measured.
+
+    A lone surrogate is deliberately not tested. A label can hold one only when the decoded body
+    does, and the same character then stays in the skeleton, whose ingress write fails on it
+    whatever the label is. Downgrading it would only store an unreferenced attachment first, so
+    ``put_attachment``'s own encode fault propagates instead, writing nothing."""
     if len(label) > _ATTACHMENT_CONTENT_TYPE_MAX or "\x00" in label:
         return False
-    try:
-        # Strict UTF-16 refuses exactly the strings UTF-8 refuses, the lone surrogates, and its
-        # length counts the code units NVARCHAR counts.
-        units = len(label.encode("utf-16-le")) // 2
-    except UnicodeEncodeError:
-        return False
-    return units <= _ATTACHMENT_CONTENT_TYPE_MAX
+    return utf16_units(label) <= _ATTACHMENT_CONTENT_TYPE_MAX
 
 
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
