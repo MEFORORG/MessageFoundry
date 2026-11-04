@@ -7784,10 +7784,10 @@ def _security_events_where(username: str, until: float | None) -> tuple[str, lis
     At least these residuals are open too, rather than accepted (BACKLOG #3378). SQL Server
     compares ``actor = ?`` under the column's collation, so under a case-insensitive one the feed
     also shows rows recorded under a case variant of the name. Its ``=`` also ignores trailing
-    spaces under any collation, and a failed sign-in records the name as typed, so a row under the
-    name with trailing spaces shows too (#3072 is the same compare in the rename path). ``ts`` and ``created_at`` are each stamped by
-    the host that wrote them, so on a server store that several hosts share, clock skew between
-    them can move a row across the bound."""
+    spaces under any collation. A failed sign-in records the name as typed, so a row under the name
+    with trailing spaces shows too. #3072 is the same compare in the rename path. ``ts`` and
+    ``created_at`` are each stamped by the host that wrote them. So on a server store that several
+    hosts share, clock skew between them can move a row across the bound."""
     params: list[Any] = [username, username]
     clause = (
         " WHERE actor = ? AND action LIKE 'auth.%'"

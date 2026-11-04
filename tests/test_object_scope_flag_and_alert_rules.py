@@ -27,6 +27,7 @@ from starlette.requests import Request
 
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app
+from messagefoundry.api.message_scope import CONNECTION_DENIED_DETAIL
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
@@ -39,7 +40,7 @@ from tests.test_channel_rbac import _add, _login, _probe, _service, engine  # no
 from tests.test_connection_audit_writes import toml_engine  # noqa: F401
 from tests.test_dual_control_reload import _settle_unlanded
 
-_DENIED = {"detail": "not authorized for this connection"}
+_DENIED = {"detail": CONNECTION_DENIED_DETAIL}
 
 
 async def _user(service: AuthService, username: str, role: Role, scope: list[str]) -> None:
