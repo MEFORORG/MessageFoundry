@@ -213,3 +213,12 @@ def test_the_toolkit_command_installs_the_remote_debug_guard_on_import() -> None
     # Control: the guard module alone installs nothing, so a True below is the toolkit's doing.
     assert answers("") == "False"
     assert answers("import messagefoundry_toolkit.__main__;") == "True"
+
+
+def test_the_impact_kinds_are_the_engines_renameable_kinds() -> None:
+    """``impact``'s argparse choices are a literal so ``--help`` need not import the engine's
+    config package, which makes them a hand copy of ``RENAMEABLE_KINDS``. A kind added to one and
+    not the other would be refused by argparse or by ``plan_rename``, so the copies must agree."""
+    from messagefoundry.config.impact import RENAMEABLE_KINDS
+
+    assert toolkit_cli._IMPACT_KINDS == RENAMEABLE_KINDS

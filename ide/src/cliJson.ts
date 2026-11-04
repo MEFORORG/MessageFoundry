@@ -56,6 +56,17 @@ export type CliModule = "messagefoundry" | "messagefoundry_toolkit";
 export const ENGINE_MODULE: CliModule = "messagefoundry";
 export const TOOLKIT_MODULE: CliModule = "messagefoundry_toolkit";
 
+/** The command a user types in a terminal to run what `python -m <module>` ran. A Record, so a new
+ *  module does not compile until it names its command. */
+const COMMAND_NAMES: Record<CliModule, string> = {
+  messagefoundry: "messagefoundry",
+  messagefoundry_toolkit: "messagefoundry-toolkit",
+};
+
+export function commandName(module: CliModule): string {
+  return COMMAND_NAMES[module];
+}
+
 /** What the user is told when the selected interpreter has no toolkit. Our text, never the CLI's. */
 export const TOOLKIT_MISSING_MESSAGE =
   "the selected Python interpreter has no messagefoundry-toolkit, which the Steps view and Generate " +
@@ -133,17 +144,21 @@ const USAGE_ON_STDOUT = /^\s*usage:/i;
 /**
  * Parse a `--json` CLI result's stdout. An `{"error": ...}` body throws an `Error` carrying the CLI's
  * composed message. Every other failure throws a {@link CliOutputError} whose message quotes nothing
- * the CLI printed.
+ * the CLI printed, and names the command `module` ran.
  */
-export function parseJsonResult<T>(res: CliResult, args: string[]): T {
-  const label = commandLabel(args);
+export function parseJsonResult<T>(
+  res: CliResult,
+  args: string[],
+  module: CliModule = ENGINE_MODULE,
+): T {
+  const label = `${commandName(module)} ${commandLabel(args)}`;
   const text = res.stdout.trim();
   if (!text) {
     if (res.stderr.trim() === UNTRUSTED_WORKSPACE_STDERR) {
       throw new CliOutputError(UNTRUSTED_WORKSPACE_STDERR, false); // our own text, not the CLI's
     }
     throw new CliOutputError(
-      `messagefoundry ${label} exited with code ${res.code} and printed no JSON. Its error output ` +
+      `${label} exited with code ${res.code} and printed no JSON. Its error output ` +
         `(${byteLength(res.stderr)} bytes) is not shown here because it can quote message data. Run ` +
         "the same command with --json in a terminal to read it.",
       looksLikeUnknownArgument(res.stderr),
@@ -155,7 +170,7 @@ export function parseJsonResult<T>(res: CliResult, args: string[]): T {
     parsed = JSON.parse(text);
   } catch {
     throw new CliOutputError(
-      `messagefoundry ${label} exited with code ${res.code} and printed ${byteLength(res.stdout)} ` +
+      `${label} exited with code ${res.code} and printed ${byteLength(res.stdout)} ` +
         "bytes that are not valid JSON. The output is not shown here because it can quote message " +
         "data. One cause is a print() at the top level of a config module. Run the same command " +
         "with --json in a terminal to read it.",

@@ -17,14 +17,14 @@ import {
 // BACKLOG #1760 — the Steps-view param INPUT widgets are driven by the engine's `lens schema` output
 // (op -> editable params with their kind), not a hand-rolled IDE table. These are the pure, vscode-free
 // renderer + edit-mapping tests (the CI ide job has no Python, so they consume a CANNED op-schema
-// fixture — a faithful dump of `messagefoundry lens schema` — never shelling the CLI). Covers: an int
+// fixture — a faithful dump of `messagefoundry-toolkit lens schema` — never shelling the CLI). Covers: an int
 // param -> a type=number input, an enum param -> a <select>, the number round-trip (a number reaches the
 // engine as a JSON number, not a re-typed string), the text fallback for an op absent from the schema +
 // byte-identity when no schema is supplied, and a light op-name parity drift guard.
 
 // A dedicated fixtures subdir — NOT fixtures/lens/, which steps.test.ts enumerates wholesale as `lens
 // parse` results (a differently-shaped op-schema there would break that iteration). This is a canned dump
-// of `messagefoundry lens schema` (the CI ide job has no Python, so the renderer tests never shell it).
+// of `messagefoundry-toolkit lens schema` (the CI ide job has no Python, so the renderer tests never shell it).
 const FIXTURE_DIR = path.join(__dirname, "..", "..", "..", "src", "test", "fixtures", "lens-schema");
 
 function loadOpSchema(): OpSchema {

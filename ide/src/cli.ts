@@ -284,7 +284,7 @@ export function runWithStdin(
  * A failure's message never quotes the CLI's output; see cliJson.ts for why.
  */
 export async function runJson<T>(args: string[], cwd?: string, opts?: RunOptions): Promise<T> {
-  return parseJsonResult<T>(await run([...args, "--json"], cwd, opts), args);
+  return parseJsonResult<T>(await run([...args, "--json"], cwd, opts), args, opts?.module);
 }
 
 /**
@@ -298,7 +298,11 @@ export async function runJsonWithStdin<T>(
   cwd?: string,
   opts?: RunOptions,
 ): Promise<T> {
-  return parseJsonResult<T>(await runWithStdin([...args, "--json"], stdin, cwd, opts), args);
+  return parseJsonResult<T>(
+    await runWithStdin([...args, "--json"], stdin, cwd, opts),
+    args,
+    opts?.module,
+  );
 }
 
 // ---- Code-set (translation table) CLI bridge --------------------------------------------------

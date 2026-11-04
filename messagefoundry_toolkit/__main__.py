@@ -672,6 +672,7 @@ def _generate(args: argparse.Namespace) -> int:
 
 #: The object kinds `messagefoundry-toolkit impact` accepts (mirrors config.impact.RENAMEABLE_KINDS; kept as a
 #: literal so building the argparse choices doesn't import the engine on every CLI invocation).
+#: tests/test_toolkit_cli.py holds the two equal.
 _IMPACT_KINDS = frozenset(
     {"inbound", "router", "handler", "outbound", "code_set", "reference", "lookup", "fhir_lookup"}
 )

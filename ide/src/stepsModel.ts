@@ -2,8 +2,8 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Pure (vscode-free) view-model behind the read-only Steps view (ADR 0076 §2 phase 2b / #222).
 //
-// It consumes the `messagefoundry lens parse --json` contract (ADR 0076 §3) — the engine owns the
-// grammar, this file NEVER parses Python — and folds it, together with the module source text, into an
+// It consumes the `messagefoundry-toolkit lens parse --json` contract (ADR 0076 §3) — the toolkit owns
+// the grammar, this file NEVER parses Python — and folds it, together with the module source text, into an
 // ordered, nested row view-model that the webview renders (a Corepoint-style typed Steps VIEW).
 // Separated from stepsView.ts so the mapping is unit-testable node-side with the committed fixtures
 // (no Extension Host): kind→row-type, params display, the in-place `code`-row passthrough (the §4
@@ -2972,8 +2972,8 @@ export function pickMode(action: string | undefined, param: string): "path" | "s
 //
 // The IDE drives each EDITABLE param's input WIDGET from the engine's own type hints instead of a
 // hand-maintained per-op input table (a second source of truth that drifts from the signatures). The
-// engine emits it as `messagefoundry lens schema --json` (messagefoundry/lens_schema.py); the IDE shells
-// it via cli.lensSchema() and threads it through the pure renderer below. This WIDENS what an
+// toolkit emits it as `messagefoundry-toolkit lens schema --json` (messagefoundry_toolkit/lens_schema.py);
+// the IDE shells it via cli.lensSchema() and threads it through the pure renderer below. This WIDENS what an
 // already-recognized, already-editable row exposes as a richer control — it does NOT widen the
 // recognition grammar or make any new param editable (the editable gating is unchanged, ADR 0076 §5).
 

@@ -99,6 +99,7 @@ __all__ = [
     "find_funcs",
     "named_func",
     "outermost_def_sites",
+    "package_sources",
     "package_trees",
     "parse_source",
     "source_calls",
@@ -248,6 +249,20 @@ def outermost_def_sites(tree: ast.Module, test: Callable[[ast.AST], bool]) -> se
 
     walk(tree, [], False)
     return sites
+
+
+@functools.cache
+def package_sources() -> tuple[Path, ...]:
+    """Every module path of the packages :func:`package_trees` parses, sorted, for a scan that
+    reads the text itself. Each package must contribute a file, so a moved or renamed package fails
+    here rather than leaving a scan with nothing of it to read."""
+    paths = tuple(
+        sorted(path for package in _ENGINE_PACKAGES for path in (_REPO / package).rglob("*.py"))
+    )
+    for package in _ENGINE_PACKAGES:
+        if not any(path.is_relative_to(_REPO / package) for path in paths):
+            raise AssertionError(f"{package}/ contributed no module to package_sources()")
+    return paths
 
 
 @functools.cache

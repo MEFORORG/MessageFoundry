@@ -28,6 +28,7 @@ from messagefoundry.controlchars import (
     scrub_log_argument,
     strip_control_chars,
 )
+from tests._ast_sites import package_sources
 
 
 @pytest.mark.parametrize("code", [0xD800, 0xDBFF, 0xDC00, 0xDFFF])
@@ -154,13 +155,16 @@ def test_the_log_argument_scrub_is_the_escape_with_line_breaks_replaced_first() 
 # It matches both the live alphabet and C0+DEL as literally written, so after a deliberate widening
 # an old narrow copy is still caught rather than falling out of view.
 
-_PKG = Path(__file__).resolve().parent.parent / "messagefoundry"
+_REPO = Path(__file__).resolve().parent.parent
+#: The scan reads ``package_sources()``: the engine, the web console, and the toolkit that holds the
+#: authoring modules ADR 0201 slice 4 moved out of the engine (``corepoint_import.py`` among them,
+#: which strips with this alphabet).
 _DOMAIN = range(0x0000, 0x0300)
 _ALPHABET = frozenset(c for c in _DOMAIN if _is_control_char(chr(c)))
 _C0_DEL = frozenset(range(0x20)) | {0x7F}
 _TARGETS = (_ALPHABET, _C0_DEL)
 
-#: Sites allowed to spell the set themselves, keyed by (path under messagefoundry/, top-level
+#: Sites allowed to spell the set themselves, keyed by (path under the repository root, top-level
 #: symbol), with the detector kind each is expected to trip. controlchars.py's module docstring
 #: gives the reasons; a stale entry fails test_every_exemption_is_still_live.
 #:
@@ -169,9 +173,12 @@ _TARGETS = (_ALPHABET, _C0_DEL)
 #: would only suppress the one case that matters, where it is rewritten into a real copy. Its
 #: exemption is test_the_soap_carve_out_is_the_xml_char_rule_and_not_this_alphabet instead.
 _EXEMPT: dict[tuple[str, str], str] = {
-    ("controlchars.py", "_is_control_char"): "compare",  # THE definition
-    ("parsing/sniff.py", "nontext_upload_reason"): "compare",  # byte-wise density count
-    ("spreadsheet.py", "_LEADING_NOISE"): "range",  # importer-droppable leads, harness-mirrored
+    ("messagefoundry/controlchars.py", "_is_control_char"): "compare",  # THE definition
+    ("messagefoundry/parsing/sniff.py", "nontext_upload_reason"): "compare",  # byte-wise density
+    (
+        "messagefoundry/spreadsheet.py",
+        "_LEADING_NOISE",
+    ): "range",  # importer leads, harness-mirrored
 }
 
 
@@ -280,9 +287,9 @@ def _rederivations(source: str) -> list[tuple[str, str, int]]:
 def _scan_package() -> tuple[int, dict[tuple[str, str], list[tuple[str, int]]]]:
     """``(files scanned, hits by site)``. Cached: two tests read it and the scan is the cost."""
     hits: dict[tuple[str, str], list[tuple[str, int]]] = {}
-    paths = sorted(_PKG.rglob("*.py"))
+    paths = package_sources()
     for path in paths:
-        rel = path.relative_to(_PKG).as_posix()
+        rel = path.relative_to(_REPO).as_posix()
         for symbol, kind, line in _rederivations(path.read_text(encoding="utf-8")):
             hits.setdefault((rel, symbol), []).append((kind, line))
     return len(paths), hits
@@ -295,8 +302,8 @@ def test_no_site_under_messagefoundry_re_derives_the_alphabet() -> None:
     scanned, hits = _scan_package()
     offenders = {site: found for site, found in hits.items() if site not in _EXEMPT}
     assert scanned > 0 and offenders == {}, (
-        f"scanned {scanned} files under {_PKG}; re-derived C0+DEL set, import controlchars "
-        f"instead: {offenders}"
+        f"scanned {scanned} files under the engine's packages; re-derived C0+DEL set, import "
+        f"controlchars instead: {offenders}"
     )
 
 

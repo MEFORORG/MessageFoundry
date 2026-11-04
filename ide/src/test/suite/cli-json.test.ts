@@ -7,9 +7,12 @@ import * as assert from "assert";
 
 import {
   CliOutputError,
+  ENGINE_MODULE,
   TOOLKIT_MISSING_MESSAGE,
+  TOOLKIT_MODULE,
   UNTRUSTED_WORKSPACE_STDERR,
   commandLabel,
+  commandName,
   explainMissingToolkit,
   parseJsonResult,
   type CliResult,
@@ -119,6 +122,21 @@ suite("cliJson.commandLabel", () => {
     assert.strictEqual(commandLabel(["codeset", "upsert", "--data", '{"rows": []}']), "codeset upsert");
     assert.strictEqual(commandLabel(["lens", "parse", "-", "--contract", "2"]), "lens parse");
     assert.strictEqual(commandLabel([]), "command");
+  });
+
+  test("a failure names the command that ran: the toolkit's for a toolkit run, the engine's by default", () => {
+    const res = result({ stderr: "boom\n", code: 1 });
+    const lens = ["lens", "schema"];
+    assert.throws(
+      () => parseJsonResult(res, lens, TOOLKIT_MODULE),
+      (e: Error) => e.message.startsWith("messagefoundry-toolkit lens schema exited with code 1"),
+    );
+    assert.throws(
+      () => parseJsonResult(res, lens),
+      (e: Error) => e.message.startsWith("messagefoundry lens schema exited with code 1"),
+    );
+    assert.strictEqual(commandName(TOOLKIT_MODULE), "messagefoundry-toolkit");
+    assert.strictEqual(commandName(ENGINE_MODULE), "messagefoundry");
   });
 });
 
