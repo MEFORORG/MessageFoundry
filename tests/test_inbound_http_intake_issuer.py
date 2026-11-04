@@ -672,6 +672,8 @@ def test_a_body_line_with_a_nul_names_no_ca_openssl_did_not_load(head: bytes, ta
     assert index.unreadable == 1
     assert index.unmatched_keys(["CN=Root CA"]) == {}  # control
     assert "CN=Inter CA" in index.unmatched_keys(["CN=Inter CA"])
+    control = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), root)[0])
+    assert index.issuer_of(control) == "CN=Root CA"
     leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), inter)[0])
     assert index.issuer_of(leaf) == ""
 
@@ -692,6 +694,8 @@ def test_a_ca_whose_base64_line_has_a_nul_and_more_base64_is_counted_unreadable(
     assert index.unreadable == 1
     assert index.unmatched_keys(["CN=Good CA"]) == {}
     assert "CN=Odd CA" in index.unmatched_keys(["CN=Odd CA"])
+    control = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), good)[0])
+    assert index.issuer_of(control) == "CN=Good CA"
     leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), odd)[0])
     assert index.issuer_of(leaf) == ""
 
