@@ -735,19 +735,25 @@ ingress**, after reading it, is never answered `202`. The message is still recor
 `{"error": "message was not accepted", "refused_message_id": "<id>"}`. The status says whether to re-send:
 
 - **`503`** with `Retry-After` when the refusal is temporary: the engine's own, not the body's.
-  At least two refusals are classed so: the streaming detach's in-flight budget, while other
+  At least three refusals are classed so: the streaming detach's in-flight budget, while other
   detaches hold it, and an inbound `encoding` naming no text codec, which refuses every body until
   an operator fixes the name (BACKLOG #2431), so a sender re-sending every few seconds meanwhile
   leaves one `ERROR` row per attempt. Re-send the same body later. A body larger than that whole
-  budget is over-size instead.
+  budget is over-size instead. A third is a strict-validation timeout that fired before any worker
+  thread began the validate, so nothing is known of the body (BACKLOG #5078).
 - **`413`** when the body is over a size ceiling, the same code as a body over `max_body_bytes`. That
   covers at least the engine's ingress ceiling and, for HL7, the parse ceiling a streaming inbound sets
-  with `max_message_bytes`.
+  with `max_message_bytes`. Strict validation keeps its own 16 MiB cap, which does NOT follow
+  `max_message_bytes`, so a strict inbound that raises it answers `413` for a body between 16 MiB
+  and its limit unless the body is at or over `stream_threshold_bytes`
+  ([HL7-VALIDATION.md](HL7-VALIDATION.md) says why).
 - **`422`** for any other refusal, which a re-send of the same body would meet again. Examples are a
   body the engine cannot decode in a usable charset, one that does not match the declared `content_type`, or an HL7 parse
-  or strict-validation failure. A strict-validation timeout is one too, deliberately: even one caused
-  by load answers `422` and is final. BACKLOG #2105's filing listed that timeout as temporary; it is
-  reclassified as permanent.
+  or strict-validation failure. A strict-validation timeout whose validate had begun is one too,
+  deliberately, even where load slowed it: it answers `422` and is final. Only a timeout that never
+  began is told apart as temporary, above; the
+  [ADR 0154 amendment of 2026-11-03](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary)
+  says what was measured and what it does not cover.
 
 The engine's own `Rest()` outbound retries a `503` under its `RetryPolicy` and dead-letters a `413` or
 `422`, so an engine-to-engine hop behaves the same way. Which refusal gets which code, and why, is in

@@ -128,6 +128,7 @@ from messagefoundry.netaddr import (
 from messagefoundry.parsing import (
     HL7PeekError,
     Peek,
+    ValidationResult,
     encode_batch,
     summarize,
     validate,
@@ -902,6 +903,73 @@ _LOOKUP_RESULT_TIMEOUT_SECONDS = 30.0
 # names this module and the docs have always used.
 _STRICT_VALIDATE_TIMEOUT_SECONDS = STRICT_VALIDATE_TIMEOUT_SECONDS
 _strict_validate_timeout = strict_validate_timeout
+
+
+class _StrictValidateTimedOut(Exception):
+    """A listener's strict validate did not finish inside its timeout (#89).
+
+    ``started`` says whether ``hl7apy`` had begun on the body when the timeout fired (BACKLOG #5078,
+    the ADR 0154 amendment of 2026-11-03). The timeout counts the wait for a worker thread as well
+    as the validate, so under load a body can time out before it is ever looked at. That body says
+    nothing about itself, and it left no thread behind, so a receipt source answers it as temporary.
+    One that had started stays final: it may be the slow body the timeout exists for, and its
+    thread is still running. ``reason`` is value-free, only the numeric timeout."""
+
+    def __init__(self, timeout: float, *, started: bool) -> None:
+        self.started = started
+        self.reason = (
+            f"strict-validation timed out after {timeout}s"
+            if started
+            else f"strict-validation timed out after {timeout}s waiting for a worker thread"
+        )
+        super().__init__(self.reason)
+
+
+class _StrictValidateRun:
+    """One strict validate on a worker thread, which records whether it began (BACKLOG #5078).
+
+    The start and the listener's abandonment take one lock, so they cannot cross: either the worker
+    began first and :meth:`abandon` reports it started, or the listener gave up first and the worker
+    returns without validating. A run never started therefore leaves no ``hl7apy`` thread behind."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._started = False
+
+    def __call__(self, text: str, expected_version: str | None) -> ValidationResult | None:
+        with self._lock:
+            if self._abandoned:
+                return None
+            self._started = True
+        return validate(text, expected_version=expected_version)
+
+    def abandon(self) -> bool:
+        """Stop a run that has not begun, and report whether it had."""
+        with self._lock:
+            self._abandoned = True
+            return self._started
+
+
+async def _validate_strictly(ic: InboundConnection, text: str) -> ValidationResult:
+    """The listener's strict validate, off the event loop under the inbound's timeout (#89, review
+    M-11). Raises :class:`_StrictValidateTimedOut` on expiry, saying whether the validate had begun.
+
+    ``wait_for`` frees the listener but cannot kill a worker that has begun (no thread cancellation
+    in CPython): that orphaned ``hl7apy`` validate holds its thread until it returns, accepted by
+    design (mirrors ``_run_lookup``), bounded by ``enforce_size_limits``' 16 MiB and segment caps
+    that fire before the slow parse."""
+    timeout = _strict_validate_timeout(ic)
+    run = _StrictValidateRun()
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(run, text, ic.validation.hl7_version), timeout
+        )
+    except TimeoutError:
+        assert timeout is not None  # wait_for(None) never times out
+        raise _StrictValidateTimedOut(timeout, started=run.abandon()) from None
+    assert result is not None  # only an abandoned run returns None, and nothing awaits that one
+    return result
 
 
 # The generic MIME a detached document's stored content_type is downgraded to when the sender-declared
@@ -8076,30 +8144,19 @@ class RegistryRunner:
                 ic.stream_threshold_bytes,
             )
         elif ic.validation.strict:
-            timeout = _strict_validate_timeout(ic)
             try:
-                # wait_for frees THIS listener path but cannot kill the to_thread worker (no thread
-                # cancellation in CPython) — the orphaned hl7apy validate leaks its thread until it
-                # returns, accepted-by-design (mirrors _run_lookup), bounded by enforce_size_limits'
-                # 16 MiB / segment caps that fire before the slow parse (#89).
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(validate, text, expected_version=ic.validation.hl7_version),
-                    timeout,
-                )
-            except TimeoutError:
-                # DoS backstop (#89): a pathological body made hl7apy spin past the budget. Dead-letter
-                # it instead of pinning intake. The message string is PHI-safe/value-free (only the
-                # numeric timeout). HTTP owns its own 202/4xx response — no HL7 ACK here.
+                result = await _validate_strictly(ic, text)
+            except _StrictValidateTimedOut as exc:
+                # DoS backstop (#89): dead-letter instead of pinning intake. HTTP owns its own
+                # 202/4xx response — no HL7 ACK here.
                 #
-                # PERMANENT, not temporary (BACKLOG #2105): a body that times out for its own content
-                # times out on every re-send, and each attempt orphans another hl7apy thread this path
-                # cannot kill, so inviting a retry would multiply the very load this timeout bounds. A
-                # timeout caused by load instead cannot be told apart from it here. ADR 0154's
-                # 2026-10-30 amendment records the cost and when it may be reclassified.
-                timed_out = f"strict-validation timed out after {timeout}s"
-                return await self._refuse(
-                    ic, raw, text, RefusalKind.PERMANENT, error=timed_out, peek=peek
-                )
+                # A validate that had begun stays PERMANENT (BACKLOG #2105): a body that times out
+                # for its own content times out on every re-send, and each attempt orphans another
+                # hl7apy thread this path cannot kill. One that never began timed out waiting for a
+                # worker thread: nothing is known of the body and no thread was left, so it is
+                # TEMPORARY (BACKLOG #5078; ADR 0154's amendment of 2026-11-03).
+                kind = RefusalKind.PERMANENT if exc.started else RefusalKind.TEMPORARY
+                return await self._refuse(ic, raw, text, kind, error=exc.reason, peek=peek)
             if not result.ok:
                 persisted = f"strict-validation failed: {safe_text('; '.join(result.errors))}"
                 # validate() keeps its own size cap, the engine default, even where the inbound's
@@ -8464,21 +8521,15 @@ class RegistryRunner:
         elif ic.validation.strict:
             # hl7apy validation is CPU-bound (full structure/cardinality parse) — run it off the event
             # loop so a strict feed can't stall every other listener, worker, and API call (review M-11).
-            timeout = _strict_validate_timeout(ic)
             try:
-                # wait_for frees THIS listener but cannot kill the to_thread worker (no thread
-                # cancellation in CPython) — the orphaned hl7apy validate leaks its thread until it
-                # returns, accepted-by-design (mirrors _run_lookup), bounded by enforce_size_limits'
-                # 16 MiB / segment caps that fire before the slow parse (#89).
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(validate, text, expected_version=ic.validation.hl7_version),
-                    timeout,
-                )
-            except TimeoutError:
-                # DoS backstop (#89): a pathological body made hl7apy spin past the budget. Dead-letter
-                # + NAK AE instead of pinning the listener. The stored/ACK string is PHI-safe/value-free
-                # (only the numeric timeout) — unlike the validation-error path below it quotes no field.
-                timed_out = f"strict-validation timed out after {timeout}s"
+                result = await _validate_strictly(ic, text)
+            except _StrictValidateTimedOut as exc:
+                # DoS backstop (#89): dead-letter + NAK instead of pinning the listener. The stored/ACK
+                # string is PHI-safe/value-free (only the numeric timeout) — unlike the validation-error
+                # path below it quotes no field. AE whether or not the validate had begun: a timeout
+                # that began may still be load (ADR 0154's amendment of 2026-11-03), so it is not
+                # answered as final here (BACKLOG #5078).
+                timed_out = exc.reason
                 mid = await self._record_refused(ic, raw, text, error=timed_out, peek=peek)
                 ack = (
                     build_ack(peek, code="AE", text=timed_out, ack_mode=ack_mode) if reply else None
@@ -8502,10 +8553,13 @@ class RegistryRunner:
                 # messages:view_summary on read, like every other stored error.
                 persisted = f"strict-validation failed: {safe_text(joined)}"
                 mid = await self._record_refused(ic, raw, text, error=persisted, peek=peek)
-                # The AE ACK goes back to the partner that SENT this message (their own data) and is
-                # transient (never persisted), so it may carry the fuller, bounded validation text.
+                # AR, not AE (BACKLOG #5078): the body fails the same way on every re-send, which the
+                # receipt path answers as final (422, or 413 for validate()'s own size cap), and an AE
+                # invited a sender, the engine's own MLLP outbound included, to retry it. The NAK goes
+                # back to the partner that SENT this message (their own data) and is transient (never
+                # persisted), so it may carry the fuller, bounded validation text.
                 ack = (
-                    build_ack(peek, code="AE", text=joined[:200], ack_mode=ack_mode)
+                    build_ack(peek, code="AR", text=joined[:200], ack_mode=ack_mode)
                     if reply
                     else None
                 )
@@ -8515,7 +8569,7 @@ class RegistryRunner:
                     await self._capture_ack(
                         mid,
                         ic.name,
-                        ack_code="AE",
+                        ack_code="AR",
                         ack_phase="strict",
                         ack_body=None,
                         detail=persisted,

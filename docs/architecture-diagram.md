@@ -406,7 +406,7 @@ sequenceDiagram
   alt The listener cannot accept the message
     SND->>LSN: HL7 message
     LSN->>MST: record the message as ERROR, with no ingress row
-    LSN-->>SND: NAK with AR for a decode or parse failure,<br/>AE for a strict validation failure
+    LSN-->>SND: NAK with AR for a decode, parse or strict validation failure,<br/>AE for at least a strict validation timeout or an unusable codec name
   else A Router or a Handler raises, after the ACK
     WRK->>MST: dead-letter the row at its own stage
     MST->>MST: the finalizer sets ERROR<br/>when no other row is pending or in flight
