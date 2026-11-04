@@ -49,7 +49,7 @@ from messagefoundry.config.wiring import (
     build_outbound_connection,
 )
 from messagefoundry.pipeline.wiring_runner import build_check_registry
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.transports import database
 from messagefoundry.transports.base import build_destination, build_source
 from messagefoundry.transports.database import (
@@ -915,13 +915,18 @@ def test_an_sslmode_off_the_libpq_spellings_is_refused(
     driver: str, spelling: str, mode: str
 ) -> None:
     """Red on the previous head, which sent each of these. The keyword matches in any case; the
-    value must be one of libpq's six modes exactly, for every driver but MySQL Connector/ODBC."""
-    with pytest.raises(ValueError, match="'sslmode' must be one of disable, allow") as refused:
+    value must be one of libpq's six modes exactly, for every driver but MySQL Connector/ODBC. For
+    a name the engine cannot place, the refusal's wording is pinned by the BACKLOG #5029 tests."""
+    with pytest.raises(ValueError, match="'sslmode'") as refused:
         _build(odbc_driver=driver, odbc_params={spelling: mode})
     message = str(refused.value)
     assert _CONNECTION in message
-    assert "verify-full, in lower case" in message
     assert f"={mode}" not in message
+    if driver.startswith("PostgreSQL"):
+        assert "'sslmode' must be one of disable, allow" in message
+        assert "verify-full, in lower case" in message
+    else:
+        assert "cannot place this odbc_driver" in message or "the engine cannot place" in message
 
 
 @pytest.mark.parametrize("driver", ["PostgreSQL Unicode", "PostgreSQL", "/usr/lib/psqlodbcw.so"])
@@ -935,14 +940,107 @@ def test_a_psqlodbc_sslmode_verify_full_builds() -> None:
     assert dsn == "DRIVER={PostgreSQL Unicode};SERVER=db.test;SSLmode=verify-full;"
 
 
-@pytest.mark.parametrize("driver", ["MySQL ODBC 8.0 Unicode Driver", "mysql odbc 9.1 ansi driver"])
-@pytest.mark.parametrize(
-    "mode", ["DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY", "required"]
-)
+_MYSQL_NAMES = ["MySQL ODBC 8.0 Unicode Driver", "mysql odbc 9.1 ansi driver"]
+_MYSQL_MODES = ["DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"]
+
+
+@pytest.mark.parametrize("driver", _MYSQL_NAMES)
+@pytest.mark.parametrize("mode", _MYSQL_MODES)
 def test_a_mysql_driver_keeps_its_own_sslmode_spellings(driver: str, mode: str) -> None:
     """MySQL Connector/ODBC sends the same keyword with its own values, so a MySQL driver name keeps
     them. The control for the refusal above: same keyword, the rule chosen by the driver name."""
     assert f"SSLMODE={mode};" in _build(odbc_driver=driver, odbc_params={"SSLMODE": mode})
+
+
+@pytest.mark.parametrize("driver", _MYSQL_NAMES)
+@pytest.mark.parametrize(
+    "mode",
+    ["verify-full", "require", "yes", "required", "Verify_Identity", "VERIFY-IDENTITY", "on", "1"],
+)
+def test_a_mysql_driver_refuses_a_spelling_mysql_does_not_document(driver: str, mode: str) -> None:
+    """BACKLOG #5035. Red on the previous head, which sent any value under a listed MySQL name, so
+    ``verify-full``, ``require`` and ``yes`` counted as TLS addressed while, per engine PR 2691,
+    MySQL fell back to PREFERRED. The documented upper case spellings above are the control. No
+    MySQL driver was run for this: the spellings are the documentation's."""
+    with pytest.raises(
+        ValueError, match="'sslmode' must be one of DISABLED or PREFERRED"
+    ) as refused:
+        _build(odbc_driver=driver, odbc_params={"SSLMODE": mode})
+    message = str(refused.value)
+    assert _CONNECTION in message and "in upper case" in message
+    assert "verify-full" not in message, "a MySQL refusal must not offer a libpq spelling"
+
+
+_UNPLACED_DRIVERS = ["MySQL", "/usr/lib64/libmyodbc8w.so", "MariaDB ODBC 3.1 Driver"]
+
+
+@pytest.mark.parametrize("driver", _UNPLACED_DRIVERS)
+@pytest.mark.parametrize("mode", [*_MYSQL_MODES, "required", "Verify_Identity"])
+def test_a_mysql_spelling_under_an_unplaced_name_is_pointed_at_mysql_s_name(
+    driver: str, mode: str
+) -> None:
+    """BACKLOG #5029. Under RHEL's bare ``MySQL`` section or a library path, MySQL's own spelling
+    was refused with a message offering only libpq's, ``verify-full`` among them, which MySQL
+    ignores. The refusal now says the engine cannot place the driver, offers no libpq value, and
+    names the registered name that reaches MySQL's spellings."""
+    with pytest.raises(ValueError, match="'sslmode' is a MySQL spelling") as refused:
+        _build(odbc_driver=driver, odbc_params={"SSLMODE": mode})
+    message = str(refused.value)
+    assert "cannot place this odbc_driver" in message
+    assert "MySQL ODBC <version> Unicode or ANSI Driver" in message
+    assert "verify-full" not in message and f"={mode}" not in message
+
+
+@pytest.mark.parametrize("driver", [*_UNPLACED_DRIVERS, "SQLite3 ODBC Driver"])
+@pytest.mark.parametrize("mode", ["Require", "VERIFY-FULL", "yes", "on"])
+def test_another_sslmode_under_an_unplaced_name_names_both_families(driver: str, mode: str) -> None:
+    # BACKLOG #5029. libpq's list is never offered alone to a name the engine cannot place: the
+    # refusal says the name is unplaced and points MySQL at its registered name.
+    with pytest.raises(
+        ValueError, match="the engine cannot place must be exactly one of"
+    ) as refused:
+        _build(odbc_driver=driver, odbc_params={"SSLMODE": mode})
+    message = str(refused.value)
+    assert "disable, allow, prefer, require, verify-ca, verify-full;" in message
+    assert "MySQL needs its registered name" in message and f"={mode}" not in message
+
+
+@pytest.mark.parametrize("mode", ["VERIFY_IDENTITY", "Require"])
+def test_microsoft_s_driver_is_told_it_reads_encrypt(mode: str) -> None:
+    # A placed family that reads no sslmode: its refusal names the keyword it does read, and does
+    # not claim the name could not be placed.
+    with pytest.raises(ValueError, match="this driver reads Encrypt, not sslmode") as refused:
+        _build(odbc_driver="ODBC Driver 18 for SQL Server", odbc_params={"SSLmode": mode})
+    assert "cannot place" not in str(refused.value)
+
+
+@pytest.mark.parametrize("driver", ["PostgreSQL Unicode", "PostgreSQL"])
+def test_a_psqlodbc_sslmode_refusal_offers_no_mysql_spelling(driver: str) -> None:
+    # The control for the two tests above: a placed psqlODBC name is told libpq's list alone.
+    with pytest.raises(ValueError, match="'sslmode' must be one of disable") as refused:
+        _build(odbc_driver=driver, odbc_params={"SSLMODE": "VERIFY_IDENTITY"})
+    message = str(refused.value)
+    assert "MySQL" not in message and "cannot place" not in message
+
+
+@pytest.mark.parametrize(
+    ("driver", "mode", "kept"),
+    [
+        ("MySQL ODBC 8.0 Unicode Driver", "yes", _MYSQL_MODES),
+        ("MySQL", "VERIFY_IDENTITY", ["cannot place this odbc_driver", "Unicode or ANSI Driver"]),
+        ("MySQL", "yes", ["verify-full;", "the engine cannot place", "MySQL needs its registered"]),
+    ],
+)
+def test_an_sslmode_refusal_survives_the_log_redaction(
+    driver: str, mode: str, kept: list[str]
+) -> None:
+    # Two upper case words joined by a comma or a blank are a name run to the log redaction, so the
+    # MySQL list is joined with "or", and each refusal leads with what an operator needs, inside
+    # the 200 characters the redaction keeps.
+    with pytest.raises(ValueError) as refused:
+        _build(odbc_driver=driver, odbc_params={"SSLMODE": mode})
+    scrubbed = safe_text(str(refused.value))
+    assert all(word in scrubbed for word in kept), scrubbed
 
 
 # --- the connector seams, and the documented example ---------------------------------------------

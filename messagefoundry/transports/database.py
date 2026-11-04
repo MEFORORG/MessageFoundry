@@ -626,48 +626,99 @@ def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     return text
 
 
-# MySQL Connector/ODBC's registered names, in lower case. The escape list below holds them, and
-# they alone keep MySQL's own ``SSLMODE`` spellings (:func:`_refuse_unread_sslmode`).
+# The whole registered ``odbc_driver`` names, in lower case, of the three driver families the engine
+# can place (BACKLOG #2705, #5029, #5053). psqlODBC's include the bare ``PostgreSQL``, the section
+# name RHEL registers it under. Whole names, spacing included, on purpose: a vendor driver whose
+# name merely mentions a database, a library path, an odbcinst alias such as RHEL's bare ``MySQL``,
+# or another registered name that only folds to one of these is not placed. This is not a driver
+# allowlist: an unplaced name still builds, and only what the engine reads from it changes.
+_PSQLODBC_DRIVER_NAME = r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"
 _MYSQL_ODBC_DRIVER_NAME = r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"
-_MYSQL_ODBC_DRIVERS = re.compile(_MYSQL_ODBC_DRIVER_NAME)
+_MSODBC_DRIVER_NAME = r"odbc driver [0-9]+ for sql server"
+_DRIVER_FAMILY_NAMES = (
+    ("psqlodbc", re.compile(_PSQLODBC_DRIVER_NAME)),
+    ("mysql", re.compile(_MYSQL_ODBC_DRIVER_NAME)),
+    ("msodbc", re.compile(_MSODBC_DRIVER_NAME)),
+)
+
+
+def _driver_family(driver: object) -> str | None:
+    """The family ``driver``, an ``odbc_driver`` setting as written, names whole: ``"psqlodbc"``,
+    ``"mysql"`` or ``"msodbc"``, or ``None`` where the engine cannot place it. The name is read
+    trimmed and in any case, as :func:`_build_odbc_dsn` reads it, never the library it loads."""
+    name = str(driver or "").strip().lower()
+    return next((family for family, names in _DRIVER_FAMILY_NAMES if names.fullmatch(name)), None)
+
 
 # The ``odbc_driver`` names, in lower case, of the drivers whose password is always sent braced,
 # with the ODBC ``}}`` escape (BACKLOG #2705): psqlODBC's and MySQL Connector/ODBC's registered
 # names, measured on 2026-10-30 to read that escape, and Microsoft's ``ODBC Driver <n> for SQL
 # Server``, not probed then but relied on for the same escape by the SQL Server preset and the
-# store. psqlODBC's names include the bare ``PostgreSQL``, the section name RHEL registers it
-# under. The legacy name ``SQL Server`` is left out: on Linux it is commonly a FreeTDS alias, which
-# has not been measured. Whole names, spacing included, on purpose: a vendor driver whose name
-# merely mentions a database, a library path, or another registered name that only folds to one of
-# these is unmeasured and does not match.
+# store. The legacy name ``SQL Server`` is left out: on Linux it is commonly a FreeTDS alias, which
+# has not been measured. A name the families above do not place is unmeasured and does not match.
 _ODBC_BRACE_ESCAPE_DRIVERS = re.compile(
-    r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"
-    rf"|{_MYSQL_ODBC_DRIVER_NAME}"
-    r"|odbc driver [0-9]+ for sql server"
+    rf"{_PSQLODBC_DRIVER_NAME}|{_MYSQL_ODBC_DRIVER_NAME}|{_MSODBC_DRIVER_NAME}"
 )
 
-# The ``sslmode`` values the generic dialect sends for any driver but MySQL Connector/ODBC: libpq's
-# six modes, exactly, in lower case (BACKLOG #2705). psqlODBC's source reads an ``SSLmode`` value by
-# its first byte, and only a lower case one names a mode, so ``Require``, ``VERIFY-FULL``,
-# ``REQUIRED``, ``on`` or ``1`` would mean disable to it, while :func:`generic_odbc_tls_unenforced`
-# counts each as TLS addressed. Only these spellings mean the same thing to both.
+# The ``sslmode`` values psqlODBC reads: libpq's six modes, exactly, in lower case (BACKLOG #2705).
+# psqlODBC's source reads an ``SSLmode`` value by its first byte, and only a lower case one names a
+# mode, so ``Require``, ``VERIFY-FULL``, ``REQUIRED``, ``on`` or ``1`` would mean disable to it,
+# while the gate would count each as TLS addressed. Only these spellings mean the same thing to both.
 _LIBPQ_SSL_MODES = ("disable", "allow", "prefer", "require", "verify-ca", "verify-full")
+
+# The ``SSLMODE`` values MySQL Connector/ODBC documents, in the documented upper case (BACKLOG
+# #5035). Per engine PR 2691, a value it does not recognize leaves the driver at ``PREFERRED``,
+# which can fall back to plaintext. No MySQL driver was run for this list: whether the driver reads
+# another case was not measured, so only the documented spelling is accepted.
+_MYSQL_SSL_MODES = ("DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY")
 
 
 def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) -> None:
-    """A ValueError when an ``sslmode`` value is not one of :data:`_LIBPQ_SSL_MODES`, exactly
-    (BACKLOG #2705). The keyword is matched in any case, as the build matches every keyword.
+    """A ValueError when an ``sslmode`` value is not one the named driver family reads, exactly
+    (BACKLOG #2705, #5029, #5035). The keyword is matched in any case, as the build matches every
+    keyword; the value is not.
 
-    The rule depends on the driver family, read from the ``odbc_driver`` name: MySQL Connector/ODBC
-    sends the same keyword with its own upper case values (``REQUIRED``, ``VERIFY_IDENTITY``), so a
-    name :data:`_MYSQL_ODBC_DRIVERS` matches whole is left to MySQL's spellings, as before. Every
-    other driver, psqlODBC under any name included, takes the libpq spellings only. The refusal
-    lists the accepted values and never the value given."""
-    if _MYSQL_ODBC_DRIVERS.fullmatch(driver.lower()) or text in _LIBPQ_SSL_MODES:
+    The rule depends on the family :func:`_driver_family` places from the ``odbc_driver`` name.
+    MySQL Connector/ODBC takes only :data:`_MYSQL_SSL_MODES`. psqlODBC, and any name the engine
+    cannot place as psqlODBC or MySQL, take only :data:`_LIBPQ_SSL_MODES`, as before. So does
+    Microsoft's driver, which reads no ``sslmode``; its refusal says to set ``Encrypt``.
+
+    For a name it cannot place, the refusal says so, and never offers a libpq value alone: a value
+    that is a MySQL spelling in any case is pointed at MySQL's registered name, and any other is
+    given libpq's list beside that pointer. So it never steers a MySQL driver under another name to
+    a libpq value it would ignore. :func:`generic_odbc_tls_unenforced` counts no mode on such a name
+    either. Each refusal leads with what an operator needs, as a stored failure keeps about its
+    first 200 characters, and none quotes the value given.
+
+    The MySQL list is joined with ``or``: two upper case words joined by a comma or a blank are a
+    name run to the log redaction, which would blank them."""
+    family = _driver_family(driver)
+    database = f"{hop_name_prefix(connection)}DATABASE"
+    where = f"{database} odbc_params value for 'sslmode'"
+    see = "(see Generic ODBC in docs/CONNECTIONS.md)"
+    if family == "mysql":
+        if text in _MYSQL_SSL_MODES:
+            return
+        mysql = " or ".join(_MYSQL_SSL_MODES)
+        raise ValueError(f"{where} must be one of {mysql}, in upper case, for MySQL {see}")
+    if text in _LIBPQ_SSL_MODES:
         return
+    libpq = ", ".join(_LIBPQ_SSL_MODES)
+    if family == "psqlodbc":
+        raise ValueError(f"{where} must be one of {libpq}, in lower case {see}")
+    if family == "msodbc":
+        raise ValueError(
+            f"{where} must be one of {libpq}, in lower case; this driver reads Encrypt, not "
+            f"sslmode {see}"
+        )
+    if text.upper() in _MYSQL_SSL_MODES:
+        raise ValueError(
+            f"{database} 'sslmode' is a MySQL spelling, and the engine cannot place this "
+            f"odbc_driver as MySQL; name it MySQL ODBC <version> Unicode or ANSI Driver {see}"
+        )
     raise ValueError(
-        f"{hop_name_prefix(connection)}DATABASE odbc_params value for 'sslmode' must be one of "
-        f"{', '.join(_LIBPQ_SSL_MODES)}, in lower case (see Generic ODBC in docs/CONNECTIONS.md)"
+        f"{database} 'sslmode' for an odbc_driver the engine cannot place must be exactly one of "
+        f"{libpq}; MySQL needs its registered name {see}"
     )
 
 
