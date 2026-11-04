@@ -3185,6 +3185,91 @@ def test_serve_notify_quiet_in_synthetic_dev(
     assert "security-notification" not in capsys.readouterr().err
 
 
+# BACKLOG #5088: a relay the [alerts] allowlist omits is no channel. Each notice to it is refused at
+# the send, and since #5088 the notifier refuses to build, so the serve gate names the allowlist.
+_OFF_ALLOWLIST = 'smtp_allowed_hosts = ["relay.example.org"]\n'  # omits smtp.example.org
+
+
+def test_serve_refuses_a_relay_the_smtp_allowlist_omits_in_prod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS
+        + _OFF_ALLOWLIST,
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "refusing to start" in err
+    assert "[alerts].smtp_allowed_hosts" in err and "[alerts].email_smtp_host" in err
+
+
+def test_serve_starts_with_a_relay_the_smtp_allowlist_lists_in_prod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The control: the same config with the relay listed, in another case, starts.
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS
+        + 'smtp_allowed_hosts = ["relay.example.org", "SMTP.example.org"]\n',
+    )
+    assert rc == 0
+    assert "smtp_allowed_hosts" not in capsys.readouterr().err
+
+
+def test_serve_warns_on_a_relay_the_smtp_allowlist_omits_under_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\nsecurity.block_unlisted_outbound = true\n'
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS
+        + _OFF_ALLOWLIST,
+        env="staging",
+    )
+    assert rc == 0  # the app is mocked here; the real lifespan refuses the notifier build
+    err = capsys.readouterr().err
+    assert "warning:" in err and "[alerts].smtp_allowed_hosts" in err
+    assert "refusing to start" not in err
+
+
+def test_serve_waiver_with_a_relay_the_smtp_allowlist_omits_audits_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The waiver still downgrades the channel refusal, and the allowlist is named before the
+    lifespan's build refuses. With no reminder recipient either, one AUDIT line covers both
+    gates, as for a waiver with no relay at all."""
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS_NO_RECIPIENT
+        + _OFF_ALLOWLIST
+        + "security_notifications_required = false\n",
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "[alerts].smtp_allowed_hosts" in captured.err
+    both = captured.out + captured.err
+    audits = [
+        line
+        for line in both.splitlines()
+        if "AUDIT:" in line and "security_notifications_required=false" in line
+    ]
+    assert len(audits) == 1, audits
+
+
 # --- BACKLOG #2008 (ASVS 6.4.5): the credential reminders need an [alerts] RECIPIENT -------------
 
 

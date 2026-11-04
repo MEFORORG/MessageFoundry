@@ -61,6 +61,7 @@ from messagefoundry.pipeline.alert_sinks import (
     ALERTS_SMTP_CELL,
     _BackgroundDispatcher,
     _refuse_alert_smtp_revocation,
+    _refuse_off_allowlist_smtp_host,
     send_plain_email,
 )
 from messagefoundry.store.base import AuditStore
@@ -590,11 +591,14 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
     ) -> None:
+        # BACKLOG #5088: the allowlist every send applies, here at the build, with or without a
+        # login, so a relay it would refuse at every notice refuses the start instead. First, so a
+        # refused build starts nothing, and ahead of the revocation guard, which reads no allowlist.
+        _refuse_off_allowlist_smtp_host(host, allowed_hosts)
         # BACKLOG #2193 slice (c): the login rides the alerts SMTP hop, so it takes that hop's
-        # revocation guard, with the same [alerts] pair. First, so a refused build starts nothing.
+        # revocation guard, with the same [alerts] pair.
         _refuse_alert_smtp_revocation(
             host=host,
-            allowed_hosts=allowed_hosts,
             use_tls=use_tls,
             username=username,
             tls_verify=tls_verify,
