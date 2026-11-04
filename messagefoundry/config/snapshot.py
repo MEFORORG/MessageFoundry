@@ -37,6 +37,7 @@ __all__ = [
     "config_py_files",
     "is_missing_directory",
     "read_config_snapshot",
+    "with_value_file",
 ]
 
 #: The relative path ``connections.toml`` is recorded under, whichever file was read for it (the live
@@ -47,16 +48,25 @@ CONNECTIONS_REL = "connections.toml"
 #: config directory. **Covered, never loaded:** the loader reads none of them. The value file a serve
 #: start actually reads sits under ``[environments].base_dir``, which by default is not the config
 #: directory. Where it is this folder, a reload's value provider parses the bytes this snapshot read
-#: for it (:meth:`ConfigSnapshot.environment_file`); a value file elsewhere is not read here.
+#: for it (:meth:`ConfigSnapshot.environment_file`); a value file elsewhere is read into the snapshot
+#: by :func:`with_value_file`, under :data:`_VALUE_FILE_DIR`.
 _ENVIRONMENTS_DIR = "environments"
+
+#: The folder name a value file outside ``environments/`` is recorded under, with its file name
+#: alone, so the digest stays independent of where the bundle sits. No listing returns it: a listed
+#: entry is a top-level module or ``connections.toml``, or sits in one of :data:`_FOLDERS`. Covered
+#: and never loaded, like ``environments/`` (vault BACKLOG #2596).
+_VALUE_FILE_DIR = "@value-file"
+_VALUE_FILE_PREFIX = f"{_VALUE_FILE_DIR}/"
 
 #: The folders a snapshot lists, beside the directory itself.
 _FOLDERS: tuple[str, ...] = (CODESETS_DIR_NAME, _ENVIRONMENTS_DIR)
 
 
 class NotInSnapshot(LookupError):
-    """A value file outside the snapshot's ``environments/`` folder, whose bytes the snapshot did
-    not read and its digest does not cover (:meth:`ConfigSnapshot.environment_file`)."""
+    """A value file outside the snapshot's ``environments/`` folder and not the one
+    :func:`with_value_file` read into it, whose bytes the snapshot did not read and its digest does
+    not cover (:meth:`ConfigSnapshot.environment_file`)."""
 
 
 class ConfigDirMissing(FileNotFoundError):
@@ -130,7 +140,7 @@ def _covered_name(folder: str, name: str) -> bool:
 def _covered_only(rel: str) -> bool:
     """Whether ``rel`` (a file, or a folder that could not be listed) is one the fingerprint
     covers and no load reads."""
-    return rel == _ENVIRONMENTS_DIR or rel.startswith(f"{_ENVIRONMENTS_DIR}/")
+    return rel == _ENVIRONMENTS_DIR or rel.startswith((f"{_ENVIRONMENTS_DIR}/", _VALUE_FILE_PREFIX))
 
 
 def _is_module_rel(rel: str) -> bool:
@@ -160,7 +170,11 @@ def _check_rel(rel: object) -> str:
         raise ValueError(f"config snapshot path {rel!r} is not a plain relative path")
     if len(parts) == 1 and (rel == CONNECTIONS_REL or _is_module_rel(rel)):
         return rel
-    if len(parts) == 2 and parts[0] in _FOLDERS and _covered_name(parts[0], parts[1]):
+    if (
+        len(parts) == 2
+        and parts[0] in (*_FOLDERS, _VALUE_FILE_DIR)
+        and _covered_name(parts[0], parts[1])
+    ):
         return rel
     raise ValueError(f"config snapshot path {rel!r} is not a file a config load reads")
 
@@ -175,11 +189,16 @@ class ConfigSnapshot:
     ``codesets/diets.csv``, ``environments/dev.toml``) to its bytes. ``unreadable`` names each file,
     or folder, that could not be read and is left out; a strict read raises instead, so it is empty
     there. The ``environments/`` files are covered by the fingerprint and never loaded as config;
-    a reload's value provider may parse one (:meth:`environment_file`)."""
+    a reload's value provider may parse one (:meth:`environment_file`).
+
+    ``value_file`` is the absolute path of a value file outside ``environments/`` that
+    :func:`with_value_file` read into ``files`` as ``@value-file/<name>``, or tried to. It is
+    covered and never loaded, like ``environments/``, and ``None`` when there is no such file."""
 
     directory: Path
     files: Mapping[str, bytes]
     unreadable: tuple[str, ...] = ()
+    value_file: Path | None = None
     _modules: tuple[str, ...] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -217,9 +236,24 @@ class ConfigSnapshot:
         return tuple(rel for rel in self.unreadable if not _covered_only(rel))
 
     def covers_environment_file(self, path: str | Path) -> bool:
-        """Whether ``path`` is in this snapshot's ``environments/`` folder, so the snapshot's digest
-        covers the file there, or that there is none (:func:`_same_folder`)."""
-        return _same_folder(Path(path).parent, self.directory / _ENVIRONMENTS_DIR)
+        """Whether ``path`` is in this snapshot's ``environments/`` folder, or is its
+        :attr:`value_file`, so the snapshot's digest covers the file there, or that there is none
+        (:func:`_same_folder`)."""
+        return self._folder_of(Path(path)) is not None
+
+    def _folder_of(self, path: Path) -> str | None:
+        """The folder this snapshot records the value file ``path`` under, or ``None`` when it does
+        not cover it."""
+        if _same_folder(path.parent, self.directory / _ENVIRONMENTS_DIR):
+            return _ENVIRONMENTS_DIR
+        held = self.value_file
+        if (
+            held is not None
+            and os.path.normcase(path.name) == os.path.normcase(held.name)
+            and _same_folder(path.parent, held.parent)
+        ):
+            return _VALUE_FILE_DIR
+        return None
 
     def environment_file(self, path: str | Path) -> bytes | None:
         """The bytes this snapshot read for the value file ``path``, which
@@ -232,13 +266,12 @@ class ConfigSnapshot:
         folder, read a file that is gone now, or read no file by its name while one is there now,
         created since. The caller refuses then; the values are read again on the next reload."""
         value_file = Path(path)
-        if not self.covers_environment_file(value_file):
+        folder = self._folder_of(value_file)
+        if folder is None:
             raise NotInSnapshot(f"{value_file} is not in the config snapshot's environments folder")
-        prefix = f"{_ENVIRONMENTS_DIR}/"
+        prefix = f"{folder}/"
         want = os.path.normcase(prefix + value_file.name)
-        if any(
-            rel == _ENVIRONMENTS_DIR or os.path.normcase(rel) == want for rel in self.unreadable
-        ):
+        if any(rel == folder or os.path.normcase(rel) == want for rel in self.unreadable):
             raise OSError(errno.EACCES, "the config snapshot could not read this value file")
         present = os.path.lexists(value_file)
         data = self.files.get(prefix + value_file.name)
@@ -270,6 +303,37 @@ class ConfigSnapshot:
                 if not _covered_only(rel) and (code_sets or not rel.startswith(codesets))
             },
         )
+
+
+def with_value_file(
+    snapshot: ConfigSnapshot, value_file: str | Path | None, *, strict: bool
+) -> ConfigSnapshot:
+    """``snapshot`` with the value file ``value_file`` read into it, so its digest covers those
+    bytes and a reload parses them (:meth:`ConfigSnapshot.environment_file`; vault BACKLOG #2596).
+
+    ``value_file`` is the path a start reads, ``<base_dir>/<dir>/<env>.toml``, wherever
+    ``[environments].base_dir`` puts it; it is recorded made absolute. Returns ``snapshot`` itself
+    when ``value_file`` is ``None``, sits in the snapshot's ``environments/`` folder, which the
+    snapshot already read, or is the file the snapshot already holds. A file that is not there is
+    held as absent, so creating one changes the digest. With ``strict`` a fault reading it raises
+    its ``OSError``; without, it is named in :attr:`ConfigSnapshot.unreadable`. It is read as
+    :func:`read_config_snapshot` reads a file, following links. Its access list is not vetted
+    here: a caller that gates on the bytes vets the file and its folder before this read."""
+    if value_file is None:
+        return snapshot
+    path = Path(os.path.abspath(value_file))
+    if snapshot.covers_environment_file(path):
+        return snapshot
+    files = {k: v for k, v in snapshot.files.items() if not k.startswith(_VALUE_FILE_PREFIX)}
+    unreadable = {rel for rel in snapshot.unreadable if not rel.startswith(_VALUE_FILE_PREFIX)}
+    rel = _check_rel(_VALUE_FILE_PREFIX + path.name)
+    _read_into(files, unreadable, rel, path, strict=strict)
+    return ConfigSnapshot(
+        directory=snapshot.directory,
+        files=files,
+        unreadable=tuple(sorted(unreadable)),
+        value_file=path,
+    )
 
 
 def read_config_snapshot(directory: str | Path, *, strict: bool) -> ConfigSnapshot:
@@ -324,23 +388,28 @@ def read_config_snapshot(directory: str | Path, *, strict: bool) -> ConfigSnapsh
         ]
     files: dict[str, bytes] = {}
     for rel, path in candidates:
-        try:
-            # A stat that fails for any reason but absence is an unreadable file, not a missing
-            # one: Path.is_file would answer False and the file would drop out unremarked.
-            if not _is_file(path):
-                continue
-            data = _read(path)
-        except OSError as exc:
-            if strict:
-                raise
-            # Absent means removed since the listing: gone, as _is_file judges a gone path.
-            if not _is_absent(exc):
-                unreadable.add(rel)
-            continue
-        files[rel] = data
+        _read_into(files, unreadable, rel, path, strict=strict)
     return ConfigSnapshot(
         directory=Path(os.path.abspath(base)), files=files, unreadable=tuple(sorted(unreadable))
     )
+
+
+def _read_into(
+    files: dict[str, bytes], unreadable: set[str], rel: str, path: Path, *, strict: bool
+) -> None:
+    """Read ``path`` into ``files`` as ``rel`` if it is a regular file. A fault raises with
+    ``strict``; without, it adds ``rel`` to ``unreadable``. A file that is gone is neither."""
+    try:
+        # A stat that fails for any reason but absence is an unreadable file, not a missing
+        # one: Path.is_file would answer False and the file would drop out unremarked.
+        if _is_file(path):
+            files[rel] = _read(path)
+    except OSError as exc:
+        if strict:
+            raise
+        # Absent means removed since the listing: gone, as _is_file judges a gone path.
+        if not _is_absent(exc):
+            unreadable.add(rel)
 
 
 def _list_folders(base: Path, *, unlistable: set[str] | None) -> set[str]:

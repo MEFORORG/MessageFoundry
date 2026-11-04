@@ -35,6 +35,7 @@ from messagefoundry.config.snapshot import (
     ConfigSnapshot,
     is_missing_directory,
     read_config_snapshot,
+    with_value_file,
 )
 from messagefoundry.credential import constant_time_equal
 
@@ -62,7 +63,10 @@ __all__ = [
 # BACKLOG #2596). A code-set table is matched by its suffix in lower case, as the loader matches it,
 # so ``codesets/x.CSV`` is hashed on POSIX too; and a path that resolves to a file another path
 # already names is hashed under both names, so a link added beside a module changes the digest.
-_SCHEME = b"mefor-cfg-fp:v3\n"
+# v4: the value file a start reads is folded wherever ``[environments].base_dir`` puts it, as
+# ``@value-file/<name>`` when it is outside the config directory's ``environments/`` folder
+# (:func:`~messagefoundry.config.snapshot.with_value_file`, vault BACKLOG #2596).
+_SCHEME = b"mefor-cfg-fp:v4\n"
 
 #: The scheme tag :func:`config_fingerprint_detail` records beside each digest. Two digests are
 #: comparable only under one scheme: a start compares its own digest with the store's last recorded
@@ -87,7 +91,9 @@ UNREADABLE_FILES_KEY = "unreadable_files"
 # file a serve start reads sits
 # under ``[environments].base_dir``; where that is this folder, a reload parses the very bytes
 # hashed here (``ConfigSnapshot.environment_file``), so dropping them from the fold would let a
-# released reload apply values its digest does not cover. ``__pycache__`` is never read:
+# released reload apply values its digest does not cover. Elsewhere, the default layout, a caller
+# that names it (``value_file``) has it read into the snapshot and folded as ``@value-file/<name>``,
+# and a reload parses those bytes the same way. ``__pycache__`` is never read:
 # the loader compiles the source itself.
 
 
@@ -124,7 +130,9 @@ def snapshot_fingerprint(snapshot: ConfigSnapshot) -> str:
     return _fold(_entries(snapshot))
 
 
-def config_fingerprint(directory: str | Path, *, strict: bool = False) -> str:
+def config_fingerprint(
+    directory: str | Path, *, strict: bool = False, value_file: str | Path | None = None
+) -> str:
     """Return a stable SHA-256 hex digest over the content of a config bundle's loaded files.
 
     By default it is observational, as the module docstring says: a file it cannot read is left out,
@@ -132,12 +140,17 @@ def config_fingerprint(directory: str | Path, *, strict: bool = False) -> str:
     one a dual-control approval binds (vault BACKLOG #2596). There a skipped file would leave bytes
     the approval never covered, so ``strict`` raises instead.
     :func:`~messagefoundry.config.snapshot.read_config_snapshot` says at which faults, and which
-    gone directory it does not refuse."""
-    return snapshot_fingerprint(read_config_snapshot(directory, strict=strict))
+    gone directory it does not refuse. ``value_file`` is the value file a start reads, folded
+    wherever it is (:func:`~messagefoundry.config.snapshot.with_value_file`)."""
+    snapshot = read_config_snapshot(directory, strict=strict)
+    return snapshot_fingerprint(with_value_file(snapshot, value_file, strict=strict))
 
 
 def config_fingerprint_detail(
-    directory: str | Path, *, snapshot: ConfigSnapshot | None = None
+    directory: str | Path,
+    *,
+    snapshot: ConfigSnapshot | None = None,
+    value_file: str | Path | None = None,
 ) -> dict[str, object]:
     """Return the fingerprint plus the file count and a best-effort git HEAD, for an audit detail.
 
@@ -148,7 +161,8 @@ def config_fingerprint_detail(
 
     With ``snapshot``, the digest is of that snapshot, the bytes a load read and ran, and the
     directory is read for the git HEAD alone (vault BACKLOG #2596). Without it, the directory is
-    read now.
+    read now. ``value_file`` is folded as :func:`config_fingerprint` folds it; a snapshot that
+    already holds it does not read it again.
 
     It stays best-effort: a file it cannot read is left out of the digest. But it says so, under
     :data:`UNREADABLE_FILES_KEY` (the files and folders left out), present only when one was. Two
@@ -160,6 +174,7 @@ def config_fingerprint_detail(
     base = Path(directory)
     if snapshot is None:
         snapshot = read_config_snapshot(base, strict=False)
+    snapshot = with_value_file(snapshot, value_file, strict=False)
     entries = _entries(snapshot)
     detail: dict[str, object] = {
         "fingerprint": _fold(entries),

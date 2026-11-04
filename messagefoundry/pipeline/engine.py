@@ -53,6 +53,7 @@ from messagefoundry.config.wiring import (
     API_LISTENER_LABEL,
     Registry,
     WiringError,
+    assert_trusted_start_paths,
     connector_secret_env_values,
     guarding_with_env_values,
     load_config,
@@ -2718,6 +2719,15 @@ class Engine:
             return await asyncio.to_thread(self.fingerprint_bundle_blocking, path, snapshot)
         return await asyncio.to_thread(self.fingerprint_bundle_blocking, path)
 
+    def _value_file(self) -> Path | None:
+        """The value file this engine's provider reads, which every config digest it takes folds
+        and a reload's snapshot holds, wherever ``[environments].base_dir`` puts it (vault
+        BACKLOG #2596). ``None`` for a provider that names none, or no provider."""
+        provider = self._env_values_provider
+        if isinstance(provider, SnapshotEnvValuesProvider):
+            return provider.value_file
+        return None
+
     def fingerprint_bundle_blocking(
         self, path: Path, snapshot: ConfigSnapshot | None = None
     ) -> tuple[dict[str, object] | None, str | None]:
@@ -2727,10 +2737,11 @@ class Engine:
 
         try:
             # A direct call, so the crypto inventory scanner, which follows a call it can see,
-            # keeps the hash on its record.
-            if snapshot is not None:
-                return config_fingerprint_detail(path, snapshot=snapshot), None
-            return config_fingerprint_detail(path), None
+            # keeps the hash on its record. A snapshot that holds the value file is not read again.
+            detail = config_fingerprint_detail(
+                path, snapshot=snapshot, value_file=self._value_file()
+            )
+            return detail, None
         except (OSError, ValueError) as exc:
             reason = safe_exc(exc)
             log.warning("config fingerprint failed for %s: %s", path, reason)
@@ -2763,17 +2774,18 @@ class Engine:
         Not :meth:`fingerprint_bundle`, whose detail is lost whole when only its advisory VCS head
         cannot be read. An approval binds content, so that failure must not refuse a release. That
         one also stays best-effort, skipping what it cannot read, because it records provenance and
-        refuses nothing."""
-        return await asyncio.to_thread(self._content_digest_blocking, path)
+        refuses nothing. The value file this engine reads is covered wherever it is
+        (:meth:`_value_file`)."""
+        return await asyncio.to_thread(self._content_digest_blocking, path, self._value_file())
 
     @staticmethod
-    def _content_digest_blocking(path: Path) -> str | None:
+    def _content_digest_blocking(path: Path, value_file: Path | None = None) -> str | None:
         """:meth:`_content_digest` on a worker thread. A direct call, so the crypto inventory
         scanner, which follows a call it can see, keeps this hash on its record."""
         from messagefoundry.config.fingerprint import ConfigDirMissing, config_fingerprint
 
         try:
-            return config_fingerprint(path, strict=True)
+            return config_fingerprint(path, strict=True, value_file=value_file)
         except ConfigDirMissing:
             # The directory itself is gone: a missing directory, as a reload of one is, and not an
             # unreadable bundle. A file that vanished from a present one is the latter.
@@ -2792,15 +2804,32 @@ class Engine:
         """The one read of ``path`` a reload runs, after the load's trust check, read strictly so
         its digest covers every file the fingerprint names (vault BACKLOG #2596). ``None`` when a
         file or folder cannot be read, logged at WARNING as :meth:`_content_digest` logs it. A
-        missing directory raises :class:`ConfigDirMissing`, and a refused source ``WiringError``."""
-        return await asyncio.to_thread(self._reload_snapshot_blocking, path)
+        missing directory raises :class:`ConfigDirMissing`, and a refused source ``WiringError``.
+
+        The value file this engine reads (:meth:`_value_file`) is read into the snapshot too,
+        wherever ``[environments].base_dir`` puts it, after the same trust check a value read
+        makes, of the file and its folder. So the digest covers it, and the provider parses those
+        bytes rather than the file as it is later."""
+        return await asyncio.to_thread(self._reload_snapshot_blocking, path, self._value_file())
 
     @staticmethod
-    def _reload_snapshot_blocking(path: Path) -> ConfigSnapshot | None:
-        from messagefoundry.config.snapshot import ConfigDirMissing
+    def _reload_snapshot_blocking(
+        path: Path, value_file: Path | None = None
+    ) -> ConfigSnapshot | None:
+        from messagefoundry.config.snapshot import ConfigDirMissing, with_value_file
 
         try:
-            return read_trusted_snapshot(path, strict=True)
+            snapshot = read_trusted_snapshot(path, strict=True)
+            if value_file is None or snapshot.covers_environment_file(value_file):
+                return snapshot
+            # Vetted before it is read, as the config directory is: the bytes read here are the
+            # ones a reload applies (vault BACKLOG #2596, step 4).
+            assert_trusted_start_paths(
+                [value_file],
+                lead="refusing to read environment values from",
+                folders=[value_file.parent],
+            )
+            return with_value_file(snapshot, value_file, strict=True)
         except ConfigDirMissing:
             raise
         except OSError as exc:
@@ -2810,8 +2839,8 @@ class Engine:
                 "config content digest failed for %s: %s. The reload's snapshot could not be "
                 "read whole, so a released reload is refused. Any other reload reads the "
                 "directory again and refuses any file the load reads that it cannot read, every "
-                "*.py module and helper included; only the environments folder and its files "
-                "are left out",
+                "*.py module and helper included; only the environments folder, its files and "
+                "the environment value file are left out",
                 scrub_log_argument(str(path)),
                 safe_exc(exc),
             )
@@ -2875,7 +2904,10 @@ class Engine:
         the load's read cannot reach it (vault BACKLOG #2944, #3765). Off a snapshot, only a file
         the load does not read, in ``environments/``, can be left out of it, and it holds that
         folder as the load read it: a start resolves its values earlier, when the engine is built,
-        not from these bytes. The directory is read for the advisory VCS head alone.
+        not from these bytes. A value file outside the config directory (:meth:`_value_file`)
+        is not in the start load's snapshot, so it is read now, after the values were, and folded
+        as a reload's digest folds it, so the two compare. The directory is read for the advisory
+        VCS head alone.
 
         A running graph that carries no snapshot gets none of that: the digest is of the directory
         as it is now, so any covered file can be left out and a later edit can reach it. A digest
@@ -3006,7 +3038,8 @@ class Engine:
         :class:`ConfigDirMissing`. ``None`` binds nothing: an ungated reload, a convergence reload
         and a dry run pass none. The digest covers what :mod:`messagefoundry.config.fingerprint`
         hashes and no more. A :class:`~messagefoundry.config.environments.SnapshotEnvValuesProvider`
-        reads a value file in the snapshot's ``environments/`` folder from the snapshot too; after
+        reads its value file from the snapshot too, in the snapshot's ``environments/`` folder or
+        wherever ``[environments].base_dir`` puts it (:meth:`_reload_snapshot`); after
         any other read of the values from disk, a released reload takes the digest again and
         refuses a change the same way.
 
@@ -3083,9 +3116,10 @@ class Engine:
             # reach it: it re-applies the running graph (vault BACKLOG #3067).
             refusal: str | None = None
             # Vault BACKLOG #2596: the approval digest covers environments/*.toml under the config
-            # directory, so a SnapshotEnvValuesProvider is handed the snapshot and parses the bytes
-            # the digest names. Where it cannot, and for any other provider, the values are read
-            # from disk after the digest check, and a released reload checks the digest again.
+            # directory and the provider's own value file wherever it is (_value_file), so a
+            # SnapshotEnvValuesProvider is handed the snapshot and parses the bytes the digest
+            # names. Where it cannot, and for any other provider, the values are read from disk
+            # after the digest check, and a released reload checks the digest again.
             read: Mapping[str, Any] | None = None
             reads_snapshot = False
             try:

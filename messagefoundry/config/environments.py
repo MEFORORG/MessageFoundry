@@ -75,6 +75,14 @@ class SnapshotEnvValuesProvider(ABC):
         ``None`` the engine calls the provider plainly and, on a released reload, checks the digest
         again."""
 
+    @property
+    def value_file(self) -> Path | None:
+        """The value file this provider reads, wherever ``[environments].base_dir`` puts it, or
+        ``None`` when it reads none. The engine reads the file into each reload's snapshot and
+        folds it into the config digest, so an approval covers it and :meth:`from_snapshot` can
+        parse it from those bytes (vault BACKLOG #2596)."""
+        return None
+
 
 class ValuesRead(Protocol):
     """A read of one value file's environment values, from disk, or with ``snapshot`` from the
@@ -110,6 +118,10 @@ class EnvironmentValuesReader(SnapshotEnvValuesProvider):
         return self._read(
             base_dir=self.base_dir, dir_name=self.dir_name, environment=self.environment
         )
+
+    @property
+    def value_file(self) -> Path:
+        return values_file_path(self.base_dir, self.dir_name, self.environment)
 
     def from_snapshot(self, snapshot: ConfigSnapshot) -> dict[str, Any] | None:
         from messagefoundry.config.snapshot import NotInSnapshot

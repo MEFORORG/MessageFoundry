@@ -2527,10 +2527,12 @@ that snapshot's digest against the approved one before any config module runs. T
 and runs that same snapshot, and the `config_reload` row records its digest. So the config
 modules, helpers and tables checked are the ones the loader runs, and an edit to them on disk
 during the load is neither run nor recorded. The limits below name at least one import that runs
-from disk instead. Where the environment value file sits in the config directory's
-`environments/` folder, `serve` parses it from the same snapshot, so an edit to it during the load
-does not apply, and a value file created or removed there since the snapshot is refused. Otherwise,
-at least where the value file sits elsewhere or an embedded engine has another value provider, the
+from disk instead. The digest covers `serve`'s environment value file wherever
+`[environments].base_dir` puts it: in the config directory's `environments/` folder, or elsewhere,
+where the release reads it into the snapshot after vetting the file and its folder. `serve` parses
+it from the same snapshot, so an edit to it during the load does not apply, and a value file
+created or removed since the snapshot is refused. Otherwise, at least where an embedded engine has
+another value provider, the
 release reads the values from disk and then takes the digest again, which refuses a change made in
 between to a file the digest covers. If the digest differs, nothing loads and nothing swaps. The running graph keeps
 the environment values it had. A reload applies the values it re-read only with the swap, and a
@@ -2550,7 +2552,7 @@ digest, and `approval_digest_check` set to `not_reached`, and no `current_finger
 digest was taken. A missing, unlistable or disallowed directory is refused before the check too,
 with its own reason and neither field. A refusal after the digest check passed carries neither
 field either, whether the approved bytes caused it or an input the digest does not cover, such as
-an environment value file outside the config directory or a connection's CA file. The second
+a `MEFOR_VALUE_*` variable or a connection's CA file. The second
 digest above is the exception: it refuses as `digest_mismatch` with both fields, or as at least
 `digest_unavailable` or `not_found`, as the first check does.
 
@@ -2585,10 +2587,9 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   integrity seal, so a writer to the `pending_approvals` table who replaces the digest leaves a
   request the gate refuses. The seal does not stop an older sealed copy of the row being put back,
   and a keyless store checks nothing (vault BACKLOG #2592);
-- the digest covers what `config/fingerprint.py` hashes and no more. The release reads a value
-  file outside the config directory's `environments/` folder after the digest check, and a
-  `MEFOR_VALUE_*` variable too, so an edit to either changes the values a release applies under an
-  unchanged digest. The second digest samples the files, so where an embedded engine's other value
+- the digest covers what `config/fingerprint.py` hashes and no more. The release reads a
+  `MEFOR_VALUE_*` variable and the secrets directory after the digest check, so an edit to either
+  changes the values a release applies under an unchanged digest. The second digest samples the files, so where an embedded engine's other value
   provider reads a value file under the config directory, an edit to it reverted before that digest
   is not seen. The second digest also refuses an edit to any covered file made after the first,
   though the load runs the snapshot the first one checked.
