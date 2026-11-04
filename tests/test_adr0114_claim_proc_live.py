@@ -277,12 +277,13 @@ async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
     The lock is taken on the fifo index key, the shape every real contender holds, so the READPAST
     probe skips it rather than waiting on it.
 
-    A 1222 abort is the one other legal answer. One that came before the fetch names no lane and
-    never read the marker, so a pass on it proves nothing about the ``_v2`` CALL. Each abort is a
-    full rollback, so the claim is re-issued until it completes or names the lane, and the test FAILS
-    if no attempt does (BACKLOG #4915). It used to pass on that route with only a UserWarning. An
-    abort that did name the lane read the marker and is judged by ``assert_skip_named``. Every abort
-    seen, the last attempt's included, still rides out as a warning, so a re-issue never hides one."""
+    A 1222 abort is the one other legal answer. At INGRESS it comes before the fetch, so it names no
+    lane and never read the marker, and a pass on it proves nothing about the ``_v2`` CALL. Each
+    abort is a full rollback, so the claim is re-issued until one COMPLETES, and the test FAILS if
+    none does (BACKLOG #4915). It used to pass on that route with only a UserWarning. Every abort is
+    still held to ``assert_skip_named``, so one that echoes the lane fails rather than stopping the
+    re-issue as though it had read the marker. Every abort seen still rides out as a warning, even
+    when a later attempt blocks or an assertion fails, so a re-issue never hides one."""
     lane = "IB_V2_HEADSKIP"
     mids = [
         await proc_store.enqueue_ingress(channel_id=lane, raw=f"MSH|^~\\&|SKIP|{t}", now=t)
@@ -303,24 +304,28 @@ async def test_v2_proc_names_the_lane_whose_locked_head_it_skipped(
             attempts.append(attempt)
             return attempt
 
-        def _read_the_marker(r: Any) -> bool:
-            return r.lock_timeout is None or lane in r.head_skipped
+        def _completed(r: Any) -> bool:
+            return r.lock_timeout is None
 
-        res = await claim_past_empty_yield(_claim, done=_read_the_marker)
-        aborts = sum(a.lock_timeout is not None for a in attempts)
-        if aborts:
+        try:
+            res = await claim_past_empty_yield(_claim, done=_completed)
+        finally:
             # Say so in the warnings summary: a 1222 nobody sees is the defect class BACKLOG #1270
-            # is about, and a re-issue must not become one. Emitted BEFORE the assertions below
-            # (BACKLOG #4915), so a run that fails one of them still shows the aborts it saw.
-            warnings.warn(
-                f"the _v2 head-skip test saw {aborts} 1222 abort(s) in {len(attempts)} claim(s)",
-                stacklevel=1,
-            )
+            # is about, and a re-issue must not become one. In a finally and BEFORE the assertions
+            # below (BACKLOG #4915), so a run that blocks or fails one of them still shows the
+            # aborts it saw.
+            aborts = sum(a.lock_timeout is not None for a in attempts)
+            if aborts:
+                warnings.warn(
+                    f"the _v2 head-skip test saw {aborts} 1222 abort(s) in {len(attempts)} claim(s)",
+                    stacklevel=1,
+                )
         assert all(a.by_lane == {} and a.rearm == frozenset() for a in attempts)
-        assert _read_the_marker(res), (
-            f"all {len(attempts)} claims aborted on 1222 without naming the lane"
-            f" ({res.lock_timeout!r}), so the _v2 head-skip marker was never read and this test"
-            " proved nothing about it"
+        for a in attempts:  # an abort that named the lane at INGRESS echoed the request list
+            assert_skip_named(a, lane, abort_ok=True, stage=Stage.INGRESS.value)
+        assert _completed(res), (
+            f"all {len(attempts)} claims aborted on 1222 ({res.lock_timeout!r}), so the _v2"
+            " head-skip marker was never read and this test proved nothing about it"
         )
         assert_skip_named(res, lane, abort_ok=False, stage=Stage.INGRESS.value)
         rows = await ss_lane_pending(proc_store, lane)

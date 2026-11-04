@@ -106,8 +106,9 @@ def _rig(fail_on: str | None, exc: BaseException) -> tuple[_Store, _Conn, _Curso
 
 
 async def _settled(closed: list[str], want: int) -> list[str]:
-    """The discard's close runs on an executor thread; wait for it, bounded."""
-    for _ in range(200):
+    """The discard's close runs on an executor thread; wait for it, bounded at about 10 s so a late
+    worker thread on a loaded runner does not read as a close out of order."""
+    for _ in range(2000):
         if len(closed) >= want:
             break
         await asyncio.sleep(0.005)
@@ -180,6 +181,18 @@ async def test_a_release_with_no_cursor_discards_without_raising() -> None:
     assert store._pool.released == [conn]
     assert conn._conn is None
     assert await _settled(closed, 1) == ["conn"]
+
+
+async def test_a_release_before_the_lock_was_taken_discards_without_a_rollback() -> None:
+    """``held=False``, for T6's setup failing before its lock is proven taken: no ROLLBACK, which on
+    no open transaction would raise 3903 and replace the setup's own failure. The cursor still goes
+    to the gate before its connection."""
+    store, conn, cur, closed = _rig("ROLLBACK", RuntimeError("3903: no BEGIN TRANSACTION"))
+    await ss_release_row_lock(store, conn, cur, held=False)
+    assert cur.statements == []
+    assert store._pool.released == [conn]
+    assert conn._conn is None
+    assert await _settled(closed, 2) == ["cursor", "conn"]
 
 
 def _aborted(phase: ClaimAbortPhase, named: frozenset[str]) -> ClaimedHeads:

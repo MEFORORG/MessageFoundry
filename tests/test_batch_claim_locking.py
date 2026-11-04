@@ -167,11 +167,14 @@ async def test_t6_sqlserver_locked_head_blocks_not_skips(ss_store: Any) -> None:
     # no row, holds no lock, and the claim never contends — the bug this assertion now guards against).
     lock_conn = await ss_store._pool.acquire()
     lock_cur: Any = None
+    locked = False
     try:
         # Everything after the acquire sits inside the try, so a failure while taking the lock still
         # reaches the release rather than leaking the open transaction against the next test's
         # cleanup DELETE (BACKLOG #4915). The call gate goes on before the first statement, so a
-        # discard in the release never frees a handle under one a cancellation left running.
+        # discard in the release never frees a handle under one a cancellation left running. Until
+        # the lock is proven taken the release discards rather than sends a ROLLBACK, which could
+        # fail on no open transaction and replace the setup's own failure.
         install_call_gate(lock_conn)
         lock_cur = await lock_conn.cursor()
         await lock_cur.execute("BEGIN TRAN")
@@ -180,6 +183,7 @@ async def test_t6_sqlserver_locked_head_blocks_not_skips(ss_store: Any) -> None:
             (head_id, Stage.INGRESS.value),
         )
         assert len(await lock_cur.fetchall()) == 1  # the U-lock MUST land on the head row
+        locked = True
         claim = asyncio.ensure_future(
             ss_store.claim_next_fifo_batch(channel, now=200.0, stage=Stage.INGRESS.value, limit=8)
         )
@@ -187,7 +191,7 @@ async def test_t6_sqlserver_locked_head_blocks_not_skips(ss_store: Any) -> None:
             await asyncio.wait_for(asyncio.shield(claim), timeout=1.0)
         assert not claim.done()  # BLOCKED on the locked head — did NOT skip to a later seq
     finally:
-        await ss_release_row_lock(ss_store, lock_conn, lock_cur)  # release the head lock
+        await ss_release_row_lock(ss_store, lock_conn, lock_cur, held=locked)
 
     items = await asyncio.wait_for(claim, timeout=10.0)
     assert items and items[0].message_id == head_id

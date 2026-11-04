@@ -1444,6 +1444,7 @@ async def test_a_lock_timeout_is_reported_once_while_a_genuinely_empty_claim_sta
         # The negative control the sweep-sited shortcut would fail: still stranded, still diagnosed.
         assert d.phase(lane_a) is _LanePhase.IDLE and d.phase(lane_b) is _LanePhase.IDLE
         assert d.busy_violations == 0
+        await _settle()  # a stray claim still in flight must reach the shim before it is counted
         assert shim.real_claims == 0, "a claim reached the real store"
     finally:
         await d.stop()
@@ -1557,12 +1558,13 @@ async def test_each_window_reports_its_own_aborts_and_never_a_neighbours(
     abort_lane, quiet_lane = "IB_WINDOW_ABORT", "IB_WINDOW_QUIET"
     await _seed(store, abort_lane, [100.0])
     # `times=5` so every round-trip the shim intercepts aborts. `quiet_lane` is NOT its target; an
-    # outer shim answers it with a plain EMPTY, a CLEAN claim with no store round-trip. A real SQL
+    # inner shim answers it with a plain EMPTY, a CLEAN claim with no store round-trip. A real SQL
     # Server claim of that unseeded lane may legally answer with a 1222 and break the sum below
-    # (BACKLOG #4915).
-    shim = _ClaimShim(store, abort_lane, mode="lock_timeout_once", times=5)
-    quiet = _ClaimShim(shim, quiet_lane, mode="empty", times=_EVERY_CLAIM)
-    d = _make(quiet, stub, set(), clock=mc)
+    # (BACKLOG #4915). The abort shim is the OUTER one, so a round-trip carrying both lanes still
+    # reaches it first and aborts, as it did before the quiet shim existed.
+    quiet = _ClaimShim(store, quiet_lane, mode="empty", times=_EVERY_CLAIM)
+    shim = _ClaimShim(quiet, abort_lane, mode="lock_timeout_once", times=5)
+    d = _make(shim, stub, set(), clock=mc)
     await d.start()
     try:
         with caplog.at_level(logging.INFO, logger="messagefoundry.pipeline.stage_dispatcher"):
@@ -1611,7 +1613,7 @@ async def test_each_window_reports_its_own_aborts_and_never_a_neighbours(
             f"a lane NAME reached the log — a lane is a destination_name (PHI): {lines!r}"
         )
         assert d.busy_violations == 0
-        assert shim.real_claims == 0, "a claim reached the real store"
+        assert quiet.real_claims == 0, "a claim reached the real store"
     finally:
         await d.stop()
 

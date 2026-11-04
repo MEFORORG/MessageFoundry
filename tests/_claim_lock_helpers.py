@@ -107,7 +107,7 @@ async def ss_hold_row_lock(ss_store: Any, message_id: str, stage: str) -> tuple[
     return conn, cur
 
 
-async def ss_release_row_lock(ss_store: Any, conn: Any, cur: Any) -> None:
+async def ss_release_row_lock(ss_store: Any, conn: Any, cur: Any, *, held: bool = True) -> None:
     """The other half of :func:`ss_hold_row_lock`, for each caller's ``finally``: roll the held
     transaction back and return the connection to the pool. If the rollback or the cursor close
     raises, or a cancellation lands in either, the connection is discarded instead, so the release
@@ -118,10 +118,16 @@ async def ss_release_row_lock(ss_store: Any, conn: Any, cur: Any) -> None:
     running on an executor thread (BACKLOG #2049). That makes it safe on a connection a caller took
     straight from the pool. It does NOT gate a call already running when it is installed, so a
     caller that may be cancelled mid-statement gates its own connection before its first statement,
-    as :func:`ss_hold_row_lock` does. A ``cur`` of ``None`` means no statement ran, so no transaction
-    is open: the connection is discarded, the cheap safe answer on a path that already failed."""
+    as :func:`ss_hold_row_lock` does.
+
+    ``held=False`` is for a caller whose own setup failed or was cancelled before the lock was
+    proven taken, and a ``cur`` of ``None`` is treated the same way. The connection is then
+    discarded without a ROLLBACK, as :func:`ss_hold_row_lock` does on the same path: a ROLLBACK with
+    no transaction open raises 3903, which would replace the caller's own failure, and one sent
+    after a cancellation would queue behind the abandoned statement. Ending the session rolls back
+    whatever was open, and the discard costs one reconnect on a path that already failed."""
     install_call_gate(conn)
-    if cur is None:
+    if cur is None or not held:
         await _ss_discard(ss_store, conn, cur)
         return
     try:
