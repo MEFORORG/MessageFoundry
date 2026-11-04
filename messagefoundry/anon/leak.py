@@ -120,8 +120,9 @@ MALFORMED_SEGMENT = "(malformed segment)"
 #: The address a malformed line's first field always gets. :func:`structural_phi_hits` refuses on it.
 _MALFORMED_LINE = f"{MALFORMED_SEGMENT}-0"
 #: The hit a malformed line raises. Named so :func:`refusal_advice` can tell it from a PHI shape.
-#: It names some of the kinds of line the walk refuses, not all; ``normalized_message`` and the
-#: tee's run summary quote it.
+#: It names some of the kinds of line the walk refuses; ``normalized_message`` and the tee's run
+#: summary quote it. Among those it leaves out are a bare id that is well formed but not defined,
+#: and an ``MSH`` line ahead of the header.
 MALFORMED_LINE_HIT = (
     "line no rule can reach (kinds include at least a malformed segment id, a header line with "
     "no separator after its encoding characters, and a line with no fields under a header whose "
@@ -575,9 +576,9 @@ def structural_phi_hits(
     result is safe to raise/log. Empty when the message has no parseable MSH. ``version`` is
     handed to the walk behind :func:`unmapped_field_values`.
 
-    A line no rule can reach (at least a malformed segment id, a short header line, or a bare line
-    under a header with no readable version; see :func:`_line_is_malformed`) is a hit by itself, whatever
-    it holds: the anonymizer passed it through untouched, and a wrapped name or note is exactly
+    A line no rule can reach (kinds include at least a malformed segment id, a short header line,
+    and a bare line under a header with no readable version; see :func:`_line_is_malformed`) is a
+    hit by itself, whatever it holds: the anonymizer passed it through untouched, and a wrapped name or note is exactly
     what such a line tends to carry.
 
     A dashed SSN or punctuated phone that the message's own field separator cuts across fields

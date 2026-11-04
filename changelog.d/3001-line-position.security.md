@@ -6,5 +6,7 @@
   header of only `MSH|^~\&` is refused as a line no rule can reach. When the header's MSH-12 holds
   no readable version (at least: empty, not digits joined by single dots, or older than 2.1), at
   any field count, a bare line used to be judged against the segment ids of every HL7 version;
-  both anonymizers now refuse it unless a rule that rewrites a field names its segment. See
+  both anonymizers now refuse it unless a rule that rewrites a field names its segment. The
+  text of a line no rule can reach, in the `AnonError`, the leak report's hits and the tee's
+  output, changed, so a caller that matches the old text must change. See
   [PHI.md](../docs/PHI.md) section 9. (`BACKLOG #3001`)
