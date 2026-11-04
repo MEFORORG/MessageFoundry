@@ -5860,6 +5860,29 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     )
 
 
+def audit_chain_rolled(store: object) -> bool | None:
+    """Whether the keyed audit chain's newest range is under the store's ACTIVE key, as the open
+    settled it (BACKLOG #4942, #4936). ``rotate-key`` rolls the chain only after both data passes, so
+    after a key change a chain that has not rolled says no run has got that far on this key.
+
+    ``None`` when the store has no keyed chain to ask, or no key: a keyless store, a backend
+    without one, or a chain whose rows open with no genesis row. ``False`` for ranges the open could
+    not authenticate, since the caller withholds a stamp on ``False``, and an unknown answer must
+    not lift that hold. Read by attribute, so a store that is not an :class:`AuditRangeHost` answers
+    ``None``. No I/O: the open already read the chain."""
+    if not getattr(store, "_audit_chain_keyed", False):
+        return None
+    active = audit_active_key_id(
+        getattr(store, "_audit_mac_key", None), getattr(store, "_audit_mac_fn", None)
+    )
+    if active is None:
+        return None
+    if not getattr(store, "_audit_ranges_trusted", False):
+        return False
+    keys = getattr(store, "_audit_range_keys", None)
+    return bool(isinstance(keys, list) and keys and keys[-1] == active)
+
+
 # #233 (ADR 0111): the event name for a Send declined because its target outbound is present-but-NOT-
 # deployed. Recorded once per declined destination (:func:`not_deployed_detail` for the detail). It has
 # TWO load-bearing roles, and both fail unless it is in the audit floor below: (1) it is the operator-

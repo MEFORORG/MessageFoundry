@@ -8,10 +8,12 @@ indefinitely with no in-engine signal. :class:`SecretRotationRunner` is a small 
 periodically compares each tracked secret's **last-rotated date** against its **max age** and raises a
 ``secret_rotation_due`` alert when it is overdue or within ``[secret_rotation].warn_days`` of due.
 
-**Live-by-default (ASVS 13.3.4, BACKLOG #282).** The DEK is tracked without operator action: at first
-keyed start :func:`reconcile_rotation_meta` persists a NON-SECRET stamp (the DEK's one-way key-id + a
+**Live-by-default (ASVS 13.3.4, BACKLOG #282).** The DEK is tracked without operator action: a keyed
+start :func:`reconcile_rotation_meta` persists a NON-SECRET stamp (the DEK's one-way key-id + a
 *tracked-since* floor date) in store meta, and the runner falls back to it when
-``store_key_last_rotated`` is unset. The enumeration is widened beyond the DEK: each configured secret
+``store_key_last_rotated`` is unset. Not unconditionally: a start writes no stamp for a key the
+rotation record holds, and opens that record itself for a changed key the keyed audit chain has not
+been rolled to (BACKLOG #3737, #4942). The reconcile says when a stamp is written. The enumeration is widened beyond the DEK: each configured secret
 class the engine holds is fingerprinted with a **KEYED MAC** (HMAC under a per-row random key — never a
 salted hash) and the key and MAC are sealed together as a **store-cipher cell** in store meta, so a
 reader without the store key has nothing to test a guess of a low-entropy secret against (BACKLOG
@@ -309,6 +311,16 @@ async def close_rotation_record(meta_store: SecretRotationMetaStore, day: str) -
         )
 
 
+#: The WARNING a start logs when it opened the rotation record itself (BACKLOG #4942).
+_OPENED_AT_START = (
+    "secret rotation: the store key in use differs from its stamp, or has none, and the audit "
+    "chain has not been rolled to it, so no `messagefoundry rotate-key` run has completed on it. A "
+    "rotation record was opened for it, its rotation date was not stamped and its age was not "
+    "reset. Stop the engine and run `messagefoundry rotate-key`, with the prior key in "
+    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, until it exits 0."
+)
+
+
 def _rotation_hold(record: SecretRotationMetaRow | None, fingerprint: str) -> str | None:
     """Why the rotation record says the DEK ``fingerprint`` must not be stamped, as the line to log,
     or ``None`` when it does not.
@@ -509,6 +521,7 @@ async def reconcile_rotation_meta(
     now: float | None = None,
     extra_values: Mapping[str, str] | None = None,
     env_values: Mapping[str, str] | None = None,
+    audit_rolled: bool | None = None,
 ) -> dict[str, SecretStamp]:
     """Reconcile the persisted secret-rotation stamps against what the engine holds RIGHT NOW, at engine
     start (ASVS 13.3.4, BACKLOG #282). For each tracked class — the store DEK (by its one-way key-id) and
@@ -531,9 +544,18 @@ async def reconcile_rotation_meta(
 
     **A changed DEK is not stamped while the rotation record names it (BACKLOG #3737).** ``rotate-key``
     opens that record before either data pass and closes it only when a whole run is done. The
-    DEK row is left as it is, and this start reads its dates. A DEK changed with no record has
-    no such hold, and stamps: one changed by hand, or a new key's first start before any
-    ``rotate-key``. So a stamp proves a changed key, not a finished rotation.
+    DEK row is left as it is, and this start reads its dates.
+
+    **A changed DEK the audit chain has not rolled to opens that record here (BACKLOG #4942,
+    #4936).** ``audit_rolled`` is :func:`~messagefoundry.store.store.audit_chain_rolled` for the
+    store: ``rotate-key`` rolls a keyed chain only after both data passes, so ``False`` means no run
+    got that far on this key. That covers a start before the first run, a run killed before it
+    opened the record, inside the store open, and a key changed by hand. The start opens the record
+    for the key, as ``rotate-key`` would, and is held by it. A DEK changed with no record stamps only
+    where ``audit_rolled`` is not ``False``: ``None``, a store with no keyed chain to ask, such as one
+    whose rows open with no genesis row, or ``True``, a chain already rolled to the key. So on a store
+    with a keyed chain a stamp says a run rolled the chain to the key, and elsewhere it proves only a
+    changed key.
 
     It then arms the **ENFORCE escalation**: under ``[security].enforcement=ENFORCE``, a DEK older than
     ``store_key_max_age_days + enforce_grace_days`` emits its ``secret_rotation_due`` alert with
@@ -581,6 +603,15 @@ async def reconcile_rotation_meta(
         changed_fp = dek_changed(prior, fingerprint)
         record = stored.get(ROTATION_RECORD_ID)
         hold = None if changed_fp is False else _rotation_hold(record, fingerprint)
+        opened = False
+        if changed_fp and hold is None and audit_rolled is False:
+            # BACKLOG #4942, #4936: no rotate-key run has rolled the chain to this key, so data may
+            # still be under the prior one. Opened as the command opens it, dates kept, so the run
+            # that completes finds it and closes it, and a later start reads the same dates.
+            await open_rotation_record(meta_store, dek_key_id, today.isoformat())
+            record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
+            hold = _rotation_hold(record, fingerprint)
+            opened = hold is not None
         # With no stamp yet, a held key's age runs from the record, whose dates a re-run keeps, so
         # it is never younger than the run that opened it. A floor of today would restart at every
         # start, and a key held that way could never go overdue.
@@ -589,7 +620,7 @@ async def reconcile_rotation_meta(
         if hold is not None:
             # BACKLOG #3737. Nothing is written, so the run that completes still sees a change and
             # stamps it.
-            log.warning(hold)
+            log.warning(_OPENED_AT_START if opened else hold)
         elif changed_fp:
             last_rotated = today  # rotation auto-detected, so reset the clock
         elif changed_fp is None:

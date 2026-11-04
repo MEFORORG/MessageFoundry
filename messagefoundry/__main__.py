@@ -10514,7 +10514,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
     key, which docs/PHI.md states. A re-run then finds the roll a verified no-op, and the stamp and
     the close follow. A run that stops
     short leaves the record open, so no ``serve`` start stamps its key, unless one already did before
-    this run: that start's stamp stands and no record opens.
+    this run: that start's stamp stands and no record opens. On a keyed audit chain a start does not
+    stamp a changed key the chain has not rolled to; it opens the record instead (BACKLOG #4942), so
+    that exception needs a store with no keyed chain. A roll that refuses for good holds the record
+    open for good; the refusal names the way out (BACKLOG #4934, #4935).
     """
     from pathlib import Path
 
@@ -10800,6 +10803,21 @@ def _rotate_key(args: argparse.Namespace) -> int:
             f"error: the audit chain step did not complete — {rolled_msg}. Do NOT remove "
             "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until `messagefoundry rotate-key` completes "
             "without this error.",
+            file=sys.stderr,
+        )
+        # BACKLOG #4934, #4935: some chains no run can roll, under any key, a new one included, and
+        # the rotation record then holds the key's stamp for good. Name the way out here, where the
+        # operator meets it, rather than leave a re-run that can only fail again.
+        print(
+            "If a re-run, with every prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, refuses the "
+            "same way, no run will roll this chain: the roll verifies the whole chain first, so a "
+            "chain `messagefoundry audit-verify` reports broken, or one whose rows open with no "
+            "genesis row naming its key, refuses under every key. A start on the new key alone "
+            "before a roll is one way to break it. The rotation record then stays open, so no "
+            "serve start stamps this key and its age runs from the prior rotation date. The ways "
+            "out are [secret_rotation].store_key_last_rotated, set to the date of a run that "
+            "re-sealed the data with no skip, or [secret_rotation].enforce_store_key_expiry = "
+            "false, which lifts only the start refusal and is a named security loosening.",
             file=sys.stderr,
         )
         return 1
