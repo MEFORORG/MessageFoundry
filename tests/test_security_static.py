@@ -65,8 +65,7 @@ invariants can't silently regress.
   ``_code_text`` takes the text from the next ``>`` after the first match to the next ``</``. That
   is an ad-hoc same-type extraction, deliberately out of the clause's scope, as are at least
   ``_FAULT_RE``, ``_WSSE_FAULT_RE``, ``_SENDER_RE`` and ``_RECEIVER_RE``. The fault-code text drives
-  at least retry versus dead-letter. On a capturing connection, ``_FAULT_RE``'s match alone
-  decides whether a 2xx reply is recorded as ``rejected``.
+  at least retry versus dead-letter.
 """
 
 from __future__ import annotations
