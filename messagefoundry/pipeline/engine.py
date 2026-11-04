@@ -305,7 +305,8 @@ def _require_approved(
     rotation still verifies while the retired key stays configured. A hold that bound none while
     the snapshot holds one is refused, except on a store with no in-process key, where none can be
     bound: there the release goes on, as before the value file was read into the snapshot, and a
-    WARNING says so (vault BACKLOG #2596)."""
+    WARNING says so. A binding no key in the keyring checks is :class:`ConfigDigestUnavailable`,
+    not a change (vault BACKLOG #2596)."""
     from messagefoundry.config.fingerprint import (
         fingerprint_matches,
         snapshot_fingerprint,
@@ -322,7 +323,8 @@ def _require_approved(
         raise ConfigDigestMismatch(approval.fingerprint, current)
     try:
         material = value_file_material(snapshot)
-    except ValueError:
+    except ValueError as exc:
+        log.warning("the environment value file could not be checked: %s", safe_exc(exc))
         raise ConfigDigestUnavailable(approval.fingerprint) from None
     held = approval.value_file
     if material is None and held is None:
@@ -335,7 +337,18 @@ def _require_approved(
             scrub_log_argument(str(snapshot.value_file)),
         )
         return
-    if material is None or verify_config_value_file_mac(cipher, material, held) is not True:
+    if material is None or held is None:
+        raise ConfigDigestMismatch(approval.fingerprint, current, value_file=True)
+    verified = verify_config_value_file_mac(cipher, material, held)
+    if verified is None:
+        # Not a change: a binding no key in this store's keyring checks, such as one taken under
+        # a retired key since dropped, or a record of another shape. Refused, never let through.
+        log.warning(
+            "the environment value file binding of this reload's approval could not be checked: "
+            "it names no key this store holds, or is not a binding this release reads"
+        )
+        raise ConfigDigestUnavailable(approval.fingerprint)
+    if not verified:
         raise ConfigDigestMismatch(approval.fingerprint, current, value_file=True)
 
 
@@ -2827,7 +2840,8 @@ class Engine:
 
         try:
             material = value_file_material(snapshot)
-        except ValueError:
+        except ValueError as exc:
+            log.warning("the environment value file could not be bound: %s", safe_exc(exc))
             raise ConfigDigestUnavailable(None) from None
         binding = None if material is None else config_value_file_mac(self.store.cipher(), material)
         if material is not None and binding is None:

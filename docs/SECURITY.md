@@ -2540,8 +2540,10 @@ that snapshot's digest against the approved one before any config module runs. T
 and runs that same snapshot, and the `config_reload` row records its digest. So the config
 modules, helpers and tables checked are the ones the loader runs, and an edit to them on disk
 during the load is neither run nor recorded. The limits below name at least one import that runs
-from disk instead. The approval covers `serve`'s environment value file wherever
-`[environments].base_dir` puts it. In the config directory's `environments/` folder the digest
+from disk instead. On a store that holds an in-process key, the approval covers `serve`'s
+environment value file wherever `[environments].base_dir` puts it. A store with none binds a value
+file outside the config directory to nothing, as a later paragraph says. In the config directory's
+`environments/` folder the digest
 folds it. Elsewhere, the default layout, the release reads it into the snapshot after vetting the
 file, its folder, and the folder of each link along a chain of file links from it, and checks it
 against a keyed binding the hold took at request time, which the next paragraph describes. That
@@ -2582,7 +2584,8 @@ instead with `params.value_file`, an HMAC-SHA256 under a key HKDF derives from t
 [ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md)). A reader without the store key cannot
 test a guess against it; anyone with the key can. A release whose value file is not the one bound
 is refused as `digest_mismatch` with `value_file_check` set to `mismatch`, and the two published
-fingerprints in that row are equal. A store with no in-process key, a keyless store or a Vault
+fingerprints in that row are equal. A binding no key the store holds can check, as after a
+rotation drops the retired key, is refused as `digest_unavailable`. A store with no in-process key, a keyless store or a Vault
 Transit cipher, binds nothing: the release then applies whatever value file it reads, as it did
 before the file was read into the snapshot, and logs a WARNING naming the file. A value file
 inside the config directory's `environments/` folder is still folded into the published digest,

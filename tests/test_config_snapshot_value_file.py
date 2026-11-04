@@ -566,9 +566,10 @@ async def test_a_hold_that_bound_a_value_file_is_refused_by_a_store_that_cannot_
     tmp_path: Path,
 ) -> None:
     """Fail closed: a binding no key in this store's keyring verifies, as after its key was
-    dropped, refuses the release rather than letting it through unchecked."""
+    dropped, refuses the release rather than letting it through unchecked. It is not a change, so
+    it is refused as unavailable, not as a mismatch; so is a record of another shape."""
     from messagefoundry.pipeline import ApprovedConfig
-    from messagefoundry.pipeline.engine import ConfigDigestMismatch
+    from messagefoundry.pipeline.engine import ConfigDigestUnavailable
 
     cfg, _ = _layout(tmp_path)
     engine = await _engine(tmp_path, cfg)
@@ -578,11 +579,11 @@ async def test_a_hold_that_bound_a_value_file_is_refused_by_a_store_that_cannot_
         foreign = config_value_file_mac(
             make_cipher(generate_key()), b"anything the other store bound"
         )
-        with pytest.raises(ConfigDigestMismatch) as refused:
-            await engine.reload_detail(
-                approval=ApprovedConfig(approval.fingerprint, foreign), dry_run=False
-            )
-        assert refused.value.value_file
+        for unreadable in (foreign, "not a binding"):
+            with pytest.raises(ConfigDigestUnavailable):
+                await engine.reload_detail(
+                    approval=ApprovedConfig(approval.fingerprint, unreadable), dry_run=False
+                )
         # The control: the binding the engine took itself releases.
         await engine.reload_detail(approval=approval, dry_run=False)
     finally:
