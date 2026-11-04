@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Print the test files one diff-coverage shard runs, one path per line.
+"""Print the test files one test shard runs, one path per line.
 
 quality-advisory.yml's `coverage-shard` matrix runs the suite in N jobs and the `coverage` job
 combines their data. Each shard calls this with its own `--shard`, so the split must be a pure
@@ -19,6 +19,21 @@ the partition to that set, so a file pytest collects can never fall between two 
 TOOLING FILES ARE LEFT OUT. The coverage step deselects them with `-m 'not tooling'`, so a shard
 that held one would import and collect it for nothing, and the balance would count files that do
 not run. The list is tests/tooling_manifest.txt, read through its own parser.
+
+`--suite engine` IS ci.yml's ENGINE `Tests (pytest)` STEP, split across the `test` job and the
+`test-shard2` job (BACKLOG #5247). It differs from the coverage split in two ways, both constants
+below. It leaves out the web console package, which that step subtracts with `--ignore-glob`
+because the `webconsole` job runs it (BACKLOG #1027), so a shard naming one of its files would run
+it twice. And it holds the connscale smoke in shard 1, because scripts/connscale_harvest.py joins
+the smoke's readings to the `test (...)` jobs, and the herd floor is armed only there.
+
+`--check-collection` IS THE PARTITION GUARD, and it reads pytest's own collection rather than this
+file's re-implementation of it. The arguments after `--` are the step's selection. It runs
+`pytest --collect-only -q` with them, and fails if a file pytest collects is in no shard or a file
+is in two. A listed file the suite collects nothing from is collected again BY NAME, as its shard
+names it. Nothing there is right for marker deselection or a module-level skip, and is printed. Any
+test there means a collection-time ignore (`collect_ignore`, an ignore hook, `--ignore-glob`), which
+pytest skips for a named path, so its shard would run a file the suite ignores: that is a fault.
 """
 
 from __future__ import annotations
@@ -26,9 +41,12 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import importlib.util
+import re
+import subprocess
 import sys
 import tomllib
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +54,15 @@ _ROOT = Path(__file__).resolve().parents[2]
 # pytest's defaults, as of pytest 9. pyproject.toml sets neither key, so these are what it collects.
 _PYTHON_FILES = ("test_*.py", "*_test.py")
 _NORECURSE = ("*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}")
+
+#: The engine step's `--ignore-glob`, matched against the same relative path.
+ENGINE_EXCLUDE_GLOB = "*messagefoundry-webconsole*"
+#: Held in shard 1 of the engine suite whatever their hash. The module docstring says why.
+ENGINE_SUITE_SHARD_ONE = frozenset({"tests/test_connscale_smoke.py"})
+
+#: A node id's file, as `pytest --collect-only -q` prints it. A warnings-summary line is either
+#: indented or reads `path:line`, so neither matches.
+_NODE_FILE = re.compile(r"^([^\s:][^:]*\.py)::")
 
 
 def collected_files(root: Path = _ROOT) -> list[str]:
@@ -74,19 +101,150 @@ def shard_of(path: str, shards: int) -> int:
     return zlib.crc32(path.encode("utf-8")) % shards + 1
 
 
+def assign(path: str, shards: int, suite: str) -> int | None:
+    """The shard `suite` puts `path` in, or `None` when that suite does not run the file."""
+    if suite == "engine":
+        if fnmatch.fnmatch(path, ENGINE_EXCLUDE_GLOB):
+            return None
+        if path in ENGINE_SUITE_SHARD_ONE:
+            return 1
+    return shard_of(path, shards)
+
+
+def partition(shards: int, suite: str, root: Path = _ROOT) -> dict[int, list[str]]:
+    """Every shard's files, keyed 1..shards, with the tooling files left out."""
+    tooling = tooling_files(root)
+    split: dict[int, list[str]] = {n: [] for n in range(1, shards + 1)}
+    for path in collected_files(root):
+        shard = None if path in tooling else assign(path, shards, suite)
+        if shard is not None:
+            split[shard].append(path)
+    return split
+
+
+def collected_by_pytest(output: str) -> set[str]:
+    """The files `pytest --collect-only -q` printed at least one node id for."""
+    found: set[str] = set()
+    for line in output.splitlines():
+        match = _NODE_FILE.match(line)
+        if match:
+            found.add(match.group(1).replace("\\", "/"))
+    return found
+
+
+def partition_faults(split: dict[int, list[str]], collected: set[str]) -> list[str]:
+    """What is wrong with `split` against the files pytest itself `collected`. Empty means it holds."""
+    if not collected:
+        return ["pytest collected no test files, so there is nothing to compare the shards with"]
+    owners: dict[str, list[int]] = {}
+    for shard, files in split.items():
+        for path in files:
+            owners.setdefault(path, []).append(shard)
+    faults = [
+        f"{path} is in shards {nums}" for path, nums in sorted(owners.items()) if len(nums) > 1
+    ]
+    faults += [
+        f"{path} is collected by pytest and in no shard" for path in sorted(collected - set(owners))
+    ]
+    return faults
+
+
+#: `pytest` exits 5 when it collected nothing, which the re-collection of named files expects.
+_NO_TESTS_COLLECTED = 5
+
+
+def _collect(
+    run: Callable[..., subprocess.CompletedProcess[str]], pytest_args: list[str]
+) -> tuple[int, set[str]]:
+    """`pytest --collect-only -q` under these arguments: its exit code and the files it collected."""
+    # The argv is this interpreter's pytest plus the workflow's own selection, with no shell.
+    done = run(  # noqa: S603  # nosec B603
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            *pytest_args,
+        ],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if done.returncode not in (0, _NO_TESTS_COLLECTED):
+        sys.stdout.write(done.stdout[-4000:])
+        sys.stderr.write(done.stderr[-4000:])
+    return done.returncode, collected_by_pytest(done.stdout)
+
+
+def check_collection(
+    shards: int,
+    suite: str,
+    pytest_args: list[str],
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> int:
+    """Exit 0 when the shards partition pytest's collection, 1 when they do not, 2 when unmeasured.
+
+    `run` is the seam a test replaces, so a stub never reaches the process-wide `subprocess.run`."""
+    split = partition(shards, suite)
+    code, collected = _collect(run, pytest_args)
+    if code != 0:
+        print(f"pytest --collect-only exited {code}; nothing was compared", file=sys.stderr)
+        return 2
+    listed = {path for files in split.values() for path in files}
+    sizes = ", ".join(f"shard {n} {len(files)}" for n, files in split.items())
+    print(
+        f"pytest collected tests from {len(collected)} files; the shards list {len(listed)} ({sizes})"
+    )
+    faults = partition_faults(split, collected)
+    # A listed file the suite collected nothing from must collect nothing when NAMED either, the way
+    # a shard names it. One that does was dropped by a collection-time ignore, which a named path
+    # bypasses, so its shard would run a file the suite does not.
+    quiet = sorted(listed - collected)
+    if quiet:
+        code, named = _collect(run, [*pytest_args, *quiet])
+        if code not in (0, _NO_TESTS_COLLECTED):
+            print(f"pytest --collect-only of the quiet files exited {code}", file=sys.stderr)
+            return 2
+        faults += [
+            f"{path} is ignored by the suite but runs when a shard names it"
+            for path in sorted(named)
+        ]
+        for path in sorted(set(quiet) - named):
+            print(f"listed, and collects nothing named or not under this selection: {path}")
+    for fault in faults:
+        print(f"PARTITION BROKEN: {fault}", file=sys.stderr)
+    return 1 if faults else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--shard", type=int, required=True, help="1-based shard index")
+    parser.add_argument("--shard", type=int, help="1-based shard index")
     parser.add_argument("--of", type=int, required=True, dest="shards", help="shard count")
+    parser.add_argument("--suite", choices=("coverage", "engine"), default="coverage")
+    parser.add_argument(
+        "--check-collection",
+        action="store_true",
+        help="compare every shard with pytest's own collection; pass the selection after --",
+    )
+    parser.add_argument("pytest_args", nargs="*", help="with --check-collection, the selection")
     args = parser.parse_args(argv)
-    if not 1 <= args.shard <= args.shards:
+    if args.shards < 1:
+        parser.error(f"--of must be at least 1, got {args.shards}")
+    if args.check_collection:
+        if args.shard is not None:
+            parser.error("--check-collection checks every shard, so it takes no --shard")
+        return check_collection(args.shards, args.suite, args.pytest_args)
+    if args.pytest_args:
+        parser.error("only --check-collection reads pytest arguments")
+    if args.shard is None or not 1 <= args.shard <= args.shards:
         parser.error(f"--shard must be between 1 and --of ({args.shards}), got {args.shard}")
-    tooling = tooling_files()
-    files = [
-        path
-        for path in collected_files()
-        if path not in tooling and shard_of(path, args.shards) == args.shard
-    ]
+    files = partition(args.shards, args.suite)[args.shard]
     if not files:
         # An empty shard would run pytest with no paths, which collects ALL of testpaths.
         print(f"shard {args.shard} of {args.shards} holds no test files", file=sys.stderr)

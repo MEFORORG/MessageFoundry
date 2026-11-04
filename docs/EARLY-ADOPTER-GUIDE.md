@@ -683,23 +683,57 @@ decrypts it, and writes the store. It **refuses to overwrite** an existing store
 `--config-to <dir>` to restore the config bundle alongside it. Check the archive without writing anything
 with `messagefoundry restore-verify <archive>`.
 
-**A restore brings back the archive's accounts as they were (BACKLOG #2614)**: users, password
-hashes, roles, second factors and sessions. So the restore ends every session in the store it
+**A restore brings back the archive's whole store, accounts and sessions included (BACKLOG
+#2614).** So the restore ends every session in the store it
 places and writes a marker into it. The first `serve` on that store, wherever it has been moved,
 revokes every session again, writes one `store_restored` audit row naming the archive's SHA-256,
 its age and the time of its newest audit row, and raises a `store_restored` alert. Every user signs
 in again. Other commands that open the store, such as `provision-admin`, leave the marker for that
-start. The engine does not re-apply
-changes made after the archive was taken.
+start.
+
+**What a restore rolls back (BACKLOG #5094).** A restore undoes every change made to the store
+after the archive was taken, and the engine does not re-apply any of it. Re-apply by hand at least
+these audited changes made after the archive's newest audit row:
+
+- account creations, disables, enables and deletes;
+- account locks and unlocks;
+- role changes and custom roles;
+- password resets and password changes, self-service ones included: force a reset where the
+  user's own change cannot be replayed;
+- MFA and passkey enrolments and removals. A factor or passkey removed after the archive is live
+  again on the restored store;
+- recovery codes issued or used: reissue them;
+- federated sign-in (OIDC) bindings and unbindings;
+- notify-email changes;
+- channel scopes;
+- AD group-to-role and AD group-to-scope maps;
+- dual-control approval decisions: a request decided after the archive is pending again, so
+  reject it rather than approve it a second time;
+- the vault_transit bound attestation: one withdrawn since (store withdraw-transit-bound) is
+  live again, and one recorded since (store attest-transit-bound) is gone, so serve refuses
+  under [security].enforcement = enforce until it is recorded again.
+
+The statement this list is drawn from also says how to keep users off the engine while you
+re-apply the removals, what a restore can send again (duplicates to a partner), and what else it
+leaves out. `messagefoundry restore --help` prints that statement whole, at its end, on any
+installed engine, with no config or store. Read the source's audit log, or its off-host copy, for
+the changes themselves.
+
+The `restore` summary (its `rollback_notice` under `--json`) carries the statement whole too, and
+so does the `store_restored` alert: as its `rollback_notice` key in the webhook JSON and the default
+email body, and, with no `[alerts]` transport configured, in the engine log's `ALERT store_restored`
+line. A custom email template cannot name that key, and a rule with `transports = []` sends nothing.
+For those, the alert's reason in the web console's alert list keeps the archive's age, the count of
+sessions ended and a pointer to `messagefoundry restore --help`, all inside the about 200 characters
+it keeps.
 
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
 whose manifest does not say when it was taken, or that is dated more than an hour in the future,
 is refused too, and raising `--max-age-days` does not change that: only `--allow-old-archive`
-restores it. The refusal, and every successful restore, print the time of the archive's newest
-audit row. Every disable, delete, role change and
-password or factor reset made after that time is undone by the restore and must be re-applied by
-hand; read the source's audit log, or its off-host copy, for the list. To restore an older archive on
-purpose, pass `--allow-old-archive`, or raise `--max-age-days` past its age.
+restores it. The refusal, whose reason opens with `Nothing was written`, prints the time of the
+archive's newest audit row and points at `messagefoundry restore --help` for the list above; every
+successful restore prints the time and the list. To restore an older archive on purpose, pass
+`--allow-old-archive`, or raise `--max-age-days` past its age.
 
 **Escrow the encryption key SEPARATELY.** The `.mfbak` archive and the store are both encrypted with the
 same key (§6), so a restored store is **unreadable without the same `MEFOR_STORE_ENCRYPTION_KEY` / DPAPI

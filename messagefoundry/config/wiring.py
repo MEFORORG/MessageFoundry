@@ -58,6 +58,8 @@ from signal import SIGINT, default_int_handler, getsignal
 from types import CodeType, MappingProxyType, ModuleType
 from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeIs
 
+from pydantic import TypeAdapter
+
 from messagefoundry.author_output import author_code_stdout
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
@@ -91,6 +93,7 @@ from messagefoundry.config.models import (
     _check_hop_attestation,
     _check_revocation_attestation,
     bool_setting,
+    check_attested_and_accepted,
     check_db_connect_timeout,
     flag_from_settings,
     remote_file_protocol,
@@ -959,15 +962,12 @@ def refuse_capture_conflicts(
 
 
 def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) -> None:
-    """Refuse a declaration that claims its hop is both secure and not secure.
-
-    The disposition checks the attestation first, so with both set the acceptance's WARN and audit
-    record never fire, and the hop crosses silently while declaring an accepted risk."""
-    if attested and accepted:
-        raise WiringError(
-            f"{where}: tls_hop_attested (this hop IS secure) and cleartext_accepted (this hop is NOT "
-            "secure) are opposite claims. Declare the one that is true"
-        )
+    """:func:`~messagefoundry.config.models.check_attested_and_accepted`, raised as a
+    :class:`WiringError` that names the connection."""
+    try:
+        check_attested_and_accepted(attested, accepted)
+    except ValueError as exc:
+        raise WiringError(f"{where}: {exc}") from exc
 
 
 def refuse_raw_hop_attestation(settings: Mapping[str, Any], where: str) -> None:
@@ -3663,7 +3663,7 @@ def Rest(
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
     | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
     proxy_no_proxy: list[str]
-    | None = None,  # #128: NO_PROXY-style bypass host list (intranet direct)
+    | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
     """An HTTP(S) endpoint (**outbound only** today — there is no REST source yet, ADR 0003). The
     Handler produces the request body; this delivers it to ``url`` via ``method`` with ``content_type``
@@ -3675,7 +3675,10 @@ def Rest(
     ``proxy`` routes egress through a corporate **forward proxy** (ADR 0126): ``"default"`` uses the OS
     default web proxy, an ``http(s)://`` address is explicit, unset inherits ``[egress].proxy_url``.
     ``proxy_user``/``proxy_password`` (secret → ``env()``) authenticate to it (``proxy_auth_type``
-    Basic/Digest); ``proxy_no_proxy`` lists intranet hosts to reach directly.
+    Basic/Digest); ``proxy_no_proxy`` lists hosts that skip this proxy. Such a host gets no proxy
+    handler and no proxy credential from this connection, but it is not proven direct: the opener
+    still follows a proxy from the environment or the system settings, and with
+    ``proxy = "default"`` the system proxy itself still applies (``ProxyConfig.for_host``).
 
     ``tls_ca_file`` (BACKLOG #1180) pins this hop to one private CA. What it does, and what it does
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
@@ -3766,7 +3769,7 @@ def FHIR(
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
     | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
     proxy_no_proxy: list[str]
-    | None = None,  # #128: NO_PROXY-style bypass host list (intranet direct)
+    | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
     """A FHIR REST endpoint (**outbound destination only** — the inbound FHIR server facade is ADR 0023).
     The Handler produces a FHIR-JSON resource (or transaction/batch ``Bundle``) body; this delivers it to
@@ -4177,7 +4180,7 @@ def DICOMweb(
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
     | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
     proxy_no_proxy: list[str]
-    | None = None,  # #128: NO_PROXY-style bypass host list (intranet direct)
+    | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
     """A **DICOMweb STOW-RS** endpoint (ADR 0025 Phase 2 — **outbound destination only**; an inbound
     STOW-RS receiver awaits the HTTP listener, ADR 0023). The Handler produces (or forwards) a DICOM
@@ -4619,7 +4622,7 @@ def Soap(
     proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
     | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
     proxy_no_proxy: list[str]
-    | None = None,  # #128: NO_PROXY-style bypass host list (intranet direct)
+    | None = None,  # #128: hosts that skip this proxy; an env/system proxy may still apply
 ) -> ConnectionSpec:
     """A SOAP web-service endpoint (**outbound only**, ADR 0003 + 0015).
 
@@ -6299,6 +6302,13 @@ class AttestedHop:
     refused: bool
 
 
+# The field types Source and Destination declare for their cleartext and revocation pairs, so the
+# hop report reads a value set past the factory exactly as the build's model does: a lax bool flag
+# and a reason that must be a str (or None).
+_LAX_BOOL: Final = TypeAdapter(bool)
+_MODEL_REASON: Final = TypeAdapter(str | None)
+
+
 def _attested_reason_text(value: object) -> str | None:
     """The text of an attestation reason for a report, or ``None`` when none was recorded.
 
@@ -6350,15 +6360,74 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
             return True
         return False
 
+    def _typed_refused(
+        settings: Mapping[str, Any],
+        attested: bool,
+        reason: str | None,
+        *,
+        accepted: object = False,
+        cleartext_reason: object = None,
+        revocation: object = False,
+        revocation_reason: object = None,
+    ) -> bool:
+        # What _source_config and _dest_config refuse on a connection's declarations: a raw
+        # attestation key in its transport settings, the cleartext and revocation pairs the Source
+        # and Destination validators check, then the typed attestation by the settings carriers'
+        # own rule above (the flag type, a missing, blank or control-character reason, and the
+        # attested-plus-accepted pair). Such an entry is a hop the engine never builds, however it
+        # got past the factory.
+        #
+        # The cleartext and revocation values are read the way those models read them: each flag
+        # is a lax pydantic bool and each reason a pydantic str. So an int 1 or the string "false"
+        # is the flag the typed Source or Destination holds, the build builds it and it is no
+        # refusal, and a reason of another type is refused as the model refuses it, never passed to
+        # the pair rule's .strip(). The mark answers only "does the build refuse this hop". It does
+        # not say the build reads one value: _dest_config's settings mirror tests the raw flag by
+        # truthiness, so for a string "false" the settings-driven seams can read the flag set.
+        try:
+            refuse_raw_hop_attestation(settings, "")
+            accepted_flag = _LAX_BOOL.validate_python(accepted)
+            _check_cleartext_acceptance(
+                accepted_flag, _MODEL_REASON.validate_python(cleartext_reason)
+            )
+            _check_revocation_attestation(
+                _LAX_BOOL.validate_python(revocation),
+                _MODEL_REASON.validate_python(revocation_reason),
+            )
+        except (WiringError, ValueError):
+            return True
+        pair = {"tls_hop_attested": attested, "tls_hop_attested_reason": reason}
+        return _refused("", pair, accepted_flag)
+
     out = [
         AttestedHop(
-            inbound_record_name(ic.name), _attested_reason_text(ic.tls_hop_attested_reason), False
+            inbound_record_name(ic.name),
+            _attested_reason_text(ic.tls_hop_attested_reason),
+            _typed_refused(
+                ic.spec.settings,
+                ic.tls_hop_attested,
+                ic.tls_hop_attested_reason,
+                revocation=ic.tls_revocation_attested,
+                revocation_reason=ic.tls_revocation_attested_reason,
+            ),
         )
         for ic in registry.inbound.values()
         if _listed(ic.tls_hop_attested)
     ]
     out += [
-        AttestedHop(oc.name, _attested_reason_text(oc.tls_hop_attested_reason), False)
+        AttestedHop(
+            oc.name,
+            _attested_reason_text(oc.tls_hop_attested_reason),
+            _typed_refused(
+                oc.spec.settings,
+                oc.tls_hop_attested,
+                oc.tls_hop_attested_reason,
+                accepted=oc.cleartext_accepted,
+                cleartext_reason=oc.cleartext_reason,
+                revocation=oc.tls_revocation_attested,
+                revocation_reason=oc.tls_revocation_attested_reason,
+            ),
+        )
         for oc in registry.outbound.values()
         if _listed(oc.tls_hop_attested)
     ]
@@ -8651,6 +8720,8 @@ def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> Con
     _require_config_dir(directory, strict=strict)
     try:
         _assert_safe_config_source(directory)
+    except ConfigDirMissing:
+        raise
     except OSError as exc:
         # Its walk raises what it cannot list, and a path it could not vet must not load. Outside
         # strict that is a refusal, not a raw error, which a reload would answer as a 500.
@@ -8680,9 +8751,8 @@ def _require_config_dir(directory: Path, *, strict: bool) -> None:
     away after the reload's own check still answers as missing (BACKLOG #3157). Any other fault
     is refused by :func:`_refuse_config_dir`. Listed, not ``is_dir``, which answers ``False`` for a
     share Windows cannot reach or a parent this account cannot traverse, and so would call either
-    one missing. A directory that lists while ``is_dir`` says no is a fault too, because
-    :func:`_assert_safe_config_source` vets nothing where ``is_dir`` says no, and what follows this
-    check runs the directory's modules."""
+    one missing. A directory that lists while ``is_dir`` says no is a fault too: the two calls
+    disagree about the one path whose modules what follows this check runs."""
     try:
         with os.scandir(directory):
             pass
@@ -8702,7 +8772,7 @@ def _require_config_dir(directory: Path, *, strict: bool) -> None:
         _refuse_config_dir(
             directory,
             PermissionError(
-                errno.EACCES, "config directory lists but is not vetted", str(directory)
+                errno.EACCES, "config directory lists but is_dir says no", str(directory)
             ),
             strict=strict,
         )
@@ -9572,13 +9642,22 @@ def _assert_safe_config_source(directory: Path) -> None:
     paths is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
     principal a write-class right, **or when its owner is neither the engine's own account nor an
     administrator** (the Windows counterpart of that foreign-uid arm, CONFIG-2) — no longer a silent
-    no-op delegated entirely to install-time ACLs (docs/SERVICE.md, DEPLOY-1)."""
-    if not directory.is_dir():
-        return
-    # Include _*.py: the loader skips them as top-level modules, but a sibling can import them, so a
-    # writable/foreign-owned helper is just as much an injection vector (review M-21).
+    no-op delegated entirely to install-time ACLs (docs/SERVICE.md, DEPLOY-1).
+
+    A directory it cannot list raises that ``OSError``, a missing one included, and each caller
+    refuses the load. It returned with nothing vetted where ``Path.is_dir`` said no, which it says
+    for a share Windows cannot reach (vault BACKLOG #5117)."""
+    try:
+        # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
+        # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
+        paths = config_source_trust_paths(directory)
+    except OSError as exc:
+        if is_missing_directory(exc):
+            # Moved away since the caller's own check: missing, as that check answers (#3157).
+            _require_config_dir(directory, strict=True)
+        raise
     _check_trusted_paths(
-        config_source_trust_paths(directory),
+        paths,
         lead=_CONFIG_SOURCE_LEAD,
         refuse=_refuse_unsafe_config_source,
         first_is_required=True,

@@ -129,6 +129,8 @@ __all__ = [
     "AdminStore",
     "AuditStore",
     "AuthStore",
+    "CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS",
+    "ConnectionFlagLockTimeout",
     "ContentSearchError",
     "DbaDelegatedError",
     "DEFAULT_SCAN_LIMIT",
@@ -1424,10 +1426,13 @@ class QueueStore(StoreLifecycle, Protocol):
         writer. So the flag matches the newest row a call appended, unless something outside the
         store writes the table (ADR 0007, amendment of 2026-10-31).
 
-        On a server backend the flag statement waits at most
-        :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` for a lock on the table, since the audit lock is
-        held while it waits. Past that it raises :class:`ConnectionFlagLockTimeout`, having rolled
-        back and released the audit lock, with nothing written."""
+        On a server backend each lock wait the flag statement makes on the table is bounded at
+        :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`, since the audit lock is held while it waits.
+        Past it the call raises :class:`ConnectionFlagLockTimeout`, with nothing written, once the
+        transaction has rolled back and released the audit lock. Where that rollback fails, the
+        connection is discarded instead, and the audit lock is held until the server ends that
+        session. The constant's comment says what the bound covers, and ADR 0007, amendment of
+        2026-10-31, at least what it does not."""
         ...
 
     async def list_connection_flags(self) -> set[tuple[str, str]]:
@@ -3147,10 +3152,15 @@ class AuthStore(Protocol):
         """Revoke the unrevoked sessions it finds, but ``except_token_hash`` when it is given, and
         return how many it revoked (BACKLOG #2614).
 
-        Raises the session epoch of at most the accounts its read of the account list returns,
-        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
-        what it may miss. A kept session whose seal does not verify raises
-        :class:`~messagefoundry.store.row_seal.RowSealError`, and the transaction rolls back."""
+        In one transaction it raises the store's global session epoch (BACKLOG #5091), which ends
+        every session minted before it whatever account it belongs to, raises the epoch of each
+        account its read of the account list returns, ends the sessions it finds, and re-seals the
+        kept session under its account's new epoch and the new global one. The order of the
+        first three is each backend's, and its own docstring states it. store.py's
+        ``GLOBAL_SESSION_EPOCH_SQL`` says what the global epoch decides, and docs/SECURITY.md,
+        *Limits of the session sweep*, says what the revoke still leaves. A kept session whose seal
+        does not verify raises :class:`~messagefoundry.store.row_seal.RowSealError`, a store with
+        no global epoch row raises ``RuntimeError``, and either way the transaction rolls back."""
         ...
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
@@ -3573,22 +3583,31 @@ class SchemaDdlLockTimeout(SchemaLockTimeout):
         )
 
 
-#: How long a server backend's connection flag toggle waits for a lock on ``connection_flag``
-#: (BACKLOG #2623). The toggle holds the store's audit lock while it waits, so this also bounds how
-#: long a foreign lock on that table can hold every audit append. Under the engine's
-#: ``CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS``, which covers the whole store call, so the toggle's own
-#: refusal arrives before the engine stops waiting for it.
+#: How long each lock wait of a server backend's connection flag statement may last, on
+#: ``connection_flag`` (BACKLOG #2623). The toggle holds the store's audit lock while it waits, so
+#: this also bounds how long a foreign lock on that table can hold every audit append, per lock
+#: wait and per attempt, not per statement or per toggle. It sits under the engine's
+#: ``CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS``, which covers the whole store call, so a toggle that
+#: gets the audit lock at once and meets one lock hears this refusal before the engine stops
+#: waiting. A statement that meets two locks, or a toggle that first queued for the audit lock, can
+#: still be cut off by the engine instead, though each lock wait on ``connection_flag`` still ends
+#: at this bound; the wait for the audit lock is not bounded by it. Where a non-zero
+#: ``[store].command_timeout`` is at or under it, the driver's timeout ends the wait first, and SQL
+#: Server's retry waits again. ADR 0007, amendment of 2026-10-31, records at least what it does not
+#: cover.
 CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS = 5.0
 
 
 class ConnectionFlagLockTimeout(RuntimeError):
-    """A server backend's flag statement did not get its lock on ``connection_flag`` within
-    :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` (BACKLOG #2623). Only toggles write the table, and
-    they run one at a time under the audit lock, so the holder is something outside the store.
+    """A lock wait of a server backend's flag statement on ``connection_flag`` did not end within
+    :data:`CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`, or within a stricter ``lock_timeout`` a Postgres
+    role or database sets (BACKLOG #2623). Toggles run one at a time under
+    the audit lock, so the holder is something other than a toggle: at least a writer outside the
+    store, or a schema change holding a lock on the table.
 
-    Raised inside the toggle's transaction, which then rolls back with nothing written and releases
-    the audit lock. It is never retried there, since a retry would hold the audit lock again behind
-    the same holder."""
+    Raised inside the toggle's transaction, which then rolls back with nothing written; the store
+    method's docstring says what happens where that rollback fails. It is never retried there,
+    since a retry would hold the audit lock again behind the same holder."""
 
     def __init__(self, backend: StoreBackend, timeout: float) -> None:
         self.backend = backend
@@ -3599,8 +3618,9 @@ class ConnectionFlagLockTimeout(RuntimeError):
             else ""
         )
         super().__init__(
-            f"{backend.value}: a connection flag statement did not get its row lock within "
-            f"{timeout:.15g} s{stricter}; another session holds one. Nothing was written"
+            f"{backend.value}: a connection flag statement did not get its lock on the flag table "
+            f"within {timeout:.15g} s{stricter}; another session, or a schema change, holds one. "
+            "Nothing was written"
         )
 
 

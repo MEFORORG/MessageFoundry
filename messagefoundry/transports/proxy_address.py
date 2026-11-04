@@ -25,8 +25,16 @@ module. Other proxy-URL readers exist and do not, at least ``ambient_proxy``'s l
 ``requests``/``hvac`` path in ``strict_requests``.
 
 ``urlsplit`` is called here with its cache taken off, as ``strict_requests`` does (vault BACKLOG
-#3454), so this parse adds no key to the process-wide cache. That is all it does: every caller
-reads the scheme first through the cached function, so the value is a cache key all the same.
+#3454), so this parse adds no key to the process-wide cache. That is all it does: a caller that
+splits the value through the cached function first makes it a cache key all the same. At least
+``proxy_config_from_settings``, the egress gate and the static-credential hop label read the
+scheme first through ``rest.url_scheme``, which splits uncached too (vault BACKLOG #5287), and the
+``[egress].proxy_url`` load check reads only uncached splits. Tests pin that the gate and the load
+check add no key at all for a refused credential, and that the REST, SOAP, FHIR and DICOMweb
+builds leave no key for the value itself. A build that split it with other arguments, or split a
+string derived from it, makes a different key, which that test does not see. Other readers can
+still add one, at least the hop label for a value with no ``http(s)`` scheme, which falls back to
+a cached split, and ``ambient_proxy``'s label.
 
 Imports only the standard library, so ``bounded_read`` and ``rest`` can both use it without a
 cycle.
@@ -67,11 +75,12 @@ _UNCACHED_URLSPLIT: Callable[[str], urllib.parse.SplitResult] = inspect.unwrap(
 
 #: The fixed refusal text. It names the setting and the rule, never the value.
 _REFUSED = (
-    "proxy_url must be http(s)://[user:password@]host[:port] with nothing after the port but an "
+    "proxy_url must be http(s)://host[:port] with nothing after the port but an "
     "optional '/': no path, query or fragment, a host that is a DNS name, an IPv4 address or a "
     "bracketed IPv6 address, written in ASCII, and a port from 1 to 65535 with no leading zero. "
-    "Percent-encode any '/', '?', '#' or '@' in the user or password, or set them in "
-    "proxy_user/proxy_password (vault BACKLOG #2965)"
+    "A proxy login "
+    "goes in proxy_user/proxy_password: a user or a password in the URL fails the connection's "
+    "build (vault BACKLOG #2965, #3007)"
 )
 
 
@@ -86,6 +95,14 @@ class ProxyAddress:
     host: str
     port: int | None
     userinfo: str | None = field(default=None, repr=False)
+
+    @property
+    def holds_credential(self) -> bool:
+        """A user or a password in the userinfo, split as urllib splits it. ``@`` and ``:@`` hold
+        neither. urllib sends a header only when it reads both, so this asks what the URL holds,
+        not what goes on the wire (``rest.proxy_url_sends_userinfo`` asks that)."""
+        user, _, password = (self.userinfo or "").partition(":")
+        return bool(user or password)
 
     @property
     def hostname(self) -> str:
@@ -152,8 +169,9 @@ def parse_proxy_url(value: str) -> ProxyAddress:
     bracketed IPv6 address with no zone; a port outside 1 to 65535 or written with a leading
     zero; and any value on which ``urlsplit`` and urllib's ``_parse_proxy`` read a different
     scheme, userinfo, host or port. The code below is the full rule; this list is a guide to it.
-    A userinfo stays allowed. The caller strips the value and handles ``"default"``
-    first. Neither the message nor the exception chain carries any part of the value."""
+    A userinfo stays allowed by this parse, though the connector build then refuses one that
+    holds a credential (:attr:`ProxyAddress.holds_credential`). The caller strips the value and
+    handles ``"default"`` first. Neither the message nor the exception chain carries any part of the value."""
     try:
         parts = _UNCACHED_URLSPLIT(value)
         u_scheme, u_user, u_password, u_hostport = read_like_urllib(value)

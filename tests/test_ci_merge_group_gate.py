@@ -90,6 +90,11 @@ _SELF_GATED_ON_QUEUE = {
     # BACKLOG #4773: the quarantine job copies the `Tests (pytest)` step's condition, queue included.
     # That is this change's choice, not the ruling's, and it is advisory there (job continue-on-error).
     "timing-quarantine",
+    # BACKLOG #5247: test shard 2's job `if:` is the `Tests (pytest)` step's condition, queue included.
+    "test-shard2",
+    # BACKLOG #5247 too: ci-gate's step for shard 2's own result repeats that condition. The job is
+    # `always()` and ran on a queue entry before; what moved is that a step `if:` now names the event.
+    "ci-gate",
 }
 
 #: The mirror image, and the one the arm's comment in ci.yml enumerates: jobs GATED ON AN OUTPUT of
@@ -109,13 +114,14 @@ _DECIDED_BY_THE_ARM_ALONE = {
 
 #: The jobs that satisfy the SECOND half of that predicate and not the first, which is the whole
 #: of why the wider set is wider. The arm's comment in ci.yml names each of them. This was two jobs
-#: until BACKLOG #1164 added `crypto-operations` on 2026-09-24.
+#: until BACKLOG #1164 added `crypto-operations` on 2026-09-24, and two again when BACKLOG #5247 gave
+#: `ci-gate` a step `if:` naming merge_group, which moved it to the self-gated pins above.
 #:
 #: What is CHECKED about them is that they are gated on no output of the `changes` step: that is the
 #: two pins below, read together. Why each is not -- `changes` and `crypto-operations` have no `if:`
-#: at all today and `ci-gate` is `always()` -- is colour, and nothing verifies it. Do not promote it
-#: to a reason in prose somewhere else.
-_NOWHERE_AND_DECIDED_HERE_BY_NOTHING = {"changes", "ci-gate", "crypto-operations"}
+#: at all today -- is colour, and nothing verifies it. Do not promote it to a reason in prose
+#: somewhere else.
+_NOWHERE_AND_DECIDED_HERE_BY_NOTHING = {"changes", "crypto-operations"}
 
 #: The control for `_DECIDED_BY_THE_ARM_ALONE`: every job that satisfies only that second half.
 #:
@@ -137,7 +143,6 @@ _NOWHERE_AND_DECIDED_HERE_BY_NOTHING = {"changes", "ci-gate", "crypto-operations
 #: failed across those three modules. It was never a silent mutation.
 _NAMES_MERGE_GROUP_NOWHERE = {
     "changes",
-    "ci-gate",
     "crypto-operations",
     "docker-smoke",
     "ide",
@@ -155,14 +160,17 @@ _NAMES_MERGE_GROUP_NOWHERE = {
 #:
 #: sqlserver-store and postgres-store carry `serverdb` in their job `if:`; `test` and `webconsole`
 #: carry `code` in their STEP `if:` lines, which ci.yml's `code` row calls belt-and-braces -- so the
-#: tidy-up that empties this set is an invited edit, not a contrived one. timing-quarantine carries
-#: `code` and merge_group side by side in its JOB `if:`, copied from the `Tests (pytest)` step.
+#: tidy-up that empties this set is an invited edit, not a contrived one. timing-quarantine and
+#: test-shard2 carry `code` and merge_group side by side in their JOB `if:`, copied from the
+#: `Tests (pytest)` step, and ci-gate in one STEP `if:`, copied from test-shard2's.
 _SELF_GATED_AND_GATED = {
     "test",
     "webconsole",
     "sqlserver-store",
     "postgres-store",
     "timing-quarantine",
+    "test-shard2",
+    "ci-gate",
 }
 
 # The relation BETWEEN the three pins above is checked, not claimed in prose, by
@@ -413,7 +421,7 @@ def test_the_arm_decides_before_the_step_ever_runs_git(workdir: Path, tmp_path: 
 def test_the_jobs_that_run_on_a_queue_entry_regardless_are_pinned() -> None:
     """`serverdb=false` above does NOT mean the heavy legs are off in the queue.
 
-    Eight jobs name merge_group in their own `if:` and so ignore what `changes` emits. The arm's
+    Ten jobs name merge_group in their own `if:` and so ignore what `changes` emits. The arm's
     comment says this; without a check, that comment is free to go stale while reading as current --
     and a reader who believes it would size the queue's cost at a fraction of the truth.
 

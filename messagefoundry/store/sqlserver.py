@@ -204,12 +204,14 @@ from messagefoundry.store.store import (
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
     AUDIT_KEY_EPOCH_ACTION,
+    GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
+    USER_READ_SQL,
     VIEWED_EVENT,
     AdMap,
     AdMapChange,
@@ -306,6 +308,7 @@ from messagefoundry.store.store import (
     first_admin_grant,
     first_sealed_approval,
     full_authentication_clear,
+    global_epoch_or_refuse,
     held_approval_tombstone,
     if_applied,
     judge_totp,
@@ -693,7 +696,7 @@ def _mssql_session_cap_keep_sql(split_mfa_pending: bool) -> str:
 _MSSQL_SESSION_RESEAL: Final = (
     "UPDATE sessions SET token_hash=?, user_id=?, created_at=?, expires_at=?, revoked_at=?,"
     " client=?, reauth_at=?, mfa_verified_at=?, auth_mechanism=?, idp_auth_time=?, user_epoch=?,"
-    " seal=? OUTPUT inserted.token_hash WHERE token_hash=? AND seal=?"
+    " global_epoch=?, seal=? OUTPUT inserted.token_hash WHERE token_hash=? AND seal=?"
 )
 #: The whole-account session sweep, counted from ``OUTPUT``: revoke and blank the seal (BACKLOG
 #: #2592). Each caller raises the account's session epoch in the same transaction.
@@ -2200,6 +2203,16 @@ _SCHEMA: list[str] = [
         id INT NOT NULL PRIMARY KEY CHECK (id = 1),
         salt VARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
         created_at FLOAT NOT NULL)""",
+    # The store's global session epoch (BACKLOG #5091) -- see the SQLite `_SCHEMA`, and
+    # GLOBAL_SESSION_EPOCH_SQL in store.py for what it decides. One row, seeded here under the
+    # batch's exclusive applock, at 0 whenever this batch runs, which an ordinary open skips while
+    # the schema_meta marker matches (ADR 0064). docs/SECURITY.md, *Limits of the session sweep*,
+    # says what runs it and what a deleted row costs until then. Non-secret: a counter.
+    """IF OBJECT_ID('global_session_epoch','U') IS NULL CREATE TABLE global_session_epoch (
+        id INT NOT NULL PRIMARY KEY CHECK (id = 1),
+        epoch INT NOT NULL DEFAULT 0)""",
+    """IF NOT EXISTS (SELECT 1 FROM global_session_epoch WHERE id = 1)
+        INSERT INTO global_session_epoch (id, epoch) VALUES (1, 0)""",
     # The keyed-surface marker (BACKLOG #3383) -- see the SQLite `_SCHEMA` and
     # `MessageStore._encrypt_existing_rows` for when a row is written and what it decides. One row per
     # cipher-covered (table, column); never deleted by the engine. BIN2 so the code-constant names
@@ -2463,6 +2476,7 @@ _SCHEMA: list[str] = [
         revoked_at FLOAT NULL, client NVARCHAR(256) NULL, reauth_at FLOAT NULL,
         mfa_verified_at FLOAT NULL, auth_mechanism NVARCHAR(32) NULL,
         idp_auth_time FLOAT NULL, user_epoch INT NOT NULL DEFAULT 0,
+        global_epoch INT NOT NULL DEFAULT 0,
         seal NVARCHAR(128) NOT NULL DEFAULT N'')""",
     """IF COL_LENGTH('sessions','reauth_at') IS NULL
         ALTER TABLE sessions ADD reauth_at FLOAT NULL""",
@@ -2483,6 +2497,10 @@ _SCHEMA: list[str] = [
         ALTER TABLE sessions ADD user_epoch INT NOT NULL DEFAULT 0""",
     """IF COL_LENGTH('sessions','seal') IS NULL
         ALTER TABLE sessions ADD seal NVARCHAR(128) NOT NULL DEFAULT N''""",
+    # BACKLOG #5091: the global epoch a session was minted under. An existing row gets 0, which its
+    # seal never covered, so a keyed store refuses it.
+    """IF COL_LENGTH('sessions','global_epoch') IS NULL
+        ALTER TABLE sessions ADD global_epoch INT NOT NULL DEFAULT 0""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_user','IndexID') IS NULL
         CREATE INDEX ix_sessions_user ON sessions(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_expires','IndexID') IS NULL
@@ -7960,13 +7978,20 @@ class SqlServerStore:
 
         The flag statement runs under ``SET LOCK_TIMEOUT``, at
         :data:`~messagefoundry.store.base.CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`, because it holds the
-        applock while it waits. Without it a foreign lock on ``connection_flag`` would hold every
-        audit append until the driver's query timeout, and for ever at ``command_timeout = 0``.
+        applock while it waits. The setting bounds each lock wait, not the statement, so a statement
+        that meets two locks can pass it. Without it a foreign lock on ``connection_flag`` would hold
+        every audit append until the driver's query timeout, and for ever at ``command_timeout = 0``;
+        the retry re-runs a query timeout, so at the 30 s default one call could make up to
+        ``_CIPHER_MERGE_ATTEMPTS``, five, waits of 30 s each, the applock freed only between them.
+        The engine's cancel at its own bound ends the retry, but not the attempt in flight.
         Error 1222 is treated as a failed applock wait: it raises
         :class:`~messagefoundry.store.base.ConnectionFlagLockTimeout`, not retried, and the
         transaction rolls back. The setting is session-scoped and survives a rollback, so it is put
-        back to -1 right after the statement, or after the rollback on a failure, so a pooled
-        connection never carries it into other work."""
+        back to -1 right after the statement, after a retry's rollback, or after the rollback on a
+        failure, so neither a re-take of the applock nor a pooled connection's other work runs under
+        it. Where a non-zero ``command_timeout`` is at or under the bound, that fires first as
+        HYT00, which the retry re-runs as it would without the bound, and each attempt then holds
+        the applock for up to that timeout."""
         now = time.time() if now is None else now
         bound = CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS
         if flagged:
@@ -8014,9 +8039,14 @@ class SqlServerStore:
                         bounded = False
 
                     async def release() -> None:
-                        nonlocal locked
+                        nonlocal locked, bounded
                         await conn.rollback()
                         locked = False
+                        if bounded:
+                            # The rollback does not undo the SET, and the re-take's opener and
+                            # applock must wait under their own bounds, not this one.
+                            await cur.execute(_LOCK_TIMEOUT_RESET)
+                            bounded = False
 
                     await _retry_idempotent_merge(write_flag, on_retry=release, statement=statement)
                     await self._append_operator_audit(cur, written, if_applied(audit), True)
@@ -8024,7 +8054,8 @@ class SqlServerStore:
             except Exception:
                 # The transaction may hold the audit applock and an audit row (BACKLOG #2624).
                 await self._rollback_or_discard(conn)
-                if bounded:
+                # A connection that discard took out of the pool closes with its session.
+                if bounded and not getattr(conn, "closed", False):
                     await self._reset_lock_timeout(conn, after="a failed connection flag write")
                 raise
 
@@ -13777,7 +13808,7 @@ class SqlServerStore:
         )
 
     async def get_user(self, user_id: str) -> UserRecord | None:
-        d = await self._fetchone("SELECT * FROM users WHERE id=?", (user_id,))
+        d = await self._fetchone(f"{USER_READ_SQL} WHERE id=?", (user_id,))
         return UserRecord.from_mapping(d) if d else None
 
     async def get_user_role_grants(self, user_id: str) -> list[RoleGrant]:
@@ -13914,6 +13945,13 @@ class SqlServerStore:
                 raise
         return count
 
+    async def _global_session_epoch(self, cur: Any) -> int:
+        """The store's global session epoch (BACKLOG #5091), read on ``cur`` inside an open
+        transaction."""
+        await cur.execute(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
+        rows = await cur.fetchall()
+        return global_epoch_or_refuse(rows[0][0] if rows else None)
+
     async def _bump_session_epoch(self, cur: Any, user_id: str) -> None:
         """Raise the account's session epoch through the write helper, on ``cur`` inside an open
         transaction (BACKLOG #2592); store.py's ``MessageStore._bump_session_epoch`` says why a
@@ -13960,7 +13998,7 @@ class SqlServerStore:
         return int(row["n"]) if row else 0
 
     async def get_user_by_username(self, username: str) -> UserRecord | None:
-        d = await self._fetchone("SELECT * FROM users WHERE username=?", (username,))
+        d = await self._fetchone(f"{USER_READ_SQL} WHERE username=?", (username,))
         return UserRecord.from_mapping(d) if d else None
 
     async def get_user_by_directory_object_id(self, object_id: str) -> UserRecord | None:
@@ -13971,7 +14009,7 @@ class SqlServerStore:
         # The normaliser in auth/ldap.py emits ONE case, so that divergence is not reachable through
         # the login path -- it is recorded because the byte-exact comparison SQLite and Postgres
         # perform is the property a reader would assume.
-        d = await self._fetchone("SELECT * FROM users WHERE directory_object_id=?", (object_id,))
+        d = await self._fetchone(f"{USER_READ_SQL} WHERE directory_object_id=?", (object_id,))
         return UserRecord.from_mapping(d) if d else None
 
     async def get_user_by_federated_subject(self, issuer: str, subject: str) -> UserRecord | None:
@@ -13982,12 +14020,12 @@ class SqlServerStore:
         # byte-exact comparison SQLite and Postgres perform. The BIN2 remedy this file applies to
         # `reference_sets.[key]` is the fix if that divergence ever needs closing.
         d = await self._fetchone(
-            "SELECT * FROM users WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
+            f"{USER_READ_SQL} WHERE oidc_issuer=? AND oidc_subject=?", (issuer, subject)
         )
         return UserRecord.from_mapping(d) if d else None
 
     async def list_users(self) -> list[UserRecord]:
-        rows = await self._fetchall("SELECT * FROM users ORDER BY username")
+        rows = await self._fetchall(f"{USER_READ_SQL} ORDER BY username")
         return [UserRecord.from_mapping(d) for d in rows]
 
     async def count_users(self) -> int:
@@ -14228,6 +14266,7 @@ class SqlServerStore:
                     SessionRecord.from_mapping(session[0]) if session else None,
                     record,
                     await self._account_passkeys(cur, cred.user_id),
+                    global_epoch=await self._global_session_epoch(cur),
                 ):
                     await conn.rollback()  # only read; this releases the lock
                     return False
@@ -15227,6 +15266,10 @@ class SqlServerStore:
                     auth_mechanism=auth_mechanism,
                     idp_auth_time=idp_auth_time,
                     user_epoch=0 if not rows else int(rows[0][2]),
+                    # BACKLOG #5091: its own statement, after the row lock, for the reason
+                    # postgres.py's create_session gives; revoke_all_sessions says why it cannot
+                    # close a cycle.
+                    global_epoch=await self._global_session_epoch(cur),
                 )
                 record = seal_session(self._row_sealer, record)
                 await cur.execute(_SESSION_INSERT, session_insert_params(record))
@@ -15466,9 +15509,26 @@ class SqlServerStore:
         """Revoke the sessions it finds but ``except_token_hash`` (BACKLOG #2614); see
         :meth:`AuthStore.revoke_all_sessions`.
 
-        Raises the session epoch of at most the accounts its read of the account list returns,
-        then ends the sessions it finds; see docs/SECURITY.md, *Limits of the session sweep*, for
-        what it may miss."""
+        Raises the epoch of each account its read of the account list returns, ends the sessions
+        it finds, then raises the store's global session epoch (BACKLOG #5091), which ends every
+        session minted before it whatever account it belongs to, and re-seals the kept session
+        under both new epochs; docs/SECURITY.md, *Limits of the session sweep*, says what that
+        leaves.
+
+        LOCK ORDER. The global row is the LAST lock this takes, so it never waits on another lock
+        while holding that row. Taken first, as on Postgres, it would close a cycle wherever the
+        database runs without READ_COMMITTED_SNAPSHOT, which the opener only warns about: a sign-in
+        holding an account row (``create_session``'s HOLDLOCK) reads the global epoch and waits on
+        this X lock, while the loop below waits on that account row. That shape, a lock held while
+        waiting on a lock the other side holds, is the class the reverted ``UPDLOCK, HOLDLOCK``
+        read of the account list fell into against ``delete_user`` (engine PR 2679). After the
+        raise the only wait left is the kept session's row, and no other path holds that row while
+        it waits on an account row or on the global one: each path that touches both takes the
+        account row first, and this transaction already holds it. Every reader of the global row
+        takes no hint, so under READ_COMMITTED_SNAPSHOT it never waits, and without it holds its
+        shared lock only for the read. A session minted between the sweep and the commit read the
+        old value, so it ends when this commits. Read from the code and not run against a server
+        that has READ_COMMITTED_SNAPSHOT off."""
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
@@ -15483,6 +15543,12 @@ class SqlServerStore:
                         (now, except_token_hash),
                     )
                 revoked = len(await cur.fetchall())
+                await cur.execute(
+                    "UPDATE global_session_epoch SET epoch = epoch + 1"
+                    " OUTPUT inserted.epoch WHERE id = 1"
+                )
+                raised = await cur.fetchall()
+                current = global_epoch_or_refuse(raised[0][0] if raised else None)
                 if except_token_hash is not None:
                     await cur.execute(
                         "SELECT s.user_id, u.session_epoch FROM sessions s"
@@ -15493,7 +15559,9 @@ class SqlServerStore:
                     if kept:
                         epoch = int(kept[0][1])
                         await self._write_session(
-                            cur, except_token_hash, lambda s: replace(s, user_epoch=epoch)
+                            cur,
+                            except_token_hash,
+                            lambda s: replace(s, user_epoch=epoch, global_epoch=current),
                         )
                 await self._commit(conn)
             except Exception:

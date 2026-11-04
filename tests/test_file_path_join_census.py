@@ -589,6 +589,12 @@ SITES: dict[str, Site] = {
         1, OPERATOR, _CONFIG_FIXED
     ),
     "messagefoundry/config/snapshot.py::_list_folders": Site(1, OPERATOR, _CONFIG_FIXED),
+    "messagefoundry/config/snapshot.py::config_py_files": Site(
+        1,
+        REVIEWED,
+        "The operator's config directory joined to the names its own listing of that directory "
+        "returned, which a glob joined the same way before (vault BACKLOG #5117).",
+    ),
     "messagefoundry/config/snapshot.py::read_config_snapshot": Site(
         2,
         REVIEWED,

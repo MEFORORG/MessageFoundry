@@ -5492,6 +5492,82 @@ async def test_session_seal_contract(store) -> None:
         await keyed.close()
 
 
+async def test_every_account_revoke_contracts(store) -> None:
+    """BACKLOG #5091 and #2614: the global session epoch's contract, a revoke racing sign-ins, and
+    the every-account revoke's own contract, on a keyed handle. Run here because the leg runs this
+    file and not ``tests/test_b5091_global_session_epoch.py`` or ``tests/test_b2614_revoke_all.py``.
+    The fixture truncates the session and user tables on the next entry."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests._session_seal_contract import dollar_placeholders
+    from tests.test_b2614_revoke_all import assert_revoke_all_contract
+    from tests.test_b5091_global_session_epoch import (
+        assert_global_epoch_contract,
+        assert_revoke_all_races_sign_ins,
+    )
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+
+        async def raw(sql: str, params: tuple[object, ...]) -> None:
+            async with keyed._pool.acquire() as conn:
+                await conn.execute(dollar_placeholders(sql), *params)
+
+        await assert_global_epoch_contract(keyed, raw)
+        await assert_revoke_all_races_sign_ins(keyed)
+        await assert_revoke_all_contract(keyed, raw)
+    finally:
+        await keyed.close()
+
+
+async def test_a_sign_in_committing_inside_an_every_account_revoke_ends_with_it(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5091, the interleaving the gap was: an account is created and signs in, on another
+    connection, after the revoke read the account list and ran its sweep and before it commits.
+    The sweep cannot see that session and the account loop never raised its epoch, so before the
+    global epoch it stayed live. It now carries the global epoch the revoke is replacing. The hook
+    is the kept session's epoch read, which runs between the sweep and the commit."""
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.auth.tokens import hash_token
+    from messagefoundry.config.settings import AuthSettings, load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests.test_b2614_revoke_all import _mint, _user
+
+    keyed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key())
+    )
+    try:
+        service = AuthService(keyed, AuthSettings())
+        run = uuid4().hex[:8]
+        owner, late = f"b5091-o-{run}", f"b5091-l-{run}"
+        await _user(keyed, owner)
+        kept = await _mint(keyed, owner)
+        minted: list[str] = []
+        original = keyed._session_epoch
+
+        async def between_sweep_and_commit(conn: object, user_id: str) -> int:
+            if not minted:
+                await _user(keyed, late)
+                minted.append(await _mint(keyed, late))
+            return await original(conn, user_id)
+
+        monkeypatch.setattr(keyed, "_session_epoch", between_sweep_and_commit)
+        await keyed.revoke_all_sessions(except_token_hash=hash_token(kept))
+        monkeypatch.undo()
+        assert minted, "the hook did not run inside the revoke"
+        row = await keyed.get_session(hash_token(minted[0]))
+        assert row is not None and row.revoked_at is None  # the sweep missed it...
+        assert await service.identity_for_token(minted[0]) is None  # ...and it ends anyway
+        assert await service.identity_for_token(kept) is not None
+        after = await _mint(keyed, late)
+        assert await service.identity_for_token(after) is not None  # control: a later sign-in
+    finally:
+        await keyed.close()
+
+
 async def test_user_seal_contract(store) -> None:
     """BACKLOG #2592: the sealed user record, the same contract the SQLite suite runs, on a keyed
     handle, with the round trip that pins the canonical bytes (AC-19). ``raw`` runs each statement

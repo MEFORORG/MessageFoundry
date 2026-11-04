@@ -42,33 +42,42 @@ def test_the_sftp_extra_is_importable_where_the_leg_requires_it() -> None:
     assert hasattr(paramiko, "Transport"), "paramiko imported but is not the SSH library"
 
 
+#: The engine suite's two shards (BACKLOG #5247). Each runs whichever half holds this file, so each
+#: must install the extra and arm the check.
+_ENGINE_JOBS = ("test", "test-shard2")
+
+
 @functools.cache
-def _test_job_steps() -> list[dict[str, Any]]:
-    # Scoped to jobs.test on purpose. The raw-line readers in other tests take the widest install
-    # line in the whole file, which would still pass if only another job kept the extra.
+def _job_steps(job: str) -> list[dict[str, Any]]:
+    # Scoped to the engine jobs on purpose. The raw-line readers in other tests take the widest
+    # install line in the whole file, which would still pass if only another job kept the extra.
     workflow = yaml.safe_load(_CI.read_text(encoding="utf-8"))
-    steps: list[dict[str, Any]] = workflow["jobs"]["test"]["steps"]
+    steps: list[dict[str, Any]] = workflow["jobs"][job]["steps"]
     return steps
 
 
-def test_the_ci_test_job_installs_the_sftp_extra() -> None:
+@pytest.mark.parametrize("job", _ENGINE_JOBS)
+def test_the_ci_test_job_installs_the_sftp_extra(job: str) -> None:
     installs = [
         s["run"]
-        for s in _test_job_steps()
+        for s in _job_steps(job)
         if "run" in s and "uv pip install" in s["run"] and "constraints.lock -e" in s["run"]
     ]
     # CONTROL: the step this reads must still be found, or an empty list passes the check below.
-    assert len(installs) == 1, f"expected one project install step in jobs.test, found {installs}"
+    assert len(installs) == 1, f"expected one project install step in jobs.{job}, found {installs}"
     m = re.search(r'-e "\.\[([^\]]+)\]"', installs[0])
-    assert m is not None, f'no -e ".[...]" extras list in the jobs.test install step: {installs[0]}'
+    assert m is not None, (
+        f'no -e ".[...]" extras list in the jobs.{job} install step: {installs[0]}'
+    )
     extras = [e.strip() for e in m.group(1).split(",")]
-    assert "sftp" in extras, f"jobs.test installs {extras}, without sftp (BACKLOG #2084)"
+    assert "sftp" in extras, f"jobs.{job} installs {extras}, without sftp (BACKLOG #2084)"
 
 
-def test_the_ci_test_job_arms_the_runtime_check() -> None:
-    tests_steps = [s for s in _test_job_steps() if s.get("id") == "tests"]
-    assert len(tests_steps) == 1, "jobs.test has no single step with id: tests"
+@pytest.mark.parametrize("job", _ENGINE_JOBS)
+def test_the_ci_test_job_arms_the_runtime_check(job: str) -> None:
+    tests_steps = [s for s in _job_steps(job) if s.get("id") == "tests"]
+    assert len(tests_steps) == 1, f"jobs.{job} has no single step with id: tests"
     env = tests_steps[0].get("env") or {}
     assert str(env.get(_ARM)) == "1", (
-        f"the pytest step in jobs.test must set {_ARM}: '1', or the runtime check skips silently"
+        f"the pytest step in jobs.{job} must set {_ARM}: '1', or the runtime check skips silently"
     )
