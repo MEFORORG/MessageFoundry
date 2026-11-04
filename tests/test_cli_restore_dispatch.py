@@ -1470,17 +1470,74 @@ def test_a_refusal_survives_a_staging_teardown_that_fails(tmp_path, capsys, monk
     tar = _undated_config_only_tar(tmp_path)
     toml = _service_toml(tmp_path, key_b64=None)
     real = tempfile.TemporaryDirectory
+    left: list[str] = []
 
     class HeldOpen(real):  # type: ignore[valid-type,misc]
         def cleanup(self) -> None:
-            raise PermissionError(13, "held open by a scanner", self.name)
+            left.append(self.name)
+            self._finalizer.detach()  # removed by hand below, not at GC
+            # The rmtree retry's shape: its own first failure is the context of the one that
+            # escapes, so the refusal sits two links down the chain, not one.
+            try:
+                raise PermissionError(13, "first attempt refused", self.name)
+            except PermissionError:
+                raise PermissionError(13, "held open by a scanner", self.name) from None
 
     monkeypatch.setattr(tempfile, "TemporaryDirectory", HeldOpen)
     assert main(_config_only_argv(str(tar), toml, tmp_path / "cfg")) == 1
     err = _refusal(capsys)
     assert "restore failed (age_undated)" in err and "Nothing was written" in err, err
     assert "could not be removed" in err and "mefor-restore-" in err, err
+    assert ".." not in err.replace(str(tmp_path), ""), err
     assert "Traceback" not in err, err
+    assert len(left) == 1 and Path(left[0]).is_dir()
+    shutil.rmtree(left[0])
+
+
+@pytest.mark.skipif(os.name != "nt", reason="only Windows refuses to delete an open file")
+def test_a_refusal_survives_a_real_held_open_staging_file(tmp_path, capsys, monkeypatch) -> None:
+    # The real shape, not a stand-in: a handle on the staged archive makes TemporaryDirectory's
+    # rmtree fail with its own retry chained in front of the refusal.
+    tar = _undated_config_only_tar(tmp_path)
+    toml = _service_toml(tmp_path, key_b64=None)
+    handles: list = []
+    real_read = dr_backup._read_manifest_from_tar
+
+    def hold(tar_path: Path) -> dict[str, object]:
+        handles.append(open(tar_path, "rb"))  # noqa: SIM115 -- held on purpose, closed below
+        return real_read(tar_path)
+
+    monkeypatch.setattr(dr_backup, "_read_manifest_from_tar", hold)
+    try:
+        assert main(_config_only_argv(str(tar), toml, tmp_path / "cfg")) == 1
+    finally:
+        for fh in handles:
+            fh.close()
+    err = _refusal(capsys)
+    assert "restore failed (age_undated)" in err and "could not be removed" in err, err
+    assert "Traceback" not in err, err
+    for leftover in tmp_path.glob("mefor-restore-*"):
+        shutil.rmtree(leftover)
+
+
+def test_an_os_error_mid_restore_is_a_refusal(tmp_path, key_b64, capsys) -> None:
+    # A full volume mid-decrypt, or any OSError with no refusal behind it, is a refusal line, not a
+    # traceback, on both routes.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+
+    def full(*args: object, **kwargs: object) -> object:
+        raise OSError(28, "No space left on device")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(dr_backup, "decrypt_stream", full)
+        assert (
+            main(["restore", archive, "--to", str(tmp_path / "x.db"), "--service-config", toml])
+            == 1
+        )
+    err = _refusal(capsys)
+    assert "restore failed (restore)" in err and "No space left" in err, err
+    assert not (tmp_path / "x.db").exists()
+    _no_staging_left(tmp_path)
 
 
 def test_config_only_route_refuses_an_archive_marked_neither_way(tmp_path, capsys) -> None:

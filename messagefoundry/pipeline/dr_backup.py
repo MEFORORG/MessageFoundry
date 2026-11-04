@@ -3864,18 +3864,25 @@ def _restore_blocking(
             # nothing was decrypted or written: a refusal line, not a traceback.
             raise BackupError("destination", _staging_refusal(staging_parent, anchor, exc)) from exc
         if not completed:
-            refusal = exc.__context__
-            if isinstance(refusal, BackupError):
-                # The staging directory's teardown failed while a refusal was already leaving the
-                # block, and its OSError would replace that refusal with a traceback. Keep the
-                # refusal, and name the leftover, which holds decrypted archive bytes.
-                raise BackupError(
-                    refusal.kind,
-                    f"{refusal}. Its staging directory {staging} could not be removed "
-                    f"({safe_exc(exc)}) and still holds decrypted archive content: delete it by "
-                    "hand once nothing holds it open",
-                ) from refusal
-            raise
+            # A refusal already leaving the block, found anywhere in the chain: an OSError raised
+            # on its way out (the staging teardown, whose rmtree retry chains its own first
+            # failure, or a close-time flush) would otherwise replace it with a traceback.
+            refusal = _refusal_in_flight(exc)
+            if refusal is None:
+                # No refusal behind it: the OSError is the failure itself, such as a full volume
+                # mid-decrypt. A refusal line rather than a traceback, on both routes; the
+                # `finally` still rolls back what was published.
+                raise BackupError("restore", f"the restore failed: {safe_exc(exc)}") from exc
+            if not staging.exists():
+                raise refusal from exc
+            # The teardown failed, and the directory holds decrypted archive content.
+            raise BackupError(
+                refusal.kind,
+                f"{str(refusal).rstrip('.')}. Separately, the restore's own staging directory "
+                f"{staging}, beside the destination, could not be removed ({safe_exc(exc)}) and "
+                "still holds decrypted archive content: delete it by hand once nothing holds it "
+                "open",
+            ) from refusal
         # Only the staging directory's teardown runs after `completed`, so an OSError here IS that
         # teardown failing (on Windows, a scanner or the indexer still holding the extracted store
         # open). The store and bundle are intact; what is left is the plaintext staging directory,
@@ -3927,6 +3934,18 @@ def _staging_refusal(parent: Path, anchor: Path, exc: OSError) -> str:
     )
 
 
+def _refusal_in_flight(exc: BaseException) -> BackupError | None:
+    """The first :class:`BackupError` in ``exc``'s ``__context__`` chain, or ``None``."""
+    seen: set[int] = set()
+    link = exc.__context__
+    while link is not None and id(link) not in seen:
+        if isinstance(link, BackupError):
+            return link
+        seen.add(id(link))
+        link = link.__context__
+    return None
+
+
 def _missing_dirs(*paths: Path | None) -> list[Path]:
     """Each of ``paths`` that is not ``None``, and each of their ancestors, that does not exist yet,
     resolved and deepest first: what a ``mkdir(parents=True)`` of each is about to create."""
@@ -3947,6 +3966,10 @@ def _remove_made_dirs(dirs: list[Path]) -> None:
     already propagating. A directory that holds something stays, and so do its ancestors, because
     ``rmdir`` refuses each of them in turn."""
     for path in dirs:
+        # A path the mkdir never got to (an ancestor is a regular file, say) is not a directory,
+        # and there is nothing of this restore's to remove or to report there.
+        if not path.is_dir():
+            continue
         try:
             path.rmdir()
         except FileNotFoundError:
@@ -4334,9 +4357,10 @@ def _place_restored_store(src: Path, dest: Path) -> int:
 def _restore_config_members(
     tar_path: Path, config_dest: Path, *, written: list[Path] | None = None
 ) -> int:
-    """:func:`_extract_config_members`, with every failure it does not word itself made a refusal
-    (vault BACKLOG #5233): a ``PermissionError`` from a ``mkdir``, a full volume, or a
-    ``tarfile.TarError`` from a member that ends early. Unguarded, each left the restore as a CLI
+    """:func:`_extract_config_members`, with an ``OSError``, ``ValueError`` or ``tarfile.TarError``
+    it does not word itself made a refusal (vault BACKLOG #5233). At least these are covered: a
+    ``PermissionError`` from a ``mkdir``, a full volume, and a member that ends early. Any other
+    exception type still escapes as it did. Unguarded, each left the restore as a CLI
     traceback, on the config-only route and the store route alike. The caller's ``finally`` still
     rolls back what ``written`` records."""
     try:
