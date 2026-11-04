@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.lens import (
+from messagefoundry_toolkit.lens import (
     CONTRACT_LATEST,
     CONTRACT_V1,
     CONTRACT_V2,
@@ -749,7 +749,7 @@ def test_cli_contract_flag_gates_the_new_kinds_and_refuses_an_unknown_version(
     ``ide/src/test/suite/steps-contract.test.ts``; this asserts the engine end of the same contract."""
     module = tmp_path / "IB_X_router.py"
     module.write_text(ROUTER_CORPUS, encoding="utf-8")
-    argv = [sys.executable, "-m", "messagefoundry", "lens", "parse", str(module), "--json"]
+    argv = [sys.executable, "-m", "messagefoundry_toolkit", "lens", "parse", str(module), "--json"]
 
     default = subprocess.run(argv, capture_output=True, text=True, cwd=REPO_ROOT, check=False)
     assert default.returncode == 0

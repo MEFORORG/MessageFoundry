@@ -15,7 +15,7 @@ from pathlib import Path
 
 import yaml
 
-from messagefoundry.scaffold import scaffold
+from messagefoundry_toolkit.scaffold import scaffold
 
 
 def test_scaffolded_ci_is_valid_yaml_and_hardens_the_transitive_resolve(tmp_path: Path) -> None:

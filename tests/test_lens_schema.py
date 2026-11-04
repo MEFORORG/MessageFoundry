@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.__main__ import main
-from messagefoundry.lens_schema import op_param_schema
+from messagefoundry_toolkit.__main__ import main
+from messagefoundry_toolkit.lens_schema import op_param_schema
 
 # The IDE renderer tests consume a CANNED dump of this schema (the CI ide job has no Python, so those
 # tests never shell the CLI). It must stay faithful to the live derivation, or a signature change would

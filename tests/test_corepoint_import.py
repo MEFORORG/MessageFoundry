@@ -16,7 +16,8 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.checks import run_checks
-from messagefoundry.corepoint_import import (
+from messagefoundry.parsing.message import Message
+from messagefoundry_toolkit.corepoint_import import (
     _CONTAINER_KIND_BY_TAG,
     _STATEMENT_VERBS,
     _UNDERSTOOD,
@@ -44,7 +45,6 @@ from messagefoundry.corepoint_import import (
     strip_markup,
     tokenize_statement,
 )
-from messagefoundry.parsing.message import Message
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "corepoint"
@@ -252,7 +252,7 @@ def test_a_fully_mapped_import_still_says_its_endpoints_are_undeployed(
 ) -> None:
     """With nothing unmapped there is no TODO hint, so the summary must still say the endpoints bind
     nothing; otherwise a clean import reads as ready to run."""
-    from messagefoundry.__main__ import main
+    from messagefoundry_toolkit.__main__ import main
 
     export = tmp_path / "export.json"
     export.write_text(_file_export("./in", "./out"), encoding="utf-8")
@@ -723,7 +723,7 @@ def test_parse_export_converts_a_recursion_error_from_json_loads(
     def _raise_recursion(*_args: object, **_kwargs: object) -> object:
         raise RecursionError("simulated deep nesting")
 
-    monkeypatch.setattr("messagefoundry.corepoint_import.json.loads", _raise_recursion)
+    monkeypatch.setattr("messagefoundry_toolkit.corepoint_import.json.loads", _raise_recursion)
     with pytest.raises(CorepointImportError, match="nested too deeply"):
         parse_export('{"channels": []}')
 
@@ -932,7 +932,7 @@ def test_loop_exit_outside_a_loop_is_counted_unmapped(
     assert _count_steps(_handler_steps(loop), in_loop=False) == (3, [], 0)
 
     # The line a migrator reads: the stub is reported, not hidden under "0 left as TODO stubs".
-    from messagefoundry.__main__ import main
+    from messagefoundry_toolkit.__main__ import main
 
     export = tmp_path / "loop_exit.xml"
     export.write_text(_package(body), encoding="utf-8")
@@ -1792,7 +1792,7 @@ def test_one_element_off_the_allow_list_renders_the_whole_list_as_step_1(spoiler
 
 def test_a_module_with_locals_round_trips_through_the_lens() -> None:
     """ADR 0086 AC-4 for the new shapes: no whole-file refusal, and every live send is a send row."""
-    from messagefoundry.lens import parse_source
+    from messagefoundry_toolkit.lens import parse_source
 
     src = _handler_source(
         _CLONE_WRITE_SEND + _create("%NEW") + _role_send("other-handle", "%NEW", "OB_NEW")
@@ -2832,7 +2832,7 @@ def test_a_send_statement_keeps_its_nested_body() -> None:
 
 def test_cli_imports_the_xml_package(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """``messagefoundry import corepoint`` drives the XML path end to end and reports the accounting."""
-    from messagefoundry.__main__ import main
+    from messagefoundry_toolkit.__main__ import main
 
     out = tmp_path / "config"
     code = main(
@@ -2857,7 +2857,7 @@ def test_cli_reports_a_malformed_export_without_a_traceback(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Untrusted input: a broken export is a clean error + exit 1, never an uncaught traceback."""
-    from messagefoundry.__main__ import main
+    from messagefoundry_toolkit.__main__ import main
 
     bad = tmp_path / "broken.xml"
     bad.write_text("<Package><ActionList>", encoding="utf-8")

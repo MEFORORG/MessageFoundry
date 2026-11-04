@@ -5,8 +5,8 @@
 ONE IMPLEMENTATION, TWO CALLERS. It ships in the wheel, stdlib only, so an adopter's CI can run the
 code the engine's own gate runs: ``python -P -m messagefoundry.security.audit_all_platforms <lock>``.
 The engine's ``security.yml`` reaches it through ``scripts/security/audit_all_platforms.py``, a thin
-wrapper that needs no engine install; the ``audit-pin`` job ``messagefoundry init`` generates calls
-the module when the adopter commits a hashed ``requirements.lock`` (``messagefoundry/scaffold.py``).
+wrapper that needs no engine install; the ``audit-pin`` job ``messagefoundry-toolkit init`` generates calls
+the module when the adopter commits a hashed ``requirements.lock`` (the toolkit's ``scaffold.py``).
 
 THE GAP THIS CLOSES. ``pip-audit -r <lock>`` evaluates each requirement's environment marker against
 the HOST it runs on and silently skips a requirement whose marker does not match. Both of its

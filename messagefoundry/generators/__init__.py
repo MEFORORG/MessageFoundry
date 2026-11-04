@@ -4,7 +4,7 @@
 
 The reference-driven machinery lives in :mod:`messagefoundry.generators._core`; each message-type
 module (``adt``, ``oru``, …) registers a spec on import, and :mod:`messagefoundry.generators.all_types`
-imports them all. The ``messagefoundry generate`` CLI is the user-facing entry point.
+imports them all. The ``messagefoundry-toolkit generate`` CLI is the user-facing entry point.
 
 Import ``all_types`` before reading the registry so every built-in type is registered::
 

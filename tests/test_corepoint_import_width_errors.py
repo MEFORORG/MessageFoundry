@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.__main__ import main
-from messagefoundry.corepoint_import import (
+from messagefoundry_toolkit.__main__ import main
+from messagefoundry_toolkit.corepoint_import import (
     Channel,
     Control,
     CorepointImportError,
@@ -21,7 +21,7 @@ from messagefoundry.corepoint_import import (
 
 # An INPUT chosen clear of CPython's parser width wall, never an assertion about where that wall
 # sits -- the measured band and why it must not be pinned are recorded once, in the width note near
-# ``_MAX_NESTING`` in messagefoundry/corepoint_import.py. If a future CPython parses this width the
+# ``_MAX_NESTING`` in messagefoundry_toolkit/corepoint_import.py. If a future CPython parses this width the
 # tests below go red rather than quiet, which is the right way round.
 _OVER_THE_WALL = 8000
 
@@ -142,7 +142,7 @@ def test_cli_reports_import_failures_on_the_right_stream(
         ) -> ImportResult:
             raise RecursionError("synthetic recursion failure")
 
-        monkeypatch.setattr("messagefoundry.corepoint_import.import_corepoint", fail_import)
+        monkeypatch.setattr("messagefoundry_toolkit.corepoint_import.import_corepoint", fail_import)
 
     args = ["import", "corepoint", str(export), "--out", str(out)]
     if failure == "write":
@@ -265,5 +265,5 @@ def test_every_uncompilable_source_class_is_refused(
     def broken(channel: Channel) -> str:
         return source
 
-    monkeypatch.setattr("messagefoundry.corepoint_import.generate_module", broken)
+    monkeypatch.setattr("messagefoundry_toolkit.corepoint_import.generate_module", broken)
     assert expected in _refusal_message(_small_export(tmp_path), tmp_path / "out")

@@ -628,14 +628,14 @@ SITES: dict[str, Site] = {
         "snapshot holds (checked a plain name, compiled under and never opened), and to an "
         "unreadable file's relative path, which only names it in a diagnostic.",
     ),
-    "messagefoundry/corepoint_import.py::_replace_modules": Site(
+    "messagefoundry_toolkit/corepoint_import.py::_replace_modules": Site(
         1, INTERNAL, "A pid temp name beside a target the importer already built."
     ),
-    "messagefoundry/corepoint_import.py::import_corepoint": Site(
+    "messagefoundry_toolkit/corepoint_import.py::import_corepoint": Site(
         1,
         GUARDED,
         "The module stem from an export's inbound name is folded through the guard (BACKLOG #1130).",
-        "messagefoundry/corepoint_import.py::_sanitize",
+        "messagefoundry_toolkit/corepoint_import.py::_sanitize",
     ),
     "messagefoundry/engine_secrets.py::SecretsDirectory._read_file": Site(
         1,
@@ -751,7 +751,7 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."
     ),
-    "messagefoundry/scaffold.py::scaffold": Site(
+    "messagefoundry_toolkit/scaffold.py::scaffold": Site(
         1, INTERNAL, "Template paths from the module's own table, under the operator's target."
     ),
     "messagefoundry/security/__init__.py::handler_semgrep_rules": Site(

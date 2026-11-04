@@ -20,8 +20,8 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.__main__ import main
-from messagefoundry.lens import (
+from messagefoundry_toolkit.__main__ import main
+from messagefoundry_toolkit.lens import (
     LensParseError,
     LensRewriteError,
     parse_module,

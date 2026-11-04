@@ -119,6 +119,12 @@ TOOLKIT_PACKAGE = "messagefoundry_toolkit"
 RETIRED_ENGINE_PATHS: tuple[tuple[str, ...], ...] = (
     # Slice 2: the advisory ADR coverage report, now messagefoundry_toolkit/adr_analyze.py.
     ("messagefoundry", "adr_analyze.py"),
+    # Slice 4: the scaffold, the Steps view and the Corepoint importer, each now under
+    # messagefoundry_toolkit/ with the same file name.
+    ("messagefoundry", "scaffold.py"),
+    ("messagefoundry", "lens.py"),
+    ("messagefoundry", "lens_schema.py"),
+    ("messagefoundry", "corepoint_import.py"),
 )
 
 

@@ -1035,6 +1035,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:ssl.create_default_context",
         }
     ),
+    # ADR 0201 slice 4: the toolkit's `impact` loads the config graph with load_config, which digests
+    # each module it loads (vault BACKLOG #2724). The toolkit computes no digest of its own.
+    "messagefoundry_toolkit/__main__.py": frozenset({"hash:via messagefoundry.config.wiring"}),
     # ADR 0197 Amendment A (N-A): provision-admin generates the first Administrator's TOTP secret
     # and checks the code read back at the terminal, through the first-party totp module (the
     # secret from the CSPRNG, the code by HMAC and a constant-time compare), before any store write.

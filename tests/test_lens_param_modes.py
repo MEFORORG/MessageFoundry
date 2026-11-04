@@ -27,7 +27,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.lens import (
+from messagefoundry_toolkit.lens import (
     CONTRACT_V1,
     CONTRACT_V2,
     MODE_DYNAMIC,

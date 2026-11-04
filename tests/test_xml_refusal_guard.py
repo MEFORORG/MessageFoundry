@@ -36,10 +36,10 @@ from messagefoundry.api import svg_sanitize
 from messagefoundry.api.svg_sanitize import SvgRejected, sanitize_if_svg
 from messagefoundry.config.models import ConnectorType, ContentType
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
-from messagefoundry.corepoint_import import CorepointImportError, parse_any
 from messagefoundry.parsing import Message, RawMessage
 from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.store import MessageStatus
+from messagefoundry_toolkit.corepoint_import import CorepointImportError, parse_any
 
 _SVG = 'xmlns="http://www.w3.org/2000/svg"'
 _SVG_LABEL = "image/svg+xml"
@@ -196,7 +196,7 @@ def test_corepoint_cli_reports_the_refusal_and_writes_nothing(
     name: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The CLI's error path: a hostile export is a clean exit 1 with no module written."""
-    from messagefoundry.__main__ import main
+    from messagefoundry_toolkit.__main__ import main
 
     export = tmp_path / "export.xml"
     export.write_text(PAYLOADS[name], encoding="utf-8")

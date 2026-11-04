@@ -32,7 +32,14 @@ from typing import Any
 from messagefoundry.console_streams import harden_console_streams
 from messagefoundry.logging_setup import configure_stderr_logging
 
-__all__ = ["Dispatch", "HelpFormatter", "argv_wants_json", "first_command", "run_cli"]
+__all__ = [
+    "Dispatch",
+    "HelpFormatter",
+    "argv_refusal_code",
+    "argv_wants_json",
+    "first_command",
+    "run_cli",
+]
 
 #: A command's top-level subcommand names, each mapped to the handler that runs it.
 Dispatch = Mapping[str, Callable[[argparse.Namespace], int]]
@@ -44,7 +51,6 @@ def run_cli(
     *,
     configures_own_logging: frozenset[str] = frozenset(),
     author_prints_keep_stdout: frozenset[str] = frozenset(),
-    floor_code: Callable[[argparse.Namespace], str | None] | None = None,
 ) -> int:
     """Run one command line: harden, install the hooks, parse, dispatch, and return the exit code.
 
@@ -55,8 +61,9 @@ def run_cli(
     subcommands that install their own redacting root handler, so this shell gives them none.
     ``author_prints_keep_stdout`` names the subcommands whose stdout is not a result, so this shell
     does not send an author's ``print()`` to stderr for them (:mod:`messagefoundry.author_output`).
-    ``floor_code`` names the ``"code"`` the JSON error floor adds for a subcommand that promises one
-    on every failure, or None for no code; the command, not this shared shell, knows which do.
+    The JSON error floor adds the ``"code"`` :func:`argv_refusal_code` names for this command line,
+    the same rule the pre-parse refusals use, so a subcommand that promises a code on every failure
+    gets it on this path too.
     """
     # Every console entry point hardens its streams first (BACKLOG #1875), and a caller's main()
     # has usually done so already. Doing it here too costs nothing, because the call is idempotent,
@@ -176,7 +183,7 @@ def run_cli(
         text = report_uncaught(exc)
         if not as_json:
             return 1
-        code = floor_code(args) if floor_code is not None else None
+        code = argv_refusal_code(sys.argv[1:] if argv is None else argv)
         return _emit_error(text, as_json=True, code=code)
 
 
@@ -204,6 +211,12 @@ class HelpFormatter(argparse.HelpFormatter):
 #: ``set_defaults``; ``lens schema`` prints JSON either way, its flag only choosing compact output.
 #: ``lens parse`` reports an error as text without its flag, so it is not here.
 _JSON_BY_DEFAULT = frozenset({("lens", "rewrite"), ("lens", "schema")})
+
+#: The ``"code"`` a refusal adds, by subcommand path: a pre-parse refusal and the JSON error floor. ``lens rewrite`` promises a
+#: code on every refusal, for the IDE to branch on (BACKLOG #237), so a pre-parse refusal of it carries
+#: the generic one. The value is the Steps-view module's ``REFUSAL_GENERIC``, which this engine module
+#: cannot import; ``tests/test_cli_surface.py`` holds the two equal.
+_CODE_BY_DEFAULT: dict[tuple[str, ...], str] = {("lens", "rewrite"): "refused"}
 
 #: Top-level options argparse answers itself, ahead of any subcommand. None takes a value. Exact
 #: spellings are enough because both commands' top-level parsers set ``allow_abbrev=False``.
@@ -240,6 +253,16 @@ def argv_wants_json(argv: Sequence[str]) -> bool:
     pre-parse refusal on either command, so a toolkit ``lens rewrite`` refused for a version mismatch
     answers the IDE the same way the engine's refusal of a moved one would."""
     return "--json" in argv or _command_path(argv)[:2] in _JSON_BY_DEFAULT
+
+
+def argv_refusal_code(argv: Sequence[str]) -> str | None:
+    """The ``"code"`` a refusal adds beside ``"error"``, or None: one made BEFORE parsing, and the
+    JSON error floor in :func:`run_cli`.
+
+    The companion of :func:`argv_wants_json`, for the one subcommand that promises a code on every
+    refusal. ``_emit_error`` writes the code only in its JSON form, and that subcommand is JSON by
+    default, so the code always reaches the consumer that branches on it."""
+    return _CODE_BY_DEFAULT.get(_command_path(argv)[:2])
 
 
 def _safe_print(line: str) -> None:

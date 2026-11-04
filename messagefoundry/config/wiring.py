@@ -6015,7 +6015,7 @@ class Registry:
             yield (
                 "config declares no connections — no inbound and no outbound connection is "
                 "declared, so this graph would receive and send nothing; declare one, or run "
-                "'messagefoundry init' to scaffold a starter config"
+                "'messagefoundry-toolkit init' to scaffold a starter config"
             )
         for conn in self.inbound.values():
             if conn.router not in self.routers:

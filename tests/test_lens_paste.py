@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.lens import LensRewriteError, parse_source, rewrite_source
+from messagefoundry_toolkit.lens import LensRewriteError, parse_source, rewrite_source
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

@@ -13,7 +13,7 @@ import ast
 
 import pytest
 
-from messagefoundry.lens import parse_source, rewrite_source
+from messagefoundry_toolkit.lens import parse_source, rewrite_source
 
 SOURCE = """\
 @handler("H")

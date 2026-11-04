@@ -125,7 +125,7 @@ class LiteralEdit:
         return self.start_line
 
     def as_dict(self) -> dict[str, object]:
-        """JSON-friendly view for the CLI (``messagefoundry impact --rename-to``)."""
+        """JSON-friendly view for the CLI (``messagefoundry-toolkit impact --rename-to``)."""
         return {
             "file": self.file,
             "line": self.start_line,

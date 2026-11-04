@@ -10,8 +10,9 @@ parses with, which is the guarantee the earlier workaround got by catching the p
 ``main()``'s own ``parse_args`` call.
 
 The table is checked against the UNION of the two parsers' rows. ADR 0201 AC-1 adds that the two
-are disjoint and that the toolkit parser registers no production row. That rule holds in every
-slice, so a slice can move some toolkit rows and not others without a hand-kept transition list.
+are disjoint and that the toolkit parser registers no production row. AC-2 binds since slice 4 moved
+the last toolkit command: the engine parser registers exactly the production rows, and the toolkit
+parser exactly the toolkit rows.
 
 All the table's rules live in one function, :func:`_table_problems`. The real test asserts it finds
 nothing. Each planted test breaks the real data one way and asserts that the same function names the
@@ -150,8 +151,54 @@ def test_the_two_commands_split_the_rows_between_them(
     test above, which reads the merged paths."""
     problems = _split_problems(engine_paths, toolkit_paths, cli_surface.CLI_TIERS)
     assert not problems, f"the engine and toolkit parsers break ADR 0201 AC-1: {problems}"
-    # Control: slice 2 moved adr-analyze, so the toolkit parser is not empty and the split is real.
+    # Control: the toolkit parser is not empty, so the split is real.
     assert "adr-analyze" in toolkit_paths and "adr-analyze" not in engine_paths
+    assert "lens rewrite" in toolkit_paths and "lens" not in engine_paths
+
+
+def test_each_command_registers_exactly_its_own_tier(
+    engine_paths: dict[str, set[str]], toolkit_paths: dict[str, set[str]]
+) -> None:
+    """ADR 0201 AC-2, strict since slice 4. AC-1 above lets a slice leave a toolkit row on the
+    engine; this does not, so a toolkit command added back to the engine goes red here."""
+    assert _tier_problems(engine_paths, toolkit_paths, cli_surface.CLI_TIERS) == []
+
+
+def test_a_toolkit_row_left_on_the_engine_is_named(
+    engine_paths: dict[str, set[str]], toolkit_paths: dict[str, set[str]]
+) -> None:
+    engine = {**engine_paths, "generate": set()}
+    toolkit = {p: c for p, c in toolkit_paths.items() if p != "generate"}
+    assert _tier_problems(engine, toolkit, cli_surface.CLI_TIERS) == [
+        "engine registers a non-production row: generate",
+        "toolkit is missing: generate",
+    ]
+
+
+def test_a_production_row_missing_from_the_engine_is_named(
+    engine_paths: dict[str, set[str]], toolkit_paths: dict[str, set[str]]
+) -> None:
+    engine = {p: c for p, c in engine_paths.items() if p != "dryrun"}
+    assert _tier_problems(engine, toolkit_paths, cli_surface.CLI_TIERS) == [
+        "engine is missing: dryrun"
+    ]
+
+
+def _tier_problems(
+    engine: Mapping[str, set[str]], toolkit: Mapping[str, set[str]], tiers: Mapping[str, Tier]
+) -> list[str]:
+    """Every way the two parsers break ADR 0201 AC-2 against ``tiers``."""
+    production = {p for p, tier in tiers.items() if tier == "production"}
+    tooling = {p for p, tier in tiers.items() if tier == "toolkit"}
+    problems = [
+        f"engine registers a non-production row: {p}" for p in sorted(set(engine) - production)
+    ]
+    problems += [f"engine is missing: {p}" for p in sorted(production - set(engine))]
+    problems += [
+        f"toolkit registers a non-toolkit row: {p}" for p in sorted(set(toolkit) - tooling)
+    ]
+    problems += [f"toolkit is missing: {p}" for p in sorted(tooling - set(toolkit))]
+    return problems
 
 
 def test_dispatch_keys_are_the_top_level_subcommands(engine_paths: dict[str, set[str]]) -> None:
@@ -363,19 +410,52 @@ def test_a_moved_command_under_json_is_refused_on_stdout_alone(
     assert "messagefoundry-toolkit adr-analyze" in payload["error"]
 
 
-def test_lens_rewrite_takes_json_mode_without_a_flag(capsys: pytest.CaptureFixture[str]) -> None:
+def test_lens_rewrite_takes_json_mode_without_a_flag(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     """``lens rewrite`` has no ``--json`` flag and answers in JSON; ``lens schema`` prints JSON with
-    or without its flag. ``lens parse`` reports an error as text without its flag. ``lens`` is still
-    registered on the engine in slice 2, so the refusal is driven directly, not through ``main()``."""
+    or without its flag. ``lens parse`` reports an error as text without its flag. Through ``main()``,
+    since slice 4 took ``lens`` off the engine."""
     for argv in (["lens", "rewrite", "x.py"], ["lens", "schema"]):
-        assert cli_module._refuse_toolkit_command("lens", argv) == 2
+        assert _run_engine(monkeypatch, argv) == 2
         captured = capsys.readouterr()
         assert captured.err == "", argv
         assert "messagefoundry-toolkit lens" in json.loads(captured.out)["error"]
     # Control: the sibling whose errors are text without --json answers as text.
-    assert cli_module._refuse_toolkit_command("lens", ["lens", "parse", "x.py"]) == 2
+    assert _run_engine(monkeypatch, ["lens", "parse", "x.py"]) == 2
     captured = capsys.readouterr()
     assert captured.out == "" and "messagefoundry-toolkit lens" in captured.err
+
+
+def test_a_refused_lens_rewrite_carries_the_code_the_ide_branches_on(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #237 promises a ``"code"`` on every ``lens rewrite`` refusal. ADR 0201 section 3 left
+    the engine's pre-parse refusal without one until slice 4 moved ``lens``; this is that slice."""
+    from messagefoundry_toolkit.lens import REFUSAL_GENERIC
+
+    assert _run_engine(monkeypatch, ["lens", "rewrite", "x.py", "--edit", "{}"]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == REFUSAL_GENERIC
+    # The engine cannot import the toolkit, so it keeps its own copy of the value; this holds them.
+    assert cli_common.argv_refusal_code(["lens", "rewrite"]) == REFUSAL_GENERIC
+    # Control: no other refusal grows a code, so a consumer of those payloads sees no new key.
+    assert _run_engine(monkeypatch, ["lens", "schema"]) == 2
+    assert set(json.loads(capsys.readouterr().out)) == {"error"}
+    assert cli_common.argv_refusal_code(["--json", "lens", "rewrite"]) == REFUSAL_GENERIC
+    assert cli_common.argv_refusal_code(["--help", "lens", "rewrite"]) is None
+
+
+def test_the_engine_description_gives_no_toolkit_command_as_an_example() -> None:
+    """ADR 0201 section 3: the engine's ``--help`` must stop presenting the authoring commands. The
+    relsmoke row check reads the parser, not this prose, so this test is what covers it."""
+    parser, _dispatch = cli_module._build_parser()
+    description = parser.description or ""
+    toolkit_rows = sorted(row for row, tier in cli_surface.CLI_TIERS.items() if tier == "toolkit")
+    shown = [row for row in toolkit_rows if f"messagefoundry {row}" in description]
+    assert shown == [], f"the engine's description gives toolkit rows as examples: {shown}"
+    # Control: the description does give production rows as examples, so the search is live.
+    assert "messagefoundry validate" in description
 
 
 @pytest.mark.parametrize("builder", ["engine", "toolkit"])
@@ -413,9 +493,9 @@ def test_help_or_version_before_a_moved_command_still_answers(
 
 
 def test_only_a_toolkit_row_the_engine_does_not_register_is_refused() -> None:
-    assert cli_module._moved_toolkit_commands() == {"adr-analyze"}
-    # Still registered on the engine in slice 2, so the engine runs it rather than refusing it.
-    assert cli_module._moved_toolkit_command(["generate", "--type", "ADT"]) is None
+    # Since slice 4, every top-level toolkit row. A child row is reached through its group.
+    assert cli_module._moved_toolkit_commands() == {row for row in _RULED_TOOLKIT if " " not in row}
+    assert cli_module._moved_toolkit_command(["generate", "--type", "ADT"]) == "generate"
     # A production command is never refused, and an option before the command is skipped.
     assert cli_module._moved_toolkit_command(["--version"]) is None
     assert cli_module._moved_toolkit_command(["serve", "adr-analyze"]) is None

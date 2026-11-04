@@ -40,7 +40,7 @@ line); at :data:`CONTRACT_V2` the partition is extended over that trailing comme
 as a ``note`` row instead of vanishing (Amendment A §A.3 defect 1).
 
 The engine owns the grammar so it lives beside the vocabulary; the IDE consumes the JSON contract
-only (``messagefoundry lens parse <module.py> --json``). This module adds **no runtime dependency** —
+only (``messagefoundry-toolkit lens parse <module.py> --json``). This module adds **no runtime dependency** —
 stdlib ``ast`` only.
 """
 

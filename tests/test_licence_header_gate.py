@@ -12,7 +12,7 @@ The classes are deliberately four, not two. "Missing" and "wrong value" are the 
 the other two are the ways a header can be PRESENT and still not be a header, and both would make the
 gate pass a file it should fail:
 
-  * a string LITERAL containing the tag -- ``messagefoundry/corepoint_import.py`` really does carry
+  * a string LITERAL containing the tag -- ``messagefoundry_toolkit/corepoint_import.py`` really does carry
     ``"# SPDX-License-Identifier: AGPL-3.0-or-later",`` because it generates headers for imported
     configuration, so a substring check reads a header-EMITTING file as a headered one;
   * a correct tag BURIED past the head window, which a whole-file grep accepts.
@@ -483,7 +483,7 @@ def test_the_scan_finds_exactly_the_real_templates_and_not_the_prose(
     found = {name for name in _MOD.tracked_files() if _MOD.template_sites(Path(name))}
 
     assert found == {
-        "messagefoundry/corepoint_import.py",
+        "messagefoundry_toolkit/corepoint_import.py",
         "harness/config/connscale/gen_toml.py",
         "harness/load/connscale/stepconfig.py",
     }, f"the template scan drifted: {sorted(found)}"
