@@ -6251,8 +6251,10 @@ class RegistryRunner:
 
         Abandonment is safe for those four. It is NOT safe for DICOM, which releases its port inside
         ``await to_thread(server.shutdown)`` — an abandoned DICOM stop can still hold the port at
-        re-promotion. File/RemoteFile/Database/Timer only set an Event, but each is leader-gated and
-        parks on that Event, so an abandoned one finishes at most its single in-flight scan.
+        re-promotion. File/RemoteFile/Database/Timer set an Event, and each is leader-gated and
+        parks on that Event, so an abandoned one finishes at most its single in-flight scan. File,
+        RemoteFile and Database then cancel a poll task still outside a store call after their own
+        grace (BACKLOG #1620, #4685), so that scan's blocked external call is cut, not waited on.
 
         The bound is applied HERE, at the call site — never by editing a transport constant, which would
         make ``transports/`` know about clustering (the one-way dependency rule).
@@ -6361,11 +6363,11 @@ class RegistryRunner:
         start/stop/restart and every ``/connections`` handler also take. An unbounded join would
         therefore wedge engine shutdown, and the reload, re-promotion and connection API calls
         queued behind its lock, for as long as a wedged
-        File/Database ``stop()`` runs. (Database waits on its poll task with no timeout of its own;
-        once cancelled, it lets a row's hand-off and mark run for a bounded grace, which a
-        non-leader skips, then cuts the task and bounds both the join and the pool close. File now
-        cancels a poll task blocked on a share call after a grace, BACKLOG #1620, but still waits
-        without a bound while that task is inside a store call.)
+        File/Database/RemoteFile ``stop()`` runs. (File, BACKLOG #1620, and Database and
+        RemoteFile, BACKLOG #4685, cut a poll task blocked on an external call after a grace, but still wait without a bound while
+        that task is inside a store call. Once cancelled, Database lets a row's hand-off and mark
+        run for a bounded grace, which a non-leader skips, then cuts the task and bounds both the
+        join and the pool close.)
 
         On timeout we cancel and proceed: a failed rebind is isolated per connection (ADR 0031,
         operator-recoverable), whereas refusing to re-promote strands the whole graph — and
