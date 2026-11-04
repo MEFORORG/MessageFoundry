@@ -1870,8 +1870,8 @@ An **outbound** SQL connector ([ADR 0003](adr/0003-non-hl7-transports-database-r
 - **`dialect="sqlserver"`** (default) — the **SQL Server preset** over the Microsoft ODBC Driver 18.
   **Status: production / supported** — the live aioodbc round-trip is exercised by the CI SQL Server
   service-container job.
-- **`dialect="generic"`** — a **generic ODBC path** for another ODBC-reachable database (PostgreSQL,
-  MySQL, …). No new Python dependency: you install the target's **ODBC driver at the OS level**
+- **`dialect="generic"`** — a **generic ODBC path** for a database whose ODBC driver reads `SERVER`
+  as its target (PostgreSQL, MySQL, …). No new Python dependency: you install the target's **ODBC driver at the OS level**
   and name it in `odbc_driver`; see [*Generic ODBC*](#generic-odbc-postgresql--mysql) below.
 
 **Host precondition for the SQL Server ODBC hops** (at least this connector, `DatabasePoll(...)`,
@@ -1942,7 +1942,9 @@ outbound(
 
 #### Generic ODBC (PostgreSQL / MySQL)
 
-`dialect="generic"` (#66) targets **any ODBC-reachable database** without a new Python dependency: the
+`dialect="generic"` (#66) targets **a database whose ODBC driver reads `SERVER` as its target**
+(see [*Accepted `odbc_params` keywords*](#accepted-odbc_params-keywords), which says what the
+engine reports for a driver it cannot place) without a new Python dependency: the
 connector still rides the already-present `aioodbc` driver — you install the *target's* **ODBC driver at
 the OS level** (e.g. psqlODBC, MySQL Connector/ODBC) and name it in
 `odbc_driver`. The parameterized-`:name` binding, error classification and pooling are identical to
@@ -2147,9 +2149,25 @@ these kinds:
 
 Two limits follow from this:
 
-- **A driver may take its target under another keyword, and the engine does not detect that.** The
-  engine sends the target as `SERVER` and nothing else. Oracle's ODBC driver documents `DBQ` for its
-  target, and `DBQ` is refused. Whether that driver also reads `SERVER` has not been tested.
+- **A driver may take its target under another keyword.** The engine sends the target as `SERVER`
+  and nothing else, and at least `[egress].allowed_db` and the cleartext-hop guard's on-box test
+  read the host in `server`. A driver that takes its target from another keyword dials a host
+  neither judged, so neither binds that hop: a `server` of `127.0.0.1` passes the on-box test
+  while such a driver dials elsewhere. Oracle's ODBC driver documents `DBQ` for its target, and
+  `DBQ` is refused. Whether that driver also reads `SERVER` has not been tested. The engine cannot see which keyword
+  a driver reads. It places three families documented to read `SERVER`, by the registered names
+  [*The `SSLmode` spelling*](#the-sslmode-spelling) lists: psqlODBC, MySQL Connector/ODBC and
+  Microsoft's `ODBC Driver <n> for SQL Server`. In the 2026-10-30 probes under BACKLOG #2705,
+  psqlODBC 18.00.0005 connected, and MySQL Connector/ODBC was run, through engine-built strings
+  that name the host only in `SERVER`, which is consistent with that. No run was designed to test
+  whether `SERVER` is read, and Microsoft's driver was not run. A placed family is the
+  documentation's claim, not proof that either check binds the address the driver dials. For
+  any other `odbc_driver` name, building the connection logs a WARNING naming the connection,
+  not the driver, and `messagefoundry check`'s advisory `generic-db-server` line lists the connection with its `server` (BACKLOG #5163). Neither refuses
+  the connection. To clear it, name psqlODBC or MySQL Connector/ODBC by its registered name, or
+  reach that database another way than the generic dialect. For SQL Server that is
+  `dialect="sqlserver"` with Microsoft's driver, since on the generic dialect Microsoft's driver
+  ignores `PORT`.
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
   libpq still reads its CA from its default location or from the `PGSSLROOTCERT` environment

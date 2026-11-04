@@ -290,6 +290,7 @@ def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_pat
     for name in (
         "tls-allow-expired",
         "generic-db-tls",
+        "generic-db-server",
         "tls-revocation-attested",
         "fhir-update-path-form",
         "tls-check-hostname",

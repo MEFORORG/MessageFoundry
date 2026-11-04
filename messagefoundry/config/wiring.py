@@ -219,8 +219,10 @@ __all__ = [
     "query_credential_hops",
     "revocation_attested_hops",
     "unverified_generic_db_hops",
+    "server_unread_generic_db_hops",
     "POSSIBLY_GENERIC_DB_HOP",
     "UNRESOLVED_DRIVER_REASON",
+    "UNRESOLVED_SERVER_DRIVER_REASON",
     "overbroad_smart_scopes",
     "OAuthRequestAdvisories",
     "oauth_request_advisories",
@@ -4466,10 +4468,12 @@ def Database(
     """A SQL database endpoint (**outbound only** today; via the ``[sqlserver]`` extra's ``aioodbc``).
 
     ``dialect='sqlserver'`` (default) is the **production / supported** SQL Server preset over ODBC Driver
-    18. ``dialect='generic'`` (#66) targets any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL): name
-    it in ``odbc_driver`` and pass driver-specific keywords (``PORT``, ``SSLmode``, …) via ``odbc_params``;
-    credentials stay in ``username``/``password`` (emitted under ``odbc_user_key``/``odbc_password_key`` —
-    default ``UID``/``PWD``). **On the generic path configure TLS via the driver's own keyword** (e.g.
+    18. ``dialect='generic'`` (#66) targets an OS-installed ODBC driver that reads ``SERVER`` as its
+    target (PostgreSQL / MySQL; docs/CONNECTIONS.md, *Accepted odbc_params keywords*, says what is
+    reported for a driver the engine cannot place): name it in ``odbc_driver`` and pass
+    driver-specific keywords (``PORT``, ``SSLmode``, …) via ``odbc_params``; credentials stay in
+    ``username``/``password`` (emitted under ``odbc_user_key``/``odbc_password_key`` — default
+    ``UID``/``PWD``). **On the generic path configure TLS via the driver's own keyword** (e.g.
     ``odbc_driver="PostgreSQL Unicode", odbc_params={"SSLmode": "verify-full"}``; ``odbc_driver``
     defaults to Microsoft's driver, which refuses ``SSLmode``) — the SQL-Server weakened-TLS refusal
     does not apply there.
@@ -4581,9 +4585,9 @@ def DatabasePoll(
     ``mark_statement`` to take a handled row out of ``poll_statement``'s predicate, which is the shape
     this connector already requires. Pass None/0 for the unbounded fetch.
 
-    ``dialect='generic'`` (#66) polls any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL) — name it
-    in ``odbc_driver``, pass driver keywords via ``odbc_params``, and configure TLS through the driver's own
-    keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
+    ``dialect='generic'`` (#66) polls through an OS-installed ODBC driver that reads ``SERVER`` as its
+    target (PostgreSQL / MySQL; as for ``Database``) — name it in ``odbc_driver``, pass driver
+    keywords via ``odbc_params``, and configure TLS through the driver's own keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
     ``username``/``password`` (under ``odbc_user_key``/``odbc_password_key``, default ``UID``/``PWD``).
 
     At least a ``poll_statement`` of a writing shape is refused: a literal one here, when declared
@@ -6986,6 +6990,11 @@ POSSIBLY_GENERIC_DB_HOP = "possibly generic: dialect is an unresolved env() refe
 #: set (BACKLOG #5053). Where none would, the hop gets the reason every family gives instead.
 UNRESOLVED_DRIVER_REASON = "possibly delegated: odbc_driver is an unresolved env() reference"
 
+#: Opens the reason :func:`server_unread_generic_db_hops` gives when ``odbc_driver`` is an
+#: ``env()`` reference it cannot resolve, so whether the driver reads ``SERVER`` is unknown
+#: (BACKLOG #5163).
+UNRESOLVED_SERVER_DRIVER_REASON = "possibly unread: odbc_driver is an unresolved env() reference"
+
 
 #: What :func:`_db_setting` returns for an ``env()`` reference it cannot resolve.
 _UNRESOLVED = object()
@@ -7129,6 +7138,70 @@ def unverified_generic_db_hops(
                 out.append(
                     (record_name(conn.name), f"{reason} ({_peer_label(conn.spec.settings)})")
                 )
+    return sorted(out)
+
+
+def server_unread_generic_db_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
+    """The generic-ODBC ``DATABASE`` connections whose ``odbc_driver`` the engine cannot place as
+    a family documented to read ``SERVER`` as its target, as ``(name, reason)`` (BACKLOG #5163).
+
+    What that costs ``[egress].allowed_db`` is stated once, in docs/CONNECTIONS.md, *Accepted
+    odbc_params keywords*. The construction WARNING
+    (``transports.database._warn_generic_server_unread``) is this list's other surface, and both
+    read :func:`~messagefoundry.transports.database.odbc_driver_reads_server`, imported lazily for
+    the one-way rule. Listed is not a finding that the driver ignores ``SERVER``, only that the
+    engine cannot place it; refusing such a name is BACKLOG #5041, not this.
+
+    Read as :func:`unverified_generic_db_hops` reads the graph: both connection tables, inbound
+    names prefixed ``inbound:``; an ``env()`` dialect resolved against ``env_values`` when given and
+    otherwise read as possibly generic; a ``deployed=False`` connection with an ``env()`` dialect
+    skipped (ADR 0111 AC-1). An ``env()`` ``odbc_driver`` is resolved as that function resolves
+    it, never on a ``deployed=False`` connection, and one left unresolved is listed as possibly
+    unread, naming the reference's key and never its value. ``registry.lookups`` is not walked, for
+    the reason that function gives: ``DatabaseLookup`` and ``DatabaseRef`` take no dialect.
+
+    Pure -- it reads the loaded graph and touches nothing else."""
+    from messagefoundry.transports.database import SERVER_UNREAD_REASON, odbc_driver_reads_server
+
+    def unread(settings: Mapping[str, Any], *, deployed: bool) -> str | None:
+        dialect = _db_dialect(settings, env_values)
+        if dialect is not None and dialect != "generic":
+            return None
+        raw_driver = settings.get("odbc_driver")
+        # ADR 0111 AC-1: a not-deployed connection's env() values are never resolved, so its
+        # env() driver stays unread and is listed as such, as unverified_generic_db_hops lists it.
+        driver = _db_setting(settings, "odbc_driver", None, env_values if deployed else None)
+        # Only an env() reference resolves to _UNRESOLVED, so raw_driver has a key to name.
+        if driver is _UNRESOLVED and isinstance(raw_driver, EnvRef):
+            reason = (
+                f"{UNRESOLVED_SERVER_DRIVER_REASON} (env({raw_driver.key})); if it names no "
+                "driver family documented to read SERVER, the host checks on server may not bind"
+            )
+        elif odbc_driver_reads_server(driver):
+            return None
+        else:
+            reason = SERVER_UNREAD_REASON
+        if dialect is not None:
+            return reason
+        key = settings["dialect"].key
+        return f"{POSSIBLY_GENERIC_DB_HOP} (env({key})); if it is generic, {reason}"
+
+    out: list[tuple[str, str]] = []
+    for record_name, table in (
+        (_outbound_record_name, registry.outbound),
+        (inbound_record_name, registry.inbound),
+    ):
+        for conn in table.values():
+            if conn.spec.type is not ConnectorType.DATABASE or _dark_env_dialect(conn):
+                continue
+            reason = unread(conn.spec.settings, deployed=conn.deployed)
+            if reason is not None:
+                # The server alone: the generic string never sends the ``port`` setting, so the
+                # label must not print its 1433 default as the endpoint.
+                peer = _peer_label({"server": conn.spec.settings.get("server")})
+                out.append((record_name(conn.name), f"{reason} ({peer})"))
     return sorted(out)
 
 
