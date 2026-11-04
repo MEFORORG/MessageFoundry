@@ -771,9 +771,12 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
     :func:`build_strict_opener` puts this on every opener it builds, in place of the stock class.
 
     **It also refuses a request that would send a web-proxy credential to a proxy in cleartext**
-    (vault BACKLOG #2572, #3410, #3416). On a TLS leg that fully verifies the proxy it does not
-    raise: it marks the request, and the strict https handler raises before it dials (vault
-    BACKLOG #4909), so the two handlers hold that refusal together.
+    (vault BACKLOG #2572, #3410, #3416). On the TLS leg, an ``http`` target to an ``https://``
+    proxy, it does not raise for a credential from a proxy URL or a plain header no connection
+    admitted: it marks the request, whatever its TLS context, and the strict https handler raises
+    before it dials. There a context that does not fully verify the proxy is refused first, in
+    the unverified-TLS text (vault BACKLOG #3418), and one that does is refused in the TLS leg's
+    own text (vault BACKLOG #4909), so the two handlers hold that refusal together.
     :class:`ProxyCredentialsRefusedError` states the rule.
     The check is made here, per request and per proxy, because this method sees every proxy a
     request is handed to, from every source: the environment, the system settings, and a
@@ -879,7 +882,10 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     on decision d20261031T213402506-5d928c; the caller-set half is the proposed scope that row
     records, not yet ruled. So on an opener :func:`build_strict_opener` makes, a credential from
     a proxy URL, the environment or the system proxy settings is refused on every leg its proxy
-    handler judges, and so is a caller-set header no connection admitted. The requests-based
+    handler judges, and so is a caller-set header no connection admitted, with at least one
+    exception: a target urllib's own bypass list names. The proxy handler lets that request
+    through, and urllib sends it direct, past every proxy, so it adds no credential from a proxy
+    URL; a header already on it is left to the direct refusal above. The requests-based
     Vault hop is not such an opener; ``docs/CONFIGURATION.md`` says what it would still send. The
     proxy handler judges the leg, and the strict https handler raises the refusal before it dials,
     once the request is still bound for the proxy over TLS. That way a request urllib hands back
