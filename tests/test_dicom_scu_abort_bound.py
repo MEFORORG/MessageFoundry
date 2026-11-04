@@ -239,6 +239,42 @@ async def test_an_answered_store_starts_the_count_again(
     assert scu._unanswered == {}
 
 
+class _ResetMidStore:
+    """An established association whose C-STORE raises, as a transport error pynetdicom passes up
+    rather than turning into an empty status would."""
+
+    is_established = True
+
+    def send_c_store(self, dataset: object) -> object:
+        raise ConnectionResetError("reset mid-store")
+
+    def release(self) -> None:
+        pass
+
+
+async def test_an_error_raised_mid_store_counts_toward_the_same_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _needs_dicom()
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    monkeypatch.setattr(dicom_module, "_ENGINE_SCP_ABORT_PAST_BYTES", len(data) - 1)
+    scu = _uncapped_scu(1, "PACS_SCP")
+    monkeypatch.setattr(scu, "_associate", lambda ae: _ResetMidStore())
+    limit = dicom_module._MAX_UNANSWERED_SENDS_OVER_CEILING
+    raised: list[DeliveryError] = []
+    for _ in range(limit):
+        with pytest.raises(DeliveryError) as caught:
+            await scu.send(_carry(data))
+        raised.append(caught.value)
+    assert [isinstance(exc, NegativeAckError) for exc in raised] == [False] * (limit - 1) + [True]
+    final = raised[-1]
+    assert isinstance(final, NegativeAckError) and final.code == "unanswered-over-ceiling"
+    # The final refusal names the transport error as its cause.
+    assert isinstance(final.__cause__, ConnectionResetError)
+
+
 def test_each_object_keeps_its_own_count_and_one_at_the_ceiling_is_never_counted() -> None:
     scu = _scu_from({"ae_title": "MEFOR_SCU", "host": "127.0.0.1", "max_object_bytes": None})
     size = dicom_module._ENGINE_SCP_ABORT_PAST_BYTES + 1

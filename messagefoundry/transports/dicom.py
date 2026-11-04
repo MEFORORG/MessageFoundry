@@ -1605,9 +1605,9 @@ class DicomScpSource(SourceConnector):
         self._ae: Any = None
         self._server: Any = None
         # BACKLOG #1962: say so when an operator's own setting is clamped. It runs after the last
-        # refusal above, so a connection that never builds logs nothing about its limits. An explicit
-        # 128 MiB cannot be told from the shipped default, which is what an SCP left unset reads. It
-        # stays silent, because a warning on every default SCP would teach operators to ignore this.
+        # refusal above, so a connection that never builds logs nothing about its limits. It stays
+        # silent on 128 MiB, the shipped default an SCP left unset reads, whether or not it was also
+        # set explicitly, because a warning on every default SCP would teach operators to ignore it.
         if configured != self._max_object_bytes and configured != DEFAULT_MAX_OBJECT_BYTES:
             logger.warning(
                 "DICOM server (SCP) %r: max_object_bytes %s is above the engine's binary ingress ceiling of "

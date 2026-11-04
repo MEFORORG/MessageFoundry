@@ -4019,8 +4019,9 @@ def Direct(
 
 #: ``DICOM(max_object_bytes=...)`` left unset. One factory builds both roles and each has its own
 #: default (``transports/dicom.py``; vault BACKLOG #4908), so the factory writes no value it was not
-#: given. Typed ``Any`` so that the parameter's annotation stays ``int | None``, the one the
-#: connections.toml type check and the GUI schema read. Not ``_UNSET``, which is ``env()``'s.
+#: given. Typed ``Any`` so that the parameter's annotation stays ``int | None``, which is what an
+#: author may pass. DICOM is not a connections.toml transport today, so no file reads this default.
+#: Not ``_UNSET``, which is ``env()``'s.
 _ROLE_DEFAULT: Any = object()
 
 

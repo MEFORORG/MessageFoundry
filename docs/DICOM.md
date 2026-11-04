@@ -227,7 +227,7 @@ association runs **off the loop**; the C-STORE status is classified onto the eng
 - **Success** (`0x0000`) / **Warning** (`0xB0xx`, stored with a caveat) → delivered.
 - **Out of Resources** (`0xA7xx`) or an association/transport failure → **transient** `DeliveryError` (retried).
   One bound: an object over 32 MiB whose store ends with no response three times in a row is **permanent**
-  (vault BACKLOG #4908, section 3 above).
+  (vault BACKLOG #4908; the inbound SCP subsection above says why).
 - A **rejected presentation context**, an **unencodable dataset**, or any **hard refusal** (Cannot Understand,
   dataset-mismatch, Not Authorized, SOP-class-unsupported) → **permanent** `NegativeAckError` → dead-letter
   (a deterministic failure never head-blocks the FIFO lane).
