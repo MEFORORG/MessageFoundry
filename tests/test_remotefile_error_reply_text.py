@@ -324,6 +324,32 @@ def test_an_unreadable_reply_fails_transient_by_its_type(
     assert MRN not in _traceback(caught.value)
 
 
+#: A digit run longer than Python's integer-string limit, which ``int()`` refuses with a
+#: ``ValueError``.
+_TOO_LONG = "9" * 5000
+
+#: The other ``ftplib`` frames that read a number from a reply, each given one it cannot read.
+_TOO_LONG_NUMBERS: dict[str, Callable[[], BaseException]] = {
+    "pasv-port": lambda: _raised(
+        lambda: ftplib.parse227(f"227 Entering Passive Mode (192,0,2,1,{_TOO_LONG},1)")
+    ),
+    "150-byte-count": lambda: _raised(
+        lambda: ftplib.parse150(f"150 Opening data connection ({_TOO_LONG} bytes)")
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_TOO_LONG_NUMBERS))
+def test_a_reply_number_too_long_to_read_fails_transient(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    error = _TOO_LONG_NUMBERS[case]()
+    with pytest.raises(_RemoteError) as caught:
+        _ftp_client(_UnreadableFtp(error), monkeypatch).list_entries("/in")
+    assert str(caught.value) == "FTP operation failed: ValueError"
+    assert caught.value.permanent is False
+
+
 class _JunkSizeMlsd(_ScriptedFtp):
     """An ``MLSD`` listing one file whose ``size`` fact is a path, not a number."""
 

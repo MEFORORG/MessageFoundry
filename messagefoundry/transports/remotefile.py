@@ -305,8 +305,8 @@ def _unreadable_reply(exc: ValueError) -> bool:
 
     - A ``UnicodeDecodeError``: a session decodes only what the server sent, so the reply is not
       UTF-8.
-    - A plain ``ValueError`` raised in a frame of :data:`_REPLY_PARSERS`: a ``SIZE`` or an ``MLSD``
-      size, or an ``EPSV`` port, that is no number.
+    - A plain ``ValueError`` raised in a frame of :data:`_REPLY_PARSERS`: a number in a reply,
+      such as a ``SIZE`` or an ``EPSV`` port, that is no number or is too long to read.
 
     Anything else is not, and escapes as itself: at least ``ftplib``'s refusal of a CR or LF in a
     command, raised before the command is sent, an encode error for text the session cannot send,
@@ -1368,13 +1368,20 @@ class _FtpClient(_RemoteClient):
         raise fault
 
 
-#: The frames whose own ``ValueError`` is a reply value that is no number, for
-#: :func:`_unreadable_reply`: ``ftplib``'s ``SIZE`` and ``EPSV`` parsers, and
+#: The frames whose own ``ValueError`` is a reply value that is no number, or a number longer than
+#: Python's integer-string limit, for :func:`_unreadable_reply`: each ``ftplib`` frame that reads a
+#: number from a reply (``SIZE``, the ``150`` byte count, and the ``PASV`` and ``EPSV`` ports), and
 #: :meth:`_FtpClient._list`'s read of an ``MLSD`` size. Matched as the innermost frame, so a
 #: ``ValueError`` from a call they make, such as ``ftplib``'s refusal of a CR or LF in the ``SIZE``
 #: command, is not one of theirs.
 _REPLY_PARSERS = frozenset(
-    {ftplib.FTP.size.__code__, ftplib.parse229.__code__, _FtpClient._list.__code__}
+    {
+        ftplib.FTP.size.__code__,
+        ftplib.parse150.__code__,
+        ftplib.parse227.__code__,
+        ftplib.parse229.__code__,
+        _FtpClient._list.__code__,
+    }
 )
 
 
