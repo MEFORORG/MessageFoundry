@@ -255,6 +255,9 @@ _CROSS_ORIGIN_FETCH = frozenset({"cross-site", "same-site"})
 #: The ``Sec-Fetch-Site`` values a /ui WRITE is accepted with (:func:`assert_same_origin`): the
 #: browser calls the request same-origin, or user-initiated (``none``). A GET is not held to this.
 _SAME_ORIGIN_FETCH = frozenset({"same-origin", "none"})
+#: The four ``Sec-Fetch-Site`` values the Fetch Metadata standard defines. On a GET only these
+#: settle :func:`assert_same_origin`; any other value counts as absent there (B291-R1).
+_KNOWN_FETCH_SITE = _CROSS_ORIGIN_FETCH | _SAME_ORIGIN_FETCH
 #: The refusal for a request whose ``Sec-Fetch-Site`` lines disagree. Shared with
 #: :class:`._security.UiFetchMetadataMiddleware`, which gives the same answer to the same request.
 _CONFLICTING_FETCH_SITE = "conflicting Sec-Fetch-Site lines rejected"
@@ -794,10 +797,14 @@ def assert_same_origin(request: Request) -> None:
     GET     absent                   absent or empty  accept
     GET     absent                   matches          accept
     GET     absent                   does not match   refuse
-    GET     empty                    any              accept
+    GET     empty                    absent or empty  accept
+    GET     empty                    matches          accept
+    GET     empty                    does not match   refuse
     GET     cross-site or same-site  any              refuse
     GET     same-origin or none      any              accept
-    GET     any other value          any              accept
+    GET     any other value          absent or empty  accept
+    GET     any other value          matches          accept
+    GET     any other value          does not match   refuse
     ======  =======================  ===============  =======
 
     The write rows fail closed where the request names no provenance this code recognises
@@ -807,18 +814,26 @@ def assert_same_origin(request: Request) -> None:
     POST. That is an assumption about the browser, and nothing told the operator when it did not
     hold. No shipped first-party client posts to ``/ui`` without a browser.
 
-    **The GET rows are the rule a GET had before that change, and must stay.** At least one GET
-    reaches this check: ``GET /ui/oidc/start`` when its interstitial is skipped, a sign-in
-    navigation. Owner rulings R4 and R4b of 2026-09-28 hold that a sign-in GET is never blocked for
-    missing fetch metadata.
+    **A GET is settled by ``Sec-Fetch-Site`` only for the four named values.** An empty line, or
+    any other value, names no provenance this code recognises, so it counts as absent and the
+    ``Origin`` decides: a GET carrying one beside a foreign ``Origin`` is refused. That covers an
+    intermediary that folds two lines into one comma-joined value, which is an "other value".
+    B291-R1 of the vault file ``OWNER-RULINGS-2026-10-17-BATCH291.md`` ruled this (vault BACKLOG
+    #3316). Before it, any present line settled a GET, and ``Origin`` was never read.
+
+    **A GET that carries neither header is accepted, and must stay so.** At least one GET reaches
+    this check: ``GET /ui/oidc/start`` when its interstitial is skipped, a sign-in navigation.
+    Owner rulings R4 and R4b of 2026-09-28 hold that a sign-in GET is never blocked for missing
+    fetch metadata.
     """
     # "GET" and nothing wider, to match require_ui's own definition of a write.
     write = request.method != "GET"
     site = _sec_fetch_site(request)
     # Whether the Sec-Fetch-Site line decides the request, so Origin is never read. On a write an
-    # EMPTY line names no provenance, so it is absence, as an empty Origin is below. On a GET any
-    # present line decides, empty included: the pre-#1116 rule, unchanged.
-    settled_by_site = bool(site) if write else site is not None
+    # EMPTY line names no provenance, so it is absence, as an empty Origin is below; any other
+    # non-empty value is refused just after. On a GET only the four named values decide; an empty
+    # or unknown one is absence, so Origin decides (B291-R1).
+    settled_by_site = bool(site) if write else site in _KNOWN_FETCH_SITE
     if settled_by_site:
         # assert_not_cross_site's test, on the value already read.
         if site in _CROSS_ORIGIN_FETCH:

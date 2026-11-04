@@ -796,12 +796,17 @@ from typing import Any
 #: ``ConfigWriteNotRecorded`` for ``ConnectionFlagNotRecorded``, because the audit refusal that
 #: #3811 typed went with the config write.
 #:
+#: Vault BACKLOG #3316, B291-R1 of the vault file ``OWNER-RULINGS-2026-10-17-BATCH291.md``: on a
+#: GET, ``assert_same_origin`` now treats an empty or unknown ``Sec-Fetch-Site`` as absent, so the
+#: ``Origin`` decides, and ``_auth.py`` gained ``_KNOWN_FETCH_SITE``. That function is a hashed gate
+#: helper (BACKLOG #2709), so the digest moved from ``1a399261c0bf7e2b``; no engine field changed.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "1a399261c0bf7e2b"
+ENGINE_UI_SEAM: str = "866e61ec0722c342"
 
 
 @dataclass(frozen=True, slots=True)

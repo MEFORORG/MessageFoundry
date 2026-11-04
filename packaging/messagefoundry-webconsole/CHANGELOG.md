@@ -69,6 +69,14 @@ this line.**
 
 ### Security
 
+- **A `/ui` GET whose `Sec-Fetch-Site` is empty or unknown is judged by its `Origin`.** Such a
+  value now counts as absent on a GET, so a foreign `Origin` beside it is refused with a `403`.
+  Before, any present value settled a GET and `Origin` was never read. A value an intermediary
+  folded from two lines into one is an unknown value. A GET with neither header still passes, so
+  the sign-in GETs are unchanged, and a browser sends one of the four named values, so no browser
+  request changes. The rule is the table in the `assert_same_origin` docstring. Seam only: that
+  function is hashed into the seam, so the supported digest moved. (B291-R1 of the vault file
+  `OWNER-RULINGS-2026-10-17-BATCH291.md`, vault BACKLOG #3316)
 - **An IPv4 entry that is not one host's address covers nothing.** Engine settings refuse such an
   entry at load: at least all of `0.0.0.0/8`, a multicast address and the reserved class E range.
   The console matched one that reached it another way, so a URL to that address skipped the
