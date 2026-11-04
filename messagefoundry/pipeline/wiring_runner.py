@@ -8608,9 +8608,10 @@ class RegistryRunner:
                     # A document's own value, which the splice would escape, not a marker.
                     nak_code, nak_text = "AR", "OBX-5.5 document holds a delimiter or control"
                 elif isinstance(exc, UnreadableDelimitersError):
-                    # The header, not a document: no OBX-5.5 of this body can be read. No comma:
-                    # the ACK echoes a sender's own delimiters, and a comma is a plausible one.
-                    nak_code, nak_text = "AR", "no MSH or MSH-2 shorter than four characters"
+                    # The header, not a document: no OBX-5.5 of this body can be read. Only a
+                    # short MSH-2 reaches here, since the listener's parse refuses a body with no
+                    # MSH.
+                    nak_code, nak_text = "AR", "MSH-2 shorter than four characters"
                 elif isinstance(exc, Base64DelimiterError):
                     # Checked before its base class: the body's delimiters, not a marker.
                     nak_code, nak_text = "AR", "document under base64 delimiters"
@@ -9175,9 +9176,9 @@ class RegistryRunner:
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
         except UnreattachableDocumentError as exc:
-            # Only failures the MESSAGE causes, at least: the payload does not parse as HL7, or its
-            # separators cannot be read: no MSH, or an MSH-2 shorter than four characters (vault
-            # BACKLOG #2809), or a handle is
+            # Only failures the MESSAGE causes, at least: the payload does not parse as HL7, or it
+            # holds the raw marker and its separators cannot be read: no MSH, or an MSH-2 shorter
+            # than four characters (vault BACKLOG #2809), or a handle is
             # malformed, names an attachment its message does not hold, or sits outside the
             # splice, or the splice would escape a character of its stored value (BACKLOG #5099).
             # The same payload fails the same way on every attempt, so a retry could never succeed:

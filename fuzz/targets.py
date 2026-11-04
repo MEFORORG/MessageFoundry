@@ -297,8 +297,9 @@ KNOWN_FINDINGS: tuple[KnownFinding, ...] = (
             "Message.parse accepts it, so the two HL7 parsers disagree about it. On first "
             "deployment a Handler that parsed such a body with Message.parse and called "
             "extract_obx_document would get a bare ValueError, not the BinaryCarriageError that "
-            "function documents. strip_documents is not affected: it takes its HL7 path only for "
-            "an MSH-led body."
+            "function documents. strip_documents is not affected: it returns a body with no MSH "
+            "unchanged, including one that passes its 'MSH' in the first eight characters gate "
+            "(BACKLOG #5099)."
         ),
         discriminator=(
             "the exception is a bare ValueError whose message starts 'cannot determine HL7 "

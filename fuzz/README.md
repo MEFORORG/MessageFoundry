@@ -276,7 +276,8 @@ consequences differ:
 * **An FHS- or BHS-led body with no MSH.** `Peek.parse` refuses it but `Message.parse` accepts it,
   and `extract_obx_document` then raises. A Handler that parsed such a body
   with `Message.parse` would get a bare `ValueError` from `extract_obx_document` on first deployment,
-  not the `BinaryCarriageError` that function documents. `strip_documents` is not affected.
+  not the `BinaryCarriageError` that function documents. `strip_documents` is not affected: it
+  returns a body with no MSH unchanged (BACKLOG #5099).
 
 On either shape `iter_obx_documents` no longer lets the bare `ValueError` out: a body with an OBX
 and no MSH, or an MSH-2 shorter than four characters, is its named refusal, `UnreadableDelimitersError`, a

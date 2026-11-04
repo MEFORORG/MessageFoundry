@@ -1781,6 +1781,10 @@ def test_the_retention_strip_skips_a_body_whose_header_names_no_delimiters() -> 
     body = _SHORT_MSH2_DOCUMENT
     assert "OBX" in body and body.startswith("MSH")
     assert strip_documents(body, pruned_at=0.0) == (body, 0, 0)
+    # A batch header with no MSH passes the strip's "MSH" in the first eight characters gate, and
+    # its separators cannot be read either.
+    batch = "FHS|MSH|A\r" + body[body.index("OBX|") :]
+    assert strip_documents(batch, pruned_at=0.0) == (batch, 0, 0)
     # The control: the same document under a full MSH-2 is stripped.
     readable = _hl7(_b64(2000))
     stripped, documents, _reclaimed = strip_documents(readable, pruned_at=0.0)
@@ -1844,7 +1848,7 @@ async def test_a_streaming_body_whose_header_names_no_delimiters_is_refused_befo
     receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
 
     assert _ack_code(ack) == "AR"
-    assert ack is not None and "no MSH or MSH-2 shorter than four characters" in ack
+    assert ack is not None and "MSH-2 shorter than four characters" in ack
     assert receipt.refusal is RefusalKind.PERMANENT
     rows = await _rows(store, ic.name)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2

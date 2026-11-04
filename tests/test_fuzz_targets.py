@@ -644,10 +644,10 @@ def test_the_short_msh2_finding_still_reproduces_through_the_raw_helpers() -> No
     message = Message.parse(text)
     with pytest.raises(ValueError, match="cannot determine HL7 separators"):
         extract_obx_document(message)
-    # The retention strip's half is fixed: it returns the body unchanged, so the pass skips the
-    # row rather than aborting. The detach scan's half is fixed too: it refuses the body by name,
-    # which both listeners record (BACKLOG #5099).
-    assert strip_documents(text, pruned_at=0.0) == (text, 0, 0)
+    # The retention strip's half is fixed (no raise; tests/test_sender_document_handle.py pins
+    # what it returns), and the detach scan's half too: it refuses the body by name, which both
+    # listeners record (BACKLOG #5099). Only the extract above is still live.
+    strip_documents(text, pruned_at=0.0)
     with pytest.raises(UnreadableDelimitersError):
         list(iter_obx_documents(message, received=text))
     assert _is_short_msh2_shape(text)

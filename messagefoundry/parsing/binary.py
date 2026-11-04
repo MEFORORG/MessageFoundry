@@ -195,8 +195,9 @@ class Base64DelimiterError(InboundDocRefError):
 class UnreattachableDocumentError(ValueError):
     """The payload itself stops a re-attach (vault BACKLOG #2809, BACKLOG #5099). At least these
     shapes: the parser refuses the payload as not HL7 (an ``HL7PeekError`` without ``parser_fault``
-    set); it has no MSH, or its first MSH's MSH-2 is shorter than four characters, so its
-    separators cannot be read; an ``OBX-5.5`` handle is malformed; a
+    set); it holds the raw handle marker and has no MSH, or a first MSH whose MSH-2 is shorter
+    than four characters, so its separators cannot be read (without the raw marker such a payload
+    is carried as it is); an ``OBX-5.5`` handle is malformed; a
     handle names an attachment its own message does not hold; a handle sits somewhere the
     re-attach does not splice, such as ``NTE-3`` or a second ``OBX-5.5`` repetition; or a
     delimiter is a character of the base64 alphabet while a handle, or the marker, is in the
