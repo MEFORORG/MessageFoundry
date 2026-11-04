@@ -101,6 +101,7 @@ from messagefoundry.config.models import (
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.config.snapshot import (
+    _UNREACHABLE_WINERRORS,
     ConfigDirMissing,
     ConfigSnapshot,
     config_py_files,
@@ -122,7 +123,13 @@ from messagefoundry.exception_origin import (
     worded_by_the_engine,
 )
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
-from messagefoundry.redaction import _BUILTIN_EXC_RENDERS, _class_attribute, safe_exc, safe_name
+from messagefoundry.redaction import (
+    _BUILTIN_EXC_RENDERS,
+    REFUSAL_LOG_LIMIT,
+    _class_attribute,
+    safe_exc,
+    safe_name,
+)
 from messagefoundry.secretscrub import (
     _QUERY_NAME_SEPARATORS,
     _QUERY_NOT_CREDENTIAL_TAILS,
@@ -178,6 +185,7 @@ __all__ = [
     "OutboundConnection",
     "Registry",
     "WiringError",
+    "ConfigDirUnlistable",
     "PortConflictError",
     "StateKeyError",
     "API_LISTENER_LABEL",
@@ -224,6 +232,15 @@ _logger = logging.getLogger(__name__)
 
 class WiringError(ValueError):
     """A connection/router/handler was declared wrong, or references something missing."""
+
+
+class ConfigDirUnlistable(WiringError):
+    """A load refused because the config directory itself could not be read, for a reason other
+    than its being missing: at least a share Windows cannot reach, a folder this account cannot
+    list, and one that lists while ``Path.is_dir`` says no. Its own type, so a reload audits it as
+    ``unreadable``, as it audits the engine's own check of the target, not as a config to fix
+    (vault BACKLOG #5248). Still a ``WiringError``, so every caller that refuses a bad config
+    refuses this one the same way."""
 
 
 class PortConflictError(WiringError):
@@ -8848,9 +8865,26 @@ def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> Con
         # strict that is a refusal, not a raw error, which a reload would answer as a 500.
         if strict:
             raise
+        unvetted: OSError | None = exc
+    else:
+        unvetted = None
+    if unvetted is not None:
+        # Judged again, outside the handler so its raise carries no __context__: a directory that
+        # cannot be listed refuses as unreadable, and one gone as missing (vault BACKLOG #5248). A
+        # fault deeper in it, such as in its code-set folder, is the refusal below.
+        try:
+            _require_config_dir(directory, strict=False)
+        except (OSError, WiringError):
+            # ConfigDirMissing and ConfigDirUnlistable each replace the walk's fault: log it.
+            _logger.warning(
+                "config directory %s failed its listing after its trust walk could not vet it: %s",
+                scrub_log_argument(str(directory)),
+                scrub_log_argument(safe_exc(unvetted, limit=REFUSAL_LOG_LIMIT)),
+            )
+            raise
         raise WiringError(
-            f"{_CONFIG_SOURCE_LEAD} {directory}: could not vet it: {safe_exc(exc)}"
-        ) from exc
+            f"{_CONFIG_SOURCE_LEAD} {directory}: could not vet it: {safe_exc(unvetted)}"
+        ) from unvetted
     snapshot = read_config_snapshot(directory, strict=strict)
     # Before the directory is judged again, so that judging it cannot replace a fault this read
     # recorded with a different answer.
@@ -8922,7 +8956,10 @@ def _require_loadable(snapshot: ConfigSnapshot) -> None:
 
 
 def _unreadable_source(directory: Path, unreadable: Sequence[str]) -> WiringError:
-    return WiringError(
+    """The refusal of a load that could not read ``unreadable``: :class:`ConfigDirUnlistable`
+    where that includes the directory itself (``.``), a plain ``WiringError`` otherwise."""
+    refusal = ConfigDirUnlistable if "." in unreadable else WiringError
+    return refusal(
         f"refusing to load config from {directory}: could not read "
         f"{', '.join(unreadable)}; see the engine log and docs/SERVICE.md for required permissions"
     )
@@ -9198,6 +9235,32 @@ def _evaluate_config_dacl(
 # ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND: a candidate *.py removed between the glob and the read.
 _WIN_PATH_GONE_ERRORS = frozenset({2, 3})
 
+#: The read failures of the config directory's own owner and DACL that say nothing about its policy,
+#: only that the directory was not there to read: gone (2, 3), or on a share Windows cannot reach,
+#: the errors a listing reads the same way (``_UNREACHABLE_WINERRORS``: 53 and 67).
+#: :func:`_assert_safe_config_source` alone may answer such a refusal from a listing of the
+#: directory (vault BACKLOG #5248, #3535).
+_WIN_CONFIG_DIR_UNREACHED_ERRORS = _WIN_PATH_GONE_ERRORS | _UNREACHABLE_WINERRORS
+
+
+class _ConfigDirUnreached(WiringError):
+    """The refusal of a config directory whose own owner and DACL read failed with one of
+    :data:`_WIN_CONFIG_DIR_UNREACHED_ERRORS`. A ``WiringError`` with the refusal's own text, so every
+    caller refuses it as before; its type alone tells the load it may judge the directory again. A
+    policy refusal is never one, so no later listing can replace it."""
+
+
+def _refuse_unreached_config_dir(refuse: Callable[[str], None], message: str) -> None:
+    """``refuse(message)``, with a refusal it raises marked as :class:`_ConfigDirUnreached`."""
+    try:
+        refuse(message)
+    except WiringError as exc:
+        refusal = exc
+    else:
+        return
+    # Outside the handler, so the marked copy carries no __context__: it is the same refusal.
+    raise _ConfigDirUnreached(str(refusal))
+
 
 @dataclass(frozen=True, slots=True)
 class _WinPathSecurity:
@@ -9248,7 +9311,9 @@ def _enforce_windows_paths(
     For a config load ``paths`` is :func:`config_source_trust_paths`: the directory, every ``*.py``
     with ``_*.py`` helpers included, and the cache, connections and code-set files, the same set the
     POSIX arm reads. With ``first_is_required``, a not-found read of the first path refuses outright: that is the
-    config directory itself. Any other path that is gone by the time it is read is skipped, as below.
+    config directory itself. That refusal, and one of a read of it that could not reach its share,
+    is a :class:`_ConfigDirUnreached`, which the load may answer from a listing of the directory.
+    Any other path that is gone by the time it is read is skipped, as below.
 
     **A read that fails also REFUSES** (ADR 0036 Amendment B, BACKLOG #1654). That covers at least a
     ``GetNamedSecurityInfoW`` error, an owner SID that cannot be rendered, a DACL that cannot be
@@ -9275,19 +9340,20 @@ def _enforce_windows_paths(
         )
     for index, path in enumerate(paths):
         sec = probes.read_path(path)
-        if (
-            sec.status in _WIN_PATH_GONE_ERRORS
-            and not (first_is_required and index == 0)
-            and not os.path.lexists(path)
-        ):
+        is_config_dir = first_is_required and index == 0
+        if sec.status in _WIN_PATH_GONE_ERRORS and not is_config_dir and not os.path.lexists(path):
             continue
         if sec.status != 0:
             detail = f": {sec.status_text}" if sec.status_text else ""
-            refuse(
+            message = (
                 f"{lead} {path}: its owner and DACL could not be read (Win32 "
                 f"error {sec.status}{detail}), so it cannot be shown safe to execute; see "
                 f"docs/SERVICE.md for required permissions"
             )
+            if is_config_dir and sec.status in _WIN_CONFIG_DIR_UNREACHED_ERRORS:
+                _refuse_unreached_config_dir(refuse, message)
+            else:
+                refuse(message)
             continue
         # A NULL DACL means "no DACL present": everyone is implicitly allowed full control. That is an
         # observed insecure state, not an inability to read one.
@@ -9767,7 +9833,16 @@ def _assert_safe_config_source(directory: Path) -> None:
 
     A directory it cannot list raises that ``OSError``, a missing one included, and each caller
     refuses the load. It returned with nothing vetted where ``Path.is_dir`` said no, which it says
-    for a share Windows cannot reach (vault BACKLOG #5117)."""
+    for a share Windows cannot reach (vault BACKLOG #5117).
+
+    A refusal that came from the directory's own read finding nothing there, or no share to reach
+    (:class:`_ConfigDirUnreached`), is judged again by listing the directory, as the walk's own
+    listing would have answered: one moved away raises ``ConfigDirMissing``, which a reload audits
+    ``not_found``, and one that does not list raises that ``OSError``, which a lax load refuses as
+    :class:`ConfigDirUnlistable`, audited ``unreadable`` (vault BACKLOG #5248, #3535). Neither is a
+    config to fix. The refusal is logged then. One that still lists keeps the refusal. Every other
+    refusal stands whatever happens to the directory afterwards, a policy refusal above all: a
+    listing must never replace the answer that names what was refused."""
     try:
         # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
         # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
@@ -9777,12 +9852,32 @@ def _assert_safe_config_source(directory: Path) -> None:
             # Moved away since the caller's own check: missing, as that check answers (#3157).
             _require_config_dir(directory, strict=True)
         raise
-    _check_trusted_paths(
-        paths,
-        lead=_CONFIG_SOURCE_LEAD,
-        refuse=_refuse_unsafe_config_source,
-        first_is_required=True,
-    )
+    try:
+        _check_trusted_paths(
+            paths,
+            lead=_CONFIG_SOURCE_LEAD,
+            refuse=_refuse_unsafe_config_source,
+            first_is_required=True,
+        )
+    except _ConfigDirUnreached as exc:
+        # As a plain WiringError, so a log that names the refusal's type names a public one.
+        refusal = WiringError(str(exc))
+    else:
+        return
+    # Outside the handler, so a ConfigDirMissing raised here does not carry the refusal as its
+    # __context__; the refusal is logged instead, so it is never lost.
+    try:
+        _require_config_dir(directory, strict=True)
+    except OSError:
+        # ConfigDirMissing included. The read never reached the directory's policy, so the listing
+        # answers what the read could not; this refusal is logged rather than lost.
+        _logger.warning(
+            "config directory %s failed its listing after its trust check refused it: %s",
+            scrub_log_argument(str(directory)),
+            scrub_log_argument(safe_exc(refusal, limit=REFUSAL_LOG_LIMIT)),
+        )
+        raise
+    raise refusal
 
 
 def _check_trusted_paths(
@@ -9818,7 +9913,14 @@ def _enforce_posix_paths(
     # Root can rewrite anything, so a root owner adds no writer the engine does not already trust. A
     # root engine trusts only root (the set collapses to {0}): any other owner could rewrite code
     # that then runs as root.
-    trusted_uids = frozenset({0, euid})
+    #
+    # Neither binding below is named "trusted". CodeQL's clear-text-logging query read the local
+    # this rule's text was once bound to, `trusted`, as a secret, and followed it through the
+    # refusal into the escape-hatch WARNING in _refuse_unsafe_config_source (alert 265). The set
+    # only feeds a membership test today; it is renamed too, so that rendering it in a refusal
+    # later does not hand the query the same word. ADR 0034's 2026-10-03 amendment, rule 1.
+    allowed_owners = frozenset({0, euid})
+    owner_rule = "root" if euid == 0 else f"root or uid {euid}"
     for path in paths:
         try:
             st = path.stat()
@@ -9832,12 +9934,13 @@ def _enforce_posix_paths(
             continue
         # Code here runs as the engine's account, so a file owned by any other non-root user is an
         # escalation vector even at 0644 -- that user can rewrite it (CONFIG-2 / review M-21).
-        if st.st_uid not in trusted_uids:
-            trusted = "root" if euid == 0 else f"root or uid {euid}"
+        if st.st_uid not in allowed_owners:
+            # "what the engine loads", not "the executed code": a start's settings and env files
+            # come through here too, and neither is code.
             refuse(
                 f"{lead} {path} owned by uid {st.st_uid} -- the engine runs as "
-                f"uid {euid} and trusts only an owner that is {trusted}; that owner could rewrite "
-                "the executed code (see docs/SERVICE.md)"
+                f"uid {euid} and trusts only an owner that is {owner_rule}; uid {st.st_uid} "
+                "could rewrite what the engine loads (see docs/SERVICE.md)"
             )
 
 
