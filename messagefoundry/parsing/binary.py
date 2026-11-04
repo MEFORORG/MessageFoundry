@@ -687,9 +687,21 @@ def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int,
 
 
 def _copy_names_address(text: str, marker: str) -> bool:
-    """Whether ``marker``, the handle marker as the payload's delimiters escape it, is followed
-    somewhere in ``text`` by a content address: a handle copy, not a bare marker."""
-    return re.search(re.escape(marker) + "[0-9a-f]{64}", text) is not None
+    """Whether some occurrence of ``marker``, the handle marker as the payload's delimiters escape
+    it, is immediately followed in ``text`` by a content address, 64 lowercase hex characters: a
+    handle copy, not a bare marker. Overlapping occurrences each count, and nothing need follow
+    the address."""
+    # No regex is built from the marker: a pattern read at run time is one the static ReDoS scan
+    # cannot check. The strip keeps the per-hit test in C, since a sender controls how many hits
+    # a body holds.
+    start = text.find(marker)
+    while start != -1:
+        after = start + len(marker)
+        address = text[after : after + _SHA256_HEX_LEN]
+        if len(address) == _SHA256_HEX_LEN and not address.strip("0123456789abcdef"):
+            return True
+        start = text.find(marker, start + 1)
+    return False
 
 
 def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
