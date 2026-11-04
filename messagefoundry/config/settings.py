@@ -4711,8 +4711,9 @@ class AiSettings(_Section):
     api_key: str | None = None
     # SSRF fail-closed allowlist (ADR 0135): each entry is "host" (any port) or "host:port". The broker
     # validates its configured `endpoint` against THIS list ITSELF — an un-listed host (or an empty list)
-    # is REFUSED. Deliberately independent of [egress].allowed_http, which is permissive-when-empty and so
-    # cannot be the gate for this new egress surface.
+    # is REFUSED. Deliberately independent of [egress].allowed_http, which, when empty, allows any
+    # host under the audited `[security].block_unlisted_outbound = false` opt-out (see
+    # `EgressSettings.deny_by_default`), and so cannot be the gate for this new egress surface.
     allowed_endpoints: list[str] = []
     # Attest that revocation of the AI endpoint's server certificate is covered outside the engine
     # (BACKLOG #2193 slice (e), on the ADR 0173 section 12 pattern). The broker verifies that
@@ -5265,10 +5266,12 @@ class EgressSettings(_Section):
     # to case: a subdomain needs its own entry. The Email sender's domain must be listed too (vault
     # BACKLOG #2912): bounces and replies go to the sender, and they can carry the message body.
     #
-    # DENY-BY-DEFAULT, like `allowed_proxy` below and unlike the permissive-when-empty `allowed_*`
-    # destination lists: an EMAIL destination is refused at config load while this list is empty,
-    # whatever [security].block_unlisted_outbound says. It does not gate DIRECT, which encrypts to
-    # one partner certificate. Env (comma-separated): MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS.
+    # DENY-BY-DEFAULT EVEN UNDER THE OPT-OUT, like `allowed_proxy` below. The `allowed_*`
+    # destination lists are deny-by-default too, but allow any host when empty under the audited
+    # `[security].block_unlisted_outbound = false` opt-out (see `deny_by_default`). An EMAIL
+    # destination is refused at config load while this list is empty, whatever that switch says.
+    # It does not gate DIRECT, which encrypts to one partner certificate. Env (comma-separated):
+    # MEFOR_EGRESS_ALLOWED_RECIPIENT_DOMAINS.
     allowed_recipient_domains: list[str] = []
 
     # ADR 0126 (#112/#128): a site-wide DEFAULT forward/egress web proxy for the HTTP family
@@ -5298,11 +5301,13 @@ class EgressSettings(_Section):
     # `allowed_http`: ADR 0126 rules the proxy out of that gate's scope, because one corporate proxy
     # fronts many destinations and would have to be co-listed with every one of them.
     #
-    # DENY-BY-DEFAULT, matching `[ai].allowed_endpoints` (ADR 0135) rather than the permissive-when-
-    # empty `allowed_*` destination lists: an explicit `proxy_url` with an EMPTY `allowed_proxy` is
-    # refused at config load. That costs an operator who configures no proxy nothing (the gate only
-    # bites once a proxy is set), and it is the whole point of the key -- permissive-when-empty would
-    # leave the credential-bearing host ungated on exactly the default posture. The `"default"`
+    # DENY-BY-DEFAULT EVEN UNDER THE OPT-OUT, matching `[ai].allowed_endpoints` (ADR 0135). The
+    # `allowed_*` destination lists allow any host when empty under the audited
+    # `[security].block_unlisted_outbound = false` opt-out (see `deny_by_default`); this one does
+    # not: an explicit `proxy_url` with an EMPTY `allowed_proxy` is refused at config load, whatever
+    # that switch says. That costs an operator who configures no proxy nothing (the gate only bites
+    # once a proxy is set), and it is the whole point of the key -- an empty list that allowed any
+    # would leave the credential-bearing host ungated under that opt-out. The `"default"`
     # sentinel is exempt: it names no address at config time, and `proxy_config_from_settings` refuses
     # to combine it with proxy credentials, so that path mints no `Proxy-Authorization`.
     # Env (comma-separated): MEFOR_EGRESS_ALLOWED_PROXY.

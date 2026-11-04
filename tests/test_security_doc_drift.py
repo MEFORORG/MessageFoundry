@@ -1721,6 +1721,14 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
     ("test_docs_security_pathways.py", "_config_row"): "slices a CONFIGURATION.md table row",
     (
         "test_docs_security_pathways.py",
+        "test_the_docker_manifests_say_what_require_encryption_does",
+    ): (
+        "reads the comment on each docker manifest line that sets MEFOR_STORE_REQUIRE_ENCRYPTION "
+        "(vault BACKLOG #4178); what the setting does is pinned by calling "
+        "keyless_opt_out_refusal in tests/test_security_config.py"
+    ),
+    (
+        "test_docs_security_pathways.py",
         "test_the_guide_keeps_the_corrected_crl_signature_sentences",
     ): (
         "absence of four retired CRL-signature sentences in CONFIGURATION.md, and presence of two "
