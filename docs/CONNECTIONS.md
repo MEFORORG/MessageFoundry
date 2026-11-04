@@ -476,15 +476,31 @@ accepted and dropped.
   `SourceConnector` docstring names for a sender that waits for no reply.
 
 The connection closes after that first read, because the certificate cannot change within the
-session; anything the sender has not yet had read stays with it. The connection caps bound how
-many connections a refused sender can hold at once, but nothing yet bounds how often it may
-reconnect, and each connection records its own rows. The stored reason, the `AR`'s text and the
-WARNING log line are fixed text naming no certificate field, since a subject can name a person; the
-log line gives the connection name and peer address, at most once per address per minute, with a
-running count. The body is stored under the inbound's refused-body allowance, like every other
-refusal. The refusal itself writes no `connection_event` and no `audit_log` row, and a refused
-connection gets no `established` / `closed` pair; an event for another cause on that connection,
-such as `frame_oversize` or `handler_error`, is still written as on any connection.
+session, and the listener refuses a TLS renegotiation, so a TLS 1.2 client cannot present another
+certificate after the check; anything the sender has not yet had read stays with it.
+
+**Held to the HTTP listener's posture.** The refusal is the decision the HTTP listener's
+`intake_auth = "mtls_subject"` makes, and it is charged, audited and evented the same way:
+
+- Each refusal writes an `audit_log` row `intake.auth_subject_denied` and an `auth_subject_denied`
+  connection event, as the HTTP listener does. The row's detail is `mode=tls_client_subjects`; the
+  row and the event name the connection and peer address, never a certificate field.
+- Each refusal is charged one failed attempt against the peer's address, under the HTTP listener's
+  failed-attempt budget at the `Http()` defaults: 10 per address per minute, and 60 per minute
+  across all addresses. This listener has no setting to change or turn off those figures. A peer
+  that has spent its budget is closed unread once its handshake completes, before its certificate
+  is compared, whatever certificate it now presents, as the HTTP listener answers it `429`. That is
+  written as an `intake.auth_rate_limited` audit row and an `auth_rate_limited` connection event,
+  and leaves no message row, since nothing was read. A listed sender behind the same address is
+  closed too while the budget is spent; a listed sender that connected inside the window is exempt
+  from the 60-per-minute arm. The count is in process, so each engine shard keeps its own.
+
+The stored reason, the `AR`'s text and the WARNING log line are fixed text naming no certificate
+field, since a subject can name a person; the log line gives the connection name and peer address,
+at most once per address per minute, with a running count. The body is stored under the inbound's
+refused-body allowance, like every other refusal. A refused connection gets no `established` /
+`closed` pair; an event for another cause on that connection, such as `frame_oversize` or
+`handler_error`, is still written as on any connection.
 
 **What this does not cover yet.** The other listeners, and any further per-inbound form of the
 expected-sender assertion, are still open on BACKLOG #4907. The HTTP listener's own allowlist is

@@ -95,6 +95,7 @@ from messagefoundry.tls_handshake_failures import (
 )
 from messagefoundry.transports.admission import FrameClock, ListenerAdmission, RefusalLog
 from messagefoundry.transports.base import (
+    INTAKE_AUDIT_ACTIONS,
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
@@ -1815,6 +1816,11 @@ def _pacing_settings(
 
 # --- the expected-sender allowlist (BACKLOG #4907) -------------------------------------------------
 
+#: The connection-event reasons for a ``tls_client_subjects`` refusal: the inbound HTTP listener's
+#: own reasons for the same two kinds, fixed strings, never anything from the certificate.
+_SENDER_DENIED = "client certificate subject is not permitted"
+_SENDER_RATE_LIMITED = "too many failed authentication attempts"
+
 
 def _client_subjects_by_issuer(subjects: Any) -> dict[str, dict[str, str]] | None:
     """``tls_client_subjects`` as the matcher reads it, or ``None`` when the allowlist is off.
@@ -2006,6 +2012,11 @@ class MLLPSource(SourceConnector):
             self._issuer_of = _sender_issuer_lookup(
                 config.name or "", loaded_client_ca[0], self._client_subjects
             )
+            # The certificate is checked once, after the handshake. A TLS 1.2 renegotiation could
+            # present a different certificate after that check, so this listener refuses one. TLS
+            # 1.3 has no renegotiation, and a listener without the allowlist is left as it was.
+            assert self._ssl is not None  # a client CA was loaded, so a context was built
+            self._ssl.options |= ssl.OP_NO_RENEGOTIATION
         #: Throttles the refused-sender WARNING as the admission throttles its refusals, so a sender
         #: that reconnects in a loop cannot write a line per connection (BACKLOG #4907).
         self._unlisted_log = RefusalLog()
@@ -2247,6 +2258,83 @@ class MLLPSource(SourceConnector):
                 safe_exc(exc),
             )
             return ""
+
+    async def _admit_sender(
+        self, writer: asyncio.StreamWriter, peer_host: str | None
+    ) -> tuple[InboundHandler, bool] | None:
+        """The handler for this connection's frames and whether its sender is refused, or ``None``
+        to close the connection unread (BACKLOG #4907). The allowlist off, the inbound handler.
+
+        A sender outside ``tls_client_subjects`` gets the runner's ``refuse_unlisted_sender``,
+        which records each frame its first read completes as ``ERROR`` before answering ``AR``, so
+        none is accepted and dropped. With no refusal wired (a source built outside the runner)
+        nothing could record its messages, so none is read.
+
+        The decision is held to the inbound HTTP listener's posture for ``mtls_subject`` (ADR 0154
+        D6): the injected failed-attempt budget is consulted read-only BEFORE the certificate is
+        compared, so a peer that has spent it is closed unread, whatever certificate it now
+        presents, as HTTP answers it ``429``; a refused sender is charged one failed attempt; a
+        listed one is noted as authenticated, which exempts it from the budget's global arm. Each
+        refusal writes the connection event and the audit row HTTP writes for the same decision.
+        The log line, the event and the audit row name the peer address only, never the
+        certificate: a subject can name a person."""
+        assert self._handler is not None
+        if self._client_subjects is None:
+            return self._handler, False
+        peer = peer_host or "unknown"
+        limiter = self.intake_rate_limiter
+        if limiter is not None and not limiter.check(peer):
+            if count := self._unlisted_log.note(peer):
+                logger.warning(
+                    "MLLP listener %s: the sender at %s has spent its failed-attempt budget for "
+                    "tls_client_subjects; closing the connection unread (%d refused so far)",
+                    self._pacing_name,
+                    peer,
+                    count,
+                )
+            await self._emit_event(
+                "auth_rate_limited", peer_host=peer_host, reason=_SENDER_RATE_LIMITED
+            )
+            await self._audit_sender_refusal("auth_rate_limited", peer_host)
+            return None
+        if self._sender_listed(writer):
+            if limiter is not None:
+                limiter.note_success(peer)
+            return self._handler, False
+        if limiter is not None:
+            limiter.charge_failure(peer)
+        handle = self.refuse_unlisted_sender
+        if count := self._unlisted_log.note(peer):
+            logger.warning(
+                "MLLP listener %s: the verified certificate of the sender at %s is not on "
+                "tls_client_subjects under its issuing CA; %s (%d refused so far)",
+                self._pacing_name,
+                peer,
+                "messages completed by its first read are recorded as ERROR, then the "
+                "connection closes"
+                if handle is not None
+                else "nothing can record its messages here, so none is read and the "
+                "connection closes",
+                count,
+            )
+        await self._emit_event("auth_subject_denied", peer_host=peer_host, reason=_SENDER_DENIED)
+        await self._audit_sender_refusal("auth_subject_denied", peer_host)
+        return None if handle is None else (handle, True)
+
+    async def _audit_sender_refusal(self, kind: str, peer_host: str | None) -> None:
+        """Write the tamper-evident ``audit_log`` row for a ``tls_client_subjects`` refusal, under
+        the action the HTTP listener writes for the same ``kind`` (BACKLOG #4907).
+
+        The detail names the setting and nothing from the certificate. Fail-soft, as HTTP's is: an
+        audit fault must not drop the connection, so it is logged, scrubbed, and the refusal goes
+        on. No sink (a source built outside the runner) writes nothing."""
+        sink = self.on_intake_audit
+        if sink is None:
+            return
+        try:
+            await sink(INTAKE_AUDIT_ACTIONS[kind], peer_host, "mode=tls_client_subjects")
+        except Exception as exc:  # fail-soft; an audit bug cannot drop an MLLP client
+            logger.warning("MLLP intake audit emit failed: %s", safe_exc(exc))
 
     async def _handle_bounded(self, message: bytes, handler: InboundHandler) -> str | None:
         """Run the inbound handler inside one of this listener's in-flight slots, if the bound is on
@@ -2560,31 +2648,11 @@ class MLLPSource(SourceConnector):
                     handshaking = False
                     if self._stopping:
                         return  # the handshake finished after stop() began: refuse it unread
-                # BACKLOG #4907: a verified certificate outside tls_client_subjects. The frames
-                # of its first read go to the runner's refusal, which records each as ERROR
-                # before answering AR, so none is accepted and dropped. The line names the peer
-                # address only, never the certificate: a subject can name a person.
-                unlisted = not self._sender_listed(writer)
-                handle: InboundHandler | None = (
-                    self.refuse_unlisted_sender if unlisted else self._handler
-                )
-                if unlisted and (count := self._unlisted_log.note(peer_host or "unknown")):
-                    logger.warning(
-                        "MLLP listener %s: the verified certificate of the sender at %s is not on "
-                        "tls_client_subjects under its issuing CA; %s (%d refused so far)",
-                        self._pacing_name,
-                        peer_host or "unknown",
-                        "messages completed by its first read are recorded as ERROR, then the "
-                        "connection closes"
-                        if handle is not None
-                        else "nothing can record its messages here, so none is read and the "
-                        "connection closes",
-                        count,
-                    )
-                if handle is None:
-                    # Nothing can record a refused sender's message here (a source built outside
-                    # the runner), so none is read: closing unread leaves them with the sender.
-                    return
+                # BACKLOG #4907: the expected-sender allowlist. See the method.
+                admitted = await self._admit_sender(writer, peer_host)
+                if admitted is None:
+                    return  # closed unread: the sender keeps whatever it had not had read
+                handle, unlisted = admitted
                 if not unlisted:
                     established = True
                     await self._emit_event("established", peer_host=peer_host)

@@ -60,6 +60,7 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import ListenerAdmission
 from messagefoundry.transports.base import (
+    INTAKE_AUDIT_ACTIONS,
     InboundHandler,
     InboundReply,
     ReplyOutcome,
@@ -113,16 +114,6 @@ _HEADER_CAP_OFF_HINT = (
 # On stop()/reload, established clients are closed and their handlers given this long to finish an
 # in-flight commit before the connection tasks are cancelled (mirrors MLLPSource; bounds shutdown).
 _CLIENT_SHUTDOWN_GRACE = 5.0
-
-#: ``connection_event`` kind -> ``audit_log`` action for an intake-auth refusal (ADR 0154 D6). The
-#: kinds double as the connection_event vocabulary, which CI derives from these literal call sites and
-#: asserts against ``docs/PHI.md`` §7 and ``CONNECTION_EVENT_KINDS`` as an exact set — so adding a kind
-#: here without those two is a build failure, by design.
-_INTAKE_AUDIT_ACTIONS = {
-    "intake_auth_failed": "intake.auth_failed",
-    "auth_subject_denied": "intake.auth_subject_denied",
-    "auth_rate_limited": "intake.auth_rate_limited",
-}
 
 
 class HttpRequestError(Exception):
@@ -1283,7 +1274,7 @@ class HttpSource(SourceConnector):
         length. The peer address and the mode are what an operator needs; the credential is what an
         attacker would need.
         """
-        action = _INTAKE_AUDIT_ACTIONS.get(exc.kind)
+        action = INTAKE_AUDIT_ACTIONS.get(exc.kind)
         if action is None:
             return
         # The reason is a fixed string at every call site, never request data, so it is safe to log.

@@ -308,6 +308,12 @@ PROCESSED_FILE_LEDGER_KEEP_MAX = 100_000
 #: arm (AC-19). Bounded so a churn of distinct source addresses cannot grow it without limit.
 _INTAKE_SUCCESS_KEEP_MAX = 10_000
 
+#: The failed-attempt budget an MLLP inbound's ``tls_client_subjects`` refusals are charged to
+#: (BACKLOG #4907): the ``Http()`` factory's ``intake_auth_rate_limit`` and
+#: ``intake_auth_rate_limit_global`` defaults, per minute, which a test pins to that signature.
+_SENDER_ALLOWLIST_RATE_LIMIT = 10
+_SENDER_ALLOWLIST_RATE_LIMIT_GLOBAL = 60
+
 
 class _IntakeRateLimiter:
     """Runner-side failed-attempt budget for an intake-authenticating source (ADR 0154 D6).
@@ -2187,6 +2193,13 @@ class RegistryRunner:
             and str(ic.spec.settings.get("intake_auth") or "none") != "none"
         )
 
+    def _sender_allowlist_enabled(self, ic: InboundConnection) -> bool:
+        # BACKLOG #4907: the MLLP listener's tls_client_subjects refuses a peer at intake on the
+        # same decision as HTTP's mtls_subject, so it gets the same audit sink and budget.
+        return ic.spec.type is ConnectorType.MLLP and bool(
+            ic.spec.settings.get("tls_client_subjects")
+        )
+
     def _make_intake_audit_sink(self, ic: InboundConnection) -> IntakeAuditSink | None:
         """The per-inbound tamper-evident audit sink for intake-auth refusals (ADR 0154 D6).
 
@@ -2198,7 +2211,7 @@ class RegistryRunner:
         This is the engine's first internal writer of ``record_audit(client=)`` (ADR 0150), and the
         column's "NULL means no client was in scope" docstring is exactly why: here one demonstrably is.
         """
-        if not self._intake_auth_enabled(ic):
+        if not (self._intake_auth_enabled(ic) or self._sender_allowlist_enabled(ic)):
             return None
         # The runner holds its store as the narrower QueueStore; record_audit lives on AuditStore
         # (Store = QueueStore + AuditStore + AuthStore), which all three shipped backends implement.
@@ -2268,7 +2281,14 @@ class RegistryRunner:
         return dict(self._sync_reply_metrics)
 
     def _make_intake_rate_limiter(self, ic: InboundConnection) -> IntakeRateLimiter | None:
-        """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled."""
+        """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled.
+
+        An MLLP inbound with ``tls_client_subjects`` (BACKLOG #4907) has no budget settings of its
+        own and gets the ``Http()`` factory's defaults, which a test pins to that signature."""
+        if self._sender_allowlist_enabled(ic):
+            return _IntakeRateLimiter(
+                per_peer=_SENDER_ALLOWLIST_RATE_LIMIT, glob=_SENDER_ALLOWLIST_RATE_LIMIT_GLOBAL
+            )
         if not self._intake_auth_enabled(ic):
             return None
         per_peer = int(ic.spec.settings.get("intake_auth_rate_limit") or 0)
@@ -4933,7 +4953,8 @@ class RegistryRunner:
         # drops only, so a legitimate X12/DICOM/binary drop is not wrongly rejected.
         source.content_type = ic.content_type
         # Inject the intake-auth seams (ADR 0154 D6) the same runtime way. Both are None unless this
-        # inbound actually authenticates, so every other connection stays byte-identical. The audit
+        # inbound actually authenticates, or is an MLLP inbound with tls_client_subjects (BACKLOG
+        # #4907), so every other connection stays byte-identical. The audit
         # sink keeps transports/ store-free; the limiter is a SYNCHRONOUS predicate, so transports/
         # gains no auth/ edge either — pipeline/ owns both, which is the only layer allowed to.
         source.on_intake_audit = self._make_intake_audit_sink(ic)
@@ -7948,8 +7969,11 @@ class RegistryRunner:
 
         On an inbound that is not HL7 v2, or whose acknowledgements are off, there is no HL7 reply
         to give, so this returns ``None`` and the listener closes the connection with no reply; the
-        close, with nothing written, is that feed's refusal. Called before any decode, so a refused
-        body is stored as received, never decoded or parsed."""
+        close, with nothing written, is that feed's refusal. The body is stored as received, before
+        any decode, and the message is never routed. On an HL7 v2 inbound that replies, only its
+        first segment is then decoded, in the inbound's charset and bounded to the first
+        ``_UNLISTED_SENDER_HEADER_SCAN_BYTES``, and parsed by ``build_ack`` for the ``AR``'s header
+        echo; nothing past that segment is decoded or parsed."""
         hl7v2 = ic.content_type is ContentType.HL7V2
         mid = await self._record_refused(
             ic,

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import inspect
 import logging
 import ssl
 from pathlib import Path
@@ -37,6 +38,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     MLLP,
     ConnectionSpec,
+    Http,
     InboundConnection,
     Registry,
     WiringError,
@@ -44,9 +46,13 @@ from messagefoundry.config.wiring import (
     load_config,
 )
 from messagefoundry.mllpcodec import AckMode
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.wiring_runner import (
+    _SENDER_ALLOWLIST_RATE_LIMIT,
+    _SENDER_ALLOWLIST_RATE_LIMIT_GLOBAL,
+    RegistryRunner,
+)
 from messagefoundry.store import MessageStatus, MessageStore
-from messagefoundry.transports.mllp import MLLPSource
+from messagefoundry.transports.mllp import _SENDER_DENIED, _SENDER_RATE_LIMITED, MLLPSource
 from tests.test_api_tls import _NOW, _CaPair, _client_bundle, _dn, _new_ca, _pem, _self_signed
 from tests.test_connections_file import _config
 
@@ -137,15 +143,15 @@ async def store(tmp_path: Path):
 
 def _runner(
     store: MessageStore,
+    settings: dict[str, Any],
     content_type: ContentType = ContentType.HL7V2,
     ack_mode: AckMode = AckMode.ORIGINAL,
-    encoding: str = "utf-8",
 ) -> tuple[RegistryRunner, InboundConnection]:
     reg = Registry()
     reg.add_inbound(
         InboundConnection(
             name=_INBOUND,
-            spec=ConnectionSpec(ConnectorType.FILE, {"encoding": encoding}),
+            spec=ConnectionSpec(ConnectorType.MLLP, settings),
             router="r",
             content_type=content_type,
             ack_mode=ack_mode,
@@ -161,12 +167,22 @@ async def _wired(
     store: MessageStore,
     content_type: ContentType = ContentType.HL7V2,
     ack_mode: AckMode = AckMode.ORIGINAL,
+    events: list[tuple[str, str | None, str | None]] | None = None,
 ) -> MLLPSource:
-    """The listener started with the runner's handler and refusal, as ``_start_inbound`` wires them."""
-    runner, ic = _runner(store, content_type, ack_mode, str(settings.get("encoding") or "utf-8"))
+    """The listener started with the runner's handler, refusal, failed-attempt budget and audit
+    sink, as ``_start_inbound`` wires them. ``events`` collects its connection events."""
+    runner, ic = _runner(store, settings, content_type, ack_mode)
     source = MLLPSource(Source(type=ConnectorType.MLLP, settings=settings, ack_mode=ack_mode))
     source.content_type = content_type
     source.refuse_unlisted_sender = runner._make_unlisted_sender_refusal(ic)
+    source.intake_rate_limiter = runner._make_intake_rate_limiter(ic)
+    source.on_intake_audit = runner._make_intake_audit_sink(ic)
+    if events is not None:
+
+        async def collect(kind: str, peer_host: str | None, reason: str | None) -> None:
+            events.append((kind, peer_host, reason))
+
+        source.on_connection_event = collect
     await source.start(runner._make_handler(ic))
     return source
 
@@ -626,3 +642,156 @@ async def test_a_header_the_charset_cannot_decode_still_gets_its_ar(
         await source.stop()
     assert b"MSA|AR|" in got, got
     assert [r["status"] for r in await _rows(store)] == [MessageStatus.ERROR.value]
+
+
+# --- held to the HTTP listener's posture: budget, audit row, connection event ----------------------
+
+
+async def _send_from(
+    source: MLLPSource, bundle: Path, wire: bytes, *, local_host: str = "127.0.0.1"
+) -> bytes:
+    """Send ``wire`` from ``local_host`` and return the first reply frame, or what came before EOF.
+
+    A connection the listener closes unread may reset under the client's write, so a reset is read
+    as the close it is (``b""``); a listener that neither replies nor closes fails on the timeout."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_cert_chain(bundle)
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", source.sockport, ssl=ctx, local_addr=(local_host, 0)
+    )
+    try:
+        writer.write(wire)
+        await writer.drain()
+        return await asyncio.wait_for(reader.readuntil(b"\x1c\r"), 10.0)
+    except asyncio.IncompleteReadError as eof:
+        return eof.partial
+    except (ConnectionError, ssl.SSLError):
+        return b""
+    finally:
+        writer.close()
+
+
+async def _audits(store: MessageStore) -> list[dict[str, Any]]:
+    return [dict(row) for row in await store.list_audit(limit=200)]
+
+
+async def test_a_refusal_writes_the_audit_row_and_event_http_writes(
+    tmp_path: Path, store: MessageStore
+) -> None:
+    """One refused sender: one ``intake.auth_subject_denied`` audit row and one
+    ``auth_subject_denied`` connection event, naming the peer address and no certificate field.
+    The control on the same listener, a listed sender, writes neither."""
+    named, other = _ca("Partner CA"), _ca("Other CA")
+    events: list[tuple[str, str | None, str | None]] = []
+    source = await _wired(
+        _settings(tmp_path, [named[0], other[0]], {_issuer(named): [SUBJECT]}),
+        store,
+        events=events,
+    )
+    try:
+        accepted = await _send_from(source, _bundle(tmp_path, named), _frame(_ADT))
+        assert b"MSA|AA|" in accepted
+        assert await _audits(store) == []
+        assert "auth_subject_denied" not in [kind for kind, _, _ in events]
+        refused = await _send_from(source, _bundle(tmp_path, other), _frame(_ADT))
+    finally:
+        await source.stop()
+    assert b"MSA|AR|" in refused
+    (audit,) = await _audits(store)
+    assert audit["action"] == "intake.auth_subject_denied"
+    assert audit["channel_id"] == _INBOUND
+    assert audit["client"] == "127.0.0.1"
+    assert audit["detail"] == "mode=tls_client_subjects"
+    denied = [e for e in events if e[0] == "auth_subject_denied"]
+    assert denied == [("auth_subject_denied", "127.0.0.1", _SENDER_DENIED)]
+    assert all(_PERSON not in str(value) for value in audit.values())
+    assert all(_PERSON not in str(value) for event in events for value in event)
+
+
+async def test_a_refused_sender_that_reconnects_is_closed_unread_at_its_budget(
+    tmp_path: Path, store: MessageStore
+) -> None:
+    """The failed-attempt budget HTTP charges for ``auth_subject_denied``, reused: each refusal is
+    charged to the peer's address, and once the budget is spent the address is closed unread,
+    before any certificate is compared, as HTTP answers it ``429``. That includes a listed
+    certificate presented from the same address, which is HTTP's posture too. The control is a
+    listed sender from another address, which the spent budget does not touch."""
+    named, other = _ca("Partner CA"), _ca("Other CA")
+    events: list[tuple[str, str | None, str | None]] = []
+    source = await _wired(
+        _settings(tmp_path, [named[0], other[0]], {_issuer(named): [SUBJECT]}),
+        store,
+        events=events,
+    )
+    refused_bundle, listed_bundle = _bundle(tmp_path, other), _bundle(tmp_path, named)
+    try:
+        for attempt in range(_SENDER_ALLOWLIST_RATE_LIMIT):
+            got = await _send_from(source, refused_bundle, _frame(_ADT))
+            assert b"MSA|AR|" in got, (attempt, got)
+        over_budget = await _send_from(source, refused_bundle, _frame(_ADT))
+        same_address_listed = await _send_from(source, listed_bundle, _frame(_ADT))
+        other_address_listed = await _send_from(
+            source, listed_bundle, _frame(_ADT), local_host="127.0.0.2"
+        )
+    finally:
+        await source.stop()
+    assert over_budget == b""
+    assert same_address_listed == b""
+    assert b"MSA|AA|" in other_address_listed
+    statuses = sorted(r["status"] for r in await _rows(store))
+    # Nothing was read from the two closed-unread connections, so they left no row: the sender
+    # keeps those messages, and none is accepted and dropped.
+    assert statuses == sorted(
+        [MessageStatus.ERROR.value] * _SENDER_ALLOWLIST_RATE_LIMIT + [MessageStatus.RECEIVED.value]
+    ), statuses
+    actions = [row["action"] for row in await _audits(store)]
+    assert actions.count("intake.auth_subject_denied") == _SENDER_ALLOWLIST_RATE_LIMIT
+    assert actions.count("intake.auth_rate_limited") == 2
+    limited = [e for e in events if e[0] == "auth_rate_limited"]
+    assert limited == [("auth_rate_limited", "127.0.0.1", _SENDER_RATE_LIMITED)] * 2
+
+
+def test_the_budget_is_the_http_factory_default_and_only_with_the_allowlist(
+    tmp_path: Path, store: MessageStore
+) -> None:
+    """The MLLP allowlist has no budget settings of its own; it takes ``Http()``'s defaults. An MLLP
+    inbound without the allowlist gets no budget and no audit sink (the control)."""
+    params = inspect.signature(Http).parameters
+    assert params["intake_auth_rate_limit"].default == _SENDER_ALLOWLIST_RATE_LIMIT
+    assert params["intake_auth_rate_limit_global"].default == _SENDER_ALLOWLIST_RATE_LIMIT_GLOBAL
+    named = _ca("Partner CA")
+    (tmp_path / "on").mkdir()
+    (tmp_path / "off").mkdir()
+    on = _settings(tmp_path / "on", [named[0]], {_issuer(named): [SUBJECT]})
+    off = _settings(tmp_path / "off", [named[0]], None)
+    runner, ic = _runner(store, on)
+    assert runner._make_intake_rate_limiter(ic) is not None
+    assert runner._make_intake_audit_sink(ic) is not None
+    runner, ic = _runner(store, off)
+    assert runner._make_intake_rate_limiter(ic) is None
+    assert runner._make_intake_audit_sink(ic) is None
+
+
+def test_the_allowlist_refuses_tls_renegotiation(tmp_path: Path) -> None:
+    """The certificate is checked once, after the handshake, so a TLS 1.2 renegotiation must not be
+    able to swap it afterwards. The control: a bare mTLS listener's context is left as it was.
+
+    Asserted on the context, not by a live renegotiation: Python's ``ssl`` module exposes no way
+    for a client to start one, so no test here could attempt it."""
+    named = _ca("Partner CA")
+    (tmp_path / "on").mkdir()
+    (tmp_path / "off").mkdir()
+    on = MLLPSource(
+        Source(
+            type=ConnectorType.MLLP,
+            settings=_settings(tmp_path / "on", [named[0]], {_issuer(named): [SUBJECT]}),
+        )
+    )
+    off = MLLPSource(
+        Source(type=ConnectorType.MLLP, settings=_settings(tmp_path / "off", [named[0]], None))
+    )
+    assert on._ssl is not None and off._ssl is not None
+    assert on._ssl.options & ssl.OP_NO_RENEGOTIATION
+    assert not off._ssl.options & ssl.OP_NO_RENEGOTIATION

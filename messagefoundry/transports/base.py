@@ -34,7 +34,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Protocol, runtime_checkable
+from typing import Any, ClassVar, Final, Protocol, runtime_checkable
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
@@ -57,6 +57,7 @@ __all__ = [
     "CONNECTION_EVENT_KINDS",
     "ConnectionEventSink",
     "IntakeAuditSink",
+    "INTAKE_AUDIT_ACTIONS",
     "IntakeRateLimiter",
     "IntakeGate",
     "intake_open",
@@ -451,6 +452,19 @@ ConnectionEventSink = Callable[[str, str | None, str | None], Awaitable[None]]
 # **No credential material ever crosses this seam** — not the value, not a prefix, not its length.
 # ``detail`` carries the mode and the outcome only.
 IntakeAuditSink = Callable[[str, str | None, str | None], Awaitable[None]]
+
+#: ``connection_event`` kind -> ``audit_log`` action for an intake refusal (ADR 0154 D6), the one
+#: map both listeners that refuse a peer at intake read: the HTTP listener for ``intake_auth``, and
+#: the MLLP listener for ``tls_client_subjects`` (BACKLOG #4907), whose refused sender is audited
+#: under the same actions as HTTP's ``mtls_subject``. The kinds double as the ``connection_event``
+#: vocabulary, which CI derives from the literal emit call sites and asserts against
+#: ``docs/PHI.md`` section 7 and ``CONNECTION_EVENT_KINDS`` as an exact set, so a kind added here
+#: without those two is a build failure, by design.
+INTAKE_AUDIT_ACTIONS: Final[Mapping[str, str]] = {
+    "intake_auth_failed": "intake.auth_failed",
+    "auth_subject_denied": "intake.auth_subject_denied",
+    "auth_rate_limited": "intake.auth_rate_limited",
+}
 
 
 class IntakeRateLimiter(Protocol):

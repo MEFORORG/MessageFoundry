@@ -1717,6 +1717,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.check_hostname = False",
             "tls_context:.load_verify_locations()",
             "tls_context:.minimum_version = TLSv1_2",
+            # BACKLOG #4907: the inbound listener with tls_client_subjects refuses renegotiation,
+            # so a TLS 1.2 client cannot present another certificate after the subject check.
+            "tls_context:.options |= OP_NO_RENEGOTIATION",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:.verify_mode = CERT_REQUIRED",
             "tls_context:ssl.SSLContext",
