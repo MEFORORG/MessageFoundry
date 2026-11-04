@@ -22,10 +22,11 @@
   **`413`** on every over-size path, and any other **`422`**, each naming the `ERROR` row as
   `refused_message_id`. D5's note and **AC-8** keep their text, with a dated note in place. See
   [Amendment 2026-10-30, refusal kinds](#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).
-- **Amended 2026-11-03 (BACKLOG #5078, the batch 604 Manager's direction after an adversarial
-  review):** a strict-validation timeout whose validate never began, because no worker thread came
-  free or ran it inside the timeout, is **temporary** (`503` with `Retry-After`); one that began
-  stays `422`.
+- **Amended 2026-11-03 (BACKLOG #5078; owner ruling 2026-11-04, decision log
+  d20261104T032854299-7235a9):** a strict-validation timeout whose validate never began, because no
+  worker thread came free or ran it inside the timeout, is **temporary** (`503` with `Retry-After`,
+  `AE` on MLLP); one that began is **final** (`422`, `AR` on MLLP). Every strict-validation failure
+  answers `AR` on MLLP.
   The 2026-10-30 amendment keeps its text, with a dated note in place. See
   [Amendment 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary).
 - **NOTE: what acceptance authorised, and what has since been built.** "Accepted" normally means *build may
@@ -1491,7 +1492,7 @@ It may be reclassified only if a discriminator is later measured that tells a bo
 a retry from one which would time out again.
 *(Amended 2026-11-03, BACKLOG #5078: one such discriminator is now measured and built, for the case
 where the validate never began. That case is temporary; a timeout whose validate began stays
-permanent, as above. See the
+permanent, as above, and the owner accepted that on 2026-11-04. See the
 [amendment of 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary).)*
 
 **One code for over-size.** A body over the listener's `max_body_bytes` already answered `413`, before
@@ -1529,10 +1530,14 @@ leaving one `ERROR` row per attempt.)*
 ## Amendment 2026-11-03: a strict-validation timeout that never began is temporary
 
 **Who decided.** BACKLOG #5078 asked for a measured discriminator or an owner acceptance of the final
-`422`. The batch 604 Manager directed the Builder, after an adversarial review, to build one if it
-could be measured in the turn, and to answer temporary only where the wait for a worker dominates.
-This amendment records what was built and measured. Accepting the remaining final `422`, below, is
-not decided here.
+`422`. The batch 604 Manager had the discriminator below built and measured. The owner ruled on
+2026-11-04, in the Manager's session (decision log d20261104T032854299-7235a9), on the rest:
+
+1. MLLP's MSA-1 follows the engine convention, `AR` for a final refusal and `AE` for one a re-send
+   may clear, so a strict-validation content failure answers `AR`.
+2. A strict-validation timeout whose validate began is final on both listeners, `422` and `AR`,
+   including the cases listed below under *What the discriminator does not see*. A timeout whose
+   validate never began stays temporary, `503` and `AE`.
 
 **The cause the 2026-10-30 amendment could not see.** The listener runs `hl7apy` on the event loop's
 default `ThreadPoolExecutor` under `validation.strict_timeout_s`, and the timeout starts when the job
@@ -1550,7 +1555,7 @@ as not begun. The stored reason therefore says only "before the validate began",
 | Timeout | What is known | Receipt path | MLLP / TCP | Stored reason |
 | --- | --- | --- | --- | --- |
 | the validate never began | nothing about the body; no thread was left running | temporary: `503` with `Retry-After` | `AE` | `strict-validation timed out after <N>s before the validate began` |
-| the validate began and ran past the timeout | it may be the slow body the timeout exists for; its thread is still running | permanent: `422` | `AE` | `strict-validation timed out after <N>s`, unchanged |
+| the validate began and ran past the timeout | it may be the slow body the timeout exists for; its thread is still running | permanent: `422` | `AR` | `strict-validation timed out after <N>s`, unchanged |
 
 The 2026-10-30 reason for keeping the timeout permanent was that each retry orphans another `hl7apy`
 thread. That holds only for a validate that began. One that never began leaves no thread, so a
@@ -1563,31 +1568,35 @@ blocking work, and the same body was validated under a 0.5 s timeout, 5 trials: 
 0.512 to 0.515 s, and each reported that the validate never began. The tests in
 `tests/test_strict_refusal_classes.py` pin both arms against a real queue, reading the receipt
 handler's refusal kind, not an HTTP status: a one-worker pool held by a blocker gives a TEMPORARY
-refusal, and the same pool free gives a PERMANENT one. The kind-to-status mapping (`503`, `422`) is
+refusal, and the same pool free gives a PERMANENT one. The MLLP arms are driven end to end from the
+engine's own MLLP outbound, which reads the began timeout's `AR` as permanent and the never-began
+timeout's `AE` as retryable. The kind-to-status mapping (`503`, `422`) is
 `_refusal_status` in `transports/http_listener.py`, pinned by `tests/test_ingress_refusal_kinds.py`.
 The lock protocol itself is pinned by a direct test of `_StrictValidateRun`; the receipt-path arms
 cannot see it, because cancelling the executor future already skips a queued job.
 
-**What it does not cover, so the cost of 2026-10-30 is narrowed, not removed.**
+**What the discriminator does not see, which the owner ruling of 2026-11-04 accepts as final.** The
+cost the 2026-10-30 amendment recorded is narrowed, not removed: a valid body in either case below is
+refused as final, and a sender, the engine's own outbounds included, does not re-send it.
 
 * A validate that began late. If a worker comes free with less of the timeout left than the body
-  needs, the body times out after beginning and is answered `422`. On the machine above a conformant
+  needs, the body times out after beginning and is answered `422` (`AR` on MLLP). On the machine above a conformant
   ADT needed about 3 ms, so the window is the last few milliseconds of the timeout for such a body;
   a larger valid body widens it. No fraction of the timeout is used to call such a case load,
   because any threshold would be a guess, and the begun thread is still running.
 * Load that slows a validate after it began, such as other threads holding the GIL. It was not
   measured, and the discriminator does not see it.
 
-**MLLP is unchanged.** Both timeouts still answer `AE` with the same MSA-3 text; only the stored
-reason tells them apart, so the NAK text does not report engine load. The receipt path's status
-does (`503` versus `422`), by design: a sender cannot be told to re-send without being told the
-engine was busy. The same change made a strict-validation failure answer `AR` on MLLP, the final code,
-matching the receipt path's `422` and `413` for it (BACKLOG #5078). A validator fault, an unexpected
-exception inside `validate()` that may be the engine's own, such as a `MemoryError` under load,
-stays `AE` (`ValidationResult.fault`), and the receipt path answers it temporary, `503`. A fault
-beside a verdict the body earns every time, such as an MSH-12 version mismatch, is not a fault. The
-engine's own
-MLLP outbound dead-letters `AR` at once and retries `AE`.
+**MLLP follows the same split.** A timeout whose validate began answers `AR`, and one that never
+began answers `AE`, both with the same MSA-3 text; the stored reason also tells them apart. The code
+itself reports engine load, as the receipt path's status does (`503` versus `422`), by design: a
+sender cannot be told to re-send without being told the engine was busy. Every strict-validation
+failure answers `AR` on MLLP, the final code, matching the receipt path's `422` and `413` for it,
+whatever raised inside `validate()`. Nothing there tells an `hl7apy` trip on a body from an engine
+fault, and a body alone can reach its defensive catch-all (a plain `IndexError` from `hl7apy` on an
+MSH-2 run into MSH-3, pinned in `tests/test_strict_refusal_classes.py`). The engine's own MLLP outbound
+dead-letters `AR` at once and retries `AE`. Why the engine's `AR` and `AE` depart from the HL7 v2
+letter is stated once, in `messagefoundry/CLAUDE.md`, *ACK/NAK*.
 
 **What else is unchanged.** Strict validation's own size cap stays the engine default, 16 MiB,
 whatever the inbound's `max_message_bytes`. `docs/HL7-VALIDATION.md` says so for operators. The dry

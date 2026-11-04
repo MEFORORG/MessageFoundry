@@ -911,14 +911,16 @@ class _StrictValidateTimedOut(Exception):
     ``started`` says whether ``hl7apy`` had begun on the body when the timeout fired (BACKLOG #5078,
     the ADR 0154 amendment of 2026-11-03). The timeout counts the wait for a worker thread as well
     as the validate, so under load a body can time out before it is ever looked at. That body says
-    nothing about itself, and it left no thread behind, so a receipt source answers it as temporary.
-    One that had started stays final: it may be the slow body the timeout exists for, and its
-    thread is still running. "Began" means the worker ran the run's first line; a free thread that
-    the GIL or the OS did not schedule in time reads as not begun too, so the reason says only that.
+    nothing about itself, and it left no thread behind, so it is answered as temporary (``503``, or
+    ``AE`` on MLLP). One that had started is final (``422``, or ``AR``; owner ruling 2026-11-04): it
+    may be the slow body the timeout exists for, and its thread is still running. "Began" means the
+    worker ran the run's first line; a free thread that the GIL or the OS did not schedule in time
+    reads as not begun too, so the reason says only that.
 
     ``reason`` is value-free, only the numeric timeout, and goes to the stored ``ERROR`` row.
-    ``ack_text`` goes in an MLLP NAK's MSA-3 and is the same for both causes, so the NAK text does
-    not report engine load. The receipt path's status (``503`` versus ``422``) does, by design."""
+    ``ack_text`` goes in an MLLP NAK's MSA-3 and is the same for both causes. The answer's class
+    (``503`` or ``AE`` versus ``422`` or ``AR``) still tells a sender which one it was, by design: a
+    sender cannot be told to re-send without being told the engine was busy."""
 
     def __init__(self, timeout: float, *, started: bool) -> None:
         self.started = started
@@ -8160,11 +8162,12 @@ class RegistryRunner:
                 # DoS backstop (#89): dead-letter instead of pinning intake. HTTP owns its own
                 # 202/4xx response — no HL7 ACK here.
                 #
-                # A validate that had begun stays PERMANENT (BACKLOG #2105): a body that times out
-                # for its own content times out on every re-send, and each attempt orphans another
-                # hl7apy thread this path cannot kill. One that never began timed out waiting for a
-                # worker thread: nothing is known of the body and no thread was left, so it is
-                # TEMPORARY (BACKLOG #5078; ADR 0154's amendment of 2026-11-03).
+                # A validate that had begun is PERMANENT (BACKLOG #2105; owner ruling 2026-11-04): a
+                # body that times out for its own content times out on every re-send, and each
+                # attempt orphans another hl7apy thread this path cannot kill. One that never began
+                # timed out waiting for a worker thread: nothing is known of the body and no thread
+                # was left, so it is TEMPORARY (BACKLOG #5078; ADR 0154's amendment of 2026-11-03).
+                # _handle_inbound answers the same split AR / AE.
                 kind = RefusalKind.PERMANENT if exc.started else RefusalKind.TEMPORARY
                 return await self._refuse(ic, raw, text, kind, error=exc.reason, peek=peek)
             if not result.ok:
@@ -8172,14 +8175,7 @@ class RegistryRunner:
                 # validate() keeps its own size cap, the engine default, even where the inbound's
                 # max_message_bytes admitted the body to the peek. It says itself when that cap
                 # refused the body, measured on the text it normalized, so nothing here re-derives it.
-                # A validator fault may be the engine's (a MemoryError under load), so it is
-                # TEMPORARY, as MLLP answers it AE (BACKLOG #5078).
-                if result.oversize:
-                    kind = RefusalKind.OVERSIZE
-                elif result.fault:
-                    kind = RefusalKind.TEMPORARY
-                else:
-                    kind = RefusalKind.PERMANENT
+                kind = RefusalKind.OVERSIZE if result.oversize else RefusalKind.PERMANENT
                 return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
         # failure records ERROR + returns a refusal — never accepted-and-dropped.
@@ -8543,12 +8539,13 @@ class RegistryRunner:
             except _StrictValidateTimedOut as exc:
                 # DoS backstop (#89): dead-letter + NAK instead of pinning the listener. The stored/ACK
                 # string is PHI-safe/value-free (only the numeric timeout) — unlike the validation-error
-                # path below it quotes no field. AE whether or not the validate had begun: a timeout
-                # that began may still be load (ADR 0154's amendment of 2026-11-03), so it is not
-                # answered as final here (BACKLOG #5078).
+                # path below it quotes no field. The same split as the receipt path (owner ruling
+                # 2026-11-04, BACKLOG #5078): a validate that had begun is final, AR, and one that
+                # never began is temporary, AE.
                 mid = await self._record_refused(ic, raw, text, error=exc.reason, peek=peek)
+                timeout_code = "AR" if exc.started else "AE"
                 ack = (
-                    build_ack(peek, code="AE", text=exc.ack_text, ack_mode=ack_mode)
+                    build_ack(peek, code=timeout_code, text=exc.ack_text, ack_mode=ack_mode)
                     if reply
                     else None
                 )
@@ -8556,7 +8553,7 @@ class RegistryRunner:
                     await self._capture_ack(
                         mid,
                         ic.name,
-                        ack_code="AE",
+                        ack_code=timeout_code,
                         ack_phase="strict",
                         ack_body=None,
                         detail=exc.reason,
@@ -8571,16 +8568,13 @@ class RegistryRunner:
                 # messages:view_summary on read, like every other stored error.
                 persisted = f"strict-validation failed: {safe_text(joined)}"
                 mid = await self._record_refused(ic, raw, text, error=persisted, peek=peek)
-                # AR, not AE (BACKLOG #5078): hl7apy's verdict or the size cap fails the body the same
-                # way on every re-send, which the receipt path answers as final (422, or 413 for
-                # validate()'s own size cap), and an AE invited a sender, the engine's own MLLP
-                # outbound included, to retry it. A validator FAULT (validate()'s defensive catch-all,
-                # a MemoryError under load among them) may be the engine's, so it stays AE. The NAK
+                # AR, not AE (BACKLOG #5078; owner ruling 2026-11-04): every strict failure is final,
+                # as the receipt path answers it (422, or 413 for validate()'s own size cap), and an
+                # AE invited a sender, the engine's own MLLP outbound included, to retry it. The NAK
                 # goes back to the partner that SENT this message (their own data) and is transient
                 # (never persisted), so it may carry the fuller, bounded validation text.
-                nak_code = "AE" if result.fault else "AR"
                 ack = (
-                    build_ack(peek, code=nak_code, text=joined[:200], ack_mode=ack_mode)
+                    build_ack(peek, code="AR", text=joined[:200], ack_mode=ack_mode)
                     if reply
                     else None
                 )
@@ -8590,7 +8584,7 @@ class RegistryRunner:
                     await self._capture_ack(
                         mid,
                         ic.name,
-                        ack_code=nak_code,
+                        ack_code="AR",
                         ack_phase="strict",
                         ack_body=None,
                         detail=persisted,

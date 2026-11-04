@@ -750,7 +750,8 @@ ingress**, after reading it, is never answered `202`. The message is still recor
 - **`422`** for any other refusal, which a re-send of the same body would meet again. Examples are a
   body the engine cannot decode in a usable charset, one that does not match the declared `content_type`, or an HL7 parse
   or strict-validation failure. A strict-validation timeout whose validate had begun is one too,
-  deliberately, even where load slowed it: it answers `422` and is final. Only a timeout that never
+  deliberately, even where load slowed it: it answers `422` and is final (owner ruling 2026-11-04).
+  Only a timeout that never
   began is told apart as temporary, above; the
   [ADR 0154 amendment of 2026-11-03](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary)
   says what was measured and what it does not cover.

@@ -38,14 +38,13 @@ silent autodetection. Enable strict when: the downstream system is intolerant of
 the feed is contractually conformant, or correctness outweighs throughput. Leave it off for a tolerant
 archival/forwarding feed.
 
-What the sender hears (BACKLOG #5078):
+What the sender hears (BACKLOG #5078, owner ruling 2026-11-04):
 
 | Strict outcome | MLLP / TCP | `Http()` |
 |---|---|---|
-| the body fails validation | `AR`: final, the same body fails the same way on a re-send | `422` |
-| the validator faulted (an unexpected exception inside it, which may be the engine's) | `AE` | `503` with `Retry-After` |
+| the body fails validation, an MSH-12 version mismatch included | `AR`: final, the same body fails the same way on a re-send | `422` |
 | the body is over strict validation's own size cap | `AR` | `413` |
-| the validate began and ran past `validation.strict_timeout_s` | `AE` | `422` |
+| the validate began and ran past `validation.strict_timeout_s` | `AR` | `422` |
 | the timeout fired before any worker thread began the validate | `AE` | `503` with `Retry-After` |
 
 The engine's own MLLP outbound dead-letters an `AR` at once and retries an `AE`. Why a timeout splits
