@@ -228,9 +228,10 @@ class WiringError(ValueError):
 class ConfigDirUnlistable(WiringError):
     """A load refused because the config directory itself could not be read, for a reason other
     than its being missing: at least a share Windows cannot reach, a folder this account cannot
-    list, and one that lists while ``Path.is_dir`` says no. Its own type, so a reload audits it as ``unreadable``, as it audits the engine's own
-    check of the target, not as a config to fix (vault BACKLOG #5248). Still a ``WiringError``, so
-    every caller that refuses a bad config refuses this one the same way."""
+    list, and one that lists while ``Path.is_dir`` says no. Its own type, so a reload audits it as
+    ``unreadable``, as it audits the engine's own check of the target, not as a config to fix
+    (vault BACKLOG #5248). Still a ``WiringError``, so every caller that refuses a bad config
+    refuses this one the same way."""
 
 
 class PortConflictError(WiringError):
@@ -9669,9 +9670,10 @@ def _assert_safe_config_source(directory: Path) -> None:
     for a share Windows cannot reach (vault BACKLOG #5117).
 
     A refusal is judged again by listing the directory, so one moved away while its owners and
-    access lists were read raises ``ConfigDirMissing``, and one lost then raises the listing's
-    ``OSError``, as the walk's own listing would have: a refusal of a path that is no longer there
-    to read must not be audited as a config to fix (vault BACKLOG #5248)."""
+    access lists were read raises ``ConfigDirMissing``, as the walk's own listing would have, and
+    a reload audits it ``not_found``, not as a config to fix (vault BACKLOG #5248). The refusal is
+    logged then. Any other refusal stands, a directory that has stopped listing included: no
+    listing fault may replace the answer that names what was refused."""
     try:
         # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
         # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
@@ -9692,10 +9694,21 @@ def _assert_safe_config_source(directory: Path) -> None:
         refusal = exc
     else:
         return
-    # Outside the handler, so a raise here does not carry the refusal as its __context__. It
-    # raises only when the directory itself is gone or cannot be listed; one that lists keeps
-    # the refusal.
-    _require_config_dir(directory, strict=True)
+    # Outside the handler, so a ConfigDirMissing raised here does not carry the refusal as its
+    # __context__; the refusal is logged instead, so it is never lost.
+    try:
+        _require_config_dir(directory, strict=True)
+    except ConfigDirMissing:
+        _logger.warning(
+            "config directory %s is gone after its trust check refused it: %s",
+            scrub_log_argument(str(directory)),
+            scrub_log_argument(safe_exc(refusal)),
+        )
+        raise
+    except OSError:
+        # Present but not listable now, say a share that dropped. The refusal stands: it is the
+        # one answer that names what was refused, and a fault must not mask it.
+        pass
     raise refusal
 
 

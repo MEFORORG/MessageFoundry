@@ -1823,7 +1823,8 @@ async def test_a_directory_unlistable_only_at_the_trust_walk_is_audited_unreadab
     engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The lax load's first check lists the directory, and the trust walk's listing then fails:
-    judged again, so it is ``unreadable`` too, not a source the walk could not vet (#5248 item 4)."""
+    judged again, so it is ``unreadable`` too, not a source the walk could not vet (vault BACKLOG
+    #5248 item 4)."""
     from messagefoundry.config import wiring
 
     cfg = (tmp_path / "cfg").resolve()
