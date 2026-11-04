@@ -531,6 +531,42 @@ def test_config_directory_not_found_still_refuses(
         load_config(tmp_path)
 
 
+@pytest.mark.parametrize("gone", [2, 3])  # ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+def test_config_directory_gone_before_its_read_is_missing(gone: int, tmp_path: Path) -> None:
+    """The directory moved away between the walk's listing and this read: missing, as the load's
+    own check of it answers, so a reload audits it ``not_found``, not a source it could not vet
+    (vault BACKLOG #5248 item 1). The test above is the control: still there, it refuses."""
+    from messagefoundry.config.fingerprint import ConfigDirMissing
+    from messagefoundry.config.wiring import (
+        _CONFIG_SOURCE_LEAD,
+        _enforce_windows_paths,
+        _refuse_unsafe_config_source,
+    )
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    _write_cfg(cfg)
+    paths = [cfg, cfg / "cfg.py"]
+
+    def _read_path(path: Path) -> _WinPathSecurity:
+        if path == cfg:
+            cfg.rename(tmp_path / "moved")
+            return _WinPathSecurity(status=gone)
+        return _CLEAN_READ
+
+    probes = _WinConfigSourceProbes(
+        self_sid=_SELF, read_path=_read_path, owner_in_admins=_never_admin
+    )
+    with pytest.raises(ConfigDirMissing, match="config directory not found"):
+        _enforce_windows_paths(
+            paths,
+            probes,
+            lead=_CONFIG_SOURCE_LEAD,
+            refuse=_refuse_unsafe_config_source,
+            first_is_required=True,
+        )
+
+
 # ---- Tier 2: Windows-gated integration via icacls ---------------------------
 
 

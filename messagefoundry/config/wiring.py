@@ -178,6 +178,7 @@ __all__ = [
     "OutboundConnection",
     "Registry",
     "WiringError",
+    "ConfigDirUnlistable",
     "PortConflictError",
     "API_LISTENER_LABEL",
     "inbound_binding_conflicts",
@@ -222,6 +223,14 @@ _logger = logging.getLogger(__name__)
 
 class WiringError(ValueError):
     """A connection/router/handler was declared wrong, or references something missing."""
+
+
+class ConfigDirUnlistable(WiringError):
+    """A load refused because the config directory itself could not be listed, for a reason other
+    than its being missing: at least a share Windows cannot reach and a folder this account cannot
+    list. Its own type, so a reload audits it as ``unreadable``, as it audits the engine's own
+    check of the target, not as a config to fix (vault BACKLOG #5248). Still a ``WiringError``, so
+    every caller that refuses a bad config refuses this one the same way."""
 
 
 class PortConflictError(WiringError):
@@ -8727,6 +8736,10 @@ def read_trusted_snapshot(directory: str | Path, *, strict: bool = False) -> Con
         # strict that is a refusal, not a raw error, which a reload would answer as a 500.
         if strict:
             raise
+        # Judged again, as the walk judges a listing that says missing: a directory that cannot
+        # be listed now refuses as unreadable, and one gone as missing (vault BACKLOG #5248). A
+        # fault deeper in it, such as in its code-set folder, is the refusal below.
+        _require_config_dir(directory, strict=False)
         raise WiringError(
             f"{_CONFIG_SOURCE_LEAD} {directory}: could not vet it: {safe_exc(exc)}"
         ) from exc
@@ -8801,7 +8814,10 @@ def _require_loadable(snapshot: ConfigSnapshot) -> None:
 
 
 def _unreadable_source(directory: Path, unreadable: Sequence[str]) -> WiringError:
-    return WiringError(
+    """The refusal of a load that could not read ``unreadable``: :class:`ConfigDirUnlistable`
+    where that includes the directory itself (``.``), a plain ``WiringError`` otherwise."""
+    refusal = ConfigDirUnlistable if "." in unreadable else WiringError
+    return refusal(
         f"refusing to load config from {directory}: could not read "
         f"{', '.join(unreadable)}; see the engine log and docs/SERVICE.md for required permissions"
     )
@@ -9126,8 +9142,11 @@ def _enforce_windows_paths(
 
     For a config load ``paths`` is :func:`config_source_trust_paths`: the directory, every ``*.py``
     with ``_*.py`` helpers included, and the cache, connections and code-set files, the same set the
-    POSIX arm reads. With ``first_is_required``, a not-found read of the first path refuses outright: that is the
-    config directory itself. Any other path that is gone by the time it is read is skipped, as below.
+    POSIX arm reads. With ``first_is_required``, a not-found read of the first path, which is the
+    config directory itself, is never skipped: it raises
+    :class:`~messagefoundry.config.fingerprint.ConfigDirMissing` where nothing is there any more,
+    and refuses where something still is. Any other path that is gone by the time it is read is
+    skipped, as below.
 
     **A read that fails also REFUSES** (ADR 0036 Amendment B, BACKLOG #1654). That covers at least a
     ``GetNamedSecurityInfoW`` error, an owner SID that cannot be rendered, a DACL that cannot be
@@ -9154,11 +9173,12 @@ def _enforce_windows_paths(
         )
     for index, path in enumerate(paths):
         sec = probes.read_path(path)
-        if (
-            sec.status in _WIN_PATH_GONE_ERRORS
-            and not (first_is_required and index == 0)
-            and not os.path.lexists(path)
-        ):
+        if sec.status in _WIN_PATH_GONE_ERRORS and not os.path.lexists(path):
+            if first_is_required and index == 0:
+                # The config directory moved away during the walk: missing, as the load's own
+                # check of it answers, which a reload audits as not_found (vault BACKLOG #5248).
+                # Nothing is left to run, so this refuses the load as surely as a refusal would.
+                raise ConfigDirMissing(f"config directory not found: {path}")
             continue
         if sec.status != 0:
             detail = f": {sec.status_text}" if sec.status_text else ""
