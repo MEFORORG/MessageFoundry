@@ -79,7 +79,7 @@ class SnapshotEnvValuesProvider(ABC):
     def value_file(self) -> Path | None:
         """The value file this provider reads, wherever ``[environments].base_dir`` puts it, or
         ``None`` when it reads none. The engine reads the file into each reload's snapshot and
-        folds it into the config digest, so an approval covers it and :meth:`from_snapshot` can
+        binds it to a dual-control hold, keyed, so an approval covers it and :meth:`from_snapshot` can
         parse it from those bytes (vault BACKLOG #2596). Any file name serves; the snapshot holds
         it as ``@value-file/<name>``. A reload that cannot read it is refused."""
         return None

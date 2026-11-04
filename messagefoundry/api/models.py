@@ -683,7 +683,7 @@ class ConfigProvenance(BaseModel):
     (or if the fingerprint could not be computed); ``drift`` still answers then, as its comment says."""
 
     loaded: bool
-    fingerprint: str | None = None  # content hash of the loaded bundle (scheme mefor-cfg-fp:v4)
+    fingerprint: str | None = None  # content hash of the loaded bundle (scheme mefor-cfg-fp:v3)
     git_head: str | None = None  # commit sha at load, when the config dir is a git work tree
     files: int | None = None  # number of files folded into the fingerprint
     #: The on-disk config now differs from what was loaded, or the two digests left out different

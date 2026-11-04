@@ -1409,7 +1409,7 @@ async def test_a_hold_that_captured_no_digest_is_refused_at_release(
     async def _none(_config_dir: object) -> None:
         return None
 
-    monkeypatch.setattr(engine, "reload_target_digest", _none)
+    monkeypatch.setattr(engine, "reload_target_approval", _none)
     service = await _service(engine)
     approval_id, r = await _hold_then_release(engine, service, {})
     assert r.status_code == 422, r.text
@@ -1451,7 +1451,7 @@ async def test_an_ungated_reload_takes_no_request_time_digest(
     async def _must_not_run(_config_dir: object) -> str:
         raise AssertionError("an ungated reload took a request-time digest")
 
-    monkeypatch.setattr(engine, "reload_target_digest", _must_not_run)
+    monkeypatch.setattr(engine, "reload_target_approval", _must_not_run)
     service = await _service(engine)
     await _add(service, "deployer", Role.ADMINISTRATOR)
     async with _client(engine, service, NOT_GATED) as c:
@@ -2507,7 +2507,7 @@ async def test_a_name_no_directory_can_have_is_refused_as_missing(
 async def test_the_gated_engine_path_refuses_a_name_no_directory_can_have_as_missing(
     engine: Engine, tmp_path: Path, name: str
 ) -> None:
-    """:meth:`Engine.reload_target_digest` and an approval-bound reload both raise
+    """:meth:`Engine.reload_target_approval` and an approval-bound reload both raise
     ``ConfigDirMissing``, not ``ConfigDirUnreadable``. Both refuse at the target check, before any
     digest is taken. The strict digest's own rule for such a name is pinned in
     tests/test_config_fingerprint.py."""
@@ -2516,7 +2516,7 @@ async def test_the_gated_engine_path_refuses_a_name_no_directory_can_have_as_mis
 
     config_dir = tmp_path / "cfg" / name
     with pytest.raises(ConfigDirMissing):
-        await engine.reload_target_digest(config_dir)
+        await engine.reload_target_approval(config_dir)
     approval = ApprovedConfig(config_fingerprint(tmp_path / "cfg"))
     with pytest.raises(ConfigDirMissing):
         await engine.reload_detail(config_dir, approval=approval)

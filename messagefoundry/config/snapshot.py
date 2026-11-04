@@ -37,6 +37,7 @@ __all__ = [
     "config_py_files",
     "is_missing_directory",
     "is_regular_file",
+    "is_value_file_entry",
     "read_config_snapshot",
     "with_value_file",
 ]
@@ -54,9 +55,10 @@ CONNECTIONS_REL = "connections.toml"
 _ENVIRONMENTS_DIR = "environments"
 
 #: The folder name a value file outside ``environments/`` is recorded under, with its file name
-#: alone, so the digest stays independent of where the bundle sits. No listing returns it: a listed
-#: entry is a top-level module or ``connections.toml``, or sits in one of :data:`_FOLDERS`. Covered
-#: and never loaded, like ``environments/`` (vault BACKLOG #2596).
+#: alone, so a hold's binding of it stays independent of where the bundle sits. No listing returns
+#: it: a listed entry is a top-level module or ``connections.toml``, or sits in one of
+#: :data:`_FOLDERS`. Never loaded, like ``environments/``, and unlike that folder in no published
+#: digest: ``config.fingerprint.value_file_material`` binds it, keyed (vault BACKLOG #2596).
 _VALUE_FILE_DIR = "@value-file"
 _VALUE_FILE_PREFIX = f"{_VALUE_FILE_DIR}/"
 
@@ -66,8 +68,8 @@ _FOLDERS: tuple[str, ...] = (CODESETS_DIR_NAME, _ENVIRONMENTS_DIR)
 
 class NotInSnapshot(LookupError):
     """A value file outside the snapshot's ``environments/`` folder and not the one
-    :func:`with_value_file` read into it, whose bytes the snapshot did not read and its digest does
-    not cover (:meth:`ConfigSnapshot.environment_file`)."""
+    :func:`with_value_file` read into it, whose bytes the snapshot did not read, so no approval
+    covers them (:meth:`ConfigSnapshot.environment_file`)."""
 
 
 class ConfigDirMissing(FileNotFoundError):
@@ -215,7 +217,7 @@ class ConfigSnapshot:
             rel.startswith(_VALUE_FILE_PREFIX) for rel in (*checked, *self.unreadable)
         ):
             # Bytes no reload could serve (environment_file matches a held value_file only), so
-            # a digest of them would cover values nothing applies.
+            # a binding of them would cover values nothing applies.
             raise ValueError("a config snapshot holds a value file only with its value_file path")
         object.__setattr__(self, "files", MappingProxyType(dict(sorted(checked.items()))))
         # In path order, as the loader ran them when it globbed the directory: without case on
@@ -251,8 +253,8 @@ class ConfigSnapshot:
 
     def covers_environment_file(self, path: str | Path) -> bool:
         """Whether ``path`` is in this snapshot's ``environments/`` folder, or is its
-        :attr:`value_file`, so the snapshot's digest covers the file there, or that there is none
-        (:func:`_same_folder`)."""
+        :attr:`value_file`, so an approval of the snapshot covers the file there, or that there is
+        none (:func:`_same_folder`)."""
         return self._folder_of(Path(path)) is not None
 
     def _folder_of(self, path: Path) -> str | None:
@@ -279,7 +281,7 @@ class ConfigSnapshot:
         """The bytes this snapshot read for the value file ``path``, which
         :meth:`covers_environment_file` must accept, or ``None`` when it read no such file and none
         is there now. A caller reading values for a reload parses these instead of reading the file
-        again, so the values it applies are the bytes the digest covered (vault BACKLOG #2596).
+        again, so the values it applies are the bytes the approval covered (vault BACKLOG #2596).
 
         Raises :class:`NotInSnapshot` for a path the snapshot does not cover. Raises ``OSError``
         where the bytes cannot stand for the file now: the snapshot could not read it or its
@@ -340,11 +342,18 @@ class ConfigSnapshot:
         )
 
 
+def is_value_file_entry(rel: str) -> bool:
+    """Whether ``rel`` names the value file :func:`with_value_file` read into a snapshot, which no
+    published config digest folds (:mod:`messagefoundry.config.fingerprint`; vault BACKLOG #2596)."""
+    return rel.startswith(_VALUE_FILE_PREFIX)
+
+
 def with_value_file(
     snapshot: ConfigSnapshot, value_file: str | Path | None, *, strict: bool
 ) -> ConfigSnapshot:
-    """``snapshot`` with the value file ``value_file`` read into it, so its digest covers those
-    bytes and a reload parses them (:meth:`ConfigSnapshot.environment_file`; vault BACKLOG #2596).
+    """``snapshot`` with the value file ``value_file`` read into it, so a hold's binding covers
+    those bytes and a reload parses them (:meth:`ConfigSnapshot.environment_file`; vault BACKLOG
+    #2596). No published digest folds them (:func:`is_value_file_entry`).
 
     ``value_file`` is the path a start reads, ``<base_dir>/<dir>/<env>.toml``, wherever
     ``[environments].base_dir`` puts it. It is read by that path, so the open resolves it as the
@@ -353,12 +362,12 @@ def with_value_file(
     link. Returns ``snapshot`` itself when ``value_file`` is ``None``, sits in the snapshot's
     ``environments/`` folder, which the snapshot already read, or is the file the snapshot already
     holds, unless ``strict`` and the held read was a fault. A file that is not there is held as
-    absent, so creating one changes the digest. With ``strict`` a fault reading it raises its
+    absent, so creating one changes a hold's binding. With ``strict`` a fault reading it raises its
     ``OSError``; without, it is named in :attr:`ConfigSnapshot.unreadable`. Absent and faulted are
     judged by :func:`is_regular_file`, as a start judges them. Any file name is held, under
     ``@value-file/<name>``. Its access list is not vetted here: a caller that applies the bytes,
     as a reload does, vets the file and the folders its links lead through before this read. A
-    caller that only hashes them, such as a request-time digest, applies nothing it read."""
+    caller that only binds them, such as a request-time hold, applies nothing it read."""
     if value_file is None:
         return snapshot
     path = Path(value_file).absolute()

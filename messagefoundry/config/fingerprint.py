@@ -34,8 +34,8 @@ from messagefoundry.config.snapshot import (
     ConfigDirMissing,
     ConfigSnapshot,
     is_missing_directory,
+    is_value_file_entry,
     read_config_snapshot,
-    with_value_file,
 )
 from messagefoundry.credential import constant_time_equal
 
@@ -53,6 +53,7 @@ __all__ = [
     "left_out_of",
     "same_digest",
     "snapshot_fingerprint",
+    "value_file_material",
 ]
 
 # Version the scheme so a future change to *what* is hashed (or *how*) is itself detectable in the
@@ -63,10 +64,7 @@ __all__ = [
 # BACKLOG #2596). A code-set table is matched by its suffix in lower case, as the loader matches it,
 # so ``codesets/x.CSV`` is hashed on POSIX too; and a path that resolves to a file another path
 # already names is hashed under both names, so a link added beside a module changes the digest.
-# v4: the value file a start reads is folded wherever ``[environments].base_dir`` puts it, as
-# ``@value-file/<name>`` when it is outside the config directory's ``environments/`` folder
-# (:func:`~messagefoundry.config.snapshot.with_value_file`, vault BACKLOG #2596).
-_SCHEME = b"mefor-cfg-fp:v4\n"
+_SCHEME = b"mefor-cfg-fp:v3\n"
 
 #: The scheme tag :func:`config_fingerprint_detail` records beside each digest. Two digests are
 #: comparable only under one scheme: a start compares its own digest with the store's last recorded
@@ -91,10 +89,11 @@ UNREADABLE_FILES_KEY = "unreadable_files"
 # file a serve start reads sits
 # under ``[environments].base_dir``; where that is this folder, a reload parses the very bytes
 # hashed here (``ConfigSnapshot.environment_file``), so dropping them from the fold would let a
-# released reload apply values its digest does not cover. Elsewhere, the default layout, a caller
-# that names it (``value_file``) has it read into the snapshot and folded as ``@value-file/<name>``,
-# and a reload parses those bytes the same way. ``__pycache__`` is never read:
-# the loader compiles the source itself.
+# released reload apply values its digest does not cover. Elsewhere, the default layout, a reload's
+# snapshot holds it as ``@value-file/<name>`` and parses those bytes, but no digest here folds it:
+# it can hold credentials, and these digests are published unkeyed. A dual-control hold binds it
+# with a keyed MAC instead (:func:`value_file_material`; vault BACKLOG #2596). ``__pycache__`` is
+# never read: the loader compiles the source itself.
 
 
 def _entries(snapshot: ConfigSnapshot) -> list[tuple[str, bytes]]:
@@ -102,8 +101,13 @@ def _entries(snapshot: ConfigSnapshot) -> list[tuple[str, bytes]]:
 
     Sorting by relpath makes the fold order-independent (filesystem enumeration order can vary);
     keying on the *relative* path (not absolute) makes the digest location-independent, so two
-    byte-identical bundles at different paths fingerprint identically."""
-    return sorted((rel, hashlib.sha256(data).digest()) for rel, data in snapshot.files.items())
+    byte-identical bundles at different paths fingerprint identically. The value file a reload's
+    snapshot holds from outside the config directory is left out (:func:`value_file_material`)."""
+    return sorted(
+        (rel, hashlib.sha256(data).digest())
+        for rel, data in snapshot.files.items()
+        if not is_value_file_entry(rel)
+    )
 
 
 def _fold(entries: list[tuple[str, bytes]]) -> str:
@@ -130,9 +134,32 @@ def snapshot_fingerprint(snapshot: ConfigSnapshot) -> str:
     return _fold(_entries(snapshot))
 
 
-def config_fingerprint(
-    directory: str | Path, *, strict: bool = False, value_file: str | Path | None = None
-) -> str:
+#: Leads :func:`value_file_material`, so its bytes are never those of another construction.
+_VALUE_FILE_SCHEME = b"mefor-cfg-value-file:v1\n"
+
+
+def value_file_material(snapshot: ConfigSnapshot) -> bytes | None:
+    """What a dual-control hold binds of the value file ``snapshot`` read from outside the config
+    directory (:func:`~messagefoundry.config.snapshot.with_value_file`), or ``None`` when it read
+    none (vault BACKLOG #2596): its name, whether it was there, and its bytes, so creating,
+    removing or editing it each change the material.
+
+    No digest above folds that file, since it can hold credentials and they are published unkeyed.
+    The engine MACs this material under a key derived from the store key
+    (:func:`~messagefoundry.store.crypto.config_value_file_mac`) and never publishes it bare. A
+    value file the snapshot could not read raises ``ValueError``, since the material would then
+    claim it was not there."""
+    held = snapshot.value_file
+    if held is None:
+        return None
+    if any(is_value_file_entry(rel) for rel in snapshot.unreadable):
+        raise ValueError("the config snapshot could not read the environment value file")
+    data = next((data for rel, data in snapshot.files.items() if is_value_file_entry(rel)), None)
+    material = _VALUE_FILE_SCHEME + held.name.encode("utf-8", "surrogatepass") + b"\0"
+    return material + (b"\0" if data is None else b"\1" + data)
+
+
+def config_fingerprint(directory: str | Path, *, strict: bool = False) -> str:
     """Return a stable SHA-256 hex digest over the content of a config bundle's loaded files.
 
     By default it is observational, as the module docstring says: a file it cannot read is left out,
@@ -140,17 +167,12 @@ def config_fingerprint(
     one a dual-control approval binds (vault BACKLOG #2596). There a skipped file would leave bytes
     the approval never covered, so ``strict`` raises instead.
     :func:`~messagefoundry.config.snapshot.read_config_snapshot` says at which faults, and which
-    gone directory it does not refuse. ``value_file`` is the value file a start reads, folded
-    wherever it is (:func:`~messagefoundry.config.snapshot.with_value_file`)."""
-    snapshot = read_config_snapshot(directory, strict=strict)
-    return snapshot_fingerprint(with_value_file(snapshot, value_file, strict=strict))
+    gone directory it does not refuse."""
+    return snapshot_fingerprint(read_config_snapshot(directory, strict=strict))
 
 
 def config_fingerprint_detail(
-    directory: str | Path,
-    *,
-    snapshot: ConfigSnapshot | None = None,
-    value_file: str | Path | None = None,
+    directory: str | Path, *, snapshot: ConfigSnapshot | None = None
 ) -> dict[str, object]:
     """Return the fingerprint plus the file count and a best-effort git HEAD, for an audit detail.
 
@@ -161,8 +183,7 @@ def config_fingerprint_detail(
 
     With ``snapshot``, the digest is of that snapshot, the bytes a load read and ran, and the
     directory is read for the git HEAD alone (vault BACKLOG #2596). Without it, the directory is
-    read now. ``value_file`` is folded as :func:`config_fingerprint` folds it; a snapshot that
-    already holds it does not read it again.
+    read now.
 
     It stays best-effort: a file it cannot read is left out of the digest. But it says so, under
     :data:`UNREADABLE_FILES_KEY` (the files and folders left out), present only when one was. Two
@@ -174,15 +195,15 @@ def config_fingerprint_detail(
     base = Path(directory)
     if snapshot is None:
         snapshot = read_config_snapshot(base, strict=False)
-    snapshot = with_value_file(snapshot, value_file, strict=False)
     entries = _entries(snapshot)
     detail: dict[str, object] = {
         "fingerprint": _fold(entries),
         "scheme": FINGERPRINT_SCHEME,
         "files": len(entries),
     }
-    if snapshot.unreadable:
-        detail[UNREADABLE_FILES_KEY] = list(snapshot.unreadable)
+    left_out = [rel for rel in snapshot.unreadable if not is_value_file_entry(rel)]
+    if left_out:
+        detail[UNREADABLE_FILES_KEY] = left_out
     head = _git_head(base)
     if head is not None:
         detail["git_head"] = head

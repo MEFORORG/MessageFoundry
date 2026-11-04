@@ -900,7 +900,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # alert_sinks also imports smtplib: the alert SMTP hop's STARTTLS posture. This is the file
     # BACKLOG #1323 named as the worked example of a seam the store-only set could not match.
     "messagefoundry/pipeline/alert_sinks.py": frozenset({"messagefoundry.config.tls_policy"}),
-    "messagefoundry/pipeline/engine.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # Vault BACKLOG #2596: engine.py also reaches store.crypto for the keyed binding a reload hold
+    # takes of the environment value file. See its operation row.
+    "messagefoundry/pipeline/engine.py": frozenset(
+        {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto"}
+    ),
     # Vault BACKLOG #2354: stamps the instance hop posture around the DatabaseRef DSN build, so the
     # weakened-TLS escape is clamped exactly as the db_lookup executor's is. Builds no context.
     "messagefoundry/pipeline/reference_sync.py": frozenset({"messagefoundry.config.tls_policy"}),
@@ -1411,6 +1415,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # BACKLOG #4942: audit_chain_rolled names the active audit key by its one-way id
             # (audit_active_key_id) to compare it with the chain's newest range. No key leaves it.
             "hash:via messagefoundry.store.store",
+            # Vault BACKLOG #2596: a dual-control reload hold binds the environment value file with
+            # config_value_file_mac (HKDF off the audit-chain key, then HMAC-SHA256; the hash is
+            # audit_key_id), and a release checks it with verify_config_value_file_mac. The
+            # INVENTORY row "Reload hold value-file binding" says why it is keyed.
+            "hash:via messagefoundry.store.crypto",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:via messagefoundry.store.crypto",
+            "sign_verify:via messagefoundry.store.crypto",
         }
     ),
     "messagefoundry/pipeline/sandbox.py": frozenset({"csprng:secrets.token_hex"}),

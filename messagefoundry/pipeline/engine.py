@@ -108,6 +108,7 @@ from messagefoundry.pipeline.wiring_runner import (
 )
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
+from messagefoundry.store.crypto import Cipher
 from messagefoundry.store.store import (
     AUDIT_PREFIX_BREAK_MARKER,
     REINGRESS_TARGET_PREFIX,
@@ -194,7 +195,7 @@ class ConfigReloadDenied(Exception):
 class ConfigDirUnreadable(Exception):
     """A reload target that could not be resolved or listed for a reason other than its being
     missing, such as a parent the service account cannot traverse or a directory it cannot list. :meth:`Engine.reload_detail` and
-    :meth:`Engine.reload_target_digest` raise it before anything is read or swapped, so the reload
+    :meth:`Engine.reload_target_approval` raise it before anything is read or swapped, so the reload
     routes and the dual-control release refuse and audit it like any other refusal. The cause is
     logged at WARNING where it is raised; the message names no path."""
 
@@ -207,12 +208,17 @@ class ConfigDigestMismatch(Exception):
 
     :meth:`Engine.reload_detail` raises it before anything is swapped. ``approved`` is the digest
     the hold captured, or ``None`` when it captured none; ``current`` is the digest of the directory
-    now, or ``None`` when it could not be read. Both are content digests, never file content."""
+    now, or ``None`` when it could not be read. Both are content digests, never file content.
+    ``value_file`` is True when the two digests match and the environment value file is not the
+    one the approval bound, which neither digest covers."""
 
-    def __init__(self, approved: str | None, current: str | None) -> None:
+    def __init__(
+        self, approved: str | None, current: str | None, *, value_file: bool = False
+    ) -> None:
         super().__init__("the config on disk is not the config this reload's approval named")
         self.approved = approved
         self.current = current
+        self.value_file = value_file
 
 
 class ConfigDigestUnavailable(Exception):
@@ -275,23 +281,62 @@ class ApprovedConfig:
     """The config a dual-control approval released, which :meth:`Engine.reload_detail` binds a
     reload to (vault BACKLOG #2596, step 3). ``fingerprint`` is the digest the hold captured at
     request time, or ``None`` when it captured none; a reload bound to ``None`` refuses every
-    config."""
+    config.
+
+    ``value_file`` binds the environment value file the engine reads from outside the config
+    directory, which ``fingerprint`` leaves out because that digest is published unkeyed: the
+    :func:`~messagefoundry.store.crypto.config_value_file_mac` record the hold captured, as its
+    params stored it, so any value. ``None`` when it captured none, because the engine read no such
+    file or the store holds no in-process key (:func:`_require_approved` says what each means)."""
 
     fingerprint: str | None
+    value_file: object = None
 
 
-def _require_approved(current: str | None, approval: ApprovedConfig) -> None:
-    """Raise unless ``current`` is the digest ``approval`` names: :class:`ConfigDigestMismatch`
-    when the approval named none or the digests differ, :class:`ConfigDigestUnavailable` when no
-    digest could be taken now (``current`` is ``None``)."""
-    from messagefoundry.config.fingerprint import fingerprint_matches
+def _require_approved(
+    snapshot: ConfigSnapshot | None, approval: ApprovedConfig, cipher: Cipher
+) -> None:
+    """Raise unless ``snapshot`` is the config ``approval`` names: :class:`ConfigDigestMismatch`
+    when the approval named no digest, the digests differ, or the value file is not the one it
+    bound; :class:`ConfigDigestUnavailable` when no snapshot could be read now (``None``).
 
+    The value file the snapshot holds from outside the config directory is checked against
+    :attr:`ApprovedConfig.value_file` under ``cipher``'s keyring, so a hold filed before a store key
+    rotation still verifies while the retired key stays configured. A hold that bound none while
+    the snapshot holds one is refused, except on a store with no in-process key, where none can be
+    bound: there the release goes on, as before the value file was read into the snapshot, and a
+    WARNING says so (vault BACKLOG #2596)."""
+    from messagefoundry.config.fingerprint import (
+        fingerprint_matches,
+        snapshot_fingerprint,
+        value_file_material,
+    )
+    from messagefoundry.store.crypto import verify_config_value_file_mac
+
+    current = None if snapshot is None else snapshot_fingerprint(snapshot)
     if approval.fingerprint is None:
         raise ConfigDigestMismatch(None, current)
-    if current is None:
+    if snapshot is None or current is None:
         raise ConfigDigestUnavailable(approval.fingerprint)
     if not fingerprint_matches(current, approval.fingerprint):
         raise ConfigDigestMismatch(approval.fingerprint, current)
+    try:
+        material = value_file_material(snapshot)
+    except ValueError:
+        raise ConfigDigestUnavailable(approval.fingerprint) from None
+    held = approval.value_file
+    if material is None and held is None:
+        return
+    if material is not None and held is None and cipher.audit_mac_key() is None:
+        log.warning(
+            "the environment value file %s is not bound to this reload's approval: the store "
+            "holds no in-process key to bind it under, so an edit to it since the request is "
+            "not refused",
+            scrub_log_argument(str(snapshot.value_file)),
+        )
+        return
+    if material is None or verify_config_value_file_mac(cipher, material, held) is not True:
+        raise ConfigDigestMismatch(approval.fingerprint, current, value_file=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2725,9 +2770,9 @@ class Engine:
 
     def _value_file(self) -> Path | None:
         """The value file this engine's provider reads, wherever ``[environments].base_dir`` puts
-        it, which a reload's snapshot holds and the engine's config digests fold; ADR 0041's
-        2026-11-03 amendment says which (vault BACKLOG #2596). ``None`` for a provider that names
-        none, or no provider."""
+        it, which a reload's snapshot holds and a dual-control hold binds; ADR 0041's 2026-11-03
+        amendment says how (vault BACKLOG #2596). ``None`` for a provider that names none, or no
+        provider."""
         provider = self._env_values_provider
         if isinstance(provider, SnapshotEnvValuesProvider):
             return provider.value_file
@@ -2740,26 +2785,23 @@ class Engine:
         inventory scanner, which does not follow ``asyncio.to_thread``, keeps the hash on its record."""
         from messagefoundry.config.fingerprint import config_fingerprint_detail
 
-        # Each keyword only when set, so a call with neither is the plain one it always was.
-        kwargs: dict[str, Any] = {}
-        if snapshot is not None:
-            kwargs["snapshot"] = snapshot
         try:
-            value_file = self._value_file()
-            if value_file is not None:
-                kwargs["value_file"] = value_file
             # A direct call, so the crypto inventory scanner, which follows a call it can see,
-            # keeps the hash on its record. A snapshot that holds the value file is not read again.
-            return config_fingerprint_detail(path, **kwargs), None
+            # keeps the hash on its record.
+            if snapshot is not None:
+                return config_fingerprint_detail(path, snapshot=snapshot), None
+            return config_fingerprint_detail(path), None
         except (OSError, ValueError) as exc:
             reason = safe_exc(exc)
             log.warning("config fingerprint failed for %s: %s", path, reason)
             return None, reason
 
-    async def reload_target_digest(self, config_dir: str | Path | None) -> str:
-        """The content digest of the directory a reload of ``config_dir`` would load.
+    async def reload_target_approval(self, config_dir: str | Path | None) -> ApprovedConfig:
+        """What a held reload of ``config_dir`` binds: the content digest of the directory it would
+        load, and the keyed binding of the value file this engine reads from outside it
+        (:meth:`_approval_of`).
 
-        A held reload's approval carries it, and the release passes it back to
+        A held reload's params carry both, and the release passes them back to
         :meth:`reload_detail` in an :class:`ApprovedConfig` (vault BACKLOG #2596). The target is
         found by :meth:`_existing_reload_target`, as a reload finds it, so a path outside the reload
         roots is never read. Every refusal propagates, so a hold that release can only refuse is
@@ -2768,33 +2810,55 @@ class Engine:
         and one holding a folder or file the digest covers that cannot be read
         (:class:`ConfigDigestUnavailable`, the cause logged at WARNING)."""
         path = await self._existing_reload_target(config_dir)
-        digest = await self._content_digest(path)
-        if digest is None:
+        snapshot = await self._content_snapshot(path)
+        if snapshot is None:
             raise ConfigDigestUnavailable(None)
-        return digest
+        return await asyncio.to_thread(self._approval_of, snapshot)
 
-    async def _content_digest(self, path: Path) -> str | None:
-        """The ADR 0041 D1 content digest of ``path`` alone, for an approval to bind, or ``None``
-        when it cannot be taken. It fails closed: a file or folder it covers that cannot be read
-        gives ``None``, not the digest of the rest, and a directory that is gone, or whose name no
-        directory can have, when the digest first lists it raises :class:`ConfigDirMissing`. One
-        removed after that listing digests as the files still found (vault BACKLOG #2596).
+    def _approval_of(self, snapshot: ConfigSnapshot) -> ApprovedConfig:
+        """What a hold binds of ``snapshot``: its published content digest, which leaves the value
+        file out, and :func:`~messagefoundry.store.crypto.config_value_file_mac` of the value file
+        it holds from outside the config directory, so a reader of the hold's params cannot test a
+        guess of a value in it without the store key (vault BACKLOG #2596). No binding on a store
+        with no in-process key; :func:`_require_approved` says what a release does then. Direct
+        calls, so the crypto inventory scanner keeps the hash and the MAC on its record."""
+        from messagefoundry.config.fingerprint import snapshot_fingerprint, value_file_material
+        from messagefoundry.store.crypto import config_value_file_mac
+
+        material = value_file_material(snapshot)
+        return ApprovedConfig(
+            snapshot_fingerprint(snapshot),
+            None if material is None else config_value_file_mac(self.store.cipher(), material),
+        )
+
+    async def _content_snapshot(self, path: Path) -> ConfigSnapshot | None:
+        """``path`` read strictly, with the value file this engine reads from outside it
+        (:meth:`_value_file`), for an approval to bind or a release to check, or ``None`` when it
+        cannot be read. It fails closed: a file or folder it covers that cannot be read gives
+        ``None``, not the rest, and a directory that is gone, or whose name no directory can have,
+        when the read first lists it raises :class:`ConfigDirMissing`. One removed after that
+        listing reads as the files still found (vault BACKLOG #2596).
 
         Not :meth:`fingerprint_bundle`, whose detail is lost whole when only its advisory VCS head
         cannot be read. An approval binds content, so that failure must not refuse a release. That
         one also stays best-effort, skipping what it cannot read, because it records provenance and
-        refuses nothing. The value file this engine reads is covered wherever it is
-        (:meth:`_value_file`)."""
-        return await asyncio.to_thread(self._content_digest_blocking, path, self._value_file())
+        refuses nothing."""
+        return await asyncio.to_thread(self._content_snapshot_blocking, path, self._value_file())
 
     @staticmethod
-    def _content_digest_blocking(path: Path, value_file: Path | None = None) -> str | None:
-        """:meth:`_content_digest` on a worker thread. A direct call, so the crypto inventory
-        scanner, which follows a call it can see, keeps this hash on its record."""
-        from messagefoundry.config.fingerprint import ConfigDirMissing, config_fingerprint
+    def _content_snapshot_blocking(
+        path: Path, value_file: Path | None = None
+    ) -> ConfigSnapshot | None:
+        """:meth:`_content_snapshot` on a worker thread."""
+        from messagefoundry.config.snapshot import (
+            ConfigDirMissing,
+            read_config_snapshot,
+            with_value_file,
+        )
 
         try:
-            return config_fingerprint(path, strict=True, value_file=value_file)
+            snapshot = read_config_snapshot(path, strict=True)
+            return with_value_file(snapshot, value_file, strict=True)
         except ConfigDirMissing:
             # The directory itself is gone: a missing directory, as a reload of one is, and not an
             # unreadable bundle. A file that vanished from a present one is the latter.
@@ -2813,13 +2877,14 @@ class Engine:
     async def _reload_snapshot(self, path: Path) -> ConfigSnapshot | None:
         """The one read of ``path`` a reload runs, after the load's trust check, read strictly so
         its digest covers every file the fingerprint names (vault BACKLOG #2596). ``None`` when a
-        file or folder cannot be read, logged at WARNING as :meth:`_content_digest` logs it. A
+        file or folder cannot be read, logged at WARNING as :meth:`_content_snapshot` logs it. A
         missing directory raises :class:`ConfigDirMissing`, and a refused source ``WiringError``.
 
         The value file this engine reads (:meth:`_value_file`) is read into the snapshot too,
         wherever ``[environments].base_dir`` puts it, after the same trust check a value read
-        makes, of the file and the folders :meth:`_value_file_folders` names. So the digest covers
-        it, and the provider parses those bytes rather than the file as it is later. A file that is
+        makes, of the file and the folders :meth:`_value_file_folders` names. So a released
+        reload checks those bytes against its approval's binding (:func:`_require_approved`), and
+        the provider parses them rather than the file as it is later. A file that is
         not there is held as none; one that cannot be read raises ``WiringError`` naming it, so a
         reload, gated or not, never falls back to reading it from disk for that fault. A config
         directory that cannot be read whole still returns ``None``, as above, and then an ungated
@@ -2970,10 +3035,7 @@ class Engine:
         the load's read cannot reach it (vault BACKLOG #2944, #3765). Off a snapshot, only a file
         the load does not read, in ``environments/``, can be left out of it, and it holds that
         folder as the load read it: a start resolves its values earlier, when the engine is built,
-        not from these bytes. A value file outside the config directory (:meth:`_value_file`)
-        is not in the start load's snapshot, so it is read now, after the values were, and folded
-        as a reload's digest folds it, so the two compare. The directory is read for the advisory
-        VCS head alone.
+        not from these bytes. The directory is read for the advisory VCS head alone.
 
         A running graph that carries no snapshot gets none of that: the digest is of the directory
         as it is now, so any covered file can be left out and a later edit can reach it. A digest
@@ -3096,16 +3158,18 @@ class Engine:
         reload runs or records.
 
         ``approval`` binds the reload to the digest a dual-control approval named (vault BACKLOG
-        #2596, step 3; :meth:`reload_target_digest` took it at request time). The snapshot's digest
+        #2596, step 3; :meth:`reload_target_approval` took it at request time). The snapshot's digest
         is checked against it before ``load_config`` runs any config module, and the load then runs
         that snapshot, so the bytes checked are the bytes that run. A miss raises
         :class:`ConfigDigestMismatch`, or :class:`ConfigDigestUnavailable` when a file or folder
         cannot be read, with nothing swapped; a directory gone since the resolve gives
         :class:`ConfigDirMissing`. ``None`` binds nothing: an ungated reload, a convergence reload
         and a dry run pass none. The digest covers what :mod:`messagefoundry.config.fingerprint`
-        hashes and no more. A :class:`~messagefoundry.config.environments.SnapshotEnvValuesProvider`
-        reads its value file from the snapshot too, in the snapshot's ``environments/`` folder or
-        wherever ``[environments].base_dir`` puts it (:meth:`_reload_snapshot`); after
+        hashes and no more, and the value file outside the config directory is checked against the
+        approval's keyed binding instead (:func:`_require_approved`). A
+        :class:`~messagefoundry.config.environments.SnapshotEnvValuesProvider` reads its value file
+        from the snapshot too, in the snapshot's ``environments/`` folder or wherever
+        ``[environments].base_dir`` puts it (:meth:`_reload_snapshot`); after
         any other read of the values from disk, a released reload takes the digest again and
         refuses a change the same way.
 
@@ -3154,14 +3218,7 @@ class Engine:
             # Before load_config, which runs every config module's top-level code, so bytes
             # changed since the request are refused before they run. An edit after this read
             # changes nothing: the load runs this snapshot.
-            from messagefoundry.config.fingerprint import snapshot_fingerprint
-
-            digest = (
-                await asyncio.to_thread(snapshot_fingerprint, snapshot)
-                if snapshot is not None
-                else None
-            )
-            _require_approved(digest, approval)
+            await asyncio.to_thread(_require_approved, snapshot, approval, self.store.cipher())
         # The values this reload resolves env() against. A real reload applies them only at the
         # swap, so a refusal leaves the running graph's values as they were (vault BACKLOG #2596).
         env_values = self._env_values
@@ -3181,11 +3238,12 @@ class Engine:
             # dual-control release executor, the cluster convergence loop). A DR activation does not
             # reach it: it re-applies the running graph (vault BACKLOG #3067).
             refusal: str | None = None
-            # Vault BACKLOG #2596: the approval digest covers environments/*.toml under the config
-            # directory and the provider's own value file wherever it is (_value_file), so a
-            # SnapshotEnvValuesProvider is handed the snapshot and parses the bytes the digest
-            # names. Where it cannot, and for any other provider, the values are read from disk
-            # after the digest check, and a released reload checks the digest again.
+            # Vault BACKLOG #2596: the approval covers environments/*.toml under the config
+            # directory in its digest, and the provider's own value file wherever it is
+            # (_value_file) in its keyed binding, so a SnapshotEnvValuesProvider is handed the
+            # snapshot and parses the bytes the approval names. Where it cannot, and for any other
+            # provider, the values are read from disk after the check, and a released reload
+            # checks again.
             read: Mapping[str, Any] | None = None
             reads_snapshot = False
             try:
@@ -3229,7 +3287,12 @@ class Engine:
                 # A provider not handed the snapshot may have read a value file the digest covers
                 # from disk after the check, so the release checks the directory again now, and
                 # refuses an edit made in between rather than apply values nobody approved.
-                _require_approved(await self._content_digest(path), approval)
+                await asyncio.to_thread(
+                    _require_approved,
+                    await self._content_snapshot(path),
+                    approval,
+                    self.store.cipher(),
+                )
         # Off the event loop: load_config executes user config modules (arbitrary, potentially
         # heavy imports), which would otherwise stall every listener mid-reload (review low-3).
         # WiringError on a bad config. With a snapshot, a released reload's load failure is a

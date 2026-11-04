@@ -6,8 +6,9 @@ In the default layout the value file, ``<base_dir>/environments/<env>.toml``, si
 config directory, so the snapshot a load runs did not hold it and the digest an approval binds did
 not cover it: an edit to it between a dual-control request and its release applied under an
 unchanged digest. These tests fail on the code before the change. The value file is now read into
-the snapshot by its resolved path, folded into the digest, and parsed by ``serve``'s provider from
-those bytes.
+the snapshot by its resolved path, bound to a held reload under a key derived from the store key,
+and parsed by ``serve``'s provider from those bytes. No published digest folds it: it can hold
+credentials, and those digests are unkeyed.
 
 Synthetic values only."""
 
@@ -21,7 +22,11 @@ from typing import Any, cast
 
 import pytest
 
-from messagefoundry.config.fingerprint import config_fingerprint, config_fingerprint_detail
+from messagefoundry.config.fingerprint import (
+    config_fingerprint,
+    config_fingerprint_detail,
+    value_file_material,
+)
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.snapshot import (
     ConfigSnapshot,
@@ -31,6 +36,8 @@ from messagefoundry.config.snapshot import (
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry.pipeline import _sandbox_codec as codec
 from messagefoundry.pipeline.engine import Engine
+from messagefoundry.store import MessageStore
+from messagefoundry.store.crypto import config_value_file_mac, generate_key, make_cipher
 from tests.test_dual_control_reload import (
     _digest_mismatch_rows,
     _held_params,
@@ -55,33 +62,35 @@ def _layout(tmp_path: Path, text: str | None = _APPROVED) -> tuple[Path, Path]:
     return cfg, value_file
 
 
-# --- the snapshot and the digest -----------------------------------------------------------------
+def _material(cfg: Path, value_file: Path) -> bytes | None:
+    """What a hold binds of ``value_file``, read as a release reads it."""
+    snapshot = with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=True)
+    return value_file_material(snapshot)
 
 
-def test_an_edit_to_a_value_file_outside_the_config_directory_changes_the_digest(
+# --- the snapshot and the binding ----------------------------------------------------------------
+
+
+def test_an_edit_to_a_value_file_outside_the_config_directory_changes_the_binding(
     tmp_path: Path,
 ) -> None:
     cfg, value_file = _layout(tmp_path)
-    before = config_fingerprint(cfg, strict=True, value_file=value_file)
+    before = _material(cfg, value_file)
     value_file.write_text(_UNREVIEWED, encoding="utf-8")
-    assert config_fingerprint(cfg, strict=True, value_file=value_file) != before
+    assert _material(cfg, value_file) != before
 
 
-def test_creating_the_value_file_changes_the_digest(tmp_path: Path) -> None:
+def test_creating_the_value_file_changes_the_binding(tmp_path: Path) -> None:
     cfg, value_file = _layout(tmp_path, None)
-    before = config_fingerprint(cfg, strict=True, value_file=value_file)
+    before = _material(cfg, value_file)
     value_file.write_text("", encoding="utf-8")
-    assert config_fingerprint(cfg, strict=True, value_file=value_file) != before
+    assert _material(cfg, value_file) != before
 
 
-def test_the_digest_names_the_value_file_by_name_not_by_where_it_sits(tmp_path: Path) -> None:
+def test_the_binding_names_the_value_file_by_name_not_by_where_it_sits(tmp_path: Path) -> None:
     one_cfg, one_values = _layout(tmp_path / "one")
     other_cfg, other_values = _layout(tmp_path / "other")
-    # Byte-identical bundles, apart from the paths the config module names.
-    (other_cfg / "cfg.py").write_bytes((one_cfg / "cfg.py").read_bytes())
-    assert config_fingerprint(one_cfg, value_file=one_values) == config_fingerprint(
-        other_cfg, value_file=other_values
-    )
+    assert _material(one_cfg, one_values) == _material(other_cfg, other_values)
 
 
 def test_the_snapshot_holds_the_bytes_it_read_and_answers_them_after_an_edit(
@@ -188,8 +197,10 @@ def test_a_snapshot_already_holding_the_value_file_does_not_read_it_again(tmp_pa
     snapshot = with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=True)
     value_file.write_text(_UNREVIEWED, encoding="utf-8")
     assert with_value_file(snapshot, value_file, strict=True) is snapshot
-    detail = config_fingerprint_detail(cfg, snapshot=snapshot, value_file=value_file)
-    assert detail["fingerprint"] == config_fingerprint_detail(cfg, snapshot=snapshot)["fingerprint"]
+    # No published digest folds it (BACKLOG #2596): the snapshot's equals the directory's alone.
+    detail = config_fingerprint_detail(cfg, snapshot=snapshot)
+    assert detail["fingerprint"] == config_fingerprint(cfg)
+    assert detail["files"] == config_fingerprint_detail(cfg)["files"]
 
 
 def test_a_value_file_that_cannot_be_read_is_named_or_raised(
@@ -299,11 +310,20 @@ def test_the_reload_snapshot_vets_the_value_file_before_it_reads_it(
 # --- a dual-control release ------------------------------------------------------------------------
 
 
-async def _engine(tmp_path: Path, cfg: Path) -> Engine:
+async def _engine(tmp_path: Path, cfg: Path, *, keyed: bool = True) -> Engine:
+    """An engine reading the default layout's value file, on a store that holds a key unless
+    ``keyed`` is False: only a keyed store can bind the value file to a hold."""
     from messagefoundry.__main__ import _environment_values_reader
 
-    return await Engine.create(
-        tmp_path / "dc.db",
+    if keyed:
+        cipher = make_cipher(generate_key())
+        store = await MessageStore.open(
+            tmp_path / "dc.db", cipher=cipher, audit_mac_key=cipher.audit_mac_key()
+        )
+    else:
+        store = await MessageStore.open(tmp_path / "dc.db")
+    return Engine(
+        store,
         poll_interval=0.02,
         config_dir=cfg,
         egress_settings=EgressSettings(deny_by_default=False),
@@ -338,9 +358,10 @@ async def test_a_value_file_edited_before_the_release_is_refused_as_not_approved
         approved = _held_params(await engine.store.get_pending_approval(approval_id))
         rows = await _digest_mismatch_rows(engine)
         assert [row["approved_fingerprint"] for row in rows] == [approved["fingerprint"]]
-        assert rows[0]["current_fingerprint"] == config_fingerprint(
-            cfg, strict=True, value_file=value_file
-        )
+        # The published digests do not cover the value file, so they match; the row says the
+        # keyed binding is what failed, and holds no digest of the file.
+        assert rows[0]["current_fingerprint"] == approved["fingerprint"]
+        assert rows[0]["value_file_check"] == "mismatch"
     finally:
         await engine.stop()
 
@@ -391,23 +412,164 @@ async def test_a_value_file_edited_after_the_release_read_its_snapshot_never_app
         await engine.stop()
 
 
-async def test_the_start_digest_folds_the_value_file_as_a_reload_does(tmp_path: Path) -> None:
-    """So a start and an unchanged reload record the same digest, rather than a false change."""
-    cfg, value_file = _layout(tmp_path)
+async def test_the_start_and_a_reload_publish_one_digest_that_leaves_the_value_file_out(
+    tmp_path: Path,
+) -> None:
+    """So a start and an unchanged reload record the same digest, rather than a false change, and
+    neither folds the value file, which can hold credentials."""
+    cfg, _ = _layout(tmp_path)
     engine = await _engine(tmp_path, cfg)
     try:
         await engine.reload_detail(dry_run=False)
         reloaded = engine.loaded_config_fingerprint
         assert reloaded is not None
-        assert reloaded["fingerprint"] == config_fingerprint(cfg, value_file=value_file)
-        assert reloaded["fingerprint"] == await engine.reload_target_digest(None)
-        # The start's shape: capture_start_provenance digests the start load's snapshot, which
-        # holds no value file from outside the config directory, so the digest reads it in.
+        assert reloaded["fingerprint"] == config_fingerprint(cfg)
+        assert reloaded["fingerprint"] == (await engine.reload_target_approval(None)).fingerprint
         start_snapshot = load_config(cfg).config_snapshot
         assert start_snapshot is not None and start_snapshot.value_file is None
         bundle, reason = await engine.fingerprint_bundle(cfg, start_snapshot)
         assert reason is None and bundle is not None
         assert bundle["fingerprint"] == reloaded["fingerprint"]
+    finally:
+        await engine.stop()
+
+
+# --- the Lander's hold on PR 2786: no published digest is an oracle for the value file ----------
+
+_SECRET_A = 'DB_PASSWORD = "hunter2"\n'
+_SECRET_B = 'DB_PASSWORD = "hunter3"\n'
+
+
+async def test_published_digests_of_value_files_differing_only_in_a_secret_are_identical(
+    tmp_path: Path,
+) -> None:
+    """Before, the PR folded the value file into the unkeyed digest that GET /config/provenance,
+    the audit rows and the hold's params publish, so a reader could test a guessed secret by
+    recomputing it. Now none of them depends on the file's bytes."""
+    cfg, value_file = _layout(tmp_path, _SECRET_A)
+    engine = await _engine(tmp_path, cfg)
+    published: list[tuple[object, ...]] = []
+    bindings: list[object] = []
+    try:
+        for text in (_SECRET_A, _SECRET_B):
+            value_file.write_text(text, encoding="utf-8")
+            await engine.reload_detail(dry_run=False)
+            assert cast(Any, engine)._env_values == {"db_password": text.split('"')[1]}
+            loaded = engine.loaded_config_fingerprint
+            assert loaded is not None
+            on_disk, _reason = await engine.fingerprint_bundle(cfg)
+            assert on_disk is not None
+            approval = await engine.reload_target_approval(None)
+            published.append(
+                (
+                    loaded["fingerprint"],
+                    loaded["files"],
+                    on_disk["fingerprint"],
+                    approval.fingerprint,
+                )
+            )
+            bindings.append(approval.value_file)
+    finally:
+        await engine.stop()
+    assert published[0] == published[1]
+    # The control: the hold's keyed binding still tells the two files apart.
+    assert bindings[0] is not None and bindings[0] != bindings[1]
+
+
+def test_the_hold_s_value_file_binding_cannot_be_recomputed_without_the_store_key(
+    tmp_path: Path,
+) -> None:
+    """The binding the hold's params carry, which every approver sees: under one key the two
+    secrets bind differently, and a reader without the key cannot reproduce either, whether by a
+    plain hash of the candidate or by a MAC under another key."""
+    import hashlib
+
+    cfg, value_file = _layout(tmp_path, _SECRET_A)
+    material_a = _material(cfg, value_file)
+    value_file.write_text(_SECRET_B, encoding="utf-8")
+    material_b = _material(cfg, value_file)
+    assert material_a is not None and material_b is not None
+    key = make_cipher(generate_key())
+    record_a = config_value_file_mac(key, material_a)
+    record_b = config_value_file_mac(key, material_b)
+    assert record_a is not None and record_b is not None
+    assert record_a["digest"] != record_b["digest"]
+    for candidate in (material_a, _SECRET_A.encode()):
+        assert hashlib.sha256(candidate).hexdigest() != record_a["digest"]
+    guessed = config_value_file_mac(make_cipher(generate_key()), material_a)
+    assert guessed is not None and guessed["digest"] != record_a["digest"]
+    # The record names the key it was taken under by a one-way id only.
+    assert set(record_a) == {"alg", "kdf", "key_id", "digest"}
+
+
+async def test_the_held_params_carry_no_unkeyed_digest_of_the_value_file(tmp_path: Path) -> None:
+    import hashlib
+
+    cfg, value_file = _layout(tmp_path, _SECRET_A)
+    engine = await _engine(tmp_path, cfg)
+    try:
+        service = await _service(engine)
+        approval_id, r = await _hold_then_release(engine, service, {})
+        assert r.status_code == 200, r.text
+        params = _held_params(await engine.store.get_pending_approval(approval_id))
+        assert params["fingerprint"] == config_fingerprint(cfg)
+        assert params["value_file"]["kdf"].endswith("mefor/config-value-file/v1")
+        material = _material(cfg, value_file)
+        assert material is not None
+        text = json.dumps(params)
+        for plain in (material, _SECRET_A.encode()):
+            assert hashlib.sha256(plain).hexdigest() not in text
+    finally:
+        await engine.stop()
+
+
+async def test_on_a_keyless_store_the_value_file_is_not_bound_and_the_release_says_so(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No in-process key, so no binding: the release goes on as it did before the value file was
+    read into the snapshot, and a WARNING names the file. Never a plain hash in its place."""
+    cfg, value_file = _layout(tmp_path)
+    engine = await _engine(tmp_path, cfg, keyed=False)
+    try:
+        await engine.reload_detail(dry_run=False)
+        service = await _service(engine)
+        approval_id, r = await _hold_then_release(
+            engine,
+            service,
+            {},
+            between=lambda: value_file.write_text(_UNREVIEWED, encoding="utf-8"),
+        )
+        assert r.status_code == 200, r.text
+        params = _held_params(await engine.store.get_pending_approval(approval_id))
+        assert "value_file" not in params
+        assert "is not bound to this reload's approval" in caplog.text
+    finally:
+        await engine.stop()
+
+
+async def test_a_hold_that_bound_a_value_file_is_refused_by_a_store_that_cannot_check_it(
+    tmp_path: Path,
+) -> None:
+    """Fail closed: a binding no key in this store's keyring verifies, as after its key was
+    dropped, refuses the release rather than letting it through unchecked."""
+    from messagefoundry.pipeline import ApprovedConfig
+    from messagefoundry.pipeline.engine import ConfigDigestMismatch
+
+    cfg, _ = _layout(tmp_path)
+    engine = await _engine(tmp_path, cfg)
+    try:
+        approval = await engine.reload_target_approval(None)
+        assert isinstance(approval.value_file, dict)
+        foreign = config_value_file_mac(
+            make_cipher(generate_key()), b"anything the other store bound"
+        )
+        with pytest.raises(ConfigDigestMismatch) as refused:
+            await engine.reload_detail(
+                approval=ApprovedConfig(approval.fingerprint, foreign), dry_run=False
+            )
+        assert refused.value.value_file
+        # The control: the binding the engine took itself releases.
+        await engine.reload_detail(approval=approval, dry_run=False)
     finally:
         await engine.stop()
 
@@ -562,11 +724,11 @@ def test_a_value_file_of_any_name_is_held(tmp_path: Path) -> None:
     cfg, _ = _layout(tmp_path)
     value_file = tmp_path / "environments" / "dev.json"
     value_file.write_bytes(b"{}")
-    before = config_fingerprint(cfg, strict=True, value_file=value_file)
+    before = _material(cfg, value_file)
     snapshot = with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=True)
     assert snapshot.files["@value-file/dev.json"] == b"{}"
     value_file.write_bytes(b'{"a": 1}')
-    assert config_fingerprint(cfg, strict=True, value_file=value_file) != before
+    assert _material(cfg, value_file) != before
 
 
 def test_a_path_no_file_can_be_opened_by_is_no_value_file_to_a_start_or_a_snapshot(
