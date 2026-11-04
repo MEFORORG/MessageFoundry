@@ -69,15 +69,22 @@
   warned about. **This changes none of the §2 ratified choices:** the new key selects nothing and
   maps nothing, and the overlay still only maps a field to an existing kind.
   [PHI.md](../PHI.md) §9 is the long form.
-- **AMENDMENT PROPOSED 2026-10-27, AWAITING THE OWNER'S SIGN-OFF (BACKLOG #1192,
+- **AMENDED 2026-11-04, SIGNED OFF BY THE OWNER (BACKLOG #1192,
   [ADR 0201](0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)
-  section 5 and slice 5): the package's home moves out of the engine.** ADR 0201 was accepted on
-  2026-09-29 and designs this amendment. Its section 5 also says that changing this ADR's ratified
-  home needs the owner's sign-off on its own, in its own pull request. So the four items below are
-  proposed, not ratified, until that sign-off is recorded in this bullet. This builds nothing either
-  way: the package is still at `messagefoundry/anon/`, and every path in this ADR describes the
-  tree until ADR 0201 slice 6 moves it. That slice re-points the guards and tests that pin the
-  path, in the same change.
+  section 5 and slice 5): the package's home moves out of the engine.** Proposed 2026-10-27. The
+  owner signed it off on 2026-11-04, in session with the batch 448 Manager, logged as decision
+  `d20261104T051906109-4feca5`. Asked *"Sign the ADR 0030 amendment? It moves the
+  de-identification package from messagefoundry/anon/ to messagefoundry_toolkit/anon/ (the tee
+  keeps its vendored copy; behaviour unchanged) and withdraws the never-landed CLAUDE.md section 4
+  carve-out for anon/..."*, the owner answered *"Sign it (Recommended)"*. ADR 0201 was accepted on
+  2026-09-29 and designs this amendment. Its section 5 says that changing this ADR's ratified home
+  needs the owner's sign-off on its own, in its own pull request, and this is that record. The four
+  items below are ratified. The sign-off builds nothing: the package is still at
+  `messagefoundry/anon/`, and every path in this ADR describes the tree until ADR 0201 slice 6
+  moves it. That slice re-points the guards and tests that pin the path, in the same change.
+  > **Superseded heading, kept as a record.** Until 2026-11-04 this bullet opened *"AMENDMENT
+  > PROPOSED 2026-10-27, AWAITING THE OWNER'S SIGN-OFF"*, and said the four items were *"proposed,
+  > not ratified, until that sign-off is recorded in this bullet."*
   1. **The home becomes `messagefoundry_toolkit/anon/`**, in the `messagefoundry-toolkit`
      distribution rather than the engine wheel. This replaces the §1 *"engine-owned"* home *"sitting
      beside `parsing/`"*, one of the forks ratified before the build.
@@ -112,7 +119,7 @@
   slice that flips it) / §7 (redaction is *not* de-id); [CLAUDE.md](../../CLAUDE.md) §9 (de-id planned-not-
   built, centralize the rules) / §8 (read separators from MSH, never string-slice, parse defensively) / §4
   (`parsing/` is the one pure carve-out lib; this ADR extends that carve-out to `anon/` on acceptance
-  (*withdrawal proposed 2026-10-27, see the status banner*) — dependency direction one-way) / §12 (don't drift to declarative *logic*).
+  (*withdrawn 2026-11-04, see the status banner*) — dependency direction one-way) / §12 (don't drift to declarative *logic*).
 
 ## Context
 
@@ -157,7 +164,7 @@ The anonymizer ships as **`messagefoundry/anon/`**: a small, **pure-stdlib** pac
 `parsing/` it is a pure, side-effect-free library, but the §4 carve-out is **verbatim scoped to `parsing/`**
 and does **not** automatically extend to a new sibling. Accepting this ADR **amends CLAUDE.md §4** to add
 `anon/` to the console carve-out (listed in *To resolve on acceptance*); until then the console may not import
-it. *(Withdrawal proposed 2026-10-27: the flip never landed, and ADR 0201 moves `anon/` out of the
+it. *(Withdrawn 2026-11-04: the flip never landed, and ADR 0201 moves `anon/` out of the
 engine; see the status banner.)* The harness is unaffected — it imports engine packages freely.
 *(Corrected 2026-10-27: not this package; see the correction under the vendored-copy paragraph
 below.)* Files:
@@ -415,7 +422,7 @@ re-identification/linkage tooling.
 On landing, this **would become** the de-id framework's **first bounded slice** — a *test-data* anonymizer,
 not the full enterprise pipeline. **While this ADR is Proposed nothing is built**, so it does **not** yet flip
 [PHI.md](../PHI.md) §9 from `[ROADMAP]` to built — that flip, and the lockstep CLAUDE.md §9 / §4 (carve-out;
-*withdrawal proposed 2026-10-27, see the status banner*) and PHI.md §12/§13 edits, happen **only when the code lands**, never on acceptance (CLAUDE.md §9: "don't
+*withdrawn 2026-11-04, see the status banner*) and PHI.md §12/§13 edits, happen **only when the code lands**, never on acceptance (CLAUDE.md §9: "don't
 reference a framework that doesn't exist"). The rule table is **designed to be reusable** as the future
 AI-assistant `deidentified` data-scope source (PHI.md §9 forward-links to it on landing).
 
@@ -503,7 +510,7 @@ AI-assistant `deidentified` data-scope source (PHI.md §9 forward-links to it on
       `tee export`; requires `--capture-bodies`; errors when no captures exist; no raw bodies to stdout/CI),
       harness `CaptureSink._write` hook, and the file-backed corpus source.
 - [ ] Approve the **doc lockstep, gated on code landing (not acceptance):** add `anon/` to the CLAUDE.md §4
-      console carve-out (*withdrawal proposed 2026-10-27, see the status banner*); flip PHI.md §9 `[ROADMAP]`→built; update CLAUDE.md §9 and PHI.md §12/§13.
+      console carve-out (*withdrawn 2026-11-04, see the status banner*); flip PHI.md §9 `[ROADMAP]`→built; update CLAUDE.md §9 and PHI.md §12/§13.
 
 ---
 
