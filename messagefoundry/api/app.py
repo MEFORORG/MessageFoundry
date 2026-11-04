@@ -402,6 +402,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import (
     POSSIBLY_GENERIC_DB_HOP,
+    UNRESOLVED_DRIVER_REASON,
     EnvRef,
     InboundConnection,
     Registry,
@@ -2044,10 +2045,18 @@ def _posture_loosenings(
         []
         if registry is None
         else [
-            f"{name} ({POSSIBLY_GENERIC_DB_HOP})"
-            if reason.startswith(POSSIBLY_GENERIC_DB_HOP)
-            else name
+            f"{name} ({marker})" if marker else name
             for name, reason in unverified_generic_db_hops(registry, env_values=db_env_values)
+            for marker in [
+                next(
+                    (
+                        m
+                        for m in (POSSIBLY_GENERIC_DB_HOP, UNRESOLVED_DRIVER_REASON)
+                        if reason.startswith(m)
+                    ),
+                    None,
+                )
+            ]
             # Narrowed on the bare name, before any marker is added.
             if visible is None or visible(name)
         ]

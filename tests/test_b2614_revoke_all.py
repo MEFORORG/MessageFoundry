@@ -42,6 +42,7 @@ async def _user(store: Any, user_id: str) -> None:
         password_hash="h",
         now=time.time(),
         password_generated=False,
+        audits=(),
     )
 
 
@@ -94,6 +95,10 @@ async def assert_revoke_all_contract(store: Any, raw: RawSql) -> None:
     restored = await store.get_session(hash_token(other))
     assert restored is not None and session_seal_ok(sealer, restored)  # the copy's seal holds...
     assert await service.identity_for_token(other) is None  # ...and its epoch is stale
+    # The global epoch alone (BACKLOG #5091) would refuse the copy too, so read the account's own
+    # epoch: the loop over every account raised it.
+    bob_after = await store.get_user(bob)
+    assert bob_after is not None and bob_after.session_epoch == copy.user_epoch + 1
 
     # --- with no exception, the kept session ends too ------------------------------------------
     fresh = await _mint(store, bob)

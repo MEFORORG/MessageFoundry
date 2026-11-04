@@ -103,6 +103,7 @@ class _Harness:
             password_hash=hash_password(_PASSWORD),
             must_change_password=False,
             password_generated=False,
+            audits=(),
         )
         await self.store.set_user_roles(user_id, list(roles), assigned_by="contract")
         await self.store.set_user_channel_scope(user_id, '["IB_A"]', source="manual")
@@ -441,6 +442,7 @@ async def assert_user_record_round_trips(store: Any) -> None:
         password_generated=False,
         directory_object_id="guid-fixed",
         now=now,
+        audits=(),
     )
     await store.set_user_roles(
         "seal-fixed", [Role.VIEWER.value], assigned_by="contract", now=now + 1

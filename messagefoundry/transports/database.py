@@ -61,7 +61,7 @@ from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from functools import partial
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeGuard
 
 from messagefoundry.auth.anchor_path import WinProbe, _win_probe, windows_chain
 from messagefoundry.auth.trust_anchors import (
@@ -120,10 +120,13 @@ from messagefoundry.transports.base import (
     resolve_poll_ceiling,
 )
 from messagefoundry.transports.db_endpoint import (
+    SQLSERVER_DEFAULT_DRIVER,
     SQLSERVER_DEFAULT_PORT,
     generic_hop_endpoint,
+    is_remote_spelling,
     odbc_keyword_name,
     odbc_param,
+    sqlserver_preset_refusal,
 )
 from messagefoundry.transports.framing import declared_encoding
 from messagefoundry.transports.mllp import InsecureHopGuard
@@ -211,6 +214,10 @@ def _build_dsn(
 ) -> str:
     """Build the ODBC connection string for SQL Server from the connection settings.
 
+    It refuses settings under which the driver might not read ``SERVER={server},{port}`` as one
+    host and its port (:func:`~messagefoundry.transports.db_endpoint.sqlserver_preset_refusal`,
+    BACKLOG #4873).
+
     Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (BACKLOG #3714). It sends no
     ``ServerCertificate`` pin. A weakened TLS posture is **refused** via the shared posture-keyed
     authority (:func:`_weakened_tls_permitted`, #200) — a STRICT verify-off cell that stays refused
@@ -229,13 +236,17 @@ def _build_dsn(
     reads it, it changes nothing. A statement guard is a shape test on text. The control that
     actually refuses a write is the privilege of the account this DSN dials, which only the operator
     can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
+    where = hop_name_prefix(connection)
+    refusal = sqlserver_preset_refusal(s)
+    if refusal is not None:
+        raise ValueError(f"{where}DATABASE {refusal}")
     encrypt = bool_setting(s, "encrypt", default=True)
     trust = bool(s.get("trust_server_certificate", False))
     if (trust or not encrypt) and not _weakened_tls_permitted(
         attested=attested, posture=current_hop_posture()
     ):
         raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE connection TLS is weakened "
+            f"{where}DATABASE connection TLS is weakened "
             "(trust_server_certificate=true or encrypt=false), "
             "which is MITM-able. Use a trusted server certificate with encrypt=true; set "
             f"{HOP_ATTESTATION_LEVER} on the connection if the hop is "
@@ -244,24 +255,27 @@ def _build_dsn(
             "allow it for a trusted-network dev/test bind (the escape has no effect while enforcing, "
             "the default, or with no posture)."
         )
-    if (trust or not encrypt) and attested:
-        _audit_attested_weakened_tls("DATABASE connection", connection=connection)
     auth = str(s.get("auth", "sql")).lower()
     if auth not in ("sql", "integrated", "entra"):
-        raise ValueError(f"DATABASE destination auth must be sql|integrated|entra, got {auth!r}")
+        raise ValueError(f"{where}DATABASE auth must be sql|integrated|entra, got {auth!r}")
     # SERVER must be emitted UNBRACED so the driver parses the ",port" suffix and resolves the host for
     # the TLS handshake — a brace-quoted "SERVER={host},port" is malformed ODBC (content after the
     # closing brace) and breaks certificate handling against a real SQL Server. So the host is
     # *validated* for connection-string metacharacters instead of brace-quoted (the guard used for every
     # other free-text value), exactly like the store backend's connection_string.
     server = str(s["server"])
-    if any(ch in server for ch in ";{}=\r\n"):
+    # Not printable covers a newline, a tab and a NUL, which a driver manager may read as the end
+    # of the string, dropping the port and the TLS tail after it.
+    if any(ch in server for ch in ";{}=") or not server.isprintable():
         raise ValueError(
-            "DATABASE server must not contain ';', '{', '}', '=', or newlines (ODBC injection risk)"
+            f"{where}DATABASE server must not contain ';', '{{', '}}', '=', or a control "
+            "character (ODBC injection risk)"
         )
-    port = port_setting(s.get("port", SQLSERVER_DEFAULT_PORT), transport="DATABASE connection")
+    port = port_setting(
+        s.get("port", SQLSERVER_DEFAULT_PORT), transport=f"{where}DATABASE connection"
+    )
     parts = [
-        f"DRIVER={odbc_brace(str(s.get('odbc_driver', 'ODBC Driver 18 for SQL Server')))}",
+        f"DRIVER={odbc_brace(str(s.get('odbc_driver', SQLSERVER_DEFAULT_DRIVER)))}",
         f"SERVER={server},{port}",
         f"DATABASE={odbc_brace(str(s['database']))}",
         # No login-timeout keyword here, on purpose: see :func:`_login_timeout` (BACKLOG #2089).
@@ -278,7 +292,12 @@ def _build_dsn(
         # Advertise read-only intent; the docstring says who asks for it. Not a TLS keyword, so it
         # goes in the head, before the TLS tail (messagefoundry.odbc_dsn).
         parts.append("ApplicationIntent=ReadOnly")
-    return odbc_connection_string(parts, encrypt=encrypt, trust_server_certificate=trust)
+    dsn = odbc_connection_string(parts, encrypt=encrypt, trust_server_certificate=trust)
+    # Last, once every refusal above has passed, so a connection this builder refuses leaves no
+    # audit line saying its weakened hop was permitted.
+    if (trust or not encrypt) and attested:
+        _audit_attested_weakened_tls("DATABASE connection", connection=connection)
+    return dsn
 
 
 # A valid ODBC connection-string keyword: a letter then letters/digits/spaces/underscores. Rejecting the
@@ -350,17 +369,6 @@ _ODBC_PASSWORD_KEYS = frozenset({"pwd", "password"})
 # screens. A path keyword added to the list above belongs here too; a test holds this a subset.
 _ODBC_PATH_KEYS = frozenset({"sslca", "sslcapath", "sslcert", "sslkey"})
 
-# The ONLY keywords the engine counts as setting a generic hop's TLS mode, in the form
-# :func:`odbc_keyword_name` compares them in (BACKLOG #2483). A value on one of these is what counts
-# as the operator owning TLS. A key, certificate or CA file, or a cipher list, does not count.
-# docs/CONNECTIONS.md records what the drivers read so far do with one.
-#
-# `encrypt` IS UNPROVEN. It is here for a driver that reads it. docs/CONNECTIONS.md records that
-# neither psqlODBC's keyword parser nor MySQL Connector/ODBC's parameter page has it. On a driver
-# that ignores it, `Encrypt=yes` would clear this gate and leave the driver at its own default, so
-# treat that spelling as the operator's claim, not a tested control.
-_ODBC_TLS_MODE_KEYWORDS = frozenset({"sslmode", "encrypt"})
-
 # Names an odbc_params keyword as about TLS at all (anything ssl/tls/encrypt-ish). A name says nothing
 # about the hop, so presence is never ownership: this picks which keywords' values are read against
 # :data:`_ODBC_NO_TLS_VALUES`, and tells "no TLS keyword" from "no TLS mode" in the reason an operator
@@ -380,10 +388,9 @@ _ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
 #   assorted `Encrypt`  : no / 0 / false / off
 #   Microsoft ODBC `Encrypt` : optional (version 18 documents it as a synonym for `no`)
 #
-# Since BACKLOG #2705 the build also holds `sslmode` to libpq's six lower-case spellings on every
-# driver but MySQL Connector/ODBC (_refuse_unread_sslmode), so for a built hop this list's open end
-# matters for `encrypt`, and for `sslmode` on MySQL's driver. The posture readers classify specs
-# that were never built, so they still apply the list alone.
+# Since BACKLOG #5053 and #5035 a mode counts only on the keyword the driver family reads, and for
+# psqlODBC and MySQL only at one of that family's own spellings (_DRIVER_FAMILIES), so this list's
+# open end matters only for `encrypt` on Microsoft's driver.
 #
 # KNOWN RESIDUAL, written down rather than implied: an ENCRYPTED-BUT-UNVERIFIED value — psqlODBC
 # `require`, MySQL `REQUIRED`, `Encrypt=yes` beside a trust-everything keyword — is NOT on this list and
@@ -430,11 +437,15 @@ def _is_tls_keyword(name: str) -> bool:
     return bool(_ODBC_TLS_HINT_RE.search(name)) and not _ODBC_SECRET_KEY_RE.search(name)
 
 
-def _sets_tls_mode(params: Mapping[str, Any]) -> bool:
-    """True when a keyword in :data:`_ODBC_TLS_MODE_KEYWORDS` has a non-blank string value with no
-    blank at either end. Anything else sets nothing: the engine has no evidence of how a driver reads
-    it, and :func:`_no_tls_label` cannot see a no-TLS word inside a list. Whether the value is a good
-    one is :func:`generic_odbc_no_tls_params`'s question, not this one.
+def _sets_tls_mode(params: Mapping[str, Any], family: str) -> bool:
+    """True when the keyword ``family`` reads as its TLS mode (:data:`_DRIVER_FAMILIES`) has a
+    non-blank string value with no blank at either end, and, where that table lists the family's
+    spellings, one of them exactly. Anything else sets nothing: the engine has no evidence of how
+    the driver reads it, and :func:`_no_tls_label` cannot see a no-TLS word inside a list. Whether
+    a counted value is a good one is :func:`generic_odbc_no_tls_params`'s question, not this one.
+
+    The spellings are checked here as well as at build (:func:`_refuse_unread_sslmode`), because
+    the posture readers classify specs that were never built (BACKLOG #5035).
 
     A padded value does not count because a driver that does not trim would read something other
     than the word judged here: psqlODBC switches on the first character, so ``" require"`` would
@@ -445,13 +456,20 @@ def _sets_tls_mode(params: Mapping[str, Any]) -> bool:
     Every key is read, not the first spelling of each, so the answer for a table that names a mode
     keyword twice in different case does not depend on key order. The build refuses such a table;
     the posture readers classify specs that were never built."""
+    entry = _DRIVER_FAMILIES[family]
+    spellings = entry.tls_spellings
     return any(
-        odbc_keyword_name(str(key)) in _ODBC_TLS_MODE_KEYWORDS
-        and isinstance(value, str)
-        and value.strip()
-        and value == value.strip()
+        odbc_keyword_name(str(key)) == entry.tls_keyword
+        and _usable_mode_value(value)
+        and (spellings is None or value in spellings)
         for key, value in params.items()
     )
+
+
+def _usable_mode_value(value: object) -> TypeGuard[str]:
+    """Whether ``value`` is a non-blank string with no blank at either end: the only shape a mode
+    value can count in (:func:`_sets_tls_mode` says why)."""
+    return isinstance(value, str) and bool(value.strip()) and value == value.strip()
 
 
 def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
@@ -480,31 +498,77 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
     return found
 
 
-def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
-    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when :func:`_sets_tls_mode`
-    finds a usable mode value and no TLS keyword holds a no-TLS word. A blank, padded or non-string
-    mode value is not usable, so it does not clear the hop.
+#: The reason a hop gets when its ``odbc_driver`` name places no driver family (BACKLOG #5053).
+#: Short, because it rides in a refusal ahead of the host, and a stored failure keeps about 200
+#: characters.
+UNPLACED_DRIVER_REASON = "odbc_driver names no driver family whose TLS keyword the engine reads"
 
-    Three ways to be at risk, and they read differently to an operator, so they are reported
-    differently: a TLS keyword pinned to a no-TLS value (this names the offenders), a TLS keyword with
-    no mode beside it, such as a lone ``sslcert`` or a blank ``sslmode`` (BACKLOG #2483), or no TLS
-    keyword at all. Only :data:`_ODBC_TLS_MODE_KEYWORDS` can clear a hop. Shares
+
+def generic_odbc_tls_unenforced(params: Mapping[str, Any], *, driver: object) -> str | None:
+    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when :func:`_sets_tls_mode`
+    finds a usable mode value for the family ``driver`` names and no TLS keyword holds a no-TLS
+    word. A blank, padded or non-string mode value is not usable, so it does not clear the hop.
+
+    ``driver`` is the ``odbc_driver`` setting, as written; :func:`_driver_family` places it. It is
+    required, so no caller can judge a keyword without saying which driver reads it (BACKLOG #5053).
+
+    Four ways to be at risk, and they read differently to an operator, so they are reported
+    differently: a TLS keyword pinned to a no-TLS value (this names the offenders), a driver name
+    the engine cannot place, so no keyword counts (BACKLOG #5053), a TLS keyword with no mode the
+    family reads beside it, such as a lone ``sslcert``, a blank ``sslmode``, or ``Encrypt=yes`` on
+    psqlODBC (BACKLOG #2483, #5053), or no TLS keyword at all. Only the keyword
+    :data:`_DRIVER_FAMILIES` names for the family can clear a hop. Shares
     :func:`generic_odbc_no_tls_params` with the construction reminder — see the comment above
     :data:`_ODBC_NO_TLS_VALUES` for why a value deny-list, and for the encrypted-but-unverified residual
-    this deliberately does not classify. An unrecognized mode value stays delegated here for the same
-    reason, though since BACKLOG #2705 the build refuses an ``sslmode`` spelling
-    :func:`_refuse_unread_sslmode` rejects before this verdict is used.
+    this deliberately does not classify. That deny-list reads every TLS keyword whatever the family,
+    since it can only add a reason. For psqlODBC and MySQL Connector/ODBC a mode value must be one
+    of the family's own spellings to count; Microsoft's ``Encrypt`` value stays delegated, judged
+    by the deny-list alone.
 
     Since BACKLOG #1178 this predicate also decides whether the hop is GATED, not just reported: a
     non-``None`` reason is what builds :func:`generic_cleartext_hop_guard`. Same single definition, so
     the log line, the operator report and the refusal can never disagree about which hops are at risk —
     but widening it now widens a refusal, which the deny-list's deliberate narrowness should be read
     against."""
+    return _family_tls_verdict(params, _driver_family(driver))
+
+
+def generic_odbc_tls_unenforced_unread(params: Mapping[str, Any]) -> str | None:
+    """:func:`generic_odbc_tls_unenforced` for a driver name the caller has not read, such as an
+    unresolved ``env()`` ``odbc_driver``: ``None`` when at least one driver family the engine
+    places would clear ``params``, so the hop is possibly delegated, and otherwise the reason every
+    such family gives. Where the families give different reasons, none of which clears the hop,
+    the reason says no family reads the mode set. So a hop at risk on every driver is never
+    labelled possibly delegated."""
+    verdicts = {_family_tls_verdict(params, family) for family in _DRIVER_FAMILIES}
+    if None in verdicts:
+        return None
+    if len(verdicts) == 1:
+        return verdicts.pop()
+    return "no TLS mode is set in odbc_params that any driver family the engine places reads"
+
+
+def _family_tls_verdict(params: Mapping[str, Any], family: str | None) -> str | None:
+    """:func:`generic_odbc_tls_unenforced` for the family key ``family``. ``family`` is ``None``
+    for a name the engine cannot place, and that never returns ``None``: it returns the no-TLS
+    reason when a TLS keyword holds a no-TLS word, and :data:`UNPLACED_DRIVER_REASON` otherwise,
+    so an unplaced name can never clear the guard (BACKLOG #5053)."""
     disabling = generic_odbc_no_tls_params(params)
     if disabling:
         return "TLS is explicitly not required: " + ", ".join(sorted(disabling))
-    if _sets_tls_mode(params):
+    if family is None:
+        return UNPLACED_DRIVER_REASON
+    if _sets_tls_mode(params, family):
         return None
+    if any(
+        odbc_keyword_name(str(k)) in _ODBC_TLS_MODE_KEYWORDS and _usable_mode_value(v)
+        for k, v in params.items()
+    ):
+        # A value that would count on another family's keyword or spelling: say which one this
+        # driver reads, since the value itself is not what is wrong.
+        entry = _DRIVER_FAMILIES[family]
+        spelled = ", at its own spellings" if entry.tls_spellings is not None else ""
+        return f"a TLS mode is set that this driver does not read; it reads {entry.tls_keyword}{spelled}"
     if any(_is_tls_keyword(str(k)) for k in params):
         return "a TLS keyword is set in odbc_params, but no TLS mode has a usable value"
     return "no TLS keyword is set in odbc_params"
@@ -626,55 +690,160 @@ def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     return text
 
 
-# MySQL Connector/ODBC's registered names, in lower case. The escape list below holds them, and
-# they alone keep MySQL's own ``SSLMODE`` spellings (:func:`_refuse_unread_sslmode`).
-_MYSQL_ODBC_DRIVER_NAME = r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"
-_MYSQL_ODBC_DRIVERS = re.compile(_MYSQL_ODBC_DRIVER_NAME)
-
-# The ``odbc_driver`` names, in lower case, of the drivers whose password is always sent braced,
-# with the ODBC ``}}`` escape (BACKLOG #2705): psqlODBC's and MySQL Connector/ODBC's registered
-# names, measured on 2026-10-30 to read that escape, and Microsoft's ``ODBC Driver <n> for SQL
-# Server``, not probed then but relied on for the same escape by the SQL Server preset and the
-# store. psqlODBC's names include the bare ``PostgreSQL``, the section name RHEL registers it
-# under. The legacy name ``SQL Server`` is left out: on Linux it is commonly a FreeTDS alias, which
-# has not been measured. Whole names, spacing included, on purpose: a vendor driver whose name
-# merely mentions a database, a library path, or another registered name that only folds to one of
-# these is unmeasured and does not match.
-_ODBC_BRACE_ESCAPE_DRIVERS = re.compile(
-    r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"
-    rf"|{_MYSQL_ODBC_DRIVER_NAME}"
-    r"|odbc driver [0-9]+ for sql server"
-)
-
-# The ``sslmode`` values the generic dialect sends for any driver but MySQL Connector/ODBC: libpq's
-# six modes, exactly, in lower case (BACKLOG #2705). psqlODBC's source reads an ``SSLmode`` value by
-# its first byte, and only a lower case one names a mode, so ``Require``, ``VERIFY-FULL``,
-# ``REQUIRED``, ``on`` or ``1`` would mean disable to it, while :func:`generic_odbc_tls_unenforced`
-# counts each as TLS addressed. Only these spellings mean the same thing to both.
+# The ``sslmode`` values psqlODBC reads: libpq's six modes, exactly, in lower case (BACKLOG #2705).
+# psqlODBC's source reads an ``SSLmode`` value by its first byte, and only a lower case one names a
+# mode, so ``Require``, ``VERIFY-FULL``, ``REQUIRED``, ``on`` or ``1`` would mean disable to it,
+# while the gate would count each as TLS addressed. Only these spellings mean the same thing to both.
 _LIBPQ_SSL_MODES = ("disable", "allow", "prefer", "require", "verify-ca", "verify-full")
+
+# The ``SSLMODE`` values MySQL Connector/ODBC documents, in the documented upper case (BACKLOG
+# #5035). Per engine PR 2691, a value it does not recognize leaves the driver at ``PREFERRED``,
+# which can fall back to plaintext. No MySQL driver was run for this list: whether the driver reads
+# another case was not measured, so only the documented spelling is accepted.
+_MYSQL_SSL_MODES = ("DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY")
+
+
+class _DriverFamily(NamedTuple):
+    """What the engine knows of one driver family, placed from the ``odbc_driver`` name."""
+
+    #: The whole registered names, in lower case.
+    names: re.Pattern[str]
+    #: The keyword the family reads as its TLS mode, in the form :func:`odbc_keyword_name` gives.
+    tls_keyword: str
+    #: The values of that keyword that count as a mode, or ``None`` where any usable value counts
+    #: and the deny-list alone judges it.
+    tls_spellings: frozenset[str] | None
+    #: The verifying mode a warning gives as its example, as its keyword and value, so it never
+    #: names a spelling this family would ignore (BACKLOG #5029). Kept apart and joined only where
+    #: the warning is rendered, so this table holds no connection-string part: odbc_dsn is the one
+    #: module that writes those (tests/test_odbc_dsn.py).
+    tls_example: tuple[str, str]
+    #: Whether the family is on the escape list: its password is always sent braced, with the ODBC
+    #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
+    #: keyword never brings an unmeasured escape with it.
+    brace_escape: bool
+    #: Whether the driver reads ``SERVER=host,port`` as one host and its port, and ignores
+    #: ``PORT``: Microsoft's driver alone (:func:`~messagefoundry.transports.db_endpoint.generic_hop_endpoint`,
+    #: BACKLOG #4874).
+    reads_comma_port: bool = False
+
+
+# The three driver families the engine can place, by whole registered name in any case but spelled
+# with single spaces (BACKLOG #2705, #5029, #5053). psqlODBC's include the bare ``PostgreSQL``, the
+# section name RHEL registers it under. A vendor driver whose name merely mentions a database, a
+# library path, an odbcinst alias such as RHEL's bare ``MySQL``, or another registered name that
+# only folds to one of these is not placed. An unplaced name still builds, but no TLS mode counts
+# on it, so on an enforcing instance its hop is refused off-loopback unless it is attested: a
+# change to these patterns is a change to that control, and is reviewed as one.
+#
+# psqlODBC's keyword parser and MySQL Connector/ODBC's parameter page have no ``encrypt``, and
+# Microsoft's ODBC Driver for SQL Server reads no ``sslmode``, so each family counts one keyword
+# (BACKLOG #5053). An unplaced name has no keyword that counts.
+#
+# The escape list is the families with ``brace_escape`` set, whose password is always sent braced
+# with the ODBC ``}}`` escape (:func:`_odbc_password`, BACKLOG #2705): psqlODBC and MySQL, measured
+# on 2026-10-30 to read that escape, and Microsoft's, not probed then but relied on for the same
+# escape by the SQL Server preset and the store. The legacy name ``SQL Server`` is left out: on
+# Linux it is commonly a FreeTDS alias, which has not been measured.
+_DRIVER_FAMILIES: dict[str, _DriverFamily] = {
+    "psqlodbc": _DriverFamily(
+        re.compile(r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"),
+        "sslmode",
+        frozenset(_LIBPQ_SSL_MODES),
+        ("SSLmode", "verify-full"),
+        brace_escape=True,
+    ),
+    "mysql": _DriverFamily(
+        re.compile(r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"),
+        "sslmode",
+        frozenset(_MYSQL_SSL_MODES),
+        ("SSLMODE", "VERIFY_IDENTITY"),
+        brace_escape=True,
+    ),
+    "msodbc": _DriverFamily(
+        re.compile(r"odbc driver [0-9]+ for sql server"),
+        "encrypt",
+        None,
+        ("Encrypt", "yes"),
+        brace_escape=True,
+        reads_comma_port=True,
+    ),
+}
+
+# The ONLY keywords the engine counts as setting a generic hop's TLS mode (BACKLOG #2483), each
+# only on the family that reads it. A key, certificate or CA file, or a cipher list, does not
+# count. docs/CONNECTIONS.md records what the drivers read so far do with one.
+_ODBC_TLS_MODE_KEYWORDS = frozenset(family.tls_keyword for family in _DRIVER_FAMILIES.values())
+
+
+def _driver_family(driver: object) -> str | None:
+    """The key in :data:`_DRIVER_FAMILIES` of the family ``driver``, an ``odbc_driver`` setting as
+    written, names whole, or ``None`` where the engine cannot place it. The name is read trimmed
+    and in any case, as :func:`_build_odbc_dsn` reads it, never the library it loads."""
+    name = str(driver or "").strip().lower()
+    return next(
+        (key for key, family in _DRIVER_FAMILIES.items() if family.names.fullmatch(name)), None
+    )
 
 
 def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) -> None:
-    """A ValueError when an ``sslmode`` value is not one of :data:`_LIBPQ_SSL_MODES`, exactly
-    (BACKLOG #2705). The keyword is matched in any case, as the build matches every keyword.
+    """A ValueError when an ``sslmode`` value is not one the named driver family reads, exactly
+    (BACKLOG #2705, #5029, #5035). The keyword is matched in any case, as the build matches every
+    keyword; the value is not.
 
-    The rule depends on the driver family, read from the ``odbc_driver`` name: MySQL Connector/ODBC
-    sends the same keyword with its own upper case values (``REQUIRED``, ``VERIFY_IDENTITY``), so a
-    name :data:`_MYSQL_ODBC_DRIVERS` matches whole is left to MySQL's spellings, as before. Every
-    other driver, psqlODBC under any name included, takes the libpq spellings only. The refusal
-    lists the accepted values and never the value given."""
-    if _MYSQL_ODBC_DRIVERS.fullmatch(driver.lower()) or text in _LIBPQ_SSL_MODES:
+    The rule depends on the family :func:`_driver_family` places from the ``odbc_driver`` name.
+    MySQL Connector/ODBC takes only :data:`_MYSQL_SSL_MODES`. psqlODBC, and any name the engine
+    cannot place, take only :data:`_LIBPQ_SSL_MODES`, as before. Microsoft's driver reads no
+    ``sslmode``, so on that name any value is refused and the refusal says to set ``Encrypt``.
+
+    For a name it cannot place, the refusal advises no value at all, whatever was given: it says
+    the family could not be placed and names the registered names that place psqlODBC and MySQL.
+    Offering libpq's list there would steer a MySQL driver under another name, such as RHEL's bare
+    ``MySQL``, to a value that builds and that MySQL ignores (BACKLOG #5029). A libpq value on such
+    a name still builds, for psqlODBC under a library path, but
+    :func:`generic_odbc_tls_unenforced` counts no mode on it, so the hop stays gated. Each refusal
+    leads with what an operator needs, as a stored failure keeps about its first 200 characters,
+    and none quotes the value given.
+
+    The MySQL list is joined with ``or``: two upper case words joined by a comma or a blank are a
+    name run to the log redaction, which would blank them."""
+    family = _driver_family(driver)
+    entry = _DRIVER_FAMILIES[family] if family is not None else None
+    # The table decides, as it does for the gate: a placed family takes its own sslmode spellings,
+    # or none when it reads another keyword; an unplaced name takes libpq's.
+    if entry is None:
+        accepted: frozenset[str] = frozenset(_LIBPQ_SSL_MODES)
+    elif entry.tls_keyword == "sslmode" and entry.tls_spellings is not None:
+        accepted = entry.tls_spellings
+    else:
+        accepted = frozenset()
+    if text in accepted:
         return
+    database = f"{hop_name_prefix(connection)}DATABASE"
+    where = f"{database} odbc_params value for 'sslmode'"
+    see = "(see Generic ODBC in docs/CONNECTIONS.md)"
+    if family == "msodbc":
+        raise ValueError(
+            f"{database} 'sslmode' is not read by Microsoft's driver for SQL Server, which "
+            f"odbc_driver names or defaults to; name your driver, or set Encrypt {see}"
+        )
+    if family == "mysql":
+        mysql = " or ".join(_MYSQL_SSL_MODES)
+        raise ValueError(f"{where} must be one of {mysql}, in upper case, for MySQL {see}")
+    if family is not None:
+        libpq = ", ".join(_LIBPQ_SSL_MODES)
+        raise ValueError(f"{where} must be one of {libpq}, in lower case {see}")
     raise ValueError(
-        f"{hop_name_prefix(connection)}DATABASE odbc_params value for 'sslmode' must be one of "
-        f"{', '.join(_LIBPQ_SSL_MODES)}, in lower case (see Generic ODBC in docs/CONNECTIONS.md)"
+        f"{database} cannot place the odbc_driver family; name it PostgreSQL Unicode or ANSI, "
+        f"or MySQL ODBC <version> Unicode or ANSI Driver, as registered, and no 'sslmode' counts "
+        f"until then {see}"
     )
 
 
 def _odbc_password(password: object, *, driver: str, connection: str | None) -> str:
     """``password`` as the generic connection string sends it, or a ValueError (BACKLOG #2705).
 
-    For a driver :data:`_ODBC_BRACE_ESCAPE_DRIVERS` names, it is ALWAYS braced, with the ``}}``
+    For a driver :func:`_driver_family` places, it is ALWAYS braced, with the ``}}``
     escape, whatever it holds. psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space and
     ``%XX`` a byte; ``dlg_specific.c``, ``decode_or_remove_braces``) and takes a braced one
     literally, so only the braced form sends the password as written.
@@ -689,7 +858,8 @@ def _odbc_password(password: object, *, driver: str, connection: str | None) -> 
     describes the value beyond saying the driver cannot carry it."""
     text = str(password)
     _refuse_unsafe_text(text, what="password", connection=connection, refused="")
-    if _ODBC_BRACE_ESCAPE_DRIVERS.fullmatch(driver.lower()):
+    family = _driver_family(driver)
+    if family is not None and _DRIVER_FAMILIES[family].brace_escape:
         return odbc_brace(text)
     if not any(ch in ";{}\"'" for ch in text) and text == text.strip():
         return text
@@ -697,13 +867,6 @@ def _odbc_password(password: object, *, driver: str, connection: str | None) -> 
         f"{hop_name_prefix(connection)}DATABASE password cannot be carried by this odbc_driver; "
         "change the password (see Generic ODBC in docs/CONNECTIONS.md)"
     )
-
-
-def _is_remote_spelling(value: object) -> bool:
-    """Whether the trimmed ``value`` starts with two separators, or with the device prefix, and so
-    can name another host. The spelling only; :func:`names_another_host` adds the Windows check."""
-    text = str(value).strip()
-    return len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/?"
 
 
 #: ``GetDriveTypeW`` answers: a mapped network drive, no volume at that letter, and an unknown type.
@@ -799,7 +962,7 @@ def _windows_path_verdict(
             raise _PathEnds from None
         if target is not None:
             text = target.strip()
-            if _is_remote_spelling(text) and not _LOCAL_DEVICE_TARGET.match(text):
+            if is_remote_spelling(text) and not _LOCAL_DEVICE_TARGET.match(text):
                 raise _LeavesHost
             if text[:1] in "\\/" and text.lstrip("\\/").split("\\")[0].lower() in _NT_OBJECT_ROOTS:
                 raise OSError("the link names an NT object path")  # the walk reports it: unclear
@@ -822,9 +985,9 @@ def _windows_path_verdict(
     return False
 
 
-#: A link target :func:`_is_remote_spelling` matches that :func:`_windows_path_verdict` does not
+#: A link target :func:`is_remote_spelling` matches that :func:`_windows_path_verdict` does not
 #: count as leading off the host: two separators, ``?`` or ``.``, a separator, then a drive letter
-#: or ``Volume{``. Any other link target :func:`_is_remote_spelling` matches is counted as leading
+#: or ``Volume{``. Any other link target :func:`is_remote_spelling` matches is counted as leading
 #: off the host.
 _LOCAL_DEVICE_TARGET = re.compile(r"[\\/]{2}[?.][\\/](?:[A-Za-z]:|[Vv]olume\{)")
 
@@ -861,7 +1024,7 @@ def file_keyword_verdicts(value: object) -> FileVerdicts:
         return {}
     raw = str(value)
     return {
-        p: True if _is_remote_spelling(p) else _path_verdict(p)
+        p: True if is_remote_spelling(p) else _path_verdict(p)
         for p in dict.fromkeys((raw, raw.strip()))
         if p
     }
@@ -1270,10 +1433,13 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     one to a no-TLS value, DEBUG otherwise.
 
     Delegating TLS is not the same as declining to gate the hop. A connection whose ``odbc_params`` say
-    TLS is **not required**, or set no mode at all, is refused off-loopback on an enforcing instance by
-    :func:`generic_cleartext_hop_guard` (BACKLOG #1178), which the connectors call beside this builder.
-    What stays delegated is the case this path genuinely cannot judge: a mode keyword IS set, and the
-    engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
+    TLS is **not required**, or set no mode its driver family reads, is refused off-loopback on an
+    enforcing instance by :func:`generic_cleartext_hop_guard` (BACKLOG #1178), which the connectors
+    call beside this builder. A mode counts only on the keyword the family :func:`_driver_family`
+    places reads, and for psqlODBC and MySQL only at that family's own spellings; a name the engine
+    cannot place has no mode that counts (BACKLOG #5053, :func:`generic_odbc_tls_unenforced`). What
+    stays delegated is the case this path genuinely cannot judge: the family's mode keyword IS set,
+    and the engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
     driver = str(s.get("odbc_driver") or "").strip()
     where = hop_name_prefix(connection)
     if not driver:
@@ -1354,12 +1520,12 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     _refuse_weak_driver_key(named, connection=connection, verdicts=verdicts)
     _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
     _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
-    _warn_generic_tls_unenforced(params, connection=connection)
+    _warn_generic_tls_unenforced(params, driver=driver, connection=connection)
     return ";".join(parts) + ";"
 
 
 def _warn_generic_tls_unenforced(
-    params: Mapping[str, Any], *, connection: str | None = None
+    params: Mapping[str, Any], *, driver: str, connection: str | None = None
 ) -> None:
     """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
     path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
@@ -1380,27 +1546,38 @@ def _warn_generic_tls_unenforced(
     ``connection`` names the declaring connection (#333). Without it a site running several generic DB
     connections gets a line it cannot act on — the remedy is per-connection, so the report must be too.
     It stays optional because :func:`_build_odbc_dsn` is also called directly (tests, DSN-shape checks)
-    where there is no connection to name; every engine construction path supplies it."""
+    where there is no connection to name; every engine construction path supplies it.
+
+    The remedy's example is the named driver family's own spelling, and for a name the engine
+    cannot place it names none, so the line never steers a driver to a value it ignores (BACKLOG
+    #5029)."""
     where = (
         f"DATABASE connection {connection!r} (generic ODBC dialect)"
         if connection
         else "DATABASE generic ODBC dialect"
     )
-    reason = generic_odbc_tls_unenforced(params)
+    reason = generic_odbc_tls_unenforced(params, driver=driver)
     if reason is None:
         logger.debug(
             "%s: TLS is delegated to the driver (a TLS mode is set in odbc_params); "
             "MessageFoundry does not enforce or verify it on this path",
             where,
         )
+        return
+    family = _driver_family(driver)
+    if family is not None:
+        keyword, value = _DRIVER_FAMILIES[family].tls_example
+        remedy = f"via the driver's own keyword (e.g. {keyword}={value})"
     else:
-        logger.warning(
-            "%s: TLS verification is NOT enforced by MessageFoundry on this path and %s — configure "
-            "verifying TLS via the driver's own keyword (e.g. SSLmode=verify-full) so PHI is not sent "
-            "in plaintext",
-            where,
-            reason,
-        )
+        remedy = "with a driver named by a registered name the engine places"
+    logger.warning(
+        "%s: TLS verification is NOT enforced by MessageFoundry on this path and %s — configure "
+        "verifying TLS %s so PHI is not sent in plaintext; tls_hop_attested is only for a hop "
+        "secured by other means",
+        where,
+        reason,
+        remedy,
+    )
 
 
 # --- the generic-ODBC dialect's cleartext hop, GATED (BACKLOG #1178) ---------------------------
@@ -1461,10 +1638,17 @@ def generic_cleartext_hop_guard(
         # A malformed odbc_params is :func:`_build_odbc_dsn`'s own ValueError, not a hop decision —
         # guessing a disposition off a value that will not load would report the wrong cause.
         return None
-    reason = generic_odbc_tls_unenforced(params)
+    reason = generic_odbc_tls_unenforced(params, driver=settings.get("odbc_driver"))
     if reason is None:
         return None
-    host, port = generic_hop_endpoint(str(settings.get("server") or ""), params)
+    # generic_hop_endpoint says why ``host,port`` is split only for a family that reads it, and
+    # read whole for every other driver (BACKLOG #4874).
+    family = _driver_family(settings.get("odbc_driver"))
+    host, port = generic_hop_endpoint(
+        str(settings.get("server") or ""),
+        params,
+        reads_comma_port=family is not None and _DRIVER_FAMILIES[family].reads_comma_port,
+    )
     return InsecureHopGuard.capture(
         host=host,
         port=port,
@@ -1515,20 +1699,43 @@ def _build_connection(
     raise ValueError(f"DATABASE dialect must be 'sqlserver' or 'generic', got {dialect!r}")
 
 
-# One bare SQL word token. The T-SQL sigils (`@var`, `@@ROWCOUNT`, `#temp`) are part of the token, so
-# `#delete` reads as one identifier rather than as the `DELETE` keyword. A sigil followed by a digit
-# (`#1tmp`, `@1x`) is NOT taken as one name, though T-SQL allows it: on the generic dialect `#` and `@`
-# can be operators, and there `@1INTO` is `@`, `1`, `INTO`. The digit goes to the number scan, whose
-# glue refusal refuses the statement on every dialect.
-_SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$#@]*")
+# One bare SQL word token. A LEADING T-SQL sigil (`@var`, `@@ROWCOUNT`, `#temp`) is part of the token,
+# so `#delete` reads as one identifier rather than as the `DELETE` keyword. A sigil INSIDE a word
+# starts a new token (BACKLOG #5259): `INTO#x` is `INTO` then `#x`, so the keyword is seen. That is
+# this gate's fail-closed choice, not a claim about how any server lexes `INTO#x`: whichever way a
+# lexer reads it, the statement is refused. A sigil followed by a digit (`#1tmp`, `@1x`) is NOT taken
+# as one name, though T-SQL allows it: on the generic dialect `#` and `@` can be operators, and there
+# `@1INTO` is `@`, `1`, `INTO`. The digit goes to the number scan, whose glue refusal refuses the
+# statement on every dialect.
+_SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$]*")
+# The same word under MySQL's comment model, where `#` starts a comment and so never opens a name:
+# `@#x` is `@`, then a comment.
+_SQL_WORD_RE_MYSQL = re.compile(r"@{0,2}[A-Za-z_][A-Za-z0-9_$]*")
+
+# Characters other than LF that a lexer may end a line comment at. A `--` comment ends at an LF here,
+# and one holding any of these before that LF is refused (BACKLOG #5259), whatever lexer reads it:
+# SQL lexers can disagree about which of them end a line comment, and either guess lets a write
+# through. Ending at a CR admits `--x\r' <LF> DELETE ... --'`, where the quote swallows a DELETE that
+# a lexer ending at the LF runs; ending at the LF admits `--x\rDELETE`. A CR right before the LF is a
+# CRLF ending and is not refused. The set holds at least Python's `str.splitlines` breaks less LF,
+# and NUL, at which MySQL's comment loop stops. Nothing proves it holds every character some lexer
+# ends a comment at; one outside it is a miss.
+_SQL_OTHER_LINE_BREAKS = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 
 # Write/authority keywords refused anywhere outside a string literal, a quoted identifier or a comment.
 # `INTO` is here because `SELECT ... INTO copy` writes a table while still opening with `SELECT`; the
 # CTE-terminal forms (`WITH c AS (...) DELETE ...`) fall to the same scan. DDL is included for the
-# reason a chained `DROP` is refused: a lookup has no business carrying it.
+# reason a chained `DROP` is refused: a lookup has no business carrying it. `RECEIVE` dequeues a
+# Service Broker message (a bare one needs a `;` before it, per the T-SQL docs, but one inside
+# `WAITFOR (RECEIVE ...)` needs none) and `UPDATETEXT`/`WRITETEXT` write a text column. `BEGIN` is refused as a
+# bare word, which covers every `BEGIN TRAN` form: `SELECT 1 BEGIN TRAN` would leave
+# `@@TRANCOUNT` at 1 on a pooled autocommit connection. An unquoted name spelled like one of these
+# words is refused too, failing closed: at least a PostgreSQL column `begin` on the generic dialect,
+# and on any dialect a column `receive`, which T-SQL does not reserve.
 _SQL_WRITE_KEYWORDS = frozenset(
     {
         "ALTER",
+        "BEGIN",
         "CREATE",
         "DELETE",
         "DENY",
@@ -1539,9 +1746,12 @@ _SQL_WRITE_KEYWORDS = frozenset(
         "INSERT",
         "INTO",
         "MERGE",
+        "RECEIVE",
         "REVOKE",
         "TRUNCATE",
         "UPDATE",
+        "UPDATETEXT",
+        "WRITETEXT",
     }
 )
 
@@ -1551,11 +1761,14 @@ _SQL_WRITE_KEYWORDS = frozenset(
 # fail-closed choice, not a MySQL rule: MySQL accepts `TRUNCATE (1.2, 2)`, and the gate refuses it.
 # Only `dialect='generic'` gets the exemption. The SQL Server preset never does: SQL Server has no
 # native function of either name, and an ODBC scalar escape (`{fn TRUNCATE(x, 2)}`), which its
-# driver does translate, is refused with the rest, failing closed. The generic dialect can still reach SQL Server (its default `odbc_driver` is the SQL
-# Server driver), so the exemption there rests on this premise, read from the documented T-SQL
-# grammar and not run against a server: no T-SQL statement puts a `(` straight after `INSERT` or
-# `TRUNCATE`. `INSERT` takes `TOP (n)`, `INTO` or a target name first, and `TRUNCATE` takes `TABLE`.
-# "Immediately" is the raw text, not the next surviving token: a quoted identifier or a comment
+# driver does translate, is refused with the rest, failing closed. The generic dialect can still
+# reach SQL Server (its default `odbc_driver` is the SQL Server driver), so the exemption there must
+# not admit a T-SQL write. A T-SQL statement CAN put a `(` straight after `INSERT`: the column list of
+# `MERGE ... WHEN NOT MATCHED THEN INSERT(cols) VALUES (...)`, read from the documented T-SQL grammar
+# and not run against a server. The exemption is still safe there because `MERGE` is itself in
+# `_SQL_WRITE_KEYWORDS` and gets no exemption, so the statement is refused at its `MERGE` whatever
+# its `INSERT(` reads as. A standalone T-SQL `INSERT` takes `TOP (n)`, `INTO` or a target name first,
+# and `TRUNCATE` takes `TABLE`. "Immediately" is the raw text, not the next surviving token: a quoted identifier or a comment
 # between the keyword and the `(` is dropped by the scan, and `INSERT [patients](mrn) VALUES (1)`
 # must not read as a call.
 # `EXEC`/`EXECUTE` are deliberately NOT here — T-SQL `EXEC('...')` is dynamic SQL, the exact shape
@@ -1589,21 +1802,40 @@ def _read_only_message(subject: str) -> str:
     )
 
 
-def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") -> list[_SqlToken]:
+def _scan_sql_tokens(
+    statement: str, *, subject: str = "db_lookup statement", mysql_comments: bool = False
+) -> list[_SqlToken]:
     """Tokenize ``statement`` into :class:`_SqlToken` values, dropping comments and the contents of string
     literals and quoted identifiers.
 
     Single-quoted strings and double-quoted / ``[...]``-bracketed / backtick-quoted identifiers are
     consumed whole, doubled-delimiter escapes included, so a keyword *inside* one is data and never a
-    token. T-SQL block comments nest, so the scan tracks depth.
+    token.
+
+    ``mysql_comments`` picks the comment model (BACKLOG #5259). Off, it is the T-SQL one, which
+    PostgreSQL shares: ``--`` always starts a comment, block comments nest, so the scan tracks depth,
+    and ``#`` is a sigil. On, it is MySQL's: ``--`` starts a comment only when an ASCII space or
+    control character, DEL included, follows it (``5 --1`` is ``5 - -1``), and a non-ASCII character
+    after it is refused, since the connection's character set decides what that is; ``#`` starts a
+    comment and never opens a name; block comments do not nest; and a ``/*!`` or MariaDB ``/*M!``
+    comment is refused, since a server may run its body or read it as a plain comment.
+    :func:`_require_read_only` says which caller gets which. Quoting is the same in both.
 
     An unterminated literal or comment raises :class:`DbLookupError`: the rest of such a statement
-    cannot be read, and guessing at it is how a shape-based gate gets bypassed. So does a numeric
-    literal with a word character glued to its end (:data:`_SQL_NUMBER_RE`): SQL Server reads
-    ``0xUPDATE`` as ``0x`` then ``UPDATE`` and ``1e1INTO`` as ``1e1`` then ``INTO``. That refusal
-    also catches valid reads, at least an Oracle ``1.5f``, a MySQL name that starts with a digit
-    (``2024_orders``), a MySQL ``0b101``, a T-SQL ``#1tmp`` or ``@1x`` and a ``:1st`` placeholder;
-    it fails closed on purpose.
+    cannot be read, and guessing at it is how a shape-based gate gets bypassed. So does a line comment
+    holding a line break other than LF, or a NUL, before the LF that ends it
+    (:data:`_SQL_OTHER_LINE_BREAKS` says why), and a ``--(*`` ODBC vendor escape on either model. So
+    does a numeric literal with a word character glued to its end
+    (:data:`_SQL_NUMBER_RE`): SQL Server reads ``0xUPDATE`` as ``0x`` then ``UPDATE`` and
+    ``1e1INTO`` as ``1e1`` then ``INTO``. Those refusals, and the split of a word at an internal
+    sigil (:data:`_SQL_WORD_RE`), also catch valid reads, at least an Oracle ``1.5f``, a MySQL name
+    that starts with a digit (``2024_orders``), a MySQL ``0b101``, a T-SQL ``#1tmp``, ``@1x`` or
+    ``t#1x``, a ``:1st`` placeholder, a line comment in a statement with CR-only line endings, and a
+    name such as ``update#n`` whose part before an internal ``#`` or ``@`` is a write keyword. The
+    MySQL model adds at least a ``--`` comment with no space after the dashes or with a non-ASCII
+    character right after them, any ``/*!`` or ``/*M!`` comment (``/*!40001 SQL_NO_CACHE */``
+    included), a nested block comment's tail holding a write keyword or a lone quote, and a T-SQL
+    ``#temp`` name whose line ends inside a multi-line quoted literal. It fails closed on purpose.
     ``subject`` names whose statement it is in that refusal."""
     refusal = _read_only_message(subject)
     tokens: list[_SqlToken] = []
@@ -1613,14 +1845,37 @@ def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") ->
         if ch.isspace():
             i += 1
             continue
-        if statement.startswith("--", i):
+        # MySQL makes `--` a comment only when a space or control character follows it, ASCII DEL
+        # included; `--x` is two minus signs, so the rest of its line is code and falls through to the
+        # one-character token below. Whether a non-ASCII character there is a space or a control
+        # depends on the connection's character set, which the gate cannot see, so that is refused.
+        after = statement[i + 2 : i + 3] if mysql_comments and statement.startswith("--", i) else ""
+        if after > "\x7f":
+            raise DbLookupError(f"{refusal}; a '--' is followed by a non-ASCII character")
+        if (statement.startswith("--", i) and not " " < after < "\x7f") or (
+            mysql_comments and ch == "#"
+        ):
+            if statement.startswith("--(*", i):
+                # The ODBC long-form escape, `--(*vendor(Microsoft),product(ODBC) call p *)--`, which
+                # the ODBC spec has a driver translate: a comment to the T-SQL scan, a call to a driver.
+                raise DbLookupError(f"{refusal}; found an ODBC vendor escape")
             nl = statement.find("\n", i)
-            i = n if nl == -1 else nl + 1
+            end = n if nl == -1 else nl
+            if not _SQL_OTHER_LINE_BREAKS.isdisjoint(statement[i:end].rstrip("\r")):
+                raise DbLookupError(
+                    f"{refusal}; a line comment holds a line break other than LF, or a NUL"
+                )
+            i = end + 1
             continue
+        if mysql_comments and statement.startswith(("/*!", "/*M!"), i):
+            # MySQL runs an executable comment's body, but reads it as a plain comment when its version
+            # prefix is above the server's, and MySQL itself reads `/*M!` that way. Two readings the
+            # gate cannot choose between, so it refuses.
+            raise DbLookupError(f"{refusal}; found a MySQL executable comment")
         if statement.startswith("/*", i):
             depth, i = 1, i + 2
             while i < n and depth:
-                if statement.startswith("/*", i):
+                if statement.startswith("/*", i) and not mysql_comments:
                     depth, i = depth + 1, i + 2
                 elif statement.startswith("*/", i):
                     depth, i = depth - 1, i + 2
@@ -1651,7 +1906,7 @@ def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") ->
             tokens.append(_SqlToken("number", num.group(0), end))
             i = end
             continue
-        m = _SQL_WORD_RE.match(statement, i)
+        m = (_SQL_WORD_RE_MYSQL if mysql_comments else _SQL_WORD_RE).match(statement, i)
         if m:
             tokens.append(_SqlToken("word", m.group(0).upper(), m.end()))
             i = m.end()
@@ -1674,15 +1929,35 @@ def _require_read_only(
     identifiers are skipped, and then three rules apply:
 
     1. it must *begin* (after comments and whitespace) with the word ``SELECT`` or ``WITH``;
-    2. no write or authority keyword (at least ``INSERT``/``UPDATE``/``DELETE``/``MERGE``/``INTO``/
-       ``EXEC``, plus DDL — :data:`_SQL_WRITE_KEYWORDS`) may appear outside a literal or a comment;
+    2. no keyword :data:`_SQL_WRITE_KEYWORDS` lists (at least ``INSERT``/``UPDATE``/``DELETE``/
+       ``MERGE``/``INTO``/``EXEC``, DDL and the ``BEGIN`` of ``BEGIN TRAN``) may appear outside a
+       literal or a comment; a write or transaction-control verb it does not list passes;
     3. nothing may follow a ``;`` (no chained second statement); a trailing one is fine.
+
+    Rule 2 also refuses a ``CALL`` word inside an open ODBC ``{`` escape (``{call p}``,
+    ``{?= call p(?)}``, ``{:r = call p}``), anywhere in the statement, on every dialect. Rule 1 alone refused only a
+    leading one (BACKLOG #5259). On every dialect but ``sqlserver`` it refuses a bare ``CALL`` too,
+    since MySQL and PostgreSQL run one; SQL Server has no ``CALL`` statement, so there a ``call``
+    name is still admitted. Rule 1 also refuses a leading ``SELECT`` or ``WITH`` glued to a ``#``
+    or ``@``, which was one name before :data:`_SQL_WORD_RE` split words at a sigil.
 
     One exception to rule 2: on ``dialect="generic"`` only, ``INSERT`` or ``TRUNCATE`` with a ``(``
     as the very next character is MySQL's scalar function, not a statement
-    (:data:`_SQL_FUNCTION_FORM_KEYWORDS`). Every other dialect value gets no exception, so a caller
-    that does not know the dialect gets the stricter test. ``db_lookup`` and ``DatabaseRef`` are SQL
-    Server only and pass none.
+    (:data:`_SQL_FUNCTION_FORM_KEYWORDS`). Every other dialect value gets no exception.
+    ``db_lookup`` and ``DatabaseRef`` are SQL Server only and pass none, so they get the
+    ``sqlserver`` default. ``DatabasePoll`` passes its own dialect, and while that dialect is an
+    ``env()`` value it tests the poll as ``generic`` when declared and again with the resolved
+    dialect when the source is built; ``DatabaseSource`` passes the dialect it was built with.
+
+    Every dialect but ``sqlserver`` is tokenized twice, once with each comment model of
+    :func:`_scan_sql_tokens`, and the three rules apply to each token list: the generic path can
+    reach at least SQL Server, PostgreSQL and MySQL, which disagree about comments. The aim is that a
+    statement one of them reads as a write is refused whichever one is behind the connection; it is
+    an aim, not a proof, and at least a write hidden in a MySQL backslash escape, a PostgreSQL
+    ``E'...'`` escape or dollar quote, or behind a comment a lexer ends at a character
+    :data:`_SQL_OTHER_LINE_BREAKS` lacks still passes. The generic test refuses everything the
+    ``sqlserver`` test does, less the function-form exception, and can refuse reads the
+    ``sqlserver`` test admits.
 
     Rule 2 is what makes this a read-only test rather than a leading-token test. Opening with ``SELECT``
     or ``WITH`` never implied the rest was a read: ``SELECT * INTO copy FROM patients`` writes a table,
@@ -1696,10 +1971,27 @@ def _require_read_only(
     :class:`DbLookupError` on violation. The message stays PHI-free — it never echoes statement text,
     and any keyword it names comes from the fixed vocabulary above, never from operator data."""
     refusal = _read_only_message(subject)
-    tokens = _scan_sql_tokens(statement, subject=subject)
-    if not tokens or tokens[0].kind != "word" or tokens[0].text not in ("SELECT", "WITH"):
-        raise DbLookupError(refusal)
+    preset = dialect == "sqlserver"
+    # The T-SQL model runs first on every dialect, so a refusal it raises reads as it always did.
+    for mysql_comments in (False,) if preset else (False, True):
+        tokens = _scan_sql_tokens(statement, subject=subject, mysql_comments=mysql_comments)
+        _check_read_only_tokens(statement, tokens, refusal, dialect=dialect)
+    return None
+
+
+def _check_read_only_tokens(
+    statement: str, tokens: list[_SqlToken], refusal: str, *, dialect: str
+) -> None:
+    """Apply :func:`_require_read_only`'s three rules to one scan's ``tokens``, raising on a miss."""
+    preset = dialect == "sqlserver"
     function_forms = dialect == "generic"
+    if (
+        not tokens
+        or tokens[0].kind != "word"
+        or tokens[0].text not in ("SELECT", "WITH")
+        or statement.startswith(("#", "@"), tokens[0].end)
+    ):
+        raise DbLookupError(refusal)
     last = len(tokens) - 1
     for index, (kind, text, end) in enumerate(tokens):
         if kind != "word":
@@ -1708,6 +2000,8 @@ def _require_read_only(
             if text == ";" and index != last:
                 raise DbLookupError(refusal)
             continue
+        if text == "CALL" and (not preset or _inside_odbc_escape(tokens, index)):
+            raise DbLookupError(f"{refusal}; found a 'CALL' keyword")
         if text not in _SQL_WRITE_KEYWORDS:
             continue
         if (
@@ -1717,7 +2011,25 @@ def _require_read_only(
         ):
             continue  # a scalar function call that shares the keyword's name, not a statement
         raise DbLookupError(f"{refusal}; found a '{text}' keyword")
-    return None
+
+
+def _inside_odbc_escape(tokens: list[_SqlToken], index: int) -> bool:
+    """Whether ``tokens[index]`` sits inside an open ODBC ``{`` escape, at any nesting depth.
+
+    Not only a ``{`` with ``?=`` between: ``db_lookup`` tests the statement before
+    :func:`_parse_named_params` turns a ``:name`` into ``?``, so ``{:r = call p}`` reaches the driver
+    as ``{? = call p}``, and a ``CALL`` after a nested ``{fn ...}`` closes is still inside the outer
+    ``{``. Any ``CALL`` inside an open ``{`` is refused, a false refusal of at least a ``call`` name
+    inside a ``{fn ...}`` escape included."""
+    depth = 0
+    for kind, text, _ in reversed(tokens[:index]):
+        if kind == "other" and text == "}":
+            depth += 1
+        elif kind == "other" and text == "{":
+            if not depth:
+                return True
+            depth -= 1
+    return False
 
 
 def _parse_named_params(statement: str) -> tuple[str, list[str]]:
@@ -2643,8 +2955,9 @@ async def _probe_db(
 
 def _json_default(value: Any) -> Any:
     """JSON-serialize DB column types ``json.dumps`` can't handle natively (dates, ``Decimal``, bytes),
-    so a polled row becomes a JSON-object body. An unknown type raises ``TypeError`` (surfaced as a
-    poll error and logged) rather than silently dropping data."""
+    so a polled row becomes a JSON-object body. An unknown type raises ``TypeError``, which
+    :meth:`DatabaseSource._select` skips and reports as ``row_undecodable``, rather than silently
+    dropping data."""
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     if isinstance(value, Decimal):
@@ -2906,7 +3219,7 @@ class DatabaseDestination(DestinationConnector):
             self._pool = None
 
 
-#: How many undecodable rows ONE poll will step past before it stops fetching and defers the rest
+#: How many rows that cannot become a body ONE poll will step past before it stops fetching and defers the rest
 #: (BACKLOG #1662). A flat number rather than a multiple of ``poll_max_rows``, so it holds for a
 #: ceiling of 1 as well as the shipped 500: one poll pulls at most ``poll_max_rows + 64`` rows out of
 #: the driver, and logs at most 64 skip lines, which is already fewer than the 500 the shipped code
@@ -2915,8 +3228,9 @@ class DatabaseDestination(DestinationConnector):
 #: **A stop rule re-creates the starvation it was written against whenever the poison run is longer
 #: than the bound**, so the bound alone is not the answer and is not asked to be: the dominant case,
 #: a ``body_column`` that names no selected column, is caught once per poll before any row is read,
-#: and never reaches this budget at all. What is left here is genuinely per-row (an undecodable BLOB,
-#: an unserializable column type), where a run of more than 64 in front of the good rows means a
+#: and never reaches this budget at all, nor does a codec fault that is no conversion failure, which
+#: ends the poll. What is left here is per-row (an undecodable BLOB, an unserializable column type, a
+#: body the configured ``encoding`` cannot carry), where a run of more than 64 in front of the good rows means a
 #: table one poll cannot repair — and the operator gets 64 ``row_undecodable`` events saying so.
 _MAX_SKIPPED_ROWS_PER_POLL = 64
 
@@ -2944,12 +3258,13 @@ _LEADER_RECHECK_S = 0.05
 class _PolledBatch(NamedTuple):
     """What one poll took from ``poll_statement``.
 
-    ``rows`` are ``(record, body)`` pairs that decoded; ``skipped`` carries one PHI-free reason per
-    row that could not become a body; ``skip_budget_spent`` says this poll stopped fetching early
-    because it hit :data:`_MAX_SKIPPED_ROWS_PER_POLL`. Reasons are carried out rather than reported
-    in place so the pool connection is released before anything is logged or emitted."""
+    ``rows`` are ``(record, raw)`` pairs whose body decoded and then encoded in the configured
+    ``encoding``, ``raw`` being the bytes the handler gets; ``skipped`` carries one PHI-free reason
+    per row that could not become those bytes; ``skip_budget_spent`` says this poll stopped fetching
+    early because it hit :data:`_MAX_SKIPPED_ROWS_PER_POLL`. Reasons are carried out rather than
+    reported in place so the pool connection is released before anything is logged or emitted."""
 
-    rows: list[tuple[dict[str, Any], str]]
+    rows: list[tuple[dict[str, Any], bytes]]
     skipped: list[str]
     skip_budget_spent: bool
 
@@ -2961,14 +3276,15 @@ def _read_only_poll_refusal(statement: str, *, dialect: str = "sqlserver") -> st
     the handler. A poll that claims rows, such as ``UPDATE ... RETURNING``, would mark every row it
     matches, but :meth:`DatabaseSource._select` hands off at most ``poll_max_rows`` of them, so the
     rows past the ceiling would be marked and never ingested, and so would at least a row whose
-    handler failed (:meth:`DatabaseSource._poll_once` goes on to the next row) and the rows a stop
-    leaves behind. That is accept-and-drop. Only the per-row ``mark_statement``, run after
-    the handler returns, may mark a row.
+    handler failed, the rows behind it when a ``mark_statement`` is set
+    (:meth:`DatabaseSource._poll_once` then stops the batch there, BACKLOG #4921) and the rows a
+    stop leaves behind. That is accept-and-drop. Only the per-row
+    ``mark_statement``, run after the handler returns, may mark a row.
 
     The test is :func:`_require_read_only`, the one ``db_lookup`` uses, applied whatever
     ``poll_max_rows`` is; its docstring says what it refuses. ``dialect`` is the poll's own, so a
     ``generic`` poll admits MySQL's scalar ``INSERT(...)``/``TRUNCATE(...)``, which ``db_lookup``,
-    always on the SQL Server preset, refuses. A locking ``FOR UPDATE`` read is refused
+    always on the SQL Server preset, refuses, and is also scanned with MySQL's comment model. A locking ``FOR UPDATE`` read is refused
     with the rest (``UPDATE`` is a keyword), and on this autocommit connection its lock ends with the
     statement, so refusing it loses nothing. **It reads the statement's shape only**, so at least a
     ``SELECT`` that calls a function which writes, and a T-SQL second statement with no ``;`` whose
@@ -3000,10 +3316,13 @@ class DatabaseSource(SourceConnector):
 
     The File source's *process-then-mark-done* shape (at-least-once), with a query instead of a
     directory: a cooperatively-cancellable background loop runs the operator-declared ``poll_statement``
-    (a read-only ``SELECT`` of the next batch; a writing poll is refused at construction, BACKLOG
-    #2178), hands each row to the handler as a body, and — **only after the
-    handler returns** — runs the optional ``mark_statement`` (an ``UPDATE``/``DELETE`` bound from that
-    row's columns) so the row isn't re-read. A crash before the mark re-emits the row next poll
+    (a read-only ``SELECT`` of the next batch; at least a poll of a writing shape is refused at
+    construction, BACKLOG #2178, but not every writing poll: at least a ``SELECT`` that calls a
+    function which writes, and a T-SQL second statement with no ``;`` whose verb the test does not
+    list, pass, see :func:`_read_only_poll_refusal`), hands each row to the
+    handler as a body, and — **only after the handler returns** — runs the optional
+    ``mark_statement`` (an ``UPDATE``/``DELETE`` bound from that row's columns) so the row isn't
+    re-read. A crash before the mark re-emits the row next poll
     (at-least-once); the downstream pipeline must tolerate duplicates. Poll errors are logged-not-fatal
     (a bad poll never kills the poller, mirroring the File source).
 
@@ -3017,7 +3336,9 @@ class DatabaseSource(SourceConnector):
     that bounds the leadership-transition duplicate window, the engine can't enforce row claim/mark
     atomicity here: it's on the operator's SQL. The claim is ``mark_statement``, run per row after the
     handler returns, so a row both nodes read in the brief transition window is a duplicate, the same
-    at-least-once class as a crash mid-poll, never a loss. ``poll_statement`` must not claim; see
+    at-least-once class as a crash mid-poll, and not a loss, **provided** ``poll_statement`` writes
+    nothing and ``mark_statement`` marks only the row it was bound from. A poll that claims rows as
+    it reads them can lose a row it claimed and never handed off. ``poll_statement`` must not claim; see
     :func:`_read_only_poll_refusal`.
     """
 
@@ -3257,7 +3578,7 @@ class DatabaseSource(SourceConnector):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # A poll error (connection drop, a bad poll_statement, an unserializable column) must
+                # A poll error (connection drop, a bad poll_statement, a codec fault) must
                 # NOT kill the poller — that would silently stop the connection from receiving while it
                 # still reports running. Log and retry on the next interval (mirrors the File source).
                 # Not logger.exception: its traceback ends in the driver's text, which quotes the
@@ -3325,42 +3646,65 @@ class DatabaseSource(SourceConnector):
             await self._emit_event("row_undecodable", reason=reason)
         if batch.skip_budget_spent:
             logger.error(
-                "DATABASE source skipped %d undecodable rows in one poll and stopped fetching; the "
-                "rest of the result set is deferred to the next poll (nothing dropped or marked)",
+                "DATABASE source skipped %d rows it could not turn into a body in one poll and "
+                "stopped fetching; the rest of the result set is deferred to the next poll (nothing "
+                "dropped or marked)",
                 len(batch.skipped),
             )
         me = asyncio.current_task()
-        for record, body in batch.rows:
+        for record, raw in batch.rows:
             if self._stop.is_set():
                 break  # shutting down — leave the rest unmarked for the next start (at-least-once)
             # A cancelled stop() gives the hand-off and mark a grace. Keyed by task, so a cut task
             # unwinding late cannot clear the flag of a task a later start() made.
             self._row_step_task = me
             try:
-                await self._ingest_row(record, body)
+                go_on = await self._ingest_row(record, raw)
             finally:
                 if self._row_step_task is me:
                     self._row_step_task = None
+            if not go_on:
+                # BACKLOG #4921. Stop at the first handler failure: no later row of this poll is
+                # handed off or marked. A high-water-mark mark_statement would otherwise run on the
+                # next row and move the cursor past the failed one, which the next poll would then
+                # never select. That holds only while poll_statement returns rows in cursor order
+                # over a unique cursor column; an earlier row with a higher or equal key has
+                # already moved the cursor. The failed row and
+                # every row behind it wait for the next poll, so a row that fails every time holds
+                # back the rows behind it (head-of-line). With no mark_statement no mark can move
+                # past the failed row, so stopping would not make it any likelier to be read again,
+                # and the batch goes on.
+                break
 
-    async def _ingest_row(self, record: dict[str, Any], body: str) -> None:
-        """Hand one row to the pipeline, then mark it. A cancelled stop() lets this step run for up
-        to :data:`_ROW_STEP_GRACE_S` before it cuts it, so the step is NOT atomic under shutdown."""
+    async def _ingest_row(self, record: dict[str, Any], raw: bytes) -> bool:
+        """Hand one row's encoded body to the pipeline, then mark the row. Returns whether the batch
+        goes on: False only when the handler raised and a ``mark_statement`` is set; True when the
+        row was handed off, whether or not its mark then failed. A body the configured ``encoding``
+        cannot carry never gets here: :meth:`_select` skips it as it skips an undecodable row. A
+        cancelled stop() lets this step run for up to :data:`_ROW_STEP_GRACE_S` before it cuts it,
+        so the step is NOT atomic under shutdown."""
         assert self._handler is not None
         try:
-            await self._handler(body.encode(self._encoding))
+            await self._handler(raw)
         except Exception as exc:
             # The handler records every message-level outcome itself (parse/route → ERROR) and
-            # returns, so an exception here is an infrastructure failure (the durable store write
-            # failed). Leave the row UNMARKED so the next poll re-emits it (at-least-once) — marking
-            # it now would drop a received-but-unrecorded message (mirrors the File source's M-15).
+            # returns, so an exception here is usually an infrastructure failure (the durable store
+            # write failed), but it can be row-specific too, such as SQL Server's 2628 truncation in
+            # the store write. Leave the row UNMARKED so the next poll re-emits it (at-least-once) —
+            # marking it now would drop a received-but-unrecorded message (mirrors the File source's
+            # M-15). The event makes the stall visible when the row fails every time (#4921).
             # _safe_db_error: on a server store the handler's write is itself a driver call, and a
             # rejection quotes the value it refused, as SQL Server's 2628 truncation and asyncpg's
             # DETAIL line do (#1661).
+            reason = _safe_db_error(exc)
+            stops = self._mark_sql is not None
+            outcome = "row left unmarked and poll stopped" if stops else "row left unmarked"
             logger.warning(
-                "DATABASE source handler failed (row left unmarked, will retry): %s",
-                _safe_db_error(exc),
+                "DATABASE source handler failed (%s, will retry next poll): %s", outcome, reason
             )
-            return
+            # The fixed outcome leads, so the store's bound on a reason cuts the error text, never it.
+            await self._emit_event("handler_error", reason=f"{outcome}: {reason}")
+            return not stops
         try:
             await self._mark(record)
         except Exception as exc:
@@ -3373,17 +3717,20 @@ class DatabaseSource(SourceConnector):
                 "DATABASE source mark failed (row will re-emit, a duplicate): %s",
                 _safe_db_error(exc),
             )
+        return True
 
     async def _select(self) -> _PolledBatch:
-        """Run ``poll_statement``, decode each row into a body, and return the decodable ones (at most
-        ``poll_max_rows``) plus a PHI-free reason per row that could not be decoded. The connection is
-        released before the rows are handed to the (possibly slow) handler, so a batch never holds a
-        pool connection hostage to downstream store I/O.
+        """Run ``poll_statement``, turn each row into the bytes the handler gets, and return the rows
+        that made them (at most ``poll_max_rows``) plus a PHI-free reason per row that could not. The
+        connection is released before the rows are handed to the (possibly slow) handler, so a batch
+        never holds a pool connection hostage to downstream store I/O.
 
-        **Decoding happens HERE, under the open cursor, and that is what lets the ceiling count rows
-        that produced something** (BACKLOG #1662). ``_body`` is pure, synchronous and cheap — a dict
-        lookup or a ``json.dumps`` — so running it at the fetch costs nothing extra and means a row the
-        source cannot read is replaced rather than spending a ceiling slot on nothing. The shipped code
+        **Decoding and encoding happen HERE, under the open cursor, and that is what lets the ceiling
+        count rows that produced something** (BACKLOG #1662). ``_body`` is pure, synchronous and
+        cheap — a dict lookup or a ``json.dumps``, then ``str.encode`` — so running it at the fetch
+        costs little and means a row the source cannot read, or whose body
+        the configured ``encoding`` cannot carry (BACKLOG #4921), is replaced rather than spending a
+        ceiling slot on nothing, and counts against the same skip budget. The shipped code
         charged the ceiling at the fetch and skipped the row afterwards, so one undecodable row sorting
         first starved a ``poll_max_rows=1`` feed forever: three polls handled nothing and the good row
         behind it was never reached.
@@ -3418,7 +3765,7 @@ class DatabaseSource(SourceConnector):
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
         cur: Any = None
-        rows: list[tuple[dict[str, Any], str]] = []
+        rows: list[tuple[dict[str, Any], bytes]] = []
         skipped: list[str] = []
         budget_spent = False
         ceiling = self._poll_max_rows
@@ -3437,6 +3784,11 @@ class DatabaseSource(SourceConnector):
                     ],
                     False,
                 )
+            # Only _mark reads a record once its body is made, so the batch need not hold the body
+            # twice, once in the record and once as raw, unless the mark binds that column.
+            drop_body = self._body_column
+            if drop_body is not None and drop_body in self._mark_names:
+                drop_body = None
             want = 0
             while True:
                 if ceiling is None:
@@ -3452,17 +3804,19 @@ class DatabaseSource(SourceConnector):
                     # remainder.
                     want = ceiling - len(rows)
                     batch = list(await cur.fetchmany(want))
-                for raw in batch:
-                    record = dict(zip(columns, raw))  # noqa: B905
+                for row in batch:
+                    record = dict(zip(columns, row))  # noqa: B905
                     try:
-                        body = self._body(record)
+                        raw = self._body(record)
                     except (ValueError, TypeError) as exc:
                         skipped.append(safe_exc(exc))
                         if len(skipped) >= _MAX_SKIPPED_ROWS_PER_POLL:
                             budget_spent = True
                             break
                         continue
-                    rows.append((record, body))
+                    if drop_body is not None:
+                        del record[drop_body]
+                    rows.append((record, raw))
                 if ceiling is None or budget_spent or len(batch) < want or len(rows) >= ceiling:
                     # A short batch means the driver is out of rows, so there is nothing to top up
                     # with — the ONLY reason to fetch again is a skip, and then only for the shortfall.
@@ -3494,8 +3848,12 @@ class DatabaseSource(SourceConnector):
             await _close_and_release(pool, conn, cur)
         return _PolledBatch(rows, skipped, budget_spent)
 
-    def _body(self, record: dict[str, Any]) -> str:
-        """The body for one row: a single column verbatim (``body_column``) or the whole row as JSON."""
+    def _body(self, record: dict[str, Any]) -> bytes:
+        """The bytes the handler gets for one row: a single column verbatim (``body_column``) or the
+        whole row as JSON, encoded in the configured ``encoding``. A row that cannot become them
+        raises ``ValueError`` or ``TypeError``, which :meth:`_select` skips. That includes a body
+        the encoding cannot carry (BACKLOG #4921): :meth:`_through_codec` makes each codec failure
+        it lists a ``ValueError``."""
         if self._body_column is not None:
             try:
                 value = record[self._body_column]
@@ -3504,9 +3862,37 @@ class DatabaseSource(SourceConnector):
                     f"body_column {self._body_column!r} is not in the poll_statement result columns"
                 ) from None
             if isinstance(value, (bytes, bytearray)):
-                return bytes(value).decode(self._encoding)
-            return value if isinstance(value, str) else str(value)
-        return json.dumps(record, default=_json_default)
+                text = self._through_codec(bytes(value).decode)
+            else:
+                text = value if isinstance(value, str) else str(value)
+        else:
+            text = json.dumps(record, default=_json_default)
+        return self._through_codec(text.encode)
+
+    def _through_codec[T](self, call: Callable[[str], T]) -> T:
+        """Run one ``decode`` or ``encode`` in the configured ``encoding``, so that a codec's failure on
+        this row reaches :meth:`_select`'s skip with no row value in it (BACKLOG #4921).
+
+        A ``UnicodeError`` goes through as it is: ``safe_exc`` renders it from its attributes, never
+        its message. Any other ``ValueError``, and a ``TypeError`` (a codec returning the wrong
+        type), becomes a ``ValueError`` of fixed text naming the step and the class, because a
+        third-party codec's message can quote the value it refused, and the ``row_undecodable``
+        reason never carries a row value. ``_select`` skips both classes, so neither may leave here
+        with the codec's message.
+
+        Anything else propagates and ends the poll (CLAUDE.md section 6): a ``LookupError`` is the
+        codec name, not the row, so it fails every row alike and is reported once per poll; and a
+        ``RuntimeError``, ``MemoryError`` or ``RecursionError`` is a codec's bug or a resource
+        fault, not a row it cannot convert."""
+        try:
+            return call(self._encoding)
+        except UnicodeError:
+            raise
+        except (ValueError, TypeError) as exc:
+            failed = type(exc).__name__
+        # Raised outside the handler, so neither __cause__ nor __context__ holds the codec's error;
+        # ``from None`` would leave it on __context__ (tests/test_from_none_is_not_redaction.py).
+        raise ValueError(f"the configured encoding could not {call.__name__} the row ({failed})")
 
     async def _mark(self, record: dict[str, Any]) -> None:
         if self._mark_sql is None:
@@ -3706,7 +4092,13 @@ class DatabaseLookupExecutor:
             attested = hop_attestation_from_settings(s)
             # read_only=True: advertise ApplicationIntent=ReadOnly on the lookup pool (ADR 0010). Fail
             # fast on weakened-TLS / bad-auth config.
-            self._dsn[cname] = _build_dsn(dict(s), read_only=True, attested=attested)
+            self._dsn[cname] = _build_dsn(
+                dict(s),
+                read_only=True,
+                attested=attested,
+                # Named as the loosening reports name a lookup, so a refusal matches its row.
+                connection=f"db_lookup:{cname}",
+            )
             self._pool_max[cname] = count_setting(
                 s.get("pool_max", 5), knob="pool_max", transport=f"DatabaseLookup {cname!r}"
             )

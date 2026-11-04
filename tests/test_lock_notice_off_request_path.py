@@ -477,6 +477,7 @@ async def _peak_reads_across_accounts(
                 auth_provider="local",
                 password_hash=user.password_hash,
                 password_generated=False,
+                audits=(),
             )
             await store.set_user_notify_email(f"u-{n}", email=f"other-{n}@example.org")
             other = await store.get_user(f"u-{n}")
@@ -963,6 +964,7 @@ async def test_a_lock_notice_raised_after_the_relay_closed_records_mailed_false(
             username="other-holder",
             auth_provider="local",
             password_generated=False,
+            audits=(),
         )
         await store.set_user_notify_email(other_id, email="other@example.org")
         other_user = await store.get_user(other_id)
