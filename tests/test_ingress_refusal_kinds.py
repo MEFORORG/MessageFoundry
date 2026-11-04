@@ -4,7 +4,9 @@
 
 Owner ruling 2026-09-30, recorded as ADR 0154's amendment of 2026-10-30: a TEMPORARY refusal is
 answered ``503`` with ``Retry-After``, an over-size one ``413`` on every over-size path, and any other
-``422``. Each names the ``ERROR`` row as ``refused_message_id``. The strict-validation timeout stays ``422``.
+``422``. Each names the ``ERROR`` row as ``refused_message_id``. A strict-validation timeout whose
+validate had begun stays ``422``; one that never began is temporary (BACKLOG #5078, pinned in
+``tests/test_strict_refusal_classes.py``).
 
 Every case drives the real runner's receipt handler behind a real listener socket, so the answer is
 the one a partner would read. The engine-to-engine pair at the bottom sends from the engine's own REST
@@ -186,7 +188,9 @@ async def test_the_strict_validation_timeout_stays_a_permanent_422(
         release.wait(10.0)  # held until the answer is read, so the orphaned thread ends at once
 
     monkeypatch.setattr(wiring_runner, "validate", _stuck_validate)
-    monkeypatch.setattr(wiring_runner, "_strict_validate_timeout", lambda ic: 0.01)
+    # 1 s, not a few ms: a timeout that fires before a worker thread begins the validate is now
+    # TEMPORARY (BACKLOG #5078), and under GIL contention a thread can take tens of ms to begin.
+    monkeypatch.setattr(wiring_runner, "_strict_validate_timeout", lambda ic: 1.0)
     ic = _ic(validation=Validation(strict=True))
     try:
         resp = await _post_through_runner(store, ic, HL7.encode("ascii"))
