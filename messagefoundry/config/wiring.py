@@ -9812,10 +9812,13 @@ def _enforce_posix_paths(
         # Code here runs as the engine's account, so a file owned by any other non-root user is an
         # escalation vector even at 0644 -- that user can rewrite it (CONFIG-2 / review M-21).
         if st.st_uid not in trusted_uids:
-            trusted = "root" if euid == 0 else f"root or uid {euid}"
+            # Not named for what it is: CodeQL's clear-text-logging heuristic reads a name holding
+            # "trusted" as a secret, and the refusal reaches a log line (alert 265; ADR 0034's
+            # 2026-10-03 amendment, rule 1).
+            owner_rule = "root" if euid == 0 else f"root or uid {euid}"
             refuse(
                 f"{lead} {path} owned by uid {st.st_uid} -- the engine runs as "
-                f"uid {euid} and trusts only an owner that is {trusted}; that owner could rewrite "
+                f"uid {euid} and trusts only an owner that is {owner_rule}; that owner could rewrite "
                 "the executed code (see docs/SERVICE.md)"
             )
 
