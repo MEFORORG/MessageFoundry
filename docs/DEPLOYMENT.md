@@ -310,8 +310,9 @@ Container-specific essentials, for that unsupported image (all detailed in [`../
   invariant is void across a restart. Set `MEFOR_STORE_ENCRYPTION_KEY`, the at-rest cipher key:
   `serve` refuses a keyless store by default. Also set `MEFOR_STORE_REQUIRE_ENCRYPTION=true`, as the
   shipped manifests do. It keeps that refusal in force past the audited opt-out
-  (`[security].allow_unencrypted_phi = true`, or `encrypt_stored_data = false`) and encrypts nothing
-  itself; [PHI.md](PHI.md#3-encryption-at-rest) §3 states the rule.
+  (`[security].allow_unencrypted_phi = true` or `[security].encrypt_stored_data = false`, which under
+  the default `enforcement = enforce` also needs `allow_unencrypted_phi_under_strict_enforcement`)
+  and encrypts nothing itself; [PHI.md](PHI.md#3-encryption-at-rest) §3 states the rule.
 - **Exposure:** Topology A (in-process TLS — the **recommended** of the two) or Topology B
   (reverse-proxy / same-pod sidecar). The engine serves TLS out of the box, on a self-signed pair it
   mints on first run (ADR 0172). `[api].tls_cert_file` defaults unset, and an off-loopback bind refuses
