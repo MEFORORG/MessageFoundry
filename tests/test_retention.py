@@ -470,8 +470,8 @@ async def _attachment_rows(store: MessageStore, message_id: str) -> int:
 
 #: Stage predicates each backend's `purge_dead_letters` BODY may still carry, and why. The body
 #: statements (the payload blank, the `last_error` clear and the attachment release) must be
-#: stage-agnostic on all three; the
-#: ONE survivor is SQLite's store-once `body_ref` release, which is legitimately outbound-scoped
+#: stage-agnostic on all three; the ONE survivor is SQLite's store-once `body_ref` release, which is
+#: legitimately outbound-scoped
 #: because `body_ref` is written only by `_insert_outbound_deliveries`.
 _ALLOWED_STAGE_PREDICATES = {"sqlite": 1, "postgres": 0, "sqlserver": 0}
 
