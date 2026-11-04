@@ -774,7 +774,10 @@ that context's CRL, with no attestation, so the rule rests on each caller passin
 its meaning, so the disposition and the line read one field: a CRL on a context that skips time
 validity earns no credit, and such a hop is refused under an enforcing posture unless attested
 (vault BACKLOG #5086, owner ruling 2026-11-03). The call sites below still pass no context there,
-which now changes no disposition and is how they pick the remedy they name.)* The
+which now changes no disposition. The remedy a refusal names comes from the `ways_across` a call
+site passes: MLLP, the DICOM SCU and FTPS pass `EXPIRY_RELAXED_WAYS_ACROSS`, REST, SOAP and FHIR
+still name the default (§13, *Left open*), and a caller that hands `capture()` the relaxed context
+with no `ways_across` gets `EXPIRY_RELAXED_WAYS_ACROSS` from it.)* The
 choice is made at each call site: at least `RestDestination.__init__` (`transports/rest.py`),
 `SoapDestination.__init__` (`soap.py`), `FhirDestination.__init__` (`fhir.py`), FTPS's
 `_guard_ftps_revocation` (`remotefile.py`), and the MLLP and SCU sites §13 names.

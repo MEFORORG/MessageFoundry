@@ -2542,8 +2542,11 @@ def revocation_hop_disposition(
        rather than declared away. The caller derives it from that context (see
        :meth:`RevocationHopGuard.capture`), never from the presence of a ``[tls].crl_file`` setting: a
        configured CRL that a given hop's handshake never consults must not silence that hop's guard.
-       Nor may a CRL on a context that skips time validity (:func:`skips_validity_period`), which
-       accepts that CRL past ``nextUpdate``; ``capture`` passes False for one (vault BACKLOG #5086).
+       A CRL on a context that skips time validity (:func:`skips_validity_period`) is accepted past
+       ``nextUpdate``, so ``capture`` passes False for one (vault BACKLOG #5086). This function does
+       not read the context: a caller that derives the flag itself, as the Vault and proxy legs in
+       ``transports/strict_requests.py`` do from :func:`context_checks_revocation` alone, carries
+       that check only while it builds no such context, which neither does today.
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
        **this hop**, per-connection (``tls_revocation_attested``).
     #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing hop with unchecked revocation.
@@ -2650,9 +2653,9 @@ class RevocationHopGuard:
     #: ``VERIFY_CRL_CHECK_LEAF`` (:func:`context_checks_revocation`) and does not skip time validity
     #: (:func:`skips_validity_period`), which would let a CRL past ``nextUpdate`` through. Derived
     #: from the context in :meth:`capture`, never from a global setting. It is the one field that
-    #: decides both the disposition's CRL arm and whether the attested crossing is logged, at
-    #: :meth:`enforce_construction` and the AI broker's own arm (vault BACKLOG #5086, owner ruling
-    #: 2026-11-03).
+    #: decides both the disposition's CRL arm and whether the attested crossing is logged (vault
+    #: BACKLOG #5086, owner ruling 2026-11-03). Find its readers by symbol; at least
+    #: :meth:`enforce_construction`, the AI broker and the ``messagefoundry verify`` report read it.
     crl_checked: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's
@@ -2721,7 +2724,12 @@ class RevocationHopGuard:
         that is sometimes in-gate and sometimes not.
 
         ``declaration`` is the setting :attr:`declaration` says it is; omitted, the record names a
-        connection's flag."""
+        connection's flag.
+
+        A context that skips time validity earns no CRL credit (:attr:`crl_checked`). With no
+        ``ways_across`` of its own, such a hop names :data:`EXPIRY_RELAXED_WAYS_ACROSS`, since the
+        default offers ``[tls].crl_file``, a lever that cannot cross it (SDS-3.7)."""
+        expiry_relaxed = context is not None and skips_validity_period(context)
         return cls(
             host=host,
             cell=cell,
@@ -2729,9 +2737,10 @@ class RevocationHopGuard:
             attested=attested,
             posture=posture if posture is not None else current_hop_posture(),
             blanket_attested=tls_revocation_attested(),
-            crl_checked=context_checks_revocation(context)
-            and not (context is not None and skips_validity_period(context)),
-            ways_across=ways_across,
+            crl_checked=context_checks_revocation(context) and not expiry_relaxed,
+            ways_across=EXPIRY_RELAXED_WAYS_ACROSS
+            if ways_across is None and expiry_relaxed
+            else ways_across,
             attested_reason=attested_reason,
             connection=connection,
             declaration=declaration,

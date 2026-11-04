@@ -470,7 +470,7 @@ def test_a_dicom_tls_association_is_refused_when_it_checks_no_revocation() -> No
     assert "connection 'OB_PACS';" in str(exc.value)
 
 
-def _attested_guard(
+def _capture_guard(
     context: ssl.SSLContext | None, *, attested: bool = True, **over: Any
 ) -> RevocationHopGuard:
     return RevocationHopGuard.capture(
@@ -496,11 +496,11 @@ def _crl_context(*, skip_validity: bool) -> ssl.SSLContext:
 
 def test_an_attested_hop_that_really_checks_a_crl_logs_no_crossing() -> None:
     """The line says the hop crossed WITHOUT a revocation check, so on a hop that has one it is a
-    false record. ``_attested_guard(None)`` is the control: the same hop with no CRL logs it."""
+    false record. ``_capture_guard(None)`` is the control: the same hop with no CRL logs it."""
     with _guard_log() as log:
-        _attested_guard(_crl_context(skip_validity=False)).enforce_construction()
+        _capture_guard(_crl_context(skip_validity=False)).enforce_construction()
         assert not log.audit, log.state()
-        _attested_guard(None).enforce_construction()
+        _capture_guard(None).enforce_construction()
     assert log.audit, log.state()
 
 
@@ -508,7 +508,7 @@ def test_a_crl_on_a_context_that_skips_time_validity_keeps_the_crossing_line() -
     """``NO_CHECK_TIME`` lets a CRL past ``nextUpdate`` through, so that CRL is not a check that may
     silence the line. ``crl_checked`` is False on it (vault BACKLOG #5086), so the hop crosses on
     its attestation, ALLOW, and keeps the line."""
-    guard = _attested_guard(_crl_context(skip_validity=True))
+    guard = _capture_guard(_crl_context(skip_validity=True))
     assert guard.crl_checked is False
     assert guard.disposition() is HopDisposition.ALLOW
     with _guard_log() as log:
@@ -521,13 +521,19 @@ def test_an_unattested_crl_on_a_context_that_skips_time_validity_is_refused() ->
     is no revocation check and must not cross an enforcing hop on its own (vault BACKLOG #5086,
     owner ruling 2026-11-03). Before that ruling the disposition read the bare CRL flag, so this
     guard was ALLOWed with no attestation and no line. The keep-time CRL is the control: it is a
-    check, and it still crosses."""
-    relaxed = _attested_guard(_crl_context(skip_validity=True), attested=False)
+    check, and it still crosses. The refusal offers only levers that can cross it, never the CRL
+    it already has; a caller's own ``ways_across`` still wins."""
+    relaxed = _capture_guard(_crl_context(skip_validity=True), attested=False)
     assert relaxed.crl_checked is False
     assert relaxed.disposition() is HopDisposition.REFUSE
-    with pytest.raises(InsecureHopRefused, match="revocation"):
+    with pytest.raises(InsecureHopRefused, match="revocation") as exc:
         relaxed.enforce_construction()
-    kept = _attested_guard(_crl_context(skip_validity=False), attested=False)
+    assert EXPIRY_RELAXED_WAYS_ACROSS in str(exc.value)
+    assert "Configure [tls].crl_file" not in str(exc.value)
+    own = _capture_guard(_crl_context(skip_validity=True), attested=False, ways_across="")
+    assert own.ways_across == ""
+    kept = _capture_guard(_crl_context(skip_validity=False), attested=False)
+    assert kept.ways_across is None
     assert kept.disposition() is HopDisposition.ALLOW
     kept.enforce_construction()
 
@@ -536,10 +542,10 @@ def test_the_line_names_the_connection_flag_unless_the_hop_passes_its_own_declar
     """The default keeps every connection's record byte-identical; a hop whose operator set another
     setting names that one, so the record leads back to what they set."""
     with _guard_log() as default:
-        _attested_guard(None).enforce_construction()
+        _capture_guard(None).enforce_construction()
     assert default.audit.endswith(f"(tls_revocation_attested; reason: {REASON})"), default.state()
     with _guard_log() as named:
-        _attested_guard(None, declaration="[x].y_attested").enforce_construction()
+        _capture_guard(None, declaration="[x].y_attested").enforce_construction()
     assert named.audit.endswith(f"([x].y_attested; reason: {REASON})"), named.state()
 
 
