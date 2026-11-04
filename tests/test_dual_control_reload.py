@@ -1804,7 +1804,7 @@ async def test_a_directory_lost_after_the_target_check_is_not_audited_as_missing
 ) -> None:
     """An ungated reload's strict read fails, so the load reads the directory itself and refuses.
     Audited ``unreadable``, as the target check audits the same fault, not ``invalid_config``,
-    which sent an operator looking for a config to fix (vault BACKLOG #5248 item 4)."""
+    which would send an operator looking for a config to fix (vault BACKLOG #5248 item 4)."""
     service = await _service(engine)
     await _add(service, "op", Role.ADMINISTRATOR)
     async with _client(engine, service, NOT_GATED, raise_app_exceptions=False) as c:
