@@ -696,8 +696,56 @@ def test_closing_writes_nothing_where_no_run_opened_a_record(tmp_path: Path) -> 
 _WAY_OUT = (
     "[secret_rotation].store_key_last_rotated",
     "[secret_rotation].enforce_store_key_expiry = false",
-    "refuses under every key",
+    "no run will roll it, under any key",
 )
+
+
+def test_a_keyed_chain_holds_a_hand_change_over_another_keys_record_and_keeps_its_dates(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #4942, on a keyed chain: a record naming B, and key C set by hand. The start opens
+    the record for C and keeps B's record dates, so a held key's age cannot restart. Over a closed
+    record it takes today's date."""
+    db, key_a, key_b, key_c = tmp_path / "keyed.db", generate_key(), generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+    asyncio.run(_plant_record(db, key_a, dek_fingerprint(_key_id(key_b)), "2020-02-02"))
+    rows = asyncio.run(_serve_reconcile(db, key_c, key_a))
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+    record = rows[ROTATION_RECORD_ID]
+    assert record.fingerprint == dek_fingerprint(_key_id(key_c))
+    assert (record.tracked_since, record.last_rotated) == ("2020-02-02", "2020-02-02")
+
+    closed = tmp_path / "closed.db"
+    asyncio.run(_seed(closed, tmp_path / "uploads2", key_a))
+    asyncio.run(_plant_record(closed, key_a, "", "2020-02-02"))
+    reopened = asyncio.run(_serve_reconcile(closed, key_c, key_a))[ROTATION_RECORD_ID]
+    assert reopened.fingerprint == dek_fingerprint(_key_id(key_c))
+    assert reopened.last_rotated != "2020-02-02"
+
+
+def test_a_stamp_under_an_unknown_scheme_is_held_on_a_keyed_chain(tmp_path: Path) -> None:
+    """An unknown-scheme stamp cannot say whether the key changed. Re-stamped with the new key, it
+    would hide the change from the run that completes, so on a chain not rolled to the key the start
+    holds it as it holds a change."""
+    db, key_a, key_b = tmp_path / "scheme.db", generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+
+    async def unknown_scheme() -> None:
+        store = await _open(db, key_a)
+        try:
+            await store.upsert_secret_rotation_meta(
+                _DEK,
+                fingerprint="sha3-16:" + "a" * 16,
+                tracked_since=_OLD_DATE,
+                last_rotated=_OLD_DATE,
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(unknown_scheme())
+    rows = asyncio.run(_serve_reconcile(db, key_b, key_a))
+    assert rows[_DEK].fingerprint == "sha3-16:" + "a" * 16
+    assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))
 
 
 def test_a_start_on_the_new_key_alone_before_the_roll_breaks_the_chain_and_the_refusal_names_the_way_out(
@@ -753,3 +801,28 @@ def test_a_chain_with_no_genesis_row_refuses_every_key_and_names_the_way_out(
     rows = asyncio.run(_rows(db, key_c, key_b, key_a))
     assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_c))
     assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+
+
+async def test_engine_start_passes_the_chain_answer_and_holds_the_key(tmp_path: Path) -> None:
+    """The production wiring: a real ``Engine.start`` over a keyed chain not rolled to the new key.
+    Without ``audit_rolled`` from the engine the reconcile defaults to ``None`` and stamps."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    db, key_a, key_b = tmp_path / "engine.db", generate_key(), generate_key()
+    await _seed(db, tmp_path / "uploads", key_a)
+    store = await _open(db, key_b, key_a)
+    engine = Engine(
+        store,
+        secret_rotation_settings=SecretRotationSettings(),
+        security_enforcement=SecurityEnforcement.WARN,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        await engine.start()
+        rows = await store.get_secret_rotation_meta()
+    finally:
+        await engine.stop()
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+    assert rows[_DEK].last_rotated == _OLD_DATE
+    assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))

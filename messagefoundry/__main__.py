@@ -10809,15 +10809,16 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # the rotation record then holds the key's stamp for good. Name the way out here, where the
         # operator meets it, rather than leave a re-run that can only fail again.
         print(
-            "If a re-run, with every prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, refuses the "
-            "same way, no run will roll this chain: the roll verifies the whole chain first, so a "
-            "chain `messagefoundry audit-verify` reports broken, or one whose rows open with no "
-            "genesis row naming its key, refuses under every key. A start on the new key alone "
-            "before a roll is one way to break it. The rotation record then stays open, so no "
-            "serve start stamps this key and its age runs from the prior rotation date. The ways "
-            "out are [secret_rotation].store_key_last_rotated, set to the date of a run that "
-            "re-sealed the data with no skip, or [secret_rotation].enforce_store_key_expiry = "
-            "false, which lifts only the start refusal and is a named security loosening.",
+            "Where `messagefoundry audit-verify` reports this chain broken, or this error says it "
+            "does not open with a genesis row naming its key, no run will roll it, under any key, "
+            "a new one included, because the roll verifies the whole chain first. A start on the "
+            "new key alone before a roll is one way to break it. The rotation record then stays "
+            "open, so no serve start stamps this key, and its age runs from the prior rotation "
+            "date, or from the date the record opened where there is none. The ways out are "
+            "[secret_rotation].store_key_last_rotated, set to the date of a run that re-sealed "
+            "the data with no skip, which then dates this key at every start until you change "
+            "it, or [secret_rotation].enforce_store_key_expiry = false, which lifts only the "
+            "start refusal and is a named security loosening.",
             file=sys.stderr,
         )
         return 1

@@ -247,7 +247,8 @@ def dek_fingerprint(key_id: str) -> str:
 
 
 #: The ``secret_rotation_meta`` row that is the rotation record (BACKLOG #3737): which store key
-#: ``rotate-key`` started on and has not finished. It tracks no secret and holds none. Its
+#: ``rotate-key`` started on, or a start found changed with the keyed audit chain not rolled to it
+#: (BACKLOG #4942), and no run has finished. It tracks no secret and holds none. Its
 #: ``fingerprint`` is that key's :func:`dek_fingerprint`, or :data:`_ROTATION_RECORD_CLOSED` once a
 #: run completes. Its dates are when it first opened, or when a run closed it. A ``:`` keeps it
 #: apart from every environment-variable name. An ``env()`` key is free text, so the reconcile drops one with this
@@ -269,11 +270,13 @@ def dek_changed(prior: SecretRotationMetaRow | None, fingerprint: str) -> bool |
 async def open_rotation_record(meta_store: SecretRotationMetaStore, key_id: str, day: str) -> None:
     """Record that ``rotate-key`` is moving this store to the DEK ``key_id``, before either data
     pass, so a crash or a failed step in one leaves the record standing (BACKLOG #3737). The store
-    open has run by then and can already have written under the key.
+    open has run by then and can already have written under the key. A ``serve`` start calls it too,
+    for a changed key the keyed audit chain has not rolled to (BACKLOG #4942).
 
     Skipped when the stored stamp already names ``key_id``, so there is nothing for
     :func:`reconcile_rotation_meta` to withhold. That is a run with the key already in use, or one a
-    ``serve`` start reached first, and that start's stamp stands. A stamp under a scheme this release
+    ``serve`` start stamped first, which it does only where it had no keyed audit chain to ask, and
+    that start's stamp stands. A stamp under a scheme this release
     does not know cannot say so, and opens the record.
 
     An open record keeps its dates, whatever key it names and even when it cannot be read, because
@@ -317,7 +320,8 @@ _OPENED_AT_START = (
     "chain has not been rolled to it, so no `messagefoundry rotate-key` run has completed on it. A "
     "rotation record was opened for it, its rotation date was not stamped and its age was not "
     "reset. Stop the engine and run `messagefoundry rotate-key`, with the prior key in "
-    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, until it exits 0."
+    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED, until it exits 0. If it refuses at its audit chain step, "
+    "its error says whether a re-run can clear that, and the way out where none can."
 )
 
 
@@ -603,15 +607,17 @@ async def reconcile_rotation_meta(
         changed_fp = dek_changed(prior, fingerprint)
         record = stored.get(ROTATION_RECORD_ID)
         hold = None if changed_fp is False else _rotation_hold(record, fingerprint)
-        if changed_fp and hold is None and audit_rolled is False:
+        # Not only a key that changed: one whose stamp names an unknown scheme (`None`) cannot say,
+        # and re-stamping it with the new fingerprint would hide the change from the run.
+        if changed_fp is not False and hold is None and audit_rolled is False:
             # BACKLOG #4942, #4936: no rotate-key run has rolled the chain to this key, so data may
             # still be under the prior one. Opened as the command opens it, dates kept, so the run
-            # that completes finds it and closes it, and a later start reads the same dates. It
-            # always writes here: the stamp changed, and a record naming this key would have held.
-            # Re-read for those dates, which `dated` below takes when there is no stamp.
+            # that completes finds it and closes it, and a later start reads the same dates.
+            # Re-read for those dates, which `dated` below takes when there is no stamp, and to see
+            # that it wrote: a writer between the two reads can have stamped the key first.
             await open_rotation_record(meta_store, dek_key_id, today.isoformat())
             record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
-            hold = _OPENED_AT_START
+            hold = _OPENED_AT_START if _rotation_hold(record, fingerprint) else None
         # With no stamp yet, a held key's age runs from the record, whose dates a re-run keeps, so
         # it is never younger than the run that opened it. A floor of today would restart at every
         # start, and a key held that way could never go overdue.
