@@ -506,6 +506,11 @@ _FAULT_RUN_QUIET_SECONDS = 10.0
 _WORKER_RUN_COUNT = IN_THIS_RUN
 
 
+# BACKLOG #4607: a per-lane worker death this long after the last one starts a new run of deaths.
+# Longer than any wait a run's own repeat deaths leave between them (_REPEND_RETRY_CAP_SECONDS).
+_DEATH_RUN_QUIET_SECONDS = 120.0
+
+
 @dataclass
 class _LaneClaims:
     """The rows one per-lane worker holds claimed, kept where its supervisor can read them after
@@ -518,21 +523,31 @@ class _LaneClaims:
     worker's record to the replacement (:meth:`RegistryRunner._lane_claims_for`), which re-pends
     exactly these rows before its first claim (:meth:`RegistryRunner._recover_then_run`).
 
-    ``deaths`` is the run of consecutive deaths on the lane with no settled pass between them. It
-    backs off the death's traceback in the supervisor and paces a replacement that follows a
-    repeat death, and :meth:`settle` closes it."""
+    ``deaths`` is the lane's run of deaths with no settled pass between them, and ``last_death``
+    the monotonic time of the latest. The run backs off the death's traceback in the supervisor
+    and paces a replacement that follows a repeat death; :meth:`settle` closes it, and so does a
+    death :data:`_DEATH_RUN_QUIET_SECONDS` after the last."""
 
     ids: list[str] = field(default_factory=list)
     fence: RependFence | None = None
     deaths: FailureRun = field(default_factory=FailureRun)
+    last_death: float = 0.0
 
     def settle(self, worker: str, name: str) -> None:
         """A pass resolved its whole claimed batch: nothing is held, and a run of deaths ends."""
         self.ids.clear()
         if self.deaths.count:
-            self.deaths = self.deaths.clear(
-                log, "%s worker %r: respawn", worker, name, level=logging.WARNING
-            )
+            self.close_deaths(worker, name)
+
+    def close_deaths(self, worker: str, name: str) -> None:
+        self.deaths = self.deaths.clear(
+            log,
+            "%s worker %r: respawn",
+            worker,
+            name,
+            level=logging.WARNING,
+            count_label=_WORKER_RUN_COUNT,
+        )
 
 
 class _WorkerFaultLog:
@@ -6580,6 +6595,7 @@ class RegistryRunner:
         placement, so start/reconcile/respawn all inherit the gate while the connector stays built
         (status, DR parking and the dead-letter sweeps keep keying off the full outbound map)."""
         if not self._per_lane_delivery(name):
+            self._lane_claims.pop(("delivery", name), None)  # #4607
             return
         out = self._dispatchers.get(Stage.OUTBOUND)
         held = None if out is None else out.phase(name)
@@ -6622,6 +6638,7 @@ class RegistryRunner:
                 name,
                 held,
             )
+            self._lane_claims.pop(("delivery", name), None)  # #4607: another consumer drains it
             return
         if not self._owns_destination(name):
             log.info(
@@ -6631,6 +6648,7 @@ class RegistryRunner:
                 self._destination_owner(name),
                 self.registry.shard_id,
             )
+            self._lane_claims.pop(("delivery", name), None)  # #4607: another shard drains it
             return
         task = self._start_lane_worker(
             "delivery", name, self._delivery_worker, self._workers.get(name)
@@ -6739,15 +6757,39 @@ class RegistryRunner:
         """Log a per-lane worker's death on the backoff of its lane's run of deaths (1st, 2nd,
         4th ...), each line carrying the traceback (BACKLOG #4607). A replacement now re-pends the
         rows a dead worker held, so a row that kills its worker every time dies again at each
-        respawn, and one traceback per death would flood the log."""
+        respawn, and one traceback per death would flood the log.
+
+        A run that reaches ``infra_fault_stop_after`` deaths raises ``lane_stuck`` once. No other
+        alert sees such a lane: the replacement re-pends the row before its in-flight age grows,
+        and the buildup checks run only after a pass that settles."""
         exc = task.exception()
         claims = self._lane_claims.get((kind, name))
         if exc is None or claims is None:  # a task installed without _start_lane_worker
             log.error("%s worker %r exited unexpectedly; respawning", kind, name, exc_info=exc)
             return
+        now = time.monotonic()
+        if claims.deaths.count and now - claims.last_death >= _DEATH_RUN_QUIET_SECONDS:
+            claims.close_deaths(kind, name)  # a death long after the last is a new run
+        claims.last_death = now
         claims.deaths = claims.deaths.record(
-            log, exc, "%s worker %r exited unexpectedly; respawning", kind, name
+            log,
+            exc,
+            "%s worker %r exited unexpectedly; respawning",
+            kind,
+            name,
+            count_label=_WORKER_RUN_COUNT,
         )
+        if claims.deaths.count == self._infra_fault_stop_after:
+            try:
+                self._alert_sink.lane_stuck(
+                    name,
+                    detail=(
+                        f"{kind} worker died {claims.deaths.count} times with no pass settling "
+                        "between; its lane is held on the row it died holding"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — an alert failure must not stop the respawn
+                log.warning("%s worker %r: lane_stuck alert failed", kind, name, exc_info=True)
 
     def _start_lane_worker(
         self,
@@ -6773,13 +6815,13 @@ class RegistryRunner:
 
         **Only a worker that DIED passes its rows on**: done, not cancelled, and raised. Every
         caller spawns only over a missing or finished worker, and each (stage, lane) has exactly
-        one consumer (ADR 0059; :meth:`_spawn_worker` refuses a second), so nothing live holds a
-        row the dead worker held: the replacement is the lane's next consumer and re-pends them
-        before it claims. A worker that RETURNED holds nothing it did not hand back, and the reload
-        backstop covers a failed tail release (:meth:`_recover_stopped_worker_residue`). A
-        CANCELLED one is teardown's, whose rows wait for the next start by design. The record is
-        registered at once, so a replacement that dies before its re-pend lands passes the same
-        rows on again."""
+        one consumer (ADR 0059; :meth:`_spawn_worker` refuses a second, and drops the record of a
+        lane it will not spawn on), so nothing live holds a row the dead worker held: the
+        replacement is the lane's next consumer and re-pends them before it claims. A worker that
+        RETURNED holds nothing it did not hand back, and the reload backstop covers a failed tail
+        release (:meth:`_recover_stopped_worker_residue`). A CANCELLED one is teardown's, whose rows
+        wait for the next start by design. The record is registered at once, so a replacement that
+        dies before its re-pend lands passes the same rows on again."""
         key = (kind, name)
         old = self._lane_claims.get(key)
         died = (
@@ -6789,7 +6831,9 @@ class RegistryRunner:
             and prev.exception() is not None
         )
         if died and old is not None:
-            claims = _LaneClaims(ids=list(old.ids), fence=old.fence, deaths=old.deaths)
+            claims = _LaneClaims(
+                ids=list(old.ids), fence=old.fence, deaths=old.deaths, last_death=old.last_death
+            )
         else:
             claims = _LaneClaims()
         self._lane_claims[key] = claims
@@ -6805,22 +6849,36 @@ class RegistryRunner:
         """A dead per-lane worker's replacement: re-pend the rows it died holding, then run the
         worker (BACKLOG #4607).
 
+        After a REPEAT death in one run (:meth:`_log_worker_death`), it first waits a capped
+        doubling backoff, so a row that kills its worker every time, or a re-pend that dies itself,
+        does not respawn and die again with no pause. A stop ends the wait with the rows INFLIGHT
+        for the next start; the lane's pause or #122 halt (:meth:`_hold_abandon`) ends it early, as
+        it ends a held re-pend.
+
         The re-pend is the except arm's own (:meth:`_repend_claimed_on_fault`), with the rows and
         the lease the dead worker claimed under, so a ``BaseException`` death ends where an
         ``Exception`` fault does: the write is retried while the replacement holds the lane, and it
         claims nothing until the rows are pending again, so no later row overtakes them. Only a
-        stop returns first, with the rows INFLIGHT for the next start; any other end of the hold
-        goes on to the worker, as the except arm does. ``reschedule_claimed`` is guarded
-        ``status='inflight'``, so a row the dead worker had already handed off is left alone.
+        stop returns first; any other end of the hold goes on to the worker, as the except arm
+        does. ``reschedule_claimed`` is guarded ``status='inflight'``, so a row the dead worker had
+        already handed off is left alone.
 
-        After a REPEAT death with no settled pass between, the replacement then waits a capped
-        doubling backoff before its first claim, so a row that kills its worker every time does
-        not respawn, re-claim and die with no pause. Like the except arm's re-pend, this one undoes
-        the claim's ``attempts`` increment, so ``max_attempts`` never dead-letters such a row: the
-        lane stays held on it, which keeps per-lane FIFO, and the death log and the in-flight watch
-        show it."""
+        Like the except arm's re-pend, this one undoes the claim's ``attempts`` increment, so
+        ``max_attempts`` never dead-letters a row that kills every worker: the lane stays held on
+        it, which keeps per-lane FIFO. The death log shows it, and ``lane_stuck`` pages it once a
+        run reaches ``infra_fault_stop_after`` deaths."""
         if self._stop.is_set():
             return
+        abandon = self._hold_abandon(kind, name)
+        if claims.deaths.count >= 2:
+            delay = _capped_backoff(
+                _WORKER_ERROR_BACKOFF_SECONDS, claims.deaths.count - 2, _REPEND_RETRY_CAP_SECONDS
+            )
+            while delay > 0.0 and not abandon():
+                step = min(delay, _WORKER_ERROR_BACKOFF_SECONDS)
+                if await self._stop_or_sleep(step):
+                    return
+                delay -= step
         if claims.ids:
             # On the death log's own schedule, so a row that kills every worker does not flood it.
             log.log(
@@ -6832,25 +6890,22 @@ class RegistryRunner:
                 len(claims.ids),
             )
             ended = await self._repend_claimed_on_fault(
-                kind, name, claims.ids, fence=claims.fence, abandon=self._hold_abandon(kind, name)
+                kind, name, claims.ids, fence=claims.fence, abandon=abandon
             )
             if ended is HoldResult.STOPPED:
                 return
             claims.ids.clear()
-        if claims.deaths.count >= 2:
-            delay = _capped_backoff(
-                _WORKER_ERROR_BACKOFF_SECONDS, claims.deaths.count - 2, _REPEND_RETRY_CAP_SECONDS
-            )
-            if await self._stop_or_sleep(delay):
-                return
         await run(name, claims=claims)
 
     def _hold_abandon(self, kind: str, name: str) -> Callable[[], bool]:
         """The ``abandon`` predicate worker ``kind`` passes its held re-pend
-        (:meth:`_repend_claimed_on_fault` says what each one ends)."""
+        (:meth:`_repend_claimed_on_fault` says what each one ends): the delivery gates for a
+        delivery lane, the #122 halt for an inbound's router, transform or response lane."""
         if kind == "delivery":
             return lambda: not self._lane_may_deliver(name)
-        return functools.partial(self._inbound_log_halted, name)
+        if kind in ("router", "transform", "response"):
+            return functools.partial(self._inbound_log_halted, name)
+        raise ValueError(f"no hold predicate for worker kind {kind!r}")
 
     # --- pooled-mode dispatcher management (ADR 0066) ------------------------
 
@@ -9666,6 +9721,9 @@ class RegistryRunner:
             # and under infra_fault_policy = stop at infra_fault_stop_after failures, after which
             # the head's hold counts its own failures toward the lane's STOP.
             else:
+                # #4607: noted first, so a death inside the hold below still hands them on.
+                if (out := self._dispatchers.get(Stage.OUTBOUND)) is not None:
+                    out.note_held(name, extras)
                 held = await self._repend_claimed_on_fault(
                     "batch delivery",
                     name,
@@ -10100,7 +10158,7 @@ class RegistryRunner:
                     claimed,
                     faults=faults,
                     fence=fence,
-                    abandon=self._hold_abandon("inbound", name),
+                    abandon=self._hold_abandon("router", name),
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
@@ -10461,7 +10519,7 @@ class RegistryRunner:
                     claimed,
                     faults=faults,
                     fence=fence,
-                    abandon=self._hold_abandon("inbound", name),
+                    abandon=self._hold_abandon("response", name),
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start
@@ -10601,7 +10659,7 @@ class RegistryRunner:
                     claimed,
                     faults=faults,
                     fence=fence,
-                    abandon=self._hold_abandon("inbound", name),
+                    abandon=self._hold_abandon("transform", name),
                 )
                 if held is HoldResult.STOPPED:
                     return  # stopped while holding them: they stay INFLIGHT for the next start

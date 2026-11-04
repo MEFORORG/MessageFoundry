@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
+from messagefoundry.pipeline.stage_dispatcher import LaneResultKind, _LaneOutcome
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore, Stage
 from tests.test_task_resilience import (
@@ -158,11 +159,18 @@ async def test_a_row_that_kills_each_replacement_holds_its_lane_and_logs_on_a_ba
 ) -> None:
     """Each replacement inherits the row from the worker before it, so a row that kills four
     workers in a row is still never overtaken. The deaths are one run: its traceback is logged on
-    the 1st, 2nd and 4th, not on every death, and a settled pass closes it with a line."""
+    the 1st, 2nd and 4th, not on every death, and a settled pass closes it with a line. A run that
+    reaches ``infra_fault_stop_after`` deaths pages ``lane_stuck`` once, since no other alert sees a
+    lane whose row is re-pended at every respawn."""
     caplog.set_level(logging.WARNING, logger="messagefoundry.pipeline.wiring_runner")
     _shorten_backoffs(monkeypatch)
     store, runner, collector = await _start_runner(tmp_path, "per_lane")
     try:
+        pages: list[str] = []
+        monkeypatch.setattr(runner, "_infra_fault_stop_after", 3)
+        monkeypatch.setattr(
+            runner._alert_sink, "lane_stuck", lambda name, *, detail: pages.append(name)
+        )
         killer = _install_killer(store, collector, site, monkeypatch, kills=4)
         await _queue_a_then_b(runner, store, killer, stage)
         killer.gate.set()
@@ -178,6 +186,7 @@ async def test_a_row_that_kills_each_replacement_holds_its_lane_and_logs_on_a_ba
         ]
         assert [r.getMessage().rsplit(": ", 1)[-1] for r in deaths] == ["1)", "2)", "4)"]
         assert any("respawn recovered after 4" in r.getMessage() for r in caplog.records)
+        assert pages == [key]
     finally:
         await runner.stop()
         await store.close()
@@ -254,11 +263,39 @@ async def test_rows_a_dying_serializer_noted_beyond_its_prefix_are_re_pended_wit
         st = dispatcher._states["OB"]
         dispatcher.note_held("OB", ["extra-1", "extra-2"])
         item: Any = SimpleNamespace(id="head-1")
-        _, dated = dispatcher._dead_serializer_outcome("OB", [item])
+        _, dated, released = dispatcher._dead_serializer_outcome("OB", [item])
         assert dated == ["head-1", "extra-1", "extra-2"]
+        assert released == []
         monkeypatch.setattr(dispatcher, "_start_serializer", lambda *a, **k: None)
         dispatcher._spawn_serializer("OB", [item])
         assert st.held_extra_ids == []
+    finally:
+        await runner.stop()
+        await store.close()
+
+
+async def test_a_replacement_takes_over_where_its_dead_serializer_stopped(tmp_path: Path) -> None:
+    """A replacement repeats a body that had finished, so a STOP it died re-pending stays a STOP
+    and its tail is released, not dated. A body that died part way through its prefix made
+    progress when it was past the first row, so the recovery does not escalate the lane's streak,
+    and only the rows from the one it died on are dated."""
+    store, runner, _ = await _start_runner(tmp_path, "pooled")
+    try:
+        dispatcher = runner._dispatchers[Stage.INGRESS]
+        st = dispatcher._states["IB"]
+        items: Any = [SimpleNamespace(id=f"r{n}") for n in range(3)]
+        st.drained = (_LaneOutcome(LaneResultKind.STOP, made_progress=True), ["r1", "r2"], None)
+        outcome, dated, released = dispatcher._dead_serializer_outcome("IB", items)
+        assert outcome.kind is LaneResultKind.STOP
+        assert (dated, released) == ([], ["r1", "r2"])
+
+        st.drained = None
+        st.drain_index = 1
+        st.infra_error_streak = 5
+        outcome, dated, released = dispatcher._dead_serializer_outcome("IB", items)
+        assert outcome.kind is LaneResultKind.RETRY and outcome.is_infra_fault
+        assert outcome.made_progress
+        assert (dated, released) == (["r1", "r2"], [])
     finally:
         await runner.stop()
         await store.close()
