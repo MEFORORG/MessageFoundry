@@ -189,8 +189,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # BACKLOG #3378: for a bad direction, a channel-scoped caller gets the audited 403 the
             # API handler gives a non-inbound target, not the 404 below. That 404 returns before the
             # handler's scope check, so on a first deployment such a caller's probe here would leave
-            # no denial row. The row carries the handler's flag-direction marker, so it reads as
-            # this refusal rather than as a request asked of the wrong engine shard.
+            # no denial row. The row's marker is the handler's; docs/SECURITY.md says what it tells.
             if identity.allowed_channels is not None:
                 await core.audit_channel_denied(
                     engine, identity, name, client_ip(request), flag_direction_not_inbound=True

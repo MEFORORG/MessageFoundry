@@ -115,9 +115,18 @@ async def test_ui_flag_bad_direction_from_a_scoped_caller_is_the_audited_403(
             headers=SAME_ORIGIN,
         )
         assert r.status_code == 403, r.text[:300]
+        # An outbound direction reaches the JSON handler, which writes the marker itself.
+        r = await c.post(
+            "/ui/connections/IB_A/flag",
+            data={"direction": "outbound", "flagged": "true"},
+            headers=SAME_ORIGIN,
+        )
+        assert r.status_code == 403, r.text[:300]
         rows = await engine.store.list_audit(actor="dep", action="auth.channel_denied")
-        unmarked = [json.loads(row["detail"]) for row in rows]
-        assert unmarked.count({"channel": "IB_B"}) == 1, unmarked
+        details = [json.loads(row["detail"]) for row in rows]
+        assert details.count({"channel": "IB_B"}) == 1, details
+        marked = {"channel": "IB_A", "flag_direction_not_inbound": True}
+        assert details.count(marked) == 2, details
     async with ui_client(engine, service) as c:
         await cookie_login(c, "wide")
         r = await c.post(

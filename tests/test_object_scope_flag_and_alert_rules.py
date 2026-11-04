@@ -40,7 +40,12 @@ from tests.test_channel_rbac import _add, _login, _probe, _service, engine  # no
 from tests.test_connection_audit_writes import toml_engine  # noqa: F401
 from tests.test_dual_control_reload import _settle_unlanded
 
-_DENIED = {"detail": CONNECTION_DENIED_DETAIL}
+# The literal pins the client-visible text, which must name no reason (BACKLOG #2551).
+_DENIED = {"detail": "not authorized for this connection"}
+
+
+def test_denied_body_is_the_shared_constant() -> None:
+    assert {"detail": CONNECTION_DENIED_DETAIL} == _DENIED
 
 
 async def _user(service: AuthService, username: str, role: Role, scope: list[str]) -> None:
@@ -133,6 +138,7 @@ async def test_flag_direction_refusal_row_carries_its_marker(
         assert status == 422
         assert not [a for a in audit if a[0] == "auth.channel_denied"], audit
     rows = await toml_engine.store.list_audit(actor="own", action="auth.channel_denied")
+    assert len(rows) == 2, rows
     details = {row["channel_id"]: json.loads(row["detail"]) for row in rows}
     assert details == {
         "IB_TOML": {"channel": "IB_TOML", "flag_direction_not_inbound": True},
