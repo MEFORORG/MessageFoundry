@@ -84,6 +84,7 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    DeadLetterPurge,
     FailOutcome,
     FederatedUnbind,
     LatencyHistogram,
@@ -869,8 +870,9 @@ class QueueStore(StoreLifecycle, Protocol):
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker to HL7-peek the reply (in ``pipeline/``) before
-        :meth:`ingress_handoff`. ``None`` if the row is gone or its reference is malformed, ``""``
-        if the artifact is gone."""
+        :meth:`ingress_handoff`. ``None`` if the row is gone or its reference is malformed. ``""``
+        if the artifact row is missing, its body was erased, or the reply was empty: the peek needs
+        no more, and :meth:`ingress_handoff` tells those three apart itself (BACKLOG #4996)."""
         ...
 
     async def mark_failed(
@@ -1680,13 +1682,14 @@ class QueueStore(StoreLifecycle, Protocol):
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Null dead-lettered bodies updated before ``older_than`` (their own window), at **every
         stage** — a dead ``ingress``/``routed`` row carries the full raw body and is reached here
         (#1188, ASVS 14.2.7), not only a dead ``outbound`` row. ``connection_cutoffs`` (#34, ADR 0027)
         optionally overrides the cutoff per ``destination_name`` (``float('-inf')`` = keep forever);
         default empty ⇒ a single global cutoff. A row with a NULL ``destination_name`` (ingress, routed,
-        response) always takes the global window. Returns the number purged."""
+        response) always takes the global window. Returns a :class:`DeadLetterPurge` (BACKLOG
+        #4996)."""
         ...
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:

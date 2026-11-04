@@ -210,6 +210,7 @@ from messagefoundry.store.store import (
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
+    REINGRESS_ARTIFACT_MISSING,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
@@ -237,6 +238,7 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
     FailOutcome,
@@ -8216,7 +8218,8 @@ class SqlServerStore:
         """Consume one in-flight ``Stage.RESPONSE`` work-row and re-ingress the captured reply as a new
         message on the loopback inbound (ADR 0013 Increment 2), in ONE transaction. Idempotent: returns
         ``False`` if the work-row was already consumed. A corrupt/unparseable ref, a re-ingress that
-        would exceed ``correlation_depth_cap``, or a reply retention erased (BACKLOG #1560) is
+        would exceed ``correlation_depth_cap``, a reply retention erased (BACKLOG #1560) or a
+        ``response`` row that is missing (:data:`REINGRESS_ARTIFACT_MISSING`, BACKLOG #4996) is
         dead-lettered (and the token still consumed; one whose reply is erased is also blanked). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
@@ -8325,16 +8328,16 @@ class SqlServerStore:
                     (origin_msg_id, dest, seq),
                 )
                 art = await cur.fetchone()
-                # A missing row is a corrupt reference. A NULL body means retention erased the reply
-                # (BACKLOG #1560; the SQLite twin says how a token reaches here). `#eligible` is
-                # materialized once, so a replay can commit between that read and the erasure. It
-                # must never become a child message. A missing row is damage, not an erasure, so
-                # that token is not blanked: its sealed reference is the evidence.
+                # A NULL body means retention erased the reply (BACKLOG #1560; the SQLite twin says
+                # how a token reaches here). `#eligible` is materialized once, so a replay can
+                # commit between that read and the erasure. It must never become a child message.
+                # A missing row is damage, not an erasure, so that token is not blanked: its
+                # sealed reference is the evidence.
                 if art is None:
                     return await _consume_dead(
                         "ingress_handoff(missing-artifact)",
-                        "re-ingress work-row reference is corrupt/unparseable",
-                        "re-ingress ref corrupt",
+                        REINGRESS_ARTIFACT_MISSING,
+                        "re-ingress reply missing",
                     )
                 if art[0] is None:
                     return await _consume_dead(
@@ -8539,7 +8542,8 @@ class SqlServerStore:
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
         """The decrypted reply body behind a ``Stage.RESPONSE`` work-row (ADR 0013) — for the re-ingress
         worker's HL7 peek. ``None`` if the work-row is missing/consumed or its ref is unparseable; ``''``
-        if the artifact body is missing/empty. Reads the SAME immutable artifact ``ingress_handoff``
+        if the artifact row is missing, its body was erased, or the reply was empty, as on SQLite.
+        Reads the SAME immutable artifact ``ingress_handoff``
         re-reads, so the peek and the persisted raw always agree."""
         row = await self._fetchone(
             f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",
@@ -8559,7 +8563,7 @@ class SqlServerStore:
         )
         return (
             self._cipher.decrypt(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
-            if (art and art["body"])
+            if (art and art["body"] is not None)
             else ""
         )
 
@@ -9669,10 +9673,11 @@ class SqlServerStore:
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Blank the payload of dead rows updated before ``older_than`` (retention). Keeps the
         dead row + 'dead' status (counts/disposition) but frees the body and ``last_error``;
-        idempotent, because a row left with neither no longer matches.
+        idempotent, because a row left with neither no longer matches. Returns a
+        :class:`DeadLetterPurge` (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -9691,13 +9696,21 @@ class SqlServerStore:
         )
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # As on SQLite: two statements, one count each (BACKLOG #4996). DATALENGTH, not
+                # `<> ''`: T-SQL pads trailing spaces before comparing, so a whitespace-only body
+                # would otherwise read as blank and survive.
                 await cur.execute(
-                    "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=? AND (payload <> '' OR last_error IS NOT NULL)"
-                    f" AND updated_at < {cutoff_sql}",
+                    "UPDATE queue SET payload=''"
+                    f" WHERE status=? AND DATALENGTH(payload) > 0 AND updated_at < {cutoff_sql}",
                     (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 purged = cur.rowcount
+                await cur.execute(
+                    "UPDATE queue SET last_error=NULL"
+                    f" WHERE status=? AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                    (OutboxStatus.DEAD.value, *cutoff_params),
+                )
+                cleared = cur.rowcount
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
                 # it can no longer be replayed. If that was the message's LAST replayable row (per the
                 # negated live-holder predicate), release its streaming attachment here — the deferred half
@@ -9721,7 +9734,10 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
-        return int(purged) if purged is not None else 0
+        return DeadLetterPurge(
+            bodies=int(purged) if purged is not None else 0,
+            errors_cleared=int(cleared) if cleared is not None else 0,
+        )
 
     async def wal_checkpoint(self) -> None:
         """No-op on SQL Server — there is no SQLite WAL to checkpoint (the engine never calls this on

@@ -967,6 +967,11 @@ _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 #: The ``last_error`` of a re-ingress token whose ``response`` artifact retention erased (BACKLOG
 #: #1560). The server backends import it for their own ``ingress_handoff``.
 REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
+#: The ``last_error`` of a re-ingress token whose ``response`` row is gone altogether. Retention keeps
+#: the row, so this is damage rather than an erasure, and the reference itself opened: named apart
+#: from a reference that did not, so an operator knows which row to look for (BACKLOG #4996).
+REINGRESS_ARTIFACT_MISSING: Final = "re-ingress reply row is missing"
+
 
 #: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
 #: drift apart. Used by :meth:`_attachment_still_referenced_sql`, which reached this predicate first:
@@ -974,6 +979,24 @@ REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
 _REPLAYABLE_BODY_Q = _REPLAYABLE_BODY.replace("payload", "q.payload").replace(
     "body_ref", "q.body_ref"
 )
+
+
+@dataclass(frozen=True)
+class DeadLetterPurge:
+    """What one ``purge_dead_letters`` call did (BACKLOG #4996). Counts only, never content.
+
+    ``bodies`` is the dead rows whose ``payload`` it blanked, whatever that payload held: the
+    retention audit's purged count. It is a body (on a keyed store, a sealed empty body too), a
+    store-once row's ``shared_body`` key, or a re-ingress token's reply reference. Blanking that
+    reference leaves the reply in ``response.body`` until :meth:`MessageStore.purge_message_bodies`
+    erases it. A row whose payload was already blank is not counted. ``errors_cleared`` is the dead
+    rows whose ``last_error`` it nulled, a payload-blanked row included. It is counted apart because
+    a row whose payload was already blank can still hold error text, which may carry PHI, and a pass
+    that clears only that text must still write its audit row. The backends' docstrings point here."""
+
+    bodies: int = 0
+    errors_cleared: int = 0
+
 
 #: The ``handler_name`` stamped on a pass-through COMPLETION MARKER (BACKLOG #1580). A marker is the
 #: already-terminal ``stage='outbound'`` row :meth:`MessageStore._insert_passthrough_marker` writes so
@@ -9767,8 +9790,9 @@ class MessageStore:
         builds the AAD from the selected row instead of ``cell_aad(table, column, *aad_cols)`` (the
         queue payload's routing tag, BACKLOG #2593). ``blank_where``, when given, names the blank
         values that are real rows (BACKLOG #3495, :meth:`_encrypt_existing_rows`). They are sealed
-        only on a surface with no marker and no ciphertext, under the opt-out too, and they count as
-        something to seal, so the marker can never be written over them unsealed. All identifiers
+        only by the open that writes the marker on a surface holding no ciphertext, under the
+        opt-out too (BACKLOG #4996). There they count as something to seal, so that open never
+        writes the marker over them unsealed. All identifiers
         are code constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a
         parameter.
 
@@ -13006,7 +13030,8 @@ class MessageStore:
         it is dead-lettered and consumed like a corrupt reference, and the failure is audited. A token
         whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
         produces no child and cannot be replayed. One whose ``response`` row is missing is damage: it
-        is dead-lettered as a corrupt reference and keeps its reference as the evidence."""
+        is dead-lettered under :data:`REINGRESS_ARTIFACT_MISSING` and keeps its reference as the
+        evidence."""
         tag_failures: list[CellTagError] = []
         try:
             return await self._ingress_handoff_txn(
@@ -13103,9 +13128,7 @@ class MessageStore:
             )
             art = await cur.fetchone()
             if art is None:
-                return await _consume_dead(
-                    "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
-                )
+                return await _consume_dead(REINGRESS_ARTIFACT_MISSING, "re-ingress reply missing")
             if art["body"] is None:
                 return await _consume_dead(
                     REINGRESS_ARTIFACT_ERASED, "re-ingress reply erased", erased=True
@@ -13267,8 +13290,8 @@ class MessageStore:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker so it can HL7-peek the reply (in ``pipeline/``, keeping the store
         parsing-free) before calling :meth:`ingress_handoff`. ``None`` if the row is gone (a committed
-        prior handoff) or its reference is malformed, and ``""`` if the artifact is gone, which
-        ``ingress_handoff`` then dead-letters. The
+        prior handoff) or its reference is malformed, and ``""`` if the artifact row is missing, its
+        body was erased, or the reply was empty; :meth:`ingress_handoff` tells those apart. The
         ``ingress_handoff`` it precedes re-reads the same immutable artifact for the message raw, so the
         peek and the raw always agree."""
         async with self._read() as db:
@@ -18796,13 +18819,14 @@ class MessageStore:
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Null the bodies of dead-lettered rows last updated before ``older_than`` — their own
         retention window, separate from :meth:`purge_message_bodies` because a dead row stays
         replayable (re-queueing its stored ``payload``) until purged. Keeps the row + ``dead`` status
         (counts/disposition intact) and blanks ``payload`` + ``last_error``; after this the row can no
         longer be meaningfully replayed (its body is gone — the intended retention trade-off).
-        Idempotent (guards on a non-blank payload); returns the number of dead rows purged.
+        Idempotent: a re-run matches no row. Returns a :class:`DeadLetterPurge`, which says what
+        each of its counts covers (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7). A router raise dead-letters the
         ``ingress`` row and a handler raise the ``routed`` row
@@ -18851,12 +18875,19 @@ class MessageStore:
                 f"stage=? AND status=? AND body_ref IS NOT NULL AND updated_at < {cutoff_sql}",
                 (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
             )
+            # Two statements, so each count is its own rowcount (DeadLetterPurge, BACKLOG #4996).
             cur = await self._db.execute(
-                "UPDATE queue SET payload='', last_error=NULL "
-                "WHERE status=? AND (payload <> '' OR last_error IS NOT NULL) "
-                f"AND updated_at < {cutoff_sql}",
+                "UPDATE queue SET payload='' "
+                f"WHERE status=? AND payload <> '' AND updated_at < {cutoff_sql}",
                 (OutboxStatus.DEAD.value, *cutoff_params),
             )
+            purged = int(cur.rowcount)
+            cur = await self._db.execute(
+                "UPDATE queue SET last_error=NULL "
+                f"WHERE status=? AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                (OutboxStatus.DEAD.value, *cutoff_params),
+            )
+            cleared = int(cur.rowcount)
             # #149 Phase 3a: a dead row just lost its payload + body_ref, so it can no longer be
             # replayed. If that was the message's LAST replayable row (no pending/inflight and no other
             # still-replayable dead row, per the negated live-holder predicate), release its streaming
@@ -18878,7 +18909,7 @@ class MessageStore:
                 ),
             )
             await self._commit()
-            return int(cur.rowcount)
+            return DeadLetterPurge(bodies=purged, errors_cleared=cleared)
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries last written before ``older_than`` (ADR 0005 retention).

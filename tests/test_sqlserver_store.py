@@ -47,6 +47,7 @@ from tests._keyed_reopen_contract import (
     server_keyed_reopen_report,
 )
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
+from tests._keyless_blank_contract import keyed_cipher
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -4710,7 +4711,7 @@ async def test_attachment_dead_purge_releases_after_body_purge(store) -> None:
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1
     assert await _a_refcount(store, ref) == 1  # kept: dead row still replayable
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _a_row_payload(store, oid) == ""
     assert await _a_refcount(store, ref) is None  # last replayable holder gone → GC
     assert await _a_joins(store, mid) == 0
@@ -4720,7 +4721,9 @@ async def test_attachment_dead_purge_releases_when_run_first(store) -> None:
     ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
     mid, oid = await _a_dead_deliver(store, now=0.0, ref=ref)
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1  # dead purge BEFORE body purge
+    assert (
+        await store.purge_dead_letters(older_than=10 * DAY)
+    ).bodies == 1  # dead purge BEFORE body purge
     assert await _a_row_payload(store, oid) == ""
     assert await _a_refcount(store, ref) is None  # released here — dead row was the last holder
     assert await _a_joins(store, mid) == 0
@@ -4736,8 +4739,10 @@ async def test_attachment_dead_purge_idempotent_no_underflow(store) -> None:
     m2, _ = await _a_dead_deliver(store, now=20 * DAY, ref=ref, dest="OB_2")
     assert await _a_refcount(store, ref) == 2
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1  # only m1 past cutoff
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 0  # re-run: nothing to blank
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1  # only m1 past cutoff
+    assert (
+        await store.purge_dead_letters(older_than=10 * DAY)
+    ).bodies == 0  # re-run: nothing to blank
 
     assert await _a_refcount(store, ref) == 1  # m1 released once; m2 survives
     assert await _a_chunks(store, ref) == len(_A_CHUNKS)
@@ -6431,9 +6436,10 @@ async def test_keyless_blank_contract(store, case) -> None:
 
     key = generate_key()
 
-    async def open_keyed() -> SqlServerStore:
+    async def open_keyed(**kw: Any) -> SqlServerStore:
         return await SqlServerStore.open(
-            load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
+            load_settings(environ=os.environ).store,
+            cipher=keyed_cipher(make_cipher, key, **kw),
         )
 
     raw, fetch = _raw_adapters(store)
