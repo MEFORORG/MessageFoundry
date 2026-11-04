@@ -1163,8 +1163,11 @@ async def test_a_symlinked_connections_toml_is_recorded_as_left_out_of_the_archi
             pytest.skip("a symlink cannot be made here (Windows without the privilege)")
     else:
         (cfg / "connections.toml").write_text("# connections\n")
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.dr_backup"):
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry"):
         result, manifest, detail, names = await _full_pass_record(tmp_path, key_b64, cfg)
+    # The capture saw the pass, so an empty `warned` below is a pass that warned of nothing, not a
+    # capture that read nothing.
+    assert caplog.records
     # The digest covers the file either way, so its own left-out list cannot be the record.
     assert result.config_bundled and result.config_unreadable_files == ()
     warned = [r.getMessage() for r in caplog.records if "could not list or add" in r.getMessage()]
