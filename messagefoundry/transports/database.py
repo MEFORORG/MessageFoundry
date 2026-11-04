@@ -692,9 +692,11 @@ class _DriverFamily(NamedTuple):
     #: The values of that keyword that count as a mode, or ``None`` where any usable value counts
     #: and the deny-list alone judges it.
     tls_spellings: frozenset[str] | None
-    #: The verifying mode a warning gives as its example, so it never names a spelling this
-    #: family would ignore (BACKLOG #5029).
-    tls_example: str
+    #: The verifying mode a warning gives as its example, as its keyword and value, so it never
+    #: names a spelling this family would ignore (BACKLOG #5029). Kept apart and joined only where
+    #: the warning is rendered, so this table holds no connection-string part: odbc_dsn is the one
+    #: module that writes those (tests/test_odbc_dsn.py).
+    tls_example: tuple[str, str]
     #: Whether the family is on the escape list: its password is always sent braced, with the ODBC
     #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
     #: keyword never brings an unmeasured escape with it.
@@ -727,21 +729,21 @@ _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
         re.compile(r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"),
         "sslmode",
         frozenset(_LIBPQ_SSL_MODES),
-        "SSLmode=verify-full",
+        ("SSLmode", "verify-full"),
         brace_escape=True,
     ),
     "mysql": _DriverFamily(
         re.compile(r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"),
         "sslmode",
         frozenset(_MYSQL_SSL_MODES),
-        "SSLMODE=VERIFY_IDENTITY",
+        ("SSLMODE", "VERIFY_IDENTITY"),
         brace_escape=True,
     ),
     "msodbc": _DriverFamily(
         re.compile(r"odbc driver [0-9]+ for sql server"),
         "encrypt",
         None,
-        "Encrypt=yes",
+        ("Encrypt", "yes"),
         brace_escape=True,
         reads_comma_port=True,
     ),
@@ -1549,12 +1551,11 @@ def _warn_generic_tls_unenforced(
         )
         return
     family = _driver_family(driver)
-    example = _DRIVER_FAMILIES[family].tls_example if family else None
-    remedy = (
-        f"via the driver's own keyword (e.g. {example})"
-        if example
-        else "with a driver named by a registered name the engine places"
-    )
+    if family is not None:
+        keyword, value = _DRIVER_FAMILIES[family].tls_example
+        remedy = f"via the driver's own keyword (e.g. {keyword}={value})"
+    else:
+        remedy = "with a driver named by a registered name the engine places"
     logger.warning(
         "%s: TLS verification is NOT enforced by MessageFoundry on this path and %s — configure "
         "verifying TLS %s so PHI is not sent in plaintext; tls_hop_attested is only for a hop "
