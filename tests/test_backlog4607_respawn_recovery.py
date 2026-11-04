@@ -32,6 +32,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
     _LaneOutcome,
     _LanePhase,
     _LaneState,
+    wait_to_retry,
 )
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _LaneClaims
 from messagefoundry.store import MessageStore, Stage
@@ -680,3 +681,32 @@ async def test_a_dropped_lane_record_reports_a_strand_only_for_a_worker_that_die
 
     await runner._recover_then_run("router", "IB", _LaneClaims(["r1"], _leading()), run)
     assert caplog.text.count("stay in flight until the next start") == 2
+
+
+# --- the round-4 review repairs -------------------------------------------------------------------
+
+
+async def test_a_zero_delay_wait_reads_a_stop_that_is_already_set(tmp_path: Path) -> None:
+    """R4-2. ``_stop_or_sleep(0.0)`` is the first wait of a fenced not-the-leader hold
+    (:func:`wait_to_retry`). Before the repair ``wait_for`` cancelled the stop's wait before it ran,
+    so the wait read "not stopped" with the stop set, and a replacement whose leadership read True
+    again sent its re-pend during the teardown."""
+    db = await MessageStore.open(tmp_path / "r4-2.db")
+    try:
+        runner = RegistryRunner(
+            _registry(tmp_path), db, egress=EgressSettings(deny_by_default=False)
+        )
+        assert await runner._stop_or_sleep(0.0) is False
+        runner._stop.set()
+        assert await runner._stop_or_sleep(0.0) is True
+        held = await wait_to_retry(
+            0.0,
+            poll=0.01,
+            sleep=runner._stop_or_sleep,
+            fence=_leading(),
+            abandon=None,
+            not_leader=lambda: None,
+        )
+        assert held is HoldResult.STOPPED  # None would send the write
+    finally:
+        await db.close()

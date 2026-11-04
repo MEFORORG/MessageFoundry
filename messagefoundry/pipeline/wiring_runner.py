@@ -11909,7 +11909,14 @@ class RegistryRunner:
 
     async def _stop_or_sleep(self, delay: float) -> bool:
         """Sleep up to ``delay`` seconds; return True if a stop was requested meanwhile (so a
-        backing-off worker exits promptly on shutdown instead of sleeping out the full delay)."""
+        backing-off worker exits promptly on shutdown instead of sleeping out the full delay).
+
+        The stop is read first (BACKLOG #4607): ``wait_for`` with a zero delay cancels the wait
+        before it runs, so ``delay=0.0`` would read "not stopped" with the stop already set, and a
+        hold's zero-delay first wait (:func:`wait_to_retry`) would send its write during a teardown.
+        The pooled twin, ``StageDispatcher._slept_into_stop``, reads it after its sleep."""
+        if self._stop.is_set():
+            return True
         try:
             await asyncio.wait_for(self._stop.wait(), delay)
             return True
