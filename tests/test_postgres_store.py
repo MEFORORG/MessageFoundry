@@ -1777,11 +1777,16 @@ async def test_staged_pipeline_processes_to_delivered(store) -> None:
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
 
-async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
+@pytest.mark.parametrize("verbosity", ["all", "errors", "off"])
+async def test_mark_done_writes_reply_dropped_with_the_delivery(store, verbosity: str) -> None:
     """BACKLOG #3462: the Postgres twin of the SQLite test of the same name. ``reply_dropped``
     rides the DONE flip beside ``delivered``. Controls: a vanished row writes nothing and returns
     False, and a plain ``mark_done`` writes no ``reply_dropped``. Events are read through
-    ``events_for``, which decrypts ``detail``."""
+    ``events_for``, which decrypts ``detail``. Parametrized over the event verbosity as the
+    SQLite test is (BACKLOG #4917): ``delivered`` is thinned below ``all`` and ``reply_dropped``
+    is not. Set on the fixture's store, since each backend reads it at write time."""
+    store._message_events = verbosity
+    delivered = [("delivered", "OB1", None)] if verbosity == "all" else []
     detail = "HTTP 200; reply body over the 64-byte bound"
 
     async def _to_outbound(now: float):
@@ -1808,7 +1813,7 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
     mid, out = await _to_outbound(100.0)
     assert await store.mark_done(out.id, now=110.0, reply_dropped=detail) is True
     after_drop = await store.events_for(mid)
-    assert _tail(after_drop) == [("delivered", "OB1", None), ("reply_dropped", "OB1", detail)]
+    assert _tail(after_drop) == [*delivered, ("reply_dropped", "OB1", detail)]
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
     async def _dropped_anywhere():
@@ -1826,7 +1831,7 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
 
     plain, other = await _to_outbound(120.0)
     assert await store.mark_done(other.id, now=130.0) is True
-    assert _tail(await store.events_for(plain)) == [("delivered", "OB1", None)]
+    assert _tail(await store.events_for(plain)) == delivered
     assert await _dropped_anywhere() == 1
 
 

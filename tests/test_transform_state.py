@@ -22,12 +22,15 @@ from messagefoundry.config.settings import RetentionSettings
 from messagefoundry.config.state import activated as state_activated
 from messagefoundry.config.state import reset, set_active, state_get
 from messagefoundry.config.wiring import (
+    STATE_KEY_MAX_PAIR_UNITS,
+    STATE_KEY_MAX_UNITS,
     ConnectionSpec,
     InboundConnection,
     OutboundConnection,
     Registry,
     Send,
     SetState,
+    StateKeyError,
     WiringError,
 )
 from messagefoundry.parsing.message import Message
@@ -116,6 +119,59 @@ def test_setstate_rejects_a_trailing_space_and_names_no_value() -> None:
     assert "MRN" not in str(json_exc.value)
     # Nothing chained: json's own exception carries a note naming the dict key it failed on.
     assert json_exc.value.__cause__ is None and json_exc.value.__context__ is None
+
+
+def test_setstate_refuses_a_nul_and_names_no_value() -> None:
+    """BACKLOG #4917: Postgres text cannot hold U+0000, so the handoff INSERT would fail there.
+    Refused on every backend, at construction, as a typed ``StateKeyError``."""
+    for ns, key, field in (("MRN-NS\x00", "k", "namespace"), ("ns", "MRN\x00KEY", "key")):
+        with pytest.raises(StateKeyError, match=rf"{field} must not contain U\+0000") as exc:
+            SetState(ns, key, "v")
+        assert "MRN" not in str(exc.value)
+        assert isinstance(exc.value, WiringError)  # every existing handler still catches it
+    # Control: other control characters are not this rule's business.
+    assert SetState("ns", "k\x01", "v").key == "k\x01"
+
+
+def test_setstate_bounds_each_field_and_the_pair_in_utf16_units() -> None:
+    """BACKLOG #4917: SQL Server's ``state`` columns are ``NVARCHAR(256)`` and ``pk_state`` is a
+    clustered key capped at 900 bytes, two per UTF-16 code unit. Each bound is accepted exactly at
+    its limit and refused one unit over, and an astral character counts as two units, as NVARCHAR
+    counts it."""
+    assert (STATE_KEY_MAX_UNITS, STATE_KEY_MAX_PAIR_UNITS) == (256, 450)
+    full = "n" * STATE_KEY_MAX_UNITS
+    rest = "k" * (STATE_KEY_MAX_PAIR_UNITS - STATE_KEY_MAX_UNITS)
+    assert SetState(full, rest, 1).namespace == full  # exactly at both limits
+    assert SetState(rest, full, 1).key == full
+    with pytest.raises(StateKeyError, match="namespace is 257 UTF-16 code units; the limit is 256"):
+        SetState(full + "n", "k", 1)
+    with pytest.raises(StateKeyError, match="key is 257 UTF-16 code units"):
+        SetState("n", full + "k", 1)
+    with pytest.raises(StateKeyError, match="together are 451 UTF-16 code units; the limit is 450"):
+        SetState(full, rest + "k", 1)
+    # U+1F600 is one code point and two UTF-16 code units: 128 of them fill a column exactly.
+    astral = "\U0001f600"
+    assert SetState("ns", astral * 128, 1).key == astral * 128
+    with pytest.raises(StateKeyError, match="key is 258 UTF-16 code units"):
+        SetState("ns", astral * 129, 1)
+    # A lone surrogate is counted, not raised as an unrelated UnicodeEncodeError.
+    with pytest.raises(StateKeyError, match="key is 257 UTF-16 code units"):
+        SetState("ns", chr(0xD800) * 257, 1)
+
+
+def test_setstate_converts_a_too_deep_value_to_a_wiring_error() -> None:
+    """BACKLOG #4917: ``json.dumps`` raises ``RecursionError`` on a value nested past the
+    interpreter's depth. The Handler sees the documented ``WiringError``, with nothing chained."""
+    deep: list[object] = []
+    node = deep
+    for _ in range(100_000):
+        child: list[object] = []
+        node.append(child)
+        node = child
+    with pytest.raises(WiringError, match="JSON-serializable") as exc:
+        SetState("ns", "k", deep)
+    assert not isinstance(exc.value, StateKeyError)  # a value fault, not a key fault
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
 
 
 # --- write side: applied in the handoff transaction --------------------------

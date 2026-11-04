@@ -82,6 +82,9 @@ def state_get(namespace: str, key: str, default: StateValue = None) -> StateValu
 
     Call it inside a Handler at run time::
 
+        mrn = (msg["PID-3.1"] or "").rstrip(" ")  # SetState refuses a trailing space
+        if not mrn:  # and an empty key
+            return Send("OB_DOWNSTREAM", msg)
         anon = state_get("patient_anon", mrn)
         if anon is None:
             anon = derive_anon_id(mrn)

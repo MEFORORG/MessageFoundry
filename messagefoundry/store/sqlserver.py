@@ -920,6 +920,9 @@ _SQL_STATE_MERGE: Final[str] = (
     " WHEN NOT MATCHED THEN INSERT (namespace, [key], value, set_at, message_id)"
     " VALUES (?,?,?,?,?);"
 )
+# The collation `_SCHEMA` gives state.namespace and state.[key] (BACKLOG #1588). The open-time report
+# compares sys.columns against it (BACKLOG #4917); a test pins that the DDL names the same one.
+_STATE_KEY_COLLATION: Final[str] = "Latin1_General_100_BIN2"
 
 
 # BACKLOG #1628: how many times, and how far apart, the open-time RCSI check re-reads the state after
@@ -2120,6 +2123,10 @@ _SCHEMA: list[str] = [
     # MERGE matched another spelling and kept it, while the value was sealed to the incoming one, so a
     # keyed reopen failed closed. BIN2 does NOT fix trailing spaces: `=` and the PK pad them under
     # every collation, so 'k' and 'k ' would still be one row. SetState refuses a trailing space instead.
+    # This is the one statement of that padding fact for the state and reference tables; the other
+    # comments point here. The CREATE runs only where `state` is absent, so an older table keeps its
+    # collation: _report_state_key_collation says so at open (BACKLOG #4917). pk_state is clustered,
+    # so its key is capped at 900 bytes: SetState bounds the pair (STATE_KEY_MAX_PAIR_UNITS).
     """IF OBJECT_ID('state','U') IS NULL CREATE TABLE state (
         namespace NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
         [key] NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL, value NVARCHAR(MAX) NOT NULL,
@@ -2136,8 +2143,8 @@ _SCHEMA: list[str] = [
     # binary collation (BIN2) makes key equality case- and accent-exact like SQLite/Postgres: under a
     # case-insensitive database default, externally-sourced keys differing only by case would raise a
     # PK duplicate MID-transaction — a perpetual per-interval sync-failure alert. BIN2 does NOT fix a
-    # trailing space: `=` and the PK pad it under every collation, BIN2 included, so keys differing only
-    # by trailing spaces still collide here. value is ciphertext at rest (snapshot values may carry PHI).
+    # trailing space (the `state` comment above says why), so _guard_reference_widths refuses keys
+    # that differ only by one. value is ciphertext at rest (snapshot values may carry PHI).
     # reference_version.name/version carry the same collation so the active-snapshot LEFT JOIN can
     # never hit a cross-column collation conflict.
     """IF OBJECT_ID('reference','U') IS NULL CREATE TABLE reference (
@@ -3871,9 +3878,12 @@ class SqlServerStore:
             # The audit chain's state, and on a fresh keyed store its genesis row (#2594). The
             # genesis append takes the audit applock and needs INSERT and SELECT only.
             await load_audit_chain(store, read_only=read_only)
+            # Reports on every open, read-only included; it reads metadata only (BACKLOG #4917).
+            folded = await store._report_state_key_collation()
             if not read_only:
                 # A read-only handle loads no cache, as on SQLite: each decrypts every cell (#1780).
-                await store._load_state_cache()  # ADR 0005 read-through cache warm-up
+                # ADR 0005 read-through cache warm-up
+                await store._load_state_cache(folded_collation=folded)
                 await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
         except Exception:
             # Don't leak the pool if first-open initialization fails (M-6). The executor is released
@@ -8533,8 +8543,42 @@ class SqlServerStore:
         resolves cross-message; ``transform_handoff`` refreshes it post-commit."""
         return MappingProxyType(self._state_cache)
 
-    async def _load_state_cache(self) -> None:
-        """Warm the transform-state read-through cache from the ``state`` table at open (ADR 0005)."""
+    async def _report_state_key_collation(self) -> str | None:
+        """Report a ``state`` table whose key columns are not BIN2, and return the collation found.
+
+        BACKLOG #4917. The ``state`` CREATE runs only where the table is absent, so a table made
+        before BACKLOG #1588 keeps the database default. Under a case-insensitive default it merged
+        ``MRN-abc`` and ``mrn-ABC`` into one row, kept the stored spelling and sealed the value to the
+        incoming one. This logs a WARNING naming the collation and the remedy. It repairs nothing,
+        and the open goes on: such a row may still decrypt, and :meth:`_load_state_cache` notes
+        the cause on any row that does not. Returns ``None`` when both columns are BIN2 or the
+        table is absent."""
+        rows = await self._fetchall(
+            "SELECT name, collation_name FROM sys.columns"
+            " WHERE object_id = OBJECT_ID('state') AND name IN ('namespace', 'key')"
+        )
+        found = sorted(
+            {str(r["collation_name"]) for r in rows if r["collation_name"] != _STATE_KEY_COLLATION}
+        )
+        if not found:
+            return None
+        collation = ", ".join(found)
+        log.warning(
+            "sqlserver: the state table's namespace/key columns use collation %s, not %s. The table"
+            " predates BACKLOG #1588, so keys differing only in case or accent may have been merged"
+            " into one row; the engine does not repair them. Remedy, which loses every state row:"
+            " drop the state table and delete the schema_meta row, so the next open (or"
+            " provision-schema) re-runs the DDL batch and creates the table again",
+            collation,
+            _STATE_KEY_COLLATION,
+        )
+        return collation
+
+    async def _load_state_cache(self, *, folded_collation: str | None = None) -> None:
+        """Warm the transform-state read-through cache from the ``state`` table at open (ADR 0005).
+
+        ``folded_collation`` is what :meth:`_report_state_key_collation` found. When it is set, a
+        row that fails to decrypt carries a note naming that collation as a likely cause."""
         rows = await self._fetchall("SELECT namespace, [key], value FROM state")
         cache = new_state_cache()  # sealed (BACKLOG #1174); the decrypt below still fails closed
         for r in rows:
@@ -8543,12 +8587,21 @@ class SqlServerStore:
             # through the shared helper: a keyless open of an encrypted store raises the operator-facing
             # StoreKeylessError (table + remedy), and a keyed cipher that cannot decrypt a row raises
             # CipherError — neither is swallowed.
-            cache[(r["namespace"], r["key"])] = decrypt_json_cell(
-                self._cipher,
-                r["value"],
-                aad=cell_aad("state", "value", r["namespace"], r["key"]),
-                table="state",
-            )
+            try:
+                cache[(r["namespace"], r["key"])] = decrypt_json_cell(
+                    self._cipher,
+                    r["value"],
+                    aad=cell_aad("state", "value", r["namespace"], r["key"]),
+                    table="state",
+                )
+            except CipherError as exc:
+                if folded_collation is not None:
+                    exc.add_note(
+                        f"the state table's key columns use collation {folded_collation}, not"
+                        f" {_STATE_KEY_COLLATION}: a row merged across a case or accent variant"
+                        " is sealed to the other spelling (BACKLOG #1588, #4917)"
+                    )
+                raise
         self._state_cache = cache
 
     async def _load_reference_cache(self) -> None:
@@ -8615,12 +8668,17 @@ class SqlServerStore:
         (NVARCHAR's unit — a naive ``len()`` counts code points and passes astral-plane keys straight
         into that truncation). The error NEVER carries a raw key: keys may be PHI for a patient-keyed
         set (CLAUDE.md §9), so it names the set + the key's ordinal, code-unit length, and a truncated
-        hash only."""
+        hash only.
+
+        It also refuses two keys equal once trailing U+0020 is stripped (BACKLOG #4917):
+        ``pk_reference`` pads them (the ``state`` comment in ``_SCHEMA`` says why), so the second
+        INSERT would raise a PK duplicate mid-transaction, every interval. Named by ordinal and hash."""
         if len(name.encode("utf-16-le")) // 2 > 256:
             raise ValueError(
                 f"reference set name exceeds NVARCHAR(256) "
                 f"({len(name.encode('utf-16-le')) // 2} UTF-16 code units); refusing the snapshot"
             )
+        padded: dict[str, int] = {}  # key with trailing spaces stripped -> first ordinal
         for ordinal, key in enumerate(rows):
             units = len(key.encode("utf-16-le")) // 2
             if units > 450:
@@ -8629,6 +8687,14 @@ class SqlServerStore:
                     f"reference set {name!r}: key #{ordinal} exceeds NVARCHAR(450) "
                     f"({units} UTF-16 code units, sha256:{digest}); refusing the snapshot "
                     "(key value withheld: reference keys may be PHI)"
+                )
+            first = padded.setdefault(key.rstrip(" "), ordinal)
+            if first != ordinal:
+                digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+                raise ValueError(
+                    f"reference set {name!r}: key #{ordinal} (sha256:{digest}) differs from key "
+                    f"#{first} only by trailing spaces, which SQL Server compares as equal; "
+                    "refusing the snapshot (key values withheld: reference keys may be PHI)"
                 )
 
     async def write_reference_snapshot(
