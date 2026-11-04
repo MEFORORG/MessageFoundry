@@ -70,6 +70,11 @@ def _rules(side: Any, *extra: tuple[str, str]) -> tuple[Any, ...]:
     return (*side.rules.DEFAULT_RULES, *(side.rules.FieldRule(p, k) for p, k in extra))
 
 
+def _rewriting(rules: tuple[Any, ...]) -> set[str]:
+    """The paths of the rules that rewrite a field, as the adapters hand them to the walk."""
+    return {rule.path for rule in rules if rule.kind != "keep"}
+
+
 def _checked(side: Any, message: str, rules: tuple[Any, ...], **kwargs: Any) -> tuple[str, Any]:
     reports: list[Any] = []
     out = side.anon.anonymize_checked(
@@ -211,7 +216,7 @@ def test_the_refused_bare_lines_are_still_refused(
     rules = _rules(side, *extra)
     with pytest.raises(side.anon.AnonError, match="no rule can reach"):
         side.anon.anonymize(message, salt=_SALT, rules=rules)
-    rewriting = {rule.path for rule in rules if rule.kind != "keep"}
+    rewriting = _rewriting(rules)
     addresses = [address for address, _ in side.leak.unmapped_field_values(message, rewriting)]
     assert "(malformed segment)-0" in addresses
     assert not any(address.endswith(_NO_FIELDS) for address in addresses)
@@ -377,14 +382,128 @@ def test_a_header_too_short_to_hold_a_version_is_refused(side: Any, message: str
 @_SIDES
 def test_a_three_field_header_is_still_the_header(side: Any) -> None:
     """The control for the case above: one more separator puts the header at the floor, so it
-    is skipped as a header and the message is emitted. Which bare line may stand behind such a
-    header, whose MSH-12 is still empty, is the any-version reading ``docs/PHI.md`` section 9
-    states, and this test does not pin it."""
+    is skipped as a header and the message is emitted. Its MSH-12 is still empty, so a bare line
+    behind it stands only when a rule that rewrites names its segment; the section below pins
+    that."""
     message = "\r".join((f"{_SHORT_MSH}|", _PID))
     assert side.leak.has_unreachable_line(message) is False
     addresses = [address for address, _ in side.leak.unmapped_field_values(message, set())]
     assert addresses and not any(address.startswith(("(", "MSH-")) for address in addresses)
     side.anon.anonymize(message, salt=_SALT, rules=_rules(side))
+
+
+# --- step 3 of the row: a bare line under a header with no readable version -------------------------
+
+#: A header at the three-field floor, with a real 2.3 header behind it, then a bare ``SFT``. The
+#: separators come from the first line, whose MSH-12 is empty. ``SFT`` came in with 2.5.
+_BYPASS = "\r".join((f"{_SHORT_MSH}|", _msh("2.3"), _PID, "SFT"))
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        _BYPASS,
+        "\r".join((f"{_SHORT_MSH}|", _PID, "PV2")),
+        *(_message("PV2", version=v) for v in ("", "x", "2.", "2..5", "2.²", "1.0", "2.0")),
+    ),
+    ids=(
+        "real-header-behind",
+        "floor-header",
+        "empty",
+        "letter",
+        "trailing-dot",
+        "double-dot",
+        "superscript",
+        "1.0",
+        "2.0",
+    ),
+)
+@_SIDES
+def test_a_bare_line_under_a_header_with_no_readable_version_is_refused(
+    side: Any, message: str
+) -> None:
+    """The reproduction. With no readable version in MSH-12, a bare line was judged against the
+    ids of EVERY HL7 version, so the bare ``SFT`` behind a three-field header and a real 2.3
+    header was emitted, on both anonymizers. No table says which ids are empty segments of such a
+    message, so a bare line no rule names is refused (Manager decision d20261104T072138416-0d18f5)."""
+    with pytest.raises(side.anon.AnonError, match="no rule can reach") as exc:
+        side.anon.anonymize(message, salt=_SALT, rules=_rules(side))
+    assert "a line with no fields under a header whose MSH-12 holds no HL7 version" in str(
+        exc.value
+    )
+    assert side.leak.has_unreachable_line(message) is True
+    rewriting = _rewriting(_rules(side))
+    assert side.leak.MALFORMED_LINE_HIT in side.leak.structural_phi_hits(message, rewriting)
+    addresses = [address for address, _ in side.leak.unmapped_field_values(message, rewriting)]
+    assert "(malformed segment)-0" in addresses
+    assert not any(address.endswith(_NO_FIELDS) for address in addresses)
+
+
+@pytest.mark.parametrize(
+    ("message", "seg", "line"),
+    ((_BYPASS, "SFT", 4), (_message("PV2", version="x"), "PV2", 3)),
+    ids=("real-header-behind", "letter"),
+)
+@_SIDES
+def test_a_rewriting_rule_on_the_segment_lets_the_bare_line_stand(
+    side: Any, message: str, seg: str, line: int
+) -> None:
+    """The way through the refusal above: a rule that rewrites a field of the segment names it,
+    so the bare line is an empty segment of that rule, and it gets its record."""
+    rules = _rules(side, (f"{seg}-3", "drop"))
+    out = side.anon.anonymize(message, salt=_SALT, rules=rules)
+    assert out.split("\r")[-1] == seg
+    rewriting = _rewriting(rules)
+    assert side.leak.has_unreachable_line(message, rewriting) is False
+    assert (_bare(seg, line), "") in side.leak.unmapped_field_values(message, rewriting)
+
+
+@_NO_SCANNER
+@_SIDES
+def test_the_checked_run_passes_the_bare_line_a_rewriting_rule_names(side: Any) -> None:
+    """The same at the leak-check, which reads the version from the input: the bare ``SFT`` is
+    emitted, and the coverage report names it by its position."""
+    out, report = _checked(side, _BYPASS, _rules(side, ("SFT-3", "drop")))
+    assert out.split("\r")[-1] == "SFT"
+    assert report.structural_hits == []
+    assert _bare("SFT", 4) in report.unmapped_fields
+
+
+@pytest.mark.parametrize(
+    "message", (_BYPASS, _message("PV2", version="x")), ids=("real-header-behind", "letter")
+)
+@_SIDES
+def test_a_keep_does_not_let_the_bare_line_stand(side: Any, message: str) -> None:
+    """A keep rewrites nothing, so it names no segment a bare line may stand for."""
+    seg = message.split("\r")[-1]
+    with pytest.raises(side.anon.AnonError, match="no rule can reach"):
+        side.anon.anonymize(message, salt=_SALT, rules=_rules(side, (f"{seg}-3", "keep")))
+
+
+@pytest.mark.parametrize(
+    ("version", "seg"),
+    (("2.3", "PV2"), ("2.5", "SFT"), ("2.5.1", "PV2"), ("2.10", "SFT")),
+)
+@_SIDES
+def test_a_bare_line_under_a_readable_version_still_passes(
+    side: Any, version: str, seg: str
+) -> None:
+    """The control: a bare id the header's own readable version defines is an empty segment, and
+    no rule is needed."""
+    message = _message(seg, version=version)
+    out = side.anon.anonymize(message, salt=_SALT, rules=_rules(side))
+    assert out.split("\r")[-1] == seg
+    assert side.leak.has_unreachable_line(message) is False
+
+
+@_SIDES
+def test_a_versionless_message_still_names_its_segments_in_addresses(side: Any) -> None:
+    """Only a bare line is judged by the rules alone. A field's address still prints any id some
+    HL7 version defines, so ``PV2-3`` is not read as ``(unknown segment)-3``."""
+    message = _message("PV2|||WARD", version="x")
+    addresses = [address for address, _ in side.leak.unmapped_field_values(message, set())]
+    assert "PV2-3" in addresses
+    assert not any(address.startswith("(") for address in addresses)
 
 
 # --- the position counts only the lines that hold something ---------------------------------------

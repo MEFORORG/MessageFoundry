@@ -460,15 +460,16 @@ def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
 
     Then REFUSE a message holding a line no rule can reach (BACKLOG #2246): one whose first field
     is not a segment id, or bare text that is not a segment id the message's HL7 version defines
-    or a rule names. Such a line would pass through untouched, and a wrapped name or note is what
-    it tends to carry. Raises a body-free :class:`AnonError`, so plain ``anonymize`` and
+    or a rule names. Under a header whose MSH-12 holds no readable version, bare text passes
+    only as an id a rule names (BACKLOG #3001). Such a line would pass through untouched, and a
+    wrapped name or note is what it tends to carry. Raises a body-free :class:`AnonError`, so plain ``anonymize`` and
     ``anonymize_checked`` agree.
 
     ``mapped_paths`` is the paths of the rules the caller will apply. The adapters pass them, so
     the anonymizer and the leak-check judge a bare rule-named id (``ZPD``) the same way. A caller
     with no rules passes nothing, and then only a version-defined id may stand bare."""
     # Imported here because ``leak`` imports this module; the one definition of such a line is there.
-    from .leak import has_unreachable_line
+    from .leak import MALFORMED_LINE_HIT, has_unreachable_line
 
     text = raw.replace("\x0b", "").replace("\x1c", "")
     text = text.replace("\r\n", "\r").replace("\n", "\r")
@@ -477,9 +478,9 @@ def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
     )
     if has_unreachable_line(text, mapped_paths):
         raise AnonError(
-            "message has a line no rule can reach (a malformed segment id, or a header line with "
-            "no separator after its encoding characters) — refusing to emit; repair the line, "
-            "then retry"
+            f"message has a {MALFORMED_LINE_HIT} — refusing to emit; repair the line, give the "
+            "header its version, or map a field of that segment with a rule that rewrites (a rule "
+            "on MSH-12 does not help: the input's version is the one judged), then retry"
         )
     return text
 

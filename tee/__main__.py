@@ -48,7 +48,13 @@ from pathlib import Path
 from tee import __version__, mefor_api, mllp
 from tee.anon import anonymize_checked
 from tee.anon.keying import Keyer
-from tee.anon.leak import RETARGET_ADVICE, CoverageTally, LeakReport, has_retarget_residue
+from tee.anon.leak import (
+    MALFORMED_LINE_HIT,
+    RETARGET_ADVICE,
+    CoverageTally,
+    LeakReport,
+    has_retarget_residue,
+)
 from tee.anon.rules import (
     RETARGET_ACKNOWLEDGED,
     AnonError,
@@ -789,9 +795,8 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             else ""
         )
         steps = [
-            "Extend the rule map or add a keep in an anon.toml overlay, or repair each line no "
-            "rule can reach (a malformed segment id, or a header line with no separator after "
-            "its encoding characters), then retry."
+            "Extend the rule map or add a keep in an anon.toml overlay, or repair each "
+            f"{MALFORMED_LINE_HIT}, then retry."
         ]
         if residue_reports:
             # A keep is the wrong advice here: it would leave the whole field.
