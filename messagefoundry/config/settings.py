@@ -10804,7 +10804,9 @@ def security_loosenings(
                 "posture, and no declaration lifts that. A hop that is built may carry the rows, "
                 "and the DSN credential, in plaintext. A name marked possibly generic has an env() "
                 "dialect this reading could not resolve, and the above holds of it only if it "
-                "resolves to generic",
+                "resolves to generic. A name marked possibly delegated has an env() odbc_driver "
+                "this reading could not resolve, and the above holds of it only if that driver's "
+                "family does not count its mode",
             )
         )
     # Owner ruling 2026-09-24: the one per-hop declaration that ALLOWs rather than WARNs, so it is the

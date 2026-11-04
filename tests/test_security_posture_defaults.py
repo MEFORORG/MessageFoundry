@@ -3416,9 +3416,9 @@ def test_db_readers_resolve_an_env_dialect_when_given_values() -> None:
 def test_the_tls_reader_resolves_an_env_driver_as_the_build_does() -> None:
     """BACKLOG #5053. The classifier judges a TLS keyword by the driver family, so the posture
     reader resolves an ``env()`` ``odbc_driver`` as it resolves an ``env()`` dialect: a psqlODBC
-    name with ``SSLmode=verify-full`` is delegated, as the build delegates it. With no value the
-    hop is listed under a reason that says the name was not read. A connection that is not deployed
-    is skipped, as one with an ``env()`` dialect is (ADR 0111 AC-1), and the cast never runs."""
+    name with ``SSLmode=verify-full`` is delegated, as the build delegates it. With no value, or
+    on a connection that is not deployed (ADR 0111 AC-1, where the cast never runs), the hop is
+    listed under a reason that says the name was not read, and a no-TLS value is still named."""
     from messagefoundry.config.wiring import (
         UNRESOLVED_DRIVER_REASON,
         Database,
@@ -3455,7 +3455,9 @@ def test_the_tls_reader_resolves_an_env_driver_as_the_build_does() -> None:
     outbound("OB_DARK", deployed=False)
     values = {"ob_live_driver": "PostgreSQL Unicode", "ob_dark_driver": "PostgreSQL Unicode"}
     resolved = dict(unverified_generic_db_hops(reg, env_values=values))
-    assert "OB_LIVE" not in resolved and "OB_DARK" not in resolved
+    assert "OB_LIVE" not in resolved
+    # The dark connection's driver is never resolved, so it is listed as unread, not as unplaced.
+    assert resolved["OB_DARK"].startswith(UNRESOLVED_DRIVER_REASON)
     assert cast_ran == ["PostgreSQL Unicode"], "only the deployed connection's value is resolved"
     # The control: the same live hop with a value that names no family is listed.
     listed = dict(unverified_generic_db_hops(reg, env_values={**values, "ob_live_driver": "MySQL"}))
@@ -3463,9 +3465,23 @@ def test_the_tls_reader_resolves_an_env_driver_as_the_build_does() -> None:
     # No values: the driver is unresolved, so the hop is listed rather than guessed clear, and the
     # reason says the name was not read rather than that it cannot be placed.
     unread = dict(unverified_generic_db_hops(reg))["OB_LIVE"]
-    assert unread.startswith(UNRESOLVED_DRIVER_REASON) and "OB_DARK" not in dict(
-        unverified_generic_db_hops(reg)
+    assert unread.startswith(UNRESOLVED_DRIVER_REASON)
+    # A no-TLS value never depended on the driver, so a dark connection still reports it.
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_DARK_OFF",
+            Database(
+                server="db.example.invalid",
+                dialect="generic",
+                odbc_driver=env("ob_dark_off_driver", cast=driver_cast),  # type: ignore[arg-type]
+                odbc_params={"SSLmode": "disable"},
+                statement="INSERT INTO r (a) VALUES (:a)",
+            ),
+            deployed=False,
+        )
     )
+    off = dict(unverified_generic_db_hops(reg, env_values=values))["OB_DARK_OFF"]
+    assert off.startswith("TLS is explicitly not required: SSLmode=disable")
 
 
 def test_db_readers_never_resolve_a_not_deployed_env_dialect() -> None:

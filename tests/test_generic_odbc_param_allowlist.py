@@ -975,7 +975,7 @@ _UNPLACED_DRIVERS = ["MySQL", "/usr/lib64/libmyodbc8w.so", "MariaDB ODBC 3.1 Dri
 
 
 @pytest.mark.parametrize("driver", _UNPLACED_DRIVERS)
-@pytest.mark.parametrize("mode", [*_MYSQL_MODES, "required", "Verify_Identity"])
+@pytest.mark.parametrize("mode", _MYSQL_MODES)
 def test_a_mysql_spelling_under_an_unplaced_name_is_pointed_at_mysql_s_name(
     driver: str, mode: str
 ) -> None:
@@ -987,12 +987,17 @@ def test_a_mysql_spelling_under_an_unplaced_name_is_pointed_at_mysql_s_name(
         _build(odbc_driver=driver, odbc_params={"SSLMODE": mode})
     message = str(refused.value)
     assert "cannot place this odbc_driver" in message
-    assert "MySQL ODBC <version> Unicode or ANSI Driver, value in upper case" in message
+    assert "MySQL ODBC <version> Unicode or ANSI Driver" in message
     assert "verify-full" not in message and f"={mode}" not in message
 
 
-@pytest.mark.parametrize("driver", [*_UNPLACED_DRIVERS, "SQLite3 ODBC Driver"])
-@pytest.mark.parametrize("mode", ["Require", "VERIFY-FULL", "yes", "on"])
+@pytest.mark.parametrize(
+    "driver",
+    [*_UNPLACED_DRIVERS, "SQLite3 ODBC Driver", "/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so"],
+)
+# A MySQL word in another case is here too: under a library path it is as likely a psqlODBC typo,
+# so it is not steered to MySQL's name alone.
+@pytest.mark.parametrize("mode", ["Require", "VERIFY-FULL", "yes", "on", "required", "Disabled"])
 def test_another_sslmode_under_an_unplaced_name_names_both_families(driver: str, mode: str) -> None:
     # BACKLOG #5029. libpq's list is never offered alone to a name the engine cannot place: the
     # refusal says the name is unplaced and points MySQL at its registered name.
@@ -1010,10 +1015,12 @@ def test_microsoft_s_driver_refuses_any_sslmode_and_names_encrypt(mode: str) -> 
     # A placed family that reads no sslmode: any value is refused, libpq's included, since the
     # driver would ignore it, and the refusal names the keyword it does read. Encrypt is the
     # control: the same driver builds with it.
-    with pytest.raises(ValueError, match="'sslmode' is not read by this driver; set Encrypt") as no:
+    with pytest.raises(ValueError, match="'sslmode' is not read by Microsoft's driver") as no:
         _build(odbc_driver="ODBC Driver 18 for SQL Server", odbc_params={"SSLmode": mode})
     message = str(no.value)
     assert "cannot place" not in message and "verify-full" not in message
+    # Named as the default too: a generic connection that sets no odbc_driver gets this driver.
+    assert "names or defaults to" in message and "set Encrypt" in message
     built = _build(odbc_driver="ODBC Driver 18 for SQL Server", odbc_params={"Encrypt": "yes"})
     assert "Encrypt=yes;" in built
 

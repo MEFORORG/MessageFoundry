@@ -685,8 +685,9 @@ class _DriverFamily(NamedTuple):
 # with single spaces (BACKLOG #2705, #5029, #5053). psqlODBC's include the bare ``PostgreSQL``, the
 # section name RHEL registers it under. A vendor driver whose name merely mentions a database, a
 # library path, an odbcinst alias such as RHEL's bare ``MySQL``, or another registered name that
-# only folds to one of these is not placed. This is not a driver allowlist: an unplaced name still
-# builds, and only what the engine reads from it changes.
+# only folds to one of these is not placed. An unplaced name still builds, but no TLS mode counts
+# on it, so on an enforcing instance its hop is refused off-loopback unless it is attested: a
+# change to these patterns is a change to that control, and is reviewed as one.
 #
 # psqlODBC's keyword parser and MySQL Connector/ODBC's parameter page have no ``encrypt``, and
 # Microsoft's ODBC Driver for SQL Server reads no ``sslmode``, so each family counts one keyword
@@ -748,8 +749,9 @@ def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) ->
     ``sslmode``, so on that name any value is refused and the refusal says to set ``Encrypt``.
 
     For a name it cannot place, the refusal says so, and never offers a libpq value alone: a value
-    that is a MySQL spelling in any case is pointed at MySQL's registered name, and any other is
-    given libpq's list beside that pointer. So it never steers a MySQL driver under another name to
+    spelled exactly as MySQL documents it is pointed at MySQL's registered name, and any other is
+    given libpq's list beside that pointer. A near miss in another case, such as ``required``, gets
+    libpq's list too, since it is as likely a psqlODBC typo under a library path. So it never steers a MySQL driver under another name to
     a libpq value it would ignore. :func:`generic_odbc_tls_unenforced` counts no mode on such a name
     either. Each refusal leads with what an operator needs, as a stored failure keeps about its
     first 200 characters, and none quotes the value given.
@@ -757,26 +759,35 @@ def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) ->
     The MySQL list is joined with ``or``: two upper case words joined by a comma or a blank are a
     name run to the log redaction, which would blank them."""
     family = _driver_family(driver)
-    accepted: tuple[str, ...] = {"mysql": _MYSQL_SSL_MODES, "msodbc": ()}.get(
-        family or "", _LIBPQ_SSL_MODES
-    )
+    entry = _DRIVER_FAMILIES[family] if family is not None else None
+    # The table decides, as it does for the gate: a placed family takes its own sslmode spellings,
+    # or none when it reads another keyword; an unplaced name takes libpq's.
+    if entry is None:
+        accepted: frozenset[str] = frozenset(_LIBPQ_SSL_MODES)
+    elif entry.tls_keyword == "sslmode" and entry.tls_spellings is not None:
+        accepted = entry.tls_spellings
+    else:
+        accepted = frozenset()
     if text in accepted:
         return
     database = f"{hop_name_prefix(connection)}DATABASE"
     where = f"{database} odbc_params value for 'sslmode'"
     see = "(see Generic ODBC in docs/CONNECTIONS.md)"
     if family == "msodbc":
-        raise ValueError(f"{database} 'sslmode' is not read by this driver; set Encrypt {see}")
+        raise ValueError(
+            f"{database} 'sslmode' is not read by Microsoft's driver for SQL Server, which "
+            f"odbc_driver names or defaults to; name your driver, or set Encrypt {see}"
+        )
     if family == "mysql":
         mysql = " or ".join(_MYSQL_SSL_MODES)
         raise ValueError(f"{where} must be one of {mysql}, in upper case, for MySQL {see}")
     libpq = ", ".join(_LIBPQ_SSL_MODES)
     if family is not None:
         raise ValueError(f"{where} must be one of {libpq}, in lower case {see}")
-    if text.upper() in _MYSQL_SSL_MODES:
+    if text in _MYSQL_SSL_MODES:
         raise ValueError(
             f"{database} 'sslmode' is a MySQL spelling; the engine cannot place this odbc_driver "
-            f"as MySQL. Name it MySQL ODBC <version> Unicode or ANSI Driver, value in upper case {see}"
+            f"as MySQL. Name it MySQL ODBC <version> Unicode or ANSI Driver {see}"
         )
     raise ValueError(
         f"{database} 'sslmode' for an odbc_driver the engine cannot place must be exactly one of "
@@ -1517,12 +1528,12 @@ def _warn_generic_tls_unenforced(
     remedy = (
         f"via the driver's own keyword (e.g. {example})"
         if example
-        else "with a driver named by a registered name the engine places, or declare "
-        "tls_hop_attested if the hop is secured by other means"
+        else "with a driver named by a registered name the engine places"
     )
     logger.warning(
         "%s: TLS verification is NOT enforced by MessageFoundry on this path and %s — configure "
-        "verifying TLS %s so PHI is not sent in plaintext",
+        "verifying TLS %s so PHI is not sent in plaintext; tls_hop_attested is only for a hop "
+        "secured by other means",
         where,
         reason,
         remedy,

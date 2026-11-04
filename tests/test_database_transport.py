@@ -780,7 +780,7 @@ def test_a_lone_certificate_keyword_warns_and_names_the_remedy(
         (_PSQL, "SSLmode=verify-full", "VERIFY_IDENTITY"),
         (_MYSQL, "SSLMODE=VERIFY_IDENTITY", "verify-full"),
         (_MSODBC, "Encrypt=yes", "verify-full"),
-        ("MySQL", "or declare tls_hop_attested", "verify-full"),
+        ("MySQL", "a registered name the engine places", "verify-full"),
     ],
 )
 def test_the_warning_names_the_family_s_own_spelling(

@@ -130,6 +130,14 @@ def generic_hop_endpoint(server: str, params: Mapping[str, Any]) -> tuple[str, i
     if "," in text:
         return text, port_or_zero(keyword)
     host, in_server = split_generic_server(text)
+    # Only a host, ``host:port`` or ``[v6]:port`` written exactly is split. Anything else, at least
+    # ``[::1]remote``, ``[::1]:5432x`` and ``127.0.0.1 : 5432``, is read whole too, so no text the
+    # split dropped can sit behind a loopback host.
+    written = (f"[{host}]" if text.startswith("[") else host) + (
+        f":{in_server}" if in_server else ""
+    )
+    if written != text or (in_server and not port_or_zero(in_server)):
+        return text, port_or_zero(keyword)
     # A usable port in `server` wins; otherwise the PORT keyword; otherwise unknown. 0 is the "neither
     # said" value, so `or` reads correctly here — a port is never legitimately 0.
     return host, port_or_zero(in_server) or port_or_zero(keyword)

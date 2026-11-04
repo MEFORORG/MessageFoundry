@@ -1981,16 +1981,13 @@ count is above `0` (vault BACKLOG #2613).
 - **When acceptable:** never, on a hop carrying PHI. Set the driver's verifying TLS mode —
   `SSLmode=verify-full` (psqlODBC), `SSLMODE=VERIFY_IDENTITY` (MySQL), or the equivalent — and treat it
   as a deployment requirement. The `dialect='sqlserver'` default is unaffected and keeps its refusal.
-- **How it is detected, precisely:** the engine places the `odbc_driver` name, by whole registered
-  name, as psqlODBC, MySQL Connector/ODBC or Microsoft's ODBC Driver for SQL Server (BACKLOG #5053).
-  The hop counts as owned only when the one mode keyword that family reads, in any case of the
-  keyword, has a non-blank string value with no blank at either end, and no TLS-shaped
-  `odbc_params` key (`ssl`/`tls`/`encrypt`) holds one of the known no-TLS spellings. That keyword
-  is `sslmode` for psqlODBC and MySQL, at that family's own spellings only (libpq's six in lower
-  case; MySQL's five in upper case, BACKLOG #5035), and `encrypt` for Microsoft's driver. So
-  `Encrypt=yes` on psqlODBC counts as no mode, and on a name the engine cannot place, at least a
-  library path, an odbcinst alias or another vendor's driver, no keyword counts at all. The value
-  check matters: matching the key alone read `SSLmode=disable` as TLS
+- **How it is detected, precisely:** the engine places the `odbc_driver` name in a driver family
+  (BACKLOG #5053). The hop counts as owned only when the one mode keyword that family reads, at a
+  spelling it reads, has a non-blank string value with no blank at either end, and no TLS-shaped
+  `odbc_params` key (`ssl`/`tls`/`encrypt`) holds one of the known no-TLS spellings. On a name the
+  engine cannot place, no keyword counts at all. The families, their keywords and their spellings
+  are tabled once, in [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling).
+  The value check matters: matching the key alone read `SSLmode=disable` as TLS
   ownership. So did a lone key or certificate path, or a blank mode, none of which the engine counts
   as a mode (BACKLOG #2483). A passphrase-shaped key such as `sslpassword` is not
   TLS-shaped for this check, and its value is never classified or reported (BACKLOG #1352).
@@ -2000,7 +1997,6 @@ count is above `0` (vault BACKLOG #2613).
   the deny-list clears the check on Microsoft's driver however it is spelled. The family is read
   from the driver NAME, never the library it loads, so a name registered for another library is
   taken at its word. No MySQL driver was run for the MySQL spellings.
-  [CONNECTIONS.md](CONNECTIONS.md#the-sslmode-spelling) records the families.
 - **What reports it:** a WARN at each construction naming the connection and any keyword pinned to a no-TLS value;
   a `generic-db-tls` line in `messagefoundry check`; and a `generic_odbc_tls_unenforced` entry in
   `security_loosenings()` / `GET /security/posture`. Inbound names are prefixed `inbound:`. A

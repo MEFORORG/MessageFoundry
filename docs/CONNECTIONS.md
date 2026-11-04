@@ -1967,9 +1967,9 @@ plaintext. A padded value is refused because one driver may trim it and another 
 psqlODBC's source reads an `SSLmode` value by its first character, and only a lower-case one
 names a mode, so `Require`, `VERIFY-FULL`, `REQUIRED`, `on`, `1` and `True` mean `disable` to it.
 This was read in the source, not measured against a server. The engine's no-TLS check would count
-each of those as TLS addressed. So on the generic dialect an `SSLmode` value must be
-exactly one of libpq's six modes, in lower case, or the connection is refused when it is built,
-with an error that lists the six.
+each of those as TLS addressed. So under a psqlODBC name, and under a name the engine cannot
+place, an `SSLmode` value must be exactly one of libpq's six modes, in lower case, or the
+connection is refused when it is built. Other driver families follow the table below.
 
 The rule depends on the driver family, read from the `odbc_driver` name. The engine places a name
 only when it is a whole registered name, in any case but spelled with single spaces:
@@ -1991,7 +1991,8 @@ bare `MySQL` section, another vendor's driver for the same database, or a regist
 doubled space, takes the libpq spellings at build, as before. The engine cannot tell which
 spelling such a driver reads, so the refusal says so, and never offers libpq's list alone: a
 MySQL spelling is pointed at MySQL's registered name, and any other value gets libpq's list
-beside that pointer (BACKLOG #5029). **No `SSLmode` on such a name counts as a TLS mode**, so its
+beside that pointer (BACKLOG #5029). A value in MySQL's words but another case, such as
+`required`, gets libpq's list, as it may be a psqlODBC typo. **No `SSLmode` on such a name counts as a TLS mode**, so its
 hop is gated as one with no mode (see the TLS note below). To have a driver's TLS mode counted,
 name it by one of the registered names above. Otherwise declare the hop with `tls_hop_attested`
 if it is secured by other means, or, on an outbound, accept it with `cleartext_accepted`. The
@@ -2059,9 +2060,9 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > **Spell a psqlODBC mode exactly, in lower case.** Its keyword parser has no `Encrypt`, so
 > `Encrypt=yes` cleared this check with no TLS attempted until BACKLOG #5053; it now counts as no
 > mode on a psqlODBC name. It also reads `SSLmode` by a
-> case-sensitive first letter and sends anything it does not recognize to `disable`. Since BACKLOG
-> #2705 the build refuses an `sslmode` outside libpq's six lower-case spellings for every driver but
-> MySQL Connector/ODBC, so `SSLmode=REQUIRE` is refused at build rather than cleared here. These
+> case-sensitive first letter and sends anything it does not recognize to `disable`. The build
+> holds `sslmode` to each family's spellings, as [*The `SSLmode` spelling*](#the-sslmode-spelling)
+> says, so `SSLmode=REQUIRE` is refused at build rather than cleared here. These
 > psqlODBC facts come from its source at commit `0395bf4cc33a`, and were not measured against a
 > driver.
 >

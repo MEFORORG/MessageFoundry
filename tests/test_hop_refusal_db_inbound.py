@@ -866,8 +866,13 @@ def test_generic_guard_is_none_off_the_arm() -> None:
         ("db.example", {"PORT": "9" * 4400}, ("db.example", 0)),  # no int() digit-limit crash
         # ONE definition of "is this a port": an unusable suffix falls through to the keyword rather
         # than swallowing the question, so both lookups agree on what counts.
-        ("db.example:notaport", {"PORT": "5432"}, ("db.example", 5432)),
-        ("db.example:999999", {"PORT": "5432"}, ("db.example", 5432)),
+        # An unusable suffix is not a port, so the text is read whole and the keyword gives the port.
+        ("db.example:notaport", {"PORT": "5432"}, ("db.example:notaport", 5432)),
+        ("db.example:999999", {"PORT": "5432"}, ("db.example:999999", 5432)),
+        # BACKLOG #4874: text the split would drop is never left behind a loopback host.
+        ("[::1]remote.example", {}, ("[::1]remote.example", 0)),
+        ("[::1]:5432x", {}, ("[::1]:5432x", 0)),
+        ("127.0.0.1 : 5432", {}, ("127.0.0.1 : 5432", 0)),
     ],
 )
 def test_generic_hop_endpoint_splits(

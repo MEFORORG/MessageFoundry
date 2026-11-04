@@ -211,6 +211,7 @@ __all__ = [
     "revocation_attested_hops",
     "unverified_generic_db_hops",
     "POSSIBLY_GENERIC_DB_HOP",
+    "UNRESOLVED_DRIVER_REASON",
     "overbroad_smart_scopes",
     "OAuthRequestAdvisories",
     "oauth_request_advisories",
@@ -6802,7 +6803,7 @@ POSSIBLY_GENERIC_DB_HOP = "possibly generic: dialect is an unresolved env() refe
 
 #: The generic-hop reason when ``odbc_driver`` is an ``env()`` reference the reader cannot resolve,
 #: so its driver family is unknown (BACKLOG #5053).
-UNRESOLVED_DRIVER_REASON = "odbc_driver is an unresolved env() reference, so no TLS mode is judged"
+UNRESOLVED_DRIVER_REASON = "possibly delegated: odbc_driver is an unresolved env() reference"
 
 
 #: What :func:`_db_setting` returns for an ``env()`` reference it cannot resolve.
@@ -6902,7 +6903,7 @@ def unverified_generic_db_hops(
         generic_odbc_tls_unenforced,
     )
 
-    def unenforced(settings: Mapping[str, Any]) -> str | None:
+    def unenforced(settings: Mapping[str, Any], *, deployed: bool) -> str | None:
         dialect = _db_dialect(settings, env_values)
         if dialect is not None and dialect != "generic":
             return None
@@ -6912,7 +6913,9 @@ def unverified_generic_db_hops(
         # The classifier reads the driver family from odbc_driver (BACKLOG #5053), resolved as the
         # dialect is. An unresolved one places no family, so the hop is listed, the safe direction
         # for an advisory list, under a reason that says the name was not read.
-        driver = _db_setting(settings, "odbc_driver", None, env_values)
+        # A not-deployed connection's env() values are never resolved (ADR 0111 AC-1), so its
+        # env() driver stays unread; a no-TLS value beside it is still reported.
+        driver = _db_setting(settings, "odbc_driver", None, env_values if deployed else None)
         unread = driver is _UNRESOLVED
         reason = generic_odbc_tls_unenforced(params, driver=None if unread else driver)
         if unread and reason == UNPLACED_DRIVER_REASON:
@@ -6933,10 +6936,7 @@ def unverified_generic_db_hops(
         for conn in table.values():
             if conn.spec.type is not ConnectorType.DATABASE or _dark_env_dialect(conn):
                 continue
-            if not conn.deployed and isinstance(conn.spec.settings.get("odbc_driver"), EnvRef):
-                # ADR 0111 AC-1, as _dark_env_dialect: never resolved, so never read as a risk.
-                continue
-            reason = unenforced(conn.spec.settings)
+            reason = unenforced(conn.spec.settings, deployed=conn.deployed)
             if reason is not None:
                 out.append(
                     (record_name(conn.name), f"{reason} ({_peer_label(conn.spec.settings)})")
