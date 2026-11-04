@@ -39,8 +39,10 @@ protocol class is replaced.
 * **A handshake past its bound, where the loop runs it. A known limit, declined by owner ruling
   2026-10-26 (vault BACKLOG #3785 item 7).** The loop aborts the transport and never calls
   ``do_handshake`` again, so nothing raises, and a peer that opens sockets and stays silent is not
-  counted there. Where a listener runs its own handshakes, it still counts that case itself: the
-  MLLP listener on every loop, the HTTP listener on the stdlib loop, and the DICOM SCP always. A
+  counted there. A listener still counts that case itself in ``_start_tls`` and
+  ``_handshake_accepted`` in ``transports/mllp.py`` (the MLLP listener, every loop), in
+  ``_start_tls`` in ``transports/http_listener.py`` (the HTTP listener, stdlib loop), and in
+  ``_handshake`` in ``transports/dicom.py`` (the DICOM SCP, always). A
   certificate the client refuses with a TLS alert, a missing client certificate, a protocol
   downgrade and plaintext on a TLS port all raise, so all are counted. A client that refuses a certificate by closing the socket
   with no alert, as asyncio's own client does, looks like a hang-up and is not counted.
