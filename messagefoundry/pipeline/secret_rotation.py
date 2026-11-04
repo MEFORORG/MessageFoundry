@@ -282,8 +282,9 @@ async def open_rotation_record(
     for a changed key the keyed audit chain has not rolled to (BACKLOG #4942), with ``keep_another``:
     it then writes nothing over a record open for another key. That record holds its own key, which a
     run may have rolled the chain to with an upload still under the prior key, so replacing it would
-    let a later start on that key stamp it. ``rotate-key`` replaces it, keeping its dates, because the
-    run then re-seals what the record stood for.
+    let a later start on that key stamp it. ``rotate-key`` replaces it, keeping its dates: a run that
+    completes re-seals what the record stood for, and one that stops short leaves that key unheld,
+    which a start back on it can stamp.
 
     Skipped when the stored stamp already names ``key_id``, so there is nothing for
     :func:`reconcile_rotation_meta` to withhold. That is a run with the key already in use, or one a
@@ -297,16 +298,17 @@ async def open_rotation_record(
     :func:`_kept_dates` reads it as an undetermined age. Only a closed or absent record takes
     ``day``.
 
-    Returns whether the record stands open naming ``key_id`` after the call: ``False`` for a run
-    with the key already in use and for a record kept for another key. ``rotate-key`` reads it to
-    tell a real key change from a same-key run (BACKLOG #4934, #4935)."""
+    Returns whether the record stands open naming ``key_id`` after the call: ``True`` where it
+    opened it or found it so, ``False`` where the stamp already names ``key_id`` and no record
+    does, or it kept a record open for another key. ``rotate-key`` reads it before it names a way
+    out of the record (BACKLOG #4934, #4935)."""
     fingerprint = dek_fingerprint(key_id)
     rows = await meta_store.get_secret_rotation_meta()
     record = rows.get(ROTATION_RECORD_ID)
-    if dek_changed(rows.get(_DEK_CLASS_ID), fingerprint) is False:
-        return False
     if record is not None and record.fingerprint == fingerprint:
         return True
+    if dek_changed(rows.get(_DEK_CLASS_ID), fingerprint) is False:
+        return False
     held = record if _record_open(record) else None
     if keep_another and held is not None:
         return False
@@ -585,14 +587,14 @@ async def reconcile_rotation_meta(
     **A changed DEK the audit chain has not rolled to opens that record here (BACKLOG #4942,
     #4936).** ``audit_rolled`` is :func:`~messagefoundry.store.store.audit_chain_rolled` for the
     store: ``rotate-key`` rolls a keyed chain only after both data passes, so ``False`` means no run
-    got that far on this key. That covers a start before the first run, a run killed before it
-    opened the record, inside the store open, and a key changed by hand. The start opens the record
-    for the key, as ``rotate-key`` would, and is held by it. Where the record stands open for another
-    key the start keeps it and is held all the same, so that key stays held when it comes back. A
-    DEK changed with no record stamps only where ``audit_rolled`` is not ``False``: ``None``, a
-    store with no keyed chain to ask, such as one whose rows open with no genesis row, or ``True``, a chain already rolled to the key. So on a store
-    with a keyed chain a stamp says a run rolled the chain to the key, and elsewhere it proves only a
-    changed key.
+    got that far on this key. That covers at least a start before the first run, a run killed
+    before it opened the record, inside the store open, and a key changed by hand. The start opens
+    the record for the key, as ``rotate-key`` would, and is held by it. Where the record stands open
+    for another key the start keeps it and is held all the same, so that key stays held when it
+    comes back. A DEK changed with no record stamps only where ``audit_rolled`` is not ``False``:
+    ``None``, a store with no keyed chain to ask, such as one whose rows open with no genesis row,
+    or ``True``, a chain already rolled to the key. So on a store with a keyed chain a stamp says a
+    run rolled the chain to the key, and elsewhere it proves only a changed key.
 
     It then arms the **ENFORCE escalation**: under ``[security].enforcement=ENFORCE``, a DEK older than
     ``store_key_max_age_days + enforce_grace_days`` emits its ``secret_rotation_due`` alert with

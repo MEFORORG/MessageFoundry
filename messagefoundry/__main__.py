@@ -10698,7 +10698,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
                 await close_rotation_record(store, today)
             # BACKLOG #4934, #4935: some chains no run can roll, under any key, a new one
             # included, and the rotation record then holds a changed key's stamp for good. Name a
-            # way out only then: a same-key run opened no record and has no age to fix, and a
+            # way out only then: a run with the key already stamped opens no record, and a
             # refusal a re-run or a restored key clears has its own remedy in the roll's error.
             way_out = record_named and not rolled[0] and audit_roll_refused_for_good(rolled[1])
             return count, uploads, rolled, way_out

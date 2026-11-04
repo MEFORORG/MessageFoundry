@@ -700,6 +700,35 @@ def test_closing_writes_nothing_where_no_run_opened_a_record(tmp_path: Path) -> 
     assert asyncio.run(run()) == {}
 
 
+def test_opening_says_whether_the_record_names_the_key(tmp_path: Path) -> None:
+    """What ``rotate-key`` reads before it names a way out (BACKLOG #4934, #4935). A record left
+    open naming the key counts even where the stamp names it too, as a run killed between its stamp
+    and its close leaves them. A stamp alone, and a record kept for another key, do not count."""
+    db, key_a, key_b = tmp_path / "named.db", generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+
+    async def run() -> tuple[bool, bool, bool, bool]:
+        store = await _open(db, key_a)
+        try:
+            stamped_only = await open_rotation_record(store, _key_id(key_a), "2026-10-30")
+            opened = await open_rotation_record(store, _key_id(key_b), "2026-10-30")
+            kept = await open_rotation_record(
+                store, _key_id(generate_key()), "2026-10-30", keep_another=True
+            )
+            await store.upsert_secret_rotation_meta(
+                ROTATION_RECORD_ID,
+                fingerprint=dek_fingerprint(_key_id(key_a)),
+                tracked_since="2026-10-30",
+                last_rotated="2026-10-30",
+            )
+            left_open = await open_rotation_record(store, _key_id(key_a), "2026-10-30")
+            return stamped_only, opened, kept, left_open
+        finally:
+            await store.close()
+
+    assert asyncio.run(run()) == (False, True, False, True)
+
+
 _WAY_OUT = (
     "note: no run will roll this audit chain, under any key",
     "[secret_rotation].store_key_last_rotated",

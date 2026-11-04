@@ -644,18 +644,22 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    rolled to it opens the rotation record for that key itself, writes no stamp, and logs a WARNING.
    A record already open for another key is kept rather than replaced, and still holds that key
    when it comes back, since a run may have rolled the chain to it with an upload still under the
-   prior key. That covers a start between setting the new key and the first run, a run killed inside the store
-   open before it opened the record, and a key changed by hand; each is held until a run completes.
-   A key changed with no record still stamps on a store with no keyed chain to ask, such as one
-   whose audit rows open with no genesis row naming its key, so there a stamp proves only a changed
-   key. On such a store, do not start `serve` between setting a new key and running `rotate-key`:
-   that stamp stands however the run ends. On any store, do not start `serve` on the new key alone before a run's roll succeeds: the chain's
-   current range is then under a key it does not hold, so it keys new audit rows under the new key,
-   those rows never verify inside that range, and no later `rotate-key` can roll the chain.
-   **A roll that refuses for good holds the key for good (BACKLOG #4934, #4935).** The roll verifies
-   the whole chain first, so a chain `audit-verify` reports broken, or one whose rows open with no
-   genesis row, refuses under every key, a new one included, and the record stays open. On a run
-   that changed the key, that refusal names at least two ways out:
+   prior key. A `rotate-key` run on a third key does replace it, so if that run stops short, a start
+   back on the rolled key stamps it. That covers at least a start between setting the new key and
+   the first run, a run killed inside the store open before it opened the record, and a key changed
+   by hand; each is held until a run completes. A key changed with no record still stamps on a
+   store with no keyed chain to ask, such as one whose audit rows open with no genesis row naming
+   its key, so there a stamp proves only a changed key. On such a store, do not start `serve`
+   between setting a new key and running `rotate-key`: that stamp stands however the run ends. On a
+   store with a keyed chain, do not start `serve` on the new key alone before a run's roll succeeds:
+   the chain's current range is then under a key it does not hold, so it keys new audit rows under
+   the new key, those rows never verify inside that range, and no later `rotate-key` can roll the
+   chain. **A roll that refuses for good holds the key for good (BACKLOG #4934, #4935).** The roll
+   verifies the whole chain first, so a chain whose rows do not verify, or whose rows open with no
+   genesis row, refuses under every key, a new one included, and the record stays open. A newest
+   range under a key that is not configured is not one of these, though `audit-verify` reports it
+   too: put that key back in `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` and re-run. Where a run that
+   opened the record meets a refusal for good, it names at least two ways out:
    `[secret_rotation].store_key_last_rotated`, set to the date of a run that re-sealed the data with
    no skip, and `[secret_rotation].enforce_store_key_expiry = false`, which lifts only the start
    refusal and is a named security loosening.
