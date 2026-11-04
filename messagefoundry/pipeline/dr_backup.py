@@ -2009,6 +2009,8 @@ def _win_api() -> Any:
         ctypes.c_void_p,
         wintypes.DWORD,
     ]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     return kernel32
 
 
@@ -2053,14 +2055,13 @@ def _win_attribute_tag(fd: int) -> tuple[int, int]:
 
 
 @functools.cache
-def _win_security_api() -> tuple[Any, Any]:
-    """``advapi32`` and ``kernel32`` with the prototypes :func:`_win_owner_of_handle` uses."""
+def _win_security_api() -> Any:
+    """``advapi32`` with the prototypes :func:`_win_owner_of_handle` uses."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the Windows security API runs only on Windows")
     from ctypes import wintypes
 
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     pvoid_p = ctypes.POINTER(ctypes.c_void_p)
     advapi32.GetSecurityInfo.restype = wintypes.DWORD
     advapi32.GetSecurityInfo.argtypes = [
@@ -2081,9 +2082,7 @@ def _win_security_api() -> tuple[Any, Any]:
         ctypes.POINTER(wintypes.LPWSTR),
         ctypes.c_void_p,
     ]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    return advapi32, kernel32
+    return advapi32
 
 
 def _win_owner_of_handle(handle: int) -> object | None:
@@ -2094,9 +2093,7 @@ def _win_owner_of_handle(handle: int) -> object | None:
         raise OSError("the Windows security API runs only on Windows")
     from ctypes import wintypes
 
-    from messagefoundry.store.store import _SDDL_OWNER, _resolve_sid
-
-    advapi32, kernel32 = _win_security_api()
+    advapi32, kernel32 = _win_security_api(), _win_api()
     owner_info = 0x00000001  # OWNER_SECURITY_INFORMATION
     descriptor = ctypes.c_void_p()
     status = advapi32.GetSecurityInfo(
@@ -2123,6 +2120,14 @@ def _win_owner_of_handle(handle: int) -> object | None:
             kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
     finally:
         kernel32.LocalFree(descriptor)
+    return _owner_from_sddl(sddl)
+
+
+def _owner_from_sddl(sddl: str | None) -> object | None:
+    """The owner SID an SDDL string names, aliases resolved, so :func:`_owner_of` and
+    :func:`_owner_of_fd` answer in one form. ``None`` when it names none."""
+    from messagefoundry.store.store import _SDDL_OWNER, _resolve_sid
+
     found = _SDDL_OWNER.search(sddl) if sddl else None
     return _resolve_sid(found.group(1)) if found else None
 
@@ -2771,11 +2776,9 @@ def _owner_of(path: Path) -> object | None:
         return None
     if sys.platform != "win32":
         return st.st_uid
-    from messagefoundry.store.store import _SDDL_OWNER, _read_dacl_sddl, _resolve_sid
+    from messagefoundry.store.store import _read_dacl_sddl
 
-    sddl = _read_dacl_sddl(path, owner=True)
-    found = _SDDL_OWNER.search(sddl) if sddl else None
-    return _resolve_sid(found.group(1)) if found else None
+    return _owner_from_sddl(_read_dacl_sddl(path, owner=True))
 
 
 def _sweep_abandoned_staging(root: Path, *, owned_like: Path) -> int:

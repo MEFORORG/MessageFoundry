@@ -272,7 +272,7 @@ def test_the_windows_fallback_refuses_a_junction_root(tmp_path) -> None:
 
 
 def test_a_leaked_probe_file_is_swept_and_a_nonempty_one_is_kept(tmp_path) -> None:
-    """A POSIX probe file whose removal failed is empty and holds no lock. The sweep of its root by
+    """A probe file whose removal failed is empty and holds no lock. The sweep of its root by
     its owner removes it, and leaves a probe-named file that holds anything."""
     root = tmp_path / "root"
     root.mkdir()
