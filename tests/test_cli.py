@@ -3223,51 +3223,45 @@ def test_serve_starts_with_a_relay_the_smtp_allowlist_lists_in_prod(
     assert "smtp_allowed_hosts" not in capsys.readouterr().err
 
 
-def test_serve_warns_on_a_relay_the_smtp_allowlist_omits_under_warn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    rc, _ = _run_secure_serve(
-        tmp_path,
-        monkeypatch,
-        'security.enforcement = "warn"\nsecurity.block_unlisted_outbound = true\n'
-        + _SECURE_RETENTION
-        + _SECURE_ALERTS
-        + _OFF_ALLOWLIST,
-        env="staging",
-    )
-    assert rc == 0  # the app is mocked here; the real lifespan refuses the notifier build
-    err = capsys.readouterr().err
-    assert "warning:" in err and "[alerts].smtp_allowed_hosts" in err
-    assert "refusing to start" not in err
-
-
-def test_serve_waiver_with_a_relay_the_smtp_allowlist_omits_audits_once(
+@pytest.mark.parametrize(
+    ("posture", "env"),
+    [
+        pytest.param('security.enforcement = "warn"\n', "staging", id="warn"),
+        pytest.param("", "prod", id="waiver"),
+    ],
+)
+def test_serve_refuses_a_relay_the_smtp_allowlist_omits_at_every_posture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    posture: str,
+    env: str,
 ) -> None:
-    """The waiver still downgrades the channel refusal, and the allowlist is named before the
-    lifespan's build refuses. With no reminder recipient either, one AUDIT line covers both
-    gates, as for a waiver with no relay at all."""
+    """Neither warn nor the waiver admits the relay: the lifespan builds the security notifier on
+    the same condition, and that build refuses it, so the start would only fail later, after the
+    store opened. The gate refuses it first, naming the allowlist, and audits no waiver for a
+    start that never happens."""
+    waiver = "security_notifications_required = false\n" if posture == "" else ""
     rc, _ = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        "security.block_unlisted_outbound = true\n"
+        posture
+        + "security.block_unlisted_outbound = true\n"
         + _SECURE_RETENTION
         + _SECURE_ALERTS_NO_RECIPIENT
         + _OFF_ALLOWLIST
-        + "security_notifications_required = false\n",
+        + waiver,
+        env=env,
     )
-    assert rc == 0
+    assert rc == 2
     captured = capsys.readouterr()
-    assert "[alerts].smtp_allowed_hosts" in captured.err
-    both = captured.out + captured.err
-    audits = [
+    assert "refusing to start" in captured.err and "[alerts].smtp_allowed_hosts" in captured.err
+    assert "Configure the [alerts] SMTP transport" not in captured.err  # it is configured
+    assert not [
         line
-        for line in both.splitlines()
+        for line in (captured.out + captured.err).splitlines()
         if "AUDIT:" in line and "security_notifications_required=false" in line
     ]
-    assert len(audits) == 1, audits
 
 
 # --- BACKLOG #2008 (ASVS 6.4.5): the credential reminders need an [alerts] RECIPIENT -------------

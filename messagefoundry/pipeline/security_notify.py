@@ -832,6 +832,9 @@ def security_notifier_from_settings(
     # rule. Refuse it here instead, where it stops startup, rather than at each send, where the
     # failure is only a log line (vault BACKLOG #2870).
     checked_sender("[alerts].email_from", alerts.email_from)
+    # BACKLOG #5088: before the password is read, so a relay the allowlist forbids costs no
+    # secret-store read, and a store that is down cannot hide this refusal. The build repeats it.
+    _refuse_off_allowlist_smtp_host(alerts.email_smtp_host, alerts.smtp_allowed_hosts)
     smtp_password = resolve_connector_secret(
         secret_provider,
         ref=alerts.email_password_secret,

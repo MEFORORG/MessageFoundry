@@ -4411,26 +4411,25 @@ def _serve(args: argparse.Namespace) -> int:
         settings.alerts.email_smtp_host or "", settings.alerts.smtp_allowed_hosts
     )
     security_channel_ready = security_channel_configured and not smtp_relay_off_allowlist
-    # Printed in every branch below, ahead of its own text, so an operator is never told to
-    # configure an SMTP relay that is configured. The lifespan's notifier build refuses this relay.
-    off_allowlist_text = (
-        f"[alerts].email_smtp_host {settings.alerts.email_smtp_host!r} is not in "
-        "[alerts].smtp_allowed_hosts, so every security notice to it would be refused and the "
-        "notifier refuses to build. List the relay in [alerts].smtp_allowed_hosts, or point "
-        "[alerts].email_smtp_host at a host it lists."
-        if smtp_relay_off_allowlist
-        else ""
-    )
+    if smtp_relay_off_allowlist:
+        # At every enforcement level and despite the waiver: the lifespan builds the security
+        # notifier on exactly this condition, and that build refuses the relay, so a start let
+        # through here would fail later, after the store opened. Refused here instead, naming the
+        # allowlist, so an operator is never told to configure an SMTP relay that is configured.
+        print(
+            "error: the out-of-band security-notification channel cannot send; refusing to start "
+            f"(ASVS 6.3.5/6.3.7). [alerts].email_smtp_host {settings.alerts.email_smtp_host!r} is "
+            "not in [alerts].smtp_allowed_hosts, so the security notifier refuses to build and "
+            "every notice to that relay would be refused. List the relay in "
+            "[alerts].smtp_allowed_hosts, or point [alerts].email_smtp_host at a host it lists. "
+            "[security].enforcement = warn and [alerts].security_notifications_required=false "
+            "do not admit it.",
+            file=sys.stderr,
+        )
+        return 2
     if not security_channel_ready:
         if settings.alerts.security_notifications_required:
-            if enforcing and off_allowlist_text:
-                print(
-                    "error: the out-of-band security-notification channel on a "
-                    f"{'production ' if production else ''}PHI instance ({env_name!r}) cannot "
-                    f"send; refusing to start (ASVS 6.3.5/6.3.7). {off_allowlist_text}",
-                    file=sys.stderr,
-                )
-            elif enforcing:
+            if enforcing:
                 print(
                     "error: no out-of-band security-notification channel is configured on a "
                     f"{'production ' if production else ''}PHI instance ({env_name!r}); refusing to "
@@ -4444,48 +4443,34 @@ def _serve(args: argparse.Namespace) -> int:
                     "pull-only feed, set [alerts].security_notifications_required=false (audited).",
                     file=sys.stderr,
                 )
-            if enforcing:
                 return 2
-            if off_allowlist_text:
-                print(
-                    "warning: the out-of-band security-notification channel in a PHI-carrying "
-                    f"environment ({env_name!r}) cannot send (ASVS 6.3.5/6.3.7). "
-                    f"{off_allowlist_text}",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    "warning: no out-of-band security-notification channel is configured in a "
-                    f"PHI-carrying environment ({env_name!r}) — account-security events have no "
-                    "push channel; the pull-only /me/security-events feed carries the user's own "
-                    "events but not an administrator's change to their account. Configure the "
-                    "[alerts] SMTP transport (email_smtp_host + email_from) with "
-                    "[auth].notify_security_events on (ASVS 6.3.5/6.3.7).",
-                    file=sys.stderr,
-                )
-        else:
-            if enforcing:
-                logging.getLogger(__name__).warning(
-                    "AUDIT: starting a %sPHI instance (environment %r) with no security-"
-                    "notification channel ([alerts].security_notifications_required=false) — "
-                    "a user sees their own account-security events only in the pull-only "
-                    "/me/security-events feed, and an administrator's change to their account not "
-                    "at all (out-of-band-notification opt-out override).",
-                    "production " if production else "",
-                    env_name,
-                )
-                print(
-                    f"warning: [alerts].security_notifications_required=false — a "
-                    f"{'production ' if production else ''}PHI "
-                    f"instance ({env_name!r}) has no out-of-band security-event push (only the "
-                    "pull-only /me/security-events feed). Configure [alerts] SMTP + "
-                    "[auth].notify_security_events to enable it.",
-                    file=sys.stderr,
-                )
-            # The waiver accepts having no push channel; it does not admit the relay, whose build
-            # in the lifespan still refuses. So say why here first, at every enforcement level.
-            if off_allowlist_text:
-                print(f"warning: {off_allowlist_text}", file=sys.stderr)
+            print(
+                "warning: no out-of-band security-notification channel is configured in a "
+                f"PHI-carrying environment ({env_name!r}) — account-security events have no push "
+                "channel; the pull-only /me/security-events feed carries the user's own events but "
+                "not an administrator's change to their account. Configure the [alerts] SMTP "
+                "transport (email_smtp_host + email_from) with [auth].notify_security_events on "
+                "(ASVS 6.3.5/6.3.7).",
+                file=sys.stderr,
+            )
+        elif enforcing:
+            logging.getLogger(__name__).warning(
+                "AUDIT: starting a %sPHI instance (environment %r) with no security-"
+                "notification channel ([alerts].security_notifications_required=false) — "
+                "a user sees their own account-security events only in the pull-only "
+                "/me/security-events feed, and an administrator's change to their account not at "
+                "all (out-of-band-notification opt-out override).",
+                "production " if production else "",
+                env_name,
+            )
+            print(
+                f"warning: [alerts].security_notifications_required=false — a "
+                f"{'production ' if production else ''}PHI "
+                f"instance ({env_name!r}) has no out-of-band security-event push (only the "
+                "pull-only /me/security-events feed). Configure [alerts] SMTP + "
+                "[auth].notify_security_events to enable it.",
+                file=sys.stderr,
+            )
 
     # --- BACKLOG #2008 (ASVS 6.4.5): the credential reminders need a RECIPIENT, not just a relay ---
     # The unclaimed-temporary-password reminder, the cert-expiry reminder and the secret-rotation

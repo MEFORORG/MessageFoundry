@@ -2432,6 +2432,10 @@ def notifier_from_settings(
     an enforcing posture unless their ``[alerts]`` attestation pair is set or, for SMTP only, a
     ``[tls].crl_file`` reaches the hop. For those guards ``None`` with none stamped counts as
     enforcing (ADR 0173 section 12)."""
+    if alerts.email_smtp_host and alerts.email_from and alerts.email_to:
+        # BACKLOG #5088: before the password is read, so a relay the allowlist forbids costs no
+        # secret-store read, and a store that is down cannot hide this refusal. The build repeats it.
+        _refuse_off_allowlist_smtp_host(alerts.email_smtp_host, alerts.smtp_allowed_hosts)
     smtp_password = resolve_connector_secret(
         secret_provider,
         ref=alerts.email_password_secret,

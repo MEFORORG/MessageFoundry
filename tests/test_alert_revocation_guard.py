@@ -261,6 +261,27 @@ def test_a_relay_with_no_login_outside_the_allowlist_is_refused_at_the_build() -
             _notifier(ENFORCING, allowed_hosts=("other.example.test",), **over)
 
 
+def test_an_off_allowlist_relay_is_refused_before_its_password_is_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relay the egress policy forbids costs no secret-store read, and a store that is down
+    cannot hide the allowlist refusal behind its own error."""
+    from messagefoundry.pipeline import security_notify
+
+    for module in (alert_sinks, security_notify):
+        monkeypatch.setattr(module, "resolve_connector_secret", _raises(RuntimeError))
+    settings = AlertsSettings(
+        email_smtp_host=RELAY,
+        email_from="alerts@example.test",
+        email_to=["ops@example.test"],
+        smtp_allowed_hosts=["other.example.test"],
+    )
+    with pytest.raises(ValueError, match="smtp_allowed_hosts"):
+        notifier_from_settings(settings, posture=ENFORCING)
+    with pytest.raises(ValueError, match="smtp_allowed_hosts"):
+        security_notifier_from_settings(settings, posture=ENFORCING)
+
+
 def test_a_listed_relay_is_still_judged_for_revocation() -> None:
     # The control for the two above: a relay the allowlist lists, in any case, reaches the guard.
     with pytest.raises(InsecureHopRefused, match="revocation"):
