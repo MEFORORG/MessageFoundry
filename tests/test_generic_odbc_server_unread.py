@@ -171,7 +171,8 @@ def test_the_reader_walks_both_tables_and_skips_the_preset() -> None:
     reg = Registry()
     _outbound(reg, "OB_PG", dialect="generic", odbc_driver="PostgreSQL Unicode")
     _outbound(reg, "OB_ORACLE", dialect="generic", odbc_driver="Oracle in OraDB19Home1")
-    # Not this reader's arm. The preset also sends a named odbc_driver; that is not covered here.
+    # Not this reader's arm: the preset refuses a non-Microsoft odbc_driver when its string is
+    # built (BACKLOG #4873), which registering the connection here does not do.
     _outbound(reg, "OB_PRESET", database="MFDB", odbc_driver="Oracle in OraDB19Home1")
     reg.add_inbound(
         build_inbound_connection(
