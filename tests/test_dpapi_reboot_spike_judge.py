@@ -538,6 +538,10 @@ def test_a_failed_control_never_answers(judged: Judged, scenario: str) -> None:
 def test_a_failed_crosscheck_voids_every_arm(judged: Judged, scenario: str) -> None:
     assert [_v(judged, scenario, a) for a in ("A1", "A2", "A3", "A4", "A5")] == ["INCONCLUSIVE"] * 5
     assert _v(judged, scenario, "VERDICT") == "INCONCLUSIVE"
+    # The verdict names the crosscheck, not A1 to A3, which all opened the blob.
+    verdict = judged[scenario]["VERDICT"]
+    assert "crosscheck FAILED" in verdict, verdict
+    assert "did not all open the blob" not in verdict, verdict
 
 
 def test_a1_protect_failure_is_no_only_for_the_key_refusal_beside_machine_scope(
@@ -766,8 +770,18 @@ $RigPath = $Rig
 $log = Join-Path $Arg 'step.txt'
 try { Invoke-PayloadStep $log 'Report' ''; 'step=RETURNED' } catch { "step=$($_.Exception.Message)" }
 foreach ($line in Get-Content -LiteralPath $log) { "log=$line" }
+# The positive control: a stand-in for the rig that answers and exits 0.
+$RigPath = Join-Path $Arg 'stub.ps1'
+$log = Join-Path $Arg 'ok.txt'
+try { Invoke-PayloadStep $log 'Start' 'A2'; 'ok=RETURNED' } catch { "ok=$($_.Exception.Message)" }
+foreach ($line in Get-Content -LiteralPath $log) { "oklog=$line" }
 """
 )
+
+_STUB_RIG = r"""
+param([string]$Mode, [string]$Step, [string]$Arm)
+"stub ran $Mode $Step $Arm under $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion.Major)"
+"""
 
 
 @_NEEDS_WINPS
@@ -776,7 +790,12 @@ def test_a_payload_step_runs_the_rig_under_windows_powershell(tmp_path: Path) ->
     # powershell.exe, whose breaker refuses this machine and exits 1, so the parent fails the step.
     driver = tmp_path / "step.ps1"
     driver.write_text(_PAYLOAD_STEP_DRIVER, encoding="ascii")
+    (tmp_path / "stub.ps1").write_text(_STUB_RIG, encoding="ascii")
     lines = _run_pwsh(driver, tmp_path, 120).splitlines()
+    # A step that exits 0 returns, and its output is logged under its header.
+    assert "ok=RETURNED" in lines, lines
+    oklog = [line[len("oklog=") :] for line in lines if line.startswith("oklog=")]
+    assert oklog == ["----- guest step Start A2 -----", "stub ran Guest Start A2 under Desktop 5"]
     step = next(line for line in lines if line.startswith("step="))
     winps = "windowspowershell\\v1.0\\powershell.exe"
     assert step.startswith("step=the guest step Report failed under "), step
@@ -934,9 +953,9 @@ function Enter-HvTestLock {
     $o | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $global:released = $true }
     $o
 }
-function Get-VM { [pscustomobject]@{ Heartbeat = 'OkApplicationsHealthy'; State = 'Off' } }
+function Get-VM { [pscustomobject]@{ Name = 'REVTEST01'; Heartbeat = 'OkApplicationsHealthy'; State = 'Off' } }
 function Get-VMSnapshot { [pscustomobject]@{ Name = 'cp' } }
-function Get-VMSwitch { [pscustomobject]@{ SwitchType = 'Private' } }
+function Get-VMSwitch { [pscustomobject]@{ Name = 'MEFOR-Lab'; SwitchType = 'Private' } }
 $script:nic = $null
 function Get-VMNetworkAdapter { $script:nic }
 function Start-VM { }

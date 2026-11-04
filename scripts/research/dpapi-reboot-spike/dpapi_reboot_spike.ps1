@@ -65,7 +65,8 @@
   was not seen unloaded, so a refusal there shows; only a YES is held back to INCONCLUSIVE. The
   verdict line reads INVALID when any arm is INVALID or any of A1 to A3 is NO, whatever A4 and A5
   say, except that an A3 NO after a seen unload is a real refusal and reads INCONCLUSIVE, naming
-  it; INCONCLUSIVE when A1 to A3 do not all open the blob (A3 counted where the unload was not
+  it; INCONCLUSIVE, naming the crosscheck, when the administrator's crosscheck is not the
+  key-state refusal; INCONCLUSIVE when A1 to A3 do not all open the blob (A3 counted where the unload was not
   seen; the payload's exit code is the same test); else SURVIVES when A4 and A5 both open the
   user-scope blob with every control held; SURVIVES, BUT NOT AT THE BOOT-TIME START when A5 opens it
   and A4 reads NO; DOES NOT SURVIVE when A5 reads NO and A4 did not open it; INCONCLUSIVE, A4
@@ -94,7 +95,8 @@
                    process in -Mode Guest, the code and the PowerShell Host mode's steps run on.
     -Mode Guest    One step inside the VM. Host mode calls it over PowerShell Direct, and Payload
                    mode as a Windows PowerShell 5.1 process; run it by hand
-                   only to clean up: -Mode Guest -Step Uninstall.
+                   only to clean up, -Mode Guest -Step Uninstall, or to print the work folder's
+                   text files, -Mode Guest -Step Report, which neither route calls.
 
   CIRCUIT BREAKERS (CLAUDE.md section 5). Host mode checks [Environment]::MachineName is MEFORHV01.
   Guest and Payload modes check [Environment]::MachineName is REVTEST01, the guest computer name the
@@ -193,9 +195,11 @@ $RigPath = $PSCommandPath
 $ServiceName = 'MeforDpapiReboot'
 $Account = "NT SERVICE\$ServiceName"
 $Root = 'C:\mefor-dpapi-reboot'
-$Bin = Join-Path $Root 'bin'
-$Work = Join-Path $Root 'work'
-$Exe = Join-Path $Bin "$ServiceName.exe"
+# Guest paths, built as strings: Join-Path checks the drive exists, and these are the guest's, read
+# on the host too (where the test runs the rig's functions, on Linux as well).
+$Bin = "$Root\bin"
+$Work = "$Root\work"
+$Exe = "$Bin\$ServiceName.exe"
 # The guest steps' own waits, in seconds; Host mode's guest-call timeouts are built from them.
 $ReportWaitSeconds = 120
 $BootReportWaitSeconds = 300
@@ -626,7 +630,8 @@ function Step-BootReport {
     "service_after_boot=$($svc.Status) start_type=$($svc.StartType)"
     $name = (Get-Content -LiteralPath (Join-Path $Work 'arm.txt') -Raw).Trim()
     Complete-Report $name $BootReportWaitSeconds
-    Show-ScmEvents
+    # Complete-Report already showed them where the report is missing.
+    if (Test-Path -LiteralPath (Join-Path $Work "report-$name.txt")) { Show-ScmEvents }
 }
 
 function Step-Report {
@@ -857,6 +862,9 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
     if ($broken.Count) { $overall = "INVALID ($($broken -join ', '): the instrument or the setup failed)" }
     elseif ($v['A3'][0] -eq 'NO') {
         $overall = 'INCONCLUSIVE (A3 NO after a seen profile unload: the blob did not survive the reload, so the reboot arms are not read)'
+    } elseif ($crossProblem) {
+        # Every arm is INCONCLUSIVE on it, so name it rather than read it as A1 to A3 failing.
+        $overall = "INCONCLUSIVE ($($crossProblem): the user-scope blob is not shown bound to the service account, so no arm is read)"
     } elseif (-not $prePass) {
         $overall = 'INCONCLUSIVE (A1 to A3 did not all open the blob, so the instrument is not shown working before the reboot)'
     } elseif ($Rebooted) {
@@ -909,7 +917,14 @@ function Invoke-Payload {
         # Out before the uninstall deletes them, on a failed step too, so the judge can be re-run.
         # Continue: a failed copy is reported, and must not skip the uninstall.
         if (Test-Path -LiteralPath $Work) { Copy-Item -Path (Join-Path $Work '*.txt') -Destination $OutDir -ErrorAction Continue }
-        Invoke-PayloadStep $log 'Uninstall' ''
+        # Logged, not thrown: a throw here would replace a failed step's error, or fail a run whose
+        # readings passed, over cleanup the next hvtest run's revert discards anyway.
+        try { Invoke-PayloadStep $log 'Uninstall' '' }
+        catch [System.Management.Automation.RuntimeException] {
+            $line = "uninstall FAILED: $($_.Exception.Message)"
+            $line | Add-Content -LiteralPath $log -Encoding ASCII
+            Write-Host $line
+        }
     }
     $exit
 }
@@ -1095,13 +1110,15 @@ function Invoke-HostRun {
     # Every check after the prompt, which can sit for any length of time, and under the lock.
     $lock = Enter-HvTestLock
     try {
-        $vm = @(Get-VM -Name $VMName)
+        # Listed and filtered, as hvtest does: -Name raises its own error when nothing matches,
+        # which would escape before the count check could say nothing ran.
+        $vm = @(Get-VM | Where-Object { $_.Name -eq $VMName })
         if ($vm.Count -ne 1) { throw "STOP     $($vm.Count) VMs are named $VMName, not 1; nothing ran" }
         if ($vm[0].State -ne 'Off') { throw "STOP     $VMName is $($vm[0].State), not Off; nothing ran" }
-        $snap = @(Get-VMSnapshot -VMName $VMName -Name $Checkpoint)
+        $snap = @(Get-VMSnapshot -VM $vm[0] | Where-Object { $_.Name -eq $Checkpoint })
         if ($snap.Count -ne 1) { throw "STOP     $VMName has $($snap.Count) checkpoints named $Checkpoint, not 1; nothing ran" }
         $snap = $snap[0]
-        $lab = @(Get-VMSwitch -Name 'MEFOR-Lab')
+        $lab = @(Get-VMSwitch | Where-Object { $_.Name -eq 'MEFOR-Lab' })
         if ($lab.Count -ne 1 -or [string]$lab[0].SwitchType -ne 'Private') { throw "STOP     MEFOR-Lab is not one Private switch; nothing ran" }
         # The judge reads the reports folder whole, and the log appends, so an earlier run's files
         # would pass for this run's.
