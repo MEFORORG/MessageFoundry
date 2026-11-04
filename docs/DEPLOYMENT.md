@@ -1157,10 +1157,11 @@ skips a CRL's own validity window, so a hop that sets it must earn **no CRL cred
 hands the guard no context or opener when the setting is on (`skips_validity_period` reads it off the
 context), as MLLP, the DICOM C-STORE SCU, REST, SOAP, FHIR and both FTPS directions do, and a new call
 site names `EXPIRY_RELAXED_WAYS_ACROSS` as its remedy (ADR 0173 §13). A connector that takes the
-setting and hands the guard its relaxed context is still refused off-box under an enforcing
-posture unless attested, because
-`RevocationHopGuard.capture` reads `skips_validity_period` too and gives that context's CRL no
-credit; with no remedy of its own, that refusal names `EXPIRY_RELAXED_WAYS_ACROSS`. CORRECTED 2026-11-03:
+setting and hands the guard its relaxed context has been refused off-box under an enforcing
+posture unless attested since vault BACKLOG #5086, which made `RevocationHopGuard.capture` give that
+context's CRL no credit; before it, the guard admitted such a hop on that CRL. That is no reason to
+drop the call-site rule above, which still stands (ADR 0173 §13; §4.3's note of 2026-11-03 says
+what the guard now does). CORRECTED 2026-11-03:
 this said such a connector "lets a stale CRL admit the hop", which stopped being true under vault
 BACKLOG #5086. CORRECTED 2026-10-30:
 this said `tls_allow_expired` must be listed "even though no refusal keys on it", which stopped being

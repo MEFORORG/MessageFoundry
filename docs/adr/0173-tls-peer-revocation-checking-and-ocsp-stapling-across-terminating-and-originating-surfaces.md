@@ -773,13 +773,15 @@ that context's CRL, with no attestation, so the rule rests on each caller passin
 *(Note 2026-11-03: no longer so. `crl_is_a_check` is gone, and `capture()` sets `crl_checked` with
 its meaning, so the disposition and the line read one field: a CRL on a context that skips time
 validity earns no credit, and such a hop is refused under an enforcing posture unless attested
-(vault BACKLOG #5086, owner ruling 2026-11-03). The call sites below still pass no context there,
-which now changes no disposition. The remedy a refusal names comes from the `ways_across` a call
-site passes: MLLP, the DICOM SCU and FTPS pass `EXPIRY_RELAXED_WAYS_ACROSS`, REST, SOAP and FHIR
-still name the default (§13, *Left open*), and a connection that hands `capture()` the relaxed
-context with no `ways_across` gets `EXPIRY_RELAXED_WAYS_ACROSS` from it. Unlike the 2026-10-30
-correction, which the paragraph's closing sentence says changed no disposition, this one does: such
-a hop is refused where the guard used to admit it.)* The
+(vault BACKLOG #5086, owner ruling 2026-11-03). The remedy a refusal names comes from the
+`ways_across` a call site passes: MLLP, the DICOM SCU and FTPS pass `EXPIRY_RELAXED_WAYS_ACROSS`,
+REST, SOAP and FHIR still name the default (§13, *Left open*), and a connection that hands
+`capture()` the relaxed context with no `ways_across` gets `EXPIRY_RELAXED_WAYS_ACROSS` from it.
+Unlike the 2026-10-30 correction, which the paragraph's closing sentence says changed no
+disposition, this one changes the guard's: a hop handed such a context is refused where the guard
+used to admit it. No shipped call site's disposition moves, because every shipped caller that
+builds a context skipping time validity (each caller of `relax_verify_expiry`) hands the guard no
+context there: the call sites below, MLLP and the DICOM SCU since vault BACKLOG #2978.)* The
 choice is made at each call site: at least `RestDestination.__init__` (`transports/rest.py`),
 `SoapDestination.__init__` (`soap.py`), `FhirDestination.__init__` (`fhir.py`), FTPS's
 `_guard_ftps_revocation` (`remotefile.py`), and the MLLP and SCU sites §13 names.

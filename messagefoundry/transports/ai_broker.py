@@ -179,8 +179,11 @@ def _refuse_an_unrevoked_ai_hop(
       only. The authority ranks it below the enforcing refusal (BACKLOG #299), so it does not
       cross this hop under an enforcing or unknown posture.
     * ``crl_checked`` is read off ``opener``'s https context, the opener the broker will dial
-      through, never off a setting. Today that is rest.py's shared import-time opener, which
-      loads no CRL, so it is ``False``, and no CRL lever is built for this hop.
+      through, never off a setting. It is ``True`` only when that context checks a CRL
+      (``context_checks_revocation``) and does not skip time validity
+      (``skips_validity_period``), which would accept a CRL past its ``nextUpdate`` (vault
+      BACKLOG #5086). Today that is rest.py's shared import-time opener, which loads no CRL and
+      does not skip time validity, so it is ``False``, and no CRL lever is built for this hop.
     * An attestation with no reason or a blank one, and a reason holding a control character or a
       lone surrogate, are refused here as at settings load, so a broker built directly cannot
       cross with no recorded reason or forge a log line through it.
