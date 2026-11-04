@@ -2103,7 +2103,10 @@ the same permission set on the same method reds CI until it is listed here.
 > look the named inbound up in the whole config, which `messagefoundry check` reads: an inbound
 > that exists and that the actor's scope lists was asked of the wrong engine shard, or was removed
 > by a reload. That case was read from the code, not run on more than one engine shard (BACKLOG
-> #3031).
+> #3031). A row naming an in-scope inbound has at least one more cause, on any deployment: a
+> flag request from that actor whose direction is not `inbound`, through the JSON route or the
+> web console's (BACKLOG #3378). The row does not say which, so read the actor's other requests
+> around it before closing it as a wrong-engine-shard request.
 > With an engine bound but not started there is no graph and no name exists. Every route still
 > checks the scope first, so a name outside it gets the 403. A name inside it gets 503 from the
 > first three routes and 404 from the control routes, with no denial row. With no engine bound at

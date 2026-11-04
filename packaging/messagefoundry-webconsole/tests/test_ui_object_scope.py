@@ -17,6 +17,7 @@ import pytest
 from _ui_clients import SAME_ORIGIN, auth_service, cookie_login, provision, ui_client
 from fastapi import HTTPException
 
+from messagefoundry.api.message_scope import CONNECTION_DENIED_DETAIL
 from messagefoundry.api.models import ConnectionRow
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
@@ -99,8 +100,11 @@ async def test_ui_flag_bad_direction_from_a_scoped_caller_is_the_audited_403(
                 headers=SAME_ORIGIN,
             )
             assert r.status_code == 403, (name, r.status_code, r.text[:300])
+            assert CONNECTION_DENIED_DETAIL in r.text, r.text[:300]
         rows = await engine.store.list_audit(actor="dep", action="auth.channel_denied")
         assert sorted(row["channel_id"] for row in rows) == ["IB_A", "IB_B"]
+        # ADR 0150: a console denial names the browser's host, as the JSON route's does.
+        assert all(row["client"] for row in rows), rows
     async with ui_client(engine, service) as c:
         await cookie_login(c, "wide")
         r = await c.post(

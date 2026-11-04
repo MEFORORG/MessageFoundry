@@ -5798,8 +5798,9 @@ def create_app(
         (BACKLOG #3378). Those routes act on this process's runner, so they read its own inbounds.
         The flag lives in the store, so this one reads ``inbound_names()``, every inbound in the
         deployment, and a caller's in-scope inbound on a sibling engine shard is no denial. Both
-        give the same refusal for an outbound and for a name outside the scope; a change to one of
-        those rules has to be made in both places."""
+        give the same refusal for an outbound and for a name outside the scope, and so does the web
+        console's flag route for a direction that names neither side. A change to that refusal has
+        to be made in at least those three places."""
         rr = engine.registry_runner
         if identity.allowed_channels is not None and (
             req.direction != "inbound"

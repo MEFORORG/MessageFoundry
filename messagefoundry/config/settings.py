@@ -5752,7 +5752,8 @@ class AlertRule(BaseModel):
     # suppress instead).
     recipients: list[str] | None = None
     # #138 (ADR 0127): optional operator label for this rule, surfaced as the {rule_id} alert-email
-    # template variable and in the read-only /alerts/rules view. Non-PHI free text; NEVER interpolated as
+    # template variable and in the read-only /alerts/rules view, which gives a channel-scoped caller
+    # None in its place (BACKLOG #3378). Non-PHI free text; NEVER interpolated as
     # code (it is a value substituted into an allowlisted template placeholder). None = "" in a template.
     id: str | None = None
     # #144 (ADR 0128): OPTIONAL auto-remediation control action fired when this rule matches — one of
