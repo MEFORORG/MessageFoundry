@@ -446,7 +446,9 @@ def _detach_connection(conn: Any) -> asyncio.Future[None] | None:
 
     The one detach sequence both discards use (BACKLOG #1940, engine PR 1722 defect 5): the
     quarantine of a cancelled call (:meth:`SqlServerStore._release_dirty`, ADR 0159) and the
-    discard after a failed audit rollback (:meth:`SqlServerStore._rollback_or_discard`).
+    discard after a rollback that failed or ran past its bound
+    (:meth:`SqlServerStore._rollback_or_discard`), whether of an audit append, a lease claim or
+    another write.
 
     **The first write is the guarantee, and nothing here awaits.** aioodbc derives
     ``Connection.closed`` from ``_conn``, and its pool re-lends a connection only when it is not
@@ -5398,26 +5400,32 @@ class SqlServerStore:
     async def _rollback_or_discard(self, conn: Any, *, within: float | None = None) -> None:
         """Roll back a failed transaction; if that rollback fails too, discard the connection.
 
-        ``within`` bounds the rollback, in seconds; ``None`` leaves it unbounded. A rollback that
-        runs past the bound is treated as one that failed: the connection is discarded, and the
-        rollback still running on its executor thread closes the handle as it returns (the call
-        gate's hand-off, BACKLOG #2049). :meth:`_fetch_rows` passes the lease claim's clamp here, so
-        a stalled rollback after a failed claim cannot hold ``_leadership_lock`` past it, and also
-        uses this method on its unclamped reads (BACKLOG #5066).
+        **Why discard (BACKLOG #1940).** A rollback that fails may leave the transaction open, and
+        :meth:`_acquire` recycles a connection on an ordinary error, so the next borrower's COMMIT
+        would make the failed work durable, and the next borrower would inherit its locks. The
+        first case found was the audit append: the approval gate answers a refused release row with
+        503, which says the row is absent, so a recycled open INSERT would contradict it. The same
+        holds for a lease claim's ``HOLDLOCK`` (BACKLOG #5066) and the single-statement writes of
+        :meth:`_execute` and :meth:`_execute_output`. The rollback's own error is logged, not
+        raised: the caller re-raises its original error.
 
-        BACKLOG #1940. The approval gate answers a refused release row with 503, which says the row is
-        absent. A rollback that fails may leave the INSERT open, and :meth:`_acquire` recycles a
-        connection on an ordinary error, so the next borrower's COMMIT would make the row durable.
-        The rollback's own error is logged, not raised: the caller re-raises its original error.
+        ``within`` bounds the rollback, in seconds; ``None``, which every caller but
+        :meth:`_fetch_rows` on a clamped read passes, leaves it unbounded and enters no timeout at
+        all. A rollback that runs past the bound is treated as one that failed: the connection is
+        discarded, and the rollback still running on its executor thread closes the handle as it
+        returns (the call gate's hand-off, BACKLOG #2049). :meth:`_fetch_rows` passes the lease
+        claim's clamp, so a stalled rollback after a failed claim cannot hold ``_leadership_lock``
+        past it (BACKLOG #5066).
 
         The discard is :func:`_detach_connection`, the same detach :meth:`_release_dirty` uses, and
         unlike that method it does NOT wait for the close.
         ``_release_dirty`` swallows a cancellation while it waits, which is safe only where the
-        original error IS that cancellation. Not waiting also releases the in-process
-        ``_audit_lock`` sooner. **It does not end the stall, only moves it.** The open transaction
-        holds ``_AUDIT_APPEND_LOCK``, a transaction-owned applock, until the close lands and the
-        server ends the session. Until then every audit append, in this process and in other engine
-        shards, waits on ``sp_getapplock``.
+        original error IS that cancellation. Not waiting also releases an in-process lock the caller
+        holds, such as ``_audit_lock``, sooner. **It does not end the stall, only moves it.** The
+        open transaction keeps its server-side locks until the close lands and the server ends the
+        session. For an audit append that is ``_AUDIT_APPEND_LOCK``, a transaction-owned applock, so
+        until then every audit append, in this process and in other engine shards, waits on
+        ``sp_getapplock``.
 
         Call this after the cursor has closed, so the detached close cannot race the cursor's close on
         another thread. If the executor refuses the close (at loop teardown), the refusal is logged
@@ -5426,9 +5434,14 @@ class SqlServerStore:
 
         A cancellation during the rollback itself propagates, and :meth:`_acquire` quarantines."""
         try:
-            async with asyncio.timeout(within):  # None never expires
+            if within is None:
+                # No timeout context at all: asyncio.timeout(None) still needs a current task, and
+                # outside one it raises, which would discard without trying the rollback.
                 await conn.rollback()
-        except Exception:  # noqa: BLE001 - every driver fault, and the bound; the caller raises the original
+            else:
+                async with asyncio.timeout(within):
+                    await conn.rollback()
+        except Exception:  # noqa: BLE001 - every driver fault, and the bound; the caller re-raises
             log.warning(
                 "sqlserver: rollback after a failed transaction failed or ran past its bound;"
                 " discarding the connection",
@@ -5565,13 +5578,13 @@ class SqlServerStore:
         :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets the borrow, the
         statement and the rollback bounds, so none can be set without the others."""
         if timeout_clamp is None:
-            borrow, statement_timeout, rollback_bound = self._acquire(), None, None
+            borrow, statement_timeout, floored_clamp = self._acquire(), None, None
         else:
             # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
             # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
             # rollback after a failure gets the same floored clamp (BACKLOG #5066).
-            rollback_bound = max(1.0, timeout_clamp)
-            borrow = self._acquire_clamped(rollback_bound)
+            floored_clamp = max(1.0, timeout_clamp)
+            borrow = self._acquire_clamped(floored_clamp)
             statement_timeout = _clamped_statement_timeout(
                 timeout_clamp, self._settings.command_timeout
             )
@@ -5595,7 +5608,7 @@ class SqlServerStore:
                 # it returns to the pool so the next borrower starts clean (M-6). After the cursor has
                 # closed and the timeout is restored, so a discard races neither; _rollback_or_discard
                 # says why it is bounded and discards (BACKLOG #5066).
-                await self._rollback_or_discard(conn, within=rollback_bound)
+                await self._rollback_or_discard(conn, within=floored_clamp)
                 raise
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 
@@ -5609,8 +5622,8 @@ class SqlServerStore:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
         claim/renew is its only caller.
 
-        Two windows before the statement returns, each at most the clamp floored at 1 s. The wait for a pooled connection is the
-        smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_fetch_rows` applies
+        Two windows before the statement returns, each at most the clamp floored at 1 s. The wait
+        for a pooled connection is the smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_fetch_rows` applies
         the floor, :meth:`_acquire_clamped` the minimum): a renew that waited out a saturated pool past the
         fence would otherwise still extend the lease after this node self-fenced. The statement's
         own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.
@@ -5639,15 +5652,19 @@ class SqlServerStore:
         """Run a single write statement (or T-SQL batch) in its own committed transaction, and return
         the driver's row count (``-1`` when it reports none). Most callers ignore it; the cluster
         stepdown reads it to say truthfully whether its owner-scoped release matched a row."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
             try:
-                await cur.execute(sql, params)
-                # getattr: some test cursors model no row count, and -1 is the DB-API 'unknown'.
-                count = getattr(cur, "rowcount", -1)
-                rows = count if isinstance(count, int) else -1
-                await self._commit(conn)
+                async with self._cursor(conn) as cur:
+                    await cur.execute(sql, params)
+                    # getattr: some test cursors model no row count, and -1 is the DB-API 'unknown'.
+                    count = getattr(cur, "rowcount", -1)
+                    rows = count if isinstance(count, int) else -1
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # A rollback that fails would otherwise recycle a connection still holding the
+                # write's X locks; _rollback_or_discard discards it instead. After the cursor block,
+                # so a detached close cannot race the cursor's own close.
+                await self._rollback_or_discard(conn)
                 raise
         return rows
 
@@ -5660,14 +5677,17 @@ class SqlServerStore:
         count can come back ``-1`` for a zero-match UPDATE. ``_fetchall`` would not do: it commits
         as a READ. The rows are drained before the commit, and ``_cursor`` frees the statement
         handle the ``OUTPUT`` clause leaves open."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
             try:
-                await cur.execute(sql, params)
-                columns = [c[0] for c in cur.description]
-                rows = await cur.fetchall()
-                await self._commit(conn)
+                async with self._cursor(conn) as cur:
+                    await cur.execute(sql, params)
+                    columns = [c[0] for c in cur.description]
+                    rows = await cur.fetchall()
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # As in _execute: a failed rollback discards rather than recycles the connection,
+                # and it runs after the cursor block.
+                await self._rollback_or_discard(conn)
                 raise
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 

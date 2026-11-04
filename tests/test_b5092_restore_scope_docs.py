@@ -63,10 +63,11 @@ def test_security_md_says_only_messagefoundry_restore_onto_sqlite_is_recorded() 
         "a SQLite store put back by copying its files",
         "the first `serve` ends no session, writes no `store_restored` row and raises no "
         "`store_restored` alert",
-        # The audit anchor's start-up walk is the one signal, and it is opt-in; the docs must not
-        # say the engine cannot tell, nor that the anchor ends sessions.
-        "A start-up signal such a restore can raise is the audit anchor's, and only where it is "
-        "set up.",
+        # The audit anchor's start-up walk is one signal, not the only one, and it is opt-in; the
+        # docs must not say the engine cannot tell, nor that the anchor ends sessions.
+        "One start-up signal that can catch such a restore is the audit anchor's, and only where "
+        "it is set up.",
+        "Other start-up signals may follow from what the restore rolled back",
         "none of them records the restore as one",
         "stop every engine process and cluster node on the store before the restore",
         "That alert ends no session and writes no `store_restored` row.",

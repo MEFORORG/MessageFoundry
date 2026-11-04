@@ -5588,8 +5588,8 @@ holds a marker (`consume_restore_record` returns nothing there). So the first `s
 session, writes no `store_restored` row and raises no `store_restored` alert, and the backup's
 sessions are accepted until they expire or are revoked.
 
-**A start-up signal such a restore can raise is the audit anchor's, and only where it is set
-up.** With `[integrity].audit_verify_on_start = true` and `[integrity].audit_anchor_file`
+**One start-up signal that can catch such a restore is the audit anchor's, and only where it is
+set up.** With `[integrity].audit_verify_on_start = true` and `[integrity].audit_anchor_file`
 holding an anchor taken after the backup, the start-up audit walk reports the restored log as
 truncated and raises an `integrity_drift` alert
 ([CONFIGURATION.md](CONFIGURATION.md#integrity) says how). That alert ends no session and writes

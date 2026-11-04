@@ -318,19 +318,74 @@ async def test_a_hung_rollback_ends_at_the_clamp_and_discards_the_connection() -
     assert conn.closed is True
 
 
-async def test_a_hung_rollback_on_a_failed_claim_releases_the_leadership_lock() -> None:
-    """End to end over the coordinator: the tick that failed its claim returns inside the bound,
-    and a stepdown waiting on _leadership_lock can then take it."""
+async def test_a_hung_rollback_on_a_failed_claim_frees_the_leadership_lock_in_the_bound() -> None:
+    """End to end over the coordinator: a second acquirer, standing in for a stepdown, waits on
+    _leadership_lock while the tick that failed its claim sits in a hung rollback, and gets the lock
+    inside the bound. With the rollback unbounded the tick never lets go, and the wait times out.
+    Asserting the lock is free after the tick returns would prove nothing: ``async with`` always
+    releases on the way out."""
     conn = _Conn()
     conn.rollback_hangs = True
     conn.fail = RuntimeError("HYT00 query timeout expired")
     coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=1.0)
+    tick = asyncio.create_task(coord._maintain_leadership())
+    async with asyncio.timeout(2.0):  # the tick holds the lock and has entered the rollback
+        while conn.rolled_back == 0:
+            await asyncio.sleep(0)
+    assert coord._leadership_lock.locked() is True
     started = time.monotonic()
+    try:
+        await asyncio.wait_for(coord._leadership_lock.acquire(), timeout=3.0)
+    finally:
+        if not tick.done():  # the red case: do not leave the hung tick behind the test
+            tick.cancel()
+    waited = time.monotonic() - started
+    coord._leadership_lock.release()
+    assert waited < 3.0, waited
     with pytest.raises(RuntimeError, match="HYT00"):
-        await coord._maintain_leadership()
-    assert time.monotonic() - started < 3.0
-    assert coord._leadership_lock.locked() is False
+        await tick
     assert conn.closed is True
+
+
+def test_an_unbounded_rollback_outside_a_task_still_runs() -> None:
+    """``within=None``, which every caller but a clamped read passes, enters no timeout at all.
+    ``asyncio.timeout(None)`` still needs a current task, so wrapping the rollback in it raised
+    RuntimeError outside one, and the broad except then discarded the connection without trying the
+    rollback. Driven by hand, so no task is current."""
+    conn = _Conn()
+    coro = _store(conn)._rollback_or_discard(conn)
+    with pytest.raises(StopIteration):
+        coro.send(None)
+    assert conn.rolled_back == 1
+    assert conn.closed is False  # rolled back cleanly, so not discarded
+
+
+@pytest.mark.parametrize("method", ["_execute", "_execute_output"])
+async def test_a_failed_rollback_after_a_failed_write_discards_the_connection(method: str) -> None:
+    """The heartbeat and stepdown-release writes: a rollback that fails may leave the write's X
+    locks held, so the connection is discarded rather than recycled, and the caller sees the write's
+    own error. Before, a bare rollback raised its own error over the write's, and the connection
+    went back to the pool."""
+    conn = _Conn()
+    conn.rollback_fail = RuntimeError("08S01 communication link failure during rollback")
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    store = _store(conn)
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await getattr(store, method)("UPDATE leader_lease SET owner = NULL", ("A",))
+    assert conn.rolled_back == 1
+    assert conn.closed is True
+
+
+@pytest.mark.parametrize("method", ["_execute", "_execute_output"])
+async def test_a_rollback_after_a_failed_write_that_succeeds_recycles(method: str) -> None:
+    """Control for the test above: a clean rollback keeps the connection."""
+    conn = _Conn()
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    store = _store(conn)
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await getattr(store, method)("UPDATE leader_lease SET owner = NULL", ("A",))
+    assert conn.rolled_back == 1
+    assert conn.closed is False
 
 
 async def test_a_rollback_that_succeeds_still_recycles_the_connection() -> None:

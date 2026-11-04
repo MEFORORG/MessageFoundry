@@ -734,7 +734,7 @@ raises no `store_restored` alert. Stop every engine process and cluster node on 
 such a restore. Before the first `serve` after it, run `messagefoundry
 admin-revoke-sessions` against the restored store, and re-apply by hand the changes listed above.
 [SECURITY.md](SECURITY.md#a-restored-store-brings-its-sessions-back-and-only-messagefoundry-restore-records-it)
-says what is and is not recorded, and the start-up signal such a restore can raise.
+says what is and is not recorded, and at least one start-up signal such a restore can raise.
 
 **`restore` refuses an archive older than a week.** The default is `--max-age-days 7`. An archive
 whose manifest does not say when it was taken, or that is dated more than an hour in the future,
