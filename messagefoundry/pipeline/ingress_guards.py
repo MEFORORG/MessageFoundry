@@ -93,6 +93,7 @@ __all__ = [
     "IngressTooLarge",
     "admit_resubmission",
     "admit_resubmitted_body",
+    "canonical_carried_size",
     "carry_binary_ingress",
     "check_binary_size",
     "check_declared_type",
@@ -214,7 +215,7 @@ def ingress_size_error(size: int) -> str | None:
 _CANONICAL_B64 = re.compile(r"[A-Za-z0-9+/]*={0,2}")
 
 
-def _canonical_carried_size(payload: str) -> int | None:
+def canonical_carried_size(payload: str) -> int | None:
     """The byte count ``payload`` carries if it is canonical base64, else ``None``.
 
     Whitespace is not stripped first. A decoder tolerates it, but here it would let padding of any
@@ -245,7 +246,7 @@ def reingress_size_error(ic: InboundConnection, body: str) -> str | None:
             # No base64 this short can carry more than the ceiling, and whitespace only shortens it.
             # That also bounds a padded or corrupt carriage to the length of a ceiling-size one.
             return None
-        carried = _canonical_carried_size(payload)
+        carried = canonical_carried_size(payload)
         if carried is not None:
             return ingress_size_error(carried)
     return ingress_size_error(len(body))

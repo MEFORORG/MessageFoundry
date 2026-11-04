@@ -968,6 +968,11 @@ _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 #: #1560). The server backends import it for their own ``ingress_handoff``.
 REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
 
+#: The ``error`` of a re-ingress child whose body failed its HL7 peek, when the worker passes no reason
+#: of its own. The server backends import it, and so does the re-ingress worker, which leads it with
+#: the refused-body allowance note when it stores only the head (vault BACKLOG #4796).
+REINGRESS_PEEK_FAILED: Final = "re-ingress body failed HL7 peek"
+
 #: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
 #: drift apart. Used by :meth:`_attachment_still_referenced_sql`, which reached this predicate first:
 #: the attachment GC already treated a purged row as unreplayable while ``replay`` replayed it anyway.
@@ -12846,6 +12851,8 @@ class MessageStore:
         summary: str | None,
         peek_failed: bool = False,
         peek_error: str | None = None,
+        refused_raw: str | None = None,
+        refused_metadata: Mapping[str, Any] | None = None,
         now: float | None = None,
     ) -> bool:
         """Consume one INFLIGHT ``Stage.RESPONSE`` work-row and produce the re-ingressed message+ingress
@@ -12858,6 +12865,8 @@ class MessageStore:
         child). On ``peek_failed`` the child is produced ``RECEIVED→ERROR`` with **no** ingress row (it
         owes no work) — count-and-log holds, the token is still consumed. The peek-derived
         ``control_id``/``message_type``/``summary`` are passed **in** so the store stays parsing-free.
+        So are a ``peek_failed`` child's ``refused_raw`` and ``refused_metadata``, the refused-body
+        allowance's bounded view and record (vault BACKLOG #4796); see :meth:`QueueStore.ingress_handoff`.
         Returns ``True`` if this call performed the handoff, ``False`` if it was an already-consumed no-op.
 
         An origin whose metadata cell fails its row tag (BACKLOG #2593) makes the token unrecoverable:
@@ -12876,6 +12885,8 @@ class MessageStore:
                 summary=summary,
                 peek_failed=peek_failed,
                 peek_error=peek_error,
+                refused_raw=refused_raw,
+                refused_metadata=refused_metadata,
                 now=time.time() if now is None else now,
                 tag_failures=tag_failures,
             )
@@ -12893,6 +12904,8 @@ class MessageStore:
         summary: str | None,
         peek_failed: bool,
         peek_error: str | None,
+        refused_raw: str | None,
+        refused_metadata: Mapping[str, Any] | None,
         now: float,
         tag_failures: list[CellTagError],
     ) -> bool:
@@ -13041,12 +13054,13 @@ class MessageStore:
                         "correlation_root_id": root,
                         "correlation_depth": child_depth,
                         "reingress_of_seq": seq,
+                        **(refused_metadata if peek_failed and refused_metadata else {}),
                     }
                 )
                 await self._insert_message(
                     new_mid,
                     channel_id=loopback_channel_id,
-                    raw=body,
+                    raw=refused_raw if peek_failed and refused_raw is not None else body,
                     status=(
                         MessageStatus.ERROR.value if peek_failed else MessageStatus.RECEIVED.value
                     ),
@@ -13055,9 +13069,7 @@ class MessageStore:
                     source_type="reingress",
                     summary=summary,
                     metadata=child_meta,
-                    error=(
-                        (peek_error or "re-ingress body failed HL7 peek") if peek_failed else None
-                    ),
+                    error=(peek_error or REINGRESS_PEEK_FAILED) if peek_failed else None,
                     now=now,
                     origin=MessageOrigin.REINGRESS,
                 )

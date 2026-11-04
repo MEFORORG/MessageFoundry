@@ -32,6 +32,11 @@ holds its own copy. A poll source is different: the engine consumes the only cop
 a row it marks), so the runner keeps every refusal from one whole. Nothing here pauses intake, so it
 is not the depth budget that owner rulings R1 and R2 keep off.
 
+A loopback re-ingress refusal, a captured reply too large or not peekable, is charged to the same
+allowance under the loopback's name (vault BACKLOG #4796, :meth:`RefusedBodyAllowance.bound_held`).
+Its ``ERROR`` child is not a pre-ingress row, but it stored the whole reply a second time just as
+a listener's refusal stored the whole frame.
+
 The allowance is a token bucket per inbound name, held by the engine process. An inbound lives on
 exactly one engine shard, so a per-inbound count needs no cross-shard state. The Engine owns one
 :class:`RefusedBodyAllowance` and hands it to every runner a reload builds, so a reload does not
@@ -52,10 +57,12 @@ from messagefoundry.config.settings import REFUSED_BODY_HEAD_BYTES as DEFAULT_HE
 from messagefoundry.config.settings import (
     REFUSED_BODY_WINDOW_SECONDS as DEFAULT_WINDOW_SECONDS,
 )
+from messagefoundry.content_type import ContentType
 from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
+from messagefoundry.parsing.binary import decode as decode_carriage
 from messagefoundry.parsing.binary import is_marked
-from messagefoundry.pipeline.ingress_guards import store_safe_raw
+from messagefoundry.pipeline.ingress_guards import canonical_carried_size, store_safe_raw
 from messagefoundry.redaction import _DEFAULT_LIMIT as _ERROR_LIMIT
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.crypto import Cipher, refused_body_digest
@@ -100,12 +107,17 @@ class RefusedBodyPolicy:
 
 @dataclass(frozen=True, slots=True)
 class BoundedRefusal:
-    """What to store for one refused body: the ``raw`` view, the ``error`` text, and the ``metadata``
-    JSON carrying its length and its keyed digest."""
+    """What to store for one refused body: the ``raw`` view, the ``error`` text, and the ``record``
+    of its length and its keyed digest, stored in the message's metadata under :data:`METADATA_KEY`."""
 
     raw: str
     error: str
-    metadata: str
+    record: dict[str, object]
+
+    @property
+    def metadata(self) -> str:
+        """The metadata JSON that holds :attr:`record`."""
+        return json.dumps({METADATA_KEY: self.record})
 
 
 class RefusedBodyAllowance:
@@ -168,7 +180,6 @@ class RefusedBodyAllowance:
         The HMAC runs on the event loop, as the decode before it does: about the same cost, and
         no thread or await between the refusal and its row, so a cancelled listener cannot leave a
         refusal unrecorded in that gap and a full thread pool cannot hold up its NAK."""
-        digest = refused_body_digest(cipher, wire)
         head_bytes = self.policy.head_bytes
         carried, stored_bytes = _stored_form(wire, text)
         fits_in_head = (len(wire) if carried else stored_bytes) <= head_bytes
@@ -177,19 +188,49 @@ class RefusedBodyAllowance:
             stored = store_safe_raw(wire, content_type, text=text)
         else:
             stored = _head(wire, text, content_type, head_bytes)
+        return self._refusal(wire, stored, error, whole=whole, cipher=cipher)
+
+    def bound_held(
+        self, inbound: str, body: str, content_type: str, error: str, *, cipher: Cipher
+    ) -> BoundedRefusal:
+        """Decide what to store for a body the engine already held when it refused it: a captured
+        reply a loopback re-ingress could not admit (vault BACKLOG #4796). It shares :meth:`bound`'s
+        allowance, head and record, with two differences.
+
+        The whole form is ``body`` itself, which is what the re-ingress child stored before this
+        bound, and the charge is its UTF-8 length. And ``body`` is a stored string, not wire bytes:
+        on a binary loopback a canonical ``mfb64:v1:`` carriage stands for the bytes it carries, so
+        the length, the digest and the head describe those bytes. Every other body, a padded or
+        corrupt carriage included, is described by its UTF-8.
+
+        The reply also stays in its origin's ``response`` row until retention erases it, so a head
+        here drops no byte the engine does not still hold."""
+        head_bytes = self.policy.head_bytes
+        wire, text = _held_wire(body, content_type)
+        stored_bytes = len(wire) if text is not None else len(body)  # carriage is ASCII
+        fits_in_head = len(wire) <= head_bytes
+        whole = fits_in_head or self.try_charge(inbound, stored_bytes)
+        stored = body if whole else _head(wire, text, content_type, head_bytes)
+        return self._refusal(wire, stored, error, whole=whole, cipher=cipher)
+
+    def _refusal(
+        self, wire: bytes, stored: str, error: str, *, whole: bool, cipher: Cipher
+    ) -> BoundedRefusal:
+        """The :class:`BoundedRefusal` for ``stored``, the view chosen for ``wire``: the allowance
+        note on a head, and the record of the body's length and keyed digest."""
+        if not whole:
             note = f"[refused-body allowance spent: stored only the head of a {len(wire):,}-byte body] "
             error = _with_note(note, error)
         record: dict[str, object] = {
             "bytes": len(wire),
-            "body_hmac": digest,
+            "body_hmac": refused_body_digest(cipher, wire),
             "stored": "whole" if whole else "head",
         }
         if not whole:
             # The bound this head was cut to, kept because the policy may change before anyone reads
             # it: the edit-and-resubmit refusal names it (:func:`head_only_resubmit_refusal`).
-            record["head_bytes"] = head_bytes
-        metadata = json.dumps({METADATA_KEY: record})
-        return BoundedRefusal(raw=stored, error=error, metadata=metadata)
+            record["head_bytes"] = self.policy.head_bytes
+        return BoundedRefusal(raw=stored, error=error, record=record)
 
 
 def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | None:
@@ -240,6 +281,22 @@ def _stored_form(wire: bytes, text: str | None) -> tuple[bool, int]:
         # The latin-1 view: one character per byte, two UTF-8 bytes for each byte from 0x80 up.
         return False, 2 * len(wire) - len(wire.translate(None, _HIGH_BYTES))
     return True, len(CARRIAGE_MARKER) + 4 * ((len(wire) + 2) // 3)  # mfb64:v1: byte carriage
+
+
+def _held_wire(body: str, content_type: str) -> tuple[bytes, str | None]:
+    """The bytes a held ``body`` stands for, and its text view, or ``None`` for carriage.
+
+    Only a canonical carriage on a binary content type stands for the bytes it carries, as
+    :func:`~messagefoundry.pipeline.ingress_guards.reingress_size_error` sizes it, by the same
+    :func:`~messagefoundry.pipeline.ingress_guards.canonical_carried_size` test. A decoder strips
+    whitespace, so a padded carriage would otherwise measure as the few bytes it decodes to."""
+    if (
+        ContentType(content_type).is_binary
+        and is_marked(body)
+        and canonical_carried_size(body[len(CARRIAGE_MARKER) :]) is not None
+    ):
+        return decode_carriage(body), None
+    return body.encode("utf-8", "surrogatepass"), body
 
 
 def with_refusal_note(note: str, error: str) -> str:

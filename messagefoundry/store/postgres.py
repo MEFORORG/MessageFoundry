@@ -214,6 +214,7 @@ from messagefoundry.store.store import (
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
+    REINGRESS_PEEK_FAILED,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
@@ -5560,6 +5561,8 @@ class PostgresStore:
         summary: str | None,
         peek_failed: bool = False,
         peek_error: str | None = None,
+        refused_raw: str | None = None,
+        refused_metadata: Mapping[str, Any] | None = None,
         now: float | None = None,
     ) -> bool:
         """Postgres twin of :meth:`MessageStore.ingress_handoff` (ADR 0013 Increment 2) — the same
@@ -5730,13 +5733,14 @@ class PostgresStore:
                                 "correlation_root_id": root,
                                 "correlation_depth": child_depth,
                                 "reingress_of_seq": seq,
+                                **(refused_metadata if peek_failed and refused_metadata else {}),
                             }
                         )
                         await self._insert_message(
                             conn,
                             new_mid,
                             channel_id=loopback_channel_id,
-                            raw=body,
+                            raw=refused_raw if peek_failed and refused_raw is not None else body,
                             status=(
                                 MessageStatus.ERROR.value
                                 if peek_failed
@@ -5747,11 +5751,7 @@ class PostgresStore:
                             source_type="reingress",
                             summary=summary,
                             metadata=child_meta,
-                            error=(
-                                (peek_error or "re-ingress body failed HL7 peek")
-                                if peek_failed
-                                else None
-                            ),
+                            error=((peek_error or REINGRESS_PEEK_FAILED) if peek_failed else None),
                             now=now,
                             origin=MessageOrigin.REINGRESS,
                         )

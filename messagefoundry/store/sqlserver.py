@@ -209,6 +209,7 @@ from messagefoundry.store.store import (
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
+    REINGRESS_PEEK_FAILED,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
@@ -8193,6 +8194,8 @@ class SqlServerStore:
         summary: str | None,
         peek_failed: bool = False,
         peek_error: str | None = None,
+        refused_raw: str | None = None,
+        refused_metadata: Mapping[str, Any] | None = None,
         now: float | None = None,
     ) -> bool:
         """Consume one in-flight ``Stage.RESPONSE`` work-row and re-ingress the captured reply as a new
@@ -8202,7 +8205,9 @@ class SqlServerStore:
         dead-lettered (and the token still consumed; one whose reply is erased is also blanked). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
-        corrupt ref, and the failure is audited once the transaction has closed."""
+        corrupt ref, and the failure is audited once the transaction has closed. A ``peek_failed``
+        child stores ``refused_raw`` and ``refused_metadata`` as :meth:`QueueStore.ingress_handoff`
+        says (vault BACKLOG #4796)."""
         tag_failures: list[CellTagError] = []
         try:
             return await self._ingress_handoff_txn(
@@ -8214,6 +8219,8 @@ class SqlServerStore:
                 summary=summary,
                 peek_failed=peek_failed,
                 peek_error=peek_error,
+                refused_raw=refused_raw,
+                refused_metadata=refused_metadata,
                 now=time.time() if now is None else now,
                 tag_failures=tag_failures,
             )
@@ -8231,6 +8238,8 @@ class SqlServerStore:
         summary: str | None,
         peek_failed: bool,
         peek_error: str | None,
+        refused_raw: str | None,
+        refused_metadata: Mapping[str, Any] | None,
         now: float,
         tag_failures: list[CellTagError],
     ) -> bool:
@@ -8401,6 +8410,7 @@ class SqlServerStore:
                             "correlation_root_id": root,
                             "correlation_depth": child_depth,
                             "reingress_of_seq": seq,
+                            **(refused_metadata if peek_failed and refused_metadata else {}),
                         }
                     )
                     await cur.execute(
@@ -8415,7 +8425,7 @@ class SqlServerStore:
                             control_id,
                             message_type,
                             self._cipher.encrypt(
-                                body,
+                                refused_raw if peek_failed and refused_raw is not None else body,
                                 aad=message_cell_aad(
                                     "raw", message_id=new_mid, channel_id=loopback_channel_id
                                 ),
@@ -8425,9 +8435,7 @@ class SqlServerStore:
                             else MessageStatus.RECEIVED.value,
                             # Ciphered like every other messages.error writer (EF-3).
                             self._enc(
-                                (peek_error or "re-ingress body failed HL7 peek")
-                                if peek_failed
-                                else None,
+                                (peek_error or REINGRESS_PEEK_FAILED) if peek_failed else None,
                                 aad=message_cell_aad(
                                     "error", message_id=new_mid, channel_id=loopback_channel_id
                                 ),

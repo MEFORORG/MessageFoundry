@@ -56,6 +56,7 @@ from tests._keyed_reopen_contract import (
     server_keyed_reopen_report,
 )
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
+from tests._reingress_refused_body_contract import CASES as REINGRESS_REFUSED_BODY_CASES
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -537,6 +538,13 @@ async def test_ingress_handoff_parity(store) -> None:
         )
         is False
     )
+
+
+@pytest.mark.parametrize("case", REINGRESS_REFUSED_BODY_CASES)
+async def test_reingress_refused_body_contract(store, case) -> None:
+    """Vault BACKLOG #4796: a refused loopback re-ingress is charged to the refused-body allowance,
+    the same contract the SQLite suite runs: past it only the head is stored, inside it the whole."""
+    await case(store)
 
 
 async def test_ingress_handoff_peek_error_is_the_recorded_reason(store) -> None:
