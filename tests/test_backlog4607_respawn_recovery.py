@@ -801,11 +801,13 @@ async def test_a_per_lane_worker_that_died_after_writing_its_rows_closes_its_run
     ``test_only_an_ordered_per_lane_batch_counts_fewer_rows_in_flight_as_progress``."""
     runner = RegistryRunner(_registry(tmp_path), db, egress=EgressSettings(deny_by_default=False))
     # A written row is no longer in flight; an id the store never claimed reads the same.
+    # In batch order: a router batch hands its rows off one at a time, so a written row comes
+    # before any row still in flight.
     ids = ["written-row"]
     if case != "every-row-written":
-        ids.insert(0, await _claimed_ingress_row(db))
+        ids.append(await _claimed_ingress_row(db))
     if case == "row-in-flight":
-        ids.pop()
+        ids.pop(0)
     sleeps: list[float] = []
 
     async def sleep(delay: float) -> bool:
@@ -1055,14 +1057,15 @@ async def test_a_pooled_replacement_that_owes_no_write_does_not_wait_on_leadersh
     assert flap.reads == 0
 
 
-async def test_a_death_holding_none_of_the_runs_suspects_starts_a_new_run(
-    db: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("case", ["two-poison-rows", "disjoint-batches"])
+async def test_unordered_deaths_on_rows_no_pass_resolves_still_add_up_and_page(
+    case: str, db: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Round 6, review round 1. A row the dead worker delivered before it died stays a suspect,
-    and no settled unordered pass resolves it again, so unrelated deaths on different rows kept
-    adding to one run, backing off and paging a lane whose passes settled between them. A row
-    that kills every worker is held at every death, so a death holding none of the suspects
-    starts a new run."""
+    """Round 6, review round 2. A rule that started a new run at a death holding none of the
+    run's suspects reset the count whenever two deaths in a row held disjoint rows, so two
+    poison rows that fresh rows pass by turns, or batches that each write a row and die, never
+    backed off or paged. A death holding none of the suspects now replaces them and stays in the
+    run."""
     runner = RegistryRunner(_registry(tmp_path), db, egress=EgressSettings(deny_by_default=False))
     pages: list[str] = []
     monkeypatch.setattr(runner, "_infra_fault_stop_after", 3)
@@ -1072,12 +1075,13 @@ async def test_a_death_holding_none_of_the_runs_suspects_starts_a_new_run(
     claims = _LaneClaims()
     runner._lane_claims[("delivery", "OB")] = claims
     for n in range(3):
-        claims.ids[:] = [f"delivered-{n}", f"died-on-{n}"]  # a different row each time
+        if case == "two-poison-rows":
+            claims.ids[:] = [f"fresh-{n}", f"poison-{n % 2}"]
+        else:
+            claims.ids[:] = [f"delivered-{n}", f"died-on-{n}"]
         runner._log_worker_death("delivery", "OB", await _dead_task())
-        claims.ids[:] = [f"died-on-{n}", f"fresh-{n}"]  # the re-pended row now goes through
-        claims.settle("delivery", "OB", ordered=False)
-    assert claims.deaths.count == 1
-    assert pages == []
+    assert claims.deaths.count == 3
+    assert pages == ["OB"]
 
 
 async def test_a_stop_during_the_read_of_a_recovery_that_owes_no_write_strands_nothing(

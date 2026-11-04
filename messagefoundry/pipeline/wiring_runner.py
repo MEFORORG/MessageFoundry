@@ -533,9 +533,11 @@ class _LaneClaims:
     an UNORDERED lane a settled pass closes it only once it has resolved every row the run's
     deaths all held (``suspects``): fresh rows sort ahead of a re-pended row there, so a pass
     that never reached the row killing the workers would otherwise close the run at every death,
-    with no backoff and no page. A row that kills every worker is held at every death, so a death
-    holding none of the suspects starts a new run, as a far-apart one does; a row the dead worker
-    wrote before it died stays a suspect until the next death drops it or starts a new run. Not on
+    with no backoff and no page. A death holding none of the suspects replaces them and stays in
+    the run, so two poison rows, or batches that each write a row and die, still add up. A row the
+    dead worker wrote before it died stays a suspect until a later death drops it, so after one
+    such death the run may stay open until the quiet gap below, and a death inside it counts as a
+    repeat. Not on
     a claim that finds nothing:
     a replacement's re-pend dates its rows into the future, so the lane reads empty until the row
     that killed the workers is due again. A death that comes :data:`_DEATH_RUN_QUIET_SECONDS` or
@@ -6805,14 +6807,8 @@ class RegistryRunner:
             log.error("%s worker %r exited unexpectedly; respawning", kind, name, exc_info=exc)
             return
         now = time.monotonic()
-        held = set(claims.ids)
-        if claims.deaths.count and (
-            now - claims.last_death >= _DEATH_RUN_QUIET_SECONDS
-            or (held and claims.suspects and not held & claims.suspects)
-        ):
-            # Far apart, or holding none of the rows every earlier death held: an unrelated death
-            # starts a new run.
-            claims.close_deaths(kind, name)
+        if claims.deaths.count and now - claims.last_death >= _DEATH_RUN_QUIET_SECONDS:
+            claims.close_deaths(kind, name)  # far apart: an unrelated death starts a new run
         claims.last_death = now
         claims.note_death()
         claims.deaths = claims.deaths.record(
