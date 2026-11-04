@@ -1079,8 +1079,11 @@ fleet, so never take them*.
   **AMENDED 2026-11-04, added after the move (ledger ruling R2, owner-signed in session: *"Sign
   R1-R9"*).** R2 amends the rulings of 2026-10-12 and 2026-10-31 ("merge, file rows") in their
   filing mechanics only: a merged PR now files at most one row. `CLAUDE.md` section 5 states the new
-  mechanics once, at the end of its merge bullet, so read them there. The signed text is the vault's
-  `docs/LEDGER-INFLOW-RULINGS.md`, from vault PR 2818 (open on 2026-11-04).
+  mechanics once, at the end of its merge bullet, so read them there. The 2026-10-31 rulings are
+  not recorded in this repository; the vault ledger's banners quote at least the owner's answers
+  *"Merge, file rows"* on engine PRs 2675 and 2676, and *"Merge both, file rows"* on engine PRs
+  2691 and 2671. The signed text is vault commit `22579b250`, `docs/LEDGER-INFLOW-RULINGS-DRAFT.md`,
+  now `docs/LEDGER-INFLOW-RULINGS.md` in vault PR 2818 (open on 2026-11-04).
 
 - **A PR's merge state is a join over clocks, and the join is the part you must not miss.**
   `gh pr view <N> --json mergeStateStatus` is the starting read, never the verdict: it reports

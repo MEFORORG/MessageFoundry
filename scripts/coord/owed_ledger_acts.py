@@ -70,15 +70,15 @@ precede the merge). Statuses printed: OWED, MISSING (the row is in neither ledge
 READ, ERROR (a failed read, or no ledger commit before a baseline: a shallow clone), and DONE with
 ``--all``.
 
-LEDGER RULING R2 (owner-signed 2026-11-04, in session: "Sign R1-R9") changes what ``file`` should
-say, not how it is read. From that date a merged PR files at most one row, holding its open findings
-as numbered items, so an ask made since then should read ``file=1`` at most. A larger count, from
-an earlier ask or a mistaken one, is still read as written, and filing asks on one PR are still
-summed, so two asks of ``file=1`` on one PR stay OWED after the one row R2 allows: the safe
-direction, for a person to clear. An item R2 adds to a row that already exists (a step on the row
-the PR cites, or a finding rolled up into a module's open row) is not a new row, so the filing
-count never sees it. The signed text is the vault's ``docs/LEDGER-INFLOW-RULINGS.md``, from vault
-PR 2818 (open on 2026-11-04).
+LEDGER RULING R2 (owner-signed 2026-11-04, in session: "Sign R1-R9"; ``CLAUDE.md`` section 5's
+merge bullet states it) changes what ``file`` should say, not how it is read. From that date a
+merged PR files at most one row, so an ask made since then should read ``file=1`` at most. A larger
+count, from an earlier ask or a mistaken one, is still read as written, and filing asks on one PR
+are still summed, so two asks of ``file=1`` on one PR (a marker in the body and again in a
+comment, say) stay OWED after the one row R2 allows: the safe direction, for a person to clear. An
+item R2 adds to a row that already exists (a step on the row the PR cites, or a finding rolled up
+into a module's open row) is not a new row, so the filing count never sees it, and an ask for it
+under ``rows`` stays OWED while that row stays OPEN.
 
 WHAT IT CANNOT SEE. At least: an ask sent only by fleet mail (so a Manager should also put the
 marker on the PR), an ask in an inline review comment, an ask past the first 100 comments ``gh``
