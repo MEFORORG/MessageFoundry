@@ -27,8 +27,10 @@
   draws the value and protects it twice, in user scope (the question) and in machine scope (a
   control). Every start then unprotects both and compares with the value, and runs two negative
   controls: a user-scope blob protected by the administrator who installed the service (it must be
-  refused, or user scope is not bound to the account), and a copy of its own blob with one byte
-  flipped (it must be refused, or the unprotect checks nothing). A machine-scope blob that opens
+  refused with NTE_BAD_KEY_STATE, or the service is not held to its own account's keys), and a copy
+  of its own blob with one byte flipped (it must be refused, or the unprotect checks nothing). After
+  A1 the administrator also tries the service's own user-scope blob (crosscheck.txt), which must be
+  refused, or the blob is not bound to the service account at all. A machine-scope blob that opens
   shows DPAPI and the file read worked in that process, so a user-scope refusal beside it is a real
   NO and not a broken instrument.
 
@@ -38,10 +40,11 @@
     A3  a start after the account's profile was seen unloaded (Win32_UserProfile.Loaded)
     A4  after a reboot: the start the SCM makes at boot (start type Automatic)
     A5  after a reboot: a demand start
-  The reboot is proven from the reports themselves: A4's boot time (its clock minus its uptime) must
-  be at least 60 seconds after A3's. The verdict line is SURVIVES only if A4 and A5 both open the
-  user-scope blob with every control held, DOES NOT SURVIVE if either is refused with the controls
-  held, and INCONCLUSIVE otherwise.
+  The reboot is proven from the reports themselves, for A4 and for A5 each against A3: the uptime
+  went down (the tick count resets only at a boot), or the boot time (clock minus uptime) moved at
+  least 60 seconds. The verdict line reads SURVIVES when A4 and A5 both open the user-scope blob with
+  every control held; SURVIVES, BUT NOT AT THE BOOT-TIME START when A5 opens it and A4 is refused;
+  DOES NOT SURVIVE when A5 is refused with the controls held; and INCONCLUSIVE otherwise.
 
   THREE MODES.
     -Mode Host     On MEFORHV01, elevated, by the owner. Refuses unless REVTEST01 is Off, reverts it
@@ -61,16 +64,20 @@
   (HKLM\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters) and refuse unless VirtualMachineName is
   REVTEST01 and PhysicalHostName is MEFORHV01. A guest without those values is refused.
 
-  WHAT IT CHANGES. In the guest: the service, C:\mefor-dpapi-reboot, and the virtual account's
-  profile, all removed by -Step Uninstall; the VM is reverted afterwards in any case. On the host:
-  REVTEST01's state (reverted to the checkpoint, started, turned off, reverted again) and one output
-  folder. Nothing else: no switch, no other VM, no account, no firewall rule.
+  WHAT IT CHANGES, at least. In the guest: the service and its virtual account, C:\mefor-dpapi-reboot,
+  the account's profile under C:\Windows\ServiceProfiles (which -Step Uninstall removes only once it
+  is unloaded, and the 2026-11-04 runs never saw it unloaded), System event log entries and the
+  shutdown tracker. Every run reverts the VM afterwards, which discards all of that. On the host:
+  REVTEST01's state (reverted to the checkpoint, started, turned off, reverted again), hvtest's lock
+  file for REVTEST01, held for the run so hvtest reports the VM busy, the TEMP folder the owner
+  command makes, and its output folder. It creates no switch, no VM and no host account, and changes
+  no firewall rule.
 
-  OWNER COMMAND (MEFORHV01, PowerShell 7 started with Run as administrator, while no hvtest run is
-  in flight; `ssh hvtest list` from MEFORDEV01 shows REVTEST01 Off). <SHA> is the full commit SHA
-  of this file's commit, which the report that ships it names:
+  OWNER COMMAND (MEFORHV01, PowerShell 7 started with Run as administrator). <SHA> is the full
+  commit SHA of a commit holding this file, which the report that ships it names; it is fetched by
+  SHA, so it still works after the branch is merged and deleted:
 
-    if ([Environment]::MachineName -ne 'MEFORHV01') { Write-Host "STOP     this must run on MEFORHV01, but this is $([Environment]::MachineName); nothing ran" } else { $d = Join-Path $env:TEMP ('dpapi-reboot-' + [guid]::NewGuid().ToString('N')); $null = New-Item -ItemType Directory -Path $d; $repo = Join-Path $HOME 'mfsrc'; git -C $repo fetch origin b452-3411-dpapi-reboot-spike; $f = Join-Path $d 'dpapi_reboot_spike.ps1'; git -C $repo show '<SHA>:scripts/research/dpapi-reboot-spike/dpapi_reboot_spike.ps1' > $f; if ((Get-Item -LiteralPath $f).Length -lt 1000) { Write-Host 'STOP     the script did not arrive; nothing ran' } else { pwsh -NoProfile -ExecutionPolicy Bypass -File $f -Mode Host -OutDir (Join-Path $d 'out') } }
+    if ([Environment]::MachineName -ne 'MEFORHV01') { Write-Host "STOP     this must run on MEFORHV01, but this is $([Environment]::MachineName); nothing ran" } else { $d = Join-Path $env:TEMP ('dpapi-reboot-' + [guid]::NewGuid().ToString('N')); $null = New-Item -ItemType Directory -Path $d; $repo = Join-Path $HOME 'mfsrc'; git -C $repo fetch origin '<SHA>'; $f = Join-Path $d 'dpapi_reboot_spike.ps1'; git -C $repo show '<SHA>:scripts/research/dpapi-reboot-spike/dpapi_reboot_spike.ps1' > $f; if ((Get-Item -LiteralPath $f).Length -lt 1000) { Write-Host 'STOP     the script did not arrive; nothing ran' } else { pwsh -NoProfile -ExecutionPolicy Bypass -File $f -Mode Host -OutDir (Join-Path $d 'out') } }
 
   It prints the DPAPI-REBOOT lines at the end and leaves them, the transcript and the raw reports
   in the out folder it names.
@@ -104,7 +111,7 @@
 param(
     [Parameter(Mandatory, Position = 0)][ValidateSet('Host', 'Payload', 'Guest')][string]$Mode,
     [Parameter(Position = 1)]
-    [ValidateSet('Install', 'Start', 'ProfileReload', 'Reboot', 'BootReport', 'Report', 'Uninstall')]
+    [ValidateSet('Install', 'Start', 'CrossCheck', 'ProfileReload', 'Reboot', 'BootReport', 'Report', 'Uninstall')]
     [string]$Step,
     # Start, ProfileReload and Reboot: the arm the next service start answers (A1 to A5).
     [Parameter(Position = 2)][ValidatePattern('^(A[1-5])?$')][string]$Arm = '',
@@ -327,6 +334,13 @@ public static class Spike
         return 0;
     }
 
+    public static int TryOpen(string path)
+    {
+        // Run as the administrator, against the service's own user-scope blob.
+        Console.WriteLine("admin_open=" + Open(ReadOrNull(path), null) + " by " + WindowsIdentity.GetCurrent().Name);
+        return 0;
+    }
+
     public static void Crash(string dir, Exception e)
     {
         File.WriteAllText(Path.Combine(dir, "crash-" + DateTime.UtcNow.Ticks + ".txt"), e.ToString());
@@ -366,6 +380,7 @@ public static class Program
     public static int Main(string[] args)
     {
         if (args.Length == 2 && args[0] == "--protect-foreign") { return Spike.ProtectForeign(args[1]); }
+        if (args.Length == 2 && args[0] == "--try-open") { return Spike.TryOpen(args[1]); }
         if (args.Length != 1)
         {
             Console.Error.WriteLine("usage: MeforDpapiReboot.exe <work dir> | --protect-foreign <work dir>");
@@ -390,6 +405,16 @@ function Invoke-Native {
     $exit = $LASTEXITCODE
     if ($null -eq $exit -or $exit -ne 0) { throw "$File $($Arguments -join ' ') exited '$exit': $out" }
     $out
+}
+
+function Invoke-Tolerant {
+    param([Parameter(Mandatory)][string]$File, [string[]]$Arguments)
+    # For a call whose failure costs one control, not the run: its output and exit code become a
+    # reading. Continue for the reason Invoke-Native gives.
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = $null
+    $out = (& $File @Arguments 2>&1 | Out-String).Trim()
+    "$out exit=$LASTEXITCODE"
 }
 
 function Get-ServiceSid {
@@ -481,9 +506,8 @@ function Step-Install {
     # counts for a write.
     $null = Invoke-Native 'icacls.exe' @($Work, '/grant', "*${sid}:(OI)(CI)M")
     $null = Invoke-Native 'icacls.exe' @($Bin, '/grant', "*${sid}:(OI)(CI)RX")
-    # Not Invoke-Native: a failure here costs one control, which the judge then reads as absent.
-    $foreign = (& $Exe --protect-foreign $Work 2>&1 | Out-String).Trim()
-    "$foreign exit=$LASTEXITCODE"
+    # A failure here costs one control, which the judge then reads as absent.
+    Invoke-Tolerant $Exe @('--protect-foreign', $Work)
     "install=OK service=$ServiceName account=$Account sid=$sid"
     "registration=ObjectName $($reg.ObjectName), ServiceSidType 3 (restricted), RequiredPrivileges $privs, Start 2 (auto)"
 }
@@ -499,6 +523,13 @@ function Step-Start {
         return
     }
     Complete-Report $Arm 120
+}
+
+function Step-CrossCheck {
+    # The administrator tries the service's own user-scope blob; the judge needs it refused.
+    $line = Invoke-Tolerant $Exe @('--try-open', (Join-Path $Work 'user.blob'))
+    Set-Content -LiteralPath (Join-Path $Work 'crosscheck.txt') -Value $line -Encoding ASCII
+    "crosscheck $line"
 }
 
 function Step-ProfileReload {
@@ -555,6 +586,7 @@ function Invoke-GuestStep([string]$Name) {
     switch ($Name) {
         'Install' { Step-Install }
         'Start' { Step-Start }
+        'CrossCheck' { Step-CrossCheck }
         'ProfileReload' { Step-ProfileReload }
         'Reboot' { Step-Reboot }
         'BootReport' { Step-BootReport }
@@ -565,9 +597,12 @@ function Invoke-GuestStep([string]$Name) {
 }
 
 # The arms both routes run before any reboot, as (step, arm) pairs.
-$PreRebootSteps = @(@('Install', ''), @('Start', 'A1'), @('Start', 'A2'), @('ProfileReload', 'A3'))
+$PreRebootSteps = @(@('Install', ''), @('Start', 'A1'), @('CrossCheck', ''), @('Start', 'A2'), @('ProfileReload', 'A3'))
 
 # --- the judge ----------------------------------------------------------------------------------
+
+# CryptUnprotectData's refusal of another account's user-scope blob, as the 2026-11-04 runs read it.
+$NteBadKeyState = 'FAIL win32=-2146893813'
 
 function Read-Report([string]$Dir, [string]$Name) {
     $path = Join-Path $Dir "report-$Name.txt"
@@ -589,9 +624,13 @@ function Get-Verdict($Report, [string]$Action, [string]$Extra) {
         return @('INCONCLUSIVE', "ran as $($Report['identity']) $($Report['sid']), not the virtual account")
     }
     if ($Report['action'] -ne $Action) { return @('INCONCLUSIVE', "action $($Report['action']), not $Action") }
-    if ($Action -eq 'protect' -and $Report['protect_user'] -ne 'OK') { return @('NO', "protect_user $($Report['protect_user'])") }
+    if ($Action -eq 'protect' -and $Report['protect_user'] -ne 'OK') {
+        # Only a NO when machine scope worked in the same process; else DPAPI itself did not run.
+        if ($Report['protect_machine'] -eq 'OK') { return @('NO', "protect_user $($Report['protect_user']); protect_machine OK") }
+        return @('INCONCLUSIVE', "protect_user $($Report['protect_user']), protect_machine $($Report['protect_machine'])")
+    }
     $controls = "foreign $($Report['control_foreign']), tampered $($Report['control_tampered']), machine $($Report['machine_unprotect'])"
-    $held = ([string]$Report['control_foreign']).StartsWith('FAIL') -and ([string]$Report['control_tampered']).StartsWith('FAIL') -and
+    $held = $Report['control_foreign'] -eq $NteBadKeyState -and ([string]$Report['control_tampered']).StartsWith('FAIL') -and
         $Report['machine_unprotect'] -eq 'OK match'
     if (-not $held) { return @('INCONCLUSIVE', "a control FAILED: $controls") }
     if ($Extra) { return @('INCONCLUSIVE', "$Extra; controls HELD: $controls") }
@@ -601,32 +640,41 @@ function Get-Verdict($Report, [string]$Action, [string]$Extra) {
     @('INCONCLUSIVE', "user_unprotect $user; controls HELD: $controls")
 }
 
-function Get-BootGap($Earlier, $Later) {
-    # Seconds between the boots two reports ran in, each its own clock less its own uptime.
-    ([DateTime]::Parse($Later['boot_utc']).ToUniversalTime() - [DateTime]::Parse($Earlier['boot_utc']).ToUniversalTime()).TotalSeconds
+function Get-RebootProblem($Before, $After) {
+    # '' when a reboot lies between the two reports. Either reading proves one: the tick count went
+    # down (it resets only at a boot), or the boot time moved 60 s or more. The second rests on the
+    # guest clock, the first does not.
+    if (-not $Before -or -not $After) { return 'no reboot shown: a report is missing' }
+    if ([UInt64]$After['uptime_ms'] -lt [UInt64]$Before['uptime_ms']) { return '' }
+    $gap = ([DateTime]::Parse($After['boot_utc']).ToUniversalTime() - [DateTime]::Parse($Before['boot_utc']).ToUniversalTime()).TotalSeconds
+    if ($gap -ge 60) { return '' }
+    "no reboot shown: uptime did not go down and boot times differ by $([int]$gap) s"
 }
 
 function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
     # Returns @{ Lines; Verdicts }, Verdicts keyed A1 to A5.
     $r = @{}
     foreach ($a in 'A1', 'A2', 'A3', 'A4', 'A5') { $r[$a] = Read-Report $Dir $a }
+    # A global control: the administrator must not open the service's user-scope blob.
+    $cross = ''
+    $cf = Join-Path $Dir 'crosscheck.txt'
+    if (Test-Path -LiteralPath $cf) { $cross = (Get-Content -LiteralPath $cf -Raw).Trim() }
+    $crossProblem = ''
+    if (-not $cross.StartsWith('admin_open=FAIL ')) { $crossProblem = "crosscheck FAILED: '$cross'" }
     $v = @{}
-    $v['A1'] = Get-Verdict $r['A1'] 'protect' ''
-    $v['A2'] = Get-Verdict $r['A2'] 'unprotect' ''
+    $v['A1'] = Get-Verdict $r['A1'] 'protect' $crossProblem
+    $v['A2'] = Get-Verdict $r['A2'] 'unprotect' $crossProblem
     $extra = 'the profile was not seen unloaded before the start'
     $pf = Join-Path $Dir 'profile-A3.txt'
     if ((Test-Path -LiteralPath $pf) -and ((Get-Content -LiteralPath $pf -Raw) -match 'loaded_before_start=False')) { $extra = '' }
+    if ($crossProblem) { $extra = $crossProblem }
     $v['A3'] = Get-Verdict $r['A3'] 'unprotect' $extra
     if ($Rebooted) {
-        $extra = 'no reboot shown: report-A3 or report-A4 is missing'
-        if ($r['A3'] -and $r['A4']) {
-            $gap = Get-BootGap $r['A3'] $r['A4']
-            if ($gap -ge 60) { $extra = '' } else { $extra = "boot times differ by $([int]$gap) s, under 60" }
+        foreach ($a in 'A4', 'A5') {
+            $extra = Get-RebootProblem $r['A3'] $r[$a]
+            if ($crossProblem) { $extra = $crossProblem }
+            $v[$a] = Get-Verdict $r[$a] 'unprotect' $extra
         }
-        $v['A4'] = Get-Verdict $r['A4'] 'unprotect' $extra
-        $extra = 'report-A5 is not from the boot report-A4 is from'
-        if ($r['A4'] -and $r['A5'] -and [Math]::Abs((Get-BootGap $r['A4'] $r['A5'])) -lt 60) { $extra = '' }
-        $v['A5'] = Get-Verdict $r['A5'] 'unprotect' $extra
     } else {
         $notRun = @('NOT RUN', 'this route cannot reboot the VM inside a run')
         $v['A4'] = $notRun
@@ -639,11 +687,14 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
         A4 = 'A4 after a reboot, the SCM start at boot'
         A5 = 'A5 after a reboot, a demand start'
     }
-    $lines = @(foreach ($a in 'A1', 'A2', 'A3', 'A4', 'A5') { "DPAPI-REBOOT $($names[$a]): $($v[$a][0]) ($($v[$a][1]))" })
+    $lines = @("DPAPI-REBOOT crosscheck, the administrator opens the service's user-scope blob: $cross")
+    $lines += @(foreach ($a in 'A1', 'A2', 'A3', 'A4', 'A5') { "DPAPI-REBOOT $($names[$a]): $($v[$a][0]) ($($v[$a][1]))" })
     $overall = 'NOT RUN'
     if ($Rebooted) {
-        if ($v['A4'][0] -eq 'YES' -and $v['A5'][0] -eq 'YES') { $overall = 'SURVIVES' }
-        elseif ($v['A4'][0] -eq 'NO' -or $v['A5'][0] -eq 'NO') { $overall = 'DOES NOT SURVIVE' }
+        # A5 is the survival question: a demand start, once boot is over. A4 can only narrow it.
+        if ($v['A5'][0] -eq 'YES' -and $v['A4'][0] -eq 'YES') { $overall = 'SURVIVES' }
+        elseif ($v['A5'][0] -eq 'YES' -and $v['A4'][0] -eq 'NO') { $overall = 'SURVIVES, BUT NOT AT THE BOOT-TIME START' }
+        elseif ($v['A5'][0] -eq 'NO') { $overall = 'DOES NOT SURVIVE' }
         else { $overall = 'INCONCLUSIVE' }
     }
     @{ Lines = $lines + "DPAPI-REBOOT VERDICT: $overall"; Verdicts = $v }
@@ -659,7 +710,7 @@ function Invoke-PayloadStep([string]$Log, [string]$Name, [string]$ArmName) {
 
 function Invoke-Payload {
     # Returns the exit code: 0 when A1 and A2 are YES and A3 is not NO. A3 reads INCONCLUSIVE when
-    # the profile never unloads, which the 2026-11-04 run showed is this build's behaviour, not a
+    # the profile never unloads, which the 2026-11-04 runs showed is this build's behaviour, not a
     # fault of the run.
     if (-not $OutDir) { throw '-Mode Payload needs -OutDir (entry.ps1 passes HVTEST_RESULTS)' }
     $null = New-Item -ItemType Directory -Force -Path $OutDir
@@ -687,9 +738,10 @@ function Write-Log([string]$Line) {
 }
 
 function Invoke-Guest($Session, [string]$GuestStep, [string]$ArmName = '') {
+    # Streamed, so the lines a step printed before it threw still reach the log.
     Write-Log "----- guest step $GuestStep $ArmName -----"
-    $out = Invoke-Command -Session $Session -FilePath $PSCommandPath -ArgumentList 'Guest', $GuestStep, $ArmName
-    foreach ($line in @($out)) { Write-Log ([string]$line) }
+    Invoke-Command -Session $Session -FilePath $PSCommandPath -ArgumentList 'Guest', $GuestStep, $ArmName |
+        ForEach-Object { Write-Log ([string]$_) }
 }
 
 function Get-GuestBoot($Session) {
@@ -698,7 +750,8 @@ function Get-GuestBoot($Session) {
 
 function Wait-GuestSession($Credential, [Nullable[DateTime]]$BootAfter, [int]$Seconds) {
     # Each failed attempt is logged with its type. While a guest boots the failure types vary (the
-    # VM bus not up, the credential service not up, a session that drops), so no one type is caught.
+    # VM bus not up, the credential service not up, a session that drops), so no one type is caught;
+    # a refused credential is the exception, and stops the wait at once.
     $deadline = (Get-Date).AddSeconds($Seconds)
     while ((Get-Date) -lt $deadline) {
         $s = $null
@@ -709,12 +762,26 @@ function Wait-GuestSession($Credential, [Nullable[DateTime]]$BootAfter, [int]$Se
             if ($boot -gt $BootAfter.Value.AddSeconds(30)) { Write-Log "guest back, last boot $($boot.ToString('o'))"; return $s }
             Remove-PSSession $s
         } catch {
-            Write-Log "waiting for the guest: $($_.Exception.GetType().FullName): $($_.Exception.Message)"
             if ($s) { Remove-PSSession $s -ErrorAction SilentlyContinue }
+            if ($_.Exception.Message -match 'credential is invalid') { throw "STOP     the VM credential was refused: $($_.Exception.Message)" }
+            Write-Log "waiting for the guest: $($_.Exception.GetType().FullName): $($_.Exception.Message)"
         }
         Start-Sleep -Seconds 10
     }
     throw "STOP     no PowerShell Direct session to $VMName within $Seconds s"
+}
+
+function Enter-HvTestLock {
+    # hvtest's own per-VM lock (HvTestRunner.ps1 Enter-VmLock): the open handle with no sharing is
+    # the lock, so while this run holds it an hvtest run on the VM reports busy, and this run cannot
+    # start while one is in flight.
+    $path = Join-Path 'C:\ProgramData\hvtest\lock' ($VMName.ToLowerInvariant() + '.lock')
+    if (-not (Test-Path -LiteralPath (Split-Path -Parent $path))) { throw "STOP     no hvtest lock folder at $(Split-Path -Parent $path); nothing ran" }
+    try {
+        New-Object System.IO.FileStream ($path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    } catch [System.Management.Automation.MethodInvocationException] {
+        throw "STOP     $VMName is busy: an hvtest run holds $path ($($_.Exception.GetBaseException().Message)); nothing ran"
+    }
 }
 
 function Invoke-HostRun {
@@ -722,43 +789,68 @@ function Invoke-HostRun {
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'STOP     run this from PowerShell started with Run as administrator; nothing ran' }
     Import-Module Hyper-V
     if (-not $OutDir) { throw 'STOP     -Mode Host needs -OutDir; nothing ran' }
-    $vm = Get-VM -Name $VMName
-    if ($vm.State -ne 'Off') { throw "STOP     $VMName is $($vm.State), not Off; an hvtest run may hold it. Wait until 'ssh hvtest list' shows it Off; nothing ran" }
-    $snap = Get-VMSnapshot -VMName $VMName -Name $Checkpoint
-    $lab = Get-VMSwitch -Name 'MEFOR-Lab'
-    if ([string]$lab.SwitchType -ne 'Private') { throw "STOP     MEFOR-Lab is $($lab.SwitchType), not Private; nothing ran" }
-    $null = New-Item -ItemType Directory -Force -Path $OutDir
-    $script:HostLog = Join-Path $OutDir 'dpapi-reboot-spike-host.txt'
     $cred = Get-Credential -UserName $VmUser -Message "Local administrator of the test VM $VMName (the hvtest VM credential)"
+    # Every check after the prompt, which can sit for any length of time, and under the lock.
+    $lock = Enter-HvTestLock
+    try {
+        $vm = @(Get-VM -Name $VMName)
+        if ($vm.Count -ne 1) { throw "STOP     $($vm.Count) VMs are named $VMName, not 1; nothing ran" }
+        if ($vm[0].State -ne 'Off') { throw "STOP     $VMName is $($vm[0].State), not Off; nothing ran" }
+        $snap = @(Get-VMSnapshot -VMName $VMName -Name $Checkpoint)
+        if ($snap.Count -ne 1) { throw "STOP     $VMName has $($snap.Count) checkpoints named $Checkpoint, not 1; nothing ran" }
+        $snap = $snap[0]
+        $lab = @(Get-VMSwitch -Name 'MEFOR-Lab')
+        if ($lab.Count -ne 1 -or [string]$lab[0].SwitchType -ne 'Private') { throw "STOP     MEFOR-Lab is not one Private switch; nothing ran" }
+        $null = New-Item -ItemType Directory -Force -Path $OutDir
+        $script:HostLog = Join-Path $OutDir 'dpapi-reboot-spike-host.txt'
+        $reports = Join-Path $OutDir 'reports'
+        $null = New-Item -ItemType Directory -Force -Path $reports
+        Invoke-Rig $cred $snap $reports
+    } finally {
+        $lock.Dispose()
+    }
+}
+
+function Invoke-Rig($Credential, $Snap, [string]$Reports) {
     $session = $null
-    # After the prompt, so the transcript never holds it. It catches what the log does not: an
-    # error that ends the run.
+    # After the prompt, so the transcript never holds it.
     $null = Start-Transcript -LiteralPath (Join-Path $OutDir 'transcript.txt')
     try {
         Write-Log "host=$([Environment]::MachineName) vm=$VMName checkpoint=$Checkpoint utc=$((Get-Date).ToUniversalTime().ToString('o'))"
-        Restore-VMSnapshot -VMSnapshot $snap -Confirm:$false
+        Restore-VMSnapshot -VMSnapshot $Snap -Confirm:$false
         foreach ($nic in @(Get-VMNetworkAdapter -VMName $VMName)) {
             if ($nic.SwitchName -and $nic.SwitchName -ne 'MEFOR-Lab') { throw "STOP     $VMName has an adapter on '$($nic.SwitchName)', not MEFOR-Lab; not started" }
         }
         Start-VM -Name $VMName
-        $session = Wait-GuestSession $cred $null 600
+        $session = Wait-GuestSession $Credential $null 600
         foreach ($s in $PreRebootSteps) { Invoke-Guest $session $s[0] $s[1] }
         $bootBefore = Get-GuestBoot $session
         Invoke-Guest $session 'Reboot' 'A4'
         Remove-PSSession $session
         $session = $null
-        $session = Wait-GuestSession $cred $bootBefore 900
+        $session = Wait-GuestSession $Credential $bootBefore 900
         Invoke-Guest $session 'BootReport'
         Invoke-Guest $session 'Start' 'A5'
-        $reports = Join-Path $OutDir 'reports'
-        $null = New-Item -ItemType Directory -Force -Path $reports
-        Copy-Item -FromSession $session -Path 'C:\mefor-dpapi-reboot\work\*.txt' -Destination $reports
-        Invoke-Guest $session 'Uninstall'
-        foreach ($line in (Invoke-Judge $reports $true).Lines) { Write-Log $line }
+    } catch {
+        # Logged here: the transcript stops in finally, before a rethrown error reaches the console.
+        Write-Log "FAILED: $($_.Exception.GetType().FullName): $($_.Exception.Message)"
+        throw
     } finally {
-        if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
+        # The readings come out before the revert destroys them, on success and failure alike.
+        if ($session) {
+            try {
+                Copy-Item -FromSession $session -Path 'C:\mefor-dpapi-reboot\work\*.txt' -Destination $Reports -ErrorAction Stop
+                Invoke-Guest $session 'Uninstall'
+            } catch {
+                Write-Log "could not copy the reports or uninstall: $($_.Exception.Message)"
+            }
+            Remove-PSSession $session -ErrorAction SilentlyContinue
+        } else {
+            Write-Log 'no guest session at the end, so no reports were copied'
+        }
+        foreach ($line in (Invoke-Judge $Reports $true).Lines) { Write-Log $line }
         Stop-VM -Name $VMName -TurnOff -Force -ErrorAction Continue
-        Restore-VMSnapshot -VMSnapshot $snap -Confirm:$false -ErrorAction Continue
+        Restore-VMSnapshot -VMSnapshot $Snap -Confirm:$false -ErrorAction Continue
         Write-Log "$VMName turned off and reverted to $Checkpoint; output in $OutDir"
         $null = Stop-Transcript
     }
