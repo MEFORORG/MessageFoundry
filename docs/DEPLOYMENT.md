@@ -1154,10 +1154,12 @@ posture gate refuses the setting itself — **reported is not gated**, and the t
 either implied the other (a `dialect='generic'` DATABASE hop with a mode outside the no-TLS deny-list is
 not gated and not on the `generic-db-tls` line, so name it as that). `tls_allow_expired` is not inert to the revocation guard, though: it also
 skips a CRL's own validity window, so a hop that sets it must earn **no CRL credit**. Its call site
-hands the guard no context or opener when the setting is on (`skips_validity_period` reads it off the
-context), as MLLP, the DICOM C-STORE SCU, REST, SOAP, FHIR and both FTPS directions do, and a new call
-site names `EXPIRY_RELAXED_WAYS_ACROSS` as its remedy (ADR 0173 §13). A connector that takes the
-setting and hands the guard its relaxed context lets a stale CRL admit the hop. CORRECTED 2026-10-30:
+says so when the setting is on: at least MLLP, the DICOM C-STORE SCU and both FTPS directions pass
+the context they dial with and `expiry_relaxed=True` to `RevocationHopGuard.capture`, which drops the
+CRL credit and names `EXPIRY_RELAXED_WAYS_ACROSS` as the remedy, and at least REST, SOAP and FHIR hand
+the guard no context or opener (ADR 0173 §13 and its §4.3 note of 2026-11-03). A new call site passes
+the flag. A connector that takes the setting and hands the guard its relaxed context without the flag
+lets a stale CRL admit the hop (vault BACKLOG #5086). CORRECTED 2026-10-30:
 this said `tls_allow_expired` must be listed "even though no refusal keys on it", which stopped being
 true once the call sites handed the guard no context or opener for such a hop, so it earns no CRL
 credit (on MLLP and the DICOM C-STORE SCU since vault BACKLOG #2978); and a field with no factory parameter and no `connections.toml`

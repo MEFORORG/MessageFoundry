@@ -897,7 +897,8 @@ def relax_verify_expiry(ctx: ssl.SSLContext, *, host: str) -> None:
     The granular alternative to the blunt ``tls_verify=false`` (which drops chain AND hostname AND expiry
     together via ``CERT_NONE``): this ORs :data:`_X509_V_FLAG_NO_CHECK_TIME` into ``ctx.verify_flags`` so a
     peer certificate whose ``notAfter`` has passed (or whose ``notBefore`` is in the future) is accepted
-    **while the chain is still fully validated, and the hostname too unless the hop also sets
+    **while the chain's signatures, names and constraints are still validated (not its validity
+    periods, as above), and the hostname too unless the hop also sets
     ``tls_check_hostname=false``**. It is a per-connection opt-in
     (``tls_allow_expired=true``) for a partner that has let its server cert lapse — a real-world
     operational reality — without opening the MITM hole ``tls_verify=false`` does.
@@ -944,8 +945,10 @@ def skips_validity_period(ctx: ssl.SSLContext) -> bool:
 
     OpenSSL applies that flag to a CRL's validity window as well as the certificate's, so a CRL past
     ``nextUpdate`` is accepted at the handshake on such a context. A CRL there is therefore no
-    evidence of a revocation check that may relax a :class:`RevocationHopGuard` refusal. The MLLP
-    destination and the DICOM SCU ask this of the context they dial with and, on True, pass
+    evidence of a revocation check that may relax a :class:`RevocationHopGuard` refusal.
+    :meth:`RevocationHopGuard.capture` asks it of every context it is handed, for
+    :attr:`~RevocationHopGuard.crl_is_a_check`. At least the MLLP destination and the DICOM SCU
+    also ask it of the context they dial with and, on True, pass
     ``expiry_relaxed=True`` to :meth:`RevocationHopGuard.capture`, which drops the CRL credit and
     names :data:`EXPIRY_RELAXED_WAYS_ACROSS` (vault BACKLOG #2978 and #5089, ADR 0173 §13). FTPS
     (vault BACKLOG #2193) reaches the same answer from the ``tls_allow_expired`` setting and passes
@@ -2689,8 +2692,9 @@ class RevocationHopGuard:
     #: be false there.
     expiry_relaxed: bool = False
     #: Whether the context handed to :meth:`capture` skips the validity-period check
-    #: (:func:`skips_validity_period`), whatever the caller said. It feeds :attr:`crl_is_a_check`
-    #: only; no disposition and no wording reads it.
+    #: (:func:`skips_validity_period`), whatever the caller said. It feeds :attr:`crl_is_a_check`,
+    #: which at least :meth:`enforce_construction` and the AI broker read to decide whether the
+    #: attested crossing is logged. :meth:`_disposition` and :meth:`_detail` do not read it.
     context_skips_validity: bool = False
     #: This hop's OWN remediation sentence, for a hop the connection-shaped default does not fit
     #: (BACKLOG #1498). The default names ``[tls].crl_file`` and a connection's

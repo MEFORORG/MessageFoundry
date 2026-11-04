@@ -2112,8 +2112,9 @@ def _guard_ftps_revocation(
 
     A ``tls_allow_expired`` hop passes ``expiry_relaxed=True``, which drops the CRL credit, so a
     CRL cannot relax its refusal and only an attestation crosses it (ADR 0173 §13).
-    ``relax_verify_expiry`` sets ``X509_V_FLAG_NO_CHECK_TIME``, which OpenSSL applies to a CRL's validity window as well as the certificate's, so a CRL past
-    ``nextUpdate`` would still be accepted. The REST family reads the same setting for the same
+    ``relax_verify_expiry`` sets ``X509_V_FLAG_NO_CHECK_TIME``, which OpenSSL applies to a CRL's
+    validity window as well as the certificate's, so a CRL past ``nextUpdate`` would still be
+    accepted. The REST family reads the same setting for the same
     reason (``refuse_unrevoked_verified_hop``, vault BACKLOG #2188); the truthiness here is the
     one ``_ftps_ssl_context`` relaxes on."""
     if context is None or context.verify_mode is ssl.CERT_NONE:
