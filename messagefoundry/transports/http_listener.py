@@ -824,9 +824,9 @@ class HttpSource(SourceConnector):
             on_client_ca=loaded_client_ca.append,
         )
         # Failed TLS handshakes and their throttled `tls_handshake_failed` events (vault BACKLOG
-        # #3302), counted as the MLLP listener counts them: `_start_tls` where this listener runs
-        # the handshake, and the context's hook (`HandshakeFailures.watch`, armed at start()) where
-        # the loop does. The peer is known only in the first case.
+        # #3302): `_start_tls` counts where this listener runs the handshake, as the MLLP
+        # listener's does, and the context's hook (`HandshakeFailures.watch`, armed at start())
+        # where the loop does. The peer is known only in the first case.
         self._tls_failures = HandshakeFailures(self._emit_tls_failure)
         # True while this listener runs TLS handshakes itself, after admission (BACKLOG #2479); set
         # at start() from the running loop, see `_upgrades_tls_itself`.

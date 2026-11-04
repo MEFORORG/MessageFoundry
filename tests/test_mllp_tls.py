@@ -972,7 +972,7 @@ def test_stop_and_restart_on_uvloop(
         finally:
             await _close_raw(writer)
         if cert is not None:
-            # Restored first, so the real client never races the shortened bound.
+            # Back to the real bound for the real client.
             monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 10.0)
             await source.start(_ack)
             try:
@@ -1414,6 +1414,9 @@ async def _plaintext_upgrade_probe(tmp_path: Path) -> tuple[int, bool]:
             completed = True
         except (OSError, AttributeError):  # AttributeError: closed during it, see `_start_tls`
             completed = False
+        except Exception as exc:  # any other fault fails the probe now, rather than as a timeout
+            outcome.set_exception(exc)
+            raise
         outcome.set_result((buffered, completed))
         with contextlib.suppress(AttributeError, OSError):
             writer.close()

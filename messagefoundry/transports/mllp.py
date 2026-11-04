@@ -1643,6 +1643,11 @@ def _lost_its_transport(writer: asyncio.StreamWriter) -> bool:
 _ACCEPT_RETRY_DELAY = 1.0
 
 
+#: The accept failures that mean a resource ran short, after which `_AcceptingServer` waits
+#: `_ACCEPT_RETRY_DELAY` before accepting again; the same set asyncio's own server pauses on. Any
+#: other failure belongs to the one connection, which is skipped.
+_ACCEPT_SHORTAGE = frozenset({errno.EMFILE, errno.ENFILE, errno.ENOBUFS, errno.ENOMEM})
+
 #: What binding an address reports where its family is not enabled on the host, for example ``::1``
 #: with IPv6 disabled. ``asyncio.start_server`` skips such an address; so does `_bind_tcp`.
 _FAMILY_NOT_ENABLED = frozenset({errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT})
@@ -1657,6 +1662,7 @@ async def _bind_tcp(host: str, port: int) -> list[socket.socket]:
         host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
     sockets: list[socket.socket] = []
+    skipped: OSError | None = None
     try:
         for family, _kind, _proto, _canonname, address in dict.fromkeys(infos):
             try:
@@ -1664,8 +1670,16 @@ async def _bind_tcp(host: str, port: int) -> list[socket.socket]:
             except OSError as exc:
                 if exc.errno not in _FAMILY_NOT_ENABLED:
                     raise
+                logger.debug(
+                    "MLLP listener skipped %r, its family is not enabled: %s",
+                    address,
+                    safe_exc(exc),
+                )
+                skipped = exc
         if not sockets:
-            raise OSError(f"MLLP listener: {host!r} resolved to no address to bind")
+            # The last skip keeps its errno, so a bind host no interface holds still reads as a
+            # bind failure (EADDRNOTAVAIL) to the runner, as it does from asyncio.start_server.
+            raise skipped or OSError(f"MLLP listener: {host!r} resolved to no address to bind")
     except BaseException:
         for sock in sockets:
             sock.close()
@@ -1701,14 +1715,16 @@ class _AcceptedPeer:
         return self._peername if name == "peername" else default
 
 
-def _closer(sock: socket.socket) -> Callable[[asyncio.Task[None]], None]:
+def _closer(sock: socket.socket, name: str) -> Callable[[asyncio.Task[None]], None]:
     """A done callback for an accept loop: close its listening socket ``sock`` whatever the task's
     outcome, and log a fault that ended it, since nothing else would record that it stopped."""
 
     def close(done: asyncio.Task[None]) -> None:
         sock.close()
         if not done.cancelled() and (exc := done.exception()) is not None:
-            logger.error("MLLP listener accept loop failed and stopped: %s", safe_exc(exc))
+            logger.error(
+                "MLLP listener %s: accept loop failed and stopped: %s", name, safe_exc(exc)
+            )
 
     return close
 
@@ -1724,29 +1740,41 @@ class _AcceptingServer:
     """
 
     def __init__(
-        self, sockets: list[socket.socket], on_socket: Callable[[socket.socket], None]
+        self,
+        sockets: list[socket.socket],
+        on_socket: Callable[[socket.socket], None],
+        *,
+        name: str,
     ) -> None:
         self.sockets = sockets
+        self._name = name
         loop = asyncio.get_running_loop()
         self._accepting: list[asyncio.Task[None]] = []
         for sock in sockets:
             task = loop.create_task(self._accept(sock, on_socket))
             # Closed once its accept loop is done, so never under an accept still pending, and
             # closed even if the task is cancelled before its first step.
-            task.add_done_callback(_closer(sock))
+            task.add_done_callback(_closer(sock, name))
             self._accepting.append(task)
 
-    @staticmethod
-    async def _accept(sock: socket.socket, on_socket: Callable[[socket.socket], None]) -> None:
+    async def _accept(
+        self, sock: socket.socket, on_socket: Callable[[socket.socket], None]
+    ) -> None:
         loop = asyncio.get_running_loop()
         while True:
             try:
                 conn, _address = await loop.sock_accept(sock)
-            except ConnectionAbortedError:
-                continue  # the peer went before it was accepted, as asyncio's own server skips it
             except OSError as exc:
+                if exc.errno not in _ACCEPT_SHORTAGE:
+                    # This connection's own failure, the peer gone before the accept among them:
+                    # skip it, as asyncio's own server does, and keep accepting.
+                    logger.debug(
+                        "MLLP listener %s skipped a failed accept: %s", self._name, safe_exc(exc)
+                    )
+                    continue
                 logger.warning(
-                    "MLLP listener accept failed, retrying in %gs: %s",
+                    "MLLP listener %s accept failed, retrying in %gs: %s",
+                    self._name,
                     _ACCEPT_RETRY_DELAY,
                     safe_exc(exc),
                 )
@@ -2143,7 +2171,9 @@ class MLLPSource(SourceConnector):
                 self._on_tls_accept if self._upgrade_tls else self._on_client, self.host, self.port
             )
             return
-        self._server = _AcceptingServer(await _bind_tcp(self.host, self.port), self._on_tls_socket)
+        self._server = _AcceptingServer(
+            await _bind_tcp(self.host, self.port), self._on_tls_socket, name=self._pacing_name
+        )
 
     def _on_tls_socket(self, sock: socket.socket) -> None:
         """Take a socket `_AcceptingServer` accepted, in its own task (BACKLOG #1606). The socket
@@ -2183,8 +2213,10 @@ class MLLPSource(SourceConnector):
         assert self._ssl is not None
         try:
             peer = _AcceptedPeer(sock)
-        except OSError:
-            return  # gone before anything read it; the done callback closes it
+        except OSError as exc:
+            # Gone before anything read it; the done callback closes it.
+            logger.debug("MLLP connection gone before admission: %s", safe_exc(exc))
+            return
         peer_host = _peer_host(peer)
         refusal = self._admission.check(peer, peer_host)
         if refusal is not None:
@@ -2211,6 +2243,9 @@ class MLLPSource(SourceConnector):
                     ssl_shutdown_timeout=_TLS_SHUTDOWN_TIMEOUT,
                 )
             except OSError as exc:
+                # Out of `_handshakes` before the report below awaits, so a stop() that cancels the
+                # tasks still in their handshake cannot cancel a report already in flight.
+                self._handshakes.discard(task)
                 logger.debug(
                     "TLS handshake on MLLP from %s did not complete: %s",
                     peer.get_extra_info("peername"),
