@@ -804,12 +804,6 @@ class SoapDestination(DestinationConnector):
             if failure is not None:
                 raise failure  # byte-identical: a 2xx <Fault> still dead-letters/retries
             return None
-        # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any
-        # echoed secret before it leaves this method (a validating registry may echo a bad credential in
-        # its <Fault>). Guarded so a no-body_secrets connection is byte-identical.
-        if self._body_secrets:
-            body = self._scrub_body_secrets(body)
-            headers = {k: self._scrub_body_secrets(v) for k, v in headers.items()}
         if failure is not None:
             # Capturing: record the application <Fault> as a rejected reply rather than raising, so the
             # row is delivered-with-a-rejection (operators reconcile from the captured response).
@@ -875,15 +869,23 @@ class SoapDestination(DestinationConnector):
     def _post_and_classify(
         self, payload: str
     ) -> tuple[str, int, dict[str, str], DeliveryError | None]:
-        """:meth:`_post`, then the 2xx reply's classification, both in the caller's worker thread.
+        """:meth:`_post`, then the 2xx reply's classification and capture scrub, in the caller's
+        worker thread.
 
         A fault can arrive inside a 2xx body, so the reply is classified. Transport-level faults
         (non-2xx, URL/timeout) already raised inside _post, for both modes. The RAW reply is
         classified: a partner fault names none of OUR secrets, and _WSSE_FAULT_RE must see the
-        unscrubbed text. BACKLOG #2827: the scan reads up to the 16 MiB reply cap, so it stays off
-        the event loop, as the non-2xx scan inside _post already was."""
+        unscrubbed text. BACKLOG #2827: both passes read up to the 16 MiB reply cap, so they stay
+        off the event loop, as the non-2xx scan inside _post already was."""
         body, status, headers = self._post(payload)
-        return body, status, headers, _classify_soap(status, body)
+        failure = _classify_soap(status, body)
+        # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any
+        # echoed secret before send() returns it (a validating registry may echo a bad credential in
+        # its <Fault>). Guarded so a no-body_secrets connection is byte-identical.
+        if self.capture_response and self._body_secrets:
+            body = self._scrub_body_secrets(body)
+            headers = {k: self._scrub_body_secrets(v) for k, v in headers.items()}
+        return body, status, headers, failure
 
     def _post(self, payload: str) -> tuple[str, int, dict[str, str]]:
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before

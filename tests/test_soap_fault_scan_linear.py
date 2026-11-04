@@ -147,7 +147,10 @@ def _classify_2xx(body: str) -> object:
     "make", list(_PATHOLOGICAL_REPLIES.values()), ids=list(_PATHOLOGICAL_REPLIES)
 )
 def test_a_pathological_reply_is_classified_in_linear_time(make: Callable[[int], str]) -> None:
-    """The whole 2xx classification, every regex in it, on a reply up to 400,000 characters."""
+    """The whole 2xx classification, every regex in it, on a reply up to 400,000 characters. Each
+    shape is first shown to read as a fault, so the timing covers the fault-code extraction rather
+    than a fault-less fall-through to the status."""
+    assert isinstance(_classify_2xx(make(1_000)), NegativeAckError)
     readings = _scaling_ratios(_classify_2xx, make, 100_000)
     ratio = min(readings)
     assert ratio < _MAX_LINEAR_RATIO, (
@@ -156,12 +159,16 @@ def test_a_pathological_reply_is_classified_in_linear_time(make: Callable[[int],
 
 
 @pytest.mark.parametrize("shape", ["faultcode-start-tags", "unterminated-value-tags"])
-def test_the_linear_check_fails_the_old_patterns(shape: str) -> None:
+def test_the_linear_check_fails_the_old_patterns(
+    shape: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Positive control: the check above must fail the patterns #2827 replaced, or its pass proves
-    nothing. It asserts exactly the negation of that pass condition, once per old pattern and once
-    per tail (``(.*?)</`` and ``[^>]*>``). The old patterns took about 0.4 s at 44,000 characters,
-    so this runs at 4,000 and 16,000."""
-    readings = _scaling_ratios(_old_fault_code, _PATHOLOGICAL_REPLIES[shape], 4_000)
+    nothing. It times the same subject, the 2xx classification, with the old extraction patched
+    in, and asserts exactly the negation of that pass condition, once per old pattern and once per
+    tail (``(.*?)</`` and ``[^>]*>``). The old patterns took about 0.4 s at 44,000 characters, so
+    this runs at 4,000 and 16,000 rather than the linear check's sizes."""
+    monkeypatch.setattr(soap, "_fault_code", _old_fault_code)
+    readings = _scaling_ratios(_classify_2xx, _PATHOLOGICAL_REPLIES[shape], 4_000)
     ratio = min(readings)
     assert ratio >= _MAX_LINEAR_RATIO, (
         f"the old patterns scaled by only {ratio:.2f}x ({_attempts(readings)})"
@@ -195,12 +202,14 @@ class _Opener:
         return _Resp(self._body)
 
 
-def _dest() -> SoapDestination:
+def _dest(*, capture_response: bool) -> SoapDestination:
     d = build_destination(
         Destination(
             name="OB_SOAP",
             type=ConnectorType.SOAP,
-            settings=Soap(url="https://api.example.com/svc").settings,
+            settings=Soap(
+                url="https://api.example.com/svc", capture_response=capture_response
+            ).settings,
         ),
         egress=EgressSettings(deny_by_default=False),
     )
@@ -208,22 +217,52 @@ def _dest() -> SoapDestination:
     return d
 
 
-async def test_a_2xx_reply_is_classified_off_the_event_loop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Mutation: classify in ``send`` after the thread returns, as before #2827. Red: the recorded
-    thread is the loop's."""
-    threads: list[int] = []
+_SECRET = "an-echoed-credential"
 
-    def recording(status: int, body: str) -> DeliveryError | None:
-        threads.append(threading.get_ident())
+
+@pytest.mark.parametrize("capture_response", [False, True], ids=["raising", "capturing"])
+async def test_a_2xx_reply_is_classified_off_the_event_loop(
+    capture_response: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The POST, the classification and the capture scrub share one worker thread, not the loop's.
+
+    Mutation: classify, or scrub, in ``send`` after the thread returns, as before #2827. Red: that
+    recorded thread is the loop's. Mutation: a second ``to_thread`` hop for either. Red: the
+    threads differ from the POST's."""
+    threads: dict[str, list[int]] = {"post": [], "classify": [], "scrub": []}
+
+    def classify(status: int, body: str) -> DeliveryError | None:
+        threads["classify"].append(threading.get_ident())
         return _classify_soap(status, body)
 
-    monkeypatch.setattr(soap, "_classify_soap", recording)
-    dest = _dest()
-    fault = b"<soap:Fault><faultcode>soap:Client</faultcode></soap:Fault>"
-    dest._opener = _Opener(fault)  # type: ignore[assignment]
-    with pytest.raises(NegativeAckError):
-        await dest.send("<env/>")
-    assert len(threads) == 1
-    assert threads[0] != threading.get_ident()
+    monkeypatch.setattr(soap, "_classify_soap", classify)
+    dest = _dest(capture_response=capture_response)
+    # A secret the partner echoes in its Fault, which a capturing connection must mask.
+    dest._body_secrets = (("{{TOKEN}}", _SECRET),)
+    post, scrub = dest._post, dest._scrub_body_secrets
+
+    def recording_post(payload: str) -> tuple[str, int, dict[str, str]]:
+        threads["post"].append(threading.get_ident())
+        return post(payload)
+
+    def recording_scrub(text: str) -> str:
+        threads["scrub"].append(threading.get_ident())
+        return scrub(text)
+
+    monkeypatch.setattr(dest, "_post", recording_post)
+    monkeypatch.setattr(dest, "_scrub_body_secrets", recording_scrub)
+    fault = f"<soap:Fault><faultcode>soap:Client</faultcode>{_SECRET}</soap:Fault>"
+    dest._opener = _Opener(fault.encode())  # type: ignore[assignment]
+    if capture_response:
+        response = await dest.send("<env>{{TOKEN}}</env>")
+        assert response is not None and response.outcome == "rejected"
+        assert _SECRET not in response.body and "***" in response.body
+        assert threads["scrub"], "a capturing connection with body_secrets scrubs the reply"
+    else:
+        with pytest.raises(NegativeAckError, match="Sender fault"):
+            await dest.send("<env>{{TOKEN}}</env>")
+        assert not threads["scrub"]
+    (worker,) = threads["post"]
+    assert worker != threading.get_ident()
+    assert threads["classify"] == [worker]
+    assert set(threads["scrub"]) <= {worker}
