@@ -4401,13 +4401,39 @@ def _serve(args: argparse.Namespace) -> int:
     # [alerts] is not optional on a stock instance. The explicit, audited opt-out is
     # [alerts].security_notifications_required=false (accept the pull-only /me/security-events feed in
     # writing). "Effective channel" == notify_security_events on + SMTP host + sender (parity with the
-    # app.py notifier wiring). Not scoped to sign-in: `serve` always requires it (vault BACKLOG #2719),
-    # so there are always accounts to notify.
+    # app.py notifier wiring), with that host on [alerts].smtp_allowed_hosts. Not scoped to sign-in:
+    # `serve` always requires it (vault BACKLOG #2719), so there are always accounts to notify.
+    #
+    # BACKLOG #5088: a relay the allowlist omits is no channel. Every send to it is refused, and the
+    # notifier now refuses to build, so this gate names the allowlist rather than reporting a
+    # healthy channel. The test is alert_host_allowed, the one the build and every send apply. It
+    # lives here and not in an AlertsSettings validator, so `messagefoundry check` does not catch it.
+    from messagefoundry.pipeline.alert_sinks import alert_host_allowed
+
     security_channel_ready = bool(
         settings.auth.notify_security_events
         and settings.alerts.email_smtp_host
         and settings.alerts.email_from
     )
+    if security_channel_ready and not alert_host_allowed(
+        settings.alerts.email_smtp_host or "", settings.alerts.smtp_allowed_hosts
+    ):
+        # At every enforcement level and despite the waiver: the lifespan builds the security
+        # notifier on exactly this condition, and that build refuses the relay, so a start let
+        # through here would fail later, after the store opened. Refused here instead, naming the
+        # allowlist, so an operator is never told to configure an SMTP relay that is configured.
+        # The setting is named, never its value.
+        print(
+            "error: the out-of-band security-notification channel cannot send; refusing to start "
+            "(ASVS 6.3.5/6.3.7). [alerts].email_smtp_host is not in [alerts].smtp_allowed_hosts, "
+            "so the security notifier refuses to build and every notice to that relay would be "
+            "refused. List the relay in [alerts].smtp_allowed_hosts, or point "
+            "[alerts].email_smtp_host at a host it lists. [security].enforcement = warn and "
+            "[alerts].security_notifications_required=false do not admit it; to rely on the "
+            "pull-only feed instead, set that waiver and turn [auth].notify_security_events off.",
+            file=sys.stderr,
+        )
+        return 2
     if not security_channel_ready:
         if settings.alerts.security_notifications_required:
             if enforcing:

@@ -344,14 +344,21 @@ def test_email_transport_sends_via_smtp(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_email_transport_rejects_host_outside_allowlist() -> None:
     # WP-11c: an SMTP host not on [alerts].smtp_allowed_hosts is refused *before* connecting (egress
-    # control, parity with the webhook). The check fires first, so no SMTP fake is needed.
+    # control, parity with the webhook). The check fires first, so no SMTP fake is needed. Since
+    # BACKLOG #5088 the build refuses it too, a tightening: it used to build and fail every send.
+    with pytest.raises(ValueError, match="not in the configured allowlist"):
+        EmailTransport(
+            host="smtp.evil.example",
+            port=587,
+            sender="mf@example",
+            recipients=["ops@example"],
+            allowed_hosts=("smtp.corp.example",),
+        )
     t = EmailTransport(
-        host="smtp.evil.example",
-        port=587,
-        sender="mf@example",
-        recipients=["ops@example"],
-        allowed_hosts=("smtp.corp.example",),
+        host="smtp.corp.example", port=587, sender="mf@example", recipients=["ops@example"]
     )
+    t.allowed_hosts = ("smtp.corp.example",)
+    t.host = "smtp.evil.example"  # the send's own check, on a transport the build admitted
     with pytest.raises(ValueError, match="not in the configured allowlist"):
         t._send({"type": "connection_stopped", "connection": "OB_X", "detail": "x"})
 
