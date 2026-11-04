@@ -166,9 +166,9 @@ def test_the_poll_test_admits_mysql_scalar_insert_on_the_generic_dialect_only() 
 
 
 def test_an_env_dialect_poll_is_tested_as_generic_when_declared() -> None:
-    """A dialect that is not a literal is tested as ``generic`` at declaration, the permissive
-    superset: it admits MySQL's scalar ``INSERT()``, which the build re-tests with the resolved
-    dialect, and still refuses every write, as origin/main did with its single test.
+    """A dialect that is not a literal is tested as ``generic`` at declaration: it admits MySQL's
+    scalar ``INSERT()``, which the build re-tests with the resolved dialect, and still refuses every
+    write, as origin/main did with its single test.
 
     Red mutation: skip the declaration test for a non-literal dialect and the UPDATE poll declares."""
     from messagefoundry.config.wiring import env
@@ -185,6 +185,67 @@ def test_an_env_dialect_poll_is_tested_as_generic_when_declared() -> None:
         DatabasePoll(
             server="sql.example.com",
             poll_statement="UPDATE mf_inbox SET status='CLAIMED' WHERE status='NEW'",
+            dialect=env("DB_DIALECT"),  # type: ignore[arg-type]
+            mark_statement=_MARK,
+        )
+    _assert_refusal_text(str(info.value))
+
+
+# --- BACKLOG #5259: misses measured after engine PR 2718 ---------------------------------------------
+
+_GENERIC = {"dialect": "generic", "odbc_driver": "MySQL ODBC 9.0 Unicode Driver"}
+
+_POLL_MISSES = [
+    pytest.param("SELECT id, payload INTO#x FROM mf_inbox", {}, id="item1-sigil-glued-into"),
+    pytest.param("SELECT id FROM mf_inbox UPDATE@x SET a=1", {}, id="item1-sigil-glued-update"),
+    pytest.param("SELECT id FROM mf_inbox {call dbo.claim_next_batch}", {}, id="item3-call-escape"),
+    pytest.param("SELECT id FROM mf_inbox CALL claim_next_batch()", _GENERIC, id="item3-bare-call"),
+    pytest.param("SELECT id FROM mf_inbox --x\rDELETE FROM mf_inbox", {}, id="item4-lone-cr"),
+    pytest.param("SELECT 5 --1 INTO OUTFILE '/tmp/x'", _GENERIC, id="item2-dash-no-space"),
+    pytest.param("SELECT id FROM mf_inbox /*! INTO OUTFILE '/tmp/x' */", _GENERIC, id="item2-bang"),
+    pytest.param(
+        "SELECT id FROM mf_inbox /* /* */ DELETE FROM mf_inbox */", _GENERIC, id="extra-no-nest"
+    ),
+    pytest.param(
+        "SELECT id FROM mf_inbox #'\nDELETE FROM mf_inbox -- '", _GENERIC, id="extra-hash"
+    ),
+]
+
+
+@pytest.mark.parametrize(("poll", "over"), _POLL_MISSES)
+def test_a_poll_the_gate_used_to_miss_is_refused_when_declared_and_built(
+    poll: str, over: dict[str, str]
+) -> None:
+    """Each passed both the declaration and the build at origin/main e0f5f744e0. The generic rows
+    need the poll's dialect threaded through to the comment model.
+
+    Red mutation: drop ``dialect=`` from ``_read_only_poll_refusal``'s call and the generic rows
+    build."""
+    with pytest.raises(WiringError) as declared:
+        DatabasePoll(
+            server="sql.example.com",
+            database="MFDB",
+            poll_statement=poll,
+            mark_statement=_MARK,
+            **over,  # type: ignore[arg-type]
+        )
+    _assert_refusal_text(str(declared.value))
+    with pytest.raises(ValueError) as built:
+        _build_raw(poll, **over)
+    _assert_refusal_text(str(built.value))
+
+
+def test_an_env_dialect_poll_gets_the_mysql_comment_model_when_declared() -> None:
+    """An ``env()`` dialect is tested as ``generic`` at declaration, so a MySQL-only write is refused
+    there too, before the build tests the resolved dialect.
+
+    Red mutation: test a non-literal dialect as ``sqlserver`` and the poll declares."""
+    from messagefoundry.config.wiring import env
+
+    with pytest.raises(WiringError) as info:
+        DatabasePoll(
+            server="sql.example.com",
+            poll_statement="SELECT id FROM mf_inbox /*!DELETE FROM mf_inbox*/",
             dialect=env("DB_DIALECT"),  # type: ignore[arg-type]
             mark_statement=_MARK,
         )

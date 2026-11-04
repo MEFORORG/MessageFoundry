@@ -80,8 +80,8 @@ UNREADABLE_FILES_KEY = "unreadable_files"
 
 # What is hashed is what :func:`~messagefoundry.config.snapshot.read_config_snapshot` reads: every
 # config module (by ``config.snapshot._covered_name``, which gives the list a load digests and runs;
-# of the reads a load makes, only ADR 0036's trust check lists by ``config_py_files``, a separate
-# copy of the rule; ``_``-prefixed helpers included and a dot-named ``.IB_OLD.py`` or AppleDouble
+# of the reads a load makes, only ADR 0036's trust check lists by ``config_py_files``, which applies
+# the same rule; ``_``-prefixed helpers included and a dot-named ``.IB_OLD.py`` or AppleDouble
 # ``._X.py`` skipped), ``connections.toml``, each ``codesets/`` table, and each
 # ``environments/*.toml`` under the config directory. The last is never loaded as config. The value
 # file a serve start reads sits

@@ -309,15 +309,35 @@ toggle there was always whole. A database writer outside the store is still the 
 above. The order follows from the code: when this was written the live cross-handle test (AC-7) ran
 only on SQLite, and its Postgres and SQL Server legs run on hosted CI alone. The fix has a cost: a
 toggle now waits on its flag statement holding the audit lock, so a foreign lock on
-`connection_flag` would hold every audit append in the store while it waits. That wait is bounded
-at `CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS`, 5 s, under the engine's 10 s bound on the store call:
-`lock_timeout` local to the toggle's transaction on Postgres, kept where the role or database sets
-a stricter one, and `SET LOCK_TIMEOUT` on SQL Server, put back to -1 after the statement or after
-the rollback. Past it the toggle raises `ConnectionFlagLockTimeout`, which is never retried, rolls
-back and releases the audit lock, having written nothing, and the API answers 503. Before the bound
-each such wait ran to the driver's query timeout, 30 s by default, and without end at
-`command_timeout = 0`. Its live test, a foreign transaction holding the row while an audit append
-runs from another handle, runs on the Postgres and SQL Server legs, hosted CI only.
+`connection_flag` would hold every audit append in the store while it waits. Each such lock wait
+is bounded at `CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS` in `store/base.py`, under the engine's
+`CONNECTION_FLAG_WRITE_TIMEOUT_SECONDS` on the store call: `lock_timeout` local to the toggle's
+transaction on Postgres, kept where the role or database sets a stricter one, and `SET
+LOCK_TIMEOUT` on SQL Server, put back to -1 after the statement or after a rollback. Past it the
+toggle raises `ConnectionFlagLockTimeout`, which is never retried, having written nothing, and the
+API answers 503. The rollback releases the audit lock; where the rollback itself fails, the
+connection is discarded and the lock is held until the server ends that session. Other writes that
+take the audit lock before a row lock, at least the approval writes, are not bounded by this. Its
+live test, a foreign transaction holding the row while an audit append runs from another handle,
+runs on the Postgres and SQL Server legs, hosted CI only.
+
+**What the bound does not cover, at least.** The bound is per lock wait, not per statement or per
+toggle: each wait gets it in full, so a statement that meets two locks can pass it and meet the
+engine's cut-off instead. It does not bound the toggle's own wait for the audit lock, which keeps
+the bound it had. On Postgres it also bounds the audit append's lock waits, so a lock on
+`audit_log` held past it fails the toggle with the driver's untyped 55P03. **Where a non-zero
+`[store].command_timeout` is at or under the bound, the bound is not what ends the wait**: the
+driver's query timeout fires first, with the driver's own refusal rather than
+`ConnectionFlagLockTimeout`, and on SQL Server the flag statement's retry re-runs that timeout, so
+the toggle takes the audit lock again and waits again, attempt after attempt, until the attempts
+run out or the engine cuts the call off. Without the bound, a store call's wait would run to the
+driver's query timeout, `command_timeout`, 30 s by default, and without end at 0. On SQL Server the
+retry re-runs a query timeout for up to five attempts in all (`_CIPHER_MERGE_ATTEMPTS` in
+`store/sqlserver.py`), so a store call could hold every audit append for five waits of 30 s each,
+freed only for the backoff between them. The engine cancels the store call at its own bound, which
+ends the retry; on SQL Server the cancel does not end the attempt in flight, which holds the audit
+lock until its own timeout and the discarded connection's close. Through the engine at the 30 s
+default, then, a SQL Server toggle would hold the audit lock for one wait of 30 s rather than five.
 
 **Not changed by this amendment.** A dry-run reload still runs config modules, and is still not held
 for an approver, because the IDE promote pre-flight would stall on a second person.

@@ -229,6 +229,7 @@ async def _oidc_round_trip(
             auth_provider="ad",
             directory_object_id="guid-jdoe",
             password_generated=False,
+            audits=(),
         )
     else:
         jdoe_id = jdoe.id

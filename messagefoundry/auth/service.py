@@ -200,6 +200,7 @@ from messagefoundry.store.store import (
     require_notify_email,
     role_seal_ok,
     seed_notify_email,
+    session_epochs_current,
     session_seal_ok,
     session_sealed_by_retired_key,
     user_seal_ok,
@@ -1506,9 +1507,9 @@ def _is_single_mailbox(address: str) -> bool:
         bool(at)
         and bool(local)
         and "@" not in domain
+        # A dot inside the domain, which the send rule does not ask for. A dot at either end is the
+        # send rule's to refuse, below, as an empty label (BACKLOG #3075 item 8).
         and "." in domain.strip(".")
-        and not domain.startswith(".")
-        and not domain.endswith(".")
         and all(ch.isprintable() and not ch.isspace() for ch in address)
         and not any(ch in _ADDRESS_FORBIDDEN_CHARS for ch in address)
         # The rule send_plain_email applies to every notice's RCPT TO (vault BACKLOG #2870). Without
@@ -4250,6 +4251,9 @@ class AuthService:
                     password_hash=None,
                     must_change_password=True,
                     password_generated=False,
+                    # No audit row with the INSERT (BACKLOG #5070): the run's record is the
+                    # `auth.first_administrator_provisioned` row written once the grant has landed.
+                    audits=(),
                 )
             except Exception as exc:
                 if not _is_integrity_refusal(exc):
@@ -11493,8 +11497,9 @@ class AuthService:
         - ``"credential"``: the owner's admin-issued temporary credential is past its deadline
           (:meth:`_credential_lapsed`, BACKLOG #2298). A disabled account is not judged here: the
           gate refuses it for that reason, and does not audit it as a lapse.
-        - ``"epoch"``: a whole-account revoke raised the account's epoch after this session was
-          sealed, so the session belongs to sessions that were ended (BACKLOG #2592). That revoke
+        - ``"epoch"``: a whole-account revoke raised the account's epoch, or an every-account
+          revoke raised the store's global epoch, after this session was sealed, so the session
+          belongs to sessions that were ended (BACKLOG #2592, #5091). That revoke
           blanked every seal it reached under the account's lock. On SQL Server its sweep can miss
           a row a rotation moved mid-scan, and that row stays live with a valid seal and the old
           epoch (BACKLOG #2738). It is ended and reported like a row that fails its seal;
@@ -11506,7 +11511,9 @@ class AuthService:
         record what they record for a live session."""
         if not user.disabled and self._credential_lapsed(user, now):
             return "credential"
-        if session.user_epoch != user.session_epoch:
+        if not session_epochs_current(
+            session, user_epoch=user.session_epoch, global_epoch=user.global_session_epoch
+        ):
             return "epoch"
         return None
 
@@ -11602,20 +11609,25 @@ class AuthService:
         hidden too, since the validator refuses them on presentation (BACKLOG #2096). So is a row
         that fails its integrity seal (BACKLOG #2592): it resolves to nothing, so it is not one of
         the user's sessions, and it is handled as :meth:`_load_session` handles one. So is a row
-        minted under an older session epoch than the account's, which the validator refuses."""
+        minted under an older session epoch than the account's, or an older global one than the
+        store's (BACKLOG #5091), which the validator refuses."""
         rows = await self._store.list_sessions(user_id, idle_seconds=self.session_idle_seconds)
         if not rows:
             return []
         user = await self._load_user(user_id)
-        epoch = None if user is None else user.session_epoch
         sealer = self._store.row_sealer()
         kept: list[SessionRecord] = []
         for row in rows:
+            # The seal check first, even with no account: it ends a row that fails it.
             if not await self._session_row_holds(row, sealer):
                 continue
-            if row.user_epoch == epoch:
+            if user is None:
+                continue
+            if session_epochs_current(
+                row, user_epoch=user.session_epoch, global_epoch=user.global_session_epoch
+            ):
                 kept.append(row)
-            elif epoch is not None:
+            else:
                 await self._session_seal_failed(row.token_hash)  # see identity_for_token
         return kept
 
@@ -15728,6 +15740,9 @@ class AuthService:
                 # operator never sets a lasting password the user keeps (ASVS 6.4.6 / WP-L3-12).
                 must_change_password=True,
                 password_generated=True,
+                # No audit row with the INSERT (BACKLOG #5070): `user.created` names the
+                # roles, so it is written below, after `set_user_roles`.
+                audits=(),
             )
         except Exception as exc:
             if not _is_integrity_refusal(exc):
@@ -15837,7 +15852,11 @@ class AuthService:
             new_notify = _require_single_mailbox(notify_email)
         if disabled and await self.is_last_enabled_admin(user_id):
             raise LastAdministratorRefused("cannot disable the last administrator")
-        await self._store.update_user_profile(user_id, display_name=display_name, email=email)
+        # No audit row with the UPDATE (BACKLOG #5070): this save's `user.updated` row also
+        # records the disable outcome, so it is written below, once that is known.
+        await self._store.update_user_profile(
+            user_id, display_name=display_name, email=email, audits=()
+        )
         # The profile write above never names `notify_email`: it is the same call `_upsert_ad_user`
         # makes, and on a directory account `email` is the directory's.
         if before is not None and new_notify is not None:

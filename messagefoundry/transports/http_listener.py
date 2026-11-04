@@ -90,6 +90,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_MAX_BODY_BYTES",
+    "DEFAULT_MAX_HANDSHAKES_PER_HOST",
     "DEFAULT_MAX_HEADER_BYTES",
     "HttpRequest",
     "HttpRequestError",
@@ -107,6 +108,15 @@ DEFAULT_MAX_BODY_BYTES = (
 DEFAULT_MAX_HEADER_BYTES = (
     64 * 1024
 )  # cap the request line + headers (a header-flood / slow-loris guard)
+#: The most sockets one peer address may hold a ``max_connections`` slot with while still in
+#: their TLS handshake (vault BACKLOG #4888), which happens only where this listener upgrades TLS
+#: itself (`_upgrades_tls_itself`). 32 is an eighth of :data:`DEFAULT_MAX_CONNECTIONS`, the ratio
+#: the other listeners' per-host cap ships at, so at the default ``max_connections`` a stalling
+#: address could hold at most an eighth of the listener. The budget does not scale with
+#: ``max_connections``: at 32 slots or fewer, ``max_connections`` refuses first and one stalling
+#: address could hold every slot. ``docs/DEPLOYMENT.md``, *Per-address listener caps behind the VIP*, holds the
+#: rationale and the L4 load-balancer counter-case.
+DEFAULT_MAX_HANDSHAKES_PER_HOST = 32
 _HEADER_CAP_OFF_HINT = (
     "this cap cannot be switched off; leave it unset or None for the 64 KiB default"
 )
@@ -862,12 +872,20 @@ class HttpSource(SourceConnector):
             knob="max_connections_per_host",
             transport="HTTP source",
         )
+        # vault BACKLOG #4888: the per-host bound that DOES ship on, for the handshake phase only.
+        self.max_handshakes_per_host: int | None = positive_cap(
+            s.get("max_handshakes_per_host", DEFAULT_MAX_HANDSHAKES_PER_HOST),
+            int,
+            knob="max_handshakes_per_host",
+            transport="HTTP source",
+        )
         self._admission = ListenerAdmission(
             transport="HTTP",
             max_connections=self.max_connections,
             max_connections_per_host=self.max_connections_per_host,
             source_ip_allowlist=self.source_ip_allowlist,
             name=config.name or "",
+            max_handshakes_per_host=self.max_handshakes_per_host,
         )
         # Live client writers + handler tasks so stop()/reload can actively close established
         # connections and bound the wait (mirrors MLLPSource, review H-2 / #55).
@@ -1322,7 +1340,7 @@ class HttpSource(SourceConnector):
             # vault BACKLOG #2606: stop, allowlist, global cap and per-host cap, decided in one place
             # for every socket listener (transports/admission.py). Refused before a request byte,
             # and, where this listener upgrades TLS itself, before any TLS byte (BACKLOG #2479).
-            refusal = self._admission.check(writer, peer_host)
+            refusal = self._admission.check(writer, peer_host, handshake=self._upgrade_tls)
             if refusal is not None:
                 if refusal.kind is None:
                     return  # the listener is stopping: close unread, with no answer
@@ -1341,9 +1359,13 @@ class HttpSource(SourceConnector):
                 # The handshake runs inside an admitted slot (BACKLOG #2479), so a socket that never
                 # sends a ClientHello is counted against both caps until the handshake bound ends
                 # it, and the finally below gives the slot back however the handshake ends.
+                # It also counts against the handshake budget until the handshake ends, however
+                # it ends (vault BACKLOG #4888).
                 epoch = self._admission.admit(peer_host)
                 handshaking = True
-                if not await self._start_tls(reader, writer, peer_host):
+                with self._admission.handshake(peer_host, epoch):
+                    upgraded = await self._start_tls(reader, writer, peer_host)
+                if not upgraded:
                     return  # never a session: no `established`, so no `closed` either
                 handshaking = False
                 answerable = True

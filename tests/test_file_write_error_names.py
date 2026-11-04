@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #2814: a FILE or REMOTEFILE write failure never carries the name rendered from the
-message into the error text.
+"""BACKLOG #2814: a FILE write failure never carries the name rendered from the message into the
+error text. The REMOTEFILE half is in ``tests/test_remotefile_error_reply_text.py`` (BACKLOG #5026).
 
 The template here names the file after PID-3.1 and PID-5.1, so the rendered name holds a synthetic
 MRN. ``test_the_runner_stores_and_alerts_no_rendered_name`` checks that it reaches none of the
@@ -20,7 +20,6 @@ import errno
 import logging
 import os
 import traceback
-from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
 
@@ -31,18 +30,15 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, Registry
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.redaction import safe_exc, safe_name
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
-    NegativeAckError,
     build_destination,
 )
 from messagefoundry.transports.file import FileDestination, _Replaced
-from messagefoundry.transports.remotefile import _RemoteError
 from tests._refusal_log_capture import record_texts
-from tests.test_remotefile_transport import _dest, _FakeClient
 
 MRN = "SYN900002"
 OUT = "OB_FILE_ADT"
@@ -172,75 +168,6 @@ async def test_the_runner_stores_and_alerts_no_rendered_name(
     for text in (row["last_error"], event.reason, detail):
         assert MRN not in text
     assert not [r for r in caplog.records if any(MRN in t for t in record_texts(r))]
-
-
-class _EchoingClient(_FakeClient):
-    """A server whose refusal at ``step`` quotes the paths it names, as an FTP 550 reply can. The
-    rename reply quotes the name lower-cased, as a case-insensitive server's stored case can."""
-
-    def __init__(self, step: str, *, permanent: bool) -> None:
-        super().__init__()
-        self.step = step
-        self.permanent = permanent
-
-    def _refuse(self, quoted: str) -> _RemoteError:
-        return _RemoteError(
-            f"FTP rejected the operation: 550 {quoted}: Permission denied",
-            permanent=self.permanent,
-            credential_fault=self.permanent,
-        )
-
-    def store(self, path: str, data: bytes) -> None:
-        self.ops.append(("store", path))
-        if self.step == "store":
-            raise self._refuse(path)
-        self.files[path] = data
-
-    def rename(self, src: str, dst: str) -> None:
-        self.ops.append(("rename", dst))
-        raise self._refuse(f"{src} -> {dst.lower()}")
-
-    def publish(self, src: str, candidates: Sequence[str]) -> str | None:
-        self.ops.append(("publish", candidates[1]))
-        raise self._refuse(f"{src} -> {candidates[0]}, {candidates[1]}")
-
-
-@pytest.mark.parametrize("permanent", [False, True], ids=["transient", "permanent"])
-@pytest.mark.parametrize("step", ["store", "publish", "rename"])
-async def test_the_remotefile_error_text_holds_no_rendered_name(
-    monkeypatch: pytest.MonkeyPatch, step: str, permanent: bool
-) -> None:
-    client = _EchoingClient(step, permanent=permanent)
-    dest = _dest(monkeypatch, client, filename=TEMPLATE, overwrite=step == "rename")
-    with pytest.raises(DeliveryError) as raised:
-        await dest.send(BODY)
-    (quoted,) = [path for op, path in client.ops if op == step]
-    assert MRN in quoted  # the reply quoted a path that held the name
-    text = str(raised.value)
-    assert text.startswith("FTP rejected the operation: 550 ") and "Permission denied" in text
-    assert MRN not in text.upper() and MRN not in safe_exc(raised.value).upper()
-    # The unscrubbed reply is not chained, so a traceback of the delivery error cannot print it.
-    assert MRN not in _traceback(raised.value).upper()
-    # The markers survive the scrub: a permanent credential refusal still stops the lane.
-    assert isinstance(raised.value, NegativeAckError) is permanent
-    if permanent:
-        assert cast(NegativeAckError, raised.value).credential_fault
-
-
-def test_without_names_keeps_text_that_names_no_file() -> None:
-    exc = _RemoteError("FTP operation failed: timed out", permanent=False, config_fault=True)
-    scrubbed = exc.without_names([f"/in/{NAME}"])
-    assert str(scrubbed) == str(exc) and scrubbed.config_fault and not scrubbed.permanent
-
-
-def test_without_names_swaps_each_name_once_in_one_pass() -> None:
-    # A shorter name must not be matched again inside the label a longer one became, and an echo
-    # in another case takes the label of the name as rendered.
-    names = ["/in/1.hl7", "/in/1-1.hl7", "/in/11.hl7"]
-    exc = _RemoteError("550 /in/1-1.hl7 and /in/1.HL7", permanent=True)
-    assert str(exc.without_names(names)) == (
-        f"550 /in/{safe_name('1-1.hl7')} and /in/{safe_name('1.hl7')}"
-    )
 
 
 @pytest.mark.parametrize(

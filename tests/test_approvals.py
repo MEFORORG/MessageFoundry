@@ -190,7 +190,9 @@ async def test_the_queue_marks_the_callers_own_requests_by_user_id(engine: Engin
         assert await _mark(maker) is True
         assert await _mark(await _token(c, "checker")) is False
         # Rename the requester (same session) and give the freed name to somebody else.
-        assert await engine.store.set_user_username(maker_id, "maker2", expected_username="maker")
+        assert await engine.store.set_user_username(
+            maker_id, "maker2", expected_username="maker", audits=()
+        )
         await _add(service, "maker", Role.ADMINISTRATOR)
         assert await _mark(maker) is True
         assert await _mark(await _token(c, "maker")) is False
@@ -1504,7 +1506,9 @@ async def test_renamed_requester_still_cannot_approve_their_own_request(engine: 
         jdoe = await _token(c, "jdoe")
         approval_id = (await _request_replay(c, jdoe)).json()["approval_id"]
         # The directory renames the requester mid-window; the engine copies the new name down.
-        assert await engine.store.set_user_username(jdoe_id, "jdoe2", expected_username="jdoe")
+        assert await engine.store.set_user_username(
+            jdoe_id, "jdoe2", expected_username="jdoe", audits=()
+        )
         # POSITIVE CONTROL, and it is what makes the 403 below evidence of anything. The stored
         # `requester` and the approver's LIVE username must actually DIFFER at this point -- if they
         # did not, a username comparison would refuse too and the assertion could pass under the very
@@ -1530,7 +1534,9 @@ async def test_a_new_user_holding_the_freed_username_can_approve(engine: Engine)
     jdoe_id = await _add(service, "jdoe", Role.ADMINISTRATOR)
     async with _client(engine, service, ON) as c:
         approval_id = (await _request_replay(c, await _token(c, "jdoe"))).json()["approval_id"]
-        assert await engine.store.set_user_username(jdoe_id, "jdoe2", expected_username="jdoe")
+        assert await engine.store.set_user_username(
+            jdoe_id, "jdoe2", expected_username="jdoe", audits=()
+        )
         await _add(service, "jdoe", Role.ADMINISTRATOR)  # a second person inherits the freed name
         ok = await c.post(f"/approvals/{approval_id}/approve", headers=await _token(c, "jdoe"))
         assert ok.status_code == 200  # pre-fix: 403

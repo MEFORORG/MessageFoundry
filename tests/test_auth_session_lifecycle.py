@@ -49,7 +49,7 @@ async def test_backward_clock_step_revokes_session() -> None:
     try:
         service = AuthService(store, AuthSettings())
         await store.create_user(
-            user_id="u", username="u", auth_provider="local", password_generated=False
+            user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
         )
         # A session stamped in the "future" (as if the wall clock later stepped back) must be
         # rejected and revoked, not silently honoured.
@@ -97,7 +97,7 @@ async def test_enforce_session_cap_revokes_oldest() -> None:
     store = await _store()
     try:
         await store.create_user(
-            user_id="u", username="u", auth_provider="local", password_generated=False
+            user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
         )
         big = time.time() + 10_000
         for h, created in (("h1", 1.0), ("h2", 2.0), ("h3", 3.0)):
