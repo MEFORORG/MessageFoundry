@@ -3268,9 +3268,9 @@ has. The re-read narrows it from the whole proof check to those writes.
 
 **A directory step-up or enrolment leg refuses a present account that lost a role in the directory
 (BACKLOG #2240).** At least the code and passkey legs above, the two enrolment legs, the IdP
-step-up leg and the password re-bind below make this test. Each judges the groups its own
-directory answer returns: the directory lookup, keyed by the row's directory object id, on the
-code, passkey, enrolment and IdP legs, and the bind on the re-bind. The engine maps those groups to
+step-up leg and the password re-bind below make this test. Each judges the groups a directory
+answer returns: the directory lookup's on the code, passkey, enrolment and IdP legs, and the
+bind's on the re-bind. The engine maps those groups to
 roles as the reconciliation pass does. If any role stored on the account is not among those, the
 leg refuses. Without this, an operator demoted in the directory since sign-in would renew its
 window, clear the MFA gate, or be minted an action-bound grant with the old roles until the

@@ -984,14 +984,12 @@ DIRECTORY_ROLE_MAP_UNSEALED = "directory_role_map_unsealed"
 
 
 class DirectoryRefusal(Enum):
-    """Why a second-factor, enrolment or password re-bind leg refused a directory account on the
-    directory's answer rather than on its proof, carried on ``Elevation.directory_refusal`` so a
-    caller can name the fix that clears it (BACKLOG #3082). The federated step-up leg does not set
+    """Which fix clears a second-factor, enrolment or password re-bind leg's directory refusal,
+    carried on ``Elevation.directory_refusal`` so a caller can name it (BACKLOG #3082). The federated step-up leg does not set
     it; it refuses with its own closed-set reason. Whether the proof was checked is the
     ``Elevation.directory_refusal`` field's to say.
 
-    ``UNCONFIRMED``: the directory did not confirm the account is present and enabled, or could not
-    be asked. A later try, or an administrator, clears it; a new sign-in would fail the same way.
+    ``UNCONFIRMED``: every other directory refusal. A later try, or an administrator, clears it.
     ``DEMOTED``: the account is present and enabled, but lost a role in the directory (BACKLOG
     #2240; the rule is in ``AuthService._directory_roles_lost``). A new sign-in clears it, because
     it takes the roles the groups grant now. The precise cause stays on the audit row; a caller
@@ -1260,9 +1258,7 @@ class Elevation:
     #: those also sets it on an account that lost a role in the directory since sign-in
     #: (``directory_roles_demoted``). In every case nothing was charged, and the proof was never
     #: checked, except where the re-bind's bind succeeded (BACKLOG #3081): the bind proved the
-    #: password right, and the account was refused for what the bind returned, a lost role, a role
-    #: map that fails its seal, or a row that moved during the bind, so a retry is refused again
-    #: until that clears. It qualifies the wrong-proof state: the token still authenticates, and
+    #: password right, and the account was refused after it. It qualifies the wrong-proof state: the token still authenticates, and
     #: the caller must name the directory's refusal, by the fix below, rather than call the code,
     #: the password or the passkey wrong. The precise cause goes to the audit row (``reason`` on
     #: ``auth.reauth``, ``outcome`` on ``auth.mfa_failed`` or ``auth.webauthn_failed``). The caller
@@ -6768,7 +6764,7 @@ class AuthService:
         if mismatch is not None:
             return await refuse(mismatch)
         # BACKLOG #2154: the role test, by calling _directory_roles_lost directly, whose docstring
-        # states the rule and the legs that refuse on it. This leg does not go through
+        # states the rule. This leg does not go through
         # _directory_step_up_refusal, the wrapper the second-factor legs reach it through, because
         # that wrapper's own directory probe would replace this leg's not_in_directory reason with
         # the probe's outcome. The row is read after the directory round trip, through the loader
