@@ -517,8 +517,9 @@ def test_a_loopback_http_sidecar_warns_at_construction(caplog: pytest.LogCapture
     Captured at DEBUG from every logger, so a header value logged at any level anywhere would be
     seen. The probe line is the positive control: the capture does see a DEBUG line, and the token
     in it, so the absence asserted after it is not the capture's blindness."""
-    with caplog.at_level(logging.DEBUG):
-        logging.getLogger("messagefoundry.transports.rest").debug("probe %s", _SYNTHETIC_BEARER)
+    rest_logger = "messagefoundry.transports.rest"
+    with caplog.at_level(logging.DEBUG), caplog.at_level(logging.DEBUG, logger=rest_logger):
+        logging.getLogger(rest_logger).debug("probe %s", _SYNTHETIC_BEARER)
         assert _SYNTHETIC_BEARER in caplog.text
         caplog.clear()
         _rest(

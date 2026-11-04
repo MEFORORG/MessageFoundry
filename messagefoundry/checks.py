@@ -2927,8 +2927,9 @@ def _check_ech_cleartext_sidecar(config_dir: str | Path) -> CheckResult:
         required=False,
         detail=(
             f"{len(found)} REST connection(s) send through an ECH sidecar whose hop on this host "
-            f"is cleartext http — {listed}. That hop carries the body and every request header, "
-            "any credential included; an https sidecar listener encrypts it (ADR 0139)"
+            f"is cleartext http, or may where marked possibly — {listed}. That hop carries the "
+            "body and every request header, any credential included; an https sidecar listener "
+            "encrypts it (ADR 0139)"
         ),
     )
 

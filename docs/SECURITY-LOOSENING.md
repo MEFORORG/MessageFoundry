@@ -1934,16 +1934,21 @@ count is above `0` (vault BACKLOG #2613).
   `http://127.0.0.1` `url` shows what it is. The list names every `http://` sidecar, whatever the
   `url`.
 - **The fix:** run the sidecar's listener on `https://`, which encrypts the hop and takes it off
-  this list. The engine verifies that listener's certificate against the operating system's trust
-  store alone, not a connection's `tls_ca_file` or the `[tls]` policy, so the certificate must
-  chain to a CA that store holds and name the loopback host the URL uses.
+  this list. The two hops verify the listener's certificate against different stores. The delivery
+  request reads the operating system's trust store alone, not the connection's `tls_ca_file` or
+  the `[tls]` policy. On a SMART or OAuth2 connection the token-endpoint request reads the anchor
+  its token URL resolves to, the connection's `tls_ca_file` included. So the certificate must name
+  the loopback host the URL uses and chain to a CA every hop that takes it reads.
 - **It is never silent:** a WARNING at every construction naming the connection, never a header
   value; an `ech-sidecar-cleartext` line in `messagefoundry check` naming every such connection;
   and an `ech_sidecar` entry in `security_loosenings()`, which `GET /security/posture` shows. The
-  last two read one list, and it leaves out a sidecar the build refuses. An `env()` value is
+  last two read one list. It leaves out a sidecar the build refuses, but it reads only
+  `ech_egress` and `ech_sidecar`, so a connection the build refuses for another reason, such as a
+  `proxy_url` beside them, can still be on it. An `env()` value is
   resolved where the reader has the instance's values: `GET /security/posture` on a running engine
   does, and `messagefoundry check` does not. One it cannot resolve is listed, marked possibly,
-  unless the other key alone rules the hop out, as a literal `https://` sidecar does.
+  unless the other key alone rules the hop out, as a literal `https://` sidecar does. A
+  `deployed = false` connection with an `env()` value is left off, because it is never built.
 - **Where it is NOT reported:** the serve-time loosening warning, which fires before the graph is
   loaded, exactly as for `cleartext_accepted`. `messagefoundry security show` and a graphless
   `GET /security/posture` cannot see it either, and say so in `loosenings_scope`.

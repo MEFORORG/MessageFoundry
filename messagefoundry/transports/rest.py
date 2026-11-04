@@ -2530,10 +2530,11 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     recovers it — ADR 0139.) It is
     NOT a forward proxy: a proxy would tunnel ``https`` via CONNECT and the engine's own non-ECH
     ClientHello would still leak the SNI. Instead the REST destination sends its request to the sidecar
-    over **cleartext loopback** with the real destination in the ``Host`` header (see
+    over **loopback** with the real destination in the ``Host`` header (see
     :meth:`RestDestination._ech_request`), and the sidecar re-originates the ``https`` + ECH connection —
     verifying the upstream cert. So **destination TLS (verification + ECH) is delegated to the sidecar**;
-    the engine→sidecar hop is same-host cleartext (ADR 0092 loopback posture).
+    the engine→sidecar hop is same-host (ADR 0092 loopback posture), and cleartext on an ``http``
+    sidecar, a listed loosening (:func:`ech_sidecar_is_cleartext`).
 
     Config fails closed: ``ech_egress`` set with no ``ech_sidecar`` raises, and a **non-loopback** sidecar
     is refused (a remote "sidecar" would leak the SNI on the hop to it, defeating the purpose).
@@ -2845,8 +2846,9 @@ class RestDestination(DestinationConnector):
         self._connection_name = config.name
         self._header_rule = dynamic_header_rule(scheme, self.url, verify_tls=verify)
         if self._ech_sidecar is not None:
-            # ECH mode (ADR 0139): the engine->sidecar hop is cleartext http over loopback (the sidecar
-            # owns destination TLS + ECH + cert verification), so a plain no-redirect opener carries it —
+            # ECH mode (ADR 0139): the engine->sidecar hop is loopback, cleartext on an http sidecar (the
+            # sidecar owns destination TLS + ECH + cert verification), so a plain no-redirect opener
+            # carries it —
             # never the verify/proxy/insecure opener built above for a direct destination hop.
             # The empty proxy map keeps any proxy handler off this opener (vault BACKLOG #2579). The
             # loopback rule alone already dials every accepted sidecar direct, so this adds no

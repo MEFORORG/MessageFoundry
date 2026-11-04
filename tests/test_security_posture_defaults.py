@@ -2853,6 +2853,56 @@ def test_the_ech_reader_resolves_an_env_sidecar_with_the_values(value: str, list
         assert found["OB_ECH_ENV"] == "an http:// sidecar"
 
 
+@pytest.mark.parametrize(
+    ("extra", "deployed", "listed"),
+    [
+        # An env() ech_egress beside a literal https sidecar: the sidecar alone rules it out.
+        ({"ech_egress": "ENV", "ech_sidecar": "https://127.0.0.1:8123"}, True, False),
+        # ...and beside a literal http one it is possibly on.
+        ({"ech_egress": "ENV", "ech_sidecar": "http://127.0.0.1:8123"}, True, True),
+        # A literal ech_egress=False rules out an env() sidecar.
+        ({"ech_egress": False, "ech_sidecar": "ENV"}, True, False),
+        # A not-deployed connection with an env() value is never built, so it is skipped...
+        ({"ech_egress": True, "ech_sidecar": "ENV"}, False, False),
+        # ...and its control: the same connection deployed is listed as possibly.
+        ({"ech_egress": True, "ech_sidecar": "ENV"}, True, True),
+        # A not-deployed literal http sidecar is still read, as the DATABASE readers read one.
+        ({"ech_egress": True, "ech_sidecar": "http://127.0.0.1:8123"}, False, True),
+    ],
+    ids=[
+        "env-egress-https",
+        "env-egress-http",
+        "off-env-sidecar",
+        "dark-env",
+        "deployed-env",
+        "dark-literal",
+    ],
+)
+def test_the_ech_reader_branches(extra: dict[str, object], deployed: bool, listed: bool) -> None:
+    """Each arm of the reader with no env values, as ``messagefoundry check`` reads it. ``"ENV"``
+    stands for an env() reference."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        Registry,
+        build_outbound_connection,
+        ech_cleartext_sidecar_hops,
+        env,
+    )
+
+    settings = {
+        "url": "https://partner.example.org/ingest",
+        **{key: env(key) if value == "ENV" else value for key, value in extra.items()},
+    }
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_X", ConnectionSpec(type=ConnectorType.REST, settings=settings), deployed=deployed
+        )
+    )
+    assert bool(ech_cleartext_sidecar_hops(reg)) is listed
+
+
 async def test_posture_route_names_an_http_ech_sidecar(engine: Engine) -> None:
     """``GET /security/posture`` reads the set off the live graph."""
     engine.add_registry(_ech_sidecar_registry())
