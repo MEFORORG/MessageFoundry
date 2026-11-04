@@ -110,8 +110,10 @@ DEFAULT_MAX_HEADER_BYTES = (
 #: The most sockets one peer address may hold a ``max_connections`` slot with while still in
 #: their TLS handshake (vault BACKLOG #4888), which happens only where this listener upgrades TLS
 #: itself (`_upgrades_tls_itself`). 32 is an eighth of :data:`DEFAULT_MAX_CONNECTIONS`, the ratio
-#: the other listeners' per-host cap ships at, so a stalling address holds at most an eighth of the
-#: listener. ``docs/DEPLOYMENT.md``, *Per-address listener caps behind the VIP*, holds the
+#: the other listeners' per-host cap ships at, so at the default ``max_connections`` a stalling
+#: address could hold at most an eighth of the listener. The budget does not scale with
+#: ``max_connections``: at 32 slots or fewer, ``max_connections`` refuses first and one stalling
+#: address could hold every slot. ``docs/DEPLOYMENT.md``, *Per-address listener caps behind the VIP*, holds the
 #: rationale and the L4 load-balancer counter-case.
 DEFAULT_MAX_HANDSHAKES_PER_HOST = 32
 _HEADER_CAP_OFF_HINT = (

@@ -507,8 +507,11 @@ security-signal burst detector, so a legitimate burst of refusals could raise a
 **What it does not bound.** A peer that completes its handshake leaves the count, and on a listener
 with no `tls_ca_file` a completed handshake proves nothing about who the peer is. Such a peer, or
 any peer on a plaintext listener, can still hold a slot until `receive_timeout` (60 s) by sending
-nothing. Only `max_connections`, and `max_connections_per_host` where it is set, bound that, with
-`source_ip_allowlist` limiting who can try, as before this budget.
+nothing. Of the admission controls, at least `max_connections`, and `max_connections_per_host`
+where it is set, bound that, with `source_ip_allowlist` limiting who can try, as before this
+budget. The 32 is fixed and does not follow `max_connections`, so on a listener with
+`max_connections` at 32 or fewer it adds no bound: one stalling address could again hold every
+slot.
 
 **The counter-case, behind a balancer that collapses addresses.** There the 32 bound every client's
 handshakes together. A client behind the balancer that stalls 32 handshakes would refuse every
