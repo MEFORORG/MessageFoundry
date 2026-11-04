@@ -1976,7 +1976,7 @@ class MLLPSource(SourceConnector):
         # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
         self._stopping = False  # a restart of this same instance serves again (see `_stopping`)
-        guard_accepts()  # on the Proactor loop, a peer reset would close the listening socket
+        guard_accepts()  # see messagefoundry.proactor_accept
         self._tls_failures.open()
         self._inflight = (
             asyncio.Semaphore(self.max_inflight_frames) if self.max_inflight_frames else None

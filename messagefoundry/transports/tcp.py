@@ -564,7 +564,7 @@ class TcpSource(SourceConnector):
         # uniform across all sources (mirrors MLLPSource).
         self._handler = handler
         self._admission.stopping = False  # a restart of this same instance serves again
-        guard_accepts()  # on the Proactor loop, a peer reset would close the listening socket
+        guard_accepts()  # see messagefoundry.proactor_accept
         self._server = await asyncio.start_server(self._on_client, self.host, self.port)
 
     @property

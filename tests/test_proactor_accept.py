@@ -24,13 +24,16 @@ import asyncio
 import contextlib
 import errno
 import gc
+import inspect
 import logging
 import signal
 import socket
 import struct
 import sys
 import time
+import warnings
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -180,6 +183,35 @@ def test_control_without_the_read_mark_the_skipped_accept_is_reported_twice(
     _on_fresh_proactor(run)
 
 
+def _unclosed_sockets_after_one_skip(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The ``unclosed socket`` warnings a guarded listener's one skipped accept leaves behind."""
+
+    async def run() -> None:
+        with caplog.at_level(logging.DEBUG, logger=proactor_accept.__name__):
+            async with _bare_listener(guard=True) as (_accepted, _reported, _listening):
+                assert await _until(lambda: _SKIPPED in caplog.text, timeout=5.0)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ResourceWarning)
+        _on_fresh_proactor(run)
+        gc.collect()  # an accept socket left open closes, and warns, only when it is collected
+    return [str(w.message) for w in caught if "unclosed <socket" in str(w.message)]
+
+
+@windows_only
+def test_a_skipped_accept_leaves_no_socket_open(caplog: pytest.LogCaptureFixture) -> None:
+    assert _unclosed_sockets_after_one_skip(caplog) == []
+
+
+@windows_only
+def test_control_without_the_close_the_skipped_accept_socket_is_left_open(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The guard finds the socket among the helper task's arguments; hide them and it leaks.
+    monkeypatch.setattr(inspect, "getcoroutinelocals", lambda coro: {})
+    assert _unclosed_sockets_after_one_skip(caplog) != []
+
+
 _SOURCES = ("http", "mllp", "tcp", "x12")
 
 
@@ -311,7 +343,9 @@ async def _hold(future: _Accepted, conn: socket.socket) -> None:
 class _FakeAccept:
     """An ``accept`` whose every call returns a future the test settles, and starts a helper task
     holding a fresh accept socket, as ``IocpProactor.accept`` does. ``raises`` maps a 1-based call
-    number to the error that call raises at once."""
+    number to the error that call raises at once, after it has made its accept socket, as
+    ``IocpProactor.accept`` makes it before ``AcceptEx``. ``conns[n]`` is ``futures[n]``'s socket,
+    and ``orphans`` holds the sockets of the calls that raised."""
 
     def __init__(
         self, loop: asyncio.AbstractEventLoop, raises: dict[int, OSError] | None = None
@@ -319,15 +353,17 @@ class _FakeAccept:
         self.loop = loop
         self.futures: list[_Accepted] = []
         self.conns: list[socket.socket] = []
+        self.orphans: list[socket.socket] = []
         self.raises = raises or {}
         self.calls = 0
 
     def __call__(self, listener: socket.socket) -> _Accepted:
         self.calls += 1
+        conn = socket.socket()
         if self.calls in self.raises:
+            self.orphans.append(conn)
             raise self.raises[self.calls]
         future: _Accepted = self.loop.create_future()
-        conn = socket.socket()
         self.futures.append(future)
         self.conns.append(conn)
         self.loop.create_task(_hold(future, conn))
@@ -338,15 +374,22 @@ class _FakeAccept:
 def _guarded_fake(
     raises: dict[int, OSError] | None = None,
 ) -> Iterator[tuple[_FakeAccept, socket.socket, _Accepted]]:
-    """A guarded accept on an open loopback socket: yields the fake, the listener and the future."""
+    """A guarded accept on an open loopback socket: yields the fake, the listener and the future.
+    On exit the accept is cancelled, so no try or helper task outlives the test."""
     loop = asyncio.get_running_loop()
     fake = _FakeAccept(loop, raises)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         try:
-            yield fake, listener, _guarded(loop, fake)(listener)
+            outer = _guarded(loop, fake)(listener)
+            try:
+                yield fake, listener, outer
+            finally:
+                outer.cancel()
+                for future in fake.futures:
+                    future.cancel()
         finally:
-            for conn in fake.conns:
+            for conn in fake.conns + fake.orphans:
                 conn.close()
 
 
@@ -364,6 +407,8 @@ def test_peer_dropped_reads_the_windows_codes_and_connection_errors() -> None:
     assert not _peer_dropped(_winerror(10038))  # WSAENOTSOCK: the listener itself
     assert not _peer_dropped(OSError(errno.EINVAL, "no winerror"))
     assert not _peer_dropped(RuntimeError())
+    assert not _peer_dropped(BrokenPipeError())  # WSAESHUTDOWN maps here: not a peer's drop
+    assert not _peer_dropped(ConnectionRefusedError())
 
 
 async def test_a_peer_dropped_accept_is_posted_again_and_its_socket_closed() -> None:
@@ -384,10 +429,25 @@ async def test_a_peer_drop_reported_at_once_is_posted_again_too() -> None:
     # AcceptEx can return WSAECONNRESET directly, on the first post or a later one.
     raises: dict[int, OSError] = {1: ConnectionResetError(), 3: _winerror(64)}
     with _guarded_fake(raises) as (fake, _listener, outer):
-        assert fake.calls == 2 and len(fake.futures) == 1
+        # The re-post waits for the loop's next iteration, so a repeating failure cannot hold it.
+        assert fake.calls == 1 and fake.futures == []
+        assert await _until(lambda: len(fake.futures) == 1)
+        assert fake.calls == 2
         fake.futures[0].set_exception(_winerror(1236))
         assert await _until(lambda: len(fake.futures) == 2)
         assert fake.calls == 4
+        assert not outer.done()
+        # Each immediate failure's accept socket is closed, which the stdlib leaves to the GC.
+        assert len(fake.orphans) == 2 and all(s.fileno() == -1 for s in fake.orphans)
+
+
+async def test_a_repeating_immediate_peer_drop_lets_the_loop_run() -> None:
+    raises: dict[int, OSError] = dict.fromkeys(range(1, 1000), ConnectionResetError())
+    with _guarded_fake(raises) as (fake, _listener, outer):
+        ran = asyncio.Event()
+        asyncio.get_running_loop().call_soon(ran.set)
+        await asyncio.wait_for(ran.wait(), 1.0)
+        assert fake.calls < 10  # one try per iteration, not a spin on the loop's thread
         assert not outer.done()
 
 
@@ -481,4 +541,24 @@ def test_the_guard_leaves_a_selector_loop_alone(caplog: pytest.LogCaptureFixture
 
     with caplog.at_level(logging.DEBUG, logger=proactor_accept.__name__):
         _on_fresh_loop(run, asyncio.SelectorEventLoop)
-    assert caplog.records == []
+    assert [r for r in caplog.records if r.name == proactor_accept.__name__] == []
+
+
+def test_the_engine_api_lifespan_installs_the_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The lifespan's call is what guards uvicorn's own listener, which no source start() reaches.
+    from fastapi.testclient import TestClient
+
+    from messagefoundry.api import app as app_module
+    from messagefoundry.config.settings import EgressSettings
+
+    calls: list[object] = []
+    monkeypatch.setattr(app_module, "guard_accepts", lambda loop=None: calls.append(loop))
+    app = app_module.create_managed_app(
+        db_path=tmp_path / "guard.db",
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    with TestClient(app):
+        assert calls == [None]

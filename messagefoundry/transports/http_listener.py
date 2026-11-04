@@ -937,7 +937,7 @@ class HttpSource(SourceConnector):
         # require_receipt refuses any other handler here, before a single message is accepted.
         self._handler = require_receipt(handler, source="HTTP source")
         self._admission.stopping = False  # a restart of this same instance serves again
-        guard_accepts()  # on the Proactor loop, a peer reset would close the listening socket
+        guard_accepts()  # see messagefoundry.proactor_accept
         self._tls_failures.open()
         # BACKLOG #2479, the shape BACKLOG #1606 fixed on MLLP. On the stdlib loop a TLS listener
         # accepts PLAIN TCP and upgrades each admitted socket itself, so the allowlist and both
