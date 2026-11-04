@@ -5395,8 +5395,15 @@ class SqlServerStore:
             # Not logged here: _drain_detached_close, on the closer, already logged it at WARNING.
             return
 
-    async def _rollback_or_discard(self, conn: Any) -> None:
-        """Roll back a failed audit append; if that rollback fails too, discard the connection.
+    async def _rollback_or_discard(self, conn: Any, *, within: float | None = None) -> None:
+        """Roll back a failed transaction; if that rollback fails too, discard the connection.
+
+        ``within`` bounds the rollback, in seconds; ``None`` leaves it unbounded. A rollback that
+        runs past the bound is treated as one that failed: the connection is discarded, and the
+        rollback still running on its executor thread closes the handle as it returns (the call
+        gate's hand-off, BACKLOG #2049). :meth:`_fetch_rows` passes the lease claim's clamp here, so
+        a stalled rollback after a failed claim cannot hold ``_leadership_lock`` past it, and also
+        uses this method on its unclamped reads (BACKLOG #5066).
 
         BACKLOG #1940. The approval gate answers a refused release row with 503, which says the row is
         absent. A rollback that fails may leave the INSERT open, and :meth:`_acquire` recycles a
@@ -5419,10 +5426,15 @@ class SqlServerStore:
 
         A cancellation during the rollback itself propagates, and :meth:`_acquire` quarantines."""
         try:
-            await conn.rollback()
-        except Exception:  # noqa: BLE001 - every driver fault; the caller raises the original
+            if within is None:
+                await conn.rollback()
+            else:
+                async with asyncio.timeout(within):
+                    await conn.rollback()
+        except Exception:  # noqa: BLE001 - every driver fault, and the bound; the caller raises the original
             log.warning(
-                "sqlserver: rollback after a failed audit append failed; discarding the connection",
+                "sqlserver: rollback after a failed transaction failed or ran past its bound;"
+                " discarding the connection",
                 exc_info=True,
             )
             # Its future is deliberately not awaited; see the docstring.
@@ -5556,33 +5568,40 @@ class SqlServerStore:
         :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets both bounds, so
         neither can be set without the other."""
         if timeout_clamp is None:
-            borrow, statement_timeout = self._acquire(), None
+            borrow, statement_timeout, rollback_bound = self._acquire(), None, None
         else:
             # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
-            # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow.
-            borrow = self._acquire_clamped(max(1.0, timeout_clamp))
+            # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
+            # rollback after a failure gets the same floored clamp (BACKLOG #5066).
+            rollback_bound = max(1.0, timeout_clamp)
+            borrow = self._acquire_clamped(rollback_bound)
             statement_timeout = _clamped_statement_timeout(
                 timeout_clamp, self._settings.command_timeout
             )
-        async with (
-            borrow as conn,
-            self._statement_timeout(conn, statement_timeout),
-            self._cursor(conn) as cur,
-        ):
+        async with borrow as conn:
             try:
-                await cur.execute(sql, params) if params else await cur.execute(sql)
-                columns = [c[0] for c in cur.description]
-                rows = await cur.fetchall()
-                # Read-snapshot release, NOT a durable write — commit without counting (A1). This is the
-                # single read helper (_fetchall, _fetchone and _fetchone_clamped delegate here); routing
-                # every read through _commit was what made committed_txns a superset of the write cost
-                # model on a live SQL Server.
-                await self._commit_read(conn)
+                async with (
+                    self._statement_timeout(conn, statement_timeout),
+                    self._cursor(conn) as cur,
+                ):
+                    await cur.execute(sql, params) if params else await cur.execute(sql)
+                    columns = [c[0] for c in cur.description]
+                    rows = await cur.fetchall()
+                    # Read-snapshot release, NOT a durable write — commit without counting (A1). This is
+                    # the single read helper (_fetchall, _fetchone and _fetchone_clamped delegate here);
+                    # routing every read through _commit was what made committed_txns a superset of the
+                    # write cost model on a live SQL Server.
+                    await self._commit_read(conn)
             except Exception:
                 # autocommit=False: a failed read otherwise leaves the pooled connection mid-txn (and
                 # under RCSI an open snapshot pins the version store / bloats tempdb). Roll back before
-                # it returns to the pool so the next borrower starts clean (M-6).
-                await conn.rollback()
+                # it returns to the pool so the next borrower starts clean (M-6). After the cursor has
+                # closed and the statement timeout is restored, so a discard cannot race either on
+                # another thread. A rollback that fails, or on the clamped path runs past its bound,
+                # discards the connection rather than lend an open transaction (BACKLOG #5066): the
+                # clamped caller holds the coordinator's _leadership_lock, and the claim's MERGE holds
+                # HOLDLOCK range locks on leader_lease.
+                await self._rollback_or_discard(conn, within=rollback_bound)
                 raise
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 
@@ -5607,9 +5626,15 @@ class SqlServerStore:
         it is issued. Here they do not: the statement timeout counts whole seconds, so what a borrow
         leaves of a 1 s clamp cannot be expressed. A renew can therefore land up to about twice the
         clamp after it is issued, while ``ClusterSettings._renew_fits_the_margin`` compares the
-        clamp alone with the margin. The COMMIT and a ROLLBACK after the statement are calls on the
-        connection, not statements, so neither the clamp nor ``[store].command_timeout`` is known to
-        bound them, by a reading of pyodbc's documentation, not a measurement."""
+        clamp alone with the margin. The COMMIT after the statement is a call on the connection, not a
+        statement, so neither the clamp nor ``[store].command_timeout`` is known to bound it, by a
+        reading of pyodbc's documentation, not a measurement.
+
+        **The ROLLBACK after a failure has its own bound (BACKLOG #5066):** the clamp floored at
+        1 s, applied on the event loop by :meth:`_rollback_or_discard`. One that fails or runs past
+        it discards the connection, so a claim's open ``HOLDLOCK`` transaction is never lent to the
+        next borrower. A failed claim can therefore hold the caller's ``_leadership_lock`` for up to
+        about three times the clamp, plus a COMMIT nothing here bounds."""
         rows = await self._fetch_rows(sql, params, timeout_clamp)
         return rows[0] if rows else None
 

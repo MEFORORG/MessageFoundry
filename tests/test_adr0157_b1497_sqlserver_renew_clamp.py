@@ -269,6 +269,84 @@ async def test_the_unclamped_read_is_unchanged() -> None:
     assert conn.raw.assigned == [30]
 
 
+# --- the rollback after a failed claim (BACKLOG #5066) -------------------------
+
+
+class _RollbackFails(_Conn):
+    async def rollback(self) -> None:
+        self.rolled_back += 1
+        raise RuntimeError("08S01 communication link failure during rollback")
+
+
+class _RollbackHangs(_Conn):
+    async def rollback(self) -> None:
+        self.rolled_back += 1
+        await asyncio.Event().wait()
+
+
+@pytest.mark.parametrize("clamped", [True, False], ids=["clamped", "unclamped"])
+async def test_a_failed_rollback_discards_the_connection_and_raises_the_original(
+    clamped: bool,
+) -> None:
+    """A rollback that fails may leave the claim's HOLDLOCK transaction open, so the connection
+    must never go back to the pool able to be lent. The caller sees the claim's own error, not the
+    rollback's. Before #5066 the connection was recycled open and the rollback's error replaced the
+    original, on both paths."""
+    conn = _RollbackFails()
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    store = _store(conn)
+    with pytest.raises(RuntimeError, match="HYT00"):
+        if clamped:
+            await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=4.5)
+        else:
+            await store._fetchone("SELECT 1", ())
+    assert conn.rolled_back == 1
+    assert conn.closed is True  # detached: aioodbc's pool will not re-lend a closed connection
+    # The restore ran before the rollback and its discard, never beside them.
+    assert conn.raw.assigned == ([30, 4, 30] if clamped else [30])
+
+
+async def test_a_hung_rollback_ends_at_the_clamp_and_discards_the_connection() -> None:
+    """The bound (step 1 of #5066): the rollback gets the clamp floored at 1 s. Past it the
+    connection is discarded and the claim's error is raised, so the rollback cannot hold the
+    leadership lock unbounded."""
+    conn = _RollbackHangs()
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    store = _store(conn)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=1.0)
+    elapsed = time.monotonic() - started
+    assert 0.9 <= elapsed < 3.0, elapsed
+    assert conn.rolled_back == 1
+    assert conn.closed is True
+
+
+async def test_a_hung_rollback_on_a_failed_claim_releases_the_leadership_lock() -> None:
+    """End to end over the coordinator: the tick that failed its claim returns inside the bound,
+    and a stepdown waiting on _leadership_lock can then take it."""
+    conn = _RollbackHangs()
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=1.0)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await coord._maintain_leadership()
+    assert time.monotonic() - started < 3.0
+    assert coord._leadership_lock.locked() is False
+    assert conn.closed is True
+
+
+async def test_a_rollback_that_succeeds_still_recycles_the_connection() -> None:
+    """Control: the bound changes nothing when the rollback returns in time."""
+    conn = _Conn()
+    conn.fail = RuntimeError("HYT00 query timeout expired")
+    store = _store(conn)
+    with pytest.raises(RuntimeError, match="HYT00"):
+        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=1.0)
+    assert conn.rolled_back == 1
+    assert conn.closed is False
+
+
 # --- the coordinator ---------------------------------------------------------
 
 
