@@ -3158,8 +3158,11 @@ class AuthStore(Protocol):
         raising the account's session epoch in the same transaction (BACKLOG #2592). Returns how
         many it revoked and whether it re-stamped the kept session with the new epoch in that
         transaction (:class:`~messagefoundry.store.store.RevokeResult`, BACKLOG #4975): only when
-        that session is the account's and carried the epoch the raise replaced (store.py's
-        ``KeptSessionRestamp``). ``kept`` is False with no ``except_token_hash``."""
+        that session is the account's and carried the epoch the raise replaced and the store's
+        current global epoch, read in that transaction (store.py's ``KeptSessionRestamp``). A
+        session of the account it declines to re-stamp it ends in the same transaction and counts,
+        and reports ``ended_kept`` (follow-up to BACKLOG #4975). ``kept`` is False with no
+        ``except_token_hash``."""
         ...
 
     async def count_user_sessions(
@@ -3167,7 +3170,9 @@ class AuthStore(Protocol):
     ) -> int:
         """How many sessions :meth:`revoke_user_sessions` would end, given the same ``user_id`` and
         ``except_token_hash``: every unrevoked row of the account, idle or expired ones included,
-        but for the excepted one (BACKLOG #3393).
+        but for the excepted one (BACKLOG #3393). Where the revoke declines to re-stamp the
+        excepted session it ends that one too and counts it (``RevokeResult.ended_kept``), so its
+        ``count`` is then one more than this; its ``others`` is this number.
 
         Deliberately the revoke's predicate and not :meth:`list_sessions`'s, so the number an offer
         to sign out the other sessions shows is the number the revoke then ends. Each backend
@@ -3188,8 +3193,9 @@ class AuthStore(Protocol):
         account its read of the account list returns, ends the sessions it finds, and re-seals the
         kept session under its account's new epoch and the new global one, only when it carried
         both epochs those raises replaced (store.py's ``KeptSessionRestamp``, BACKLOG #4975): a
-        kept session an earlier sweep missed is left unstamped, so it is refused when next
-        presented, and ``kept`` is False. The order of the first three is each backend's, and its
+        kept session an earlier sweep missed, or one whose account's record failed its seal, is
+        ended in the same transaction and counted instead, ``kept`` is False and ``ended_kept``
+        True (follow-up to BACKLOG #4975). The order of the first three is each backend's, and its
         own docstring states it. store.py's
         ``GLOBAL_SESSION_EPOCH_SQL`` says what the global epoch decides, and docs/SECURITY.md,
         *Limits of the session sweep*, says what the revoke still leaves. A kept session whose seal
