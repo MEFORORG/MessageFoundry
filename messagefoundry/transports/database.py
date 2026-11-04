@@ -103,11 +103,13 @@ from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import prints_a_codec_error, safe_exc
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
+    POLL_STOP_GRACE_S,
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
     InboundHandler,
     NegativeAckError,
+    PollStopGuard,
     SourceConnector,
     count_setting,
     float_setting,
@@ -2632,7 +2634,8 @@ async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = Non
     reload would otherwise wait as long as that call runs. With no connection held back, an
     in-flight call is an ordinary one, and the close waits for it as it did before #2394, however
     long it takes. ``bound`` instead stops the wait at that many seconds whatever the count: the
-    source's stop after a cancel (BACKLOG #1620) passes it.
+    source's stop after a cancel (BACKLOG #1620), or after it cut a blocked poll (BACKLOG #4685),
+    passes it.
 
     **Stopping the wait frees nothing.** The close is waited on through :func:`asyncio.wait`, which
     never cancels it, so a close cut halfway never leaves a connection's handle for aioodbc's
@@ -3043,16 +3046,18 @@ _MAX_SKIPPED_ROWS_PER_POLL = 64
 #: them (BACKLOG #1620). It bounds the cancel; a step that outlasts it is hung and is cut, and its
 #: row re-emits as the at-least-once duplicate a failed mark already makes.
 _ROW_STEP_GRACE_S = 2.0
-#: How long a cancelled DatabaseSource.stop() waits for the poll task it cut to finish (BACKLOG
-#: #1620). A cut task can still be held by a driver call on an executor thread, such as a cursor
-#: close behind a hung statement; stop() then returns with the task still referenced, so the next
-#: stop() joins it before closing the pool under it.
+#: How long a DatabaseSource.stop() waits for the poll task it cut to finish, after a cancel
+#: (BACKLOG #1620) or after an ordinary stop's grace (BACKLOG #4685). A cut task can still be held
+#: by a driver call on an executor thread, such as a cursor close behind a hung statement; stop()
+#: then returns with the task still referenced, so the next stop() joins it before closing the pool
+#: under it.
 _CUT_JOIN_TIMEOUT_S = 2.0
 #: How long a pool close waits once it has a reason to stop waiting (:func:`_close_pool_bounded`).
 #: A pool waits for every connection in use to come back, so one a hung driver call holds would make
 #: it wait forever. A cancelled DatabaseSource.stop() waits this long whatever its pool holds
-#: (BACKLOG #1620). Every other close of a DATABASE pool, the source's ordinary stop, the
-#: destination's, the db_lookup executor's and a DatabaseRef sync's teardown, waits this long only
+#: (BACKLOG #1620), and so does an ordinary one that cut its poll task (BACKLOG #4685). Every other
+#: close of a DATABASE pool, the source's other ordinary stops, the destination's, the db_lookup
+#: executor's and a DatabaseRef sync's teardown, waits this long only
 #: while a connection is held back behind a cancelled borrow (BACKLOG #2394), and otherwise waits
 #: for its in-flight calls without a bound.
 _POOL_CLOSE_TIMEOUT_S = 2.0
@@ -3232,6 +3237,8 @@ class DatabaseSource(SourceConnector):
         self._task: asyncio.Task[None] | None = None
         # The poll task inside a row's hand-off and mark; a cancelled stop() gives it a grace.
         self._row_step_task: asyncio.Task[Any] | None = None
+        # The poll task inside a hand-off, which an ordinary stop() never cuts (BACKLOG #4685).
+        self._stop_guard = PollStopGuard()
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -3263,20 +3270,30 @@ class DatabaseSource(SourceConnector):
         referenced, and the next stop() joins it. A close failure after a cancel is logged, never
         raised over it.
 
-        **An ordinary stop() waits for the pool as before, unless a borrow was cancelled.** It
-        waits for an in-flight call without a bound, but stops at :data:`_POOL_CLOSE_TIMEOUT_S` once
-        a connection is held back behind a cancelled borrow (BACKLOG #2394), such as a
-        ``test_connection`` probe whose ``SELECT 1`` was cancelled while it hung.
+        **An ordinary stop() gives up on a blocked driver call after** :data:`POLL_STOP_GRACE_S`
+        (BACKLOG #4685), as ``FileSource.stop()`` does on a blocked share call. The poll task sees
+        ``_stop`` between rows and between polls, so it usually returns at once. A select, a pool
+        borrow or a mark hung on an unresponsive server is cut after the grace, logged, and from
+        then on handled as a cut after a cancel: the join and the pool close are bounded as above.
+        A row whose mark is cut re-emits on the next start, the duplicate a failed mark makes.
+        **A hand-off is never cut**; :class:`PollStopGuard` says how long stop() then waits.
+
+        **An ordinary stop() the poll task finished in time waits for the pool as before, unless a
+        borrow was cancelled.** It waits for an in-flight call without a bound, but stops at
+        :data:`_POOL_CLOSE_TIMEOUT_S` once a connection is held back behind a cancelled borrow
+        (BACKLOG #2394), such as a ``test_connection`` probe whose ``SELECT 1`` was cancelled while
+        it hung.
         """
         self._stop.set()
         task = self._task
+        cut = False
         try:
             if task is not None:
-                await self._join_poll(task)
+                cut = await self._join_poll(task)
         except (asyncio.CancelledError, Exception):
             await self._finish_stop(task, interrupted=True)
             raise
-        await self._finish_stop(task, interrupted=False)
+        await self._finish_stop(task, interrupted=cut)
 
     async def _finish_stop(self, task: asyncio.Task[None] | None, *, interrupted: bool) -> None:
         """Clear a finished poll task, log its fault, and close the pool, bounded if interrupted."""
@@ -3297,38 +3314,53 @@ class DatabaseSource(SourceConnector):
             if not interrupted:
                 raise
             logger.warning(
-                "DATABASE source pool close failed during a cancel: %s", _safe_db_error(exc)
+                "DATABASE source pool close failed after a cancel or a cut: %s", _safe_db_error(exc)
             )
 
-    async def _join_poll(self, task: asyncio.Task[None]) -> None:
-        """Wait for the poll task; on a cancel, apply stop()'s row-step grace, then cut and join."""
+    async def _join_poll(self, task: asyncio.Task[None]) -> bool:
+        """Wait for the poll task, bounded outside a hand-off; on a cancel, apply stop()'s row-step
+        grace, then cut and join. Returns whether an ordinary stop() gave up on the task and cut it."""
         current = asyncio.current_task()
         # Read before the wait, so a cancel this task already carried does not count as a second.
         before = current.cancelling() if current is not None else 0
         try:
-            # wait, not gather: a cancelled wait leaves the task alone, so the arm below decides.
-            await asyncio.wait({task})
+            # A cancelled join leaves the task alone, so the arm below decides.
+            if await self._stop_guard.join(task, POLL_STOP_GRACE_S):
+                return False
         except asyncio.CancelledError:
             try:
                 again = current is not None and current.cancelling() - before > 1
                 if self._row_step_task is task and not again:
                     await self._row_grace(task)
             finally:
-                task.cancel()  # a no-op once the task has finished
-                if self._row_step_task is task:
-                    # Cut: a later cancelled stop() must not grant this task a grace again while it
-                    # only finishes a cursor close.
-                    self._row_step_task = None
-                # wait, not gather, again: a further cancel is not forwarded into the task, and the
-                # timeout bounds a task a driver call holds.
-                await asyncio.wait({task}, timeout=_CUT_JOIN_TIMEOUT_S)
-                if not task.done():
-                    logger.warning(
-                        "DATABASE source poll task still running %.1fs after a cancelled stop() "
-                        "cut it; it stays registered and the next stop() joins it",
-                        _CUT_JOIN_TIMEOUT_S,
-                    )
+                await self._cut(task, "a cancelled stop()")
             raise
+        logger.warning(
+            "DATABASE source poll task did not stop within %.1fs, most likely a driver call "
+            "blocked on an unresponsive server; cancelled it. A row it had handed off but not "
+            "marked re-emits on the next start.",
+            POLL_STOP_GRACE_S,
+        )
+        await self._cut(task, "an ordinary stop()")
+        return True
+
+    async def _cut(self, task: asyncio.Task[None], by: str) -> None:
+        """Cancel the poll task and join it for at most :data:`_CUT_JOIN_TIMEOUT_S`."""
+        task.cancel()  # a no-op once the task has finished
+        if self._row_step_task is task:
+            # Cut: a later cancelled stop() must not grant this task a grace again while it only
+            # finishes a cursor close.
+            self._row_step_task = None
+        # wait, not gather: a further cancel is not forwarded into the task, and the timeout bounds
+        # a task a driver call holds.
+        await asyncio.wait({task}, timeout=_CUT_JOIN_TIMEOUT_S)
+        if not task.done():
+            logger.warning(
+                "DATABASE source poll task still running %.1fs after %s cut it; it stays "
+                "registered and the next stop() joins it",
+                _CUT_JOIN_TIMEOUT_S,
+                by,
+            )
 
     async def _row_grace(self, task: asyncio.Task[None]) -> None:
         """Wait up to :data:`_ROW_STEP_GRACE_S` for the row step, while this node leads.
@@ -3485,7 +3517,8 @@ class DatabaseSource(SourceConnector):
         so the step is NOT atomic under shutdown."""
         assert self._handler is not None
         try:
-            await self._handler(raw)
+            with self._stop_guard.store_call():  # an ordinary stop() never cuts it (#4685)
+                await self._handler(raw)
         except Exception as exc:
             # The handler records every message-level outcome itself (parse/route → ERROR) and
             # returns, so an exception here is usually an infrastructure failure (the durable store
