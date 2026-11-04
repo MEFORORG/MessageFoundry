@@ -255,8 +255,9 @@ _CROSS_ORIGIN_FETCH = frozenset({"cross-site", "same-site"})
 #: The ``Sec-Fetch-Site`` values a /ui WRITE is accepted with (:func:`assert_same_origin`): the
 #: browser calls the request same-origin, or user-initiated (``none``). A GET is not held to this.
 _SAME_ORIGIN_FETCH = frozenset({"same-origin", "none"})
-#: The four ``Sec-Fetch-Site`` values the Fetch Metadata standard defines. On a GET only these
-#: settle :func:`assert_same_origin`; any other value counts as absent there (B291-R1).
+#: The four ``Sec-Fetch-Site`` values the Fetch Metadata standard defines. On any method only these
+#: settle :func:`assert_same_origin`. Any other non-empty value is refused on a write and counts as
+#: absent on a GET (B291-R1). Not hashed into the UI seam: the walk follows functions only.
 _KNOWN_FETCH_SITE = _CROSS_ORIGIN_FETCH | _SAME_ORIGIN_FETCH
 #: The refusal for a request whose ``Sec-Fetch-Site`` lines disagree. Shared with
 #: :class:`._security.UiFetchMetadataMiddleware`, which gives the same answer to the same request.
@@ -1233,9 +1234,9 @@ def _issue_continuation(request: Request, next_path: str) -> None:
       a value the origin check does not recognise, is judged by its ``Origin``, as
       :func:`assert_same_origin`'s table says, and a top-level GET carries no ``Origin`` either,
       which that check accepts. So on a browser without Fetch Metadata, a link opened from outside
-      the browser still issues the page; this rule does not close that case. A window-only unlock page (one that
-      binds no action) is never issued: it always continues, so an entry would only fill the
-      per-session cap and evict a pending ``auto_retry`` issue."""
+      the browser still issues the page; this rule does not close that case. A window-only unlock
+      page (one that binds no action) is never issued: it always continues, so an entry would only
+      fill the per-session cap and evict a pending ``auto_retry`` issue."""
     token = session_token(request)
     action = lookup_ui_action(next_path)
     if (

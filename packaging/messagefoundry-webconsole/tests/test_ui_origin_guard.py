@@ -211,11 +211,6 @@ def test_a_padded_sec_fetch_site_is_refused_by_the_check_itself() -> None:
         assert (refused.value.status_code, refused.value.detail) == (403, _CROSS_SITE), value
 
 
-#: GET ``Sec-Fetch-Site`` values that name no provenance the check recognises: empty, an unknown
-#: token, another case, padding, and two lines an intermediary folded into one comma-joined value.
-_UNRECOGNISED_GET_SITES = ("", "x", "Same-Origin", " same-origin", "same-origin, none")
-
-
 def test_a_get_with_an_empty_or_unknown_sec_fetch_site_is_decided_by_origin() -> None:
     """B291-R1 of the vault file ``OWNER-RULINGS-2026-10-17-BATCH291.md`` (vault BACKLOG #3316):
     on a GET, an empty or unknown ``Sec-Fetch-Site`` counts as absent, and ``Origin`` decides. So
@@ -233,7 +228,10 @@ def test_a_get_with_an_empty_or_unknown_sec_fetch_site_is_decided_by_origin() ->
     def request(method: str, headers: dict[str, str]) -> Any:
         return origin_check_request(method, {"host": "t", **headers})
 
-    for value in _UNRECOGNISED_GET_SITES:
+    # The table's own values for the two narrowed states: empty, an unknown token, another case,
+    # padding, and two lines an intermediary folded into one comma-joined value.
+    for value in (*_TABLE_SITES["empty"], *_TABLE_SITES["any other value"]):
+        assert value is not None
         with pytest.raises(HTTPException) as refused:
             webconsole_auth.assert_same_origin(
                 request("GET", {"sec-fetch-site": value, "origin": EVIL_ORIGIN})
