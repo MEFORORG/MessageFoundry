@@ -141,20 +141,24 @@ serves some others on a thread of their own, outside the hold below.
 fragment, the SCP allows `timeout_seconds` plus the message's data set bytes so far at 64 KiB a
 second. A message still incomplete past that ends the association with an A-ABORT. The check runs
 as each P-DATA-TF lands, so the end can come as late as the next PDU's header and body reads, each
-of which has `timeout_seconds`. A peer that sends no next PDU is ended by the read deadline. A
+of which has `timeout_seconds`. A peer that sends nothing more is ended by pynetdicom's idle timer,
+after `timeout_seconds`, and one that stops part way through a PDU by the read deadline. A
 message whose last fragment arrives is served however long it took, and the next message's clock
 starts at its own first fragment. The 64 KiB a second is a constant, not a setting. The bound is
 per message, not per association. At least these limits apply:
 
 - The SCP counts at most twice the effective `max_object_bytes` of one object, and the effective
   cap is at most 16 MiB, so one message lasts at most
-  `timeout_seconds + 2 * min(max_object_bytes, 16 MiB) / (64 KiB a second)` before the next PDU's
-  reads: 30 + 512 seconds, about 9 minutes, at the defaults.
+  `timeout_seconds + 2 * min(max_object_bytes, 16 MiB) / (64 KiB a second)` from the end of its
+  first PDU's reads to the start of the next PDU's: 30 + 512 seconds, about 9 minutes, at the
+  defaults. Those two PDUs' header and body reads, each up to `timeout_seconds`, come on top.
 - A link slower than 64 KiB a second has its larger objects cut. At a link rate of `r` bytes a
   second, an object is cut once its data set is over `timeout_seconds * r * 64 KiB / (64 KiB - r)`.
   At the default 30 seconds that is objects over about 2 MiB at 32 KiB a second, and over about
-  640 KiB at 16 KiB a second. A link that slow sees a failed association, which this engine's own
-  C-STORE client reads as transient and retries.
+  640 KiB at 16 KiB a second. The cut falls at the same point on every attempt, so such an object
+  is never delivered over that link. This engine's own C-STORE client reads the failed association
+  as transient and retries the object at the head of its lane, so the lane stops there until the
+  object is moved aside. Raising `timeout_seconds` on the SCP raises the size that is cut.
 - A peer that sends small complete messages one after another, such as a C-ECHO every few seconds,
   still holds a `max_associations` slot for as long as it keeps sending. Each of its messages
   completes, so no deadline ends it, and this bound does not close that case.

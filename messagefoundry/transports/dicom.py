@@ -640,7 +640,8 @@ class _ReceiptTally:
     A message also has a deadline, from the PDU that brings its first fragment (vault BACKLOG #5080):
     ``timeout_seconds`` plus its data set bytes so far at :data:`_MIN_MESSAGE_BYTES_PER_SECOND`. It
     is checked as each P-DATA-TF is counted, so a message that is past it ends the association when
-    its next PDU lands, and a peer that sends no next PDU is ended by the read deadline instead. A
+    its next PDU lands. A peer that sends nothing more is ended by pynetdicom's idle timer, and one
+    that stops part way through a PDU by the read deadline. A
     message that completes is never ended by it, and the clock starts again with the next one."""
 
     def __init__(
