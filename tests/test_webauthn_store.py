@@ -69,7 +69,12 @@ async def test_the_conditional_bind_predicate_fails_closed_on_seals_and_epochs(
     store = await MessageStore.open(tmp_path / "pred.db")
     try:
         await store.create_user(
-            user_id="p1", username="p1", auth_provider="local", now=1.0, password_generated=False
+            user_id="p1",
+            username="p1",
+            auth_provider="local",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
         assert await store.create_session(token_hash="ps", user_id="p1", expires_at=1e10, now=1.0)
         await store.mark_session_mfa_verified("ps", now=2.0)
@@ -134,6 +139,7 @@ async def test_webauthn_public_key_plaintext_under_cipher(tmp_path: Path) -> Non
             password_hash="h",
             now=1.0,
             password_generated=False,
+            audits=(),
         )
         await store.add_webauthn_credential(_cred("u1", "key", id_hash="h1", created_at=2.0))
         async with store._read() as conn:  # noqa: SLF001 - white-box: raw column, no decrypt

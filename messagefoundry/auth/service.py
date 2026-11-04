@@ -4250,6 +4250,9 @@ class AuthService:
                     password_hash=None,
                     must_change_password=True,
                     password_generated=False,
+                    # None with the INSERT (BACKLOG #5070): the run's record is the
+                    # `auth.first_administrator_provisioned` row written once the grant has landed.
+                    audits=(),
                 )
             except Exception as exc:
                 if not _is_integrity_refusal(exc):
@@ -15728,6 +15731,9 @@ class AuthService:
                 # operator never sets a lasting password the user keeps (ASVS 6.4.6 / WP-L3-12).
                 must_change_password=True,
                 password_generated=True,
+                # None with the INSERT (BACKLOG #5070): `user.created` names the roles, so it is
+                # written below, after `set_user_roles`.
+                audits=(),
             )
         except Exception as exc:
             if not _is_integrity_refusal(exc):
@@ -15837,7 +15843,11 @@ class AuthService:
             new_notify = _require_single_mailbox(notify_email)
         if disabled and await self.is_last_enabled_admin(user_id):
             raise LastAdministratorRefused("cannot disable the last administrator")
-        await self._store.update_user_profile(user_id, display_name=display_name, email=email)
+        # None with the UPDATE (BACKLOG #5070): this save's `user.updated` row also records the
+        # disable outcome, so it is written below, once that is known.
+        await self._store.update_user_profile(
+            user_id, display_name=display_name, email=email, audits=()
+        )
         # The profile write above never names `notify_email`: it is the same call `_upsert_ad_user`
         # makes, and on a directory account `email` is the directory's.
         if before is not None and new_notify is not None:

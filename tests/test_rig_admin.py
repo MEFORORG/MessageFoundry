@@ -879,6 +879,7 @@ def _seed_directory_administrator(db: Path, key: str) -> None:
                 auth_provider=AuthProvider.AD.value,
                 password_hash=None,
                 password_generated=False,
+                audits=(),
             )
             await service.initialize()  # seeds the role the assignment refers to
             await store.set_user_roles("id-dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")
@@ -987,6 +988,7 @@ async def test_the_rig_guard_refuses_the_write_too_and_keeps_the_shipped_words()
             auth_provider=AuthProvider.AD.value,
             password_hash=None,
             password_generated=False,
+            audits=(),
         )
         await service.initialize()
         await store.set_user_roles("id-dir-a", [Role.ADMINISTRATOR.value], assigned_by="test")

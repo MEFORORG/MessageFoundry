@@ -334,7 +334,9 @@ from messagefoundry.store.store import (
     report_unsealed_role_records,
     report_unsealed_users,
     report_user_reseal,
+    require_ingress_audit,
     require_notify_email,
+    require_operator_audit,
     require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
@@ -6507,6 +6509,7 @@ class SqlServerStore:
         is inserted (Phase 3a). A missing ref fails loud → the whole ingress rolls back → no ACK for a
         body we couldn't reference (content-addressing dedups the sender's resend; the startup sweep
         reclaims the orphan). Empty/None → the byte-identical no-detach path."""
+        require_ingress_audit(audit, origin)  # BACKLOG #5071
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
@@ -11599,6 +11602,7 @@ class SqlServerStore:
         docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
         A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580).
         ``audit``'s row commits with the replay (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -11722,6 +11726,7 @@ class SqlServerStore:
         ``INSERT … WHERE NOT EXISTS`` + ``rowcount`` is the atomic gate; the outbound row is created only
         when it made a row (ADR 0090 §4). ``audit``'s row commits with the resend, a duplicate included
         (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -11995,6 +12000,7 @@ class SqlServerStore:
         EXISTS`` + ``rowcount`` gate (keyed to ``(origin, "@reingress:<channel>")``) admits exactly one;
         the deterministic content-addressed child id is the partial-rollback defense. ``audit``'s row
         commits with the resubmit, a duplicate included (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -12171,6 +12177,7 @@ class SqlServerStore:
         message from ``ERROR`` to ``ROUTED`` with nothing re-queued. It binds no parameter, so it does
         not disturb the positional ``?`` order ``params`` depends on. The pass-through marker exclusion
         (:data:`_NOT_PT_MARKER`, BACKLOG #1580) rides the same ``clause`` for the same reason."""
+        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})", f"({_NOT_PT_MARKER})"]
         params: list[Any] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
@@ -12225,6 +12232,7 @@ class SqlServerStore:
         now: float | None = None,
         audit: OperatorAudit[int],
     ) -> int:
+        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "destination_name=?", "status=?"]
         params: list[Any] = [Stage.OUTBOUND.value, destination_name, OutboxStatus.PENDING.value]
@@ -13511,7 +13519,7 @@ class SqlServerStore:
         approver: str,
         decided_at: float,
         seal_read: object,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
         #3638); the Store protocol states the contract. Locks as :meth:`decide_pending_approval`
@@ -13734,7 +13742,7 @@ class SqlServerStore:
         ]
 
     async def _append_operator_audit[R](
-        self, cur: Any, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+        self, cur: Any, written: AuditedWrite, audit: OperatorAudit[R], result: R
     ) -> None:
         """Append an operator mutation's audit row before its commit (BACKLOG #2624), so an append
         that fails rolls the mutation back. The caller's first statement opened the transaction the
@@ -13764,7 +13772,7 @@ class SqlServerStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -14395,7 +14403,7 @@ class SqlServerStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
@@ -14859,7 +14867,7 @@ class SqlServerStore:
         *,
         expected_username: str,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says

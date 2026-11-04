@@ -892,7 +892,7 @@ async def test_the_confinement_holds_on_every_store_backend(backend_store: Any) 
     name = f"confine-{uuid4().hex[:12]}"
     user_id = uuid4().hex
     await backend_store.create_user(
-        user_id=user_id, username=name, auth_provider="local", password_generated=False
+        user_id=user_id, username=name, auth_provider="local", password_generated=False, audits=()
     )
     try:
         identity = await service.identity_for_user_id(user_id)
@@ -922,6 +922,7 @@ async def test_every_store_backend_can_create_an_account_without_adopting_its_ad
         email=mail,
         adopt_notify_email=False,
         password_generated=False,
+        audits=(),
     )
     try:
         user = await backend_store.get_user(user_id)
@@ -1056,6 +1057,7 @@ async def test_every_store_backend_commits_the_audit_row_with_the_profile_update
         auth_provider="ad",
         email="first@example.org",
         password_generated=False,
+        audits=(),
     )
     try:
         detail = json.dumps({"user_id": user_id, "source": "directory"})
@@ -1097,6 +1099,7 @@ async def test_every_store_backend_binds_a_typed_address_in_the_same_insert(
         adopt_notify_email=False,
         notify_email=ADDRESS,
         password_generated=False,
+        audits=(),
     )
     try:
         user = await backend_store.get_user(user_id)

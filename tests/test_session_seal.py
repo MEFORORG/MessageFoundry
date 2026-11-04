@@ -132,7 +132,7 @@ async def test_a_key_rotation_ends_every_session(tmp_path: Path) -> None:
     store = await MessageStore.open(path, cipher=make_cipher(old, write_v2=True))
     try:
         await store.create_user(
-            user_id="u", username="u", auth_provider="local", password_generated=False
+            user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
         )
         token = mint_token()
         await store.create_session(
@@ -158,7 +158,7 @@ async def test_a_session_sealed_under_a_retired_key_ends_without_an_alert(tmp_pa
     store = await MessageStore.open(path, cipher=make_cipher(old, write_v2=True))
     try:
         await store.create_user(
-            user_id="u", username="u", auth_provider="local", password_generated=False
+            user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
         )
         stale, bent = mint_token(), mint_token()
         for token in (stale, bent):
@@ -190,7 +190,7 @@ async def test_the_inventory_hides_a_session_from_an_older_epoch(
     store, path = keyed
     service = AuthService(store, AuthSettings())
     await store.create_user(
-        user_id="u", username="u", auth_provider="local", password_generated=False
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
     )
     token = mint_token()
     await store.create_session(
@@ -207,7 +207,7 @@ async def test_a_keyless_store_writes_no_seal_and_checks_none(tmp_path: Path) ->
     try:
         assert store.row_sealer() is None
         await store.create_user(
-            user_id="u", username="u", auth_provider="local", password_generated=False
+            user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
         )
         token = mint_token()
         await store.create_session(
@@ -227,7 +227,7 @@ async def test_a_refused_session_is_audited_and_alerted_once_per_interval(
     alerts: list[str] = []
     service = AuthService(store, AuthSettings(), integrity_alert=alerts.append)
     await store.create_user(
-        user_id="u", username="u", auth_provider="local", password_generated=False
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
     )
     good = mint_token()
     await store.create_session(
@@ -258,7 +258,7 @@ async def test_signing_out_elsewhere_ends_every_session_when_the_callers_own_fai
     store, path = keyed
     service = AuthService(store, AuthSettings())
     await store.create_user(
-        user_id="u", username="u", auth_provider="local", password_generated=False
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
     )
     tokens = [mint_token() for _ in range(3)]
     for token in tokens:
@@ -283,7 +283,7 @@ async def test_signing_out_elsewhere_keeps_the_callers_own_session(
     store, _ = keyed
     service = AuthService(store, AuthSettings())
     await store.create_user(
-        user_id="u", username="u", auth_provider="local", password_generated=False
+        user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
     )
     tokens = [mint_token() for _ in range(3)]
     for token in tokens:

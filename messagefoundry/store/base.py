@@ -379,7 +379,13 @@ class QueueStore(StoreLifecycle, Protocol):
         :attr:`supports_streaming_attachments` is True ever receives a non-empty value.
 
         ``audit`` is for an operator's inject only (BACKLOG #2624): its row, built from the new
-        message id, commits in the same transaction. A live receipt passes none.
+        message id, commits in the same transaction. A live receipt passes none. It stays optional
+        in the type because this one method is both paths. What holds the inject is, at least:
+        :meth:`~messagefoundry.pipeline.Engine.inject_message`, whose ``audit`` is required; and,
+        at runtime, a refusal of an operator ``origin`` (``operator_edit``, ``operator_upload``)
+        with no audit, a :class:`TypeError` raised before anything is written (BACKLOG #5071,
+        ``store.require_ingress_audit``). That refusal keys on ``origin``, so a direct caller that
+        injects with the default ``partner`` origin writes neither the operator label nor a row.
 
         ``origin`` and ``origin_actor`` fill the plain ``messages.origin`` pair (vault BACKLOG #2615).
         A live receipt keeps the default, ``partner``; an operator's inject names itself and the user."""
@@ -1080,9 +1086,12 @@ class QueueStore(StoreLifecycle, Protocol):
 
     # The operator mutations. Each takes a REQUIRED ``audit`` that builds the operator's audit row
     # from the result, and the row commits in the mutation's own transaction (BACKLOG #2624,
-    # OperatorAudit). Required with no default, so a caller cannot run one and record nothing by
-    # leaving the argument out; ``enqueue_ingress`` stays optional because a live receipt has no
-    # operator. An ``OperatorAudit`` may still return ``None``, which records nothing.
+    # OperatorAudit). Required with no default, so a typed caller cannot run one and record nothing
+    # by leaving the argument out, and each backend raises TypeError, before any write, on an
+    # explicit ``None`` or anything not callable (BACKLOG #5069). ``enqueue_ingress`` keeps an
+    # optional ``audit`` because it is also the live receipt path; see its docstring for what holds
+    # the operator inject there. An ``OperatorAudit`` may still RETURN ``None`` for a result,
+    # which records nothing: that is decided, and the reason is on ``store.OperatorAudit``.
     async def replay(
         self,
         message_id: str,
@@ -2037,7 +2046,7 @@ class AuditStore(Protocol):
         approver: str,
         decided_at: float,
         seal_read: object,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Move a ``pending`` request whose row FAILS its integrity seal to ``rejected`` (BACKLOG
         #3638; owner ruling 2026-10-26). ``True`` iff this call moved it.
@@ -2165,7 +2174,7 @@ class AuthStore(Protocol):
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Insert one account row.
 
@@ -2227,7 +2236,7 @@ class AuthStore(Protocol):
         *,
         expected_username: str,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Refresh the **cached** username on a directory-backed row (BACKLOG #1532).
 
@@ -2357,7 +2366,7 @@ class AuthStore(Protocol):
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields, never ``notify_email`` (BACKLOG #1139).
 

@@ -3393,6 +3393,7 @@ def _seed_locked(db: Path, *, locked_until: float | None) -> tuple[str, str]:
                 auth_provider="local",
                 password_hash=pw_hash,
                 password_generated=False,
+                audits=(),
             )
             if locked_until is not None:
                 await s.record_login_failure(

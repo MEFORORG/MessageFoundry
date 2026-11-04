@@ -45,6 +45,7 @@ async def _seed(store: MessageStore, user_id: str = "u1") -> str:
         password_hash="h",
         now=time.time(),
         password_generated=False,
+        audits=(),
     )
     token = mint_token()
     await store.create_session(

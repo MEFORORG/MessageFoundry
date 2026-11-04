@@ -1601,7 +1601,11 @@ async def test_local_sessions_and_signed_out_users_are_never_probed() -> None:
             actor="test",
         )
         await store.create_user(
-            user_id="dormant", username="dormant", auth_provider="ad", password_generated=False
+            user_id="dormant",
+            username="dormant",
+            auth_provider="ad",
+            password_generated=False,
+            audits=(),
         )
         await _signed_in_ad_user(service, store, "jdoe")
 
@@ -1625,7 +1629,11 @@ async def test_a_map_edit_revokes_rows_the_clock_calls_expired() -> None:
         await service.initialize()
         now = time.time()
         await store.create_user(
-            user_id="stepped", username="stepped", auth_provider="ad", password_generated=False
+            user_id="stepped",
+            username="stepped",
+            auth_provider="ad",
+            password_generated=False,
+            audits=(),
         )
         await store.create_session(
             token_hash="stepped-hash", user_id="stepped", expires_at=now - 60, now=now - 120
@@ -1661,6 +1669,7 @@ async def test_a_user_whose_only_session_is_idle_is_still_probed() -> None:
                 auth_provider="ad",
                 password_generated=False,
                 directory_object_id=_object_id_for(username),
+                audits=(),
             )
             await store.create_session(
                 token_hash=f"{username}-hash",
@@ -3246,7 +3255,11 @@ async def test_a_rename_onto_a_name_another_row_holds_leaves_both_rows_alone() -
         assert jdoe is not None
         # The departed operator's row: still in the store, holding the name, with no live session.
         await store.create_user(
-            user_id="departed-row", username="jbloggs", auth_provider="ad", password_generated=False
+            user_id="departed-row",
+            username="jbloggs",
+            auth_provider="ad",
+            password_generated=False,
+            audits=(),
         )
 
         # The directory renames jdoe onto the departed operator's name.
@@ -3407,7 +3420,11 @@ async def test_every_backend_integrity_class_is_absorbed(driver: str, error: Exc
 
         async def _raise_driver_error(*a: object, **kw: object) -> bool:
             await store.create_user(
-                user_id="winner", username="jbloggs", auth_provider="ad", password_generated=False
+                user_id="winner",
+                username="jbloggs",
+                auth_provider="ad",
+                password_generated=False,
+                audits=(),
             )
             raise error
 
@@ -3463,7 +3480,11 @@ async def test_a_lost_username_race_is_absorbed_and_does_not_kill_the_pass() -> 
         # first draft of this test passed for the wrong reason.
         async def _raise_integrity(*a: object, **kw: object) -> bool:
             await store.create_user(
-                user_id="winner", username="jbloggs", auth_provider="ad", password_generated=False
+                user_id="winner",
+                username="jbloggs",
+                auth_provider="ad",
+                password_generated=False,
+                audits=(),
             )
             raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
 
@@ -3675,6 +3696,7 @@ async def test_a_rename_that_writes_nothing_sends_no_notice(shape: str) -> None:
                 username="jdoe-married",
                 auth_provider="ad",
                 password_generated=False,
+                audits=(),
             )
         elif shape == "write_race":
 
@@ -3684,6 +3706,7 @@ async def test_a_rename_that_writes_nothing_sends_no_notice(shape: str) -> None:
                     username="jdoe-married",
                     auth_provider="ad",
                     password_generated=False,
+                    audits=(),
                 )
                 raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
 
@@ -3697,6 +3720,7 @@ async def test_a_rename_that_writes_nothing_sends_no_notice(shape: str) -> None:
                     username="jdoe-married",
                     auth_provider="ad",
                     password_generated=False,
+                    audits=(),
                 )
                 return False
 
@@ -3750,7 +3774,7 @@ async def test_a_rename_already_applied_by_another_caller_is_not_told_twice(
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
         await store.set_user_username(
-            user_id, "jdoe-married", expected_username="jdoe"
+            user_id, "jdoe-married", expected_username="jdoe", audits=()
         )  # the sign-in got there first
         held = await store.get_user_by_username("jdoe-married")
         assert held is not None and held.id == user_id
@@ -3809,7 +3833,7 @@ async def test_a_stale_plan_does_not_overwrite_a_newer_sign_in_rename(
             if username == "jdoe-married" and not signed_in:
                 signed_in.append(username)
                 assert await store.set_user_username(
-                    user_id, "jdoe-remarried", expected_username="jdoe"
+                    user_id, "jdoe-remarried", expected_username="jdoe", audits=()
                 )
             return await load_by_name(username)
 
@@ -3846,7 +3870,9 @@ async def test_a_sign_in_rename_is_not_skipped_when_a_pass_wrote_an_older_name_f
     stale-plan skip is the reconciler's alone, and the login writes, audits and notifies once."""
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
-        assert await store.set_user_username(user_id, "jdoe-married", expected_username="jdoe")
+        assert await store.set_user_username(
+            user_id, "jdoe-married", expected_username="jdoe", audits=()
+        )
 
         await service._refresh_cached_username(
             user_id=user_id,
@@ -3881,12 +3907,15 @@ async def test_a_stale_plan_is_skipped_not_filed_as_a_conflict_when_another_row_
     """
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
-        assert await store.set_user_username(user_id, "jdoe-remarried", expected_username="jdoe")
+        assert await store.set_user_username(
+            user_id, "jdoe-remarried", expected_username="jdoe", audits=()
+        )
         await store.create_user(
             user_id="holder-row",
             username="jdoe-married",
             auth_provider="ad",
             password_generated=False,
+            audits=(),
         )
         held = await store.get_user_by_username("jdoe-married")
         assert held is not None and held.id == "holder-row"
@@ -3969,7 +3998,7 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
     store, _ldap, service, notifier, user_id = await _renamed_service()
     try:
         holds = "jdoe-interim"
-        assert await store.set_user_username(user_id, holds, expected_username="jdoe")
+        assert await store.set_user_username(user_id, holds, expected_username="jdoe", audits=())
         held: UserRecord | None = None
         if shape == "pre_check":
             await store.create_user(
@@ -3977,6 +4006,7 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
                 username="jdoe-married",
                 auth_provider="ad",
                 password_generated=False,
+                audits=(),
             )
             held = await store.get_user_by_username("jdoe-married")
         elif shape == "write_race":
@@ -3987,6 +4017,7 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
                     username="jdoe-married",
                     auth_provider="ad",
                     password_generated=False,
+                    audits=(),
                 )
                 raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
 
@@ -3999,6 +4030,7 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
                     username="jdoe-married",
                     auth_provider="ad",
                     password_generated=False,
+                    audits=(),
                 )
                 return False
 
@@ -4047,7 +4079,9 @@ async def test_a_stale_held_row_is_not_a_conflict_when_this_row_already_has_the_
         assert row is not None
         # A record of another row that held the name when the caller read it, and holds it no more.
         stale_held = replace(row, id="gone-holder", username="jdoe-married")
-        assert await store.set_user_username(user_id, "jdoe-married", expected_username="jdoe")
+        assert await store.set_user_username(
+            user_id, "jdoe-married", expected_username="jdoe", audits=()
+        )
 
         caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
         caplog.clear()  # only the refresh's own records, not the sign-in setup's
@@ -4125,6 +4159,7 @@ async def test_a_stale_held_row_refusal_names_the_row_that_holds_the_name_now(
             username="jdoe-married",
             auth_provider="ad",
             password_generated=False,
+            audits=(),
         )
         caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
         caplog.clear()
@@ -4171,11 +4206,12 @@ async def test_a_pass_whose_holder_read_went_stale_writes_the_rename(
                 username="jdoe-married",
                 auth_provider="ad",
                 password_generated=False,
+                audits=(),
             )
             seen = await lookup_by_name(username)
             assert seen.user is not None and seen.user.id == "gone-holder"
             assert await store.set_user_username(
-                "gone-holder", "jdoe-retired", expected_username="jdoe-married"
+                "gone-holder", "jdoe-retired", expected_username="jdoe-married", audits=()
             )
             return seen
 
@@ -4217,7 +4253,9 @@ async def test_a_stale_held_row_is_no_conflict_when_this_row_took_the_name_since
         async def _sign_in_renames_first(username: str) -> _UserLookup:
             hooked.append(username)
             if len(hooked) == 1:
-                assert await store.set_user_username(user_id, username, expected_username="jdoe")
+                assert await store.set_user_username(
+                    user_id, username, expected_username="jdoe", audits=()
+                )
             return await lookup_by_name(username)
 
         service._lookup_by_username = _sign_in_renames_first  # type: ignore[method-assign]
@@ -4253,6 +4291,7 @@ async def test_a_holder_that_fails_its_seal_by_the_re_read_is_refused_with_the_l
             username="jdoe-married",
             auth_provider="ad",
             password_generated=False,
+            audits=(),
         )
         held = await service._load_user_by_username("jdoe-married")
         assert held is not None and held.id == "holder-row", "the caller's read must verify"
@@ -4656,7 +4695,7 @@ async def test_requests_parse_a_stored_scope_with_the_planners_parser() -> None:
     store = await MessageStore.open(":memory:")
     try:
         await store.create_user(
-            user_id="u", username="u", auth_provider="ad", password_generated=False
+            user_id="u", username="u", auth_provider="ad", password_generated=False, audits=()
         )
         user = await store.get_user("u")
         assert user is not None
@@ -4694,7 +4733,7 @@ async def _login_writes(
         # One group per channel, so any ``mapped`` set is reachable from a group set.
         await store.set_ad_group_scope_map([(f"cn=ch-{c}", c) for c in ("IB_A", "IB_B", "*")])
         await store.create_user(
-            user_id="u", username="u", auth_provider="ad", password_generated=False
+            user_id="u", username="u", auth_provider="ad", password_generated=False, audits=()
         )
         if stored is not None:
             await store.set_user_channel_scope(
@@ -5394,7 +5433,11 @@ async def test_a_refused_rename_conflict_audit_row_does_not_end_the_pass(
         await service.initialize()
         await _signed_in_ad_user(service, store, "jdoe")
         await store.create_user(
-            user_id="departed-row", username="jbloggs", auth_provider="ad", password_generated=False
+            user_id="departed-row",
+            username="jbloggs",
+            auth_provider="ad",
+            password_generated=False,
+            audits=(),
         )
         refusal = sqlite3.OperationalError("synthetic: disk I/O error")
         refused = _refuse_first(monkeypatch, store, "auth.ad_username_refresh_conflict", refusal)
