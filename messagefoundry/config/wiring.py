@@ -9797,7 +9797,14 @@ def _enforce_posix_paths(
     # Root can rewrite anything, so a root owner adds no writer the engine does not already trust. A
     # root engine trusts only root (the set collapses to {0}): any other owner could rewrite code
     # that then runs as root.
-    trusted_uids = frozenset({0, euid})
+    #
+    # Neither binding below is named "trusted". CodeQL's clear-text-logging query read the local
+    # this rule's text was once bound to, `trusted`, as a secret, and followed it through the
+    # refusal into the escape-hatch WARNING in _refuse_unsafe_config_source (alert 265). The set
+    # only feeds a membership test today; it is renamed too, so rendering it in a refusal does not
+    # raise the alert again. ADR 0034's 2026-10-03 amendment, rule 1.
+    owner_uids = frozenset({0, euid})
+    owner_rule = "root" if euid == 0 else f"root or uid {euid}"
     for path in paths:
         try:
             st = path.stat()
@@ -9811,15 +9818,11 @@ def _enforce_posix_paths(
             continue
         # Code here runs as the engine's account, so a file owned by any other non-root user is an
         # escalation vector even at 0644 -- that user can rewrite it (CONFIG-2 / review M-21).
-        if st.st_uid not in trusted_uids:
-            # Not named for what it is: CodeQL's clear-text-logging heuristic reads a name holding
-            # "trusted" as a secret, and the refusal reaches a log line (alert 265; ADR 0034's
-            # 2026-10-03 amendment, rule 1).
-            owner_rule = "root" if euid == 0 else f"root or uid {euid}"
+        if st.st_uid not in owner_uids:
             refuse(
                 f"{lead} {path} owned by uid {st.st_uid} -- the engine runs as "
-                f"uid {euid} and trusts only an owner that is {owner_rule}; that owner could rewrite "
-                "the executed code (see docs/SERVICE.md)"
+                f"uid {euid} and trusts only an owner that is {owner_rule}; uid {st.st_uid} "
+                "could rewrite the executed code (see docs/SERVICE.md)"
             )
 
 

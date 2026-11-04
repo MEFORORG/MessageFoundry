@@ -863,6 +863,9 @@ read from. This is a third: what the source is called. Three notes in
 |---|---|---|
 | `mfa` as a separate word, such as `mfa_verify_min_elapsed_seconds` or `OIDC_MFA_CLAIM_EXCEPTION` | A number, or a fixed sentence | Two on PR 1842; 241, 242 and 248 to 251 on PR 1959 |
 | `trusted_proxies` | A list of proxy addresses | 122, dismissed under *Misclassified value*; 209 on `main` |
+| `trusted`, a local in `config/wiring.py`'s `_enforce_posix_paths` | The fixed words naming the owners a config path may have | 265, on `main` and on PR 2760; fixed under rule 1 by renaming it `owner_rule` (vault BACKLOG #5248) |
+
+Rule 1 covers a local variable too, since the engine chooses its name.
 
 PR 1959's repair comment read the `mfa` pattern at CodeQL 2.27.1 as `([_-]|\b)mfa([_-]|\b)`. That
 reading is attributed to that pull request and was not re-measured here.
