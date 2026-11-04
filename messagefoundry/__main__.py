@@ -11346,9 +11346,10 @@ def _restore(args: argparse.Namespace) -> int:
 
     The engine could write an archive and verify one, and had no way to restore one; ADR 0048's cold seed
     is the consumer (restore here, then activate onto the restored store). Verifies the archive first and
-    refuses anything but a ``PASS``, then decrypts it and writes the store to ``--to``. **Never
-    overwrites:** an existing destination is refused rather than clobbered. PHI-safe output (paths,
-    counts, fingerprints — never a body or key bytes)."""
+    refuses anything but a ``PASS``, then decrypts it and writes the store to ``--to``. A config-only
+    archive carries no store, so ``--to`` refuses one, and ``--config-to`` alone writes its config
+    bundle instead. **Never overwrites:** an existing destination is refused rather than clobbered.
+    PHI-safe output (paths, counts, fingerprints — never a body or key bytes)."""
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.dr_backup import (
         RESTORE_NEEDS_A_DESTINATION,
