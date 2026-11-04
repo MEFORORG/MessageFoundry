@@ -1202,7 +1202,7 @@ async def test_a_folder_the_walk_cannot_list_is_recorded(
 
 @pytest.mark.parametrize(
     ("fault", "named"),
-    [(PermissionError, True), (FileNotFoundError, False)],
+    [(PermissionError(13, "synthetic"), True), (FileNotFoundError(2, "synthetic"), False)],
     ids=["denied", "gone"],
 )
 async def test_a_file_whose_stat_fails_is_named_unless_it_is_gone(
@@ -1219,7 +1219,7 @@ async def test_a_file_whose_stat_fails_is_named_unless_it_is_gone(
 
     def lstat(self: Path) -> os.stat_result:
         if self.name == "probe.tmp":
-            raise fault(2, "synthetic", str(self))
+            raise fault
         return real_lstat(self)
 
     monkeypatch.setattr(Path, "lstat", lstat)
@@ -1248,6 +1248,43 @@ async def test_the_skipped_list_is_capped_and_counted(tmp_path, key_b64, monkeyp
     assert _skipped_everywhere(result, manifest, detail) == ["a.py", "b.py"]
     counts = (result.config_skipped_count, manifest["config_skipped_count"])
     assert counts == (3, 3) and detail["config_skipped_count"] == 3
+
+
+def test_the_skipped_list_is_capped_by_its_encoded_size(monkeypatch) -> None:
+    """A thousand long names could still pass the manifest's read cap, so the list is also cut at
+    a byte budget, counted as ``json.dumps`` writes each name; the short list is the control."""
+    from messagefoundry.pipeline import dr_backup as dr
+
+    monkeypatch.setattr(dr, "_MAX_SKIPPED_BYTES", 25)
+    # Each name below takes 10 bytes: 8 for the escaped character with its quotes, 2 for ", ".
+    assert dr._capped_skips(("é", "è", "ê")) == ("é", "è")
+    assert dr._capped_skips(("a", "b")) == ("a", "b")
+
+
+@pytest.mark.parametrize(
+    "make_link", [_make_junction, _make_dir_symlink], ids=["junction", "symlink"]
+)
+async def test_a_directory_link_reaches_the_skipped_list(tmp_path, key_b64, make_link) -> None:
+    """The directory-link WARNING alone is not the record; the plain subfolder is the control."""
+    cfg = _config_with_a_linked_dir(tmp_path, make_link)
+    result, manifest, detail, names = await _full_pass_record(tmp_path, key_b64, cfg)
+    assert names == ["config/feed.py", "config/sub/plain.txt"]
+    assert _skipped_everywhere(result, manifest, detail) == ["linked", "sub/nested"]
+
+
+async def test_a_second_hardlink_to_an_added_file_is_named(tmp_path, key_b64) -> None:
+    """``tar`` stores the second name of one inode as a link member, which a restore does not
+    write, so the walk does not count it as a file and names it; the first name is archived."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "a.toml").write_text("# shared\n")
+    try:
+        os.link(cfg / "a.toml", cfg / "b.toml")
+    except (OSError, NotImplementedError):
+        pytest.skip("a hardlink cannot be made here")
+    result, manifest, detail, names = await _full_pass_record(tmp_path, key_b64, cfg)
+    assert "config/a.toml" in names
+    assert _skipped_everywhere(result, manifest, detail) == ["b.toml"]
 
 
 def _lose_config_after_its_inspection(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:

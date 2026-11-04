@@ -309,11 +309,24 @@ class BackupResult:
 #: class name, so this one is spelled so it cannot be read as one.
 CONFIG_WALK_ADDED_NOTHING = "no-regular-file"
 
-#: How many of the paths the archive walk passed over a pass records by name (vault BACKLOG
-#: #5233); the record also carries the total. A config dir can hold any number of links, such as
-#: a linked package tree, and an uncapped list long enough to pass :data:`_MAX_MANIFEST_BYTES`
-#: would make the whole archive, store snapshot included, one that verify and restore refuse.
+#: How many of the paths the archive walk passed over a pass records by name, and how many bytes
+#: of the manifest's JSON they may take (vault BACKLOG #5233); the record also carries the total.
+#: A config dir can hold any number of links, such as a linked package tree, and a list long
+#: enough to pass :data:`_MAX_MANIFEST_BYTES` would make the whole archive, store snapshot
+#: included, one that verify and restore refuse.
 _MAX_SKIPPED_RECORDED = 1000
+_MAX_SKIPPED_BYTES = 256 * 1024
+
+
+def _capped_skips(skipped: tuple[str, ...]) -> tuple[str, ...]:
+    """The leading ``skipped`` paths that fit both caps above, each measured as the manifest
+    encodes it (``json.dumps`` escapes every non-ASCII character to six bytes)."""
+    size = 0
+    for i, rel in enumerate(skipped[:_MAX_SKIPPED_RECORDED]):
+        size += len(json.dumps(rel)) + 2  # the separator ", "
+        if size > _MAX_SKIPPED_BYTES:
+            return skipped[:i]
+    return skipped[:_MAX_SKIPPED_RECORDED]
 
 
 @dataclass(frozen=True)
@@ -337,7 +350,7 @@ class _ConfigBundle:
         over: a bundled pass whose walk added no regular file carries no config, so it is recorded
         as not bundled, with :data:`CONFIG_WALK_ADDED_NOTHING` as its error (vault BACKLOG
         #5220)."""
-        walked = replace(self, skipped=skipped[:_MAX_SKIPPED_RECORDED], skipped_count=len(skipped))
+        walked = replace(self, skipped=_capped_skips(skipped), skipped_count=len(skipped))
         if self.bundled and added == 0:
             return replace(walked, bundled=False, error=CONFIG_WALK_ADDED_NOTHING)
         return walked
@@ -1213,15 +1226,9 @@ class BackupRunner:
         Returns how many regular files it added, which a config-only pass needs (vault BACKLOG
         #5220), and what it passed over, so the archive records what it does not carry (vault
         BACKLOG #5233): sorted paths relative to ``base``, ``.`` for ``base`` itself, as
-        :func:`~messagefoundry.config.fingerprint.describe_left_out` reads them. That names at
-        least each file it did not add as a regular file (a symlink, a file whose stat fails for any
-        reason but absence, a socket, a hardlink to a file already added, which ``tar`` stores as a
-        link member, a path swapped for something else before its add), each directory link it
-        pruned, and each folder it could not list. A file gone by its stat is no longer config, and
-        is not named. Nor is a lock file, or a candidate or staging folder the walk lists as a
-        plain folder; one that is a link or whose ``lstat`` fails is pruned as a link, and named. A
-        file below a pruned link or an unlisted folder is not named on its own; the link or the
-        folder is."""
+        :func:`~messagefoundry.config.fingerprint.describe_left_out` reads them. What that names,
+        and what it does not, is stated once, in the ``include_config`` row of
+        ``docs/CONFIGURATION.md``."""
         pruned: list[str] = []
         unlisted: list[str] = []
         found: list[Path] = []
@@ -1250,7 +1257,8 @@ class BackupRunner:
             if _is_config_edit_artifact(rel):
                 continue
             try:
-                regular = stat.S_ISREG(path.lstat().st_mode)
+                st = path.lstat()
+                regular = stat.S_ISREG(st.st_mode) and not _stat_names_another_path(st)
             except FileNotFoundError:
                 # Gone since the listing, such as an editor's save probe: no longer config.
                 continue
@@ -2481,8 +2489,13 @@ def _walk_unfollowed(
     def record_unlisted(exc: OSError) -> None:
         # os.walk names the folder it failed to list. With no name the folder is unknown, so root
         # is recorded: that overstates the loss rather than let it pass unrecorded.
-        if unlisted is not None:
-            unlisted.append(os.fsdecode(exc.filename) if exc.filename is not None else str(root))
+        if unlisted is None:
+            return
+        name = os.fsdecode(exc.filename) if exc.filename is not None else str(root)
+        # A subfolder gone since its parent was listed is no longer config; root gone is a loss.
+        if isinstance(exc, FileNotFoundError) and name != str(root):
+            return
+        unlisted.append(name)
 
     for dirpath, dirs, files in os.walk(root, onerror=record_unlisted, followlinks=False):
         kept = []
@@ -2507,6 +2520,13 @@ def _is_dir_link(path: str, *, unreadable: bool = False) -> bool:
         st = os.lstat(path)
     except OSError:
         return unreadable
+    return _stat_names_another_path(st)
+
+
+def _stat_names_another_path(st: os.stat_result) -> bool:
+    """Whether an ``lstat`` result is a link as :func:`_is_dir_link` reads one, for a file or a
+    folder. On Windows a name-surrogate reparse point other than a symlink, such as a WSL link,
+    reads as ``S_IFREG``, so the mode alone does not say."""
     reparse = getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     return stat.S_ISLNK(st.st_mode) or bool(
         reparse and getattr(st, "st_reparse_tag", 0) & _WIN_NAME_SURROGATE
