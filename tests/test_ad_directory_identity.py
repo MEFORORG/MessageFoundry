@@ -711,6 +711,7 @@ async def test_an_unbound_row_is_never_adopted_by_name() -> None:
             display_name="J Smith",
             email="jsmith@example.org",
             password_generated=False,
+            audits=(),
         )
         out = await service._complete_ad_login(
             _principal("jsmith", GUID_A_TEXT), None, mfa_verified=True
@@ -759,6 +760,7 @@ async def test_a_reissued_name_cannot_reach_an_id_less_row() -> None:
             display_name="J Smith",
             email="jsmith@example.org",
             password_generated=False,
+            audits=(),
         )
         roles_before = set(await store.get_user_role_ids("legacy-row"))
         out = await service._complete_ad_login(_principal("jsmith", None), None, mfa_verified=True)

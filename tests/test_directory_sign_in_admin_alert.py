@@ -116,6 +116,7 @@ async def _existing_directory_account(engine: Engine, *roles: Role) -> None:
         auth_provider="ad",
         directory_object_id=_object_id("jdoe"),
         password_generated=False,
+        audits=(),
     )
     await engine.store.set_user_roles(user_id, [r.value for r in roles], assigned_by="ad-sync")
 
