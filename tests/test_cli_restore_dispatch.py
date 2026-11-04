@@ -1198,6 +1198,91 @@ def test_store_member_guard_refuses_only_a_store_led_tar(tmp_path, first) -> Non
         assert out.getvalue() == data
 
 
+@pytest.mark.parametrize("first", ["store.db", "config/feed.py"])
+def test_store_member_guard_holds_small_frames_until_it_has_checked(tmp_path, first) -> None:
+    # An archive sealed with a small frame size reaches the guard in pieces. Nothing may land
+    # before the check, and a stream shorter than the head is checked at `finish`.
+    for size in (4096, 2 * dr_backup._GUARD_HEAD_BYTES):
+        body = b"x" * size
+        data = _plain_tar(tmp_path / f"{size}.tar", [(first, body)]).read_bytes()
+        out = io.BytesIO()
+        guard = dr_backup._StoreMemberGuard(out)
+        try:
+            for i in range(0, len(data), 4096):
+                guard.write(data[i : i + 4096])
+            guard.finish()
+        except dr_backup.BackupError:
+            assert first == "store.db", size
+            assert out.getvalue() == b"", (size, "store bytes landed before the refusal")
+        else:
+            assert first != "store.db", (size, "a store-led tar was let through")
+            assert out.getvalue() == data, size
+
+
+def test_restore_config_to_alone_refuses_a_store_under_a_config_only_manifest(
+    tmp_path, capsys
+) -> None:
+    # A manifest that says config-only does not settle it: an archive that carries a store member
+    # (here after the config, so the early guard passes it) is refused, not restored with its store
+    # dropped.
+    tar = _plain_tar(
+        tmp_path / "liar.tar",
+        [
+            ("config/feed.py", b"# a router\n"),
+            ("store.db", b"SQLite format 3\x00"),
+            ("manifest.json", b'{"config_only": true}'),
+        ],
+    )
+    toml = _service_toml(tmp_path, key_b64=None)
+    cfg = tmp_path / "cfg"
+    assert main([*_config_only_argv(str(tar), toml, cfg), "--allow-old-archive"]) == 1
+    assert "carries a store" in _refusal(capsys)
+    assert not cfg.exists()
+
+
+def test_restore_config_only_route_stages_beside_a_dot_config_to(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    # `--config-to .` is its own unresolved parent, so staging there would put the decrypted
+    # archive inside the bundle's own directory. It stages in the resolved parent instead.
+    tar = _undated_config_only_tar(tmp_path)
+    toml = _service_toml(tmp_path, key_b64=None)
+    here = tmp_path / "empty-here"
+    here.mkdir()
+    monkeypatch.chdir(here)
+    staged_in: list[Path] = []
+    real = tempfile.TemporaryDirectory
+
+    def spy(*args, **kwargs):
+        if kwargs.get("prefix") == "mefor-restore-":
+            staged_in.append(Path(kwargs["dir"]).resolve())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", spy)
+    assert main([*_config_only_argv(str(tar), toml, Path(".")), "--allow-old-archive"]) == 0
+    assert staged_in == [tmp_path.resolve()], staged_in
+    assert sorted(p.name for p in here.iterdir()) == ["feed.py"]
+
+
+def test_restore_refuses_a_dangling_link_member_before_the_store_is_extracted(tmp_path) -> None:
+    # The pre-extract scan refuses the link the extractor would refuse, so a whole-store restore
+    # does not extract, verify and place the store only to roll it back.
+    tar = _plain_tar(
+        tmp_path / "dangling.tar",
+        [("config/a.toml", b"[a]\n"), _hard_link("config/b.toml", "config/absent.toml")],
+    )
+    d = tmp_path / "dr"
+    with pytest.raises(dr_backup.BackupError) as excinfo:
+        dr_backup._refuse_colliding_config_members(tar, d / "msg.db", tmp_path / "cfg")
+    assert excinfo.value.kind == "restore" and "config/b.toml" in str(excinfo.value)
+    # The control: a link to the member before it passes the scan.
+    ok = _plain_tar(
+        tmp_path / "ok.tar",
+        [("config/a.toml", b"[a]\n"), _hard_link("config/b.toml", "config/a.toml")],
+    )
+    dr_backup._refuse_colliding_config_members(ok, d / "msg.db", tmp_path / "cfg")
+
+
 # --- (5b-ter) vault BACKLOG #5233 item 3: the no-config refusal is not a closed list --------------
 
 

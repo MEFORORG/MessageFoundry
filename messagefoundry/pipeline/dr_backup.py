@@ -3527,8 +3527,9 @@ def _restore_blocking(
     reached the same refusal first. With ``config_dest`` alone, the archive is decrypted under the
     same key, downgrade and size checks, its manifest is read, the age refusal applies, and then only
     its config bundle is extracted, under every check :func:`_restore_config_members` applies. An
-    archive that carries a store is refused on this route, at its first tar header where the store
-    leads it (:class:`_StoreMemberGuard`) and at the manifest in any case: its store is the restore."""
+    archive that carries a store is refused on this route, at its first tar member where the store
+    leads it (:class:`_StoreMemberGuard`), and after the decrypt in any case, by its manifest or by
+    the store member itself: its store is the restore."""
     import sqlite3
 
     from messagefoundry.store.store import (
@@ -3578,10 +3579,19 @@ def _restore_blocking(
             "restores only on a box with no store key configured.",
         )
 
+    # The config-only route stages in the RESOLVED parent: an unresolved `.` (or `""`) is its own
+    # parent, which would stage the decrypted archive inside the bundle's own directory.
+    staging_parent = anchor.parent if dest_store_path is not None else anchor.resolve().parent
+    if dest_store_path is None and staging_parent == anchor.resolve():
+        raise BackupError(
+            "destination",
+            f"--config-to {anchor} is a filesystem root, so there is no directory beside it to stage "
+            "the decrypted archive in; choose a directory below it",
+        )
     try:
-        anchor.parent.mkdir(parents=True, exist_ok=True)
+        staging_parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        raise BackupError("destination", _staging_refusal(anchor, exc)) from exc
+        raise BackupError("destination", _staging_refusal(staging_parent, anchor, exc)) from exc
     # The rollback's three facts, kept outside the staging block so the `finally` can read them after
     # it: whether the store was published (before that, every refusal already leaves nothing behind),
     # which config paths this restore created, and whether the restore itself completed. `finally`
@@ -3615,18 +3625,18 @@ def _restore_blocking(
         # a file carries the temp directory's entries explicitly (it removes inherited entries only;
         # measured on the hosted runners, CI run 36039014999). A hard-linked placement then shares the
         # published DACL. A follow-up recorded in ADR 0163.
-        with tempfile.TemporaryDirectory(prefix="mefor-restore-", dir=anchor.parent) as tmp:
+        with tempfile.TemporaryDirectory(prefix="mefor-restore-", dir=staging_parent) as tmp:
             staging = Path(tmp)
             tar_path = staging / "archive.tar"
             with open(archive_path, "rb") as raw_src, open(tar_path, "wb") as tar_fh:
                 src = _HashingReader(raw_src)
                 _secure_file(tar_path)
                 # On the config-only route a store-carrying archive is refused at its first tar
-                # header, not after the whole store is decrypted beside --config-to only to be
-                # refused at the manifest, which stays the authority (vault BACKLOG #5233).
-                dst: BinaryIO = (
-                    cast(BinaryIO, _StoreMemberGuard(tar_fh)) if dest_store_path is None else tar_fh
-                )
+                # member, not after the whole store is decrypted beside --config-to only to be
+                # refused after it; the checks after the decrypt stay the authority (vault BACKLOG
+                # #5233).
+                guard = _StoreMemberGuard(tar_fh) if dest_store_path is None else None
+                dst: BinaryIO = cast(BinaryIO, guard) if guard is not None else tar_fh
                 if match_key is not None:
                     # A failed GCM tag is the point of the AEAD framing, so it is an ORDINARY outcome
                     # here, not a bug: refuse the way the destination check does rather than escape as
@@ -3671,6 +3681,8 @@ def _restore_blocking(
                                 "destination volume",
                             )
                         dst.write(buf)
+                if guard is not None:
+                    guard.finish()
 
             # `_read_manifest_from_tar` reports every way the manifest can be unusable -- absent, a
             # directory, over the cap, not UTF-8, not JSON, not an object -- as `tarfile.TarError`
@@ -3687,7 +3699,10 @@ def _restore_blocking(
                 ) from exc
             config_only = bool(manifest.get("config_only"))
             if dest_store_path is None:
-                if not config_only:
+                # The manifest's word, and the members themselves: a manifest that says config-only
+                # over an archive that carries a store is refused too, not restored with its store
+                # dropped.
+                if not config_only or _tar_has_member(tar_path, _STORE_MEMBER):
                     raise BackupError("destination", _CARRIES_A_STORE_REFUSAL)
                 # The age refusal binds here too: an old bundle brings back old credentials and old
                 # router and handler code, and --max-age-days / --allow-old-archive say what they
@@ -3821,7 +3836,7 @@ def _restore_blocking(
         if staging is None:
             # The staging directory itself could not be made (an unwritable parent, say), so
             # nothing was decrypted or written: a refusal line, not a traceback.
-            raise BackupError("destination", _staging_refusal(anchor, exc)) from exc
+            raise BackupError("destination", _staging_refusal(staging_parent, anchor, exc)) from exc
         if not completed:
             raise
         # Only the staging directory's teardown runs after `completed`, so an OSError here IS that
@@ -3863,49 +3878,84 @@ def _restore_blocking(
     )
 
 
-def _staging_refusal(anchor: Path, exc: OSError) -> str:
-    """The refusal for a restore whose staging directory, beside ``anchor``, could not be made."""
+def _staging_refusal(parent: Path, anchor: Path, exc: OSError) -> str:
+    """The refusal for a restore that could not make ``parent``, or its staging directory in it."""
     return (
-        f"could not create the restore's staging directory in {anchor.parent}, beside {anchor} "
-        f"({safe_exc(exc)}); nothing was written. The restore stages the decrypted archive there, "
-        "so that directory must be writable"
+        f"could not create {parent}, or the restore's staging directory in it ({safe_exc(exc)}). "
+        f"The restore stages the decrypted archive there, beside {anchor}, so that directory must "
+        "exist or be creatable, and be writable. Nothing was decrypted"
     )
 
 
 class _StoreMemberGuard:
-    """Writes the decrypted tar through to ``raw``, and refuses before the first member's header
-    lands when that member is the store (vault BACKLOG #5233). Used only on the config-only route,
-    where a store-carrying archive is refused anyway: the backup writes the store first, so this
-    catches it at the first frame instead of after a multi-GB decrypt. The manifest check after the
-    decrypt stays the authority, for an archive that puts its store anywhere else.
+    """Writes the decrypted tar through to ``raw``, and refuses before any of it lands when its first
+    member is the store (vault BACKLOG #5233). Used only on the config-only route, where a
+    store-carrying archive is refused anyway: the backup writes the store first, so this catches it
+    at the first frames instead of after a multi-GB decrypt. The member scan after the decrypt stays
+    the authority, for an archive that puts its store anywhere else.
 
-    The first member is read with :mod:`tarfile` from the first :data:`_GUARD_HEAD_BYTES` written,
-    not from the first 512-byte block, because ``tar.add`` can open with a PAX extended header that
-    carries the member's real name (measured on Windows). A head that does not parse is left to the
-    manifest check, as is an archive shorter than the head."""
+    It HOLDS every write until :data:`_GUARD_HEAD_BYTES` have arrived (or :meth:`finish` is called
+    at the end of a shorter stream), then reads the first member from them with :mod:`tarfile`, not
+    from the first 512-byte block, because ``tar.add`` can open with a PAX extended header that
+    carries the member's real name (measured on Windows). Holding is what makes "before any of it
+    lands" true whatever frame size the archive was sealed with. A head that does not parse is left
+    to the checks after the decrypt."""
 
     def __init__(self, raw: BinaryIO) -> None:
         self._raw = raw
-        self._head = b""
-        self._checked = False
+        self._held: list[bytes] = []
+        self._held_bytes = 0
+        self._released = False
 
     def write(self, data: bytes) -> int:
-        if not self._checked:
-            self._head += data[: _GUARD_HEAD_BYTES - len(self._head)]
-            if len(self._head) >= _GUARD_HEAD_BYTES:
-                self._checked = True
-                if self._first_member_name() == _STORE_MEMBER:
-                    raise BackupError("destination", _CARRIES_A_STORE_REFUSAL)
-                self._head = b""
-        return self._raw.write(data)
+        if self._released:
+            return self._raw.write(data)
+        self._held.append(bytes(data))
+        self._held_bytes += len(data)
+        if self._held_bytes >= _GUARD_HEAD_BYTES:
+            self._release()
+        return len(data)
 
-    def _first_member_name(self) -> str | None:
-        try:
-            with tarfile.open(fileobj=io.BytesIO(self._head), mode="r:") as tar:
-                first = tar.next()
-        except (tarfile.TarError, OSError, ValueError):
-            return None
-        return None if first is None else first.name
+    def finish(self) -> None:
+        """Check and write what is still held: the end of a stream shorter than the head."""
+        if not self._released:
+            self._release()
+
+    def __getattr__(self, name: str) -> object:
+        # Anything but `write` goes to the file itself, so a codec that calls another method on
+        # its output does not fail on this route alone.
+        return getattr(self._raw, name)
+
+    def _release(self) -> None:
+        self._released = True
+        head = b"".join(self._held)
+        self._held = []
+        if _first_member_name(head) == _STORE_MEMBER:
+            raise BackupError("destination", _CARRIES_A_STORE_REFUSAL)
+        self._raw.write(head)
+
+
+def _first_member_name(head: bytes) -> str | None:
+    """The name of the first member of the tar that ``head`` opens, or ``None`` if it does not parse."""
+    try:
+        with tarfile.open(fileobj=io.BytesIO(head), mode="r:") as tar:
+            first = tar.next()
+    except (tarfile.TarError, OSError, ValueError):
+        return None
+    return None if first is None else first.name
+
+
+def _tar_has_member(tar_path: Path, name: str) -> bool:
+    """Does the tar at ``tar_path`` carry a member of exactly ``name``? Looked up the way
+    :func:`_extract_member` looks the store up, so the two cannot disagree."""
+    try:
+        with tarfile.open(tar_path, "r:") as tar:
+            tar.getmember(name)
+    except KeyError:
+        return False
+    except (tarfile.TarError, OSError) as exc:
+        raise BackupError("restore", safe_exc(exc)) from exc
+    return True
 
 
 #: How much of the decrypted tar :class:`_StoreMemberGuard` reads its first member from: room for a
@@ -4092,11 +4142,17 @@ def _refuse_colliding_config_members(
             *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
         )
     }
+    seen: set[str] = set()
     try:
         with tarfile.open(tar_path, "r:") as tar:
             for member in tar.getmembers():
                 if not _is_config_payload_member(member):
                     continue
+                # A hard link the extractor will refuse is refused here, before the store is
+                # extracted, verified and placed only to be rolled back (vault BACKLOG #5233).
+                if member.islnk() and member.linkname not in seen:
+                    raise BackupError("restore", _dangling_link_refusal(member))
+                seen.add(member.name)
                 out = config_dest / member.name[len(_CONFIG_PREFIX) :]
                 if _norm_for_compare(out) not in published:
                     continue
@@ -4113,6 +4169,15 @@ def _refuse_colliding_config_members(
         # this reads ATTACKER-SUPPLIED member names into ``Path``: a name the platform cannot parse
         # must be a refusal, not a traceback out of a check whose whole job is to refuse.
         raise BackupError("restore", safe_exc(exc)) from exc
+
+
+def _dangling_link_refusal(member: tarfile.TarInfo) -> str:
+    """The refusal for a hard-link config member that names no config file extracted before it."""
+    return (
+        f"archive carries a config member {member.name!r} that is a hard link to "
+        f"{member.linkname!r}, which is not a config file this restore has already extracted; "
+        "refusing to restore it rather than leave that name out"
+    )
 
 
 def _is_config_payload_member(member: tarfile.TarInfo) -> bool:
@@ -4264,12 +4329,7 @@ def _restore_config_members(
                 # member it matches, the store included.
                 target = extracted.get(member.linkname)
                 if target is None:
-                    raise BackupError(
-                        "restore",
-                        f"archive carries a config member {member.name!r} that is a hard link to "
-                        f"{member.linkname!r}, which is not a config file this restore has already "
-                        "extracted; refusing to restore it rather than leave that name out",
-                    )
+                    raise BackupError("restore", _dangling_link_refusal(member))
                 data = target
             if data.size > _MAX_RESTORE_MEMBER_BYTES:
                 raise BackupError(

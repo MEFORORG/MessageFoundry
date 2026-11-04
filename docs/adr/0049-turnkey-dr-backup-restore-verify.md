@@ -296,6 +296,8 @@ Subcommands on the existing `messagefoundry` argparse surface (sibling of `serve
   the database the restore had just verified while the summary still reported the verified row counts.
   The check is per member, so restoring both halves into one directory stays legal for an archive that
   carries no colliding member. A config-only archive (server-DB store) is refused: there is no store in it.
+  **Amended (vault BACKLOG #5233):** `--config-to <dir>` with no `--to` restores only such an archive's
+  config bundle, and refuses an archive that carries a store.
 
 The CLI must **never** print a message body and runs the heavy PRAGMA/decrypt work synchronously in the
 command (it is not in the serving hot path).

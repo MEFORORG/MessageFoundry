@@ -1338,7 +1338,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--service-config",
         default=None,
         help="service settings TOML (default: ./messagefoundry.toml if present) — the store key source. "
-        "There is deliberately no --db here (unlike backup / restore-verify): --to IS the store path "
+        "There is deliberately no --db here (unlike backup / restore-verify): --to, when given, IS the store path "
         "this writes, and the decrypt key comes from [store] regardless of any path",
     )
     # BACKLOG #2614: a restore undoes every account change made after the archive was taken, so an
