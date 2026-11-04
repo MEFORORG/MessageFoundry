@@ -1863,13 +1863,16 @@ check finds the path leads to another host, or cannot finish reading the trimmed
 refusals apply in every SSL mode. At least these spellings count as paths the check cannot finish
 (vault BACKLOG #5197): a link whose target is rooted with no drive (`\RPC Control\...`,
 `/Device/...`), a drive-relative spelling (`C:ca.pem`, `D:link\ca.pem`), and a name in the path
-that ends in a space or a dot. A `subst` drive onto a share counts as leading to another host.
+that ends in a space or a dot, a device prefix written with forward slashes (`//?/C:/ca.pem`),
+and a stream name after a link. A `subst` drive onto a share counts as leading to another host.
 When the check cannot finish, a WARNING names the kind of cause, never the path; the path is
 logged at DEBUG only. The value is judged as the text the build sends, so `0` is checked as the
 path `0`. The check is defence in depth, not a guarantee. It misses at least: links to some
 object paths; paths that change after the build; the contents of an `SSLCAPATH` folder; and, on
-POSIX, anything beyond the spelling. The owner, 2026-11-03, accepted paths that change after the
-build and the contents of an `SSLCAPATH` folder as recorded limits. The check does not change the value sent to the driver.
+POSIX, anything beyond the spelling. The owner, 2026-11-03, accepted two of these as recorded
+limits: a path that changes after a check, which also leaves the anchor check below a swap
+window, and the contents of an `SSLCAPATH` folder, which that anchor check does not read either.
+The check does not change the value sent to the driver.
 
 This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
 reads `SERVER` as its target.
@@ -1901,9 +1904,10 @@ anchor. There is no pin for this file. A missing file or a directory is left to 
 too, and a pipe or device is refused unread. **What it does not
 cover**, at least: a running lane's pool goes on reading the file at each new connect until the
 lane is rebuilt, even after a later check refuses it; any check-then-load leaves a swap window, as
-for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all. The owner, 2026-11-03,
-accepted the swap window and the unchecked `SSLCAPATH` contents as recorded limits. A padded
-`SSLCA` value is refused here too, as the build refuses it, before either spelling is read.
+for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all. The swap window and
+the `SSLCAPATH` contents are the recorded limits the paragraph on file keywords above names. A
+padded or boolean `SSLCA` value is refused here too, as the build refuses it, before either
+spelling is read.
 
 An `SSLKEY` file, and an `SSLCERT` file when no `SSLKEY` is set, takes the key-wrap check
 (BACKLOG #1352, #3090) when the connection is built, with `sslpassword` as its passphrase. A key

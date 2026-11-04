@@ -1757,10 +1757,10 @@ def database_ca_anchor_spec(
     refused setting, as it does a bad pin. ``docs/CONNECTIONS.md``, Generic ODBC, states that
     check's limits.
 
-    A value the build refuses as text (``_odbc_literal``), a padded one included, raises
-    ``ValueError`` too, in every ``sslmode``, before either spelling is walked or statted: no
-    spelling of it is a file a driver is handed, and checking the trimmed one would clear a value
-    the build never sends (vault BACKLOG #5197 item 8)."""
+    A value the build refuses as a boolean or as text (``_odbc_literal``), a padded one included,
+    raises ``ValueError`` too, in every ``sslmode``, before either spelling is walked or statted:
+    no spelling of it is a file a driver is handed, and checking the trimmed one would clear a
+    value the build never sends (vault BACKLOG #5197 item 8)."""
     value = _generic_odbc_param(settings, "sslca")
     if value is None:
         return None
@@ -1771,6 +1771,13 @@ def database_ca_anchor_spec(
         names_another_host,
     )
 
+    if isinstance(value, bool):
+        # The build refuses a boolean before it reads the text, so ``True`` is never a file a
+        # driver is handed, and the lane check must not walk or stat the relative path "True".
+        raise ValueError(
+            f"{kind} '{name}' odbc_params value for 'sslca' must not be a boolean; write the "
+            "driver's own spelling as a string"
+        )
     _odbc_literal(value, what="odbc_params value for 'sslca'", connection=name)
 
     verdicts = file_keyword_verdicts(value)

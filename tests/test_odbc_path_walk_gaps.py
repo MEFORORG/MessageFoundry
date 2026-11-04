@@ -178,7 +178,7 @@ def test_items_9_10_and_12_reach_the_anchor_walk_too() -> None:
     assert cause is not None
     links = {r"C:\certs": r"\RPC Control\certlink"}
     _chain, cause = windows_chain(r"C:\certs\ca.pem", r"C:\work", _probe(links))
-    assert cause is not None and "phi" not in cause.kind
+    assert cause is not None and "certs" in cause and "certs" not in cause.kind
 
 
 # --- item 15: a falsy value that is not text -----------------------------------------------------
@@ -272,3 +272,79 @@ def test_item_22_a_walk_cause_carries_a_path_free_kind() -> None:
     )
     assert isinstance(cause, anchor_path.WalkCause)
     assert "phi-name" in cause and "phi-name" not in cause.kind
+
+
+# --- review of #5197: spellings the walk read as other objects ----------------------------------
+
+
+def test_review_a_stream_name_after_a_link_is_not_cleared() -> None:
+    """``ntpath.join`` restarts at a remaining ``D:ca.pem``, so after a link the walk read
+    ``D:\\ca.pem`` where Windows opens a stream of ``C:\\real\\D``. Red: cleared as ``False``."""
+    links = {r"C:\certs\lnk": r"C:\real"}
+    assert _walk(r"C:\certs\lnk\D:ca.pem", links) is None
+    _chain, cause = windows_chain(r"C:\certs\lnk\D:ca.pem", r"C:\work", _probe(links))
+    assert cause is not None
+
+
+@pytest.mark.parametrize(
+    ("path", "links", "substs"),
+    [
+        # A subst drive behind a forward-slash device prefix skipped the subst lookup: was False.
+        (r"C:\certs\ca.pem", {r"C:\certs\ca.pem": "//?/S:/ca.pem"}, {"S:": r"\??\UNC\f.test\s"}),
+        ("//?/S:/ca.pem", {}, {"S:": r"\??\C:\certs"}),
+        # A local device path in forward slashes read as a share: was True.
+        (r"C:\certs\ca.pem", {r"C:\certs\ca.pem": "//./C:/real/ca.pem"}, {}),
+        ("//./C:/certs/ca.pem", {}, {}),
+    ],
+)
+def test_review_a_forward_slash_device_prefix_is_not_cleared(
+    path: str, links: dict[str, str], substs: dict[str, str]
+) -> None:
+    """``_strip_win_prefix`` reads backslash prefixes only, and normpath turns these into one
+    after it has looked. The walk now names them a device path it does not read."""
+    assert _walk(path, links, substs=substs, cwd=_no_cwd) is None
+
+
+def test_review_a_volume_guid_path_is_still_walked() -> None:
+    """The control: a volume GUID path keeps its prefix and is walked, in either separator."""
+    assert _walk(r"\\?\Volume{0000}\certs\ca.pem", cwd=_no_cwd) is False
+    assert _walk("//?/Volume{0000}/certs/ca.pem", cwd=_no_cwd) is False
+
+
+def test_review_a_walk_cause_needs_a_kind() -> None:
+    """No fallback from ``kind`` to the text, which can name a path. Red: the text was the kind."""
+    with pytest.raises(TypeError):
+        anchor_path.WalkCause(r"C:\phi-name is a mount point")  # type: ignore[call-arg]
+    assert anchor_path.WalkCause.plain("fixed").kind == "fixed"
+
+
+def test_review_a_working_directory_failure_is_named_as_one(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def gone() -> str:
+        raise FileNotFoundError(2, "gone")
+
+    caplog.set_level(logging.WARNING, logger=database.logger.name)
+    assert _walk("ca.pem", cwd=gone) is None
+    assert any("working directory" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_review_the_lane_check_refuses_a_boolean_sslca(
+    monkeypatch: pytest.MonkeyPatch, value: bool
+) -> None:
+    """The build refuses a boolean ``odbc_params`` value before reading its text, so the lane check
+    does too, before it walks or stats ``True``. Red: it walked the relative path ``True``."""
+
+    def never(_path: str) -> bool | None:
+        raise AssertionError("a boolean must be refused before it is walked")
+
+    monkeypatch.setattr(database, "_path_verdict", never)
+    settings: dict[str, Any] = {
+        "dialect": "generic",
+        "odbc_driver": "MySQL ODBC 9.1 Unicode Driver",
+        "server": "db.synthetic.test",
+        "odbc_params": {"SSLMODE": "VERIFY_IDENTITY", "SSLCA": value},
+    }
+    with pytest.raises(ValueError, match="must not be a boolean"):
+        ta.database_ca_anchor_spec("OB_DB_GEN", settings)

@@ -818,8 +818,10 @@ def _windows_path_verdict(
         return True
     except _PathEnds:
         return False
-    except OSError as exc:  # a reader the walk does not guard, such as drive_target
-        _not_cleared(f"a drive could not be read: {type(exc).__name__}", exc)
+    except OSError as exc:  # a reader the walk does not guard: drive_target, or cwd
+        _not_cleared(
+            f"a drive or the working directory could not be read: {type(exc).__name__}", exc
+        )
         return None
     if cause is not None and cause.kind == SHARE_CAUSE:
         return True  # the walk reached a share, as through a subst drive onto \??\UNC\host\share

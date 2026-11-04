@@ -412,14 +412,20 @@ WinProbe = Callable[[str], tuple[str, str | None]]
 class WalkCause(str):
     """A cause :func:`windows_chain` answers. The text can name a path from the operator's config,
     so it belongs at DEBUG; ``kind`` never names one, so a line above DEBUG may carry it
-    (``docs/PHI.md``, vault BACKLOG #5197 item 22)."""
+    (``docs/PHI.md``, vault BACKLOG #5197 item 22). ``kind`` is required, with no fallback to the
+    text: a cause written without one would otherwise carry its path above DEBUG unnoticed."""
 
     kind: str
 
-    def __new__(cls, text: str, kind: str | None = None) -> WalkCause:
+    def __new__(cls, text: str, kind: str) -> WalkCause:
         cause = super().__new__(cls, text)
-        cause.kind = text if kind is None else kind
+        cause.kind = kind
         return cause
+
+    @classmethod
+    def plain(cls, text: str) -> WalkCause:
+        """A cause whose ``text`` is a fixed sentence that names no path, so it is its own kind."""
+        return cls(text, text)
 
 
 def subst_target(answer: str) -> str | None:
@@ -441,6 +447,8 @@ def _drive_relative(path: str) -> bool:
 
 
 _TOO_MANY_HOPS = f"the path passes through more than {MAX_LINK_HOPS} links"
+_DEVICE_PATH = "the path is a device path this check does not read"
+_STREAM = "the path names an alternate data stream"
 _DRIVE_RELATIVE = (
     "the path names a drive with no separator after it, so Windows reads it from that drive's own "
     "working directory"
@@ -491,13 +499,14 @@ def windows_chain(
     At least these end the walk with a cause, since Windows would open another object than the text
     names (vault BACKLOG #5197): a drive-relative spelling (:func:`_drive_relative`), in the path, a
     link target or a ``subst`` target; a name ending in a space or a dot, which Win32 strips; and a
-    link target rooted with no drive (:data:`_ROOTED_LINK`). A path that reaches a share ends with
+    link target rooted with no drive (:data:`_ROOTED_LINK`); a device prefix written with forward
+    slashes (``//?/S:/x``); and a stream name after a link. A path that reaches a share ends with
     :data:`SHARE_CAUSE`."""
     full = _strip_win_prefix(path)
     if full is None:
-        return [], WalkCause("the path is a device path this check does not read")
+        return [], WalkCause.plain(_DEVICE_PATH)
     if _drive_relative(full):
-        return [], WalkCause(_DRIVE_RELATIVE)
+        return [], WalkCause.plain(_DRIVE_RELATIVE)
     if not ntpath.isabs(full) and not full.startswith("\\\\"):
         full = ntpath.join(cwd() if callable(cwd) else cwd, full)
     chain: list[tuple[str, str]] = []
@@ -512,16 +521,24 @@ def windows_chain(
     pending = full
     while True:
         norm = ntpath.normpath(pending)
+        if norm.startswith("\\\\.\\") or (
+            norm.startswith("\\\\?\\") and norm[4:11].lower() != "volume{"
+        ):
+            # Only a device prefix written with forward slashes (``//?/S:/x``, ``//./C:/x``) reaches
+            # here, since normpath turns them into backslashes after _strip_win_prefix has looked.
+            # Read as a share or a drive, it skipped the subst lookup or answered "share" for a
+            # local device path, so it is a cause instead (vault BACKLOG #5197 review).
+            return chain, WalkCause.plain(_DEVICE_PATH)
         if norm.startswith("\\\\") and not norm.startswith("\\\\?\\"):
-            return chain, WalkCause(SHARE_CAUSE)
+            return chain, WalkCause.plain(SHARE_CAUSE)
         drive, rest = ntpath.splitdrive(norm)
         if not drive:
-            return chain, WalkCause("the path has no drive or volume")
+            return chain, WalkCause.plain("the path has no drive or volume")
         substituted = drive_target(drive) if len(drive) == 2 else None
         if substituted is not None:
             hops += 1
             if hops > MAX_LINK_HOPS:
-                return chain, WalkCause(_TOO_MANY_HOPS)
+                return chain, WalkCause.plain(_TOO_MANY_HOPS)
             target = _strip_win_prefix(substituted)
             if not target:
                 return chain, WalkCause(
@@ -529,7 +546,7 @@ def windows_chain(
                     "a drive stands for a path this check does not read",
                 )
             if _drive_relative(target):
-                return chain, WalkCause(_DRIVE_RELATIVE)
+                return chain, WalkCause.plain(_DRIVE_RELATIVE)
             pending = target + rest
             continue
         root = drive + "\\"
@@ -542,7 +559,7 @@ def windows_chain(
         spliced = False
         for i, name in enumerate(parts):
             if ":" in name:
-                return chain, WalkCause("the path names an alternate data stream")
+                return chain, WalkCause.plain(_STREAM)
             child = ntpath.join(cur, name)
             if name.endswith((" ", ".")) and name not in (".", ".."):
                 return chain, WalkCause(
@@ -562,7 +579,7 @@ def windows_chain(
                 add(child, LINK)
                 hops += 1
                 if hops > MAX_LINK_HOPS:
-                    return chain, WalkCause(_TOO_MANY_HOPS)
+                    return chain, WalkCause.plain(_TOO_MANY_HOPS)
                 spliced_target = _strip_win_prefix(target or "")
                 if not spliced_target:
                     return chain, WalkCause(
@@ -570,12 +587,16 @@ def windows_chain(
                         "a link points at a path this check does not read",
                     )
                 if _drive_relative(spliced_target):
-                    return chain, WalkCause(_DRIVE_RELATIVE)
+                    return chain, WalkCause.plain(_DRIVE_RELATIVE)
                 if spliced_target[:1] in ("\\", "/") and spliced_target[1:2] not in ("\\", "/"):
                     return chain, WalkCause(f"the link {child!r}: {_ROOTED_LINK}", _ROOTED_LINK)
                 if not (ntpath.isabs(spliced_target) or spliced_target.startswith("\\\\")):
                     spliced_target = ntpath.join(cur, spliced_target)
                 remaining = parts[i + 1 :]
+                if any(":" in rest_name for rest_name in remaining):
+                    # ntpath.join would restart at a remaining ``D:ca.pem`` and drop the folders
+                    # before it, where Windows opens a stream of the name before the colon.
+                    return chain, WalkCause.plain(_STREAM)
                 pending = ntpath.join(spliced_target, *remaining) if remaining else spliced_target
                 spliced = True
                 break
