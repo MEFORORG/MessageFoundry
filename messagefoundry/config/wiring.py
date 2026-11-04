@@ -8224,7 +8224,6 @@ def config_code_digest(source: Path | ConfigSnapshot) -> str | None:
 #: How every config-source refusal of a load begins.
 _CONFIG_SOURCE_LEAD = "refusing to load config from"
 
-
 #: The folder Python's source loader reads compiled modules from. A matching cache file there runs
 #: in place of the source beside it, so whoever can write it changes the code a load runs.
 _BYTECODE_CACHE_DIR = "__pycache__"
@@ -9745,7 +9744,8 @@ def _assert_safe_config_source(directory: Path) -> None:
             first_is_required=True,
         )
     except _ConfigDirUnreached as exc:
-        refusal = exc
+        # As a plain WiringError, so a log that names the refusal's type names a public one.
+        refusal = WiringError(str(exc))
     else:
         return
     # Outside the handler, so a ConfigDirMissing raised here does not carry the refusal as its
@@ -9761,8 +9761,7 @@ def _assert_safe_config_source(directory: Path) -> None:
             scrub_log_argument(safe_exc(refusal, limit=REFUSAL_LOG_LIMIT)),
         )
         raise
-    # As a plain WiringError, so a log that names the refusal's type names a public one.
-    raise WiringError(str(refusal))
+    raise refusal
 
 
 def _check_trusted_paths(

@@ -562,7 +562,8 @@ def test_a_refusal_stands_when_its_directory_then_stops_listing(
 ) -> None:
     """A source refused by its access check, whose directory then stops listing, as a share lost
     during the reads does: the refusal stands, so a listing fault never replaces the one answer
-    that names what was refused (vault BACKLOG #5248). Only a directory gone is re-answered."""
+    that names what was refused (vault BACKLOG #5248). Only a refusal from the directory's own read
+    finding it gone, or its share unreachable, is re-answered."""
     from messagefoundry.config.wiring import ConfigDirUnlistable
     from tests._share_fault import _share_fault
 
