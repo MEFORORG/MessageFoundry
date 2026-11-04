@@ -1253,8 +1253,8 @@ class BackupRunner:
             )
         # What is passed over as neither a link nor config: unlisted folders, then files below.
         passed_over = {Path(p).relative_to(base).as_posix() for p in unlisted}
-        added = 0
-        # The names this walk added as regular members, which a second hard link may name.
+        # The names this walk added as regular members, which a second hard link may name; their
+        # count is the regular files it added.
         regular_names: set[str] = set()
         # Sorted whole, as the earlier `sorted(rglob)` was, so the member order is unchanged.
         for path in sorted(found):
@@ -1279,13 +1279,14 @@ class BackupRunner:
             members = tar.getmembers()
             last = members[-1] if len(members) > before else None
             if last is not None and last.isreg():
-                added += 1
                 regular_names.add(last.name)
-            elif last is None or not (last.islnk() and last.linkname in regular_names):
+            elif last is not None and last.islnk() and last.linkname in regular_names:
+                # A second name of a file this walk already added: tar stores it as a link member
+                # naming that one, and a restore writes it as a copy of that file's bytes
+                # (`_extract_config_members`), so the archive carries it (vault BACKLOG #5233).
+                pass
+            else:
                 passed_over.add(rel.as_posix())
-            # Otherwise a second name of a file this walk already added: tar stores it as a link
-            # member naming that one, and a restore writes it as a copy of that file's bytes
-            # (:func:`_extract_config_members`), so the archive carries it (vault BACKLOG #5233).
         if passed_over:
             from messagefoundry.config.fingerprint import describe_left_out
 
@@ -1297,7 +1298,7 @@ class BackupRunner:
                 min(len(passed_over), _MAX_SKIPPED_RECORDED),
                 scrub_log_argument(describe_left_out(sorted(passed_over)[:_MAX_SKIPPED_RECORDED])),
             )
-        return added, tuple(sorted(passed_over | set(links)))
+        return len(regular_names), tuple(sorted(passed_over | set(links)))
 
     # --- keep-N retention ----------------------------------------------------
 
@@ -3470,6 +3471,12 @@ def _extract_member(
             member = tar.getmember(name)
         except KeyError:
             return None
+        # A member of that name that is not a file is refused, not read as absent: absent, it sent
+        # the config-only restore route and this one to each other (vault BACKLOG #5233), since
+        # :func:`_tar_has_member` counts it as present. Nor is a link member followed, which would
+        # read another member's bytes as this one's.
+        if not member.isreg():
+            raise tarfile.TarError(f"archive {name} member is not a regular file")
         if member.size > max_member_bytes:
             raise tarfile.TarError(
                 f"archive member exceeds the restore extract cap ({max_member_bytes} bytes)"
@@ -3742,7 +3749,8 @@ def _restore_blocking(
     archive that carries a store is refused on this route, at its first tar member where the store
     leads it (:class:`_StoreMemberGuard`), and after the decrypt in any case, by the store member
     itself: its store is the restore. One whose manifest does not mark it config-only is refused
-    there too."""
+    there too. One whose manifest marks it config-only while it carries a store is refused as
+    malformed on both routes, so neither sends the operator to the other."""
     import sqlite3
 
     from messagefoundry.store.store import (
@@ -3915,11 +3923,22 @@ def _restore_blocking(
                     "restore", f"archive manifest could not be read: {safe_exc(exc)}"
                 ) from exc
             config_only = bool(manifest.get("config_only"))
+            # The members themselves, then the manifest's word, on BOTH routes and by one check. A
+            # manifest that says config-only over an archive that carries a store is malformed:
+            # each route used to send the operator to the other, `--to` trusting the manifest and
+            # `--config-to` the member (vault BACKLOG #5233). Neither restores it, store dropped or
+            # bundle dropped. On the config-only route `_StoreMemberGuard` can still meet a store
+            # that leads the tar before the manifest is read; it sends the operator to `--to`,
+            # which then refuses here.
+            # Read only where the answer is used: a store route that is not config-only finds a
+            # missing or non-file store member in `_extract_member` anyway.
+            carries_store = (config_only or dest_store_path is None) and _tar_has_member(
+                tar_path, _STORE_MEMBER
+            )
+            if config_only and carries_store:
+                raise BackupError("restore", _CONTRADICTORY_ARCHIVE_REFUSAL)
             if dest_store_path is None:
-                # The members themselves, then the manifest's word: a manifest that says config-only
-                # over an archive that carries a store is refused too, not restored with its store
-                # dropped.
-                if _tar_has_member(tar_path, _STORE_MEMBER):
+                if carries_store:
                     raise BackupError("destination", _CARRIES_A_STORE_REFUSAL)
                 if not config_only:
                     # No store, and no word that there should be none: neither route restores it,
@@ -4244,8 +4263,10 @@ def _first_member_name(head: bytes) -> str | None:
 
 
 def _tar_has_member(tar_path: Path, name: str) -> bool:
-    """Does the tar at ``tar_path`` carry a member of exactly ``name``? Looked up the way
-    :func:`_extract_member` looks the store up, so the two cannot disagree."""
+    """Does the tar at ``tar_path`` carry a member of exactly ``name``, of any type? Looked up the
+    way :func:`_extract_member` looks the store up, which refuses a member of that name that is not
+    a regular file rather than read it as absent, so the two cannot disagree (vault BACKLOG
+    #5233)."""
     try:
         with tarfile.open(tar_path, "r:") as tar:
             tar.getmember(name)
@@ -4272,6 +4293,13 @@ RESTORE_NEEDS_A_DESTINATION = (
 _CARRIES_A_STORE_REFUSAL = (
     "this archive carries a store, so restoring it needs --to <new store path>; --config-to "
     "alone restores only a CONFIG-ONLY archive's config bundle"
+)
+
+#: Both routes' refusal of an archive whose manifest marks it config-only over a store member
+#: (vault BACKLOG #5233). It names no other route, because each route would send it to the other.
+_CONTRADICTORY_ARCHIVE_REFUSAL = (
+    f"the archive is malformed: its manifest marks it CONFIG-ONLY, yet it carries a {_STORE_MEMBER} "
+    "member; refusing to restore it on either route"
 )
 
 

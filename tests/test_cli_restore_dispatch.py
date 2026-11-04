@@ -1224,25 +1224,103 @@ def test_store_member_guard_holds_small_frames_until_it_has_checked(tmp_path, fi
             assert out.getvalue() == data, size
 
 
-def test_restore_config_to_alone_refuses_a_store_under_a_config_only_manifest(
-    tmp_path, capsys
+@pytest.mark.parametrize("store", ["regular", "directory"])
+@pytest.mark.parametrize("route", ["--to", "--config-to"])
+def test_a_store_under_a_config_only_manifest_meets_one_refusal_on_both_routes(
+    tmp_path, capsys, route, store
 ) -> None:
-    # A manifest that says config-only does not settle it: an archive that carries a store member
-    # (here after the config, so the early guard passes it) is refused, not restored with its store
-    # dropped.
+    # A manifest that says config-only over an archive that carries a store member (here after the
+    # config, so the early guard passes it) is malformed. Each route used to send the operator to
+    # the other: `--to` trusted the manifest and offered `--config-to`, and `--config-to` saw the
+    # member and offered `--to` (vault BACKLOG #5233). Now both refuse it as malformed, naming
+    # neither. A store member that is a directory is a store member to both routes as well.
+    body: bytes | object = b"SQLite format 3\x00" if store == "regular" else _DIRECTORY_MEMBER
     tar = _plain_tar(
         tmp_path / "liar.tar",
         [
             ("config/feed.py", b"# a router\n"),
-            ("store.db", b"SQLite format 3\x00"),
+            ("store.db", body),
             ("manifest.json", b'{"config_only": true}'),
         ],
     )
     toml = _service_toml(tmp_path, key_b64=None)
+    dest = tmp_path / "restored.db"
     cfg = tmp_path / "cfg"
-    assert main([*_config_only_argv(str(tar), toml, cfg), "--allow-old-archive"]) == 1
-    assert "carries a store" in _refusal(capsys)
-    assert not cfg.exists()
+    if route == "--to":
+        argv = ["restore", str(tar), "--to", str(dest), "--service-config", toml]
+    else:
+        argv = _config_only_argv(str(tar), toml, cfg)
+    assert main([*argv, "--allow-old-archive"]) == 1
+    err = _refusal(capsys)
+    assert "restore failed (restore)" in err and "malformed" in err, err
+    assert dr_backup._CARRIES_A_STORE_REFUSAL not in err, err
+    assert "--config-to <dir> and no --to" not in err, err
+    assert not dest.exists() and not cfg.exists()
+    _no_staging_left(tmp_path)
+
+
+def test_a_store_led_config_only_archive_ends_in_the_malformed_refusal(tmp_path, capsys) -> None:
+    # The early guard on the config-only route meets a store that leads the tar before it can
+    # read the manifest, so it sends the operator to `--to`. Following that word for word must end
+    # in the malformed refusal, not send them back.
+    tar = _plain_tar(
+        tmp_path / "led.tar",
+        [
+            ("store.db", b"SQLite format 3\x00"),
+            ("config/feed.py", b"# a router\n"),
+            ("manifest.json", b'{"config_only": true}'),
+        ],
+    )
+    toml = _service_toml(tmp_path, key_b64=None)
+    assert main([*_config_only_argv(str(tar), toml, tmp_path / "cfg"), "--allow-old-archive"]) == 1
+    assert "needs --to" in _refusal(capsys)
+    to = ["restore", str(tar), "--to", str(tmp_path / "x.db"), "--service-config", toml]
+    assert main([*to, "--allow-old-archive"]) == 1
+    err = _refusal(capsys)
+    assert "malformed" in err and "--config-to <dir> and no --to" not in err, err
+
+
+@pytest.mark.parametrize("store", ["directory", "regular"])
+def test_a_directory_store_member_is_present_to_both_lookups(tmp_path, store) -> None:
+    # `_tar_has_member` and `_extract_member` agree on a store member that is not a file: present,
+    # and refused by the extractor rather than read as absent (vault BACKLOG #5233). The regular
+    # member is the control.
+    body = _DIRECTORY_MEMBER if store == "directory" else b"SQLite format 3\x00"
+    tar = _plain_tar(tmp_path / "store.tar", [("store.db", body)])
+    assert dr_backup._tar_has_member(tar, "store.db")
+    if store == "directory":
+        with pytest.raises(tarfile.TarError, match="not a regular file"):
+            dr_backup._extract_member(tar, "store.db", tmp_path)
+    else:
+        out = dr_backup._extract_member(tar, "store.db", tmp_path)
+        assert out is not None and out.read_bytes() == body
+
+
+def test_a_link_store_member_is_refused_not_followed(tmp_path) -> None:
+    # A store member that is a link to another member used to be followed by `extractfile`, so a
+    # config file's bytes were extracted as the store. It is refused as not a regular file.
+    tar = _plain_tar(
+        tmp_path / "link.tar",
+        [("config/feed.py", b"# a router\n"), _hard_link("store.db", "config/feed.py")],
+    )
+    with pytest.raises(tarfile.TarError, match="not a regular file"):
+        dr_backup._extract_member(tar, "store.db", tmp_path)
+    assert not (tmp_path / "extracted_store.db").exists()
+
+
+def test_a_directory_store_member_is_refused_on_the_store_route(tmp_path, capsys) -> None:
+    # With no config-only word, the store route refuses a store member that is not a file as such,
+    # where it once called the archive store-less.
+    tar = _plain_tar(
+        tmp_path / "dir.tar", [("store.db", _DIRECTORY_MEMBER), ("manifest.json", b"{}")]
+    )
+    toml = _service_toml(tmp_path, key_b64=None)
+    dest = tmp_path / "restored.db"
+    argv = ["restore", str(tar), "--to", str(dest), "--service-config", toml]
+    assert main([*argv, "--allow-old-archive"]) == 1
+    err = _refusal(capsys)
+    assert "not a regular file" in err and "no store.db member" not in err, err
+    assert not dest.exists()
 
 
 def test_restore_config_only_route_stages_beside_a_dot_config_to(

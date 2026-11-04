@@ -1272,13 +1272,9 @@ async def test_a_directory_link_reaches_the_skipped_list(tmp_path, key_b64, make
     assert _skipped_everywhere(result, manifest, detail) == ["linked", "sub/nested"]
 
 
-async def test_a_second_hardlink_to_an_added_file_is_carried_not_skipped(tmp_path, key_b64) -> None:
-    """``tar`` stores the second name of one inode as a link member naming the first, and a restore
-    writes that member as a copy of the first (vault BACKLOG #5233). So the walk must not record it
-    as left out: the record said the archive lacked a file the restore brings back. The restore
-    landing both names is the half that makes the empty list true."""
-    from messagefoundry.pipeline.dr_backup import run_restore
-
+def _config_with_a_hardlink_pair(tmp_path: Path) -> Path:
+    """A config dir holding ``a.toml`` and ``b.toml``, two names of one file; skips where a hard
+    link cannot be made."""
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "a.toml").write_text("# shared\n")
@@ -1286,6 +1282,17 @@ async def test_a_second_hardlink_to_an_added_file_is_carried_not_skipped(tmp_pat
         os.link(cfg / "a.toml", cfg / "b.toml")
     except (OSError, NotImplementedError):
         pytest.skip("a hardlink cannot be made here")
+    return cfg
+
+
+async def test_a_second_hardlink_to_an_added_file_is_carried_not_skipped(tmp_path, key_b64) -> None:
+    """``tar`` stores the second name of one inode as a link member naming the first, and a restore
+    writes that member as a copy of the first (vault BACKLOG #5233). So the walk must not record it
+    as left out: the record said the archive lacked a file the restore brings back. The restore
+    landing both names is the half that makes the empty list true."""
+    from messagefoundry.pipeline.dr_backup import run_restore
+
+    cfg = _config_with_a_hardlink_pair(tmp_path)
     result, manifest, detail, names = await _full_pass_record(tmp_path, key_b64, cfg)
     assert names == ["config/a.toml", "config/b.toml"]
     assert _skipped_everywhere(result, manifest, detail) == []
@@ -1306,13 +1313,7 @@ async def test_a_second_hardlink_to_an_added_file_is_carried_not_skipped(tmp_pat
 async def test_a_symlink_beside_a_hardlink_pair_is_still_skipped(tmp_path, key_b64) -> None:
     """The control for the test above: carrying a second hard link must not carry every link. A
     symlink is still passed over and recorded."""
-    cfg = tmp_path / "config"
-    cfg.mkdir()
-    (cfg / "a.toml").write_text("# shared\n")
-    try:
-        os.link(cfg / "a.toml", cfg / "b.toml")
-    except (OSError, NotImplementedError):
-        pytest.skip("a hardlink cannot be made here")
+    cfg = _config_with_a_hardlink_pair(tmp_path)
     try:
         (cfg / "c.toml").symlink_to(cfg / "a.toml")
     except (OSError, NotImplementedError):
