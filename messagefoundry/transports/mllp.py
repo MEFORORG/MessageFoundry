@@ -45,7 +45,6 @@ from messagefoundry.config.settings import (
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
-    EXPIRY_RELAXED_WAYS_ACROSS,
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
@@ -744,8 +743,10 @@ def _mllp_ssl_context(
     if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert
         # #129 (ADR 0094): granular expiry-only relaxation — honour a partner cert whose notAfter has
-        # passed while STILL validating the chain, and the hostname unless tls_check_hostname=false
-        # (relax_verify_expiry's WARNING says which). Opt-in per connection (default False = byte-
+        # passed while STILL validating the chain's signatures and key usage, and the hostname
+        # unless tls_check_hostname=false (relax_verify_expiry's WARNING says which). At least the
+        # intermediates' and the trust anchor's validity periods, and a CRL's own window, go
+        # unchecked too (vault BACKLOG #5089). Opt-in per connection (default False = byte-
         # identical); applied on the verify path only, so it composes with (never bypasses) the
         # tls_verify=false refusal above and the #200 cleartext/verify-off hop refusals.
         if s.get("tls_allow_expired"):
@@ -918,25 +919,27 @@ class MLLPDestination(DestinationConnector):
         # off-loopback is refused at the enforced construction gate unless tls_revocation_attested / the
         # blanket env opts in; loopback / synthetic / non-prod / attested stay byte-identical.
         #
-        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so it
-        # is handed to the guard as no context: see skips_validity_period (owner ruling 2026-10-05;
-        # vault BACKLOG #2978, ADR 0173 §13).
-        expiry_relaxed = self._ssl is not None and skips_validity_period(self._ssl)
+        # A context that skips validity-period checks (tls_allow_expired) earns no CRL credit, so
+        # the guard is told with expiry_relaxed, which drops that credit and names the relaxed
+        # remedy: see skips_validity_period (owner ruling 2026-10-05; vault BACKLOG #2978 and #5089,
+        # ADR 0173 §13).
         self._revocation_guard: RevocationHopGuard | None = (
             RevocationHopGuard.capture(
                 host=self.host,
                 cell="MLLP outbound",
-                description="verified MLLP-over-TLS egress (no revocation check)",
+                # The relaxed record says itself what the hop lacks, and a CRL there still refuses
+                # a leaf it lists, so "(no revocation check)" would lead it with less than is true.
+                description="verified MLLP-over-TLS egress"
+                + ("" if skips_validity_period(self._ssl) else " (no revocation check)"),
                 attested=config.tls_revocation_attested,
                 attested_reason=config.tls_revocation_attested_reason,
                 connection=config.name,
-                # BACKLOG #299: the context this hop will actually hand to wrap_socket, unless it
-                # skips validity-period checks (above, #2978), when it is deliberately None and
-                # must stay so. A CRL that reached it (via [tls].crl_file through the resolved
-                # anchor) sets VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the
-                # setting -- so a sibling hop the same CRL never reached keeps its refusal.
-                context=None if expiry_relaxed else self._ssl,
-                ways_across=EXPIRY_RELAXED_WAYS_ACROSS if expiry_relaxed else None,
+                # BACKLOG #299: the context this hop will actually hand to wrap_socket. A CRL that
+                # reached it (via [tls].crl_file through the resolved anchor) sets
+                # VERIFY_CRL_CHECK_LEAF, and the guard reads that flag rather than the setting --
+                # so a sibling hop the same CRL never reached keeps its refusal.
+                context=self._ssl,
+                expiry_relaxed=skips_validity_period(self._ssl),
             )
             if self._ssl is not None and self._ssl.verify_mode is not ssl.CERT_NONE
             else None

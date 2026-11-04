@@ -818,7 +818,9 @@ async def test_a_rename_during_the_code_check_is_audited_under_the_new_name(
 
     async def _verify_while_renamed(*args: Any, **kwargs: Any) -> bool:
         good = await real_verify(*args, **kwargs)
-        assert await store.set_user_username(e.user_id, "jdoe-renamed", expected_username="jdoe")
+        assert await store.set_user_username(
+            e.user_id, "jdoe-renamed", expected_username="jdoe", audits=()
+        )
         return good
 
     monkeypatch.setattr(e.service, "_verify_second_factor", _verify_while_renamed)
@@ -846,7 +848,9 @@ async def test_a_replayed_code_checked_across_a_rename_is_charged_under_the_new_
 
     async def _verify_while_renamed(*args: Any, **kwargs: Any) -> bool:
         good = await real_verify(*args, **kwargs)
-        assert await store.set_user_username(e.user_id, "jdoe-renamed", expected_username="jdoe")
+        assert await store.set_user_username(
+            e.user_id, "jdoe-renamed", expected_username="jdoe", audits=()
+        )
         return good
 
     monkeypatch.setattr(e.service, "_verify_second_factor", _verify_while_renamed)
@@ -1161,7 +1165,9 @@ async def test_a_session_lost_while_queued_is_audited_once(
 
     @asynccontextmanager
     async def _queue_while_something_lands(username: str) -> AsyncIterator[None]:
-        assert await store.set_user_username(e.user_id, "jdoe-renamed", expected_username="jdoe")
+        assert await store.set_user_username(
+            e.user_id, "jdoe-renamed", expected_username="jdoe", audits=()
+        )
         if change == "revoke":
             await store.revoke_session(hash_token(e.token))
         else:

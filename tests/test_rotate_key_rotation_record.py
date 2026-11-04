@@ -36,7 +36,7 @@ from messagefoundry.pipeline.secret_rotation import (
     secrets_from_settings_and_stamps,
 )
 from messagefoundry.store.crypto import CipherError, cipher_info, generate_key, make_cipher
-from messagefoundry.store.store import MessageStore, SecretRotationMetaRow
+from messagefoundry.store.store import MessageStore, SecretRotationMetaRow, audit_chain_rolled
 from messagefoundry.uploads import UploadStore
 from tests.test_cli import _rotate_env
 
@@ -87,6 +87,11 @@ def _plant_unopenable_upload(uploads: Path) -> list[Path]:
     return [uploads / f"{meta.file_id}.blob", uploads / f"{meta.file_id}.meta"]
 
 
+async def _refuse_reencrypt(self: MessageStore) -> int:
+    """Stands in for a store pass that aborts, so the run stops before the audit roll."""
+    raise CipherError("no configured key decrypts this value")
+
+
 def _env(monkeypatch: pytest.MonkeyPatch, active: str, retired: str, uploads: Path) -> None:
     _rotate_env(monkeypatch, active=active, retired=retired, uploads=uploads)
 
@@ -100,7 +105,8 @@ async def _rows(db: Path, key: str, *retired: str) -> dict[str, SecretRotationMe
 
 
 async def _serve_reconcile(db: Path, key: str, *retired: str) -> dict[str, SecretRotationMetaRow]:
-    """What a ``serve`` start does to the rows, through the real store, returning them after."""
+    """What a ``serve`` start does to the rows, through the real store, returning them after. It
+    passes the chain's answer as ``Engine.start`` does (BACKLOG #4942)."""
     store = await _open(db, key, *retired)
     try:
         await reconcile_rotation_meta(
@@ -109,6 +115,7 @@ async def _serve_reconcile(db: Path, key: str, *retired: str) -> dict[str, Secre
             dek_key_id=_key_id(key),
             enforcement=SecurityEnforcement.WARN,
             env_values={},
+            audit_rolled=audit_chain_rolled(store),
         )
         return await store.get_secret_rotation_meta()
     finally:
@@ -170,11 +177,7 @@ def test_a_run_the_store_pass_aborts_leaves_the_record_open(
     """The record is opened first, so a run that never reaches the stamp step is held too. A killed
     process stands where this abort does: neither gets as far as anything written last."""
     db, uploads, key_a, key_b = rig
-
-    async def refuse(self: MessageStore) -> int:
-        raise CipherError("no configured key decrypts this value")
-
-    monkeypatch.setattr(MessageStore, "reencrypt_to_active", refuse)
+    monkeypatch.setattr(MessageStore, "reencrypt_to_active", _refuse_reencrypt)
     _env(monkeypatch, key_b, key_a, uploads)
     assert main(["rotate-key", "--db", str(db)]) == 1
     capsys.readouterr()
@@ -187,16 +190,23 @@ def test_a_refused_audit_step_leaves_the_record_open(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The other way a run ends PARTIAL. Its stamp was withheld already; the start must not supply
-    it."""
+    it. The refusal here is one a re-run clears, so the run must not name a way out of a record
+    that a re-run closes (BACKLOG #4934, #4935): that note is for a roll that refuses for good."""
     db, uploads, key_a, key_b = rig
 
     async def refuse(self: MessageStore) -> tuple[bool, str]:
-        return False, "refused for the test"
+        return False, (
+            "the audit log changed while the chain was being rolled, so nothing was written; stop "
+            "the engine and re-run `messagefoundry rotate-key`"
+        )
 
     monkeypatch.setattr(MessageStore, "roll_audit_key_epoch", refuse)
     _env(monkeypatch, key_b, key_a, uploads)
     assert main(["rotate-key", "--db", str(db)]) == 1
-    assert "Do NOT remove" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "Do NOT remove" in err
+    for phrase in _WAY_OUT:
+        assert phrase not in err
     assert asyncio.run(_serve_reconcile(db, key_b, key_a))[_DEK].last_rotated == _OLD_DATE
 
 
@@ -271,20 +281,118 @@ def test_a_run_with_the_same_key_opens_no_record(
     assert ROTATION_RECORD_ID not in asyncio.run(_rows(db, key_a))
 
 
-def test_a_key_changed_with_no_rotate_key_still_stamps(tmp_path: Path) -> None:
-    """Out of band, with no record at all: as it did before the record."""
+async def _seed_keyless_chain(db: Path, uploads: Path, key: str) -> None:
+    """:func:`_seed`, over an audit row a keyless store wrote first, so the chain opens with no
+    genesis row and :func:`audit_chain_rolled` has no keyed chain to answer from."""
+    store = await MessageStore.open(db)
+    try:
+        await store.record_audit("test.keyless", actor="u")
+    finally:
+        await store.close()
+    await _seed(db, uploads, key)
+
+
+def test_a_key_changed_with_no_keyed_chain_to_ask_still_stamps(tmp_path: Path) -> None:
+    """Out of band, with no record at all, on a store with no keyed audit chain: nothing says a run
+    has not finished, so the start stamps, as it did before the record. A keyed chain holds the
+    same start, in the test after this one (BACKLOG #4942)."""
     db, key_a, key_b = tmp_path / "oob.db", generate_key(), generate_key()
-    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+    asyncio.run(_seed_keyless_chain(db, tmp_path / "uploads", key_a))
     rows = asyncio.run(_serve_reconcile(db, key_b, key_a))
     assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_b))
     assert rows[_DEK].last_rotated != _OLD_DATE
+    assert ROTATION_RECORD_ID not in rows
+
+
+def test_a_serve_start_before_the_first_run_opens_the_record_and_stamps_nothing(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #4942. A start on the new key before any rotate-key, on a keyed chain. Before it,
+    this start stamped the new key and opened no record, so a later run that stopped short could
+    not withhold it. It must leave the DEK row as it was, open the record for the new key, and the
+    run that completes must stamp it and close the record. A second start keeps the first one's
+    dates, so the hold does not restart the key's age."""
+    db, uploads, key_a, key_b = rig
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.secret_rotation"):
+        rows = asyncio.run(_serve_reconcile(db, key_b, key_a))
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+    assert rows[_DEK].last_rotated == _OLD_DATE
+    record = rows[ROTATION_RECORD_ID]
+    assert record.fingerprint == dek_fingerprint(_key_id(key_b))
+    assert "the audit chain has not been rolled to it" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.secret_rotation"):
+        again = asyncio.run(_serve_reconcile(db, key_b, key_a))
+    assert again[ROTATION_RECORD_ID] == record
+    assert again[_DEK] == rows[_DEK]
+    assert "rotate-key has not completed" in caplog.text
+
+    _env(monkeypatch, key_b, key_a, uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 0
+    assert "OK:" in capsys.readouterr().out
+    done = asyncio.run(_rows(db, key_b))
+    assert done[_DEK].fingerprint == dek_fingerprint(_key_id(key_b))
+    assert done[_DEK].last_rotated != _OLD_DATE
+    assert done[ROTATION_RECORD_ID].fingerprint == ""
+
+
+def test_a_run_killed_before_it_opened_the_record_leaves_no_stamp(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #4936. The run stops after its store open and before the record opens, the window a
+    kill inside the open stands in. No record exists, and the next start must still not stamp."""
+    db, uploads, key_a, key_b = rig
+    _env(monkeypatch, key_b, key_a, uploads)
+
+    async def killed(*_args: object) -> None:
+        raise CipherError("stands in for a kill before the record opens")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("messagefoundry.pipeline.secret_rotation.open_rotation_record", killed)
+        assert main(["rotate-key", "--db", str(db)]) == 1
+    capsys.readouterr()
+    assert ROTATION_RECORD_ID not in asyncio.run(_rows(db, key_b, key_a))
+
+    rows = asyncio.run(_serve_reconcile(db, key_b, key_a))
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+    assert rows[_DEK].last_rotated == _OLD_DATE
+    assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))
+
+
+def test_the_chain_answers_whether_it_rolled_to_the_active_key(tmp_path: Path) -> None:
+    """The signal the start reads, across the states it must tell apart."""
+    keyed, keyless = tmp_path / "keyed.db", tmp_path / "keyless.db"
+    key_a, key_b = generate_key(), generate_key()
+    asyncio.run(_seed(keyed, tmp_path / "u1", key_a))
+    asyncio.run(_seed_keyless_chain(keyless, tmp_path / "u2", key_a))
+
+    async def answer(db: Path, key: str | None, *retired: str) -> bool | None:
+        store = await (MessageStore.open(db) if key is None else _open(db, key, *retired))
+        try:
+            return audit_chain_rolled(store)
+        finally:
+            await store.close()
+
+    assert asyncio.run(answer(keyed, key_a)) is True
+    assert asyncio.run(answer(keyed, key_b, key_a)) is False
+    assert asyncio.run(answer(keyed, key_b)) is False  # the range's key is not configured
+    assert asyncio.run(answer(keyless, key_a)) is None
+    assert asyncio.run(answer(tmp_path / "empty.db", None)) is None
+    assert audit_chain_rolled(object()) is None
 
 
 def test_a_key_changed_by_hand_over_a_closed_record_still_stamps(tmp_path: Path) -> None:
     """A closed record is a blank, not an unreadable one. Read as unreadable, it would withhold every
-    hand change after the first completed rotation, for good."""
+    hand change after the first completed rotation, for good. On a store with no keyed chain, so
+    the chain's own hold (BACKLOG #4942) does not stand in front of the record's."""
     db, key_a, key_b = tmp_path / "closed.db", generate_key(), generate_key()
-    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+    asyncio.run(_seed_keyless_chain(db, tmp_path / "uploads", key_a))
 
     async def open_then_close() -> None:
         store = await _open(db, key_a)
@@ -302,14 +410,15 @@ def test_a_key_changed_by_hand_over_a_closed_record_still_stamps(tmp_path: Path)
 
 def test_a_record_naming_another_key_does_not_hold_this_one(tmp_path: Path) -> None:
     """A run stopped on key B, and the operator then set key C by hand. C has no run behind it, so it
-    is an out-of-band change and stamps."""
+    is an out-of-band change, and the record naming B does not hold it. On a store with no keyed
+    chain it stamps; on a keyed one the chain holds it instead (BACKLOG #4942)."""
     db, key_a, key_b, key_c = (
         tmp_path / "other.db",
         generate_key(),
         generate_key(),
         generate_key(),
     )
-    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+    asyncio.run(_seed_keyless_chain(db, tmp_path / "uploads", key_a))
 
     async def record_b() -> None:
         store = await _open(db, key_a)
@@ -589,3 +698,245 @@ def test_closing_writes_nothing_where_no_run_opened_a_record(tmp_path: Path) -> 
             await store.close()
 
     assert asyncio.run(run()) == {}
+
+
+def test_opening_says_whether_the_record_holds_the_key(tmp_path: Path) -> None:
+    """What ``rotate-key`` reads before it names a way out (BACKLOG #4934, #4935): whether the
+    record holds the key, so no start stamps it. A record naming a key the stamp names too, as a
+    run killed between its stamp and its close leaves them, holds nothing, and neither does a stamp
+    alone or a record kept for another key."""
+    db, key_a, key_b = tmp_path / "named.db", generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+
+    async def run() -> tuple[bool, bool, bool, bool]:
+        store = await _open(db, key_a)
+        try:
+            stamped_only = await open_rotation_record(store, _key_id(key_a), "2026-10-30")
+            opened = await open_rotation_record(store, _key_id(key_b), "2026-10-30")
+            kept = await open_rotation_record(
+                store, _key_id(generate_key()), "2026-10-30", keep_another=True
+            )
+            await store.upsert_secret_rotation_meta(
+                ROTATION_RECORD_ID,
+                fingerprint=dek_fingerprint(_key_id(key_a)),
+                tracked_since="2026-10-30",
+                last_rotated="2026-10-30",
+            )
+            left_open = await open_rotation_record(store, _key_id(key_a), "2026-10-30")
+            return stamped_only, opened, kept, left_open
+        finally:
+            await store.close()
+
+    assert asyncio.run(run()) == (False, True, False, False)
+
+
+_WAY_OUT = (
+    "note: no run will roll this audit chain, under any key",
+    "[secret_rotation].store_key_last_rotated",
+    "[secret_rotation].enforce_store_key_expiry = false",
+)
+
+
+def test_a_keyed_chain_holds_a_hand_change_over_another_keys_record_and_keeps_that_record(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #4942, on a keyed chain: a record naming B, and key C set by hand. The start holds C
+    and keeps B's record as it was, so B stays held and a held key's age cannot restart. Over a
+    closed record it opens one for C, dated today. The test after this one is why B's record must
+    survive."""
+    db, key_a, key_b, key_c = tmp_path / "keyed.db", generate_key(), generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+    asyncio.run(_plant_record(db, key_a, dek_fingerprint(_key_id(key_b)), "2020-02-02"))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.secret_rotation"):
+        rows = asyncio.run(_serve_reconcile(db, key_c, key_a))
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+    record = rows[ROTATION_RECORD_ID]
+    assert record.fingerprint == dek_fingerprint(_key_id(key_b))
+    assert (record.tracked_since, record.last_rotated) == ("2020-02-02", "2020-02-02")
+    assert "the rotation record stands open for another store key" in caplog.text
+
+    closed = tmp_path / "closed.db"
+    asyncio.run(_seed(closed, tmp_path / "uploads2", key_a))
+    asyncio.run(_plant_record(closed, key_a, "", "2020-02-02"))
+    reopened = asyncio.run(_serve_reconcile(closed, key_c, key_a))[ROTATION_RECORD_ID]
+    assert reopened.fingerprint == dek_fingerprint(_key_id(key_c))
+    assert reopened.last_rotated != "2020-02-02"
+
+
+def test_a_start_on_a_third_key_keeps_the_record_that_holds_a_rolled_key(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #4942. A run to B rolls the chain to B but skips an upload, which may still be under
+    A, so its record holds B. The operator sets C by hand and starts, then returns to B and starts.
+    The chain is rolled to B, so only the record can hold B, and a start on C that replaced it with
+    C would let the start on B stamp B while that upload is still under A."""
+    db, uploads, key_a, key_b = rig
+    key_c = generate_key()
+    _plant_unopenable_upload(uploads)
+    _env(monkeypatch, key_b, key_a, uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    capsys.readouterr()
+    record_b = asyncio.run(_rows(db, key_b, key_a))[ROTATION_RECORD_ID]
+    assert record_b.fingerprint == dek_fingerprint(_key_id(key_b))
+
+    on_c = asyncio.run(_serve_reconcile(db, key_c, key_b, key_a))
+    assert on_c[ROTATION_RECORD_ID] == record_b
+    assert on_c[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+
+    back_on_b = asyncio.run(_serve_reconcile(db, key_b, key_a))
+    assert back_on_b[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+    assert back_on_b[_DEK].last_rotated == _OLD_DATE
+    assert back_on_b[ROTATION_RECORD_ID] == record_b
+
+
+def test_a_third_key_run_that_stops_short_does_not_unhold_the_rolled_key(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #4942. A run to B rolls the chain to B and skips an upload, so its record holds B. A
+    run to C then replaces that record and stops before its roll, so the chain stays rolled to B.
+    A start back on B must not stamp it: the upload skipped in the B run may still be under A."""
+    db, uploads, key_a, key_b = rig
+    key_c = generate_key()
+    _plant_unopenable_upload(uploads)
+    _env(monkeypatch, key_b, key_a, uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    with monkeypatch.context() as patch:
+        patch.setattr(MessageStore, "reencrypt_to_active", _refuse_reencrypt)
+        _env(monkeypatch, key_c, f"{key_b},{key_a}", uploads)
+        assert main(["rotate-key", "--db", str(db)]) == 1
+    capsys.readouterr()
+    record_c = asyncio.run(_rows(db, key_c, key_b, key_a))[ROTATION_RECORD_ID]
+    assert record_c.fingerprint == dek_fingerprint(_key_id(key_c))
+
+    back_on_b = asyncio.run(_serve_reconcile(db, key_b, key_a))
+    assert back_on_b[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+    assert back_on_b[_DEK].last_rotated == _OLD_DATE
+    assert back_on_b[ROTATION_RECORD_ID] == record_c
+
+
+def test_a_stamp_under_an_unknown_scheme_is_held_on_a_keyed_chain(tmp_path: Path) -> None:
+    """An unknown-scheme stamp cannot say whether the key changed. Re-stamped with the new key, it
+    would hide the change from the run that completes, so on a chain not rolled to the key the start
+    holds it as it holds a change."""
+    db, key_a, key_b = tmp_path / "scheme.db", generate_key(), generate_key()
+    asyncio.run(_seed(db, tmp_path / "uploads", key_a))
+
+    async def unknown_scheme() -> None:
+        store = await _open(db, key_a)
+        try:
+            await store.upsert_secret_rotation_meta(
+                _DEK,
+                fingerprint="sha3-16:" + "a" * 16,
+                tracked_since=_OLD_DATE,
+                last_rotated=_OLD_DATE,
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(unknown_scheme())
+    rows = asyncio.run(_serve_reconcile(db, key_b, key_a))
+    assert rows[_DEK].fingerprint == "sha3-16:" + "a" * 16
+    assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))
+
+
+def test_a_start_on_the_new_key_alone_before_the_roll_breaks_the_chain_and_the_refusal_names_the_way_out(
+    rig: tuple[Path, Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #4934, measured. A run stops before the roll, then a start on the new key alone
+    writes an audit row under it inside the prior key's range. No later run can roll that chain, so
+    the refusal must say so and name the way out, not only send the operator to re-run."""
+    db, uploads, key_a, key_b = rig
+    with monkeypatch.context() as patch:
+        patch.setattr(MessageStore, "reencrypt_to_active", _refuse_reencrypt)
+        _env(monkeypatch, key_b, key_a, uploads)
+        assert main(["rotate-key", "--db", str(db)]) == 1
+    capsys.readouterr()
+
+    async def a_start_on_the_new_key_alone() -> None:
+        store = await _open(db, key_b)
+        try:
+            await store.record_audit("test.after_stop", actor="u")
+        finally:
+            await store.close()
+
+    asyncio.run(a_start_on_the_new_key_alone())
+    for _ in range(2):  # a re-run refuses the same way
+        assert main(["rotate-key", "--db", str(db)]) == 1
+        err = capsys.readouterr().err
+        assert "refusing to roll a broken audit chain" in err
+        for phrase in _WAY_OUT:
+            assert phrase in err
+    rows = asyncio.run(_rows(db, key_b, key_a))
+    assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))
+    assert rows[_DEK].last_rotated == _OLD_DATE
+
+
+def test_a_chain_with_no_genesis_row_refuses_every_key_and_names_the_way_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #4935. Keyless audit rows: the roll refuses for good, a brand new key included, and
+    the record stays open. The refusal names the two levers that get out."""
+    monkeypatch.chdir(tmp_path)
+    db, uploads = tmp_path / "keyless.db", tmp_path / "uploads"
+    key_a, key_b, key_c = generate_key(), generate_key(), generate_key()
+    asyncio.run(_seed_keyless_chain(db, uploads, key_a))
+    for active, retired in ((key_b, key_a), (key_c, f"{key_b},{key_a}")):
+        _env(monkeypatch, active, retired, uploads)
+        assert main(["rotate-key", "--db", str(db)]) == 1
+        err = capsys.readouterr().err
+        assert "does not open with a genesis row naming its key" in err
+        for phrase in _WAY_OUT:
+            assert phrase in err
+    rows = asyncio.run(_rows(db, key_c, key_b, key_a))
+    assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_c))
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+
+
+def test_a_same_key_run_on_a_chain_no_run_rolls_names_no_way_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #4934, #4935. A run with the key already in use, to seal uploads, opens no record,
+    and its key was never rotated. Its roll refuses for good on a chain with no genesis row, but
+    the note would tell the operator a record stays open and to set the key's rotation date, which
+    would reset the age of a key that never changed."""
+    monkeypatch.chdir(tmp_path)
+    db, uploads, key_a = tmp_path / "same.db", tmp_path / "uploads", generate_key()
+    asyncio.run(_seed_keyless_chain(db, uploads, key_a))
+    _env(monkeypatch, key_a, "", uploads)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    err = capsys.readouterr().err
+    assert "does not open with a genesis row naming its key" in err
+    for phrase in _WAY_OUT:
+        assert phrase not in err
+    assert ROTATION_RECORD_ID not in asyncio.run(_rows(db, key_a))
+
+
+async def test_engine_start_passes_the_chain_answer_and_holds_the_key(tmp_path: Path) -> None:
+    """The production wiring: a real ``Engine.start`` over a keyed chain not rolled to the new key.
+    Without ``audit_rolled`` from the engine the reconcile defaults to ``None`` and stamps."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    db, key_a, key_b = tmp_path / "engine.db", generate_key(), generate_key()
+    await _seed(db, tmp_path / "uploads", key_a)
+    store = await _open(db, key_b, key_a)
+    engine = Engine(
+        store,
+        secret_rotation_settings=SecretRotationSettings(),
+        security_enforcement=SecurityEnforcement.WARN,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    try:
+        await engine.start()
+        rows = await store.get_secret_rotation_meta()
+    finally:
+        await engine.stop()
+    assert rows[_DEK].fingerprint == dek_fingerprint(_key_id(key_a))
+    assert rows[_DEK].last_rotated == _OLD_DATE
+    assert rows[ROTATION_RECORD_ID].fingerprint == dek_fingerprint(_key_id(key_b))

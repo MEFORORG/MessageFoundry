@@ -201,6 +201,7 @@ async def _seed(db: Path) -> list[str]:
                 password_hash="h",
                 now=0.0,
                 password_generated=False,
+                audits=(),
             )
             token = mint_token()
             await store.create_session(

@@ -23,6 +23,7 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -56,6 +57,7 @@ from tests._keyed_reopen_contract import (
     server_keyed_reopen_report,
 )
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
+from tests._keyless_blank_contract import keyed_cipher
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -1013,6 +1015,7 @@ async def test_security_events_for_user_scopes_to_actor(store) -> None:
         auth_provider="local",
         password_generated=False,
         now=1.0,
+        audits=(),
     )
     await store.record_audit("auth.login_success", actor="alice", detail="1")
     await store.record_audit("auth.login_failed", actor="bob", detail="b")  # other actor
@@ -1035,6 +1038,7 @@ async def test_auth_users_roles_sessions(store) -> None:
         password_hash="hash",
         now=1000.0,
         password_generated=False,
+        audits=(),
     )
     assert await store.count_users() == 1
     user = await store.get_user_by_username("alice")
@@ -1364,7 +1368,6 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
 
     The shared body is the one the SQL Server suite runs. The probe reads ``pg_locks``: a lock
     request not yet granted whose blocker, per ``pg_blocking_pids``, is the bind's backend."""
-    from typing import Any
 
     from tests._federated_unbind_store_contract import (
         _assert_bind_and_user_delete_take_one_lock_order,
@@ -1470,6 +1473,7 @@ async def test_channel_scope_source_roundtrip_and_upgrade(store) -> None:
         auth_provider="ad",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
     got = await store.get_user("scope-src")
@@ -1508,7 +1512,12 @@ async def test_the_scope_write_compare_and_sets_on_its_source(store) -> None:
     from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
 
     await store.create_user(
-        user_id="cas-src", username="cas-src", auth_provider="ad", now=1.0, password_generated=False
+        user_id="cas-src",
+        username="cas-src",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+        audits=(),
     )
     cas = store.set_user_channel_scope_if_source
     assert (await store.get_user("cas-src")).channel_scope_source is None
@@ -1566,6 +1575,7 @@ async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
         directory_object_id=BOUND_GUID,
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     found = await store.get_user_by_directory_object_id(BOUND_GUID)
     assert found is not None and found.id == "dir-upgrade"
@@ -1610,6 +1620,7 @@ async def test_session_idp_auth_time_column_upgrade_is_idempotent(store) -> None
         directory_object_id="guid-idp-upgrade",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_session(
         token_hash="i" * 64,
@@ -1646,6 +1657,7 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_session(
         token_hash="s1", user_id="u2", expires_at=9_999.0, client="10.1.1.1", now=1.0
@@ -1684,6 +1696,7 @@ async def test_set_password_claim_stamp_round_trip(store) -> None:
         password_hash="h0",
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
     # Precondition: the INSERT does not list the column, so a stamp seen later came from set_password.
     seeded = await store.get_user("u3")
@@ -1777,11 +1790,16 @@ async def test_staged_pipeline_processes_to_delivered(store) -> None:
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
 
-async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
+@pytest.mark.parametrize("verbosity", ["all", "errors", "off"])
+async def test_mark_done_writes_reply_dropped_with_the_delivery(store, verbosity: str) -> None:
     """BACKLOG #3462: the Postgres twin of the SQLite test of the same name. ``reply_dropped``
     rides the DONE flip beside ``delivered``. Controls: a vanished row writes nothing and returns
     False, and a plain ``mark_done`` writes no ``reply_dropped``. Events are read through
-    ``events_for``, which decrypts ``detail``."""
+    ``events_for``, which decrypts ``detail``. Parametrized over the event verbosity as the
+    SQLite test is (BACKLOG #4917): ``delivered`` is thinned below ``all`` and ``reply_dropped``
+    is not. Set on the fixture's store, since each backend reads it at write time."""
+    store._message_events = verbosity
+    delivered = [("delivered", "OB1", None)] if verbosity == "all" else []
     detail = "HTTP 200; reply body over the 64-byte bound"
 
     async def _to_outbound(now: float):
@@ -1808,7 +1826,7 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
     mid, out = await _to_outbound(100.0)
     assert await store.mark_done(out.id, now=110.0, reply_dropped=detail) is True
     after_drop = await store.events_for(mid)
-    assert _tail(after_drop) == [("delivered", "OB1", None), ("reply_dropped", "OB1", detail)]
+    assert _tail(after_drop) == [*delivered, ("reply_dropped", "OB1", detail)]
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
     async def _dropped_anywhere():
@@ -1826,7 +1844,7 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
 
     plain, other = await _to_outbound(120.0)
     assert await store.mark_done(other.id, now=130.0) is True
-    assert _tail(await store.events_for(plain)) == [("delivered", "OB1", None)]
+    assert _tail(await store.events_for(plain)) == delivered
     assert await _dropped_anywhere() == 1
 
 
@@ -3978,7 +3996,7 @@ async def test_attachment_dead_purge_releases_after_body_purge(store) -> None:
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1
     assert await _a_refcount(store, ref) == 1
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _a_row_payload(store, oid) == ""
     assert await _a_refcount(store, ref) is None
     assert await _a_joins(store, mid) == 0
@@ -3988,7 +4006,7 @@ async def test_attachment_dead_purge_releases_when_run_first(store) -> None:
     ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
     mid, oid = await _a_dead_deliver(store, now=0.0, ref=ref)
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _a_row_payload(store, oid) == ""
     assert await _a_refcount(store, ref) is None
     assert await _a_joins(store, mid) == 0
@@ -4004,8 +4022,8 @@ async def test_attachment_dead_purge_idempotent_no_underflow(store) -> None:
     m2, _ = await _a_dead_deliver(store, now=20 * DAY, ref=ref, dest="OB_2")
     assert await _a_refcount(store, ref) == 2
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 0
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 0
 
     assert await _a_refcount(store, ref) == 1
     assert await _a_chunks(store, ref) == len(_A_CHUNKS)
@@ -4280,7 +4298,12 @@ async def test_a_v032_preset_table_is_migrated_by_provision_schema_pg(store) -> 
 
     for uid, uname in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
         await store.create_user(
-            user_id=uid, username=uname, auth_provider="local", now=1.0, password_generated=False
+            user_id=uid,
+            username=uname,
+            auth_provider="local",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
     try:
         for pid, owner, name, now in (
@@ -5060,7 +5083,11 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
         # BACKLOG #3510: a user row, so the leg proves the sealed record and its TOTP secret come
         # through the rotation too, not only the message cells.
         await seed.create_user(
-            user_id="u-rot", username="rot", auth_provider="local", password_generated=False
+            user_id="u-rot",
+            username="rot",
+            auth_provider="local",
+            password_generated=False,
+            audits=(),
         )
         await seed.set_totp_secret("u-rot", secret=_ROTATED_TOTP_SECRET)
     finally:
@@ -5790,9 +5817,10 @@ async def test_keyless_blank_contract(store, case) -> None:
 
     key = generate_key()
 
-    async def open_keyed() -> PostgresStore:
+    async def open_keyed(**kw: Any) -> PostgresStore:
         return await PostgresStore.open(
-            load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
+            load_settings(environ=os.environ).store,
+            cipher=keyed_cipher(make_cipher, key, **kw),
         )
 
     raw, fetch = _raw_adapters(store)

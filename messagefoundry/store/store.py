@@ -967,6 +967,11 @@ _REPLAYABLE_BODY = "payload <> '' OR body_ref IS NOT NULL"
 #: The ``last_error`` of a re-ingress token whose ``response`` artifact retention erased (BACKLOG
 #: #1560). The server backends import it for their own ``ingress_handoff``.
 REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
+#: The ``last_error`` of a re-ingress token whose ``response`` row is gone altogether. Retention keeps
+#: the row, so this is damage rather than an erasure, and the reference itself opened: named apart
+#: from a reference that did not, so an operator knows which row to look for (BACKLOG #4996).
+REINGRESS_ARTIFACT_MISSING: Final = "re-ingress reply row is missing"
+
 
 #: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
 #: drift apart. Used by :meth:`_attachment_still_referenced_sql`, which reached this predicate first:
@@ -974,6 +979,24 @@ REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
 _REPLAYABLE_BODY_Q = _REPLAYABLE_BODY.replace("payload", "q.payload").replace(
     "body_ref", "q.body_ref"
 )
+
+
+@dataclass(frozen=True)
+class DeadLetterPurge:
+    """What one ``purge_dead_letters`` call did (BACKLOG #4996). Counts only, never content.
+
+    ``bodies`` is the dead rows whose ``payload`` it blanked, whatever that payload held: the
+    retention audit's purged count. It is a body (on a keyed store, a sealed empty body too), a
+    store-once row's ``shared_body`` key, or a re-ingress token's reply reference. Blanking that
+    reference leaves the reply in ``response.body`` until :meth:`MessageStore.purge_message_bodies`
+    erases it. A row whose payload was already blank is not counted. ``errors_cleared`` is the dead
+    rows whose ``last_error`` it nulled, a payload-blanked row included. It is counted apart because
+    a row whose payload was already blank can still hold error text, which may carry PHI, and a pass
+    that clears only that text must still write its audit row. The backends' docstrings point here."""
+
+    bodies: int = 0
+    errors_cleared: int = 0
+
 
 #: The ``handler_name`` stamped on a pass-through COMPLETION MARKER (BACKLOG #1580). A marker is the
 #: already-terminal ``stage='outbound'`` row :meth:`MessageStore._insert_passthrough_marker` writes so
@@ -5910,6 +5933,29 @@ async def settle_audit_ranges(
         )
 
 
+#: The refusals of :func:`roll_audit_key_range` that no re-run, restored key or new key clears,
+#: because the roll verifies the whole chain first (BACKLOG #4934, #4935). Each is the start of the
+#: refusal's text, so :func:`audit_roll_refused_for_good` reads the same strings the roll writes.
+_ROLL_NO_GENESIS = "the audit chain does not open with a genesis row naming its key"
+_ROLL_UNAUTHENTICATED = "the audit chain's key ranges do not authenticate"
+_ROLL_BROKEN = "refusing to roll a broken audit chain"
+_ROLL_BROKEN_UNDER_ACTIVE = "the audit chain is under the active key but does not verify"
+_ROLL_REFUSED_FOR_GOOD = (
+    _ROLL_NO_GENESIS,
+    _ROLL_UNAUTHENTICATED,
+    _ROLL_BROKEN,
+    _ROLL_BROKEN_UNDER_ACTIVE,
+)
+
+
+def audit_roll_refused_for_good(message: str) -> bool:
+    """Whether ``message``, a refusal :func:`roll_audit_key_range` returned, is one no re-run clears,
+    under any key, a new one included: a chain that does not verify, or rows with no genesis row
+    (BACKLOG #4934, #4935). ``False`` for the refusals a re-run or a restored key can clear, such as
+    a missing range key or a head that moved during the roll."""
+    return message.startswith(_ROLL_REFUSED_FOR_GOOD)
+
+
 async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     """``rotate-key``'s audit step (BACKLOG #1904): open a range under the ACTIVE key.
 
@@ -5923,13 +5969,16 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     the key the chain names for that range is not configured (BACKLOG #1945).
 
     OFFLINE ONLY: another process keeps the range it read at open, so an engine left running would go
-    on appending under the old key after the range row and break the chain."""
+    on appending under the old key after the range row and break the chain.
+
+    A refusal no re-run clears starts with one of :data:`_ROLL_REFUSED_FOR_GOOD`; a new one goes
+    there too, or ``rotate-key`` names no way out after it (BACKLOG #4934, #4935)."""
     active_id = audit_active_key_id(host._audit_mac_key, host._audit_mac_fn)
     if not host._audit_chain_keyed:
         if host._audit_chain_unkeyed:
             return False, (
-                "the audit chain does not open with a genesis row naming its key, so it has no "
-                "keyed range to roll; run `messagefoundry audit-verify`"
+                f"{_ROLL_NO_GENESIS}, so it has no keyed range to roll; run "
+                "`messagefoundry audit-verify`"
             )
         return True, "audit chain is keyless; no keyed range to roll"
     if active_id is None:
@@ -5937,14 +5986,14 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     if not host._audit_ranges_trusted:
         return (
             False,
-            "the audit chain's key ranges do not authenticate; run `messagefoundry audit-verify`",
+            f"{_ROLL_UNAUTHENTICATED}; run `messagefoundry audit-verify`",
         )
     current, current_from = host._audit_range_key_id, host._audit_range_from
     # A keyed, trusted chain was settled at open, which sets all three. The test narrows the types.
     if current is None or current_from is None or not host._audit_range_keys:
         return (
             False,
-            "the audit chain's key ranges do not authenticate; run `messagefoundry audit-verify`",
+            f"{_ROLL_UNAUTHENTICATED}; run `messagefoundry audit-verify`",
         )
     # BACKLOG #1945: `current` is where NEW rows go, and settle_audit_ranges moves that to the active
     # key when the chain's own current range is under a key that is not configured. Read as the
@@ -5979,8 +6028,8 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
     )
     if not ok:
         if current == active_id:
-            return False, f"the audit chain is under the active key but does not verify: {msg}"
-        return False, f"refusing to roll a broken audit chain: {msg}"
+            return False, f"{_ROLL_BROKEN_UNDER_ACTIVE}: {msg}"
+        return False, f"{_ROLL_BROKEN}: {msg}"
     if len(rows) < current_from:
         # The log is shorter than the range this handle read at open: rows went missing while it
         # was open. A shorter chain still verifies, so this is the one place the roll can see it.
@@ -6025,6 +6074,29 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         f"audit chain range from seq={current_from} closed ({closes['rows']} row(s)); a new range "
         f"under the active key opens at seq={host._audit_range_from}"
     )
+
+
+def audit_chain_rolled(store: object) -> bool | None:
+    """Whether the keyed audit chain's newest range is under the store's ACTIVE key, as the open
+    settled it (BACKLOG #4942, #4936). ``rotate-key`` rolls the chain only after both data passes, so
+    after a key change a chain that has not rolled says no run has got that far on this key.
+
+    ``None`` when the store has no keyed chain to ask, or no key: a keyless store, a backend
+    without one, or a chain whose rows open with no genesis row. ``False`` for ranges the open could
+    not authenticate, since the caller withholds a stamp on ``False``, and an unknown answer must
+    not lift that hold. Read by attribute, so a store that is not an :class:`AuditRangeHost` answers
+    ``None``. No I/O: the open already read the chain."""
+    if not getattr(store, "_audit_chain_keyed", False):
+        return None
+    active = audit_active_key_id(
+        getattr(store, "_audit_mac_key", None), getattr(store, "_audit_mac_fn", None)
+    )
+    if active is None:
+        return None
+    if not getattr(store, "_audit_ranges_trusted", False):
+        return False
+    keys = getattr(store, "_audit_range_keys", None)
+    return bool(isinstance(keys, list) and keys and keys[-1] == active)
 
 
 # #233 (ADR 0111): the event name for a Send declined because its target outbound is present-but-NOT-
@@ -7250,6 +7322,13 @@ before the one commit. So a crash, or a failed append, keeps both or neither. ``
 result records nothing, as a replay that re-queued no row records nothing. The row's detail can
 carry the result, such as a count, which is why this is a function and not a row.
 
+DECIDED (BACKLOG #5069): a ``None`` return stays allowed, because it is the caller's own per-result
+statement that this result changed nothing worth a row, which :func:`if_applied` relies on for an
+alert id that matched no row. What is refused, with :class:`TypeError` and before any write, is a
+missing audit: ``None`` or anything not callable in its place (:func:`require_operator_audit`).
+The one exception is an operator inject, which always writes a message, so its ``None`` return is
+refused too (BACKLOG #5071, :func:`require_ingress_audit`).
+
 It must be pure and quick: it runs inside the mutation's transaction, which holds the mutation's
 row locks (and on SQLite the writer lock). It runs BEFORE the audit chain's lock is taken, so it must
 not read chain state."""
@@ -7616,17 +7695,101 @@ async def _audit_row_mac_verifies(
     )
 
 
-def operator_audits[R](audit: OperatorAudit[R] | None, result: R) -> tuple[AuditAppend, ...]:
-    """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624)."""
-    if audit is None:
-        return ()
+def require_operator_audit(audit: object, mutation: str) -> None:
+    """Refuse a missing operator audit before ``mutation`` writes anything (BACKLOG #5069).
+
+    Every operator mutation's ``audit`` is required with no default, so mypy refuses a typed caller
+    that leaves it out or passes ``None``. This is the runtime half, for a caller mypy does not
+    check: an explicit ``None``, or anything else that is not callable, raises :class:`TypeError`.
+    Each mutation calls it first, so the refusal writes nothing."""
+    if not callable(audit):
+        raise TypeError(
+            f"{mutation} needs an operator audit, a callable that builds its audit row; got "
+            f"{type(audit).__name__} (BACKLOG #5069)"
+        )
+
+
+#: The message origins only an operator's action writes (vault BACKLOG #2615). ``enqueue_ingress``
+#: refuses one of these with no audit (BACKLOG #5071). Listed, not derived from a name, so a new
+#: origin is a decision: the test classifies every member as operator or not.
+OPERATOR_ORIGINS: Final = frozenset({MessageOrigin.OPERATOR_EDIT, MessageOrigin.OPERATOR_UPLOAD})
+
+
+def require_ingress_audit(
+    audit: OperatorAudit[str] | None, origin: MessageOrigin
+) -> OperatorAudit[str] | None:
+    """``enqueue_ingress``'s refusal (BACKLOG #5071), and the audit it then runs.
+
+    Before anything is written, an operator origin with no audit or with one that is not callable,
+    and an audit given with any other origin, raise :class:`TypeError`. The audit must also build
+    a row: an inject always writes a message, so a ``None`` row raises inside the transaction and
+    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes none.
+
+    It keys on ``origin``, so it cannot see an operator's inject written with the default
+    ``partner`` origin: such a call writes neither the operator label nor an audit row. Nothing at
+    the type level holds a direct caller of the store either, since ``audit`` stays optional there.
+    The engine's inject, :meth:`~messagefoundry.pipeline.Engine.inject_message`, requires its
+    ``audit`` and always writes ``operator_upload``."""
+    operator = origin in OPERATOR_ORIGINS
+    if not operator:
+        if audit is not None:
+            # An audit is an operator's inject; with this origin the message would be labelled
+            # as a receipt, so the caller forgot the origin.
+            raise TypeError(
+                f"enqueue_ingress was given an audit with origin {str(origin)!r}; an operator's"
+                " inject names its operator origin (BACKLOG #5071)"
+            )
+        return None
+    if not callable(audit):
+        raise TypeError(
+            f"enqueue_ingress with origin {str(origin)!r} needs an operator audit, a callable that"
+            f" builds its audit row; got {type(audit).__name__} (BACKLOG #5071)"
+        )
+    build = audit
+
+    def row_required(message_id: str) -> AuditAppend:
+        row = build(message_id)
+        if row is None:
+            raise TypeError(
+                "an operator inject's audit returned no row, and an inject always writes a"
+                " message, so it always records one (BACKLOG #5071)"
+            )
+        return row
+
+    return row_required
+
+
+def operator_audits[R](audit: OperatorAudit[R], result: R) -> tuple[AuditAppend, ...]:
+    """The rows a mutation appends for ``result``: none, or the one ``audit`` returns (#2624).
+
+    A return that is neither ``None`` nor an :class:`AuditAppend` raises :class:`TypeError`
+    (BACKLOG #5069); a ``None`` RETURN stays allowed, see :data:`OperatorAudit`. ``None`` in place
+    of ``audit`` raises here too. Each mutation already refused it at entry, before any write; this
+    is the backstop for a mutation that forgets that line, and here the raise rolls it back."""
+    require_operator_audit(audit, "an operator mutation")
     row = audit(result)
-    return () if row is None else (row,)
+    if row is None:
+        return ()
+    if not isinstance(row, AuditAppend):
+        raise TypeError(
+            f"an operator audit returned {type(row).__name__}, not an AuditAppend or None"
+            " (BACKLOG #5069)"
+        )
+    return (row,)
 
 
 def if_applied(audit: AuditAppend) -> OperatorAudit[bool]:
     """``audit`` when the mutation changed a row, otherwise nothing (vault BACKLOG #3217). The
-    operator alert mutations take one, so an unknown or resolved id records no row."""
+    operator alert mutations take one, so an unknown or resolved id records no row.
+
+    Anything but an :class:`AuditAppend`, an explicit ``None`` included, raises :class:`TypeError`
+    here, so an alert mutation given no row cannot change the alert and record nothing (BACKLOG
+    #5069)."""
+    if not isinstance(audit, AuditAppend):
+        raise TypeError(
+            f"an operator alert mutation or connection flag needs an AuditAppend; got {type(audit).__name__}"
+            " (BACKLOG #5069)"
+        )
     return lambda applied: audit if applied else None
 
 
@@ -8717,7 +8880,8 @@ class SecretRotationMetaRow:
     ISO date first observed, ``last_rotated`` the ISO date the fingerprint last changed. Never a value.
 
     One row tracks no secret: the rotation record, ``secret_key`` ``rotate-key:incomplete`` (BACKLOG
-    #3737). Its ``fingerprint`` is the key id of the DEK a ``rotate-key`` run started on and has not
+    #3737). Its ``fingerprint`` is the key id of the DEK a ``rotate-key`` run started on, or a start
+    found changed with the keyed audit chain not rolled to it (BACKLOG #4942), and no run has
     finished, unsealed, or blank once one finished. Its dates are when it first opened, or when a
     run closed it."""
 
@@ -9726,8 +9890,9 @@ class MessageStore:
         builds the AAD from the selected row instead of ``cell_aad(table, column, *aad_cols)`` (the
         queue payload's routing tag, BACKLOG #2593). ``blank_where``, when given, names the blank
         values that are real rows (BACKLOG #3495, :meth:`_encrypt_existing_rows`). They are sealed
-        only on a surface with no marker and no ciphertext, under the opt-out too, and they count as
-        something to seal, so the marker can never be written over them unsealed. All identifiers
+        only by the open that writes the marker on a surface holding no ciphertext, under the
+        opt-out too (BACKLOG #4996). There they count as something to seal, so that open never
+        writes the marker over them unsealed. All identifiers
         are code constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a
         parameter.
 
@@ -11315,6 +11480,7 @@ class MessageStore:
         leaves the attachment at refcount 0 (no ACK → the sender resends; content-addressing dedups the
         resend and the startup ``sweep_orphan_attachments`` reclaims the orphan). Empty/None → the
         byte-identical no-detach path (no incref)."""
+        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: one skeleton holds a de-duplicated document (two identical OBX-5.5 values
@@ -12964,7 +13130,8 @@ class MessageStore:
         it is dead-lettered and consumed like a corrupt reference, and the failure is audited. A token
         whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
         produces no child and cannot be replayed. One whose ``response`` row is missing is damage: it
-        is dead-lettered as a corrupt reference and keeps its reference as the evidence."""
+        is dead-lettered under :data:`REINGRESS_ARTIFACT_MISSING` and keeps its reference as the
+        evidence."""
         tag_failures: list[CellTagError] = []
         try:
             return await self._ingress_handoff_txn(
@@ -13061,9 +13228,7 @@ class MessageStore:
             )
             art = await cur.fetchone()
             if art is None:
-                return await _consume_dead(
-                    "re-ingress work-row reference is corrupt/unparseable", "re-ingress ref corrupt"
-                )
+                return await _consume_dead(REINGRESS_ARTIFACT_MISSING, "re-ingress reply missing")
             if art["body"] is None:
                 return await _consume_dead(
                     REINGRESS_ARTIFACT_ERASED, "re-ingress reply erased", erased=True
@@ -13225,8 +13390,8 @@ class MessageStore:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker so it can HL7-peek the reply (in ``pipeline/``, keeping the store
         parsing-free) before calling :meth:`ingress_handoff`. ``None`` if the row is gone (a committed
-        prior handoff) or its reference is malformed, and ``""`` if the artifact is gone, which
-        ``ingress_handoff`` then dead-letters. The
+        prior handoff) or its reference is malformed, and ``""`` if the artifact row is missing, its
+        body was erased, or the reply was empty; :meth:`ingress_handoff` tells those apart. The
         ``ingress_handoff`` it precedes re-reads the same immutable artifact for the message raw, so the
         peek and the raw always agree."""
         async with self._read() as db:
@@ -13921,6 +14086,7 @@ class MessageStore:
 
         ``audit`` builds the operator's audit row from the count, and the row commits with the
         replay (BACKLOG #2624, :data:`OperatorAudit`)."""
+        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             cur = await self._db.execute(
@@ -14050,6 +14216,7 @@ class MessageStore:
         commits with the resend (BACKLOG #2624, :data:`OperatorAudit`). On the edit path the child records
         origin ``operator_edit`` with ``actor`` as its ``origin_actor``, and the outcome names it in
         ``new_message_id`` (vault BACKLOG #2615)."""
+        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             # Idempotency gate FIRST (ADR 0090 §4): claim the key, and only proceed if we created the
@@ -14281,6 +14448,7 @@ class MessageStore:
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
         commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`). The child records origin
         ``operator_edit`` with ``actor`` as its ``origin_actor`` (vault BACKLOG #2615)."""
+        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_txn(self._db, self._lock):
             mcur = await self._db.execute(
@@ -14461,6 +14629,7 @@ class MessageStore:
         **A depth-capped pass-through marker is excluded the same way** (:data:`_NOT_PT_MARKER`,
         BACKLOG #1580), through the same shared ``clause``: no worker drains its inbound-only lane, and
         its parent must keep the ``ERROR`` the breach earned rather than revert to ``ROUTED``."""
+        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})", f"({_NOT_PT_MARKER})"]
         params: list[object] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
@@ -14519,6 +14688,7 @@ class MessageStore:
 
         ``audit`` builds the operator's audit row from the count, zero included, and the row commits
         with the cancel (BACKLOG #2624, :data:`OperatorAudit`)."""
+        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, _writer_guard(self._db, self._lock):
             # The claim's own lane predicate (stage, destination_name, status), so the head query seeks
@@ -15558,7 +15728,7 @@ class MessageStore:
         ]
 
     async def _append_operator_audit[R](
-        self, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+        self, written: AuditedWrite, audit: OperatorAudit[R], result: R
     ) -> None:
         """Append an operator mutation's audit row before its commit (BACKLOG #2624), so an append
         that fails rolls the mutation back with it. ``written`` tees the row once the commit lands."""
@@ -15566,7 +15736,7 @@ class MessageStore:
         written.add(audits, await self._append_audits(audits, now=written.now))
 
     async def _commit_operator_noop[R](
-        self, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+        self, written: AuditedWrite, audit: OperatorAudit[R], result: R
     ) -> None:
         """Audit an operator mutation that found nothing to change (BACKLOG #2624). Its row may be
         the only write, so commit only when there is one: a bare commit would count a transaction."""
@@ -15911,7 +16081,7 @@ class MessageStore:
         approver: str,
         decided_at: float,
         seal_read: object,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
         #3638). The Store protocol states the contract: the row is read and checked in the write,
@@ -16412,7 +16582,7 @@ class MessageStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -16634,7 +16804,7 @@ class MessageStore:
         *,
         expected_username: str,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says why
@@ -16769,7 +16939,7 @@ class MessageStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
@@ -18751,13 +18921,14 @@ class MessageStore:
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Null the bodies of dead-lettered rows last updated before ``older_than`` — their own
         retention window, separate from :meth:`purge_message_bodies` because a dead row stays
         replayable (re-queueing its stored ``payload``) until purged. Keeps the row + ``dead`` status
         (counts/disposition intact) and blanks ``payload`` + ``last_error``; after this the row can no
         longer be meaningfully replayed (its body is gone — the intended retention trade-off).
-        Idempotent (guards on a non-blank payload); returns the number of dead rows purged.
+        Idempotent: a re-run matches no row. Returns a :class:`DeadLetterPurge`, which says what
+        each of its counts covers (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7). A router raise dead-letters the
         ``ingress`` row and a handler raise the ``routed`` row
@@ -18806,12 +18977,19 @@ class MessageStore:
                 f"stage=? AND status=? AND body_ref IS NOT NULL AND updated_at < {cutoff_sql}",
                 (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
             )
+            # Two statements, so each count is its own rowcount (DeadLetterPurge, BACKLOG #4996).
             cur = await self._db.execute(
-                "UPDATE queue SET payload='', last_error=NULL "
-                "WHERE status=? AND (payload <> '' OR last_error IS NOT NULL) "
-                f"AND updated_at < {cutoff_sql}",
+                "UPDATE queue SET payload='' "
+                f"WHERE status=? AND payload <> '' AND updated_at < {cutoff_sql}",
                 (OutboxStatus.DEAD.value, *cutoff_params),
             )
+            purged = int(cur.rowcount)
+            cur = await self._db.execute(
+                "UPDATE queue SET last_error=NULL "
+                f"WHERE status=? AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                (OutboxStatus.DEAD.value, *cutoff_params),
+            )
+            cleared = int(cur.rowcount)
             # #149 Phase 3a: a dead row just lost its payload + body_ref, so it can no longer be
             # replayed. If that was the message's LAST replayable row (no pending/inflight and no other
             # still-replayable dead row, per the negated live-holder predicate), release its streaming
@@ -18833,7 +19011,7 @@ class MessageStore:
                 ),
             )
             await self._commit()
-            return int(cur.rowcount)
+            return DeadLetterPurge(bodies=purged, errors_cleared=cleared)
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries last written before ``older_than`` (ADR 0005 retention).

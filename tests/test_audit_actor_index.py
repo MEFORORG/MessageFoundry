@@ -146,6 +146,7 @@ async def test_security_events_tell_apart_two_names_sharing_the_indexed_prefix(s
             auth_provider="local",
             password_generated=False,
             now=1.0,
+            audits=(),
         )
     await store.record_audit("auth.login_success", actor=mine, detail="mine")
     await store.record_audit("auth.login_success", actor=theirs, detail="theirs")

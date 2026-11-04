@@ -179,6 +179,7 @@ __all__ = [
     "Registry",
     "WiringError",
     "PortConflictError",
+    "StateKeyError",
     "API_LISTENER_LABEL",
     "inbound_binding_conflicts",
     "resolved_encoding_problems",
@@ -211,6 +212,7 @@ __all__ = [
     "revocation_attested_hops",
     "unverified_generic_db_hops",
     "POSSIBLY_GENERIC_DB_HOP",
+    "UNRESOLVED_DRIVER_REASON",
     "overbroad_smart_scopes",
     "OAuthRequestAdvisories",
     "oauth_request_advisories",
@@ -232,6 +234,14 @@ class PortConflictError(WiringError):
     to 422, ``messagefoundry check`` still reports it, and the runner's ADR 0031 per-connection
     isolation still records the offending inbound as failed (the engine comes up DEGRADED rather than
     aborting). Callers that care can still catch the conflict specifically."""
+
+
+class StateKeyError(WiringError):
+    """A :class:`SetState` ``namespace`` or ``key`` that some store backend could not hold exactly.
+
+    A subclass of :class:`WiringError`, so a Handler fault still reaches every existing handler of
+    that error unchanged. The message names the field and the rule, never the text: a state key is
+    often an MRN."""
 
 
 @dataclass(frozen=True)
@@ -2532,8 +2542,9 @@ def MLLP(
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able, and is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
-    # OUTBOUND: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname
-    # too unless tls_check_hostname=False.
+    # OUTBOUND: honour an EXPIRED server cert (#129). The chain's signatures are still verified, and
+    # the hostname too unless tls_check_hostname=False; at least the other chain certificates' and a
+    # CRL's validity windows are not (relax_verify_expiry).
     tls_allow_expired: bool = False,
     tls_ciphers: str
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
@@ -2663,9 +2674,11 @@ def MLLP(
     exactly like LDAPS / SQL Server. TLS is TLS 1.2+ and composes with the ``[egress].allowed_mllp``
     allowlist (both enforced). ``tls_allow_expired=True`` (outbound, #129 / ADR 0094) is the **granular**
     alternative to ``tls_verify=False`` for the narrow real-world case of a partner whose server
-    certificate has lapsed: it honours an **expired** cert while STILL verifying the chain and hostname
-    (a wrong-host / untrusted-chain cert is still rejected), logs a WARN, and — because verification stays
-    ON — is NOT an insecure hop the #200 posture gate refuses. Default ``False`` = byte-identical.
+    certificate has lapsed: it honours an **expired** cert while STILL verifying the chain's signatures
+    and, unless ``tls_check_hostname=False``, the hostname (a wrong-host / untrusted-chain cert is
+    still rejected). At least the intermediates' and the trust anchor's validity periods, and a CRL's
+    own window, go unchecked too (``relax_verify_expiry``). It logs a WARN, and — because verification
+    stays ON — is NOT an insecure hop the #200 posture gate refuses. Default ``False`` = byte-identical.
 
     ``tls_ciphers`` (**both directions**, ADR 0188) is the opt-in OpenSSL cipher string for **this
     hop**, the per-connection sibling of ``[api].tls_ciphers``. Unset (the default) the listener and
@@ -2930,6 +2943,8 @@ def Http(
     max_header_bytes: int | None = 64 * 1024,  # cap the request line + headers (header-flood guard)
     max_connections_per_host: int
     | None = None,  # cap clients from ONE peer address; OFF by default
+    max_handshakes_per_host: int
+    | None = 32,  # cap ONE peer address's sockets still in their TLS handshake (on by default)
     # Message-RATE pacing (BACKLOG #1114) — the MLLP pacer, ported. Defaults to OFF for the ruled
     # reason in MLLP(). Scoped to the LISTENER, not the connection: this connector answers one
     # request per connection, so a per-connection bucket would pace nothing at all.
@@ -3002,7 +3017,10 @@ def Http(
     ``max_connections_per_host`` caps concurrent sockets from one peer address and **ships off** here
     (vault BACKLOG #2606): behind a reverse proxy every partner arrives from one address, so a cap
     would become the listener's whole capacity. Set one only where the listener sees real client
-    addresses.
+    addresses. ``max_handshakes_per_host`` (32) **ships on**: it caps only the sockets one address
+    holds a connection slot with while still in their TLS handshake, which happens where the engine
+    runs on a stdlib event loop with ``tls=True`` (vault BACKLOG #4888). See ``docs/DEPLOYMENT.md``
+    for the L4 load-balancer case.
 
     **Message-rate pacing (BACKLOG #1114).** ``max_messages_per_second`` bounds how fast this listener
     takes messages in; ``message_burst`` is how large a burst passes before the sustained rate applies
@@ -3082,6 +3100,7 @@ def Http(
         "max_body_bytes": max_body_bytes,
         "max_header_bytes": max_header_bytes,
         "max_connections_per_host": max_connections_per_host,
+        "max_handshakes_per_host": max_handshakes_per_host,
         "max_messages_per_second": max_messages_per_second,
         "message_burst": message_burst,
         "tls": tls,
@@ -3643,7 +3662,7 @@ def Rest(
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
-    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
+    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain signatures+hostname still verified, not validity windows; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -3749,7 +3768,7 @@ def FHIR(
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
-    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
+    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain signatures+hostname still verified, not validity windows; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -4047,7 +4066,7 @@ def DICOM(
     tls_crl_file: str
     | EnvRef
     | None = None,  # opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
-    tls_allow_expired: bool = False,  # OUTBOUND SCU: honour an EXPIRED PACS cert (chain+hostname still verified; #129)
+    tls_allow_expired: bool = False,  # OUTBOUND SCU: honour an EXPIRED PACS cert (chain signatures+hostname still verified, not validity windows; #129)
     tls_ciphers: str
     | EnvRef
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
@@ -4354,7 +4373,9 @@ def Database(
     it in ``odbc_driver`` and pass driver-specific keywords (``PORT``, ``SSLmode``, …) via ``odbc_params``;
     credentials stay in ``username``/``password`` (emitted under ``odbc_user_key``/``odbc_password_key`` —
     default ``UID``/``PWD``). **On the generic path configure TLS via the driver's own keyword** (e.g.
-    ``odbc_params={"SSLmode": "verify-full"}``) — the SQL-Server weakened-TLS refusal does not apply there.
+    ``odbc_driver="PostgreSQL Unicode", odbc_params={"SSLmode": "verify-full"}``; ``odbc_driver``
+    defaults to Microsoft's driver, which refuses ``SSLmode``) — the SQL-Server weakened-TLS refusal
+    does not apply there.
 
     The Handler produces a JSON-object body; the connector binds its keys to the ``:name`` parameters in
     ``statement`` (translated to positional ``?`` — always parameterized, never string-built) and runs it. A
@@ -4437,17 +4458,21 @@ def DatabasePoll(
     """A SQL database polling **source** (inbound, ADR 0003 §3; SQL Server via the ``[sqlserver]`` extra +
     ODBC Driver 18 — **production / supported**). Every ``poll_seconds`` it runs ``poll_statement`` (a ``SELECT``),
     hands each row to the bound router as a body, then runs ``mark_statement`` (bound from the row's
-    columns) so the row isn't re-read — the File source's *process-then-mark-done* shape. At-least-once:
-    a crash before the mark re-emits the row, so the downstream pipeline **must tolerate duplicates**.
+    columns) so the row isn't re-read — the File source's *process-then-mark-done* shape.
+    At-least-once with a poll that does not write and a mark that takes out only the row handed off:
+    a crash before the mark re-emits the row, so the downstream pipeline **must tolerate
+    duplicates**.
 
     Lead pattern is a status column: ``poll_statement='SELECT id, payload FROM mf_inbox WHERE status=\\'NEW\\''``
-    + ``mark_statement='UPDATE mf_inbox SET status=\\'DONE\\' WHERE id=:id'`` (a ``DELETE`` or a
-    high-water-mark ``UPDATE`` work through the same ``mark_statement``). ``body_column`` unset → the
-    whole row as a JSON object (pair with ``content_type=json``); set → that one column's value verbatim
-    (e.g. a column holding an HL7 message → ``content_type=hl7v2``). With a ``mark_statement``, a
-    handler failure stops that poll at the failed row, so a row that fails every time holds back the
-    rows behind it; the *Database source* section of docs/CONNECTIONS.md says what a high-water mark
-    needs on top of that (BACKLOG #4921). Put secrets (``password``) in
+    + ``mark_statement='UPDATE mf_inbox SET status=\\'DONE\\' WHERE id=:id'`` (a ``DELETE`` keyed
+    the same way also works as the ``mark_statement``). ``body_column`` unset → the whole row as a
+    JSON object (pair with ``content_type=json``); set → that one column's value verbatim (e.g. a
+    column holding an HL7 message → ``content_type=hl7v2``). With a ``mark_statement``, a handler
+    failure stops that poll at the failed row, so a row that fails every time holds back the rows
+    behind it (BACKLOG #4921). A high-water-mark ``UPDATE`` also runs as a ``mark_statement``, but
+    even with that stop it is not at-least-once: it can leave a row that was never handed off behind
+    its cursor. The *Database source* section of docs/CONNECTIONS.md says what one needs and names
+    some of the cases where it loses a row even then (BACKLOG #4958). Put secrets (``password``) in
     ``env()``; TLS is on by default (on the SQL Server preset, weakening it is refused unless the
     ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
     ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.
@@ -4464,10 +4489,12 @@ def DatabasePoll(
     keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
     ``username``/``password`` (under ``odbc_user_key``/``odbc_password_key``, default ``UID``/``PWD``).
 
-    A ``poll_statement`` that could write is refused: a literal one here, when declared (as
-    ``generic`` while the dialect is an ``env()`` value), and every
+    At least a ``poll_statement`` of a writing shape is refused: a literal one here, when declared
+    (as ``generic`` while the dialect is an ``env()`` value), and every
     one, an ``env()`` value included, when the source is built (BACKLOG #2178;
-    ``transports.database._read_only_poll_refusal`` says what and why)."""
+    ``transports.database._read_only_poll_refusal`` says what and why). Not every writing poll is
+    refused: at least a ``SELECT`` that calls a function which writes, and a T-SQL second statement
+    with no ``;`` whose verb the test does not list, pass."""
     _reject_envref_odbc_params(odbc_params)
     # Refused at declaration, as DatabaseRef's statement is (BACKLOG #2617), because
     # `messagefoundry check` builds connectors only with a messagefoundry.toml. An empty statement is
@@ -4593,7 +4620,7 @@ def Soap(
     basic_password: str | EnvRef | None = None,
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) is refused off-box unless tls_hop_attested is declared, and in every case with a credential or a static header off the allowlist; MEFOR_ALLOW_INSECURE_TLS works only at [security].enforcement = warn
-    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain+hostname still verified; #129)
+    tls_allow_expired: bool = False,  # honour an EXPIRED server cert (chain signatures+hostname still verified, not validity windows; #129)
     tls_ca_file: str | EnvRef | None = None,  # PEM: trust ONLY this CA for the server (#1180)
     tls_ca_pin: str | EnvRef | None = None,  # SHA-256 of tls_ca_file; a mismatch refuses (#2371)
     encoding: str = "utf-8",
@@ -4838,7 +4865,8 @@ def Ftp(
     host: str | EnvRef,  # the FTP server (may be env())
     port: int | EnvRef = 21,
     tls: bool | EnvRef = False,  # True → FTPS (explicit TLS, PROT P); False → plain ftp
-    # FTPS: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname too
+    # FTPS: honour an EXPIRED server cert (#129). The chain's signatures are still verified (not the
+    # other chain certificates' or a CRL's validity windows; relax_verify_expiry), and the hostname too
     # unless a hand-built spec sets tls_check_hostname=False, which a credentialed hop may not.
     tls_allow_expired: bool = False,
     tls_ca_file: str | EnvRef | None = None,  # FTPS: PEM, trust ONLY this CA for the server (#1180)
@@ -4934,6 +4962,14 @@ class Send:
 #: :func:`messagefoundry.config.state.state_get` returns on a hit.
 StateValue = str | int | float | bool | None | list[Any] | dict[str, Any]
 
+#: The longest :class:`SetState` ``namespace`` or ``key``, in UTF-16 code units: SQL Server's
+#: ``state`` columns are ``NVARCHAR(256)``, and a longer bind would fail the handoff there.
+STATE_KEY_MAX_UNITS: Final = 256
+#: The longest ``namespace`` plus ``key``, in UTF-16 code units. ``pk_state`` is SQL Server's
+#: clustered primary key, whose key is capped at 900 bytes, two per code unit. Two full-width
+#: ``NVARCHAR(256)`` columns would be 1024 bytes, so this pair cap, not the column width, binds.
+STATE_KEY_MAX_PAIR_UNITS: Final = 450
+
 
 @dataclass(frozen=True)
 class SetState:
@@ -4954,20 +4990,63 @@ class SetState:
         # Validate at construction so a non-serializable value fails in the author's handler (with a
         # clear message) rather than deep inside the store's INSERT during a handoff. namespace/key
         # are the composite PK and must be non-empty strings.
-        # Every message names the field only: namespace, key and value may be PHI.
+        # Every message names the field and the rule, plus the length in UTF-16 code units for a
+        # length refusal and json's reason for a value refusal, never the text: namespace, key and
+        # value may be PHI.
+        # Each key rule below is refused on EVERY backend, though only one backend needs it, so a
+        # feed behaves the same wherever it runs (BACKLOG #1588, #4917).
+        units = 0
         for name, text in (("namespace", self.namespace), ("key", self.key)):
             if not isinstance(text, str) or not text:
-                raise WiringError(f"SetState {name} must be a non-empty string")
-            # BACKLOG #1588: SQL Server pads trailing U+0020 in `=` and the primary key under every
-            # collation, BIN2 included, so 'k' and 'k ' would be one stored row there and two cache
-            # entries. Refused on every backend so a feed behaves the same wherever it runs.
+                raise StateKeyError(f"SetState {name} must be a non-empty string")
+            # SQL Server pads trailing U+0020 (the `state` DDL comment in store/sqlserver.py), so
+            # 'k' and 'k ' would be one stored row there and two cache entries.
             if text.endswith(" "):
-                raise WiringError(f"SetState {name} must not end with a space")
+                raise StateKeyError(f"SetState {name} must not end with a space")
+            # Postgres TEXT cannot hold U+0000, so the handoff INSERT would fail there.
+            if "\x00" in text:
+                raise StateKeyError(f"SetState {name} must not contain U+0000 (NUL)")
+            # NVARCHAR counts UTF-16 code units. ASCII is one unit per char, so the usual MRN-style
+            # key skips the encode. A strict encode refuses a lone surrogate (U+D800..U+DFFF): no
+            # backend stores one, and cell_aad's UTF-8 encode would raise it inside the handoff, a
+            # store error the runner retries rather than a content fault it dead-letters. A key
+            # already over the limit in code points is refused unencoded: each is at least a unit,
+            # so a huge content-derived key costs no copy.
+            at_least = ""
+            if text.isascii():
+                field_units = len(text)
+            elif len(text) > STATE_KEY_MAX_UNITS:
+                field_units, at_least = len(text), "at least "
+            else:
+                lone_surrogate = False
+                try:
+                    field_units = len(text.encode("utf-16-le")) // 2
+                except UnicodeEncodeError:
+                    # Raised outside the handler: the encode error's `.object` is the whole key, so
+                    # it must not ride the chain as __context__ (nor would `from None` stop that).
+                    lone_surrogate = True
+                if lone_surrogate:
+                    raise StateKeyError(
+                        f"SetState {name} must not contain a lone surrogate (U+D800..U+DFFF)"
+                    )
+            if field_units > STATE_KEY_MAX_UNITS:
+                raise StateKeyError(
+                    f"SetState {name} is {at_least}{field_units} UTF-16 code units; the limit is "
+                    f"{STATE_KEY_MAX_UNITS}"
+                )
+            units += field_units
+        if units > STATE_KEY_MAX_PAIR_UNITS:
+            raise StateKeyError(
+                f"SetState namespace and key together are {units} UTF-16 code units; the limit is "
+                f"{STATE_KEY_MAX_PAIR_UNITS}"
+            )
         import json
 
         try:
             json.dumps(self.value)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RecursionError) as exc:
+            # RecursionError: a value nested past the interpreter's depth. Converted like the others
+            # so the Handler sees the documented WiringError, not a bare interpreter fault.
             reason = str(exc)
         else:
             return
@@ -6805,6 +6884,32 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
 #: text rather than state the hop is generic.
 POSSIBLY_GENERIC_DB_HOP = "possibly generic: dialect is an unresolved env() reference"
 
+#: The generic-hop reason when ``odbc_driver`` is an ``env()`` reference the reader cannot resolve,
+#: so its driver family is unknown, and at least one family the engine places would count the mode
+#: set (BACKLOG #5053). Where none would, the hop gets the reason every family gives instead.
+UNRESOLVED_DRIVER_REASON = "possibly delegated: odbc_driver is an unresolved env() reference"
+
+
+#: What :func:`_db_setting` returns for an ``env()`` reference it cannot resolve.
+_UNRESOLVED = object()
+
+
+def _db_setting(
+    settings: Mapping[str, Any], key: str, default: object, env_values: Mapping[str, Any] | None
+) -> object:
+    """A DATABASE connection's ``key`` setting, an ``env()`` reference resolved as the build
+    resolves it with :func:`resolve_env_settings`, or :data:`_UNRESOLVED` when it cannot be: no
+    values, or a key the values do not hold and no default."""
+    value = settings.get(key, default)
+    if not isinstance(value, EnvRef):
+        return value
+    if env_values is None:
+        return _UNRESOLVED
+    try:
+        return resolve_env_settings({key: value}, env_values)[key]
+    except WiringError:
+        return _UNRESOLVED
+
 
 def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | None) -> str | None:
     """A DATABASE connection's dialect in lower case, or ``None`` when it is an ``env()`` reference
@@ -6814,16 +6919,8 @@ def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | Non
     values, so a reader handed those values resolves it the same way, default included. With no
     values, or a key the values do not hold and no default, the answer is ``None``: a reader must not
     guess an arm, since each arm reads the same settings differently."""
-    dialect = settings.get("dialect", "sqlserver")
-    if not isinstance(dialect, EnvRef):
-        return str(dialect).lower()
-    if env_values is None:
-        return None
-    try:
-        resolved = resolve_env_settings({"dialect": dialect}, env_values)
-    except WiringError:
-        return None
-    return str(resolved["dialect"]).lower()
+    dialect = _db_setting(settings, "dialect", "sqlserver", env_values)
+    return None if dialect is _UNRESOLVED else str(dialect).lower()
 
 
 def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
@@ -6852,10 +6949,14 @@ def unverified_generic_db_hops(
 
     The exemption itself is narrower since BACKLOG #1178: a hop this function reports is also refused at
     connector construction on an enforcing instance off-loopback, through the shared cleartext-hop
-    authority. This lists what that classifier flags, not every delegated hop: one whose usable mode
-    value (see ``transports.database._sets_tls_mode``) is outside the no-TLS deny-list is absent. A
-    blank, padded or non-string mode value is flagged and listed. A hop can appear here and still be crossed legitimately, on-box or under a declared
-    attestation or acceptance, so never read it as "who is crossing in the clear".
+    authority. This lists what that classifier flags, not every delegated hop: one whose mode value
+    counts for its driver family (see ``transports.database._sets_tls_mode``) and is outside the
+    no-TLS deny-list is absent. A mode counts only on the keyword the family placed from
+    ``odbc_driver`` reads, and for psqlODBC and MySQL only at that family's own spellings, so a mode
+    keyword the named driver does not read, and any hop whose ``odbc_driver`` the engine cannot
+    place, is flagged and listed (BACKLOG #5053). A blank, padded or non-string mode value is
+    flagged and listed too. A hop can appear here and still be crossed legitimately, on-box or
+    under a declared attestation or acceptance, so never read it as "who is crossing in the clear".
 
     It walks **both** connection tables, unlike :func:`accepted_cleartext_hops`: a ``DatabasePoll``
     inbound crosses the same hop in the same dialect with the same credential in the same DSN, so
@@ -6885,16 +6986,31 @@ def unverified_generic_db_hops(
     surfaces, never on the hot path.
 
     Pure — it reads the loaded graph and touches nothing else."""
-    from messagefoundry.transports.database import generic_odbc_tls_unenforced
+    from messagefoundry.transports.database import (
+        generic_odbc_tls_unenforced,
+        generic_odbc_tls_unenforced_unread,
+    )
 
-    def unenforced(settings: Mapping[str, Any]) -> str | None:
+    def unenforced(settings: Mapping[str, Any], *, deployed: bool) -> str | None:
         dialect = _db_dialect(settings, env_values)
         if dialect is not None and dialect != "generic":
             return None
         params = settings.get("odbc_params") or {}
         if not isinstance(params, Mapping):
             return None
-        reason = generic_odbc_tls_unenforced(params)
+        # The classifier reads the driver family from odbc_driver (BACKLOG #5053), resolved as the
+        # dialect is. An unresolved one places no family, so the hop is listed, the safe direction
+        # for an advisory list, under a reason that says the name was not read.
+        # A not-deployed connection's env() values are never resolved (ADR 0111 AC-1), so its
+        # env() driver stays unread; a no-TLS value beside it is still reported.
+        driver = _db_setting(settings, "odbc_driver", None, env_values if deployed else None)
+        # Possibly delegated only where some family would clear the params: a hop at risk on
+        # every driver keeps the reason they all give.
+        reason: str | None
+        if driver is _UNRESOLVED:
+            reason = generic_odbc_tls_unenforced_unread(params) or UNRESOLVED_DRIVER_REASON
+        else:
+            reason = generic_odbc_tls_unenforced(params, driver=driver)
         if reason is None or dialect is not None:
             return reason
         # Unresolved: read as possibly generic rather than as not generic. A SQL Server value would
@@ -6911,7 +7027,7 @@ def unverified_generic_db_hops(
         for conn in table.values():
             if conn.spec.type is not ConnectorType.DATABASE or _dark_env_dialect(conn):
                 continue
-            reason = unenforced(conn.spec.settings)
+            reason = unenforced(conn.spec.settings, deployed=conn.deployed)
             if reason is not None:
                 out.append(
                     (record_name(conn.name), f"{reason} ({_peer_label(conn.spec.settings)})")

@@ -282,6 +282,50 @@ async def test_verify_fails_when_the_manifest_expects_a_table_the_snapshot_does_
     await store.close()
 
 
+@pytest.mark.parametrize(
+    ("shape", "reason"),
+    [
+        ("empty", "records no row counts"),
+        ("missing", "records no row counts"),
+        ("disjoint", "share none with"),
+    ],
+)
+async def test_verify_fails_when_the_manifest_row_counts_compare_nothing(
+    tmp_path, shape: str, reason: str
+) -> None:
+    """BACKLOG #5056: the compare is keyed off the manifest's own tables, so a manifest recording
+    none, or none the snapshot has, compares nothing and used to verify PASS. A full archive's
+    manifest always lists its store's tables, so this shape is the #2186 empty stand-in or a
+    damaged manifest, and it must FAIL with a reason that says the compare read nothing."""
+    key_b64 = generate_key()
+    store, archive, ss = await _backup(tmp_path, key_b64)
+    try:
+        key = base64.b64decode(key_b64)
+
+        # The control: the untouched archive passes, so the FAIL below is the manifest edit alone.
+        good = await run_restore_verify(archive, store_settings=ss)
+        assert good.status == "PASS", good.reason
+
+        def _hollow_the_counts(manifest: dict[str, Any]) -> None:
+            if shape == "empty":
+                manifest["row_counts"] = {}
+            elif shape == "missing":
+                del manifest["row_counts"]
+            else:
+                manifest["row_counts"] = {"a_table_this_snapshot_does_not_have": 0}
+
+        hollow = tmp_path / f"no-counts-{shape}.mfbak"
+        _reseal_with_mutated_manifest(archive, key, hollow, _hollow_the_counts)
+
+        res = await run_restore_verify(str(hollow), store_settings=ss)
+        assert res.status == "FAIL", res.reason
+        assert res.integrity_ok is True
+        assert res.row_counts.get("messages", 0) >= 1  # the snapshot itself was counted
+        assert res.reason is not None and reason in res.reason
+    finally:
+        await store.close()
+
+
 async def test_full_restore_verify_opens_through_open_store(tmp_path) -> None:
     key_b64 = generate_key()
     store, archive, ss = await _backup(tmp_path, key_b64)

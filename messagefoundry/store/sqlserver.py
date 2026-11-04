@@ -92,6 +92,7 @@ from messagefoundry.store.base import (
     PROVISION_SCHEMA_COMMAND,
     UPLOAD_RESERVATION_STALE_AFTER,
     ConnectionFlagLockTimeout,
+    ReferenceKeyCollision,
     SchemaDdlLockTimeout,
     SchemaLockTimeout,
     SchemaNotProvisionedError,
@@ -209,6 +210,7 @@ from messagefoundry.store.store import (
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
+    REINGRESS_ARTIFACT_MISSING,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
@@ -236,6 +238,7 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
     EpochBump,
@@ -342,7 +345,9 @@ from messagefoundry.store.store import (
     report_unsealed_role_records,
     report_unsealed_users,
     report_user_reseal,
+    require_ingress_audit,
     require_notify_email,
+    require_operator_audit,
     require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
@@ -928,6 +933,12 @@ _SQL_STATE_MERGE: Final[str] = (
     " WHEN NOT MATCHED THEN INSERT (namespace, [key], value, set_at, message_id)"
     " VALUES (?,?,?,?,?);"
 )
+# The collation `_SCHEMA` gives state.namespace and state.[key] (BACKLOG #1588); a test pins that the
+# DDL names this one. The open-time report accepts any binary collation, not only this name. The DDL
+# keeps the literal, as every other BIN2 column in `_SCHEMA` does, so that test compares two separate
+# spellings; interpolating this constant would leave the text and `_schema_hash` unchanged but would
+# make the test compare the constant with itself.
+_STATE_KEY_COLLATION: Final[str] = "Latin1_General_100_BIN2"
 
 
 # BACKLOG #1628: how many times, and how far apart, the open-time RCSI check re-reads the state after
@@ -2128,6 +2139,10 @@ _SCHEMA: list[str] = [
     # MERGE matched another spelling and kept it, while the value was sealed to the incoming one, so a
     # keyed reopen failed closed. BIN2 does NOT fix trailing spaces: `=` and the PK pad them under
     # every collation, so 'k' and 'k ' would still be one row. SetState refuses a trailing space instead.
+    # This is the one statement of that padding fact for the state and reference tables; the other
+    # comments point here. The CREATE runs only where `state` is absent, so an older table keeps its
+    # collation: _report_state_key_collation says so at open (BACKLOG #4917). pk_state is clustered,
+    # so its key is capped at 900 bytes: SetState bounds the pair (STATE_KEY_MAX_PAIR_UNITS).
     """IF OBJECT_ID('state','U') IS NULL CREATE TABLE state (
         namespace NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
         [key] NVARCHAR(256) COLLATE Latin1_General_100_BIN2 NOT NULL, value NVARCHAR(MAX) NOT NULL,
@@ -2144,8 +2159,8 @@ _SCHEMA: list[str] = [
     # binary collation (BIN2) makes key equality case- and accent-exact like SQLite/Postgres: under a
     # case-insensitive database default, externally-sourced keys differing only by case would raise a
     # PK duplicate MID-transaction — a perpetual per-interval sync-failure alert. BIN2 does NOT fix a
-    # trailing space: `=` and the PK pad it under every collation, BIN2 included, so keys differing only
-    # by trailing spaces still collide here. value is ciphertext at rest (snapshot values may carry PHI).
+    # trailing space (the `state` comment above says why), so _guard_reference_widths refuses keys
+    # that differ only by one. value is ciphertext at rest (snapshot values may carry PHI).
     # reference_version.name/version carry the same collation so the active-snapshot LEFT JOIN can
     # never hit a cross-column collation conflict.
     """IF OBJECT_ID('reference','U') IS NULL CREATE TABLE reference (
@@ -2963,7 +2978,8 @@ def _build_pool_executor(settings: StoreSettings, maxsize: int | None = None) ->
     WHY THE STORE NEEDS ITS OWN. aioodbc runs EVERY pyodbc call through
     ``loop.run_in_executor(self._executor, ...)`` and passes ``executor=None`` unless told otherwise, so
     by default every connection in this pool shares the event loop's DEFAULT ThreadPoolExecutor. CPython
-    sizes that at ``min(32, cpu_count + 4)`` -- eight threads on a four-vCPU runner -- and that width is
+    sizes that at ``min(32, (os.process_cpu_count() or 1) + 4)`` -- eight threads on a runner whose
+    process may use four CPUs -- and that width is
     INDEPENDENT of ``[store].pool_size``. So the configured pool silently cannot exceed the loop default.
 
     WHY THAT DEADLOCKS RATHER THAN MERELY THROTTLING, which is the part worth keeping. A write like
@@ -3864,6 +3880,9 @@ class SqlServerStore:
         store._read_only = read_only
         try:
             await store._ensure_schema(create=create, read_only=read_only)
+            # Right after the schema, so a later open step that fails still leaves the report
+            # logged; read-only included, since it reads metadata only (BACKLOG #4917).
+            folded = await store._report_state_key_collation()
             if store._fifo_claim_proc:
                 # ADR 0114 sub-lever A startup gate (AC-7): verify the deployed procs (existence +
                 # body hash + compat) — a miss degrades LOUDLY to the shipped batch, never a failed
@@ -3896,7 +3915,8 @@ class SqlServerStore:
             await load_audit_chain(store, read_only=read_only)
             if not read_only:
                 # A read-only handle loads no cache, as on SQLite: each decrypts every cell (#1780).
-                await store._load_state_cache()  # ADR 0005 read-through cache warm-up
+                # ADR 0005 read-through cache warm-up
+                await store._load_state_cache_noting(folded)
                 await store._load_reference_cache()  # ADR 0006 reference-snapshot read cache
         except Exception:
             # Don't leak the pool if first-open initialization fails (M-6). The executor is released
@@ -6530,6 +6550,7 @@ class SqlServerStore:
         is inserted (Phase 3a). A missing ref fails loud → the whole ingress rolls back → no ACK for a
         body we couldn't reference (content-addressing dedups the sender's resend; the startup sweep
         reclaims the orphan). Empty/None → the byte-identical no-detach path."""
+        audit = require_ingress_audit(audit, origin)  # BACKLOG #5071
         now = time.time() if now is None else now
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
@@ -8203,7 +8224,8 @@ class SqlServerStore:
         """Consume one in-flight ``Stage.RESPONSE`` work-row and re-ingress the captured reply as a new
         message on the loopback inbound (ADR 0013 Increment 2), in ONE transaction. Idempotent: returns
         ``False`` if the work-row was already consumed. A corrupt/unparseable ref, a re-ingress that
-        would exceed ``correlation_depth_cap``, or a reply retention erased (BACKLOG #1560) is
+        would exceed ``correlation_depth_cap``, a reply retention erased (BACKLOG #1560) or a
+        ``response`` row that is missing (:data:`REINGRESS_ARTIFACT_MISSING`, BACKLOG #4996) is
         dead-lettered (and the token still consumed; one whose reply is erased is also blanked). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
@@ -8312,16 +8334,16 @@ class SqlServerStore:
                     (origin_msg_id, dest, seq),
                 )
                 art = await cur.fetchone()
-                # A missing row is a corrupt reference. A NULL body means retention erased the reply
-                # (BACKLOG #1560; the SQLite twin says how a token reaches here). `#eligible` is
-                # materialized once, so a replay can commit between that read and the erasure. It
-                # must never become a child message. A missing row is damage, not an erasure, so
-                # that token is not blanked: its sealed reference is the evidence.
+                # A NULL body means retention erased the reply (BACKLOG #1560; the SQLite twin says
+                # how a token reaches here). `#eligible` is materialized once, so a replay can
+                # commit between that read and the erasure. It must never become a child message.
+                # A missing row is damage, not an erasure, so that token is not blanked: its
+                # sealed reference is the evidence.
                 if art is None:
                     return await _consume_dead(
                         "ingress_handoff(missing-artifact)",
-                        "re-ingress work-row reference is corrupt/unparseable",
-                        "re-ingress ref corrupt",
+                        REINGRESS_ARTIFACT_MISSING,
+                        "re-ingress reply missing",
                     )
                 if art[0] is None:
                     return await _consume_dead(
@@ -8526,7 +8548,8 @@ class SqlServerStore:
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
         """The decrypted reply body behind a ``Stage.RESPONSE`` work-row (ADR 0013) — for the re-ingress
         worker's HL7 peek. ``None`` if the work-row is missing/consumed or its ref is unparseable; ``''``
-        if the artifact body is missing/empty. Reads the SAME immutable artifact ``ingress_handoff``
+        if the artifact row is missing, its body was erased, or the reply was empty, as on SQLite.
+        Reads the SAME immutable artifact ``ingress_handoff``
         re-reads, so the peek and the persisted raw always agree."""
         row = await self._fetchone(
             f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",
@@ -8546,7 +8569,7 @@ class SqlServerStore:
         )
         return (
             self._cipher.decrypt(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
-            if (art and art["body"])
+            if (art and art["body"] is not None)
             else ""
         )
 
@@ -8555,6 +8578,38 @@ class SqlServerStore:
         The runner publishes it around each router/transform run so a Handler's ``state_get(...)``
         resolves cross-message; ``transform_handoff`` refreshes it post-commit."""
         return MappingProxyType(self._state_cache)
+
+    async def _report_state_key_collation(self) -> str | None:
+        """Log a WARNING for a ``state`` table whose key columns are not binary (BACKLOG #4917; the
+        ``state`` comment in ``_SCHEMA`` says how one arises). Repairs nothing, and the open goes
+        on. Returns the collation found, or ``None`` when both are BIN2 or the table is absent."""
+        rows = await self._fetchall(
+            "SELECT name, collation_name FROM sys.columns"
+            " WHERE object_id = OBJECT_ID('state') AND name IN ('namespace', 'key')"
+        )
+        # Any binary collation compares code points, as the cache does; only a linguistic one folds.
+        found = sorted(
+            {
+                str(r["collation_name"])
+                for r in rows
+                # A token, not a suffix: Latin1_General_100_BIN2_UTF8 is binary too.
+                if not {"BIN", "BIN2"} & set(str(r["collation_name"]).upper().split("_"))
+            }
+        )
+        if not found:
+            return None
+        collation = ", ".join(found)
+        log.warning(
+            "sqlserver: the state table's namespace/key columns use collation %s, not a binary one"
+            " such as the %s the shipped DDL names. Keys this collation compares as equal, such as"
+            " ones differing only in case under a case-insensitive collation, may have been merged"
+            " into one row; the engine does not repair them. Remedy, which loses every state row:"
+            " drop the state table and delete the schema_meta row, so the next open (or"
+            " provision-schema) re-runs the DDL batch and creates the table again",
+            collation,
+            _STATE_KEY_COLLATION,
+        )
+        return collation
 
     async def _load_state_cache(self) -> None:
         """Warm the transform-state read-through cache from the ``state`` table at open (ADR 0005)."""
@@ -8573,6 +8628,20 @@ class SqlServerStore:
                 table="state",
             )
         self._state_cache = cache
+
+    async def _load_state_cache_noting(self, folded_collation: str | None) -> None:
+        """:meth:`_load_state_cache`, with a note on a ``CipherError`` naming the folding collation
+        :meth:`_report_state_key_collation` found, a possible cause (BACKLOG #4917)."""
+        try:
+            await self._load_state_cache()
+        except CipherError as exc:
+            if folded_collation is not None:
+                exc.add_note(
+                    f"the state table's key columns use collation {folded_collation}, not a"
+                    " binary one, so this row may have been merged across a case or accent variant"
+                    " and sealed to the other spelling (BACKLOG #1588, #4917)"
+                )
+            raise
 
     async def _load_reference_cache(self) -> None:
         """Populate the in-memory reference cache from the ACTIVE snapshot of each set (ADR 0006).
@@ -8638,12 +8707,21 @@ class SqlServerStore:
         (NVARCHAR's unit — a naive ``len()`` counts code points and passes astral-plane keys straight
         into that truncation). The error NEVER carries a raw key: keys may be PHI for a patient-keyed
         set (CLAUDE.md §9), so it names the set + the key's ordinal, code-unit length, and a truncated
-        hash only."""
+        hash only.
+
+        It also refuses two keys equal once trailing U+0020 is stripped (BACKLOG #4917):
+        ``pk_reference`` pads them (the ``state`` comment in ``_SCHEMA`` says why), so the second
+        INSERT would raise a PK duplicate mid-transaction, every interval. It raises
+        :class:`ReferenceKeyCollision`, naming the keys by ordinal only, because ``reference_sync``
+        logs that class's message whole, where it logs any other source error by class name only."""
         if len(name.encode("utf-16-le")) // 2 > 256:
             raise ValueError(
                 f"reference set name exceeds NVARCHAR(256) "
                 f"({len(name.encode('utf-16-le')) // 2} UTF-16 code units); refusing the snapshot"
             )
+        # Only a key ending in a space can pad onto another, so only those are stripped and held:
+        # usually none, so a large set costs one endswith per key, not a second dict of every key.
+        padded: dict[str, int] = {}  # stripped form of a space-ending key -> its ordinal
         for ordinal, key in enumerate(rows):
             units = len(key.encode("utf-16-le")) // 2
             if units > 450:
@@ -8653,6 +8731,22 @@ class SqlServerStore:
                     f"({units} UTF-16 code units, sha256:{digest}); refusing the snapshot "
                     "(key value withheld: reference keys may be PHI)"
                 )
+            if not key.endswith(" "):
+                continue
+            stripped = key.rstrip(" ")
+            first = padded.get(stripped)
+            if first is None and stripped in rows:
+                first = next(i for i, k in enumerate(rows) if k == stripped)
+            if first is not None:
+                later, first = max(ordinal, first), min(ordinal, first)
+                # No digest: an MRN-shaped key is guessable from a short unsalted hash, and the two
+                # ordinals already find the rows in the source.
+                raise ReferenceKeyCollision(
+                    f"reference set {name!r}: keys #{first} and #{later} differ only by trailing"
+                    " spaces, which SQL Server compares as equal; refusing the snapshot (key"
+                    " values withheld: reference keys may be PHI)"
+                )
+            padded[stripped] = ordinal
 
     async def write_reference_snapshot(
         self, *, name: str, version: str, rows: Mapping[str, Any]
@@ -9585,10 +9679,11 @@ class SqlServerStore:
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Blank the payload of dead rows updated before ``older_than`` (retention). Keeps the
         dead row + 'dead' status (counts/disposition) but frees the body and ``last_error``;
-        idempotent, because a row left with neither no longer matches.
+        idempotent, because a row left with neither no longer matches. Returns a
+        :class:`DeadLetterPurge` (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -9607,13 +9702,21 @@ class SqlServerStore:
         )
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # As on SQLite: two statements, one count each (BACKLOG #4996). DATALENGTH, not
+                # `<> ''`: T-SQL pads trailing spaces before comparing, so a whitespace-only body
+                # would otherwise read as blank and survive.
                 await cur.execute(
-                    "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=? AND (payload <> '' OR last_error IS NOT NULL)"
-                    f" AND updated_at < {cutoff_sql}",
+                    "UPDATE queue SET payload=''"
+                    f" WHERE status=? AND DATALENGTH(payload) > 0 AND updated_at < {cutoff_sql}",
                     (OutboxStatus.DEAD.value, *cutoff_params),
                 )
                 purged = cur.rowcount
+                await cur.execute(
+                    "UPDATE queue SET last_error=NULL"
+                    f" WHERE status=? AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                    (OutboxStatus.DEAD.value, *cutoff_params),
+                )
+                cleared = cur.rowcount
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
                 # it can no longer be replayed. If that was the message's LAST replayable row (per the
                 # negated live-holder predicate), release its streaming attachment here — the deferred half
@@ -9637,7 +9740,10 @@ class SqlServerStore:
             except Exception:
                 await conn.rollback()
                 raise
-        return int(purged) if purged is not None else 0
+        return DeadLetterPurge(
+            bodies=int(purged) if purged is not None else 0,
+            errors_cleared=int(cleared) if cleared is not None else 0,
+        )
 
     async def wal_checkpoint(self) -> None:
         """No-op on SQL Server — there is no SQLite WAL to checkpoint (the engine never calls this on
@@ -11622,6 +11728,7 @@ class SqlServerStore:
         docstring carries the reasoning — including why the ``stuck`` count deliberately does not.
         A pass-through completion marker is skipped the same way (:data:`_NOT_PT_MARKER`, #1580).
         ``audit``'s row commits with the replay (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.replay")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -11745,6 +11852,7 @@ class SqlServerStore:
         ``INSERT … WHERE NOT EXISTS`` + ``rowcount`` is the atomic gate; the outbound row is created only
         when it made a row (ADR 0090 §4). ``audit``'s row commits with the resend, a duplicate included
         (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.resend_to")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -12018,6 +12126,7 @@ class SqlServerStore:
         EXISTS`` + ``rowcount`` gate (keyed to ``(origin, "@reingress:<channel>")``) admits exactly one;
         the deterministic content-addressed child id is the partial-rollback defense. ``audit``'s row
         commits with the resubmit, a duplicate included (BACKLOG #2624)."""
+        require_operator_audit(audit, "store.reingress")  # BACKLOG #5069
         now = time.time() if now is None else now
         async with AuditedWrite(now) as written, self._acquire() as conn:
             try:
@@ -12194,6 +12303,7 @@ class SqlServerStore:
         message from ``ERROR`` to ``ROUTED`` with nothing re-queued. It binds no parameter, so it does
         not disturb the positional ``?`` order ``params`` depends on. The pass-through marker exclusion
         (:data:`_NOT_PT_MARKER`, BACKLOG #1580) rides the same ``clause`` for the same reason."""
+        require_operator_audit(audit, "store.replay_dead")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "status=?", f"({_REPLAYABLE_BODY})", f"({_NOT_PT_MARKER})"]
         params: list[Any] = [Stage.OUTBOUND.value, OutboxStatus.DEAD.value]
@@ -12248,6 +12358,7 @@ class SqlServerStore:
         now: float | None = None,
         audit: OperatorAudit[int],
     ) -> int:
+        require_operator_audit(audit, "store.cancel_queued")  # BACKLOG #5069
         now = time.time() if now is None else now
         where = ["stage=?", "destination_name=?", "status=?"]
         params: list[Any] = [Stage.OUTBOUND.value, destination_name, OutboxStatus.PENDING.value]
@@ -13534,7 +13645,7 @@ class SqlServerStore:
         approver: str,
         decided_at: float,
         seal_read: object,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         """Move a ``pending`` request that fails its integrity seal to ``rejected`` (BACKLOG
         #3638); the Store protocol states the contract. Locks as :meth:`decide_pending_approval`
@@ -13757,7 +13868,7 @@ class SqlServerStore:
         ]
 
     async def _append_operator_audit[R](
-        self, cur: Any, written: AuditedWrite, audit: OperatorAudit[R] | None, result: R
+        self, cur: Any, written: AuditedWrite, audit: OperatorAudit[R], result: R
     ) -> None:
         """Append an operator mutation's audit row before its commit (BACKLOG #2624), so an append
         that fails rolls the mutation back. The caller's first statement opened the transaction the
@@ -13787,7 +13898,7 @@ class SqlServerStore:
         now: float | None = None,
         adopt_notify_email: bool = True,
         notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         check_password_generated(password_generated=password_generated, password_hash=password_hash)
         now = time.time() if now is None else now
@@ -14429,7 +14540,7 @@ class SqlServerStore:
         display_name: str | None,
         email: str | None,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
         calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
@@ -14893,7 +15004,7 @@ class SqlServerStore:
         *,
         expected_username: str,
         now: float | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> bool:
         # BACKLOG #1532. Cache refresh for a directory-reported rename -- see AuthStore.
         # BACKLOG #2290: `username=?` on the old name makes it a compare-and-set; AuthStore says

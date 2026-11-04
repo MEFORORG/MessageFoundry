@@ -10,6 +10,10 @@ verdicts must agree, except for two stated differences: the two navigation lists
 canonical dotted-quad IPv4 address of one host, and the recipient list caps a domain at 252
 characters, the most an address leaves, where the shape rule allows 253 (BACKLOG #3075).
 
+Two more lists keep their own rule with a written reason, ``[egress].proxy_no_proxy`` and
+``[auth].oidc_allowed_username_domains`` (BACKLOG #3075 items 2 and 3). The same table feeds each,
+and the tests pin what each does with it, so a drift between either rule and the shared one shows.
+
 Read on the unfixed code at ``873aa9d75a``: ``organization_domains`` and
 ``external_link_allowlist`` accepted every value in :data:`_REFUSED` except the URL, port and
 wildcard forms (``"."`` was dropped silently), and ``allowed_recipient_domains`` accepted
@@ -23,9 +27,18 @@ import string
 import pytest
 from pydantic import ValidationError
 
-from messagefoundry.config.settings import EgressSettings, SecuritySettings, _not_a_host_address
+from messagefoundry.auth.oidc.claims import ClaimsError, OidcClaimPolicy, _resolve_username
+from messagefoundry.auth.service import _is_single_mailbox
+from messagefoundry.config.models import SignatureAlgorithm
+from messagefoundry.config.settings import (
+    AuthSettings,
+    EgressSettings,
+    SecuritySettings,
+    _not_a_host_address,
+)
 from messagefoundry.domainshape import domain_shape_problem, is_canonical_ipv4, upn_suffix_key
 from messagefoundry.transports.email import envelope_address_problem
+from messagefoundry.transports.rest import proxy_bypasses_host
 from messagefoundry_webconsole import _external
 from messagefoundry_webconsole._external import is_allowlisted, is_external
 
@@ -79,6 +92,9 @@ _ACCEPTED = [
 #: The stated difference: a canonical IPv4 address is a navigation host, never a mail domain.
 _IPV4 = "10.20.30.40"
 
+#: Every value in the shared table, refused and accepted alike.
+_TABLE = [*_REFUSED, *_ACCEPTED, _IPV4]
+
 #: Canonical quads that are no one host's address: unspecified, the rest of its ``0.0.0.0/8`` block
 #: at both ends, limited broadcast, multicast and class E. Built from integers, so the file carries
 #: no routable literal for the leak scan.
@@ -110,7 +126,7 @@ def test_every_list_accepts_the_same_values(list_name: str, value: str) -> None:
 
 #: The values whose probe address reaches the domain check. One holding "@", "/" or ":" fails the
 #: read-back first, so its verdict would agree for an unrelated reason.
-_DOMAIN_ONLY = [v for v in [*_REFUSED, *_ACCEPTED, _IPV4] if not set(v) & set("@/:")]
+_DOMAIN_ONLY = [v for v in _TABLE if not set(v) & set("@/:")]
 
 #: A 252-character domain, the longest an address can carry, and one a character longer.
 _LONGEST_SENDABLE = ".".join(["x" * 63] * 3 + ["x" * 60])
@@ -127,6 +143,157 @@ def test_the_address_check_agrees_with_the_recipient_list(value: str) -> None:
     except ValidationError:
         listed = False
     assert (envelope_address_problem("a@" + value.strip()) is None) is listed
+
+
+@pytest.mark.parametrize("value", [*(v.strip() for v in _DOMAIN_ONLY), "localhost"])
+def test_the_notify_mailbox_check_is_the_send_rule_and_a_dot(value: str) -> None:
+    """BACKLOG #3075 item 8 and #2962 item 5: ``_is_single_mailbox`` in ``auth/service.py`` dropped
+    its own leading-dot and trailing-dot tests, because the send rule it also applies refuses both
+    as an empty label. So over the shared table its verdict is the send rule's, plus a dot inside
+    the domain, which the shared rule does not ask for and the mailbox check keeps.
+
+    The expectation restates the function's own two conjuncts, so this pins agreement with the send
+    rule rather than the dot rule; the test below holds the dot-edge cases with stated verdicts.
+    ``localhost`` is the one case the dot conjunct decides: the send rule takes a single label and
+    the mailbox check refuses it, the single-label split #2962 item 2 keeps open.
+
+    Mutation: drop ``envelope_address_problem(address) is None`` from ``_is_single_mailbox``. Red:
+    at least ``.example.org`` and ``example.org.``. Mutation: drop the dot conjunct. Red:
+    ``localhost``."""
+    address = "a@" + value
+    expected = envelope_address_problem(address) is None and "." in value.strip(".")
+    assert _is_single_mailbox(address) is expected
+
+
+@pytest.mark.parametrize("domain", [".example.org", "example.org.", ".example.org.", ".", ".."])
+def test_the_send_rule_refuses_a_dot_at_either_end_of_a_mailbox_domain(domain: str) -> None:
+    # The cases the two dropped checks in _is_single_mailbox held. The send rule refuses each as an
+    # empty label; the first three reach _is_single_mailbox past its own dot conjunct, so for them
+    # the send rule alone refuses. "." and ".." fail that conjunct too, since stripping leaves "".
+    address = "a@" + domain
+    assert "empty label" in (envelope_address_problem(address) or "")
+    assert not _is_single_mailbox(address)
+
+
+def _no_proxy(value: str) -> list[str]:
+    loaded: list[str] = EgressSettings.model_validate({"proxy_no_proxy": [value]}).proxy_no_proxy
+    return loaded
+
+
+@pytest.mark.parametrize("value", _TABLE)
+def test_the_proxy_bypass_list_loads_every_shared_table_value_as_written(value: str) -> None:
+    """BACKLOG #3075 item 2, declined in writing beside ``proxy_no_proxy`` in
+    ``config/settings.py``: the list keeps the transport's NO_PROXY rule, ``_proxy_bypasses``, and
+    applies no shape check at load. So every value the shared rule refuses loads too, unchanged.
+    The tests below pin what the bypass rule then does with each.
+
+    Mutation: apply ``domain_shape_problem`` to ``proxy_no_proxy`` at load. Red: every refused
+    value."""
+    assert _no_proxy(value) == [value]
+
+
+#: The refused values that bypass the proxy for ``example.org`` and its subdomains. Each is a form
+#: the proxy rule names: a dot-led suffix and a wildcard suffix (the field's comment), a port, which
+#: the rule ignores (the same comment), and a trailing dot, which it strips (its docstring). Each
+#: covers the same hosts ``example.org`` does. The written reason names a malformed entry that
+#: bypasses every host, ``*:443``; see :data:`_PROXY_COVERS_EVERY_HOST`.
+_PROXY_COVERS_EXAMPLE_ORG = {".example.org", "example.org.", "example.org:25", "*.example.org"}
+
+
+@pytest.mark.parametrize("value", list(_REFUSED))
+def test_a_refused_value_bypasses_the_proxy_only_in_a_form_the_proxy_rule_names(value: str) -> None:
+    """The rest of the refused values cover neither ``example.org`` nor ``mx.example.org``, so
+    those hosts go through the proxy, one of the two directions the written reason says a malformed
+    entry fails in; :data:`_PROXY_COVERS_EVERY_HOST` pins the other. No value here covers
+    ``example.net``, the one outside host this probes.
+
+    Each value still bypasses the host it spells, as the next tests pin for two. The written reason
+    names the underscore host and the IP literal; at least the empty-label, hyphen-edge, long-label,
+    digit-led and non-ASCII values are hosts it does not name. ``https://example.org`` is cut at its
+    first ``:`` to the pattern ``https``, so it covers a host named ``https`` and not the one it
+    spells. Pinned as they are, not endorsed.
+
+    Mutation: strip a leading ``-`` from each entry in ``_proxy_bypasses``. Red: ``-mx.example.org``
+    covers ``mx.example.org``. Mutation: let an entry starting with ``*`` bypass every host. Red:
+    ``*.example.org`` covers ``example.net``."""
+    covers, loaded = value in _PROXY_COVERS_EXAMPLE_ORG, _no_proxy(value)
+    for host in ("example.org", "mx.example.org"):
+        assert proxy_bypasses_host(host, loaded) is covers, host
+    assert not proxy_bypasses_host("example.net", loaded)
+
+
+#: Malformed entries that bypass the proxy for every host, because each reads as ``*``: the rule
+#: ignores a port, strips a trailing dot and strips brackets. The written reason names the first.
+_PROXY_COVERS_EVERY_HOST = ["*:443", "*.", "[*]"]
+
+
+@pytest.mark.parametrize("value", _PROXY_COVERS_EVERY_HOST)
+def test_a_decorated_wildcard_bypasses_the_proxy_for_every_host(value: str) -> None:
+    # The widening direction the written reason beside proxy_no_proxy names, pinned so a change to
+    # it is a decision. Mutation: stop stripping the port in _strip_proxy_host_port. Red: "*:443".
+    # Mutation: stop stripping the brackets. Red: "[*]".
+    assert _no_proxy(value) == [value]
+    assert proxy_bypasses_host("example.net", _no_proxy(value))
+
+
+@pytest.mark.parametrize("value", ["mx_1.example.org", "0x7f000001"])
+def test_an_entry_the_shared_rule_refuses_still_bypasses_the_host_it_spells(value: str) -> None:
+    # The written reason: the list takes an underscore host and an IP literal. Mutation: refuse a
+    # host holding "_" in _proxy_bypasses. Red: the first case.
+    assert proxy_bypasses_host(value, _no_proxy(value))
+
+
+@pytest.mark.parametrize("value", [*_ACCEPTED, _IPV4])
+def test_an_accepted_value_bypasses_the_proxy_for_its_host_and_subdomains(value: str) -> None:
+    """The agreement half: a value the shared rule accepts covers the host it names and every
+    subdomain, on a label boundary. The IPv4 address is not agreement: the shared rule refuses it,
+    and the proxy rule takes it (the written reason) and suffix-matches it as it does a domain, so
+    it covers ``mx.10.20.30.40``, where the console matches an address exactly. The written reason
+    does not name that suffix match; pinned as it is, not endorsed.
+
+    Mutation: match only an exact host in ``_proxy_bypasses``. Red: the subdomain assertion."""
+    host, loaded = value.strip().lower(), _no_proxy(value)
+    assert proxy_bypasses_host(host, loaded)
+    assert proxy_bypasses_host("mx." + host, loaded)
+    assert not proxy_bypasses_host("not" + host, loaded)
+
+
+def _username_policy(value: str) -> OidcClaimPolicy:
+    allowed = AuthSettings(oidc_allowed_username_domains=[value]).effective_oidc_username_domains
+    return OidcClaimPolicy(
+        issuer="https://idp.example",
+        client_id="mefor-console",
+        signing_algorithms=[SignatureAlgorithm.RS256],
+        nonce="n",
+        max_age_seconds=300,
+        allowed_username_domains=frozenset(allowed),
+    )
+
+
+@pytest.mark.parametrize("value", _TABLE)
+def test_the_oidc_suffix_list_loads_every_shared_table_value_and_matches_it_exactly(
+    value: str,
+) -> None:
+    """BACKLOG #3075 item 3, declined in writing in ``effective_oidc_username_domains``: an entry is
+    compared with the raw suffix an identity provider writes into a claim, not with a DNS name, so
+    the list applies no shape check and every value the shared rule refuses loads too. What keeps
+    that safe is the exact compare: an entry admits the one suffix it spells, in
+    ``upn_suffix_key`` form, and no subdomain of it.
+
+    One case the written reason does not name: ``a@example.org`` loads, and admits a claim
+    ``jdoe@a@example.org``, whose suffix after the first ``@`` is that entry. The claim check's own
+    comment treats a second ``@`` as the attack form. Pinned as it is, not endorsed.
+
+    Mutation: apply ``domain_shape_problem`` to ``oidc_allowed_username_domains`` in a field
+    validator. Red: every refused value. A check placed only in the OIDC-enabled model validator
+    would not show here, since this loads with OIDC off. Mutation: let ``_resolve_username`` match a subdomain. Red: the last
+    assertion."""
+    suffix = value.strip()
+    policy = _username_policy(value)
+    assert policy.allowed_username_domains == {upn_suffix_key(suffix)}
+    assert _resolve_username({"preferred_username": "jdoe@" + suffix}, policy) == "jdoe"
+    with pytest.raises(ClaimsError, match="not in the configured allow-list"):
+        _resolve_username({"preferred_username": "jdoe@mx." + suffix}, policy)
 
 
 def test_the_recipient_list_refuses_a_domain_no_address_can_carry() -> None:

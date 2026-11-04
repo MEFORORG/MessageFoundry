@@ -2679,15 +2679,22 @@ def _check_expiry_relaxed(config_dir: str | Path) -> CheckResult:
     # The hostname half is true only where the connection does not ALSO turn the name check off.
     # CORRECTED (ASVS 12.3.2 re-read, 2026-10-01): this said "chain, hostname and key usage are still
     # verified" for every listed hop, which was false on a hop that also set tls_check_hostname=false.
+    # CORRECTED 2026-11-03 (vault BACKLOG #5089): "chain ... still verified" over-stated too. The
+    # relaxation skips at least the other chain certificates' validity periods and a CRL's own window
+    # (relax_verify_expiry), so the line claims only the chain's signatures.
     unchecked = {name for name, _ in hostname_unchecked_hops(registry)}
     both = sorted(name for name, _ in relaxed if name in unchecked)
+    windows = (
+        "at least the validity periods of the intermediates and the trust anchor, and a CRL's own "
+        "validity window, go unchecked too"
+    )
     if not both:
-        still = "chain, hostname and key usage are still verified"
+        still = f"{windows}; the chain's signatures, the hostname and key usage are still verified"
     else:
         # "The others" only when there are some.
         still = (
-            "chain and key usage are still verified; the hostname is NOT on "
-            f"{', '.join(both)}, which also set tls_check_hostname=false (an env() value is "
+            f"{windows}; the chain's signatures and key usage are still verified; the hostname is "
+            f"NOT on {', '.join(both)}, which also set tls_check_hostname=false (an env() value is "
             "counted as false, because it cannot be read before it resolves)"
         )
         if len(both) < len(relaxed):
@@ -3013,8 +3020,10 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
     So this stays ``required=False`` on purpose, and not because the arm is ungated. It has no posture
     to key on, so a refusal here would have to re-derive the gradient's loopback / attested / accepted
     arms from the graph — a second, silently different definition of a decision that already has one.
-    A hop with a usable mode value outside the no-TLS deny-list is not reported here at all (a blank,
-    padded or non-string mode value is): the engine cannot prove that value verifies
+    A hop with a usable mode value outside the no-TLS deny-list, on the keyword and at a spelling its
+    driver family reads, is not reported here at all (a blank, padded or non-string mode value is,
+    and so is any mode on a driver name the engine cannot place, BACKLOG #5053): the engine cannot
+    prove that value verifies
     anything, and refusing on that would be guess-based and would break legitimate drivers, exactly
     what ADR 0092 declined. SKIPs when the graph will not load, same convention as its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, unverified_generic_db_hops
@@ -3047,7 +3056,9 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
         required=False,
         detail=(
             f"{len(hops)} generic-ODBC database connection(s) may cross in plaintext — {listed}; "
-            "set a verifying TLS mode in odbc_params (e.g. SSLmode=verify-full). An enforcing "
+            "set the verifying TLS mode the driver family reads in odbc_params, under the "
+            "driver's registered name (psqlODBC SSLmode=verify-full, MySQL "
+            "SSLMODE=VERIFY_IDENTITY, Microsoft's driver Encrypt=yes). An enforcing "
             "instance REFUSES these off-loopback at build-check unless the connection declares "
             # The spelling of config.tls_policy.HOP_ATTESTATION_LEVER, written out so this module
             # does not import a crypto module for a string (the crypto-inventory gate).
