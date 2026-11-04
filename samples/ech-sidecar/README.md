@@ -133,6 +133,11 @@ connection uses OAuth2 client-credentials or SMART Backend Services — the **to
 each re-addressed to it, so the authorization server's hostname is not left in a cleartext outer
 ClientHello while the payload hop is routed (BACKLOG #1176).
 
+**An `http://` sidecar leaves the hop to it cleartext on this host.** The engine logs a WARNING for
+each such connection and lists it as a loosening. What crosses that hop, and how it is reported, is
+stated once in
+[SECURITY-LOOSENING.md](../../docs/SECURITY-LOOSENING.md#ech_sidecar-at-an-http-url--the-hop-to-the-ech-sidecar-is-cleartext).
+
 **Every other connector REFUSES the key rather than ignoring it.** `ech_egress` is honoured only by the
 REST destination; on any other outbound, and on any inbound, construction fails loudly
 (`transports/base.py`, `build_destination` / `build_source`). Read that refusal as what it is: it
