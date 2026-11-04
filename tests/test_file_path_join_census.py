@@ -985,7 +985,7 @@ IDE_SITES: dict[str, Site] = {
     ),
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/sourceControl.ts": Site(7, OPERATOR, _IDE_WORKSPACE),
-    "ide/src/statusBar.ts": Site(2, OPERATOR, _IDE_WORKSPACE),
+    "ide/src/statusBar.ts": Site(4, OPERATOR, _IDE_WORKSPACE),
     "ide/src/stepsView.ts": Site(3, OPERATOR, _IDE_WORKSPACE + " Two are fixed media names."),
     "ide/src/symbolIndex.ts": Site(
         1, OPERATOR, "Names from listing the operator's config directory."
