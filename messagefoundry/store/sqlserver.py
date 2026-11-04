@@ -920,9 +920,15 @@ _SQL_STATE_MERGE: Final[str] = (
     " WHEN NOT MATCHED THEN INSERT (namespace, [key], value, set_at, message_id)"
     " VALUES (?,?,?,?,?);"
 )
-# The collation `_SCHEMA` gives state.namespace and state.[key] (BACKLOG #1588). The open-time report
-# compares sys.columns against it (BACKLOG #4917); a test pins that the DDL names the same one.
+# The collation `_SCHEMA` gives state.namespace and state.[key] (BACKLOG #1588); a test pins that the
+# DDL names this one. The open-time report accepts any binary collation, not only this name.
 _STATE_KEY_COLLATION: Final[str] = "Latin1_General_100_BIN2"
+
+
+class ReferenceKeyCollision(ValueError):
+    """Two keys of one reference snapshot differ only by trailing spaces, which SQL Server compares
+    as equal (BACKLOG #4917). ``reference_sync`` logs only an error's class name, so the name is
+    the diagnosis an operator sees."""
 
 
 # BACKLOG #1628: how many times, and how far apart, the open-time RCSI check re-reads the state after
@@ -3848,6 +3854,9 @@ class SqlServerStore:
         store._read_only = read_only
         try:
             await store._ensure_schema(create=create, read_only=read_only)
+            # Right after the schema, so a later open step that fails still leaves the report
+            # logged; read-only included, since it reads metadata only (BACKLOG #4917).
+            folded = await store._report_state_key_collation()
             if store._fifo_claim_proc:
                 # ADR 0114 sub-lever A startup gate (AC-7): verify the deployed procs (existence +
                 # body hash + compat) — a miss degrades LOUDLY to the shipped batch, never a failed
@@ -3878,8 +3887,6 @@ class SqlServerStore:
             # The audit chain's state, and on a fresh keyed store its genesis row (#2594). The
             # genesis append takes the audit applock and needs INSERT and SELECT only.
             await load_audit_chain(store, read_only=read_only)
-            # Reports on every open, read-only included; it reads metadata only (BACKLOG #4917).
-            folded = await store._report_state_key_collation()
             if not read_only:
                 # A read-only handle loads no cache, as on SQLite: each decrypts every cell (#1780).
                 # ADR 0005 read-through cache warm-up
@@ -8544,22 +8551,28 @@ class SqlServerStore:
         return MappingProxyType(self._state_cache)
 
     async def _report_state_key_collation(self) -> str | None:
-        """Log a WARNING for a ``state`` table whose key columns are not BIN2 (BACKLOG #4917; the
+        """Log a WARNING for a ``state`` table whose key columns are not binary (BACKLOG #4917; the
         ``state`` comment in ``_SCHEMA`` says how one arises). Repairs nothing, and the open goes
         on. Returns the collation found, or ``None`` when both are BIN2 or the table is absent."""
         rows = await self._fetchall(
             "SELECT name, collation_name FROM sys.columns"
             " WHERE object_id = OBJECT_ID('state') AND name IN ('namespace', 'key')"
         )
+        # Any binary collation compares code points, as the cache does; only a linguistic one folds.
         found = sorted(
-            {str(r["collation_name"]) for r in rows if r["collation_name"] != _STATE_KEY_COLLATION}
+            {
+                str(r["collation_name"])
+                for r in rows
+                if not str(r["collation_name"]).upper().endswith(("_BIN2", "_BIN"))
+            }
         )
         if not found:
             return None
         collation = ", ".join(found)
         log.warning(
-            "sqlserver: the state table's namespace/key columns use collation %s, not %s. The table"
-            " predates BACKLOG #1588, so keys differing only in case or accent may have been merged"
+            "sqlserver: the state table's namespace/key columns use collation %s, not a binary one"
+            " such as %s. The table predates BACKLOG #1588, so keys differing only in case or accent"
+            " may have been merged"
             " into one row; the engine does not repair them. Remedy, which loses every state row:"
             " drop the state table and delete the schema_meta row, so the next open (or"
             " provision-schema) re-runs the DDL batch and creates the table again",
@@ -8588,15 +8601,15 @@ class SqlServerStore:
 
     async def _load_state_cache_noting(self, folded_collation: str | None) -> None:
         """:meth:`_load_state_cache`, with a note on a ``CipherError`` naming the folding collation
-        :meth:`_report_state_key_collation` found, the likely cause (BACKLOG #4917)."""
+        :meth:`_report_state_key_collation` found, a possible cause (BACKLOG #4917)."""
         try:
             await self._load_state_cache()
         except CipherError as exc:
             if folded_collation is not None:
                 exc.add_note(
-                    f"the state table's key columns use collation {folded_collation}, not"
-                    f" {_STATE_KEY_COLLATION}: a row merged across a case or accent variant is"
-                    " sealed to the other spelling (BACKLOG #1588, #4917)"
+                    f"the state table's key columns use collation {folded_collation}, not a"
+                    " binary one, so this row may have been merged across a case or accent variant"
+                    " and sealed to the other spelling (BACKLOG #1588, #4917)"
                 )
             raise
 
@@ -8668,7 +8681,9 @@ class SqlServerStore:
 
         It also refuses two keys equal once trailing U+0020 is stripped (BACKLOG #4917):
         ``pk_reference`` pads them (the ``state`` comment in ``_SCHEMA`` says why), so the second
-        INSERT would raise a PK duplicate mid-transaction, every interval. Named by ordinal and hash."""
+        INSERT would raise a PK duplicate mid-transaction, every interval. It raises
+        :class:`ReferenceKeyCollision`, named by ordinal only, because ``reference_sync`` logs the
+        class name and never the message."""
         if len(name.encode("utf-16-le")) // 2 > 256:
             raise ValueError(
                 f"reference set name exceeds NVARCHAR(256) "
@@ -8694,11 +8709,12 @@ class SqlServerStore:
                 first = next(i for i, k in enumerate(rows) if k == stripped)
             if first is not None:
                 later, first = max(ordinal, first), min(ordinal, first)
-                digest = hashlib.sha256(key.encode()).hexdigest()[:12]
-                raise ValueError(
+                # No digest: an MRN-shaped key is guessable from a short unsalted hash, and the two
+                # ordinals already find the rows in the source.
+                raise ReferenceKeyCollision(
                     f"reference set {name!r}: keys #{first} and #{later} differ only by trailing"
-                    f" spaces (sha256:{digest} is one), which SQL Server compares as equal;"
-                    " refusing the snapshot (key values withheld: reference keys may be PHI)"
+                    " spaces, which SQL Server compares as equal; refusing the snapshot (key"
+                    " values withheld: reference keys may be PHI)"
                 )
             padded[stripped] = ordinal
 

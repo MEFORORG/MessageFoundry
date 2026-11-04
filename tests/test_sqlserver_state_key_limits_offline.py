@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.config.wiring import STATE_KEY_MAX_PAIR_UNITS, STATE_KEY_MAX_UNITS
 from messagefoundry.store import sqlserver as ss
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.sqlserver import SqlServerStore
@@ -34,14 +35,20 @@ def _bare_store(rows: list[dict[str, Any]]) -> tuple[SqlServerStore, list[str]]:
     return store, seen
 
 
-def test_the_state_ddl_names_the_collation_the_report_compares_against() -> None:
-    """The report is only as good as its constant: both key columns of the shipped ``state`` DDL
-    carry exactly ``_STATE_KEY_COLLATION``."""
+def test_the_state_ddl_matches_the_setstate_bounds_and_the_collation() -> None:
+    """``SetState``'s bounds and the report are only as good as their constants: both key columns of
+    the shipped ``state`` DDL are ``NVARCHAR(STATE_KEY_MAX_UNITS)`` under ``_STATE_KEY_COLLATION``,
+    ``pk_state`` is the clustered key, and the pair bound fits its 900-byte cap at two bytes a
+    unit. A widened column or a moved constant fails here, not only on the hosted legs."""
     (ddl,) = [stmt for stmt in ss._SCHEMA if "CREATE TABLE state (" in stmt]
     for column in ("namespace", "[key]"):
         assert re.search(
-            rf"{re.escape(column)} NVARCHAR\(256\) COLLATE {ss._STATE_KEY_COLLATION} NOT NULL", ddl
+            rf"{re.escape(column)} NVARCHAR\({STATE_KEY_MAX_UNITS}\)"
+            rf" COLLATE {ss._STATE_KEY_COLLATION} NOT NULL",
+            ddl,
         ), column
+    assert "CONSTRAINT pk_state PRIMARY KEY (namespace, [key])" in ddl  # clustered by default
+    assert 2 * STATE_KEY_MAX_PAIR_UNITS <= 900 < 2 * (STATE_KEY_MAX_PAIR_UNITS + 1)
 
 
 async def test_a_bin2_state_table_reports_nothing(caplog: pytest.LogCaptureFixture) -> None:
@@ -86,6 +93,16 @@ async def test_an_older_state_table_is_reported_and_not_repaired(
     assert len(seen) == 1 and seen[0].lstrip().upper().startswith("SELECT")
 
 
+@pytest.mark.parametrize(
+    "collation", ["Latin1_General_BIN2", "SQL_Latin1_General_CP1_BIN2", "Latin1_General_100_BIN"]
+)
+async def test_any_binary_collation_reports_nothing(collation: str) -> None:
+    """A binary collation compares code points, so it cannot merge case variants."""
+    rows = [{"name": n, "collation_name": collation} for n in ("namespace", "key")]
+    store, _ = _bare_store(rows)
+    assert await store._report_state_key_collation() is None
+
+
 async def test_one_drifted_column_is_enough_to_report() -> None:
     store, _ = _bare_store(
         [
@@ -114,7 +131,7 @@ async def test_an_undecryptable_row_names_the_drifted_collation(
     with pytest.raises(CipherError) as drifted:
         await store._load_state_cache_noting("SQL_Latin1_General_CP1_CI_AS")
     notes = getattr(drifted.value, "__notes__", [])
-    assert any("SQL_Latin1_General_CP1_CI_AS" in n and "#4917" in n for n in notes)
+    assert any("SQL_Latin1_General_CP1_CI_AS" in n and "may have been" in n for n in notes)
 
     store2, _ = _bare_store([row])
     store2._cipher = object()  # type: ignore[assignment]
@@ -132,11 +149,11 @@ def test_reference_keys_differing_only_by_trailing_spaces_are_refused() -> None:
         ({"MRN-1  ": 1, "other": 2, "MRN-1 ": 3}, 0, 2),  # two padded keys, no bare one
         ({"MRN-1 ": 1, "other": 2, "MRN-1": 3}, 0, 2),  # the bare key comes later
     ):
-        with pytest.raises(ValueError, match="only by trailing spaces") as exc:
+        with pytest.raises(ss.ReferenceKeyCollision, match="only by trailing spaces") as exc:
             store._guard_reference_widths("set", rows)
         text = str(exc.value)
         assert f"keys #{first} and #{later} differ" in text
-        assert "MRN" not in text  # raw keys withheld (PHI)
+        assert "MRN" not in text and "sha256" not in text  # nothing of the key (PHI)
 
 
 def test_reference_keys_that_do_not_collide_pass_the_guard() -> None:

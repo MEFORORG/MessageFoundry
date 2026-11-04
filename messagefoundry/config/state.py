@@ -86,9 +86,12 @@ def state_get(namespace: str, key: str, default: StateValue = None) -> StateValu
         if not mrn:  # and an empty key
             return Send("OB_DOWNSTREAM", msg)
         anon = state_get("patient_anon", mrn)
+        ops = []
         if anon is None:
             anon = derive_anon_id(mrn)
-            return [Send("OB_DOWNSTREAM", msg), SetState("patient_anon", mrn, anon)]
+            ops.append(SetState("patient_anon", mrn, anon))
+        msg["PID-3.1"] = anon
+        return [Send("OB_DOWNSTREAM", msg), *ops]
 
     Resolves against the engine-maintained read-through cache view the runner publishes around the run
     (it reflects every committed write as of this call — see the module note on non-linearization).

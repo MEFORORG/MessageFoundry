@@ -4980,12 +4980,19 @@ class SetState:
             # Postgres TEXT cannot hold U+0000, so the handoff INSERT would fail there.
             if "\x00" in text:
                 raise StateKeyError(f"SetState {name} must not contain U+0000 (NUL)")
-            # NVARCHAR counts UTF-16 code units; surrogatepass so a lone surrogate is counted, not
-            # raised from here as an unrelated UnicodeEncodeError. ASCII is one unit per char, so
-            # the usual MRN-style key skips the encode.
-            field_units = (
-                len(text) if text.isascii() else len(text.encode("utf-16-le", "surrogatepass")) // 2
-            )
+            # NVARCHAR counts UTF-16 code units. ASCII is one unit per char, so the usual MRN-style
+            # key skips the encode. A strict encode refuses a lone surrogate (U+D800..U+DFFF): no
+            # backend stores one, and cell_aad's UTF-8 encode would raise it inside the handoff, a
+            # store error the runner retries rather than a content fault it dead-letters.
+            if text.isascii():
+                field_units = len(text)
+            else:
+                try:
+                    field_units = len(text.encode("utf-16-le")) // 2
+                except UnicodeEncodeError:
+                    raise StateKeyError(
+                        f"SetState {name} must not contain a lone surrogate (U+D800..U+DFFF)"
+                    ) from None
             if field_units > STATE_KEY_MAX_UNITS:
                 raise StateKeyError(
                     f"SetState {name} is {field_units} UTF-16 code units; the limit is "

@@ -154,9 +154,12 @@ def test_setstate_bounds_each_field_and_the_pair_in_utf16_units() -> None:
     assert SetState("ns", astral * 128, 1).key == astral * 128
     with pytest.raises(StateKeyError, match="key is 258 UTF-16 code units"):
         SetState("ns", astral * 129, 1)
-    # A lone surrogate is counted, not raised as an unrelated UnicodeEncodeError.
-    with pytest.raises(StateKeyError, match="key is 257 UTF-16 code units"):
-        SetState("ns", chr(0xD800) * 257, 1)
+    # A lone surrogate is refused as a key fault, not raised as a bare UnicodeEncodeError, and at
+    # construction rather than inside the handoff's cell_aad encode.
+    for lone in (chr(0xD800), chr(0xDFFF), "MRN-" + chr(0xDC80)):
+        with pytest.raises(StateKeyError, match="lone surrogate") as exc:
+            SetState("ns", lone, 1)
+        assert "MRN" not in str(exc.value) and exc.value.__cause__ is None
 
 
 def test_setstate_converts_a_too_deep_value_to_a_wiring_error() -> None:

@@ -637,18 +637,19 @@ def anonymize(msg):
   is an **upsert by `(namespace, key)`** the engine applies **inside the routed→outbound handoff
   transaction**. `Send`-only Handlers are unchanged — fully **backward compatible**.
 - **Keys are exact, and bounded.** `namespace` and `key` must be non-empty strings that do not end
-  in a space (U+0020) and contain no NUL (U+0000). Each is at most 256 UTF-16 code units, and the two
-  together at most 450. `SetState(...)` raises `StateKeyError` (a `WiringError`) at construction
-  otherwise, on every store backend, and the error names the field, never its value. Each rule
-  exists for one backend: SQL Server ignores trailing spaces when it compares keys, so `k` and `k `
-  would otherwise be one stored row there and two everywhere else; Postgres text cannot hold NUL;
-  and SQL Server's `state` columns are `NVARCHAR(256)` under a clustered primary key capped at 900
-  bytes. A field read from a fixed-width sender can carry padding: strip it before keying on it, for
-  example `(msg["PID-3.1"] or "").rstrip(" ")`. Case and accents are compared exactly on SQLite, on
+  in a space (U+0020) and contain no NUL (U+0000) and no lone surrogate (U+D800 to U+DFFF). Each is
+  at most 256 UTF-16 code units, and the two together at most 450. `SetState(...)` raises
+  `StateKeyError` (a `WiringError`) at construction otherwise, on every store backend, and the error
+  names the field, never its value. Why: SQL Server ignores trailing spaces when it compares keys,
+  so `k` and `k ` would otherwise be one stored row there and two everywhere else; Postgres text
+  cannot hold NUL; no backend stores a lone surrogate; and SQL Server's `state` columns are
+  `NVARCHAR(256)` under a clustered primary key capped at 900 bytes. A field read from a fixed-width
+  sender can carry padding: strip it before keying on it, for example
+  `(msg["PID-3.1"] or "").rstrip(" ")`. Case and accents are compared exactly on SQLite, on
   Postgres, and on a SQL Server database whose `state` table this release or a later one created. A
   SQL Server `state` table created earlier keeps the database's default collation, which may fold
-  case (BACKLOG #1588); the engine logs a WARNING at every open of such a table, naming the
-  collation and the remedy, and repairs nothing (BACKLOG #4917).
+  case (BACKLOG #1588); the engine logs a WARNING at every open of a table whose key columns are not
+  binary, naming the collation and the remedy, and repairs nothing (BACKLOG #4917).
 - **Exactly-once / re-run safety.** Because the write commits in the **same transaction** as the
   outbound rows, a crash before commit leaves **no** state (atomic with the handoff) and the attempt
   that commits applies the write **exactly once per message** — this preserves the staged pipeline's

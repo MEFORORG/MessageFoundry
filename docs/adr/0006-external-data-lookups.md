@@ -293,8 +293,9 @@ first-ever reference-row key-rotation tests on all three backends.
   stops keys differing only by a trailing space from colliding. It does not: SQL Server pads
   trailing spaces in `=` and in index keys under every collation, BIN2 included, so such keys still
   collide here, and nothing refuses them yet. **AMENDED 2026-11-03 (BACKLOG #4917):** the SQL
-  Server `write_reference_snapshot` now refuses such a snapshot before its transaction, naming
-  the two keys by ordinal and hash, so the sync keeps the last-good snapshot and alerts.
+  Server `write_reference_snapshot` now refuses such a snapshot before its transaction with
+  `ReferenceKeyCollision`, naming the two keys by ordinal only, so the sync keeps the last-good
+  snapshot and alerts.
 - **Encryption at rest.** Values are `cipher.encrypt(json.dumps(v))` (`mfenc`), covered by **both**
   `reencrypt_to_active` (key rotation) **and** `_encrypt_existing_rows` (the no-key→key migration
   pass). The migration pass is required because "born encrypted" is false: under a no-key deployment
