@@ -20,7 +20,7 @@ import pytest
 
 from messagefoundry.store import MessageStore, OutboxStatus, Stage
 from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
-from messagefoundry.store.queue_tag import LIVE_INLINE_ROW
+from messagefoundry.store.queue_tag import LIVE_INLINE_ROW, PENDING_INLINE_ROW
 from tests import _keyless_blank_contract as contract
 from tests._ast_sites import call_sites, named_func, parse_source
 from tests._queue_tag_contract import RawFetch, RawSql
@@ -182,6 +182,22 @@ async def test_the_seal_reserves_the_blanks_on_the_invocation_bound(
     assert seen[("queue", "payload")] == 1  # no plaintext on this surface, one blank
 
 
+def test_the_sealed_surface_literal_names_pending_alone() -> None:
+    """BACKLOG #4994: on a sealed surface the opt-out seals ``pending`` blanks only. Widening it back
+    to ``inflight`` would seal a row a peer engine shard has claimed and will dead-letter, leaving a
+    dead row with a valid empty body that replays."""
+    assert f"status = '{OutboxStatus.PENDING.value}'" in PENDING_INLINE_ROW
+    for other in (
+        OutboxStatus.INFLIGHT,
+        OutboxStatus.DONE,
+        OutboxStatus.DEAD,
+        OutboxStatus.CANCELLED,
+    ):
+        assert f"'{other.value}'" not in PENDING_INLINE_ROW
+    assert f"stage <> '{Stage.RESPONSE.value}'" in PENDING_INLINE_ROW
+    assert "body_ref IS NULL" in PENDING_INLINE_ROW
+
+
 def test_the_live_row_literal_names_the_statuses_it_means() -> None:
     """The fragment is a literal so a backend can splice it, and the enum is what the rows hold."""
     assert OutboxStatus.PENDING.value in LIVE_INLINE_ROW
@@ -213,3 +229,7 @@ def test_every_backend_passes_the_blank_rows_to_its_queue_sweep(module: str, bla
     [keyword] = [kw for kw in call.keywords if kw.arg == "blank_where"]
     text = ast.unparse(keyword.value)
     assert blank in text and "LIVE_INLINE_ROW" in text
+    # The opt-out's set on a sealed surface, spelled with the same blank (BACKLOG #4994).
+    [sealed] = [kw for kw in call.keywords if kw.arg == "sealed_blank_where"]
+    text = ast.unparse(sealed.value)
+    assert blank in text and "PENDING_INLINE_ROW" in text

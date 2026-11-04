@@ -757,8 +757,8 @@ This section is kept rather than deleted, because the claim it used to make is t
   with this off it is refused (`CipherError`) and alerted (`integrity_drift`, subject `store-cipher`).
   With it on, that value is returned as the row's content, and the next keyed open or `rotate-key`
   seals it into genuine ciphertext, after which no evidence of the substitution survives. A blank
-  planted on a live queue row is sealed the same way at the next keyed open and delivered as an
-  empty body (BACKLOG #4994). Cell binding
+  planted on a `pending` queue row is sealed the same way at the next keyed open and delivered as
+  an empty body (BACKLOG #4994). Cell binding
   (`aad_bind`) does not cover this: a moved ciphertext has a tag to fail, and a plaintext value has none
   (ASVS 11.3.3, BACKLOG #1169).
 - **When acceptable:** a store that holds legitimate unmarked values in a column that is already
@@ -769,8 +769,11 @@ This section is kept rather than deleted, because the claim it used to make is t
   left on a queue row still waiting to be sent, a blank `payload` on a `pending` inline row outside
   the `response` stage, and the row is delivered as an empty body (BACKLOG #4994). An `inflight`
   blank is not sealed there, because a peer engine shard may have claimed it and be about to
-  dead-letter it; the claim refuses it. With this off, a `pending` blank stays refused at the claim, as a plant would be: the claim dead-letters it with an
-  `integrity_drift` alert, and a dead blank row cannot be replayed, because it reads as an erasure.
+  dead-letter it; the claim refuses it. That includes one a crashed keyless run left in flight,
+  because the open runs before such rows are reset to `pending`, so that empty body is lost. With
+  this off, a `pending` blank stays refused at the claim, as a plant would be: the claim
+  dead-letters it with an `integrity_drift` alert, and a dead blank row cannot be replayed, because
+  it reads as an erasure.
   So turn this on BEFORE the first keyed open that follows a keyless run. Without it, a blank is
   sealed only by the open that first seals `queue.payload`, a column with no `keyed_surface` record
   and no ciphertext (BACKLOG #3495). It is a no-op with **no `[store].encryption_key`**.

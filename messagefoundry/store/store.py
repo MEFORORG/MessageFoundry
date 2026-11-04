@@ -9518,8 +9518,8 @@ class MessageStore:
         surface that holds no ciphertext, looks exactly like legacy plaintext, so that open seals
         it. On a surface that already holds ciphertext the data check refuses it instead. A value
         written into a marked surface by a later KEYLESS run of the same store, or by hand, is
-        refused even if the table had emptied out; the opt-out below seals it for one open, a live
-        blank queue row included (see the blank rule below). A read-only open writes no marker. A store restored from a file copy keeps
+        refused even if the table had emptied out; the opt-out below seals it for one open, a
+        ``pending`` blank queue row included (see the blank rule below). A read-only open writes no marker. A store restored from a file copy keeps
         the copy's markers. ``rotate-key`` changes no marker, because a surface stays keyed under any
         key. The uploaded-file store (``uploads.py``) is a directory, not a table, and has no marker.
 
@@ -9529,8 +9529,8 @@ class MessageStore:
         surface.
 
         NULL and blank ``''`` are not sealed: ``''`` is what every purge path writes. **The exception
-        is a live empty queue row on a surface that is still unsealed (BACKLOG #3495), or on any
-        surface under the opt-out (BACKLOG #4994).** A
+        is a live empty queue row on a surface that is still unsealed (BACKLOG #3495), or a
+        ``pending`` one on a sealed surface under the opt-out (BACKLOG #4994).** A
         keyless store writes an empty body as ``''``, and :func:`open_queue_cell` refuses a blank on
         a keyed store, so that row would dead-letter with a false ``integrity_drift`` alarm the first
         time it was claimed. This open seals it under its own tag instead, in the marker's
@@ -9688,9 +9688,10 @@ class MessageStore:
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(table, pending_where, like)
         blanks = 0
-        # A blank on a sealed surface is sealed only under the opt-out (BACKLOG #4994).
+        # A blank on a sealed surface is sealed only under the opt-out, and only the narrower set
+        # (BACKLOG #4994), so that is what is counted there: the count reserves the GCM bound.
         if blank_where is not None and (not keyed or not strict):
-            blanks = await self._count_unmarked(table, blank_where)
+            blanks = await self._count_blanks(table, sealed_blank_where if keyed else blank_where)
         is_sealed = keyed
         if (blanks or (pending and strict)) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
@@ -9699,6 +9700,7 @@ class MessageStore:
                 # its legitimate seal is not reported as a plant. Without the opt-out the
                 # return below leaves a blank here refused.
                 pending = await self._count_unmarked(table, pending_where, like)
+                blanks = await self._count_blanks(table, sealed_blank_where) if blanks else 0
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)
@@ -9766,6 +9768,10 @@ class MessageStore:
         # Top the reserve back up for whatever follows; the burst itself was reserved in step 2.
         await self._charge_bound_batch()
         return sealed
+
+    async def _count_blanks(self, table: str, where: str | None) -> int:
+        """The rows of ``table`` matching ``where``, or 0 when there is no such set to seal."""
+        return 0 if where is None else await self._count_unmarked(table, where)
 
     async def _surface_keyed(self, table: str, column: str) -> bool:
         """Whether ``table.column`` has its persisted ``keyed_surface`` marker (BACKLOG #3383)."""

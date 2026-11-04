@@ -3306,11 +3306,16 @@ class PostgresStore:
         keyed = await self._surface_keyed(table, column)
         pending = int(await self._fetchval(count_sql, like) or 0)
         blanks = 0
-        # A blank on a sealed surface is sealed only under the opt-out (BACKLOG #4994).
+
+        # As on SQLite: on a sealed surface only the opt-out's narrower set is counted (BACKLOG
+        # #4994), because the count reserves the GCM bound.
+        async def count_blanks(where: str | None) -> int:
+            if where is None:
+                return 0
+            return int(await self._fetchval(f"SELECT COUNT(*) FROM {table} WHERE {where}") or 0)
+
         if blank_where is not None and (not keyed or not strict):
-            blanks = int(
-                await self._fetchval(f"SELECT COUNT(*) FROM {table} WHERE {blank_where}") or 0
-            )
+            blanks = await count_blanks(sealed_blank_where if keyed else blank_where)
         is_sealed = keyed
         if (blanks or (pending and strict)) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
@@ -3319,6 +3324,7 @@ class PostgresStore:
                 # so count again rather than report its legitimate seal as a plant. Without the
                 # opt-out the return below leaves a blank here refused.
                 pending = int(await self._fetchval(count_sql, like) or 0)
+                blanks = await count_blanks(sealed_blank_where) if blanks else 0
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)

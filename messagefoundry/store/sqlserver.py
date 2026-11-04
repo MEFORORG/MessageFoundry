@@ -4144,11 +4144,18 @@ class SqlServerStore:
         keyed = await self._surface_keyed(table, column)
         pending = await self._count_unmarked(count_sql, like)
         blanks = 0
-        # A blank on a sealed surface is sealed only under the opt-out (BACKLOG #4994).
-        if blank_where is not None and (not keyed or not strict):
-            blanks = await self._count_unmarked(
-                f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {blank_where}"
+
+        # As on SQLite: on a sealed surface only the opt-out's narrower set is counted (BACKLOG
+        # #4994), because the count reserves the GCM bound.
+        async def count_blanks(where: str | None) -> int:
+            if where is None:
+                return 0
+            return await self._count_unmarked(
+                f"SELECT COUNT_BIG(*) AS n FROM {table} WHERE {where}"
             )
+
+        if blank_where is not None and (not keyed or not strict):
+            blanks = await count_blanks(sealed_blank_where if keyed else blank_where)
         is_sealed = keyed
         if (blanks or (pending and strict)) and not keyed:
             is_sealed = await self._surface_holds_ciphertext(table, column, like)
@@ -4157,6 +4164,7 @@ class SqlServerStore:
                 # so count again rather than report its legitimate seal as a plant. Without the
                 # opt-out the return below leaves a blank here refused.
                 pending = await self._count_unmarked(count_sql, like)
+                blanks = await count_blanks(sealed_blank_where) if blanks else 0
         if not (pending or blanks) or (strict and is_sealed):
             if pending:
                 report_sealed_surface(log, self._cipher, table, column, pending)
