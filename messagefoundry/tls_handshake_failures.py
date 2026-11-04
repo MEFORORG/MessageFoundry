@@ -30,19 +30,11 @@ protocol class is replaced.
 
 * **The peer's address, which the hook does not read.** These reports name no peer, and a trailing
   report for several failures names none anyway. A TLS object holds two memory buffers and no
-  socket, so the hook has no public route to its connection. Measured for vault BACKLOG #3302 on
-  CPython 3.14.7 and uvicorn 0.54.0, with the stdlib loop on Windows: inside ``do_handshake`` the
-  address was reachable at least two ways, through the caller's frame and through
-  ``gc.get_referrers``, each to the loop protocol's private ``_transport``. Both read private loop
-  state, so the hook uses neither. uvloop was not measured, since it has no Windows build. A route
-  that reads no private state, and is not built: the loop is handed no context and the listener
-  runs the handshake itself, as the MLLP and HTTP listeners do on the stdlib loop. For the API that
-  would be the engine's own HTTP protocol class, which serve already hands uvicorn. It too would
-  name a peer on the stdlib loop only (``_upgrades_tls_itself`` in ``transports/mllp.py``), and it
-  has at least these costs. uvicorn sets the scheme in ``connection_made``, before an upgrade, so
-  ``effective_https`` would drop the cookie's Secure flag and ``__Host-`` prefix. The mTLS shim
-  reads the peer certificate in ``connection_made`` too. The listeners' upgrade writes private
-  stream state. ``_log_api_handshake_failures`` ignores the peer it is handed.
+  socket. Measured for vault BACKLOG #3302 on CPython 3.14.7 and uvicorn 0.54.0, with the stdlib
+  Proactor loop on Windows: inside ``do_handshake`` the address was reachable only through private
+  loop state, at least through the caller's frame and through ``gc.get_referrers``, each to the
+  loop protocol's private ``_transport``. uvloop was not measured, since it has no Windows build.
+  Whether to build a peer report is an open owner question (vault BACKLOG #3302).
 * **A handshake past its bound, where the loop runs it. A known limit, declined by owner ruling
   2026-10-26 (vault BACKLOG #3785 item 7).** The loop aborts the transport and never calls
   ``do_handshake`` again, so nothing raises, and a peer that opens sockets and stays silent is not

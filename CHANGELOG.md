@@ -17,10 +17,6 @@ All notable changes to MessageFoundry are documented here. The format follows
 - On Windows, a generic DATABASE file keyword is now also refused when a best-effort check finds
   its path leads to another host, or cannot finish reading the path; see the Generic ODBC section of
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
-- The 0.5.2 entry said that where the event loop runs a TLS handshake, the peer's address is not
-  known. More exactly, the loop's hook does not read it: on the standard asyncio loop the hook
-  could reach it through the loop's private state, and does not. The records still name no peer there; the
-  module docstring of `messagefoundry/tls_handshake_failures.py` says why. (vault `BACKLOG #3302`)
 
 ## [0.5.2] — 2026-10-20 — Early Access
 
