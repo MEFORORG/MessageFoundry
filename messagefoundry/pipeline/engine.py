@@ -2820,8 +2820,10 @@ class Engine:
         wherever ``[environments].base_dir`` puts it, after the same trust check a value read
         makes, of the file and the folders :meth:`_value_file_folders` names. So the digest covers
         it, and the provider parses those bytes rather than the file as it is later. A file that is
-        not there is held as none; one that cannot be read raises ``WiringError`` naming it, so no
-        reload, gated or not, falls back to reading it from disk."""
+        not there is held as none; one that cannot be read raises ``WiringError`` naming it, so a
+        reload, gated or not, never falls back to reading it from disk for that fault. A config
+        directory that cannot be read whole still returns ``None``, as above, and then an ungated
+        reload reads the values from disk."""
         return await asyncio.to_thread(self._reload_snapshot_blocking, path, self._value_file())
 
     @staticmethod
@@ -2840,10 +2842,17 @@ class Engine:
             if not os.path.islink(hop):
                 break
             text = os.readlink(hop)
-            # Windows answers an absolute target in its \\?\ form; the plain form names the same
-            # folder and compares with the others.
-            if os.name == "nt" and text.startswith("\\\\?\\"):
-                text = "\\\\" + text[8:] if text[4:8].upper() == "UNC\\" else text[4:]
+            if os.name == "nt":
+                import errno
+
+                from messagefoundry.auth.anchor_path import _strip_win_prefix
+
+                # Windows answers an absolute target in its \\?\ form; the plain form names the
+                # same folder and compares with the others. A device path has no folder to vet.
+                plain = _strip_win_prefix(text)
+                if plain is None:
+                    raise OSError(errno.EINVAL, "a value file link leads to a device path", text)
+                text = plain
             target = Path(text)
             hop = target if target.is_absolute() else hop.parent / target
             folders.append(hop.parent)

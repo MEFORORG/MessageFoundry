@@ -22,7 +22,7 @@ from __future__ import annotations
 import errno
 import os
 import stat
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from types import MappingProxyType
@@ -346,9 +346,10 @@ def with_value_file(
     holds, unless ``strict`` and the held read was a fault. A file that is not there is held as
     absent, so creating one changes the digest. With ``strict`` a fault reading it raises its
     ``OSError``; without, it is named in :attr:`ConfigSnapshot.unreadable`. Absent and faulted are
-    judged by :func:`is_regular_file`. Any file name is held, under ``@value-file/<name>``. Its
-    access list is not vetted here: a caller that gates on the bytes vets the file and its folder
-    before this read."""
+    judged by :func:`is_regular_file`, as a start judges them. Any file name is held, under
+    ``@value-file/<name>``. Its access list is not vetted here: a caller that applies the bytes,
+    as a reload does, vets the file and the folders its links lead through before this read. A
+    caller that only hashes them, such as a request-time digest, applies nothing it read."""
     if value_file is None:
         return snapshot
     path = Path(value_file).absolute()
@@ -362,7 +363,7 @@ def with_value_file(
     files = {k: v for k, v in snapshot.files.items() if not k.startswith(_VALUE_FILE_PREFIX)}
     unreadable = {rel for rel in snapshot.unreadable if not rel.startswith(_VALUE_FILE_PREFIX)}
     rel = _check_rel(_VALUE_FILE_PREFIX + path.name)
-    _read_into(files, unreadable, rel, path, strict=strict)
+    _read_into(files, unreadable, rel, path, strict=strict, computed=True)
     return ConfigSnapshot(
         directory=snapshot.directory,
         files=files,
@@ -430,20 +431,32 @@ def read_config_snapshot(directory: str | Path, *, strict: bool) -> ConfigSnapsh
 
 
 def _read_into(
-    files: dict[str, bytes], unreadable: set[str], rel: str, path: Path, *, strict: bool
+    files: dict[str, bytes],
+    unreadable: set[str],
+    rel: str,
+    path: Path,
+    *,
+    strict: bool,
+    computed: bool = False,
 ) -> None:
     """Read ``path`` into ``files`` as ``rel`` if it is a regular file. A fault raises with
-    ``strict``; without, it adds ``rel`` to ``unreadable``. A file that is gone is neither."""
+    ``strict``; without, it adds ``rel`` to ``unreadable``. A file that is gone is neither.
+
+    ``computed`` says ``path`` was built, as a value file's is, rather than returned by a listing,
+    so absence is judged as a start judges that file (:func:`is_regular_file`). A listed name is
+    there, so only nothing at the path is absence; a name too long, or a folder in the path that
+    is a file, is a fault in reading a file the load was going to run."""
+    absent = is_missing_directory if computed else _is_absent
     try:
         # A stat that fails for any reason but absence is an unreadable file, not a missing
         # one: Path.is_file would answer False and the file would drop out unremarked.
-        if is_regular_file(path):
+        if _is_file(path, absent):
             files[rel] = _read(path)
     except OSError as exc:
         if strict:
             raise
-        # Absent means removed since the listing: gone, as is_regular_file judges a gone path.
-        if not is_missing_directory(exc):
+        # Absent means removed since the listing: gone, as _is_file judges a gone path.
+        if not absent(exc):
             unreadable.add(rel)
 
 
@@ -500,17 +513,24 @@ def _same_folder(one: Path, other: Path) -> bool:
 
 def is_regular_file(path: str | Path) -> bool:
     """Whether ``path`` is a regular file, following links: the one judgement of absent against
-    faulted that a start's value read, a snapshot's read and :meth:`ConfigSnapshot.environment_file`
-    share (vault BACKLOG #2596). ``Path.is_file`` answers ``False`` for a path it cannot stat, so a
+    faulted that a start's value read, :func:`with_value_file` and
+    :meth:`ConfigSnapshot.environment_file` share for a value file (vault BACKLOG #2596). A file a
+    listing returned is judged more narrowly (:func:`_read_into`). ``Path.is_file`` answers ``False`` for a path it cannot stat, so a
     fault would read as no file; this stats it instead. ``False`` where no file can be opened by
     that path, as :func:`is_missing_directory` judges a folder: nothing by that name (a dangling
     link, or a file removed since a listing), a folder in the path that is a file, a name too long,
     or one Windows refuses. Any other error is raised, at least access denied and a share Windows
     cannot reach."""
+    return _is_file(Path(path), is_missing_directory)
+
+
+def _is_file(path: Path, absent: Callable[[OSError], bool]) -> bool:
+    """Whether ``path`` is a regular file, following links, with ``absent`` judging which stat
+    errors mean no file rather than a fault, which raises."""
     try:
-        return stat.S_ISREG(Path(path).stat().st_mode)
+        return stat.S_ISREG(path.stat().st_mode)
     except OSError as exc:
-        if is_missing_directory(exc):
+        if absent(exc):
             return False
         raise
 

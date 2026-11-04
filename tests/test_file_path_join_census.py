@@ -588,6 +588,13 @@ SITES: dict[str, Site] = {
     "messagefoundry/config/snapshot.py::ConfigSnapshot._folder_of": Site(
         1, OPERATOR, _CONFIG_FIXED
     ),
+    "messagefoundry/config/snapshot.py::ConfigSnapshot._held_path": Site(
+        2,
+        REVIEWED,
+        "The folder a value file was read from, or the operator's config directory's fixed "
+        "environments folder, joined to a name the snapshot holds, which _check_rel holds to one "
+        "plain name; stated, never opened or written (vault BACKLOG #2596).",
+    ),
     "messagefoundry/config/snapshot.py::_list_folders": Site(1, OPERATOR, _CONFIG_FIXED),
     "messagefoundry/config/snapshot.py::config_py_files": Site(
         1,
@@ -747,6 +754,13 @@ SITES: dict[str, Site] = {
         "A directory name os.walk listed under the operator's config directory, joined to lstat "
         "it for a link or a junction and, when pruned, named in the caller's WARNING (BACKLOG "
         "#5221).",
+    ),
+    "messagefoundry/pipeline/engine.py::Engine._value_file_folders": Site(
+        1,
+        REVIEWED,
+        "A file link's own target, joined to the folder holding the link, only to name the folder "
+        "the vet checks before the value file is read; nothing is opened or written through it "
+        "(vault BACKLOG #2596).",
     ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."

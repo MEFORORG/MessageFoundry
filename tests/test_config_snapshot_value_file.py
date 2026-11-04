@@ -13,6 +13,7 @@ Synthetic values only."""
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -550,6 +551,25 @@ def test_a_path_no_file_can_be_opened_by_is_no_value_file_to_a_start_or_a_snapsh
         )
         snapshot = with_value_file(read_config_snapshot(cfg, strict=True), path, strict=True)
         assert snapshot.environment_file(path) is None
+
+
+def test_a_listed_config_module_a_stat_cannot_reach_is_still_a_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The value file's wider absence does not reach a file a listing returned: there a name too
+    long, or a folder that is a file, is a fault, and a load refuses it rather than drop it."""
+    cfg, _ = _layout(tmp_path)
+    real_stat = Path.stat
+
+    def _stat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.name == "cfg.py":
+            raise OSError(errno.ENAMETOOLONG, "name too long", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    with pytest.raises(OSError, match="too long"):
+        read_config_snapshot(cfg, strict=True)
+    assert read_config_snapshot(cfg, strict=False).unreadable_loaded == ("cfg.py",)
 
 
 def test_a_stat_fault_on_the_value_file_is_a_fault_to_a_start_too(
