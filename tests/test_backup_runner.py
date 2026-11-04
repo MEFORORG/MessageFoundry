@@ -20,6 +20,7 @@ import tarfile
 import time
 from collections import namedtuple
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1094,11 +1095,27 @@ async def test_a_full_pass_records_whether_its_walk_added_a_config_file(
     """``config_bundled`` used to say only that the walk was asked to run, so a full pass over a
     dir it added nothing from recorded true. The manifest, the result and the audit row now agree
     on what the archive carries; the one-file dir is the control."""
-    import base64
-
     from messagefoundry.pipeline.dr_backup import CONFIG_WALK_ADDED_NOTHING
 
     cfg = _config_holding_only(tmp_path, shape)
+    # A full pass still succeeds, which the helper asserts.
+    result, manifest, detail, _names = await _full_pass_record(tmp_path, key_b64, cfg)
+    expected = (True, None) if shape == "one-file" else (False, CONFIG_WALK_ADDED_NOTHING)
+    assert (manifest["config_bundled"], manifest["config_bundle_error"]) == expected
+    assert (result.config_bundled, result.config_bundle_error) == expected
+    assert (detail["config_bundled"], detail["config_bundle_error"]) == expected
+
+
+# --- the archive records what its config walk passed over (vault BACKLOG #5233) ---
+
+
+async def _full_pass_record(
+    tmp_path: Path, key_b64: str, cfg: Path
+) -> tuple[BackupResult, dict, dict, list[str]]:
+    """One full pass over ``cfg``. Returns the result, its manifest, its ``dr_backup`` audit
+    detail and the archive's ``config/`` member names."""
+    import base64
+
     store = await _store_with_rows(tmp_path / "msg.db", key_b64)
     try:
         result = await BackupRunner(
@@ -1110,15 +1127,132 @@ async def test_a_full_pass_records_whether_its_walk_added_a_config_file(
         rows = [r for r in await store.list_audit(limit=10) if r["action"] == "dr_backup"]
     finally:
         await store.close()
-    assert result is not None and not result.config_only  # a full pass still succeeds
+    assert result is not None and not result.config_only
     with open(result.archive_path, "rb") as src:
-        manifest = _manifest_from_tar_bytes(_decrypt_to_bytes(src, base64.b64decode(key_b64)))
+        tar_bytes = _decrypt_to_bytes(src, base64.b64decode(key_b64))
     (row,) = rows
-    detail = json.loads(row["detail"])
-    expected = (True, None) if shape == "one-file" else (False, CONFIG_WALK_ADDED_NOTHING)
-    assert (manifest["config_bundled"], manifest["config_bundle_error"]) == expected
-    assert (result.config_bundled, result.config_bundle_error) == expected
-    assert (detail["config_bundled"], detail["config_bundle_error"]) == expected
+    names = sorted(n for n in _member_names(tar_bytes) if n.startswith("config/"))
+    return result, _manifest_from_tar_bytes(tar_bytes), json.loads(row["detail"]), names
+
+
+def _skipped_everywhere(result: BackupResult, manifest: dict, detail: dict) -> list[str]:
+    """``config_skipped_files`` as the result, the manifest and the audit row record it, once
+    the three are shown to agree."""
+    recorded = list(result.config_skipped_files)
+    assert manifest["config_skipped_files"] == recorded
+    assert detail["config_skipped_files"] == recorded
+    return recorded
+
+
+@pytest.mark.parametrize("shape", ["linked", "regular"])
+async def test_a_symlinked_connections_toml_is_recorded_as_left_out_of_the_archive(
+    tmp_path, key_b64, shape, caplog
+) -> None:
+    """The digest reads ``connections.toml`` through the link, and the walk does not follow it,
+    so ``config_bundled`` true and a digest covering the file used to read as an archive that
+    holds it. The regular file is the control."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text("# router")
+    if shape == "linked":
+        outside = tmp_path / "outside.toml"
+        outside.write_text("# connections outside the bundle\n")
+        try:
+            (cfg / "connections.toml").symlink_to(outside)
+        except (OSError, NotImplementedError):
+            pytest.skip("a symlink cannot be made here (Windows without the privilege)")
+    else:
+        (cfg / "connections.toml").write_text("# connections\n")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.dr_backup"):
+        result, manifest, detail, names = await _full_pass_record(tmp_path, key_b64, cfg)
+    # The digest covers the file either way, so its own left-out list cannot be the record.
+    assert result.config_bundled and result.config_unreadable_files == ()
+    warned = [r.getMessage() for r in caplog.records if "could not list or add" in r.getMessage()]
+    if shape == "linked":
+        assert names == ["config/feed.py"]
+        assert _skipped_everywhere(result, manifest, detail) == ["connections.toml"]
+        assert len(warned) == 1 and warned[0].endswith(": connections.toml")
+    else:
+        assert names == ["config/connections.toml", "config/feed.py"]
+        assert _skipped_everywhere(result, manifest, detail) == []
+        assert warned == []
+
+
+@pytest.mark.parametrize("listable", [False, True], ids=["unlistable", "listable"])
+async def test_a_folder_the_walk_cannot_list_is_recorded(
+    tmp_path, key_b64, monkeypatch, listable
+) -> None:
+    """``os.walk`` swallowed a listing fault, so a folder it could not list left the archive with
+    no record. ``fixtures/`` is outside the digest, so only the walk can name it. The listable
+    folder is the control."""
+    cfg = tmp_path / "config"
+    (cfg / "fixtures").mkdir(parents=True)
+    (cfg / "feed.py").write_text("# router")
+    (cfg / "fixtures" / "a01.hl7").write_text("MSH|^~\\&|")
+    unlistable = cfg / "fixtures"
+    real_scandir = os.scandir
+
+    def scandir(path: Any = ".") -> object:
+        # Anything but a name, such as the descriptor a staging walk lists by, goes through.
+        if not listable and isinstance(path, str | os.PathLike) and Path(path) == unlistable:
+            raise PermissionError(13, "synthetic", os.fspath(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    result, manifest, detail, names = await _full_pass_record(tmp_path, key_b64, cfg)
+    if listable:
+        assert names == ["config/feed.py", "config/fixtures/a01.hl7"]
+        assert _skipped_everywhere(result, manifest, detail) == []
+    else:
+        assert names == ["config/feed.py"]
+        assert _skipped_everywhere(result, manifest, detail) == ["fixtures"]
+
+
+def _lose_config_after_its_inspection(monkeypatch: pytest.MonkeyPatch, cfg: Path) -> None:
+    """Remove ``cfg`` once ``_inspect_config`` has read it, before the walk, so its guard does
+    not fire. A pass over any other config dir is left alone."""
+    real_inspect = BackupRunner._inspect_config
+
+    def inspect_then_lose(self: BackupRunner, config_dir: Path | None) -> object:
+        bundle = real_inspect(self, config_dir)
+        if config_dir == cfg:
+            shutil.rmtree(cfg)
+        return bundle
+
+    monkeypatch.setattr(BackupRunner, "_inspect_config", inspect_then_lose)
+
+
+async def test_a_config_dir_lost_after_its_inspection_is_recorded_on_a_full_pass(
+    tmp_path, key_b64, monkeypatch
+) -> None:
+    """The dir is read by ``_inspect_config`` and gone by the walk: the full pass keeps its store
+    snapshot and records the config dir itself as left out."""
+    from messagefoundry.pipeline.dr_backup import CONFIG_WALK_ADDED_NOTHING
+
+    cfg = _config_holding_only(tmp_path, "one-file")
+    _lose_config_after_its_inspection(monkeypatch, cfg)
+    result, manifest, detail, names = await _full_pass_record(tmp_path, key_b64, cfg)
+    assert names == []
+    assert (result.config_bundled, result.config_bundle_error) == (
+        False,
+        CONFIG_WALK_ADDED_NOTHING,
+    )
+    assert _skipped_everywhere(result, manifest, detail) == ["."]
+
+
+async def test_a_config_only_pass_whose_config_dir_is_lost_after_its_inspection_is_refused(
+    tmp_path, key_b64, monkeypatch
+) -> None:
+    """``_inspect_config`` reads the dir, so its guard does not fire; the dir is gone before the
+    walk. The pass still fails as a ``snapshot`` failure, before it publishes or prunes. The
+    control is :func:`test_a_config_only_pass_with_one_config_file_still_publishes`."""
+    cfg = _config_holding_only(tmp_path, "one-file")
+    _lose_config_after_its_inspection(monkeypatch, cfg)
+    dest, prior, outcome = await _prior_then_config_only(tmp_path, key_b64, config_dir=cfg)
+    assert not cfg.exists(), "the dir was read by the inspection and then lost"
+    assert isinstance(outcome, BackupError) and outcome.kind == "snapshot"
+    assert "added no regular file" in str(outcome)
+    assert sorted(p.name for p in dest.iterdir()) == [prior.name]
 
 
 # --- AC-9/AC-10: failure alerts + preserves the prior good archive -----------
