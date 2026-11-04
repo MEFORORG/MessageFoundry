@@ -367,7 +367,7 @@ def test_an_unparsable_certificate_in_the_trust_store_refuses_the_build(
     cadata = (_pem(good[0]) + _wrapped(_der(odd[0]) + b"\x30\x00", label)).decode("ascii")
     assert _openssl_loads(cadata) == 2  # the premise: OpenSSL loads the odd block
     with pytest.raises(
-        ValueError, match=r"IB_PARTNER: tls_ca_file: .*certificate block 2 .*cannot be parsed"
+        ValueError, match=r"IB_PARTNER': tls_ca_file: .*certificate block 2 .*cannot be parsed"
     ):
         _client_issuer_index("IB_PARTNER", cadata, {"CN=Acme CA": [SUBJECT]})
     # Control: the same store without the junk block builds and warns about nothing.
@@ -405,7 +405,7 @@ def test_a_version_4_ca_refuses_the_build() -> None:
     odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
     cadata = (_pem(good[0]) + _odd_twin(odd[0], "v4")).decode("ascii")
     assert _openssl_loads(cadata) == 2  # the premise: OpenSSL loads it
-    with pytest.raises(ValueError, match=r"IB_PARTNER: tls_ca_file: .*cannot be parsed"):
+    with pytest.raises(ValueError, match=r"IB_PARTNER': tls_ca_file: .*cannot be parsed"):
         _client_issuer_index("IB_PARTNER", cadata, {})
 
 
@@ -736,7 +736,7 @@ def test_a_silent_stop_in_tls_ca_file_refuses_the_listener(tmp_path: Path) -> No
     inter = _ca(_dn((NameOID.COMMON_NAME, "Inter CA")), by=root)
     cadata = _pem(root[0]) + _SILENT_STOPS["empty-foo"] + _pem(inter[0])
     with pytest.raises(
-        ValueError, match=r"HTTP source .*: tls_ca_file: .*does not load 1 CA certificate"
+        ValueError, match=r"HTTP listener .*: tls_ca_file: .*does not load 1 CA certificate"
     ):
         _source(tmp_path, [], {"CN=Inter CA": [SUBJECT]}, cadata=cadata)
 

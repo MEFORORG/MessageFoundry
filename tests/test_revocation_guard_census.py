@@ -281,7 +281,11 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         "loads a client CA file into a scratch context to compare what OpenSSL took with the mTLS "
         "issuer index (BACKLOG #4948); never handshakes"
     ),
-    "messagefoundry/pki.py::_loads_as_no_ca": Exempt(
+    "messagefoundry/pki.py::_all_load_as_no_ca": Exempt(
+        "loads certificates into a scratch context to ask whether OpenSSL reads any as a CA "
+        "(BACKLOG #4948); never handshakes"
+    ),
+    "messagefoundry/pki.py::_openssl_reads_as_ca": Exempt(
         "loads one certificate into a scratch context to ask whether OpenSSL reads it as a CA "
         "(BACKLOG #4948); never handshakes"
     ),

@@ -1757,7 +1757,7 @@ def _refuse_unless_openssl_loads(cadata: str, indexed: Set[bytes], *, label: str
     always drop a certificate it is given twice (measured on OpenSSL 3.5.7, a CA listed twice after
     another CA with its DN and a third between them), and a second copy signs nothing a first does
     not. A certificate the index holds that is not in that list must be one OpenSSL reads as no CA,
-    asked of a context holding it alone, or it would be a CA the index read and OpenSSL never
+    asked of a context holding only those, or it would be a CA the index read and OpenSSL never
     loaded. OpenSSL lists no other certificate, so those are compared only by count, and a copy of
     one kept twice refuses. A count that balances over two different such certificates is not
     caught here, so :meth:`IssuerIndex.issuer_of` lets one name only a leaf that is itself."""
@@ -1776,33 +1776,59 @@ def _refuse_unless_openssl_loads(cadata: str, indexed: Set[bytes], *, label: str
     loaded_others = scratch.cert_store_stats()["x509"] - len(listed)
     if missed := len(cas - indexed):
         problem = (
-            f"loads {missed} CA certificate(s) from this file that the mTLS issuer map did not read"
+            f"loads {missed} CA certificate(s) from this file that the mTLS issuer map did not "
+            "read. Write each certificate as a plain PEM block"
         )
-    elif extra := sum(not _loads_as_no_ca(der) for der in others):
-        problem = f"does not load {extra} CA certificate(s) the mTLS issuer map read from this file"
+    elif not _all_load_as_no_ca(others):
+        reads = [_openssl_reads_as_ca(der) for der in others]
+        if extra := reads.count(True):
+            problem = (
+                f"does not load {extra} CA certificate(s) the mTLS issuer map read from this file. "
+                "Remove any empty or non-certificate PEM block before them, which can stop the TLS "
+                "library reading the file"
+            )
+        else:
+            problem = (
+                f"cannot load {len(reads) - reads.count(False)} certificate(s) the mTLS issuer map "
+                "read from this file. Remove or re-issue them"
+            )
     elif loaded_others != len(others):
         problem = (
             f"loads {loaded_others} certificate(s) that are not CAs from this file, where the "
-            f"mTLS issuer map read {len(others)}"
+            f"mTLS issuer map read {len(others)}. List each certificate once, and remove any empty "
+            "or non-certificate PEM block"
         )
     else:
         return cas
     raise ValueError(
-        f"{label}: the TLS library {problem}, so the map could name a CA the handshake never "
-        "trusts or miss one it does. Remove any empty or non-certificate PEM block, and any line "
-        "that is not part of a block, and list each certificate once"
+        f"{label}: the TLS library {problem}. Until then the map could name a CA the handshake "
+        "never trusts or miss one it does"
     )
 
 
-def _loads_as_no_ca(der: bytes) -> bool:
-    """Whether OpenSSL loads the certificate ``der`` and reads it as no CA, in a context alone."""
+def _all_load_as_no_ca(ders: Set[bytes]) -> bool:
+    """Whether OpenSSL loads every distinct certificate in ``ders`` and reads none as a CA, in one
+    context holding only them. Distinct certificates are never merged, so the count is exact."""
+    if not ders:
+        return True
+    alone = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    try:
+        alone.load_verify_locations(cadata=b"".join(ders))
+    except ssl.SSLError:
+        return False
+    stats = alone.cert_store_stats()
+    return stats["x509"] == len(ders) and stats["x509_ca"] == 0
+
+
+def _openssl_reads_as_ca(der: bytes) -> bool | None:
+    """Whether OpenSSL reads the certificate ``der`` as a CA, in a context holding it alone, or
+    ``None`` when it cannot load it. Asked only to say which certificate a refusal is about."""
     alone = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     try:
         alone.load_verify_locations(cadata=der)
     except ssl.SSLError:
-        return False
-    stats = alone.cert_store_stats()
-    return stats["x509"] == 1 and stats["x509_ca"] == 0
+        return None
+    return alone.cert_store_stats()["x509_ca"] == 1
 
 
 #: PEM labels OpenSSL's ``load_verify_locations(cadata=)`` loads a certificate from and
@@ -1871,8 +1897,10 @@ def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
     ``Name: value`` header line with no blank line after it), a block whose body opens with a
     blank line, or with a header line and a blank line, and holds a data line over 64 characters,
     and a block with a ``:`` in its label or in a body line, which OpenSSL reads as a header line.
-    :class:`IssuerIndex` refuses every such file, because it checks this scan's result against
-    what OpenSSL loaded (:func:`_refuse_unless_openssl_loads`)."""
+    :class:`IssuerIndex` refuses such a file at least where the scan reads a certificate OpenSSL
+    did not, because it checks this scan's result against what OpenSSL loaded
+    (:func:`_refuse_unless_openssl_loads`). A block of these shapes after the last certificate
+    hides nothing, and the file builds."""
     lines = _pem_reader_lines(pem)
     for line in lines:
         if not (line.startswith(b"-----BEGIN ") and line.endswith(b"-----")):

@@ -720,7 +720,7 @@ def _client_issuer_index(
     # Lazy: pki pulls in cryptography, which a listener without mtls_subject never needs.
     from messagefoundry.pki import IssuerIndex
 
-    index = IssuerIndex(cadata, label=f"HTTP source {name}: tls_ca_file")
+    index = IssuerIndex(cadata, label=f"HTTP listener {name!r}: tls_ca_file")
     for issuer in index.unmatched_keys(subjects):
         # pki's own reason names the API's file, so this line states both causes in this
         # listener's terms rather than quote it.
