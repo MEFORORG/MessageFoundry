@@ -2530,6 +2530,8 @@ def MLLP(
     | None = None,  # BOTH: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142, #2371)
     tls_crl_file: str
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
+    tls_client_subjects: Mapping[str, Sequence[str]]
+    | None = None,  # INBOUND: expected senders: issuing CA's DN -> QUALIFIED "SAN:DNS:<v>" / "CN:<v>"
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able, and is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
     # OUTBOUND: honour an EXPIRED server cert (#129). The chain is still verified, and the hostname
@@ -2677,7 +2679,17 @@ def MLLP(
     forward-secret, encrypting, peer-authenticating, 128-bit floor) and then applied, so opting in
     NARROWS this one hop. A rejected string fails loud at construction, surfaced by
     ``messagefoundry check`` / dry-run. Any OpenSSL ``@`` directive is refused too, for being one:
-    ``@SECLEVEL=0`` lowers the security level without naming a suite (BACKLOG #2106)."""
+    ``@SECLEVEL=0`` lowers the security level without naming a suite (BACKLOG #2106).
+
+    ``tls_client_subjects`` (**inbound only**, BACKLOG #4907) names the senders this listener
+    expects. ``tls_ca_file`` alone admits any certificate its CAs ever signed; this binds each
+    sender to a name under the CA that issued it, in the same table ``Http``'s
+    ``intake_client_subjects`` takes: ``{"CN=Acme CA,O=Acme": ["SAN:DNS:partner.example"]}``. A
+    verified certificate with no listed name under the loaded CA whose key signed it is refused:
+    its first message is recorded as an ``ERROR`` row, then answered ``AR`` where the inbound
+    replies in HL7, and the connection closes. ``docs/CONNECTIONS.md`` states which names count
+    and how they match. It needs ``tls=True`` and ``tls_ca_file``; unset, nothing changes."""
+    client_subjects = _mllp_client_subjects(tls_client_subjects, tls=tls, tls_ca_file=tls_ca_file)
     return ConnectionSpec(
         ConnectorType.MLLP,
         {
@@ -2711,12 +2723,47 @@ def MLLP(
             "tls_ca_file": tls_ca_file,
             "tls_ca_pin": tls_ca_pin,
             "tls_crl_file": tls_crl_file,
+            "tls_client_subjects": client_subjects,
             "tls_verify": tls_verify,
             "tls_check_hostname": tls_check_hostname,
             "tls_allow_expired": tls_allow_expired,
             "tls_ciphers": tls_ciphers,
         },
     )
+
+
+def _mllp_client_subjects(value: Any, *, tls: Any, tls_ca_file: Any) -> dict[str, list[str]] | None:
+    """``MLLP``'s ``tls_client_subjects`` checked at factory time, or ``None`` when unset (#4907).
+
+    The table's shape is ``Http``'s ``intake_client_subjects``, checked by the same function. Then
+    each rule refuses a setting that would be inert or refuse everyone with no start-time error:
+    an empty table, a listener with no client CA (no certificate is requested, so none is listed),
+    and a name ``cert_name_candidates`` can never yield."""
+    if value is None:
+        return None
+    setting = "MLLP tls_client_subjects"
+    subjects = _intake_subjects_by_issuer(value, factory="MLLP", key="tls_client_subjects")
+    if not subjects:
+        raise WiringError(
+            f"{setting} names no issuing CA; omit the setting to leave the allowlist off, since an "
+            "empty one would read as a control that admits no one"
+        )
+    if not tls or not tls_ca_file:
+        raise WiringError(
+            f"{setting} needs tls=True and tls_ca_file: without a client CA the listener requests "
+            "no certificate, so no sender could be listed"
+        )
+    unqualified = [
+        n for names in subjects.values() for n in names if not QUALIFIED_CERT_NAME.fullmatch(n)
+    ]
+    if unqualified:
+        raise WiringError(
+            f"{setting} entries must be qualified: {len(unqualified)} are not "
+            "'SAN:<type>:<value>' / 'CN:<value>', each part non-empty. A certificate's names are "
+            "matched as 'SAN:DNS:<value>' and 'CN:<value>', so any other name matches nothing and "
+            "would refuse the sender it names"
+        )
+    return subjects
 
 
 def Tcp(
@@ -3358,8 +3405,13 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
         )
 
 
-def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
+def _intake_subjects_by_issuer(
+    value: Any, *, factory: str = "Http", key: str = "intake_client_subjects"
+) -> dict[str, list[str]] | None:
     """``Http``'s ``intake_client_subjects`` checked for shape, or ``None`` when unset (#2287).
+
+    ``MLLP``'s ``tls_client_subjects`` (BACKLOG #4907) has the same shape and is checked here too;
+    ``factory`` and ``key`` name the setting in every refusal.
 
     The setting is a table: the DN of each issuing CA, as ``cryptography``'s ``rfc4514_string()``
     renders that CA's subject, mapped to a list of qualified subject names. This mirrors
@@ -3375,7 +3427,7 @@ def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
     with the shape to write, and there is no compatibility shim, because nothing is deployed."""
     if value is None:
         return None
-    setting = "Http intake_client_subjects"
+    setting = f"{factory} {key}"
     # An EnvRef only. In connections.toml, parse_env_setting has already turned any top-level table
     # whose keys fit {env, default, cast} into an EnvRef (refused here) or refused it itself, so no
     # raw marker arrives from a file. A code-first dict keyed "env" is not decoded; it reaches the
@@ -3389,8 +3441,9 @@ def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
         raise WiringError(
             f"{setting} must be a table keyed by the DN of the CA that issues each partner's "
             "certificate, each naming that CA's subjects, e.g. "
-            "{'CN=Acme CA,O=Acme': ['CN:partner.example']}; a flat list of subjects is no longer "
-            "read, because it let any CA in tls_ca_file issue a listed subject (BACKLOG #2287)"
+            "{'CN=Acme CA,O=Acme': ['CN:partner.example']}; a flat list of subjects is not "
+            "read, because it would let any CA in tls_ca_file issue a listed subject (BACKLOG "
+            "#2287)"
         )
     if not value:
         return None
@@ -3419,7 +3472,7 @@ def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
                 "['CN:partner.example'], not a single value"
             )
         # The item scan first, so no message below can quote an item that is a reference.
-        _reject_envref_in_lists("Http", **{f"intake_client_subjects {issuer!r}": names})
+        _reject_envref_in_lists(factory, **{f"{key} {issuer!r}": names})
         if not names:
             raise WiringError(f"{setting} issuer {issuer!r} names no subjects")
         for index, name in enumerate(names):

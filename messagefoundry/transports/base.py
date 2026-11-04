@@ -1281,6 +1281,16 @@ class SourceConnector(abc.ABC):
     #: poll sources and the timer consult it. The loopback and pass-through sources read nothing.
     intake_gate: IntakeGate | None = None
 
+    #: Optional refusal for a message from a sender whose verified certificate is not on its
+    #: inbound's certificate-subject allowlist (BACKLOG #4907), **injected by the runner after
+    #: build**, the same runtime-injection shape as :attr:`on_connection_event`. The runner
+    #: records the message as an ``ERROR`` row, then returns the ``AR`` reply where the inbound
+    #: answers in HL7, else ``None``, so a refused message is counted and logged rather than
+    #: accepted and dropped. Only the MLLP listener's ``tls_client_subjects`` calls it so far.
+    #: ``None`` (a direct build) means nothing can record such a message, and a listener that
+    #: refuses a sender then reads none of its messages.
+    refuse_unlisted_sender: InboundHandler | None = None
+
     @abc.abstractmethod
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None

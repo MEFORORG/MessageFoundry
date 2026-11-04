@@ -937,6 +937,15 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     EscapedDocumentError,
 )
 
+#: BACKLOG #4907: the stored reason, and the MSA-3 text, for a message from a sender whose verified
+#: certificate is not on its inbound's allowlist. Fixed strings, because a certificate subject can
+#: name a person and neither the row nor the reply may carry one.
+_UNLISTED_SENDER_ERROR = (
+    "sender refused: its verified certificate is not on this inbound's certificate-subject "
+    "allowlist under its issuing CA"
+)
+_UNLISTED_SENDER_NAK_TEXT = "sender not permitted"
+
 
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
 # PortConflictError naming the connection + binding, instead of a bare unattributed OSError aborting the
@@ -4925,6 +4934,10 @@ class RegistryRunner:
         # measurement. A source consults it BEFORE it reads: a listener before its next socket read,
         # the DICOM SCP before it accepts a new association, a poll source or timer at its tick.
         source.intake_gate = self._intake_gate
+        # BACKLOG #4907: the refusal a listener hands a message from a sender whose verified
+        # certificate is not on its allowlist, injected onto every source the same runtime way. A
+        # source that keeps no allowlist never calls it, so every other inbound is byte-identical.
+        source.refuse_unlisted_sender = self._make_unlisted_sender_refusal(ic)
         # Vault BACKLOG #2608: a poll source's refusals are stored whole, never as a head, because the
         # file it deletes or the row it marks was the only copy. Keyed on the transport's own declared
         # contract, not on a connector type (CLAUDE.md section 4).
@@ -7892,6 +7905,51 @@ class RegistryRunner:
             return await self._handle_inbound(ic, raw)
 
         return on_message
+
+    def _make_unlisted_sender_refusal(self, ic: InboundConnection):  # type: ignore[no-untyped-def]
+        # BACKLOG #4907: the source's `refuse_unlisted_sender` seam, bound to this inbound.
+        async def refuse(raw: bytes) -> str | None:
+            return await self._refuse_unlisted_sender(ic, raw)
+
+        return refuse
+
+    async def _refuse_unlisted_sender(self, ic: InboundConnection, raw: bytes) -> str | None:
+        """Record a message from a sender outside the inbound's certificate-subject allowlist as
+        ``ERROR``, then return the ``AR`` reply, or ``None`` where the inbound sends none (BACKLOG
+        #4907).
+
+        The order is the one #2607's closing step 5 set: the row is committed before the reply is
+        built, so the message is counted and logged, never accepted and dropped. ``AR``, not ``AE``,
+        because the same sender is refused the same way on every resend; the engine's own MLLP
+        destination dead-letters an ``AR`` at once. Nothing from the certificate reaches the row, the
+        reply or the log: the reason and the MSA-3 text are fixed, because a subject can name a
+        person. The body is kept under the refused-body allowance, as every other refusal's is.
+
+        On an inbound that is not HL7 v2, or whose acknowledgements are off, there is no HL7 reply
+        to give, so this returns ``None`` and the listener closes the connection with no reply; the
+        close, with nothing written, is that feed's refusal. Called before any decode, so a refused
+        body is stored as received, never decoded or parsed."""
+        hl7v2 = ic.content_type is ContentType.HL7V2
+        mid = await self._record_refused(
+            ic,
+            raw,
+            None,
+            error=_UNLISTED_SENDER_ERROR,
+            message_type=None if hl7v2 else ic.content_type.value,
+        )
+        if not hl7v2 or ic.ack_mode is AckMode.NONE:
+            return None
+        ack = build_ack(raw, code="AR", text=_UNLISTED_SENDER_NAK_TEXT, ack_mode=ic.ack_mode)
+        if self._capture_ack_enabled(ic):
+            await self._capture_ack(
+                mid,
+                ic.name,
+                ack_code="AR",
+                ack_phase="ingest",
+                ack_body=None,
+                detail=_UNLISTED_SENDER_ERROR,
+            )
+        return ack
 
     def _make_http_handler(self, ic: InboundConnection):  # type: ignore[no-untyped-def]
         # The HTTP listen source (ADR 0023) needs the engine message_id back so its 202 respond-with-
