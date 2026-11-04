@@ -3509,11 +3509,8 @@ def _serve(args: argparse.Namespace) -> int:
     # on a network-reachable host, a REVOKED-but-unexpired server (or mTLS client) certificate is still
     # accepted: stdlib `ssl` performs no OCSP/CRL fetch and the engine deliberately attempts none (on-
     # prem, offline-by-default; CLAUDE.md §2). So refuse fail-closed unless the operator attests
-    # (MEFOR_TLS_REVOCATION_ATTESTED=1) that its PKI enforces revocation. A declared upstream
-    # terminator does not exempt the bind (BACKLOG #4636): off loopback the exposed-bind gate above
-    # refuses a plaintext proxy hop, so the engine terminates that hop's TLS itself, on the operator
-    # certificate. Loopback and plaintext binds start byte-identically (the predicate short-circuits).
-    # Layered AFTER the §0 exposed-bind ladder above (extend-never-weaken), like the keyless-store /
+    # (MEFOR_TLS_REVOCATION_ATTESTED=1) that its PKI enforces revocation; a declared terminator does
+    # not exempt the bind (BACKLOG #4636, the predicate's docstring says why). Layered AFTER the §0 exposed-bind ladder above (extend-never-weaken), like the keyless-store /
     # open-egress / MFA-at-exposure gates.
     if in_process_tls_revocation_refused(
         tls_enabled=settings.api.tls_enabled,
@@ -3528,8 +3525,9 @@ def _serve(args: argparse.Namespace) -> int:
             "[api].tls_terminated_upstream does not exempt this bind: the engine still terminates "
             "the proxy-to-engine hop's TLS itself (BACKLOG #4636). Set "
             "MEFOR_TLS_REVOCATION_ATTESTED=1 to attest that your PKI enforces revocation for the "
-            "certificates this engine serves and accepts, or bind [api].host to loopback behind a "
-            "revocation-checking reverse proxy on the same machine. See "
+            "certificates this engine serves and accepts, or keep the engine on loopback "
+            "([security].local_access_only = true) behind a revocation-checking reverse proxy on "
+            "the same machine. See "
             "docs/adr/0078-certificate-revocation-posture.md.",
             file=sys.stderr,
         )

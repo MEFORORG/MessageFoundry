@@ -68,6 +68,16 @@ explicit operator opt-out.
      revocation-checking PKI (short-lived / ACME-rotated certs, an OCSP-must-staple issuer, an OS
      trust store that consults CRLs): the `MEFOR_TLS_REVOCATION_ATTESTED=1` env escape.
 
+   *(Note 2026-11-04: the declared proxy is no longer a proof form, BACKLOG #4636, Manager decision
+   d20261104T080839080-981796. The first bullet keeps its original wording. Since #4636 `serve`
+   refuses a plaintext proxy-to-engine hop on any bind host that is not loopback, so off loopback a
+   declared proxy re-encrypts to the engine, and the engine terminates that hop's TLS itself on an
+   operator certificate. The proxy's revocation checks cover the browser's hop and not that
+   certificate, so the attestation is now the only proof form for an off-loopback in-process bind.
+   A proxy on the same machine in front of a loopback bind still never reaches the gate, as the
+   loopback case in decision 3 says. The same holds for "proxy-terminated deployments" in the
+   *Opt-out* paragraph below.)*
+
 3. **Scope of the enforced gate.** The **in-process `[api]` uvicorn TLS path** is gated at
    `serve` time: WHEN the engine terminates TLS in-process (`[api].tls_cert_file` set) on a
    **network-reachable** host (`[api].host` non-loopback) and revocation is **not** proven in front,
@@ -100,6 +110,10 @@ gate and start **byte-identically** — the default `127.0.0.1` posture is compl
   `tls_enabled`, so a bind with no in-process cert never trips it.
 - **The proxy-terminated path** (WP-15) is untouched — a declared proxy is "revocation proven in
   front" and starts unchanged.
+  *(Note 2026-11-04: no longer so off loopback, BACKLOG #4636, Manager decision
+  d20261104T080839080-981796. An off-loopback bind behind a declared proxy now runs in-process TLS
+  on an operator certificate and needs the attestation, as the note under decision 2 says. A
+  plaintext proxy-terminated bind exists only on loopback now, and it still starts unchanged.)*
 - The gate **extends, never weakens**, the ADR 0002 §0 exposed-bind ladder (it is an additional refusal
   layered after it, mirroring the keyless-store / open-egress / MFA-at-exposure gates).
 
@@ -115,13 +129,23 @@ gate and start **byte-identically** — the default `127.0.0.1` posture is compl
   → `tests/test_listener_tls_exposure.py::test_serve_loopback_inprocess_tls_starts`
 - **AC-3** — WHERE a declared TLS-terminating proxy is configured
   (`tls_terminated_upstream` + `trusted_proxies`), THE SYSTEM SHALL start (revocation proven in front).
-  → `tests/test_listener_tls_exposure.py::test_serve_proxy_terminated_offloopback_starts`
+  *(Note 2026-11-04: amended by BACKLOG #4636, Manager decision d20261104T080839080-981796. WHERE a
+  declared proxy fronts an off-loopback in-process TLS bind, THE SYSTEM SHALL refuse to start without
+  `MEFOR_TLS_REVOCATION_ATTESTED` and start with it; WHERE it fronts a loopback plaintext bind, THE
+  SYSTEM SHALL start. The test was renamed with the change.)*
+  → `tests/test_listener_tls_exposure.py::test_serve_proxy_terminated_offloopback_needs_the_attestation`
+  → `tests/test_listener_tls_exposure.py::test_serve_loopback_plaintext_terminator_stays_exempt`
 - **AC-4** — WHEN the operator sets `MEFOR_TLS_REVOCATION_ATTESTED=1`, THE SYSTEM SHALL start an
   in-process off-loopback TLS bind (the documented opt-out).
   → `tests/test_listener_tls_exposure.py::test_serve_inprocess_tls_offloopback_attested_starts`
 - **AC-5** — THE `in_process_tls_revocation_refused` predicate SHALL return `False` for the loopback,
   plaintext, proxy-terminated, and attested cases, and `True` only for an unproven in-process
   off-loopback TLS bind.
+  *(Note 2026-11-04: the predicate no longer takes a proxy-terminated input, BACKLOG #4636, Manager
+  decision d20261104T080839080-981796, the way engine PR 2578 removed `proxy_proven` from
+  `revocation_hop_disposition`. It returns `False` for the loopback, plaintext and attested cases,
+  and `True` for an unattested in-process off-loopback TLS bind, a declared terminator in front of
+  it included. A loopback plaintext terminator is the plaintext case.)*
   → `tests/test_tls_policy.py::test_in_process_tls_revocation_refused_matrix`
 
 ## Options considered

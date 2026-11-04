@@ -144,11 +144,13 @@ against one case that matters, described under
 
 - **(A) In-process TLS — default shipped posture.** Engine binds `0.0.0.0:8443` with `tls_cert_file`/
   `tls_key_file`; MLLP runs `tls=True`. Self-contained, fewest moving parts.
-- **(B) Reverse-proxy / same-pod sidecar — k8s-preferred.** Engine stays loopback (or behind a trusted
-  terminator with `tls_terminated_upstream=true` + `trusted_proxies=[…]` +
+- **(B) Reverse-proxy / same-pod sidecar — k8s-preferred.** Engine stays on loopback behind the
+  sidecar, declared with `tls_terminated_upstream=true` + `trusted_proxies=[…]` +
   `plaintext_upstream_hop_acknowledged=true`, required because with no `tls_cert_file` that hop is
-  plaintext); the sidecar does TLS + mTLS +
-  OCSP-must-staple revocation. The engine bound to `127.0.0.1` never trips the exposure gate.
+  plaintext; the sidecar does TLS + mTLS + OCSP-must-staple revocation. The engine bound to
+  `127.0.0.1` never trips the exposure gate. A plaintext hop is refused on any other bind host, so a
+  terminator in another pod or on another host needs `tls_cert_file` and the revocation
+  attestation, as [SECURITY.md](../docs/SECURITY.md) says (BACKLOG #4636).
 
 Reaching the engine through a published port requires binding **off-loopback inside the container**
 (Docker NAT forwards to the container interface, not its loopback). The startup bind guard then requires

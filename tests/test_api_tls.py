@@ -3770,9 +3770,7 @@ def _reencrypting_proxy_toml(
 def _run_reencrypting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe: _RecordingProbe
 ) -> int:
-    # An off-loopback bind serving an operator certificate with no terminator in front meets the ADR
-    # 0078 revocation gate first. Attested here so that gate is not the one under test.
-    monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
+    # The fixture serves an operator certificate, so _run_posture_b attests revocation (ADR 0078).
     return _run_posture_b(tmp_path, monkeypatch, env="prod", probe=probe)
 
 

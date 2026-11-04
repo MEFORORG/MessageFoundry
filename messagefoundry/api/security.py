@@ -1588,7 +1588,11 @@ def enforce_phi_read_hop(request: Request) -> None:
             "PHI read refused: this production-PHI instance's API serve hop is not proven secure "
             "(no loopback bind, in-process TLS, or declared TLS-terminating proxy), so PHI is not "
             "emitted over it (posture-keyed refusal, #200/ADR 0092). Configure [api].tls_cert_file "
-            "(with [api].tls_terminated_upstream + trusted_proxies beside it behind a proxy).",
+            "(with [api].tls_terminated_upstream + trusted_proxies beside it behind a proxy that "
+            "re-encrypts to the engine), or keep the engine on loopback "
+            "([security].local_access_only = true) behind a TLS-terminating proxy on the same "
+            "machine; serve accepts a plaintext proxy hop only there "
+            "(BACKLOG #4636).",
         )
 
 

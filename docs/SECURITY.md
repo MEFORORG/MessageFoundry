@@ -269,7 +269,11 @@ secures nothing by itself. It is a listed
 loosening, and [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how each start reports it. With an operator
 `tls_cert_file` the engine serves that hop over TLS, so nothing needs acknowledging and the setting is
 not required. The proxy must then speak https to the engine and trust that certificate, or every
-request through it fails. Setting the acknowledgement without `tls_terminated_upstream` is refused at
+request through it fails. Off loopback that bind is in-process TLS, so the
+[ADR 0078](adr/0078-certificate-revocation-posture.md) revocation gate applies to it: `serve`
+refuses it (exit 2) unless `MEFOR_TLS_REVOCATION_ATTESTED=1` is set in the service environment.
+The declared terminator does not exempt it, because the proxy's revocation checks cover the
+browser's hop and not the engine's own certificate (BACKLOG #4636). Setting the acknowledgement without `tls_terminated_upstream` is refused at
 load. `messagefoundry check` runs the same test as a required check, `upstream-hop-ack`, against the
 `messagefoundry.toml` it finds, so the commit/CI gate catches both refusals before `serve` does, for
 the bind host that file names. A bind host given only as `serve --host` is not in that file, so the

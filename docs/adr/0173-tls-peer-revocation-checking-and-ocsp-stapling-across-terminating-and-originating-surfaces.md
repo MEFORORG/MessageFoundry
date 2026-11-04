@@ -270,6 +270,13 @@ false-premise defect:
    wired at `__main__.py:1722`. `serve` refuses an in-process off-loopback `[api]` TLS bind unless a
    declared TLS-terminating reverse proxy (WP-15) or `MEFOR_TLS_REVOCATION_ATTESTED` proves
    revocation in front. Loopback and proxy-terminated binds never trip it.
+   *(Note 2026-11-04: a declared proxy no longer exempts the bind, BACKLOG #4636, Manager decision
+   d20261104T080839080-981796. Since #4636 a plaintext proxy-to-engine hop is refused off loopback,
+   so a proxy in front of an off-loopback bind re-encrypts to the engine's own operator certificate,
+   which the proxy's revocation checks do not cover. Such a bind now needs
+   `MEFOR_TLS_REVOCATION_ATTESTED`. A plaintext proxy-terminated bind exists only on loopback, and
+   it still never trips the refusal. The predicate's docstring in `config/tls_policy.py` is the
+   source of record. The item keeps its original wording.)*
 3. **Terminating mTLS listeners — `check_inbound_revocation`** (`pipeline/wiring_runner.py:6779`,
    body `:6800-6826`). Refuses an mTLS listener that verifies client certificates with no
    `tls_crl_file`, on an enforcing production-PHI instance.

@@ -80,7 +80,7 @@ the gate. The right topology depends on the orchestrator.
 |---|---|---|---|
 | **Plain Docker, single host** | **(a) in-process TLS** — engine binds `0.0.0.0:8443`, mount PEM cert/key, `-p 8443:8443` | in-container **MLLP-over-TLS** (`tls=true` per connection), `-p 2575:2575` | Self-contained, matches the single-binary / broker-free ethos; no extra moving parts. |
 | **Kubernetes / same-pod sidecar / `--network host`** | **(c→b) loopback + TLS-terminating sidecar** — engine binds `127.0.0.1`, sidecar terminates TLS, forwards to `127.0.0.1`; set `trusted_proxies=[127.0.0.1]` + `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055) | a **TLS-terminating TCP sidecar** for MLLP, engine MLLP binds loopback (gate passes) — *or* in-container MLLP-over-TLS | A shared network namespace makes the engine genuinely loopback-bound, so the gate passes **trivially** and only the hardened proxy is exposed. Cleanest from the engine's view. |
-| **Separate proxy container on a Docker network** (not shared netns) | **(b) upstream TLS, re-encrypted** — engine binds `0.0.0.0:8765` on the internal network, `tls_terminated_upstream=true` + `trusted_proxies=[<proxy IP>]` + an operator `tls_cert_file` the proxy trusts, so the proxy-to-engine hop is TLS (a plaintext hop is refused off loopback, BACKLOG #4636); do **not** publish the engine port to the host | in-container **MLLP-over-TLS** (no MLLP proxy primitive in the design unless you add a TCP/TLS sidecar) | Fits shops standardizing on nginx/Caddy/IIS or an ingress controller; the proxy is also the right place for OCSP-must-staple revocation and client-cert mTLS. |
+| **Separate proxy container on a Docker network** (not shared netns) | **(b) upstream TLS, re-encrypted** — engine binds `0.0.0.0:8765` on the internal network, `tls_terminated_upstream=true` + `trusted_proxies=[<proxy IP>]` + an operator `tls_cert_file` the proxy trusts, so the proxy-to-engine hop is TLS (a plaintext hop is refused off loopback, BACKLOG #4636), plus `MEFOR_TLS_REVOCATION_ATTESTED=1`, because that bind is in-process TLS; do **not** publish the engine port to the host | in-container **MLLP-over-TLS** (no MLLP proxy primitive in the design unless you add a TCP/TLS sidecar) | Fits shops standardizing on nginx/Caddy/IIS or an ingress controller; the proxy is also the right place for OCSP-must-staple revocation and client-cert mTLS. |
 
 ### The three options, justified
 
@@ -187,7 +187,9 @@ listen_address = "0.0.0.0"
 port = 8765
 tls_terminated_upstream = true
 # REQUIRED off loopback: serve refuses a plaintext proxy->engine hop there (BACKLOG #4636). The
-# proxy connects to the engine over https and trusts this certificate.
+# proxy connects to the engine over https and trusts this certificate. The engine then terminates
+# TLS itself, so serve also refuses this bind until MEFOR_TLS_REVOCATION_ATTESTED=1 is set in the
+# container's environment (ADR 0078); the proxy in front does not exempt it.
 tls_cert_file = "/etc/mefor/tls/api.crt"
 tls_key_file  = "/etc/mefor/tls/api.key"
 trusted_proxies = ["10.4.2.7"]                # the proxy's EXACT address(es) — see the warning below

@@ -48,7 +48,7 @@ JSON-only instance:
 | Posture (off-loopback bind) | Result |
 |---|---|
 | in-process TLS (`[api].tls_cert_file`) | **refused (exit 2) until `MEFOR_TLS_REVOCATION_ATTESTED=1` is also set** — the engine terminates TLS itself and performs no OCSP/CRL check, so revocation has to be attested ([ADR 0078](adr/0078-certificate-revocation-posture.md)). With the attestation: starts |
-| proxy-terminated TLS (`[api].tls_terminated_upstream` + `trusted_proxies`) | **refused (exit 2) in every mode unless you supply `[api].tls_cert_file`**, so the proxy re-encrypts to the engine. Without one the proxy-to-engine hop is plaintext, and `[api].plaintext_upstream_hop_acknowledged` accepts that hop on a loopback bind only (BACKLOG #4636). With the certificate set, it still needs the attestations: on a **PHI** instance under `[security].enforcement = enforce` (the shipped default) it is **refused** until `[api].proxy_intra_service_auth` **and** `[api].proxy_tls_min_version` are declared as well. Option B's block below sets both |
+| proxy-terminated TLS (`[api].tls_terminated_upstream` + `trusted_proxies`) | **refused (exit 2) in every mode unless you supply `[api].tls_cert_file`**, so the proxy re-encrypts to the engine. Without one the proxy-to-engine hop is plaintext, and `[api].plaintext_upstream_hop_acknowledged` accepts that hop on a loopback bind only (BACKLOG #4636). With the certificate set, the engine terminates TLS itself, so it is refused until `MEFOR_TLS_REVOCATION_ATTESTED=1` is set, as in the row above: the declared proxy does not exempt it. It still needs the Posture-B attestations too: on a **PHI** instance under `[security].enforcement = enforce` (the shipped default) it is **refused** until `[api].proxy_intra_service_auth` **and** `[api].proxy_tls_min_version` are declared as well. Option B's block below sets both |
 | no operator certificate, plus `serve --allow-insecure-bind` **or** `[security].require_encryption_for_remote = false` | **starts**, with a stderr warning — the API serves TLS on the engine's self-signed placeholder, which no trust store vouches for, so a remote client can authenticate the engine only by pinning that exact certificate |
 | …the same, on a **PHI-classified** instance under `[security].enforcement = enforce` (the default) | refused — the escape is clamped shut and cannot relax a bind on the placeholder |
 | no operator certificate, no escape | refused |
@@ -120,8 +120,9 @@ Setting it is **you taking responsibility for revocation**: the engine
 performs no OCSP/CRL check of its own (stdlib `ssl` has no fetch), so the certificate this listener
 presents must be backed by a revocation-checking PKI — short-lived / ACME-rotated certs, an
 OCSP-must-staple issuer, or a trust store that consults CRLs. If you cannot make that claim
-honestly, **use Option B instead**: terminating at a revocation-checking proxy satisfies the same
-gate without an attestation. It is blanket and process-wide — it also clears the outbound
+honestly, **use Option B instead, with the engine on loopback**: a revocation-checking proxy on the
+same machine in front of a loopback bind never reaches the gate. Option B off loopback does not
+avoid it, because the engine then terminates TLS on its own certificate (BACKLOG #4636). It is blanket and process-wide — it also clears the outbound
 revocation refusals on this engine's verifying TLS connectors, so read
 [`DEPLOYMENT.md`](DEPLOYMENT.md) § *Revocation-guard behavior* before setting it
 ([ADR 0078](adr/0078-certificate-revocation-posture.md)).
@@ -136,9 +137,12 @@ engine warns at startup rather than refusing, so this is easy to miss. An intern
 
 A proxy (nginx, IIS/ARR, HAProxy, a k8s ingress) terminates TLS and forwards plaintext to the engine.
 Tell the engine a terminator is in front so the exposure gates know a proxy is there and the
-audit/rate-limit source IP is the real client. The engine then terminates no TLS itself, so this
-posture needs **no** `MEFOR_TLS_REVOCATION_ATTESTED` — revocation is delegated to the terminator,
-which is why it is the better option when you cannot attest a revocation-checking PKI:
+audit/rate-limit source IP is the real client. On the loopback bind below the engine terminates no
+TLS itself, so this posture needs **no** `MEFOR_TLS_REVOCATION_ATTESTED` — revocation is delegated to
+the terminator, which is why it is the better option when you cannot attest a revocation-checking
+PKI. The off-loopback variant does not get that exemption: there the engine terminates the proxy's
+hop on `[api].tls_cert_file`, so it needs the attestation as Option A does (BACKLOG #4636,
+[SECURITY.md](SECURITY.md)):
 
 This block keeps the engine on loopback, with the proxy on the same machine: that is the only bind
 on which `serve` accepts the plaintext proxy-to-engine hop (BACKLOG #4636). For a proxy on another
@@ -324,7 +328,7 @@ https://engine-host:8765/ui
 |---|---|
 | `[security].serve_web_console = true`, set **explicitly** | The console's default-on posture ([ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md)) covers **local loopback binds only**. On an *exposed* instance — a non-loopback bind, a declared TLS terminator, a set `[api].trusted_proxies`, **or** a set `web_console_public_address` — a *default-on* (not explicitly requested) console **auto-degrades to JSON-only** with a stderr warning, and `/ui` is simply not served ([`__main__.py`](../messagefoundry/__main__.py), the `console_exposed` block). Default-on must not turn a working exposed JSON serve into a start failure, so this degrades rather than refusing — which means an operator who never sets the switch gets **no console and no error**, only a warning line. |
 | The **`messagefoundry-webconsole`** wheel installed | It is a separate optional package. With `serve_web_console` **explicitly** `true` and the wheel absent, `serve` **refuses to start** (exit 2). Left at the default it degrades to JSON-only with a warning instead. |
-| TLS — Option A or Option B above, **including that option's own second precondition** | An off-loopback `/ui` bind without in-process TLS or a declared terminator is **refused at startup**, and `--allow-insecure-bind` does not cover it (§1). Configuring the TLS keys is not enough on its own: Option A additionally refuses without `MEFOR_TLS_REVOCATION_ATTESTED=1`, and Option B additionally refuses (PHI + `enforcement = enforce` + off-loopback) without `[api].proxy_intra_service_auth` and `[api].proxy_tls_min_version`. Both refusals land *before* the console gates, so the symptom is a dead engine, not a 404. |
+| TLS — Option A or Option B above, **including that option's own second precondition** | An off-loopback `/ui` bind without an operator certificate is **refused at startup**, a declared terminator included (BACKLOG #4636), and `--allow-insecure-bind` does not cover it (§1). Configuring the TLS keys is not enough on its own: Option A additionally refuses without `MEFOR_TLS_REVOCATION_ATTESTED=1`, and so does Option B's off-loopback variant, whose engine serves TLS on its own certificate (BACKLOG #4636). Option B also refuses (PHI + `enforcement = enforce` + off-loopback) without `[api].proxy_intra_service_auth` and `[api].proxy_tls_min_version`. Both refusals land *before* the console gates, so the symptom is a dead engine, not a 404. |
 
 ### Certificate trust is the **browser's**, not the engine's
 
@@ -381,7 +385,7 @@ mTLS here is **transport authentication only** unless you also populate
 | Engine won't start: `refusing to serve the browser ops dashboard … without an operator certificate or a declared TLS-terminating proxy` | An off-loopback `/ui` bind with neither of those. The engine would still encrypt the hop on its generated self-signed placeholder, but no trust store vouches for that certificate, so the browser surface refuses it. Configure `tls_cert_file` (Option A), or Option B with the engine kept on loopback behind a proxy on the same machine. `--allow-insecure-bind` does **not** cover `/ui`. |
 | Engine won't start: `…serve_web_console=true needs the web console package` | Install `messagefoundry-webconsole` (or set `serve_web_console = false` for a JSON-only engine). |
 | Engine won't start: `refusing to serve … on non-loopback host` | An off-loopback `[security].listen_address` without an operator certificate on the JSON API. The engine would serve the placeholder there too, and refuses it for the same reason. Same fix as above. |
-| Engine won't start: `refusing to serve the API with in-process TLS on non-loopback host … performs NO certificate revocation check` | The [ADR 0078](adr/0078-certificate-revocation-posture.md) revocation gate on Option A. Set `MEFOR_TLS_REVOCATION_ATTESTED=1` in the **service environment** (not the TOML), or move to Option B and let the proxy do revocation. This gate reads neither the data label nor `[security].enforcement`, so a synthetic/lab box and a `warn`-dialled box hit it too. |
+| Engine won't start: `refusing to serve the API with in-process TLS on non-loopback host … performs NO certificate revocation check` | The [ADR 0078](adr/0078-certificate-revocation-posture.md) revocation gate on Option A. Set `MEFOR_TLS_REVOCATION_ATTESTED=1` in the **service environment** (not the TOML), or move to Option B with the engine on loopback and let the proxy do revocation. Option B off loopback hits this gate too (BACKLOG #4636). This gate reads neither the data label nor `[security].enforcement`, so a synthetic/lab box and a `warn`-dialled box hit it too. |
 | Engine won't start: `refusing to serve on a … PHI instance … behind an upstream TLS terminator … without: [api].proxy_intra_service_auth …` | The Posture-B attestation gate on Option B. Declare **both** `[api].proxy_intra_service_auth` (`mtls`/`network`/`shared_secret`) and `[api].proxy_tls_min_version` (`1.2`/`1.3`) — see Option B's block. It fires on a PHI instance under `enforcement = enforce` with an off-loopback bind; the loopback-behind-a-proxy variant warns instead. |
 | Signed in, but every route returns `403` with `X-MFA-Required: 1` | `[security].require_mfa` is on (the default) and this account hasn't enrolled a factor. Enrol a factor at `/ui/account`: TOTP first, or a passkey the browser stores as discoverable. A local account the requirement covers cannot change its password until it holds one of those: the engine answers `enrol an authenticator app first`. A directory account may enrol either ([the order](SECURITY.md#webauthn-passkeys-wp-14b-adr-0068)). Until then, the console answers most pages with a redirect, usually to `/ui/mfa`. That page sends an account with no factor on to `/ui/account` to enrol. The account and enrolment pages serve the session meanwhile. |
 

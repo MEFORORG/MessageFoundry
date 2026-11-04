@@ -127,7 +127,7 @@ flowchart LR
     T3RP["Reverse proxy<br/>terminates TLS"]:::ext
     T3ENGINEB["Engine API<br/>mints no certificate<br/>trusts forwarded headers only from trusted_proxies"]:::api
     T3CLIENTB -.->|"HTTPS and WSS<br/>encrypted"| T3RP
-    T3RP -.->|"HTTP and WS, plaintext by design<br/>the site secures this hop<br/>HTTPS instead when tls_cert_file is set"| T3ENGINEB
+    T3RP -.->|"HTTP and WS, plaintext by design, loopback bind only<br/>the site secures this hop<br/>HTTPS when tls_cert_file is set, required off loopback"| T3ENGINEB
   end
 ```
 
@@ -137,8 +137,10 @@ self-signed pair on first run.
 has the storage, reuse and renewal rules for that pair.
 
 In the second case the engine mints nothing, and the proxy-to-engine hop is plaintext unless
-`[api].tls_cert_file` is also set. The site secures that hop, and `serve` refuses to start until the
-operator acknowledges it.
+`[api].tls_cert_file` is also set. A plaintext hop is accepted only from a proxy on the same
+machine, with the engine bound to loopback, and only once the operator acknowledges it. Off loopback
+the engine needs `tls_cert_file`, and that bind is in-process TLS, so the revocation gate applies to
+it too. [SECURITY.md](SECURITY.md) states both rules (BACKLOG #1179, #4636).
 
 Both cases carry more startup checks, and a declared proxy triggers some of them even on a loopback
 bind. [Before you expose off-loopback](#before-you-expose-off-loopback) has them, and its step 1
@@ -371,7 +373,7 @@ are an owner act and remain **pending**.
 | **Transport encryption** (12.x) | — *enable* the shipped native API/WSS TLS + MLLP-over-TLS | already built (Gate #4) |
 | **MFA / multi-layer admin** (6.3.3 / 8.4.2) | your **directory (AD / Entra)** — healthcare orgs are now *required* to enforce MFA there. MEFOR authenticates against it, but counts its MFA only through a checked OIDC claim (see note below) | **a native second factor is built and required by default** (ADR 0002 WP-14) — RFC 6238 TOTP, `[security].require_mfa = true` with `require_mfa_scope = "every_local_account"` + the step-up gate. A WebAuthn passkey (WP-14b) is another factor, for the browser only, and it needs the optional `[webauthn]` extra. The factor reaches directory accounts too, on the rule [SECURITY.md](SECURITY.md#multi-factor-authentication-totp-wp-14) states |
 | **TLS client-cert / mTLS** (12.3.5) | your **PKI**; MF's API mTLS is built (`tls_client_ca_file`, opt-in) | enable mTLS + a console client cert |
-| **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) — **still the control for most hops**, and for a named few the engine also makes you say so | **ENFORCED on the API bind + at least nine outbound hops; delegated everywhere else.** An off-loopback in-process-TLS API bind is refused at `serve`, and **at least nine** verifying outbound TLS hops — MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb https, SMTP/EMAIL, the **PostgreSQL** store hop, the **SMART token endpoint**, the **`[logging]` TLS syslog forwarder**, the **OIDC token and JWKS legs** (those three added by [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3), the **OAuth2 client-credentials token endpoint** (BACKLOG #2112), and the **`fhir_lookup` read hop**, the **DICOM C-STORE SCU over TLS**, the **FTPS upload** and a **credentialed DIRECT relay** (BACKLOG #2193) — are refused at construction on an enforcing PHI instance, and so are the **inbound FTPS poll**, an inbound connection that dials out, and the **LDAPS AD bind** when `serve` builds the auth service (BACKLOG #2193; its CRL is `[auth].ad_tls_crl_file`), and the **`[alerts]` SMTP relay when it carries a login** and the **https alert webhook** when `serve` builds the alert notifier, and the **AI-broker endpoint** at `POST /ai/chat`, which crosses only on loopback or on its `[ai].endpoint_revocation_attested` pair (BACKLOG #2193). The API bind crosses when revocation is **proven in front** by an upstream TLS terminator, or is **attested** with `MEFOR_TLS_REVOCATION_ATTESTED=1`. **An outbound hop has no proven-in-front lever, and that env no longer clears one on an enforcing instance.** There, an outbound hop crosses on loopback, on a CRL loaded on that hop (not on a hop that sets `tls_allow_expired`, ADR 0173 §13), or, on a connection, with that connection's own `tls_revocation_attested`; the Vault hops, the alert webhook and the AI-broker endpoint take a settings pair instead, and the alert SMTP login takes `[tls].crl_file` or a settings pair (BACKLOG #2193). For the OIDC legs that CRL is `[auth].oidc_tls_crl_file`. **Other verifying hops are NOT gated and stay fully delegated** — the **SQL Server** store hop, the `dialect='sqlserver'` DATABASE destination, and the `[alerts]` SMTP relay with no login. *(Until 2026-10-30 this listed the webhook and the AI-broker endpoint, which BACKLOG #2193 has since gated.)* "Add OCSP/CRL to the TLS contexts" is **not** an available option anywhere: stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately attempts none. See [Revocation-guard behavior](#revocation-guard-behavior) |
+| **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) — **still the control for most hops**, and for a named few the engine also makes you say so | **ENFORCED on the API bind + at least nine outbound hops; delegated everywhere else.** An off-loopback in-process-TLS API bind is refused at `serve`, and **at least nine** verifying outbound TLS hops — MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb https, SMTP/EMAIL, the **PostgreSQL** store hop, the **SMART token endpoint**, the **`[logging]` TLS syslog forwarder**, the **OIDC token and JWKS legs** (those three added by [ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md) §4.3), the **OAuth2 client-credentials token endpoint** (BACKLOG #2112), and the **`fhir_lookup` read hop**, the **DICOM C-STORE SCU over TLS**, the **FTPS upload** and a **credentialed DIRECT relay** (BACKLOG #2193) — are refused at construction on an enforcing PHI instance, and so are the **inbound FTPS poll**, an inbound connection that dials out, and the **LDAPS AD bind** when `serve` builds the auth service (BACKLOG #2193; its CRL is `[auth].ad_tls_crl_file`), and the **`[alerts]` SMTP relay when it carries a login** and the **https alert webhook** when `serve` builds the alert notifier, and the **AI-broker endpoint** at `POST /ai/chat`, which crosses only on loopback or on its `[ai].endpoint_revocation_attested` pair (BACKLOG #2193). The API bind crosses only when revocation is **attested** with `MEFOR_TLS_REVOCATION_ATTESTED=1`; a declared upstream terminator no longer exempts an off-loopback bind, which runs in-process TLS on your certificate (BACKLOG #4636), and a loopback bind never reaches the gate. **An outbound hop has no proven-in-front lever, and that env no longer clears one on an enforcing instance.** There, an outbound hop crosses on loopback, on a CRL loaded on that hop (not on a hop that sets `tls_allow_expired`, ADR 0173 §13), or, on a connection, with that connection's own `tls_revocation_attested`; the Vault hops, the alert webhook and the AI-broker endpoint take a settings pair instead, and the alert SMTP login takes `[tls].crl_file` or a settings pair (BACKLOG #2193). For the OIDC legs that CRL is `[auth].oidc_tls_crl_file`. **Other verifying hops are NOT gated and stay fully delegated** — the **SQL Server** store hop, the `dialect='sqlserver'` DATABASE destination, and the `[alerts]` SMTP relay with no login. *(Until 2026-10-30 this listed the webhook and the AI-broker endpoint, which BACKLOG #2193 has since gated.)* "Add OCSP/CRL to the TLS contexts" is **not** an available option anywhere: stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately attempts none. See [Revocation-guard behavior](#revocation-guard-behavior) |
 | **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | **built** — `[logging].forward_*` ships operational logs + audit rows, both with only best-effort PHI redaction ([PHI.md §7](PHI.md#7-logging--phi-redaction)), to a syslog/SIEM collector, over **native TLS** with `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514). **Required under the shipped `enforce`**: `serve` and `supervise` refuse to start without verified TLS to a collector on another host, with `forward_tls_ca_file` and `forward_tls_crl_file` set (BACKLOG #1966); `enforcement = "warn"` only warns. A local agent on 127.0.0.1 does not satisfy it. The collector is an egress destination too: [`[egress].allowed_syslog`](CONFIGURATION.md#egress) says when an unlisted one is refused, under either enforcement value. Steps: [SERVICE.md](SERVICE.md#configure-off-box-log-forwarding-before-the-first-start) |
 
 **Write the delegation into your deployment runbook.** "We run MEFOR inside our network behind
@@ -484,8 +486,10 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    (exit 2), not an advisory, and not covered by `--allow-insecure-bind`:
    - **In-process TLS** also needs `MEFOR_TLS_REVOCATION_ATTESTED=1` — your attestation that the PKI
      behind the cert enforces revocation, because the engine performs no OCSP/CRL
-     ([ADR 0078](adr/0078-certificate-revocation-posture.md)). The alternative is to terminate at a
-     revocation-checking proxy instead (which is branch B). If you name a proxy that re-encrypts to
+     ([ADR 0078](adr/0078-certificate-revocation-posture.md)). Branch B needs it too, because off
+     loopback it is in-process TLS on your certificate (BACKLOG #4636). The one way around it is
+     a revocation-checking proxy on the same machine with the engine bound to loopback, which
+     never reaches the gate. If you name a proxy that re-encrypts to
      your certificate in `[api].trusted_proxies`, you also need `[api].proxy_tls_min_version` and
      `[security].web_console_public_address`, which the startup TLS-floor probe dials. The
      `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md#api) says when each one refuses
@@ -1086,10 +1090,13 @@ the **outbound gate only** (the listener gate reads neither the data label nor `
 refuses regardless). Item 6 is the realistic failure mode — a mis-set box, not a missing
 attestation:
 
-1. **Prove revocation in front — API gate only.** Terminate at a revocation-checking reverse proxy:
+1. **Keep the engine on loopback behind a revocation-checking proxy — API gate only.** Bind the
+   engine to loopback and terminate at a reverse proxy on the same machine:
    `[api].tls_terminated_upstream` + `[api].trusted_proxies` (+ `[api].plaintext_upstream_hop_acknowledged`,
-   see [CONFIGURATION.md](CONFIGURATION.md)), after which the engine terminates no TLS
-   itself and the listener gate never fires. **There is no outbound equivalent.** The authority has no
+   see [CONFIGURATION.md](CONFIGURATION.md)). A loopback bind never reaches the listener gate.
+   **A declared proxy in front of an off-loopback bind does not clear it** (BACKLOG #4636): there
+   the engine terminates the proxy hop's TLS on its own certificate, so the bind needs option 2's
+   attestation, as [SECURITY.md](SECURITY.md) says. **There is no outbound equivalent.** The authority has no
    input for a revocation-checking egress terminator. Routing your egress through such a proxy is good
    practice and does not change the engine's decision, so an outbound hop still needs option 2's
    per-connection attestation, option 3 or option 4.

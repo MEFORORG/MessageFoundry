@@ -356,7 +356,8 @@ the call to the Console on 2026-09-02; the Console decided ([ADR 0118](adr/0118-
 - **Compensating controls:** keep `require_encryption_for_remote = true` (TLS required); front with a
   revocation-checking reverse proxy (`[api].tls_terminated_upstream` + `trusted_proxies`); a managed admin
   host / mTLS (OFF-LOOPBACK-DEPLOYMENT.md).
-- **Still refused:** an off-box bind with no operator certificate and no declared TLS-terminating proxy.
+- **Still refused:** an off-box bind with no operator certificate, with or without a declared
+  TLS-terminating proxy (BACKLOG #4636).
   The engine's self-signed placeholder does not count. Under the default `enforce`, nothing lifts this.
   Under `[security].enforcement = warn`, `require_encryption_for_remote = false` (below) or
   `--allow-insecure-bind` lets the bind serve on the placeholder.
@@ -1413,8 +1414,10 @@ count is above `0` (vault BACKLOG #2613).
   mode (BACKLOG #1179). Off loopback it refuses the plaintext hop even with it (BACKLOG #4636;
   [SECURITY.md](SECURITY.md) states the rule).
 - **Compensating controls:** set `[api].tls_cert_file` so the engine serves that hop over TLS, and point
-  the proxy at https with that certificate trusted. Short of that, keep the proxy on the same host.
-  Isolation limits who can read the hop; it does not encrypt it.
+  the proxy at https with that certificate trusted. Off loopback that bind is in-process TLS, so it
+  also needs `MEFOR_TLS_REVOCATION_ATTESTED=1` ([SECURITY.md](SECURITY.md)). Short of that, the
+  same-host proxy that `serve` already requires is the only isolation. Isolation limits who can read the hop; it does not
+  encrypt it.
 - **Visibility:** each start with the acknowledgement honoured writes a WARNING-level startup **AUDIT**
   line, and `GET /security/posture` names it. That makes the loosening visible; it protects nothing.
 - **Reversible:** yes. Supply `[api].tls_cert_file` and restart; the acknowledgement then does nothing

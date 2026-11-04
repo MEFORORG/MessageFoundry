@@ -1024,10 +1024,8 @@ def in_process_tls_revocation_refused(
     revocation checks cover the browser's hop, not this one. The plaintext terminator the predicate
     still exempts is the loopback one, through ``not tls_enabled``: it terminates no TLS in the engine.
 
-    Pure predicate so the ``_serve`` gate stays a one-liner and is unit-testable in isolation. Returns
-    ``False`` (start unchanged, **byte-identical**) for the loopback default, a plaintext bind
-    (``not tls_enabled``) or an attested bind — ``True`` only for an otherwise unproven in-process
-    off-loopback TLS bind, a declared upstream terminator included."""
+    Pure predicate so the ``_serve`` gate stays a one-liner and is unit-testable in isolation; the
+    loopback default, a plaintext bind and an attested bind start **byte-identically**."""
     return tls_enabled and not is_loopback and not attested
 
 
