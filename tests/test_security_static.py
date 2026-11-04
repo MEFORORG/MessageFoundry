@@ -56,11 +56,11 @@ invariants can't silently regress.
   outside :data:`_XML_PARSER_MODULES`. The one *import-free* route that exists in this tree —
   ``parsing/xml/_deps.py``'s lazy loaders — is covered by its own clause
   (:data:`_XML_DEPS_CONSUMERS`) rather than left to the module-name matcher. Separately,
-  ``transports/soap.py`` triages SOAP faults over the XML response body with regexes and
-  ``str.find``: ``_FAULT_RE`` finds the fault, ``_FAULTCODE_RE``/``_CODEVALUE_RE`` match only the
-  code's start-tag name, and ``_code_text`` takes the code's text. That is an ad-hoc same-type
-  extraction, deliberately out of the clause's scope, because it drives only retry-vs-dead-letter
-  classification, never a security decision.
+  ``transports/soap.py`` triages SOAP faults with regexes and ``str.find`` over the XML response
+  body. Its fault-code patterns, ``_FAULTCODE_RE``/``_CODEVALUE_RE``, match only a ``faultcode`` or
+  ``Value`` start tag's name, and ``_code_text`` takes the text after it. That is an ad-hoc
+  same-type extraction, deliberately out of the clause's scope, because it drives only
+  retry-vs-dead-letter classification, never a security decision.
 """
 
 from __future__ import annotations

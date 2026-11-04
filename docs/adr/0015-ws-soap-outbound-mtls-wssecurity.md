@@ -139,8 +139,11 @@ is a new message envelope), not a purity violation. (The idempotency footgun thi
 This is **load-bearing** because the codebase is **regex-only and imports no XML parser** today: response
 faults are detected by regex (`_FAULT_RE`, [`soap.py`](../../messagefoundry/transports/soap.py)). The
 fault code is found without a parser too: `_FAULTCODE_RE` / `_CODEVALUE_RE` match only its start tag's
-name, and `_code_text` takes the text after that tag with `str.find`. *(Corrected 2026-11-04: until
-BACKLOG #2827 made the scan linear, the two patterns captured the code text themselves.)* There is no
+name, and `_code_text` takes the text after that tag with `str.find`. *(Corrected 2026-11-04, for
+the fault-code sentence only: until BACKLOG #2827 made the scan linear, the two patterns captured the
+code text themselves. The rest of this section is as accepted and was not re-read then. The engine
+has since gained XML parser imports, at least in `parsing/` and `api/svg_sanitize.py`;
+`tests/test_security_static.py` keeps their clauses.)* There is no
 `xml.etree` / `ElementTree` / `lxml` / `defusedxml` import anywhere under `messagefoundry/`. We keep
 that posture:
 
