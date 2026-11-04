@@ -35,7 +35,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, ClassVar, Protocol, runtime_checkable
+from typing import Any, ClassVar, Final, Protocol, runtime_checkable
 
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
@@ -59,6 +59,7 @@ __all__ = [
     "CONNECTION_EVENT_KINDS",
     "ConnectionEventSink",
     "IntakeAuditSink",
+    "INTAKE_AUDIT_ACTIONS",
     "IntakeRateLimiter",
     "IntakeGate",
     "intake_open",
@@ -460,6 +461,19 @@ ConnectionEventSink = Callable[[str, str | None, str | None], Awaitable[None]]
 # ``detail`` carries the mode and the outcome only.
 IntakeAuditSink = Callable[[str, str | None, str | None], Awaitable[None]]
 
+#: ``connection_event`` kind -> ``audit_log`` action for an intake refusal (ADR 0154 D6), the one
+#: map both listeners that refuse a peer at intake read: the HTTP listener for ``intake_auth``, and
+#: the MLLP listener for ``tls_client_subjects`` (BACKLOG #4907), whose refused sender is audited
+#: under the same actions as HTTP's ``mtls_subject``. The kinds double as the ``connection_event``
+#: vocabulary, which CI derives from the literal emit call sites and asserts against
+#: ``docs/PHI.md`` section 7 and ``CONNECTION_EVENT_KINDS`` as an exact set, so a kind added here
+#: without those two is a build failure, by design.
+INTAKE_AUDIT_ACTIONS: Final[Mapping[str, str]] = {
+    "intake_auth_failed": "intake.auth_failed",
+    "auth_subject_denied": "intake.auth_subject_denied",
+    "auth_rate_limited": "intake.auth_rate_limited",
+}
+
 
 class IntakeRateLimiter(Protocol):
     """The failed-attempt budget an intake-authenticating source consults (ADR 0154 D6).
@@ -468,7 +482,8 @@ class IntakeRateLimiter(Protocol):
     and synchronous is honest: the underlying sliding window completes without awaiting, so it is
     atomic on the event loop.
 
-    The three methods exist separately because the budget is charged on **failure only**. Consulting
+    Consulting, charging and noting are separate methods because the budget is charged on **failure
+    only**; :meth:`check_peer` is a narrower read of the same budget. Consulting
     and charging in one call — which is what the shipped ``allow()`` does — would turn a
     brute-force bound into a per-peer throughput cap, silently refusing an authenticated partner's
     traffic pre-ingress, where it is not even counted.
@@ -476,6 +491,17 @@ class IntakeRateLimiter(Protocol):
 
     def check(self, peer: str) -> bool:
         """Whether ``peer`` may make another attempt. **Read-only** — never records one."""
+        ...
+
+    def check_peer(self, peer: str) -> bool:
+        """Whether ``peer``'s OWN per-address budget admits another attempt, the global arm unread.
+        **Read-only**, as :meth:`check` is.
+
+        For a source that can tell a listed peer apart before anything is read, as MLLP's
+        ``tls_client_subjects`` can (BACKLOG #4907): it consults this before the compare and the
+        global arm only once the compare has refused, so refusals from other addresses can never
+        close a listed sender unread.
+        """
         ...
 
     def charge_failure(self, peer: str) -> None:
@@ -1534,6 +1560,16 @@ class SourceConnector(abc.ABC):
     #: so a direct caller or test that never sets it is byte-identical. At least the listeners, the
     #: poll sources and the timer consult it. The loopback and pass-through sources read nothing.
     intake_gate: IntakeGate | None = None
+
+    #: Optional refusal for a message from a sender whose verified certificate is not on its
+    #: inbound's certificate-subject allowlist (BACKLOG #4907), **injected by the runner after
+    #: build**, the same runtime-injection shape as :attr:`on_connection_event`. The runner
+    #: records the message as an ``ERROR`` row, then returns the ``AR`` reply where the inbound
+    #: answers in HL7, else ``None``, so a refused message is counted and logged rather than
+    #: accepted and dropped. Only the MLLP listener's ``tls_client_subjects`` calls it so far.
+    #: ``None`` (a direct build) means nothing can record such a message, and a listener that
+    #: refuses a sender then reads none of its messages.
+    refuse_unlisted_sender: InboundHandler | None = None
 
     @abc.abstractmethod
     async def start(

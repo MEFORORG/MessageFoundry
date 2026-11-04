@@ -381,6 +381,7 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 | `tls_key_file` | both | — | private key for `tls_cert_file`. |
 | `tls_ca_file` | both | — | trust anchor — **in:** verify client certs (opt-in mTLS → require a client cert); **out:** verify the server cert. |
 | `tls_ca_pin` | both | - | the SHA-256 of `tls_ca_file`; the syntax is *Trust-anchor pin syntax* in [CONFIGURATION.md](CONFIGURATION.md#api). Pins the CA's integrity (BACKLOG #1142): a pin that does not match always refuses. Under `[security].enforcement = enforce` the engine also refuses a CA another account can replace, or one whose permissions or path it cannot read; a matching pin lets the second kind load, with a warning and an `auth.trust_anchor` row. Each check writes its rows under `inbound:<connection name>`. An outbound connection's CA takes the same checks at start and at every reload, under `outbound:<connection name>`, and there a matching pin is no escape: see [The engine checks the file at every start and reload](#the-engine-checks-the-file-at-every-start-and-reload-tls_ca_pin) (vault BACKLOG #2371). It pins `tls_ca_file` only. A `tls_crl_file` is read by path with no pin, and a certificate in it that `tls_ca_file` does not already hold refuses the build (BACKLOG #1890). Set without `tls` and `tls_ca_file`, it is refused, since nothing would check it. Set but empty or whitespace, it is refused too; leave it out for no pin. |
+| `tls_client_subjects` | in | - (off) | the senders this listener expects (BACKLOG #4907): a table whose keys are issuing-CA DNs and whose values are lists of **qualified** names, `"SAN:DNS:feed.partner.example"` / `"CN:feed.partner.example"`. `tls_ca_file` alone admits any certificate its CAs ever signed; with this set, a verified certificate with no listed name under the loaded CA that signed it is refused. Needs `tls` and `tls_ca_file`. Unset, the listener behaves as it did without it. [Expected senders](#expected-senders-tls_client_subjects) below says which names count, how they match, and what a refused sender gets. |
 | `tls_verify` | out | `true` | verify the server's certificate. `false` is MITM-able and is **refused at construction**. `MEFOR_ALLOW_INSECURE_TLS=1` downgrades that refusal to a loud warning **only where the clamp allows it** (#200, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) decision 2): the escape is inert on an instance that is **both** PHI-classified **and** at `[security].enforcement = enforce`. That is the shipped default, so **on a stock instance the refusal stands with the variable set** — treat the env var as a lab tool, not a deployment option. Nothing else opens this hop: `cleartext_accepted` deliberately does **not** reach a verify-off hop (it has TLS — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted)), and the MLLP verify-off refusal does not read [`tls_hop_attested`](#attesting-a-hop-secure-tls_hop_attested) either. If the partner's certificate has merely lapsed, `tls_allow_expired` below is the narrower lever — read that row before reaching for it. |
 | `tls_check_hostname` | out | `true` | require the server cert to match `host` (SNI + hostname check). `false` keeps the chain check and accepts any certificate from the trust anchor, whatever host it names. It is a [reported loosening](SECURITY-LOOSENING.md): a WARNING at each build, a `tls-check-hostname` line in `messagefoundry check`, and a `security_loosenings()` entry (ASVS 12.3.2). |
 | `tls_allow_expired` | out | `false` | **(#129, ADR 0094)** honour a partner **server cert whose validity period has lapsed** (`notAfter` past) while STILL validating the chain's signatures and key usage, and the hostname too unless `tls_check_hostname = false`. It is not the leaf's validity period alone: at least the validity periods of the intermediates and the trust anchor, and a CRL's own validity window, go unchecked too (CORRECTED 2026-11-03: this said the chain was still validated, unqualified). It is the **granular** alternative to `tls_verify=false` for the narrow expired-cert case. It is genuinely narrower (a wrong-host or untrusted-chain peer is still rejected), but do not book it as "not MITM-able": **expiry is the control that retires a certificate**, so a hop that ignores it will keep authenticating a **compromised key indefinitely** — and on a verifying hop with no revocation gate nothing else would catch that certificate either (CORRECTED 2026-10-28: this named DICOM-SCU and FTPS as such hops; BACKLOG #2193 has since gated both). It takes one lever away from the revocation gate: on every connector this row names as taking it, a `[tls].crl_file` cannot admit a hop that sets it, so off-box on an enforcing instance only `tls_revocation_attested` with its reason crosses (ADR 0173 §13). **No posture gate covers this setting itself.** It needs no `MEFOR_ALLOW_INSECURE_TLS`; `[security].enforcement = enforce` does not clamp it; verification stays on, so no #200 cleartext/verify-off refusal keys on it. It **is reported**, by the WARNING logged at each connector build, a `tls-allow-expired` line in `messagefoundry check` and a `security_loosenings()` entry, and so `GET /security/posture`; the serve-time loosening warning fires before the graph loads and cannot name it. CORRECTED 2026-10-01: this row said it was absent from `security_loosenings()` and from `check`, which stopped being true under BACKLOG #333. Nothing expires a "two-week bridge" set when a partner's cert lapses, so record the connection name and a removal date in your own risk register. Relaxes both validity bounds (a not-yet-valid cert is also accepted). `false` (default) = **byte-identical** (an expired cert is rejected as before). It is a factory parameter on **six** outbound connectors — **MLLP, FTPS (`Ftp(tls=True)`), DICOM C-STORE SCU, REST, SOAP, FHIR** — and on the `Ftp(tls=True)` inbound poller, which dials out through the same FTPS context (CORRECTED 2026-10-01: this said "six outbound connectors only"), and is **not** honoured by the engine's other verifying TLS hops, including **`DICOMweb()`** (which reuses the REST client but does not read it), the `Database(...)` destination / `DatabasePoll(...)` source, and the `Email()`/`Direct()` SMTP TLS legs. |
@@ -408,6 +409,142 @@ simulated lane shows as `simulated` on `GET /connections` and `[SIMULATED]` in t
 > gates. Loopback test rigs
 > may stay plaintext. On the **outbound** side, `tls=true` is subject to the revocation gate described at
 > the top of this section.
+
+#### Expected senders (`tls_client_subjects`)
+
+An MLLP listener with `tls_ca_file` verifies each client certificate's chain, and nothing more: any
+certificate its CAs ever signed is admitted as any sender. `tls_client_subjects` binds each expected
+sender to a name under the CA that issued it (BACKLOG #4907, the first slice of the expected-sender
+assertion). It takes the same table as the HTTP listener's `intake_client_subjects`, and the same
+matcher reads both:
+
+```toml
+[[inbound]]
+name = "IB_ACME_ADT"
+transport = "mllp"
+router = "acme_router"
+  [inbound.settings]
+  port = 2575
+  tls = true
+  tls_cert_file = "C:/certs/engine.pem"
+  tls_key_file = "C:/certs/engine.key"
+  tls_ca_file = "C:/certs/acme-ca.pem"
+  [inbound.settings.tls_client_subjects]
+  'CN=Acme Partner CA,O=Acme' = ["SAN:DNS:adt-feed.acme.example"]
+```
+
+In code: `MLLP(port=2575, tls=True, ..., tls_client_subjects={"CN=Acme Partner CA,O=Acme":
+["SAN:DNS:adt-feed.acme.example"]})`.
+
+**Which certificate field counts.** The operator names it, in the entry. `SAN:<type>:<value>`
+matches a subjectAltName entry of that type, such as `SAN:DNS:...` or `SAN:URI:...`, and `CN:<value>`
+matches a commonName in the subject. Prefer a SAN entry where the partner's certificate carries one;
+`CN:` is the defined fallback for a certificate that carries none. The two never stand in for each
+other: a `CN:` entry does not match a SAN with the same text, so a commonName cannot pass as a pinned
+SAN. The rest of the subject DN is not read, so an entry cannot name an `O=` or `OU=`. A name in any
+other form is refused at build, since it could never match. So is a SAN type spelled other than as
+Python's `ssl` spells it: `DNS`, `email`, `URI`, `IP Address`, `Registered ID`, `DirName` and
+`othername`, so `SAN:IP:...` and `SAN:dns:...` are refused with the right spelling named. An
+`IP Address` value is written as `ssl` writes it: IPv4 dotted, and IPv6 as eight upper-case hex
+groups with no leading zeros and no `::`, such as `2001:DB8:0:0:0:0:0:1`. A `DirName` value is the
+Python tuple `ssl` reports, such as `((('commonName', 'feed.example'),),)`, and an `othername` value
+carries its form first, such as `UPN:feed@partner.example`; either in another form is refused.
+
+**A placeholder is not a name.** For a SAN it cannot render, `ssl` reports fixed text instead:
+at least `othername:<unsupported>` for an otherName of a type OpenSSL does not print,
+`X400Name:<unsupported>` and `EdiPartyName:<unsupported>` whatever those names hold,
+`IP Address:<invalid>` for a malformed address, and, by CPython's source, `Registered ID:<INVALID>`
+in upper case. A placeholder is recognized in any case. Every certificate carrying such a name
+presents the same text, so one such entry would admit all of them under that CA. The same holds
+for a name `ssl` may have cut short: it reads an `othername` or `Registered ID` as one printed line
+of at most 2046 bytes, stopping after a newline, so such a value can be the first part of many
+names. An entry
+holding either is refused at build, and the matcher never reads either from a certificate, so it
+matches nothing even on a listener built some other way. That matcher is shared, so the operator
+API's `tls_client_cert_identities` and the HTTP listener's `intake_client_subjects` skip a
+placeholder too; neither of those settings refuses one at build.
+
+**An `othername` holding a NUL is never matched.** `ssl` reports an otherName as the text OpenSSL
+prints for it, and that text stops at the value's first NUL byte: a UPN
+`victim@partner.example<NUL>evil` is reported as `UPN:victim@partner.example`, which is the whole of
+a different name. So the listener reads the certificate's own DER after the handshake, and when any
+otherName value in it holds a zero byte, or cannot be read, none of that certificate's `othername`
+names is matched; its other names still are. A zero byte inside a value `ssl` reports only as
+`<unsupported>` counts too, which can only refuse. A `tls_client_subjects` entry holding a NUL is
+refused at build. The operator API and the HTTP listener read the DER the same way for the shared
+matcher (BACKLOG #4907), so neither matches such an `othername` either.
+
+**How it matches.** Exactly, character for character, as Python's `ssl` module reports the name: no
+case folding, no wildcards, no prefix or suffix match. A DNS name in a different case does not match,
+so write the name as the certificate carries it. A certificate is admitted when any one of its names
+is listed.
+
+**Bound to the issuing CA.** Each key is the DN of a CA loaded from `tls_ca_file`, written as
+`cryptography`'s `Name.rfc4514_string()` renders that CA's subject. A name counts only under the
+loaded CA whose key signed the leaf, found by signature and never by the leaf's issuer field alone,
+so a second CA in `tls_ca_file` that issues a listed name is refused. A leaf signed by an
+intermediate the client sends counts only when that intermediate is itself loaded in `tls_ca_file`.
+At start the listener warns about a key naming no loaded CA, or naming two with one subject and
+different keys; no sender is admitted under such a key. The HTTP listener's `intake_client_subjects`
+row above says the same, at more length.
+
+**What a refused sender gets.** The connection completes its TLS handshake, then the listener reads
+from the sender and hands each message that read completed to the engine's refusal, which records
+it as an `ERROR` row before any reply is built. So each message read is counted and logged, never
+accepted and dropped.
+
+- On an HL7 v2 inbound with acknowledgements on, the sender then gets an `AR` (`CR` in enhanced
+  mode) whose MSA-3 reads `sender not permitted`, and the connection closes. `AR`, not `AE`, because
+  the same sender is refused the same way on every resend.
+- On an inbound that is not HL7 v2, or whose `ack_mode` is `none`, there is no HL7 reply to give.
+  The message is recorded the same way, then the connection closes with nothing written; the close
+  is that feed's refusal.
+- If the `ERROR` row cannot be written, no `AR` is sent. On an inbound that replies in HL7 the
+  sender gets the listener's `AE`, the one any inbound-handler fault gets, so it resends. On any
+  other inbound nothing is sent and the connection closes; that message is then recorded only by a
+  `handler_error` connection event and an ERROR log line, not as a row, which is the gap the
+  `SourceConnector` docstring names for a sender that waits for no reply.
+
+The connection closes after the first read that completes a message, which can include a message
+begun in earlier reads, up to `max_frame_bytes`, because the certificate cannot change within the
+session, and the listener refuses a TLS renegotiation, so a TLS 1.2 client cannot present another
+certificate after the check; anything the sender has not yet had read stays with it.
+
+**Held to the HTTP listener's posture.** The refusal is the decision the HTTP listener's
+`intake_auth = "mtls_subject"` makes, and it is charged, audited and evented the same way:
+
+- Each refusal writes an `audit_log` row `intake.auth_subject_denied` and an `auth_subject_denied`
+  connection event, as the HTTP listener does. The row's detail is `mode=tls_client_subjects`; the
+  row and the event name the connection and peer address, never a certificate field.
+- Each refusal is charged one failed attempt against the peer's address, under the HTTP listener's
+  failed-attempt budget at the `Http()` defaults: 10 per address per minute, and 60 per minute
+  across all addresses. This listener has no setting to change or turn off those figures. An
+  address that has spent its own budget is closed unread once its handshake completes, before its
+  certificate is compared, whatever certificate it now presents, as the HTTP listener answers it
+  `429`; a listed sender behind that address is closed too while its budget is spent. The
+  60-per-minute arm is read only once the compare has refused a sender, since it bounds refusals
+  and a listed sender makes none: an unlisted sender is closed unread while that arm is spent, and
+  a listed sender is never closed by it, however many refusals other addresses have made. A close
+  on either arm is written as an `intake.auth_rate_limited` audit row and an `auth_rate_limited`
+  connection event, and leaves no message row, since nothing was read. The count is in process,
+  so each engine shard keeps its own.
+- What each arm bounds is refusals: the per-address arm those from one address, the global arm
+  those from every address, and with each refusal its `ERROR` rows, its
+  `intake.auth_subject_denied` row and its event. Neither arm bounds the closes on a spent budget.
+  Each such close still writes its `intake.auth_rate_limited` row and its event, and only its
+  WARNING line is throttled, so a peer that keeps reconnecting on a spent budget would drive one
+  audit write per completed handshake.
+
+The stored reason, the `AR`'s text and the WARNING log line are fixed text naming no certificate
+field, since a subject can name a person; the log line gives the connection name and peer address,
+at most once per address per minute, with a running count. The body is stored under the inbound's
+refused-body allowance, like every other refusal. A refused connection gets no `established` /
+`closed` pair; an event for another cause on that connection, such as `frame_oversize` or
+`handler_error`, is still written as on any connection.
+
+**What this does not cover yet.** The other listeners, and any further per-inbound form of the
+expected-sender assertion, are still open on BACKLOG #4907. The HTTP listener's own allowlist is
+`intake_client_subjects`.
 
 **Operability (optional, validated at wiring time — caught in dry-run / `messagefoundry check`):**
 `metadata` — a free-form table of operator labels (owner / runbook / environment) on **either**

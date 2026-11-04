@@ -96,6 +96,8 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
 )
 from messagefoundry.config.wiring import (
+    INTAKE_AUTH_RATE_LIMIT_DEFAULT,
+    INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,
     FhirLookupSpec,
     InboundConnection,
     OutboundConnection,
@@ -164,6 +166,7 @@ from messagefoundry.pipeline.ingress_guards import (
     check_declared_type,
     check_decoded,
     decode_body,
+    ingress_encoding,
     peek_max_bytes,
     reingress_size_error,
     streaming_over_threshold,
@@ -242,6 +245,7 @@ from messagefoundry.transports.admission import RefusalLog
 from messagefoundry.transports.base import (
     ENCODING_CODE,
     ConnectionEventSink,
+    InboundHandler,
     IntakeAuditSink,
     IntakeGate,
     IntakeRateLimiter,
@@ -349,6 +353,9 @@ class _IntakeRateLimiter:
         if self._global is None or self._authenticated_recently(peer):
             return True
         return self._global.would_allow(peer)
+
+    def check_peer(self, peer: str) -> bool:
+        return self._per_peer.would_allow(peer)
 
     def charge_failure(self, peer: str) -> None:
         self._per_peer.allow(peer)
@@ -1056,6 +1063,34 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     DocRefError,
     EscapedDocumentError,
 )
+
+#: BACKLOG #4907: the stored reason, and the MSA-3 text, for a message from a sender whose verified
+#: certificate is not on its inbound's allowlist. Fixed strings, because a certificate subject can
+#: name a person and neither the row nor the reply may carry one.
+_UNLISTED_SENDER_ERROR = (
+    "sender refused: its verified certificate is not on this inbound's certificate-subject "
+    "allowlist under its issuing CA"
+)
+_UNLISTED_SENDER_NAK_TEXT = "sender not permitted"
+#: How far into a refused body the AR's header echo looks for the end of MSH, so a large refused
+#: body is never parsed whole to echo it. The MLLP listener's handler-fault NAK bounds its own scan
+#: separately, at a larger figure; an MSH longer than this is echoed from its first part only.
+_UNLISTED_SENDER_HEADER_SCAN_BYTES = 4096
+
+
+def _header_segment(raw: bytes, encoding: str) -> str:
+    """The first segment of a refused body, decoded in the inbound's charset, for the AR's echo.
+
+    Bounded and lenient: nothing past the first segment break is read, and a segment that does not
+    decode strictly gives ``""``, so ``build_ack`` falls back to its own header defaults. Strict, not
+    ``errors="replace"``: a U+FFFD echoed into the AR would not re-encode under a charset such as
+    ``ascii``, and the reply would then fail to frame after the row was written."""
+    prefix = raw[:_UNLISTED_SENDER_HEADER_SCAN_BYTES].lstrip()
+    breaks = [i for i in (prefix.find(b"\r"), prefix.find(b"\n")) if i >= 0]
+    try:
+        return prefix[: min(breaks, default=len(prefix))].decode(encoding)
+    except (LookupError, UnicodeDecodeError):
+        return ""
 
 
 def _detach_refusal_kind(exc: Exception) -> RefusalKind:
@@ -2291,6 +2326,13 @@ class RegistryRunner:
             and str(ic.spec.settings.get("intake_auth") or "none") != "none"
         )
 
+    def _sender_allowlist_enabled(self, ic: InboundConnection) -> bool:
+        # BACKLOG #4907: the MLLP listener's tls_client_subjects refuses a peer at intake on the
+        # same decision as HTTP's mtls_subject, so it gets the same audit sink and budget.
+        return ic.spec.type is ConnectorType.MLLP and bool(
+            ic.spec.settings.get("tls_client_subjects")
+        )
+
     def _make_intake_audit_sink(self, ic: InboundConnection) -> IntakeAuditSink | None:
         """The per-inbound tamper-evident audit sink for intake-auth refusals (ADR 0154 D6).
 
@@ -2302,7 +2344,7 @@ class RegistryRunner:
         This is the engine's first internal writer of ``record_audit(client=)`` (ADR 0150), and the
         column's "NULL means no client was in scope" docstring is exactly why: here one demonstrably is.
         """
-        if not self._intake_auth_enabled(ic):
+        if not (self._intake_auth_enabled(ic) or self._sender_allowlist_enabled(ic)):
             return None
         # The runner holds its store as the narrower QueueStore; record_audit lives on AuditStore
         # (Store = QueueStore + AuditStore + AuthStore), which all three shipped backends implement.
@@ -2372,7 +2414,14 @@ class RegistryRunner:
         return dict(self._sync_reply_metrics)
 
     def _make_intake_rate_limiter(self, ic: InboundConnection) -> IntakeRateLimiter | None:
-        """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled."""
+        """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled.
+
+        An MLLP inbound with ``tls_client_subjects`` (BACKLOG #4907) has no budget settings of its
+        own and gets the ``Http()`` factory's defaults."""
+        if self._sender_allowlist_enabled(ic):
+            return _IntakeRateLimiter(
+                per_peer=INTAKE_AUTH_RATE_LIMIT_DEFAULT, glob=INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT
+            )
         if not self._intake_auth_enabled(ic):
             return None
         per_peer = int(ic.spec.settings.get("intake_auth_rate_limit") or 0)
@@ -5037,7 +5086,8 @@ class RegistryRunner:
         # drops only, so a legitimate X12/DICOM/binary drop is not wrongly rejected.
         source.content_type = ic.content_type
         # Inject the intake-auth seams (ADR 0154 D6) the same runtime way. Both are None unless this
-        # inbound actually authenticates, so every other connection stays byte-identical. The audit
+        # inbound actually authenticates, or is an MLLP inbound with tls_client_subjects (BACKLOG
+        # #4907), so every other connection stays byte-identical. The audit
         # sink keeps transports/ store-free; the limiter is a SYNCHRONOUS predicate, so transports/
         # gains no auth/ edge either — pipeline/ owns both, which is the only layer allowed to.
         source.on_intake_audit = self._make_intake_audit_sink(ic)
@@ -5059,6 +5109,13 @@ class RegistryRunner:
         # measurement. A source consults it BEFORE it reads: a listener before its next socket read,
         # the DICOM SCP before it accepts a new association, a poll source or timer at its tick.
         source.intake_gate = self._intake_gate
+        # BACKLOG #4907: the refusal a listener hands a message from a sender whose verified
+        # certificate is not on its allowlist, injected the same runtime way. None unless this
+        # inbound keeps one, like the intake-auth seams above, so every other inbound is
+        # byte-identical.
+        source.refuse_unlisted_sender = (
+            self._make_unlisted_sender_refusal(ic) if self._sender_allowlist_enabled(ic) else None
+        )
         # Vault BACKLOG #2608: a poll source's refusals are stored whole, never as a head, because the
         # file it deletes or the row it marks was the only copy. Keyed on the transport's own declared
         # contract, not on a connector type (CLAUDE.md section 4).
@@ -8026,6 +8083,59 @@ class RegistryRunner:
             return await self._handle_inbound(ic, raw)
 
         return on_message
+
+    def _make_unlisted_sender_refusal(self, ic: InboundConnection) -> InboundHandler:
+        # BACKLOG #4907: the source's `refuse_unlisted_sender` seam, bound to this inbound.
+        async def refuse(raw: bytes) -> str | None:
+            return await self._refuse_unlisted_sender(ic, raw)
+
+        return refuse
+
+    async def _refuse_unlisted_sender(self, ic: InboundConnection, raw: bytes) -> str | None:
+        """Record a message from a sender outside the inbound's certificate-subject allowlist as
+        ``ERROR``, then return the ``AR`` reply, or ``None`` where the inbound sends none (BACKLOG
+        #4907).
+
+        The order is the one #2607's closing step 5 set: the row is committed before the reply is
+        built, so the message is counted and logged, never accepted and dropped. ``AR``, not ``AE``,
+        because the same sender is refused the same way on every resend; the engine's own MLLP
+        destination dead-letters an ``AR`` at once. Nothing from the certificate reaches the row, the
+        reply or the log: the reason and the MSA-3 text are fixed, because a subject can name a
+        person. The body is kept under the refused-body allowance, as every other refusal's is.
+
+        On an inbound that is not HL7 v2, or whose acknowledgements are off, there is no HL7 reply
+        to give, so this returns ``None`` and the listener closes the connection with no reply; the
+        close, with nothing written, is that feed's refusal. The body is stored as received, before
+        any decode, and the message is never routed. On an HL7 v2 inbound that replies, only its
+        first segment is then decoded, in the inbound's charset and bounded to the first
+        ``_UNLISTED_SENDER_HEADER_SCAN_BYTES``, and parsed by ``build_ack`` for the ``AR``'s header
+        echo; nothing past that segment is decoded or parsed."""
+        hl7v2 = ic.content_type is ContentType.HL7V2
+        mid = await self._record_refused(
+            ic,
+            raw,
+            None,
+            error=_UNLISTED_SENDER_ERROR,
+            message_type=None if hl7v2 else ic.content_type.value,
+        )
+        if not hl7v2 or ic.ack_mode is AckMode.NONE:
+            return None
+        ack = build_ack(
+            _header_segment(raw, ingress_encoding(ic)),
+            code="AR",
+            text=_UNLISTED_SENDER_NAK_TEXT,
+            ack_mode=ic.ack_mode,
+        )
+        if self._capture_ack_enabled(ic):
+            await self._capture_ack(
+                mid,
+                ic.name,
+                ack_code="AR",
+                ack_phase="ingest",
+                ack_body=None,
+                detail=_UNLISTED_SENDER_ERROR,
+            )
+        return ack
 
     def _make_http_handler(self, ic: InboundConnection):  # type: ignore[no-untyped-def]
         # The HTTP listen source (ADR 0023) needs the engine message_id back so its 202 respond-with-
