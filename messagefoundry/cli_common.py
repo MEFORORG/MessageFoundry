@@ -128,8 +128,9 @@ def run_cli(
     #     `serve` already behaves this way. The fix for an operator is a named logger, not basicConfig.
     # The audit tee's INFO records reached stderr through `ensure_logger_sink` (#1199) before this;
     # that now finds this handler and adds no second one. The exempt subcommands are named at
-    # `_CONFIGURES_OWN_LOGGING` in `__main__.py`; what covers the window before their own handlers
-    # is stated once, in the docstring of `logging_setup.install_filtered_last_resort`.
+    # `_CONFIGURES_OWN_LOGGING` in `__main__.py`. Their window before their own handlers is not
+    # covered here: every caller's `main()` calls `logging_setup.install_filtered_last_resort`
+    # first, before it parses (BACKLOG #3768), and a new caller must too. Its docstring says why.
     #
     # Only when the root has NO handler yet, which is the state a `python -m messagefoundry` process
     # starts in. A caller that configured logging before calling main() owns its own handlers, and

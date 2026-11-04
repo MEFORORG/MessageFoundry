@@ -4196,10 +4196,11 @@ def _run_warning_driver(
     returncode: int,
     handlers_line: str,
     leaks: bool = False,
+    module: str = "messagefoundry.__main__",
 ) -> None:
-    """Run ``body`` in a child after ``import logging`` and the CLI module, then assert it reached
-    main() with no root handler, printed ``handlers_line``, and logged the probe once, redacted, or
-    whole where ``leaks`` says the child took the filter out (a control).
+    """Run ``body`` in a child after ``import logging`` and the CLI ``module``, as ``m``, then
+    assert it reached main() with no root handler, printed ``handlers_line``, and logged the probe
+    once, redacted, or whole where ``leaks`` says the child took the filter out (a control).
     ``body`` prints ``handlers_line`` itself, at the moment it means to measure."""
     import subprocess
     import sys
@@ -4207,7 +4208,7 @@ def _run_warning_driver(
     driver = tmp_path / name
     driver.write_text(
         "import logging\n"
-        "import messagefoundry.__main__ as m\n"
+        f"import {module} as m\n"
         "print('handlers-before-main', len(logging.getLogger().handlers), flush=True)\n" + body,
         encoding="utf-8",
     )

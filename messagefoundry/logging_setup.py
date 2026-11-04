@@ -2173,29 +2173,27 @@ class _FilteredLastResort(logging.StreamHandler[TextIO]):
 
 def install_filtered_last_resort() -> logging.Handler | None:
     """Replace ``logging.lastResort`` with one carrying the PHI filter chain, and return it (BACKLOG
-    #3768). Where it is already the filtered one, return that and build nothing. Return None, and
-    change nothing, where the root logger already has a handler or ``lastResort`` is neither the
-    filtered one nor the standard library's own.
+    #3768). Checked in this order: where the root logger already has a handler, return None and
+    change nothing, even when ``lastResort`` is already the filtered one; where ``lastResort`` is
+    already the filtered one, return it and build nothing; where it is neither that nor the
+    standard library's own, return None and change nothing.
 
     The standard library hands a record to ``logging.lastResort`` when no handler took it: no
     handler on the logger or any ancestor it propagates to. That handler prints ``WARNING`` and
-    above to stderr with no filter, and under NSSM that stderr is ``service.err.log``.
-    ``__main__.main`` calls this before it parses the arguments, for every subcommand. ``serve``
-    and ``supervise`` are why: each calls :func:`configure_logging` only part-way through
-    (``__main__._serve``, ``__main__._supervise``), and until then its root has no handler.
-    Records keep the level gate, the stream and the rule for when they arrive; each is now
-    redacted and scrubbed, and carries the text formatter's prefix. A record a handler took never
-    reaches it, so nothing is written twice.
-
-    Left in place for the life of the process, it still takes a record no handler takes after
-    :func:`configure_logging` has run, such as one from a logger that does not propagate and has
-    no handler, and prints it to stderr only, in the text format.
+    above to stderr with no filter, and under NSSM that stderr is ``service.err.log``. The
+    ``main()`` of each command that runs :func:`messagefoundry.cli_common.run_cli`, which is
+    ``messagefoundry`` and ``messagefoundry-toolkit``, calls this first, before it parses the
+    arguments. ``serve`` and ``supervise`` are why: each calls :func:`configure_logging` only
+    part-way through (``__main__._serve``, ``__main__._supervise``), and until then its root has
+    no handler. Records keep the level gate and the rule for when they arrive, and each is now
+    redacted and scrubbed. A record a handler took never reaches it, so nothing is written twice.
+    It is left in place for the life of the process.
 
     **Only on an empty root and the stdlib's own** ``lastResort``, as ``run_cli``'s sink: the
     choice is process-wide, and a host that configured logging first, such as an embedding host
     or pytest's capture, or that set ``lastResort`` itself, even to None, owns it. What this
-    leaves unfiltered, the module-import window first, is stated once, in ``docs/PHI.md``
-    section 7 row 1."""
+    leaves unfiltered, and where and how what it takes is written, is stated once, in
+    ``docs/PHI.md`` section 7 row 1."""
     if logging.getLogger().handlers:
         return None
     if not isinstance(logging.lastResort, _FilteredLastResort):
