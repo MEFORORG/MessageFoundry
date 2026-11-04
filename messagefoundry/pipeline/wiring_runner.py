@@ -947,6 +947,21 @@ class _AttachmentWriteFailed(Exception):
 _ATTACHMENT_CONTENT_TYPE_MAX = 256
 
 
+def _label_fits_every_backend(label: str) -> bool:
+    """Whether every backend's ``attachment.content_type`` takes ``label`` (BACKLOG #1619): no NUL,
+    which PostgreSQL ``TEXT`` refuses (an HL7 ``\\X00\\`` escape decodes to one), encodable as
+    UTF-8, and no wider than :data:`_ATTACHMENT_CONTENT_TYPE_MAX`. A label failing any of these
+    would fail the write on every resend. The length test comes first, so a long sender-controlled
+    label is never copied to be measured."""
+    if "\x00" in label or len(label) > _ATTACHMENT_CONTENT_TYPE_MAX:
+        return False
+    try:
+        label.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return utf16_units(label) <= _ATTACHMENT_CONTENT_TYPE_MAX
+
+
 def _attachment_body_fault(exc: BaseException) -> str | None:
     """A content-free name for a ``put_attachment`` fault that lies in the document it was handed,
     or ``None`` for any other fault, which the detach then lets propagate (BACKLOG #1619).
@@ -8318,16 +8333,11 @@ class RegistryRunner:
                 # family (image/pdf/zip/xml/json) whose magic bytes the document contradicts, store the
                 # generic octet-stream so the download route can never serve a mislabelled active-content
                 # payload as its claimed inert type. Non-sniffable labels are kept as declared.
-                # A label some backend's column cannot hold is downgraded the same way: one longer
-                # than the narrowest column, or one holding a NUL (an HL7 \X00\ escape decodes to
-                # one), which PostgreSQL TEXT refuses. Either would fail every resend (BACKLOG #1619).
+                # A label some backend's column cannot hold is downgraded the same way (BACKLOG #1619).
                 safe_ct = content_type
-                if (
-                    not attachment_mime_agrees(content_type, b64_head(verbatim_b64))
-                    or "\x00" in content_type
-                    or len(content_type) > _ATTACHMENT_CONTENT_TYPE_MAX
-                    or utf16_units(content_type) > _ATTACHMENT_CONTENT_TYPE_MAX
-                ):
+                if not attachment_mime_agrees(
+                    content_type, b64_head(verbatim_b64)
+                ) or not _label_fits_every_backend(content_type):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
                 fault: str | None = None
                 try:

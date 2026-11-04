@@ -338,6 +338,19 @@ async def test_a_label_holding_a_nul_is_downgraded_before_the_write(store: Messa
     assert await _attachment_types(store) == ["application/octet-stream"]
 
 
+@pytest.mark.parametrize(
+    ("label", "fits"),
+    [("Application", True), ("Ap\udcffp", False), ("Ap\x00p", False), ("X" * 300, False)],
+    ids=["plain", "lone-surrogate", "nul", "long"],
+)
+def test_a_label_no_backend_column_takes_is_refused_before_the_write(
+    label: str, fits: bool
+) -> None:
+    # A lone surrogate cannot reach the MLLP path (its bytes decode strictly), so the rule is read
+    # directly; asyncpg would refuse it with no SQLSTATE, so it would propagate on every resend.
+    assert wiring_runner._label_fits_every_backend(label) is fits
+
+
 def test_the_content_type_bound_is_the_sql_server_column_width() -> None:
     # The bound copies the store's DDL, so a change to the column must move it too.
     from messagefoundry.store import sqlserver
@@ -355,6 +368,8 @@ async def test_a_pyodbc_shaped_class_22_fault_is_the_documents(
     # does for drivers a leg may not have installed; a RuntimeError keeps it inside the catch.
     from messagefoundry.store import base as store_base
 
+    # Built before the patch, so the cached production catch never holds the stand-in.
+    store_base.store_call_errors()
     drivers = store_base.store_driver_errors()
     monkeypatch.setattr(store_base, "store_driver_errors", lambda: (*drivers, _PyodbcDataError))
     runner, ic = _runner(store, ConnectorType.MLLP)
