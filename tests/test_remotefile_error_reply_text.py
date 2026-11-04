@@ -279,10 +279,13 @@ def _junk_size() -> ftplib.FTP:
     return ftp
 
 
-#: Replies ``ftplib`` or the client cannot read, each raising a ``ValueError`` that quotes them.
+#: Replies ``ftplib`` cannot read, each raising a ``ValueError`` that quotes them, from the frame
+#: that read the reply.
 _UNREADABLE: dict[str, Callable[[], BaseException]] = {
     "size-no-number": lambda: _raised(lambda: _junk_size().size("/in/x")),
-    "mlsd-size-no-number": lambda: _raised(lambda: int(f"/in/{NAME}")),
+    "epsv-port-no-number": lambda: _raised(
+        lambda: ftplib.parse229(f"229 Extended Passive (|||/in/{NAME}|)", ("192.0.2.1", 21))
+    ),
     "not-utf-8": lambda: _raised(lambda: f"550 /in/{NAME} \xe9".encode("latin-1").decode()),
 }
 
@@ -319,6 +322,59 @@ def test_an_unreadable_reply_fails_transient_by_its_type(
     assert caught.value.permanent is False
     assert caught.value.__context__ is None and caught.value.__cause__ is None
     assert MRN not in _traceback(caught.value)
+
+
+class _JunkSizeMlsd(_ScriptedFtp):
+    """An ``MLSD`` listing one file whose ``size`` fact is a path, not a number."""
+
+    def mlsd(self, path: str = "", facts: Any = ()) -> Iterator[tuple[str, dict[str, str]]]:
+        return iter([("a.hl7", {"type": "file", "size": f"/in/{NAME}"})])
+
+
+def test_an_mlsd_size_that_is_no_number_fails_transient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The client's own read of an ``MLSD`` size is a reply read too, so it maps like ``ftplib``'s."""
+    with pytest.raises(_RemoteError) as caught:
+        _ftp_client(_JunkSizeMlsd({}), monkeypatch).list_entries("/in")
+    assert str(caught.value) == "FTP operation failed: ValueError"
+    assert caught.value.permanent is False
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    assert MRN not in _traceback(caught.value)
+
+
+def test_a_newline_in_a_credential_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``ftplib`` refuses a CR or LF in a command before it sends it. That is this side's input, which
+    every retry would send again, so it escapes as itself rather than as a transient fault that
+    retries without end. The connection is still closed."""
+    closed: list[bool] = []
+    monkeypatch.setattr(ftplib.FTP, "connect", lambda self, *a, **k: "220 ready")
+    monkeypatch.setattr(ftplib.FTP, "close", lambda self: closed.append(True))
+    client = _FtpClient(
+        {"host": "ftp.example.com", "username": "user\r\nDELE /in/x", "password": "pw"},
+        tls=False,
+    )
+    with pytest.raises(ValueError, match="illegal newline") as raised:
+        client._connect()
+    assert not isinstance(raised.value, _RemoteError)
+    assert closed == [True]
+
+
+def test_a_newline_in_a_path_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    ftp = ftplib.FTP()  # no host: the refusal comes before any I/O
+    ftp.quit = lambda: "221 Goodbye"  # type: ignore[method-assign]
+    monkeypatch.setattr(_FtpClient, "_connect", lambda self: ftp)
+    with pytest.raises(ValueError, match="illegal newline") as raised:
+        _FtpClient({"host": "ftp.example.com"}, tls=False).remove("/in/a\r\nDELE /in/b")
+    assert not isinstance(raised.value, _RemoteError)
+
+
+def test_a_local_value_error_from_no_reply_parser_is_not_transient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CONTROL for the frame test: the same type, raised where no reply is read, is not mapped."""
+    with pytest.raises(ValueError, match="raised by no reply parser"):
+        _ftp_client(_UnreadableFtp(ValueError("raised by no reply parser")), monkeypatch).list_dir(
+            "/in"
+        )
 
 
 def test_an_unreadable_greeting_fails_the_connect_transient(

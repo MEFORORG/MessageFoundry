@@ -293,11 +293,36 @@ _FTP_REPLY_MEANINGS = {
 #: the error text.
 _FTP_REPLY_CODE = re.compile(r"[1-5][0-9][0-9](?![0-9])")
 
-#: What an FTP session raises that a retry may clear: ``ftplib``'s own errors, and a
-#: ``ValueError``, which ``ftplib`` raises where it parses a reply it cannot read, such as an
-#: ``EPSV`` port or a ``SIZE`` that is no number, or a reply that is not UTF-8. Its text quotes the
-#: reply, so it is mapped like the rest rather than escaping as an internal error (BACKLOG #5026).
-_FTP_TRANSIENT: tuple[type[BaseException], ...] = (*ftplib.all_errors, ValueError)
+#: What an FTP session raises that a retry may clear: ``ftplib``'s own errors. A ``ValueError``
+#: joins them only where :func:`_unreadable_reply` finds it came from reading a reply.
+_FTP_TRANSIENT: tuple[type[BaseException], ...] = ftplib.all_errors
+
+
+def _unreadable_reply(exc: ValueError) -> bool:
+    """Whether ``exc`` came from reading a server's reply, which a retry may clear, rather than from
+    this side's own input, which none can (BACKLOG #5026). A reply's ``ValueError`` quotes the
+    reply, so it is mapped like ``ftplib``'s own errors rather than escaping as an internal error.
+
+    - A ``UnicodeDecodeError``: a session decodes only what the server sent, so the reply is not
+      UTF-8.
+    - A plain ``ValueError`` raised in a frame of :data:`_REPLY_PARSERS`: a ``SIZE`` or an ``MLSD``
+      size, or an ``EPSV`` port, that is no number.
+
+    Anything else is not, and escapes as itself: at least ``ftplib``'s refusal of a CR or LF in a
+    command, raised before the command is sent, an encode error for text the session cannot send,
+    and the ``idna`` codec's refusal of the host name. Each would fail alike on every retry, so a
+    transient class would retry it without end."""
+    if isinstance(exc, UnicodeDecodeError):
+        return True
+    if type(exc) is not ValueError:
+        return False
+    tb = exc.__traceback__
+    if tb is None:
+        return False
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    return tb.tb_frame.f_code in _REPLY_PARSERS
+
 
 #: ``getaddrinfo``'s own codes, which a ``socket.gaierror`` carries as its errno and which
 #: ``errno.errorcode`` does not name. Read from this platform's ``socket`` module.
@@ -529,7 +554,7 @@ def _ftp_size(ftp: ftplib.FTP, path: str) -> int | None:
 
     A #116 caller sends ``TYPE I`` first on its session: several common servers refuse ``SIZE`` in
     ASCII mode, and the binary size is the one ``retrbinary`` reads. A transient reply still raises,
-    for ``_op`` to map, and so does a ``213`` whose value is no number (:data:`_FTP_TRANSIENT`)."""
+    for ``_op`` to map, and so does a ``213`` whose value is no number (:func:`_unreadable_reply`)."""
     try:
         return ftp.size(path)
     except (ftplib.error_perm, ftplib.error_proto):
@@ -1112,7 +1137,12 @@ class _FtpClient(_RemoteClient):
                 )
             else:
                 fault = _RemoteError(f"FTP connect failed: {_fault_detail(exc)}", permanent=False)
-        except _FTP_TRANSIENT as exc:  # connect/timeout/4xx/protocol/OSError/unreadable reply
+        except _FTP_TRANSIENT as exc:  # connect/timeout/4xx/protocol/OSError
+            fault = _RemoteError(f"FTP connect failed: {_fault_detail(exc)}", permanent=False)
+        except ValueError as exc:
+            if not _unreadable_reply(exc):
+                ftp.close()
+                raise
             fault = _RemoteError(f"FTP connect failed: {_fault_detail(exc)}", permanent=False)
         except BaseException:
             ftp.close()
@@ -1312,9 +1342,9 @@ class _FtpClient(_RemoteClient):
     def _op(self, fn: Callable[[ftplib.FTP], _T]) -> _T:
         """Connect, run ``fn(ftp)``, always close. A connect fault arrives already classified from
         :meth:`_connect`. An operation fault is mapped here: a permanent reply (``error_perm`` --
-        no-such-file, no-perm) is permanent; a connect/IO/timeout/protocol error, or a reply it
-        cannot read (:data:`_FTP_TRANSIENT`), is transient. The error carries the reply code, never
-        the reply (BACKLOG #5026)."""
+        no-such-file, no-perm) is permanent; a connect/IO/timeout/protocol error
+        (:data:`_FTP_TRANSIENT`), or a reply it cannot read (:func:`_unreadable_reply`), is
+        transient. The error carries the reply code, never the reply (BACKLOG #5026)."""
         ftp = self._connect()
         try:
             return fn(ftp)
@@ -1324,6 +1354,10 @@ class _FtpClient(_RemoteClient):
             )
         except _FTP_TRANSIENT as exc:
             fault = _RemoteError(f"FTP operation failed: {_fault_detail(exc)}", permanent=False)
+        except ValueError as exc:
+            if not _unreadable_reply(exc):
+                raise
+            fault = _RemoteError(f"FTP operation failed: {_fault_detail(exc)}", permanent=False)
         finally:
             try:
                 ftp.quit()
@@ -1332,6 +1366,16 @@ class _FtpClient(_RemoteClient):
         # Raised outside the handlers, so the reply, which can quote the path, is on neither
         # __cause__ nor __context__.
         raise fault
+
+
+#: The frames whose own ``ValueError`` is a reply value that is no number, for
+#: :func:`_unreadable_reply`: ``ftplib``'s ``SIZE`` and ``EPSV`` parsers, and
+#: :meth:`_FtpClient._list`'s read of an ``MLSD`` size. Matched as the innermost frame, so a
+#: ``ValueError`` from a call they make, such as ``ftplib``'s refusal of a CR or LF in the ``SIZE``
+#: command, is not one of theirs.
+_REPLY_PARSERS = frozenset(
+    {ftplib.FTP.size.__code__, ftplib.parse229.__code__, _FtpClient._list.__code__}
+)
 
 
 #: SSH MAC algorithms this connector will PROPOSE (BACKLOG #1171, ASVS 11.4.1). Appendix C of the

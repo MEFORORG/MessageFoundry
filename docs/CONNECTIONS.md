@@ -1487,8 +1487,11 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   error reads like `FTP rejected the operation: reply 550 (file unavailable, such as not found or no
   access)`: the code and a fixed meaning for at least the common codes, and the code alone for any
   other. An SFTP error names the exception's type and errno, such as `SFTP path not found:
-  FileNotFoundError, errno 2 (ENOENT)`; paramiko keeps no other SFTP status apart, so any other
-  refusal reads as a bare `OSError`. A TLS failure names OpenSSL's reason and, for a certificate
+  FileNotFoundError, errno 2 (ENOENT)`. paramiko keeps three SFTP statuses apart: no such file, as
+  that `FileNotFoundError`; permission denied, as `SFTP operation failed: PermissionError, errno 13
+  (EACCES)`; and end of file, as `SFTP connection closed: EOFError`. It raises any other status as
+  an `OSError` carrying the server's text alone, so that reads as a bare `SFTP operation failed:
+  OSError`. A TLS failure names OpenSSL's reason and, for a certificate
   check, its verify message, which are this engine's own wording. To see the server's own wording,
   read the server's log. One exception: an SFTP connect refusal keeps paramiko's text, and
   `_SftpClient._connect` says why. `_RemoteError` in `transports/remotefile.py` states the rule.
