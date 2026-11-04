@@ -474,7 +474,8 @@ class IntakeRateLimiter(Protocol):
     and synchronous is honest: the underlying sliding window completes without awaiting, so it is
     atomic on the event loop.
 
-    The three methods exist separately because the budget is charged on **failure only**. Consulting
+    Consulting, charging and noting are separate methods because the budget is charged on **failure
+    only**; :meth:`check_peer` is a narrower read of the same budget. Consulting
     and charging in one call — which is what the shipped ``allow()`` does — would turn a
     brute-force bound into a per-peer throughput cap, silently refusing an authenticated partner's
     traffic pre-ingress, where it is not even counted.

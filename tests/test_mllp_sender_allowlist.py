@@ -835,14 +835,15 @@ class _Limiter:
         self.calls.append(("success", peer))
 
 
-async def test_a_listed_sender_is_noted_at_every_message_and_never_charged(
+async def test_a_listed_sender_reads_only_its_own_arm_and_is_never_charged(
     tmp_path: Path, store: MessageStore
 ) -> None:
     """ADR 0154 D6's two invariants on this listener: the address's own budget is consulted before
     the subject is compared, and a listed sender is never charged. A listed sender never reaches the
-    global arm (``check``); it is noted as authenticated at the accept and at every message, as HTTP
-    notes a partner at every request. The control is a refused sender, which reads the global arm
-    once its compare has refused, is charged and is never noted."""
+    global arm (``check``), and is not noted as authenticated either: here the note would gate
+    nothing for it and would only exempt an unlisted certificate from the same address from the
+    global arm. The control is a refused sender, which reads the global arm once its compare has
+    refused and is charged."""
     named, other = _ca("Partner CA"), _ca("Other CA")
     source = await _wired(
         _settings(tmp_path, [named[0], other[0]], {_issuer(named): [SUBJECT]}), store
@@ -860,8 +861,7 @@ async def test_a_listed_sender_is_noted_at_every_message_and_never_charged(
     finally:
         await source.stop()
     assert b"MSA|AA|CTRL4907" in got and b"MSA|AA|CTRL4908" in got
-    assert listed_calls[0] == ("check_peer", "127.0.0.1")
-    assert listed_calls[1:] == [("success", "127.0.0.1")] * 3, listed_calls
+    assert listed_calls == [("check_peer", "127.0.0.1")], listed_calls
     assert limiter.calls == [
         ("check_peer", "127.0.0.1"),
         ("check", "127.0.0.1"),

@@ -2279,8 +2279,10 @@ class MLLPSource(SourceConnector):
         compare has refused: it bounds the volume of refusals and the audit writes they drive, and
         a listed sender drives none. That leaves no way for refusals from other addresses to close
         a listed sender unread, which matters because MLLP has no setting that turns the global arm
-        off. A refused sender is charged one failed attempt; a listed one is noted as
-        authenticated. Each refusal writes the connection event and the audit row the HTTP listener
+        off. A refused sender is charged one failed attempt. A listed one is not noted as
+        authenticated, as HTTP notes its partners: here the note would gate nothing for the listed
+        sender and would only exempt an unlisted certificate from the same address from the global
+        arm. Each refusal writes the connection event and the audit row the HTTP listener
         writes for the same decision. The log line, the event and the audit row name the peer
         address only, never the certificate: a subject can name a person."""
         assert self._handler is not None
@@ -2289,14 +2291,16 @@ class MLLPSource(SourceConnector):
         peer = peer_host or "unknown"
         limiter = self.intake_rate_limiter
         if limiter is not None and not limiter.check_peer(peer):
-            await self._refuse_spent_budget(peer, peer_host)
+            await self._refuse_spent_budget(peer, peer_host, which="its failed-attempt budget")
             return None
         if self._sender_listed(writer):
-            if limiter is not None:
-                limiter.note_success(peer)
             return self._handler, False
         if limiter is not None and not limiter.check(peer):
-            await self._refuse_spent_budget(peer, peer_host)
+            await self._refuse_spent_budget(
+                peer,
+                peer_host,
+                which="the listener's global failed-attempt budget, as an unlisted sender",
+            )
             return None
         if limiter is not None:
             limiter.charge_failure(peer)
@@ -2318,15 +2322,18 @@ class MLLPSource(SourceConnector):
         await self._audit_sender_refusal("auth_subject_denied", peer_host)
         return None if handle is None else (handle, True)
 
-    async def _refuse_spent_budget(self, peer: str, peer_host: str | None) -> None:
+    async def _refuse_spent_budget(self, peer: str, peer_host: str | None, *, which: str) -> None:
         """Log, emit and audit a ``tls_client_subjects`` sender closed unread on a spent
-        failed-attempt budget, its own address's or, for an unlisted sender, the global one."""
+        failed-attempt budget, its own address's or, for an unlisted sender, the global one.
+        ``which`` names the arm in the log line, so a close on the global arm does not read as
+        the address's own failures."""
         if count := self._budget_log.note(peer):
             logger.warning(
-                "MLLP listener %s: the sender at %s has spent its failed-attempt budget for "
-                "tls_client_subjects; closing the connection unread (%d refused so far)",
+                "MLLP listener %s: the sender at %s has spent %s for tls_client_subjects; "
+                "closing the connection unread (%d refused so far)",
                 self._pacing_name,
                 peer,
+                which,
                 count,
             )
         await self._emit_event(
@@ -2666,16 +2673,6 @@ class MLLPSource(SourceConnector):
                 if admitted is None:
                     return  # closed unread: the sender keeps whatever it had not had read
                 handle, unlisted = admitted
-                # BACKLOG #4907: a listed sender is noted as authenticated at every frame, as the
-                # HTTP listener notes one at every request. Unlike HTTP's, this listener's admission
-                # never reads the global arm for a listed sender (`_admit_sender`), so the note does
-                # not decide whether the partner gets in. None while the allowlist is off or for a
-                # refused sender.
-                listed_limiter = (
-                    self.intake_rate_limiter
-                    if self._client_subjects is not None and not unlisted
-                    else None
-                )
                 if not unlisted:
                     established = True
                     await self._emit_event("established", peer_host=peer_host)
@@ -2721,8 +2718,6 @@ class MLLPSource(SourceConnector):
                         handler_dropped = False
                         for message in decoder.feed(chunk):
                             decoded += 1
-                            if listed_limiter is not None:
-                                listed_limiter.note_success(peer_host or "unknown")
                             try:
                                 # BACKLOG #1725 act 3: bounded per listener; see the method.
                                 reply = await self._handle_bounded(message, handle)
