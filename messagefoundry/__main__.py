@@ -8671,6 +8671,47 @@ _PROVISION_AUTH_REFUSALS = {
 _NOTHING_PROVISIONED = "Refusing to provision; nothing was written"
 
 
+def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str:
+    """What a refused store open left behind, as far as the command knows it (BACKLOG #5067).
+
+    ``"nothing was written"`` for every refusal but one. A server store whose live schema falls
+    short of this build's DDL batch (``ServerSchemaMismatchError``, BACKLOG #1720), raised itself
+    or as the cause of a :class:`_StoreOpenRefused`, is refused after the open has touched the
+    database. The open rolls its batch back and writes no schema marker. But on SQL Server under
+    ``[store].schema_management = auto`` a writable open first switches the database's
+    READ_COMMITTED_SNAPSHOT option on (``SqlServerStore._ensure_database_options``), outside that
+    batch, and the refusal does not switch it back. So that refusal says the batch was rolled
+    back and, there, that the setting may already have changed. A sentence with no full stop,
+    so a caller can end it."""
+    from messagefoundry.config.settings import SchemaManagement, StoreBackend
+    from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
+
+    if not isinstance(exc, ServerSchemaMismatchError) and not isinstance(
+        exc.__cause__, ServerSchemaMismatchError
+    ):
+        return "nothing was written"
+    left = (
+        "the open rolled its schema batch back and wrote no schema marker, and this command wrote "
+        "no row"
+    )
+    if (
+        store.backend is StoreBackend.SQLSERVER
+        and store.resolved_schema_management() is SchemaManagement.AUTO
+    ):
+        left += (
+            ". Under [store].schema_management = auto the open may already have switched the "
+            "database's READ_COMMITTED_SNAPSHOT option on, before that batch; the refusal does "
+            "not switch it back"
+        )
+    return left
+
+
+def _provision_open_refusal(exc: BaseException, store: StoreSettings) -> str:
+    """``provision-admin``'s text for a refused store open: the refusal, then what it left
+    behind (:func:`_open_refusal_left_behind`, BACKLOG #5067)."""
+    return f"{_sentence(exc)} Refusing to provision; {_open_refusal_left_behind(exc, store)}"
+
+
 def _sentence(message: object) -> str:
     """``message`` as a sentence ending in one full stop, so a clause can follow it."""
     return str(message).rstrip().rstrip(".") + "."
@@ -8960,9 +9001,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # a server store off-box with no revocation check, or a weakened-TLS escape, at `enforce`.
         # Its text names the hop and the setting that clears it. Or (BACKLOG #1720) a server
         # store's live schema falls short of this build's DDL batch: the open rolled the batch back
-        # and wrote no marker, and the text lists the differences and the remedy. Exit 2: could not
-        # start, never the dispatch floor's 1, this command's refusal.
-        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
+        # and wrote no marker, and the text lists the differences and the remedy, then says what
+        # the open may have changed before it (#5067). Exit 2: could not start, never the
+        # dispatch floor's 1, this command's refusal.
+        _emit_error(_provision_open_refusal(exc, settings.store), as_json=args.json)
         return 2
     except TrustAnchorError as exc:
         return _emit_trust_anchor_refusal(exc, as_json=args.json)
@@ -9029,6 +9071,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
             return _emit_error(str(exc), as_json=args.json)
 
     actor = f"cli:{getpass.getuser()}"
+
+    def before_the_write(text: str) -> str:
+        """``text`` for a refusal raised before the write wrote anything, but after the key was
+        shown (BACKLOG #5067). It then says so, as ``admin-reset-totp`` does, or the app keeps an
+        entry for a seed that was never stored. Unchanged under ``--no-totp``: no key was shown."""
+        if totp_secret is None:
+            return text
+        return (
+            f"{_sentence(text)} If you added the entry this run showed to the authenticator app, "
+            "delete it: its seed was never stored, and a run that succeeds shows a new key."
+        )
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
@@ -9117,14 +9170,18 @@ def _provision_admin(args: argparse.Namespace) -> int:
     except FirstAdministratorRefused as exc:
         return _emit_error(str(exc), as_json=args.json)
     except (_KeylessProvisionRefused, KeylessAuditChainRefused, _UnauditableWrite) as exc:
-        # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it
-        _emit_error(str(exc), as_json=args.json)
+        # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it.
+        # Each is raised before the write, so the shown key's entry has no seed (#5067).
+        _emit_error(before_the_write(str(exc)), as_json=args.json)
         return 2
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         # Refused before the prompt already; one that changed since is refused the same way. A
         # short server schema (#1720) can first arrive here: with no `schema_meta` table the
-        # pre-check finds no store, and only this create=True open runs the DDL batch.
-        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
+        # pre-check finds no store, and only this create=True open runs the DDL batch. The text
+        # says what the open may have changed, and that the shown key's entry has no seed (#5067).
+        _emit_error(
+            before_the_write(_provision_open_refusal(exc, settings.store)), as_json=args.json
+        )
         return 2
     except sqlite3.IntegrityError as exc:
         # BACKLOG #2697. Ahead of the arm below, which it subclasses: a write the store refused is
@@ -9609,10 +9666,13 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         ``hint`` follows the message once the key has been shown. The texts of the first two
         families are the engine's own and name settings, files, tables or key ids, never a value.
         Each goes through ``codec_safe_str``: a key source's codec error quotes a byte of what it
-        decoded (BACKLOG #2532)."""
+        decoded (BACKLOG #2532). A short server schema says what the open may have changed before
+        it (BACKLOG #5067)."""
         if isinstance(exc, could_not_start):
+            left = _open_refusal_left_behind(exc, settings.store)
             _emit_error(
-                f"{_sentence(codec_safe_str(exc))} Nothing was written.{hint}", as_json=args.json
+                f"{_sentence(codec_safe_str(exc))} {left[:1].upper()}{left[1:]}.{hint}",
+                as_json=args.json,
             )
             return 2
         if isinstance(exc, (StoreKeylessError, CipherError)):
