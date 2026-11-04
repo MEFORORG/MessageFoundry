@@ -1623,9 +1623,7 @@ with one exception (vault BACKLOG #2572, #3410, #3416, #3417, #3418, #4909).** T
 and a `proxy_user` and `proxy_password` pair. The proxy may come from `proxy_url`, from
 `HTTP_PROXY` or `HTTPS_PROXY`, or from the system proxy settings. That covers at least REST, SOAP,
 FHIR, DICOMweb, `FhirLookup`, the token endpoints, the alert webhook, the OIDC legs and the AI
-broker. The error names no part of the proxy URL. A credential from the environment or the system
-proxy settings crosses no leg, the TLS leg to an `https://` proxy that fully verifies included
-(vault BACKLOG #4909). Which legs are refused, and the one exception for a `proxy_user` credential
+broker. The error names no part of the proxy URL. Which legs are refused, and the one exception for a `proxy_user` credential
 its connection admitted when it was built, are stated once, on
 [`ProxyCredentialsRefusedError`](../messagefoundry/transports/bounded_read.py), with what it does
 not check.

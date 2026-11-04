@@ -190,11 +190,10 @@ def test_measured_urllib_opens_tls_first_for_an_http_target_with_no_https_proxy(
     assert proxy.tls_first == 1
 
 
-def _engine_refuses_over_tls(opener: urllib.request.OpenerDirector, proxy: _WireProxy) -> None:
+def _engine_refuses_over_tls(opener: urllib.request.OpenerDirector) -> None:
     """The engine's opener refuses before it dials, in the verified TLS leg's own text."""
     with pytest.raises(ProxyCredentialsRefusedError) as raised:
         opener.open(_HTTP_TARGET, timeout=5)
-    assert proxy.connections == 0
     _assert_fixed_refusal(raised.value, "#4909")
 
 
@@ -212,10 +211,12 @@ def test_the_engine_opener_refuses_an_http_target_with_no_https_proxy_over_tls()
             value = f"https://{cred}{proxy.address}"
             opener = build_strict_opener(urllib.request.ProxyHandler({"http": value}))
             if refused:
-                _engine_refuses_over_tls(opener, proxy)
+                _engine_refuses_over_tls(opener)
             else:
                 _open_and_discard(opener, _HTTP_TARGET)
-        if not refused:
+        if refused:
+            assert proxy.connections == 0
+        else:
             _reached_tls_first(proxy)
 
 
@@ -249,10 +250,12 @@ def test_an_http_target_to_a_bypassed_https_proxy_is_refused_before_the_tls_leg(
             # Set after the build, so the pass shows the bypass list is read at send time.
             monkeypatch.setenv("NO_PROXY", proxy.address.rsplit(":", 1)[0])
             if refused:
-                _engine_refuses_over_tls(opener, proxy)
+                _engine_refuses_over_tls(opener)
             else:
                 _open_and_discard(opener, _HTTP_TARGET)
-        if not refused:
+        if refused:
+            assert proxy.connections == 0
+        else:
             _reached_tls_first(proxy)
 
 
@@ -464,6 +467,29 @@ def test_an_environment_proxy_with_credentials_is_refused_on_every_opener_family
     monkeypatch.setenv("HTTPS_PROXY", _CREDENTIALED)
     opener = _FAMILIES[family]()
     _refused(opener, target)
+
+
+@pytest.mark.parametrize("family", list(_FAMILIES))
+def test_an_environment_proxy_credential_is_refused_on_the_tls_leg_of_every_opener_family(
+    recorded: None, monkeypatch: pytest.MonkeyPatch, family: str
+) -> None:
+    """Leg 2 of vault BACKLOG #4909 on each family: ``HTTP_PROXY`` names a credentialed
+    ``https://`` proxy, with no ``HTTPS_PROXY``. Nothing is dialled. A family whose context does
+    not verify the proxy keeps that refusal's own text (vault BACKLOG #3418). The control is the
+    same family behind a credential-free proxy, which is dialled with no header."""
+    monkeypatch.setenv("HTTP_PROXY", f"https://{_CRED}@{_PROXY_HOST}")
+    with pytest.raises(ProxyCredentialsRefusedError) as raised:
+        _FAMILIES[family]().open(_HTTP_TARGET, timeout=1)
+    item = (
+        "#3418" if family in ("http-family-verify-off", "http-family-expiry-relaxed") else "#4909"
+    )
+    assert f"vault BACKLOG {item}" in str(raised.value)
+    _assert_names_no_credential(raised.value)
+
+    monkeypatch.setenv("HTTP_PROXY", f"https://{_PROXY_HOST}")
+    dialled = _dial(_FAMILIES[family](), _HTTP_TARGET)
+    assert dialled.host == _PROXY_HOST
+    assert dialled.proxy_header is None
 
 
 @pytest.mark.parametrize("family", list(_FAMILIES))

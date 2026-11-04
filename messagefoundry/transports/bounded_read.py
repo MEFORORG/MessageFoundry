@@ -778,8 +778,9 @@ class LoopbackDirectProxyHandler(urllib.request.ProxyHandler):
 
     ``caller_header_admitted`` is set only by a connection whose ``proxy_user`` credential its
     posture-keyed guard admitted when the connection was built
-    (``transports.rest.ProxyConfig``). It lets that caller-set header across a cleartext proxy leg,
-    the one exception :class:`ProxyCredentialsRefusedError` states, and nowhere else.
+    (``transports.rest.ProxyConfig``). It lets that caller-set header across a cleartext proxy leg
+    or a TLS leg that fully verifies the proxy, the one exception
+    :class:`ProxyCredentialsRefusedError` states, and nowhere else.
     """
 
     def __init__(
@@ -877,13 +878,12 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     own text. The environment half rests on decision d20261031T213402506-5d928c. The caller-set
     half is the proposed scope that row records, not yet ruled.
 
-    **The one exception.** A caller-set header that its connection
-    admitted when it was built is sent on the leg to the proxy that connection's
-    ``transports.rest.ProxyConfig`` names: a cleartext leg, or a TLS leg that fully verifies. The admitting check is the connection's posture-keyed
-    guard, ``transports.rest.proxy_auth_handler_from_settings``. It admits a ``proxy_user``
-    credential when the connection declares ``cleartext_accepted``, or the proxy is on this
-    machine. The
-    connection's proxy handler then carries ``caller_header_admitted``. The exception covers that
+    **The one exception.** A caller-set header that its connection admitted when it was built is
+    sent on the leg to the proxy that connection's ``transports.rest.ProxyConfig`` names: a
+    cleartext leg, or a TLS leg that fully verifies. The admitting check is the connection's
+    posture-keyed guard, ``transports.rest.proxy_auth_handler_from_settings``. It admits a
+    ``proxy_user`` credential when the connection declares ``cleartext_accepted``, or the proxy is
+    on this machine. The connection's proxy handler then carries ``caller_header_admitted``. The exception covers that
     header in its plain spelling only, under a name that is a ``str`` and no subclass of one.
     Every other spelling :func:`is_proxy_credential_header_name` reads is never admitted, and
     none is sent: a name with other characters at either end, and a name of the plain one, a
@@ -903,9 +903,10 @@ class ProxyCredentialsRefusedError(urllib.error.URLError):
     refused regardless**, admitted or not, because that guard never reads the TLS context.
 
     So an admitted header may cross a cleartext leg but not an unverified TLS leg. That asymmetry
-    is reachable only through a hand-built proxy map that sends ``http`` to an ``https://`` proxy.
-    ``ProxyConfig`` maps both schemes to one proxy, so an ``http`` target rides a ``CONNECT`` and is
-    judged as cleartext; it never reaches the unverified TLS check.
+    is reachable at least through a hand-built proxy map that sends ``http`` to an ``https://``
+    proxy, and through a bypass list that names the proxy's own host. Otherwise ``ProxyConfig``
+    maps both schemes to one proxy, so an ``http`` target rides a ``CONNECT`` and is judged as
+    cleartext.
 
     urllib keeps the header when it hands a request on to the next proxy (vault BACKLOG #3410),
     and its redirect handler copies it onto a new request. So the check reads the header on the
@@ -1030,10 +1031,13 @@ def _refuse_proxy_credentials_on_this_leg(req: urllib.request.Request, *, contex
     use, or ``None`` for plain ``http``. A plainly spelled header on a ``CONNECT`` tunnel is left
     alone: it rides in the cleartext ``CONNECT``, which :class:`LoopbackDirectProxyHandler` judged
     when it set the tunnel. So is one on a plain ``http`` request to a proxy, for the same reason.
+    On the TLS leg to an ``https`` proxy, a request that proxy handler marked is refused here,
+    after the unverified-TLS check (vault BACKLOG #4909): the mark is how the judgement made at
+    ``proxy_open`` reaches the leg the request really takes.
 
     **No header in another spelling of the name gets past here.** The verdicts are read once,
     from :func:`_proxy_header_verdicts`, and each such header the request holds is refused on
-    its verdict. One that could be sent is a credential on its way out. The two refusals above
+    its verdict. One that could be sent is a credential on its way out. The refusals above
     the loop take it where they apply, and the loop takes it where they do not. A proxy handler
     refuses it first on every leg it sets up, so the loop is reached only by a request routed
     to a proxy some other way. One that can never be sent is refused last. Only a plainly
