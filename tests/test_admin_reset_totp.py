@@ -84,6 +84,7 @@ def _seed(
                     auth_provider="local",
                     password_hash=None,
                     password_generated=False,
+                    audits=(),
                 )
                 await store.set_user_roles("u-viewer", [Role.VIEWER.value], assigned_by="test")
             return list(outcome.recovery_codes)
@@ -298,7 +299,11 @@ def test_a_directory_administrator_is_accepted(
         store = await MessageStore.open(db)
         try:
             await store.create_user(
-                user_id="u-ad", username="ad-admin", auth_provider="ad", password_generated=False
+                user_id="u-ad",
+                username="ad-admin",
+                auth_provider="ad",
+                password_generated=False,
+                audits=(),
             )
             await store.set_user_roles("u-ad", [Role.ADMINISTRATOR.value], assigned_by="test")
             staged_cell = await store.set_totp_secret("u-ad", secret=PROVISION_TOTP_SECRET)
@@ -582,6 +587,7 @@ def test_a_second_enabled_administrator_is_refused_and_named(
             auth_provider="local",
             password_hash=None,
             password_generated=False,
+            audits=(),
         )
         await store.set_user_roles("u-second", [Role.ADMINISTRATOR.value], assigned_by="test")
 

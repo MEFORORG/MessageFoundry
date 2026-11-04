@@ -6686,9 +6686,10 @@ class SecretRotationSettings(_Section):
     keeps its alert-only behaviour. Opting in tightens the posture; leaving it empty is not reported
     as a loosening.
 
-    The store DEK is tracked **live-by-default** (ASVS 13.3.4, BACKLOG #282): at first keyed start the
-    engine persists a non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and
-    watches the DEK off it, so setting ``store_key_last_rotated`` (an ISO ``YYYY-MM-DD`` date) is an
+    The store DEK is tracked **live-by-default** (ASVS 13.3.4, BACKLOG #282): a keyed start persists a
+    non-secret tracked-since stamp (the DEK key-id + first-seen date) in store meta and watches the DEK
+    off it, except for a key the rotation record holds, which ``reconcile_rotation_meta`` states
+    (BACKLOG #3737, #4942), so setting ``store_key_last_rotated`` (an ISO ``YYYY-MM-DD`` date) is an
     **override**, not a prerequisite. The connector/AD/SMTP/Vault/OIDC credentials the engine holds are
     tracked too — each is fingerprinted with a keyed MAC sealed as a store-cipher cell (BACKLOG #3472)
     and its clock reset when the secret no longer matches it (rotation auto-detected). The broader
@@ -6703,8 +6704,9 @@ class SecretRotationSettings(_Section):
     )
     # Store DEK tracking: the operator MAY record when the store encryption key was last rotated (ISO
     # YYYY-MM-DD) + how long it may live. When unset, the DEK is tracked LIVE-BY-DEFAULT off a persisted
-    # tracked-since stamp (ASVS 13.3.4, BACKLOG #282): the engine records the DEK key-id + first-seen date
-    # in store meta at first keyed start, so the operator date is an OVERRIDE, not a prerequisite. These
+    # tracked-since stamp (ASVS 13.3.4, BACKLOG #282): a keyed start records the DEK key-id + first-seen
+    # date in store meta, unless the rotation record holds that key (BACKLOG #3737, #4942), so the
+    # operator date is an OVERRIDE, not a prerequisite. These
     # are DATES, not the key — never a secret value.
     store_key_last_rotated: str | None = None
     store_key_max_age_days: int = 365  # rotate the store DEK within this many days of last_rotated
@@ -7845,6 +7847,29 @@ class ServiceSettings(_InputHidingModel):
             " clamp, and its COMMIT is not bounded by it, so a renew issued just before this node"
             f" self-fences can still land and re-extend the lease. {remedy}"
         )
+
+    @model_validator(mode="after")
+    def _config_only_backup_bundles_config(self) -> ServiceSettings:
+        """A backup on a server-DB store is config-only, so with ``include_config = false`` every
+        archive it writes carries nothing to restore, yet each would take a keep-N slot. The run
+        refuses such a pass (vault BACKLOG #5220); this refuses the configuration that makes every
+        pass one, at load, where ``serve`` and ``check`` read it. Spans two sections, so it lives
+        here. A pass forced config-only on SQLite, or whose walk adds nothing, is judged at run time
+        only, because only the run knows it."""
+        if (
+            self.backup.enabled
+            and self.backup.config_only_on_server_db
+            and not self.backup.include_config
+            and self.store.backend in (StoreBackend.POSTGRES, StoreBackend.SQLSERVER)
+        ):
+            raise ValueError(
+                "[backup].include_config = false cannot be combined with [store].backend = "
+                f"{self.store.backend.value!r}: the store backup there is DBA-delegated, so every "
+                "DR backup is config-only and would archive nothing. Set [backup].include_config = "
+                "true. Setting [backup].enabled = false stops the scheduled backup, but the "
+                "`messagefoundry backup` command turns enabled on, so it still refuses"
+            )
+        return self
 
     @model_validator(mode="after")
     def _dr_activate_not_clustered(self) -> ServiceSettings:

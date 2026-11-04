@@ -285,15 +285,22 @@ class BackupResult:
     #: the run alerts ``backup_failed`` with kind ``cleanup`` and records this in its audit row, and the
     #: next backup's sweep retries the directory.
     staging_leftover: str | None = None
-    #: Whether the archive carries the config dir under ``config/``, the dir this pass read, and,
-    #: when it could not be read, the fault's class name (vault BACKLOG #3094). A full run with
-    #: ``config_bundled`` false and a fault still succeeds: the store snapshot is worth keeping.
+    #: Whether the archive carries a config file under ``config/``, the dir this pass read, and,
+    #: when it could not be read, the fault's class name (vault BACKLOG #3094), or
+    #: :data:`CONFIG_WALK_ADDED_NOTHING` when the walk added no regular file (vault BACKLOG #5220).
+    #: A full run with ``config_bundled`` false still succeeds: the store snapshot is worth keeping.
     config_bundled: bool = False
     config_dir: str | None = None
     config_bundle_error: str | None = None
     #: What ``config_fingerprint`` left out as unreadable (vault BACKLOG #3765): it covers the rest.
     #: :meth:`BackupRunner._inspect_config` says what reaches it on a bundled pass.
     config_unreadable_files: tuple[str, ...] = ()
+
+
+#: The ``config_bundle_error`` a pass records when its config walk added no regular file, as for an
+#: empty dir or one holding only links (vault BACKLOG #5220). Every other value there is an exception
+#: class name, so this one is spelled so it cannot be read as one.
+CONFIG_WALK_ADDED_NOTHING = "no-regular-file"
 
 
 @dataclass(frozen=True)
@@ -307,6 +314,14 @@ class _ConfigBundle:
     #: The files and folders ``fingerprint`` left out, so a reader does not take it for the digest
     #: of the whole bundle (vault BACKLOG #3765).
     left_out: tuple[str, ...] = ()
+
+    def after_walk(self, added: int) -> _ConfigBundle:
+        """This bundle as the record states it once the walk has run: a bundled pass whose walk
+        added no regular file carries no config, so it is recorded as not bundled, with
+        :data:`CONFIG_WALK_ADDED_NOTHING` as its error (vault BACKLOG #5220)."""
+        if self.bundled and added == 0:
+            return replace(self, bundled=False, error=CONFIG_WALK_ADDED_NOTHING)
+        return self
 
     def manifest_fields(self) -> dict[str, object]:
         """The fields the manifest and the ``dr_backup`` audit row both carry. PHI-free: a
@@ -535,6 +550,30 @@ class BackupRunner:
 
     async def _do_backup(self, now: float, *, force_config_only: bool = False) -> BackupResult:
         s = self._settings
+        # Decide config-only vs full per backend + setting (AC-7). SQLite → full store snapshot; a
+        # server-DB store → config-only (or skip) because the DB backup is DBA-delegated (#52). The CLI
+        # --config-only flag forces config-only even on SQLite.
+        config_only = force_config_only or self._is_server_db()
+        # Read once, so the space check, the archive's config/ members and its fingerprint all name
+        # one directory even if a reload lands during the pass.
+        config_dir = self._current_config_dir()
+        if self._is_server_db() and not s.config_only_on_server_db:
+            raise BackupError(
+                "snapshot",
+                f"store backend {self._backend_value()!r} is DBA-delegated (BACKLOG #52) and "
+                "[backup].config_only_on_server_db=false — nothing to back up; the DB is the DBA's job",
+            )
+        if config_only and (config_dir is None or not s.include_config):
+            # A config-only archive without its config holds nothing to restore, yet it would verify
+            # and take a keep-N slot from an archive that does (vault BACKLOG #5220). Refused before
+            # any I/O; a dir that cannot be listed, and a walk that adds no file, are refused below.
+            why = (
+                "no config dir is loaded"
+                if config_dir is None
+                else "[backup].include_config is false"
+            )
+            raise BackupError("snapshot", f"config-only backup: {why}; nothing to archive")
+
         dest_dir = Path(s.destination)
         self._ensure_destination(dest_dir)
 
@@ -555,20 +594,6 @@ class BackupRunner:
         # A store on the frozen v1 writer has no salt: the frames are then sealed under the DEK and
         # charged to the DEK's row, which is where that store's own values are counted too.
         salt = self._store_salt() if key is not None else None
-
-        # Decide config-only vs full per backend + setting (AC-7). SQLite → full store snapshot; a
-        # server-DB store → config-only (or skip) because the DB backup is DBA-delegated (#52). The CLI
-        # --config-only flag forces config-only even on SQLite.
-        config_only = force_config_only or self._is_server_db()
-        # Read once, so the space check, the archive's config/ members and its fingerprint all name
-        # one directory even if a reload lands during the pass.
-        config_dir = self._current_config_dir()
-        if self._is_server_db() and not s.config_only_on_server_db:
-            raise BackupError(
-                "snapshot",
-                f"store backend {self._backend_value()!r} is DBA-delegated (BACKLOG #52) and "
-                "[backup].config_only_on_server_db=false — nothing to back up; the DB is the DBA's job",
-            )
 
         ext = _ENCRYPTED_EXT if key is not None else _PLAINTEXT_EXT
         stamp = _utc_stamp(now)
@@ -719,7 +744,8 @@ class BackupRunner:
             bundle = await asyncio.to_thread(self._inspect_config, config_dir)
             if config_only and bundle.error is not None:
                 # A config-only archive without its config holds nothing to restore, yet it would
-                # verify and take a keep-N slot from an archive that does. It fails instead.
+                # verify and take a keep-N slot from an archive that does. It fails instead. A walk
+                # that adds no file is refused in the build, which is where the walk runs.
                 raise BackupError(
                     "snapshot",
                     f"config-only backup: the config dir {config_dir} could not be read "
@@ -730,6 +756,7 @@ class BackupRunner:
                     snapshot_sha256,
                     row_counts,
                     archive_bytes,
+                    config_files_added,
                     staging_leftover,
                 ) = await asyncio.to_thread(
                     self._build_in_staging,
@@ -788,6 +815,8 @@ class BackupRunner:
         # every earlier archive that also passed — and nothing that failed (AC-6).
         pruned = self._prune_keep_n(dest_dir, inst, just_written=archive_path)
 
+        # What the archive carries, as its manifest records it (vault BACKLOG #5220).
+        bundle = bundle.after_walk(config_files_added)
         return BackupResult(
             archive_path=str(archive_path),
             archive_bytes=archive_bytes,
@@ -984,12 +1013,12 @@ class BackupRunner:
         now: float,
         bundle: _ConfigBundle,
         salt: bytes | None = None,
-    ) -> tuple[str, dict[str, int], int, str | None]:
+    ) -> tuple[str, dict[str, int], int, int, str | None]:
         """Run :meth:`_build_archive_blocking` in ``work`` and release ``work`` on every exit, from this
-        thread. Returns the build's result plus the release's leftover sentence (``None`` when no file
-        in the directory still holds plaintext). Releasing here, not on the loop, is what makes a
-        cancelled build clean up after itself: it keeps running on this thread, and the directory goes
-        only once it has let go of the files."""
+        thread. Returns the build's four values, then the release's leftover sentence (``None`` when
+        no file in the directory still holds plaintext). Releasing here, not on the loop, is what
+        makes a cancelled build clean up after itself: it keeps running on this thread, and the
+        directory goes only once it has let go of the files."""
         if not work.claim():
             raise OSError(f"the backup staging directory {work.path} was released before the build")
         try:
@@ -1009,6 +1038,10 @@ class BackupRunner:
             leftover = work.release()
             if leftover is None:
                 raise
+            if isinstance(exc, BackupError):
+                # A refusal the build raised itself (vault BACKLOG #5220): the leftover leads for the
+                # same reason, and a note would not reach the audit row or the alert.
+                raise BackupError(exc.kind, f"{leftover}; the build failed: {exc}") from exc
             if isinstance(exc, OSError | BackupCodecError):
                 # Named in the error itself, first, so the audit row and the alert carry it; a note
                 # would not survive the loop wrapping this into a BackupError.
@@ -1031,10 +1064,11 @@ class BackupRunner:
         secure: bool,
         bundle: _ConfigBundle,
         salt: bytes | None = None,
-    ) -> tuple[str, dict[str, int], int]:
+    ) -> tuple[str, dict[str, int], int, int]:
         """tar(store.db + config/ + manifest.json) → stream-encrypt to ``out_path``. Runs entirely
         OFF the event loop (the consistent snapshot at ``snap_path`` was already taken on the loop by the
-        caller). Returns ``(snapshot_sha256, row_counts, archive_bytes)``. The tar goes to a file in
+        caller). Returns ``(snapshot_sha256, row_counts, archive_bytes, config_files_added)``, the
+        last the regular config files the walk added. The tar goes to a file in
         ``work_dir`` (not RAM) so a multi-GB store never sits in memory; the codec then streams it to the
         archive. That tar is plaintext, so with ``secure`` it is locked to its owner before its first
         byte, the way the restore path locks its own staged tar.
@@ -1049,25 +1083,6 @@ class BackupRunner:
             snapshot_sha256 = _sha256_file(snap_path)
             row_counts = _count_tables(snap_path)
 
-        manifest = {
-            "format": "mfbak",
-            # The .mfbak archive format version — parity with the AAD-bound codec header (ADR 0049
-            # "What's in the archive"). The header's value is authoritative for decode; this is the
-            # human-/tooling-readable copy inside the manifest.
-            "format_version": FORMAT_VERSION,
-            "engine_version": self._engine_version,
-            "instance": self._instance,
-            "created_utc": _utc_iso(now),
-            "snapshot_method": self._settings.snapshot_method,
-            "config_only": config_only,
-            "backend": self._backend_value(),
-            "key_id": key_id,  # one-way fingerprint, NEVER key bytes
-            **bundle.manifest_fields(),
-            "snapshot_sha256": snapshot_sha256,
-            "row_counts": row_counts,
-        }
-        manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
-
         # In the run's own staging directory, which the caller releases on every exit.
         tar_path = work_dir / "archive.tar"
         with open(tar_path, "wb") as tar_fh:
@@ -1075,8 +1090,39 @@ class BackupRunner:
             with tarfile.open(fileobj=tar_fh, mode="w") as tar:
                 if snap_path is not None:
                     tar.add(snap_path, arcname=_STORE_MEMBER)
+                added = 0
                 if bundle.bundled and bundle.path is not None:
-                    self._add_config_dir(tar, bundle.path)
+                    added = self._add_config_dir(tar, bundle.path)
+                if config_only and added == 0:
+                    # Before the archive is written, so nothing is published or pruned: an archive of
+                    # a manifest alone would verify and take a keep-N slot (vault BACKLOG #5220).
+                    # The verdict leads the message, ahead of the path. A staging leftover, when
+                    # there is one, is put ahead of both by `_build_in_staging`.
+                    raise BackupError(
+                        "snapshot",
+                        "config-only backup: the config walk added no regular file, so there is "
+                        f"nothing to archive (config dir {bundle.path})",
+                    )
+                # Built after the walk, so `config_bundled` says whether a config file was added,
+                # not whether the walk was asked to run (vault BACKLOG #5220).
+                manifest = {
+                    "format": "mfbak",
+                    # The .mfbak archive format version — parity with the AAD-bound codec header
+                    # (ADR 0049 "What's in the archive"). The header's value is authoritative for
+                    # decode; this is the human-/tooling-readable copy inside the manifest.
+                    "format_version": FORMAT_VERSION,
+                    "engine_version": self._engine_version,
+                    "instance": self._instance,
+                    "created_utc": _utc_iso(now),
+                    "snapshot_method": self._settings.snapshot_method,
+                    "config_only": config_only,
+                    "backend": self._backend_value(),
+                    "key_id": key_id,  # one-way fingerprint, NEVER key bytes
+                    **bundle.after_walk(added).manifest_fields(),
+                    "snapshot_sha256": snapshot_sha256,
+                    "row_counts": row_counts,
+                }
+                manifest_bytes = json.dumps(manifest, sort_keys=True).encode("utf-8")
                 info = tarfile.TarInfo(_MANIFEST_MEMBER)
                 info.size = len(manifest_bytes)
                 info.mtime = int(now)
@@ -1109,9 +1155,9 @@ class BackupRunner:
             dst.flush()
             os.fsync(dst.fileno())
         archive_bytes = out_path.stat().st_size
-        return snapshot_sha256, row_counts, archive_bytes
+        return snapshot_sha256, row_counts, archive_bytes, added
 
-    def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> None:
+    def _add_config_dir(self, tar: tarfile.TarFile, base: Path) -> int:
         """Add the config dir ``base`` under ``config/`` — every regular file (incl. ``_*.py``,
         ``connections.toml``, ``codesets/``, fixtures). A link out of the bundle would smuggle an
         arbitrary host file into the archive, so the walk aims to add only regular files and does
@@ -1135,7 +1181,10 @@ class BackupRunner:
         candidate lives only for one validation, so one listed here may be gone by the add, and a
         killed editor's leftover is not config. So is the backup's own staging, which a data dir
         inside the config dir puts there (BACKLOG #1174): its plaintext snapshot and the tar being
-        written must not ride in the bundle."""
+        written must not ride in the bundle.
+
+        Returns how many regular files it added, which a config-only pass needs (vault BACKLOG
+        #5220)."""
         pruned: list[str] = []
         found: list[Path] = []
         for dirpath, dirs, files in _walk_unfollowed(base, pruned):
@@ -1155,6 +1204,7 @@ class BackupRunner:
                     ", ".join(sorted(Path(p).relative_to(base).as_posix() for p in pruned))
                 ),
             )
+        added = 0
         # Sorted whole, as the earlier `sorted(rglob)` was, so the member order is unchanged.
         for path in sorted(found):
             if path.is_symlink() or not path.is_file():
@@ -1162,7 +1212,14 @@ class BackupRunner:
             rel = path.relative_to(base)
             if _is_config_edit_artifact(rel):
                 continue
+            before = len(tar.getmembers())
             tar.add(path, arcname=f"{_CONFIG_PREFIX}{rel.as_posix()}", recursive=False)
+            # Counted from the member tar wrote, so a path swapped for a link or a folder after the
+            # check above does not count as a file, nor one tar skipped, such as a socket.
+            members = tar.getmembers()
+            if len(members) > before and members[-1].isreg():
+                added += 1
+        return added
 
     # --- keep-N retention ----------------------------------------------------
 
@@ -2816,11 +2873,8 @@ def _verify_in_staging(
 
     # (3) integrity_check (the fuller PRAGMA integrity_check, off the hot path).
     integrity_ok, integrity_msg = _integrity_check(snap)
-    raw_counts = manifest.get("row_counts")
-    manifest_counts = (
-        {str(k): int(v) for k, v in raw_counts.items()} if isinstance(raw_counts, dict) else {}
-    )
     row_counts = _count_tables(snap)
+    manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
     if not integrity_ok:
         return VerifyResult(
             "FAIL",
@@ -2829,35 +2883,15 @@ def _verify_in_staging(
             manifest_counts=manifest_counts,
             reason=f"integrity_check failed: {integrity_msg}",
         )
-    # (4) row-count sanity vs the manifest (catches a torn/truncated snapshot).
-    #
-    # Compared over the MANIFEST's own keys, not by dict equality (BACKLOG #1722 follow-up).
-    # `_count_tables` derives its table set from the file it is given, so `row_counts` here
-    # reflects the RESTORED snapshot's own schema, which can legitimately be a superset of
-    # what an OLDER manifest recorded — a manifest written before this table set was widened
-    # (or before a later table existed at all) has fewer keys than the archive it describes
-    # really has tables. `run_restore_verify` is explicitly a standalone check of an OLDER
-    # archive (see its docstring and the AC-5 comment above), so that gap is an ordinary
-    # thing to hit, not tampering, and dict equality would FAIL every such archive on sight.
-    # A table the manifest tracked but the snapshot's schema no longer has (dropped, or never
-    # existed there) reads as a 0, the same convention the old fixed-list `_count_tables` used
-    # for a table absent from the schema — so a manifest count of 0 for it still passes, and a
-    # nonzero one still correctly FAILs (real data loss). A table `row_counts` has that the
-    # manifest never tracked is not compared at all: an older manifest cannot be faulted for
-    # not knowing about a table it never counted.
-    mismatches = {
-        table: (manifest_counts[table], row_counts.get(table, 0))
-        for table in manifest_counts
-        if row_counts.get(table, 0) != manifest_counts[table]
-    }
-    if mismatches:
+    # (4) row-count sanity vs the manifest (catches a torn/truncated snapshot, and a compare that
+    # read nothing); :func:`_compare_row_counts` says why it is keyed off the manifest's tables.
+    if count_refusal is not None:
         return VerifyResult(
             "FAIL",
             integrity_ok=True,
             row_counts=row_counts,
             manifest_counts=manifest_counts,
-            reason=f"row-count mismatch on {sorted(mismatches)}: "
-            f"snapshot={row_counts} manifest={manifest_counts}",
+            reason=count_refusal,
         )
     decrypted_cells = 0
     if full:
@@ -2987,7 +3021,7 @@ def _count_tables(db_path: Path) -> dict[str, int]:
     has fewer keys than a snapshot's schema really has — and that is expected, not tampering:
     ``run_restore_verify`` is a standalone check of an archive from any earlier point (AC-5), so an
     older, narrower manifest is an ordinary thing to verify. The compare in
-    :func:`_verify_archive_blocking` is written to tolerate exactly that (keyed off the manifest's
+    :func:`_compare_row_counts` is written to tolerate exactly that (keyed off the manifest's
     own keys, not dict equality) — this function only ever reports what IS in the schema, and does
     not itself guarantee cross-build equality.
 
@@ -3894,36 +3928,86 @@ def _discard_partial_restore(dest_store_path: Path, written: list[Path]) -> None
             log.warning("could not remove the partially restored config member %s: %s", path, exc)
 
 
-def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str, int]:
-    """``integrity_check`` + the manifest row-count compare on the extracted ``store.db``, run on the
-    exact file about to be placed. Same two checks (and the same helpers) as
-    :func:`_verify_archive_blocking` steps 3-4; returns the counts for the restore summary.
+def _compare_row_counts(
+    manifest: dict[str, object], row_counts: dict[str, int]
+) -> tuple[dict[str, int], str | None]:
+    """The manifest's recorded counts, and the reason the snapshot's ``row_counts`` fail the compare
+    against them (``None`` when they agree). The one compare both :func:`_verify_in_staging` (the
+    archive verify) and :func:`_verify_extracted_store` (restore's pre-place check) run.
 
-    The compare is keyed off the MANIFEST's own keys rather than dict equality, for the reason
-    :func:`_verify_archive_blocking` gives at its step 4: :func:`_count_tables` derives its table set
-    from the snapshot's own ``sqlite_master`` (BACKLOG #1722), so a manifest written before that set
-    was widened records fewer tables than the archive really has. Restoring an archive taken by an
-    EARLIER build is the ordinary case for this subcommand, so dict equality would refuse on sight the
-    archives a restore exists to accept. A table the manifest tracked that the snapshot's schema lacks
-    reads as 0, so a manifest count of 0 still passes and a nonzero one still raises: real data loss is
-    still caught. A table the snapshot has that the manifest never tracked is not compared at all."""
-    integrity_ok, integrity_msg = _integrity_check(snap)
-    if not integrity_ok:
-        raise BackupError("verify", f"the archive's store failed integrity_check: {integrity_msg}")
-    row_counts = _count_tables(snap)
+    Keyed off the MANIFEST's own tables, not dict equality (BACKLOG #1722 follow-up).
+    :func:`_count_tables` derives its table set from the file it is given, so ``row_counts`` reflects
+    the snapshot's own schema, which can legitimately be a superset of what an OLDER manifest
+    recorded: one written before this table set was widened (or before a later table existed) has
+    fewer keys than the archive really has tables. Verifying or restoring an archive taken by an
+    earlier build is ordinary (AC-5), so dict equality would refuse every such archive on sight. A
+    table the manifest tracked that the snapshot's schema lacks reads as 0, so a manifest count of 0
+    for it still agrees and a nonzero one is real data loss. A table the snapshot has that the
+    manifest never tracked is not compared at all.
+
+    Because the compare walks the manifest's tables, it reads nothing when the manifest records none
+    (``row_counts`` empty or missing), and nothing of the snapshot when the two share no table, the
+    case of a snapshot whose schema holds no table at all: every manifest count then reads as 0. A PASS there would certify counts nobody compared, the shape BACKLOG #2186 produced
+    when the backup and the verify both counted an empty stand-in, so at least those refuse (BACKLOG
+    #5056). A full archive never legitimately has either: its manifest lists every table of its
+    store, and even the oldest, four-table manifest names ``messages``. A config-only archive carries
+    no snapshot and returns before this compare. A ``row_counts`` that is not a mapping, or a count
+    that is not a non-negative integer, refuses too, rather than being coerced (``3.9`` read as
+    ``3``) or raising out of the verify."""
     raw_counts = manifest.get("row_counts")
-    manifest_counts = (
-        {str(k): int(v) for k, v in raw_counts.items()} if isinstance(raw_counts, dict) else {}
-    )
+    manifest_counts: dict[str, int] = {}
+    if raw_counts is not None and not isinstance(raw_counts, dict):
+        return manifest_counts, (
+            f"the manifest's row counts are a {type(raw_counts).__name__}, not a mapping of table "
+            "to count, so they cannot be compared"
+        )
+    malformed: list[str] = []
+    for table, count in (raw_counts or {}).items():
+        # bool is an int subclass, and a float, a string or a null is not a row count.
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            manifest_counts[str(table)] = count
+        else:
+            malformed.append(str(table))
+    if malformed:
+        return manifest_counts, (
+            f"the manifest's row counts for {sorted(malformed)} are not non-negative integers, so "
+            "they cannot be compared"
+        )
+    if not manifest_counts:
+        return manifest_counts, (
+            "the manifest records no row counts, so the row-count compare would read nothing; a "
+            "full archive's manifest lists every table of its store"
+        )
     mismatches = sorted(
         table for table in manifest_counts if row_counts.get(table, 0) != manifest_counts[table]
     )
     if mismatches:
-        raise BackupError(
-            "verify",
-            f"row-count mismatch on {mismatches} (a torn or truncated snapshot): "
-            f"snapshot={row_counts} manifest={manifest_counts}",
+        return manifest_counts, (
+            f"row-count mismatch on {mismatches} (a torn snapshot or a wrong manifest): "
+            f"snapshot={row_counts} manifest={manifest_counts}"
         )
+    # After the mismatch check, so a truncated snapshot against nonzero counts still reads as the
+    # data loss it is; what reaches here is an all-zero manifest agreeing with tables it never saw.
+    if not manifest_counts.keys() & row_counts.keys():
+        return manifest_counts, (
+            f"the manifest's {len(manifest_counts)} table(s) share none with the archive's store.db "
+            f"({len(row_counts)} table(s)), so the row-count compare would read nothing"
+        )
+    return manifest_counts, None
+
+
+def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str, int]:
+    """``integrity_check`` + the manifest row-count compare (:func:`_compare_row_counts`) on the
+    extracted ``store.db``, run on the exact file about to be placed. Same two checks (and the same
+    helpers) as :func:`_verify_archive_blocking` steps 3-4; returns the counts for the restore
+    summary."""
+    integrity_ok, integrity_msg = _integrity_check(snap)
+    if not integrity_ok:
+        raise BackupError("verify", f"the archive's store failed integrity_check: {integrity_msg}")
+    row_counts = _count_tables(snap)
+    _manifest_counts, count_refusal = _compare_row_counts(manifest, row_counts)
+    if count_refusal is not None:
+        raise BackupError("verify", count_refusal)
     return row_counts
 
 

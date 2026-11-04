@@ -54,7 +54,11 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store
-from messagefoundry.store.base import DEFAULT_STORE_ACQUIRE_TIMEOUT, acquire_pooled
+from messagefoundry.store.base import (
+    DEFAULT_STORE_ACQUIRE_TIMEOUT,
+    ReferenceKeyCollision,
+    acquire_pooled,
+)
 from messagefoundry.transports.base import count_setting, float_setting
 from messagefoundry.transports.egress import check_lookup_allowed
 
@@ -563,7 +567,13 @@ class ReferenceSyncRunner:
         # genuine re-materialization and keep stale data (Track B Step 6 correctness). The leading
         # seconds keep versions roughly time-ordered for an operator reading reference_version.
         version = f"v{int(self._clock())}-{uuid4().hex[:8]}"
-        await self._store.write_reference_snapshot(name=spec.name, version=version, rows=rows)
+        try:
+            await self._store.write_reference_snapshot(name=spec.name, version=version, rows=rows)
+        except ReferenceKeyCollision as exc:
+            # BACKLOG #4917: sync_all logs only the class. This text holds the set's name and two
+            # ordinals, never a key, so it is logged whole: the ordinals find the rows in the source.
+            log.error("%s (not synced)", exc)
+            raise
         log.info(
             "reference set %r materialized: %d rows (version %s)", spec.name, len(rows), version
         )

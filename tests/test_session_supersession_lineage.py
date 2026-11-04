@@ -105,6 +105,7 @@ async def test_an_elevation_during_the_identity_provider_round_trip_is_followed(
         auth_provider="ad",
         directory_object_id="guid-jdoe",
         password_generated=False,
+        audits=(),
     )
     await service.bind_federated_subject(
         jdoe_id, "S-1-5-21-fed", expected_issuer=None, expected_subject=None, actor="admin"
