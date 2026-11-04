@@ -27,14 +27,18 @@ exception becomes a ``500`` that skips the caller's audited-refusal branch.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import hmac
+import ipaddress
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 __all__ = [
+    "OTHERNAMES_INTACT_KEY",
     "QUALIFIED_CERT_NAME",
+    "SAN_TYPES",
     "VERIFIED_ISSUER_KEY",
     "constant_time_equal",
     "constant_time_match",
@@ -42,6 +46,7 @@ __all__ = [
     "cert_name_candidates",
     "client_cert_principal",
     "client_cert_principal_under_issuer",
+    "unmatchable_san_reason",
 ]
 
 # Compared in place of an unconfigured credential slot so the number of digest comparisons does not
@@ -128,7 +133,151 @@ def constant_time_equal(a: str | bytes, b: str | bytes) -> bool:
 #: A configured name :func:`cert_name_candidates` can actually yield: ``CN:<value>`` or
 #: ``SAN:<type>:<value>``, each part non-empty. Anything else loads and then never matches (#2237).
 #: Shared by ``[api].tls_client_cert_identities`` and ``Http``'s ``intake_client_subjects`` (#2287).
+#: It checks shape only; ``MLLP``'s ``tls_client_subjects`` also applies :func:`unmatchable_san_reason`.
 QUALIFIED_CERT_NAME = re.compile(r"CN:.+|SAN:[^:]+:.+", re.DOTALL)
+
+#: The ``subjectAltName`` types ``ssl.getpeercert()`` reports a real value for, spelled as it spells
+#: them (CPython ``_ssl.c``, ``_get_peer_alt_names``). A ``SAN:<type>:`` with any other type, or the
+#: same type in another case, is never yielded by :func:`cert_name_candidates` (BACKLOG #4907).
+SAN_TYPES = ("DNS", "email", "URI", "IP Address", "Registered ID", "DirName", "othername")
+
+#: The types ``ssl`` reports only as a placeholder: it hands x400Address and ediPartyName to OpenSSL's
+#: ``GENERAL_NAME_print``, which writes ``X400Name:<unsupported>`` and ``EdiPartyName:<unsupported>``
+#: whatever the name holds.
+_PLACEHOLDER_ONLY_SAN_TYPES = frozenset({"X400Name", "EdiPartyName"})
+
+#: The text ``ssl`` reports in place of a SAN it cannot render: ``<unsupported>`` for an otherName of a
+#: type OpenSSL does not print, or whose value has the wrong ASN.1 type, and ``<invalid>`` for an
+#: iPAddress of neither 4 nor 16 bytes. Measured on CPython 3.14.7 with OpenSSL 3.5.7 by decoding
+#: certificates carrying each form. ``_ssl.c`` also writes ``<INVALID>``, in upper case, for a
+#: Registered ID whose text does not fit its buffer; that is read from CPython's source, since
+#: OpenSSL 3.5.7 refused every certificate tried that could reach it. So the text is compared with
+#: case folded. One such text stands for a whole class of names, so a listed placeholder would
+#: admit every certificate carrying any name of that class (BACKLOG #4907).
+_SAN_PLACEHOLDERS = ("<unsupported>", "<invalid>")
+
+#: The SAN types CPython's ``_ssl.c`` copies or formats whole. Every other type, ``othername`` and
+#: ``Registered ID`` among them, is printed by OpenSSL's ``GENERAL_NAME_print`` and read back with one
+#: ``BIO_gets`` into a 2048-byte buffer, so ``ssl`` keeps at most :data:`_PRINTED_SAN_LINE_BYTES`
+#: bytes of ``<type>:<value>`` and stops after the first newline. Measured on CPython 3.14.7 with
+#: OpenSSL 3.5.7: a UPN ``al<LF>ce`` is reported ``UPN:al<LF>``, and a 2100-character UPN as 2036
+#: characters of value. Such a value may be the first part of a longer name, so it stands for every
+#: name that starts the same way, as a placeholder stands for a class (BACKLOG #4907).
+_WHOLE_SAN_TYPES = frozenset({"DNS", "email", "URI", "IP Address", "DirName"})
+_PRINTED_SAN_LINE_BYTES = 2046
+
+#: Other spellings of a ``SAN_TYPES`` entry, folded, mapped to the one ``ssl`` writes, so a refusal
+#: can name the right spelling: RFC 5280's names, and the short forms an operator might reach for.
+_SAN_TYPE_SPELLINGS = {
+    **{t.lower().replace(" ", ""): t for t in SAN_TYPES},
+    "ip": "IP Address",
+    "rid": "Registered ID",
+    "dnsname": "DNS",
+    "rfc822name": "email",
+    "uniformresourceidentifier": "URI",
+    "directoryname": "DirName",
+}
+
+
+def _is_placeholder_san(san_type: str, value: str) -> bool:
+    """Whether ``SAN:<san_type>:<value>`` is text ``ssl`` reports in place of a name it cannot
+    render, in any case. Fail-closed: a real name carrying the marker text is dropped too, and can
+    only be refused, never admitted, by that."""
+    folded = value.casefold()
+    return san_type in _PLACEHOLDER_ONLY_SAN_TYPES or any(p in folded for p in _SAN_PLACEHOLDERS)
+
+
+def _is_cut_short_san(san_type: str, value: str) -> bool:
+    """Whether ``ssl`` may have cut ``SAN:<san_type>:<value>`` short (:data:`_WHOLE_SAN_TYPES`): it
+    ends in a newline or fills the line ``ssl`` reads. Fail-closed, as :func:`_is_placeholder_san`:
+    a whole name that happens to fill the line exactly is dropped too."""
+    if san_type in _WHOLE_SAN_TYPES:
+        return False
+    line = f"{san_type}:{value}".encode("utf-8", "surrogatepass")
+    return value.endswith("\n") or len(line) >= _PRINTED_SAN_LINE_BYTES
+
+
+def _is_dirname_text(value: str) -> bool:
+    """Whether ``value`` is a DirName as ``ssl`` reports it: a Python tuple of RDNs, rendered with
+    ``repr``, such as ``((('commonName', 'x'),),)``."""
+    try:
+        parsed = ast.literal_eval(value)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return False
+    return isinstance(parsed, tuple) and repr(parsed) == value
+
+
+def _ssl_ip_text(value: str) -> str | None:
+    """``value`` as ``ssl`` writes an iPAddress SAN, or ``None`` when it is not an address.
+
+    ``_ssl.c`` formats the raw bytes itself: IPv4 dotted, IPv6 as eight upper-case hex groups with
+    no leading zeros and no ``::`` compression, so ``2001:db8::1`` is reported ``2001:DB8:0:0:0:0:0:1``."""
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if address.version == 4:
+        return str(address)
+    packed = address.packed
+    return ":".join(f"{(packed[i] << 8) | packed[i + 1]:X}" for i in range(0, 16, 2))
+
+
+def unmatchable_san_reason(name: str) -> str | None:
+    """Why :func:`cert_name_candidates` can never yield the ``SAN:`` name ``name``, or ``None``.
+
+    ``None`` for any name that is not ``SAN:<type>:<value>``: :data:`QUALIFIED_CERT_NAME` checks
+    shape. This refuses, at least, a type ``ssl`` never reports, including one of
+    :data:`SAN_TYPES` in another case; a placeholder ``ssl`` reports for a name it cannot render; a
+    value ``ssl`` may have cut short; an IP address in a spelling ``ssl`` never writes; a DirName
+    that is not the tuple ``ssl`` reports; an otherName holding a NUL; and an otherName with no
+    ``<form>:`` before its value. It
+    does not check any other value against what a certificate can hold. The reason quotes nothing the operator wrote, only ``ssl``'s own
+    spellings, so it can go into an error message as it is."""
+    if not name.startswith("SAN:") or name.count(":") < 2:
+        return None
+    _, san_type, value = name.split(":", 2)
+    folded = san_type.lower().replace(" ", "")
+    if _is_placeholder_san(san_type, value) or folded in {
+        t.lower() for t in _PLACEHOLDER_ONLY_SAN_TYPES
+    }:
+        return (
+            "a placeholder, such as 'SAN:othername:<unsupported>', that ssl reports in place of a "
+            "name it cannot render. X400Name and EdiPartyName are only ever reported that way. "
+            "Every certificate carrying such a name presents the same text, so it names no one "
+            "sender, and a placeholder is never matched"
+        )
+    if _is_cut_short_san(san_type, value):
+        return (
+            "a value ssl may have cut short: it keeps at most 2046 bytes of an othername or "
+            "Registered ID line and stops after a newline, so such an entry would match every "
+            "name that starts the same way"
+        )
+    if san_type not in SAN_TYPES:
+        spelling = _SAN_TYPE_SPELLINGS.get(folded)
+        if spelling is not None:
+            return f"a SAN type ssl never reports in that spelling; ssl writes it {spelling!r}"
+        return "a SAN type ssl never reports; it reports " + ", ".join(repr(t) for t in SAN_TYPES)
+    if san_type == "IP Address" and _ssl_ip_text(value) != value:
+        return (
+            "an IP address in a spelling ssl never writes: IPv4 dotted, and IPv6 as eight "
+            "upper-case hex groups with no leading zeros and no '::'"
+        )
+    if san_type == "DirName" and not _is_dirname_text(value):
+        return (
+            "a DirName in a form ssl never reports: it reports the name as a Python tuple of "
+            "RDNs, such as ((('commonName', 'feed.example'),),)"
+        )
+    if san_type == "othername" and "\x00" in value:
+        return (
+            "an othername holding a NUL, which ssl never reports: it stops an othername at its "
+            "first NUL, and no othername of a certificate holding one is matched"
+        )
+    if san_type == "othername" and (":" not in value or not value.split(":", 1)[0]):
+        return (
+            "an othername in a form ssl never reports: it reports '<form>:<value>', such as "
+            "'UPN:feed@partner.example'"
+        )
+    return None
 
 
 def cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:
@@ -137,7 +286,17 @@ def cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:
     Yields ``"CN:<commonName>"`` for each subject commonName RDN and ``"SAN:<type>:<value>"`` for each
     subjectAltName entry (e.g. ``"SAN:DNS:svc.internal"``). These are the exact keys an operator lists
     under an issuer in ``[api].tls_client_cert_identities`` — qualifying the name space (CN vs SAN,
-    SAN type) means a spoofed commonName can never collide with a pinned DNS SAN."""
+    SAN type) means a spoofed commonName can never collide with a pinned DNS SAN.
+
+    A SAN ``ssl`` reports only as a placeholder (:data:`_SAN_PLACEHOLDERS`, such as
+    ``othername:<unsupported>``), or may have cut short (:data:`_WHOLE_SAN_TYPES`), is left out, so
+    no listed entry can match it (BACKLOG #4907). Such text stands for a whole class of names, so
+    matching it would admit every certificate carrying any of them. Every caller shares this, the operator API and the HTTP listener included.
+
+    An ``othername`` is yielded only when ``peercert`` carries :data:`OTHERNAMES_INTACT_KEY` set to
+    ``True``, which a caller sets only after reading the certificate's own DER: ``ssl`` cuts an
+    otherName value at its first NUL, so its text alone cannot show that it is whole."""
+    othernames_intact = peercert.get(OTHERNAMES_INTACT_KEY) is True
     candidates: list[str] = []
     for rdn in peercert.get(
         "subject", ()
@@ -147,7 +306,11 @@ def cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:
                 candidates.append(f"CN:{pair[1]}")
     for pair in peercert.get("subjectAltName", ()):
         if len(pair) == 2:
-            candidates.append(f"SAN:{pair[0]}:{pair[1]}")
+            san_type, value = f"{pair[0]}", f"{pair[1]}"
+            if san_type == "othername" and not othernames_intact:
+                continue
+            if not _is_placeholder_san(san_type, value) and not _is_cut_short_san(san_type, value):
+                candidates.append(f"SAN:{san_type}:{value}")
     return candidates
 
 
@@ -193,6 +356,17 @@ def client_cert_principal(
 #: leaf, or ``""`` when none qualifies. ``ssl`` never produces this key, and each overwrites it on
 #: every connection, so a peer cannot supply it.
 VERIFIED_ISSUER_KEY = "mf_verified_issuer"
+
+#: The key the api shim, the inbound HTTP listener and the MLLP listener add beside
+#: :data:`VERIFIED_ISSUER_KEY`: ``True`` only when
+#: ``pki.san_othernames_intact`` read the leaf's DER and found every otherName value whole
+#: (BACKLOG #4907). ``ssl`` prints an otherName value as a C string, so its text stops at the
+#: value's first NUL: measured on CPython 3.14.7 with OpenSSL 3.5.7, a UPN
+#: ``victim@x.example<NUL>evil`` is reported ``UPN:victim@x.example``, which is the whole of a
+#: different name. Absent, or anything but ``True``, :func:`cert_name_candidates` yields no
+#: ``othername`` for that certificate, so a caller that never reads the DER fails closed. ``ssl``
+#: never produces this key, and each caller overwrites it on every connection.
+OTHERNAMES_INTACT_KEY = "mf_othernames_intact"
 
 
 def client_cert_principal_under_issuer(

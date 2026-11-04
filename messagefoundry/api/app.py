@@ -399,6 +399,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import (
     POSSIBLY_GENERIC_DB_HOP,
     UNRESOLVED_DRIVER_REASON,
+    ConfigDirUnlistable,
     EnvRef,
     InboundConnection,
     Registry,
@@ -487,6 +488,7 @@ from messagefoundry.pipeline.wiring_runner import (
     ShardLaneOwnershipError,
 )
 from messagefoundry.privilege_probes import probe_vault
+from messagefoundry.redaction import REFUSAL_LOG_LIMIT as _REFUSAL_LOG_LIMIT
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.remotedebug import (
     RemoteDebugPosture,
@@ -2545,16 +2547,10 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     WiringError,
 )
 
-#: The answer bound :func:`_audit_refused_reload` passes to ``safe_exc`` for at least its 404, 422
-#: and 503 refusal WARNINGs and its reload_fault ERROR, which carry the real reload error that the answer
-#: withholds. ``safe_exc``'s default 200-character cut dropped the directory from a long config
-#: path and the fix from a long WiringError. 8192 is twice the 4096 that ``FilesystemPath`` allows a ``config_dir``, so any
-#: directory the API accepts fits with its message, and a multi-line WiringError fits too. It still
-#: bounds how much redaction-missed text one line carries and what each handler's filters re-scan on
-#: the event loop. ``safe_exc`` redacts before the cut. The bound is on the text BEFORE
-#: ``scrub_log_argument`` escapes it, so a run of control characters can still grow the line several
-#: times over. The cut keeps the head, so an error longer than this still loses its tail.
-_REFUSAL_LOG_LIMIT: Final = 8192
+
+#: The answer to a reload whose config directory the engine could not resolve or list: at the
+#: target check, or in the load after it (vault BACKLOG #5248).
+_UNREADABLE_DETAIL: Final = "the engine could not read the config directory; see the engine log"
 
 #: The answer's bound on a hop refusal raised BUILDING the ``POST /alerts/test-email`` transport
 #: (BACKLOG #2193). The revocation guard's text runs to about 900 characters and its levers start
@@ -2625,9 +2621,11 @@ async def _audit_refused_reload(
     request whose digest cannot be taken is refused the same way, with no hold filed. A release
     refused before its digest check (:class:`ConfigRefusedBeforeApprovalCheck`) keeps its reason
     and adds ``approved_fingerprint`` and ``approval_digest_check`` ``not_reached``. A directory
-    that cannot be resolved for another reason writes reason ``unreadable`` and answers 422; the
-    engine logged why at WARNING. Any other ``Exception`` is a fault inside the reload, a plain
-    ``FileNotFoundError`` from a runner start or swap among them (not a missing directory): it
+    that cannot be resolved for another reason, or that the load cannot list once it has been
+    (:class:`~messagefoundry.config.wiring.ConfigDirUnlistable`, vault BACKLOG #5248), writes
+    reason ``unreadable`` and answers 422; why is logged at WARNING. Any other ``Exception`` is a
+    fault inside the reload, a plain ``FileNotFoundError`` from a runner start or swap among them
+    (not a missing directory): it
     writes reason ``reload_fault`` with the error's type name, is logged at ERROR, and answers 500
     with a generic detail (BACKLOG #3157). A ``reload_fault`` row does not claim the old graph is
     still serving: at least a fault raised after the swap committed leaves the new one live, and
@@ -2699,7 +2697,16 @@ async def _audit_refused_reload(
         # The engine logged the cause, scrubbed, where it raised this.
         warn("config reload refused: its config directory could not be resolved or listed")
         action, detail["reason"] = "config_reload_failed", "unreadable"
-        status, answer = 422, "the engine could not read the config directory; see the engine log"
+        status, answer = 422, _UNREADABLE_DETAIL
+    elif isinstance(exc, ConfigDirUnlistable):
+        # The load met a directory lost after the target check (vault BACKLOG #5248). Its refusal
+        # names the directory, so it is logged as any other load refusal is.
+        warn(
+            "config reload refused (unreadable): %s",
+            scrub_log_argument(safe_exc(exc, limit=_REFUSAL_LOG_LIMIT)),
+        )
+        action, detail["reason"] = "config_reload_failed", "unreadable"
+        status, answer = 422, _UNREADABLE_DETAIL
     elif isinstance(exc, ConfigDigestUnavailable):
         # Not "the config changed": nothing shows it did. The digest's own WARNING names the cause.
         warn("config reload refused: its config digest could not be taken")

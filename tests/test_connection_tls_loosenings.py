@@ -194,8 +194,10 @@ def test_check_surfaces_the_expiry_bridge(tmp_path: Path) -> None:
     r = _result(report, "tls-allow-expired")
     assert r.ok and not r.required and not r.skipped
     assert "OB_BRIDGE" in r.detail and "partner.example.invalid:6100" in r.detail
-    # Advisory, and honest in both directions: it must not imply verify-off.
-    assert "chain, hostname and key usage are still verified" in r.detail
+    # Advisory, and honest in both directions: it must not imply verify-off, and it must not claim the
+    # whole chain is verified (vault BACKLOG #5089).
+    assert "the chain's signatures, the hostname and key usage are still verified" in r.detail
+    assert "validity periods of the intermediates and the trust anchor" in r.detail
 
 
 def test_check_surfaces_the_hostname_unchecked_set(tmp_path: Path) -> None:
@@ -219,6 +221,7 @@ def test_check_expiry_line_stops_claiming_the_hostname_where_it_is_off(tmp_path:
     report = run_checks(_write_config(tmp_path, module=_HOSTNAME_MODULE), run_lint=False)
     detail = _result(report, "tls-allow-expired").detail
     assert "chain, hostname and key usage are still verified" not in detail
+    assert "the chain's signatures, the hostname and key usage" not in detail
     assert "the hostname is NOT on OB_BOTH" in detail
     assert "and is on the others" in detail  # OB_EXPIRED is the other, and it checks the name
 
@@ -287,6 +290,7 @@ def test_check_skips_rather_than_reporting_clean_on_an_unloadable_config(tmp_pat
     for name in (
         "tls-allow-expired",
         "generic-db-tls",
+        "generic-db-server",
         "tls-revocation-attested",
         "fhir-update-path-form",
         "tls-check-hostname",

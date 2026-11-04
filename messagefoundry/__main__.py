@@ -153,6 +153,9 @@ def main(argv: list[str] | None = None) -> int:
     # `run_cli` below hardens again, which is a no-op the second time. This call stays the FIRST
     # statement of main() anyway, because tests/test_cp1252_console_safety.py reads it here.
     harden_console_streams()
+    # BACKLOG #3768: before parsing, so a record no handler takes from here until a subcommand's
+    # handlers exist meets the filter chain. docs/PHI.md section 7 row 1 says what it misses.
+    install_filtered_last_resort()
     # A PROCESS property too, and only honoured before pyodbc's first ODBC use in the process, so it
     # is set here, ahead of config loading and every subcommand (BACKLOG #2049; see odbc_env.py).
     disable_driver_manager_pooling()
@@ -2795,10 +2798,6 @@ def _serve(args: argparse.Namespace) -> int:
     # A no-op where the interpreter was started with remote debugging disabled, which is every
     # engine shard under `supervise`.
     install_remote_debug_guard()
-    # BACKLOG #3768: configure_logging runs only after the gates below, so until then a record no
-    # handler takes goes to `logging.lastResort`. This gives it the filter chain; the function
-    # says what else it keeps. The comments below that name the filtered lastResort rely on it.
-    install_filtered_last_resort()
 
     import uvicorn
 
@@ -2842,7 +2841,7 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # APPLIED here, REPORTED after configure_logging (below). The call must run before PHI can be
     # resident; the report must not, because in a real process the root logger still has no
-    # handlers here and every record is serviced by the filtered logging.lastResort above — which
+    # handlers here and every record is serviced by main()'s filtered logging.lastResort — which
     # drops < WARNING at ANY --log-level and reaches none of the handlers or the off-box forwarder
     # the operator configured. A hardened
     # container (RLIMIT_MEMLOCK=0) would otherwise print a WARNING to stderr on every start that no
@@ -12913,10 +12912,10 @@ def _emit_trust_anchor_refusal(exc: TrustAnchorError, *, as_json: bool) -> int:
 #: Adding a name here takes a subcommand OUT of that default. `tests/test_cli.py` pins this set and
 #: checks that each member really calls `configure_logging`.
 #:
-#: `serve` calls `configure_logging` only after its settings, key and egress gates run. For that
-#: window `_serve` calls `install_filtered_last_resort` near its start (BACKLOG #3768), whose
-#: docstring says what it covers. `supervise` calls
-#: `configure_logging` on its first line, so it has no such window.
+#: Neither has a handler before its own `configure_logging` call: `serve` makes it only after its
+#: settings, key and egress gates run, and `supervise` after its remote-debug guard and imports.
+#: For that window main() calls `install_filtered_last_resort` before parsing (BACKLOG #3768); its
+#: docstring says what it covers, and docs/PHI.md section 7 row 1 what it misses.
 _CONFIGURES_OWN_LOGGING = frozenset({"serve", "supervise"})
 
 #: The subcommands `run_cli` does NOT mark as carrying a result on stdout, so a print() in a config

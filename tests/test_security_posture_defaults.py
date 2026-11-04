@@ -2535,6 +2535,10 @@ _CONNECTION_DEVIATIONS_EXEMPT = {
     # strict AEAD allow-list to that one hop, and leaving it unset is the shipped posture every other
     # connection already has. A reader that reported it would be reporting operators who hardened.
     "tls_ciphers": "opt-in AEAD allow-list on one hop -- a tightening, not a deviation to report",
+    # BACKLOG #4907. A TIGHTENING, like tls_ciphers and tls_ca_pin above: setting it refuses a
+    # verified MLLP sender whose certificate names no listed subject under its issuing CA, and
+    # leaving it unset is the shipped posture of every mTLS listener.
+    "tls_client_subjects": "opt-in MLLP sender allowlist -- a tightening, not a deviation to report",
     # Not TLS at all — the regex matches the word 'verify' in an HL7 ACK correlation check.
     "verify_ack_control_id": "HL7 ACK control-id correlation, unrelated to transport TLS",
     # Verify-off and TLS-off are GATED rather than reported: the ADR 0092 posture-keyed cell refuses
@@ -2776,6 +2780,16 @@ def test_the_expiry_entry_no_longer_promises_the_hostname_unconditionally() -> N
     risk = dict(_pairs(expiry_hops=("OB_X",)))["tls_allow_expired"]
     assert "hostname match and key usage are still fully verified" not in risk
     assert "tls_check_hostname=false" in risk
+
+
+def test_the_expiry_entry_no_longer_claims_the_whole_chain_is_verified() -> None:
+    """CORRECTED 2026-11-03 (vault BACKLOG #5089): the entry said "the chain signature and key usage
+    are still fully verified". The relaxation also skips at least the other chain certificates'
+    validity periods and a CRL's own window, and the entry now says so."""
+    risk = dict(_pairs(expiry_hops=("OB_X",)))["tls_allow_expired"]
+    assert "still fully verified" not in risk
+    assert "validity periods of the intermediates and the trust anchor" in risk
+    assert "a CRL's own validity window" in risk
 
 
 def test_the_revocation_attestation_is_actually_wired() -> None:

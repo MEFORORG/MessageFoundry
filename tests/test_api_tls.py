@@ -64,6 +64,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import validate_proxy_tls_posture
 from messagefoundry.credential import (
+    OTHERNAMES_INTACT_KEY,
     VERIFIED_ISSUER_KEY,
     client_cert_principal,
     client_cert_principal_under_issuer,
@@ -2352,7 +2353,7 @@ def test_extract_verified_peercert_variants() -> None:
     # A verified client cert surfaces as its getpeercert() dict. The verified issuer is always
     # re-derived, never passed through: this fake has no verified chain, so it is "".
     surfaced = extract_verified_peercert(_FakeTransport(_FakeSSL(cert)))  # type: ignore[arg-type]
-    assert surfaced == {**cert, VERIFIED_ISSUER_KEY: ""}
+    assert surfaced == {**cert, VERIFIED_ISSUER_KEY: "", OTHERNAMES_INTACT_KEY: False}
     # Server-only TLS (empty getpeercert()) surfaces nothing — deny-by-default upstream.
     assert extract_verified_peercert(_FakeTransport(_FakeSSL({}))) is None  # type: ignore[arg-type]
     # A None cert, a plaintext transport, and an incomplete handshake all surface nothing.
@@ -2370,7 +2371,11 @@ def test_enriched_app_state_snapshots_only_with_cert() -> None:
     cert = _peercert("svc.internal")
     enriched = enriched_app_state(base, _FakeTransport(_FakeSSL(cert)))  # type: ignore[arg-type]
     assert enriched is not base
-    assert enriched[MF_CLIENT_PEERCERT_STATE_KEY] == {**cert, VERIFIED_ISSUER_KEY: ""}
+    assert enriched[MF_CLIENT_PEERCERT_STATE_KEY] == {
+        **cert,
+        VERIFIED_ISSUER_KEY: "",
+        OTHERNAMES_INTACT_KEY: False,
+    }
     assert enriched["shared"] == 1
     assert MF_CLIENT_PEERCERT_STATE_KEY not in base  # producer never mutates the shared state
 
@@ -2394,7 +2399,11 @@ def test_client_cert_protocol_enriches_app_state_post_handshake() -> None:
     # super().connection_made ran (base behaviour preserved) AND the verified cert is now in app_state.
     assert proto.made is transport  # type: ignore[attr-defined]
     stashed = proto.app_state[MF_CLIENT_PEERCERT_STATE_KEY]  # type: ignore[attr-defined]
-    assert stashed == {**_peercert("svc.internal"), VERIFIED_ISSUER_KEY: ""}
+    assert stashed == {
+        **_peercert("svc.internal"),
+        VERIFIED_ISSUER_KEY: "",
+        OTHERNAMES_INTACT_KEY: False,
+    }
     assert proto.app_state["shared"] == 1  # type: ignore[attr-defined]
 
 
@@ -2487,6 +2496,20 @@ def _pem(cert: x509.Certificate) -> bytes:
     return cert.public_bytes(serialization.Encoding.PEM)
 
 
+def _upn(value: bytes) -> x509.OtherName:
+    """A UPN otherName holding ``value`` as a DER UTF8String, as written, NUL bytes included."""
+    assert len(value) < 0x80  # short-form length keeps the encoding one line
+    return x509.OtherName(
+        x509.ObjectIdentifier("1.3.6.1.4.1.311.20.2.3"), b"\x0c" + bytes([len(value)]) + value
+    )
+
+
+#: A UPN with a NUL in it, and the UPN ``ssl`` reports in its place: CPython's ``ssl`` stops an
+#: otherName at its first NUL (BACKLOG #4907), so the certificate reads as the listed one.
+_NUL_UPN = b"victim@acme.example\x00evil"
+_LISTED_UPN = "SAN:othername:UPN:victim@acme.example"
+
+
 def _client_bundle(
     tmp_path: Path,
     signer: _CaPair,
@@ -2494,13 +2517,15 @@ def _client_bundle(
     cn: str = "svc.internal",
     leaf_issuer: x509.Name | None = None,
     sent: tuple[x509.Certificate, ...] = (),
+    san: tuple[x509.GeneralName, ...] = (),
 ) -> Path:
     """A client cert + key PEM in ``tmp_path``: a leaf ``cn`` signed by ``signer``, then ``sent``.
 
     ``leaf_issuer`` overrides the leaf's issuer FIELD (the signer still signs it); ``sent`` are
-    intermediates the client presents. Shared with ``tests/test_inbound_http_intake_issuer.py``."""
+    intermediates the client presents; ``san``, when given, is the leaf's subjectAltName. Shared
+    with ``tests/test_inbound_http_intake_issuer.py``."""
     leaf_key = ec.generate_private_key(ec.SECP256R1())
-    leaf = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(_dn((NameOID.COMMON_NAME, cn)))
         .issuer_name(leaf_issuer or signer[0].subject)
@@ -2512,8 +2537,10 @@ def _client_bundle(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(signer[1].public_key()),
             critical=False,
         )
-        .sign(signer[1], hashes.SHA256())
     )
+    if san:
+        builder = builder.add_extension(x509.SubjectAlternativeName(list(san)), critical=False)
+    leaf = builder.sign(signer[1], hashes.SHA256())
     bundle = tmp_path / f"client-{len(list(tmp_path.iterdir()))}.pem"
     bundle.write_bytes(
         _pem(leaf)
@@ -2535,12 +2562,13 @@ def _shim_view(
     cn: str = "svc.internal",
     leaf_issuer: x509.Name | None = None,
     sent: tuple[x509.Certificate, ...] = (),
+    san: tuple[x509.GeneralName, ...] = (),
 ) -> dict[str, Any]:
     """What the mTLS shim records for a leaf ``cn`` signed by ``signer``, verified against ``trusted``.
 
     The leaf and its arguments are :func:`_client_bundle`'s. Fails the test if the handshake itself
     does not verify."""
-    bundle = _client_bundle(tmp_path, signer, cn=cn, leaf_issuer=leaf_issuer, sent=sent)
+    bundle = _client_bundle(tmp_path, signer, cn=cn, leaf_issuer=leaf_issuer, sent=sent, san=san)
     client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     client.check_hostname = False
     client.verify_mode = ssl.CERT_NONE  # the ENGINE side is the verifier under test
@@ -2638,6 +2666,23 @@ def test_two_loaded_cas_with_one_name_are_ambiguous(tmp_path: Path) -> None:
     assert _shim_view(tmp_path, first, [first[0], second[0]])[VERIFIED_ISSUER_KEY] == ""
     # Control: with only one of them loaded, the same handshake does name it.
     assert _shim_view(tmp_path, first, [first[0]])[VERIFIED_ISSUER_KEY] == "CN=Acme CA"
+
+
+def test_an_othername_holding_a_nul_maps_to_no_one(tmp_path: Path) -> None:
+    # ssl reports a UPN "victim@acme.example<NUL>evil" as the listed "UPN:victim@acme.example", so
+    # the text alone matched before BACKLOG #4907. The shim reads the leaf's DER and drops it.
+    ca = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    issuer_map = {"CN=Acme CA": {_LISTED_UPN: "svc"}}
+    cut = _shim_view(tmp_path, ca, [ca[0]], cn="unlisted.example", san=(_upn(_NUL_UPN),))
+    assert cut["subjectAltName"] == (("othername", "UPN:victim@acme.example"),)
+    assert cut[OTHERNAMES_INTACT_KEY] is False
+    assert client_cert_principal_under_issuer(cut, issuer_map) is None
+    # Control: the whole name, from the same CA, maps.
+    whole = _shim_view(
+        tmp_path, ca, [ca[0]], cn="unlisted.example", san=(_upn(b"victim@acme.example"),)
+    )
+    assert whole[OTHERNAMES_INTACT_KEY] is True
+    assert client_cert_principal_under_issuer(whole, issuer_map) == "svc"
 
 
 def test_a_ca_reissued_under_the_same_key_is_one_issuer(tmp_path: Path) -> None:

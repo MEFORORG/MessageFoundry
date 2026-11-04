@@ -58,12 +58,14 @@ from tests._keyed_reopen_contract import (
 )
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
 from tests._keyless_blank_contract import keyed_cipher
+from tests._queue_tag_contract import RawFetch, RawSql
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
     assert_replayed_routed_row_settles,
 )
 from tests._store_audit import ALERT_AUDIT, no_operator_audit, no_purge_audit
+from tests._undecryptable_reply_contract import SPOILS as UNDECRYPTABLE_REPLY_SPOILS
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -5263,7 +5265,7 @@ async def test_over_max_message_bytes_naks_ar_pg(store) -> None:
     assert await _attachment_count(store) == 0
 
 
-async def test_stream_inflight_budget_naks_ae_pg(store) -> None:
+async def test_stream_inflight_budget_naks_ar_pg(store) -> None:
     b64 = _big_b64(2000)
     raw = _hl7_with_doc(b64)
     ic = _streaming_ic(threshold=500)
@@ -5276,7 +5278,8 @@ async def test_stream_inflight_budget_naks_ae_pg(store) -> None:
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
-    assert _stream_ack_code(ack) == "AE"  # detach refused (backpressure) → NAK AE
+    # The body alone is over the whole budget, so no re-send could fit: final, AR (BACKLOG #5078).
+    assert _stream_ack_code(ack) == "AR"
     row = await _only_message(store)
     assert row["status"] == MessageStatus.ERROR.value
     assert "streaming detach failed" in row["error"]
@@ -5703,7 +5706,7 @@ async def test_rotation_moves_an_approval_tombstone_to_the_active_key(store) -> 
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.postgres import PostgresStore
     from tests._approval_seal_contract import assert_tombstone_reseal_contract
-    from tests._session_seal_contract import RawSql, dollar_placeholders
+    from tests._session_seal_contract import dollar_placeholders
 
     async def open_store(key: str, retired: tuple[str, ...]) -> PostgresStore:
         return await PostgresStore.open(
@@ -5769,8 +5772,8 @@ async def test_queue_tag_contract(store) -> None:
         await keyed.close()
 
 
-def _raw_adapters(s) -> tuple[object, object]:
-    """``(raw, fetch)`` for the two contracts below, on pooled connections, outside the store."""
+def _raw_adapters(s) -> tuple[RawSql, RawFetch]:
+    """``(raw, fetch)`` for the contracts below, on pooled connections, outside the store."""
     from tests._session_seal_contract import dollar_placeholders
 
     async def raw(sql: str, params: tuple[object, ...]) -> None:
@@ -5801,6 +5804,24 @@ async def test_erased_reply_contract(store, case, keyed) -> None:
     )
     try:
         await case(sealed, fetch, raw)
+    finally:
+        await sealed.close()
+
+
+@pytest.mark.parametrize("spoil", UNDECRYPTABLE_REPLY_SPOILS, ids=lambda s: s.__name__)
+async def test_undecryptable_reply_contract(store, spoil) -> None:
+    """BACKLOG #4995: a reply body that does not decrypt is dead-lettered with its reference kept and
+    the loopback lane moves, the same contract the SQLite suite runs, on a keyed handle."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests import _undecryptable_reply_contract as contract
+
+    raw, fetch = _raw_adapters(store)
+    sealed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        await contract.assert_lane_moves_past_an_undecryptable_reply(sealed, fetch, raw, spoil)
     finally:
         await sealed.close()
 

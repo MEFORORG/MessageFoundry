@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, assert_never, cast
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.credential import (
+    OTHERNAMES_INTACT_KEY,
     VERIFIED_ISSUER_KEY,
     client_cert_principal_under_issuer,
     constant_time_match_any,
@@ -60,6 +61,7 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import ListenerAdmission
 from messagefoundry.transports.base import (
+    INTAKE_AUDIT_ACTIONS,
     InboundHandler,
     InboundReply,
     ReplyOutcome,
@@ -123,16 +125,6 @@ _HEADER_CAP_OFF_HINT = (
 # On stop()/reload, established clients are closed and their handlers given this long to finish an
 # in-flight commit before the connection tasks are cancelled (mirrors MLLPSource; bounds shutdown).
 _CLIENT_SHUTDOWN_GRACE = 5.0
-
-#: ``connection_event`` kind -> ``audit_log`` action for an intake-auth refusal (ADR 0154 D6). The
-#: kinds double as the connection_event vocabulary, which CI derives from these literal call sites and
-#: asserts against ``docs/PHI.md`` §7 and ``CONNECTION_EVENT_KINDS`` as an exact set — so adding a kind
-#: here without those two is a build failure, by design.
-_INTAKE_AUDIT_ACTIONS = {
-    "intake_auth_failed": "intake.auth_failed",
-    "auth_subject_denied": "intake.auth_subject_denied",
-    "auth_rate_limited": "intake.auth_rate_limited",
-}
 
 
 class HttpRequestError(Exception):
@@ -1189,7 +1181,14 @@ class HttpSource(SourceConnector):
                 peer,
                 HttpRequestError(401, "intake authentication required", kind="intake_auth_failed"),
             )
-        verified = {**peercert, VERIFIED_ISSUER_KEY: self._verified_issuer(ssl_object)}
+        # Lazy, as _client_issuer_index's: pki pulls in cryptography.
+        from messagefoundry.pki import peer_othernames_intact
+
+        verified = {
+            **peercert,
+            VERIFIED_ISSUER_KEY: self._verified_issuer(ssl_object),
+            OTHERNAMES_INTACT_KEY: peer_othernames_intact(ssl_object),
+        }
         if client_cert_principal_under_issuer(verified, self._intake_subjects) is None:
             # A chain a trusted CA signed, carrying a subject nobody allow-listed under THAT CA — an
             # AUTHORIZATION failure, and deliberately distinct from the 401 above (deny-by-default).
@@ -1301,7 +1300,7 @@ class HttpSource(SourceConnector):
         length. The peer address and the mode are what an operator needs; the credential is what an
         attacker would need.
         """
-        action = _INTAKE_AUDIT_ACTIONS.get(exc.kind)
+        action = INTAKE_AUDIT_ACTIONS.get(exc.kind)
         if action is None:
             return
         # The reason is a fixed string at every call site, never request data, so it is safe to log.
@@ -1533,7 +1532,8 @@ class HttpSource(SourceConnector):
             # owner ruling of 2026-09-30 answers a temporary refusal 503 with Retry-After and keeps a
             # permanent one at 422. Which refusals are temporary, the one 413 for over-size and the
             # ERROR row's id in the body are Manager decision d20261030T155119571-255c98 (BACKLOG #2105);
-            # the unusable codec name joined the temporary class later, under BACKLOG #2431. Returns False:
+            # at least the unusable codec name (BACKLOG #2431) and a strict-validation timeout that
+            # never began (BACKLOG #5078) joined the temporary class later. Returns False:
             # this is a post-record refusal with no connection-event kind of its own, so the outer
             # ``closed`` still fires. The drain gets the receipt-sized budget in both modes: this is a
             # fixed few dozen bytes, never the partner-sized body reply_write_timeout exists for.
