@@ -26,7 +26,7 @@ regexes = [
   # a hardcoded literal string naming the test scenario, not a credential — trips generic-api-key on entropy.
   '''adr0114-fence-test''',
   # --- BACKLOG #1478 -- WRITE-TIME log-filter credential fixtures ---------------------------------
-  # Nine SYNTHETIC needles invented for tests/test_logging_credential_scrub.py. Each is a value that
+  # SYNTHETIC needles invented for tests/test_logging_credential_scrub.py. Each is a value that
   # test asserts does NOT survive the production log-handler filter chain, so each is published in
   # test source by construction. They trip generic-api-key on ENTROPY, and the entropy is deliberate:
   # every token carries a hyphen AND an underscore so no fixture can pass for the wrong reason.

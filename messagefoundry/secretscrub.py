@@ -908,7 +908,8 @@ _MEMBER_EXTRA_WORDS = ("token",)
 #
 # IT IS ITS OWN PASS, AND IT RUNS LAST in :func:`_run`, over the text every other pass left. It only
 # replaces a span with ``<key>=<placeholder>``, and the key is text those passes kept, so every
-# character it leaves was already in their output: it hides the same or more of a line, never less.
+# character it leaves was already in their output: within one call it hides the same or more of a
+# line, never less. That holds for a call, not across two (the residuals below say where).
 # Its first draft was a branch of ``_CREDENTIAL_KV``, tried at the same position as the label, and a
 # review of that draft found at least four shapes where it printed a value the label pattern hid: a
 # later label written with a quoted key, a "}" or "@" that ``_KEY_MATERIAL`` or ``_DSN_PASSWORD``
@@ -927,19 +928,25 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # "&", "=" and "://" alike. One quote may open it. Stopping at a later quote costs nothing the builder
 # sends, since a plain password and every ``odbc_params`` value refuse quotes, and it keeps the rest
 # of a quoted echo (``'...;PWD=a b' refused``) readable; stopping early is safe here because an earlier
-# pass has already hidden whatever it hides. A braced value is taken by ``_ODBC_BRACED`` and then on
-# to the same stops, so ``;sslpassword={a;b} c`` is hidden whole, and an unclosed "{" takes the rest
-# of the line, as ``_ODBC_BRACED_OVERRUN`` does for the label pattern. An empty value is no match.
+# pass has already hidden whatever it hides. A braced value is taken by ``_ODBC_BRACED`` with its body
+# kept to one line, and then on to the same stops, so ``;sslpassword={a;b} c`` is hidden whole, and a
+# "{" not closed on its line takes the rest of the line, as ``_ODBC_BRACED_OVERRUN`` does for the
+# label pattern. A brace may not cross a line: a traceback keeps its frames, and an unclosed "{" on
+# one line cannot walk the rest of a long record from every later ";<key>={". An empty value is no
+# match.
 #
 # LINEAR. A match starts only AT a ";", which group 1 takes with the key so the replacement keeps it,
-# so the key run cannot be entered mid-word; the key run and every value walk are possessive, and
-# the lookbehinds are a fixed set of fixed widths. A plain walk stops at the next ";", so walks
-# from two starts never overlap; a braced walk that crosses a ";" ends the match beyond it, and the
-# scan resumes there. ``tests/test_connection_string_member_scrub.py`` pins the time on a long line.
+# so the key run cannot be entered mid-word. The key run and the braced and plain walks are
+# possessive, the overrun has nothing after it to retry, and the lookbehinds are a fixed set of fixed
+# widths. Every walk stays on its line. A plain walk stops at the next ";", so walks from two starts
+# never overlap; a braced walk may cross a ";" on its line, and then ends the match there, or fails
+# and the overrun takes that line, so no later start re-reads it.
+# ``tests/test_connection_string_member_scrub.py`` pins the time on a long line and on many lines.
 #
 # WHAT IT COSTS, at least: text after a glued ``;password=`` in prose or in a URL's matrix parameters
 # is hidden to the next ";" or the end of the line, and a later label inside that span loses its
-# label to the placeholder. Its value was already hidden by an earlier pass, or is hidden here.
+# label to the placeholder. Within the call its value was already hidden by an earlier pass, or is
+# hidden here; across a second pass, see the last residual below.
 #
 # WHAT IT LEAVES, at least these:
 #
@@ -950,18 +957,26 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # * a key holding "." or "-", or a space before its "=" (``;PWD =x``), left to ``_CREDENTIAL_KV``;
 # * on the write-time chain, a member glued to a percent-encoded HL7 run in one token
 #   (``a%7Cb%7Cc;sslpassword=x y``). :mod:`messagefoundry.redaction` runs first and replaces the
-#   whole token, ";" and all, so the value's tail after a space prints, as it did before #5030.
+#   whole token, ";" and all, so the value's tail after a space prints, as it did before #5030;
+# * a second pass over this pass's output, at least a record two handlers filter, and store error
+#   text the support bundle redacts, then the write-time chain, then the bundle again. A later label
+#   inside the member's span loses its label here, so a reader that runs after this pass and would
+#   read that label's value past the ";" no longer finds it. A review measured that printing a
+#   value ``origin/main`` hid on 14 store-path and 5 two-handler lines of a 20,000-line fuzz, such
+#   as ``;sslpassword=%2Cpassword=&state=,;f6q``: the bundle's first pass takes ``state=``, and the
+#   write-time query filter then never reads its value. An open finding of BACKLOG #5030.
 #
-# The words are :data:`_CREDENTIAL_WORDS` and :data:`_MEMBER_EXTRA_WORDS`, which together are the
-# builder's own secret keywords, ``transports/database.py`` ``_ODBC_SECRET_KEY_RE``. They and the two
-# brace fragments are spelled literally, so the regex scanner in ``tests/test_security_static.py``
-# reads the pattern; ``tests/test_connection_string_member_scrub.py`` holds the words to the tuples
-# and the fragments to ``_ODBC_BRACED`` and ``_ODBC_BRACED_OVERRUN``. ``support/redact.py`` imports
-# this one object and runs it after its own PHI pass, so the bundle has no copy to drift.
+# The words are :data:`_CREDENTIAL_WORDS` and :data:`_MEMBER_EXTRA_WORDS`: the builder's own secret
+# keywords, ``transports/database.py`` ``_ODBC_SECRET_KEY_RE``, plus a bare ``pass``, which that set
+# lacks and which is why ``;Bypass=1`` is hidden. They and the two brace fragments are spelled
+# literally, so the regex scanner in ``tests/test_security_static.py`` reads the pattern;
+# ``tests/test_connection_string_member_scrub.py`` holds the words to the tuples and the fragments
+# to ``_ODBC_BRACED`` and ``_ODBC_BRACED_OVERRUN``. ``support/redact.py`` imports this one object and
+# runs it last of its credential passes, so the bundle has no copy to drift.
 _CONNECTION_STRING_MEMBER = re.compile(
     r"(?i)(;[A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
     r"|(?<=secret)|(?<=credential)|(?<=token)))="
-    r"(?:\{(?:[^}]|\}\})*+\}(?!\})[^;'\"\r\n]*+|\{[^\r\n]*|['\"]?[^;'\"\r\n]++)"
+    r"(?:\{(?:[^}\r\n]|\}\})*+\}(?!\})[^;'\"\r\n]*+|\{[^\r\n]*|['\"]?[^;'\"\r\n]++)"
 )
 
 

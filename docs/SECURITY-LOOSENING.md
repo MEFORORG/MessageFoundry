@@ -1945,7 +1945,8 @@ count is above `0` (vault BACKLOG #2613).
   a reload into an engine started without a graph as well as for one that replaces a running graph.
   A reload of a runner that exists but is not started makes no builds, so the later start logs it
   again. At a start that logs it, each outbound lane the start builds logs it in a step just before
-  its own build, and an operator start does the same for its outbound. After the outbound lanes and
+  its own build, and every later build of an unbuilt lane through `start_outbound` does the same,
+  at least an operator start and a schedule window's opening. After the outbound lanes and
   the `DatabaseLookup` executor, each `FhirLookup` logs it in the same step, before any lookup is
   built. So the URL is named while the connection is down, whether its build or another setting
   failed, at least on an unresolved `env()` value; its failure is recorded and alerted (BACKLOG

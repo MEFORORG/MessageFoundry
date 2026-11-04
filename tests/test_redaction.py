@@ -2889,19 +2889,27 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
     ]
     shipped = [secretscrub.scrub_credentials(text) != text for text in texts]
     member = secretscrub._CONNECTION_STRING_MEMBER
+    # Which texts the shipped filters change with the escape start kept and only the member pass
+    # off, so a text the escape start alone changes cannot be counted as the member's.
+    with monkeypatch.context() as patched:
+        patched.setattr(secretscrub, "_CONNECTION_STRING_MEMBER", re.compile(r"(?!)"))
+        without_member = [secretscrub.scrub_credentials(text) != text for text in texts]
     changed = unmatched = escape_only = member_only = 0
     with monkeypatch.context() as patched:
         _start_labels_at_a_word_boundary_alone(patched)
         patched.setattr(secretscrub, "_CONNECTION_STRING_MEMBER", re.compile(r"(?!)"))
-        for text, shipped_changed in zip(texts, shipped, strict=True):
+        for text, shipped_changed, escape_changed in zip(
+            texts, shipped, without_member, strict=True
+        ):
             if (
                 secretscrub.scrub_credentials(text) != text
                 or logging_setup._scrub_credential_query(text) != text
             ):
                 changed += 1
                 assert redaction._CREDENTIAL_AHEAD.search(text) is not None, repr(text)
-            elif shipped_changed and widened.search(text) is not None:
+            elif escape_changed:
                 escape_only += 1
+                assert widened.search(text) is not None, repr(text)
             elif shipped_changed:
                 member_only += 1
                 assert member.search(text) is not None, repr(text)

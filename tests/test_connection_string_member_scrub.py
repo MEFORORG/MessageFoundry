@@ -228,7 +228,8 @@ def test_the_member_pattern_spells_the_word_tuples_and_brace_fragments() -> None
     pattern = secretscrub._CONNECTION_STRING_MEMBER.pattern
     words = re.findall(r"\(\?<=([a-z]+)\)", pattern)
     assert sorted(words) == sorted(secretscrub._CREDENTIAL_WORDS + secretscrub._MEMBER_EXTRA_WORDS)
-    assert secretscrub._ODBC_BRACED in pattern
+    # The braced body is kept to one line here; the label pattern's may cross one.
+    assert secretscrub._ODBC_BRACED.replace("[^}]", r"[^}\r\n]") in pattern
     assert secretscrub._ODBC_BRACED_OVERRUN in pattern
     in_bundle = vars(bundle_redact)["_CONNECTION_STRING_MEMBER"]
     assert in_bundle is secretscrub._CONNECTION_STRING_MEMBER
@@ -236,7 +237,21 @@ def test_the_member_pattern_spells_the_word_tuples_and_brace_fragments() -> None
 
 @pytest.mark.parametrize(
     "unit",
-    [";", ";pwd=", ";pwd=a b", ";pwd={", ";pwd={a}}", ";sslpassword=x", ";Xpass", ";a=b c,d&e"],
+    [
+        *(
+            ";",
+            ";pwd=",
+            ";pwd=a b",
+            ";pwd={",
+            ";pwd={a}}",
+            ";sslpassword=x",
+            ";Xpass",
+            ";a=b c,d&e",
+        ),
+        # Many lines, each with a "{" it never closes: a brace walk that crossed lines re-read the
+        # rest of the record from every one (a review measured 5 s on 64 KB).
+        *("x;sslpwd={\n", "partner said;AccessToken={\n", ";pwd={a\n}"),
+    ],
 )
 def test_a_long_semicolon_dense_line_scrubs_in_linear_time(unit: str) -> None:
     """About 400 KB of one unit. Linear work is milliseconds; a quadratic walk over this many ";"
@@ -271,3 +286,18 @@ def test_a_token_keyword_glued_or_bare_is_hidden_whole(
     out = apply(line)
     assert not [f for f in ("Qv7m", "kX4r", "Pw9z", "mT3y", "Yb8n") if f in out], out
     assert "AccessToken=" in out and "PORT=1" in out, out
+
+
+def test_a_brace_left_open_on_one_line_keeps_the_frames_below_it() -> None:
+    """A traceback's later frames stay readable: the braced walk stops at its line."""
+    text = 'connect failed;sslpwd={a1q b2q\n  File "x.py", line 3, in f\n    d = {"k": 1}\n'
+    out = scrub_credentials(text)
+    assert "a1q" not in out and "b2q" not in out, out
+    assert 'File "x.py", line 3, in f' in out and 'd = {"k": 1}' in out, out
+
+
+def test_the_bundle_runs_the_member_pass_after_its_second_layer() -> None:
+    """Run before ``scrub_credentials``, the member pass swallowed a later label whose quoted value
+    that layer hid, and the bundle printed it (round 2 of the review)."""
+    out = redact_log_line(";KeyStorePwd=Authorization: Bearer api_token='a1q b2q'")
+    assert "a1q" not in out and "b2q" not in out, out

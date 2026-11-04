@@ -588,19 +588,19 @@ def redact_log_line(line: str) -> str:
     body = _redact_phi(
         body
     )  # shared engine PHI pass: generic HL7 segments/field runs + DOB + names
-    # A connection-string member, its value taken to the next ";" (BACKLOG #5030). secretscrub's own
-    # object, not a copy, and run here rather than among this module's passes: after the PHI pass,
-    # which judges a token by its separators and would see fewer of them once this pass took a "&",
-    # and over the whole body before the split below, since this module's placeholder can sit
-    # inside the value (``;PWD=[REDACTED] kx,Pw&mv;``). It only ever hides more; the reason is on
-    # the pattern.
-    if ";" in body:
-        body = _CONNECTION_STRING_MEMBER.sub(_keep_label, body)
     # The second credential layer; see the comment above this function.
     pieces = [body] if logged_placeholder else body.split(REDACTION_PLACEHOLDER)
     body = REDACTION_PLACEHOLDER.join(
         scrub_credentials(piece, placeholder=REDACTION_PLACEHOLDER) for piece in pieces
     )
+    # A connection-string member, its value taken to the next ";" (BACKLOG #5030). secretscrub's own
+    # object, not a copy, run LAST of the credential passes, over the joined body: after the PHI
+    # pass, which judges a token by its separators and would see fewer once this pass took a "&";
+    # after the second layer, whose labels it would otherwise swallow before they are read; and
+    # over the whole body, since this module's placeholder can sit inside the value
+    # (``;PWD=[REDACTED] kx,Pw&mv;``), where the split above would cut it.
+    if ";" in body:
+        body = _CONNECTION_STRING_MEMBER.sub(_keep_label, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
     return prefix + body
 

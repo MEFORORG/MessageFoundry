@@ -252,9 +252,9 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
 #:
 #: **A second exception: no arm reads ``secretscrub._CONNECTION_STRING_MEMBER`` (BACKLOG #5030).**
-#: A draft that did switched the run off on every text holding ``;<key ending in pass, pwd, secret,
-#: credential or token>=``, ``;Bypass=1`` among them, so an encoded PHI run beside one printed where
-#: the run hid it. Without the arm the run applies as it did before #5030. The price: where a member
+#: A draft that did switched the run off on every text holding ``;<key>=`` with a key ending in one
+#: of that pattern's words (``password``, ``pass``, ``pwd``, ``token`` and the rest), ``;Bypass=1``
+#: among them, so an encoded PHI run beside one printed where the run hid it. Without the arm the run applies as it did before #5030. The price: where a member
 #: sits in the run's own token, as in ``a%7Cb%7Cc;sslpassword=x y``, the run takes the token and the
 #: value's tail after a space prints, as it did before #5030. This module is stdlib-only and cannot
 #: import them, so ``tests/test_redaction.py`` holds each arm to its source, and checks by behaviour
