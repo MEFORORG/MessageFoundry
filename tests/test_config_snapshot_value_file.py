@@ -257,6 +257,21 @@ def test_a_snapshot_holds_value_file_bytes_only_with_the_value_file_s_path() -> 
         ConfigSnapshot(directory=Path("cfg"), files={}, unreadable=("@value-file/dev.toml",))
 
 
+def test_a_hold_binds_no_value_file_held_under_another_name(tmp_path: Path) -> None:
+    """Bytes held under another name are not the ones a reload serves for the value file, so a
+    binding of them would cover values nothing applies."""
+    where = (tmp_path / "dev.toml").absolute()
+    own = ConfigSnapshot(
+        directory=Path("cfg"), files={"@value-file/dev.toml": b"X"}, value_file=where
+    )
+    assert value_file_material(own) is not None  # the control
+    other = ConfigSnapshot(
+        directory=Path("cfg"), files={"@value-file/other.toml": b"X"}, value_file=where
+    )
+    with pytest.raises(ValueError, match="another name"):
+        value_file_material(other)
+
+
 def test_serve_s_provider_parses_the_value_file_from_the_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

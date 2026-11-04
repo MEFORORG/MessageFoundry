@@ -36,6 +36,7 @@ from messagefoundry.config.snapshot import (
     is_missing_directory,
     is_value_file_entry,
     read_config_snapshot,
+    value_file_rel,
 )
 from messagefoundry.credential import constant_time_equal
 
@@ -148,13 +149,17 @@ def value_file_material(snapshot: ConfigSnapshot) -> bytes | None:
     The engine MACs this material under a key derived from the store key
     (:func:`~messagefoundry.store.crypto.config_value_file_mac`) and never publishes it bare. A
     value file the snapshot could not read raises ``ValueError``, since the material would then
-    claim it was not there."""
+    claim it was not there, and so does one held under any name but its own, whose bytes no reload
+    would serve under that name."""
     held = snapshot.value_file
     if held is None:
         return None
     if any(is_value_file_entry(rel) for rel in snapshot.unreadable):
         raise ValueError("the config snapshot could not read the environment value file")
-    data = next((data for rel, data in snapshot.files.items() if is_value_file_entry(rel)), None)
+    rel = value_file_rel(held.name)
+    if any(is_value_file_entry(other) and other != rel for other in snapshot.files):
+        raise ValueError("the config snapshot holds a value file under another name")
+    data = snapshot.files.get(rel)
     material = _VALUE_FILE_SCHEME + held.name.encode("utf-8", "surrogatepass") + b"\0"
     return material + (b"\0" if data is None else b"\1" + data)
 

@@ -2635,7 +2635,9 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   and a keyless store checks nothing (vault BACKLOG #2592);
 - the digest covers what `config/fingerprint.py` hashes and no more. The release reads a
   `MEFOR_VALUE_*` variable and the secrets directory after the digest check, so an edit to either
-  changes the values a release applies under an unchanged digest. The second digest samples the files, so where an embedded engine's other value
+  changes the values a release applies under an unchanged digest. So does an edit to the value
+  file outside the config directory on a store with no in-process key, which binds no value file,
+  as the paragraph on what the published digest reveals says. The second digest samples the files, so where an embedded engine's other value
   provider reads a value file under the config directory, an edit to it reverted before that digest
   is not seen. The second digest also refuses an edit to any covered file made after the first,
   though the load runs the snapshot the first one checked.

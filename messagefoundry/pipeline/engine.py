@@ -2825,11 +2825,21 @@ class Engine:
         from messagefoundry.config.fingerprint import snapshot_fingerprint, value_file_material
         from messagefoundry.store.crypto import config_value_file_mac
 
-        material = value_file_material(snapshot)
-        return ApprovedConfig(
-            snapshot_fingerprint(snapshot),
-            None if material is None else config_value_file_mac(self.store.cipher(), material),
-        )
+        try:
+            material = value_file_material(snapshot)
+        except ValueError:
+            raise ConfigDigestUnavailable(None) from None
+        binding = None if material is None else config_value_file_mac(self.store.cipher(), material)
+        if material is not None and binding is None:
+            # At the hold too, not only at its release, so the log says so before an approver
+            # acts on it.
+            log.warning(
+                "the environment value file %s is not bound to this reload's approval: the store "
+                "holds no in-process key to bind it under, so an edit to it before the release "
+                "will not be refused",
+                scrub_log_argument(str(snapshot.value_file)),
+            )
+        return ApprovedConfig(snapshot_fingerprint(snapshot), binding)
 
     async def _content_snapshot(self, path: Path) -> ConfigSnapshot | None:
         """``path`` read strictly, with the value file this engine reads from outside it

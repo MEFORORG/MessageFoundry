@@ -38,6 +38,7 @@ __all__ = [
     "is_missing_directory",
     "is_regular_file",
     "is_value_file_entry",
+    "value_file_rel",
     "read_config_snapshot",
     "with_value_file",
 ]
@@ -348,6 +349,11 @@ def is_value_file_entry(rel: str) -> bool:
     return rel.startswith(_VALUE_FILE_PREFIX)
 
 
+def value_file_rel(name: str) -> str:
+    """The relative path :func:`with_value_file` records a value file named ``name`` under."""
+    return _VALUE_FILE_PREFIX + name
+
+
 def with_value_file(
     snapshot: ConfigSnapshot, value_file: str | Path | None, *, strict: bool
 ) -> ConfigSnapshot:
@@ -380,7 +386,7 @@ def with_value_file(
             return snapshot
     files = {k: v for k, v in snapshot.files.items() if not k.startswith(_VALUE_FILE_PREFIX)}
     unreadable = {rel for rel in snapshot.unreadable if not rel.startswith(_VALUE_FILE_PREFIX)}
-    rel = _check_rel(_VALUE_FILE_PREFIX + path.name)
+    rel = _check_rel(value_file_rel(path.name))
     _read_into(files, unreadable, rel, path, strict=strict, computed=True)
     return ConfigSnapshot(
         directory=snapshot.directory,
