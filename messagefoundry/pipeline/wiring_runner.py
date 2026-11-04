@@ -8475,14 +8475,9 @@ class RegistryRunner:
             # anything is the configuration's fault, so AE (resend once it is fixed); bytes invalid
             # in a usable charset are the message's, so AR.
             #
-            # A poll source that gets here, at least the file and remote-file sources for a name no
-            # codec answers to (the timer and database sources fail to build on such a name, and a
-            # name such as "undefined" raises in those two sources' own batch split before the
-            # hand-off, docs/CONNECTIONS.md says), gets no NAK: its handler's answer
-            # cannot say "refused", so it consumes its input after this ERROR row as it does for
-            # every refusal. That row stores the input whole, since a poll source is exempt from the
-            # refused-body allowance, so the store keeps what the source consumed; holding the input
-            # instead would need a receipt contract on every poll source (BACKLOG #5102).
+            # A poll source's answer cannot say "refused", so it consumes its input after this row
+            # rather than hold it for the fix (BACKLOG #5102). What each source does is listed once,
+            # in docs/CONNECTIONS.md, "An inbound encoding follows one rule on every source".
             nak_code = _nak_code(_guard_refusal_kind(exc))
             ack = (
                 build_ack(raw, code=nak_code, text="decode error", ack_mode=ack_mode)

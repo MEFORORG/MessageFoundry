@@ -1494,10 +1494,12 @@ class FileSource(SourceConnector):
             return True
         try:
             text = raw.decode(self.encoding)
-        except (UnicodeDecodeError, LookupError):
+        except (UnicodeError, LookupError):
             # Not decodable in the declared encoding (or an unknown codec name): can't safely find MSH
             # boundaries, so hand the raw bytes off unchanged — the pipeline's strict-decode then
             # records ERROR for it, exactly as in the pre-split single-hand-off path. Never a drop.
+            # UnicodeError, not only UnicodeDecodeError: a codec that refuses every conversion, such
+            # as "undefined", raises the base class, and must reach that decode too (BACKLOG #5102).
             await self._handler(raw)
             return True
         messages = split_batch(
