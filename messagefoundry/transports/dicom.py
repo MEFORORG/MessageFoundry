@@ -72,7 +72,7 @@ import time
 from collections.abc import Callable, Coroutine, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import BytesIO
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, assert_never, cast
 
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import ConnectorType, Destination, Source
@@ -200,6 +200,21 @@ _STATUS_CANNOT_UNDERSTAND = 0xC000  # final: this object will not be taken as se
 #: status, and 0xC211 when the handler raises.
 _STATUS_REFUSED_OVER_CAP = 0xC010
 _STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist: the backstop in _on_c_store
+
+
+def _refusal_dimse_status(kind: RefusalKind) -> int:
+    """The C-STORE status an engine ingress refusal of ``kind`` is answered with (BACKLOG #2105),
+    in step with ``http_listener._refusal_status``. DIMSE has no "after an operator acts" status,
+    so a configuration refusal takes the re-send class rather than one a sender drops the object on
+    (BACKLOG #5102). ``assert_never``, so mypy refuses a new kind left unmapped."""
+    match kind:
+        case RefusalKind.TEMPORARY | RefusalKind.CONFIGURATION:
+            return _STATUS_OUT_OF_RESOURCES
+        case RefusalKind.PERMANENT | RefusalKind.OVERSIZE:
+            return _STATUS_CANNOT_UNDERSTAND
+        case _:
+            assert_never(kind)
+
 
 # A-ASSOCIATE-RJ fields for "busy, retry later" (DICOM PS3.8 section 9.3.4), sent while the engine's
 # intake is paused (BACKLOG #290): rejected-transient, from the service provider's presentation
@@ -2174,11 +2189,7 @@ class DicomScpSource(SourceConnector):
                 receipt.message_id,
                 receipt.refusal.value,
             )
-            # DIMSE has no "retry once the operator acts" status, so a configuration refusal takes
-            # the re-send class, never the final one a sender drops the object on (BACKLOG #5102).
-            if receipt.refusal in (RefusalKind.TEMPORARY, RefusalKind.CONFIGURATION):
-                return _STATUS_OUT_OF_RESOURCES
-            return _STATUS_CANNOT_UNDERSTAND
+            return _refusal_dimse_status(receipt.refusal)
         logger.info(
             "DICOM C-STORE accepted from %s (SOP class %s, instance %s)",
             peer_ip,

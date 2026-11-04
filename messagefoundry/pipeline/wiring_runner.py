@@ -929,7 +929,7 @@ class _StrictValidateTimedOut(Exception):
         #: The receipt path's class and the MLLP NAK's MSA-1, kept together so the two listeners
         #: cannot split the timeout differently.
         self.refusal_kind = RefusalKind.PERMANENT if started else RefusalKind.TEMPORARY
-        self.nak_code = "AR" if started else "AE"
+        self.nak_code = _nak_code(self.refusal_kind)
         self.ack_text = f"strict-validation timed out after {timeout}s"
         self.reason = self.ack_text if started else f"{self.ack_text} before the validate began"
         super().__init__(self.reason)

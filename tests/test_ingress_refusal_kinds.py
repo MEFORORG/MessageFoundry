@@ -119,12 +119,12 @@ async def _the_one_error_row(store: MessageStore) -> dict[str, Any]:
     return rows[0]
 
 
-def _assert_names_the_row(resp: _Response, row: dict[str, Any], kind: str | None = None) -> None:
+def _assert_names_the_row(resp: _Response, row: dict[str, Any]) -> None:
     assert resp.json() == {"error": "message was not accepted", "refused_message_id": row["id"]}
     # BACKLOG #2105: the row itself says which kind of refusal it was, so an operator can tell a
-    # temporary one, which the sender will re-send, from a final one before resending it. A ``503``
-    # is temporary unless the caller names the configuration kind, which shares it (BACKLOG #5102).
-    kind = kind or {503: "temporary", 413: "oversize", 422: "permanent"}[resp.status]
+    # temporary one, which the sender will re-send, from a final one before resending it. The
+    # configuration kind's 503 is pinned in tests/test_inbound_http_source.py (BACKLOG #5102).
+    kind = {503: "temporary", 413: "oversize", 422: "permanent"}[resp.status]
     assert row["error"].startswith(f"[refusal kind: {kind}] "), row["error"]
     # The harness reads only an accepted answer's message_id, so this real refusal reads as none.
     assert message_id_of(resp.body) is None
@@ -204,28 +204,6 @@ async def test_the_strict_validation_timeout_stays_a_permanent_422(
     row = await _the_one_error_row(store)
     assert "strict-validation timed out" in row["error"]
     _assert_names_the_row(resp, row)
-
-
-# --- configuration: 503 with no Retry-After ------------------------------------------------------
-
-
-async def test_an_unusable_codec_name_is_503_with_no_retry_after_and_names_its_row(
-    store: MessageStore,
-) -> None:
-    # BACKLOG #5102 (Manager decision d20261104T003342588-cbb49e): the inbound's codec name, not the
-    # body, is at fault, so a final 422 would make a sender drop a body the engine takes once an
-    # operator fixes the name. But nothing clears it on its own, so no Retry-After tells the sender
-    # to come back in five seconds. Base answered 503 with Retry-After and tagged the row temporary.
-    ic = _ic()
-    ic.spec.settings["encoding"] = (
-        "not-a-real-codec"  # past the load-time check, as a bad value lands
-    )
-    resp = await _post_through_runner(store, ic, HL7.encode("ascii"))
-    assert resp.status == 503
-    assert "retry-after" not in resp.headers
-    row = await _the_one_error_row(store)
-    assert "decode error (not-a-real-codec)" in row["error"]
-    _assert_names_the_row(resp, row, kind="configuration")
 
 
 # --- over-size: 413 on every path -----------------------------------------------------------------

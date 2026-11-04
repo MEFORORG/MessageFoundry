@@ -1706,7 +1706,7 @@ concurrent detaches answers `503` and `AE`. The batch 604 change under the
 [amendment of 2026-11-03](#amendment-2026-11-03-a-strict-validation-timeout-that-never-began-is-temporary)
 built that (BACKLOG #5078); `_nak_code` now maps every final class to `AR` in one place.
 
-The tests: `tests/test_ingress_refusal_kinds.py` pins the `503` with no `Retry-After` behind a real
-listener, the classifier, the kind-to-MSA-1 mapping, and the `Rest()` outbound retrying the `503`;
-`tests/test_dicom_scp.py` pins `0xA700`; `tests/test_inbound_http_source.py` and
-`tests/test_ingress_guard_parity.py` pin the stored tag.
+The tests: `tests/test_inbound_http_source.py` pins the `503` with no `Retry-After` behind a real
+listener, and the stored tag; `tests/test_ingress_refusal_kinds.py` pins the classifier, the
+kind-to-MSA-1 mapping, and the `Rest()` outbound retrying the `503`; `tests/test_dicom_scp.py` pins
+`0xA700`; `tests/test_ingress_guard_parity.py` pins the stored tag on both callers.
