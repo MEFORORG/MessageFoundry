@@ -45,14 +45,17 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
+    HandlerFaultUnrecovered,
     InboundHandler,
     NegativeAckError,
     SourceConnector,
     encode_wire_body,
     float_setting,
+    owes_hl7_reply,
     port_setting,
     positive_cap,
     probe_tcp_reachable,
+    recover_handler_fault,
     register_destination,
     register_source,
     wait_for_intake,
@@ -505,7 +508,9 @@ class X12Destination(DestinationConnector):
                         f"sent ISA-13={sent}); delivery indeterminate"
                     )
                 occurrence = match
-            ta104 = (msg.get("TA1-04", occurrence=occurrence) or "").upper()
+            # Stripped as well as upper-cased: the element is the partner's text, and a padded "R " or
+            # "E " must reach its own arm rather than fall through to the accepted default below.
+            ta104 = (msg.get("TA1-04", occurrence=occurrence) or "").strip().upper()
             # The acknowledged interchange's control number — not PHI. Once matched it is our own ISA13.
             control = (
                 _loggable_sent(sent_isa13)
@@ -533,19 +538,27 @@ class X12Destination(DestinationConnector):
                         body=text, outcome="accepted", detail="TA1*E accepted-with-errors"
                     )
                 return None
-            # Every value that reaches here is accepted: A, an empty TA1-04, and any other value.
+            # Every value that reaches here is accepted: A, an empty TA1-04, and any other value. An
+            # empty or out-of-set code stays accepted rather than retried: the partner answered this
+            # interchange, and a retry would re-send one it may have accepted, which ADR 0016 rules
+            # unsafe for a state-changing 278N. TA1-04 is a closed code set (A, E, R), but the element
+            # is the partner's text, so the warning and the captured detail are fixed phrases that
+            # carry none of it: the store's scrub does not catch every identifier (BACKLOG #2984).
+            if ta104 == "A":
+                detail = "TA1*A"
+            elif not ta104:
+                detail = "TA1 with no TA1-04 code"
+            else:
+                detail = "TA1 with a TA1-04 outside A, E and R"
+            if ta104 != "A":
+                logger.warning(
+                    "X12 %s:%d returned a %s (TA1-01=%s); recorded as delivered, not retried",
+                    self.host,
+                    self.port,
+                    detail,
+                    control,
+                )
             if self.capture_response:
-                # TA1-04 is a closed code set (A, E, R), but the element is the partner's text. The
-                # arms above match only an exact "R" or "E": ta104 is upper-cased, not stripped, so a
-                # padded value such as "R " reaches here. Only a literal A is echoed, as TA1*A; an
-                # empty TA1-04 and any other value get a fixed phrase carrying none of the partner's
-                # text, since the store's scrub does not catch every identifier (BACKLOG #2984).
-                if ta104 == "A":
-                    detail = "TA1*A"
-                elif not ta104:
-                    detail = "TA1 with no TA1-04 code"
-                else:
-                    detail = "TA1 with a TA1-04 outside A, E and R"
                 return DeliveryResponse(body=text, outcome="accepted", detail=detail)
             return None
         # No TA1: a business response (271/277/278) returned instead — it IS the confirmation.
@@ -632,6 +645,9 @@ class X12Source(SourceConnector):
         self.host: str = str(s.get("host") or "127.0.0.1")
         self.port: int = port_setting(s["port"], transport="X12 source")
         self.encoding: str = declared_encoding(s.get("encoding"))
+        # Read only to tell whether a handler fault owes the sender a reply (BACKLOG #5022): the
+        # runner, not this listener, builds the reply.
+        self.ack_mode = config.ack_mode
         # Caps below: key absent → secure default; None/0 in any spelling (including the string "0"
         # an uncast env() yields) → disabled; a negative or NaN → refused at build (BACKLOG #1872).
         self.max_connections: int | None = positive_cap(
@@ -806,6 +822,7 @@ class X12Source(SourceConnector):
                     max_frame_seconds=self.max_frame_seconds,
                     receive_timeout=self.receive_timeout,
                 )
+                peer = writer.get_extra_info("peername")  # fixed for the connection
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     # The engine's own waits (pacing, an intake pause) do not spend the frame budget.
@@ -830,15 +847,43 @@ class X12Source(SourceConnector):
                         decoded = 0
                         for interchange in decoder.feed(chunk):
                             decoded += 1
-                            reply = await self._handler(interchange)
+                            fault: str | None = None
+                            try:
+                                reply = await self._handler(interchange)
+                            except Exception as exc:  # noqa: BLE001 -- see recover_handler_fault
+                                # BACKLOG #5022: the reader framed this interchange cleanly, so this
+                                # is a handler fault, not a framing fault. Only the scrubbed text
+                                # leaves this clause; recover_handler_fault says why.
+                                fault = safe_exc(exc)
+                            if fault is not None:
+                                # Set until recovered, so a cancel inside it is no clean close.
+                                failed = True
+                                try:
+                                    reply = await recover_handler_fault(
+                                        self._handler,
+                                        interchange,
+                                        fault,
+                                        owes_reply=owes_hl7_reply(self.ack_mode, self.content_type),
+                                        transport="X12",
+                                        peer=peer,
+                                        log=logger,
+                                        stopped=lambda: self._admission.stopping,
+                                        report=lambda reason: self._emit_event(
+                                            "handler_error", peer_host=peer_host, reason=reason
+                                        ),
+                                    )
+                                except HandlerFaultUnrecovered:
+                                    break  # handler_error is recorded; close
+                                failed = False
                             if reply is not None:
                                 writer.write(reply.encode(self.encoding))  # verbatim reply
                                 await self._drain_reply(writer)
+                        if failed:
+                            break
                         # Charge AFTER the interchanges in this chunk are fully handled.
                         if pacer is not None:
                             pacer.settle(decoded)
                     except X12FrameError as exc:
-                        peer = writer.get_extra_info("peername")
                         logger.warning(
                             "X12 interchange from %s over cap; closing connection: %s", peer, exc
                         )
@@ -853,9 +898,9 @@ class X12Source(SourceConnector):
                     except OSError:
                         raise  # peer reset / write failure → handled by the outer OSError catch (quiet)
                     except Exception as exc:
-                        # Last-resort (ASVS 16.5.4): an unexpected handler/codec error must not let the
-                        # per-connection task die silently or leak detail. Log redacted; drop the conn.
-                        peer = writer.get_extra_info("peername")
+                        # Last-resort (ASVS 16.5.4): an unexpected codec or reply-encoding error must
+                        # not let the per-connection task die silently or leak detail. Log redacted;
+                        # drop the conn. A handler fault is caught above and is `handler_error`.
                         logger.error(
                             "X12 connection from %s failed unexpectedly: %s", peer, safe_exc(exc)
                         )
