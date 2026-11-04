@@ -7,8 +7,10 @@ import * as assert from "assert";
 
 import {
   CliOutputError,
+  TOOLKIT_MISSING_MESSAGE,
   UNTRUSTED_WORKSPACE_STDERR,
   commandLabel,
+  explainMissingToolkit,
   parseJsonResult,
   type CliResult,
 } from "../../cliJson";
@@ -117,5 +119,40 @@ suite("cliJson.commandLabel", () => {
     assert.strictEqual(commandLabel(["codeset", "upsert", "--data", '{"rows": []}']), "codeset upsert");
     assert.strictEqual(commandLabel(["lens", "parse", "-", "--contract", "2"]), "lens parse");
     assert.strictEqual(commandLabel([]), "command");
+  });
+});
+
+// ADR 0201 slice 4: `lens` and `generate` run `python -m messagefoundry_toolkit`. An interpreter
+// without the toolkit must answer with a line naming the distribution, through the CLI's own contract.
+suite("cliJson.explainMissingToolkit", () => {
+  const MISSING = [
+    "C:\\venv\\Scripts\\python.exe: No module named messagefoundry_toolkit\n",
+    "/venv/bin/python: Error while finding module specification for 'messagefoundry_toolkit.__main__' " +
+      "(ModuleNotFoundError: No module named 'messagefoundry_toolkit')\n",
+  ];
+
+  test("a missing toolkit becomes the CLI's error body, which parseJsonResult surfaces", () => {
+    for (const stderr of MISSING) {
+      const res = explainMissingToolkit(result({ stderr, code: 1 }));
+      assert.strictEqual(res.stderr, TOOLKIT_MISSING_MESSAGE, stderr);
+      assert.strictEqual(res.code, 1);
+      assert.throws(
+        () => parseJsonResult(res, ["lens", "schema"]),
+        (e: unknown) => e instanceof Error && e.message === TOOLKIT_MISSING_MESSAGE,
+      );
+    }
+    assert.ok(TOOLKIT_MISSING_MESSAGE.includes("pip install messagefoundry-toolkit=="));
+  });
+
+  test("anything else passes through unchanged (control arms)", () => {
+    // A broken install, where the package is there and a submodule is not, keeps the CLI's own path.
+    const broken = result({ stderr: "No module named 'messagefoundry_toolkit.lens'\n", code: 1 });
+    assert.strictEqual(explainMissingToolkit(broken), broken);
+    // A success, even one whose stderr happens to carry the words.
+    const ok = result({ stdout: "{}", stderr: MISSING[0], code: 0 });
+    assert.strictEqual(explainMissingToolkit(ok), ok);
+    // Some other module missing.
+    const other = result({ stderr: "No module named 'hl7apy'\n", code: 1 });
+    assert.strictEqual(explainMissingToolkit(other), other);
   });
 });

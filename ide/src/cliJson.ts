@@ -47,6 +47,45 @@ export interface CliResult {
   code: number;
 }
 
+/**
+ * The Python module each command runs under. The engine's own commands run `python -m messagefoundry`.
+ * The authoring commands the extension uses, `lens` and `generate`, moved to the separate
+ * `messagefoundry-toolkit` distribution (ADR 0201 slice 4), whose module is `messagefoundry_toolkit`.
+ */
+export type CliModule = "messagefoundry" | "messagefoundry_toolkit";
+export const ENGINE_MODULE: CliModule = "messagefoundry";
+export const TOOLKIT_MODULE: CliModule = "messagefoundry_toolkit";
+
+/** What the user is told when the selected interpreter has no toolkit. Our text, never the CLI's. */
+export const TOOLKIT_MISSING_MESSAGE =
+  "the selected Python interpreter has no messagefoundry-toolkit, which the Steps view and Generate " +
+  "Samples run. Install it in that interpreter at the engine's own version: pip install " +
+  "messagefoundry-toolkit==<version>, where <version> is what `python -m messagefoundry --version` prints.";
+
+/**
+ * Python's refusal of `-m messagefoundry_toolkit` when the package is absent. The lookahead keeps a
+ * missing SUBMODULE (`messagefoundry_toolkit.lens`) out: that is a broken install, not a missing one,
+ * and keeps the CLI's own path. Python quotes the name in one wording and not in the other.
+ */
+const TOOLKIT_NOT_FOUND = /No module named '?messagefoundry_toolkit'?(?![\w.])/;
+
+/**
+ * A toolkit run whose interpreter has no toolkit, rewritten into the CLI's own error contract with
+ * {@link TOOLKIT_MISSING_MESSAGE}: an `{"error": ...}` body on stdout, which `parseJsonResult` and the
+ * Steps view's rewrite parser both surface, and the same line on stderr, which a raw caller shows.
+ * Any other result is returned unchanged.
+ */
+export function explainMissingToolkit(res: CliResult): CliResult {
+  if (res.code === 0 || !TOOLKIT_NOT_FOUND.test(res.stderr)) {
+    return res;
+  }
+  return {
+    stdout: JSON.stringify({ error: TOOLKIT_MISSING_MESSAGE }),
+    stderr: TOOLKIT_MISSING_MESSAGE,
+    code: res.code,
+  };
+}
+
 /** The synthetic stderr cli.ts returns, without running anything, in an untrusted workspace. */
 export const UNTRUSTED_WORKSPACE_STDERR =
   "workspace not trusted — MessageFoundry CLI disabled until you trust this workspace";

@@ -1,12 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-// Thin bridge to the `messagefoundry` Python CLI: shell out to a subcommand and parse its JSON.
+// Thin bridge to the `messagefoundry` Python CLI: shell out to a subcommand and parse its JSON. The
+// authoring commands (`lens`, `generate`) run under the toolkit's module instead (ADR 0201 slice 4).
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 
-import { UNTRUSTED_WORKSPACE_STDERR, parseJsonResult, type CliResult } from "./cliJson";
+import {
+  ENGINE_MODULE,
+  TOOLKIT_MODULE,
+  UNTRUSTED_WORKSPACE_STDERR,
+  explainMissingToolkit,
+  parseJsonResult,
+  type CliModule,
+  type CliResult,
+} from "./cliJson";
 import { settingIsSet } from "./connectionWizardModel";
 import { LENS_CONTRACT, isUnknownArgumentError, looksLikeUnknownArgument } from "./stepsModel";
 import type { LensParseResult, OpSchema } from "./stepsModel";
@@ -189,19 +198,26 @@ export interface RunOptions {
    * cannot stall it for the life of the window.
    */
   readonly timeoutMs?: number;
+  /**
+   * The module to run, `messagefoundry` when omitted. The toolkit's commands pass
+   * {@link TOOLKIT_MODULE}; a toolkit missing from the interpreter then resolves as a clear refusal
+   * naming the distribution (`explainMissingToolkit`), not as Python's bare module error.
+   */
+  readonly module?: CliModule;
 }
 
-/** Run `python -m messagefoundry <args>` and resolve with stdout/stderr/exit code (never rejects). */
+/** Run `python -m <module> <args>` and resolve with stdout/stderr/exit code (never rejects). */
 export function run(args: string[], cwd?: string, opts: RunOptions = {}): Promise<CliResult> {
   if (isExecGated()) {
     // Untrusted workspace: refuse to exec any (possibly repo-supplied) interpreter (SEC-004). Return
     // a synthetic non-zero result; callers already treat a non-zero exit as the error path.
     return Promise.resolve({ stdout: "", stderr: UNTRUSTED_WORKSPACE_STDERR, code: 1 });
   }
+  const module = opts.module ?? ENGINE_MODULE;
   return new Promise((resolve) => {
     execFile(
       pythonPath(),
-      ["-m", "messagefoundry", ...args],
+      ["-m", module, ...args],
       { cwd, maxBuffer: 64 * 1024 * 1024, timeout: opts.timeoutMs ?? 0 },
       (err, stdout, stderr) => {
         const code =
@@ -210,27 +226,41 @@ export function run(args: string[], cwd?: string, opts: RunOptions = {}): Promis
             : err
               ? 1
               : 0;
-        resolve({ stdout: stdout ?? "", stderr: stderr ?? "", code });
+        resolve(settle(module, { stdout: stdout ?? "", stderr: stderr ?? "", code }));
       },
     );
   });
 }
 
+/** The options that run a command on the toolkit's module (ADR 0201 slice 4). */
+export const TOOLKIT_RUN: RunOptions = { module: TOOLKIT_MODULE };
+
+/** A toolkit result passes through `explainMissingToolkit`; an engine result is returned as it came. */
+function settle(module: CliModule, res: CliResult): CliResult {
+  return module === TOOLKIT_MODULE ? explainMissingToolkit(res) : res;
+}
+
 /**
- * Run `python -m messagefoundry <args>` feeding `stdin` to the child, resolving with stdout/stderr/exit
+ * Run `python -m <module> <args>` feeding `stdin` to the child, resolving with stdout/stderr/exit
  * code (never rejects). Used by the Steps view's `lens rewrite - --edit …`, which reads the live
  * editor buffer from stdin (never the on-disk file) so a rewrite operates on the current, possibly-dirty
  * document. Same exec gate as {@link run}. stdin/stdout are UTF-8, so module source round-trips exactly.
  */
-export function runWithStdin(args: string[], stdin: string, cwd?: string): Promise<CliResult> {
+export function runWithStdin(
+  args: string[],
+  stdin: string,
+  cwd?: string,
+  opts: RunOptions = {},
+): Promise<CliResult> {
   if (isExecGated()) {
     return Promise.resolve({ stdout: "", stderr: UNTRUSTED_WORKSPACE_STDERR, code: 1 });
   }
+  const module = opts.module ?? ENGINE_MODULE;
   return new Promise((resolve) => {
     const child = execFile(
       pythonPath(),
-      ["-m", "messagefoundry", ...args],
-      { cwd, maxBuffer: 64 * 1024 * 1024, encoding: "utf8" },
+      ["-m", module, ...args],
+      { cwd, maxBuffer: 64 * 1024 * 1024, encoding: "utf8", timeout: opts.timeoutMs ?? 0 },
       (err, stdout, stderr) => {
         const code =
           err && typeof (err as { code?: unknown }).code === "number"
@@ -238,7 +268,7 @@ export function runWithStdin(args: string[], stdin: string, cwd?: string): Promi
             : err
               ? 1
               : 0;
-        resolve({ stdout: stdout ?? "", stderr: stderr ?? "", code });
+        resolve(settle(module, { stdout: stdout ?? "", stderr: stderr ?? "", code }));
       },
     );
     // Swallow a stdin write error (e.g. EPIPE if the child exited before consuming input) — the exit
@@ -262,8 +292,13 @@ export async function runJson<T>(args: string[], cwd?: string, opts?: RunOptions
  * the Steps view to re-project the LIVE buffer (`lens parse - --json`, source over stdin) after a
  * structural edit shifts every row coordinate — reading the dirty buffer, never the on-disk file.
  */
-export async function runJsonWithStdin<T>(args: string[], stdin: string, cwd?: string): Promise<T> {
-  return parseJsonResult<T>(await runWithStdin([...args, "--json"], stdin, cwd), args);
+export async function runJsonWithStdin<T>(
+  args: string[],
+  stdin: string,
+  cwd?: string,
+  opts?: RunOptions,
+): Promise<T> {
+  return parseJsonResult<T>(await runWithStdin([...args, "--json"], stdin, cwd, opts), args);
 }
 
 // ---- Code-set (translation table) CLI bridge --------------------------------------------------
@@ -298,8 +333,8 @@ export function codesetList(cwd?: string): Promise<CodeSetSummary[]> {
 
 // ---- lens contract negotiation (ADR 0076 §A.7 / §D.7) -----------------------------------------
 //
-// `lens parse` emits no schema version of its own and the extension shells whatever `messagefoundry` is
-// on PATH, so the two skew directions are handled EXPLICITLY here rather than discovered at render time:
+// `lens parse` emits no schema version of its own and the extension shells whatever toolkit is in the
+// selected interpreter (`python -m messagefoundry_toolkit`, ADR 0201 slice 4), so the two skew directions are handled EXPLICITLY here rather than discovered at render time:
 //
 //  * an OLDER extension meeting a NEWER engine passes no `--contract`, so the engine defaults to the
 //    shipped contract and never sends a kind that extension cannot title (it would render blank); and
@@ -325,12 +360,13 @@ export async function lensParseStdin(
       ["lens", "parse", "-", "--contract", String(contract)],
       source,
       cwd,
+      TOOLKIT_RUN,
     );
   } catch (err) {
     if (!isUnknownArgumentError(err)) {
       throw err;
     }
-    return runJsonWithStdin<LensParseResult>(["lens", "parse", "-"], source, cwd);
+    return runJsonWithStdin<LensParseResult>(["lens", "parse", "-"], source, cwd, TOOLKIT_RUN);
   }
 }
 
@@ -349,9 +385,10 @@ export async function lensRewriteStdin(
   contract: number = LENS_CONTRACT,
 ): Promise<CliResult> {
   const args = ["lens", "rewrite", "-", "--edit", JSON.stringify(spec)];
-  const first = await runWithStdin([...args, "--contract", String(contract)], source, cwd);
+  const withContract = [...args, "--contract", String(contract)];
+  const first = await runWithStdin(withContract, source, cwd, TOOLKIT_RUN);
   if (first.code !== 0 && looksLikeUnknownArgument(first.stderr + first.stdout)) {
-    return runWithStdin(args, source, cwd);
+    return runWithStdin(args, source, cwd, TOOLKIT_RUN);
   }
   return first;
 }
@@ -360,10 +397,10 @@ export async function lensRewriteStdin(
  * `lens schema` — the transform-vocabulary parameter schema (BACKLOG #1760; op -> editable params with
  * their widget kind/choices), derived by the engine from its own action + diagnostic signatures. The
  * Steps editor drives its per-param input widgets from it. Config-independent (a pure signature
- * introspection), so it takes no `--config`; the CLI is lazy-imported engine-side and starts no server.
+ * introspection), so it takes no `--config`; the toolkit command is lazy-imported and starts no server.
  */
 export function lensSchema(cwd?: string): Promise<OpSchema> {
-  return runJson<OpSchema>(["lens", "schema"], cwd);
+  return runJson<OpSchema>(["lens", "schema"], cwd, TOOLKIT_RUN);
 }
 
 /** `codeset show NAME` — the DETAIL/grid for one code set (a .toml one comes back read-only). */
