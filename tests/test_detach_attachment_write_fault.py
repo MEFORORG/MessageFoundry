@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #1619 step 2, as re-cut: a ``put_attachment`` fault in the DOCUMENT is a TEMPORARY refusal.
+"""BACKLOG #1619 step 2, as re-cut: a ``put_attachment`` fault in the DOCUMENT is a PERMANENT refusal.
 
 A streaming inbound detaches its large documents with ``put_attachment`` before the ingress commit.
 A fault there used to escape the runner with no message row. For a fault that recurs for the same
@@ -8,9 +8,12 @@ body, every retrying source then live-locked on it: the file source left the fil
 scan, and MLLP answered AE and closed on every resend.
 
 Such a fault, one ``wiring_runner._attachment_body_fault`` names (its docstring is the rule), is now
-recorded as ONE ``ERROR`` row and answered as a temporary refusal: ``AE`` from the MLLP path, a
-temporary refusal from a receipt source. Every other fault, a store fault that may clear among them,
-still propagates exactly as before, and the tests below pin what each source then does with it.
+recorded as ONE ``ERROR`` row and answered as a permanent refusal, as an escaped document is:
+``AR`` from the MLLP path, a permanent refusal (``422`` on HTTP) from a receipt source. A temporary
+answer would invite a conforming sender to resend the same body forever (Manager decision
+d20261104T081642325-1a4f74). Every other fault, a store fault that may clear and a SQLSTATE class 22
+among them, still propagates exactly as before, and the tests below pin what each source then does
+with it.
 
 If the ``ERROR`` write fails too, the store is down, and the failure propagates to the transport
 exactly as BACKLOG #1608 pins for the ingress commit (``tests/test_ack_after_commit_invariant.py``).
@@ -40,8 +43,10 @@ from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, RefusedBodyPolicy
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, StreamingAttachmentsUnsupported
+from messagefoundry.store import base as store_base
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.transports.file import FileSource
+from messagefoundry.transports.http_listener import _refusal_status
 from messagefoundry.transports.mllp import CR, EB, MLLPSource, frame
 from messagefoundry.transports.receipt import RefusalKind
 from tests.test_database_transport import _src, _SrcConn, _SrcCursor, _SrcPool
@@ -75,10 +80,16 @@ def _deterministic() -> Exception:
     return sqlite3.DataError(_DRIVER_TEXT)
 
 
+#: SQL Server's 2628 truncation text, which quotes the value it refused.
+_TRUNCATED = "String or binary data would be truncated. Truncated value: 'DOE^JANE'. (2628)"
+
+
 def _sqlstate_22001() -> Exception:
-    return _ServerDriverError(
-        "22001", "String or binary data would be truncated. Truncated value: 'DOE^JANE'. (2628)"
-    )
+    return _ServerDriverError("22001", _TRUNCATED)
+
+
+def _pyodbc_22001() -> Exception:
+    return _PyodbcDataError("22001", f"[22001] {_TRUNCATED}")
 
 
 def _locked() -> Exception:
@@ -96,7 +107,6 @@ DETERMINISTIC = [
         lambda: UnicodeEncodeError("utf-8", "\udcff", 0, 1, "surrogates not allowed"),
         id="unicode",
     ),
-    pytest.param(_sqlstate_22001, id="sqlstate-22001"),
 ]
 
 #: Faults that may clear, or that say nothing about the document: each must propagate.
@@ -221,11 +231,11 @@ async def _fail_error_write(*args: Any, **kwargs: Any) -> NoReturn:
     raise _ErrorWriteFailed("injected failure of the ERROR write")
 
 
-# --- the MLLP path: a fault in the document is one ERROR row and an AE ---------------------------
+# --- the MLLP path: a fault in the document is one ERROR row and an AR ---------------------------
 
 
 @pytest.mark.parametrize("fault", DETERMINISTIC)
-async def test_a_fault_in_the_document_is_one_error_row_and_an_ae(
+async def test_a_fault_in_the_document_is_one_error_row_and_an_ar(
     store: MessageStore,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -239,8 +249,9 @@ async def test_a_fault_in_the_document_is_one_error_row_and_an_ae(
         ack = await runner._handle_inbound(ic, _doc_hl7().encode("utf-8"))
 
     assert put.calls == 1, "the injection never fired"
-    assert _msa_code(ack) == "AE"
-    assert ack is not None and "streaming detach failed" in ack
+    # AR, as an escaped document: the same body meets the fault on every resend.
+    assert _msa_code(ack) == "AR"
+    assert ack is not None and "attachment write failed" in ack
     rows = await _rows(store)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
     error = rows[0]["error"]
@@ -248,21 +259,10 @@ async def test_a_fault_in_the_document_is_one_error_row_and_an_ae(
     assert await store.in_pipeline_depth() == 0  # refused, never handed to the ingress stage
     assert runner._stream_inflight_bytes == 0  # the budget reservation is released
     # The driver's text, which can quote a value, reaches neither the row nor the log.
-    assert "DOE^JANE" not in error and "too big" not in error and "Truncated" not in error
+    assert "DOE^JANE" not in error and "too big" not in error
     logged = [r.getMessage() for r in caplog.records if "attachment write failed" in r.getMessage()]
     assert len(logged) == 1 and "IB_STREAM" in logged[0]
-    assert "DOE^JANE" not in caplog.text and "Truncated" not in caplog.text
-
-
-async def test_a_sqlstate_class_22_fault_keeps_its_sqlstate_in_the_row(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    runner, ic = _runner(store, ConnectorType.MLLP)
-    monkeypatch.setattr(store, "put_attachment", _FaultingPut(store, fault=_sqlstate_22001))
-
-    await runner._handle_inbound(ic, _doc_hl7().encode("utf-8"))
-
-    assert "SQLSTATE 22001" in (await _rows(store))[0]["error"]
+    assert "DOE^JANE" not in caplog.text
 
 
 @pytest.mark.parametrize("fault", TRANSIENT)
@@ -360,35 +360,45 @@ def test_the_content_type_bound_is_the_sql_server_column_width() -> None:
     assert f"content_type NVARCHAR({width}) NOT NULL" in source
 
 
-async def test_a_pyodbc_shaped_class_22_fault_is_the_documents(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "fault",
+    [pytest.param(_sqlstate_22001, id="asyncpg-shaped"), pytest.param(_pyodbc_22001, id="pyodbc")],
+)
+async def test_a_sqlstate_class_22_fault_propagates_and_a_document_fault_is_the_control(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, fault: Callable[[], Exception]
 ) -> None:
-    # SQL Server's driver carries the SQLSTATE in args[0], read only for a server driver's own
-    # error. The stand-in joins the production list, as tests/test_keyless_chain_every_command.py
-    # does for drivers a leg may not have installed; a RuntimeError keeps it inside the catch.
-    from messagefoundry.store import base as store_base
-
-    # Built before the patch, so the cached production catch never holds the stand-in.
-    store_base.store_call_errors()
+    # With the label bounded before the write, a class-22 data exception more likely comes from a
+    # drifted column than from the document, so it propagates and the input is kept (Manager
+    # decision d20261104T081642325-1a4f74). SQL Server's driver carries the SQLSTATE in args[0], read
+    # only for a server driver's own error; the stand-in joins the production list, as
+    # tests/test_keyless_chain_every_command.py does for drivers a leg may not have installed.
+    store_base.store_call_errors()  # built before the patch, so the cached catch never holds it
     drivers = store_base.store_driver_errors()
     monkeypatch.setattr(store_base, "store_driver_errors", lambda: (*drivers, _PyodbcDataError))
+    # The production reader sees class 22, so the propagation below is not a SQLSTATE it missed.
+    assert store_base.driver_sqlstate(fault()) == "22001"
     runner, ic = _runner(store, ConnectorType.MLLP)
-    text = "[22001] String or binary data would be truncated. Truncated value: 'DOE^JANE'. (2628)"
-    monkeypatch.setattr(
-        store, "put_attachment", _FaultingPut(store, fault=lambda: _PyodbcDataError("22001", text))
-    )
+    put = _FaultingPut(store, fault=fault)
+    monkeypatch.setattr(store, "put_attachment", put)
 
+    with pytest.raises(type(fault())):
+        await runner._handle_inbound(ic, _doc_hl7().encode("utf-8"))
+
+    assert put.calls == 1, "the injection never fired"
+    assert await _rows(store) == []
+    assert runner._stream_inflight_bytes == 0
+
+    # The control: the same runner and body with a fault the document owns is recorded and refused.
+    monkeypatch.setattr(store, "put_attachment", _FaultingPut(store))
     ack = await runner._handle_inbound(ic, _doc_hl7().encode("utf-8"))
-
-    assert _msa_code(ack) == "AE"
-    error = (await _rows(store))[0]["error"]
-    assert "SQLSTATE 22001" in error and "DOE^JANE" not in error
+    assert _msa_code(ack) == "AR"
+    assert [r["status"] for r in await _rows(store)] == [MessageStatus.ERROR.value]
 
 
-# --- a receipt source: a TEMPORARY refusal that names the row ------------------------------------
+# --- a receipt source: a PERMANENT refusal that names the row ------------------------------------
 
 
-async def test_a_receipt_source_gets_a_temporary_refusal_naming_the_error_row(
+async def test_a_receipt_source_gets_a_permanent_refusal_naming_the_error_row(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner, ic = _runner(store, ConnectorType.HTTP)
@@ -396,12 +406,14 @@ async def test_a_receipt_source_gets_a_temporary_refusal_naming_the_error_row(
 
     receipt = await runner._handle_inbound_http(ic, _doc_hl7().encode("utf-8"))
 
-    assert receipt.refusal is RefusalKind.TEMPORARY
+    assert receipt.refusal is RefusalKind.PERMANENT
+    assert _refusal_status(receipt.refusal) == 422  # what Http() answers it with, no Retry-After
     rows = await _rows(store)
     assert [(r["id"], r["status"]) for r in rows] == [
         (receipt.message_id, MessageStatus.ERROR.value)
     ]
-    assert rows[0]["error"].startswith("[refusal kind: temporary] ")
+    assert rows[0]["error"].startswith("[refusal kind: permanent] ")
+    assert "attachment write failed" in rows[0]["error"]
 
 
 async def test_a_receipt_source_lets_a_transient_fault_propagate(
@@ -452,7 +464,7 @@ async def test_a_fault_on_a_later_document_refuses_the_whole_body(
     ack = await runner._handle_inbound(ic, body.encode("utf-8"))
 
     assert len(calls) == 2, "the second document was never written"
-    assert _msa_code(ack) == "AE"
+    assert _msa_code(ack) == "AR"
     assert [r["status"] for r in await _rows(store)] == [MessageStatus.ERROR.value]
     cur = await store._db.execute("SELECT refcount FROM attachment")
     assert [r[0] for r in await cur.fetchall()] == [0]
@@ -679,7 +691,7 @@ async def test_control_a_fault_in_the_document_on_that_inbound_is_one_error_row(
     assert kinds == ["established", "closed"]
 
 
-# --- MLLP over a socket: AE, and the connection stays up for the next frame ----------------------
+# --- MLLP over a socket: AR, and the connection stays up for the next frame ----------------------
 
 
 async def _read_reply(reader: asyncio.StreamReader, timeout: float = 3.0) -> bytes:
@@ -688,7 +700,7 @@ async def _read_reply(reader: asyncio.StreamReader, timeout: float = 3.0) -> byt
     return b""
 
 
-async def test_the_mllp_listener_answers_ae_and_keeps_the_connection(
+async def test_the_mllp_listener_answers_ar_and_keeps_the_connection(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner, ic = _runner(store, ConnectorType.MLLP)
@@ -707,7 +719,7 @@ async def test_the_mllp_listener_answers_ae_and_keeps_the_connection(
         try:
             writer.write(frame(_doc_hl7("MSG1")))
             await writer.drain()
-            assert b"MSA|AE|MSG1|" in await _read_reply(reader)
+            assert b"MSA|AR|MSG1|" in await _read_reply(reader)
             # The same socket takes the next frame: a refusal, not a handler fault, so the listener
             # does not close the connection after it (PR 1583 closes only on a fault).
             writer.write(frame(_doc_hl7("MSG2")))

@@ -226,7 +226,6 @@ from messagefoundry.store import (
 )
 from messagefoundry.store.base import (
     AuditStore,
-    driver_sqlstate,
     pool_over_provisioned_warning,
     store_call_errors,
 )
@@ -936,9 +935,11 @@ class _StreamBudgetExceeded(Exception):
 class _AttachmentWriteFailed(Exception):
     """The store's ``put_attachment`` refused a document for a fault in the document itself, one
     :func:`_attachment_body_fault` names, so every resend of the same body meets it again: a
-    TEMPORARY refusal, as the Manager's decision d20261104T042552411-c23337 sets (BACKLOG #1619).
-    Propagating it left a retrying source re-reading that body forever. Every other
-    ``put_attachment`` fault still propagates, as a store fault always has."""
+    PERMANENT refusal, answered as an escaped document is (``AR`` on MLLP, ``422`` on HTTP), as the
+    Manager's decisions d20261104T042552411-c23337 and d20261104T081642325-1a4f74 set (BACKLOG
+    #1619). Propagating it left a retrying source re-reading that body forever, and a TEMPORARY
+    answer would invite a conforming sender to resend it forever. Every other ``put_attachment``
+    fault still propagates, as a store fault always has."""
 
 
 #: The widest ``content_type`` every backend's ``attachment`` column holds, in UTF-16 code units:
@@ -968,17 +969,21 @@ def _attachment_body_fault(exc: BaseException) -> str | None:
 
     A fault is the body's only when it is positively known to recur for that body: a document or
     label that cannot be encoded (``UnicodeEncodeError``; a decode failure may be a driver's or a
-    service's, not the document's), SQLite's "string or blob too big"
-    (``sqlite3.DataError``), or a server driver's SQLSTATE class 22, a data exception such as SQL
-    Server's 2628 truncation (``driver_sqlstate``). Anything unclassified counts as transient,
-    because propagating never consumes the input: the transport NAKs and closes, a TCP inbound with
-    no reply holds the frame (BACKLOG #5022), and a poll source leaves the file or row for its next
-    scan. Recording it instead would finish a body over a fault that may clear, and past the
-    refused-body allowance a listener's row keeps only the head. So at least these propagate: a lost
-    connection, a lock or deadlock (``transports.database._is_transient``'s 08 and 40 classes and
-    HYT00), a locked SQLite file, and class 23, since the only constraint ``put_attachment`` can
-    break is the content address's key, which a concurrent put of the same document breaks and a
-    resend then dedups against.
+    service's, not the document's), or SQLite's "string or blob too big" (``sqlite3.DataError``).
+    Anything unclassified counts as transient, because propagating never consumes the input: the
+    transport NAKs and closes, a TCP inbound with no reply holds the frame (BACKLOG #5022), and a
+    poll source leaves the file or row for its next scan. Recording it instead would finish a body
+    over a fault that may clear, and past the refused-body allowance a listener's row keeps only the
+    head. So at least these propagate: a lost connection, a lock or deadlock
+    (``transports.database._is_transient``'s 08 and 40 classes and HYT00), a locked SQLite file, and
+    class 23, since the only constraint ``put_attachment`` can break is the content address's key,
+    which a concurrent put of the same document breaks and a resend then dedups against.
+
+    A server driver's SQLSTATE class 22, a data exception such as SQL Server's 2628 truncation,
+    propagates too (Manager decision d20261104T081642325-1a4f74). The label, the one
+    sender-controlled value a column could refuse, is bounded before the write
+    (:func:`_label_fits_every_backend`), so class 22 more likely comes from a drifted schema than
+    from the document, and recording it would consume a body the fixed schema then accepts.
 
     The read side classifies differently on purpose. :data:`_STORE_READ_CONTENT_FAULTS` names what a
     read raises for a STORED cell, so a ``CipherError`` there is the cell failing authentication. A
@@ -986,13 +991,9 @@ def _attachment_body_fault(exc: BaseException) -> str | None:
     never the document, and propagates. And a read's row stays in the store whichever arm it takes,
     while here a recorded fault ends the body and a propagated one keeps the input, so only the
     write needs a transient-or-deterministic split."""
-    name = f"{type(exc).__module__}.{type(exc).__qualname__}"
     if isinstance(exc, (UnicodeEncodeError, sqlite3.DataError)):
-        return name
-    if isinstance(exc, (sqlite3.Error, OSError)):
-        return None  # no SQLSTATE to read, and the read would retry the absent drivers' imports
-    state = driver_sqlstate(exc)
-    return f"{name}, SQLSTATE {state}" if state is not None and state.startswith("22") else None
+        return f"{type(exc).__module__}.{type(exc).__qualname__}"
+    return None
 
 
 #: The refusals ``_detach_documents`` raises for a body it does not detach, an attachment write that
@@ -8191,12 +8192,10 @@ class RegistryRunner:
                 # Of the body's refusals, only the in-flight budget clears, as concurrent detaches
                 # finish, so only it invites a re-send, and only when the body would fit the budget
                 # once they have: one larger than the whole budget is over-size. An unsupported
-                # backend, a malformed handle and an escaped document refuse the same body every time.
+                # backend, a malformed handle, an escaped document and a fault in a document
+                # (_AttachmentWriteFailed, #1619) refuse the same body every time.
                 if isinstance(exc, _StreamBudgetExceeded):
                     kind = RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
-                elif isinstance(exc, _AttachmentWriteFailed):
-                    # A fault in a document (#1619); _AttachmentWriteFailed says why TEMPORARY.
-                    kind = RefusalKind.TEMPORARY
                 else:
                     kind = RefusalKind.PERMANENT
                 return await self._refuse(
@@ -8628,8 +8627,8 @@ class RegistryRunner:
         # documents VERBATIM into the attachment substrate BEFORE the ingress commit, so the pipeline
         # carries only the small skeleton + a `mfdoc:v1:ref:` handle. This runs AFTER the synchronous
         # header parse/validate (a malformed header already NAK'd above) and BEFORE the commit/ACK, so a
-        # detach failure is a synchronous ERROR + NAK: AE for budget/backpressure, an unsupported
-        # backend or a failed attachment write, AR for an escaped document (below) — the message is
+        # detach failure is a synchronous ERROR + NAK: AE for budget/backpressure or an unsupported
+        # backend, AR for an escaped document or a fault in a document (below) — the message is
         # NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store. A failed ERROR
         # write propagates to the transport instead (BACKLOG #1608).
         skeleton = text
@@ -8640,12 +8639,13 @@ class RegistryRunner:
             except _DETACH_REFUSALS as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
-                # A budget or backend refusal may clear on a resend, so AE, and a fault in a document
-                # takes AE as its TEMPORARY kind (#1619).
-                # An escaped document is the message itself and fails the same way every time, so AR
-                # (vault BACKLOG #2809).
+                # A budget or backend refusal may clear on a resend, so AE. An escaped document (vault
+                # BACKLOG #2809) and a fault in a document (#1619) are the message itself and fail
+                # the same way every time, so AR.
                 if isinstance(exc, EscapedDocumentError):
                     nak_code, nak_text = "AR", "escaped document in OBX-5.5"
+                elif isinstance(exc, _AttachmentWriteFailed):
+                    nak_code, nak_text = "AR", "attachment write failed"
                 else:
                     nak_code, nak_text = "AE", "streaming detach failed"
                 ack = (
