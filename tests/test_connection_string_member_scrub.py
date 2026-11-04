@@ -20,8 +20,8 @@ from collections.abc import Callable
 
 import pytest
 
-from messagefoundry import secretscrub
-from messagefoundry.logging_setup import CredentialScrubFilter
+from messagefoundry import logging_setup, redaction, secretscrub
+from messagefoundry.logging_setup import CredentialScrubFilter, _install_phi_filters
 from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.support import redact as bundle_redact
 from messagefoundry.support.redact import redact_log_line
@@ -172,67 +172,302 @@ def test_the_phi_passes_see_the_text_they_saw_before(line: str) -> None:
         assert "DOE" not in out and "JOHN" not in out, f"{surface}: {out!r}"
 
 
-def test_the_member_pass_only_adds_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A differential: every planted value the scrubbers print WITH the member pass, they print
-    without it too. Run against the first draft's branch form, a fuzz of this kind found values it
-    printed that the scrubbers hid without it (1144 lines of 80,000, recorded in the commit)."""
-    pieces = (
-        ";PWD=",
-        ";sslpassword=",
-        "password'=",
-        'password":',
-        "private_key'=",
-        "encryption_key={",
-        ";xpass=",
-        "postgres://svc:",
-        "@db",
-        " \n",
-        "DOE^JOHN",
-        " :",
-        "'",
-        '"',
-        "{",
-        "}",
-        ";",
-        ",",
-        "&",
-        "=",
-        " ",
-        "%7C",
-        "Token=",
-        "a1q",
-        "b2q",
-        "c3q",
-        "d4q",
-        "[REDACTED]",
-        "secret=",
-    )
+#: Lines a review measured printing, on a SECOND redaction, a value ``origin/main`` hid, while the
+#: member pass replaced a whole value with the placeholder (BACKLOG #5030). Each loses something a
+#: later pass reads: a separator the PHI pass counts ("&", "^", "%5E", "%26"), a later label
+#: (``state=``, ``?code=``, ``Token=``, ``MEFOR_X=``), a segment ID, a DICOM element, the userinfo
+#: opener, or the length of a base64 run. The word mask keeps each, so none may print.
+_SHAPES_A_SECOND_PASS_PRINTED = (
+    ";sslpassword=%2Cpassword=&state=,;f6q",
+    'password":;xpass=&state=[REDACTED];}%7Cb2q',
+    ";xpass=&state=postgres://svc:;c3qc3q;Token=",
+    ";xpass=:?code=;xpass=;f6q",
+    ";xpass=MEFOR_X=b2q^;Token='\"e5qa1q:",
+    "|\n<redacted>d4q;sslpassword=e5qDOE^JOHN};Token=;PWD=f6q",
+    'c3q@db^\na1q;PWD=private_key={&state="',
+    ".d4q%26\n;xpass=%5E",
+    ";sslpassword=\\Token='\r\nc3q",
+    "a1q;xpass=PID|1||\n&state=' d4q%7C{b2qpassword=19800505",
+    "&<redacted>19800505;xpass=nonnumeric port: '\nc3q%5E.@hpassword=MEFOR_X=",
+    "&b2qf6q;AccessToken=%5E,QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB/secret: xprivate_key=",
+)
+
+_NEVER = re.compile(r"(?!)")
+_UNIT = secretscrub._MEMBER_VALUE_UNIT.pattern
+
+
+def _keep_without(*words: str) -> re.Pattern[str]:
+    kept = [w for w in secretscrub._MEMBER_KEEP_WORDS if w not in words]
+    return re.compile("|".join(re.escape(w) for w in kept), re.IGNORECASE)
+
+
+#: Each rule of the word mask, switched off, with a shape that then prints a value the baseline hid
+#: on some later redaction. So every rule is there for a measured reason, and a test that passes
+#: with the rule on is evidence.
+_RULE_CONTROLS = (
+    ("kept credential and query words", "_MEMBER_KEEP", _NEVER, ";xpass=:?code=;xpass=;f6q"),
+    (
+        "kept PHI words",
+        "_MEMBER_KEEP",
+        _keep_without(
+            "mrn", "name", "address", "0010", "patient", "medicalrecordlocator",
+            "responsibleperson", "msh", "bhs", "fhs",
+        ),
+        'e5q;AccessToken="name": %26\na1qcode=d4qe5q123-45-6789[redacted]',
+    ),
+    (
+        "long base64 run",
+        "_MEMBER_LONG_B64",
+        _NEVER,
+        "&b2qf6q;AccessToken=%5E,QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB/secret: xprivate_key=",
+    ),
+    (
+        "segment ID",
+        "_MEMBER_SEGMENT_ID",
+        _NEVER,
+        "a1q;xpass=PID|1||\n&state=' d4q%7C{b2qpassword=19800505",
+    ),
+    (
+        "DICOM tag",
+        "_MEMBER_VALUE_UNIT",
+        re.compile(_UNIT.replace(r"|\([0-9A-Fa-f]{4}, ?[0-9A-Fa-f]{4}\)", "")),
+        ",a1q;AccessToken=(0010,1000)=\na1qb2qMRN\t",
+    ),
+    (
+        "userinfo opener",
+        "_MEMBER_VALUE_UNIT",
+        re.compile(_UNIT.replace("|nonnumeric port: ", "")),
+        "&<redacted>19800505;xpass=nonnumeric port: '\nc3q%5E.@hpassword=MEFOR_X=",
+    ),
+    (
+        "encoded HL7 separator",
+        "_MEMBER_VALUE_UNIT",
+        re.compile(_UNIT.replace("|%(?:7[CcEe]|5[Ee]|26)", "")),
+        ".d4q%26\n;xpass=%5E",
+    ),
+)  # fmt: skip
+
+#: Fragments for the seeded differential below: the labels and separators of every pass, the
+#: HL7, DICOM and userinfo shapes a later PHI pass reads, and planted values ``<letter><digit>q``.
+_DIFFERENTIAL_PIECES = (
+    ";PWD=", ";sslpassword=", ";xpass=", ";AccessToken=", ";Token=", "password=", "password'=",
+    'password":', "secret=", "secret: ", "api_token=", "token=", "private_key=", "encryption_key={",
+    "MEFOR_X=", "postgres://svc:", "@db", "%2Cpassword=", "Bearer ", "?code=", "&state=",
+    "nonnumeric port: '", "PID|1||", "(0010,1000)", "MRN", "DOE^JOHN", "Jane Doe", "19800505",
+    "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", "'", '"', "{", "}", ";", ",", "&", "=", " ", ":", "\n",
+    "\t", "%7C", "%5E", "%26", "|", "^", "/", "a1q", "b2q", "c3q", "d4q", "e5q", "f6q",
+    "[REDACTED]", "<redacted>",
+)  # fmt: skip
+
+
+class _Capture(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.out: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.out.append(record.getMessage())
+
+
+def _through_three_handlers(line: str) -> list[str]:
+    """``line`` logged once to three handlers that each carry the production chain. They rewrite the
+    one record in place, so the second handler filters what the first left, and the third what the
+    second left: the chain applied once, twice and three times."""
+    logger = logging.getLogger(f"{_LOGGER}.three")
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    captures = [_Capture() for _ in range(3)]
+    for capture in captures:
+        _install_phi_filters(capture)
+        logger.addHandler(capture)
+    try:
+        logger.error("%s", line)
+    finally:
+        for capture in captures:
+            logger.removeHandler(capture)
+    return [capture.out[0] for capture in captures]
+
+
+def _every_redaction_path(line: str) -> dict[str, str]:
+    """``line`` through each path that redacts text once or more: a single pass of each surface, the
+    chain once, twice and three times, a chain line the bundle reads back from the log, and store
+    error text (the bundle's redaction, logged through the chain, read back by the bundle)."""
+    once, twice, thrice = _through_three_handlers(line)
+    stored = _through_three_handlers(redact_log_line(line))
+    return {
+        "scrub_credentials": scrub_credentials(line),
+        "redact_log_line": redact_log_line(line),
+        "chain once": once,
+        "chain twice": twice,
+        "chain three times": thrice,
+        "chain, then bundle": redact_log_line(once),
+        "chain twice, then bundle": redact_log_line(twice),
+        "store path": redact_log_line(stored[0]),
+        "store path, two handlers": redact_log_line(stored[1]),
+    }
+
+
+def _without_member_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take the member pass out of both surfaces, which is what ``origin/main`` runs: the pass is the
+    only change these modules carry for BACKLOG #5030."""
+    monkeypatch.setattr(secretscrub, "_CONNECTION_STRING_MEMBER", _NEVER)
+    monkeypatch.setattr(bundle_redact, "_CONNECTION_STRING_MEMBER", _NEVER)
+
+
+def _printed_where_the_baseline_hid(
+    lines: list[str], with_member: list[dict[str, str]], baseline: list[dict[str, str]]
+) -> list[tuple[str, str, str]]:
+    found = []
+    for line, new, old in zip(lines, with_member, baseline, strict=True):
+        for path, out in new.items():
+            if any(f in out and f not in old[path] for f in _planted(line)):
+                found.append((path, line, out))
+    return found
+
+
+def test_a_second_or_third_redaction_prints_nothing_the_baseline_hid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A differential over every redaction path: each planted value printed WITH the member pass is
+    printed without it too, on one pass and on two or three. A draft that replaced the whole value
+    passed the one-pass half of this and failed the rest (the shapes above, and 124 to 145 random
+    lines of 320,000 on each later path). The commit records the full measurement."""
     rng = random.Random(5030)
-    lines = list(_SHAPES_THE_FIRST_DRAFT_PRINTED) + [
-        "".join(rng.choice(pieces) for _ in range(rng.randint(3, 14))) for _ in range(3000)
+    lines = [
+        *_SHAPES_THE_FIRST_DRAFT_PRINTED,
+        *_SHAPES_A_SECOND_PASS_PRINTED,
+        *(shape for *_, shape in _RULE_CONTROLS),
+        *(
+            "".join(rng.choice(_DIFFERENTIAL_PIECES) for _ in range(rng.randint(3, 14)))
+            for _ in range(1500)
+        ),
     ]
-    with_member = [(scrub_credentials(line), redact_log_line(line)) for line in lines]
-    never = re.compile(r"(?!)")  # matches nowhere
-    monkeypatch.setattr(secretscrub, "_CONNECTION_STRING_MEMBER", never)
-    monkeypatch.setattr(bundle_redact, "_CONNECTION_STRING_MEMBER", never)
-    for line, (scrubbed, bundled) in zip(lines, with_member, strict=True):
-        base_scrubbed, base_bundled = scrub_credentials(line), redact_log_line(line)
-        for fragment in _planted(line):
-            assert fragment not in scrubbed or fragment in base_scrubbed, (line, scrubbed)
-            assert fragment not in bundled or fragment in base_bundled, (line, bundled)
+    with_member = [_every_redaction_path(line) for line in lines]
+    with monkeypatch.context() as patched:
+        _without_member_pass(patched)
+        baseline = [_every_redaction_path(line) for line in lines]
+    assert _printed_where_the_baseline_hid(lines, with_member, baseline) == []
+
+
+def test_the_differential_fails_on_the_whole_value_draft(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The control for the differential above: with each value replaced whole by the placeholder, as
+    the draft did, it finds the second-pass shapes, so a pass of the test is evidence."""
+    lines = list(_SHAPES_A_SECOND_PASS_PRINTED)
+    with monkeypatch.context() as patched:
+        _without_member_pass(patched)
+        baseline = [_every_redaction_path(line) for line in lines]
+    monkeypatch.setattr(secretscrub, "_mask_member_value", lambda _value: "<redacted>")
+    whole_value = [_every_redaction_path(line) for line in lines]
+    printed = _printed_where_the_baseline_hid(lines, whole_value, baseline)
+    # Every shape is in the list because the draft printed it on at least one later path.
+    assert {line for _, line, _ in printed} == set(lines)
+    assert not [path for path, _, _ in printed if path in ("scrub_credentials", "redact_log_line")]
+
+
+@pytest.mark.parametrize(
+    ("attr", "off", "shape"),
+    [control[1:] for control in _RULE_CONTROLS],
+    ids=[control[0] for control in _RULE_CONTROLS],
+)
+def test_each_mask_rule_is_needed(
+    monkeypatch: pytest.MonkeyPatch, attr: str, off: re.Pattern[str], shape: str
+) -> None:
+    """With one rule of the word mask off, its shape prints a value the baseline hid on a later
+    redaction; with every rule on, it does not."""
+    assert getattr(secretscrub, attr).pattern != off.pattern  # the switch is not a no-op
+    with monkeypatch.context() as patched:
+        _without_member_pass(patched)
+        baseline = [_every_redaction_path(shape)]
+    assert _printed_where_the_baseline_hid([shape], [_every_redaction_path(shape)], baseline) == []
+    monkeypatch.setattr(secretscrub, attr, off)
+    assert _printed_where_the_baseline_hid([shape], [_every_redaction_path(shape)], baseline)
 
 
 def test_the_member_pattern_spells_the_word_tuples_and_brace_fragments() -> None:
     """The pattern is a literal so the static regex scanner reads it; this holds the literal to its
-    sources, and the bundle to the same object, so neither can drift."""
+    sources, and the bundle to the same function, so neither can drift."""
     pattern = secretscrub._CONNECTION_STRING_MEMBER.pattern
     words = re.findall(r"\(\?<=([a-z]+)\)", pattern)
     assert sorted(words) == sorted(secretscrub._CREDENTIAL_WORDS + secretscrub._MEMBER_EXTRA_WORDS)
     # The braced body is kept to one line here; the label pattern's may cross one.
     assert secretscrub._ODBC_BRACED.replace("[^}]", r"[^}\r\n]") in pattern
     assert secretscrub._ODBC_BRACED_OVERRUN in pattern
-    in_bundle = vars(bundle_redact)["_CONNECTION_STRING_MEMBER"]
-    assert in_bundle is secretscrub._CONNECTION_STRING_MEMBER
+    assert vars(bundle_redact)["_CONNECTION_STRING_MEMBER"] is secretscrub._CONNECTION_STRING_MEMBER
+    assert vars(bundle_redact)["_mask_member"] is secretscrub._mask_member
+
+
+def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
+    """The mask keeps a word where a later pass reads it. This holds each kept word and shape to the
+    pass it is for, so a word added there and not here goes red."""
+
+    def kept(word: str) -> bool:
+        return secretscrub._MEMBER_KEEP.search(word) is not None
+
+    sources = {
+        "secretscrub credential words": secretscrub._CREDENTIAL_WORDS,
+        "secretscrub token words": secretscrub._TOKEN_WORDS,
+        "secretscrub key-material words": secretscrub._KEY_MATERIAL_WORDS,
+        "secretscrub query-credential words": secretscrub._QUERY_CREDENTIAL_WORDS,
+        "secretscrub query-credential compounds": secretscrub._QUERY_CREDENTIAL_COMPOUNDS,
+        "secretscrub env prefix": (secretscrub._ENV_PREFIX,),
+        "logging_setup query keys": logging_setup._CREDENTIAL_QUERY_KEYS,
+        "logging_setup query stop words": logging_setup._QUERY_STOP_WORDS,
+        "redaction credential-ahead words": tuple(
+            word
+            for alternation in re.findall(
+                r"\(\?:((?:[a-z_\-]+\|)+[a-z_\-]+)\)", redaction._CREDENTIAL_AHEAD.pattern
+            )
+            for word in alternation.split("|")
+        ),
+        "redaction glued credential words": redaction._GLUED_CREDENTIAL_WORDS,
+        "redaction DICOM label words": redaction._DICOM_LABEL_WORDS,
+        "redaction widened key words": redaction._WIDENED_KEY_WORDS,
+        "redaction MRN": ("mrn",),
+        "redaction MSH headers": ("MSH", "BHS", "FHS"),
+        "bundle scheme words": ("bearer", "basic", "digest", "mfb64"),
+    }
+    missing = {name: [w for w in words if not kept(w)] for name, words in sources.items()}
+    assert not {name: words for name, words in missing.items() if words}
+    # The literal search is the tuple, reduced by subsumption and nothing else.
+    alternatives = secretscrub._MEMBER_KEEP.pattern.removeprefix("(?i)").split("|")
+    assert set(alternatives) <= {word.lower() for word in secretscrub._MEMBER_KEEP_WORDS}
+    assert all(kept(word) for word in secretscrub._MEMBER_KEEP_WORDS)
+    assert redaction._MSH_DELIMITERS.pattern.startswith("(?:MSH|BHS|FHS)")
+    # Shapes kept whole, each spelled as its pass spells it.
+    assert redaction._USERINFO_OPENER == "nonnumeric port: '"
+    assert "nonnumeric port: " in secretscrub._MEMBER_VALUE_UNIT.pattern
+    assert secretscrub._MEMBER_LONG_B64.pattern == bundle_redact._LONG_B64.pattern
+    assert redaction._HL7_SEGMENT.pattern.startswith(r"\b([A-Z][A-Z0-9]{2})")
+    assert redaction._ENCODED_SEPARATOR.pattern == r"%(?:7[CcEe]|5[Ee]|26)"
+    assert redaction._ENCODED_SEPARATOR.pattern in secretscrub._MEMBER_VALUE_UNIT.pattern
+
+
+@pytest.mark.parametrize(
+    ("line", "masked"),
+    [
+        # A word for a word: the separators a later pass counts stay where they were.
+        (";PWD=Qv7m kX4r,Pw9z&mT3y=Yb8n;", ";PWD=<redacted> redacted,redacted&redacted=redacted;"),
+        (";xpass=a1q%5E", ";xpass=redacted%5E"),
+        # A later pass's label, segment ID, DICOM tag and userinfo opener stay whole.
+        (";xpass=&state=b2q;", ";xpass=&state=redacted;"),
+        (";xpass=x.PID|1||", ";xpass=x.PID|redacted||"),
+        (";xpass=(0010,1000)c3q", ";xpass=(0010,1000)redacted"),
+        (";xpass=nonnumeric port: 'd4q@h'", ";xpass=nonnumeric port: 'd4q@h'"),
+        # A base64 run stays long enough for the bundle's sweep.
+        (";xpass=a1q QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB", ";xpass=redacted " + "redacted" * 4),
+    ],
+)
+def test_the_mask_replaces_words_and_keeps_what_a_later_pass_reads(line: str, masked: str) -> None:
+    assert scrub_credentials(line) == masked
+
+
+def test_a_masked_member_is_masked_the_same_on_a_second_pass() -> None:
+    """The mask keeps the placeholders it and the earlier passes wrote, so a second pass changes
+    nothing it wrote."""
+    once = scrub_credentials(_dsn())
+    assert scrub_credentials(once) == once
+    bundled = redact_log_line(_dsn())
+    assert redact_log_line(bundled) == bundled
 
 
 @pytest.mark.parametrize(
@@ -247,6 +482,8 @@ def test_the_member_pattern_spells_the_word_tuples_and_brace_fragments() -> None
             ";sslpassword=x",
             ";Xpass",
             ";a=b c,d&e",
+            # Words inside long base64 runs, each found by bisection.
+            ";pwd=QUFBQUFBQUFBQUFBQUFBQUFBQUFB a ",
         ),
         # Many lines, each with a "{" it never closes: a brace walk that crossed lines re-read the
         # rest of the record from every one (a review measured 5 s on 64 KB).
@@ -263,17 +500,32 @@ def test_a_long_semicolon_dense_line_scrubs_in_linear_time(unit: str) -> None:
     assert time.perf_counter() - started < 10.0
 
 
+def test_one_long_member_value_masks_in_linear_time() -> None:
+    """One value of about 400 KB, words and base64 runs alternating: the mask walks it once and
+    finds the run under each word by bisection, where a scan of every run per word was quadratic."""
+    line = "DRIVER={X};pwd=" + "QUFBQUFBQUFBQUFBQUFBQUFBQUFB a b " * 12_000
+    started = time.perf_counter()
+    scrub_credentials(line)
+    redact_log_line(line)
+    assert time.perf_counter() - started < 10.0
+
+
 @pytest.mark.parametrize(
     "line",
     [
-        "DRIVER={Acme};SERVER=db1.example;DATABASE=mf;sslmode=require;PORT=5432",
-        "reload done; 3 outbounds rebuilt; 0 failed",
-        "matrix /fhir;version=4;format=json",
+        # Each holds a credential word, so the gate admits the member pass and the pattern itself must
+        # refuse: a key that holds the word but ends in another, a word after "; " in prose, and a
+        # key that ends in "ive".
+        "DRIVER={Acme};SERVER=db1.example;PasswordPolicy=strict;TokenEndpoint=https://idp.example/t",
+        "reload done; secret rotation scheduled; token cache warmed",
+        "matrix /fhir;version=4;passive=true;format=json",
     ],
 )
 def test_a_connection_string_with_no_credential_member_is_unchanged(line: str) -> None:
+    assert secretscrub._admits(secretscrub._gate_fold(line), secretscrub._CREDENTIAL_HINT)
     assert scrub_credentials(line) == line
     assert _credential_filter_alone(line) == line
+    assert redact_log_line(line) == line
 
 
 @pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=[name for name, _ in _SURFACES])

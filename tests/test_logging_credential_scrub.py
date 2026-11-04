@@ -322,7 +322,11 @@ def test_the_production_filter_chain_scrubs_every_credential_family(fam: Family)
     """The value must not survive the chain, and the reader must see that redaction happened."""
     out = run_chain(fam.line).getMessage()
     assert fam.secret not in out, f"{fam.name}: the credential survived the chain -- got {out!r}"
-    assert CREDENTIAL_PLACEHOLDER in out, f"{fam.name}: nothing was marked redacted -- got {out!r}"
+    # The member pass masks each word of a value with a bare word and no brackets, so a later pass
+    # reads the same separators (BACKLOG #5030); that word after the "=" is its mark.
+    member_only = fam.patterns == ("_CONNECTION_STRING_MEMBER",)
+    marker = f"={secretscrub._MEMBER_MASK}" if member_only else CREDENTIAL_PLACEHOLDER
+    assert marker in out, f"{fam.name}: nothing was marked redacted -- got {out!r}"
 
 
 @pytest.mark.parametrize("fam", FAMILIES, ids=lambda f: f.name)

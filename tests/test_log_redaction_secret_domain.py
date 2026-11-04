@@ -584,7 +584,11 @@ def test_every_secret_family_value_is_redacted(fam: Family) -> None:
     """The value must not survive redact_log_line, and the reader must see redaction happened."""
     out = redact_log_line(fam.line)
     assert fam.secret not in out, f"{fam.name}: secret survived redaction -- got {out!r}"
-    assert REDACTION_PLACEHOLDER in out, f"{fam.name}: nothing was marked redacted -- got {out!r}"
+    # The member pass masks each word of a value with a bare word and no brackets, so a later pass
+    # reads the same separators (BACKLOG #5030); that word after the "=" is its mark.
+    member_only = fam.patterns == ("_CONNECTION_STRING_MEMBER",)
+    marker = f"={scrub_mod._MEMBER_MASK}" if member_only else REDACTION_PLACEHOLDER
+    assert marker in out, f"{fam.name}: nothing was marked redacted -- got {out!r}"
 
 
 @pytest.mark.parametrize("fam", FAMILIES, ids=lambda f: f.name)
