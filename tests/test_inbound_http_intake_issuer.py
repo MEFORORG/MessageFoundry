@@ -645,19 +645,35 @@ def test_a_label_is_compared_up_to_a_nul_as_openssl_compares_it() -> None:
     assert index.unmatched_keys(["CN=Odd CA", "CN=Good CA"]) == {}
 
 
-def test_a_body_line_is_read_up_to_a_nul_as_openssl_keeps_it() -> None:
-    """OpenSSL keeps each body line up to its first NUL, so a CA whose base64 lines carry a NUL and
-    junk after them still loads. The index must read the same text, or that CA would be counted
-    unreadable and every partner under it refused (BACKLOG #4948)."""
-    odd = _ca(_dn((NameOID.COMMON_NAME, "Odd CA")))
-    good = _ca(_dn((NameOID.COMMON_NAME, "Good CA")))
-    lines = _pem(odd[0]).split(b"\n")
-    lines[1] += b"\x00junk"
-    cadata = (b"\n".join(lines) + _pem(good[0])).decode("ascii")
-    assert _loaded_subjects(cadata) == {"CN=Odd CA", "CN=Good CA"}  # the premise
+@pytest.mark.parametrize(
+    ("head", "tail"),
+    [
+        # OpenSSL's header check finds the ':' past the NUL.
+        pytest.param(b"", b"\x00:junk", id="nul-then-colon"),
+        # After a blank first body line, OpenSSL's 64-character data-line limit counts the byte
+        # past the NUL.
+        pytest.param(b"\n", b"\x00A", id="blank-then-nul-over-64"),
+    ],
+)
+def test_a_body_line_with_a_nul_names_no_ca_openssl_did_not_load(head: bytes, tail: bytes) -> None:
+    """OpenSSL reads a body line past its first NUL in at least two checks, and on these shapes it
+    silently stops loading the file there, so the intermediate after the root is never loaded. The
+    index must not read the line only up to the NUL and name that intermediate: a client sending it
+    as its own intermediate verifies through the root, and a subject listed under the intermediate
+    would be admitted. The index reads the whole line, which ``cryptography`` refuses, so the block
+    is counted and names no issuer (BACKLOG #4948)."""
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    inter = _ca(_dn((NameOID.COMMON_NAME, "Inter CA")), by=root)
+    lines = _pem(inter[0]).split(b"\n")
+    lines[1] = head + lines[1] + tail
+    cadata = (_pem(root[0]) + b"\n".join(lines)).decode("ascii")
+    assert _loaded_subjects(cadata) == {"CN=Root CA"}  # the premise: OpenSSL stops after the root
     index = IssuerIndex(cadata)
-    assert index.unreadable == 0
-    assert index.unmatched_keys(["CN=Odd CA", "CN=Good CA"]) == {}
+    assert index.unreadable > 0
+    assert index.unmatched_keys(["CN=Root CA"]) == {}  # control
+    assert "CN=Inter CA" in index.unmatched_keys(["CN=Inter CA"])
+    leaf = _der(_new_ca(_dn((NameOID.COMMON_NAME, "leaf")), inter)[0])
+    assert index.issuer_of(leaf) == ""
 
 
 @pytest.mark.parametrize(
