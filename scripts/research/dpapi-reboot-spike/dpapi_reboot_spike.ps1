@@ -120,31 +120,28 @@
   no firewall rule.
 
   OWNER COMMAND (MEFORHV01, PowerShell 7 started with Run as administrator). It is pinned to
-  b8ad8d8587c3be84c67738570a82f478272aa79f, the commit whose code below this header is this
+  47039223ae5ccd12072b7b0ae07770e9341a19da, the commit whose code below this header is this
   file's; the commit that pins it here changes only this header. It is fetched by SHA, so it
   still works after the branch is merged and deleted:
 
-    if ([Environment]::MachineName -ne 'MEFORHV01') { Write-Host "STOP     this must run on MEFORHV01, but this is $([Environment]::MachineName); nothing ran" } else { $d = Join-Path $env:TEMP ('dpapi-reboot-' + [guid]::NewGuid().ToString('N')); $null = New-Item -ItemType Directory -Path $d; $repo = Join-Path $HOME 'mfsrc'; git -C $repo fetch origin 'b8ad8d8587c3be84c67738570a82f478272aa79f'; $f = Join-Path $d 'dpapi_reboot_spike.ps1'; git -C $repo show 'b8ad8d8587c3be84c67738570a82f478272aa79f:scripts/research/dpapi-reboot-spike/dpapi_reboot_spike.ps1' > $f; if ((Get-Item -LiteralPath $f).Length -lt 1000) { Write-Host 'STOP     the script did not arrive; nothing ran' } else { pwsh -NoProfile -ExecutionPolicy Bypass -File $f -Mode Host -OutDir (Join-Path $d 'out') } }
+    if ([Environment]::MachineName -ne 'MEFORHV01') { Write-Host "STOP     this must run on MEFORHV01, but this is $([Environment]::MachineName); nothing ran" } else { $d = Join-Path $env:TEMP ('dpapi-reboot-' + [guid]::NewGuid().ToString('N')); $null = New-Item -ItemType Directory -Path $d; $repo = Join-Path $HOME 'mfsrc'; git -C $repo fetch origin '47039223ae5ccd12072b7b0ae07770e9341a19da'; $f = Join-Path $d 'dpapi_reboot_spike.ps1'; git -C $repo show '47039223ae5ccd12072b7b0ae07770e9341a19da:scripts/research/dpapi-reboot-spike/dpapi_reboot_spike.ps1' > $f; if ((Get-Item -LiteralPath $f).Length -lt 1000) { Write-Host 'STOP     the script did not arrive; nothing ran' } else { pwsh -NoProfile -ExecutionPolicy Bypass -File $f -Mode Host -OutDir (Join-Path $d 'out') } }
 
   It prints the DPAPI-REBOOT lines at the end and leaves them, the transcript and the raw reports
   in the out folder it names.
 
-  RESULTS. The code that ran is commit b6f720a8bba787628ea38b9dca47d255353b816f, an earlier pin of
-  this file, not the one the owner command pins now. The later code grades only the key-state
-  refusal as NO and bounds the Host-mode guest calls; every FAIL in the lines below is that refusal
-  or the tampered control's win32=13, so the later judge reads them the same. No run of the later
-  code is recorded here. -Mode
-  Payload, run from MEFORDEV01 through hvtest (Invoke-HvTest.ps1 at vault 27cf79f8d, its hvtest
-  folder the same as vault origin/main 5387351d2) on REVTEST01 at post-move-mefor-lab-2026-10-17,
-  results stamp 20261104T095749Z; hvtest printed "end: pass, exit 0: entry exit 0", every stage
-  ok. Verbatim lines from the VM's dpapi-reboot-spike.txt, a selection, unedited:
+  RESULTS. The code that ran is commit 47039223ae5ccd12072b7b0ae07770e9341a19da, the commit the
+  owner command pins, with every guest step under Windows PowerShell 5.1 as Host mode runs it.
+  -Mode Payload, run from MEFORDEV01 through hvtest (Invoke-HvTest.ps1 and HvTestCommand.ps1 at
+  vault origin/main 7697441b2) on REVTEST01 at post-move-mefor-lab-2026-10-17, results stamp
+  20261104T162933Z; hvtest printed "end: pass, exit 0: entry exit 0", every stage ok. Verbatim
+  lines from the VM's dpapi-reboot-spike.txt, a selection, unedited:
     guest=REVTEST01 os=Microsoft Windows Server 2022 Datacenter version=10.0.20348 build=20348
-    caller=REVTEST01\Administrator powershell=7.6.7
+    caller=REVTEST01\Administrator powershell=5.1.20348.4294
     registration=ObjectName NT SERVICE\MeforDpapiReboot, ServiceSidType 3 (restricted), RequiredPrivileges SeChangeNotifyPrivilege, Start 2 (auto)
     profile-A3 loaded_before_start=True profile=C:\Windows\ServiceProfiles\MeforDpapiReboot
     profile=kept, still loaded: C:\Windows\ServiceProfiles\MeforDpapiReboot
     DPAPI-REBOOT crosscheck, the administrator opens the service's user-scope blob: admin_open=FAIL win32=-2146893813 by REVTEST01\Administrator exit=0
-    DPAPI-REBOOT boots: A1 boot_id=5 uptime_ms=15937 boot_utc=2026-11-04T09:57:58.8049069Z; A2 boot_id=5 uptime_ms=16359 boot_utc=2026-11-04T09:57:58.8047813Z; A3 boot_id=5 uptime_ms=319015 boot_utc=2026-11-04T09:57:58.8132341Z; A4 no report; A5 no report
+    DPAPI-REBOOT boots: A1 boot_id=5 uptime_ms=11234 boot_utc=2026-11-04T16:29:41.0311941Z; A2 boot_id=5 uptime_ms=12390 boot_utc=2026-11-04T16:29:41.0314429Z; A3 boot_id=5 uptime_ms=315921 boot_utc=2026-11-04T16:29:41.0314425Z; A4 no report; A5 no report
     DPAPI-REBOOT A1 first start, protect and unprotect in user scope: YES (user_unprotect OK match; controls HELD: foreign FAIL win32=-2146893813, tampered FAIL win32=13, machine OK match)
     DPAPI-REBOOT A2 after a service restart: YES (user_unprotect OK match; controls HELD: foreign FAIL win32=-2146893813, tampered FAIL win32=13, machine OK match)
     DPAPI-REBOOT A3 after the profile was unloaded: INCONCLUSIVE (the profile was not seen unloaded before the start; user_unprotect OK match; controls HELD: foreign FAIL win32=-2146893813, tampered FAIL win32=13, machine OK match)
@@ -152,10 +149,11 @@
     DPAPI-REBOOT A5 after a reboot, a demand start: NOT RUN (this route cannot reboot the VM inside a run)
     DPAPI-REBOOT VERDICT: NOT RUN
   Notes, not raw lines. profile-A3 was read after A3's step waited 300 s with the service stopped.
-  A3's start opened the blob (the result now read before the unload test), so the payload's pass
-  is the PrePass rule. Four runs of earlier drafts of this file (05:46, 06:03, 06:58 and 07:35
-  UTC, the last at cde90392a) gave the same A1 to A5 answers; those drafts did not read A3's
-  result while the profile stayed loaded.
+  A3's start opened the blob, so the payload's pass is the PrePass rule. Every start's
+  user_blob_sha256 was A1's. Earlier runs of this file gave the same A1 to A5 answers: one of
+  96c9eb3c2 (stamp 20261104T152847Z, guest steps under 5.1 too), and one of b6f720a8b (stamp
+  20261104T095749Z) and four of earlier drafts (05:46, 06:03, 06:58 and 07:35 UTC), all with
+  guest steps under the payload's PowerShell 7.6.7.
   What that shows. User-scope DPAPI works under the restricted virtual account, and the blob is
   bound to it both ways: the service cannot open the administrator's blob, nor the administrator
   the service's (-2146893813 is 0x8009000B, NTE_BAD_KEY_STATE). It survives a restart. The virtual
