@@ -164,8 +164,9 @@ def test_a_broken_chain_still_exits_1(
 
 def test_each_refusal_is_typed_and_still_a_value_error(tmp_path: Path) -> None:
     """Each refusal raises ``StoreTlsRefused``, which every handler of a refused hop catches, and
-    which a caller that caught the bare ``ValueError`` still catches. The fourth is a PostgreSQL
-    pin file gone since the settings load, the same kind of refusal."""
+    which a caller that caught the bare ``ValueError`` still catches. The later ones are a
+    PostgreSQL pin file gone since the settings load and a CRL file that cannot be judged, refused
+    by the context builder ``_build_ssl`` calls at the open."""
     from messagefoundry.config.tls_policy import HopPosture
     from messagefoundry.store.postgres import _build_ssl, _verifying_context
     from messagefoundry.store.sqlserver import check_pinned_certificate, connection_string
@@ -175,11 +176,18 @@ def test_each_refusal_is_typed_and_still_a_value_error(tmp_path: Path) -> None:
     enforcing = HopPosture(enforcing=True)
     pin = _ca_cert_file(tmp_path, signs=False, not_after_days=-1)
     gone = _pg(ssl_root_cert=pin).model_copy(update={"ssl_root_cert": str(tmp_path / "gone.pem")})
+    crl = tmp_path / "unjudgeable.crl"
+    crl.write_text("not a CRL\n", encoding="utf-8")
+    bad_crl = _pg().model_copy(update={"ssl_crl_file": str(crl)})
     for refuse in (
         lambda: _build_ssl(_pg(trust_server_certificate=True), posture=enforcing),
         lambda: connection_string(_ss(trust_server_certificate=True), posture=enforcing),
         lambda: check_pinned_certificate(_ss(ssl_root_cert=pin), posture=enforcing),
         lambda: _verifying_context(gone),
+        lambda: _build_ssl(gone, posture=enforcing),
+        # Any refusal the context builder makes is typed at the open, a CRL that cannot be judged
+        # among them.
+        lambda: _build_ssl(bad_crl, posture=enforcing),
     ):
         with pytest.raises(StoreTlsRefused):
             refuse()

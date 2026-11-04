@@ -8680,10 +8680,11 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     of a :class:`_StoreOpenRefused`, is refused after the open has touched the database. The open
     rolls its batch back and writes no schema marker. But on SQL Server under
     ``[store].schema_management = auto`` a writable open first switches the database's
-    READ_COMMITTED_SNAPSHOT option on (``SqlServerStore._ensure_database_options``), outside that
-    batch, and the refusal does not switch it back. So for that refusal it says the batch was
-    rolled back and, there, that the setting may already have changed: sentences, the last with
-    no full stop, so a caller can end it."""
+    READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options on
+    (``SqlServerStore._ensure_database_options``), outside that batch, and the refusal does not
+    switch them back. So for that refusal it says the batch was rolled back and, there, that those
+    options may already have changed: sentences, the last with no full stop, so a caller can end
+    it."""
     from messagefoundry.config.settings import SchemaManagement, StoreBackend
     from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
 
@@ -8699,18 +8700,22 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     ):
         left += (
             ". Under [store].schema_management = auto the open may already have switched the "
-            "database's READ_COMMITTED_SNAPSHOT option on, before that batch; the refusal does "
-            "not switch it back"
+            "database's READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options on, before "
+            "that batch; the refusal does not switch them back"
         )
     return left
 
 
 def _provision_open_refusal(exc: BaseException, store: StoreSettings) -> str:
     """``provision-admin``'s text for a refused store open: the refusal, then what it left
-    behind (:func:`_open_refusal_left_behind`, BACKLOG #5067)."""
+    behind (:func:`_open_refusal_left_behind`, BACKLOG #5067). Through ``codec_safe_str``, as
+    every other command prints an open refusal: a key source's codec error quotes a byte of what
+    it decoded (BACKLOG #2532)."""
+    from messagefoundry.redaction import codec_safe_str
+
     left = _open_refusal_left_behind(exc, store)
     tail = _NOTHING_PROVISIONED if left is None else f"Refusing to provision. {left}"
-    return f"{_sentence(exc)} {tail}"
+    return f"{_sentence(codec_safe_str(exc))} {tail}"
 
 
 def _sentence(message: object) -> str:
@@ -9071,15 +9076,19 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     actor = f"cli:{getpass.getuser()}"
 
-    def before_the_write(text: str) -> str:
-        """``text`` for a refusal raised before the write wrote anything, but after the key was
-        shown (BACKLOG #5067). It then says so, as ``admin-reset-totp`` does, or the app keeps an
-        entry for a seed that was never stored. Unchanged under ``--no-totp``: no key was shown."""
+    def after_the_key(text: str, *, unwritten: bool = True) -> str:
+        """``text`` for a refusal at the write, after the key was shown (BACKLOG #5067). It then
+        names the entry the operator may have added, as ``admin-reset-totp`` does, or the app
+        keeps an entry this run will never use. ``unwritten`` for a refusal raised before the write
+        wrote anything, whose seed was never stored. The service's own refusals can follow a
+        partial write that a later run repairs with a new key, so they say only that the run did
+        not finish. Unchanged under ``--no-totp``: no key was shown."""
         if totp_secret is None:
             return text
+        why = "its seed was never stored" if unwritten else "this run did not finish"
         return (
             f"{_sentence(text)} If you added the entry this run showed to the authenticator app, "
-            "delete it: its seed was never stored, and a run that succeeds shows a new key."
+            f"delete it: {why}, and a run that succeeds shows a new key."
         )
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
@@ -9167,20 +9176,19 @@ def _provision_admin(args: argparse.Namespace) -> int:
     try:
         outcome, store_path = run_guarded(run())
     except FirstAdministratorRefused as exc:
-        return _emit_error(str(exc), as_json=args.json)
+        # The service's refusal, after the key was shown; some follow a partial write (#5067).
+        return _emit_error(after_the_key(str(exc), unwritten=False), as_json=args.json)
     except (_KeylessProvisionRefused, KeylessAuditChainRefused, _UnauditableWrite) as exc:
         # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it.
         # Each is raised before the write, so the shown key's entry has no seed (#5067).
-        _emit_error(before_the_write(str(exc)), as_json=args.json)
+        _emit_error(after_the_key(str(exc)), as_json=args.json)
         return 2
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         # Refused before the prompt already; one that changed since is refused the same way. A
         # short server schema (#1720) can first arrive here: with no `schema_meta` table the
         # pre-check finds no store, and only this create=True open runs the DDL batch. The text
         # says what the open may have changed, and that the shown key's entry has no seed (#5067).
-        _emit_error(
-            before_the_write(_provision_open_refusal(exc, settings.store)), as_json=args.json
-        )
+        _emit_error(after_the_key(_provision_open_refusal(exc, settings.store)), as_json=args.json)
         return 2
     except sqlite3.IntegrityError as exc:
         # BACKLOG #2697. Ahead of the arm below, which it subclasses: a write the store refused is

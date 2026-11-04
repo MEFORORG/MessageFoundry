@@ -22,7 +22,8 @@ driver module is a stand-in, so what is proved is whether the guard let the comm
   constant;
 * :func:`test_a_weakened_hop_is_refused` is the weakened-TLS check, which a SQL Server store has
   too, beside the pin's anchor checks, which these tests do not drive
-  (``tests/test_b5000_store_tls_refusal_exit.py`` drives both on ``audit-verify``);
+  (``tests/test_b5000_store_tls_refusal_exit.py`` drives the SQL Server weakened check and an
+  expired pin, the pin's validity check, on ``audit-verify``);
 * :func:`test_warn_keeps_refusing_a_weakened_hop_with_the_escape` and
   :func:`test_warn_keeps_refusing_an_unattested_off_box_vault` hold the no-loosening rule (Manager
   decision d20261031T021248404-699a64): at ``warn`` each command still refuses what it refused with

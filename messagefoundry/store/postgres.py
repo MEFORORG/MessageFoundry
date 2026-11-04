@@ -86,6 +86,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import (
     HopPosture,
+    InsecureHopRefused,
     RevocationHopGuard,
     StoreTlsRefused,
     current_hop_posture,
@@ -1564,7 +1565,15 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # disjoint conditions so one hop is never refused twice).
     # settings.server is str | None; an empty host reads as loopback (is_loopback_hop_host) → ALLOW, so a
     # missing server (a Postgres config that would fail elsewhere) never trips the revocation refusal.
-    ctx = _verifying_context(settings)
+    try:
+        ctx = _verifying_context(settings)
+    except InsecureHopRefused:
+        raise
+    except ValueError as exc:
+        # BACKLOG #5000: the context builder refuses the hop's own TLS settings (the pin file, the
+        # CRL file and its dates, the suites) with a ValueError. Typed here, at the open, so every
+        # refusal it makes, now or later, is could not start rather than the CLI floor's exit 1.
+        raise StoreTlsRefused(str(exc)) from exc
     # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
     # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
     # that flag rather than the setting. The pool builds a fresh context per connection through the

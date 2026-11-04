@@ -30,7 +30,7 @@ from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
 from tests.test_b1720_cli_schema_refusal_exit import _DIFFERENCE, _PASSWORD
 from tests.test_b1720_cli_schema_refusal_exit import shell as shell  # noqa: F401
 
-_RCSI = "READ_COMMITTED_SNAPSHOT"
+_RCSI = "READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options"
 _ROLLED_BACK = "rolled its schema batch back and wrote no schema marker"
 _UNUSED_ENTRY = "If you added the entry this run showed to the authenticator app, delete it"
 
@@ -160,7 +160,7 @@ def test_provision_admin_write_says_what_the_open_left_and_names_the_entry(
     """The write's ``create=True`` open, after the key was shown: the text also names the unused
     authenticator entry.
 
-    Mutation: drop ``before_the_write`` from the write's open-refusal arm."""
+    Mutation: drop ``after_the_key`` from the write's open-refusal arm."""
     _refused_at_the_write(monkeypatch, backend, _refusal(backend))
     out = _run(_provision(_settings(shell, backend, management)), capsys)
     _assert_left_behind(out, names_the_setting=_STORES[backend, management])
@@ -184,7 +184,7 @@ def test_provision_admin_keyless_refusal_at_the_write_names_the_entry(
 ) -> None:
     """A keyless refusal at the write comes after the key was shown too, and before any write.
 
-    Mutation: drop ``before_the_write`` from the keyless arm."""
+    Mutation: drop ``after_the_key`` from the keyless arm."""
     from messagefoundry.store import base
 
     refusal = base.KeylessAuditChainRefused("mefor", "[store].synthetic_setting")
@@ -225,6 +225,79 @@ def test_any_other_open_refusal_keeps_its_text() -> None:
         schema_management=SchemaManagement.AUTO,
     )
     assert _open_refusal_left_behind(RuntimeError("a hop refusal"), store) is None
+    wrapped_other = _StoreOpenRefused("a key refusal")
+    wrapped_other.__cause__ = RuntimeError("a key refusal")
+    assert _open_refusal_left_behind(wrapped_other, store) is None
     wrapped = _StoreOpenRefused("short")
     wrapped.__cause__ = _refusal("sqlserver")
     assert _RCSI in (_open_refusal_left_behind(wrapped, store) or "")
+
+
+def test_provision_admin_service_refusal_at_the_write_names_the_entry(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The service's own refusal at the write, after the key was shown. Some follow a partial
+    write, so the text says the run did not finish, never that the seed was not stored. Exit 1,
+    this command's refusal, as before.
+
+    Mutation: print ``str(exc)`` alone again in the ``FirstAdministratorRefused`` arm."""
+    from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.store import base
+
+    async def opening(*_args: object, create: bool = False, **_kwargs: object) -> object:
+        if not create:
+            raise base.StoreNotFoundError.server_schema(StoreBackend.SQLSERVER, "mefor")
+        return _OpenedStore()
+
+    class _OpenedStore:
+        path = "127.0.0.1/mefor"
+
+        def cipher_info(self) -> object:
+            return types.SimpleNamespace(encrypts=True)
+
+        def audit_append_refusal(self) -> None:
+            return None
+
+        async def get_user_by_username(self, _username: str) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    async def refused(*_args: object, **_kwargs: object) -> object:
+        raise FirstAdministratorRefused("synthetic service refusal")
+
+    _refused_at_the_write(monkeypatch, "sqlserver", RuntimeError("unused"))
+    monkeypatch.setattr(base, "open_store", opening)
+    monkeypatch.setattr(AuthService, "provision_first_administrator", refused)
+    code = main(_provision(_settings(shell, "sqlserver", "auto")))
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert code == 1, out
+    assert "synthetic service refusal" in out, out
+    assert _UNUSED_ENTRY in out and "this run did not finish" in out, out
+    assert "its seed was never stored" not in out, out
+
+
+def test_provision_admin_open_refusal_quotes_no_key_byte(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A key source's codec error at provision-admin's open does not print the byte it quotes,
+    as no other store command does (BACKLOG #2532).
+
+    Mutation: build ``_provision_open_refusal``'s text from ``str(exc)``."""
+    from messagefoundry.store import base
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    async def refusing(*_args: object, **_kwargs: object) -> object:
+        try:
+            b"\xe9".decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise KeyProviderError(exc) from exc
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(base, "open_store", refusing)
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert "xe9" not in out.lower(), out
+    assert "nothing was written" in out, out
