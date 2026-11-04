@@ -8,7 +8,7 @@ or hand-edit a message (or seed one from a preset) and send it over MLLP with an
 expectation** — Accept (AA/CA), Reject (AE/AR), or No ACK (verified with a short bounded wait, so
 an unexpected reply is flagged rather than ignored) — or drop it as a file. Pair it with the Monitor tab
 to confirm the resulting disposition (e.g. a no-MSH message → ERROR + AR NAK; a wrong-version
-message into the strict inbound → ERROR + AE).
+message into the strict inbound → ERROR + AR, since BACKLOG #5078).
 
 MLLP sends frame through ``frame_checked`` by default, as the Send tab does: a message holding an
 MLLP start or end byte would not arrive as one message, so it is refused before any connection and
