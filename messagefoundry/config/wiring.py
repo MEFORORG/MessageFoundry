@@ -4444,7 +4444,10 @@ def DatabasePoll(
     + ``mark_statement='UPDATE mf_inbox SET status=\\'DONE\\' WHERE id=:id'`` (a ``DELETE`` or a
     high-water-mark ``UPDATE`` work through the same ``mark_statement``). ``body_column`` unset → the
     whole row as a JSON object (pair with ``content_type=json``); set → that one column's value verbatim
-    (e.g. a column holding an HL7 message → ``content_type=hl7v2``). Put secrets (``password``) in
+    (e.g. a column holding an HL7 message → ``content_type=hl7v2``). With a ``mark_statement``, a
+    handler failure stops that poll at the failed row, so a row that fails every time holds back the
+    rows behind it; the *Database source* section of docs/CONNECTIONS.md says what a high-water mark
+    needs on top of that (BACKLOG #4921). Put secrets (``password``) in
     ``env()``; TLS is on by default (on the SQL Server preset, weakening it is refused unless the
     ``inbound()`` declares ``tls_hop_attested``; ``MEFOR_ALLOW_INSECURE_TLS`` works only at
     ``[security].enforcement = warn``); the polled ``server`` is gated by ``[egress].allowed_db``.
@@ -4470,9 +4473,11 @@ def DatabasePoll(
     # `messagefoundry check` builds connectors only with a messagefoundry.toml. An empty statement is
     # a missing setting, which construction refuses. Imported here: messagefoundry.transports imports
     # this module at its top level.
-    # A dialect that is not a literal (an env() ref) is tested as generic, the permissive superset:
-    # it refuses every write the strict test does and admits only the INSERT(/TRUNCATE( calls, which
-    # the build re-tests with the resolved dialect. So no dialect is guessed into a false refusal.
+    # A dialect that is not a literal (an env() ref) is tested as generic: it refuses every write the
+    # sqlserver test does, admitting more only for the INSERT(/TRUNCATE( calls, which the build
+    # re-tests with the resolved dialect. It is not a pure superset (BACKLOG #5259): its MySQL comment
+    # scan and its bare-CALL refusal can refuse a read that a resolved sqlserver dialect would admit,
+    # at least a `--x` comment holding a write keyword. That false refusal fails closed.
     if isinstance(poll_statement, str) and poll_statement:
         from messagefoundry.transports.database import _read_only_poll_refusal
 

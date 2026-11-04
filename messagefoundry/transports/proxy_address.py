@@ -26,9 +26,15 @@ module. Other proxy-URL readers exist and do not, at least ``ambient_proxy``'s l
 
 ``urlsplit`` is called here with its cache taken off, as ``strict_requests`` does (vault BACKLOG
 #3454), so this parse adds no key to the process-wide cache. That is all it does: a caller that
-reads the scheme first through the cached function makes the value a cache key all the same. At
-least the connector build and the egress gate do, through ``rest.url_scheme``. The
-``[egress].proxy_url`` load check does not; a test pins that its credential refusal adds no key.
+splits the value through the cached function first makes it a cache key all the same. At least
+``proxy_config_from_settings``, the egress gate and the static-credential hop label read the
+scheme first through ``rest.url_scheme``, which splits uncached too (vault BACKLOG #5287), and the
+``[egress].proxy_url`` load check reads only uncached splits. Tests pin that the gate and the load
+check add no key at all for a refused credential, and that the REST, SOAP, FHIR and DICOMweb
+builds leave no key for the value itself. A build that split it with other arguments, or split a
+string derived from it, makes a different key, which that test does not see. Other readers can
+still add one, at least the hop label for a value with no ``http(s)`` scheme, which falls back to
+a cached split, and ``ambient_proxy``'s label.
 
 Imports only the standard library, so ``bounded_read`` and ``rest`` can both use it without a
 cycle.

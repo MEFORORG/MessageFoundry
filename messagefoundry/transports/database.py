@@ -1515,12 +1515,28 @@ def _build_connection(
     raise ValueError(f"DATABASE dialect must be 'sqlserver' or 'generic', got {dialect!r}")
 
 
-# One bare SQL word token. The T-SQL sigils (`@var`, `@@ROWCOUNT`, `#temp`) are part of the token, so
-# `#delete` reads as one identifier rather than as the `DELETE` keyword. A sigil followed by a digit
-# (`#1tmp`, `@1x`) is NOT taken as one name, though T-SQL allows it: on the generic dialect `#` and `@`
-# can be operators, and there `@1INTO` is `@`, `1`, `INTO`. The digit goes to the number scan, whose
-# glue refusal refuses the statement on every dialect.
-_SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$#@]*")
+# One bare SQL word token. A LEADING T-SQL sigil (`@var`, `@@ROWCOUNT`, `#temp`) is part of the token,
+# so `#delete` reads as one identifier rather than as the `DELETE` keyword. A sigil INSIDE a word
+# starts a new token (BACKLOG #5259): `INTO#x` is `INTO` then `#x`, so the keyword is seen. That is
+# this gate's fail-closed choice, not a claim about how any server lexes `INTO#x`: whichever way a
+# lexer reads it, the statement is refused. A sigil followed by a digit (`#1tmp`, `@1x`) is NOT taken
+# as one name, though T-SQL allows it: on the generic dialect `#` and `@` can be operators, and there
+# `@1INTO` is `@`, `1`, `INTO`. The digit goes to the number scan, whose glue refusal refuses the
+# statement on every dialect.
+_SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$]*")
+# The same word under MySQL's comment model, where `#` starts a comment and so never opens a name:
+# `@#x` is `@`, then a comment.
+_SQL_WORD_RE_MYSQL = re.compile(r"@{0,2}[A-Za-z_][A-Za-z0-9_$]*")
+
+# Characters other than LF that a lexer may end a line comment at. A `--` comment ends at an LF here,
+# and one holding any of these before that LF is refused (BACKLOG #5259), whatever lexer reads it:
+# SQL lexers can disagree about which of them end a line comment, and either guess lets a write
+# through. Ending at a CR admits `--x\r' <LF> DELETE ... --'`, where the quote swallows a DELETE that
+# a lexer ending at the LF runs; ending at the LF admits `--x\rDELETE`. A CR right before the LF is a
+# CRLF ending and is not refused. The set holds at least Python's `str.splitlines` breaks less LF,
+# and NUL, at which MySQL's comment loop stops. Nothing proves it holds every character some lexer
+# ends a comment at; one outside it is a miss.
+_SQL_OTHER_LINE_BREAKS = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 
 # Write/authority keywords refused anywhere outside a string literal, a quoted identifier or a comment.
 # `INTO` is here because `SELECT ... INTO copy` writes a table while still opening with `SELECT`; the
@@ -1551,11 +1567,14 @@ _SQL_WRITE_KEYWORDS = frozenset(
 # fail-closed choice, not a MySQL rule: MySQL accepts `TRUNCATE (1.2, 2)`, and the gate refuses it.
 # Only `dialect='generic'` gets the exemption. The SQL Server preset never does: SQL Server has no
 # native function of either name, and an ODBC scalar escape (`{fn TRUNCATE(x, 2)}`), which its
-# driver does translate, is refused with the rest, failing closed. The generic dialect can still reach SQL Server (its default `odbc_driver` is the SQL
-# Server driver), so the exemption there rests on this premise, read from the documented T-SQL
-# grammar and not run against a server: no T-SQL statement puts a `(` straight after `INSERT` or
-# `TRUNCATE`. `INSERT` takes `TOP (n)`, `INTO` or a target name first, and `TRUNCATE` takes `TABLE`.
-# "Immediately" is the raw text, not the next surviving token: a quoted identifier or a comment
+# driver does translate, is refused with the rest, failing closed. The generic dialect can still
+# reach SQL Server (its default `odbc_driver` is the SQL Server driver), so the exemption there must
+# not admit a T-SQL write. A T-SQL statement CAN put a `(` straight after `INSERT`: the column list of
+# `MERGE ... WHEN NOT MATCHED THEN INSERT(cols) VALUES (...)`, read from the documented T-SQL grammar
+# and not run against a server. The exemption is still safe there because `MERGE` is itself in
+# `_SQL_WRITE_KEYWORDS` and gets no exemption, so the statement is refused at its `MERGE` whatever
+# its `INSERT(` reads as. A standalone T-SQL `INSERT` takes `TOP (n)`, `INTO` or a target name first,
+# and `TRUNCATE` takes `TABLE`. "Immediately" is the raw text, not the next surviving token: a quoted identifier or a comment
 # between the keyword and the `(` is dropped by the scan, and `INSERT [patients](mrn) VALUES (1)`
 # must not read as a call.
 # `EXEC`/`EXECUTE` are deliberately NOT here — T-SQL `EXEC('...')` is dynamic SQL, the exact shape
@@ -1589,21 +1608,40 @@ def _read_only_message(subject: str) -> str:
     )
 
 
-def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") -> list[_SqlToken]:
+def _scan_sql_tokens(
+    statement: str, *, subject: str = "db_lookup statement", mysql_comments: bool = False
+) -> list[_SqlToken]:
     """Tokenize ``statement`` into :class:`_SqlToken` values, dropping comments and the contents of string
     literals and quoted identifiers.
 
     Single-quoted strings and double-quoted / ``[...]``-bracketed / backtick-quoted identifiers are
     consumed whole, doubled-delimiter escapes included, so a keyword *inside* one is data and never a
-    token. T-SQL block comments nest, so the scan tracks depth.
+    token.
+
+    ``mysql_comments`` picks the comment model (BACKLOG #5259). Off, it is the T-SQL one, which
+    PostgreSQL shares: ``--`` always starts a comment, block comments nest, so the scan tracks depth,
+    and ``#`` is a sigil. On, it is MySQL's: ``--`` starts a comment only when an ASCII space or
+    control character, DEL included, follows it (``5 --1`` is ``5 - -1``), and a non-ASCII character
+    after it is refused, since the connection's character set decides what that is; ``#`` starts a
+    comment and never opens a name; block comments do not nest; and a ``/*!`` or MariaDB ``/*M!``
+    comment is refused, since a server may run its body or read it as a plain comment.
+    :func:`_require_read_only` says which caller gets which. Quoting is the same in both.
 
     An unterminated literal or comment raises :class:`DbLookupError`: the rest of such a statement
-    cannot be read, and guessing at it is how a shape-based gate gets bypassed. So does a numeric
-    literal with a word character glued to its end (:data:`_SQL_NUMBER_RE`): SQL Server reads
-    ``0xUPDATE`` as ``0x`` then ``UPDATE`` and ``1e1INTO`` as ``1e1`` then ``INTO``. That refusal
-    also catches valid reads, at least an Oracle ``1.5f``, a MySQL name that starts with a digit
-    (``2024_orders``), a MySQL ``0b101``, a T-SQL ``#1tmp`` or ``@1x`` and a ``:1st`` placeholder;
-    it fails closed on purpose.
+    cannot be read, and guessing at it is how a shape-based gate gets bypassed. So does a line comment
+    holding a line break other than LF, or a NUL, before the LF that ends it
+    (:data:`_SQL_OTHER_LINE_BREAKS` says why), and a ``--(*`` ODBC vendor escape on either model. So
+    does a numeric literal with a word character glued to its end
+    (:data:`_SQL_NUMBER_RE`): SQL Server reads ``0xUPDATE`` as ``0x`` then ``UPDATE`` and
+    ``1e1INTO`` as ``1e1`` then ``INTO``. Those refusals, and the split of a word at an internal
+    sigil (:data:`_SQL_WORD_RE`), also catch valid reads, at least an Oracle ``1.5f``, a MySQL name
+    that starts with a digit (``2024_orders``), a MySQL ``0b101``, a T-SQL ``#1tmp``, ``@1x`` or
+    ``t#1x``, a ``:1st`` placeholder, a line comment in a statement with CR-only line endings, and a
+    name such as ``update#n`` whose part before an internal ``#`` or ``@`` is a write keyword. The
+    MySQL model adds at least a ``--`` comment with no space after the dashes or with a non-ASCII
+    character right after them, any ``/*!`` or ``/*M!`` comment (``/*!40001 SQL_NO_CACHE */``
+    included), a nested block comment's tail holding a write keyword or a lone quote, and a T-SQL
+    ``#temp`` name whose line ends inside a multi-line quoted literal. It fails closed on purpose.
     ``subject`` names whose statement it is in that refusal."""
     refusal = _read_only_message(subject)
     tokens: list[_SqlToken] = []
@@ -1613,14 +1651,37 @@ def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") ->
         if ch.isspace():
             i += 1
             continue
-        if statement.startswith("--", i):
+        # MySQL makes `--` a comment only when a space or control character follows it, ASCII DEL
+        # included; `--x` is two minus signs, so the rest of its line is code and falls through to the
+        # one-character token below. Whether a non-ASCII character there is a space or a control
+        # depends on the connection's character set, which the gate cannot see, so that is refused.
+        after = statement[i + 2 : i + 3] if mysql_comments and statement.startswith("--", i) else ""
+        if after > "\x7f":
+            raise DbLookupError(f"{refusal}; a '--' is followed by a non-ASCII character")
+        if (statement.startswith("--", i) and not " " < after < "\x7f") or (
+            mysql_comments and ch == "#"
+        ):
+            if statement.startswith("--(*", i):
+                # The ODBC long-form escape, `--(*vendor(Microsoft),product(ODBC) call p *)--`, which
+                # the ODBC spec has a driver translate: a comment to the T-SQL scan, a call to a driver.
+                raise DbLookupError(f"{refusal}; found an ODBC vendor escape")
             nl = statement.find("\n", i)
-            i = n if nl == -1 else nl + 1
+            end = n if nl == -1 else nl
+            if not _SQL_OTHER_LINE_BREAKS.isdisjoint(statement[i:end].rstrip("\r")):
+                raise DbLookupError(
+                    f"{refusal}; a line comment holds a line break other than LF, or a NUL"
+                )
+            i = end + 1
             continue
+        if mysql_comments and statement.startswith(("/*!", "/*M!"), i):
+            # MySQL runs an executable comment's body, but reads it as a plain comment when its version
+            # prefix is above the server's, and MySQL itself reads `/*M!` that way. Two readings the
+            # gate cannot choose between, so it refuses.
+            raise DbLookupError(f"{refusal}; found a MySQL executable comment")
         if statement.startswith("/*", i):
             depth, i = 1, i + 2
             while i < n and depth:
-                if statement.startswith("/*", i):
+                if statement.startswith("/*", i) and not mysql_comments:
                     depth, i = depth + 1, i + 2
                 elif statement.startswith("*/", i):
                     depth, i = depth - 1, i + 2
@@ -1651,7 +1712,7 @@ def _scan_sql_tokens(statement: str, *, subject: str = "db_lookup statement") ->
             tokens.append(_SqlToken("number", num.group(0), end))
             i = end
             continue
-        m = _SQL_WORD_RE.match(statement, i)
+        m = (_SQL_WORD_RE_MYSQL if mysql_comments else _SQL_WORD_RE).match(statement, i)
         if m:
             tokens.append(_SqlToken("word", m.group(0).upper(), m.end()))
             i = m.end()
@@ -1678,11 +1739,30 @@ def _require_read_only(
        ``EXEC``, plus DDL — :data:`_SQL_WRITE_KEYWORDS`) may appear outside a literal or a comment;
     3. nothing may follow a ``;`` (no chained second statement); a trailing one is fine.
 
+    Rule 2 also refuses a ``CALL`` word inside an open ODBC ``{`` escape (``{call p}``,
+    ``{?= call p(?)}``, ``{:r = call p}``), anywhere in the statement, on every dialect. Rule 1 alone refused only a
+    leading one (BACKLOG #5259). On every dialect but ``sqlserver`` it refuses a bare ``CALL`` too,
+    since MySQL and PostgreSQL run one; SQL Server has no ``CALL`` statement, so there a ``call``
+    name is still admitted. Rule 1 also refuses a leading ``SELECT`` or ``WITH`` glued to a ``#``
+    or ``@``, which was one name before :data:`_SQL_WORD_RE` split words at a sigil.
+
     One exception to rule 2: on ``dialect="generic"`` only, ``INSERT`` or ``TRUNCATE`` with a ``(``
     as the very next character is MySQL's scalar function, not a statement
-    (:data:`_SQL_FUNCTION_FORM_KEYWORDS`). Every other dialect value gets no exception, so a caller
-    that does not know the dialect gets the stricter test. ``db_lookup`` and ``DatabaseRef`` are SQL
-    Server only and pass none.
+    (:data:`_SQL_FUNCTION_FORM_KEYWORDS`). Every other dialect value gets no exception.
+    ``db_lookup`` and ``DatabaseRef`` are SQL Server only and pass none, so they get the
+    ``sqlserver`` default. ``DatabasePoll`` passes its own dialect, and while that dialect is an
+    ``env()`` value it tests the poll as ``generic`` when declared and again with the resolved
+    dialect when the source is built; ``DatabaseSource`` passes the dialect it was built with.
+
+    Every dialect but ``sqlserver`` is tokenized twice, once with each comment model of
+    :func:`_scan_sql_tokens`, and the three rules apply to each token list: the generic path can
+    reach at least SQL Server, PostgreSQL and MySQL, which disagree about comments. The aim is that a
+    statement one of them reads as a write is refused whichever one is behind the connection; it is
+    an aim, not a proof, and at least a write hidden in a MySQL backslash escape, a PostgreSQL
+    ``E'...'`` escape or dollar quote, or behind a comment a lexer ends at a character
+    :data:`_SQL_OTHER_LINE_BREAKS` lacks still passes. The generic test refuses everything the
+    ``sqlserver`` test does, less the function-form exception, and can refuse reads the
+    ``sqlserver`` test admits.
 
     Rule 2 is what makes this a read-only test rather than a leading-token test. Opening with ``SELECT``
     or ``WITH`` never implied the rest was a read: ``SELECT * INTO copy FROM patients`` writes a table,
@@ -1696,10 +1776,27 @@ def _require_read_only(
     :class:`DbLookupError` on violation. The message stays PHI-free — it never echoes statement text,
     and any keyword it names comes from the fixed vocabulary above, never from operator data."""
     refusal = _read_only_message(subject)
-    tokens = _scan_sql_tokens(statement, subject=subject)
-    if not tokens or tokens[0].kind != "word" or tokens[0].text not in ("SELECT", "WITH"):
-        raise DbLookupError(refusal)
+    preset = dialect == "sqlserver"
+    # The T-SQL model runs first on every dialect, so a refusal it raises reads as it always did.
+    for mysql_comments in (False,) if preset else (False, True):
+        tokens = _scan_sql_tokens(statement, subject=subject, mysql_comments=mysql_comments)
+        _check_read_only_tokens(statement, tokens, refusal, dialect=dialect)
+    return None
+
+
+def _check_read_only_tokens(
+    statement: str, tokens: list[_SqlToken], refusal: str, *, dialect: str
+) -> None:
+    """Apply :func:`_require_read_only`'s three rules to one scan's ``tokens``, raising on a miss."""
+    preset = dialect == "sqlserver"
     function_forms = dialect == "generic"
+    if (
+        not tokens
+        or tokens[0].kind != "word"
+        or tokens[0].text not in ("SELECT", "WITH")
+        or statement.startswith(("#", "@"), tokens[0].end)
+    ):
+        raise DbLookupError(refusal)
     last = len(tokens) - 1
     for index, (kind, text, end) in enumerate(tokens):
         if kind != "word":
@@ -1708,6 +1805,8 @@ def _require_read_only(
             if text == ";" and index != last:
                 raise DbLookupError(refusal)
             continue
+        if text == "CALL" and (not preset or _inside_odbc_escape(tokens, index)):
+            raise DbLookupError(f"{refusal}; found a 'CALL' keyword")
         if text not in _SQL_WRITE_KEYWORDS:
             continue
         if (
@@ -1717,7 +1816,25 @@ def _require_read_only(
         ):
             continue  # a scalar function call that shares the keyword's name, not a statement
         raise DbLookupError(f"{refusal}; found a '{text}' keyword")
-    return None
+
+
+def _inside_odbc_escape(tokens: list[_SqlToken], index: int) -> bool:
+    """Whether ``tokens[index]`` sits inside an open ODBC ``{`` escape, at any nesting depth.
+
+    Not only a ``{`` with ``?=`` between: ``db_lookup`` tests the statement before
+    :func:`_parse_named_params` turns a ``:name`` into ``?``, so ``{:r = call p}`` reaches the driver
+    as ``{? = call p}``, and a ``CALL`` after a nested ``{fn ...}`` closes is still inside the outer
+    ``{``. Any ``CALL`` inside an open ``{`` is refused, a false refusal of at least a ``call`` name
+    inside a ``{fn ...}`` escape included."""
+    depth = 0
+    for kind, text, _ in reversed(tokens[:index]):
+        if kind == "other" and text == "}":
+            depth += 1
+        elif kind == "other" and text == "{":
+            if not depth:
+                return True
+            depth -= 1
+    return False
 
 
 def _parse_named_params(statement: str) -> tuple[str, list[str]]:
@@ -2643,8 +2760,9 @@ async def _probe_db(
 
 def _json_default(value: Any) -> Any:
     """JSON-serialize DB column types ``json.dumps`` can't handle natively (dates, ``Decimal``, bytes),
-    so a polled row becomes a JSON-object body. An unknown type raises ``TypeError`` (surfaced as a
-    poll error and logged) rather than silently dropping data."""
+    so a polled row becomes a JSON-object body. An unknown type raises ``TypeError``, which
+    :meth:`DatabaseSource._select` skips and reports as ``row_undecodable``, rather than silently
+    dropping data."""
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     if isinstance(value, Decimal):
@@ -2906,7 +3024,7 @@ class DatabaseDestination(DestinationConnector):
             self._pool = None
 
 
-#: How many undecodable rows ONE poll will step past before it stops fetching and defers the rest
+#: How many rows that cannot become a body ONE poll will step past before it stops fetching and defers the rest
 #: (BACKLOG #1662). A flat number rather than a multiple of ``poll_max_rows``, so it holds for a
 #: ceiling of 1 as well as the shipped 500: one poll pulls at most ``poll_max_rows + 64`` rows out of
 #: the driver, and logs at most 64 skip lines, which is already fewer than the 500 the shipped code
@@ -2915,8 +3033,9 @@ class DatabaseDestination(DestinationConnector):
 #: **A stop rule re-creates the starvation it was written against whenever the poison run is longer
 #: than the bound**, so the bound alone is not the answer and is not asked to be: the dominant case,
 #: a ``body_column`` that names no selected column, is caught once per poll before any row is read,
-#: and never reaches this budget at all. What is left here is genuinely per-row (an undecodable BLOB,
-#: an unserializable column type), where a run of more than 64 in front of the good rows means a
+#: and never reaches this budget at all, nor does a codec fault that is no conversion failure, which
+#: ends the poll. What is left here is per-row (an undecodable BLOB, an unserializable column type, a
+#: body the configured ``encoding`` cannot carry), where a run of more than 64 in front of the good rows means a
 #: table one poll cannot repair — and the operator gets 64 ``row_undecodable`` events saying so.
 _MAX_SKIPPED_ROWS_PER_POLL = 64
 
@@ -2944,12 +3063,13 @@ _LEADER_RECHECK_S = 0.05
 class _PolledBatch(NamedTuple):
     """What one poll took from ``poll_statement``.
 
-    ``rows`` are ``(record, body)`` pairs that decoded; ``skipped`` carries one PHI-free reason per
-    row that could not become a body; ``skip_budget_spent`` says this poll stopped fetching early
-    because it hit :data:`_MAX_SKIPPED_ROWS_PER_POLL`. Reasons are carried out rather than reported
-    in place so the pool connection is released before anything is logged or emitted."""
+    ``rows`` are ``(record, raw)`` pairs whose body decoded and then encoded in the configured
+    ``encoding``, ``raw`` being the bytes the handler gets; ``skipped`` carries one PHI-free reason
+    per row that could not become those bytes; ``skip_budget_spent`` says this poll stopped fetching
+    early because it hit :data:`_MAX_SKIPPED_ROWS_PER_POLL`. Reasons are carried out rather than
+    reported in place so the pool connection is released before anything is logged or emitted."""
 
-    rows: list[tuple[dict[str, Any], str]]
+    rows: list[tuple[dict[str, Any], bytes]]
     skipped: list[str]
     skip_budget_spent: bool
 
@@ -2961,14 +3081,15 @@ def _read_only_poll_refusal(statement: str, *, dialect: str = "sqlserver") -> st
     the handler. A poll that claims rows, such as ``UPDATE ... RETURNING``, would mark every row it
     matches, but :meth:`DatabaseSource._select` hands off at most ``poll_max_rows`` of them, so the
     rows past the ceiling would be marked and never ingested, and so would at least a row whose
-    handler failed (:meth:`DatabaseSource._poll_once` goes on to the next row) and the rows a stop
-    leaves behind. That is accept-and-drop. Only the per-row ``mark_statement``, run after
-    the handler returns, may mark a row.
+    handler failed, the rows behind it when a ``mark_statement`` is set
+    (:meth:`DatabaseSource._poll_once` then stops the batch there, BACKLOG #4921) and the rows a
+    stop leaves behind. That is accept-and-drop. Only the per-row
+    ``mark_statement``, run after the handler returns, may mark a row.
 
     The test is :func:`_require_read_only`, the one ``db_lookup`` uses, applied whatever
     ``poll_max_rows`` is; its docstring says what it refuses. ``dialect`` is the poll's own, so a
     ``generic`` poll admits MySQL's scalar ``INSERT(...)``/``TRUNCATE(...)``, which ``db_lookup``,
-    always on the SQL Server preset, refuses. A locking ``FOR UPDATE`` read is refused
+    always on the SQL Server preset, refuses, and is also scanned with MySQL's comment model. A locking ``FOR UPDATE`` read is refused
     with the rest (``UPDATE`` is a keyword), and on this autocommit connection its lock ends with the
     statement, so refusing it loses nothing. **It reads the statement's shape only**, so at least a
     ``SELECT`` that calls a function which writes, and a T-SQL second statement with no ``;`` whose
@@ -3257,7 +3378,7 @@ class DatabaseSource(SourceConnector):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # A poll error (connection drop, a bad poll_statement, an unserializable column) must
+                # A poll error (connection drop, a bad poll_statement, a codec fault) must
                 # NOT kill the poller — that would silently stop the connection from receiving while it
                 # still reports running. Log and retry on the next interval (mirrors the File source).
                 # Not logger.exception: its traceback ends in the driver's text, which quotes the
@@ -3325,42 +3446,65 @@ class DatabaseSource(SourceConnector):
             await self._emit_event("row_undecodable", reason=reason)
         if batch.skip_budget_spent:
             logger.error(
-                "DATABASE source skipped %d undecodable rows in one poll and stopped fetching; the "
-                "rest of the result set is deferred to the next poll (nothing dropped or marked)",
+                "DATABASE source skipped %d rows it could not turn into a body in one poll and "
+                "stopped fetching; the rest of the result set is deferred to the next poll (nothing "
+                "dropped or marked)",
                 len(batch.skipped),
             )
         me = asyncio.current_task()
-        for record, body in batch.rows:
+        for record, raw in batch.rows:
             if self._stop.is_set():
                 break  # shutting down — leave the rest unmarked for the next start (at-least-once)
             # A cancelled stop() gives the hand-off and mark a grace. Keyed by task, so a cut task
             # unwinding late cannot clear the flag of a task a later start() made.
             self._row_step_task = me
             try:
-                await self._ingest_row(record, body)
+                go_on = await self._ingest_row(record, raw)
             finally:
                 if self._row_step_task is me:
                     self._row_step_task = None
+            if not go_on:
+                # BACKLOG #4921. Stop at the first handler failure: no later row of this poll is
+                # handed off or marked. A high-water-mark mark_statement would otherwise run on the
+                # next row and move the cursor past the failed one, which the next poll would then
+                # never select. That holds only while poll_statement returns rows in cursor order
+                # over a unique cursor column; an earlier row with a higher or equal key has
+                # already moved the cursor. The failed row and
+                # every row behind it wait for the next poll, so a row that fails every time holds
+                # back the rows behind it (head-of-line). With no mark_statement no mark can move
+                # past the failed row, so stopping would not make it any likelier to be read again,
+                # and the batch goes on.
+                break
 
-    async def _ingest_row(self, record: dict[str, Any], body: str) -> None:
-        """Hand one row to the pipeline, then mark it. A cancelled stop() lets this step run for up
-        to :data:`_ROW_STEP_GRACE_S` before it cuts it, so the step is NOT atomic under shutdown."""
+    async def _ingest_row(self, record: dict[str, Any], raw: bytes) -> bool:
+        """Hand one row's encoded body to the pipeline, then mark the row. Returns whether the batch
+        goes on: False only when the handler raised and a ``mark_statement`` is set; True when the
+        row was handed off, whether or not its mark then failed. A body the configured ``encoding``
+        cannot carry never gets here: :meth:`_select` skips it as it skips an undecodable row. A
+        cancelled stop() lets this step run for up to :data:`_ROW_STEP_GRACE_S` before it cuts it,
+        so the step is NOT atomic under shutdown."""
         assert self._handler is not None
         try:
-            await self._handler(body.encode(self._encoding))
+            await self._handler(raw)
         except Exception as exc:
             # The handler records every message-level outcome itself (parse/route → ERROR) and
-            # returns, so an exception here is an infrastructure failure (the durable store write
-            # failed). Leave the row UNMARKED so the next poll re-emits it (at-least-once) — marking
-            # it now would drop a received-but-unrecorded message (mirrors the File source's M-15).
+            # returns, so an exception here is usually an infrastructure failure (the durable store
+            # write failed), but it can be row-specific too, such as SQL Server's 2628 truncation in
+            # the store write. Leave the row UNMARKED so the next poll re-emits it (at-least-once) —
+            # marking it now would drop a received-but-unrecorded message (mirrors the File source's
+            # M-15). The event makes the stall visible when the row fails every time (#4921).
             # _safe_db_error: on a server store the handler's write is itself a driver call, and a
             # rejection quotes the value it refused, as SQL Server's 2628 truncation and asyncpg's
             # DETAIL line do (#1661).
+            reason = _safe_db_error(exc)
+            stops = self._mark_sql is not None
+            outcome = "row left unmarked and poll stopped" if stops else "row left unmarked"
             logger.warning(
-                "DATABASE source handler failed (row left unmarked, will retry): %s",
-                _safe_db_error(exc),
+                "DATABASE source handler failed (%s, will retry next poll): %s", outcome, reason
             )
-            return
+            # The fixed outcome leads, so the store's bound on a reason cuts the error text, never it.
+            await self._emit_event("handler_error", reason=f"{outcome}: {reason}")
+            return not stops
         try:
             await self._mark(record)
         except Exception as exc:
@@ -3373,17 +3517,20 @@ class DatabaseSource(SourceConnector):
                 "DATABASE source mark failed (row will re-emit, a duplicate): %s",
                 _safe_db_error(exc),
             )
+        return True
 
     async def _select(self) -> _PolledBatch:
-        """Run ``poll_statement``, decode each row into a body, and return the decodable ones (at most
-        ``poll_max_rows``) plus a PHI-free reason per row that could not be decoded. The connection is
-        released before the rows are handed to the (possibly slow) handler, so a batch never holds a
-        pool connection hostage to downstream store I/O.
+        """Run ``poll_statement``, turn each row into the bytes the handler gets, and return the rows
+        that made them (at most ``poll_max_rows``) plus a PHI-free reason per row that could not. The
+        connection is released before the rows are handed to the (possibly slow) handler, so a batch
+        never holds a pool connection hostage to downstream store I/O.
 
-        **Decoding happens HERE, under the open cursor, and that is what lets the ceiling count rows
-        that produced something** (BACKLOG #1662). ``_body`` is pure, synchronous and cheap — a dict
-        lookup or a ``json.dumps`` — so running it at the fetch costs nothing extra and means a row the
-        source cannot read is replaced rather than spending a ceiling slot on nothing. The shipped code
+        **Decoding and encoding happen HERE, under the open cursor, and that is what lets the ceiling
+        count rows that produced something** (BACKLOG #1662). ``_body`` is pure, synchronous and
+        cheap — a dict lookup or a ``json.dumps``, then ``str.encode`` — so running it at the fetch
+        costs little and means a row the source cannot read, or whose body
+        the configured ``encoding`` cannot carry (BACKLOG #4921), is replaced rather than spending a
+        ceiling slot on nothing, and counts against the same skip budget. The shipped code
         charged the ceiling at the fetch and skipped the row afterwards, so one undecodable row sorting
         first starved a ``poll_max_rows=1`` feed forever: three polls handled nothing and the good row
         behind it was never reached.
@@ -3418,7 +3565,7 @@ class DatabaseSource(SourceConnector):
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
         cur: Any = None
-        rows: list[tuple[dict[str, Any], str]] = []
+        rows: list[tuple[dict[str, Any], bytes]] = []
         skipped: list[str] = []
         budget_spent = False
         ceiling = self._poll_max_rows
@@ -3437,6 +3584,11 @@ class DatabaseSource(SourceConnector):
                     ],
                     False,
                 )
+            # Only _mark reads a record once its body is made, so the batch need not hold the body
+            # twice, once in the record and once as raw, unless the mark binds that column.
+            drop_body = self._body_column
+            if drop_body is not None and drop_body in self._mark_names:
+                drop_body = None
             want = 0
             while True:
                 if ceiling is None:
@@ -3452,17 +3604,19 @@ class DatabaseSource(SourceConnector):
                     # remainder.
                     want = ceiling - len(rows)
                     batch = list(await cur.fetchmany(want))
-                for raw in batch:
-                    record = dict(zip(columns, raw))  # noqa: B905
+                for row in batch:
+                    record = dict(zip(columns, row))  # noqa: B905
                     try:
-                        body = self._body(record)
+                        raw = self._body(record)
                     except (ValueError, TypeError) as exc:
                         skipped.append(safe_exc(exc))
                         if len(skipped) >= _MAX_SKIPPED_ROWS_PER_POLL:
                             budget_spent = True
                             break
                         continue
-                    rows.append((record, body))
+                    if drop_body is not None:
+                        del record[drop_body]
+                    rows.append((record, raw))
                 if ceiling is None or budget_spent or len(batch) < want or len(rows) >= ceiling:
                     # A short batch means the driver is out of rows, so there is nothing to top up
                     # with — the ONLY reason to fetch again is a skip, and then only for the shortfall.
@@ -3494,8 +3648,12 @@ class DatabaseSource(SourceConnector):
             await _close_and_release(pool, conn, cur)
         return _PolledBatch(rows, skipped, budget_spent)
 
-    def _body(self, record: dict[str, Any]) -> str:
-        """The body for one row: a single column verbatim (``body_column``) or the whole row as JSON."""
+    def _body(self, record: dict[str, Any]) -> bytes:
+        """The bytes the handler gets for one row: a single column verbatim (``body_column``) or the
+        whole row as JSON, encoded in the configured ``encoding``. A row that cannot become them
+        raises ``ValueError`` or ``TypeError``, which :meth:`_select` skips. That includes a body
+        the encoding cannot carry (BACKLOG #4921): :meth:`_through_codec` makes each codec failure
+        it lists a ``ValueError``."""
         if self._body_column is not None:
             try:
                 value = record[self._body_column]
@@ -3504,9 +3662,37 @@ class DatabaseSource(SourceConnector):
                     f"body_column {self._body_column!r} is not in the poll_statement result columns"
                 ) from None
             if isinstance(value, (bytes, bytearray)):
-                return bytes(value).decode(self._encoding)
-            return value if isinstance(value, str) else str(value)
-        return json.dumps(record, default=_json_default)
+                text = self._through_codec(bytes(value).decode)
+            else:
+                text = value if isinstance(value, str) else str(value)
+        else:
+            text = json.dumps(record, default=_json_default)
+        return self._through_codec(text.encode)
+
+    def _through_codec[T](self, call: Callable[[str], T]) -> T:
+        """Run one ``decode`` or ``encode`` in the configured ``encoding``, so that a codec's failure on
+        this row reaches :meth:`_select`'s skip with no row value in it (BACKLOG #4921).
+
+        A ``UnicodeError`` goes through as it is: ``safe_exc`` renders it from its attributes, never
+        its message. Any other ``ValueError``, and a ``TypeError`` (a codec returning the wrong
+        type), becomes a ``ValueError`` of fixed text naming the step and the class, because a
+        third-party codec's message can quote the value it refused, and the ``row_undecodable``
+        reason never carries a row value. ``_select`` skips both classes, so neither may leave here
+        with the codec's message.
+
+        Anything else propagates and ends the poll (CLAUDE.md section 6): a ``LookupError`` is the
+        codec name, not the row, so it fails every row alike and is reported once per poll; and a
+        ``RuntimeError``, ``MemoryError`` or ``RecursionError`` is a codec's bug or a resource
+        fault, not a row it cannot convert."""
+        try:
+            return call(self._encoding)
+        except UnicodeError:
+            raise
+        except (ValueError, TypeError) as exc:
+            failed = type(exc).__name__
+        # Raised outside the handler, so neither __cause__ nor __context__ holds the codec's error;
+        # ``from None`` would leave it on __context__ (tests/test_from_none_is_not_redaction.py).
+        raise ValueError(f"the configured encoding could not {call.__name__} the row ({failed})")
 
     async def _mark(self, record: dict[str, Any]) -> None:
         if self._mark_sql is None:

@@ -109,6 +109,7 @@ def test_a_session_seal_covers_every_other_field_by_default() -> None:
     expected = [f.name for f in fields(SessionRecord) if f.name not in SESSION_SEAL_EXCLUDED]
     assert covered == expected
     assert "user_id" in covered and "user_epoch" in covered and "token_hash" in covered
+    assert "global_epoch" in covered  # BACKLOG #5091
 
 
 async def test_the_session_record_matches_the_sessions_table(
