@@ -3120,7 +3120,8 @@ class RemoteFileSource(SourceConnector):
                 continue
             if stopped:
                 # A stop arrived before the file's last message: the whole file stays, and the next
-                # start hands it over again (at-least-once, as the File source does).
+                # start hands it over again (at-least-once, as the File source does). Break, not
+                # return, so the prune below still bounds what this poll recorded.
                 break
             await self._after_processing(path, name, len(raw))
             disposed += 1
@@ -3128,9 +3129,9 @@ class RemoteFileSource(SourceConnector):
                 # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
                 await self._leave_record(file_key)
                 newly_recorded += 1
-        if newly_recorded and self.processed_ledger is not None and not self._stop.is_set():
-            # Bound growth (age + count), only when something new. Skipped once a stop is signalled,
-            # as the File source does, so stop() never waits out housekeeping.
+        if newly_recorded and self.processed_ledger is not None:
+            # Bound growth (age + count), only when something new. A store call, so the stop bound
+            # waits for it rather than cutting it (#4685).
             with self._stop_guard.store_call():
                 await self.processed_ledger.prune()
 

@@ -1356,9 +1356,9 @@ At least these, read 2026-10-26:
 
   *Amended 2026-11-03 (BACKLOG #4685):* an uncancelled RemoteFile `stop()` now waits
   `POLL_STOP_GRACE_S` for the poll task, then cancels it and logs a WARNING, and that bound never
-  cancels the task inside a store call: a hand-off, or a leave-mode ledger read or write. A stop
-  also skips the ledger prune, as File's does. When cut, it still cancels the poll task at once,
-  wherever it is, as above. Timer is unchanged, and has no grace bound by design: its only awaits
+  cancels the task inside a store call: at least a hand-off, or a leave-mode ledger read, write or
+  prune. Unlike File's, a stop still runs the end-of-poll ledger prune. When cut, it still
+  cancels the poll task at once, wherever it is, as above. Timer is unchanged, and has no grace bound by design: its only awaits
   are the stop signal and the hand-off, so such a bound could only ever wait on a store call.
 - **Loopback, PassThrough.** `stop()` returns at once.
 
