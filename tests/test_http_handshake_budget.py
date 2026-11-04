@@ -6,9 +6,9 @@ On a loop that upgrades TLS itself (``_upgrades_tls_itself``, the stdlib loops) 
 before its handshake, so it holds a ``max_connections`` slot until the handshake ends, up to the 10 s
 handshake bound. ``max_connections_per_host`` ships off on ``Http()`` (vault BACKLOG #2606), so before
 this row one address that never finished a handshake, at least an mTLS peer with no client
-certificate, could have held every one of the 256 slots. ``max_handshakes_per_host`` bounds only that
-unauthenticated phase: a socket leaves it the moment its handshake ends, so a completed connection
-never counts against it, and the per-host cap stays off for authenticated traffic behind an L4 load
+certificate, could have held every one of the 256 slots. ``max_handshakes_per_host`` bounds only the
+handshake: a socket leaves the count the moment its handshake ends, so a completed connection never
+counts against it, and the per-host cap stays off for established traffic behind an L4 load
 balancer.
 
 Each refusal test carries a control: a socket within the budget, or a completed handshake, admitted
@@ -76,11 +76,15 @@ async def test_one_address_holds_at_most_the_budget_in_its_handshake(
         opened.append((await _silent_socket(source.sockport))[1])
         await _until(lambda: source._admission.active == 2, "a socket within budget was refused")
         assert events.kinds() == ["at_capacity"]
+        # Every handshake that ends gives its count back while the listener runs, not only at the
+        # reset a stop() makes.
+        while opened:
+            await _close_raw(opened.pop())
+        await _until(lambda: source._admission.handshaking == {}, "a handshake count was kept")
     finally:
         for writer in opened:
             await _close_raw(writer)
         await asyncio.wait_for(source.stop(), timeout=10.0)
-    assert source._admission.handshaking == {}
 
 
 async def test_a_completed_handshake_does_not_count_against_the_budget(
@@ -123,8 +127,10 @@ async def test_the_budget_is_inert_where_the_loop_runs_the_handshake(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """On a loop that does not upgrade TLS itself (uvloop's path, forced here), a socket in its
-    handshake takes no slot, so there is nothing for the budget to bound. Two silent sockets from
-    one address with a budget of 1 leave a real client from that address served."""
+    handshake takes no slot and is not counted. Two silent sockets from one address with a budget
+    of 1 leave a real client from that address served. This pins behaviour, not wiring: on this path
+    `_on_client` runs only after the loop's handshake, so no wiring change could make the budget
+    count these sockets."""
     monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
     monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
     source, cert = _tls_source(tmp_path, max_handshakes_per_host=1)

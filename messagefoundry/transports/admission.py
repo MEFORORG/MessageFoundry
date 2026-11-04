@@ -189,10 +189,11 @@ class ListenerAdmission:
     capacity; switch it off there.
 
     ``max_handshakes_per_host`` counts only sockets from one peer address that hold a slot while
-    still in their TLS handshake, the phase in which no peer has authenticated yet. A socket leaves
-    that count when its handshake ends, however it ends (:meth:`handshake`), so it bounds the
-    unauthenticated holding without capping an address's established connections (vault BACKLOG
-    #4888). Only a listener that admits a socket before upgrading it passes ``handshake`` to
+    still in their TLS handshake. A socket leaves that count when its handshake ends, however it
+    ends (:meth:`handshake`), so it bounds the slots a peer that never finishes a handshake can
+    hold, at least an mTLS peer with no client certificate, without capping an address's
+    established connections (vault BACKLOG #4888). It does not bound a peer that completes its
+    handshake and then sends nothing; ``docs/DEPLOYMENT.md`` says what does. Only a listener that admits a socket before upgrading it passes ``handshake`` to
     :meth:`check`, then runs the handshake inside :meth:`handshake`.
     """
 
