@@ -506,11 +506,6 @@ _FAULT_RUN_QUIET_SECONDS = 10.0
 _WORKER_RUN_COUNT = IN_THIS_RUN
 
 
-# BACKLOG #4607: a per-lane worker death this long after the last one starts a new run of deaths.
-# Longer than any wait a run's own repeat deaths leave between them (_REPEND_RETRY_CAP_SECONDS).
-_DEATH_RUN_QUIET_SECONDS = 120.0
-
-
 @dataclass
 class _LaneClaims:
     """The rows one per-lane worker holds claimed, kept where its supervisor can read them after
@@ -523,15 +518,15 @@ class _LaneClaims:
     worker's record to the replacement (:meth:`RegistryRunner._lane_claims_for`), which re-pends
     exactly these rows before its first claim (:meth:`RegistryRunner._recover_then_run`).
 
-    ``deaths`` is the lane's run of deaths with no settled pass between them, and ``last_death``
-    the monotonic time of the latest. The run backs off the death's traceback in the supervisor
-    and paces a replacement that follows a repeat death; :meth:`settle` closes it, and so does a
-    death :data:`_DEATH_RUN_QUIET_SECONDS` after the last."""
+    ``deaths`` is the lane's run of deaths with no settled pass between them. It backs off the
+    death's traceback in the supervisor and paces a replacement that follows a repeat death.
+    :meth:`settle` closes it, on a pass that resolved its batch. Not on a claim that finds nothing:
+    a replacement's re-pend dates its rows into the future, so the lane reads empty until the row
+    that killed the workers is due again."""
 
     ids: list[str] = field(default_factory=list)
     fence: RependFence | None = None
     deaths: FailureRun = field(default_factory=FailureRun)
-    last_death: float = 0.0
 
     def settle(self, worker: str, name: str) -> None:
         """A pass resolved its whole claimed batch: nothing is held, and a run of deaths ends."""
@@ -6595,7 +6590,7 @@ class RegistryRunner:
         placement, so start/reconcile/respawn all inherit the gate while the connector stays built
         (status, DR parking and the dead-letter sweeps keep keying off the full outbound map)."""
         if not self._per_lane_delivery(name):
-            self._lane_claims.pop(("delivery", name), None)  # #4607
+            self._drop_lane_claims("delivery", name)
             return
         out = self._dispatchers.get(Stage.OUTBOUND)
         held = None if out is None else out.phase(name)
@@ -6638,7 +6633,7 @@ class RegistryRunner:
                 name,
                 held,
             )
-            self._lane_claims.pop(("delivery", name), None)  # #4607: another consumer drains it
+            self._drop_lane_claims("delivery", name)
             return
         if not self._owns_destination(name):
             log.info(
@@ -6648,7 +6643,7 @@ class RegistryRunner:
                 self._destination_owner(name),
                 self.registry.shard_id,
             )
-            self._lane_claims.pop(("delivery", name), None)  # #4607: another shard drains it
+            self._drop_lane_claims("delivery", name)
             return
         task = self._start_lane_worker(
             "delivery", name, self._delivery_worker, self._workers.get(name)
@@ -6767,10 +6762,6 @@ class RegistryRunner:
         if exc is None or claims is None:  # a task installed without _start_lane_worker
             log.error("%s worker %r exited unexpectedly; respawning", kind, name, exc_info=exc)
             return
-        now = time.monotonic()
-        if claims.deaths.count and now - claims.last_death >= _DEATH_RUN_QUIET_SECONDS:
-            claims.close_deaths(kind, name)  # a death long after the last is a new run
-        claims.last_death = now
         claims.deaths = claims.deaths.record(
             log,
             exc,
@@ -6785,7 +6776,7 @@ class RegistryRunner:
                     name,
                     detail=(
                         f"{kind} worker died {claims.deaths.count} times with no pass settling "
-                        "between; its lane is held on the row it died holding"
+                        f"between, the last holding {len(claims.ids)} claimed row(s)"
                     ),
                 )
             except Exception:  # noqa: BLE001 — an alert failure must not stop the respawn
@@ -6831,9 +6822,7 @@ class RegistryRunner:
             and prev.exception() is not None
         )
         if died and old is not None:
-            claims = _LaneClaims(
-                ids=list(old.ids), fence=old.fence, deaths=old.deaths, last_death=old.last_death
-            )
+            claims = _LaneClaims(ids=list(old.ids), fence=old.fence, deaths=old.deaths)
         else:
             claims = _LaneClaims()
         self._lane_claims[key] = claims
@@ -6877,8 +6866,22 @@ class RegistryRunner:
             while delay > 0.0 and not abandon():
                 step = min(delay, _WORKER_ERROR_BACKOFF_SECONDS)
                 if await self._stop_or_sleep(step):
+                    self._log_left_in_flight(kind, name, claims.ids)
                     return
                 delay -= step
+        fence = claims.fence
+        if claims.ids and fence is not None and not fence.may_write():
+            # Not the fault-time write but a retry of it, so it is fenced as the hold's retries
+            # are: a successor may have claimed these rows, and reschedule_claimed is guarded only
+            # by status='inflight'. They stay in flight for that successor's recovery.
+            log.warning(
+                "%s worker %r: not re-pending %d row(s) its predecessor died holding: this node no "
+                "longer leads under the lease they were claimed under",
+                kind,
+                name,
+                len(claims.ids),
+            )
+            claims.ids.clear()
         if claims.ids:
             # On the death log's own schedule, so a row that kills every worker does not flood it.
             log.log(
@@ -6890,12 +6893,31 @@ class RegistryRunner:
                 len(claims.ids),
             )
             ended = await self._repend_claimed_on_fault(
-                kind, name, claims.ids, fence=claims.fence, abandon=abandon
+                kind, name, claims.ids, fence=fence, abandon=abandon
             )
             if ended is HoldResult.STOPPED:
+                self._log_left_in_flight(kind, name, claims.ids)
                 return
             claims.ids.clear()
         await run(name, claims=claims)
+
+    @staticmethod
+    def _log_left_in_flight(kind: str, name: str, ids: Sequence[str]) -> None:
+        """Say that a stop, or a lane changing consumer, left a dead worker's rows in flight
+        (BACKLOG #4607): no later step re-pends them before the next start. Counts only."""
+        if ids:
+            log.warning(
+                "%s worker %r: %d row(s) a dead worker held stay in flight until the next start",
+                kind,
+                name,
+                len(ids),
+            )
+
+    def _drop_lane_claims(self, kind: str, name: str) -> None:
+        """Forget the claims record of a lane this node will not run a worker on (BACKLOG #4607)."""
+        claims = self._lane_claims.pop((kind, name), None)
+        if claims is not None:
+            self._log_left_in_flight(kind, name, claims.ids)
 
     def _hold_abandon(self, kind: str, name: str) -> Callable[[], bool]:
         """The ``abandon`` predicate worker ``kind`` passes its held re-pend
@@ -9148,6 +9170,7 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
+                unsent = False
                 for i, item in enumerate(items):
                     # #2771: the two loop-top gates, re-asked PER ITEM, before the pacing wait and
                     # again after it. An UNORDERED claim holds up to claim_limit rows, and a paced lane
@@ -9175,6 +9198,7 @@ class RegistryRunner:
                         # take the except arm's re-pend rather than reach a quiescence signal with the
                         # rows still INFLIGHT.
                         await self.store.release_claimed(claimed[i:])
+                        unsent = True
                         break
                     # #134 (ADR 0082): a batching outbound coalesces this claimed head + the lane's next
                     # due rows into ONE BHS…BTS envelope; the plain path delivers one message per send.
@@ -9188,7 +9212,10 @@ class RegistryRunner:
                     if outcome[0] is _ItemOutcome.STOPPED:
                         await self._release_tail_on_stop("delivery", name, claimed[i + 1 :])
                         return
-                claims.settle("delivery", name)  # #1844: resolved, before anything else can raise
+                if unsent:  # released, not resolved: a run of deaths stays open
+                    claimed.clear()
+                else:  # #1844: resolved, before anything else can raise
+                    claims.settle("delivery", name)
                 faults.healthy()
             except asyncio.CancelledError:
                 raise

@@ -295,7 +295,7 @@ class _LaneState:
     # BACKLOG #2074: consecutive claimer deaths raised while this lane was being dispatched. Reset
     # by a serializer handoff, by the stop itself and by every re-arm; see _stop_claimer_killer.
     claimer_deaths: int = 0
-    # BACKLOG #4607: serializer deaths on this lane with no clean drain or STOPPED re-arm between
+    # BACKLOG #4607: serializer deaths on this lane with no serializer surviving its body between
     # them, which pace the respawn in _on_lane_task_done and back off its log.
     serializer_deaths: FailureRun = field(default_factory=FailureRun)
     # BACKLOG #4607: rows the lane's serializer claimed outside its prefix (a batching outbound's
@@ -1435,18 +1435,29 @@ class StageDispatcher:
 
         A lane whose dead serializer had already left PROCESSING (its terminal transition raised
         part way) is only logged, as before: what it holds is no longer this prefix. A repeat death
-        is respawned after a backoff, ``serializer_deaths`` counting the deaths with no clean drain
-        or STOPPED re-arm between them. A row that kills every serializer at its head is bounded the
-        way a T17 fault is: each recovery at the head is a zero-progress infra fault, so the lane's
-        ``infra_error_streak`` grows, its park backs off, and ``infra_fault_policy`` STOPs it or
-        pages ``lane_stuck``. A stop, a cancel and the teardown are not respawned; their rows
+        is respawned after a backoff, ``serializer_deaths`` counting the deaths with no serializer
+        surviving its body between them. A row that kills every serializer at its head is bounded
+        the way a T17 fault is: each recovery at the head is a zero-progress infra fault, so the
+        lane's ``infra_error_streak`` grows, its park backs off, and ``infra_fault_policy`` STOPs it
+        or pages ``lane_stuck``. A replacement that itself dies, before its terminal transition,
+        moves no streak, so a run of ``infra_fault_stop_after`` deaths pages ``lane_stuck`` once
+        here. A stop, a cancel and the teardown are not respawned; their rows
         wait for the next start, as a cancelled serializer's do."""
         if self._lane_tasks.get(lane) is task:
             self._lane_tasks.pop(lane, None)
-        if task.cancelled() or self._stop.is_set():
+        if task.cancelled():
             return
         exc = task.exception()
         if exc is None:
+            return
+        if self._stop.is_set():
+            log.warning(
+                "StageDispatcher %s lane %s serializer died during a stop holding %d claimed row(s); "
+                "they stay in flight until the next start",
+                self._stage.value,
+                lane,
+                len(items),
+            )
             return
         st = self._states.get(lane)
         if st is None or st.phase is not _LanePhase.PROCESSING or lane in self._lane_tasks:
@@ -1470,6 +1481,22 @@ class StageDispatcher:
             count_label=IN_THIS_RUN,
         )
         deaths = st.serializer_deaths.count
+        if deaths == self._infra_fault_stop_after:
+            try:
+                self._alert_sink.lane_stuck(
+                    lane,
+                    detail=(
+                        f"{self._stage.value} serializer died {deaths} times with no serializer "
+                        f"surviving its body between, the last holding {len(items)} claimed row(s)"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — an alert failure must not stop the respawn
+                log.warning(
+                    "StageDispatcher %s lane %s: lane_stuck alert failed",
+                    self._stage.value,
+                    lane,
+                    exc_info=True,
+                )
         delay = (
             0.0
             if deaths == 1
@@ -1497,9 +1524,11 @@ class StageDispatcher:
         """What a replacement for a dead serializer applies (:meth:`_on_lane_task_done`). Returns
         ``(outcome, rows to date to its park_until, rows to release)``.
 
-        A serializer whose body had FINISHED died in a re-pend hold, so the replacement repeats that
-        body's outcome and writes (``_LaneState.drained``): a STOP stays a STOP, and a re-pend the
-        dead hold already landed is a no-op, every write being guarded ``status='inflight'``.
+        A serializer whose body had FINISHED died in a re-pend hold or in its terminal transition,
+        so the replacement repeats that body's outcome and writes (``_LaneState.drained``): a STOP
+        stays a STOP, and a re-pend the dead serializer already landed is a no-op, every write being
+        guarded ``status='inflight'``. A T17 head is dated again from now, by the backoff the body
+        used, since the respawn delay may have outlasted the body's date.
 
         Otherwise the body died at prefix item ``i`` (``_LaneState.drain_index``), and the outcome is
         the T17 fault ``_drain_lane``'s ``except`` arm builds there, progress and streak included,
@@ -1508,14 +1537,14 @@ class StageDispatcher:
         waits behind the head anyway; releasing it past-due instead would let the sweep re-ready the
         lane at its cadence whenever the row that killed it was not the first, the spin fix A
         collapses."""
-        st = self._states.get(lane)
-        if st is None:
-            park_until = self._clock() + self._infra_backoff(0)
-            outcome = _LaneOutcome(LaneResultKind.RETRY, park_until, is_infra_fault=True)
-            return outcome, [it.id for it in items], []
+        st = self._states[lane]  # the caller respawns only a lane whose state it read
         if st.drained is not None:
             outcome, tail, head = st.drained
-            return outcome, [head[0]] if head is not None else [], list(tail)
+            if head is None:
+                return outcome, [], list(tail)
+            streak = 0 if outcome.made_progress else st.infra_error_streak
+            park_until = self._clock() + self._infra_backoff(streak)
+            return replace(outcome, park_until=park_until), [head[0]], list(tail)
         i = min(st.drain_index, max(len(items) - 1, 0))
         streak = st.infra_error_streak if i == 0 else 0
         park_until = self._clock() + self._infra_backoff(streak)
@@ -1556,12 +1585,21 @@ class StageDispatcher:
             while delay > 0.0 and not self._hold_abandoned(lane):
                 step = min(delay, _RESPAWN_BACKOFF_BASE_SECONDS)
                 if await self._slept_into_stop(step):
-                    return  # teardown: the rows stay INFLIGHT for the next start
+                    log.warning(
+                        "StageDispatcher %s lane %s: stopped before re-pending %d claimed row(s) a "
+                        "dead serializer held; they stay in flight for the next start",
+                        self._stage.value,
+                        lane,
+                        len(items),
+                    )
+                    return
                 delay -= step
             outcome, head_ids, tail_ids = self._dead_serializer_outcome(lane, items)
             when = outcome.park_until or 0.0
-            if fence.moved():
-                # Another node's lease is held now, so a successor may own these rows: no write.
+            if not fence.may_write():
+                # Retries of the dead serializer's writes, not its first, so fenced as a hold's
+                # retries are: a successor may own these rows, and every write is guarded only by
+                # status='inflight'. They stay in flight for that successor's recovery.
                 head = tail = HoldResult.SUPERSEDED
         else:
             st0 = self._states.get(lane)
@@ -1664,7 +1702,8 @@ class StageDispatcher:
             return
         self._release_lane_slot(st)
         st.held_extra_ids.clear()
-        st.drained = None
+        if not recover:  # #4607: this serializer survived its body, so a run of deaths ends
+            self._close_serializer_deaths(lane, st)
         # Consume the stamp UNCONDITIONALLY: whichever branch runs below, this episode is over, and a
         # stamp that survived it could be mis-booked onto the lane's NEXT episode.
         _episode_start_ns = st.episode_start_ns
@@ -1692,7 +1731,6 @@ class StageDispatcher:
             )
             st.infra_error_streak = 0
             st.lane_stuck_alerted = False
-            self._close_serializer_deaths(lane, st)  # #4607: the lane drained cleanly
             # A full batch (claim hit per_lane_limit) ⇒ more due rows likely remain — feeds T13b's greedy
             # sweep/seed backlog drain (a wake-less residue must not throttle to one row per sweep).
             self._lane_done(
@@ -2139,7 +2177,7 @@ class StageDispatcher:
             st.infra_error_streak = 0
             st.lane_stuck_alerted = False
             st.claimer_deaths = 0
-            self._close_serializer_deaths(lane, st)
+            st.serializer_deaths = FailureRun()  # #4607: a re-arm, not a recovery, so no line
         st.phase = _LanePhase.READY
         st.dirty = False
         st.park_until = None

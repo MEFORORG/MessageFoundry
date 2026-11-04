@@ -23,8 +23,13 @@ from typing import Any
 import pytest
 
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
-from messagefoundry.pipeline.stage_dispatcher import LaneResultKind, _LaneOutcome
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.stage_dispatcher import (
+    HoldResult,
+    LaneResultKind,
+    RependFence,
+    _LaneOutcome,
+)
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _LaneClaims
 from messagefoundry.store import MessageStore, Stage
 from tests.test_task_resilience import (
     _control_ids,
@@ -296,6 +301,38 @@ async def test_a_replacement_takes_over_where_its_dead_serializer_stopped(tmp_pa
         assert outcome.kind is LaneResultKind.RETRY and outcome.is_infra_fault
         assert outcome.made_progress
         assert (dated, released) == (["r1", "r2"], [])
+    finally:
+        await runner.stop()
+        await store.close()
+
+
+async def test_a_replacement_sends_no_re_pend_once_its_node_no_longer_leads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The replacement's re-pend is a retry of the dead worker's, not its first write, so it is
+    fenced as a hold's retries are: a node that no longer leads under the lease the rows were
+    claimed under sends none, since a successor may hold them. The control fence sends one."""
+    store, runner, _ = await _start_runner(tmp_path, "per_lane")
+    try:
+        sent: list[list[str]] = []
+
+        async def repend(kind: str, name: str, ids: list[str], **_: Any) -> HoldResult:
+            sent.append(list(ids))
+            return HoldResult.LANDED
+
+        ran: list[list[str]] = []
+
+        async def run(name: str, *, claims: _LaneClaims) -> None:
+            ran.append(list(claims.ids))
+
+        monkeypatch.setattr(runner, "_repend_claimed_on_fault", repend)
+        demoted = RependFence(lambda: False, lambda: 1, True, 1)
+        await runner._recover_then_run("router", "IB", _LaneClaims(["r1"], demoted), run)
+        assert (sent, ran) == ([], [[]])
+
+        leading = RependFence(lambda: True, lambda: 1, True, 1)
+        await runner._recover_then_run("router", "IB", _LaneClaims(["r1"], leading), run)
+        assert (sent, ran) == ([["r1"]], [[], []])
     finally:
         await runner.stop()
         await store.close()
