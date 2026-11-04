@@ -242,7 +242,7 @@ def _client_cert_opener(
     if allow_expired:
         relax_verify_expiry(
             ctx, host=host
-        )  # chain signatures + hostname still verified; every validity window relaxed
+        )  # chain signatures + hostname still verified; validity windows relaxed (BACKLOG #5089)
     # Assert forward secrecy LAST, so it sees the final suite list (ASVS 12.1.2). The docstring above
     # already claimed parity with mllp.py / api/tls.py on the TLS floor; this makes the claim true of
     # the cipher assertion those siblings also carry.

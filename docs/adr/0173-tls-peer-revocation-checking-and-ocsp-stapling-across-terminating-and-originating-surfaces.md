@@ -957,7 +957,7 @@ references name, they meant:
 | `apiclient/client.py:214` | the `cacert` branch of `_build_verify_context` in `apiclient/client.py` (`:222` was the `truststore` branch) | accepted by the owner |
 | `store/postgres.py:729` | the `trust_server_certificate` branch of `_build_ssl` | verify-off |
 | `rest.py:275` | `_insecure_opener` | verify-off |
-| `rest.py:296` | `_expiry_relaxed_opener`, a VERIFYING opener that relaxes only the expiry check | guarded |
+| `rest.py:296` | `_expiry_relaxed_opener`, a VERIFYING opener that relaxes the expiry checks: at least the leaf's, the intermediates' and the trust anchor's validity periods, and a CRL's own window (CORRECTED 2026-11-03, BACKLOG #5089: this said only the expiry check) | guarded |
 | `soap.py:202` | `_client_cert_opener`, which now builds through `build_verifying_client_context` | guarded |
 | `tls_policy.py:1218` | the `verify=False` arm of `build_smtp_tls_context` (`:1216`, the verifying arm, is graded per caller below) | verify-off |
 
