@@ -32,10 +32,12 @@ import pytest
 from messagefoundry import odbc_call_gate
 from messagefoundry.odbc_call_gate import call_gate, install_call_gate, raw_cursor
 from messagefoundry.transports import database
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from tests._odbc_cancel_fakes import (
     USE_AFTER_FREE,
     AioConn,
     RawConn,
+    RawCursor,
     cancel_once_started,
     never,
     wait_until,
@@ -148,6 +150,85 @@ async def test_a_send_whose_rollback_fails_discards_its_connection(
     assert "rollback after a failed send failed" in caplog.text
 
 
+class _LinkLostCursor(RawCursor):
+    """A cursor whose failing statement raises as a pyodbc driver error, SQLSTATE first."""
+
+    def execute(self, sql: str, *params: object) -> RawCursor:
+        try:
+            return super().execute(sql, *params)
+        except RuntimeError as exc:
+            raise RuntimeError("08S01", "[08S01] communication link failure") from exc
+
+
+class _LinkLostRollbackRefused(_RollbackRefused):
+    """The statement fails with a driver error, and its rollback is refused too."""
+
+    def cursor(self) -> RawCursor:
+        cur = _LinkLostCursor(self)
+        self.cursors.append(cur)
+        return cur
+
+
+async def test_a_driver_error_whose_rollback_fails_is_classified_and_discarded(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """The INSERT fails with a driver error and the rollback fails after it. The send's failure is
+    classified as it would be had the rollback passed (a dropped link, so a transient retry), with
+    the rollback's error as its cause, and the connection is discarded, so the retry cannot meet
+    the open INSERT. Red before this round: the raw rollback error reached the runner's
+    internal-error arm, which dead-letters by default."""
+    rig.release.set()
+    _aioodbc_serving(
+        monkeypatch,
+        rig,
+        pool_type=_WakingPool,
+        raw_type=_LinkLostRollbackRefused,
+        blocks=never,
+        fails=frozenset({_INSERT}),
+    )
+    with pytest.raises(DeliveryError, match="transient") as caught:
+        await _destination().send('{"a": 1}')
+    assert not isinstance(caught.value, NegativeAckError)
+    assert str(caught.value.__cause__) == "refused by the stand-in server"
+    pool = rig.pools[0]
+    assert pool.free == [] and rig.conn.closed and "commit" not in rig.log, rig.log
+
+
+async def test_a_failed_wake_is_logged_and_only_a_closed_connection_wakes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_release`` runs in callers' ``finally`` blocks, so a wake that fails is logged rather than
+    raised over the caller's outcome. A ``closed`` that is not literally ``True`` is not read as a
+    discard, so it wakes nothing."""
+
+    class _Pool:
+        def __init__(self) -> None:
+            self.released: list[object] = []
+            self.wakes = 0
+
+        async def release(self, conn: object) -> None:
+            self.released.append(conn)
+
+        async def _wakeup(self) -> None:
+            self.wakes += 1
+            raise RuntimeError("wake refused by the stand-in pool")
+
+    class _Closed:
+        closed = True
+
+    class _Odd:
+        def closed(self) -> bool:  # a method, truthy as an attribute
+            return True
+
+    pool = _Pool()
+    closed, odd = _Closed(), _Odd()
+    with caplog.at_level("WARNING", logger=_DB_LOG):
+        await database._release(pool, closed)
+        await database._release(pool, odd)
+    assert pool.released == [closed, odd] and pool.wakes == 1
+    assert "waking the pool for a closed connection failed" in caplog.text
+
+
 async def test_a_failed_send_whose_rollback_succeeds_keeps_its_connection(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
@@ -185,6 +266,27 @@ async def test_a_discard_into_a_pool_with_no_wakeup_holds_it_back_and_says_so_on
         assert database._holds_back(pool) == 1
         await database._wake(pool)  # a second discard into the same pool
     assert database._holds_back(pool) == 2
+    assert caplog.text.count("has no _wakeup") == 1, caplog.text
+
+
+async def test_a_cancelled_discard_into_a_pool_with_no_wakeup_nets_one_hold(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The cancel path's accounting: the detached return holds one, the unwakeable discard holds
+    one for good, and the return settling drops the first. One stays, and ERROR is logged once."""
+    monkeypatch.setattr(odbc_call_gate, "_REPORTED", set())
+    _aioodbc_serving(monkeypatch, rig, raw_type=_RollbackRefused, blocks=lambda s: s == _INSERT)
+    task = await cancel_once_started(rig.started, _destination().send('{"a": 1}'))
+    done, _pending = await asyncio.wait({task}, timeout=1.0)
+    assert done and task.cancelled()
+    pool = rig.pools[0]
+    assert database._holds_back(pool) == 1, "the detached return was not counted"
+    with caplog.at_level("ERROR", logger=odbc_call_gate.log.name):
+        rig.release.set()
+        assert await wait_until(lambda: pool.returned), "the connection never came back"
+        await asyncio.sleep(0.05)  # time for the return's settle to land after the wake
+    assert rig.conn.closed and pool.free == []
+    assert database._holds_back(pool) == 1
     assert caplog.text.count("has no _wakeup") == 1, caplog.text
 
 

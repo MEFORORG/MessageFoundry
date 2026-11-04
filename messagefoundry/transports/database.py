@@ -2099,14 +2099,25 @@ async def _release(pool: Any, conn: Any) -> None:
 
     aioodbc 0.5.0's ``Pool.release`` drops a closed connection from its in-use set and wakes
     nobody, so a borrower waiting for a free slot, or a ``wait_closed``, would sleep on although
-    the slot is free. The only closed connection this module returns is one it discarded after a
-    failed rollback (:func:`_close_and_release`, :func:`_close_after_a_cancel`), so this matters
-    on that path alone. ``closed`` is read before the release, because aioodbc closes an open
-    connection released into a closing pool and wakes the pool itself then."""
-    discarded = bool(getattr(conn, "closed", False))
+    the slot is free. A closed connection reaches here at least when this module discarded it after
+    a failed rollback (:func:`_close_and_release`, :func:`_close_after_a_cancel`), and when a borrow
+    found it with no driver handle (:func:`_driver_connection`); each frees a slot, so each wakes.
+    ``closed`` is read before the release, because aioodbc closes an open connection released into
+    a closing pool and wakes the pool itself then. Only a literal ``True`` counts, so a stand-in
+    whose ``closed`` is some other object is not read as closed. A failed wake is logged, not
+    raised: this runs in callers' ``finally`` blocks, and must not mask their outcome."""
+    discarded = getattr(conn, "closed", False) is True
     await pool.release(conn)
-    if discarded:
+    if not discarded:
+        return
+    try:
         await _wake(pool)
+    except Exception as exc:  # noqa: BLE001 - the release succeeded; nobody is left to raise to
+        logger.warning(
+            "DATABASE: waking the pool for a closed connection failed; a waiting borrower waits "
+            "until its acquire_timeout: %s",
+            _safe_db_error(exc),
+        )
 
 
 async def _wake(pool: Any) -> None:
@@ -2117,7 +2128,8 @@ async def _wake(pool: Any) -> None:
     wakes a ``wait_closed`` on it, so :func:`_close_pool_bounded` would wait for ever; the count
     makes that close stop at its bound instead. A borrower waiting for a slot still waits until its
     ``acquire_timeout``, then retries, and that retry opens a new connection. Logged at ERROR once
-    per process for the pool's type (:func:`~messagefoundry.odbc_call_gate.report_once`)."""
+    per process for the aioodbc pool's type, never the :class:`_AutocommitPool` wrapper's
+    (:func:`~messagefoundry.odbc_call_gate.report_once`)."""
     wakeup = getattr(pool, "_wakeup", None)
     if callable(wakeup):
         await wakeup()
@@ -2125,7 +2137,7 @@ async def _wake(pool: Any) -> None:
     _hold_back(pool)
     report_once(
         "_wakeup",
-        pool,
+        _pool_key(pool),
         "odbc: the connection pool %s has no _wakeup, so a connection discarded after a failed "
         "rollback wakes no waiter; a close of such a pool stops waiting at its bound, and a "
         "waiting borrower at its acquire_timeout",
@@ -2320,7 +2332,8 @@ class _AutocommitPool:
             if work.done() and isinstance(exc, Exception):
                 # The thread resolved ``work`` with a driver error, so no call is running on it.
                 # Returned open, not closed: a close here is itself a worker-thread call that a
-                # cancellation could abandon, and aioodbc wakes no waiter for a closed connection.
+                # cancellation could abandon, and a driver error on a set does not leave a
+                # transaction open the way a failed rollback can (BACKLOG #5010).
                 await _return_to_pool(self._pool, conn)
             else:
                 # The borrower left (a cancel, or the coroutine closed) while the thread may still
@@ -2898,19 +2911,24 @@ class DatabaseDestination(DestinationConnector):
                 captured = await self._capture(cur) if self.capture_response else None
                 await conn.commit()
             except Exception as exc:
+                state = _sqlstate(exc)
                 try:
                     await conn.rollback()
-                except Exception:
+                except Exception as rollback_exc:
                     # BACKLOG #5010: the INSERT may still be open on a live session, and the next
-                    # send's commit would commit it with its own. The rollback's error still
-                    # propagates, as it did; the connection is closed instead of returned.
+                    # send's commit would commit it with its own, so the connection is closed
+                    # instead of returned.
                     discard = True
                     logger.warning(
                         "DATABASE: rollback after a failed send failed; the connection is "
                         "discarded rather than returned to its pool"
                     )
-                    raise
-                state = _sqlstate(exc)
+                    if state is None:
+                        raise  # the send's failure is no driver error: the rollback's propagates
+                    # Classified as it would be had the rollback passed, so a dropped link retries
+                    # rather than dead-letters as an internal error. The discard keeps the retry
+                    # from meeting the open INSERT; the rollback's error is the cause.
+                    raise _classify_db_error(state, str(exc)) from rollback_exc
                 if state is None:
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
                 raise _classify_db_error(state, str(exc)) from exc
