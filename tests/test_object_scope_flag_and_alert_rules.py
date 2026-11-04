@@ -27,6 +27,7 @@ from starlette.requests import Request
 
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app
+from messagefoundry.api.message_scope import CONNECTION_DENIED_DETAIL
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
@@ -39,7 +40,12 @@ from tests.test_channel_rbac import _add, _login, _probe, _service, engine  # no
 from tests.test_connection_audit_writes import toml_engine  # noqa: F401
 from tests.test_dual_control_reload import _settle_unlanded
 
+# The literal pins the client-visible text, which must name no reason (BACKLOG #2551).
 _DENIED = {"detail": "not authorized for this connection"}
+
+
+def test_denied_body_is_the_shared_constant() -> None:
+    assert {"detail": CONNECTION_DENIED_DETAIL} == _DENIED
 
 
 async def _user(service: AuthService, username: str, role: Role, scope: list[str]) -> None:
@@ -111,6 +117,36 @@ async def test_flag_refuses_every_target_outside_the_callers_scope(
         assert (await _flag(c, toml_engine, hw, "OB_TOML", "outbound"))[0] == 200
 
 
+async def test_flag_direction_refusal_row_carries_its_marker(
+    toml_engine: Engine,  # noqa: F811
+) -> None:
+    """BACKLOG #3378: a flag request refused for its direction can name an inbound inside the
+    actor's own scope, which a wrong-engine-shard request does too. Its denial row carries
+    ``flag_direction_not_inbound`` so the two are told apart. The control: an out-of-scope inbound
+    refused with the right direction carries no marker. A direction that is neither side is a 422
+    with no denial row, before any scope check."""
+    service = await _service(toml_engine, admin_write_rate_limit=False)
+    await _user(service, "own", Role.DEPLOYMENT, ["IB_TOML"])
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=create_app(toml_engine, auth=service)),
+        base_url="http://t",
+    ) as c:
+        h = await _login(c, "own")
+        assert (await _flag(c, toml_engine, h, "IB_TOML", "outbound"))[:2] == (403, _DENIED)
+        assert (await _flag(c, toml_engine, h, "IB_NOPE", "inbound"))[:2] == (403, _DENIED)
+        status, _, audit = await _flag(c, toml_engine, h, "IB_TOML", "sideways")
+        assert status == 422
+        assert not [a for a in audit if a[0] == "auth.channel_denied"], audit
+    rows = await toml_engine.store.list_audit(actor="own", action="auth.channel_denied")
+    assert len(rows) == 2, rows
+    details = {row["channel_id"]: json.loads(row["detail"]) for row in rows}
+    assert details == {
+        "IB_TOML": {"channel": "IB_TOML", "flag_direction_not_inbound": True},
+        "IB_NOPE": {"channel": "IB_NOPE"},
+    }
+    assert await toml_engine.store.list_connection_flags() == set()
+
+
 async def test_flag_with_no_graph_checks_the_scope_first(engine: Engine) -> None:  # noqa: F811
     """With no registry runner the scope still decides first: a name outside it gets the audited
     403, and a name inside it reaches the engine, which refuses it 409 for its own reason."""
@@ -155,6 +191,10 @@ _RULES = AlertsSettings(
 )
 
 
+#: What the caller scoped to ``IB_A`` reads of ``_RULES``: ``(id, connection, control_target)``.
+_SCOPED_SHOWN = [(None, "*", None), (None, "IB_A", None), (None, "IB_A", "IB_A")]
+
+
 async def test_alert_rules_withhold_any_rule_naming_the_estate_outside_the_scope(
     engine: Engine,  # noqa: F811
 ) -> None:
@@ -167,15 +207,42 @@ async def test_alert_rules_withhold_any_rule_naming_the_estate_outside_the_scope
     app = create_app(engine, auth=service, alerts_settings=_RULES)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
 
-        async def ids(username: str) -> list[str]:
+        async def shown(username: str) -> list[tuple[str | None, str, str | None]]:
             r = await c.get("/alerts/rules", headers=await _login(c, username))
             assert r.status_code == 200, r.text
-            return [rule["id"] for rule in r.json()["rules"]]
+            return [
+                (rule["id"], rule["connection"], rule["control_target"])
+                for rule in r.json()["rules"]
+            ]
 
-        assert await ids("wide") == [r.id for r in _RULES.rules]
-        assert await ids("scoped") == ["all", "mine", "mine-targets-mine"]
+        assert await shown("wide") == [(r.id, r.connection, r.control_target) for r in _RULES.rules]
+        # A scoped caller reads no rule's free-text id (BACKLOG #3378), so the rules are told apart
+        # by the two fields the filter reads.
+        assert await shown("scoped") == _SCOPED_SHOWN
         # An unprovisioned operator still sees the rule that names nobody.
-        assert await ids("empty") == ["all"]
+        assert await shown("empty") == [(None, "*", None)]
+
+
+async def test_alert_rules_id_cannot_name_a_connection_outside_the_scope(
+    engine: Engine,  # noqa: F811
+) -> None:
+    """BACKLOG #3378: a rule's id is free text, so an in-scope rule can carry an out-of-scope name
+    in its label. A scoped caller reads the rule with a null id, and no byte of the answer holds
+    that name. The control: an all-channels caller reads the id whole."""
+    rules = AlertsSettings(rules=[AlertRule(id="page OB_SECRET on IB_A", connection="IB_A")])
+    service = await _service(engine)
+    await _user(service, "scoped", Role.OPERATOR, ["IB_A"])
+    await _user(service, "wide", Role.OPERATOR, [ALL_CHANNELS])
+    app = create_app(engine, auth=service, alerts_settings=rules)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        wide = await c.get("/alerts/rules", headers=await _login(c, "wide"))
+        assert [r["id"] for r in wide.json()["rules"]] == ["page OB_SECRET on IB_A"]
+        scoped = await c.get("/alerts/rules", headers=await _login(c, "scoped"))
+        assert scoped.status_code == 200, scoped.text
+        assert [(r["id"], r["connection"]) for r in scoped.json()["rules"]] == [(None, "IB_A")]
+        assert "OB_SECRET" not in scoped.text
+    # The rule itself is shown, so nothing was withheld and no count row is written.
+    assert await engine.store.list_audit(action="alert_rules_withheld") == []
 
 
 async def test_alert_rules_read_that_withholds_writes_one_count_only_audit_row(
@@ -253,7 +320,9 @@ def _assert_answered_and_logged(
     r: httpx.Response, caplog: pytest.LogCaptureFixture, error: type[Exception]
 ) -> None:
     assert r.status_code == 200, r.text
-    assert [rule["id"] for rule in r.json()["rules"]] == ["all", "mine", "mine-targets-mine"]
+    assert [
+        (rule["id"], rule["connection"], rule["control_target"]) for rule in r.json()["rules"]
+    ] == _SCOPED_SHOWN
     [lost] = [rec for rec in caplog.records if "its audit row failed" in rec.getMessage()]
     assert lost.levelno == logging.ERROR
     assert f"showed 3 and withheld {len(_RULES.rules) - 3} rules" in lost.getMessage()

@@ -803,6 +803,14 @@ from typing import Any
 #: NOT hashed: the walk follows functions only, so a change to that set's members moves no digest.
 #: ``test_ui_origin_guard.py`` drives its effect, through the docstring table.
 #:
+#: BACKLOG #3378: the console imports ``api.message_scope.CONNECTION_DENIED_DETAIL``, a module
+#: constant, and passes the keyword ``flag_direction_not_inbound`` to the ``audit_channel_denied``
+#: callback. The digest covers neither a module constant (BACKLOG #1624) nor that callback's
+#: signature, so it did not move, and the handshake catches neither skew. A newer console on an
+#: older engine raises ImportError at mount; the console release that carries this raises its
+#: ``messagefoundry`` floor instead. An older console on this engine passes the handshake and still
+#: answers a scoped caller's bad flag direction with the unaudited 404.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
