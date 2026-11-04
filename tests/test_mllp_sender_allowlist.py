@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import functools
 import inspect
 import logging
 import ssl
@@ -48,7 +49,8 @@ from messagefoundry.config.wiring import (
     load_config,
 )
 from messagefoundry.mllpcodec import AckMode
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline import wiring_runner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _IntakeRateLimiter
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.transports.mllp import _SENDER_DENIED, _SENDER_RATE_LIMITED, MLLPSource
 from tests.test_api_tls import _NOW, _CaPair, _client_bundle, _dn, _new_ca, _pem, _self_signed
@@ -183,6 +185,33 @@ async def _wired(
         source.on_connection_event = collect
     await source.start(runner._make_handler(ic))
     return source
+
+
+#: A failed-attempt window no test run reaches, for the tests that spend a whole budget.
+_LONG_WINDOW_SECONDS = 3600.0
+
+
+@pytest.fixture
+def long_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runner's budget with the factory's own counts but a window no test run reaches.
+
+    A test that spends a whole budget makes one real TLS connection per refusal, up to the global
+    count inside the real 60-second window. On a loaded runner that can take longer than the
+    window, and a reset arm then lets a connection the test expects closed through. Only the
+    window changes: ``_make_intake_rate_limiter`` still picks the counts."""
+    monkeypatch.setattr(
+        wiring_runner,
+        "_IntakeRateLimiter",
+        functools.partial(_IntakeRateLimiter, window_seconds=_LONG_WINDOW_SECONDS),
+    )
+
+
+def _assert_long_window(source: MLLPSource) -> None:
+    """The control for ``long_window``: the listener holds the long-window budget, so a pass is
+    not owed to a fast run inside the real window."""
+    limiter = source.intake_rate_limiter
+    assert isinstance(limiter, _IntakeRateLimiter), limiter
+    assert limiter._window == _LONG_WINDOW_SECONDS
 
 
 async def _exchange(source: MLLPSource, bundle: Path, body: str = _ADT) -> tuple[bytes, bytes]:
@@ -709,7 +738,7 @@ async def test_a_refusal_writes_the_audit_row_and_event_http_writes(
 
 
 async def test_a_refused_sender_that_reconnects_is_closed_unread_at_its_budget(
-    tmp_path: Path, store: MessageStore, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, store: MessageStore, caplog: pytest.LogCaptureFixture, long_window: None
 ) -> None:
     """The failed-attempt budget HTTP charges for ``auth_subject_denied``, reused: each refusal is
     charged to the peer's address, and once the budget is spent the address is closed unread,
@@ -723,6 +752,7 @@ async def test_a_refused_sender_that_reconnects_is_closed_unread_at_its_budget(
         store,
         events=events,
     )
+    _assert_long_window(source)
     refused_bundle, listed_bundle = _bundle(tmp_path, other), _bundle(tmp_path, named)
     budget = INTAKE_AUTH_RATE_LIMIT_DEFAULT
     try:
@@ -759,7 +789,7 @@ async def test_a_refused_sender_that_reconnects_is_closed_unread_at_its_budget(
 
 
 async def test_refusals_from_other_addresses_never_close_a_listed_sender(
-    tmp_path: Path, store: MessageStore
+    tmp_path: Path, store: MessageStore, long_window: None
 ) -> None:
     """The global arm bounds refusals, and a listed sender drives none, so it is consulted only once
     the compare has refused. Unlisted senders from six addresses spend the whole global budget, each
@@ -775,6 +805,7 @@ async def test_refusals_from_other_addresses_never_close_a_listed_sender(
         store,
         events=events,
     )
+    _assert_long_window(source)
     refused_bundle, listed_bundle = _bundle(tmp_path, other), _bundle(tmp_path, named)
     per_peer, glob = INTAKE_AUTH_RATE_LIMIT_DEFAULT, INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT
     spenders = [f"127.0.0.{2 + i}" for i in range(-(-glob // per_peer))]
