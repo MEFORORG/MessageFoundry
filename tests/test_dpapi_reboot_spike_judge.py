@@ -44,7 +44,7 @@ $errors = $null
 $tree = [System.Management.Automation.Language.Parser]::ParseFile($Rig, [ref]$null, [ref]$errors)
 if ($errors.Count -ne 0) { throw "the rig does not parse: $($errors[0].Message)" }
 $top = @($tree.EndBlock.Statements)
-foreach ($n in 'ServiceName', 'Account', 'NteBadKeyState') {
+foreach ($n in VARIABLES) {
     $a = @($top | Where-Object { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -eq "`$$n" })
     if ($a.Count -ne 1) { throw "the rig assigns `$$n $($a.Count) times at top level" }
     . ([scriptblock]::Create($a[0].Extent.Text))
@@ -57,8 +57,11 @@ foreach ($n in FUNCTIONS) {
 """
 
 
-def _lift(*functions: str) -> str:
-    return _LIFT.replace("FUNCTIONS", ", ".join(f"'{f}'" for f in functions))
+def _lift(*functions: str, variables: tuple[str, ...] = ()) -> str:
+    names = ("ServiceName", "Account", "NteBadKeyState", *variables)
+    return _LIFT.replace("VARIABLES", ", ".join(f"'{n}'" for n in names)).replace(
+        "FUNCTIONS", ", ".join(f"'{f}'" for f in functions)
+    )
 
 
 def _run_pwsh(driver: Path, arg: Path, timeout: int) -> str:
@@ -276,6 +279,9 @@ SCENARIOS: dict[str, Scenario] = {
     "a1_protect_refused": Scenario(
         _no_blob_run({"protect_user": "FAIL win32=5"}, {}), crosscheck=CROSS_ABSENT
     ),
+    "a1_protect_key_refused": Scenario(
+        _no_blob_run({"protect_user": BAD_KEY}, {}), crosscheck=CROSS_ABSENT
+    ),
     "a1_dpapi_down": Scenario(
         _no_blob_run(
             {"protect_user": "FAIL win32=5", "protect_machine": "FAIL win32=5"},
@@ -318,6 +324,21 @@ SCENARIOS: dict[str, Scenario] = {
         _all(A2=_report("A2", **REFUSED), A4=None, A5=None), rebooted=False
     ),
 }
+
+# Refusals that are not the key-state refusal: access denied, the RPC server unavailable, a FAIL
+# with no last error, and the invalid-parameter code the docs say tampering may also give. Each may
+# be the host rather than the key, so none may read NO. The REFUSED scenarios above are the
+# positive control that the key-state refusal still does.
+OTHER_CODES = ("5", "1722", "0", "87")
+for _c in OTHER_CODES:
+    _fail = {"user_unprotect": f"FAIL win32={_c}"}
+    SCENARIOS[f"a5_fail_{_c}"] = Scenario(
+        _all(A4=_report("A4", **_fail), A5=_report("A5", **_fail))
+    )
+    SCENARIOS[f"a2_fail_{_c}"] = Scenario(_all(A2=_report("A2", **_fail)))
+    SCENARIOS[f"a3_fail_{_c}_unloaded"] = Scenario(
+        _all(A3=_report("A3", **_fail)), profile="loaded_before_start=False profile=x"
+    )
 
 
 def _parse(stdout: str) -> dict[str, dict[str, str]]:
@@ -400,7 +421,8 @@ _OVERALL: list[tuple[str, str]] = [
     ("a5_damaged", "INVALID"),
     ("a4_mismatch", "INVALID"),
     ("a5_other_value", "INVALID"),
-    ("a1_protect_refused", "INVALID"),
+    ("a1_protect_refused", "INCONCLUSIVE"),
+    ("a1_protect_key_refused", "INVALID"),
     ("a1_no_sha", "INCONCLUSIVE"),
     ("a3_control_failed", "INCONCLUSIVE"),
     ("cross_failed_a2_damaged", "INVALID"),
@@ -456,15 +478,46 @@ def test_a_failed_crosscheck_voids_every_arm(judged: Judged, scenario: str) -> N
     assert _v(judged, scenario, "VERDICT") == "INCONCLUSIVE"
 
 
-def test_a1_protect_failure_is_no_only_beside_a_working_machine_scope(judged: Judged) -> None:
+def test_a1_protect_failure_is_no_only_for_the_key_refusal_beside_machine_scope(
+    judged: Judged,
+) -> None:
     # The crosscheck read ABSENT because the protect failed; the protect is what A1 reports.
-    assert _v(judged, "a1_protect_refused", "A1") == "NO"
+    assert _v(judged, "a1_protect_key_refused", "A1") == "NO"
+    assert f"protect_user {BAD_KEY}" in judged["a1_protect_key_refused"]["A1"]
+    # Access denied is not the key refusal, even beside a machine scope that worked.
+    assert _v(judged, "a1_protect_refused", "A1") == "INCONCLUSIVE"
     assert "protect_user FAIL win32=5" in judged["a1_protect_refused"]["A1"]
     assert _v(judged, "a1_dpapi_down", "A1") == "INCONCLUSIVE"
     assert "protect_machine FAIL win32=5" in judged["a1_dpapi_down"]["A1"]
     # Every later arm has no blob to open, and the absent crosscheck still voids them.
     for a in ("A2", "A3", "A4", "A5"):
         assert _v(judged, "a1_protect_refused", a) == "INCONCLUSIVE"
+
+
+@pytest.mark.parametrize("code", OTHER_CODES)
+def test_only_the_key_state_refusal_reads_no(judged: Judged, code: str) -> None:
+    fail = f"FAIL win32={code}"
+    for arm in ("A4", "A5"):
+        assert _v(judged, f"a5_fail_{code}", arm) == "INCONCLUSIVE"
+        assert f"user_unprotect {fail}, not the key-state refusal" in judged[f"a5_fail_{code}"][arm]
+    # Not DOES NOT SURVIVE: the reboot arms answered nothing.
+    assert _v(judged, f"a5_fail_{code}", "VERDICT") == "INCONCLUSIVE"
+    # Before the reboot it is not a broken instrument either, but nor is A1 to A3 shown working.
+    assert _v(judged, f"a2_fail_{code}", "A2") == "INCONCLUSIVE"
+    assert fail in judged[f"a2_fail_{code}"]["A2"]
+    assert _v(judged, f"a2_fail_{code}", "VERDICT") == "INCONCLUSIVE"
+    assert "did not all open the blob" in judged[f"a2_fail_{code}"]["VERDICT"]
+    assert judged[f"a2_fail_{code}"]["prepass"].endswith("False")
+    # After a seen unload too: only the key refusal is the real A3 NO.
+    assert _v(judged, f"a3_fail_{code}_unloaded", "A3") == "INCONCLUSIVE"
+    assert "A3 NO" not in judged[f"a3_fail_{code}_unloaded"]["VERDICT"]
+
+
+def test_the_key_state_refusal_still_reads_no(judged: Judged) -> None:
+    # The positive control for the test above, at each place a NO is read.
+    assert _v(judged, "a5_refused", "A5") == "NO"
+    assert _v(judged, "a2_refused_a5_opened", "A2") == "NO"
+    assert _v(judged, "a3_refused_unloaded", "A3") == "NO"
 
 
 def test_without_a_reboot_the_reboot_arms_read_not_run(judged: Judged) -> None:
@@ -586,14 +639,12 @@ def test_only_a_sharing_or_lock_violation_reads_busy(tmp_path: Path) -> None:
 # Host mode runs only on MEFORHV01, once. So its reboot wait and its cleanup run here against
 # stand-ins for the Hyper-V and remoting cmdlets: a function shadows a cmdlet of the same name.
 _HOST_DRIVER = (
-    _lift("Wait-GuestSession", "Get-VMStateText", "Stop-AndRevert")
+    _lift("Wait-Guest", "Get-VMStateText", "Stop-AndRevert")
     + r"""
 $VMName = 'REVTEST01'; $Checkpoint = 'cp'
-$script:states = @(); $script:uptimes = @(); $script:stopFails = $false
+$script:states = @(); $script:uptimes = @(); $script:stopFails = $false; $script:credFails = $false
 function Write-Log([string]$Line) { }
 function Start-Sleep { }
-function New-PSSession { 'session' }
-function Remove-PSSession { }
 function Get-VM {
     $s = 'Off'
     if ($script:states.Count) { $s, $script:states = $script:states }
@@ -603,20 +654,27 @@ $script:reads = 0
 # Past the list, a guest that has been up for days.
 function Get-GuestUptimeMs {
     $script:reads++
+    if ($script:credFails) { throw 'The credential is invalid.' }
     if ($script:reads -le $script:uptimes.Count) { $script:uptimes[$script:reads - 1] } else { 999999999 }
 }
 function Stop-VM { if ($script:stopFails) { throw 'stop refused' } }
 function Restore-VMSnapshot { }
 
-# No reboot asked: the first session is the one.
-"none=$(Wait-GuestSession $null $null 60)"
-# The first session is still the boot before (up longer than the 120 s since the ask), the second
+# No reboot asked: the first answer is the one.
+Wait-Guest $null $null 60
+"none=reads=$script:reads"
+# The first answer is still the boot before (up longer than the 120 s since the ask), the second
 # is the new boot.
-$script:uptimes = @(900000, 30000)
-"rebooted=$(Wait-GuestSession $null ([DateTime]::UtcNow.AddSeconds(-120)) 60) reads=$script:reads"
+$script:reads = 0; $script:uptimes = @(900000, 30000)
+Wait-Guest $null ([DateTime]::UtcNow.AddSeconds(-120)) 60
+"rebooted=reads=$script:reads"
 # A guest that never reboots never reads as back, nor does a tick count that wrapped negative.
 $script:reads = 0; $script:uptimes = @(-5)
-try { $null = Wait-GuestSession $null ([DateTime]::UtcNow.AddSeconds(-120)) 1; 'never=RETURNED' } catch { "never=$($_.Exception.Message) reads>1=$($script:reads -gt 1)" }
+try { $null = Wait-Guest $null ([DateTime]::UtcNow.AddSeconds(-120)) 1; 'never=RETURNED' } catch { "never=$($_.Exception.Message) reads>1=$($script:reads -gt 1)" }
+# A refused credential stops the wait at the first answer.
+$script:reads = 0; $script:credFails = $true
+try { $null = Wait-Guest $null $null 60; 'cred=RETURNED' } catch { "cred=$($_.Exception.Message) reads=$script:reads" }
+$script:credFails = $false
 
 $script:states = @('Off', 'Off')
 "clean=[$(Stop-AndRevert $null)]"
@@ -633,13 +691,222 @@ def test_host_reboot_wait_and_cleanup(tmp_path: Path) -> None:
     driver.write_text(_HOST_DRIVER, encoding="ascii")
     lines = _run_pwsh(driver, tmp_path, 120).strip().splitlines()
     out = dict(line.split("=", 1) for line in lines)
-    assert out["none"] == "session"
-    assert out["rebooted"] == "session reads=2"
-    assert out["never"].startswith("STOP     no PowerShell Direct session"), out["never"]
+    assert out["none"] == "reads=1"
+    assert out["rebooted"] == "reads=2"
+    assert out["never"].startswith("STOP     no PowerShell Direct answer"), out["never"]
     assert out["never"].endswith("reads>1=True"), out["never"]
+    assert out["cred"].startswith("STOP     the VM credential was refused"), out["cred"]
+    assert out["cred"].endswith("reads=1"), out["cred"]
     assert out["clean"] == "[]"
     assert "Stop-VM failed: stop refused" in out["stopfail"]
     assert "after Stop-VM it was Running, not Off" in out["stopfail"]
     assert out["stopfail"].startswith("STOP     REVTEST01 was not turned off and reverted")
     assert "after the revert it was Saved, not Off" in out["saved"]
     assert "it is Saved now" in out["saved"]
+
+
+# Every Host-mode guest call is a job with a timeout. Here Invoke-Command is a stand-in that hands
+# back a real thread job, so Wait-Job, Stop-Job and Receive-Job run as written, and the rig's
+# behaviour on a hang (stop the job, revert, release the lock, name the arm) runs end to end.
+_HANG_DRIVER = (
+    _lift(
+        "Invoke-GuestCall",
+        "Invoke-Guest",
+        "Copy-GuestReports",
+        "Get-GuestUptimeMs",
+        "Wait-Guest",
+        "Get-VMStateText",
+        "Stop-AndRevert",
+        "Invoke-Rig",
+        "Invoke-HostRun",
+        variables=(
+            "Root",
+            "Work",
+            "ReportWaitSeconds",
+            "BootReportWaitSeconds",
+            "ProfileWaitSeconds",
+            "StopWaitSeconds",
+            "GuestCallSeconds",
+            "PreRebootSteps",
+        ),
+    )
+    + r"""
+$VMName = 'REVTEST01'; $Checkpoint = 'cp'
+# Loaded before Import-Module is shadowed below.
+$null = Start-ThreadJob { 1 } | Wait-Job | Remove-Job
+foreach ($k in @($GuestCallSeconds.Keys)) { $GuestCallSeconds[$k] = 2 }
+$script:log = [Collections.Generic.List[string]]::new()
+$script:calls = [Collections.Generic.List[string]]::new()
+$script:behaviour = @{}
+$script:restores = 0; $script:stops = 0; $global:released = $false
+function Write-Log([string]$Line) { $script:log.Add($Line) }
+function Start-Sleep { }
+function Start-Transcript { }
+function Stop-Transcript { }
+function Test-HostElevated { $true }
+function Import-Module { }
+function Get-Credential { 'cred' }
+function Enter-HvTestLock {
+    $o = [pscustomobject]@{}
+    $o | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $global:released = $true }
+    $o
+}
+function Get-VM { [pscustomobject]@{ Heartbeat = 'OkApplicationsHealthy'; State = 'Off' } }
+function Get-VMSnapshot { [pscustomobject]@{ Name = 'cp' } }
+function Get-VMSwitch { [pscustomobject]@{ SwitchType = 'Private' } }
+$script:nic = $null
+function Get-VMNetworkAdapter { $script:nic }
+function Start-VM { }
+function Stop-VM { $script:stops++ }
+function Restore-VMSnapshot { $script:restores++ }
+function Invoke-Judge { @{ Lines = @('DPAPI-REBOOT VERDICT: judged') } }
+function Invoke-Command {
+    param($VMName, $Credential, $FilePath, $ScriptBlock, $ArgumentList, [switch]$AsJob)
+    if (-not $AsJob) { throw 'a guest call without -AsJob' }
+    # Bound, not truthy: a lifted function has no $PSCommandPath, so FilePath arrives empty here.
+    if ($PSBoundParameters.ContainsKey('FilePath')) { $label = "step $($ArgumentList[1]) $($ArgumentList[2])".TrimEnd() }
+    elseif ($ArgumentList) { $label = 'copy' } else { $label = 'uptime' }
+    $script:calls.Add($label)
+    switch ([string]$script:behaviour[$label]) {
+        'hang' { Start-ThreadJob { 'partial line'; Start-Sleep -Seconds 60 } }
+        'fail' { Start-ThreadJob { 'before the error'; throw 'guest boom' } }
+        default {
+            if ($label -eq 'uptime') { Start-ThreadJob { 0 } }
+            # A guest-supplied name with a path in it: only its leaf may be written.
+            elseif ($label -eq 'copy') { Start-ThreadJob { [pscustomobject]@{ Name = '..\report-A1.txt'; Bytes = [byte[]](104, 105) } } }
+            else { $l = $label; Start-ThreadJob { "ok $using:l" } }
+        }
+    }
+}
+function Show-Run([string]$Name) {
+    foreach ($line in $script:log) { "$Name log=$line" }
+    "$Name calls=$($script:calls -join ',')"
+    "$Name restores=$script:restores stops=$script:stops released=$global:released jobs=$(@(Get-Job).Count)"
+    $script:log.Clear(); $script:calls.Clear(); $script:restores = 0; $script:stops = 0; $global:released = $false
+}
+
+# One call: its output, an error after output, and a hang.
+"ok=$((Invoke-GuestCall 'cred' 'x' 10 @{ FilePath = 'f'; ArgumentList = 'Guest', 'Report', '' }) -join ',')"
+$script:behaviour = @{ 'step Fail' = 'fail'; 'step Hang' = 'hang' }
+$got = @()
+try { Invoke-GuestCall 'cred' 'x' 10 @{ FilePath = 'f'; ArgumentList = 'Guest', 'Fail', '' } | ForEach-Object { $got += $_ }; 'fail=RETURNED' }
+catch { "fail=$($_.Exception.Message) got=$($got -join ',')" }
+$got = @()
+$t = [Diagnostics.Stopwatch]::StartNew()
+try { Invoke-GuestCall 'cred' 'the guest step Hang' 2 @{ FilePath = 'f'; ArgumentList = 'Guest', 'Hang', '' } | ForEach-Object { $got += $_ }; 'hang=RETURNED' }
+catch { "hang=$($_.Exception.GetType().Name)|$($_.Exception.Message)|got=$($got -join ',')|fast=$($t.Elapsed.TotalSeconds -lt 20)|jobs=$(@(Get-Job).Count)" }
+$script:calls.Clear()
+
+# A hang before the reboot, through Invoke-HostRun, so the lock release is seen.
+$OutDir = Join-Path $Arg 'pre'
+$script:behaviour = @{ 'step Start A2' = 'hang' }
+try { Invoke-HostRun; 'pre run=RETURNED' } catch { "pre run=$($_.Exception.Message)" }
+"pre leaf=$(Test-Path -LiteralPath (Join-Path $OutDir 'reports\report-A1.txt')) escaped=$(Test-Path -LiteralPath (Join-Path $OutDir 'report-A1.txt'))"
+Show-Run 'pre'
+
+# A hang after the reboot, at A5.
+$OutDir = Join-Path $Arg 'post'
+$null = New-Item -ItemType Directory -Path (Join-Path $OutDir 'reports')
+$script:behaviour = @{ 'step Start A5' = 'hang' }
+try { Invoke-Rig 'cred' $null (Join-Path $OutDir 'reports'); 'post run=RETURNED' } catch { "post run=$($_.Exception.Message)" }
+Show-Run 'post'
+
+# A STOP that is not a hang, before the VM starts: it too is printed again last.
+$OutDir = Join-Path $Arg 'nic'
+$script:behaviour = @{}; $script:nic = [pscustomobject]@{ SwitchName = 'External' }
+try { Invoke-HostRun; 'nic run=RETURNED' } catch { "nic run=$($_.Exception.Message)" }
+$script:nic = $null
+Show-Run 'nic'
+
+# No hang: the whole run, and the uninstall at its end.
+$OutDir = Join-Path $Arg 'clean'
+$script:behaviour = @{}
+try { Invoke-HostRun; 'clean run=RETURNED' } catch { "clean run=$($_.Exception.Message)" }
+Show-Run 'clean'
+"""
+)
+
+
+@pytest.fixture(scope="module")
+def hang_lines(tmp_path_factory: pytest.TempPathFactory) -> list[str]:
+    root = tmp_path_factory.mktemp("dpapi-reboot-hang")
+    driver = root / "hang.ps1"
+    driver.write_text(_HANG_DRIVER, encoding="ascii")
+    return _run_pwsh(driver, root, 180).strip().splitlines()
+
+
+def _run_lines(lines: list[str], name: str, key: str) -> list[str]:
+    prefix = f"{name} {key}="
+    return [line[len(prefix) :] for line in lines if line.startswith(prefix)]
+
+
+def test_a_guest_call_returns_its_output_and_its_error(hang_lines: list[str]) -> None:
+    assert "ok=ok step Report" in hang_lines
+    fail = next(line for line in hang_lines if line.startswith("fail="))
+    assert fail == "fail=guest boom got=before the error", fail
+
+
+def test_a_hung_guest_call_is_stopped_and_named(hang_lines: list[str]) -> None:
+    hang = next(line for line in hang_lines if line.startswith("hang="))
+    kind, message, got, fast, jobs = hang[len("hang=") :].split("|")
+    assert kind == "TimeoutException"
+    # No STOP at this depth: Wait-Guest retries a hung probe, so only the rig words it as a STOP.
+    assert message == "the guest step Hang did not finish within 2 s", message
+    # The output before the hang is still returned, and the job is gone.
+    assert got == "got=partial line"
+    assert fast == "fast=True"
+    assert jobs == "jobs=0"
+
+
+@pytest.mark.parametrize(("run", "arm"), [("pre", "Start A2"), ("post", "Start A5")])
+def test_a_hang_reverts_names_the_arm_and_skips_the_rest(
+    hang_lines: list[str], run: str, arm: str
+) -> None:
+    log = _run_lines(hang_lines, run, "log")
+    stop = f"STOP     the guest step {arm} did not finish within 2 s"
+    # The run fails with the STOP line, and prints it again last.
+    assert _run_lines(hang_lines, run, "run")[0].startswith(stop)
+    assert log[-1].startswith(stop), log[-1]
+    assert any(line.startswith("FAILED: System.TimeoutException") for line in log)
+    # The finally ran whole: reports copied, uninstall skipped, VM reverted, judge read.
+    assert "uninstall skipped: a guest call hung" in log
+    assert "REVTEST01 turned off and reverted to cp; output in" in " ".join(log)
+    assert "DPAPI-REBOOT VERDICT: judged" in log
+    calls = _run_lines(hang_lines, run, "calls")[0].split(",")
+    assert calls[-1] == "copy"
+    assert f"step {arm}" in calls
+    assert "step Uninstall" not in calls
+    # One restore at the start, one in the revert; the job is gone.
+    counts = _run_lines(hang_lines, run, "restores")[0]
+    assert counts.startswith("2 stops=1"), counts
+    assert counts.endswith("jobs=0"), counts
+
+
+def test_a_hang_still_releases_the_hvtest_lock(hang_lines: list[str]) -> None:
+    assert _run_lines(hang_lines, "pre", "restores")[0].split()[2] == "released=True"
+    # Only the leaf of the guest's file name is written.
+    assert "pre leaf=True escaped=False" in hang_lines
+
+
+def test_any_stop_that_ends_the_run_is_printed_last(hang_lines: list[str]) -> None:
+    stop = "STOP     REVTEST01 has an adapter on 'External', not MEFOR-Lab; not started"
+    assert _run_lines(hang_lines, "nic", "run") == [stop]
+    log = _run_lines(hang_lines, "nic", "log")
+    assert log[-1] == stop, log[-1]
+    # No guest call was made, and the uninstall is not skipped for a hang that did not happen.
+    assert _run_lines(hang_lines, "nic", "calls") == [""]
+    assert "uninstall skipped: a guest call hung" not in log
+    assert _run_lines(hang_lines, "nic", "restores")[0] == "2 stops=1 released=True jobs=0"
+
+
+def test_a_run_without_a_hang_reaches_a5_and_uninstalls(hang_lines: list[str]) -> None:
+    assert _run_lines(hang_lines, "clean", "run") == ["RETURNED"]
+    calls = _run_lines(hang_lines, "clean", "calls")[0].split(",")
+    reboot, boot, a5 = (
+        calls.index(c) for c in ("step Reboot A4", "step BootReport A4", "step Start A5")
+    )
+    assert reboot < boot < a5
+    assert calls[-1] == "step Uninstall"
+    log = _run_lines(hang_lines, "clean", "log")
+    assert not any(line.startswith("STOP") for line in log)
+    assert _run_lines(hang_lines, "clean", "restores")[0] == "2 stops=1 released=True jobs=0"
