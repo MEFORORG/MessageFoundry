@@ -35,6 +35,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any, Protocol
 
 from messagefoundry.netaddr import peer_ip_allowed
 
@@ -173,6 +174,13 @@ _AT_CAPACITY = Refusal(kind="at_capacity")
 _AT_HOST_CAPACITY = Refusal(kind="at_capacity", reason="max_connections_per_host")
 
 
+class PeerInfo(Protocol):
+    """What admission reads of a connection: its ``peername``. An ``asyncio.StreamWriter`` is one,
+    and so is the MLLP listener's stand-in for a socket no transport owns yet (BACKLOG #1606)."""
+
+    def get_extra_info(self, name: str, default: Any = None) -> Any: ...
+
+
 class ListenerAdmission:
     """The pre-read admission decision for one socket listener, and the counts it rests on.
 
@@ -218,7 +226,7 @@ class ListenerAdmission:
         #: from one the tables still count (vault BACKLOG #2939).
         self._epoch = 0
 
-    def check(self, writer: asyncio.StreamWriter, peer_host: str | None) -> Refusal | None:
+    def check(self, writer: PeerInfo, peer_host: str | None) -> Refusal | None:
         """Decide whether to admit this connection. Logs a refusal, throttled; emits no event.
 
         Every refusal but the stopping one is passed to :func:`notify_refusal`."""
@@ -230,7 +238,7 @@ class ListenerAdmission:
             notify_refusal(self.name)
         return refusal
 
-    def _refusal(self, writer: asyncio.StreamWriter, peer_host: str | None) -> Refusal | None:
+    def _refusal(self, writer: PeerInfo, peer_host: str | None) -> Refusal | None:
         if self.source_ip_allowlist is not None:
             peer = writer.get_extra_info("peername")
             if not peer_ip_allowed(peer, self.source_ip_allowlist):

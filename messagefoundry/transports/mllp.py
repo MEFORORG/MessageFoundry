@@ -91,7 +91,7 @@ from messagefoundry.tls_handshake_failures import (
     HandshakeFailures,
     handshake_cause,
 )
-from messagefoundry.transports.admission import FrameClock, ListenerAdmission
+from messagefoundry.transports.admission import FrameClock, ListenerAdmission, PeerInfo
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -298,14 +298,14 @@ _ACK_DRAIN_GRACE = _CLIENT_SHUTDOWN_GRACE
 # A constant rather than a per-connection setting, for the reason `_ACK_DRAIN_GRACE` gives: there is
 # no feed-shaped traffic to size it against, and a setting would carry the `None`/`0` = "off" spelling
 # every cap here accepts, which would restore the unbounded window through a supported value.
-# **This bounds how LONG an unhandshaken socket lives; on the stdlib loop the caps bound how MANY.**
-# There the listener accepts plain TCP and upgrades an admitted socket itself (see
-# `_on_tls_accept`), so `source_ip_allowlist`, `max_connections` and `max_connections_per_host` all
-# act BEFORE the handshake, and a socket in its handshake holds a real slot. When the bound fires,
-# the handshake is aborted, the slot is given back, and the line is logged at DEBUG only, so a flood
-# of silent sockets cannot fill the log. **On any other loop, uvloop included, the loop runs the
-# handshake and all three act only after it** (see `_upgrades_tls_itself`), so there this bounds
-# how long such a socket lives, not how many a peer can open.
+# **This bounds how LONG an unhandshaken socket lives; the caps bound how MANY.** The listener
+# admits each socket in plain TCP before its handshake: on the stdlib loop it upgrades an admitted
+# socket itself (see `_on_tls_accept`), and on any other loop, uvloop included, it runs its own
+# accept loop and hands an admitted socket to the loop's TLS layer (see `_AcceptingServer`). So
+# `source_ip_allowlist`, `max_connections` and `max_connections_per_host` all act BEFORE the
+# handshake, and a socket in its handshake holds a real slot. When the bound fires, the handshake is
+# aborted, the slot is given back, and the line is logged at DEBUG only, so a flood of silent
+# sockets cannot fill the log.
 _TLS_HANDSHAKE_TIMEOUT = 10.0
 
 # Seconds a closed TLS connection waits for the peer's close_notify before the socket is dropped
@@ -313,7 +313,7 @@ _TLS_HANDSHAKE_TIMEOUT = 10.0
 # `max_connections` slot, so a peer that never answered held each socket that long uncounted. Equal
 # to the shutdown grace, and named apart from it for the reason `_ACK_DRAIN_GRACE` gives: shortening
 # teardown in a test must not silently shorten this too. On the stdlib loop stop() does not wait
-# for it, and on uvloop it can; see stop().
+# for it, and on any other loop it can; see stop().
 _TLS_SHUTDOWN_TIMEOUT = _CLIENT_SHUTDOWN_GRACE
 
 #: Characters of a negative acknowledgment's MSA-3 that reach the :class:`NegativeAckError` message
@@ -1568,7 +1568,7 @@ class MLLPDestination(DestinationConnector):
 # --- source ------------------------------------------------------------------
 
 
-def _peer_host(writer: asyncio.StreamWriter) -> str | None:
+def _peer_host(writer: PeerInfo) -> str | None:
     """The peer IP from the socket for a connection-event row (#46) — socket metadata, never payload.
     ``None`` for a UNIX/unresolved peer."""
     peer = writer.get_extra_info("peername")
@@ -1577,18 +1577,29 @@ def _peer_host(writer: asyncio.StreamWriter) -> str | None:
     return None
 
 
+#: The loop classes whose TLS upgrade `_upgrades_tls_itself` rests on a reading of: the stdlib's
+#: own, matched exactly (vault BACKLOG #4552).
+_STDLIB_LOOPS: frozenset[type] = frozenset(
+    cls
+    for cls in (asyncio.SelectorEventLoop, getattr(asyncio, "ProactorEventLoop", None))
+    if cls is not None
+)
+
+
 def _upgrades_tls_itself(loop: asyncio.AbstractEventLoop) -> bool:
-    """Whether a TLS listener on ``loop`` accepts plain TCP and upgrades each socket itself, so its
-    caps and allowlist run before the handshake (BACKLOG #1606). True for ``asyncio.BaseEventLoop``
-    and its subclasses, which the stdlib loops are.
+    """Whether a TLS listener on ``loop`` accepts plain TCP and upgrades each socket itself with
+    ``StreamWriter.start_tls``, so its caps and allowlist run before the handshake (BACKLOG #1606).
+    True only for the stdlib's own loop classes, ``SelectorEventLoop`` and ``ProactorEventLoop``.
 
     The upgrade is safe only where pausing reading inside ``connection_made`` is known to keep the
     ClientHello out of the plaintext reader. On the stdlib loops it is, read in their source: the
     selector transport arms its reader only if not paused, and the Proactor issues no receive while
-    paused. A subclass is trusted to keep the stdlib transports; that is not read. A loop outside
-    ``BaseEventLoop`` keeps the loop-level handshake, because a wrong guess there would stall every
-    TLS connection. A source reading of uvloop's 0.22.1 and 0.23.0 sdists found the upgrade unsafe
-    there. Both versions agree on at least these three points:
+    paused. A subclass, even of ``asyncio.BaseEventLoop``, could replace the transports that reading
+    rests on, so it is matched exactly and a subclass is treated as an unknown loop (vault BACKLOG
+    #4552). A wrong guess here would stall every TLS connection. A source reading of uvloop's 0.22.1
+    and 0.23.0 sdists found the upgrade unsafe there, and
+    ``test_a_plaintext_upgrade_loses_the_client_hello_on_uvloop`` pins the result. Both versions
+    agree on at least these three points:
 
     * ``UVBaseTransport._call_connection_made`` (``handles/basetransport.pyx``) calls
       ``protocol.connection_made`` and then ``self._start_reading()`` with no check for a pause, so
@@ -1605,13 +1616,16 @@ def _upgrades_tls_itself(loop: asyncio.AbstractEventLoop) -> bool:
     would fail. Before enabling the upgrade on a later uvloop, re-read at least those three, and how
     the loop orders ``connection_made``, the task's first step and the first read (``_on_idle``).
 
-    So on uvloop the caps and allowlist apply after the handshake. uvicorn runs the engine on uvloop
-    wherever it is installed; the pyproject marker on the engine's own uvloop dependency says where
-    that is. ``loop.connect_accepted_socket(..., ssl=...)`` exists on the stdlib loops and on
-    uvloop. It would hand the TLS layer an admitted socket before any read, at the cost of the
-    listener running its own accept loop. It is not built.
+    uvicorn runs the engine on uvloop wherever uvloop is installed, and the engine installs it
+    through its own ``uvloop`` dependency in ``pyproject.toml``. That dependency's environment
+    marker is the one statement of where, and every other mention links here. On any loop this
+    returns False for, the MLLP listener runs its own accept loop instead (`_AcceptingServer`):
+    it admits each socket in plain TCP, then hands it to ``loop.connect_accepted_socket(...,
+    ssl=...)`` before anything has read it, so its caps and allowlist still run before the
+    handshake. The HTTP listener has no such loop, so there its caps and allowlist apply after the
+    handshake.
     """
-    return isinstance(loop, asyncio.BaseEventLoop)
+    return type(loop) in _STDLIB_LOOPS
 
 
 def _lost_its_transport(writer: asyncio.StreamWriter) -> bool:
@@ -1620,6 +1634,106 @@ def _lost_its_transport(writer: asyncio.StreamWriter) -> bool:
     here; see ``MLLPSource._start_tls``."""
     transport: asyncio.BaseTransport | None = writer.transport
     return transport is None
+
+
+#: Seconds `_AcceptingServer` waits before accepting again after an accept failed, for example for
+#: want of a descriptor. asyncio's own server waits the same (``ACCEPT_RETRY_DELAY``), so a resource
+#: shortage costs one log line a second rather than a busy loop.
+_ACCEPT_RETRY_DELAY = 1.0
+
+
+async def _bind_tcp(host: str, port: int) -> list[socket.socket]:
+    """Listening sockets for ``host``:``port``, bound as ``asyncio.start_server`` binds them: one per
+    address ``host`` resolves to, with ``socket.create_server``'s options (``SO_REUSEADDR`` on
+    POSIX, an IPv6 socket IPv6-only) and a backlog of 100."""
+    infos = await asyncio.get_running_loop().getaddrinfo(
+        host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+    )
+    sockets: list[socket.socket] = []
+    try:
+        for family, _kind, _proto, _canonname, address in dict.fromkeys(infos):
+            sockets.append(socket.create_server(address, family=family, backlog=100))
+        if not sockets:
+            raise OSError(f"MLLP listener: {host!r} resolved to no address to bind")
+    except BaseException:
+        for sock in sockets:
+            sock.close()
+        raise
+    for sock in sockets:
+        sock.setblocking(False)
+    return sockets
+
+
+class _AcceptedPeer:
+    """What admission reads of an accepted socket that no transport owns yet: its peer address.
+    Read once, at construction, which raises ``OSError`` if the peer is already gone."""
+
+    __slots__ = ("_peername",)
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._peername: Any = sock.getpeername()
+
+    def get_extra_info(self, name: str, default: Any = None) -> Any:
+        return self._peername if name == "peername" else default
+
+
+def _closer(sock: socket.socket) -> Callable[[asyncio.Task[None]], None]:
+    """A done callback that closes ``sock``, whatever the task's outcome."""
+
+    def close(_done: asyncio.Task[None]) -> None:
+        sock.close()
+
+    return close
+
+
+class _AcceptingServer:
+    """The accept loop a TLS listener runs itself where the loop's TLS upgrade is not known to be
+    safe (BACKLOG #1606; see `_upgrades_tls_itself`), standing in for ``asyncio.Server``.
+
+    Each accepted socket goes to ``on_socket`` before anything has read it, so the listener decides
+    it in plain TCP and only an admitted socket reaches the loop's TLS layer. A TLS client speaks
+    first, but its ClientHello waits in the kernel until that layer reads it. It offers no
+    ``close_clients()``: the listener tracks the sockets it accepted itself (`MLLPSource.stop`).
+    """
+
+    def __init__(
+        self, sockets: list[socket.socket], on_socket: Callable[[socket.socket], None]
+    ) -> None:
+        self.sockets = sockets
+        loop = asyncio.get_running_loop()
+        self._accepting: list[asyncio.Task[None]] = []
+        for sock in sockets:
+            task = loop.create_task(self._accept(sock, on_socket))
+            # Closed once its accept loop is done, so never under an accept still pending, and
+            # closed even if the task is cancelled before its first step.
+            task.add_done_callback(_closer(sock))
+            self._accepting.append(task)
+
+    @staticmethod
+    async def _accept(sock: socket.socket, on_socket: Callable[[socket.socket], None]) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                conn, _address = await loop.sock_accept(sock)
+            except ConnectionAbortedError:
+                continue  # the peer went before it was accepted, as asyncio's own server skips it
+            except OSError as exc:
+                logger.warning(
+                    "MLLP listener accept failed, retrying in %gs: %s",
+                    _ACCEPT_RETRY_DELAY,
+                    safe_exc(exc),
+                )
+                await asyncio.sleep(_ACCEPT_RETRY_DELAY)
+                continue
+            on_socket(conn)
+
+    def close(self) -> None:
+        """Stop accepting. Each listening socket closes once its accept loop has finished."""
+        for task in self._accepting:
+            task.cancel()
+
+    async def wait_closed(self) -> None:
+        await asyncio.gather(*self._accepting, return_exceptions=True)
 
 
 class _MessagePacer:
@@ -1916,15 +2030,15 @@ class MLLPSource(SourceConnector):
         # Carried only so a pacing report can name this connection (BACKLOG #290).
         self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): when set, a connecting peer whose IP
-        # is not listed is refused when its connection reaches `_on_client` -- with TLS on, that is
-        # before the handshake on the stdlib loop and after it on uvloop (BACKLOG #1606; see
-        # _TLS_HANDSHAKE_TIMEOUT). Absent/empty = no restriction.
+        # is not listed is refused before anything reads its socket -- with TLS on, that is before
+        # the handshake, on every loop (BACKLOG #1606; see _TLS_HANDSHAKE_TIMEOUT). Absent/empty = no
+        # restriction.
         sa = s.get("source_ip_allowlist")
         self.source_ip_allowlist: list[str] | None = [str(x) for x in sa] if sa else None
         # WP-13b: per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file). Built
         # once here so a bad cert/key fails at build. None when tls is off → plaintext, byte-identical.
         self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True, name=config.name or "")
-        self._server: asyncio.Server | None = None
+        self._server: asyncio.Server | _AcceptingServer | None = None
         self._handler: InboundHandler | None = None
         #: The pre-read admission shared with the raw-TCP, X12 and HTTP listeners (vault BACKLOG
         #: #2606): the stop flag, the allowlist, both connection caps, the live counts per peer
@@ -1942,8 +2056,12 @@ class MLLPSource(SourceConnector):
         # alone hangs on a still-connected sender on py3.12.1+ and is a no-op quiesce on 3.11 (H-2).
         self._clients: set[asyncio.StreamWriter] = set()
         self._client_tasks: set[asyncio.Task[None]] = set()
-        # True while this listener runs TLS handshakes itself, after its own checks (BACKLOG #1606);
-        # set at start() from the running loop, see `_upgrades_tls_itself`.
+        # The `_handshake_accepted` tasks still inside the loop's TLS handshake, which stop() cancels
+        # so their sockets close at once rather than at the handshake bound (BACKLOG #1606).
+        self._handshakes: set[asyncio.Task[None]] = set()
+        # True while this listener runs TLS handshakes itself with `start_tls`, after its own checks
+        # (BACKLOG #1606); set at start() from the running loop, see `_upgrades_tls_itself`. False
+        # with TLS on means `_AcceptingServer` instead.
         self._upgrade_tls = False
         # Failed TLS handshakes and their throttled `tls_handshake_failed` events (vault BACKLOG
         # #2613), on every loop since #3302: `_start_tls` counts where this listener runs the
@@ -1979,32 +2097,109 @@ class MLLPSource(SourceConnector):
         self._inflight = (
             asyncio.Semaphore(self.max_inflight_frames) if self.max_inflight_frames else None
         )
-        # A TLS listener on the stdlib loop accepts PLAIN TCP and upgrades each admitted socket
-        # itself (BACKLOG #1606), so the allowlist and both connection caps run before the
-        # handshake rather than after it. `_upgrades_tls_itself` says why other loops do not.
+        # A TLS listener accepts PLAIN TCP and admits each socket before its handshake (BACKLOG
+        # #1606), so the allowlist and both connection caps run before the handshake rather than
+        # after it. On the stdlib loop it upgrades an admitted socket itself; `_upgrades_tls_itself`
+        # says why other loops get `_AcceptingServer` instead.
         self._upgrade_tls = self._ssl is not None and _upgrades_tls_itself(
             asyncio.get_running_loop()
         )
+        if self._ssl is not None:  # this listener counts its own failures; a hooked context would
+            self._tls_failures.unwatch(self._ssl)  # count each one twice
         if self._ssl is None or self._upgrade_tls:
-            if self._ssl is not None:  # a context an earlier start() hooked counts nothing
-                self._tls_failures.unwatch(self._ssl)
             self._server = await asyncio.start_server(
                 self._on_tls_accept if self._upgrade_tls else self._on_client, self.host, self.port
             )
             return
-        # The loop runs the handshake, and `_on_client` sees the socket only after it. Both ends of
-        # the TLS socket's life are bounded here instead: the handshake, and the close_notify
-        # exchange after writer.close(). Read at start() so a test can shorten them. A failed
-        # handshake never reaches `_on_client` either, so the context reports it (vault #3302).
-        self._tls_failures.watch(self._ssl)
-        self._server = await asyncio.start_server(
-            self._on_client,
-            self.host,
-            self.port,
-            ssl=self._ssl,
-            ssl_handshake_timeout=_TLS_HANDSHAKE_TIMEOUT,
-            ssl_shutdown_timeout=_TLS_SHUTDOWN_TIMEOUT,
-        )
+        self._server = _AcceptingServer(await _bind_tcp(self.host, self.port), self._on_tls_socket)
+
+    def _on_tls_socket(self, sock: socket.socket) -> None:
+        """Take a socket `_AcceptingServer` accepted, in its own task (BACKLOG #1606). The socket
+        stays in ``unwrapped`` while this listener still owns it, so the done callback can close it
+        if the task ends first, even cancelled before its first step."""
+        unwrapped = [sock]
+        task = asyncio.get_running_loop().create_task(self._handshake_accepted(sock, unwrapped))
+        self._client_tasks.add(task)
+        task.add_done_callback(lambda done: self._accepted_task_done(done, unwrapped))
+
+    def _accepted_task_done(self, task: asyncio.Task[None], unwrapped: list[socket.socket]) -> None:
+        """`_client_task_done` for a `_handshake_accepted` task: drop it, close a socket the TLS
+        layer never took, and log a fault the task did not handle itself."""
+        self._client_tasks.discard(task)
+        for sock in unwrapped:
+            sock.close()
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            logger.error("MLLP client connection task failed: %s", safe_exc(exc))
+
+    async def _handshake_accepted(
+        self, sock: socket.socket, unwrapped: list[socket.socket]
+    ) -> None:
+        """Admit a socket `_AcceptingServer` accepted, then run its TLS handshake through the loop,
+        and hand a completed one to `_on_client` (BACKLOG #1606).
+
+        Nothing has read the socket yet, so a refused one never starts a handshake. An admitted one
+        holds its slot through the handshake and gives it back however the handshake ends; once it
+        completes, `_on_client` takes the slot over. Both TLS bounds go to
+        ``connect_accepted_socket``, which closes the socket on any failure, a cancellation by
+        stop() included. A failure is logged and counted as `_start_tls` does it, with the peer.
+
+        A connection closed CLEANLY during the handshake completes the wait with a result rather
+        than an error, as `_start_tls` describes, so the transport comes back already closed. That
+        is a handshake that did not complete, and it is not counted.
+        """
+        assert self._ssl is not None
+        try:
+            peer = _AcceptedPeer(sock)
+        except OSError:
+            return  # gone before anything read it; the done callback closes it
+        peer_host = _peer_host(peer)
+        refusal = self._admission.check(peer, peer_host)
+        if refusal is not None:
+            sock.close()
+            if refusal.kind is not None:
+                await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
+            return
+        epoch = self._admission.admit(peer_host)
+        handed_over = False
+        try:
+            loop = asyncio.get_running_loop()
+            reader = asyncio.StreamReader()
+            protocol = asyncio.StreamReaderProtocol(reader)
+            task = asyncio.current_task()
+            assert task is not None  # always: `_on_tls_socket` runs this as a task
+            self._handshakes.add(task)
+            unwrapped.clear()  # the TLS layer's transport owns the socket from this call on
+            try:
+                transport, _ = await loop.connect_accepted_socket(
+                    lambda: protocol,
+                    sock,
+                    ssl=self._ssl,
+                    ssl_handshake_timeout=_TLS_HANDSHAKE_TIMEOUT,
+                    ssl_shutdown_timeout=_TLS_SHUTDOWN_TIMEOUT,
+                )
+            except OSError as exc:
+                logger.debug(
+                    "TLS handshake on MLLP from %s did not complete: %s",
+                    peer.get_extra_info("peername"),
+                    safe_exc(exc),
+                )
+                if not isinstance(exc, HUNG_UP):  # as in `_start_tls`
+                    await self._tls_failures.note(peer_host, handshake_cause(exc))
+                return
+            finally:
+                self._handshakes.discard(task)
+            if transport.is_closing():
+                logger.debug(
+                    "TLS connection on MLLP from %s closed during its handshake",
+                    peer.get_extra_info("peername"),
+                )
+                return
+            writer = asyncio.StreamWriter(transport, protocol, reader, loop)
+            handed_over = True
+            await self._on_client(reader, writer, admitted=(peer_host, epoch))
+        finally:
+            if not handed_over:
+                self._admission.release(peer_host, epoch)
 
     def _on_tls_accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         """Take a new TLS-listener socket in plain TCP, then hand it to `_on_client` (BACKLOG #1606).
@@ -2160,30 +2355,29 @@ class MLLPSource(SourceConnector):
         try:
             for writer in list(self._clients):
                 writer.close()
-            # Where this listener upgrades TLS itself, a socket still in its handshake is in
-            # `_clients` from its accept on (BACKLOG #1606; `_on_tls_accept`), so the loop above
-            # closes it and its handshake fails rather than completing mid-stop.
+            # A socket still in its TLS handshake is the listener's own from its accept on (BACKLOG
+            # #1606). Where it upgrades TLS itself it is in `_clients` (`_on_tls_accept`), so the
+            # loop above closes it and its handshake fails rather than completing mid-stop. Under
+            # `_AcceptingServer` its task is in `_handshakes`, and cancelling that task makes
+            # `connect_accepted_socket` close the socket.
+            for task in list(self._handshakes):
+                task.cancel()
             #
             # Then close every transport the SERVER tracks, a wider set than `_clients`: a plain-TCP
-            # socket accepted in the same turn stop() began, before `_on_client` first ran, and
-            # where the LOOP runs the handshake (`_upgrades_tls_itself`), a socket still in it,
-            # which never reached `_on_client`. That comes BEFORE the task wait below, or such a
-            # socket could finish its handshake during it and have a message handled mid-stop. For
-            # an established TLS client this closes the raw socket under the writer just closed; its
-            # close_notify is already queued, and close() sends what is queued before it closes, so
-            # stop() does not wait out `_TLS_SHUTDOWN_TIMEOUT`. A handler mid-commit is untouched,
-            # as with writer.close(). It awaits nothing, so it cannot wedge on the Proactor (#55).
+            # socket accepted in the same turn stop() began, before `_on_client` first ran. That
+            # comes BEFORE the task wait below. For an established TLS client on the stdlib loop
+            # this closes the raw socket under the writer just closed; its close_notify is already
+            # queued, and close() sends what is queued before it closes, so stop() does not wait
+            # out `_TLS_SHUTDOWN_TIMEOUT`. A handler mid-commit is untouched, as with
+            # writer.close(). It awaits nothing, so it cannot wedge on the Proactor (#55).
             #
-            # ONLY WHERE THE LOOP'S SERVER HAS IT. uvloop's Server (0.22.1) has no close_clients(),
-            # and uvicorn runs the engine on uvloop wherever it is installed, and the engine's own
-            # uvloop dependency installs it for CPython outside Windows. Called unguarded, it raised
-            # AttributeError here, so a reload's first stop() failed, left that listener unbound,
-            # and the reload restarted nothing. What uvloop loses, and what still holds there:
+            # ONLY WHERE THE SERVER HAS IT. uvloop's Server (0.22.1) has no close_clients(), and
+            # uvicorn runs the engine on uvloop wherever it is installed (see
+            # `_upgrades_tls_itself`). Called unguarded, it raised AttributeError here, so a
+            # reload's first stop() failed, left that listener unbound, and the reload restarted
+            # nothing. `_AcceptingServer` has none either. What is lost without it, and what holds:
             # * the same-turn plain-TCP socket above. The one-turn yield below lets it reach
             #   `_on_client`, which refuses it unread on `_stopping`.
-            # * a TLS socket still in its handshake, since uvloop keeps the loop-level handshake.
-            #   `_TLS_HANDSHAKE_TIMEOUT` still bounds it, and `_stopping` refuses it unread if it
-            #   finishes.
             # * stop() can wait, inside the grace below, for an established TLS peer's close_notify,
             #   up to `_TLS_SHUTDOWN_TIMEOUT`: `_on_client`'s finally waits for the close exchange.
             # * uvloop's wait_closed() returns once the listening socket is closed, so the wait this
@@ -2205,6 +2399,7 @@ class MLLPSource(SourceConnector):
                     await asyncio.gather(*still_running, return_exceptions=True)
             self._clients.clear()
             self._client_tasks.clear()
+            self._handshakes.clear()
             # Vault BACKLOG #2613: report the handshake failures a trailing event still held.
             # `_emit_event` is fail-soft, so this cannot fail stop(). `flush` says why it does
             # nothing once a restart has begun.
@@ -2355,16 +2550,26 @@ class MLLPSource(SourceConnector):
         await self._emit_event("handler_error", peer_host=peer_host, reason=reason)
         return owed, nak
 
-    async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    async def _on_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        *,
+        admitted: tuple[str | None, int] | None = None,
+    ) -> None:
+        """Serve one connection. ``admitted`` is the peer host and epoch of a slot
+        `_handshake_accepted` already took for it, which this call then owns and releases."""
         assert self._handler is not None
         if self._stopping:
             # Reached after stop() began, so nothing will wait for this task: refuse the connection
             # before it is registered, admitted or read (see `_stopping`). The close is not awaited.
-            # A socket this listener upgrades itself is still plain TCP here; one the loop upgraded
-            # (see `_upgrades_tls_itself`) is in TLS, and its close is bounded by
+            # A socket this listener upgrades itself is still plain TCP here; one
+            # `_handshake_accepted` hands over is in TLS, and its close is bounded by
             # `_TLS_SHUTDOWN_TIMEOUT`. No message was read, so the sender retries against the
             # restarted listener.
             logger.debug("MLLP connection refused: the listener is stopping")
+            if admitted is not None:
+                self._admission.release(*admitted)
             self._clients.discard(writer)  # `_on_tls_accept` may have registered it
             writer.close()
             return
@@ -2391,12 +2596,17 @@ class MLLPSource(SourceConnector):
             # admission shared with the other socket listeners (vault BACKLOG #2606). A per-host
             # refusal is the SAME `at_capacity` kind with a `max_connections_per_host` reason. A
             # refused connection takes no slot, so nothing is released.
-            refusal = self._admission.check(writer, peer_host)
-            if refusal is not None:
-                if refusal.kind is not None:
-                    await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
-                return  # refused (closed in the outer finally)
-            epoch = self._admission.admit(peer_host)
+            if admitted is not None:
+                peer_host, epoch = admitted  # decided before the handshake, as the slot was taken
+            else:
+                refusal = self._admission.check(writer, peer_host)
+                if refusal is not None:
+                    if refusal.kind is not None:
+                        await self._emit_event(
+                            refusal.kind, peer_host=peer_host, reason=refusal.reason
+                        )
+                    return  # refused (closed in the outer finally)
+                epoch = self._admission.admit(peer_host)
             # The `established` emit sits INSIDE the try whose finally releases the slot. It is
             # fail-soft against `Exception` but not against `CancelledError`, and stop() cancels
             # straggling client tasks — so a cancellation delivered here used to escape past
