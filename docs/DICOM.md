@@ -292,6 +292,15 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
 - **PHI.** A DICOM object is PHI (header + pixel data). It is stored through the encrypting store, **never logged
   at INFO+**, and egress-allowlisted. Every log/error line carries only **routing-safe identifiers** (SOP
   class/instance UID, AE title, peer host) or a redacted URL — never the dataset, an element value, or pixel data.
+  That holds for pynetdicom's and pydicom's own loggers too (owner ruling 2026-11-03, BACKLOG #5081). A UID or
+  AE title a peer sent that either library refuses or flags as non-conformant is not a routing-safe identifier:
+  the line stays, with the element's name and the reason, and the value reads `[redacted]`. The SCP reads each
+  command set once before pynetdicom does, and the lines that read writes are not written a second time.
+  pydicom also raises each of its lines as a `UserWarning`, which would carry the value to stderr. A warnings
+  filter, installed at import and again at each SCP start, ignores that copy; a host that resets the process's
+  warnings filters after that brings the copy back. The engine's
+  own C-STORE lines name an object's SOP class and instance UIDs only when they are conformant, and `[redacted]`
+  otherwise.
 - **Egress is fail-closed.** A DIMSE destination is gated by `[egress].allowed_tcp`; a DICOMweb destination by
   `[egress].allowed_http` — both enforced at load/reload/start.
 

@@ -64,12 +64,14 @@ import asyncio
 import contextlib
 import functools
 import logging
+import re
 import socket
 import socketserver
 import ssl
 import threading
 import time
-from collections.abc import Callable, Coroutine, Mapping
+import warnings
+from collections.abc import Callable, Coroutine, Iterator, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import BytesIO
 from typing import Any, ClassVar, cast
@@ -108,7 +110,7 @@ from messagefoundry.parsing.dicom._inflate import (
 )
 from messagefoundry.parsing.dicom.errors import DicomBombError
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import _REDACTED, safe_exc
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import (
     REFUSAL_LOG_MAX_PER_WINDOW,
@@ -402,6 +404,149 @@ def _drain_readable(sock: socket.socket) -> None:
 #: association.
 _SERVED_COMMANDS = frozenset({0x0001, 0x0030})
 
+#: The line shapes, by logger, that name a value a peer sent which pynetdicom or pydicom refuses or
+#: flags (owner ruling 2026-11-03, vault BACKLOG #5081). A match keeps ``head`` and ``tail`` and
+#: puts :data:`_REDACTED` where ``value`` was; the first that matches wins. ``pynetdicom.utils``
+#: writes ``set_uid`` and ``set_ae``: ``Non-conformant '<name>' value '<value>'`` at WARNING, and
+#: ``Invalid '<name>' value '<value>' - <reason>`` at ERROR, whose reasons are fixed strings in
+#: ``pynetdicom._validators``. ``pydicom`` writes ``warn_and_log``'s ``Invalid value for VR <VR>:
+#: <repr>.`` from ``valuerep.validate_regex``, with a pointer to PS3.5 after it when a data element
+#: is read. A peer's value can hold a quote or that fixed text, so each value is greedy and runs up
+#: to the last fixed text that can follow it, and the last pattern for each logger takes all of a
+#: line of that kind whose end it does not know. ``pynetdicom._handlers`` writes ``<label>   :
+#: <value>`` at DEBUG for each C-STORE and C-ECHO it receives or sends; a pattern with a ``label``
+#: group keeps a value that passes :func:`_kept`, since a real UID or AE title may be logged.
+_PEER_VALUE_LINES: dict[str, tuple[re.Pattern[str], ...]] = {
+    "pynetdicom.utils": (
+        re.compile(r"^(?P<head>Non-conformant '[^']*' value ')(?P<value>.*)(?P<tail>')$", re.S),
+        re.compile(r"^(?P<head>Invalid '[^']*' value ')(?P<value>.*)(?P<tail>' - [^']*)$", re.S),
+        re.compile(
+            r"^(?P<head>(?:Non-conformant|Invalid) '[^']*' value )(?P<value>.+)(?P<tail>)$", re.S
+        ),
+    ),
+    "pydicom": (
+        re.compile(
+            r"^(?P<head>Invalid value for VR [A-Z]{2}: )(?P<value>.*)"
+            r"(?P<tail>\. Please see <[^>]*> for allowed values for each VR\.)$",
+            re.S,
+        ),
+        re.compile(r"^(?P<head>Invalid value for VR [A-Z]{2}: )(?P<value>.+)(?P<tail>)$", re.S),
+    ),
+    "pynetdicom._handlers": (
+        re.compile(
+            r"^(?P<head>(?P<label>Affected SOP Class UID|Affected SOP Instance UID|Move Originator)"
+            r" +: )(?P<value>.*)(?P<tail>)$",
+            re.S,
+        ),
+    ),
+}
+
+#: Every logger the filter is on: those above, and three more a pre-read of a command set writes to
+#: with no peer value in the line, ``message_to_primitive``'s WARNING for an element with more than
+#: one value, the Move Originator setter's ERROR, and ``dsutils.decode``'s DEBUG line.
+_FILTERED_LOGGERS = (
+    *_PEER_VALUE_LINES,
+    "pynetdicom.dimse_messages",
+    "pynetdicom.dimse_primitives",
+    "pynetdicom.dsutils",
+)
+
+#: The start of the ``UserWarning`` pydicom's ``warn_and_log`` raises beside its log line, with the
+#: same value in it. It is ignored; the log line, redacted, still says what was wrong. Unignored, it
+#: goes to stderr, which the Windows service writes to a file.
+_PYDICOM_INVALID_VALUE_WARNING = r"Invalid value for VR [A-Z]{2}: "
+
+#: ``held`` is a list only inside :func:`_logs_held` on this thread, and every record the filter
+#: sees on the thread then goes into it instead of the log.
+_PRE_READ = threading.local()
+
+
+def _kept(label: str, value: str) -> bool:
+    """Whether a ``pynetdicom._handlers`` field value passes the check pynetdicom flags it on. A
+    check that raises redacts the value, since a filter that raised would raise on the pynetdicom
+    thread that logged the line."""
+    try:
+        if label == "Move Originator":
+            from pynetdicom import _config as netdicom_config
+
+            return bool(netdicom_config.VALIDATORS["AE"](value)[0])
+        if label == "Affected SOP Class UID" and value in _uid_names():
+            return True
+        return _loggable_uid(value) == value
+    except Exception:  # noqa: BLE001 - a third-party check on a peer's text; redact rather than raise
+        return False
+
+
+def _loggable_uid(value: Any) -> str:
+    """A UID the engine's own log lines may name: the value when it is a conformant UID, or empty,
+    else :data:`_REDACTED` (owner ruling 2026-11-03). A real UID may be logged; a value pydicom flags
+    as it reads it may not."""
+    from pydicom.uid import UID
+
+    text = str(value or "")
+    return text if not text or UID(text).is_valid else _REDACTED
+
+
+@functools.cache
+def _uid_names() -> frozenset[str]:
+    """The names pydicom logs a SOP class it knows by, which is the UID itself when it does not."""
+    from pydicom._uid_dict import UID_dictionary
+
+    return frozenset(entry[0] for entry in UID_dictionary.values())
+
+
+class _PeerValueFilter(logging.Filter):
+    """Redact a refused or flagged peer value from the lines :data:`_PEER_VALUE_LINES` names, and
+    hold every line inside :func:`_logs_held`. The line itself is kept, so the warning, its element
+    and its reason are still in the log; only the value goes. A filter on a logger sees only what is
+    logged on that logger itself, so it is added to each by name."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        held: list[logging.LogRecord] | None = getattr(_PRE_READ, "held", None)
+        if held is not None:
+            held.append(record)
+            return False
+        text = record.getMessage()
+        for pattern in _PEER_VALUE_LINES.get(record.name, ()):
+            matched = pattern.match(text)
+            if matched is None:
+                continue
+            if "label" not in pattern.groupindex or not _kept(matched["label"], matched["value"]):
+                record.msg, record.args = f"{matched['head']}{_REDACTED}{matched['tail']}", ()
+            break
+        return True
+
+
+_PEER_VALUE_FILTER = _PeerValueFilter()
+
+
+def _redact_flagged_peer_values() -> None:
+    """Install the redaction on the loggers it covers, and ignore pydicom's copy as a warning.
+
+    Run at import, rather than in ``logging_setup``: a filter on a logger holds whatever handlers a
+    host attaches, and ``serve``, the harness and the tests all import this transport, while only
+    ``serve`` runs ``logging_setup``. The SCP runs it again at each start, since a
+    ``warnings.catch_warnings`` block, such as pytest's around collection, puts the warnings filters
+    back as they were when it ends; that makes the warnings half best effort. Both halves are
+    idempotent."""
+    for name in _FILTERED_LOGGERS:
+        logging.getLogger(name).addFilter(_PEER_VALUE_FILTER)
+    warnings.filterwarnings("ignore", message=_PYDICOM_INVALID_VALUE_WARNING, category=UserWarning)
+
+
+_redact_flagged_peer_values()
+
+
+@contextlib.contextmanager
+def _logs_held() -> Iterator[list[logging.LogRecord]]:
+    """Hold what the filtered loggers write on this thread, and only this one, for the block."""
+    held: list[logging.LogRecord] = []
+    _PRE_READ.held = held
+    try:
+        yield held
+    finally:
+        _PRE_READ.held = None
+
 
 def _read_command_set(command_set: bytes) -> tuple[int, bool, bool] | None:
     """A whole command set read as pynetdicom reads it: its ``CommandField``, whether the message is
@@ -419,28 +564,41 @@ def _read_command_set(command_set: bytes) -> tuple[int, bool, bool] | None:
     valid gets no response there, only a WARNING, and the association goes on, so a peer could
     stream such requests; the caller ends the association on one.
 
-    Running ``message_to_primitive`` here means pynetdicom's own log lines from it are written here
-    first, and then again when pynetdicom runs it on the whole message. At least these: a setter that
-    refuses a UID logs it at ERROR before it raises; one that finds a UID non-conformant logs a
-    WARNING and does not raise; the Move Originator AE title setter logs an ERROR and does not raise;
-    and ``message_to_primitive`` itself logs a WARNING for an element with more than one value. Some
-    of those lines name the peer's UID value. They are left as they are."""
+    Running these steps here writes pynetdicom's and pydicom's log lines from them here first, and
+    then again when pynetdicom runs them on the message. At least these: a setter that refuses a UID
+    logs it at ERROR before it raises; one that finds a UID non-conformant logs a WARNING and does
+    not raise; the Move Originator AE title setter logs an ERROR and does not raise;
+    ``message_to_primitive`` itself logs a WARNING for an element with more than one value; and
+    pydicom logs a WARNING for a value it finds invalid as it reads one. So the lines written here
+    are held (:func:`_logs_held`), on this thread alone, since pynetdicom logs from other threads at
+    the same time. They are written once the read is done only when it returns ``None``, where the
+    association ends and pynetdicom never reads the message. Otherwise pynetdicom writes its own as
+    it reads the message, so one the association ends on before then for another reason, such as a
+    command the SCP does not serve or a data set past its bound, has none of them; the end's own
+    line says why it ended. :class:`_PeerValueFilter` redacts the peer's value from each line (vault
+    BACKLOG #5081)."""
     from pynetdicom.dimse_messages import _MESSAGE_TYPES, DIMSEMessage
     from pynetdicom.dsutils import decode
 
-    try:
-        command = decode(BytesIO(command_set), True, True)
-        message = DIMSEMessage()
-        message.command_set = command
-        field = int(command.CommandField)
-        message.__class__ = _MESSAGE_TYPES[field][1]
-        completes = bool(command.CommandDataSetType == 0x0101)
-        # C_CANCEL has no is_valid_request; it is not a served command, so the caller ends it as one.
-        valid = bool(getattr(message.message_to_primitive(), "is_valid_request", False))
-    except Exception as exc:  # noqa: BLE001 - a third-party parser on a peer's bytes
-        logger.debug("A DICOM command set did not decode: %s", safe_exc(exc))
-        return None
-    return field, completes, valid
+    read: tuple[int, bool, bool] | None = None
+    with _logs_held() as held:
+        try:
+            command = decode(BytesIO(command_set), True, True)
+            message = DIMSEMessage()
+            message.command_set = command
+            field = int(command.CommandField)
+            message.__class__ = _MESSAGE_TYPES[field][1]
+            completes = bool(command.CommandDataSetType == 0x0101)
+            # C_CANCEL has no is_valid_request; it is not served, so the caller ends it as one.
+            valid = bool(getattr(message.message_to_primitive(), "is_valid_request", False))
+            read = field, completes, valid
+        except Exception as exc:  # noqa: BLE001 - a third-party parser on a peer's bytes
+            # The type alone: a setter's message holds the value it refused.
+            logger.debug("A DICOM command set did not decode: %s", type(exc).__name__)
+    if read is None:  # pynetdicom will not read this message, so these are the only copy
+        for record in held:
+            logging.getLogger(record.name).handle(record)
+    return read
 
 
 def _chunked_receipt_on() -> bool:
@@ -1660,6 +1818,7 @@ class DicomScpSource(SourceConnector):
         self._stopping.clear()  # a restart must not inherit the previous stop's cut-short signal
         self._tls_failures.open()
         self._loop = asyncio.get_running_loop()  # captured ON the loop, before any off-loop work
+        _redact_flagged_peer_values()  # again: warnings filters can be put back after the import
         # start_server binds a socket + spawns acceptor threads — do it OFF the loop, then it is live.
         await asyncio.to_thread(self._start_server)
 
@@ -2068,8 +2227,9 @@ class DicomScpSource(SourceConnector):
                     safe_exc(exc),
                 )
                 return _STATUS_CANNOT_UNDERSTAND
-            sop_instance = str(getattr(dataset, "SOPInstanceUID", "") or "")
-            sop_class = str(getattr(dataset, "SOPClassUID", "") or "")
+            # For the log lines below alone, so a value pydicom flags as it reads it goes no further.
+            sop_instance = _loggable_uid(getattr(dataset, "SOPInstanceUID", ""))
+            sop_class = _loggable_uid(getattr(dataset, "SOPClassUID", ""))
             # Second charge, on the re-encoded Part-10 bytes the store would hold — the raw-length charge
             # above cannot see what the preamble, DICM and file meta add. Still BEFORE the durable commit
             # (the X12 max_interchange_bytes analog): refuse an over-cap object rather than persist it
@@ -2504,7 +2664,9 @@ class DicomScuDestination(DestinationConnector):
                 code="bad-object",
                 permanent=True,
             ) from exc
-        sop_instance = str(getattr(dataset, "SOPInstanceUID", "") or "")
+        # For the log lines and errors alone; the raw class is what the association proposes.
+        sop_instance = _loggable_uid(getattr(dataset, "SOPInstanceUID", ""))
+        logged_class = _loggable_uid(sop_class)
         ae = self._build_ae()
         ae.add_requested_context(sop_class, transfer_syntax)
         assoc = self._associate(ae)
@@ -2518,7 +2680,7 @@ class DicomScuDestination(DestinationConnector):
             if rejected and not accepted:
                 raise NegativeAckError(
                     f"DICOM C-STORE client (SCU): {self._host}:{self._port} accepted no presentation context for "
-                    f"SOP class {sop_class} (peer does not support it)",
+                    f"SOP class {logged_class} (peer does not support it)",
                     code="no-accepted-context",
                     permanent=True,
                 )
@@ -2534,7 +2696,7 @@ class DicomScuDestination(DestinationConnector):
             # both **deterministic** for the same object+peer, so a retry repeats them. Permanent (no retry)
             # so the lane is never head-blocked. PHI-safe: routing identifiers only, never the dataset.
             raise NegativeAckError(
-                f"DICOM C-STORE client (SCU) to {self._host}:{self._port} could not send SOP class {sop_class} "
+                f"DICOM C-STORE client (SCU) to {self._host}:{self._port} could not send SOP class {logged_class} "
                 "(no accepted context or unencodable dataset)",
                 code="cstore-unsendable",
                 permanent=True,
@@ -2545,7 +2707,7 @@ class DicomScuDestination(DestinationConnector):
             ) from exc
         finally:
             assoc.release()
-        self._classify(status_ds, sop_class=sop_class, sop_instance=sop_instance)
+        self._classify(status_ds, sop_class=logged_class, sop_instance=sop_instance)
 
     def _classify(self, status_ds: Any, *, sop_class: str, sop_instance: str) -> None:
         """Map the C-STORE response status onto the retry model. PHI-safe: only the status + routing
