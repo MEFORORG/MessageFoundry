@@ -3416,16 +3416,18 @@ def test_db_readers_resolve_an_env_dialect_when_given_values() -> None:
 def test_the_tls_reader_resolves_an_env_driver_as_the_build_does() -> None:
     """BACKLOG #5053. The classifier judges a TLS keyword by the driver family, so the posture
     reader resolves an ``env()`` ``odbc_driver`` as it resolves an ``env()`` dialect: a psqlODBC
-    name with ``SSLmode=verify-full`` is delegated, as the build delegates it. With no value, or on
-    a connection that is not deployed (ADR 0111 AC-1), the name is unplaced and the hop is listed,
-    and the cast never runs there."""
+    name with ``SSLmode=verify-full`` is delegated, as the build delegates it. With no value the
+    hop is listed under a reason that says the name was not read. A connection that is not deployed
+    is skipped, as one with an ``env()`` dialect is (ADR 0111 AC-1), and the cast never runs."""
     from messagefoundry.config.wiring import (
+        UNRESOLVED_DRIVER_REASON,
         Database,
         Registry,
         build_outbound_connection,
         env,
         unverified_generic_db_hops,
     )
+    from messagefoundry.transports.database import UNPLACED_DRIVER_REASON
 
     cast_ran: list[str] = []
 
@@ -3453,14 +3455,17 @@ def test_the_tls_reader_resolves_an_env_driver_as_the_build_does() -> None:
     outbound("OB_DARK", deployed=False)
     values = {"ob_live_driver": "PostgreSQL Unicode", "ob_dark_driver": "PostgreSQL Unicode"}
     resolved = dict(unverified_generic_db_hops(reg, env_values=values))
-    assert "OB_LIVE" not in resolved
-    assert "cannot place odbc_driver" in resolved["OB_DARK"]
+    assert "OB_LIVE" not in resolved and "OB_DARK" not in resolved
     assert cast_ran == ["PostgreSQL Unicode"], "only the deployed connection's value is resolved"
     # The control: the same live hop with a value that names no family is listed.
     listed = dict(unverified_generic_db_hops(reg, env_values={**values, "ob_live_driver": "MySQL"}))
-    assert "cannot place odbc_driver" in listed["OB_LIVE"]
-    # No values: the driver is unresolved, so the hop is listed rather than guessed clear.
-    assert "cannot place odbc_driver" in dict(unverified_generic_db_hops(reg))["OB_LIVE"]
+    assert listed["OB_LIVE"].startswith(UNPLACED_DRIVER_REASON)
+    # No values: the driver is unresolved, so the hop is listed rather than guessed clear, and the
+    # reason says the name was not read rather than that it cannot be placed.
+    unread = dict(unverified_generic_db_hops(reg))["OB_LIVE"]
+    assert unread.startswith(UNRESOLVED_DRIVER_REASON) and "OB_DARK" not in dict(
+        unverified_generic_db_hops(reg)
+    )
 
 
 def test_db_readers_never_resolve_a_not_deployed_env_dialect() -> None:

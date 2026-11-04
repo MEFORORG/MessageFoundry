@@ -61,7 +61,7 @@ from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from functools import partial
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeGuard
 
 from messagefoundry.auth.anchor_path import WinProbe, _win_probe, windows_chain
 from messagefoundry.auth.trust_anchors import (
@@ -441,12 +441,16 @@ def _sets_tls_mode(params: Mapping[str, Any], family: str) -> bool:
     spellings = entry.tls_spellings
     return any(
         odbc_keyword_name(str(key)) == entry.tls_keyword
-        and isinstance(value, str)
-        and value.strip()
-        and value == value.strip()
+        and _usable_mode_value(value)
         and (spellings is None or value in spellings)
         for key, value in params.items()
     )
+
+
+def _usable_mode_value(value: object) -> TypeGuard[str]:
+    """Whether ``value`` is a non-blank string with no blank at either end: the only shape a mode
+    value can count in (:func:`_sets_tls_mode` says why)."""
+    return isinstance(value, str) and bool(value.strip()) and value == value.strip()
 
 
 def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
@@ -476,10 +480,9 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
 
 
 #: The reason a hop gets when its ``odbc_driver`` name places no driver family (BACKLOG #5053).
-_UNPLACED_DRIVER_REASON = (
-    "the engine cannot place odbc_driver in a driver family whose TLS keyword it reads, so no TLS "
-    "keyword in odbc_params counts as a mode"
-)
+#: Short, because it rides in a refusal ahead of the host, and a stored failure keeps about 200
+#: characters.
+UNPLACED_DRIVER_REASON = "odbc_driver names no driver family whose TLS keyword the engine reads"
 
 
 def generic_odbc_tls_unenforced(params: Mapping[str, Any], *, driver: object) -> str | None:
@@ -513,9 +516,18 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any], *, driver: object) ->
         return "TLS is explicitly not required: " + ", ".join(sorted(disabling))
     family = _driver_family(driver)
     if family is None:
-        return _UNPLACED_DRIVER_REASON
+        return UNPLACED_DRIVER_REASON
     if _sets_tls_mode(params, family):
         return None
+    if any(
+        odbc_keyword_name(str(k)) in _ODBC_TLS_MODE_KEYWORDS and _usable_mode_value(v)
+        for k, v in params.items()
+    ):
+        # A value that would count on another family's keyword or spelling: say which one this
+        # driver reads, since the value itself is not what is wrong.
+        entry = _DRIVER_FAMILIES[family]
+        spelled = ", at its own spellings" if entry.tls_spellings is not None else ""
+        return f"a TLS mode is set that this driver does not read; it reads {entry.tls_keyword}{spelled}"
     if any(_is_tls_keyword(str(k)) for k in params):
         return "a TLS keyword is set in odbc_params, but no TLS mode has a usable value"
     return "no TLS keyword is set in odbc_params"
@@ -663,6 +675,10 @@ class _DriverFamily(NamedTuple):
     #: The verifying mode a warning gives as its example, so it never names a spelling this
     #: family would ignore (BACKLOG #5029).
     tls_example: str
+    #: Whether the family is on the escape list: its password is always sent braced, with the ODBC
+    #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
+    #: keyword never brings an unmeasured escape with it.
+    brace_escape: bool
 
 
 # The three driver families the engine can place, by whole registered name in any case but spelled
@@ -676,26 +692,32 @@ class _DriverFamily(NamedTuple):
 # Microsoft's ODBC Driver for SQL Server reads no ``sslmode``, so each family counts one keyword
 # (BACKLOG #5053). An unplaced name has no keyword that counts.
 #
-# The placed names are also the drivers whose password is always sent braced, with the ODBC ``}}``
-# escape (:func:`_odbc_password`, BACKLOG #2705): psqlODBC's and MySQL's measured on 2026-10-30 to
-# read that escape, and Microsoft's not probed then but relied on for the same escape by the SQL
-# Server preset and the store. The legacy name ``SQL Server`` is left out: on Linux it is commonly
-# a FreeTDS alias, which has not been measured.
+# The escape list is the families with ``brace_escape`` set, whose password is always sent braced
+# with the ODBC ``}}`` escape (:func:`_odbc_password`, BACKLOG #2705): psqlODBC and MySQL, measured
+# on 2026-10-30 to read that escape, and Microsoft's, not probed then but relied on for the same
+# escape by the SQL Server preset and the store. The legacy name ``SQL Server`` is left out: on
+# Linux it is commonly a FreeTDS alias, which has not been measured.
 _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
     "psqlodbc": _DriverFamily(
         re.compile(r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"),
         "sslmode",
         frozenset(_LIBPQ_SSL_MODES),
         "SSLmode=verify-full",
+        brace_escape=True,
     ),
     "mysql": _DriverFamily(
         re.compile(r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"),
         "sslmode",
         frozenset(_MYSQL_SSL_MODES),
         "SSLMODE=VERIFY_IDENTITY",
+        brace_escape=True,
     ),
     "msodbc": _DriverFamily(
-        re.compile(r"odbc driver [0-9]+ for sql server"), "encrypt", None, "Encrypt=yes"
+        re.compile(r"odbc driver [0-9]+ for sql server"),
+        "encrypt",
+        None,
+        "Encrypt=yes",
+        brace_escape=True,
     ),
 }
 
@@ -722,8 +744,8 @@ def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) ->
 
     The rule depends on the family :func:`_driver_family` places from the ``odbc_driver`` name.
     MySQL Connector/ODBC takes only :data:`_MYSQL_SSL_MODES`. psqlODBC, and any name the engine
-    cannot place as psqlODBC or MySQL, take only :data:`_LIBPQ_SSL_MODES`, as before. So does
-    Microsoft's driver, which reads no ``sslmode``; its refusal says to set ``Encrypt``.
+    cannot place, take only :data:`_LIBPQ_SSL_MODES`, as before. Microsoft's driver reads no
+    ``sslmode``, so on that name any value is refused and the refusal says to set ``Encrypt``.
 
     For a name it cannot place, the refusal says so, and never offers a libpq value alone: a value
     that is a MySQL spelling in any case is pointed at MySQL's registered name, and any other is
@@ -735,23 +757,26 @@ def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) ->
     The MySQL list is joined with ``or``: two upper case words joined by a comma or a blank are a
     name run to the log redaction, which would blank them."""
     family = _driver_family(driver)
-    accepted = _MYSQL_SSL_MODES if family == "mysql" else _LIBPQ_SSL_MODES
+    accepted: tuple[str, ...] = {"mysql": _MYSQL_SSL_MODES, "msodbc": ()}.get(
+        family or "", _LIBPQ_SSL_MODES
+    )
     if text in accepted:
         return
     database = f"{hop_name_prefix(connection)}DATABASE"
     where = f"{database} odbc_params value for 'sslmode'"
     see = "(see Generic ODBC in docs/CONNECTIONS.md)"
+    if family == "msodbc":
+        raise ValueError(f"{database} 'sslmode' is not read by this driver; set Encrypt {see}")
     if family == "mysql":
         mysql = " or ".join(_MYSQL_SSL_MODES)
         raise ValueError(f"{where} must be one of {mysql}, in upper case, for MySQL {see}")
     libpq = ", ".join(_LIBPQ_SSL_MODES)
     if family is not None:
-        reads = "; this driver reads Encrypt, not sslmode" if family == "msodbc" else ""
-        raise ValueError(f"{where} must be one of {libpq}, in lower case{reads} {see}")
+        raise ValueError(f"{where} must be one of {libpq}, in lower case {see}")
     if text.upper() in _MYSQL_SSL_MODES:
         raise ValueError(
-            f"{database} 'sslmode' is a MySQL spelling, and the engine cannot place this "
-            f"odbc_driver as MySQL; name it MySQL ODBC <version> Unicode or ANSI Driver {see}"
+            f"{database} 'sslmode' is a MySQL spelling; the engine cannot place this odbc_driver "
+            f"as MySQL. Name it MySQL ODBC <version> Unicode or ANSI Driver, value in upper case {see}"
         )
     raise ValueError(
         f"{database} 'sslmode' for an odbc_driver the engine cannot place must be exactly one of "
@@ -777,7 +802,8 @@ def _odbc_password(password: object, *, driver: str, connection: str | None) -> 
     describes the value beyond saying the driver cannot carry it."""
     text = str(password)
     _refuse_unsafe_text(text, what="password", connection=connection, refused="")
-    if _driver_family(driver) is not None:
+    family = _driver_family(driver)
+    if family is not None and _DRIVER_FAMILIES[family].brace_escape:
         return odbc_brace(text)
     if not any(ch in ";{}\"'" for ch in text) and text == text.strip():
         return text
@@ -1491,7 +1517,8 @@ def _warn_generic_tls_unenforced(
     remedy = (
         f"via the driver's own keyword (e.g. {example})"
         if example
-        else "by naming a driver the engine can place, by its registered name, then its own keyword"
+        else "with a driver named by a registered name the engine places, or declare "
+        "tls_hop_attested if the hop is secured by other means"
     )
     logger.warning(
         "%s: TLS verification is NOT enforced by MessageFoundry on this path and %s — configure "

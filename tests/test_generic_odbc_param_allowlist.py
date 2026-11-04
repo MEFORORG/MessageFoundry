@@ -987,7 +987,7 @@ def test_a_mysql_spelling_under_an_unplaced_name_is_pointed_at_mysql_s_name(
         _build(odbc_driver=driver, odbc_params={"SSLMODE": mode})
     message = str(refused.value)
     assert "cannot place this odbc_driver" in message
-    assert "MySQL ODBC <version> Unicode or ANSI Driver" in message
+    assert "MySQL ODBC <version> Unicode or ANSI Driver, value in upper case" in message
     assert "verify-full" not in message and f"={mode}" not in message
 
 
@@ -1005,13 +1005,17 @@ def test_another_sslmode_under_an_unplaced_name_names_both_families(driver: str,
     assert "MySQL needs its registered name" in message and f"={mode}" not in message
 
 
-@pytest.mark.parametrize("mode", ["VERIFY_IDENTITY", "Require"])
-def test_microsoft_s_driver_is_told_it_reads_encrypt(mode: str) -> None:
-    # A placed family that reads no sslmode: its refusal names the keyword it does read, and does
-    # not claim the name could not be placed.
-    with pytest.raises(ValueError, match="this driver reads Encrypt, not sslmode") as refused:
+@pytest.mark.parametrize("mode", ["VERIFY_IDENTITY", "Require", "verify-full", "disable"])
+def test_microsoft_s_driver_refuses_any_sslmode_and_names_encrypt(mode: str) -> None:
+    # A placed family that reads no sslmode: any value is refused, libpq's included, since the
+    # driver would ignore it, and the refusal names the keyword it does read. Encrypt is the
+    # control: the same driver builds with it.
+    with pytest.raises(ValueError, match="'sslmode' is not read by this driver; set Encrypt") as no:
         _build(odbc_driver="ODBC Driver 18 for SQL Server", odbc_params={"SSLmode": mode})
-    assert "cannot place" not in str(refused.value)
+    message = str(no.value)
+    assert "cannot place" not in message and "verify-full" not in message
+    built = _build(odbc_driver="ODBC Driver 18 for SQL Server", odbc_params={"Encrypt": "yes"})
+    assert "Encrypt=yes;" in built
 
 
 @pytest.mark.parametrize("driver", ["PostgreSQL Unicode", "PostgreSQL"])

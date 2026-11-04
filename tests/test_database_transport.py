@@ -35,6 +35,7 @@ from messagefoundry.transports.database import (
     _ODBC_NO_TLS_VALUES,
     _ODBC_PARAM_ALLOWLIST,
     _ODBC_TLS_MODE_KEYWORDS,
+    UNPLACED_DRIVER_REASON,
     DatabaseDestination,
     DatabaseSource,
     _bind_params,
@@ -555,6 +556,9 @@ _TLS_KEYWORDS_WITH_NO_MODE = sorted(
     if _is_tls_keyword(keyword)
 )
 _NO_MODE_REASON = "a TLS keyword is set in odbc_params, but no TLS mode has a usable value"
+#: The opening of the reason for a usable mode value on a keyword or spelling the family does not
+#: read (BACKLOG #5053); the classifier adds the keyword the family does read.
+_UNREAD_MODE = "a TLS mode is set that this driver does not read; it reads"
 
 
 def test_the_no_mode_table_is_not_empty_and_every_mode_keyword_is_accepted() -> None:
@@ -673,8 +677,11 @@ def test_an_sslmode_the_family_does_not_spell_is_no_mode(driver: str, value: str
     """BACKLOG #5035, #5053. Red on the previous head, which counted each as TLS addressed: a value
     psqlODBC reads by its first lower case byte, or one MySQL Connector/ODBC does not document,
     which per engine PR 2691 leaves it at PREFERRED. The build refuses these; this pins the
-    classifier the posture readers use on specs that were never built."""
-    assert generic_odbc_tls_unenforced({"SSLMODE": value}, driver=driver) == _NO_MODE_REASON
+    classifier the posture readers use on specs that were never built. The reason names the
+    keyword the family reads, since the value is a real mode spelling for some driver."""
+    assert generic_odbc_tls_unenforced({"SSLMODE": value}, driver=driver) == (
+        f"{_UNREAD_MODE} sslmode, at its own spellings"
+    )
 
 
 @pytest.mark.parametrize(
@@ -700,14 +707,16 @@ def test_encrypt_on_a_driver_that_does_not_read_it_is_no_mode(driver: str, value
     """BACKLOG #5053. psqlODBC's keyword parser and MySQL Connector/ODBC's parameter page have no
     Encrypt keyword, so Encrypt=yes cleared the hop while the driver stayed at its own default. Red
     on the previous head, which counted Encrypt on every driver. Microsoft's driver is the control."""
-    assert generic_odbc_tls_unenforced({"Encrypt": value}, driver=driver) == _NO_MODE_REASON
+    assert generic_odbc_tls_unenforced({"Encrypt": value}, driver=driver) == (
+        f"{_UNREAD_MODE} sslmode, at its own spellings"
+    )
     assert generic_odbc_tls_unenforced({"Encrypt": value}, driver=_MSODBC) is None
 
 
 def test_sslmode_on_microsofts_driver_is_no_mode() -> None:
     # The mirror: Microsoft's ODBC Driver for SQL Server reads Encrypt and no sslmode.
     params = {"SSLmode": "verify-full"}
-    assert generic_odbc_tls_unenforced(params, driver=_MSODBC) == _NO_MODE_REASON
+    assert generic_odbc_tls_unenforced(params, driver=_MSODBC) == f"{_UNREAD_MODE} encrypt"
     assert generic_odbc_tls_unenforced(params, driver=_PSQL) is None
 
 
@@ -743,7 +752,7 @@ def test_a_driver_the_engine_cannot_place_has_no_mode(
     reads, so none counts and the hop is reported and gated. Red on the previous head, which cleared
     each table that set a mode, on any name."""
     reason = generic_odbc_tls_unenforced(params, driver=driver)
-    assert reason is not None and "cannot place odbc_driver" in reason
+    assert reason == UNPLACED_DRIVER_REASON
 
 
 @pytest.mark.parametrize("driver", _UNPLACED)
@@ -771,7 +780,7 @@ def test_a_lone_certificate_keyword_warns_and_names_the_remedy(
         (_PSQL, "SSLmode=verify-full", "VERIFY_IDENTITY"),
         (_MYSQL, "SSLMODE=VERIFY_IDENTITY", "verify-full"),
         (_MSODBC, "Encrypt=yes", "verify-full"),
-        ("MySQL", "registered name", "verify-full"),
+        ("MySQL", "or declare tls_hop_attested", "verify-full"),
     ],
 )
 def test_the_warning_names_the_family_s_own_spelling(

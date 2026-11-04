@@ -6800,6 +6800,10 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
 #: text rather than state the hop is generic.
 POSSIBLY_GENERIC_DB_HOP = "possibly generic: dialect is an unresolved env() reference"
 
+#: The generic-hop reason when ``odbc_driver`` is an ``env()`` reference the reader cannot resolve,
+#: so its driver family is unknown (BACKLOG #5053).
+UNRESOLVED_DRIVER_REASON = "odbc_driver is an unresolved env() reference, so no TLS mode is judged"
+
 
 #: What :func:`_db_setting` returns for an ``env()`` reference it cannot resolve.
 _UNRESOLVED = object()
@@ -6832,16 +6836,6 @@ def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | Non
     guess an arm, since each arm reads the same settings differently."""
     dialect = _db_setting(settings, "dialect", "sqlserver", env_values)
     return None if dialect is _UNRESOLVED else str(dialect).lower()
-
-
-def _db_driver(settings: Mapping[str, Any], env_values: Mapping[str, Any] | None) -> object:
-    """A DATABASE connection's ``odbc_driver``, resolved as :func:`_db_dialect` resolves the
-    dialect, or ``None`` when it is an ``env()`` reference this reader cannot resolve.
-
-    The generic hop classifier reads the driver family from it (BACKLOG #5053), and ``None`` places
-    no family, so an unresolved name is listed as at risk: the safe direction for an advisory list."""
-    driver = _db_setting(settings, "odbc_driver", None, env_values)
-    return None if driver is _UNRESOLVED else driver
 
 
 def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
@@ -6903,19 +6897,26 @@ def unverified_generic_db_hops(
     surfaces, never on the hot path.
 
     Pure — it reads the loaded graph and touches nothing else."""
-    from messagefoundry.transports.database import generic_odbc_tls_unenforced
+    from messagefoundry.transports.database import (
+        UNPLACED_DRIVER_REASON,
+        generic_odbc_tls_unenforced,
+    )
 
-    def unenforced(settings: Mapping[str, Any], *, deployed: bool) -> str | None:
+    def unenforced(settings: Mapping[str, Any]) -> str | None:
         dialect = _db_dialect(settings, env_values)
         if dialect is not None and dialect != "generic":
             return None
         params = settings.get("odbc_params") or {}
         if not isinstance(params, Mapping):
             return None
-        # A not-deployed connection's env() values are never resolved (ADR 0111 AC-1), so its
-        # env() driver reads as unplaced: listed, the safe direction for an advisory list.
-        driver = _db_driver(settings, env_values if deployed else None)
-        reason = generic_odbc_tls_unenforced(params, driver=driver)
+        # The classifier reads the driver family from odbc_driver (BACKLOG #5053), resolved as the
+        # dialect is. An unresolved one places no family, so the hop is listed, the safe direction
+        # for an advisory list, under a reason that says the name was not read.
+        driver = _db_setting(settings, "odbc_driver", None, env_values)
+        unread = driver is _UNRESOLVED
+        reason = generic_odbc_tls_unenforced(params, driver=None if unread else driver)
+        if unread and reason == UNPLACED_DRIVER_REASON:
+            reason = UNRESOLVED_DRIVER_REASON
         if reason is None or dialect is not None:
             return reason
         # Unresolved: read as possibly generic rather than as not generic. A SQL Server value would
@@ -6932,7 +6933,10 @@ def unverified_generic_db_hops(
         for conn in table.values():
             if conn.spec.type is not ConnectorType.DATABASE or _dark_env_dialect(conn):
                 continue
-            reason = unenforced(conn.spec.settings, deployed=conn.deployed)
+            if not conn.deployed and isinstance(conn.spec.settings.get("odbc_driver"), EnvRef):
+                # ADR 0111 AC-1, as _dark_env_dialect: never resolved, so never read as a risk.
+                continue
+            reason = unenforced(conn.spec.settings)
             if reason is not None:
                 out.append(
                     (record_name(conn.name), f"{reason} ({_peer_label(conn.spec.settings)})")

@@ -10183,8 +10183,10 @@ def security_loosenings(
     ``FhirLookup`` whose literal ``url`` carries a credential-like query parameter (ASVS 14.2.1),
     ``unverified_db_hops`` is a
     generic-ODBC ``DATABASE``
-    connection whose ``odbc_params`` set no usable TLS mode, or set one to a no-TLS value, as
-    ``transports.database.generic_odbc_tls_unenforced`` judges it (#66 / ADR 0092's amendment).
+    connection whose ``odbc_params`` set no usable TLS mode its driver family reads, or set one to
+    a no-TLS value, or whose ``odbc_driver`` names no family the engine places, as
+    ``transports.database.generic_odbc_tls_unenforced`` judges it (#66 / ADR 0092's amendment,
+    BACKLOG #5053).
     Since BACKLOG #1178 an enforcing instance refuses such a hop off-loopback unless it declares
     ``tls_hop_attested`` or, outbound only, ``cleartext_accepted``; a non-enforcing instance builds
     it with a WARNING. And
@@ -10792,7 +10794,8 @@ def security_loosenings(
             (
                 "generic_odbc_tls_unenforced",
                 f"{len(unverified_db_hops)} generic-ODBC database connection(s) set no usable TLS "
-                f"mode in odbc_params, or set one to a no-TLS value ({named}) — MessageFoundry cannot "
+                "mode their driver family reads in odbc_params, set one to a no-TLS value, or name "
+                f"an odbc_driver the engine cannot place ({named}) — MessageFoundry cannot "
                 "introspect an arbitrary driver's TLS, so these hops are judged by the cleartext-hop "
                 "gate, not the SQL Server weakened-TLS refusal. An enforcing instance refuses each "
                 "one at construction unless it is on-box, declares tls_hop_attested, or (outbound "
