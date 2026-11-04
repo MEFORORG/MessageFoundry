@@ -342,6 +342,7 @@ async def test_local_login_lockout_after_threshold() -> None:
             auth_provider="local",
             password_hash=hash_password(GOOD_PASSWORD),
             password_generated=False,
+            audits=(),
         )
         for _ in range(3):
             assert not (await service.login("bob", "wrong")).ok
@@ -363,6 +364,7 @@ async def test_session_validation_idle_and_absolute_timeout() -> None:
             auth_provider="local",
             password_hash=hash_password("x"),
             password_generated=False,
+            audits=(),
         )
         await store.set_user_roles("u1", ["viewer"])
         now = time.time()
@@ -446,6 +448,7 @@ async def _local_user(store: MessageStore, *, email: str = "bob@example.org") ->
         email=email,
         password_hash=hash_password(GOOD_PASSWORD),
         password_generated=False,
+        audits=(),
     )
 
 
@@ -1006,7 +1009,9 @@ async def test_the_deliverability_gate_reads_the_notification_address() -> None:
         assert not await service.has_notifiable_admin()  # minted with no address at all
 
         # A profile-only write -- the shape of a directory sync -- must NOT satisfy the gate.
-        await store.update_user_profile(admin.id, display_name=None, email="admin@example.org")
+        await store.update_user_profile(
+            admin.id, display_name=None, email="admin@example.org", audits=()
+        )
         assert not await service.has_notifiable_admin()
 
         # Setting the engine-owned address does.
@@ -1051,7 +1056,7 @@ async def test_admin_reset_password_rejects_ad_and_unknown_users() -> None:
     try:
         service = AuthService(store, AuthSettings())
         await store.create_user(
-            user_id="ad1", username="ad", auth_provider="ad", password_generated=False
+            user_id="ad1", username="ad", auth_provider="ad", password_generated=False, audits=()
         )
         with pytest.raises(ValueError, match="local"):  # AD users have no local credential to reset
             await service.admin_reset_password("ad1", actor="admin")
@@ -1495,6 +1500,7 @@ def _race_for_the_name(store: MessageStore, monkeypatch: pytest.MonkeyPatch) -> 
             username=kwargs["username"],
             auth_provider="local",
             password_generated=False,
+            audits=(),
         )
         await original(**kwargs)
 

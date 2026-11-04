@@ -65,6 +65,7 @@ async def assert_session_rotation_contract(store: Any, *, user_id: str = "rot-u1
         password_hash="h",
         now=now,
         password_generated=False,
+        audits=(),
     )
 
     # --- the happy path: a pure re-key -------------------------------------------------------
@@ -176,6 +177,7 @@ async def assert_session_supersession_contract(store: Any, *, user_id: str = "su
         password_hash="h",
         now=now,
         password_generated=False,
+        audits=(),
     )
     expires = now + 1234.5
 
@@ -254,6 +256,7 @@ async def assert_session_lineage_contract(store: Any, *, user_id: str = "lin-u1"
         password_hash="h",
         now=now,
         password_generated=False,
+        audits=(),
     )
     expires = now + 9876.5
 

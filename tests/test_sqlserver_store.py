@@ -47,6 +47,7 @@ from tests._keyed_reopen_contract import (
     server_keyed_reopen_report,
 )
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
+from tests._keyless_blank_contract import keyed_cipher
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
@@ -724,6 +725,7 @@ async def test_security_events_for_user_scopes_to_actor(store) -> None:
         auth_provider="local",
         password_generated=False,
         now=1.0,
+        audits=(),
     )
     await store.record_audit("auth.login_success", actor="alice", detail="1")
     await store.record_audit("auth.login_failed", actor="bob", detail="b")  # other actor
@@ -783,6 +785,7 @@ async def test_auth_users_roles_sessions(store) -> None:
         password_hash="hash",
         now=1000.0,
         password_generated=False,
+        audits=(),
     )
     assert await store.count_users() == 1
     user = await store.get_user_by_username("alice")
@@ -1268,6 +1271,7 @@ async def test_directory_id_comparison_follows_this_servers_collation(store) -> 
         directory_object_id=CASE_GUID,
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
     # Unconditional, on every collation: the id as stored resolves to its own row. This is the half
     # the recycle defence rests on, and it is also the control that makes the miss-or-match below a
@@ -1314,6 +1318,7 @@ async def test_channel_scope_source_roundtrip_and_upgrade(store) -> None:
         auth_provider="ad",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.set_user_channel_scope("scope-src", '["IB_A"]', source=SCOPE_SOURCE_AD)
     got = await store.get_user("scope-src")
@@ -1352,7 +1357,12 @@ async def test_the_scope_write_compare_and_sets_on_its_source(store) -> None:
     from messagefoundry.store.store import SCOPE_SOURCE_AD, SCOPE_SOURCE_MANUAL
 
     await store.create_user(
-        user_id="cas-src", username="cas-src", auth_provider="ad", now=1.0, password_generated=False
+        user_id="cas-src",
+        username="cas-src",
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+        audits=(),
     )
     cas = store.set_user_channel_scope_if_source
     assert (await store.get_user("cas-src")).channel_scope_source is None
@@ -1399,6 +1409,7 @@ async def test_withdraw_ad_channel_scope_matches_a_scope_over_4000_characters(st
         auth_provider="ad",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.set_user_channel_scope("long-scope", scope, source=SCOPE_SOURCE_AD)
     assert (await store.get_user("long-scope")).channel_scope == scope  # stored whole
@@ -1459,6 +1470,7 @@ async def test_directory_object_id_column_upgrade_is_idempotent(store) -> None:
         directory_object_id=BOUND_GUID,
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     found = await store.get_user_by_directory_object_id(BOUND_GUID)
     assert found is not None and found.id == "dir-upgrade"
@@ -1511,6 +1523,7 @@ async def test_session_idp_auth_time_column_upgrade_is_idempotent(store) -> None
         directory_object_id="guid-idp-upgrade",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_session(
         token_hash="i" * 64,
@@ -1551,6 +1564,7 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
         password_hash="h",
         now=1.0,
         password_generated=False,
+        audits=(),
     )
     await store.create_session(
         token_hash="s1", user_id="u2", expires_at=9_999.0, client="10.1.1.1", now=1.0
@@ -1588,6 +1602,7 @@ async def test_set_password_claim_stamp_round_trip(store) -> None:
         password_hash="h0",
         now=1_000.0,
         password_generated=False,
+        audits=(),
     )
     # Precondition: the INSERT does not list the column, so a stamp seen later came from set_password.
     seeded = await store.get_user("u3")
@@ -1677,11 +1692,16 @@ async def test_staged_flow_end_to_end_processed(store) -> None:
     ]
 
 
-async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
+@pytest.mark.parametrize("verbosity", ["all", "errors", "off"])
+async def test_mark_done_writes_reply_dropped_with_the_delivery(store, verbosity: str) -> None:
     """BACKLOG #3462: the SQL Server twin of the SQLite test of the same name. ``reply_dropped``
     rides the DONE flip beside ``delivered``. Controls: a vanished row writes nothing and returns
     False, and a plain ``mark_done`` writes no ``reply_dropped``. Events are read through
-    ``events_for``, which decrypts ``detail``."""
+    ``events_for``, which decrypts ``detail``. Parametrized over the event verbosity as the
+    SQLite test is (BACKLOG #4917): ``delivered`` is thinned below ``all`` and ``reply_dropped``
+    is not. Set on the fixture's store, since each backend reads it at write time."""
+    store._message_events = verbosity
+    delivered = [("delivered", "OB1", None)] if verbosity == "all" else []
     detail = "HTTP 200; reply body over the 64-byte bound"
 
     async def _to_outbound(now: float) -> tuple[str, Any]:
@@ -1703,7 +1723,7 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
     mid, ob = await _to_outbound(100.0)
     assert await store.mark_done(ob.id, now=110.0, reply_dropped=detail) is True
     after_drop = await store.events_for(mid)
-    assert _tail(after_drop) == [("delivered", "OB1", None), ("reply_dropped", "OB1", detail)]
+    assert _tail(after_drop) == [*delivered, ("reply_dropped", "OB1", detail)]
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
     async def _dropped_anywhere() -> int:
@@ -1721,7 +1741,7 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
 
     plain, other = await _to_outbound(120.0)
     assert await store.mark_done(other.id, now=130.0) is True
-    assert _tail(await store.events_for(plain)) == [("delivered", "OB1", None)]
+    assert _tail(await store.events_for(plain)) == delivered
     assert await _dropped_anywhere() == 1
 
 
@@ -1988,8 +2008,9 @@ async def test_state_merge_collapses_case_variants_under_a_ci_default(store) -> 
 
     On a ``_CI_`` database it runs the shipped ``_SQL_STATE_MERGE`` against a scratch table whose key
     columns take the database default, and shows the two spellings collapse into one row that keeps
-    the stored spelling. The scratch table sits in the user database, not ``#temp``, because tempdb
-    carries the server collation. It skips only off ``_CI_``, where there is no collapse to show."""
+    the stored spelling. The scratch table's key columns say ``COLLATE DATABASE_DEFAULT``, which
+    resolves to the current user database's collation, the one an older ``state`` table took. It
+    skips only off ``_CI_``, where there is no collapse to show."""
     from messagefoundry.store.sqlserver import _SQL_STATE_MERGE, _state_merge_params
 
     db = await store._fetchall(
@@ -2036,8 +2057,8 @@ async def test_state_case_distinct_keys_survive_a_keyed_reopen(store) -> None:
     CipherError when ``_load_state_cache`` rebuilds the AAD from the stored spelling. Accent and
     composed-versus-decomposed spellings ride along: BIN2 compares code points, as the cache does.
 
-    Trailing spaces are not covered: SQL Server pads ``=`` under BIN2 too, so 'k' and 'k ' still
-    collide. That limit stays open."""
+    Trailing spaces are not covered here: SQL Server pads ``=`` under BIN2 too, so ``SetState``
+    refuses a trailing space instead (``tests/test_transform_state.py``)."""
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.sqlserver import SqlServerStore
 
@@ -2059,7 +2080,9 @@ async def test_state_case_distinct_keys_survive_a_keyed_reopen(store) -> None:
     settings = load_settings(environ=os.environ).store
     k = generate_key()
     try:
-        keyed = await SqlServerStore.open(settings, cipher=make_cipher(k))
+        # write_v2: the v1 writer ignores AAD, so only a v2 seal can show the AAD mismatch a merged
+        # row would carry (BACKLOG #4917, finding 5).
+        keyed = await SqlServerStore.open(settings, cipher=make_cipher(k, write_v2=True))
         try:
             await _handoff(keyed, first, 100.0)
             await _handoff(keyed, second, 200.0)
@@ -2077,7 +2100,7 @@ async def test_state_case_distinct_keys_survive_a_keyed_reopen(store) -> None:
         finally:
             await keyed.close()
 
-        reopened = await SqlServerStore.open(settings, cipher=make_cipher(k))
+        reopened = await SqlServerStore.open(settings, cipher=make_cipher(k, write_v2=True))
         try:
             assert dict(reopened.state_view()) == expected  # every row decrypts under its own AAD
         finally:
@@ -2259,7 +2282,12 @@ async def test_a_v032_preset_table_is_migrated_ss(store) -> None:
 
     for uid, uname in (("u-alice", "alice"), ("u-bob", "bob"), ("u-carol", "carol")):
         await store.create_user(
-            user_id=uid, username=uname, auth_provider="local", now=1.0, password_generated=False
+            user_id=uid,
+            username=uname,
+            auth_provider="local",
+            now=1.0,
+            password_generated=False,
+            audits=(),
         )
     try:
         for pid, owner, name, now in (
@@ -3686,6 +3714,73 @@ async def test_reference_case_differing_keys_stay_distinct(store) -> None:
         await reopened.close()
 
 
+async def test_reference_keys_differing_by_a_trailing_space_fail_guard(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #4917: keys equal once trailing spaces are stripped are refused BEFORE the snapshot
+    transaction, by ordinal only, and the prior snapshot stays live. The control removes the
+    guard and shows ``pk_reference`` itself raising the duplicate mid-transaction, so the guard is
+    not refusing a case the database would have accepted."""
+    import pyodbc
+
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    await store.write_reference_snapshot(name="padded", version="v1", rows={"ok": "1"})
+    twins = {"MRN-1": "a", "MRN-1 ": "b"}
+    with pytest.raises(ValueError, match="only by trailing spaces") as exc:
+        await store.write_reference_snapshot(name="padded", version="v2", rows=twins)
+    assert "keys #0 and #1 differ" in str(exc.value)
+    assert "MRN" not in str(exc.value)  # raw keys withheld (PHI)
+    assert store.reference_view()["padded"] == {"ok": "1"}
+    # A lone key with a trailing space is not a collision and lands as written.
+    await store.write_reference_snapshot(name="padded", version="v3", rows={"MRN-2 ": "c"})
+    assert store.reference_view()["padded"] == {"MRN-2 ": "c"}
+
+    monkeypatch.setattr(SqlServerStore, "_guard_reference_widths", lambda self, name, rows: None)
+    with pytest.raises(pyodbc.IntegrityError):
+        await store.write_reference_snapshot(name="padded", version="v4", rows=twins)
+    assert store.reference_view()["padded"] == {"MRN-2 ": "c"}
+
+
+async def test_state_keys_at_the_pair_bound_land_and_one_unit_over_fails(store) -> None:
+    """BACKLOG #4917: ``SetState`` admits a namespace plus key of up to 450 UTF-16 code units, which
+    is exactly the 900 bytes ``pk_state``'s clustered key holds. Both splits at the bound commit and
+    read back. The control hands the store one unit more directly, past ``SetState``, and shows the
+    database refusing it, so the bound is the real one and not merely a cautious one."""
+    import pyodbc
+
+    from messagefoundry.config.wiring import STATE_KEY_MAX_PAIR_UNITS, STATE_KEY_MAX_UNITS, SetState
+
+    rest = STATE_KEY_MAX_PAIR_UNITS - STATE_KEY_MAX_UNITS
+    full = STATE_KEY_MAX_UNITS
+    ops = [SetState("n" * full, "k" * rest, 1), SetState("m" * rest, "j" * full, 2)]
+    mid, rid = await _ss_seed_routed(store, channel_id="IB", raw=RAW, now=100.0)
+    assert await store.transform_handoff(
+        routed_id=rid,
+        message_id=mid,
+        channel_id="IB",
+        deliveries=[("OB", "b")],
+        state_ops=[(op.namespace, op.key, op.value) for op in ops],
+        now=100.0,
+    )
+    stored = await store._fetchall("SELECT namespace, [key] FROM state")
+    assert {(r["namespace"], r["key"]) for r in stored} == {(op.namespace, op.key) for op in ops}
+
+    over = ("n" * STATE_KEY_MAX_UNITS, "k" * (rest + 1), 3)  # 451 units, 902 bytes
+    mid2, rid2 = await _ss_seed_routed(store, channel_id="IB", raw=RAW, now=200.0)
+    with pytest.raises(pyodbc.Error):
+        await store.transform_handoff(
+            routed_id=rid2,
+            message_id=mid2,
+            channel_id="IB",
+            deliveries=[("OB", "b")],
+            state_ops=[over],
+            now=200.0,
+        )
+    after = await store._fetchall("SELECT COUNT(*) AS n FROM state")
+    assert int(after[0]["n"]) == len(ops)  # the refused write left nothing behind
+
+
 async def test_reference_plaintext_migrated_on_keyed_reopen(store) -> None:
     """STORE-1 x ADR 0006: reference rows are NOT "born encrypted" — under a no-key deployment
     IdentityCipher writes plaintext JSON, and the first keyed open's _encrypt_existing_rows reference
@@ -4617,7 +4712,7 @@ async def test_attachment_dead_purge_releases_after_body_purge(store) -> None:
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1
     assert await _a_refcount(store, ref) == 1  # kept: dead row still replayable
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _a_row_payload(store, oid) == ""
     assert await _a_refcount(store, ref) is None  # last replayable holder gone → GC
     assert await _a_joins(store, mid) == 0
@@ -4627,7 +4722,9 @@ async def test_attachment_dead_purge_releases_when_run_first(store) -> None:
     ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
     mid, oid = await _a_dead_deliver(store, now=0.0, ref=ref)
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1  # dead purge BEFORE body purge
+    assert (
+        await store.purge_dead_letters(older_than=10 * DAY)
+    ).bodies == 1  # dead purge BEFORE body purge
     assert await _a_row_payload(store, oid) == ""
     assert await _a_refcount(store, ref) is None  # released here — dead row was the last holder
     assert await _a_joins(store, mid) == 0
@@ -4643,8 +4740,10 @@ async def test_attachment_dead_purge_idempotent_no_underflow(store) -> None:
     m2, _ = await _a_dead_deliver(store, now=20 * DAY, ref=ref, dest="OB_2")
     assert await _a_refcount(store, ref) == 2
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1  # only m1 past cutoff
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 0  # re-run: nothing to blank
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1  # only m1 past cutoff
+    assert (
+        await store.purge_dead_letters(older_than=10 * DAY)
+    ).bodies == 0  # re-run: nothing to blank
 
     assert await _a_refcount(store, ref) == 1  # m1 released once; m2 survives
     assert await _a_chunks(store, ref) == len(_A_CHUNKS)
@@ -5623,7 +5722,11 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
         # BACKLOG #3510: a user row, so the leg proves the sealed record and its TOTP secret come
         # through the rotation too, not only the message cells.
         await seed.create_user(
-            user_id="u-rot", username="rot", auth_provider="local", password_generated=False
+            user_id="u-rot",
+            username="rot",
+            auth_provider="local",
+            password_generated=False,
+            audits=(),
         )
         await seed.set_totp_secret("u-rot", secret=_ROTATED_TOTP_SECRET)
     finally:
@@ -6352,9 +6455,10 @@ async def test_keyless_blank_contract(store, case) -> None:
 
     key = generate_key()
 
-    async def open_keyed() -> SqlServerStore:
+    async def open_keyed(**kw: Any) -> SqlServerStore:
         return await SqlServerStore.open(
-            load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
+            load_settings(environ=os.environ).store,
+            cipher=keyed_cipher(make_cipher, key, **kw),
         )
 
     raw, fetch = _raw_adapters(store)

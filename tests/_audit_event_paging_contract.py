@@ -94,7 +94,12 @@ async def check_security_events_paging(store: Any, tag: str) -> None:
     # written before the account existed and one under a name no account holds. Neither may show.
     await store.record_audit("auth.login_failed", actor=who, detail='{"n": "before"}', now=1.0)
     await store.create_user(
-        user_id=f"u-{who}", username=who, auth_provider="local", password_generated=False, now=2.0
+        user_id=f"u-{who}",
+        username=who,
+        auth_provider="local",
+        password_generated=False,
+        now=2.0,
+        audits=(),
     )
     await store.record_audit("auth.login_failed", actor=f"{who}-nobody", detail=None)
     assert await store.count_security_events_for_user(f"{who}-nobody") == 0

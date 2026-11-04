@@ -410,10 +410,54 @@ def _attested_with_a_reason(attested: bool, reason: str | None, *, flag: str) ->
     return True
 
 
+def alert_host_allowed(host: str, allowed_hosts: Sequence[str]) -> bool:
+    """Whether the ``[alerts]`` egress allowlist ``allowed_hosts`` admits ``host``.
+
+    The one test the build and every send of the webhook and the SMTP relay apply, and the one the
+    serve gate's security-channel check reads (BACKLOG #5088), so no two of them can disagree on
+    which host is listed. Hosts compare without case.
+
+    An empty allowlist admits every host: that is the settings' documented ``[]`` = any, and an
+    environment value that splits to no host, such as ``""`` or ``","``, yields it too. A non-empty
+    one admits only a host it lists, and an empty host is never listed, so ``[""]``, which names no
+    host, refuses every one rather than matching a URL with no host."""
+    if not allowed_hosts:
+        return True
+    candidate = host.lower()
+    return bool(candidate) and candidate in (h.lower() for h in allowed_hosts)
+
+
+def _refuse_off_allowlist_webhook(url: str, allowed_hosts: Sequence[str]) -> None:
+    """Refuse a webhook URL whose host ``[alerts].webhook_allowed_hosts`` does not admit.
+
+    Run at the build and at every POST. Names the host, never the URL: the path carries the
+    webhook's token (BACKLOG #1793)."""
+    host = urllib.parse.urlsplit(url).hostname or ""  # urlsplit lower-cases the host
+    if not host and allowed_hosts:
+        # The remedy is the URL, not the allowlist, so say that. With no allowlist the https
+        # revocation guard's hop_url_host refuses the same URL at the build.
+        raise ValueError("[alerts].webhook_url names no host")
+    if not alert_host_allowed(host, allowed_hosts):
+        raise ValueError(
+            f"[alerts].webhook_url host {host!r} is not in [alerts].webhook_allowed_hosts"
+        )
+
+
+def _refuse_off_allowlist_smtp_host(host: str, allowed_hosts: Sequence[str]) -> None:
+    """Refuse an ``[alerts]`` SMTP relay that ``[alerts].smtp_allowed_hosts`` does not admit.
+
+    Run where :class:`EmailTransport` and the security notifier are built and at every send, before
+    any other work, whatever the login and TLS settings: a relay with no login takes no revocation
+    guard, and this check must not ride behind that guard's early return."""
+    if not alert_host_allowed(host, allowed_hosts):
+        raise ValueError(
+            f"SMTP host {host!r} is not in the configured allowlist, [alerts].smtp_allowed_hosts"
+        )
+
+
 def _refuse_webhook_revocation(
     url: str,
     *,
-    allowed_hosts: tuple[str, ...],
     posture: HopPosture | None,
     attested: bool,
     attested_reason: str | None,
@@ -432,14 +476,11 @@ def _refuse_webhook_revocation(
     LDAPS bind keeps. A cleartext ``http`` URL takes no revocation guard: there is no certificate,
     and the cleartext refusal owns that hop.
 
-    A host outside ``allowed_hosts`` is left to :meth:`WebhookTransport._post`, which refuses it at
-    every POST, for the reason :func:`_refuse_alert_smtp_revocation` gives for its relay: judging
-    its revocation first would send the operator to attest a hop the egress policy forbids."""
-    split = urllib.parse.urlsplit(url)
-    if split.scheme.lower() != "https":
-        return
-    # The same host test _post applies, so the two cannot disagree on which host is listed.
-    if allowed_hosts and (split.hostname or "").lower() not in (h.lower() for h in allowed_hosts):
+    It reads no allowlist. :class:`WebhookTransport` refuses a host off
+    ``[alerts].webhook_allowed_hosts`` before it calls this (BACKLOG #5088), so every host judged
+    here is one the egress policy admits, and an off-allowlist host is refused at the build rather
+    than built unjudged."""
+    if urllib.parse.urlsplit(url).scheme.lower() != "https":
         return
     RevocationHopGuard.capture(
         # The host urllib dials. A userinfo URL, which could make a parser disagree with it, is
@@ -484,7 +525,6 @@ def _alerts_smtp_context(
 def _refuse_alert_smtp_revocation(
     *,
     host: str,
-    allowed_hosts: tuple[str, ...],
     use_tls: bool,
     username: str | None,
     tls_verify: bool,
@@ -507,9 +547,10 @@ def _refuse_alert_smtp_revocation(
     builds no verifying context, and a login over one is refused at load and again at each send,
     so there is nothing for this guard to judge.
 
-    A host outside ``allowed_hosts`` is left to :func:`send_plain_email`, which refuses it before
-    any other work at every send; judging its revocation first would send the operator to fix a
-    hop the egress policy forbids.
+    It reads no allowlist. Both callers refuse a relay off ``[alerts].smtp_allowed_hosts`` before
+    they call this (BACKLOG #5088), with or without a login, so every relay judged here is one the
+    egress policy admits, and an off-allowlist relay is refused at the build rather than built
+    unjudged.
 
     The context is built by :func:`_alerts_smtp_context`, the recipe :func:`send_plain_email` runs
     for every send, from the same arguments, so a ``[tls].crl_file`` that really loads there relaxes the refusal, and the guard
@@ -519,8 +560,6 @@ def _refuse_alert_smtp_revocation(
     scope. ``None`` reads the ambient posture, and where none is stamped it counts as enforcing
     (:func:`_alert_hop_posture`), as for the webhook."""
     if username is None or not use_tls or not tls_verify:
-        return
-    if allowed_hosts and host.lower() not in (h.lower() for h in allowed_hosts):
         return
     RevocationHopGuard.capture(
         host=host,
@@ -592,6 +631,11 @@ class WebhookTransport:
                 "(dev/trusted-network only; the escape has no effect while enforcing, the default, "
                 "or with no posture) — use https"
             )
+        # BACKLOG #5088: the allowlist _post applies, here at the build, so a host it would refuse
+        # at every POST refuses the start instead. Before the permitted-cleartext WARNING, so a
+        # refused URL never logs that its hop was permitted, and before the revocation guard, which
+        # reads no allowlist, so that guard never judges a host the egress policy forbids.
+        _refuse_off_allowlist_webhook(url, allowed_hosts)
         if scheme == "http":
             log.warning(
                 "webhook target uses plaintext http; permitted only because %s is set on an instance "
@@ -606,7 +650,6 @@ class WebhookTransport:
         # BACKLOG #2193 slice (d): last, so a URL another check refuses never logs a crossing.
         _refuse_webhook_revocation(
             url,
-            allowed_hosts=allowed_hosts,
             posture=posture,
             attested=revocation_attested,
             attested_reason=revocation_attested_reason,
@@ -638,11 +681,7 @@ class WebhookTransport:
             raise ValueError(
                 f"[alerts].webhook_url must be http or https, got scheme {split.scheme!r}"
             )
-        host = (split.hostname or "").lower()
-        if self.allowed_hosts and host not in self.allowed_hosts:
-            raise ValueError(
-                f"[alerts].webhook_url host {host!r} is not in [alerts].webhook_allowed_hosts"
-            )
+        _refuse_off_allowlist_webhook(self.url, self.allowed_hosts)
         # Never serialize INTERNAL routing keys (``_``-prefixed: e.g. the #146 ``_recipients`` override)
         # onto the wire — the fan-out loop pops them before send, but strip defensively so a webhook
         # payload can never carry recipient addresses / internal metadata even if a key slips through.
@@ -724,9 +763,7 @@ def send_plain_email(
     There is deliberately **no** ``SMTP_SSL`` arm: this cell has never had one, so
     ``[alerts].email_smtp_port=465`` (implicit TLS) does not work here and is out of scope — see #323's
     residual, which states it rather than fixing it silently."""
-    allowed = tuple(h.lower() for h in allowed_hosts)
-    if allowed and host.lower() not in allowed:
-        raise ValueError(f"SMTP host {host!r} is not in the configured allowlist")
+    _refuse_off_allowlist_smtp_host(host, allowed_hosts)
     # SMTP AUTH over an un-encrypted channel puts the password on the wire (BACKLOG #1171, ASVS
     # 11.4.1). The AUTH call below runs whenever a username is set, while STARTTLS runs only when
     # `use_tls` — so `[alerts].email_use_tls=false` beside `email_username` sent the credential in
@@ -761,8 +798,9 @@ def send_plain_email(
     # recipient override and a per-user notice address are held to it too. MAIL FROM and RCPT TO are
     # passed explicitly below rather than derived from a parse of the headers (vault BACKLOG #2870).
     envelope = checked_envelope(ALERTS_SMTP_CELL, sender, recipients)
-    # Built AFTER the allowlist check, deliberately: tests/test_alerts_test_email.py runs the REAL
-    # function and depends on a disallowed host raising before ANY other work happens.
+    # Built AFTER the allowlist check, deliberately, so a disallowed host raises before ANY other
+    # work happens. The builds refuse it first since BACKLOG #5088, so this is the send's own
+    # copy of that order, which test_the_build_and_the_send_apply_one_allowlist_test pins.
     tls_context = (
         _alerts_smtp_context(
             host=host,
@@ -856,6 +894,10 @@ class EmailTransport:
         revocation_attested: bool = False,
         revocation_attested_reason: str | None = None,
     ) -> None:
+        # BACKLOG #5088: the allowlist send_plain_email applies first at every send, here first at
+        # the build, so a relay it would refuse at every send refuses the start instead. Ahead of
+        # the revocation guard, which reads no allowlist and skips a relay with no login.
+        _refuse_off_allowlist_smtp_host(host, allowed_hosts)
         # send_plain_email checks the addresses at every send. Checking here too means a bad
         # [alerts].email_from or email_to refuses at startup, not at the first alert (#2870).
         checked_envelope(ALERTS_SMTP_CELL, sender, recipients)
@@ -863,7 +905,6 @@ class EmailTransport:
         # so an enforcing instance refuses the start, not the first alert.
         _refuse_alert_smtp_revocation(
             host=host,
-            allowed_hosts=allowed_hosts,
             use_tls=use_tls,
             username=username,
             tls_verify=tls_verify,
@@ -2403,6 +2444,11 @@ def notifier_from_settings(
     an enforcing posture unless their ``[alerts]`` attestation pair is set or, for SMTP only, a
     ``[tls].crl_file`` reaches the hop. For those guards ``None`` with none stamped counts as
     enforcing (ADR 0173 section 12)."""
+    if alerts.email_smtp_host and alerts.email_from and alerts.email_to:
+        # BACKLOG #5088: before the SMTP password is read, so a relay the allowlist forbids costs no
+        # secret-store read for it, and a store that is down cannot hide the relay's refusal. The
+        # build repeats it. The webhook reads no secret, so its check stays in its build.
+        _refuse_off_allowlist_smtp_host(alerts.email_smtp_host, alerts.smtp_allowed_hosts)
     smtp_password = resolve_connector_secret(
         secret_provider,
         ref=alerts.email_password_secret,

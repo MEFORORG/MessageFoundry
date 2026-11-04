@@ -339,6 +339,7 @@ async def test_a_duplicate_passkey_label_leaves_no_open_transaction(tmp_path: Pa
                 auth_provider="local",
                 now=1_000.0,
                 password_generated=False,
+                audits=(),
             )
         await store.add_webauthn_credential(_cred("alice", "laptop", id_hash="h1"))
         # The refusal still reaches the caller: auth/service.py renders it as "label in use".
@@ -362,6 +363,7 @@ async def test_a_duplicate_username_leaves_no_open_transaction(tmp_path: Path) -
                 auth_provider="local",
                 now=1_000.0,
                 password_generated=False,
+                audits=(),
             )
         with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
             await store.create_user(
@@ -370,6 +372,7 @@ async def test_a_duplicate_username_leaves_no_open_transaction(tmp_path: Path) -
                 auth_provider="local",
                 now=2_000.0,
                 password_generated=False,
+                audits=(),
             )
         # The double-submit shape: the WINNER's own next step opens a transaction of its own. With
         # the loser's refusal left open, that BEGIN failed and the winner got a 500.
@@ -391,6 +394,7 @@ async def test_a_session_for_a_deleted_user_leaves_no_open_transaction(tmp_path:
                 auth_provider="local",
                 now=1_000.0,
                 password_generated=False,
+                audits=(),
             )
         await store.delete_user("alice")
         with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
@@ -432,7 +436,11 @@ async def test_a_cipher_failure_mid_claim_leaves_no_torn_write(tmp_path: Path) -
         )
         await db.commit()
         await store.create_user(
-            user_id="bystander", username="b", auth_provider="local", password_generated=False
+            user_id="bystander",
+            username="b",
+            auth_provider="local",
+            password_generated=False,
+            audits=(),
         )
 
         async def state() -> tuple[str, int, int]:
@@ -479,6 +487,7 @@ async def test_an_incref_of_a_missing_attachment_leaves_no_open_transaction(
             auth_provider="local",
             now=1_000.0,
             password_generated=False,
+            audits=(),
         )
         with pytest.raises(KeyError):
             await store.attachment_incref("f" * 64)

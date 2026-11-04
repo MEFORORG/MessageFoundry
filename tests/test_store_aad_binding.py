@@ -170,7 +170,12 @@ async def test_totp_connection_event_alert_roundtrip(tmp_path: Path) -> None:
         # Through the store, so the account carries its integrity seal (BACKLOG #2592): the TOTP
         # write below refuses a keyed row the store never sealed.
         await store.create_user(
-            user_id="u1", username="alice", auth_provider="local", password_generated=False, now=0
+            user_id="u1",
+            username="alice",
+            auth_provider="local",
+            password_generated=False,
+            now=0,
+            audits=(),
         )
         await store.set_totp_secret("u1", secret="JBSWY3DPEHPK3PXP")
         assert await store.get_totp_secret("u1") == "JBSWY3DPEHPK3PXP"

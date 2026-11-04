@@ -1164,6 +1164,7 @@ async def test_a_create_that_loses_the_username_race_is_a_409_not_a_500(
             username=kwargs["username"],
             auth_provider="local",
             password_generated=False,
+            audits=(),
         )
         await original(**kwargs)
 
@@ -2655,7 +2656,7 @@ async def test_admin_reset_password_endpoint(engine: Engine) -> None:
         actor="root",
     )
     await engine.store.create_user(
-        user_id=AD_USER_ID, username="ad9", auth_provider="ad", password_generated=False
+        user_id=AD_USER_ID, username="ad9", auth_provider="ad", password_generated=False, audits=()
     )
     async with _client(engine, service) as c:
         admin_token = (await _login(c, "root")).json()["token"]
