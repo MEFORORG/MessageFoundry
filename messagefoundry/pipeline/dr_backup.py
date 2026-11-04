@@ -2896,7 +2896,7 @@ def _count_tables(db_path: Path) -> dict[str, int]:
     has fewer keys than a snapshot's schema really has — and that is expected, not tampering:
     ``run_restore_verify`` is a standalone check of an archive from any earlier point (AC-5), so an
     older, narrower manifest is an ordinary thing to verify. The compare in
-    :func:`_verify_archive_blocking` is written to tolerate exactly that (keyed off the manifest's
+    :func:`_compare_row_counts` is written to tolerate exactly that (keyed off the manifest's
     own keys, not dict equality) — this function only ever reports what IS in the schema, and does
     not itself guarantee cross-build equality.
 
@@ -3823,34 +3823,46 @@ def _compare_row_counts(
     for it still agrees and a nonzero one is real data loss. A table the snapshot has that the
     manifest never tracked is not compared at all.
 
-    Because the compare walks the manifest's tables, a manifest that records none (``row_counts``
-    empty, missing or not a mapping) has no key to mismatch, and a snapshot whose schema holds no
-    table reads every manifest count as 0. Either way a PASS would certify counts nobody compared,
-    the shape BACKLOG #2186 produced when the backup and the verify both counted an empty stand-in,
-    so both refuse (BACKLOG #5056). A full archive never legitimately has either: its manifest lists
-    every table of its store, and a real store has dozens. A config-only archive carries no snapshot
-    and returns before this compare."""
+    Because the compare walks the manifest's tables, it reads nothing when the manifest records none
+    (``row_counts`` empty, missing or not a mapping), and nothing of the snapshot when the two share
+    no table, the case of a snapshot whose schema holds no table at all: every manifest count then
+    reads as 0. A PASS there would certify counts nobody compared, the shape BACKLOG #2186 produced
+    when the backup and the verify both counted an empty stand-in, so at least those refuse (BACKLOG
+    #5056). A full archive never legitimately has either: its manifest lists every table of its
+    store, and even the oldest, four-table manifest names ``messages``. A config-only archive carries
+    no snapshot and returns before this compare. A count that is not a non-negative integer refuses
+    too, rather than being coerced (``3.9`` read as ``3``) or raising out of the verify."""
     raw_counts = manifest.get("row_counts")
-    manifest_counts = (
-        {str(k): int(v) for k, v in raw_counts.items()} if isinstance(raw_counts, dict) else {}
-    )
+    manifest_counts: dict[str, int] = {}
+    malformed: list[str] = []
+    for table, count in raw_counts.items() if isinstance(raw_counts, dict) else ():
+        # bool is an int subclass, and a float, a string or a null is not a row count.
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            manifest_counts[str(table)] = count
+        else:
+            malformed.append(str(table))
+    if malformed:
+        return manifest_counts, (
+            f"the manifest's row counts for {sorted(malformed)} are not non-negative integers, so "
+            "they cannot be compared"
+        )
     if not manifest_counts:
         return manifest_counts, (
             "the manifest records no row counts, so the row-count compare would read nothing; a "
             "full archive's manifest lists every table of its store"
         )
-    if not row_counts:
+    if not manifest_counts.keys() & row_counts.keys():
         return manifest_counts, (
-            "the archive's store.db holds no table, so the row-count compare would read nothing; "
-            f"the manifest recorded {len(manifest_counts)} table(s)"
+            f"the manifest's {len(manifest_counts)} table(s) share none with the archive's store.db "
+            f"({len(row_counts)} table(s)), so the row-count compare would read nothing"
         )
     mismatches = sorted(
         table for table in manifest_counts if row_counts.get(table, 0) != manifest_counts[table]
     )
     if mismatches:
         return manifest_counts, (
-            f"row-count mismatch on {mismatches} (a torn or truncated snapshot): "
-            f"snapshot={row_counts} manifest={manifest_counts}"
+            f"row-count mismatch on {mismatches} (a torn or truncated snapshot, or a manifest that "
+            f"does not describe it): snapshot={row_counts} manifest={manifest_counts}"
         )
     return manifest_counts, None
 

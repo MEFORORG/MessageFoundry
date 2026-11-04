@@ -1125,6 +1125,7 @@ def _snap_with(tmp_path: Path, messages: int) -> Path:
 
 _MISMATCH = "row-count mismatch"
 _NO_MANIFEST_COUNTS = "the manifest records no row counts"
+_MALFORMED = "are not non-negative integers"
 
 
 @pytest.mark.parametrize(
@@ -1148,6 +1149,17 @@ _NO_MANIFEST_COUNTS = "the manifest records no row counts"
         # the snapshot's counts as if compared. Both now refuse, because nothing was compared.
         ("manifest carrying no row_counts at all", None, _NO_MANIFEST_COUNTS),
         ("manifest carrying an empty row_counts", {}, _NO_MANIFEST_COUNTS),
+        ("manifest whose row_counts is not a mapping", [["messages", 3]], _NO_MANIFEST_COUNTS),
+        # Every manifest key reads as 0 against a schema it shares no table with, so an all-zero
+        # manifest agreed with a snapshot it never compared.
+        ("manifest sharing no table with the snapshot", {"zzz": 0}, "share none with"),
+        # A count that is not a non-negative integer refuses, rather than coercing 3.9 to 3 (which
+        # agreed with 3 rows) or raising a ValueError out of the verify.
+        ("a float count", {"messages": 3.9, "queue": 0}, _MALFORMED),
+        ("a string count", {"messages": "3", "queue": 0}, _MALFORMED),
+        ("a boolean count", {"messages": 3, "queue": False}, _MALFORMED),
+        ("a null count", {"messages": None, "queue": 0}, _MALFORMED),
+        ("a negative count", {"messages": 3, "queue": -1}, _MALFORMED),
     ],
 )
 def test_restore_row_count_compare(tmp_path, label, manifest_counts, refusal) -> None:
@@ -1168,5 +1180,5 @@ def test_restore_refuses_a_snapshot_with_no_table(tmp_path: Path) -> None:
     snap = tmp_path / "store.db"
     sqlite3.connect(snap).close()
     assert dr_backup._count_tables(snap) == {}
-    with pytest.raises(dr_backup.BackupError, match="holds no table"):
+    with pytest.raises(dr_backup.BackupError, match="share none with"):
         dr_backup._verify_extracted_store(snap, {"row_counts": {"messages": 0, "queue": 0}})
