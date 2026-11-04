@@ -4,8 +4,9 @@
 
 A streaming inbound detaches its large documents with ``put_attachment`` before the ingress commit.
 No fault from that write is classed as the document's (Manager decision d20261104T042552411-c23337,
-as amended): every one propagates to the transport with no message row, so the input is kept for a
-resend, and the tests below pin what each source then does with it. A fault answered as a refusal
+as amended): every one that is not already one of the detach's own refusals (at least
+``StreamingAttachmentsUnsupported`` is) propagates to the transport with no message row, so the
+input is kept for a resend, and the tests below pin what each source then does with it. A fault answered as a refusal
 would charge the refused-body allowance, and a body whose text no backend can encode would then fail
 the ``ERROR`` write as well, so each resend of it would drain the allowance for every other refused
 body on that inbound.
@@ -69,7 +70,7 @@ def _deadlock() -> Exception:
     return _ServerDriverError("40001", "deadlock victim (1205)")
 
 
-#: Every fault class the write can raise, a fault the same body meets again included: each propagates.
+#: Faults the write can raise, a fault the same body meets again included: each propagates.
 FAULTS = [
     pytest.param(lambda: sqlite3.DataError("string or blob too big"), id="sqlite-data"),
     pytest.param(

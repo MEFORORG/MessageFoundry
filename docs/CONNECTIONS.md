@@ -1241,8 +1241,8 @@ ceilings bound it, and they bound different things:
 Permitted **types** on this path are whatever the inbound declared. A detached document's OBX-5.2
 label is stored as `application/octet-stream` when the document contradicts a family with a leading
 magic signature (`messagefoundry/parsing/sniff.py`), or when some store backend could not hold the
-label: wider than 256 UTF-16 code units, or holding a NUL. Any other label is stored as sent, so this
-stage is not a content gate and must not be read as one.
+label: wider than 256 UTF-16 code units, or holding a NUL. No other test is made of the label, so
+this stage is not a content gate and must not be read as one.
 
 The **directory
 source's** handling of an untrusted drop directory is fixed policy (the HTTP uploaded-logs surface has

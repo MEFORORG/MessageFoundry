@@ -8390,7 +8390,8 @@ class RegistryRunner:
                 kind = RefusalKind.OVERSIZE if result.oversize else RefusalKind.PERMANENT
                 return await self._refuse(ic, raw, text, kind, error=persisted, peek=peek)
         # #149 (ADR 0105 Phase 1a): detach over-threshold documents before the ingress commit. A detach
-        # failure records ERROR + returns a refusal — never accepted-and-dropped.
+        # refusal records ERROR + returns a refusal — never accepted-and-dropped. Any other fault, a
+        # put_attachment fault among them (#1619), propagates with no row, so the input is kept.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
@@ -8802,8 +8803,9 @@ class RegistryRunner:
         # documents VERBATIM into the attachment substrate BEFORE the ingress commit, so the pipeline
         # carries only the small skeleton + a `mfdoc:v1:ref:` handle. This runs AFTER the synchronous
         # header parse/validate (a malformed header already NAK'd above) and BEFORE the commit/ACK, so a
-        # detach failure is a synchronous ERROR + NAK, in the receipt path's class (below) — the
-        # message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store.
+        # detach refusal is a synchronous ERROR + NAK, in the receipt path's class (below) — the
+        # message is NEVER accepted-and-dropped, and no ACK is sent for a body we couldn't store. Any
+        # other fault, a put_attachment fault among them (#1619), propagates to the transport.
         skeleton = text
         attachment_refs: list[str] = []
         if streaming_over:
