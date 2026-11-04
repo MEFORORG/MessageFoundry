@@ -535,29 +535,16 @@ def test_the_line_names_the_connection_flag_unless_the_hop_passes_its_own_declar
     assert named.audit.endswith(f"([x].y_attested; reason: {REASON})"), named.state()
 
 
-def test_an_attested_hop_with_a_crl_records_a_crossing_only_where_the_crl_is_no_check(
-    bare_crl: str,
-) -> None:
+def test_an_attested_hop_whose_crl_is_a_check_records_no_crossing(bare_crl: str) -> None:
     """What the attested-crossing line says, read off the context the association really dials
     with. A CRL on a hop that keeps the time check is a check, so the hop crossed on it and a line
-    saying it crossed without one would be false. ``tls_allow_expired`` sets
-    ``X509_V_FLAG_NO_CHECK_TIME``, so a CRL past ``nextUpdate`` passes that context
-    (``test_a_lapsed_crl_passes_a_context_that_skips_validity_checks``), and the line stays. The
-    relaxed SCU hands the guard no context (ADR 0173 §13), so it crosses on its attestation, not its
-    CRL, and this half does not reach ``crl_is_a_check``; the guard-level test above pins that
-    field. This limb moves a log line, never a disposition."""
+    saying it crossed without one would be false. The relaxed half, where the line stays, is
+    ``test_an_expiry_relaxed_dicom_scu_crosses_on_its_attestation_and_is_audited``. This limb moves
+    a log line, never a disposition."""
     with active_hop_posture(ENFORCING), _guard_log() as checked:
         kept = DicomScuDestination(_scu(REMOTE, attested=True, policy=_crl_policy(bare_crl)))
     assert context_checks_revocation(kept._ssl) is True
     assert not checked.audit, checked.state()
-    relaxed_cfg = _scu(REMOTE, attested=True, policy=_crl_policy(bare_crl))
-    relaxed_cfg.settings["tls_allow_expired"] = True
-    with active_hop_posture(ENFORCING), _guard_log() as relaxed:
-        skipped = DicomScuDestination(relaxed_cfg)
-    assert context_checks_revocation(skipped._ssl) is True
-    assert _RELAXED_CROSSING in relaxed.audit, relaxed.state()
-    assert "connection 'OB_PACS';" in relaxed.audit, relaxed.state()
-    assert REASON in relaxed.audit, relaxed.state()
 
 
 def test_a_dicom_tls_association_is_admitted_when_a_crl_reaches_its_own_context(
@@ -1232,9 +1219,12 @@ def test_an_expiry_relaxed_dicom_scu_crosses_on_its_attestation_and_is_audited(
     # The CRL reached the context, so the missing credit is the relaxation's.
     assert context_checks_revocation(dest._ssl) is True
     assert [guard.crl_checked for guard in guards] == [False]
+    assert [guard.expiry_relaxed for guard in guards] == [True]
     shipped = _shipped(log.audit)
     assert "connection 'OB_PACS';" in shipped and REASON in shipped, log.state()
     assert "DICOM C-STORE client (SCU) over TLS" in shipped
+    assert _RELAXED_CROSSING in shipped, log.state()
+    assert "still refuses a leaf certificate it lists" in shipped, log.state()
 
 
 def test_an_expiry_relaxed_hop_with_a_crl_warns_when_not_enforcing(bare_crl: str) -> None:

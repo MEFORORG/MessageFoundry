@@ -239,6 +239,27 @@ def test_a_relay_outside_the_allowlist_is_left_to_the_send_refusal() -> None:
         asyncio.run(transport.send({"type": "connection_stopped", "connection": "OB_X"}))
 
 
+@pytest.mark.parametrize("posture", [ENFORCING, NOT_ENFORCING], ids=["enforcing", "warn"])
+def test_both_smtp_builds_skip_the_guard_for_a_relay_outside_the_allowlist(
+    posture: HopPosture,
+) -> None:
+    """The skip holds on the security notifier as on the alert transport, and at either posture:
+    neither build refuses or warns on revocation, so the send refusal is the hop's only gate. This
+    pins today's behaviour (BACKLOG #5089); a build-time refusal of such a host would change it.
+    The listed host is the control: the same build is judged there."""
+    with _guard_log() as log:
+        _email(posture, allowed_hosts=("other.example.test",))
+        _notifier(posture, allowed_hosts=("other.example.test",))
+    assert not log.has(_SMTP_CELL), log.state()
+    if posture is ENFORCING:
+        with pytest.raises(InsecureHopRefused, match="revocation"):
+            _notifier(posture, allowed_hosts=(RELAY.upper(),))
+    else:
+        with _guard_log() as listed:
+            _notifier(posture, allowed_hosts=(RELAY.upper(),))
+        assert listed.has(_SMTP_CELL), listed.state()
+
+
 def test_an_smtp_login_on_loopback_still_crosses() -> None:
     _email(ENFORCING, host="127.0.0.1")
     _notifier(ENFORCING, host="localhost")

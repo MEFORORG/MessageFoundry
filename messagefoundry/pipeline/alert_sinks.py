@@ -388,6 +388,12 @@ def _alert_hop_posture(posture: HopPosture | None) -> HopPosture:
     return ambient if ambient is not None else HopPosture.fail_closed(enforcing=None)
 
 
+#: The ``[alerts]`` revocation attestation flags, spelled once: each is both the flag the reason
+#: check names and, prefixed, the declaration the attested-crossing line names.
+_WEBHOOK_ATTESTATION = "webhook_tls_revocation_attested"
+_EMAIL_ATTESTATION = "email_tls_revocation_attested"
+
+
 def _attested_with_a_reason(attested: bool, reason: str | None, *, flag: str) -> bool:
     """Whether an ``[alerts]`` revocation attestation counts, refusing one that cannot be recorded.
 
@@ -449,15 +455,13 @@ def _refuse_webhook_revocation(
             "carries the alert webhook's path token over verified https but performs no "
             "certificate revocation checking"
         ),
-        attested=_attested_with_a_reason(
-            attested, attested_reason, flag="webhook_tls_revocation_attested"
-        ),
+        attested=_attested_with_a_reason(attested, attested_reason, flag=_WEBHOOK_ATTESTATION),
         context=None,
         posture=_alert_hop_posture(posture),
         ways_across=_WEBHOOK_WAYS_ACROSS,
         attested_reason=attested_reason,
         connection=None,  # the alerts sink, not a connection
-        declaration="[alerts].webhook_tls_revocation_attested",
+        declaration=f"[alerts].{_WEBHOOK_ATTESTATION}",
     ).enforce_construction()
 
 
@@ -528,9 +532,7 @@ def _refuse_alert_smtp_revocation(
             "carries the [alerts] SMTP login password over verified STARTTLS but performs no "
             "certificate revocation checking"
         ),
-        attested=_attested_with_a_reason(
-            attested, attested_reason, flag="email_tls_revocation_attested"
-        ),
+        attested=_attested_with_a_reason(attested, attested_reason, flag=_EMAIL_ATTESTATION),
         context=_alerts_smtp_context(
             host=host,
             verify=True,
@@ -541,7 +543,7 @@ def _refuse_alert_smtp_revocation(
         ways_across=_ALERT_SMTP_WAYS_ACROSS,
         attested_reason=attested_reason,
         connection=None,  # the alerts sink and the security notifier, not a connection
-        declaration="[alerts].email_tls_revocation_attested",
+        declaration=f"[alerts].{_EMAIL_ATTESTATION}",
     ).enforce_construction()
 
 
