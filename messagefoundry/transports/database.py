@@ -133,6 +133,7 @@ from messagefoundry.transports.base import (
     resolve_poll_ceiling,
 )
 from messagefoundry.transports.db_endpoint import (
+    COMMA_PORT_FAMILIES,
     GENERIC_DRIVER_REFUSAL,
     SQLSERVER_DEFAULT_DRIVER,
     SQLSERVER_DEFAULT_PORT,
@@ -737,10 +738,6 @@ class _DriverFamily(NamedTuple):
     #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
     #: keyword never brings an unmeasured escape with it.
     brace_escape: bool
-    #: Whether the driver reads ``SERVER=host,port`` as one host and its port, and ignores
-    #: ``PORT``: Microsoft's driver alone (:func:`~messagefoundry.transports.db_endpoint.generic_hop_endpoint`,
-    #: BACKLOG #4874).
-    reads_comma_port: bool = False
 
 
 # What the engine knows of each family on the generic driver allowlist, keyed as
@@ -775,7 +772,6 @@ _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
         None,
         ("Encrypt", "yes"),
         brace_escape=True,
-        reads_comma_port=True,
     ),
 }
 
@@ -825,26 +821,26 @@ def _refuse_unread_sslmode(text: str, *, family: str, connection: str | None) ->
     raise ValueError(f"{where} must be one of {libpq}, in lower case {see}")
 
 
-def _odbc_password(password: object, *, driver: str, connection: str | None) -> str:
+def _odbc_password(password: object, *, family: str, connection: str | None) -> str:
     """``password`` as the generic connection string sends it, or a ValueError (BACKLOG #2705).
 
-    For a driver :func:`_driver_family` places, it is ALWAYS braced, with the ``}}``
-    escape, whatever it holds. psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space and
+    ``family`` is the key :func:`_driver_family` places from ``odbc_driver``; the build refuses a
+    name it places in none before this runs (BACKLOG #5041). For a family on the escape list, which
+    today is every family, it is ALWAYS braced, with the ``}}`` escape, whatever it holds. psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space and
     ``%XX`` a byte; ``dlg_specific.c``, ``decode_or_remove_braces``) and takes a braced one
     literally, so only the braced form sends the password as written.
 
-    For any other driver it is sent plain, and only when it holds none of ``;``, ``{``, ``}`` or a
-    quote character and has no leading or trailing space: a driver that reads no braces (the Access
-    driver) takes it only that way, and one that does not read the escape would end a braced value
-    at the first ``}`` and read the rest as further keywords. Any other password is refused for
-    such a driver. A driver missing from the list is unmeasured, not known to be unsafe.
+    A family off the escape list would get it plain, and only when it holds none of ``;``, ``{``,
+    ``}`` or a quote character and has no leading or trailing space: a driver that reads no braces
+    (the Access driver) takes it only that way, and one that does not read the escape would end a
+    braced value at the first ``}`` and read the rest as further keywords. Any other password is
+    refused for such a family.
 
     A password must be printable ASCII whatever the driver. A refusal names the setting and never
     describes the value beyond saying the driver cannot carry it."""
     text = str(password)
     _refuse_unsafe_text(text, what="password", connection=connection, refused="")
-    family = _driver_family(driver)
-    if family is not None and _DRIVER_FAMILIES[family].brace_escape:
+    if _DRIVER_FAMILIES[family].brace_escape:
         return odbc_brace(text)
     if not any(ch in ";{}\"'" for ch in text) and text == text.strip():
         return text
@@ -1487,7 +1483,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             _ODBC_PASSWORD_KEYS,
             connection=connection,
         )
-        secret = _odbc_password(password, driver=driver, connection=connection)
+        secret = _odbc_password(password, family=family, connection=connection)
         parts.append(f"{pwd_key}={secret}")
     params = s.get("odbc_params") or {}
     if not isinstance(params, Mapping):
@@ -1531,12 +1527,12 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     _refuse_weak_driver_key(named, connection=connection, verdicts=verdicts)
     _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
     _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
-    _warn_generic_tls_unenforced(params, driver=driver, connection=connection)
+    _warn_generic_tls_unenforced(params, family=family, connection=connection)
     return ";".join(parts) + ";"
 
 
 def _warn_generic_tls_unenforced(
-    params: Mapping[str, Any], *, driver: str, connection: str | None = None
+    params: Mapping[str, Any], *, family: str, connection: str | None = None
 ) -> None:
     """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
     path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
@@ -1559,15 +1555,15 @@ def _warn_generic_tls_unenforced(
     It stays optional because :func:`_build_odbc_dsn` is also called directly (tests, DSN-shape checks)
     where there is no connection to name; every engine construction path supplies it.
 
-    The remedy's example is the named driver family's own spelling, and for a name the engine
-    cannot place it names none, so the line never steers a driver to a value it ignores (BACKLOG
-    #5029)."""
+    ``family`` is the key :func:`_driver_family` placed; the build refuses a name it places in
+    none before this runs (BACKLOG #5041). The remedy's example is that family's own spelling, so
+    the line never steers a driver to a value it ignores (BACKLOG #5029)."""
     where = (
         f"DATABASE connection {connection!r} (generic ODBC dialect)"
         if connection
         else "DATABASE generic ODBC dialect"
     )
-    reason = generic_odbc_tls_unenforced(params, driver=driver)
+    reason = _family_tls_verdict(params, family)
     if reason is None:
         logger.debug(
             "%s: TLS is delegated to the driver (a TLS mode is set in odbc_params); "
@@ -1575,19 +1571,14 @@ def _warn_generic_tls_unenforced(
             where,
         )
         return
-    family = _driver_family(driver)
-    if family is not None:
-        keyword, value = _DRIVER_FAMILIES[family].tls_example
-        remedy = f"via the driver's own keyword (e.g. {keyword}={value})"
-    else:
-        remedy = "with a driver named by a registered name the engine places"
+    keyword, value = _DRIVER_FAMILIES[family].tls_example
     logger.warning(
         "%s: TLS verification is NOT enforced by MessageFoundry on this path and %s — configure "
         "verifying TLS %s so PHI is not sent in plaintext; tls_hop_attested is only for a hop "
         "secured by other means",
         where,
         reason,
-        remedy,
+        f"via the driver's own keyword (e.g. {keyword}={value})",
     )
 
 
@@ -1658,7 +1649,7 @@ def generic_cleartext_hop_guard(
     host, port = generic_hop_endpoint(
         str(settings.get("server") or ""),
         params,
-        reads_comma_port=family is not None and _DRIVER_FAMILIES[family].reads_comma_port,
+        reads_comma_port=family in COMMA_PORT_FAMILIES,
     )
     return InsecureHopGuard.capture(
         host=host,

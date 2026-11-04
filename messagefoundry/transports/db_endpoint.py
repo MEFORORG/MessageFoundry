@@ -228,9 +228,11 @@ GENERIC_DRIVER_FAMILIES: dict[str, re.Pattern[str]] = {
     "msodbc": re.compile(r"odbc driver [0-9]+ for sql server"),
 }
 
-#: The families that read the ``PORT`` keyword: psqlODBC and MySQL Connector/ODBC. Microsoft's
-#: driver ignores it and reads ``SERVER=host,port`` instead.
-_PORT_KEYWORD_FAMILIES = frozenset({"psqlodbc", "mysql"})
+#: The families on the allowlist that read ``SERVER=host,port`` as one host and its port, and
+#: ignore the ``PORT`` keyword: Microsoft's driver alone (BACKLOG #4874). Every other family reads
+#: ``PORT``. The one record of how a family takes its port, read by the egress port reading here and
+#: by :func:`generic_hop_endpoint`'s caller, the cleartext-hop guard.
+COMMA_PORT_FAMILIES = frozenset({"msodbc"})
 
 #: Why the generic dialect refuses an ``odbc_driver`` off :data:`GENERIC_DRIVER_FAMILIES`, remedy
 #: first: a stored failure keeps about its first 200 characters. Microsoft's driver is not offered
@@ -431,7 +433,7 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
             None,
             conflict="give the PORT keyword without a leading zero: a driver can read it as octal",
         )
-    if family not in _PORT_KEYWORD_FAMILIES:
+    if family in COMMA_PORT_FAMILIES:
         return DialEndpoint(
             host,
             None,
