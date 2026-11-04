@@ -5412,10 +5412,12 @@ class SqlServerStore:
         ``within`` bounds the rollback, in seconds; ``None``, which every caller but
         :meth:`_fetch_rows` on a clamped read passes, leaves it unbounded and enters no timeout at
         all. A rollback that runs past the bound is treated as one that failed: the connection is
-        discarded, and the rollback still running on its executor thread closes the handle as it
-        returns (the call gate's hand-off, BACKLOG #2049). :meth:`_fetch_rows` passes the lease
-        claim's clamp, so a stalled rollback after a failed claim cannot hold ``_leadership_lock``
-        past it (BACKLOG #5066).
+        discarded. Where the call gate already marks the rollback as running, the close is handed
+        to it and lands as it returns (BACKLOG #2049). In the short window before the gate marks
+        it, a separate close can take the gate's lock first; the rollback then runs on a closed
+        handle and fails, with nothing awaiting its error, and the close has already ended the
+        transaction. :meth:`_fetch_rows` passes the lease claim's clamp, so a stalled rollback
+        after a failed claim cannot hold ``_leadership_lock`` past it (BACKLOG #5066).
 
         The discard is :func:`_detach_connection`, the same detach :meth:`_release_dirty` uses, and
         unlike that method it does NOT wait for the close.
@@ -5434,13 +5436,10 @@ class SqlServerStore:
 
         A cancellation during the rollback itself propagates, and :meth:`_acquire` quarantines."""
         try:
-            if within is None:
-                # No timeout context at all: asyncio.timeout(None) still needs a current task, and
-                # outside one it raises, which would discard without trying the rollback.
+            # No timeout at all for None: asyncio.timeout(None) still needs a current task, and
+            # outside one it raises, which would discard without trying the rollback.
+            async with nullcontext() if within is None else asyncio.timeout(within):
                 await conn.rollback()
-            else:
-                async with asyncio.timeout(within):
-                    await conn.rollback()
         except Exception:  # noqa: BLE001 - every driver fault, and the bound; the caller re-raises
             log.warning(
                 "sqlserver: rollback after a failed transaction failed or ran past its bound;"

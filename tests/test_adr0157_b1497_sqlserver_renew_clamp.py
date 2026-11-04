@@ -19,6 +19,7 @@ the driver really ends a statement at the clamp, which no fake can.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -69,6 +70,7 @@ class _Raw:
     def __init__(self) -> None:
         self._timeout = 0
         self.assigned: list[int] = []
+        self.log: list[str] = []  # timeout assignments and rollbacks, in the order they ran
 
     @property
     def timeout(self) -> int:
@@ -79,6 +81,7 @@ class _Raw:
         assert isinstance(value, int), "pyodbc's Connection.timeout takes an int"
         self._timeout = value
         self.assigned.append(value)
+        self.log.append(f"timeout={value}")
 
     def close(self) -> None:
         pass
@@ -127,6 +130,7 @@ class _Conn:
 
     async def rollback(self) -> None:
         self.rolled_back += 1
+        self.raw.log.append("rollback")
         if self.rollback_fail is not None:
             raise self.rollback_fail
         if self.rollback_hangs:
@@ -297,8 +301,11 @@ async def test_a_failed_rollback_discards_the_connection_and_raises_the_original
             await store._fetchone("SELECT 1", ())
     assert conn.rolled_back == 1
     assert conn.closed is True  # detached: aioodbc's pool will not re-lend a closed connection
-    # The restore ran before the rollback and its discard, never beside them.
     assert conn.raw.assigned == ([30, 4, 30] if clamped else [30])
+    # The restore ran before the rollback and its discard, never beside them: nothing touched the
+    # handle's timeout after the rollback began. A rollback moved back inside the statement-timeout
+    # block would log the restore after it.
+    assert conn.raw.log[-1] == "rollback", conn.raw.log
 
 
 async def test_a_hung_rollback_ends_at_the_clamp_and_discards_the_connection() -> None:
@@ -339,9 +346,12 @@ async def test_a_hung_rollback_on_a_failed_claim_frees_the_leadership_lock_in_th
     finally:
         if not tick.done():  # the red case: do not leave the hung tick behind the test
             tick.cancel()
+            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                await tick
     waited = time.monotonic() - started
     coord._leadership_lock.release()
-    assert waited < 3.0, waited
+    # The bound is the 1 s clamp; under 2 s keeps out a lock held for about three times it.
+    assert waited < 2.0, waited
     with pytest.raises(RuntimeError, match="HYT00"):
         await tick
     assert conn.closed is True
