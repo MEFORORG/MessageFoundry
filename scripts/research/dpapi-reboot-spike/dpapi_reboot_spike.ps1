@@ -43,20 +43,31 @@
     A4  after a reboot: the start the SCM makes at boot (start type Automatic)
     A5  after a reboot: a demand start
   The reboot is proven from the reports themselves, for A4 and for A5 each against A3, and A5 must
-  be from A4's boot when A4 reported: by Windows' boot counter (PrefetchParameters BootId) when both
-  reports carry it, else by the tick count going down (it resets only at a boot), else by the boot
-  time (clock minus uptime) moving 60 seconds or more. The verdict line reads SURVIVES when A4 and A5
-  both open the user-scope blob with every control held; SURVIVES, BUT NOT AT THE BOOT-TIME START
-  when A5 opens it and A4 is refused; DOES NOT SURVIVE when A5 is refused with the controls held and
-  A4 did not open it; INCONCLUSIVE, A4 OPENED AND A5 DID NOT for that contradiction; and INCONCLUSIVE
-  otherwise.
+  be from A4's boot when A4 reported. Either signal shows a reboot: Windows' boot counter
+  (PrefetchParameters BootId) changed, or the tick count went down (it resets only at a boot) while
+  the boot time (clock minus uptime) moved later. With no counter in a report, boot times 60
+  seconds or more apart show one too. The judge prints every report's raw counter, tick count and
+  boot time on its boots line.
+
+  Each arm reads YES, NO, INVALID or INCONCLUSIVE. INVALID is a report showing a broken instrument:
+  a user-scope blob refused as damaged (win32=13), a value that opened but did not match, or a
+  plain_sha256 that is not A1's; a YES needs that match. A3 still reads its result when the profile
+  was not seen unloaded, so a refusal there shows; only a YES is held back to INCONCLUSIVE. The
+  verdict line reads INVALID when any arm is INVALID or any of A1 to A3 is NO, whatever A4 and A5
+  say; INCONCLUSIVE when A1 and A2 are not both YES; else SURVIVES when A4 and A5 both open the
+  user-scope blob with every control held; SURVIVES, BUT NOT AT THE BOOT-TIME START when A5 opens it
+  and A4 is refused; DOES NOT SURVIVE when A5 is refused with the controls held and A4 did not open
+  it; INCONCLUSIVE, A4 OPENED AND A5 DID NOT for that contradiction; and INCONCLUSIVE otherwise, A5
+  opening with A4 missing included.
 
   THREE MODES.
     -Mode Host     On MEFORHV01, elevated, by the owner. Refuses unless REVTEST01 is Off, reverts it
                    to -Checkpoint, checks its adapters are on the Private switch MEFOR-Lab or on none,
                    starts it, and drives every arm over PowerShell Direct, the reboot included. It
                    prompts once for the VM's local administrator (the hvtest VM credential). At the
-                   end, pass or fail, it turns the VM off and reverts it to -Checkpoint again.
+                   end, pass or fail, it turns the VM off and reverts it to -Checkpoint again, and
+                   reads back that it is off; where either step fails it prints a STOP line naming
+                   the VM's state, which the owner then turns off and reverts by hand.
     -Mode Payload  Inside the VM, through the hvtest harness (entry.ps1 beside this file). Runs A1 to
                    A3. hvtest cannot reboot a VM inside a run (one PowerShell Direct session per run,
                    and every run starts by reverting the checkpoint), so A4 and A5 read NOT RUN.
@@ -639,27 +650,40 @@ function Read-Report([string]$Dir, [string]$Name) {
     $r
 }
 
-function Get-Verdict($Report, [string]$Action, [string]$Extra) {
-    # Returns @(verdict, why). $Extra is a precondition the arm needs, already judged: '' when it
-    # holds. It is checked before anything that could answer, so no answer escapes it.
+function Get-Verdict($Report, [string]$Action, [string]$Extra, $Plain, [string]$YesOnly) {
+    # Returns @(verdict, why): YES, NO, INVALID (the report shows a broken instrument) or
+    # INCONCLUSIVE. $Extra is a precondition of any answer, already judged: '' when it holds.
+    # $Plain is report-A1's plain_sha256 ('' when A1 gives none), or $null for A1 itself. $YesOnly
+    # is a precondition of a YES alone, read after the result, so a refusal under it still shows.
     if (-not $Report) { return @('INCONCLUSIVE', 'no report') }
     if ($Report['identity'] -ne $Account -or -not ([string]$Report['sid']).StartsWith('S-1-5-80-')) {
         return @('INCONCLUSIVE', "ran as $($Report['identity']) $($Report['sid']), not the virtual account")
     }
     if ($Report['action'] -ne $Action) { return @('INCONCLUSIVE', "action $($Report['action']), not $Action") }
-    if ($Extra) { return @('INCONCLUSIVE', $Extra) }
     if ($Action -eq 'protect' -and $Report['protect_user'] -ne 'OK') {
-        # Only a NO when machine scope worked in the same process; else DPAPI itself did not run.
+        # Before $Extra: a failed protect leaves no blob, so the crosscheck $Extra carries reads
+        # ABSENT because of it, and would hide the cause. Only a NO when machine scope worked in
+        # the same process; else DPAPI itself did not run.
         if ($Report['protect_machine'] -eq 'OK') { return @('NO', "protect_user $($Report['protect_user']); protect_machine OK") }
         return @('INCONCLUSIVE', "protect_user $($Report['protect_user']), protect_machine $($Report['protect_machine'])")
     }
+    if ($Extra) { return @('INCONCLUSIVE', $Extra) }
+    if ($null -ne $Plain) {
+        if (-not $Plain) { return @('INCONCLUSIVE', 'report-A1 gives no plain_sha256 to compare') }
+        if ($Report['plain_sha256'] -ne $Plain) { return @('INVALID', "plain_sha256 $($Report['plain_sha256']) is not report-A1's $Plain") }
+    }
+    $user = [string]$Report['user_unprotect']
+    # ERROR_INVALID_DATA is what the tampered control gets: a damaged blob, not a lost key.
+    if ($user -eq 'FAIL win32=13' -or $user -eq 'OK mismatch') { return @('INVALID', "user_unprotect $user, a damaged blob or value") }
     $controls = "foreign $($Report['control_foreign']), tampered $($Report['control_tampered']), machine $($Report['machine_unprotect'])"
     $held = $Report['control_foreign'] -eq $NteBadKeyState -and ([string]$Report['control_tampered']).StartsWith('FAIL') -and
         $Report['machine_unprotect'] -eq 'OK match'
     if (-not $held) { return @('INCONCLUSIVE', "a control FAILED: $controls") }
-    $user = [string]$Report['user_unprotect']
-    if ($user -eq 'OK match') { return @('YES', "user_unprotect $user; controls HELD: $controls") }
-    if ($user.StartsWith('FAIL') -or $user -eq 'OK mismatch') { return @('NO', "user_unprotect $user; controls HELD: $controls") }
+    if ($user -eq 'OK match') {
+        if ($YesOnly) { return @('INCONCLUSIVE', "$YesOnly; user_unprotect $user; controls HELD: $controls") }
+        return @('YES', "user_unprotect $user; controls HELD: $controls")
+    }
+    if ($user.StartsWith('FAIL')) { return @('NO', "user_unprotect $user; controls HELD: $controls") }
     @('INCONCLUSIVE', "user_unprotect $user; controls HELD: $controls")
 }
 
@@ -677,23 +701,30 @@ function Get-BootReading($Report) {
 }
 
 function Get-BootRelation($Earlier, $Later) {
-    # 'rebooted', 'same' or 'unknown', for two reports in time order. Windows' boot counter decides
-    # when both carry it. Else a tick count that went down shows a reboot; a tick count that went up
-    # with boot times within 60 s shows the same boot, and boot times 60 s or more apart show a
-    # reboot. Those last two rest on the guest clock.
+    # 'rebooted', 'same' or 'unknown', for two reports in time order. Either of two signals shows a
+    # reboot: Windows' boot counter changed, or the tick count went down while the boot time (clock
+    # minus uptime) moved later. A counter that did not move cannot overrule the second, since
+    # nothing here shows every build moves it at every boot. With no counter, boot times 60 s or
+    # more apart show a reboot, and a tick count that went up with boot times within 60 s shows the
+    # same boot; those rest on the guest clock. Signals that disagree read 'unknown'.
     $e = Get-BootReading $Earlier
     $l = Get-BootReading $Later
-    if ($e[0] -and $l[0]) { if ($e[0] -ne $l[0]) { return 'rebooted' } else { return 'same' } }
-    if ($null -eq $e[1] -or $null -eq $l[1]) { return 'unknown' }
-    if ($l[1] -lt $e[1]) { return 'rebooted' }
-    if ($null -eq $e[2] -or $null -eq $l[2]) { return 'unknown' }
-    $gap = [Math]::Abs(($l[2] - $e[2]).TotalSeconds)
-    if ($gap -ge 60) { return 'rebooted' }
+    $idKnown = [bool]($e[0] -and $l[0])
+    $tickKnown = $null -ne $e[1] -and $null -ne $l[1]
+    $bootKnown = $null -ne $e[2] -and $null -ne $l[2]
+    $tickDown = $tickKnown -and $l[1] -lt $e[1]
+    if ($idKnown -and $e[0] -ne $l[0]) { return 'rebooted' }
+    if ($tickDown -and $bootKnown -and $l[2] -gt $e[2]) { return 'rebooted' }
+    if ($idKnown) { if ($tickDown) { return 'unknown' } else { return 'same' } }
+    if (-not $tickKnown -or -not $bootKnown) { return 'unknown' }
+    if ([Math]::Abs(($l[2] - $e[2]).TotalSeconds) -ge 60) { return 'rebooted' }
+    if ($tickDown) { return 'unknown' }
     'same'
 }
 
 function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
-    # Returns @{ Lines; Verdicts }, Verdicts keyed A1 to A5.
+    # Returns @{ Lines; Verdicts; PrePass }, Verdicts keyed A1 to A5. PrePass is the pre-reboot
+    # arms' pass: A1 and A2 YES, and A3 YES or INCONCLUSIVE only because no unload was seen.
     $r = @{}
     foreach ($a in 'A1', 'A2', 'A3', 'A4', 'A5') { $r[$a] = Read-Report $Dir $a }
     # A global control: the administrator must be refused the service's user-scope blob, by the
@@ -703,29 +734,37 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
     if (Test-Path -LiteralPath $cf) { $cross = ([string](Get-Content -LiteralPath $cf -Raw)).Trim() }
     $crossProblem = ''
     if (-not $cross.StartsWith("admin_open=$NteBadKeyState ")) { $crossProblem = "crosscheck FAILED: '$cross'" }
+    # Every later start must still hold A1's value; a different one means plain.bin changed.
+    $plain = ''
+    if ($r['A1']) { $plain = [string]$r['A1']['plain_sha256'] }
     $v = @{}
-    $v['A1'] = Get-Verdict $r['A1'] 'protect' $crossProblem
-    $v['A2'] = Get-Verdict $r['A2'] 'unprotect' $crossProblem
-    $extra = 'the profile was not seen unloaded before the start'
+    $v['A1'] = Get-Verdict $r['A1'] 'protect' $crossProblem $null ''
+    $v['A2'] = Get-Verdict $r['A2'] 'unprotect' $crossProblem $plain ''
+    # Without a seen unload A3 is one more restart: it can still fail, but cannot answer YES.
+    $unload = 'the profile was not seen unloaded before the start'
     $pf = Join-Path $Dir 'profile-A3.txt'
-    if ((Test-Path -LiteralPath $pf) -and ([string](Get-Content -LiteralPath $pf -Raw) -match 'loaded_before_start=False')) { $extra = '' }
-    if ($crossProblem) { $extra = $crossProblem }
-    $v['A3'] = Get-Verdict $r['A3'] 'unprotect' $extra
+    if ((Test-Path -LiteralPath $pf) -and ([string](Get-Content -LiteralPath $pf -Raw) -match 'loaded_before_start=False')) { $unload = '' }
+    $v['A3'] = Get-Verdict $r['A3'] 'unprotect' $crossProblem $plain $unload
+    $a3Ok = $v['A3'][0] -eq 'YES' -or ($unload -and $v['A3'][0] -eq 'INCONCLUSIVE' -and $v['A3'][1].StartsWith("$unload; "))
+    $prePass = $v['A1'][0] -eq 'YES' -and $v['A2'][0] -eq 'YES' -and $a3Ok
     if ($Rebooted) {
+        $a4Rebooted = $r['A3'] -and $r['A4'] -and (Get-BootRelation $r['A3'] $r['A4']) -eq 'rebooted'
         foreach ($a in 'A4', 'A5') {
             $extra = ''
             if (-not $r['A3'] -or -not $r[$a]) { $extra = 'no reboot shown: a report is missing' }
             else {
                 $rel = Get-BootRelation $r['A3'] $r[$a]
+                $sameAsA4 = ''
+                if ($a -eq 'A5' -and $r['A4']) { $sameAsA4 = Get-BootRelation $r['A4'] $r['A5'] }
+                # A reboot report-A4 shows is report-A5's too when both are from one boot, even
+                # where report-A5's own tick count is past report-A3's.
+                if ($rel -ne 'rebooted' -and $sameAsA4 -eq 'same' -and $a4Rebooted) { $rel = 'rebooted' }
                 if ($rel -ne 'rebooted') { $extra = "no reboot shown between report-A3 and report-${a}: $rel" }
-            }
-            # A5 narrows against A4 only when both are from one boot.
-            if (-not $extra -and $a -eq 'A5' -and $r['A4']) {
-                $rel = Get-BootRelation $r['A4'] $r['A5']
-                if ($rel -ne 'same') { $extra = "report-A5 is not shown to be from the boot report-A4 is from: $rel" }
+                # A5 narrows against A4 only when both are from one boot.
+                elseif ($sameAsA4 -and $sameAsA4 -ne 'same') { $extra = "report-A5 is not shown to be from the boot report-A4 is from: $sameAsA4" }
             }
             if ($crossProblem) { $extra = $crossProblem }
-            $v[$a] = Get-Verdict $r[$a] 'unprotect' $extra
+            $v[$a] = Get-Verdict $r[$a] 'unprotect' $extra $plain ''
         }
     } else {
         $notRun = @('NOT RUN', 'this route cannot reboot the VM inside a run')
@@ -740,9 +779,22 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
         A5 = 'A5 after a reboot, a demand start'
     }
     $lines = @("DPAPI-REBOOT crosscheck, the administrator opens the service's user-scope blob: $cross")
+    # The raw readings the reboot is judged from, so a reader can check the judge's call.
+    $boots = @(foreach ($a in 'A1', 'A2', 'A3', 'A4', 'A5') {
+            if ($r[$a]) { "$a boot_id=$($r[$a]['boot_id']) uptime_ms=$($r[$a]['uptime_ms']) boot_utc=$($r[$a]['boot_utc'])" } else { "$a no report" }
+        }) -join '; '
+    $lines += "DPAPI-REBOOT boots: $boots"
     $lines += @(foreach ($a in 'A1', 'A2', 'A3', 'A4', 'A5') { "DPAPI-REBOOT $($names[$a]): $($v[$a][0]) ($($v[$a][1]))" })
+    # A NO before the reboot, or an INVALID anywhere, is the instrument or the setup failing, and
+    # no reboot arm beside it answers the question.
+    $broken = @(foreach ($a in 'A1', 'A2', 'A3', 'A4', 'A5') {
+            if ($v[$a][0] -eq 'INVALID' -or ($v[$a][0] -eq 'NO' -and $a -in 'A1', 'A2', 'A3')) { "$a $($v[$a][0])" }
+        })
     $overall = 'NOT RUN'
-    if ($Rebooted) {
+    if ($broken.Count) { $overall = "INVALID ($($broken -join ', '): the instrument or the setup failed)" }
+    elseif ($Rebooted -and -not ($v['A1'][0] -eq 'YES' -and $v['A2'][0] -eq 'YES')) {
+        $overall = 'INCONCLUSIVE (A1 and A2 did not both read YES, so the instrument is not shown working before the reboot)'
+    } elseif ($Rebooted) {
         # A5 is the survival question: a demand start, once boot is over. A4 can only narrow it,
         # and an A4 that opened beside an A5 that did not contradicts it.
         $a4 = $v['A4'][0]; $a5 = $v['A5'][0]
@@ -752,7 +804,7 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
         elseif ($a5 -eq 'NO') { $overall = 'INCONCLUSIVE, A4 OPENED AND A5 DID NOT' }
         else { $overall = 'INCONCLUSIVE' }
     }
-    @{ Lines = $lines + "DPAPI-REBOOT VERDICT: $overall"; Verdicts = $v }
+    @{ Lines = $lines + "DPAPI-REBOOT VERDICT: $overall"; Verdicts = $v; PrePass = $prePass }
 }
 
 # --- payload mode (hvtest) ----------------------------------------------------------------------
@@ -764,9 +816,9 @@ function Invoke-PayloadStep([string]$Log, [string]$Name, [string]$ArmName) {
 }
 
 function Invoke-Payload {
-    # Returns the exit code: 0 when A1 and A2 are YES and A3 is not NO. A3 reads INCONCLUSIVE when
-    # the profile never unloads, which the 2026-11-04 runs showed is this build's behaviour, not a
-    # fault of the run.
+    # Returns the exit code: 0 when the judge's PrePass holds. A3 may read INCONCLUSIVE when its
+    # start opened the blob but the profile was never seen unloaded, which the 2026-11-04 runs
+    # showed is this build's behaviour, not a fault of the run.
     if (-not $OutDir) { throw '-Mode Payload needs -OutDir (entry.ps1 passes HVTEST_RESULTS)' }
     $null = New-Item -ItemType Directory -Force -Path $OutDir
     $log = Join-Path $OutDir 'dpapi-reboot-spike.txt'
@@ -777,8 +829,7 @@ function Invoke-Payload {
         $judged = Invoke-Judge $Work $false
         $judged.Lines | Add-Content -LiteralPath $log -Encoding ASCII
         $judged.Lines | Write-Host
-        $vs = $judged.Verdicts
-        if ($vs['A1'][0] -eq 'YES' -and $vs['A2'][0] -eq 'YES' -and $vs['A3'][0] -ne 'NO') { $exit = 0 }
+        if ($judged.PrePass) { $exit = 0 }
     } finally {
         Invoke-PayloadStep $log 'Uninstall' ''
     }
@@ -829,16 +880,21 @@ function Wait-GuestSession($Credential, [Nullable[DateTime]]$BootAfter, [int]$Se
     throw "STOP     no PowerShell Direct session to $VMName within $Seconds s"
 }
 
-function Enter-HvTestLock {
+function Enter-HvTestLock([string]$Path = (Join-Path 'C:\ProgramData\hvtest\lock' ($VMName.ToLowerInvariant() + '.lock'))) {
     # hvtest's own per-VM lock (HvTestRunner.ps1 Enter-VmLock): the open handle with no sharing is
     # the lock, so while this run holds it an hvtest run on the VM reports busy, and this run cannot
     # start while one is in flight.
-    $path = Join-Path 'C:\ProgramData\hvtest\lock' ($VMName.ToLowerInvariant() + '.lock')
-    if (-not (Test-Path -LiteralPath (Split-Path -Parent $path))) { throw "STOP     no hvtest lock folder at $(Split-Path -Parent $path); nothing ran" }
+    if (-not (Test-Path -LiteralPath (Split-Path -Parent $Path))) { throw "STOP     no hvtest lock folder at $(Split-Path -Parent $Path); nothing ran" }
     try {
-        New-Object System.IO.FileStream ($path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        New-Object System.IO.FileStream ($Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
     } catch [System.Management.Automation.MethodInvocationException] {
-        throw "STOP     $VMName is busy: an hvtest run holds $path ($($_.Exception.GetBaseException().Message)); nothing ran"
+        # hvtest's test: only a sharing or a lock violation is another run holding the file. Any
+        # other failure is a host fault, and calling it busy would send the owner to wait on nothing.
+        $base = $_.Exception.GetBaseException()
+        if ($base.HResult -eq -2147024864 -or $base.HResult -eq -2147024863) {
+            throw "STOP     $VMName is busy: an hvtest run holds $Path ($($base.Message)); nothing ran"
+        }
+        throw ("STOP     cannot open hvtest's lock file {0}: {1} HRESULT 0x{2:X8}: {3}; nothing ran" -f $Path, $base.GetType().FullName, $base.HResult, $base.Message)
     }
 }
 
@@ -868,6 +924,27 @@ function Invoke-HostRun {
     } finally {
         $lock.Dispose()
     }
+}
+
+function Get-VMStateText {
+    try { [string](Get-VM -Name $VMName -ErrorAction Stop).State }
+    catch { "unreadable ($($_.Exception.Message))" }
+}
+
+function Stop-AndRevert($Snap) {
+    # Returns '' once the VM is off and reverted, else the STOP line naming the state the owner must
+    # put right by hand. Each step runs whatever the one before did, and the off state is read back.
+    # The catches are broad on purpose: this is the cleanup, every failure lands in the STOP line,
+    # and none may skip the revert or the judge after it.
+    $problems = @()
+    try { Stop-VM -Name $VMName -TurnOff -Force -ErrorAction Stop }
+    catch { $problems += "Stop-VM failed: $($_.Exception.Message)" }
+    $state = Get-VMStateText
+    if ($state -ne 'Off') { $problems += "after Stop-VM it was $state, not Off" }
+    try { Restore-VMSnapshot -VMSnapshot $Snap -Confirm:$false -ErrorAction Stop }
+    catch { $problems += "Restore-VMSnapshot failed: $($_.Exception.Message)" }
+    if (-not $problems.Count) { return '' }
+    "STOP     $VMName was not turned off and reverted ($($problems -join '; ')); it is $(Get-VMStateText) now; turn it off and revert it to $Checkpoint by hand before anything else uses it"
 }
 
 function Invoke-Rig($Credential, $Snap, [string]$Reports) {
@@ -909,12 +986,13 @@ function Invoke-Rig($Credential, $Snap, [string]$Reports) {
         } else {
             Write-Log 'no guest session at the end, so no reports were copied'
         }
-        Stop-VM -Name $VMName -TurnOff -Force -ErrorAction Continue
-        Restore-VMSnapshot -VMSnapshot $Snap -Confirm:$false -ErrorAction Continue
-        Write-Log "$VMName turned off and reverted to $Checkpoint; output in $OutDir"
+        $endStop = Stop-AndRevert $Snap
+        if ($endStop) { Write-Log $endStop } else { Write-Log "$VMName turned off and reverted to $Checkpoint; output in $OutDir" }
         # After the revert, so a judge that throws on a damaged report cannot leave the VM running.
         try { foreach ($line in (Invoke-Judge $Reports $true).Lines) { Write-Log $line } }
         catch { Write-Log "the judge failed: $($_.Exception.GetType().FullName): $($_.Exception.Message)" }
+        # Again last, so the verdict lines cannot push it off the owner's screen.
+        if ($endStop) { Write-Log $endStop }
         $null = Stop-Transcript
     }
 }

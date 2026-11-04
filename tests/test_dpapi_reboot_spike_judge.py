@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -56,7 +57,9 @@ foreach ($n in 'Read-Report', 'Get-Verdict', 'Get-BootReading', 'Get-BootRelatio
 foreach ($row in Get-Content -LiteralPath $List) {
     $name, $dir, $rebooted = $row -split '\|'
     "==== $name"
-    (Invoke-Judge $dir ($rebooted -eq '1')).Lines
+    $j = Invoke-Judge $dir ($rebooted -eq '1')
+    $j.Lines
+    "DPAPI-REBOOT prepass: $($j.PrePass)"
 }
 """
 
@@ -96,6 +99,20 @@ def _all(**overrides: dict[str, str] | None) -> Reports:
 REFUSED = {"user_unprotect": BAD_KEY}
 # No boot counter, so the judge falls back to the tick count and then the clock.
 NO_ID = {"boot_id": ""}
+# What every start reports once A1's user-scope protect failed: there is no user.blob to open or
+# to tamper with, and the administrator's crosscheck finds none either.
+NO_BLOB = {"user_unprotect": "ABSENT", "control_tampered": "ABSENT"}
+CROSS_ABSENT = "admin_open=ABSENT by REVTEST01\\Administrator exit=0"
+
+
+def _no_blob_run(a1: dict[str, str], every: dict[str, str]) -> Reports:
+    reports: Reports = {a: _report(a, **NO_BLOB, **every) for a in ("A1", "A2", "A3", "A4", "A5")}
+    reports["A1"] = _report("A1", **NO_BLOB, **every, **a1)
+    return reports
+
+
+# The boot counter stayed put across a reboot the tick count and the boot time both show.
+STUCK_ID = {"boot_id": "7"}
 
 
 class Scenario:
@@ -119,8 +136,50 @@ SCENARIOS: dict[str, Scenario] = {
     "a4_refused": Scenario(_all(A4=_report("A4", **REFUSED))),
     "a4_opened_a5_refused": Scenario(_all(A5=_report("A5", **REFUSED))),
     "a4_missing_a5_refused": Scenario(_all(A4=None, A5=_report("A5", **REFUSED))),
-    "same_boot_id": Scenario(_all(A4=_report("A4", boot_id="7"), A5=_report("A5", boot_id="7"))),
+    # The counter did not move, but the tick count went down and the boot time moved later.
+    "stuck_id_tick_down": Scenario(
+        _all(A4=_report("A4", **STUCK_ID), A5=_report("A5", **STUCK_ID))
+    ),
+    # As above, and A5 came late enough that its tick count is past A3's: only A4 shows the reboot,
+    # and A5 is from A4's boot.
+    "stuck_id_a5_late": Scenario(
+        _all(
+            A4=_report("A4", **STUCK_ID),
+            A5=_report(
+                "A5", uptime_ms="900000", boot_utc="2026-11-04T06:18:30.0000000Z", **STUCK_ID
+            ),
+        )
+    ),
+    # The same counter, a tick count that went up and one boot time: no reboot happened.
+    "same_boot_id": Scenario(
+        _all(
+            A4=_report(
+                "A4", uptime_ms="500000", boot_utc="2026-11-04T06:03:20.0000000Z", **STUCK_ID
+            ),
+            A5=_report(
+                "A5", uptime_ms="510000", boot_utc="2026-11-04T06:03:20.0000000Z", **STUCK_ID
+            ),
+        )
+    ),
+    # The same counter and a tick count that went down, but a boot time that moved earlier: the
+    # signals disagree.
+    "same_id_tick_down_boot_earlier": Scenario(
+        _all(
+            A4=_report("A4", boot_utc="2026-11-04T05:00:00.0000000Z", **STUCK_ID),
+            A5=_report(
+                "A5", uptime_ms="95000", boot_utc="2026-11-04T05:00:00.0000000Z", **STUCK_ID
+            ),
+        )
+    ),
     "two_boots": Scenario(_all(A5=_report("A5", boot_id="9"))),
+    # No counter and a tick count past A3's, but boot times 15 minutes apart: the clock shows it.
+    "no_id_clock_rebooted": Scenario(
+        _all(
+            A3=_report("A3", **NO_ID),
+            A4=_report("A4", uptime_ms="500000", **NO_ID),
+            A5=_report("A5", uptime_ms="510000", **NO_ID),
+        )
+    ),
     "no_id_same_boot": Scenario(
         _all(
             A3=_report("A3", **NO_ID),
@@ -158,15 +217,40 @@ SCENARIOS: dict[str, Scenario] = {
     "admin_data_error": Scenario(
         _all(), crosscheck="admin_open=FAIL win32=13 by REVTEST01\\Administrator exit=0"
     ),
-    "a1_protect_refused": Scenario(_all(A1=_report("A1", protect_user="FAIL win32=5"))),
+    # A failed user-scope protect leaves no blob, so the crosscheck reads ABSENT because of it.
+    "a1_protect_refused": Scenario(
+        _no_blob_run({"protect_user": "FAIL win32=5"}, {}), crosscheck=CROSS_ABSENT
+    ),
     "a1_dpapi_down": Scenario(
-        _all(A1=_report("A1", protect_user="FAIL win32=5", protect_machine="FAIL win32=5"))
+        _no_blob_run(
+            {"protect_user": "FAIL win32=5", "protect_machine": "FAIL win32=5"},
+            {"machine_unprotect": "ABSENT"},
+        ),
+        crosscheck=CROSS_ABSENT,
     ),
-    "a1_refused_cross_absent": Scenario(
-        _all(A1=_report("A1", protect_user="FAIL win32=5")),
-        crosscheck="admin_open=ABSENT by x exit=0",
+    # A refusal before the reboot is a broken instrument or setup, whatever A4 and A5 then say.
+    "a2_refused_a5_refused": Scenario(
+        _all(
+            A2=_report("A2", **REFUSED),
+            A3=_report("A3", **REFUSED),
+            A4=_report("A4", **REFUSED),
+            A5=_report("A5", **REFUSED),
+        )
     ),
+    "a2_refused_a5_opened": Scenario(_all(A2=_report("A2", **REFUSED))),
+    # The profile stayed loaded, so A3 was one more restart, and it was refused.
+    "a3_refused_loaded": Scenario(_all(A3=_report("A3", **REFUSED))),
+    "a3_damaged_loaded": Scenario(_all(A3=_report("A3", user_unprotect="FAIL win32=13"))),
+    "a3_no_report": Scenario(_all(A3=None), rebooted=False),
+    "a5_damaged": Scenario(_all(A5=_report("A5", user_unprotect="FAIL win32=13"))),
+    "a4_mismatch": Scenario(_all(A4=_report("A4", user_unprotect="OK mismatch"))),
+    "a5_other_value": Scenario(_all(A5=_report("A5", plain_sha256="cd" * 32))),
+    "a1_no_sha": Scenario(_all(A1=_report("A1", plain_sha256=""))),
+    "a4_missing_a5_opened": Scenario(_all(A4=None)),
     "not_rebooted": Scenario(_all(A4=None, A5=None), rebooted=False),
+    "not_rebooted_a2_refused": Scenario(
+        _all(A2=_report("A2", **REFUSED), A4=None, A5=None), rebooted=False
+    ),
 }
 
 
@@ -251,12 +335,28 @@ _OVERALL: list[tuple[str, str]] = [
     ("a4_opened_a5_refused", "INCONCLUSIVE, A4 OPENED AND A5 DID NOT"),
     ("a4_refused", "SURVIVES, BUT NOT AT THE BOOT-TIME START"),
     ("a4_missing_a5_refused", "DOES NOT SURVIVE"),
+    ("a4_missing_a5_opened", "INCONCLUSIVE"),
+    ("stuck_id_tick_down", "SURVIVES"),
+    ("stuck_id_a5_late", "SURVIVES"),
     ("same_boot_id", "INCONCLUSIVE"),
+    ("same_id_tick_down_boot_earlier", "INCONCLUSIVE"),
     ("two_boots", "INCONCLUSIVE"),
     ("no_id_same_boot", "INCONCLUSIVE"),
     ("no_id_skewed_clock", "SURVIVES"),
+    ("no_id_clock_rebooted", "SURVIVES"),
     ("no_id_empty_uptime", "INCONCLUSIVE"),
     ("not_rebooted", "NOT RUN"),
+    ("a2_refused_a5_refused", "INVALID"),
+    ("a2_refused_a5_opened", "INVALID"),
+    ("a3_refused_loaded", "INVALID"),
+    ("a3_damaged_loaded", "INVALID"),
+    ("a5_damaged", "INVALID"),
+    ("a4_mismatch", "INVALID"),
+    ("a5_other_value", "INVALID"),
+    ("a1_protect_refused", "INVALID"),
+    ("a1_no_sha", "INCONCLUSIVE"),
+    ("a1_dpapi_down", "INCONCLUSIVE"),
+    ("not_rebooted_a2_refused", "INVALID"),
 ]
 
 
@@ -305,12 +405,133 @@ def test_a_failed_crosscheck_voids_every_arm(judged: Judged, scenario: str) -> N
 
 
 def test_a1_protect_failure_is_no_only_beside_a_working_machine_scope(judged: Judged) -> None:
+    # The crosscheck read ABSENT because the protect failed; the protect is what A1 reports.
     assert _v(judged, "a1_protect_refused", "A1") == "NO"
+    assert "protect_user FAIL win32=5" in judged["a1_protect_refused"]["A1"]
     assert _v(judged, "a1_dpapi_down", "A1") == "INCONCLUSIVE"
-    # The crosscheck is a precondition of every arm, A1's NO included.
-    assert _v(judged, "a1_refused_cross_absent", "A1") == "INCONCLUSIVE"
+    assert "protect_machine FAIL win32=5" in judged["a1_dpapi_down"]["A1"]
+    # Every later arm has no blob to open, and the absent crosscheck still voids them.
+    for a in ("A2", "A3", "A4", "A5"):
+        assert _v(judged, "a1_protect_refused", a) == "INCONCLUSIVE"
 
 
 def test_without_a_reboot_the_reboot_arms_read_not_run(judged: Judged) -> None:
     assert _v(judged, "not_rebooted", "A4") == "NOT RUN"
     assert _v(judged, "not_rebooted", "A5") == "NOT RUN"
+
+
+@pytest.mark.parametrize(
+    ("scenario", "arm"),
+    [("a2_refused_a5_refused", "A2"), ("a2_refused_a5_opened", "A2"), ("a3_refused_loaded", "A3")],
+)
+def test_a_refusal_before_the_reboot_voids_the_verdict(
+    judged: Judged, scenario: str, arm: str
+) -> None:
+    assert _v(judged, scenario, arm) == "NO"
+    assert f"{arm} NO" in judged[scenario]["VERDICT"]
+    assert judged[scenario]["prepass"].endswith("False")
+
+
+@pytest.mark.parametrize(
+    ("scenario", "arm", "why"),
+    [
+        ("a5_damaged", "A5", "user_unprotect FAIL win32=13"),
+        ("a4_mismatch", "A4", "user_unprotect OK mismatch"),
+        ("a3_damaged_loaded", "A3", "user_unprotect FAIL win32=13"),
+        ("a5_other_value", "A5", "is not report-A1's"),
+    ],
+)
+def test_a_damaged_blob_or_value_is_invalid(
+    judged: Judged, scenario: str, arm: str, why: str
+) -> None:
+    assert _v(judged, scenario, arm) == "INVALID"
+    assert why in judged[scenario][arm]
+    assert f"{arm} INVALID" in judged[scenario]["VERDICT"]
+
+
+def test_a_yes_needs_a1s_value(judged: Judged) -> None:
+    assert _v(judged, "a1_no_sha", "A1") == "YES"
+    for a in ("A2", "A3", "A4", "A5"):
+        assert _v(judged, "a1_no_sha", a) == "INCONCLUSIVE"
+        assert "no plain_sha256" in judged["a1_no_sha"][a]
+
+
+def test_payload_pass_holds_only_for_an_unobserved_unload(judged: Judged) -> None:
+    assert judged["all_good"]["prepass"].endswith("True")
+    assert judged["not_rebooted"]["prepass"].endswith("True")
+    assert judged["profile_unloaded"]["prepass"].endswith("True")
+    for scenario in (
+        "a3_refused_loaded",
+        "a3_damaged_loaded",
+        "a3_no_report",
+        "a1_protect_refused",
+    ):
+        assert judged[scenario]["prepass"].endswith("False"), scenario
+
+
+def test_a_stuck_boot_counter_does_not_hide_a_reboot(judged: Judged) -> None:
+    assert _v(judged, "stuck_id_tick_down", "A4") == "YES"
+    assert _v(judged, "stuck_id_tick_down", "A5") == "YES"
+    # A5's own tick count is past A3's; A4, from the same boot, shows the reboot.
+    assert _v(judged, "stuck_id_a5_late", "A5") == "YES"
+    assert "same" in judged["same_boot_id"]["A4"]
+    assert "unknown" in judged["same_id_tick_down_boot_earlier"]["A4"]
+
+
+def test_the_boots_line_carries_the_raw_readings(judged: Judged) -> None:
+    boots = judged["all_good"]["boots"]
+    assert "A3 boot_id=7 uptime_ms=400000 boot_utc=2026-11-04T06:03:20.0000000Z" in boots
+    assert "A4 boot_id=8 uptime_ms=90000 boot_utc=2026-11-04T06:18:30.0000000Z" in boots
+    assert "A4 no report" in judged["a4_missing_a5_opened"]["boots"]
+
+
+def test_a5_opening_without_a4_is_not_a_survival_verdict(judged: Judged) -> None:
+    assert _v(judged, "a4_missing_a5_opened", "A4") == "INCONCLUSIVE"
+    assert _v(judged, "a4_missing_a5_opened", "A5") == "YES"
+
+
+_LOCK_DRIVER = r"""
+param([string]$Rig, [string]$Dir)
+$ErrorActionPreference = 'Stop'
+$tree = [System.Management.Automation.Language.Parser]::ParseFile($Rig, [ref]$null, [ref]$null)
+$f = @($tree.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Enter-HvTestLock' })
+. ([scriptblock]::Create($f[0].Extent.Text))
+$VMName = 'REVTEST01'
+$path = Join-Path $Dir 'revtest01.lock'
+$held = Enter-HvTestLock $path
+try { $null = Enter-HvTestLock $path; 'second=OPENED' } catch { "second=$($_.Exception.Message)" }
+$held.Dispose()
+# A directory where the file should be: access denied, not a sharing violation.
+$null = New-Item -ItemType Directory -Path (Join-Path $Dir 'dir.lock')
+try { $null = Enter-HvTestLock (Join-Path $Dir 'dir.lock'); 'dir=OPENED' } catch { "dir=$($_.Exception.Message)" }
+"""
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the sharing-violation HRESULT is Windows'")
+def test_only_a_sharing_or_lock_violation_reads_busy(tmp_path: Path) -> None:
+    driver = tmp_path / "lock.ps1"
+    driver.write_text(_LOCK_DRIVER, encoding="ascii")
+    assert _PWSH is not None
+    proc = subprocess.run(
+        [
+            _PWSH,
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(driver),
+            "-Rig",
+            str(_RIG),
+            "-Dir",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    second, other = proc.stdout.strip().splitlines()
+    assert second.startswith("second=STOP     REVTEST01 is busy"), second
+    assert other.startswith("dir=STOP     cannot open hvtest's lock file"), other
+    assert "HRESULT 0x80070005" in other, other
+    assert "busy" not in other
