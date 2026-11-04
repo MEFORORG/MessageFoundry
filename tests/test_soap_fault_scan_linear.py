@@ -9,10 +9,15 @@ tags then cost the square of its length, and on the 2xx path that cost ran on th
 Three things are pinned here: the new extraction returns what the old patterns returned, its time
 grows linearly, and the 2xx classification runs in the worker thread. The old patterns are kept
 below, verbatim, as the reference for the first and the positive control for the second.
+
+The third is about which thread runs the scan, not about the loop staying responsive: each regex
+call holds the GIL until it returns, so the loop can still wait out one call. The linear growth is
+what bounds that wait; ``SoapDestination._post_and_classify`` says how long it measured.
 """
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import random
 import re
@@ -100,7 +105,9 @@ def test_random_replies_yield_what_the_old_patterns_did() -> None:
 #: line and attempt rule as tests/test_ad_group_dn_only.py.
 _MAX_LINEAR_RATIO = 8.0
 
-#: Replies shaped to make the old tail rescan: many start tags, none of them closed.
+#: Replies shaped to make the old tails rescan: many start tags, none of them closed. The last,
+#: ``long-prefixes``, names neither element, so it never reached the old tails; it is here for the
+#: name regexes' ``[\w.\-]+:`` prefix class, which backtracks over each run that has no colon.
 _PATHOLOGICAL_REPLIES: dict[str, Callable[[int], str]] = {
     "faultcode-start-tags": lambda k: "<soap:Fault>" + "<faultcode>" * (k // 11),
     "value-start-tags": lambda k: "<soap:Fault>" + "<soap:Value>" * (k // 12),
@@ -158,17 +165,23 @@ def test_a_pathological_reply_is_classified_in_linear_time(make: Callable[[int],
     )
 
 
-@pytest.mark.parametrize("shape", ["faultcode-start-tags", "unterminated-value-tags"])
+@pytest.mark.parametrize(
+    ("shape", "k"), [("faultcode-start-tags", 2_000), ("unterminated-value-tags", 8_000)]
+)
 def test_the_linear_check_fails_the_old_patterns(
-    shape: str, monkeypatch: pytest.MonkeyPatch
+    shape: str, k: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Positive control: the check above must fail the patterns #2827 replaced, or its pass proves
     nothing. It times the same subject, the 2xx classification, with the old extraction patched
     in, and asserts exactly the negation of that pass condition, once per old pattern and once per
-    tail (``(.*?)</`` and ``[^>]*>``). The old patterns took about 0.4 s at 44,000 characters, so
-    this runs at 4,000 and 16,000 rather than the linear check's sizes."""
+    tail (``(.*?)</`` and ``[^>]*>``).
+
+    The old patterns took about 0.4 s at 44,000 characters, so this runs far below the linear
+    check's sizes. Each ``k`` is where the old curve read well clear of the line in 12 runs on one
+    workstation (2026-11-03): 13.8x to 15.8x and 12.9x to 15.9x. The ``(.*?)</`` tail is the
+    costlier one, so its ``k`` is smaller; at 4,000 it read once at 9.6x and took 1.6 s a run."""
     monkeypatch.setattr(soap, "_fault_code", _old_fault_code)
-    readings = _scaling_ratios(_classify_2xx, _PATHOLOGICAL_REPLIES[shape], 4_000)
+    readings = _scaling_ratios(_classify_2xx, _PATHOLOGICAL_REPLIES[shape], k)
     ratio = min(readings)
     assert ratio >= _MAX_LINEAR_RATIO, (
         f"the old patterns scaled by only {ratio:.2f}x ({_attempts(readings)})"
@@ -224,12 +237,22 @@ _SECRET = "an-echoed-credential"
 async def test_a_2xx_reply_is_classified_off_the_event_loop(
     capture_response: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The POST, the classification and the capture scrub share one worker thread, not the loop's.
+    """The POST, the classification and the capture scrub run in one ``to_thread`` hop, on a
+    thread that is not the loop's.
 
     Mutation: classify, or scrub, in ``send`` after the thread returns, as before #2827. Red: that
-    recorded thread is the loop's. Mutation: a second ``to_thread`` hop for either. Red: the
-    threads differ from the POST's."""
+    recorded thread is the loop's. Mutation: a second ``to_thread`` hop for either. Red: the hop
+    count. The thread ids alone cannot see that one, since the pool may hand both hops to the same
+    idle worker."""
     threads: dict[str, list[int]] = {"post": [], "classify": [], "scrub": []}
+    hops: list[object] = []
+    to_thread = asyncio.to_thread
+
+    async def counting_to_thread[T](func: Callable[..., T], /, *args: object) -> T:
+        hops.append(func)
+        return await to_thread(func, *args)
+
+    monkeypatch.setattr(asyncio, "to_thread", counting_to_thread)
 
     def classify(status: int, body: str) -> DeliveryError | None:
         threads["classify"].append(threading.get_ident())
@@ -262,6 +285,7 @@ async def test_a_2xx_reply_is_classified_off_the_event_loop(
         with pytest.raises(NegativeAckError, match="Sender fault"):
             await dest.send("<env>{{TOKEN}}</env>")
         assert not threads["scrub"]
+    assert len(hops) == 1, f"one to_thread hop, not {len(hops)}"
     (worker,) = threads["post"]
     assert worker != threading.get_ident()
     assert threads["classify"] == [worker]

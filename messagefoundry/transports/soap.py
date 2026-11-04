@@ -875,8 +875,14 @@ class SoapDestination(DestinationConnector):
         A fault can arrive inside a 2xx body, so the reply is classified. Transport-level faults
         (non-2xx, URL/timeout) already raised inside _post, for both modes. The RAW reply is
         classified: a partner fault names none of OUR secrets, and _WSSE_FAULT_RE must see the
-        unscrubbed text. BACKLOG #2827: both passes read up to the 16 MiB reply cap, so they stay
-        off the event loop, as the non-2xx scan inside _post already was."""
+        unscrubbed text. BACKLOG #2827: both passes read up to the 16 MiB reply cap, so they run here
+        rather than on the loop's thread, as the non-2xx scan inside _post already did.
+
+        THIS DOES NOT MAKE THE LOOP IMMUNE TO THE SCAN. Each ``re`` search and ``str`` replace is one
+        C call that holds the GIL until it returns, so the loop can still wait out the longest single
+        call. What bounds that wait is the scan being linear: a 16 MiB fault reply measured 0.6 to
+        0.8 s on one workstation (2026-11-03), most of it the ``_WSSE_FAULT_RE`` pass over the whole
+        body, which predates #2827."""
         body, status, headers = self._post(payload)
         failure = _classify_soap(status, body)
         # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any
@@ -936,8 +942,8 @@ class SoapDestination(DestinationConnector):
                 # ASVS 15.2.2: bounded on the socket read. One SOAP response envelope sits far under
                 # the 16 MiB ceiling, so this refuses only a peer that is broken or hostile.
                 # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
-                # re-send. A Fault can sit inside a 2xx, so send() reads this body in both capture
-                # modes, and the refusal is permanent.
+                # re-send. A Fault can sit inside a 2xx, so _post_and_classify reads this body in both
+                # capture modes, and the refusal is permanent.
                 body = read_2xx_reply_text(
                     resp, connector=self._hop, encoding=self.encoding, body_is_needed=True
                 )
