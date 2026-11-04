@@ -32,6 +32,7 @@ import time
 from collections.abc import Callable, Mapping
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
+from messagefoundry.proactor_accept import guard_accepts
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.admission import FrameClock, ListenerAdmission
 from messagefoundry.transports.base import (
@@ -563,6 +564,7 @@ class TcpSource(SourceConnector):
         # uniform across all sources (mirrors MLLPSource).
         self._handler = handler
         self._admission.stopping = False  # a restart of this same instance serves again
+        guard_accepts()  # on the Proactor loop, a peer reset would close the listening socket
         self._server = await asyncio.start_server(self._on_client, self.host, self.port)
 
     @property
