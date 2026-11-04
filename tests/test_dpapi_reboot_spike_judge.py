@@ -208,6 +208,16 @@ SCENARIOS: dict[str, Scenario] = {
         )
     ),
     "two_boots": Scenario(_all(A5=_report("A5", boot_id="9"))),
+    # A stuck counter, and A5 from a second boot ten minutes after A4's, with a tick count past
+    # A4's: the clock disagrees with "same boot", so A5 is not judged against A4.
+    "stuck_id_second_boot": Scenario(
+        _all(
+            A4=_report("A4", **STUCK_ID),
+            A5=_report(
+                "A5", uptime_ms="200000", boot_utc="2026-11-04T06:28:30.0000000Z", **STUCK_ID
+            ),
+        )
+    ),
     # No counter, a tick count that went up and a boot time two minutes back: a clock correction
     # inside one boot, not a reboot.
     "no_id_clock_back": Scenario(
@@ -285,6 +295,10 @@ SCENARIOS: dict[str, Scenario] = {
     "a2_refused_a5_opened": Scenario(_all(A2=_report("A2", **REFUSED))),
     # The profile stayed loaded, so A3 was one more restart, and it was refused.
     "a3_refused_loaded": Scenario(_all(A3=_report("A3", **REFUSED))),
+    # The profile WAS seen unloaded and A3 was refused: a real answer, not a broken rig.
+    "a3_refused_unloaded": Scenario(
+        _all(A3=_report("A3", **REFUSED)), profile="loaded_before_start=False profile=x"
+    ),
     "a3_damaged_loaded": Scenario(_all(A3=_report("A3", user_unprotect="FAIL win32=13"))),
     "a3_no_report": Scenario(_all(A3=None), rebooted=False),
     # A3's control failed: A4 and A5 open the blob, but nothing before the reboot shows A3 working.
@@ -390,6 +404,8 @@ _OVERALL: list[tuple[str, str]] = [
     ("a1_no_sha", "INCONCLUSIVE"),
     ("a3_control_failed", "INCONCLUSIVE"),
     ("cross_failed_a2_damaged", "INVALID"),
+    ("stuck_id_second_boot", "INCONCLUSIVE"),
+    ("a3_refused_unloaded", "INCONCLUSIVE"),
     ("no_id_clock_back", "INCONCLUSIVE"),
     ("a1_dpapi_down", "INCONCLUSIVE"),
     ("not_rebooted_a2_refused", "INVALID"),
@@ -492,11 +508,13 @@ def test_a_yes_needs_a1s_value(judged: Judged) -> None:
         assert "no plain_sha256" in judged["a1_no_sha"][a]
 
 
-def test_payload_pass_holds_only_for_an_unobserved_unload(judged: Judged) -> None:
+def test_payload_pass_needs_a3_to_open_the_blob(judged: Judged) -> None:
+    # A3 counts as passing where it opened the blob, the unload seen or not.
     assert judged["all_good"]["prepass"].endswith("True")
     assert judged["not_rebooted"]["prepass"].endswith("True")
     assert judged["profile_unloaded"]["prepass"].endswith("True")
     for scenario in (
+        "a3_refused_unloaded",
         "a3_refused_loaded",
         "a3_damaged_loaded",
         "a3_no_report",
@@ -513,6 +531,17 @@ def test_a_stuck_boot_counter_does_not_hide_a_reboot(judged: Judged) -> None:
     assert _v(judged, "stuck_id_a5_late", "A5") == "YES"
     assert "same" in judged["same_boot_id"]["A4"]
     assert "unknown" in judged["same_id_tick_down_boot_earlier"]["A4"]
+    # Nor does it join two boots into one.
+    assert _v(judged, "stuck_id_second_boot", "A5") == "INCONCLUSIVE"
+    assert (
+        "not shown to be from the boot report-A4 is from: unknown"
+        in judged["stuck_id_second_boot"]["A5"]
+    )
+
+
+def test_an_a3_refusal_after_a_seen_unload_is_a_real_no(judged: Judged) -> None:
+    assert _v(judged, "a3_refused_unloaded", "A3") == "NO"
+    assert "A3 NO after a seen profile unload" in judged["a3_refused_unloaded"]["VERDICT"]
 
 
 def test_the_boots_line_carries_the_raw_readings(judged: Judged) -> None:
@@ -584,10 +613,10 @@ function Restore-VMSnapshot { }
 # The first session is still the boot before (up longer than the 120 s since the ask), the second
 # is the new boot.
 $script:uptimes = @(900000, 30000)
-"rebooted=$(Wait-GuestSession $null (Get-Date).AddSeconds(-120) 60) reads=$script:reads"
-# A guest that never reboots never reads as back.
-$script:reads = 0; $script:uptimes = @()
-try { $null = Wait-GuestSession $null (Get-Date).AddSeconds(-120) 1; 'never=RETURNED' } catch { "never=$($_.Exception.Message)" }
+"rebooted=$(Wait-GuestSession $null ([DateTime]::UtcNow.AddSeconds(-120)) 60) reads=$script:reads"
+# A guest that never reboots never reads as back, nor does a tick count that wrapped negative.
+$script:reads = 0; $script:uptimes = @(-5)
+try { $null = Wait-GuestSession $null ([DateTime]::UtcNow.AddSeconds(-120)) 1; 'never=RETURNED' } catch { "never=$($_.Exception.Message) reads>1=$($script:reads -gt 1)" }
 
 $script:states = @('Off', 'Off')
 "clean=[$(Stop-AndRevert $null)]"
@@ -607,6 +636,7 @@ def test_host_reboot_wait_and_cleanup(tmp_path: Path) -> None:
     assert out["none"] == "session"
     assert out["rebooted"] == "session reads=2"
     assert out["never"].startswith("STOP     no PowerShell Direct session"), out["never"]
+    assert out["never"].endswith("reads>1=True"), out["never"]
     assert out["clean"] == "[]"
     assert "Stop-VM failed: stop refused" in out["stopfail"]
     assert "after Stop-VM it was Running, not Off" in out["stopfail"]

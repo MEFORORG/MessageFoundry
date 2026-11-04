@@ -45,8 +45,10 @@
   The reboot is proven from the reports themselves, for A4 and for A5 each against A3, and A5 must
   be from A4's boot when A4 reported. Either signal shows a reboot: Windows' boot counter
   (PrefetchParameters BootId) changed, or the tick count went down (it resets only at a boot) while
-  the boot time (clock minus uptime) moved later. With no counter in a report, a tick count that
-  went down shows one alone, and so does a boot time 60 seconds or more later. The judge prints every report's raw counter, tick count and
+  the boot time (clock minus uptime) moved later. An unmoved counter shows the same boot only where
+  the tick count did not go down and the boot times are within 60 seconds. With no counter in a
+  report, a tick count that went down shows a reboot alone, and so does a boot time 60 seconds or
+  more later. A5 also counts as rebooted when A4 shows the reboot and A5 is from A4's boot. The judge prints every report's raw counter, tick count and
   boot time on its boots line.
 
   Each arm reads YES, NO, INVALID or INCONCLUSIVE. INVALID is a report showing a broken instrument:
@@ -54,7 +56,8 @@
   plain_sha256 that is not A1's; a YES needs that match. A3 still reads its result when the profile
   was not seen unloaded, so a refusal there shows; only a YES is held back to INCONCLUSIVE. The
   verdict line reads INVALID when any arm is INVALID or any of A1 to A3 is NO, whatever A4 and A5
-  say; INCONCLUSIVE when A1 to A3 do not all open the blob (A3 counted where the unload was not
+  say, except that an A3 NO after a seen unload is a real refusal and reads INCONCLUSIVE, naming
+  it; INCONCLUSIVE when A1 to A3 do not all open the blob (A3 counted where the unload was not
   seen; the payload's exit code is the same test); else SURVIVES when A4 and A5 both open the
   user-scope blob with every control held; SURVIVES, BUT NOT AT THE BOOT-TIME START when A5 opens it
   and A4 is refused; DOES NOT SURVIVE when A5 is refused with the controls held and A4 did not open
@@ -704,7 +707,8 @@ function Get-BootRelation($Earlier, $Later) {
     # 'rebooted', 'same' or 'unknown', for two reports in time order. Either of two signals shows a
     # reboot: Windows' boot counter changed, or the tick count went down while the boot time (clock
     # minus uptime) moved later. A counter that did not move cannot overrule the second, since
-    # nothing here shows every build moves it at every boot. With no counter, a tick count that went
+    # nothing here shows every build moves it at every boot; nor does it show the same boot beside a
+    # tick count that went down or a boot time 60 s or more away. With no counter, a tick count that went
     # down shows a reboot whatever the clock says (a clock read early at boot can put the boot time
     # back); else a boot time 60 s or more LATER shows one, and boot times within 60 s show the same
     # boot. Those last rest on the guest clock. Signals that disagree read 'unknown', a boot time
@@ -715,14 +719,20 @@ function Get-BootRelation($Earlier, $Later) {
     $tickKnown = $null -ne $e[1] -and $null -ne $l[1]
     $bootKnown = $null -ne $e[2] -and $null -ne $l[2]
     $tickDown = $tickKnown -and $l[1] -lt $e[1]
+    $gap = $null
+    if ($bootKnown) { $gap = ($l[2] - $e[2]).TotalSeconds }
     if ($idKnown -and $e[0] -ne $l[0]) { return 'rebooted' }
-    if ($tickDown -and $bootKnown -and $l[2] -gt $e[2]) { return 'rebooted' }
-    if ($idKnown) { if ($tickDown) { return 'unknown' } else { return 'same' } }
-    if (-not $tickKnown -or -not $bootKnown) { return 'unknown' }
+    if ($tickDown -and $bootKnown -and $gap -gt 0) { return 'rebooted' }
+    if ($idKnown) {
+        # An unmoved counter shows the same boot only where the tick count and the clock agree:
+        # a boot time 60 s or more later may be a second boot the counter missed.
+        if ($tickDown -or ($null -ne $gap -and [Math]::Abs($gap) -ge 60)) { return 'unknown' }
+        return 'same'
+    }
+    if (-not $tickKnown) { return 'unknown' }
     if ($tickDown) { return 'rebooted' }
-    $gap = ($l[2] - $e[2]).TotalSeconds
+    if ($null -eq $gap -or $gap -le -60) { return 'unknown' }
     if ($gap -ge 60) { return 'rebooted' }
-    if ($gap -le -60) { return 'unknown' }
     'same'
 }
 
@@ -793,13 +803,17 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
     $lines += "DPAPI-REBOOT boots: $boots"
     $lines += @(foreach ($a in $arms) { "DPAPI-REBOOT $($names[$a]): $($v[$a][0]) ($($v[$a][1]))" })
     # A NO before the reboot, or an INVALID anywhere, is the instrument or the setup failing, and
-    # no reboot arm beside it answers the question.
+    # no reboot arm beside it answers the question. An A3 NO after a seen unload is the one
+    # exception: a real refusal, which still leaves the reboot arms unread.
     $broken = @(foreach ($a in $arms) {
-            if ($v[$a][0] -eq 'INVALID' -or ($v[$a][0] -eq 'NO' -and $a -in 'A1', 'A2', 'A3')) { "$a $($v[$a][0])" }
+            $restart = ($a -in 'A1', 'A2') -or ($a -eq 'A3' -and -not $unloaded)
+            if ($v[$a][0] -eq 'INVALID' -or ($v[$a][0] -eq 'NO' -and $restart)) { "$a $($v[$a][0])" }
         })
     $overall = 'NOT RUN'
     if ($broken.Count) { $overall = "INVALID ($($broken -join ', '): the instrument or the setup failed)" }
-    elseif ($Rebooted -and -not $prePass) {
+    elseif ($Rebooted -and $v['A3'][0] -eq 'NO') {
+        $overall = 'INCONCLUSIVE (A3 NO after a seen profile unload: the blob did not survive the reload, so the reboot arms are not read)'
+    } elseif ($Rebooted -and -not $prePass) {
         $overall = 'INCONCLUSIVE (A1 to A3 did not all open the blob, so the instrument is not shown working before the reboot)'
     } elseif ($Rebooted) {
         # A5 is the survival question: a demand start, once boot is over. A4 can only narrow it,
@@ -861,24 +875,22 @@ function Invoke-Guest($Session, [string]$GuestStep, [string]$ArmName = '') {
 
 function Get-GuestUptimeMs($Session) {
     # The guest's tick count, which only a boot resets. The guest side is Windows PowerShell 5.1,
-    # whose .NET has no Environment.TickCount64.
-    Invoke-Command -Session $Session -ScriptBlock {
-        if (-not ('MeforSpike.Tick' -as [type])) {
-            Add-Type -Namespace MeforSpike -Name Tick -MemberDefinition '[DllImport("kernel32.dll")] public static extern ulong GetTickCount64();'
-        }
-        [MeforSpike.Tick]::GetTickCount64()
-    }
+    # whose .NET has no Environment.TickCount64; the 32-bit count wraps negative after 24.8 days up,
+    # which a guest started from the checkpoint minutes before never reaches, and a negative reading
+    # is refused, never taken as a fresh boot.
+    Invoke-Command -Session $Session -ScriptBlock { [Environment]::TickCount }
 }
 
 function Wait-GuestSession($Credential, $AskedAt, [int]$Seconds) {
-    # $AskedAt is the host's time just before the reboot was asked, or $null for no reboot. The
+    # $AskedAt is the host's UtcNow just before the reboot was asked, or $null for no reboot. The
     # guest is back from that reboot once its uptime is less than the time since: a guest that never
-    # rebooted has been up longer than that. It reads no guest clock, which a reboot may set wrong.
+    # rebooted has been up longer than that. It reads no guest clock, which a reboot may set wrong,
+    # and UTC, so a daylight-saving change on the host cannot shift it.
     # Each failed attempt is logged with its type. While a guest boots the failure types vary (the
     # VM bus not up, the credential service not up, a session that drops), so no one type is caught;
     # a refused credential is the exception, and stops the wait at once.
-    $deadline = (Get-Date).AddSeconds($Seconds)
-    while ((Get-Date) -lt $deadline) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
         $s = $null
         $beat = [string](Get-VM -Name $VMName).Heartbeat
         if ($beat -notlike 'Ok*') { Write-Log "waiting for the guest: heartbeat $beat"; Start-Sleep -Seconds 10; continue }
@@ -886,8 +898,8 @@ function Wait-GuestSession($Credential, $AskedAt, [int]$Seconds) {
             $s = New-PSSession -VMName $VMName -Credential $Credential -ErrorAction Stop
             if ($null -eq $AskedAt) { return $s }
             $up = [double](Get-GuestUptimeMs $s)
-            $since = ((Get-Date) - $AskedAt).TotalMilliseconds
-            if ($up -lt $since) { Write-Log "guest back: uptime_ms=$up, $([long]$since) ms since the reboot was asked"; return $s }
+            $since = ([DateTime]::UtcNow - $AskedAt).TotalMilliseconds
+            if ($up -ge 0 -and $up -lt $since) { Write-Log "guest back: uptime_ms=$up, $([long]$since) ms since the reboot was asked"; return $s }
             Write-Log "waiting for the guest: still the boot before, uptime_ms=$up, $([long]$since) ms since the reboot was asked"
             Remove-PSSession $s
         } catch {
@@ -937,11 +949,12 @@ function Invoke-HostRun {
         $snap = $snap[0]
         $lab = @(Get-VMSwitch -Name 'MEFOR-Lab')
         if ($lab.Count -ne 1 -or [string]$lab[0].SwitchType -ne 'Private') { throw "STOP     MEFOR-Lab is not one Private switch; nothing ran" }
+        # The judge reads the reports folder whole, and the log appends, so an earlier run's files
+        # would pass for this run's.
+        if ((Test-Path -LiteralPath $OutDir) -and @(Get-ChildItem -LiteralPath $OutDir -Force).Count) { throw "STOP     $OutDir already holds files from another run; pass a new -OutDir; nothing ran" }
         $null = New-Item -ItemType Directory -Force -Path $OutDir
         $script:HostLog = Join-Path $OutDir 'dpapi-reboot-spike-host.txt'
         $reports = Join-Path $OutDir 'reports'
-        # The judge reads whatever is in it, so an earlier run's reports would pass for this run's.
-        if ((Test-Path -LiteralPath $reports) -and @(Get-ChildItem -LiteralPath $reports -Force).Count) { throw "STOP     $reports already holds files from another run; pass a new -OutDir; nothing ran" }
         $null = New-Item -ItemType Directory -Force -Path $reports
         Invoke-Rig $cred $snap $reports
     } finally {
@@ -988,12 +1001,19 @@ function Invoke-Rig($Credential, $Snap, [string]$Reports) {
         foreach ($s in $PreRebootSteps) { Invoke-Guest $session $s[0] $s[1] }
         # Out before the reboot, so a guest that never comes back still leaves A1 to A3 to judge.
         Copy-Item -FromSession $session -Path (Join-Path $Work '*.txt') -Destination $Reports
-        $askedAt = Get-Date
+        $askedAt = [DateTime]::UtcNow
         Invoke-Guest $session 'Reboot' 'A4'
         Remove-PSSession $session
         $session = $null
         $session = Wait-GuestSession $Credential $askedAt 900
         Invoke-Guest $session 'BootReport'
+        # A5 is the demand start once boot is over, so it waits for 300 s of uptime: a failure that
+        # only boot timing causes then shows at A4 alone.
+        $up = [double](Get-GuestUptimeMs $session)
+        if ($up -ge 0 -and $up -lt 300000) {
+            Write-Log "waiting $([long]((300000 - $up) / 1000)) s for the guest to be 300 s up before A5"
+            Start-Sleep -Milliseconds ([int](300000 - $up))
+        }
         Invoke-Guest $session 'Start' 'A5'
     } catch {
         # Logged here: the transcript stops in finally, before a rethrown error reaches the console.
