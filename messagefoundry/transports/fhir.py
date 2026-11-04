@@ -955,11 +955,11 @@ def _unwrap_transaction_reply(
     occurrence of a repeated key reads a third way (vault BACKLOG #3796); see :func:`_agreed_reading`.
 
     The entry's ``etag``/``location``/``lastModified`` describe the updated resource, so a field the
-    entry carries suppresses the reply header of the same name, which describes the Bundle, even
-    when the entry's value is then dropped. At least a value that is not a JSON string, carries a C0
-    control character or DEL, or is longer than a header value may be, is dropped: it came from a
-    JSON body, which, unlike an HTTP header line, bounds none of those. The rest are offered to the
-    #154 allow-list."""
+    entry carries with a non-null value suppresses the reply header of the same name, which
+    describes the Bundle, even when the entry's value is then dropped. At least a value that is not
+    a JSON string, carries a C0 control character or DEL, or is longer than a header value may be,
+    is dropped: it came from a JSON body, which, unlike an HTTP header line, bounds none of those.
+    The rest are offered to the #154 allow-list."""
     try:
         obj: dict[str, Any] | None = FhirPeek.parse(body).obj
     except FhirPeekError:

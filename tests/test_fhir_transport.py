@@ -669,12 +669,13 @@ async def test_overlong_entry_etag_is_not_captured_and_hides_the_bundle_etag() -
     assert isinstance(resp, DeliveryResponse) and resp.headers == {}
 
 
-@pytest.mark.parametrize("etag", [1, True, [1], {"a": 1}])
-async def test_non_string_entry_etag_is_not_captured_and_hides_the_bundle_etag(
+@pytest.mark.parametrize("etag", [1, True, [1], {"a": 1}, 'W/"a\x7fb"'])
+async def test_unusable_entry_etag_is_not_captured_and_hides_the_bundle_etag(
     etag: object,
 ) -> None:
-    # docs/PHI.md lists a non-string entry value among the drops (BACKLOG #5017): it is neither
-    # stringified into a header nor replaced by the reply's own ETag, which describes the Bundle.
+    # docs/PHI.md lists a non-string entry value and a DEL among the drops (BACKLOG #5017): such a
+    # value is neither stringified into a header nor replaced by the reply's own ETag, which
+    # describes the Bundle.
     reply_headers = email.message.Message()
     reply_headers["ETag"] = 'W/"bundle-level"'
     dest = _dest(interaction="update", capture_response=True, capture_response_headers=["ETag"])
@@ -683,6 +684,18 @@ async def test_non_string_entry_etag_is_not_captured_and_hides_the_bundle_etag(
     )
     resp = await dest.send(UPDATE_1965)
     assert isinstance(resp, DeliveryResponse) and resp.headers == {}
+
+
+async def test_null_entry_etag_does_not_hide_the_bundle_etag() -> None:
+    # docs/PHI.md says only a NON-NULL entry field suppresses the reply header (BACKLOG #5017).
+    reply_headers = email.message.Message()
+    reply_headers["ETag"] = 'W/"bundle-level"'
+    dest = _dest(interaction="update", capture_response=True, capture_response_headers=["ETag"])
+    dest._opener = _FakeOpener(  # type: ignore[assignment]
+        body=_transaction_response("200 OK", etag=None), headers=reply_headers
+    )
+    resp = await dest.send(UPDATE_1965)
+    assert isinstance(resp, DeliveryResponse) and resp.headers == {"ETag": 'W/"bundle-level"'}
 
 
 @pytest.mark.parametrize(
