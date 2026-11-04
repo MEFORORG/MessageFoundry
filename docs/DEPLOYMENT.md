@@ -482,7 +482,8 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
    precondition — a refusal (exit 2), not an advisory, and not covered by `--allow-insecure-bind`:
    - **Both branches** also need `MEFOR_TLS_REVOCATION_ATTESTED=1`, on the rule
      [SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate) states. If you name a proxy that re-encrypts to
-     your certificate in `[api].trusted_proxies`, you also need `[api].proxy_tls_min_version` and
+     your certificate in `[api].trusted_proxies`, then under `[security].enforcement = enforce` you
+     also need `[api].proxy_tls_min_version` and
      `[security].web_console_public_address`, which the startup TLS-floor probe dials. The
      `trusted_proxies` row of [CONFIGURATION.md](CONFIGURATION.md#api) says when each one refuses
      (vault BACKLOG #3538).
@@ -1091,9 +1092,12 @@ one, so routing your egress through it is good practice and does not change the 
    through it, and routing it through the guard brought it under the rule the others already had. What it does
    on the listener is stated in [SECURITY.md](SECURITY.md#api-revocation-gate). Outbound, it still
    crosses a hop on a **non-enforcing** instance, where the
-   alternative is a warning rather than a refusal. An attestation that suppresses a would-be refusal
-   is **logged at WARNING at every construction**, so it stays visible. (A Vault hop logs it once
-   per process for each hop, because its client is rebuilt on every secret read.)
+   alternative is a warning rather than a refusal, and **that crossing is silent**: the variable
+   turns the hop's warning into an allow, and nothing is logged for it. The WARNING that keeps an
+   attestation visible is written only for a hop's own attestation, the per-connection pair below
+   or a non-connection hop's own pair, that suppresses a would-be refusal on an enforcing instance.
+   (A Vault hop logs it once per process for each hop, because its client is rebuilt on every
+   secret read.)
    **The attestation that does cross an enforcing outbound hop is per-connection:**
    `tls_revocation_attested = true` plus a mandatory `tls_revocation_attested_reason`, set on that one
    connection (an `outbound()` or `FhirLookup()` keyword, or a top-level `connections.toml` key, not a `[settings]` key —
