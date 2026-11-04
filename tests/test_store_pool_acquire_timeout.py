@@ -44,6 +44,7 @@ from messagefoundry.store.base import (
     acquire_pooled,
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
+from messagefoundry.store.store import RevokeResult
 
 FAST = 0.05  # a timeout short enough to keep the suite quick, long enough not to be flaky
 
@@ -355,7 +356,7 @@ class _BusyPool(_GatedPool):
 
 @pytest.mark.parametrize(
     ("name", "expected"),
-    [("revoke_user_sessions", 2), ("rotate_session", True)],
+    [("revoke_user_sessions", RevokeResult(2, kept=False)), ("rotate_session", True)],
 )
 async def test_postgres_post_commit_session_writes_wait_out_a_busy_pool(
     name: str, expected: object
@@ -444,7 +445,7 @@ class _MssqlSessionConn(_Conn):
 
 @pytest.mark.parametrize(
     ("name", "expected"),
-    [("revoke_user_sessions", 2), ("rotate_session", True)],
+    [("revoke_user_sessions", RevokeResult(2, kept=False)), ("rotate_session", True)],
 )
 async def test_sqlserver_post_commit_session_writes_wait_out_a_busy_pool(
     name: str, expected: object, monkeypatch: pytest.MonkeyPatch

@@ -9919,7 +9919,7 @@ class AuthService:
             self._report_directory_admin_grant(
                 user, before=user.role_ids, after=revocation.role_ids
             )
-        revoked = await self._store.revoke_user_sessions(revocation.user_id)
+        revoked = (await self._store.revoke_user_sessions(revocation.user_id)).count
         # Owner ruling 2026-10-17 narrows "audit always": a disabled or absent account whose
         # revocation ended nothing still reports, unless a verified row shows another pass revoked
         # it. Read BEFORE this revocation's own row is written, or the row would find itself.
@@ -11682,12 +11682,17 @@ class AuthService:
         self, identity: Identity, current_token_hash: str, *, actor: str
     ) -> int:
         """Revoke all of ``identity``'s sessions **except** the caller's current one ("sign out
-        everywhere else"). Returns the count revoked. Audited when any were revoked, and when the
-        caller's own session was not kept current (:meth:`_kept_session_current`, BACKLOG #4975):
-        then the scope is ``self_all``, since the gate ends that session at its next request."""
-        scope = "self_others"
+        everywhere else"). Returns the count revoked. Audited when any were revoked, and whenever
+        the revoke did not keep the caller's own session: then the scope is ``self_all``.
+
+        Whether it kept that session is the store's answer from the revoke's own transaction
+        (:class:`~messagefoundry.store.store.RevokeResult`, BACKLOG #4975), never a read made
+        after it. The store keeps the session only when it re-stamped it with the new epoch, so a
+        session an earlier sweep missed, left unstamped and refused at its next request, is not
+        reported kept. The count is always the rows this call revoked: the caller's own session is
+        in it only on the seal-failure path, where this call revoked it."""
         try:
-            revoked = await self._store.revoke_user_sessions(
+            result = await self._store.revoke_user_sessions(
                 identity.user_id, except_token_hash=current_token_hash
             )
         except RowSealError:
@@ -11695,43 +11700,15 @@ class AuthService:
             # The caller asked to end every other session and its own is suspect: end them all,
             # and audit that scope, since the caller's own session is ended too.
             await self._session_seal_failed(current_token_hash)
-            revoked = await self._store.revoke_user_sessions(identity.user_id)
-            scope = "self_all"
-        else:
-            if not await self._kept_session_current(current_token_hash):
-                scope = "self_all"
-        if revoked or scope == "self_all":
+            result = await self._store.revoke_user_sessions(identity.user_id)
+        scope = "self_others" if result.kept else "self_all"
+        if result.count or not result.kept:
             await self._audit(
                 "auth.session_revoked",
                 actor=actor,
-                detail=_json({"scope": scope, "count": revoked}),
+                detail=_json({"scope": scope, "count": result.count}),
             )
-        return revoked
-
-    async def _kept_session_current(self, token_hash: str) -> bool:
-        """Whether the session a revoke kept still resolves on its epochs: unrevoked, sealed, and
-        carrying its account's epoch and the store's global one (BACKLOG #4975). A revoke leaves
-        a kept session an earlier sweep missed unstamped, so the gate refuses it at its next
-        request, and a reply or audit row that called it kept would be wrong.
-
-        Read back after the revoke committed, in two reads, so a second revoke committing between
-        them can make a kept session read as not kept, and one landing after them can still end
-        it. Not a pure check: the two loaders end and report a row that fails its seal, as they do
-        for every reader. A refused read answers ``False`` and is logged rather than raised, so
-        the committed revoke still gets its audit row; its scope then names the wider act."""
-        try:
-            session = await self._load_session(token_hash)
-            if session is None:
-                return False
-            user = await self._load_user(session.user_id)
-        except AUDIT_WRITE_DEFECTS:
-            raise
-        except store_call_errors():
-            _log.exception("reading back the session a revoke kept failed; reported as not kept")
-            return False
-        return user is not None and session_epochs_current(
-            session, user_epoch=user.session_epoch, global_epoch=user.global_session_epoch
-        )
+        return result.count
 
     async def count_other_sessions(self, user_id: str, current_token_hash: str) -> int | None:
         """How many sessions :meth:`revoke_other_sessions` would end for this caller, at the moment
@@ -11764,7 +11741,7 @@ class AuthService:
     async def revoke_sessions_for_user(self, user_id: str, *, actor: str) -> int:
         """Admin: revoke **all** of a user's sessions (force sign-out everywhere). Returns the count.
         Audited."""
-        revoked = await self._store.revoke_user_sessions(user_id)
+        revoked = (await self._store.revoke_user_sessions(user_id)).count
         await self._audit(
             "auth.session_revoked",
             actor=actor,
@@ -11784,29 +11761,34 @@ class AuthService:
 
         A kept session whose seal fails makes the store write nothing. The caller's own session is
         then suspect, so it is ended with the rest, and the audit row's scope says so, as
-        :meth:`revoke_other_sessions` does."""
+        :meth:`revoke_other_sessions` does.
+
+        Whether the session was kept is the store's answer from the revoke's own transaction
+        (:class:`~messagefoundry.store.store.RevokeResult`, BACKLOG #4975), never a read made
+        after it: kept only when the store re-stamped it with the new epochs. Not kept covers at
+        least a session another request ended first, one an earlier sweep missed, which the store
+        leaves unstamped and the gate refuses at its next request, and the seal-failure path. The
+        count is always the rows this call revoked, as :meth:`revoke_other_sessions` counts."""
         try:
-            revoked = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
+            result = await self._store.revoke_all_sessions(except_token_hash=keep_token_hash)
         except RowSealError:
             # The sweep runs first, so the suspect row is counted with the rest: ended first by
             # the seal-failure handler, the sweep would find it gone and the reply and the audit
             # row would be one short. The handler still runs if the sweep raises, so the suspect
             # row is ended either way; its own revoke then matches nothing, and it reports.
             try:
-                revoked = await self._store.revoke_all_sessions()
+                result = await self._store.revoke_all_sessions()
             finally:
                 await self._session_seal_failed(keep_token_hash)
-        # Read back rather than inferred: a revoke of the caller's own session that landed before
-        # the sweep leaves nothing kept, and nor does a kept session an earlier sweep missed, which
-        # the store leaves unstamped (BACKLOG #4975); the reply and the audit row must say so.
-        kept = await self._kept_session_current(keep_token_hash)
         await self._audit(
             "auth.session_revoked",
             actor=actor,
-            detail=_json({"scope": "all_but_caller" if kept else "all", "count": revoked}),
+            detail=_json(
+                {"scope": "all_but_caller" if result.kept else "all", "count": result.count}
+            ),
             client=client,
         )
-        return revoked, kept
+        return result.count, result.kept
 
     async def _custom_permissions_for_ids(self, role_ids: Iterable[str]) -> frozenset[Permission]:
         """Resolve the permission overlay for any custom (``custom:``-prefixed) role ids the user holds
@@ -16996,7 +16978,7 @@ class AuthService:
             # absolute lifetime it found none, and those rows would come back on the old mapping
             # once the clock was set right. ``revoke_user_sessions`` matches every unrevoked row,
             # whatever the clock says, and costs one statement where the read cost one too.
-            revoked += await self._store.revoke_user_sessions(user_id)
+            revoked += (await self._store.revoke_user_sessions(user_id)).count
         return revoked
 
     async def sessions_ended_by_ad_map_save(self) -> frozenset[str]:

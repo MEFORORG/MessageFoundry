@@ -263,7 +263,8 @@ async def test_sqlserver_revoke_user_sessions_counts_its_output_rowset(revoked: 
         seen.append(("raise the epoch", (user_id,)))
 
     store._bump_session_epoch = bump
-    assert await store.revoke_user_sessions("u", except_token_hash=_HASH, now=_NOW) == revoked
+    result = await store.revoke_user_sessions("u", except_token_hash=_HASH, now=_NOW)
+    assert result.count == revoked
     # The account's epoch is raised first (BACKLOG #2592); the sweep is the statement that counts.
     assert seen[0][0] == "raise the epoch"
     assert "OUTPUT inserted.token_hash" in seen[1][0]

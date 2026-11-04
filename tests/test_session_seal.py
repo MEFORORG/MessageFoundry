@@ -17,7 +17,7 @@ import pathlib
 import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +31,7 @@ from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import (
     SESSION_SEAL_EXCLUDED,
     MessageStore,
+    RevokeResult,
     SessionRecord,
     session_seal_ok,
 )
@@ -344,6 +345,136 @@ async def test_a_kept_session_a_sweep_missed_is_not_reported_kept(
     assert (await scopes())[0] == "self_others"
     assert await service.identity_for_token(fresh) is not None
     assert await service.identity_for_token(stale) is None
+
+
+async def test_the_reply_and_audit_scope_follow_the_stores_kept_answer(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #4975: whether a revoke kept the caller's session is the store's answer from the
+    revoke's own transaction, and the reply and the audit scope follow it. Three cases, kept,
+    declined and the seal failure, each beside a control that differs only in that answer. The
+    count is the rows the call revoked: the caller's own row is in it on the seal-failure path,
+    where the fallback revoked it, and not on the declined path, where it was left."""
+    store, path = keyed
+    service = AuthService(store, AuthSettings())
+    await store.create_user(
+        user_id="u", username="u", auth_provider="local", password_generated=False
+    )
+
+    async def mint() -> str:
+        token = mint_token()
+        await store.create_session(
+            token_hash=hash_token(token), user_id="u", expires_at=time.time() + 3600
+        )
+        return token
+
+    async def last() -> dict[str, Any]:
+        rows = await store.list_audit(action="auth.session_revoked", limit=1)
+        return dict(json.loads(rows[0]["detail"]))
+
+    real_all, real_user = store.revoke_all_sessions, store.revoke_user_sessions
+
+    def answering(kept: bool) -> None:
+        # The real revoke runs, and only its `kept` is replaced: the service has nothing else to
+        # read the answer from.
+        async def revoke_all(**kwargs: Any) -> RevokeResult:
+            return replace(await real_all(**kwargs), kept=kept)
+
+        async def revoke_user(user_id: str, **kwargs: Any) -> RevokeResult:
+            return replace(await real_user(user_id, **kwargs), kept=kept)
+
+        monkeypatch.setattr(store, "revoke_all_sessions", revoke_all)
+        monkeypatch.setattr(store, "revoke_user_sessions", revoke_user)
+
+    for kept, every_scope, self_scope in (
+        (True, "all_but_caller", "self_others"),
+        (False, "all", "self_all"),  # declined: the same current session, the answer flipped
+    ):
+        answering(kept)
+        caller = await mint()
+        await mint()
+        identity = await service.identity_for_token(caller)
+        assert identity is not None
+        assert await service.revoke_every_session(
+            actor="u", keep_token_hash=hash_token(caller)
+        ) == (1, kept)
+        assert await last() == {"scope": every_scope, "count": 1}
+        await mint()
+        assert await service.revoke_other_sessions(identity, hash_token(caller), actor="u") == 1
+        assert await last() == {"scope": self_scope, "count": 1}
+        monkeypatch.undo()
+        await store.revoke_user_sessions("u")
+
+    # --- the seal failure: the caller's own row fails its seal, so nothing is kept --------------
+    for bent in (False, True):  # control first: the same three rows, the seal intact
+        caller, *_ = [await mint() for _ in range(3)]
+        if bent:
+            await _raw_for(path)(
+                "UPDATE sessions SET reauth_at=? WHERE token_hash=?", (1.0, hash_token(caller))
+            )
+        assert await service.revoke_every_session(
+            actor="u", keep_token_hash=hash_token(caller)
+        ) == ((3, False) if bent else (2, True))
+        assert await last() == (
+            {"scope": "all", "count": 3} if bent else {"scope": "all_but_caller", "count": 2}
+        )
+        await store.revoke_user_sessions("u")
+
+
+async def test_a_failed_read_after_the_revoke_cannot_change_the_scope(
+    keyed: tuple[MessageStore, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #4975: the service once re-derived "kept" by reading the session and its account
+    back after the revoke committed, and a refused read made it report a kept session as ended.
+    The answer now comes from the revoke itself, so a session or user read failing after the
+    commit cannot reach the reply or the audit scope. RED on the read-back: it answered False."""
+    store, _path = keyed
+    service = AuthService(store, AuthSettings())
+    await store.create_user(
+        user_id="u", username="u", auth_provider="local", password_generated=False
+    )
+    caller = mint_token()
+    await store.create_session(
+        token_hash=hash_token(caller), user_id="u", expires_at=time.time() + 3600
+    )
+    identity = await service.identity_for_token(caller)
+    assert identity is not None
+
+    async def refused(*_args: Any, **_kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    real_all, real_user = store.revoke_all_sessions, store.revoke_user_sessions
+
+    async def then_refuse_all(**kwargs: Any) -> RevokeResult:
+        result = await real_all(**kwargs)
+        monkeypatch.setattr(store, "get_session", refused)
+        monkeypatch.setattr(store, "get_user", refused)
+        return result
+
+    async def then_refuse_user(user_id: str, **kwargs: Any) -> RevokeResult:
+        result = await real_user(user_id, **kwargs)
+        monkeypatch.setattr(store, "get_session", refused)
+        monkeypatch.setattr(store, "get_user", refused)
+        return result
+
+    monkeypatch.setattr(store, "revoke_all_sessions", then_refuse_all)
+    assert await service.revoke_every_session(actor="u", keep_token_hash=hash_token(caller)) == (
+        0,
+        True,
+    )
+    monkeypatch.undo()
+    rows = await store.list_audit(action="auth.session_revoked", limit=1)
+    assert json.loads(rows[0]["detail"]) == {"scope": "all_but_caller", "count": 0}
+
+    monkeypatch.setattr(store, "revoke_user_sessions", then_refuse_user)
+    assert await service.revoke_other_sessions(identity, hash_token(caller), actor="u") == 0
+    monkeypatch.undo()
+    # Kept with nothing else ended writes no row, as before the read-back: the newest row is
+    # still the every-account one.
+    rows = await store.list_audit(action="auth.session_revoked", limit=5)
+    assert [json.loads(row["detail"])["scope"] for row in rows] == ["all_but_caller"]
+    # Control: the reads the hooks refuse are real ones, and they work once the hooks are gone.
+    assert await service.identity_for_token(caller) is not None
 
 
 async def test_signing_out_elsewhere_keeps_the_callers_own_session(

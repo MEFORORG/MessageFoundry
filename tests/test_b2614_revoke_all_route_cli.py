@@ -30,7 +30,7 @@ from messagefoundry.auth.service import (
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, RevokeResult
 from tests._admin_account import create_local_user_chosen
 from tests._phi_gate_provisions import setenv_at_rest_opt_out
 from tests.test_api_auth import PW, _clear_must_change
@@ -171,7 +171,7 @@ async def test_a_kept_session_that_fails_its_seal_is_counted_with_the_rest(
 
     async def _refuse_the_keep(
         *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
+    ) -> RevokeResult:
         if except_token_hash is not None:
             raise RowSealError(SESSION_KIND)
         return await real(now=now)

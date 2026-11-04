@@ -219,7 +219,8 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     assert await store.count_user_sessions("seal-u1") == others + 1  # mine is unrevoked too
     absent = hash_token(mint_token())  # a hash that names no row excepts nothing
     assert await store.count_user_sessions("seal-u1", except_token_hash=absent) == others + 1
-    assert await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(mine)) == others
+    result = await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(mine))
+    assert (result.count, result.kept) == (others, True)  # kept: re-stamped (BACKLOG #4975)
     assert await store.count_user_sessions("seal-u1", except_token_hash=hash_token(mine)) == 0
     assert await store.count_user_sessions("seal-u1") == 1
     assert await service.identity_for_token(mine) is not None  # the kept session, re-sealed
@@ -241,13 +242,15 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
     snapshot = await store.get_session(hash_token(missed))
     assert snapshot is not None
     current = await _mint(store)
-    assert await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(current)) >= 1
-    assert await service.identity_for_token(current) is not None  # control: a current one is kept
+    result = await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(current))
+    assert result.count >= 1 and result.kept  # control: a current one is kept, and said to be
+    assert await service.identity_for_token(current) is not None
     await raw(
         "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
         (snapshot.seal, hash_token(missed)),
     )
-    await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(missed))
+    result = await store.revoke_user_sessions("seal-u1", except_token_hash=hash_token(missed))
+    assert result.count >= 1 and not result.kept  # ended `current`; did not stamp `missed`
     left = await store.get_session(hash_token(missed))
     assert left is not None and left.revoked_at is None
     assert left.user_epoch == snapshot.user_epoch  # not re-stamped with the new epoch
@@ -271,7 +274,9 @@ async def assert_session_seal_contract(store: Any, raw: RawSql) -> None:
         (snapshot.seal, hash_token(behind)),
     )
     await raw("UPDATE users SET authz_seal=? WHERE id=?", ("mfseal:v1:b4975:bogus", "seal-u3"))
-    await store.revoke_user_sessions("seal-u3", except_token_hash=hash_token(behind))
+    assert not (
+        await store.revoke_user_sessions("seal-u3", except_token_hash=hash_token(behind))
+    ).kept
     unmoved = await store.get_user("seal-u3")
     assert unmoved is not None and unmoved.session_epoch == raised.session_epoch  # seal failed
     left = await store.get_session(hash_token(behind))

@@ -1501,7 +1501,7 @@ tuple: they act only on the caller's own account.
 | `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) -- end your own from `DELETE /me/sessions` and sign-out instead |
-| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends the sessions it finds and keeps the caller's current session, except at least when that session's seal fails, when it is ended too, and when an earlier revoke's sweep missed it, when it is left unstamped and refused when next presented (BACKLOG #4975). Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614). What it may miss: *Limits of the session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
+| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends the sessions it finds and keeps the caller's current session, except at least when that session's seal fails, when it is ended too, and when an earlier revoke's sweep missed it, when it is left unstamped and refused when next presented (BACKLOG #4975). Whether it kept that session, in the reply and in the audit row's scope, is the store's answer from the revoke's own transaction, not a read made after it (BACKLOG #4975). Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614). What it may miss: *Limits of the session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
 | `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user |
@@ -4747,20 +4747,27 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   on the global epoch only, for example one an every-account revoke missed on an account its read
   did not return, gets the new account epoch there and is still refused on the global one. The
   revoke still ends the user's other sessions, current ones included. All three stores make this
-  check. The service reads the kept session back against both epochs after the revoke commits,
-  so it does not call such a session kept: `DELETE /sessions` then answers that it was not kept
-  and audits scope `all`, and ending the user's other sessions audits scope `self_all`, even with
-  nothing else ended. That read-back is two reads, so a second revoke committing between them can
-  make it report a kept session as not kept, and a read it cannot make reports not kept. The
-  reply to `DELETE /me/sessions` still says only how many other sessions ended. The session left
-  unstamped stays unrevoked until it is presented, and its refusal then is reported as a seal
-  failure, as below.
+  check. **Each revoke reports whether it stamped the kept session, from the transaction that
+  stamped it** (`RevokeResult` in `messagefoundry/store/store.py`), and the service takes "kept"
+  from that answer and from nothing read afterwards. So a kept session left unstamped is not
+  called kept: `DELETE /sessions` answers that it was not kept and audits scope `all`, and ending
+  the user's other sessions audits scope `self_all`, even with nothing else ended. "Kept" says
+  what the revoke wrote, not what the gate will answer: the gate's expiry checks still apply, a
+  later revoke can still end the session, and the per-account revoke reports as kept a session
+  behind on the global epoch only, which it stamps as above and the gate still refuses. The count
+  in either audit row is the sessions that call revoked. Where the caller's own session failed
+  its seal, the fallback revoke ended it, so it is in the count; where the revoke left it
+  unstamped, it was not revoked and is not in the count. The reply to `DELETE /me/sessions`
+  still says only how many other sessions ended. The session left unstamped stays unrevoked
+  until it is presented, and its refusal then is reported as a seal failure, as below.
   `tests/_session_seal_contract.py` tests the per-account revoke, a seal failure included;
   `tests/test_b2614_revoke_all.py` the every-account revoke on a session behind on both epochs and
   on one behind on its account's epoch alone; and `tests/test_b5091_global_session_epoch.py` one
   behind on the global epoch alone. Each runs on SQLite and on the server legs
   `.github/workflows/ci.yml` runs from `tests/test_postgres_store.py` and
-  `tests/test_sqlserver_store.py`.
+  `tests/test_sqlserver_store.py`. Each of those three also checks the store's kept answer.
+  `tests/test_session_seal.py` tests that the service's reply and audit scope follow that answer,
+  and that a read failing after the revoke cannot change them; it runs on SQLite only.
   **A request that straddles a revoke's commit can still end the session the revoke kept, and
   reports a seal failure either way.** The gate and the session list read a session before its
   account, so such a request can see a session's old stamps beside the account's new epochs. On

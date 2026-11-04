@@ -36,7 +36,12 @@ from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store import store as store_module
-from messagefoundry.store.store import LOGIN_ADDRESS_RESET_MARKER, AdminGrant, MessageStore
+from messagefoundry.store.store import (
+    LOGIN_ADDRESS_RESET_MARKER,
+    AdminGrant,
+    MessageStore,
+    RevokeResult,
+)
 from tests._admin_account import PROVISION_EMAIL, create_admin, provision_totp
 from tests._first_admin_grant_store_contract import (
     assert_concurrent_grants_leave_one,
@@ -429,7 +434,7 @@ async def test_an_unknown_grant_outcome_that_wrote_the_role_advises_the_totp_res
     revokes: list[int] = []
     original_revoke = store.revoke_user_sessions
 
-    async def counted_revoke(user_id: str) -> int:
+    async def counted_revoke(user_id: str) -> RevokeResult:
         # How many ERROR lines had landed when this revoke ran.
         revokes.append(len(_error_lines(caplog)))
         return await original_revoke(user_id)
@@ -504,7 +509,7 @@ async def test_an_unknown_grant_outcome_revokes_even_when_the_re_read_raises(
     revokes: list[str] = []
     original_revoke = store.revoke_user_sessions
 
-    async def counted_revoke(user_id: str) -> int:
+    async def counted_revoke(user_id: str) -> RevokeResult:
         revokes.append(user_id)
         return await original_revoke(user_id)
 

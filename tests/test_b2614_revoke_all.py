@@ -26,7 +26,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.store import MessageStore, session_seal_ok
+from messagefoundry.store.store import MessageStore, RevokeResult, session_seal_ok
 
 #: Runs one statement with ``?`` placeholders against the store's database, outside the store.
 RawSql = Callable[[str, tuple[Any, ...]], Awaitable[None]]
@@ -78,7 +78,8 @@ async def assert_revoke_all_contract(store: Any, raw: RawSql) -> None:
 
     # --- every account's sessions end, but the kept one ----------------------------------------
     revoked = await store.revoke_all_sessions(except_token_hash=hash_token(kept))
-    assert revoked >= 2
+    assert revoked.count >= 2
+    assert revoked.kept  # re-stamped in the revoke's own transaction (BACKLOG #4975)
     assert await service.identity_for_token(second) is None
     assert await service.identity_for_token(other) is None
     survivor = await store.get_session(hash_token(kept))
@@ -102,13 +103,15 @@ async def assert_revoke_all_contract(store: Any, raw: RawSql) -> None:
     # --- with no exception, the kept session ends too ------------------------------------------
     fresh = await _mint(store, bob)
     assert await service.identity_for_token(fresh) is not None  # control
-    assert await store.revoke_all_sessions() >= 2
+    everything = await store.revoke_all_sessions()
+    assert everything.count >= 2 and not everything.kept  # nothing to keep, so nothing kept
     assert await service.identity_for_token(kept) is None
     assert await service.identity_for_token(fresh) is None
 
     # --- an exception naming no row excepts nothing ---------------------------------------------
     late = await _mint(store, alice)
-    assert await store.revoke_all_sessions(except_token_hash=hash_token(mint_token())) >= 1
+    nobody = await store.revoke_all_sessions(except_token_hash=hash_token(mint_token()))
+    assert nobody.count >= 1 and not nobody.kept
     assert await service.identity_for_token(late) is None
 
     # --- a kept session a sweep missed is not stamped back to validity (BACKLOG #4975) ----------
@@ -118,12 +121,12 @@ async def assert_revoke_all_contract(store: Any, raw: RawSql) -> None:
     missed = await _mint(store, alice)
     snapshot = await store.get_session(hash_token(missed))
     assert snapshot is not None
-    assert await store.revoke_all_sessions() >= 1
+    assert (await store.revoke_all_sessions()).count >= 1
     await raw(
         "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
         (snapshot.seal, hash_token(missed)),
     )
-    await store.revoke_all_sessions(except_token_hash=hash_token(missed))
+    assert not (await store.revoke_all_sessions(except_token_hash=hash_token(missed))).kept
     left = await store.get_session(hash_token(missed))
     assert left is not None and left.revoked_at is None
     assert (left.user_epoch, left.global_epoch) == (snapshot.user_epoch, snapshot.global_epoch)
@@ -135,7 +138,7 @@ async def assert_revoke_all_contract(store: Any, raw: RawSql) -> None:
     behind = await _mint(store, alice)
     snapshot = await store.get_session(hash_token(behind))
     assert snapshot is not None
-    assert await store.revoke_user_sessions(alice) >= 1
+    assert (await store.revoke_user_sessions(alice)).count >= 1
     await raw(
         "UPDATE sessions SET revoked_at=NULL, seal=? WHERE token_hash=?",
         (snapshot.seal, hash_token(behind)),
@@ -144,7 +147,7 @@ async def assert_revoke_all_contract(store: Any, raw: RawSql) -> None:
     assert account is not None
     assert snapshot.global_epoch == account.global_session_epoch  # current on the global epoch
     assert snapshot.user_epoch == account.session_epoch - 1  # one account epoch behind
-    await store.revoke_all_sessions(except_token_hash=hash_token(behind))
+    assert not (await store.revoke_all_sessions(except_token_hash=hash_token(behind))).kept
     left = await store.get_session(hash_token(behind))
     assert left is not None and left.revoked_at is None
     assert (left.user_epoch, left.global_epoch) == (snapshot.user_epoch, snapshot.global_epoch)
@@ -189,10 +192,11 @@ async def test_the_revoke_all_count_is_exact_on_sqlite(keyed: tuple[MessageStore
     kept = await _mint(store, "u1")
     await _mint(store, "u1")
     await _mint(store, "u2")
-    assert await store.revoke_all_sessions(except_token_hash=hash_token(kept)) == 2
-    assert await store.revoke_all_sessions(except_token_hash=hash_token(kept)) == 0
-    assert await store.revoke_all_sessions() == 1
-    assert await store.revoke_all_sessions() == 0
+    keep = hash_token(kept)
+    assert await store.revoke_all_sessions(except_token_hash=keep) == RevokeResult(2, kept=True)
+    assert await store.revoke_all_sessions(except_token_hash=keep) == RevokeResult(0, kept=True)
+    assert await store.revoke_all_sessions() == RevokeResult(1, kept=False)
+    assert await store.revoke_all_sessions() == RevokeResult(0, kept=False)
 
 
 @pytest.mark.skipif(

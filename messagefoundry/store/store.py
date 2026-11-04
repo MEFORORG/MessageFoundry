@@ -2854,9 +2854,21 @@ def global_epoch_raise(after: int) -> EpochRaise:
     return EpochRaise(after - 1, after)
 
 
-def restamp_kept_session(
-    user_id: str, raised: EpochRaise | None, global_raised: EpochRaise | None = None
-) -> Callable[[SessionRecord], SessionRecord]:
+@dataclass(frozen=True, slots=True)
+class RevokeResult:
+    """What ``revoke_user_sessions`` and ``revoke_all_sessions`` did (BACKLOG #4975).
+
+    :attr:`count` is how many sessions the revoke ended. :attr:`kept` is True only when the
+    revoke re-stamped the session it was asked to keep, in its own transaction, with the epochs
+    it raised (:class:`KeptSessionRestamp`); a revoke given no session to keep reports False. It
+    says what the revoke did, not what a later request sees: the gate's other checks, such as
+    expiry, still apply to a kept session, and a later revoke can still end it."""
+
+    count: int
+    kept: bool
+
+
+class KeptSessionRestamp:
     """The change a revoke applies to the session it keeps (BACKLOG #2592, #4975, #5091).
 
     The new epochs go onto the kept session only when it is ``user_id``'s and carried the epochs
@@ -2865,20 +2877,41 @@ def restamp_kept_session(
     is behind on one of them; stamping it would make it valid again, so it is left as it is and
     the gate refuses it the next time it is presented. With no account raise, as where the
     account's record fails its seal, nothing is stamped. A revoke that raises no global epoch
-    leaves the session's global stamp as it is, so a session behind on it stays refused."""
+    leaves the session's global stamp as it is, so a session behind on it stays refused.
 
-    def change(s: SessionRecord) -> SessionRecord:
-        if raised is None or s.user_id != user_id:
+    A backend passes it to ``_write_session`` and reports :meth:`kept` with what that returned,
+    so the revoke says whether it stamped the session from the same transaction that did it."""
+
+    def __init__(
+        self, user_id: str, raised: EpochRaise | None, global_raised: EpochRaise | None = None
+    ) -> None:
+        self._user_id = user_id
+        self._raised = raised
+        self._global_raised = global_raised
+        self._stamped = False
+
+    def __call__(self, s: SessionRecord) -> SessionRecord:
+        raised, global_raised = self._raised, self._global_raised
+        self._stamped = False
+        if raised is None or s.user_id != self._user_id:
             return s
         if global_raised is None:
-            return replace(s, user_epoch=raised.after) if s.user_epoch == raised.before else s
+            if s.user_epoch != raised.before:
+                return s
+            self._stamped = True
+            return replace(s, user_epoch=raised.after)
         if not session_epochs_current(
             s, user_epoch=raised.before, global_epoch=global_raised.before
         ):
             return s
+        self._stamped = True
         return replace(s, user_epoch=raised.after, global_epoch=global_raised.after)
 
-    return change
+    def kept(self, written: SessionRecord | None) -> bool:
+        """Whether the write ``_write_session`` reported carried the new epochs: False when it
+        wrote nothing (no unrevoked row, or a compare lost to a concurrent write) or when this
+        change left the session as it was. A session whose seal fails raises there instead."""
+        return written is not None and self._stamped
 
 
 def full_authentication_clear(r: UserAuthzRecord, now: float) -> UserAuthzRecord:
@@ -18032,17 +18065,19 @@ class MessageStore:
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
+    ) -> RevokeResult:
         """Revoke a user's active sessions; with ``except_token_hash`` set, all **but** that one (the
-        caller's current session — "sign out everywhere else"). Returns the number revoked.
+        caller's current session — "sign out everywhere else"). Returns the number revoked and
+        whether the kept session was re-stamped (:class:`RevokeResult`, BACKLOG #4975).
 
         Raises the account's session epoch in the same transaction (BACKLOG #2592), so an older copy
         of any of those rows resolves to nothing. The kept session is re-sealed through
         :meth:`_write_session`, under the new epoch only when it carried the epoch the raise
-        replaced (:func:`restamp_kept_session`, BACKLOG #4975); if its own seal does not verify,
+        replaced (:class:`KeptSessionRestamp`, BACKLOG #4975); if its own seal does not verify,
         that raises :class:`RowSealError` and the whole transaction, revokes included, rolls
         back."""
         now = time.time() if now is None else now
+        kept = False
         async with _writer_txn(self._db, self._lock):
             raised = await self._bump_session_epoch(user_id)
             if except_token_hash is None:
@@ -18054,9 +18089,10 @@ class MessageStore:
                 )
             revoked = int(cur.rowcount)
             if except_token_hash is not None:
-                await self._write_session(except_token_hash, restamp_kept_session(user_id, raised))
+                restamp = KeptSessionRestamp(user_id, raised)
+                kept = restamp.kept(await self._write_session(except_token_hash, restamp))
             await self._commit()
-        return revoked
+        return RevokeResult(revoked, kept)
 
     async def count_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None
@@ -18075,22 +18111,24 @@ class MessageStore:
 
     async def revoke_all_sessions(
         self, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
+    ) -> RevokeResult:
         """Revoke every account's sessions but ``except_token_hash`` (BACKLOG #2614). See
         :meth:`AuthStore.revoke_all_sessions`."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
-            revoked = await self._revoke_all_sessions_in_txn(except_token_hash, now)
+            result = await self._revoke_all_sessions_in_txn(except_token_hash, now)
             await self._commit()
-        return revoked
+        return result
 
-    async def _revoke_all_sessions_in_txn(self, except_token_hash: str | None, now: float) -> int:
+    async def _revoke_all_sessions_in_txn(
+        self, except_token_hash: str | None, now: float
+    ) -> RevokeResult:
         """The body of :meth:`revoke_all_sessions`, inside the caller's writer transaction.
 
         The store's global session epoch is raised first (BACKLOG #5091), then every account's
         epoch, as :meth:`revoke_user_sessions` raises one, then one sweep ends the rows and the kept
         row is re-sealed under its own account's new epoch and the new global one, when it carried
-        both epochs those raises replaced (:func:`restamp_kept_session`, BACKLOG #4975).
+        both epochs those raises replaced (:class:`KeptSessionRestamp`, BACKLOG #4975).
 
         The first statement is a write, which takes SQLite's write lock, so the reads below run
         under it: another process (an engine shard, or the engine beside
@@ -18114,19 +18152,19 @@ class MessageStore:
         )
         revoked = int(cur.rowcount)
         if except_token_hash is None:
-            return revoked
-        kept = await self._db.execute(
+            return RevokeResult(revoked, kept=False)
+        cur = await self._db.execute(
             "SELECT user_id FROM sessions WHERE token_hash=?", (except_token_hash,)
         )
-        owner = await kept.fetchone()
-        if owner is not None:
-            user_id = str(owner[0])
-            global_raised = global_epoch_raise(await self._global_session_epoch())
-            await self._write_session(
-                except_token_hash,
-                restamp_kept_session(user_id, raised.get(user_id), global_raised),
-            )
-        return revoked
+        owner = await cur.fetchone()
+        if owner is None:
+            return RevokeResult(revoked, kept=False)
+        user_id = str(owner[0])
+        global_raised = global_epoch_raise(await self._global_session_epoch())
+        restamp = KeptSessionRestamp(user_id, raised.get(user_id), global_raised)
+        return RevokeResult(
+            revoked, restamp.kept(await self._write_session(except_token_hash, restamp))
+        )
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
         """Record a restore once: revoke every session, append ``store_restored`` and delete the
@@ -18157,7 +18195,7 @@ class MessageStore:
                 last_audit_at=finite_or_none(row[2]),
                 restored_at=now if (at := finite_or_none(row[3])) is None else at,
                 sessions_revoked=int(row[4] or 0)
-                + await self._revoke_all_sessions_in_txn(None, now),
+                + (await self._revoke_all_sessions_in_txn(None, now)).count,
             )
             audit = AuditAppend(
                 action=STORE_RESTORED_ACTION,
