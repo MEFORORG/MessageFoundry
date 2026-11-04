@@ -973,25 +973,28 @@ REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
 REINGRESS_ARTIFACT_MISSING: Final = "re-ingress reply row is missing"
 
 
-@dataclass(frozen=True)
-class DeadLetterPurge:
-    """What one ``purge_dead_letters`` call did (BACKLOG #4996). Counts only, never content.
-
-    ``bodies`` is the dead rows whose body it blanked: the retention audit's purged count.
-    ``errors_cleared`` is the dead rows whose ``last_error`` it nulled, a body-blanked row
-    included. It is counted apart because a row that was already blank can still hold error text,
-    which may carry PHI, and a pass that clears only that text must still write its audit row."""
-
-    bodies: int = 0
-    errors_cleared: int = 0
-
-
 #: The same predicate over an aliased ``queue q``, DERIVED rather than retyped so the two can never
 #: drift apart. Used by :meth:`_attachment_still_referenced_sql`, which reached this predicate first:
 #: the attachment GC already treated a purged row as unreplayable while ``replay`` replayed it anyway.
 _REPLAYABLE_BODY_Q = _REPLAYABLE_BODY.replace("payload", "q.payload").replace(
     "body_ref", "q.body_ref"
 )
+
+
+@dataclass(frozen=True)
+class DeadLetterPurge:
+    """What one ``purge_dead_letters`` call did (BACKLOG #4996). Counts only, never content.
+
+    ``bodies`` is the dead rows whose ``payload`` it blanked: the retention audit's purged count. That
+    payload is the body, or for a store-once row its ``shared_body`` key and for a re-ingress token
+    its reply reference, each of which the blank cuts off. ``errors_cleared`` is the dead rows whose
+    ``last_error`` it nulled, a payload-blanked row included. It is counted apart because a row whose
+    payload was already blank can still hold error text, which may carry PHI, and a pass that clears
+    only that text must still write its audit row. The backends' docstrings point here."""
+
+    bodies: int = 0
+    errors_cleared: int = 0
+
 
 #: The ``handler_name`` stamped on a pass-through COMPLETION MARKER (BACKLOG #1580). A marker is the
 #: already-terminal ``stage='outbound'`` row :meth:`MessageStore._insert_passthrough_marker` writes so
@@ -18673,9 +18676,8 @@ class MessageStore:
         replayable (re-queueing its stored ``payload``) until purged. Keeps the row + ``dead`` status
         (counts/disposition intact) and blanks ``payload`` + ``last_error``; after this the row can no
         longer be meaningfully replayed (its body is gone — the intended retention trade-off).
-        Idempotent: a re-run matches no row. Returns a :class:`DeadLetterPurge`: ``bodies`` leaves
-        out a row that was already blank and only loses its ``last_error``, and ``errors_cleared``
-        counts that row (BACKLOG #4996).
+        Idempotent: a re-run matches no row. Returns a :class:`DeadLetterPurge`, which says what
+        each of its counts covers (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7). A router raise dead-letters the
         ``ingress`` row and a handler raise the ``routed`` row
@@ -18724,8 +18726,7 @@ class MessageStore:
                 f"stage=? AND status=? AND body_ref IS NOT NULL AND updated_at < {cutoff_sql}",
                 (Stage.OUTBOUND.value, OutboxStatus.DEAD.value, *cutoff_params),
             )
-            # Only the body blank is counted. A row already blank only loses its `last_error`,
-            # which purges no body, so the retention audit's count leaves it out (BACKLOG #4996).
+            # Two statements, so each count is its own rowcount (DeadLetterPurge, BACKLOG #4996).
             cur = await self._db.execute(
                 "UPDATE queue SET payload='' "
                 f"WHERE status=? AND payload <> '' AND updated_at < {cutoff_sql}",

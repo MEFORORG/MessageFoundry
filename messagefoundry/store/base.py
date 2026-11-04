@@ -1670,9 +1670,8 @@ class QueueStore(StoreLifecycle, Protocol):
         (#1188, ASVS 14.2.7), not only a dead ``outbound`` row. ``connection_cutoffs`` (#34, ADR 0027)
         optionally overrides the cutoff per ``destination_name`` (``float('-inf')`` = keep forever);
         default empty ⇒ a single global cutoff. A row with a NULL ``destination_name`` (ingress, routed,
-        response) always takes the global window. Returns a :class:`DeadLetterPurge`: the rows
-        whose body was blanked, and apart from them the rows whose ``last_error`` was nulled, so a
-        pass that cleared only error text still counts as audited work (BACKLOG #4996)."""
+        response) always takes the global window. Returns a :class:`DeadLetterPurge` (BACKLOG
+        #4996)."""
         ...
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
