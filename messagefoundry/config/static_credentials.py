@@ -59,15 +59,11 @@ both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, a
   reported here. The HTTP listener's intake-authentication gate (``check_http_intake_auth``) asks
   only whether an off-loopback listener has an effective peer control, which a narrow
   ``source_ip_allowlist`` with no credential satisfies, and never whether a credential is static.
-* A dialled connection whose :class:`~messagefoundry.config.models.ConnectorType` member has no arm
-  in ``_connection_hop`` and is not DATABASE, which the database arm reports. Such a connection
-  falls through and is not listed, so the opt-in gate does not refuse it; its credential is not
-  guessed at. With the shipped builders this arises only for a member added without an arm.
-* A builder that code registers with ``register_source``/``register_destination``, whether for a
-  member with no shipped builder of that role or with ``replace=True``. The classifier never sees
-  the builder: an outbound connection, or an inbound one of a type in ``_DIALLED_INBOUND``, is
-  classified by the shipped rules for its member, which need not match what that builder presents,
-  and any other inbound connection is not classified at all.
+* What a builder that config code registers with ``register_source``/``register_destination``
+  presents, whether the builder is new or replaces a shipped one. The connection is judged by the
+  rules for its :class:`~messagefoundry.config.models.ConnectorType` member, as the paragraph above
+  says, and a member or inbound type with no rule is not listed; ``_connection_hop`` and the
+  ``_DIALLED_INBOUND`` comment say which have one.
 * A generic-ODBC database hop that sets no top-level ``username``/``password``. The database arm
   does not read ``odbc_params``; ``static_credential_db_hops`` says what those keywords can carry.
 * A forward-proxy URL the engine cannot read: a connection's ``proxy_url`` written as an ``env()``
