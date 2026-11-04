@@ -1524,6 +1524,9 @@ def _build_connection(
 # `@1INTO` is `@`, `1`, `INTO`. The digit goes to the number scan, whose glue refusal refuses the
 # statement on every dialect.
 _SQL_WORD_RE = re.compile(r"[@#]{0,2}[A-Za-z_][A-Za-z0-9_$]*")
+# The same word under MySQL's comment model, where `#` starts a comment and so never opens a name:
+# `@#x` is `@`, then a comment.
+_SQL_WORD_RE_MYSQL = re.compile(r"@{0,2}[A-Za-z_][A-Za-z0-9_$]*")
 
 # Characters other than LF that a lexer may end a line comment at. A `--` comment ends at an LF here,
 # and one holding any of these before that LF is refused (BACKLOG #5259), whatever lexer reads it:
@@ -1620,14 +1623,15 @@ def _scan_sql_tokens(
     and ``#`` is a sigil. On, it is MySQL's: ``--`` starts a comment only when an ASCII space or
     control character, DEL included, follows it (``5 --1`` is ``5 - -1``), and a non-ASCII character
     after it is refused, since the connection's character set decides what that is; ``#`` starts a
-    comment, block comments do not nest, and the body of a ``/*!`` or MariaDB ``/*M!`` comment, which
-    MySQL runs, is scanned as code.
+    comment and never opens a name; block comments do not nest; and a ``/*!`` or MariaDB ``/*M!``
+    comment is refused, since a server may run its body or read it as a plain comment.
     :func:`_require_read_only` says which caller gets which. Quoting is the same in both.
 
     An unterminated literal or comment raises :class:`DbLookupError`: the rest of such a statement
     cannot be read, and guessing at it is how a shape-based gate gets bypassed. So does a line comment
     holding a line break other than LF, or a NUL, before the LF that ends it
-    (:data:`_SQL_OTHER_LINE_BREAKS` says why). So does a numeric literal with a word character glued to its end
+    (:data:`_SQL_OTHER_LINE_BREAKS` says why), and a ``--(*`` ODBC vendor escape on either model. So
+    does a numeric literal with a word character glued to its end
     (:data:`_SQL_NUMBER_RE`): SQL Server reads ``0xUPDATE`` as ``0x`` then ``UPDATE`` and
     ``1e1INTO`` as ``1e1`` then ``INTO``. Those refusals, and the split of a word at an internal
     sigil (:data:`_SQL_WORD_RE`), also catch valid reads, at least an Oracle ``1.5f``, a MySQL name
@@ -1635,9 +1639,9 @@ def _scan_sql_tokens(
     ``t#1x``, a ``:1st`` placeholder, a line comment in a statement with CR-only line endings, and a
     name such as ``update#n`` whose part before an internal ``#`` or ``@`` is a write keyword. The
     MySQL model adds at least a ``--`` comment with no space after the dashes or with a non-ASCII
-    character right after them, a ``/*!`` body or a
-    nested block comment's tail holding a write keyword or a lone quote, and a T-SQL ``#temp`` name
-    whose line ends inside a multi-line quoted literal. It fails closed on purpose.
+    character right after them, any ``/*!`` or ``/*M!`` comment (``/*!40001 SQL_NO_CACHE */``
+    included), a nested block comment's tail holding a write keyword or a lone quote, and a T-SQL
+    ``#temp`` name whose line ends inside a multi-line quoted literal. It fails closed on purpose.
     ``subject`` names whose statement it is in that refusal."""
     refusal = _read_only_message(subject)
     tokens: list[_SqlToken] = []
@@ -1657,6 +1661,10 @@ def _scan_sql_tokens(
         if (statement.startswith("--", i) and not " " < after < "\x7f") or (
             mysql_comments and ch == "#"
         ):
+            if statement.startswith("--(*", i):
+                # The ODBC long-form escape, `--(*vendor(Microsoft),product(ODBC) call p *)--`, which
+                # the ODBC spec has a driver translate: a comment to the T-SQL scan, a call to a driver.
+                raise DbLookupError(f"{refusal}; found an ODBC vendor escape")
             nl = statement.find("\n", i)
             end = n if nl == -1 else nl
             if not _SQL_OTHER_LINE_BREAKS.isdisjoint(statement[i:end].rstrip("\r")):
@@ -1666,9 +1674,10 @@ def _scan_sql_tokens(
             i = end + 1
             continue
         if mysql_comments and statement.startswith(("/*!", "/*M!"), i):
-            # MySQL runs an executable comment's body, so it is code here. Its `*/` scans as `*`, `/`.
-            i = statement.index("!", i) + 1
-            continue
+            # MySQL runs an executable comment's body, but reads it as a plain comment when its version
+            # prefix is above the server's, and MySQL itself reads `/*M!` that way. Two readings the
+            # gate cannot choose between, so it refuses.
+            raise DbLookupError(f"{refusal}; found a MySQL executable comment")
         if statement.startswith("/*", i):
             depth, i = 1, i + 2
             while i < n and depth:
@@ -1703,7 +1712,7 @@ def _scan_sql_tokens(
             tokens.append(_SqlToken("number", num.group(0), end))
             i = end
             continue
-        m = _SQL_WORD_RE.match(statement, i)
+        m = (_SQL_WORD_RE_MYSQL if mysql_comments else _SQL_WORD_RE).match(statement, i)
         if m:
             tokens.append(_SqlToken("word", m.group(0).upper(), m.end()))
             i = m.end()
@@ -1747,10 +1756,13 @@ def _require_read_only(
 
     Every dialect but ``sqlserver`` is tokenized twice, once with each comment model of
     :func:`_scan_sql_tokens`, and the three rules apply to each token list: the generic path can
-    reach at least SQL Server, PostgreSQL and MySQL, which disagree about comments, and a statement
-    that one of them reads as a write must be refused whichever one is behind the connection. So the
-    generic test refuses everything the ``sqlserver`` test does, less the function-form exception,
-    and can refuse reads the ``sqlserver`` test admits.
+    reach at least SQL Server, PostgreSQL and MySQL, which disagree about comments. The aim is that a
+    statement one of them reads as a write is refused whichever one is behind the connection; it is
+    an aim, not a proof, and at least a write hidden in a MySQL backslash escape, a PostgreSQL
+    ``E'...'`` escape or dollar quote, or behind a comment a lexer ends at a character
+    :data:`_SQL_OTHER_LINE_BREAKS` lacks still passes. The generic test refuses everything the
+    ``sqlserver`` test does, less the function-form exception, and can refuse reads the
+    ``sqlserver`` test admits.
 
     Rule 2 is what makes this a read-only test rather than a leading-token test. Opening with ``SELECT``
     or ``WITH`` never implied the rest was a read: ``SELECT * INTO copy FROM patients`` writes a table,
@@ -1768,16 +1780,16 @@ def _require_read_only(
     # The T-SQL model runs first on every dialect, so a refusal it raises reads as it always did.
     for mysql_comments in (False,) if preset else (False, True):
         tokens = _scan_sql_tokens(statement, subject=subject, mysql_comments=mysql_comments)
-        _check_read_only_tokens(
-            statement, tokens, refusal, preset=preset, function_forms=dialect == "generic"
-        )
+        _check_read_only_tokens(statement, tokens, refusal, dialect=dialect)
     return None
 
 
 def _check_read_only_tokens(
-    statement: str, tokens: list[_SqlToken], refusal: str, *, preset: bool, function_forms: bool
+    statement: str, tokens: list[_SqlToken], refusal: str, *, dialect: str
 ) -> None:
     """Apply :func:`_require_read_only`'s three rules to one scan's ``tokens``, raising on a miss."""
+    preset = dialect == "sqlserver"
+    function_forms = dialect == "generic"
     if (
         not tokens
         or tokens[0].kind != "word"
@@ -1793,7 +1805,7 @@ def _check_read_only_tokens(
             if text == ";" and index != last:
                 raise DbLookupError(refusal)
             continue
-        if text == "CALL" and (not preset or _follows_escape_opener(tokens, index)):
+        if text == "CALL" and (not preset or _inside_odbc_escape(tokens, index)):
             raise DbLookupError(f"{refusal}; found a 'CALL' keyword")
         if text not in _SQL_WRITE_KEYWORDS:
             continue
@@ -1806,18 +1818,22 @@ def _check_read_only_tokens(
         raise DbLookupError(f"{refusal}; found a '{text}' keyword")
 
 
-def _follows_escape_opener(tokens: list[_SqlToken], index: int) -> bool:
-    """Whether ``tokens[index]`` sits inside an ODBC escape: the nearest brace before it is a ``{``.
+def _inside_odbc_escape(tokens: list[_SqlToken], index: int) -> bool:
+    """Whether ``tokens[index]`` sits inside an open ODBC ``{`` escape, at any nesting depth.
 
     Not only a ``{`` with ``?=`` between: ``db_lookup`` tests the statement before
     :func:`_parse_named_params` turns a ``:name`` into ``?``, so ``{:r = call p}`` reaches the driver
-    as ``{? = call p}``. Any ``CALL`` inside an open ``{`` is refused, a false refusal of at least a
-    ``call`` name inside a ``{fn ...}`` escape included."""
-    while index > 0:
-        index -= 1
-        kind, text, _ = tokens[index]
-        if kind == "other" and text in ("{", "}"):
-            return text == "{"
+    as ``{? = call p}``, and a ``CALL`` after a nested ``{fn ...}`` closes is still inside the outer
+    ``{``. Any ``CALL`` inside an open ``{`` is refused, a false refusal of at least a ``call`` name
+    inside a ``{fn ...}`` escape included."""
+    depth = 0
+    for kind, text, _ in reversed(tokens[:index]):
+        if kind == "other" and text == "}":
+            depth += 1
+        elif kind == "other" and text == "{":
+            if not depth:
+                return True
+            depth -= 1
     return False
 
 

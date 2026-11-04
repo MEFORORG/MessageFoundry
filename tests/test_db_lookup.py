@@ -625,6 +625,8 @@ _CALL_ESCAPES = [
     "SELECT 1 {/* note */call sp_x}",
     # db_lookup tests the text before `:r` becomes `?`, so the driver would get `{? = call ...}`.
     "SELECT 1 {:r = call dbo.p}",
+    # Still inside the outer `{` after a nested escape closes.
+    "SELECT 1 {?= {fn x()} call p}",
 ]
 
 
@@ -643,6 +645,15 @@ def test_a_bare_call_is_refused_on_the_generic_dialect_only() -> None:
     with pytest.raises(DbLookupError, match="found a 'CALL' keyword"):
         database._require_read_only("SELECT 1 CALL sp_x()", dialect="generic")
     database._require_read_only("SELECT call FROM calls")
+
+
+@pytest.mark.parametrize("dialect", ["sqlserver", "generic"])
+def test_an_odbc_vendor_escape_is_refused(dialect: str) -> None:
+    """The ODBC long form of `{call}` hides in what the T-SQL scan reads as a `--` comment.
+    Red mutation: drop the `--(*` check, and the sqlserver preset admits it."""
+    stmt = "SELECT 1 --(*vendor(Microsoft),product(ODBC) call dbo.p *)--"
+    with pytest.raises(DbLookupError, match="found an ODBC vendor escape"):
+        database._require_read_only(stmt, dialect=dialect)
 
 
 _LONE_LINE_BREAKS = [
@@ -679,7 +690,7 @@ def test_a_crlf_ended_dash_comment_is_still_read(dialect: str) -> None:
 _MYSQL_COMMENT_MISSES = [
     # MySQL needs whitespace after `--`, so this is `5 - -1`, then INTO.
     "SELECT 5 --1 INTO OUTFILE '/tmp/x'",
-    # MySQL runs the body of an executable comment, MariaDB `/*M!` too.
+    # MySQL runs the body of an executable comment, MariaDB `/*M!` too, or reads it as a plain one.
     "SELECT 1 /*! INTO OUTFILE '/tmp/x' */",
     "SELECT 1; /*!DELETE FROM t*/",
     "SELECT 1 /*M!100100 DELETE FROM t */",
@@ -689,6 +700,8 @@ _MYSQL_COMMENT_MISSES = [
     "SELECT 1 #'\nDELETE FROM t -- '",
     # The same `#` inside a word: a word that ran on through `#` hid this comment from the MySQL scan.
     "SELECT x#'\nDELETE FROM t -- '",
+    # And after a leading sigil, which in the MySQL scan never takes the `#` into a name.
+    "SELECT 1 @#x'\nDELETE FROM t -- '",
 ]
 
 
@@ -734,10 +747,19 @@ def test_the_generic_dialect_still_refuses_what_the_tsql_reading_sees(stmt: str)
         database._require_read_only(stmt, dialect="generic")
 
 
+def test_any_mysql_executable_comment_is_refused_on_the_generic_dialect_only() -> None:
+    """A server runs a `/*!` body, or reads it as a plain comment when its version prefix is too
+    high, so the generic dialect refuses even a read. SQL Server reads it as a comment.
+    Red mutation: scan the body as code, and a nested comment plus a quote hides a write."""
+    stmt = "SELECT /*!40001 SQL_NO_CACHE */ id FROM t"
+    with pytest.raises(DbLookupError, match="found a MySQL executable comment"):
+        database._require_read_only(stmt, dialect="generic")
+    database._require_read_only(stmt)
+
+
 @pytest.mark.parametrize(
     "stmt",
     [
-        "SELECT /*!40001 SQL_NO_CACHE */ id FROM t",
         "SELECT 1 -- note\nFROM t",
         "SELECT 1 # note\nFROM t",
         "SELECT /* a /* b */ c */ 1",
