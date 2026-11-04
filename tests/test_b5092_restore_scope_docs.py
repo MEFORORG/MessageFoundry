@@ -65,8 +65,10 @@ def test_security_md_says_only_messagefoundry_restore_onto_sqlite_is_recorded() 
         "`store_restored` alert",
         # The audit anchor's start-up walk is the one signal, and it is opt-in; the docs must not
         # say the engine cannot tell, nor that the anchor ends sessions.
-        "The one start-up signal such a restore can raise is the audit anchor's, and only where "
-        "it is set up.",
+        "A start-up signal such a restore can raise is the audit anchor's, and only where it is "
+        "set up.",
+        "none of them records the restore as one",
+        "stop every engine process and cluster node on the store before the restore",
         "That alert ends no session and writes no `store_restored` row.",
         "run `messagefoundry admin-revoke-sessions` against the restored store",
         "`messagefoundry restore --help` prints the statement of what a restore rolls back",

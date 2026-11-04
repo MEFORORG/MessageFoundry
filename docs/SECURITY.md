@@ -5588,15 +5588,20 @@ holds a marker (`consume_restore_record` returns nothing there). So the first `s
 session, writes no `store_restored` row and raises no `store_restored` alert, and the backup's
 sessions are accepted until they expire or are revoked.
 
-**The one start-up signal such a restore can raise is the audit anchor's, and only where it is
-set up.** With `[integrity].audit_verify_on_start = true` and `[integrity].audit_anchor_file`
+**A start-up signal such a restore can raise is the audit anchor's, and only where it is set
+up.** With `[integrity].audit_verify_on_start = true` and `[integrity].audit_anchor_file`
 holding an anchor taken after the backup, the start-up audit walk reports the restored log as
 truncated and raises an `integrity_drift` alert
 ([CONFIGURATION.md](CONFIGURATION.md#integrity) says how). That alert ends no session and writes
-no `store_restored` row. Both settings are off by default, and the anchor file is only as recent
-as the operator keeps it.
+no `store_restored` row. Both settings are off by default, the anchor file is only as recent as
+the operator keeps it, and it catches the restore only if audit rows were written between the
+backup and the anchor. Other start-up signals may follow from what the restore rolled back, at
+least a `config_changed` alert against the store's older baseline, but none of them records the
+restore as one.
 
-**After such a restore, before the first `serve`, an operator must by hand:**
+**After such a restore, before the first `serve`, an operator must by hand** (an in-place restore
+under running engines skips that moment, so stop every engine process and cluster node on the
+store before the restore):
 
 - run `messagefoundry admin-revoke-sessions` against the restored store. It ends the sessions it
   finds, of every account, and writes one `auth.session_revoked` audit row; *Limits of the session

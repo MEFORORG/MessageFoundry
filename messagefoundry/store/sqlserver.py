@@ -5562,8 +5562,8 @@ class SqlServerStore:
     ) -> list[dict[str, Any]]:
         """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`. ``timeout_clamp`` is
         ``None`` for every caller but the cluster lease claim/renew, and ``None`` keeps the
-        :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets both bounds, so
-        neither can be set without the other."""
+        :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets the borrow, the
+        statement and the rollback bounds, so none can be set without the others."""
         if timeout_clamp is None:
             borrow, statement_timeout, rollback_bound = self._acquire(), None, None
         else:
@@ -5609,7 +5609,7 @@ class SqlServerStore:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
         claim/renew is its only caller.
 
-        Two windows, each at most the clamp floored at 1 s. The wait for a pooled connection is the
+        Two windows before the statement returns, each at most the clamp floored at 1 s. The wait for a pooled connection is the
         smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_fetch_rows` applies
         the floor, :meth:`_acquire_clamped` the minimum): a renew that waited out a saturated pool past the
         fence would otherwise still extend the lease after this node self-fenced. The statement's
@@ -5628,7 +5628,10 @@ class SqlServerStore:
         1 s, applied on the event loop by :meth:`_rollback_or_discard`. One that fails or runs past
         it discards the connection, so a claim's open ``HOLDLOCK`` transaction is never lent to the
         next borrower. A failed claim can therefore hold the caller's ``_leadership_lock`` for up to
-        about three times the clamp, plus a COMMIT nothing here bounds."""
+        about three times the clamp, plus a COMMIT, the cursor's creation and its close, none of which
+        anything here bounds. The bound frees the lock, not the server: a discarded session keeps its
+        open transaction, and the ``HOLDLOCK`` locks on ``leader_lease``, until its close lands or the
+        server ends it, and the timed-out rollback keeps its executor thread until the driver returns."""
         rows = await self._fetch_rows(sql, params, timeout_clamp)
         return rows[0] if rows else None
 
