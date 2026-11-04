@@ -10,6 +10,7 @@ installed copy, because an installed copy of a force-included tree is frozen at 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -183,14 +184,32 @@ def test_the_toolkit_command_installs_the_remote_debug_guard_on_import() -> None
     against an injected script at import (vault BACKLOG #2742). The toolkit's command must install
     it too. A fresh process each, because this one has already imported the engine's command."""
 
+    # The guard installs only where the interface is on, so the child must not inherit a switch that
+    # turns it off, and a build without the interface has nothing to guard.
+    env = {k: v for k, v in os.environ.items() if k != "PYTHON_DISABLE_REMOTE_DEBUG"}
+
     def answers(imports: str) -> str:
         probe = f"{imports}import messagefoundry.remotedebug as r;print(r._guard_answers())"
         proc = subprocess.run(
-            [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120, cwd=_REPO
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=_REPO,
+            env=env,
         )
         assert proc.returncode == 0, proc.stderr
         return proc.stdout.strip()
 
+    enabled = subprocess.run(
+        [sys.executable, "-c", "import sys;print(sys.is_remote_debug_enabled())"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+    ).stdout.strip()
+    if enabled != "True":
+        pytest.skip("this interpreter has remote debugging off, so there is nothing to guard")
     # Control: the guard module alone installs nothing, so a True below is the toolkit's doing.
     assert answers("") == "False"
     assert answers("import messagefoundry_toolkit.__main__;") == "True"

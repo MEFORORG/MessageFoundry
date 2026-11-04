@@ -79,7 +79,10 @@ pip install "messagefoundry-toolkit==<version>"   # the same version as the engi
 ```
 
 A production host needs the engine alone. A site that installs the toolkit on a production host has
-chosen to carry development code there, which is what the split exists to avoid (ASVS 15.2.3).
+chosen to carry the authoring commands there, which is what the split exists to avoid (ASVS 15.2.3).
+The split is not finished: the synthetic-HL7 generators, the HL7 schema modules and the
+de-identification package still ship in the engine wheel until later ADR 0201 slices move them, so
+an engine-only host still carries that code, with no command to run it.
 
 The extras, by group. `pyproject.toml` holds the live list.
 

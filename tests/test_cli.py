@@ -3661,7 +3661,7 @@ def test_audit_verify_exits_2_on_a_file_that_is_not_a_database(tmp_path: Path) -
 
 
 def test_a_non_serve_subcommand_installs_both_last_resort_hooks(
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Both hooks, because `install_thread_excepthook` had the identical serve-only gap: a non-main
     thread's escaping exception goes to `threading.excepthook` and nowhere else, so installing the
@@ -3680,8 +3680,10 @@ def test_a_non_serve_subcommand_installs_both_last_resort_hooks(
     try:
         sys.excepthook, threading.excepthook = sys.__excepthook__, threading.__excepthook__
 
+        # Away from the checkout, so no stray ./messagefoundry.toml decides the probe's exit.
+        monkeypatch.chdir(tmp_path)
         assert main(["ai-policy", "--json"]) == 0
-        capsys.readouterr()  # the schema payload is not what this test is about
+        capsys.readouterr()  # the policy payload is not what this test is about
 
         assert sys.excepthook is last_resort._excepthook, (
             "a non-serve subcommand ran with the stock sys.excepthook: an uncaught exception would "

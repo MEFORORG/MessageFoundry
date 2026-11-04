@@ -47,8 +47,8 @@ def install_loop_exception_handler(loop: asyncio.AbstractEventLoop | None = None
 
     ``asyncio`` IS IMPORTED HERE, NOT AT MODULE SCOPE, AND THAT IS A COST DECISION. Since BACKLOG
     #1674 the CLI installs the sync and thread hooks from ``main()`` for **every** subcommand, so
-    importing this module is now on the fast introspection path (``validate``, ``hl7schema``,
-    ``lens schema``) that ``__main__``'s docstring promises to keep cheap. The package root does not
+    importing this module is now on the fast introspection path (``validate``, and the toolkit's
+    ``hl7schema`` and ``lens schema``) that ``__main__``'s docstring promises to keep cheap. The package root does not
     load ``asyncio``, so at module scope it was a net-new import. Measured on Windows/3.14 against a
     documented 335-399 ms budget for those subcommands, marginal cost of importing this module with
     the root already loaded: **30.3 / 31.8 / 40.2 ms at module scope, 0.46 / 0.47 / 0.48 ms here**

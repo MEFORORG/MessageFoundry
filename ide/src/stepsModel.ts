@@ -765,7 +765,7 @@ export function paramWritableModes(vm: RowViewModel, name: string): readonly Par
 /** Which of the engine's `set_params` refusals a `lens rewrite` error is, for an inline message. */
 export type RewriteRefusalKind = "dynamic" | "literal-only" | "template-shape" | "column-limit";
 
-// The engine's machine-readable refusal codes (messagefoundry/lens.py, the `REFUSAL_*` constants), each
+// The engine's machine-readable refusal codes (messagefoundry_toolkit/lens.py, the `REFUSAL_*` constants), each
 // mapped to its kind. `lens rewrite` emits one beside every refusal as `{"error": ..., "code": ...}`, and
 // the lens docstring calls changing a code's string a contract change. Every other code, the generic
 // `refused` included, is not a mode refusal.

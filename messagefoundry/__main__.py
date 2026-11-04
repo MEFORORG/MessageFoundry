@@ -92,8 +92,8 @@ from messagefoundry.logging_setup import (  # noqa: E402
 from messagefoundry.odbc_env import disable_driver_manager_pooling  # noqa: E402
 
 if TYPE_CHECKING:
-    # Type-only, so the settings module still loads lazily per command: a quick `validate` /
-    # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
+    # Type-only, so the settings module still loads lazily per command: a quick `validate`
+    # call must not pay for it (see the module docstring on deferred heavy imports).
     import asyncio
 
     from messagefoundry.auth.service import AuthService

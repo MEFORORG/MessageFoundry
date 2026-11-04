@@ -161,6 +161,14 @@ suite("engine control — the bootstrap plan installs the right thing per platfo
       "./.venv/bin/python -m pip install messagefoundry messagefoundry-toolkit",
     ]);
   });
+
+  test("a scaffolded config repo installs its two pin files as written", () => {
+    const plan = buildBootstrapPlan({ hasPyproject: false, hasPinFiles: true, platform: "linux" });
+    assert.deepStrictEqual(plan.steps, [
+      "python -m venv .venv",
+      "./.venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt",
+    ]);
+  });
 });
 
 suite("engine control — planActions offers lifecycle only under the right context", () => {

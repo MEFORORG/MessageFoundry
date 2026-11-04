@@ -66,9 +66,6 @@ def main(argv: list[str] | None = None) -> int:
     # FIRST STATEMENT, as in every console entry point (BACKLOG #1875):
     # tests/test_cp1252_console_safety.py reads it here. run_cli() hardens again, which is a no-op.
     harden_console_streams()
-    # A process property honoured only before pyodbc's first ODBC use, set as the engine's main()
-    # sets it (BACKLOG #2049): `impact` loads config modules, which may open a database.
-    disable_driver_manager_pooling()
     args = sys.argv[1:] if argv is None else argv
     mismatch = version_mismatch(metadata.version)
     if mismatch is not None:
@@ -441,8 +438,6 @@ def _lens_parse(args: argparse.Namespace) -> int:
 
     Reads the source from the ``module`` file, or from stdin when it is ``-`` (the IDE re-projects the
     live buffer this way after a structural edit shifts every row coordinate). Static-only either way."""
-    import sys
-
     from messagefoundry_toolkit.lens import LensParseError, parse_module, parse_source
 
     try:
@@ -469,8 +464,6 @@ def _lens_rewrite(args: argparse.Namespace) -> int:
     Reads the source from ``module`` (or stdin when it is ``-``) and the edit spec from ``--edit`` (or
     stdin otherwise); prints the rewritten source (byte-identical outside the edited row) on success, or
     ``{"error": …}`` + exit 1 on any refusal — never a partial/lossy write."""
-    import sys
-
     from messagefoundry.redaction import safe_exc
     from messagefoundry_toolkit.lens import (
         REFUSAL_GENERIC,
@@ -692,6 +685,11 @@ def _impact(args: argparse.Namespace) -> int:
     from messagefoundry.config.impact import apply_rename, delete_impact, plan_rename
     from messagefoundry.config.reachability import build_reference_index
     from messagefoundry.config.wiring import WiringError, load_config
+
+    # A process property honoured only before pyodbc's first ODBC use, set as the engine's main()
+    # sets it (BACKLOG #2049): `impact` is the one toolkit command that loads config modules, which
+    # may open a database. Here, not in main(), so the Steps view's per-edit calls skip the import.
+    disable_driver_manager_pooling()
 
     if args.rename_to is not None and args.delete:
         return _emit_error("--rename-to and --delete are mutually exclusive", as_json=args.json)

@@ -752,6 +752,9 @@ export class EngineStatusBar implements vscode.Disposable {
     }
     const plan = buildBootstrapPlan({
       hasPyproject: fs.existsSync(path.join(ws, "pyproject.toml")),
+      hasPinFiles:
+        fs.existsSync(path.join(ws, "requirements.txt")) &&
+        fs.existsSync(path.join(ws, "requirements-dev.txt")),
       platform: process.platform,
     });
     const go = await vscode.window.showWarningMessage(
