@@ -13,7 +13,9 @@ pin what happens to one that arrives some other way:
   so it dead-letters at once rather than re-pending on a strict-FIFO lane;
 * a payload whose MSH-2 escapes the engine's own handle is re-attached, not sent with it;
 * a handle a Handler copied into ``NTE-3`` or a second ``OBX-5.5`` repetition is refused;
-* a ``mfdoc:v1:pruned:`` tombstone the sender wrote resolves nothing and is carried as text.
+* a ``mfdoc:v1:pruned:`` tombstone the sender wrote resolves nothing and is carried as text;
+* under a delimiter in the base64 alphabet, a document is refused at the detach, a marker at
+  both listeners, and a handle or marker at delivery, while ordinary delimiters are untouched.
 
 Synthetic HL7 only.
 """
@@ -990,12 +992,14 @@ async def _no_read(_sha256: str) -> str | None:
     raise AssertionError("nothing is bound, so no attachment may be read")
 
 
-def _copy_in_nte_component(field_sep: str, msh2: str, value: str) -> str:
-    """A well-formed MDM^T02 under MSH-1 ``field_sep`` and MSH-2 ``msh2``, with a small ED Base64
-    document in ``OBX-5.5`` and ``value`` set into ``NTE-3.1``. Every value is a component set,
-    which escapes every delimiter in it, so a delimiter that is a letter or digit is escaped in the
-    fixed text too and each field reads back as written."""
-    msg = Message.parse(f"MSH{field_sep}{msh2}{field_sep}\rOBX{field_sep}1{field_sep}ED\r")
+def _well_formed(
+    field_sep: str, msh2: str, obx5_5: str, nte: str | None = None, *, obx2: str = "ED"
+) -> str:
+    """A well-formed MDM^T02 under MSH-1 ``field_sep`` and MSH-2 ``msh2``, with ``obx5_5`` in an
+    ED Base64 ``OBX-5.5`` and, unless it is None, ``nte`` set into ``NTE-3.1``. Every value is a
+    component set, which escapes every delimiter in it, so a delimiter that is a letter or digit is
+    escaped in the fixed text too and each field reads back as written."""
+    msg = Message.parse(f"MSH{field_sep}{msh2}{field_sep}\rOBX{field_sep}1{field_sep}{obx2}\r")
     fields = [
         ("MSH-7.1", "20260101120000"),
         ("MSH-9.1", "MDM"),
@@ -1006,38 +1010,56 @@ def _copy_in_nte_component(field_sep: str, msh2: str, value: str) -> str:
         ("OBX-5.2", "Application"),
         ("OBX-5.3", "PDF"),
         ("OBX-5.4", "Base64"),
-        ("OBX-5.5", _b64(10)),
+        ("OBX-5.5", obx5_5),
         ("OBX-11.1", "F"),
     ]
     for path, text in fields:
         msg.set(path, text)
-    msg.add_segment(f"NTE{field_sep}1")
-    msg.set("NTE-3.1", value)
+    if nte is not None:
+        msg.add_segment(f"NTE{field_sep}1")
+        msg.set("NTE-3.1", nte)
     payload = msg.encode()
     parsed = Message.parse(payload)
     assert [parsed.field(path) for path, _ in fields] == [text for _, text in fields]
-    assert parsed.field("NTE-3.1") == value
+    assert nte is None or parsed.field("NTE-3.1") == nte
     return payload
 
 
+def _copy_in_nte_component(field_sep: str, msh2: str, value: str) -> str:
+    """:func:`_well_formed` with a small document in ``OBX-5.5`` and ``value`` in ``NTE-3.1``."""
+    return _well_formed(field_sep, msh2, _b64(10), value)
+
+
 @pytest.mark.parametrize(
-    ("field_sep", "msh2"),
+    ("field_sep", "msh2", "address_readable"),
     [
-        ("a", "^~\\&"),
-        ("|", "a~\\&"),
-        ("|", "d~\\&"),
-        ("|", "^a\\&"),
-        ("|", "^~0&"),
-        ("|", "^~\\a"),
+        ("a", "^~\\&", False),
+        ("|", "a~\\&", False),
+        ("|", "d~\\&", False),
+        ("|", "^a\\&", False),
+        ("|", "^~0&", True),
+        ("|", "^~\\a", False),
+        ("|", "^~\\/", True),
+        ("|", "A~\\&", True),
     ],
-    ids=["field-a", "component-a", "component-d", "repetition-a", "escape-0", "subcomponent-a"],
+    ids=[
+        "field-a",
+        "component-a",
+        "component-d",
+        "repetition-a",
+        "escape-0",
+        "subcomponent-a",
+        "subcomponent-slash",
+        "component-A",
+    ],
 )
 async def test_a_copy_whose_delimiters_escape_its_address_is_refused(
-    field_sep: str, msh2: str
+    field_sep: str, msh2: str, address_readable: bool
 ) -> None:
-    """A separator or escape character that is a lowercase hex digit is escaped inside the copied
-    content address too, so the address no longer reads as 64 hex. With nothing bound the copy
-    must still be refused, never carried to the partner as text (BACKLOG #5099)."""
+    """A delimiter that is a base64 character may be escaped inside the copied content address
+    too, so the address may no longer read as 64 hex. With nothing bound the copy must still be
+    refused, never carried to the partner as text (BACKLOG #5099). Where an escape leaves a run of
+    hex behind, the address scan reads one too; elsewhere only the delimiter rule refuses it."""
     from messagefoundry.parsing.binary import (
         UnreattachableDocumentError,
         _copy_names_address,
@@ -1047,20 +1069,35 @@ async def test_a_copy_whose_delimiters_escape_its_address_is_refused(
     handle = make_doc_ref(hashlib.sha256(b"copied").hexdigest(), "Application")
     payload = _copy_in_nte_component(field_sep, msh2, handle)
     escaped = Message._escape_leaf(DOC_REF_MARKER, *Message.parse(payload)._encoding_chars())
-    # The leak's premise: the copy is in the payload, but neither marker reads an address after it.
-    assert not any(_copy_names_address(payload, m) for m in (escaped, DOC_REF_MARKER))
+    reads = any(_copy_names_address(payload, m) for m in (escaped, DOC_REF_MARKER))
+    assert reads is address_readable
 
     with pytest.raises(UnreattachableDocumentError):
         await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
 
 
-@pytest.mark.parametrize("msh2", ["a~\\&", "^~0&"], ids=["component-a", "escape-0"])
-async def test_a_bare_marker_under_a_lowercase_hex_delimiter_is_refused(
+@pytest.mark.parametrize(
+    "msh2",
+    ["a~\\&", "^~0&", "m~\\&", "^g\\&", "A~\\&", "^~\\B", "^~\\/", "+~\\&", "^=\\&"],
+    ids=[
+        "component-a",
+        "escape-0",
+        "marker-letter-component",
+        "lowercase-non-hex-repetition",
+        "uppercase-component",
+        "uppercase-subcomponent",
+        "slash-subcomponent",
+        "plus-component",
+        "equals-repetition",
+    ],
+)
+async def test_a_bare_marker_under_a_base64_delimiter_is_refused(
     store: MessageStore, msh2: str
 ) -> None:
-    """Fail closed: under such delimiters no address after a marker can be read, so even a marker
-    that names none counts as a copy. Through the delivery gate it dead-letters at once, rather
-    than re-pending on the lane, and nothing reaches the partner."""
+    """Fail closed: under a delimiter in the base64 alphabet no address after a marker can be
+    read, so even a marker that names none counts as a copy (BACKLOG #5099). Through the delivery
+    gate it dead-letters at once, rather than re-pending on the lane, and nothing reaches the
+    partner."""
     from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
 
     payload = _copy_in_nte_component("|", msh2, DOC_REF_MARKER + "x")
@@ -1079,23 +1116,15 @@ async def test_a_bare_marker_under_a_lowercase_hex_delimiter_is_refused(
 
 @pytest.mark.parametrize(
     "msh2",
-    ["^~\\&", ":~\\&", "m~\\&", "^g\\&", "A~\\&", "^~\\B"],
-    ids=[
-        "default",
-        "colon-component",
-        "marker-letter-component",
-        "lowercase-non-hex-repetition",
-        "uppercase-component",
-        "uppercase-subcomponent",
-    ],
+    ["^~\\&", ":~\\&", "^~\\&#", "^~\\&/", "!~\\&"],
+    ids=["default", "colon-component", "truncation-hash", "fifth-char-slash", "bang-component"],
 )
-async def test_a_bare_marker_under_delimiters_with_no_lowercase_hex_is_carried_as_text(
+async def test_a_bare_marker_under_delimiters_with_no_base64_character_is_carried_as_text(
     msh2: str,
 ) -> None:
-    """The control: no delimiter is a lowercase hex digit, nothing is bound, and the marker names
-    no address, so the payload is carried unchanged. A lowercase letter outside a-f, a marker
-    letter included, and an uppercase hex letter escape nothing in a lowercase address, so they
-    do not count."""
+    """The control: no delimiter is a base64 character, nothing is bound, and the marker names no
+    address, so the payload is carried unchanged. A fifth MSH-2 character is not a delimiter, as
+    ``Message._encoding_chars`` reads them, so one in the base64 alphabet does not count."""
     from messagefoundry.parsing.binary import reattach_documents_in_hl7
 
     payload = _copy_in_nte_component("|", msh2, DOC_REF_MARKER + "x")
@@ -1103,6 +1132,115 @@ async def test_a_bare_marker_under_delimiters_with_no_lowercase_hex_is_carried_a
     assert escaped in payload  # the marker the guard looks for is there
 
     assert await reattach_documents_in_hl7(payload, _no_read, bound=frozenset()) == payload
+
+
+@pytest.mark.parametrize("msh2", ["^~\\&", "A~\\&"], ids=["ordinary", "uppercase-hex-component"])
+async def test_a_copy_with_an_uppercase_address_and_nothing_bound_is_refused(msh2: str) -> None:
+    """``parse_doc_ref`` lowercases a content address before it reads it, so a copy whose address
+    a Handler uppercased names the same document. Under ordinary delimiters the copy scan reads
+    it as one; under an uppercase hex delimiter the delimiter rule refuses it too (BACKLOG
+    #5099)."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    sha = hashlib.sha256(b"copied, uppercased").hexdigest()
+    copy = f"{DOC_REF_MARKER}{sha.upper()}:Application"
+    assert parse_doc_ref(copy)[0] == sha
+    payload = _copy_in_nte_component("|", msh2, copy)
+
+    with pytest.raises(UnreattachableDocumentError):
+        await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
+
+
+class _Reader:
+    """An attachment reader that records each content address it is asked for."""
+
+    def __init__(self, documents: dict[str, str]) -> None:
+        self.documents = documents
+        self.calls: list[str] = []
+
+    async def __call__(self, sha256: str) -> str | None:
+        self.calls.append(sha256)
+        return self.documents.get(sha256)
+
+
+#: A base64 document holding every character a base64 delimiter below could name.
+_EVERY_BASE64_CHARACTER = base64.b64encode(bytes(range(256)) * 3 + b"x").decode("ascii")
+
+
+@pytest.mark.parametrize(
+    ("field_sep", "msh2"),
+    [("|", "^~\\/"), ("|", "+~\\&"), ("|", "^=\\&"), ("|", "^~\\a"), ("|", "^~\\A")],
+    ids=[
+        "slash-subcomponent",
+        "plus-component",
+        "equals-repetition",
+        "a-subcomponent",
+        "A-subcomponent",
+    ],
+)
+async def test_a_bound_handle_under_a_base64_delimiter_is_refused_before_any_read(
+    field_sep: str, msh2: str
+) -> None:
+    """The splice sets the stored base64 back with ``Message.set``, which would escape a delimiter
+    in it, so the partner would get a document that is not the sender's. A handle the message
+    holds is refused before ``reader`` runs (BACKLOG #5099). Pinned on the reader's calls, so a
+    check moved after the splice turns this red."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    sha = hashlib.sha256(_EVERY_BASE64_CHARACTER.encode("ascii")).hexdigest()
+    payload = _well_formed(field_sep, msh2, make_doc_ref(sha, "Application"))
+    assert Message.parse(payload).field("OBX-5.5") == make_doc_ref(sha, "Application")
+    reader = _Reader({sha: _EVERY_BASE64_CHARACTER})
+
+    with pytest.raises(UnreattachableDocumentError, match="base64 character"):
+        await reattach_documents_in_hl7(payload, reader, bound=frozenset({sha}))
+    assert reader.calls == []
+
+
+@pytest.mark.parametrize("msh2", ["^~\\&", "^~\\&#", "^~\\&/"])
+async def test_a_bound_handle_under_ordinary_delimiters_is_spliced_verbatim(msh2: str) -> None:
+    """The control: no delimiter is a base64 character, a fifth MSH-2 character in the alphabet
+    included, so the stored document is set back byte for byte and the result is the original
+    body."""
+    from messagefoundry.parsing.binary import reattach_documents_in_hl7
+
+    original = _well_formed("|", msh2, _EVERY_BASE64_CHARACTER)
+    sha = hashlib.sha256(_EVERY_BASE64_CHARACTER.encode("ascii")).hexdigest()
+    msg = Message.parse(original)
+    msg.set("OBX-5.5", make_doc_ref(sha, "Application"))
+    reader = _Reader({sha: _EVERY_BASE64_CHARACTER})
+
+    spliced = await reattach_documents_in_hl7(msg.encode(), reader, bound=frozenset({sha}))
+
+    assert reader.calls == [sha]
+    assert spliced == original
+
+
+async def test_a_handler_that_moves_msh2_into_the_base64_alphabet_never_sends_the_handle(
+    store: MessageStore,
+) -> None:
+    """The detach wrote the handle under ordinary delimiters; a Handler then set MSH-2 so the
+    subcomponent separator is ``/``. Setting the stored base64 back would escape every ``/`` in
+    it, so the row is refused before any read and dead-letters at once (BACKLOG #5099)."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    ref = await store.put_attachment(chunk_b64(_EVERY_BASE64_CHARACTER), "application/pdf")
+    msg = Message.parse(_hl7(make_doc_ref(ref, "Application")))
+    msg.set("MSH-2", "^~\\/")
+    payload = msg.encode()
+    assert Message.parse(payload)._encoding_chars()[4] == "/"
+    reader = _Reader({ref: _EVERY_BASE64_CHARACTER})
+    with pytest.raises(UnreattachableDocumentError):
+        await reattach_documents_in_hl7(payload, reader, bound=frozenset({ref}))
+    assert reader.calls == []
+
+    runner = _runner(store)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+    rows = await _deliver_holding(store, runner, payload, ref)
+
+    assert col.deliveries == []
+    assert _dead_lettered_at_once(rows)
 
 
 def _with_marker_mid_document(doc: str) -> str:
@@ -1215,3 +1353,160 @@ def test_the_detach_scan_cannot_be_called_without_the_received_text() -> None:
     text = _hl7(_b64(10))
     with pytest.raises(TypeError):
         iter_obx_documents(Message.parse(text))  # type: ignore[call-arg]
+
+
+# --- the delimiter-class rule at ingress (BACKLOG #5099) --------------------------------------
+
+
+def _plain_ic() -> InboundConnection:
+    """An MLLP inbound with no streaming threshold: nothing is ever detached from its bodies."""
+    return InboundConnection(
+        name="IB_PLAIN",
+        spec=ConnectionSpec(ConnectorType.MLLP, {"port": 0}),
+        router="r",
+        ack_mode=AckMode.ORIGINAL,
+        content_type=ContentType.HL7V2,
+        validation=Validation(strict=False),
+    )
+
+
+async def _rows(store: MessageStore, channel: str) -> list[dict]:
+    cur = await store._db.execute(
+        "SELECT status, error FROM messages WHERE channel_id=? ORDER BY received_at", (channel,)
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def _attachment_count(store: MessageStore) -> int:
+    cur = await store._db.execute("SELECT COUNT(*) FROM attachment")
+    count = await cur.fetchone()
+    assert count is not None
+    return int(count[0])
+
+
+async def _ingress_count(store: MessageStore, channel: str) -> int:
+    cur = await store._db.execute(
+        "SELECT COUNT(*) FROM queue WHERE channel_id=? AND stage='ingress'", (channel,)
+    )
+    count = await cur.fetchone()
+    assert count is not None
+    return int(count[0])
+
+
+#: A streaming body under MSH-2 ``^~\\/``: the subcomponent separator is ``/``, which the base64
+#: document holds. Stored as-is and set back at delivery, every ``/`` would arrive as ``\\T\\``.
+_SLASH_DELIMITED_DOCUMENT = _hl7(_b64(2000, b"\xff"), msh2="^~\\/")
+
+
+def test_the_detach_scan_refuses_a_document_under_a_base64_delimiter() -> None:
+    from messagefoundry.parsing.binary import Base64DelimiterError
+
+    assert "/" in _b64(2000, b"\xff")
+    message = Message.parse(_SLASH_DELIMITED_DOCUMENT)
+    scan = iter_obx_documents(message, received=_SLASH_DELIMITED_DOCUMENT)
+    with pytest.raises(Base64DelimiterError):
+        next(scan)  # refused before the first document is yielded, so none is stored
+
+
+async def test_a_streaming_document_under_a_base64_delimiter_is_refused_before_the_ack(
+    store: MessageStore,
+) -> None:
+    """The reviewer's repro: a streaming body at or over the threshold, MSH-2 ``^~\\/``, and a
+    base64 document holding ``/``. Detached and ACKed AA, delivery would escape every ``/`` in
+    it; it is refused at the detach instead, with nothing stored, an ERROR row, an AR on MLLP and
+    a permanent refusal on HTTP (BACKLOG #5099)."""
+    from messagefoundry.transports.receipt import RefusalKind
+
+    body = _SLASH_DELIMITED_DOCUMENT
+    ic = _streaming_ic()
+    assert len(body) >= (ic.stream_threshold_bytes or 0)
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+    receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
+
+    assert _ack_code(ack) == "AR"
+    assert receipt.refusal is RefusalKind.PERMANENT
+    rows = await _rows(store, ic.name)
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
+    assert all("base64" in str(r["error"]) for r in rows)
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
+@pytest.mark.parametrize(
+    ("msh2", "streaming"),
+    [("^~\\/", False), ("m~\\&", False), ("^~\\/", True), ("m~\\&", True)],
+    ids=["slash-raw-marker", "m-escaped-marker", "slash-streaming", "m-streaming"],
+)
+async def test_a_marker_under_a_base64_delimiter_is_refused_at_both_listeners(
+    store: MessageStore, msh2: str, streaming: bool
+) -> None:
+    """At any size, a body holding the handle marker under a delimiter in the base64 alphabet is
+    refused before the ACK: delivery refuses any marker under such delimiters, so it would be
+    ACKed and then dead-letter on every outbound (BACKLOG #5099). Under ``m~\\&`` the marker is
+    escaped, so the escaped form is what the listener finds. The body has no document big enough
+    to matter: the streaming case is over the threshold by its NTE alone."""
+    from messagefoundry.transports.receipt import RefusalKind
+
+    body = _copy_in_nte_component("|", msh2, DOC_REF_MARKER + "x")
+    if streaming:
+        msg = Message.parse(body)
+        msg.add_segment("NTE|2")
+        msg.set("NTE-3.1", "y" * 600, occurrence=2)
+        body = msg.encode()
+        assert Message.parse(body).field("NTE-3.1") == DOC_REF_MARKER + "x"
+    ic = _streaming_ic() if streaming else _plain_ic()
+    assert (len(body) >= 500) is streaming
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+    receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
+
+    assert _ack_code(ack) == "AR"
+    assert receipt.refusal is RefusalKind.PERMANENT
+    rows = await _rows(store, ic.name)
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
+    assert all("handle marker" in str(r["error"]) for r in rows)
+    assert await _ingress_count(store, ic.name) == 0
+    assert await _attachment_count(store) == 0
+
+
+@pytest.mark.parametrize("msh2", ["^~\\&", "^~\\&#", "^~\\&/", "!~\\&"])
+@pytest.mark.parametrize("marker", [False, True], ids=["no-marker", "bare-marker"])
+async def test_ordinary_delimiters_are_accepted_at_both_listeners_as_before(
+    store: MessageStore, msh2: str, marker: bool
+) -> None:
+    """The control: no delimiter is a base64 character, a fifth MSH-2 character in the alphabet
+    included, so a small body is accepted AA with or without a bare marker, stored byte for byte.
+    Reserving the marker under ordinary delimiters is a policy left to the owner."""
+    body = _copy_in_nte_component("|", msh2, (DOC_REF_MARKER + "x") if marker else "plain")
+    ic = _plain_ic()
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+    receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
+
+    assert _ack_code(ack) == "AA"
+    assert receipt.refusal is None
+    cur = await store._db.execute(
+        "SELECT payload FROM queue WHERE channel_id=? AND stage='ingress'", (ic.name,)
+    )
+    assert [r[0] for r in await cur.fetchall()] == [body, body]
+
+
+@pytest.mark.parametrize("msh2", ["^~\\&", "^~\\&#", "^~\\&/"])
+async def test_a_streaming_document_under_ordinary_delimiters_is_still_detached(
+    store: MessageStore, msh2: str
+) -> None:
+    """The control for the detach refusal: the same base64 document holding ``/``, under
+    delimiters with no base64 character, is detached and ACKed AA as before."""
+    body = _hl7(_b64(2000, b"\xff"), msh2=msh2)
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+
+    assert _ack_code(ack) == "AA"
+    assert await _attachment_count(store) == 1
+    assert await _ingress_count(store, ic.name) == 1

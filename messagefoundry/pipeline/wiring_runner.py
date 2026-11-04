@@ -133,6 +133,7 @@ from messagefoundry.parsing import (
     validate,
 )
 from messagefoundry.parsing.binary import (
+    Base64DelimiterError,
     DocRefError,
     EscapedDocumentError,
     InboundDocRefError,
@@ -140,6 +141,7 @@ from messagefoundry.parsing.binary import (
     chunk_b64,
     iter_obx_documents,
     make_doc_ref,
+    marker_under_base64_delimiters,
     may_hold_doc_ref,
     reattach_documents_in_hl7,
 )
@@ -937,6 +939,13 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     DocRefError,
     EscapedDocumentError,
     InboundDocRefError,
+)
+
+#: The stored reason both listeners record when they refuse a body that holds the document handle
+#: marker under a delimiter in the base64 alphabet (BACKLOG #5099). It names no byte of the body.
+_MARKER_UNDER_BASE64_DELIMITERS = (
+    "document handle refused: the body holds the handle marker and a delimiter is a base64 "
+    "character"
 )
 
 
@@ -8067,6 +8076,18 @@ class RegistryRunner:
                     else _peek_read_fault(ic, exc)
                 ),
             )
+        if marker_under_base64_delimiters(Message(peek.message), text):
+            # Delivery refuses any handle marker under these delimiters, so the body would be
+            # accepted and then dead-letter on every outbound; refused here instead, at any size
+            # (BACKLOG #5099). The same body fails the same way every time.
+            return await self._refuse(
+                ic,
+                raw,
+                text,
+                RefusalKind.PERMANENT,
+                error=_MARKER_UNDER_BASE64_DELIMITERS,
+                peek=peek,
+            )
         if ic.validation.strict and streaming_over:
             # Whole-body strict validation is downgraded to header-only over the streaming threshold (the
             # MSH structure Peek.parse validated) — see _handle_inbound for the rationale.
@@ -8458,6 +8479,31 @@ class RegistryRunner:
                 )
             return ack
 
+        if marker_under_base64_delimiters(Message(peek.message), text):
+            # Delivery refuses any handle marker under these delimiters, so an AA here would be
+            # followed by a dead-letter on every outbound; refused here instead, at any size, and
+            # AR since the same body fails the same way every time (BACKLOG #5099).
+            mid = await self._record_refused(
+                ic, raw, text, error=_MARKER_UNDER_BASE64_DELIMITERS, peek=peek
+            )
+            ack = (
+                build_ack(
+                    peek, code="AR", text="handle marker under base64 delimiters", ack_mode=ack_mode
+                )
+                if reply
+                else None
+            )
+            if ack is not None and self._capture_ack_enabled(ic):
+                await self._capture_ack(
+                    mid,
+                    ic.name,
+                    ack_code="AR",
+                    ack_phase="ingest",
+                    ack_body=None,
+                    detail=_MARKER_UNDER_BASE64_DELIMITERS,
+                )
+            return ack
+
         if ic.validation.strict and streaming_over:
             # #149 (ADR 0105 Phase 1a): whole-body hl7apy strict validation cannot complete over the
             # streaming threshold (the detached document is opaque and the full parse would materialize
@@ -8551,6 +8597,9 @@ class RegistryRunner:
                 # message itself and fails the same way every time, so AR (vault BACKLOG #2809).
                 if isinstance(exc, EscapedDocumentError):
                     nak_code, nak_text = "AR", "escaped document in OBX-5.5"
+                elif isinstance(exc, Base64DelimiterError):
+                    # Checked before its base class: the body's delimiters, not a marker.
+                    nak_code, nak_text = "AR", "document under base64 delimiters"
                 elif isinstance(exc, InboundDocRefError):
                     # Either shape: a handle in OBX-5.5, or the marker elsewhere in a body
                     # with a document to detach.

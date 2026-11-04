@@ -31,7 +31,7 @@ import base64
 import binascii
 import re
 import time
-from collections.abc import Awaitable, Callable, Collection, Iterator
+from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator
 from typing import TYPE_CHECKING
 
 from messagefoundry.parsing._builtin_hl7 import (
@@ -73,12 +73,20 @@ DOC_REF_MARKER = "mfdoc:v1:ref:"
 #: one). Validated on build + parse so a malformed handle fails loud rather than dereferencing garbage.
 _SHA256_HEX_LEN = 64
 
-#: The characters a content address is written in.
-_HEX_DIGITS = "0123456789abcdef"
-
-#: A content address: ``_SHA256_HEX_LEN`` characters of ``_HEX_DIGITS``. Written as a literal so
-#: the static ReDoS scan reads it.
+#: A content address: ``_SHA256_HEX_LEN`` lowercase hex characters. Written as a literal so the
+#: static ReDoS scan reads it.
 _HEX64 = re.compile(r"[0-9a-f]{64}")
+
+#: A content address in either case, as :func:`parse_doc_ref` accepts one, since it lowercases
+#: first. Only the copy scan uses it, so a copy whose address was uppercased still counts as a
+#: copy (BACKLOG #5099). A literal, for the same scan.
+_HEX64_ANYCASE = re.compile(r"[0-9a-fA-F]{64}")
+
+#: The standard base64 alphabet and its padding character: every character an ``OBX-5.5`` ED
+#: Base64 value, and a handle's content address, is written in. A message that names one of them
+#: as a delimiter is refused wherever a document would be detached or set back (BACKLOG #5099);
+#: :func:`_delimits_with_base64` states the rule.
+_BASE64_ALPHABET = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
 
 __all__ = [
     "MARKER",
@@ -88,6 +96,7 @@ __all__ = [
     "DocRefError",
     "EscapedDocumentError",
     "InboundDocRefError",
+    "Base64DelimiterError",
     "UnreattachableDocumentError",
     "encode",
     "decode",
@@ -98,6 +107,7 @@ __all__ = [
     "make_document_tombstone",
     "is_doc_ref",
     "may_hold_doc_ref",
+    "marker_under_base64_delimiters",
     "make_doc_ref",
     "parse_doc_ref",
     "iter_obx_documents",
@@ -148,12 +158,23 @@ class InboundDocRefError(ValueError):
     a byte of the value."""
 
 
+class Base64DelimiterError(InboundDocRefError):
+    """A received body would have a document detached, and its MSH-1 or MSH-2 names a character of
+    the base64 alphabet as a delimiter (BACKLOG #5099). ``Message.set`` escapes that character
+    when delivery sets the stored value back, so the partner would get a document that is not the
+    sender's. Refused at the detach, before anything is stored and before the ACK. A subclass of
+    :class:`InboundDocRefError`, so both listeners refuse it the same way. The text names no byte
+    of the body."""
+
+
 class UnreattachableDocumentError(ValueError):
     """The payload itself stops a re-attach (vault BACKLOG #2809, BACKLOG #5099). At least these
     shapes: the parser refuses the payload as not HL7 (an ``HL7PeekError`` without ``parser_fault``
     set); its MSH-1 and MSH-2 do not name its separators; an ``OBX-5.5`` handle is malformed; a
-    handle names an attachment its own message does not hold; or a handle sits somewhere the
-    re-attach does not splice, such as ``NTE-3`` or a second ``OBX-5.5`` repetition. The same
+    handle names an attachment its own message does not hold; a handle sits somewhere the
+    re-attach does not splice, such as ``NTE-3`` or a second ``OBX-5.5`` repetition; or a
+    delimiter is a character of the base64 alphabet while a handle, or the marker, is in the
+    payload (:func:`_delimits_with_base64`). The same
     payload fails the same way on every attempt, so the delivery path refuses it permanently.
     Every other
     ``ValueError`` in the re-attach may be an engine fault and stays the outbound's internal-error
@@ -330,10 +351,58 @@ _DOC_REF_MARKER_CHARS = frozenset(DOC_REF_MARKER)
 #: The first MSH segment after a batch header, the one ``Message.set`` escapes by.
 _FIRST_MSH = re.compile(r"[\r\n]MSH")
 
-#: The re-attach's refusal of a handle left where the splice does not reach (BACKLOG #5099).
-_UNSPLICED_HANDLE = (
-    "a document handle sits outside the OBX-5.5 first repetitions the re-attach splices"
+#: The re-attach's refusal of a handle marker the splice did not resolve (BACKLOG #5099).
+_UNSPLICED_HANDLE = "a document handle marker was left that the re-attach splice did not resolve"
+
+#: The re-attach's refusal of a handle it would set back under base64 delimiters (BACKLOG #5099).
+_BASE64_DELIMITED_HANDLE = (
+    "the payload's delimiters include a base64 character, so a document cannot be set back verbatim"
 )
+
+
+def _delimits_with_base64(separators: Iterable[str]) -> bool:
+    """Whether any of a message's five delimiters, read as ``Message._encoding_chars`` reads them
+    (MSH-1 and the first four MSH-2 characters of the first MSH), is a character of
+    :data:`_BASE64_ALPHABET` (BACKLOG #5099).
+
+    The one delimiter-class rule. ``Message.set`` escapes a delimiter wherever it occurs in a
+    value, so under such delimiters a document set back into ``OBX-5.5`` is not the sender's
+    base64, and the content address after a copied marker may not read as one. So the ingress
+    detach refuses a body it would detach a document from (:class:`Base64DelimiterError`), both
+    listeners refuse a body that holds the marker (:func:`marker_under_base64_delimiters`), and
+    the delivery re-attach refuses a handle it would splice and any marker it finds
+    (:func:`reattach_documents_in_hl7`). Ordinary delimiters, ``|^~\\&`` and the common
+    variants, hold no base64 character and are untouched."""
+    return not _BASE64_ALPHABET.isdisjoint(separators)
+
+
+def _marker_forms(separators: tuple[str, str, str, str, str]) -> tuple[str, ...]:
+    """The handle marker as ``Message.set`` writes it under ``separators`` (a handle the engine
+    wrote, or a Handler copied into a component), and the raw marker, which a whole-field set
+    leaves unescaped where the delimiters would escape it. One entry when the two agree."""
+    from messagefoundry.parsing.message import Message
+
+    marker = Message._escape_leaf(DOC_REF_MARKER, *separators)
+    return (marker, DOC_REF_MARKER) if marker != DOC_REF_MARKER else (marker,)
+
+
+def marker_under_base64_delimiters(message: Message, text: str) -> bool:
+    """Whether a received HL7 body names a base64 character as a delimiter
+    (:func:`_delimits_with_base64`) and holds the handle marker, raw or as its delimiters escape
+    it (BACKLOG #5099). Both listeners refuse such a body before the ACK, whatever its size: the
+    delivery re-attach refuses any marker under these delimiters, so it would be ACKed and then
+    dead-letter on every outbound.
+
+    ``message`` is ``text`` parsed. A body whose MSH-1 and MSH-2 name no delimiters is False here.
+    For ordinary delimiters the cost is the header read alone; otherwise at most two substring
+    scans of ``text``."""
+    try:
+        separators = message._encoding_chars()
+    except ValueError:
+        return False
+    if not _delimits_with_base64(separators):
+        return False
+    return any(m in text for m in _marker_forms(separators))
 
 
 def may_hold_doc_ref(text: str) -> bool:
@@ -484,6 +553,11 @@ def iter_obx_documents(
     dead-letter on every outbound. No base64 value holds the marker, since base64 has no ``:``, so
     the refusal turns away no document a conformant sender sends.
 
+    It raises :class:`Base64DelimiterError`, an :class:`InboundDocRefError`, when a document would
+    be detached and a delimiter is a character of the base64 alphabet
+    (:func:`_delimits_with_base64`): delivery could not set the value back verbatim, so it would
+    refuse the handle after the ACK.
+
     Each document's value is held one at a time, as the caller's in-flight budget assumes: each
     check reads a value inside :func:`_scan_obx`, whose frame ends before the next read, and the
     value is read again when it is yielded and dropped after. Holding every value until the scan
@@ -498,6 +572,11 @@ def iter_obx_documents(
         if detachable:
             documents.append(occ)
             value_holds_marker = value_holds_marker or holds_marker
+    if documents and _detach_delimits_with_base64(message):
+        raise Base64DelimiterError(
+            "a delimiter of the body is a base64 character, so a detached document could not be "
+            "set back verbatim; refusing the detach"
+        )
     for occ in occurrences:
         if _obx_5_5_holds_escape(message, occ):
             raise EscapedDocumentError(
@@ -542,6 +621,16 @@ def _scan_obx(message: Message, occ: int, min_b64_len: int) -> tuple[bool, bool,
     if not _is_base64_ed(message, occ):
         return False, False, False
     return True, detachable, holds_marker
+
+
+def _detach_delimits_with_base64(message: Message) -> bool:
+    """Whether ``message``'s delimiters break the detach's round trip (:func:`_delimits_with_base64`).
+    Fails closed: delimiters that cannot be read are refused, as :func:`_received_holds_marker`
+    refuses them."""
+    try:
+        return _delimits_with_base64(message._encoding_chars())
+    except ValueError:
+        return True
 
 
 def _received_holds_marker(message: Message, received: str) -> bool:
@@ -695,14 +784,14 @@ def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int,
 
 def _copy_names_address(text: str, marker: str) -> bool:
     """Whether some occurrence of ``marker``, the handle marker as the payload's delimiters escape
-    it, is immediately followed in ``text`` by a content address, 64 lowercase hex characters: a
-    handle copy, not a bare marker. Overlapping occurrences each count, and nothing need follow
-    the address."""
+    it, is immediately followed in ``text`` by a content address, 64 hex characters in either
+    case, as :func:`parse_doc_ref` reads one: a handle copy, not a bare marker. Overlapping
+    occurrences each count, and nothing need follow the address."""
     # No regex is built from the marker: a pattern read at run time is one the static ReDoS scan
-    # cannot check. The per-hit test is the literal _HEX64, matched in place without a copy.
+    # cannot check. The per-hit test is the literal _HEX64_ANYCASE, matched in place without a copy.
     start = text.find(marker)
     while start != -1:
-        if _HEX64.match(text, start + len(marker)):
+        if _HEX64_ANYCASE.match(text, start + len(marker)):
             return True
         start = text.find(marker, start + 1)
     return False
@@ -745,7 +834,8 @@ async def reattach_documents_in_hl7(
     it parses the content address (:func:`parse_doc_ref`), ``await``\\ s ``reader(sha256)`` for the stored
     VERBATIM base64 string, and splices it back into ``OBX-5.5`` **byte-for-byte** (no decode/encode — the
     exact bytes the partner sent; the base64 alphabet carries no HL7 delimiter, so the message's own
-    escaping is a no-op on it). Returns the fully re-materialized HL7 text.
+    escaping is a no-op on it, under any delimiters the rule in :func:`_delimits_with_base64`
+    lets through). Returns the fully re-materialized HL7 text.
 
     ``reader`` is an INJECTED ``async`` callable (``sha256 -> verbatim base64``) so this function stays
     PURE and unit-testable: the caller (``pipeline/``) supplies the async store ``read_attachment`` read
@@ -753,8 +843,9 @@ async def reattach_documents_in_hl7(
     like a handle but ``reader`` raises **or** returns ``None`` (the attachment is missing / GC'd), a
     :class:`DocRefError` propagates — the raw ``mfdoc:v1:ref:`` text is **never** emitted (delivering it
     into a partner's ``OBX-5.5`` would be silent corruption). A malformed handle fails loud as an
-    :class:`UnreattachableDocumentError`. A body with **no** handle is returned UNCHANGED (byte-identical), mirroring
-    :func:`strip_documents` — so a below-threshold / no-detach delivery is untouched. The
+    :class:`UnreattachableDocumentError`. A body with **no** handle is returned unchanged unless
+    refused, mirroring :func:`strip_documents`, so a below-threshold / no-detach delivery is
+    untouched. The
     payload-caused shapes :class:`UnreattachableDocumentError` names raise it; every other
     ``ValueError`` propagates as it is, a stored document holding a CR or LF included.
 
@@ -763,8 +854,10 @@ async def reattach_documents_in_hl7(
     refused before ``reader`` runs, so a value the sender wrote cannot name another message's
     document. The handle marker, raw or as this payload's delimiters escape it, anywhere the
     splice does not reach is refused too where ``bound`` is not empty, the copy names a content
-    address, or a delimiter is a lowercase hex digit and so may have escaped one, so a handle a
-    Handler copied elsewhere is never emitted."""
+    address, or a delimiter is a base64 character and so may have escaped one, so a handle a
+    Handler copied elsewhere is never emitted. A handle to splice under such a delimiter is
+    refused before ``reader`` runs, since the splice would escape that character inside the
+    document (:func:`_delimits_with_base64`)."""
     # Local imports. message.py imports binary.py, never the reverse, so the cycle is broken here,
     # exactly as _strip_obx_ed does. asyncio stays out of the module scope: a sandbox worker refuses an
     # import of it once its guard is up (DEFAULT_FORBIDDEN_MODULES), this module has to stay importable
@@ -817,29 +910,27 @@ async def reattach_documents_in_hl7(
                     refused = f"OBX-5.5 occurrence {occ} holds a malformed document handle"
                 if refused is not None:
                     raise UnreattachableDocumentError(refused)
-        # The marker as Message.set writes it under this payload's delimiters: a handle the engine
-        # wrote, or a Handler copied, carries exactly this text wherever it sits.
-        # The raw marker is checked as well: a whole-field set, a Handler's NTE-3 copy for one,
-        # leaves the component separator unescaped, so under delimiters that escape the marker the
-        # copy keeps it raw.
         separators = message._encoding_chars()
-        marker = Message._escape_leaf(DOC_REF_MARKER, *separators)
-        markers = (marker, DOC_REF_MARKER) if marker != DOC_REF_MARKER else (marker,)
-        # A separator or escape character that is a lowercase hex digit is escaped inside a copied
-        # content address too, so the address after a marker cannot be read: every marker counts
-        # as a copy. An uppercase one escapes nothing in an address, which is lowercase.
-        address_unreadable = any(c in _HEX_DIGITS for c in separators)
+        # Under a base64 delimiter the splice below would escape it inside the stored document,
+        # so a handle to splice is refused before any read (_delimits_with_base64). A Handler
+        # that changed MSH-2 after the detach reaches this too.
+        base64_delimited = _delimits_with_base64(separators)
+        if found and base64_delimited:
+            raise UnreattachableDocumentError(_BASE64_DELIMITED_HANDLE)
+        markers = _marker_forms(separators)
+        # Under the same delimiters a copied content address is escaped too, so the address after
+        # a marker cannot be read: every marker counts as a copy.
         if (
             not found
             and any(m in text for m in markers)
-            and (bound or address_unreadable or any(_copy_names_address(text, m) for m in markers))
+            and (bound or base64_delimited or any(_copy_names_address(text, m) for m in markers))
         ):
             # No handle to splice, so the text is what would be sent: a marker in it is a copy.
             # Refused where the message holds a document, and also where the copy names a content
             # address, or may name one its delimiters escaped: a child that inherited none,
             # because its only handle sits outside OBX-5.5, would otherwise send the engine's
             # handle with no document. A bare marker in a message that holds nothing names no
-            # document, so it is carried as text where no delimiter is a lowercase hex digit.
+            # document, so it is carried as text where no delimiter is a base64 character.
             raise UnreattachableDocumentError(_UNSPLICED_HANDLE)
         return message, found, markers
 
@@ -856,7 +947,7 @@ async def reattach_documents_in_hl7(
     if not handles:
         # No handle in any OBX-5.5 — return the ORIGINAL text unchanged (byte-identical). The caller's
         # gate may open on a header alone, or on a bare marker outside OBX-5.5 in a message that
-        # holds no document under delimiters with no lowercase hex digit (_handles refuses the
+        # holds no document under delimiters with no base64 character (_handles refuses the
         # rest); that names no document, so it is carried through verbatim.
         return text
     for occ, sha256 in handles:
