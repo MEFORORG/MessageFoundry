@@ -2487,13 +2487,16 @@ def _pem(cert: x509.Certificate) -> bytes:
     return cert.public_bytes(serialization.Encoding.PEM)
 
 
+def _relabelled(pem: bytes, label: str) -> bytes:
+    """A ``CERTIFICATE`` PEM block's markers rewritten under ``label``, body unchanged."""
+    return pem.replace(
+        b"-----BEGIN CERTIFICATE-----", f"-----BEGIN {label}-----".encode("ascii")
+    ).replace(b"-----END CERTIFICATE-----", f"-----END {label}-----".encode("ascii"))
+
+
 def _labelled(cert: x509.Certificate, label: str) -> bytes:
-    """``cert`` as one PEM block under ``label`` in place of ``CERTIFICATE``, body unchanged."""
-    return (
-        _pem(cert)
-        .replace(b"-----BEGIN CERTIFICATE-----", f"-----BEGIN {label}-----".encode("ascii"))
-        .replace(b"-----END CERTIFICATE-----", f"-----END {label}-----".encode("ascii"))
-    )
+    """``cert`` as one PEM block under ``label`` in place of ``CERTIFICATE``."""
+    return _relabelled(_pem(cert), label)
 
 
 def _client_bundle(

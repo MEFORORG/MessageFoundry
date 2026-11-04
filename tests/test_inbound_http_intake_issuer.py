@@ -17,7 +17,6 @@ everything cannot pass.
 from __future__ import annotations
 
 import asyncio
-import base64
 import datetime
 import logging
 import ssl
@@ -42,6 +41,7 @@ from tests.test_api_tls import (
     _labelled,
     _new_ca,
     _pem,
+    _relabelled,
     _self_signed,
 )
 
@@ -154,7 +154,11 @@ async def test_the_listed_issuer_is_admitted_and_another_ca_with_the_same_subjec
             label=label,
         )
     assert len(caplog.records) >= 1, "the capture missed its own control warning"
-    at_start = [r.getMessage() for r in caplog.records if r.getMessage() != control]
+    at_start = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == listener_log and r.getMessage() != control
+    ]
     await _started(source)
     try:
         # Control: the same subject from the CA it is listed under is admitted.
@@ -331,9 +335,7 @@ def _der(cert: x509.Certificate) -> bytes:
 
 def _wrapped(der: bytes, label: str = "CERTIFICATE") -> bytes:
     """``der`` as one PEM block under ``label``, whatever bytes it holds."""
-    body = base64.b64encode(der).decode("ascii")
-    lines = "\n".join(body[at : at + 64] for at in range(0, len(body), 64))
-    return f"-----BEGIN {label}-----\n{lines}\n-----END {label}-----\n".encode("ascii")
+    return _relabelled(ssl.DER_cert_to_PEM_cert(der).encode("ascii"), label)
 
 
 @pytest.mark.parametrize("label", ["CERTIFICATE", "X509 CERTIFICATE"])
@@ -424,8 +426,35 @@ def _pinned(cn: str) -> x509.Certificate:
     )
 
 
+#: Text before a probe's BEGIN marker on its line, and text after it, each with whether OpenSSL 3.5.7
+#: was measured to load the probe. OpenSSL reads a long line in 254-byte pieces, so a marker opening
+#: the second piece loads (pki._OPENSSL_LINE_PIECE); it strips trailing bytes at or below a space.
+_BEFORE = {
+    "line": ("", True),
+    "space": (" ", False),
+    "text": ("x ", False),
+    "lone-cr": ("\r", False),
+    "254-bytes": ("y" * 254, True),
+    "255-bytes": ("y" * 255, False),
+}
+_AFTER = {
+    "spaces": ("  ", True),
+    "tab": ("\t", True),
+    "crlf": ("\r", True),
+    "control": ("\x0b", True),
+    "space-text": (" x", False),
+    "text": ("x", False),
+}
+
+
 @pytest.mark.parametrize("pinned", [False, True], ids=["ca", "pinned"])
-@pytest.mark.parametrize("prefix", ["", " ", "x ", "\r"], ids=["line", "space", "text", "lone-cr"])
+@pytest.mark.parametrize(
+    ("before", "after", "loads"),
+    [
+        *(pytest.param(b, "", ok, id=f"before-{k}") for k, (b, ok) in _BEFORE.items()),
+        *(pytest.param("", a, ok, id=f"after-{k}") for k, (a, ok) in _AFTER.items()),
+    ],
+)
 @pytest.mark.parametrize(
     "label",
     [
@@ -437,11 +466,12 @@ def _pinned(cn: str) -> x509.Certificate:
         "x509 certificate",
     ],
 )
-def test_the_index_reads_every_block_the_context_loads(
-    label: str, prefix: str, pinned: bool
+def test_the_index_reads_a_block_where_the_context_loads_it(
+    label: str, before: str, after: str, loads: bool, pinned: bool
 ) -> None:
-    """The index reads a block exactly where ``load_verify_locations(cadata=)`` loads it, by label
-    and by what precedes the BEGIN marker on its line (BACKLOG #4948).
+    """On each shape here, the index reads a block where ``load_verify_locations(cadata=)`` loads
+    it and skips it where that skips it: by label, and by what shares the BEGIN marker's line
+    (BACKLOG #4948). The index models OpenSSL's reader; it is not that reader, so this is a sample.
 
     A CA the handshake trusts that the index skips denies every partner under it; a CA the index
     reads that the handshake never loaded could be named for a leaf whose chain ran through a
@@ -449,17 +479,19 @@ def test_the_index_reads_every_block_the_context_loads(
     pinned client certificate OpenSSL does not count as one."""
     plain = _ca(_dn((NameOID.COMMON_NAME, "Plain CA")))
     probe = _pinned("Probe") if pinned else _ca(_dn((NameOID.COMMON_NAME, "Probe")))[0]
-    cadata = (_pem(plain[0]) + prefix.encode("ascii") + _labelled(probe, label)).decode("ascii")
+    marker = f"-----BEGIN {label}-----".encode("ascii")
+    block = _labelled(probe, label).replace(marker, marker + after.encode("ascii"), 1)
+    cadata = (_pem(plain[0]) + before.encode("ascii") + block).decode("ascii")
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_verify_locations(cadata=cadata)
     loaded = ctx.cert_store_stats()["x509"]
     # The measured premise, so the check below cannot pass by OpenSSL loading nothing.
-    assert loaded == (2 if label in ("CERTIFICATE", "X509 CERTIFICATE") and not prefix else 1)
+    assert loaded == (2 if loads and label in ("CERTIFICATE", "X509 CERTIFICATE") else 1)
     index = IssuerIndex(cadata)
     assert index.unreadable == 0
     assert index.unmatched_keys(["CN=Plain CA"]) == {}  # control: always read
     probe_read = index.unmatched_keys(["CN=Probe"]) == {}
-    assert probe_read == (loaded == 2), (label, prefix, pinned, loaded)
+    assert probe_read == (loaded == 2), (label, before, after, pinned, loaded)
 
 
 @pytest.mark.parametrize(

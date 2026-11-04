@@ -541,6 +541,9 @@ _UNREAD_EXTENSIONS = (x509.UnsupportedGeneralNameType, CryptographyDeprecationWa
 #: (:func:`_crl_extensions`). It stays here for any other deprecation the parse warns of, so such
 #: a CA is skipped alone rather than ending the whole judgment (vault BACKLOG #3506).
 #: :func:`_signature_state` reads a CRL whose own extensions raise one of these as ``unlisted``.
+#: :class:`IssuerIndex` also counts a loaded CA that raises one as unreadable, and its ``issuer_of``
+#: names no issuer for a client LEAF that raises one, so narrowing this tuple reaches both (BACKLOG
+#: #4948).
 _UNREADABLE_CA = (ValueError, x509.InvalidVersion, *_UNREAD_EXTENSIONS)
 
 #: One name as :func:`_issuer_name_key` compares it: per RDN, in order, the sorted attributes.
@@ -1671,22 +1674,41 @@ def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:
 #: on OpenSSL 3.5.7 (BACKLOG #4948). Missing the legacy one left a CA the handshake trusts out of
 #: the index, so every partner under it would have been refused, with a start warning naming the
 #: wrong cause.
-_PEM_CERTIFICATE_BEGIN = re.compile(rb"-----BEGIN (X509 )?CERTIFICATE-----")
+#: The BEGIN marker, then nothing but bytes at or below a space to the end of its line.
+_PEM_CERTIFICATE_BEGIN = re.compile(
+    rb"-----BEGIN (X509 )?CERTIFICATE-----[\x00-\x09\x0b-\x20]*(?:\n|\Z)"
+)
+
+#: OpenSSL reads a long line in pieces of this many bytes, and a marker opening a piece counts as
+#: opening a line: on OpenSSL 3.5.7 a BEGIN after 254, 508, 762 or 1016 bytes of text loads, and one
+#: after 253, 255, 300 or 509 does not (BACKLOG #4948).
+_OPENSSL_LINE_PIECE = 254
+
+
+def _opens_line(pem: bytes, at: int) -> bool:
+    """Whether OpenSSL's PEM reader would see offset ``at`` of ``pem`` as the start of a line."""
+    return (at - pem.rfind(b"\n", 0, at) - 1) % _OPENSSL_LINE_PIECE == 0
 
 
 def _pem_certificate_blocks(pem: bytes) -> Iterator[bytes]:
-    """Each ``CERTIFICATE`` or ``X509 CERTIFICATE`` PEM block in ``pem``, in order.
+    """Each ``CERTIFICATE`` or ``X509 CERTIFICATE`` PEM block in ``pem``, in order, as OpenSSL's
+    reader would find it, at least on the shapes measured (BACKLOG #4948).
 
-    A block opens at a BEGIN marker that starts a line, the rule :func:`_crl_blocks` records for
-    OpenSSL, so a marker inside a comment opens none. It ends at the first END marker of its own
-    label before the next such BEGIN; a BEGIN with none, such as a comment line opening with a
-    marker, is passed over. So a stray marker of either label cannot swallow the blocks after it
-    and leave a CA, or one of two CAs sharing a name, out of the index (BACKLOG #4948)."""
-    starts = [m for m in _PEM_CERTIFICATE_BEGIN.finditer(pem) if _begins_line(pem, m.start())]
-    for i, begin in enumerate(starts):
-        after = starts[i + 1].start() if i + 1 < len(starts) else len(pem)
+    A block opens at a BEGIN marker that opens a line (:func:`_opens_line`) and is the whole line
+    but for trailing bytes at or below a space, so a marker in a comment opens none. It ends at the
+    first END marker of its own label that opens a line, whatever lies between: OpenSSL reads every
+    line up to it as the block's body. A BEGIN with no such END ends the scan, since OpenSSL refuses
+    that file and no context was built from it."""
+    at = 0
+    while (begin := _PEM_CERTIFICATE_BEGIN.search(pem, at)) is not None:
+        if not _opens_line(pem, begin.start()):
+            at = begin.start() + 1
+            continue
         end = b"-----END " + (begin[1] or b"") + b"CERTIFICATE-----"
-        # Bounded by the next BEGIN, so a file of unterminated markers costs one pass, not one each.
-        stop = pem.find(end, begin.end(), after)
-        if stop >= 0:
-            yield pem[begin.start() : stop + len(end)]
+        stop = pem.find(end, begin.end())
+        while stop >= 0 and not _opens_line(pem, stop):
+            stop = pem.find(end, stop + 1)
+        if stop < 0:
+            return
+        at = stop + len(end)
+        yield pem[begin.start() : at]
