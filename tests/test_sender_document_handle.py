@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 from pathlib import Path
 
 import pytest
@@ -1789,6 +1790,34 @@ def test_the_retention_strip_skips_a_body_whose_header_names_no_delimiters() -> 
     readable = _hl7(_b64(2000))
     stripped, documents, _reclaimed = strip_documents(readable, pruned_at=0.0)
     assert documents == 1 and stripped != readable
+
+
+def test_the_retention_strip_logs_a_skip_with_no_byte_of_the_body(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A row the strip skips keeps its document past the strip window, so the skip is logged at
+    WARNING rather than passed over silently, and the record carries nothing of the body: the
+    separator read's refusal quotes MSH-1 and MSH-2, so its text is left out too (BACKLOG
+    #5099). A readable body logs nothing, the control that the record marks the skip."""
+    from messagefoundry.parsing.binary import strip_documents
+
+    logger = "messagefoundry.parsing.binary"
+    with caplog.at_level(logging.WARNING, logger=logger):
+        assert strip_documents(_hl7(_b64(2000)), pruned_at=0.0)[1] == 1
+    assert [r for r in caplog.records if r.name == logger] == []
+
+    body = _SHORT_MSH2_DOCUMENT
+    with caplog.at_level(logging.WARNING, logger=logger):
+        assert strip_documents(body, pruned_at=0.0) == (body, 0, 0)
+    records = [r for r in caplog.records if r.name == logger]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    text = records[0].getMessage()
+    assert "document strip skipped" in text
+    assert records[0].exc_info is None
+    # No field of the body, its header's delimiters and the document included.
+    for piece in ("^~", "APP", "FAC", "RCVF", "MSGID001", "20260101120000", "MDM", _b64(2000)[:16]):
+        assert piece not in text, piece
 
 
 def test_the_retention_strip_contains_any_fault_in_the_separator_read(

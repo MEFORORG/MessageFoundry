@@ -258,10 +258,11 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   pre-send `encoding_characters` / `hl7_raw_separators` failures — so the row takes the normal
   ERROR/retry/dead-letter path and **the connector never receives an un-hydrated handle** (which would
   deliver `mfdoc:v1:ref:…` into the partner's `OBX-5.5` = silent corruption).
-- **Which re-attach failures are permanent (vault BACKLOG #2809, added 2026-11-01).** At least two
-  are refused permanently: the payload does not parse as HL7, or it holds the raw handle marker and
-  its separators cannot be read because it has no `MSH` or its first `MSH`'s `MSH-2` is shorter
-  than four characters (with no raw marker, such a payload is carried as it is). Either raises `UnreattachableDocumentError`, which `_hydrate_payload` turns into a
+- **Which re-attach failures are permanent (vault BACKLOG #2809, added 2026-11-01).** At least
+  these are refused permanently: the payload does not parse as HL7, or it holds the raw handle
+  marker and its separators cannot be read because it has no `MSH` or its first `MSH`'s `MSH-2` is
+  shorter than four characters (with no raw marker, such a payload is carried as it is). Each of
+  these raises `UnreattachableDocumentError`, which `_hydrate_payload` turns into a
   permanent `NegativeAckError` (code `reattach`), so that row dead-letters alone, under either
   `internal_error` policy. On a batched outbound that member is dead-lettered alone and the rest of the
   batch goes out, provided every other member hydrates. A stored
@@ -310,9 +311,9 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   2. *Ingress marker refusal.* Both listeners refuse a body of any size that holds the handle
      marker, raw or as its delimiters escape it (`marker_under_base64_delimiters`, through
      `ingress_guards.doc_ref_marker_refusal`, which the dry-run runs too). A body whose delimiters
-     cannot be read, because it has no `MSH` or its first `MSH`'s `MSH-2` is shorter than four
-     characters, is refused when it holds the raw marker, as delivery refuses
-     it. The cost is a header read, plus up to two substring scans under such delimiters or
+     cannot be read, because its first `MSH`'s `MSH-2` is shorter than four characters, is refused
+     when it holds the raw marker, as delivery refuses it. A body with no `MSH` never reaches this
+     check: `Peek.parse` refuses it first. The cost is a header read, plus up to two substring scans under such delimiters or
      the raw-marker scan under such a header.
   3. *Egress splice refusal.* The re-attach refuses a handle it would splice before any read, so
      a Handler that changed `MSH-1` or `MSH-2` after the detach cannot corrupt the document.
@@ -330,9 +331,10 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   if splicing it back under the delimiters it arrived with reproduces it exactly, so the detach
   also refuses an ED Base64 document whose own value `Message._escape_leaf` would change under
   them, such as a non-base64 value holding `&` or a control character under `|^~\&`
-  (`NonVerbatimDocumentError`), the same way. A streaming body with an `OBX` and no `MSH`, or a
-  first `MSH` whose `MSH-2` is shorter than four characters, is refused at the detach the same way too
-  (`UnreadableDelimitersError`), since no `OBX-5.5` of it can be read. The re-attach refuses a stored value holding a
+  (`NonVerbatimDocumentError`), the same way. A streaming body with an `OBX` and a first `MSH`
+  whose `MSH-2` is shorter than four characters is refused at the detach the same way too
+  (`UnreadableDelimitersError`), since no `OBX-5.5` of it can be read; a body with no `MSH` never
+  reaches the detach, since `Peek.parse` refuses it first. The re-attach refuses a stored value holding a
   delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that
   moved `MSH-1` or `MSH-2` after the detach dead-letters the row rather than send an altered document; a
   stored control character is an engine fault for the internal-error policy, as a CR or LF is.

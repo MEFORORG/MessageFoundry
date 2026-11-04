@@ -933,8 +933,9 @@ class _StreamBudgetExceeded(Exception):
 
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
 #: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
-#: by one alone. A body with an OBX and no MSH, or an MSH-2 shorter than four characters, is one,
-#: :class:`UnreadableDelimitersError`, rather than the plain ``ValueError`` the OBX reads raise.
+#: by one alone. A body with an OBX and an MSH-2 shorter than four characters is one,
+#: :class:`UnreadableDelimitersError`, rather than the plain ``ValueError`` the OBX reads raise. A
+#: body with no MSH never reaches the detach: both listeners' ``Peek.parse`` refuses it first.
 _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     _StreamBudgetExceeded,
     StreamingAttachmentsUnsupported,
@@ -8238,7 +8239,8 @@ class RegistryRunner:
         and :class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError` for a document
         delivery's splice would not set back verbatim, and
         :class:`~messagefoundry.parsing.binary.UnreadableDelimitersError` for a body with an OBX
-        and no MSH, or an MSH-2 shorter than four characters (BACKLOG #5099) — each, as one of
+        and an MSH-2 shorter than four characters (a body with no MSH never gets here: the caller's
+        ``Peek.parse`` refused it first; BACKLOG #5099) — each, as one of
         :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""

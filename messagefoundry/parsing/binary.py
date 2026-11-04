@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator
@@ -46,6 +47,8 @@ if TYPE_CHECKING:
     # Type-only import: keep parsing.message out of this module's *runtime* imports so the dependency
     # is one-way (message.py imports binary.py, never the reverse) and there is no import cycle.
     from messagefoundry.parsing.message import Message
+
+_log = logging.getLogger(__name__)
 
 #: The self-describing carriage marker. ``v1`` versions the *algorithm* (standard base64); a future
 #: carrier (e.g. base85, if the ~33% inflation ever bites) would ship as ``v2`` without ambiguity.
@@ -759,9 +762,12 @@ def strip_documents(
     * an **HL7 message carrying OBX-5 ED embeds** → each qualifying OBX-5 value is tombstoned via the
       parsed :class:`Message` model and the message is re-encoded (so it re-parses cleanly).
 
-    Anything else (plain HL7 with no ED, HL7 with an MSH-2 shorter than four characters,
-    JSON/XML/text, an already-stripped tombstone) is returned
+    Anything else (plain HL7 with no ED, HL7 with an MSH-2 shorter than four characters, a body
+    with no MSH segment such as an FHS- or BHS-led batch, including one whose first eight
+    characters hold ``MSH``, JSON/XML/text, an already-stripped tombstone) is returned
     unchanged with ``(raw, 0, 0)`` — so the caller can skip a no-op write and the pass is idempotent.
+    A body skipped because its delimiters cannot be read is logged at WARNING, with no byte of it,
+    since its document then stays past the strip window.
 
     ``min_bytes`` skips a document whose decoded size is below the threshold (small embeds aren't worth
     evicting; ``0`` = strip every embed). ``content_type`` (the connection's declared format) labels a
@@ -850,12 +856,20 @@ def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int,
         return raw, 0, 0
     try:
         message._encoding_chars()
-    except ValueError:
+    except ValueError as exc:
         # No MSH, or an MSH-2 shorter than four characters: every OBX read would raise, and the
         # retention pass calls this with no try, so one such stored row would abort the pass on
         # every run. Its document stays, as any body this strip cannot read does (BACKLOG #5099).
         # Any ValueError, not only the bare one _delimiters_readable answers for: the detach lets
         # another fault out, but a retention pass must contain it as it contains a parse failure.
+        # Logged, not silent, because the document now outlives its window. Only the exception's
+        # class name goes in the record, never its text or the body: the separator read's refusal
+        # quotes MSH-1 and MSH-2, which are the body's.
+        _log.warning(
+            "document strip skipped a stored HL7 body: its delimiters could not be read (%s), so "
+            "its embedded documents stay",
+            type(exc).__name__,
+        )
         return raw, 0, 0
     stripped, reclaimed = strip_documents_in_hl7(message, pruned_at=pruned_at, min_bytes=min_bytes)
     if stripped == 0:

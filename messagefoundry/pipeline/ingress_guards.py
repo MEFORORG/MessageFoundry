@@ -30,9 +30,10 @@ document (:class:`~messagefoundry.parsing.binary.EscapedDocumentError`), of a re
 handle or marker (:class:`~messagefoundry.parsing.binary.InboundDocRefError`), of a document
 under a base64 delimiter (:class:`~messagefoundry.parsing.binary.Base64DelimiterError`) and of a
 document the splice would not set back verbatim
-(:class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError`) and of a body with an OBX and
-no MSH, or an MSH-2 shorter than four characters
-(:class:`~messagefoundry.parsing.binary.UnreadableDelimitersError`), each an
+(:class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError`) and of a body with an OBX
+whose MSH-2 is shorter than four characters
+(:class:`~messagefoundry.parsing.binary.UnreadableDelimitersError`; a body with no MSH never
+reaches the detach, since ``Peek.parse`` refuses it first), each an
 ``ERROR`` row on a streaming inbound, which the dry-run never raises because it never detaches. A ``str`` body, which
 only the dry-run accepts: it has nothing to decode, so :func:`decode_body` never tries the codec
 name, and a name that would refuse every received byte body passes. Bytes go through the one name
@@ -134,12 +135,13 @@ __all__ = [
 # resend (BACKLOG #1911) and the listener resolve it by one rule.
 STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
 
-#: The stored reason for an HL7 body refused because it holds the document handle marker under
-#: delimiters that are a base64 character, or that cannot be read because it has no MSH or its
-#: MSH-2 is shorter than four characters (BACKLOG #5099). It names no byte of the body.
+#: The stored reason for an HL7 body refused because it holds the document handle marker and a
+#: delimiter is a base64 character, or its delimiters cannot be read because its MSH-2 is shorter
+#: than four characters (BACKLOG #5099). A body with no MSH never reaches this check: ``Peek.parse``
+#: refuses it first. It names no byte of the body.
 DOC_REF_MARKER_REFUSED_REASON = (
-    "document handle refused: the body holds the handle marker under delimiters that are a "
-    "base64 character or unreadable"
+    "document handle refused: the body holds the handle marker, and a delimiter is a base64 "
+    "character, or the delimiters are unreadable"
 )
 
 
