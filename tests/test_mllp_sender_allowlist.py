@@ -48,13 +48,24 @@ from messagefoundry.config.wiring import (
     env,
     load_config,
 )
-from messagefoundry.credential import cert_name_candidates
+from messagefoundry.credential import OTHERNAMES_INTACT_KEY, cert_name_candidates
 from messagefoundry.mllpcodec import AckMode
 from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _IntakeRateLimiter
+from messagefoundry.pki import san_othernames_intact
 from messagefoundry.store import MessageStatus, MessageStore
 from messagefoundry.transports.mllp import _SENDER_DENIED, _SENDER_RATE_LIMITED, MLLPSource
-from tests.test_api_tls import _NOW, _CaPair, _client_bundle, _dn, _new_ca, _pem, _self_signed
+from tests.test_api_tls import (
+    _NOW,
+    _NUL_UPN,
+    _CaPair,
+    _client_bundle,
+    _dn,
+    _new_ca,
+    _pem,
+    _self_signed,
+    _upn,
+)
 from tests.test_connections_file import _config
 
 _INBOUND = "IB_ACME_ADT"
@@ -375,14 +386,20 @@ async def test_a_placeholder_san_on_a_certificate_matches_no_entry(
 
 
 def test_the_shared_matcher_drops_every_placeholder_ssl_reports() -> None:
-    """The forms measured from ``ssl.getpeercert()``; the real names beside them stay."""
+    """The forms measured from ``ssl.getpeercert()``, and ``<INVALID>``, which CPython's ``_ssl.c``
+    writes for a Registered ID; a placeholder in either case is dropped. The real names beside them
+    stay."""
     peercert = {
+        OTHERNAMES_INTACT_KEY: True,
         "subject": ((("commonName", "partner.example"),),),
         "subjectAltName": (
             ("othername", "<unsupported>"),
+            ("othername", "<UNSUPPORTED>"),
             ("X400Name", "<unsupported>"),
             ("EdiPartyName", "<unsupported>"),
             ("IP Address", "<invalid>"),
+            ("Registered ID", "<INVALID>"),
+            ("Registered ID", "<invalid>"),
             ("othername", "UPN:feed@partner.example\n"),
             ("othername", "UPN:" + "a" * 2032),
             ("Registered ID", "1.2." + "3" * 2040),
@@ -399,6 +416,102 @@ def test_the_shared_matcher_drops_every_placeholder_ssl_reports() -> None:
         "SAN:DNS:feed.partner.example",
         "SAN:DNS:" + "d" * 3000,
     ]
+
+
+def test_an_othername_is_a_candidate_only_once_the_der_was_read() -> None:
+    """``ssl`` cuts an otherName at its first NUL, so its text alone cannot show it is whole: an
+    otherName is yielded only where the caller read the DER and set the key ``True`` (BACKLOG
+    #4907). Absent or anything else, it is dropped and the other names stay."""
+    rendered = {
+        "subjectAltName": (("othername", "UPN:feed@partner.example"), ("DNS", "feed.example"))
+    }
+    assert cert_name_candidates(rendered) == ["SAN:DNS:feed.example"]
+    assert cert_name_candidates({**rendered, OTHERNAMES_INTACT_KEY: False}) == [
+        "SAN:DNS:feed.example"
+    ]
+    assert cert_name_candidates({**rendered, OTHERNAMES_INTACT_KEY: 1}) == ["SAN:DNS:feed.example"]
+    assert cert_name_candidates({**rendered, OTHERNAMES_INTACT_KEY: True}) == [
+        "SAN:othername:UPN:feed@partner.example",
+        "SAN:DNS:feed.example",
+    ]
+
+
+def _leaf_der(*names: x509.GeneralName) -> bytes:
+    ca = _ca("Partner CA")
+    key = ec.generate_private_key(ec.SECP256R1())
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(_dn((NameOID.COMMON_NAME, "any")))
+        .issuer_name(ca[0].subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - datetime.timedelta(minutes=5))
+        .not_valid_after(_NOW + datetime.timedelta(days=1))
+    )
+    if names:
+        builder = builder.add_extension(x509.SubjectAlternativeName(list(names)), critical=False)
+    return builder.sign(ca[1], hashes.SHA256()).public_bytes(serialization.Encoding.DER)
+
+
+_UPN_OID = x509.ObjectIdentifier("1.3.6.1.4.1.311.20.2.3")
+
+
+@pytest.mark.parametrize(
+    ("leaf_der", "intact"),
+    [
+        pytest.param(_leaf_der(), True, id="no-san"),
+        pytest.param(_leaf_der(x509.DNSName("feed.example")), True, id="no-othername"),
+        pytest.param(_leaf_der(_upn(b"feed@partner.example")), True, id="whole-upn"),
+        pytest.param(_leaf_der(_upn(_NUL_UPN)), False, id="nul-upn"),
+        pytest.param(
+            _leaf_der(_upn(b"feed@partner.example"), _upn(_NUL_UPN)), False, id="one-of-two"
+        ),
+        pytest.param(
+            _leaf_der(x509.OtherName(_UPN_OID, b"\x1e\x04\x00a\x00b")), False, id="bmpstring"
+        ),
+        pytest.param(b"not a certificate", False, id="not-der"),
+        pytest.param(b"", False, id="empty"),
+        pytest.param(None, False, id="none"),
+    ],
+)
+def test_the_der_read_refuses_an_othername_ssl_cannot_report_whole(
+    leaf_der: bytes | None, intact: bool
+) -> None:
+    """A NUL in an otherName's content, and a certificate that cannot be read, count as not
+    intact. So does a BMPString's zero byte, which can only refuse: ``ssl`` reports a BMPString UPN
+    as ``<unsupported>``. ``cryptography`` refuses to build an otherName value that is not exactly
+    one TLV, so that check has no case here."""
+    assert san_othernames_intact(leaf_der) is intact
+
+
+async def test_an_othername_holding_a_nul_on_a_certificate_matches_no_entry(
+    tmp_path: Path, store: MessageStore
+) -> None:
+    """``ssl`` reports a UPN ``victim@acme.example<NUL>evil`` as ``UPN:victim@acme.example``, the
+    whole of the listed name. The listener reads the leaf's DER, so it refuses that certificate,
+    over a real handshake. Control on the same listener: the whole name is admitted."""
+    named = _ca("Partner CA")
+    settings = _settings(
+        tmp_path, [named[0]], {_issuer(named): ["SAN:othername:UPN:victim@acme.example"]}
+    )
+    cut = _san_bundle(
+        tmp_path, named, cn="unrelated.example", dns="other.example", other=(_upn(_NUL_UPN),)
+    )
+    whole = _san_bundle(
+        tmp_path,
+        named,
+        cn="unrelated.example",
+        dns="other.example",
+        other=(_upn(b"victim@acme.example"),),
+    )
+    source = await _wired(settings, store)
+    try:
+        refused, rest = await _exchange(source, cut)
+        accepted, _ = await _exchange(source, whole)
+    finally:
+        await source.stop()
+    assert b"MSA|AR|" in refused and rest == b""
+    assert b"MSA|AA|" in accepted
 
 
 async def test_matching_is_exact_and_case_sensitive(tmp_path: Path, store: MessageStore) -> None:
@@ -618,6 +731,21 @@ def _mllp(subjects: Any, **overrides: Any) -> Any:
         ),
         pytest.param(
             {"CN=Partner CA": ["SAN:IP Address:<invalid>"]}, {}, "a placeholder", id="ip-invalid"
+        ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:Registered ID:<INVALID>"]}, {}, "a placeholder", id="rid-upper"
+        ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:othername:<UNSUPPORTED>"]},
+            {},
+            "a placeholder",
+            id="othername-placeholder-upper",
+        ),
+        pytest.param(
+            {"CN=Partner CA": ["SAN:othername:UPN:victim@acme.example\x00evil"]},
+            {},
+            "an othername holding a NUL",
+            id="othername-nul",
         ),
         pytest.param(
             {"CN=Partner CA": [SUBJECT, "SAN:IP:192.0.2.10"]},

@@ -1104,6 +1104,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/api/security.py": frozenset(
         {"key_cert:via messagefoundry.pipeline.cert_expiry"}
     ),
+    # BACKLOG #4907: the mTLS shim reads a client leaf's DER through pki.peer_othernames_intact, so
+    # an otherName ssl cut at a NUL is never matched. A public certificate only; no key.
+    "messagefoundry/api/tls_client_cert.py": frozenset({"key_cert:via messagefoundry.pki"}),
     "messagefoundry/api/tls.py": frozenset(
         {
             "sign_verify:via messagefoundry.config.tls_policy",
@@ -1704,6 +1707,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.credential",
             # BACKLOG #1142, slice 3: the listener's mTLS CA goes through mllp's context builder.
             "hash:via messagefoundry.transports.mllp",
+            # BACKLOG #4907: pki.peer_othernames_intact reads the client leaf's DER for the
+            # intake_client_subjects match. A public certificate only; no key.
+            "key_cert:via messagefoundry.pki",
             "key_cert:via messagefoundry.transports.mllp",
             "tls_context:via messagefoundry.transports.mllp",
         }
@@ -1716,6 +1722,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.auth.trust_anchors",
             "key_cert:via messagefoundry.config.tls_policy",
             "key_cert:via messagefoundry.keywrap",
+            # BACKLOG #4907: pki.peer_othernames_intact reads the sender leaf's DER for the
+            # tls_client_subjects match. A public certificate only; no key.
+            "key_cert:via messagefoundry.pki",
             "tls_context:.check_hostname =",
             "tls_context:.check_hostname = False",
             "tls_context:.load_verify_locations()",

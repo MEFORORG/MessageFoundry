@@ -36,6 +36,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 __all__ = [
+    "OTHERNAMES_INTACT_KEY",
     "QUALIFIED_CERT_NAME",
     "SAN_TYPES",
     "VERIFIED_ISSUER_KEY",
@@ -148,8 +149,11 @@ _PLACEHOLDER_ONLY_SAN_TYPES = frozenset({"X400Name", "EdiPartyName"})
 #: The text ``ssl`` reports in place of a SAN it cannot render: ``<unsupported>`` for an otherName of a
 #: type OpenSSL does not print, or whose value has the wrong ASN.1 type, and ``<invalid>`` for an
 #: iPAddress of neither 4 nor 16 bytes. Measured on CPython 3.14.7 with OpenSSL 3.5.7 by decoding
-#: certificates carrying each form. One such text stands for a whole class of names, so a listed
-#: placeholder would admit every certificate carrying any name of that class (BACKLOG #4907).
+#: certificates carrying each form. ``_ssl.c`` also writes ``<INVALID>``, in upper case, for a
+#: Registered ID whose text does not fit its buffer; that is read from CPython's source, since
+#: OpenSSL 3.5.7 refused every certificate tried that could reach it. So the text is compared with
+#: case folded. One such text stands for a whole class of names, so a listed placeholder would
+#: admit every certificate carrying any name of that class (BACKLOG #4907).
 _SAN_PLACEHOLDERS = ("<unsupported>", "<invalid>")
 
 #: The SAN types CPython's ``_ssl.c`` copies or formats whole. Every other type, ``othername`` and
@@ -177,9 +181,10 @@ _SAN_TYPE_SPELLINGS = {
 
 def _is_placeholder_san(san_type: str, value: str) -> bool:
     """Whether ``SAN:<san_type>:<value>`` is text ``ssl`` reports in place of a name it cannot
-    render. Fail-closed: a real name carrying the marker text is dropped too, and can only be
-    refused, never admitted, by that."""
-    return san_type in _PLACEHOLDER_ONLY_SAN_TYPES or any(p in value for p in _SAN_PLACEHOLDERS)
+    render, in any case. Fail-closed: a real name carrying the marker text is dropped too, and can
+    only be refused, never admitted, by that."""
+    folded = value.casefold()
+    return san_type in _PLACEHOLDER_ONLY_SAN_TYPES or any(p in folded for p in _SAN_PLACEHOLDERS)
 
 
 def _is_cut_short_san(san_type: str, value: str) -> bool:
@@ -224,7 +229,8 @@ def unmatchable_san_reason(name: str) -> str | None:
     shape. This refuses, at least, a type ``ssl`` never reports, including one of
     :data:`SAN_TYPES` in another case; a placeholder ``ssl`` reports for a name it cannot render; a
     value ``ssl`` may have cut short; an IP address in a spelling ``ssl`` never writes; a DirName
-    that is not the tuple ``ssl`` reports; and an otherName with no ``<form>:`` before its value. It
+    that is not the tuple ``ssl`` reports; an otherName holding a NUL; and an otherName with no
+    ``<form>:`` before its value. It
     does not check any other value against what a certificate can hold. The reason quotes nothing the operator wrote, only ``ssl``'s own
     spellings, so it can go into an error message as it is."""
     if not name.startswith("SAN:") or name.count(":") < 2:
@@ -261,6 +267,11 @@ def unmatchable_san_reason(name: str) -> str | None:
             "a DirName in a form ssl never reports: it reports the name as a Python tuple of "
             "RDNs, such as ((('commonName', 'feed.example'),),)"
         )
+    if san_type == "othername" and "\x00" in value:
+        return (
+            "an othername holding a NUL, which ssl never reports: it stops an othername at its "
+            "first NUL, and no othername of a certificate holding one is matched"
+        )
     if san_type == "othername" and (":" not in value or not value.split(":", 1)[0]):
         return (
             "an othername in a form ssl never reports: it reports '<form>:<value>', such as "
@@ -280,7 +291,12 @@ def cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:
     A SAN ``ssl`` reports only as a placeholder (:data:`_SAN_PLACEHOLDERS`, such as
     ``othername:<unsupported>``), or may have cut short (:data:`_WHOLE_SAN_TYPES`), is left out, so
     no listed entry can match it (BACKLOG #4907). Such text stands for a whole class of names, so
-    matching it would admit every certificate carrying any of them. Every caller shares this, the operator API and the HTTP listener included."""
+    matching it would admit every certificate carrying any of them. Every caller shares this, the operator API and the HTTP listener included.
+
+    An ``othername`` is yielded only when ``peercert`` carries :data:`OTHERNAMES_INTACT_KEY` set to
+    ``True``, which a caller sets only after reading the certificate's own DER: ``ssl`` cuts an
+    otherName value at its first NUL, so its text alone cannot show that it is whole."""
+    othernames_intact = peercert.get(OTHERNAMES_INTACT_KEY) is True
     candidates: list[str] = []
     for rdn in peercert.get(
         "subject", ()
@@ -291,6 +307,8 @@ def cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:
     for pair in peercert.get("subjectAltName", ()):
         if len(pair) == 2:
             san_type, value = f"{pair[0]}", f"{pair[1]}"
+            if san_type == "othername" and not othernames_intact:
+                continue
             if not _is_placeholder_san(san_type, value) and not _is_cut_short_san(san_type, value):
                 candidates.append(f"SAN:{san_type}:{value}")
     return candidates
@@ -338,6 +356,17 @@ def client_cert_principal(
 #: leaf, or ``""`` when none qualifies. ``ssl`` never produces this key, and each overwrites it on
 #: every connection, so a peer cannot supply it.
 VERIFIED_ISSUER_KEY = "mf_verified_issuer"
+
+#: The key the api shim, the inbound HTTP listener and the MLLP listener add beside
+#: :data:`VERIFIED_ISSUER_KEY`: ``True`` only when
+#: ``pki.san_othernames_intact`` read the leaf's DER and found every otherName value whole
+#: (BACKLOG #4907). ``ssl`` prints an otherName value as a C string, so its text stops at the
+#: value's first NUL: measured on CPython 3.14.7 with OpenSSL 3.5.7, a UPN
+#: ``victim@x.example<NUL>evil`` is reported ``UPN:victim@x.example``, which is the whole of a
+#: different name. Absent, or anything but ``True``, :func:`cert_name_candidates` yields no
+#: ``othername`` for that certificate, so a caller that never reads the DER fails closed. ``ssl``
+#: never produces this key, and each caller overwrites it on every connection.
+OTHERNAMES_INTACT_KEY = "mf_othernames_intact"
 
 
 def client_cert_principal_under_issuer(

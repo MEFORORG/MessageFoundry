@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, assert_never, cast
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.credential import (
+    OTHERNAMES_INTACT_KEY,
     VERIFIED_ISSUER_KEY,
     client_cert_principal_under_issuer,
     constant_time_match_any,
@@ -1180,7 +1181,14 @@ class HttpSource(SourceConnector):
                 peer,
                 HttpRequestError(401, "intake authentication required", kind="intake_auth_failed"),
             )
-        verified = {**peercert, VERIFIED_ISSUER_KEY: self._verified_issuer(ssl_object)}
+        # Lazy, as _client_issuer_index's: pki pulls in cryptography.
+        from messagefoundry.pki import peer_othernames_intact
+
+        verified = {
+            **peercert,
+            VERIFIED_ISSUER_KEY: self._verified_issuer(ssl_object),
+            OTHERNAMES_INTACT_KEY: peer_othernames_intact(ssl_object),
+        }
         if client_cert_principal_under_issuer(verified, self._intake_subjects) is None:
             # A chain a trusted CA signed, carrying a subject nobody allow-listed under THAT CA — an
             # AUTHORIZATION failure, and deliberately distinct from the 401 above (deny-by-default).

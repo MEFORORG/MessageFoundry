@@ -452,15 +452,27 @@ carries its form first, such as `UPN:feed@partner.example`; either in another fo
 
 **A placeholder is not a name.** For a SAN it cannot render, `ssl` reports fixed text instead:
 at least `othername:<unsupported>` for an otherName of a type OpenSSL does not print,
-`X400Name:<unsupported>` and `EdiPartyName:<unsupported>` whatever those names hold, and
-`IP Address:<invalid>` for a malformed address. Every certificate carrying such a name presents the
-same text, so one such entry would admit all of them under that CA. The same holds for a name `ssl`
-may have cut short: it reads an `othername` or `Registered ID` as one printed line of at most 2046
-bytes, stopping after a newline, so such a value can be the first part of many names. An entry
+`X400Name:<unsupported>` and `EdiPartyName:<unsupported>` whatever those names hold,
+`IP Address:<invalid>` for a malformed address, and, by CPython's source, `Registered ID:<INVALID>`
+in upper case. A placeholder is recognized in any case. Every certificate carrying such a name
+presents the same text, so one such entry would admit all of them under that CA. The same holds
+for a name `ssl` may have cut short: it reads an `othername` or `Registered ID` as one printed line
+of at most 2046 bytes, stopping after a newline, so such a value can be the first part of many
+names. An entry
 holding either is refused at build, and the matcher never reads either from a certificate, so it
 matches nothing even on a listener built some other way. That matcher is shared, so the operator
 API's `tls_client_cert_identities` and the HTTP listener's `intake_client_subjects` skip a
 placeholder too; neither of those settings refuses one at build.
+
+**An `othername` holding a NUL is never matched.** `ssl` reports an otherName as the text OpenSSL
+prints for it, and that text stops at the value's first NUL byte: a UPN
+`victim@partner.example<NUL>evil` is reported as `UPN:victim@partner.example`, which is the whole of
+a different name. So the listener reads the certificate's own DER after the handshake, and when any
+otherName value in it holds a zero byte, or cannot be read, none of that certificate's `othername`
+names is matched; its other names still are. A zero byte inside a value `ssl` reports only as
+`<unsupported>` counts too, which can only refuse. A `tls_client_subjects` entry holding a NUL is
+refused at build. The operator API and the HTTP listener read the DER the same way for the shared
+matcher (BACKLOG #4907), so neither matches such an `othername` either.
 
 **How it matches.** Exactly, character for character, as Python's `ssl` module reports the name: no
 case folding, no wildcards, no prefix or suffix match. A DNS name in a different case does not match,

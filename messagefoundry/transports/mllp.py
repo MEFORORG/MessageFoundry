@@ -69,7 +69,11 @@ from messagefoundry.config.tls_policy import (
     skips_validity_period,
     warn_hostname_check_off,
 )
-from messagefoundry.credential import VERIFIED_ISSUER_KEY, client_cert_principal_under_issuer
+from messagefoundry.credential import (
+    OTHERNAMES_INTACT_KEY,
+    VERIFIED_ISSUER_KEY,
+    client_cert_principal_under_issuer,
+)
 from messagefoundry.keywrap import load_connection_cert_chain
 from messagefoundry.mllpcodec import (
     _CODES,
@@ -2235,7 +2239,14 @@ class MLLPSource(SourceConnector):
             return False
         if not peercert:
             return False
-        verified = {**peercert, VERIFIED_ISSUER_KEY: self._verified_issuer(ssl_object)}
+        # Lazy, as _sender_issuer_lookup's: pki pulls in cryptography.
+        from messagefoundry.pki import peer_othernames_intact
+
+        verified = {
+            **peercert,
+            VERIFIED_ISSUER_KEY: self._verified_issuer(ssl_object),
+            OTHERNAMES_INTACT_KEY: peer_othernames_intact(ssl_object),
+        }
         return client_cert_principal_under_issuer(verified, self._client_subjects) is not None
 
     def _verified_issuer(self, ssl_object: Any) -> str:

@@ -21,7 +21,7 @@ import os
 import string
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
@@ -60,6 +60,8 @@ __all__ = [
     "judge_crl_signatures",
     "judge_every_crl",
     "quoted_issuer",
+    "peer_othernames_intact",
+    "san_othernames_intact",
     "read_crl_facts",
     "read_soonest_crl_facts",
     "crl_pem_blocks",
@@ -523,6 +525,54 @@ def quoted_issuer(issuer: str) -> str:
     while len(quoted := repr(issuer[:kept])) > _ISSUER_SHOWN:
         kept -= 1
     return f"{quoted}... (cut: the name is {len(issuer)} characters)"
+
+
+def san_othernames_intact(leaf_der: bytes | None) -> bool:
+    """Whether every otherName in ``leaf_der``'s subjectAltName is one ``ssl`` can report whole
+    (BACKLOG #4907). The caller records the answer under ``credential.OTHERNAMES_INTACT_KEY``.
+
+    ``ssl.getpeercert()`` reports an otherName as the text OpenSSL prints for it, and that text
+    stops at the value's first NUL (``credential.OTHERNAMES_INTACT_KEY`` has the measurement). So
+    this is ``False`` when any otherName value, read as one DER TLV, cannot be read, does not fill
+    the value exactly, or holds a zero byte in its content. It is also ``False`` when there is no
+    DER, or the certificate or its subjectAltName cannot be read. Fail-closed: a zero byte inside a
+    constructed value, or in a BMPString, counts too, though ``ssl`` reports either as
+    ``othername:<unsupported>`` (measured), which names no one. That can only drop this
+    certificate's otherNames, never admit one. ``True`` when there is no subjectAltName."""
+    if not leaf_der:
+        return False
+    try:
+        san = (
+            x509.load_der_x509_certificate(leaf_der)
+            .extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            .value
+        )
+        values = [name.value for name in san.get_values_for_type(x509.OtherName)]
+    except x509.ExtensionNotFound:
+        return True
+    except (*_UNREADABLE_CA, x509.DuplicateExtension):
+        return False
+    for value in values:
+        try:
+            tlv = read_der_tlv(value, 0, len(value))
+        except MalformedDer:
+            return False
+        if tlv.end != len(value) or 0 in value[tlv.start : tlv.end]:
+            return False
+    return True
+
+
+def peer_othernames_intact(ssl_object: Any) -> bool:
+    """:func:`san_othernames_intact` for the peer certificate of a TLS connection's ``ssl_object``.
+
+    Never raises. Deliberately broad, as each caller's verified-issuer read beside it is: this runs
+    on an unauthenticated path, where an escaping exception would skip the caller's audited
+    refusal. A fault yields ``False``, which can only drop the peer's otherNames."""
+    try:
+        leaf_der = ssl_object.getpeercert(binary_form=True)
+    except Exception:
+        return False
+    return san_othernames_intact(leaf_der)
 
 
 #: What ``cryptography`` raises, at least, for CRL extensions it cannot read, beside a duplicate

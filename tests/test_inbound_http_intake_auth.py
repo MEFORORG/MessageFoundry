@@ -32,7 +32,7 @@ from messagefoundry.pipeline.wiring_runner import _IntakeRateLimiter, check_http
 from messagefoundry.pki import IssuerIndex
 from messagefoundry.transports.http_listener import HttpRequestError, HttpSource
 from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
-from tests.test_api_tls import _NOW, _CaPair, _dn, _new_ca, _pem
+from tests.test_api_tls import _NOW, _NUL_UPN, _CaPair, _dn, _new_ca, _pem, _upn
 
 KEY = "acme-intake-key"
 #: The issuing CA's DN that keys ``intake_client_subjects`` (vault BACKLOG #2287).
@@ -625,10 +625,10 @@ def _peercert(common_name: str) -> dict[str, object]:
     return {"subject": ((("commonName", common_name),),)}
 
 
-def _leaf_der(ca: _CaPair) -> bytes:
-    """The DER of a leaf ``ca`` signed."""
+def _leaf_der(ca: _CaPair, san: tuple[x509.GeneralName, ...] = ()) -> bytes:
+    """The DER of a leaf ``ca`` signed, with ``san`` as its subjectAltName when given."""
     leaf_key = ec.generate_private_key(ec.SECP256R1())
-    leaf = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(_dn((NameOID.COMMON_NAME, "any")))
         .issuer_name(ca[0].subject)
@@ -636,9 +636,10 @@ def _leaf_der(ca: _CaPair) -> bytes:
         .serial_number(x509.random_serial_number())
         .not_valid_before(_NOW - datetime.timedelta(minutes=5))
         .not_valid_after(_NOW + datetime.timedelta(days=1))
-        .sign(ca[1], hashes.SHA256())
     )
-    return leaf.public_bytes(serialization.Encoding.DER)
+    if san:
+        builder = builder.add_extension(x509.SubjectAlternativeName(list(san)), critical=False)
+    return builder.sign(ca[1], hashes.SHA256()).public_bytes(serialization.Encoding.DER)
 
 
 def _partner_ca_index_and_leaf() -> tuple[IssuerIndex, bytes, bytes]:
@@ -648,6 +649,36 @@ def _partner_ca_index_and_leaf() -> tuple[IssuerIndex, bytes, bytes]:
     unloaded = _new_ca(_dn((NameOID.COMMON_NAME, "Partner CA")))
     index = IssuerIndex(_pem(ca[0]).decode("ascii"))
     return index, _leaf_der(ca), _leaf_der(unloaded)
+
+
+def test_an_othername_holding_a_nul_is_403() -> None:
+    """BACKLOG #4907: ``ssl`` stops an otherName at its first NUL, so a UPN
+    ``victim@acme.example<NUL>evil`` is reported as the listed ``UPN:victim@acme.example`` (the
+    rendered dict below, measured in ``tests/test_api_tls.py``). The listener reads the leaf's DER,
+    so that certificate is refused; the same text over a whole name is the control."""
+    src = HttpSource(
+        Source(
+            type=ConnectorType.HTTP,
+            settings={
+                "host": "127.0.0.1",
+                "port": 0,
+                "intake_auth": "mtls_subject",
+                "intake_client_subjects": {PARTNER_CA: ["SAN:othername:UPN:victim@acme.example"]},
+            },
+        )
+    )
+    ca = _new_ca(_dn((NameOID.COMMON_NAME, "Partner CA")))
+    src._issuer_index = IssuerIndex(_pem(ca[0]).decode("ascii"))
+    rendered = {
+        "subject": ((("commonName", "any"),),),
+        "subjectAltName": (("othername", "UPN:victim@acme.example"),),
+    }
+    cut = _leaf_der(ca, (_upn(_NUL_UPN),))
+    denied = src._authorize_peer_cert(_writer(rendered, cut), "10.0.0.1")
+    assert isinstance(denied, HttpRequestError)
+    assert denied.status == 403
+    whole = _leaf_der(ca, (_upn(b"victim@acme.example"),))
+    assert src._authorize_peer_cert(_writer(rendered, whole), "10.0.0.2") is None
 
 
 def test_valid_chain_unlisted_subject_is_403() -> None:
