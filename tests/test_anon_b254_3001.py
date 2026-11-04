@@ -203,8 +203,9 @@ def test_a_bare_z_id_a_rule_names_gets_a_record_and_is_decided(side: Any) -> Non
         ("ZPD", "2.5", (("ZPD-3", "keep"),)),  # a keep does not make a bare id reachable
         ("SFT", "2.3", ()),  # an id only a later version defines
         ("MSH", "2.5", ()),  # a header id carries the separators
+        ("PV2", "2.1", ()),  # 2.1 does not define PV2
     ),
-    ids=("no-version", "z-unnamed", "z-keep-only", "later-version", "header-id"),
+    ids=("no-version", "z-unnamed", "z-keep-only", "later-version", "header-id", "pv2-at-2.1"),
 )
 @_SIDES
 def test_the_refused_bare_lines_are_still_refused(

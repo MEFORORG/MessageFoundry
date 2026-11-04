@@ -2345,7 +2345,7 @@ both are described below:
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, and what a retarget of a default field leaves past its first component. A cut shape counts when at least one of its fields is one no rule maps |
 | A punctuated US phone number (`NNN-NNN-NNNN` or `(NNN) NNN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, and what a retarget of a default field leaves past its first component. A cut shape counts when at least one of its fields is one no rule maps |
 | A CX identifier typed `MR` or `MRN` appears | Fields no rule maps |
-| A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule rewriting a field of that segment names. A wrapped `LEE` or `ZOE` is such a line, and with no readable version in MSH-12 the version defines no id. Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. | Every line but a header of three or more split fields. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
+| A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule rewriting a field of that segment names. A wrapped `LEE` or `ZOE` is such a line, and with no readable version in MSH-12 the version defines no id. Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. | Every line but a header of three or more split fields whose first field is `MSH`, in capitals or not. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
 The rows describe both anonymizers, the engine's `messagefoundry/anon/` and the tee's
@@ -2437,8 +2437,8 @@ A line holding only whitespace or control characters is dropped before anything 
 **An `MSH`, `FHS` or `BHS` line with fewer than three split fields is refused,** wherever it sits,
 the header included. Such a line has no separator after its encoding characters. That includes a
 bare `FHS` and a minimal `BHS|^~\&` line; add a trailing separator to pass the second. A header
-that is only `MSH|^~\&` is refused in the same way. A header of three or more split fields is not
-walked; when its MSH-12 has no readable version, a bare line behind it is refused unless a rule
+that is only `MSH|^~\&` is refused in the same way. A header of three or more split fields whose first
+field is `MSH`, in capitals or not, is not walked; when its MSH-12 has no readable version, a bare line behind it is refused unless a rule
 that rewrites names its segment, as the paragraph on a missing version above says. Any other
 `MSH` line ahead of the header is refused, whatever it holds. That includes a leading bare `MSH`
 or `msh` (vault BACKLOG #3001).
@@ -2471,8 +2471,8 @@ that line.
 - A header not in capitals, such as `Msh`. The engine refuses the message. The tee emits it.
 - A line ahead of the header that the check does not refuse: a line with fields, or a bare id
   the header's version defines. The tee emits the line, and its leak-check walks it against the
-  header's version. The engine's parser refuses at least a message that leads with a `PID` line
-  or a bare `PV2`. A leading `BHS` or `FHS` line with its separator is emitted by both.
+  header's version. The engine's parser refuses at least a message that leads with a `PID` line.
+  A leading `BHS` or `FHS` line with its separator is emitted by both.
 - Whitespace after the last field of the last line. The engine's parser trims it before a rule
   reads the value, and the tee does not. So a date in that field is filled by the engine and
   emptied by the tee.

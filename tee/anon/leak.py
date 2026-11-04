@@ -346,8 +346,7 @@ def _line_is_malformed(fields: list[str], defined: frozenset[str] | set[str]) ->
     """True if no rule can reach this line. Either its first field is not a well-formed segment
     id, or the line has no field separator and its text is not an id in ``defined``.
 
-    A segment with no fields is legal HL7, so a bare ``PV2`` is an empty segment and passes;
-    :func:`unmapped_field_values` gives it a coverage record. A bare ``LEE`` or ``ZOE`` is three
+    A bare ``LEE`` or ``ZOE`` is three
     letters of untrusted text that no rule can address, so it is malformed. ``defined`` is the ids
     the message's HL7 version defines plus the ids a rule names, so a bare ``ZPD`` is an empty
     segment only when a rule names ``ZPD``. A Z-prefix alone does not count (BACKLOG #2247).
@@ -436,7 +435,7 @@ def unmapped_field_values(
 
     A line whose first field is not a well-formed segment id, or that has no field separator and
     is not an id the message's HL7 version defines or a rule names (a wrapped ``LEE`` looks like a
-    segment id; a bare ``PV2`` is a legal empty segment), is reported under :data:`MALFORMED_SEGMENT`,
+    segment id), is reported under :data:`MALFORMED_SEGMENT`,
     first field included as index 0, so its text reaches the detectors but never an address.
     :func:`structural_phi_hits` refuses such a line outright. A line holding only whitespace or
     control characters (NUL padding, a trailing SUB) carries nothing and is skipped.
