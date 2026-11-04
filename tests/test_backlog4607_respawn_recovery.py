@@ -724,3 +724,28 @@ def test_the_logged_lane_stuck_line_does_not_name_a_policy_the_page_may_not_be_u
     (record,) = [r for r in caplog.records if "lane_stuck" in r.getMessage()]
     assert "retry_forever" not in record.getMessage()
     assert "router worker died 3 times" in record.getMessage()
+
+
+@pytest.mark.parametrize("apart", [False, True], ids=["close-together", "far-apart"])
+async def test_per_lane_deaths_far_apart_start_a_new_run(
+    apart: bool, db: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R4-4. An idle lane never settles a pass, so before the repair every death on it joined one
+    run: rare unrelated deaths added up to a respawn backoff and finally a ``lane_stuck`` page. A
+    death :data:`_DEATH_RUN_QUIET_SECONDS` after the run's last now starts a new run; deaths close
+    together, as a row that kills every worker brings them, still add up and page once."""
+    runner = RegistryRunner(_registry(tmp_path), db, egress=EgressSettings(deny_by_default=False))
+    pages: list[str] = []
+    monkeypatch.setattr(runner, "_infra_fault_stop_after", 3)
+    monkeypatch.setattr(
+        runner._alert_sink, "lane_stuck", lambda name, *, detail: pages.append(name)
+    )
+    claims = _LaneClaims()
+    runner._lane_claims[("router", "IB")] = claims
+    gap = wiring_runner._DEATH_RUN_QUIET_SECONDS + (1.0 if apart else -1.0)
+    for _ in range(3):
+        runner._log_worker_death("router", "IB", await _dead_task())
+        claims.last_death -= gap  # the next death comes `gap` after this one
+
+    assert claims.deaths.count == (1 if apart else 3)
+    assert pages == ([] if apart else ["IB"])

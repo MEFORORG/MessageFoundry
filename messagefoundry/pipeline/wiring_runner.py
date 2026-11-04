@@ -505,6 +505,14 @@ _FAULT_RUN_QUIET_SECONDS = 10.0
 # What a worker run counts. Not "consecutive": a run may span healthy passes (see _WorkerFaultLog).
 _WORKER_RUN_COUNT = IN_THIS_RUN
 
+# BACKLOG #4607: a per-lane worker's death this long after the last death of its lane's run starts
+# a new run (_LaneClaims). A row that kills every worker kills the next one within one capped
+# respawn wait (_REPEND_RETRY_CAP_SECONDS) plus the re-pend's dating, its sleep and the row's own
+# processing, so ten capped waits leave a slow poison row inside its run while deaths minutes
+# apart read as unrelated. A row slower than that to kill is still logged with its traceback at
+# each death; only its backoff and its lane_stuck page restart.
+_DEATH_RUN_QUIET_SECONDS = 10 * _REPEND_RETRY_CAP_SECONDS
+
 
 @dataclass
 class _LaneClaims:
@@ -522,11 +530,15 @@ class _LaneClaims:
     death's traceback in the supervisor and paces a replacement that follows a repeat death.
     :meth:`settle` closes it, on a pass that resolved its batch. Not on a claim that finds nothing:
     a replacement's re-pend dates its rows into the future, so the lane reads empty until the row
-    that killed the workers is due again."""
+    that killed the workers is due again. A death that comes :data:`_DEATH_RUN_QUIET_SECONDS` or
+    more after the run's last one (``last_death``) starts a new run instead, so rare unrelated
+    deaths on an idle lane, which never settles a pass, do not add up to a backoff and a
+    ``lane_stuck`` page. The gap is the evidence there, not an empty claim."""
 
     ids: list[str] = field(default_factory=list)
     fence: RependFence | None = None
     deaths: FailureRun = field(default_factory=FailureRun)
+    last_death: float = 0.0  # time.monotonic() of the run's last death
 
     def settle(self, worker: str, name: str) -> None:
         """A pass resolved its whole claimed batch: nothing is held, and a run of deaths ends."""
@@ -6770,6 +6782,10 @@ class RegistryRunner:
         if exc is None or claims is None:  # a task installed without _start_lane_worker
             log.error("%s worker %r exited unexpectedly; respawning", kind, name, exc_info=exc)
             return
+        now = time.monotonic()
+        if claims.deaths.count and now - claims.last_death >= _DEATH_RUN_QUIET_SECONDS:
+            claims.close_deaths(kind, name)  # far apart: an unrelated death starts a new run
+        claims.last_death = now
         claims.deaths = claims.deaths.record(
             log,
             exc,
@@ -6824,7 +6840,9 @@ class RegistryRunner:
         key = (kind, name)
         old = self._lane_claims.get(key)
         if _died(prev) and old is not None:
-            claims = _LaneClaims(ids=list(old.ids), fence=old.fence, deaths=old.deaths)
+            claims = _LaneClaims(
+                ids=list(old.ids), fence=old.fence, deaths=old.deaths, last_death=old.last_death
+            )
         else:
             claims = _LaneClaims()
         self._lane_claims[key] = claims
