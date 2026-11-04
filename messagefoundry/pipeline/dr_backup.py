@@ -105,6 +105,7 @@ __all__ = [
     "RestoreResult",
     "VerifyResult",
     "BackupError",
+    "RESTORE_NEEDS_A_DESTINATION",
     "run_restore",
     "run_restore_verify",
 ]
@@ -196,7 +197,7 @@ _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 #: begin false-refusing legal archives the day that cap was raised.
 #:
 #: **:data:`_MAX_CONFIG_BYTES` is NOT that second term, and must not be read as one.** It is a
-#: restore-EXTRACT bound: its only read is in :func:`_restore_config_members`, which runs solely when
+#: restore-EXTRACT bound: its only read is in :func:`_extract_config_members`, which runs solely when
 #: ``--config-to`` was given and solely AFTER the decrypt this ceiling exists to bound. The build side
 #: (:func:`_add_config_dir`) tars the config dir with no cap at all, and the verify path never extracts
 #: config. So a `.mfbak` can legally carry a config bundle larger than ``_MAX_CONFIG_BYTES``; that is
@@ -342,7 +343,9 @@ class RestoreResult:
     counts, and one-way fingerprints only (never a body or key bytes)."""
 
     archive_path: str
-    store_path: str
+    #: ``None`` when only a CONFIG-ONLY archive's config bundle was restored (vault BACKLOG #5233);
+    #: ``store_bytes`` is then 0 and ``row_counts`` empty.
+    store_path: str | None
     store_bytes: int
     row_counts: dict[str, int]
     encrypted: bool
@@ -3476,13 +3479,17 @@ def _refuse_an_old_archive(
     last_audit_at: float | None,
     max_age_seconds: float,
     now: float,
+    config_only: bool = False,
 ) -> None:
     """Refuse an archive taken more than ``max_age_seconds`` before ``now``, or one that does not
     say when it was taken (BACKLOG #2614). A restore undoes every account change made after the
     archive, so the older it is the more an operator must re-apply, and the refusal names the
     time after which that is so. The caller words how to override it; the CLI's
-    ``--allow-old-archive`` skips this check."""
-    newest = utc_or_unknown(last_audit_at)
+    ``--allow-old-archive`` skips this check.
+
+    ``config_only`` words the refusal for the config-only route (vault BACKLOG #5233), which places
+    no store: there is no audit row to name and no account change to undo, and what an old bundle
+    brings back is old config."""
     kind = "age"
     if archive_created_at is None:
         taken = "the archive does not say when it was taken"
@@ -3502,13 +3509,20 @@ def _refuse_an_old_archive(
             f"the archive was taken {utc_or_unknown(archive_created_at)}, "
             f"{age / 86400:.1f} days ago, past the {max_age_seconds / 86400:g}-day limit"
         )
+    if config_only:
+        raise BackupError(
+            kind,
+            f"Nothing was written: {taken}. Its config bundle brings back the connection settings, "
+            "router and handler code and any secrets the config dir held when the archive was "
+            "taken, so a config change made after that must be re-applied by hand.",
+        )
     # Short, and pointing at the notice rather than carrying it (BACKLOG #5094): the refusal's
     # point is that nothing was written. The CLI adds how to override it.
     raise BackupError(
         kind,
-        f"Nothing was written: {taken}. Its newest audit row is {newest}. A restore undoes what "
-        "was changed after the archive was taken, and that must be re-applied by hand. "
-        f"{RESTORE_NOTICE_POINTER}",
+        f"Nothing was written: {taken}. Its newest audit row is {utc_or_unknown(last_audit_at)}. "
+        "A restore undoes what was changed after the archive was taken, and that must be "
+        f"re-applied by hand. {RESTORE_NOTICE_POINTER}",
     )
 
 
@@ -3530,7 +3544,7 @@ def _codec_refusal(exc: BackupCodecError) -> BackupError:
 async def run_restore(
     archive_path: str,
     *,
-    dest_store_path: str | Path,
+    dest_store_path: str | Path | None,
     store_settings: object,
     config_dest: str | Path | None = None,
     max_age_seconds: float | None = None,
@@ -3557,6 +3571,10 @@ async def run_restore(
     refused before the store is extracted (see :func:`_refuse_colliding_config_members`), as is a
     ``config_dest`` sitting under ``dest_store_path`` (:func:`_refuse_config_dest_under_the_store`).
 
+    ``dest_store_path=None`` with a ``config_dest`` restores ONLY the config bundle of a CONFIG-ONLY
+    archive, which carries no store (vault BACKLOG #5233); an archive that carries one is refused
+    there. See :func:`_restore_blocking`.
+
     **There is deliberately no ``allow_unencrypted`` here**, unlike :func:`run_restore_verify`. The
     downgrade guard stays at its strictest on the one path that writes bytes to disk. It carried such a
     parameter and nothing ever set it: the CLI documented in a comment that it withheld it on purpose,
@@ -3572,7 +3590,7 @@ async def run_restore(
     return await asyncio.to_thread(
         _restore_blocking,
         archive_path=archive_path,
-        dest_store_path=Path(dest_store_path),
+        dest_store_path=Path(dest_store_path) if dest_store_path is not None else None,
         config_dest=Path(config_dest) if config_dest is not None else None,
         keys=keys,
         max_age_seconds=max_age_seconds,
@@ -3582,7 +3600,7 @@ async def run_restore(
 def _restore_blocking(
     *,
     archive_path: str,
-    dest_store_path: Path,
+    dest_store_path: Path | None,
     config_dest: Path | None,
     keys: list[bytes],
     max_age_seconds: float | None,
@@ -3614,7 +3632,18 @@ def _restore_blocking(
     undoing it would delete a placed, verified store to answer a directory that could not be
     deleted, and leave the operator with no store, no bundle, and the plaintext staging directory
     still on disk. It raises ``BackupError("cleanup", ...)`` naming the directory instead, with the
-    store and bundle intact."""
+    store and bundle intact.
+
+    **``dest_store_path`` is ``None`` only for a CONFIG-ONLY archive's bundle (vault BACKLOG #5233).**
+    A server-DB store's archive carries no store, so ``--to`` has nothing to name, and the refusal that
+    meets ``--to`` on such an archive used to offer ``--config-to``, an option of this same command that
+    reached the same refusal first. With ``config_dest`` alone, the archive is decrypted under the
+    same key, downgrade and size checks, its manifest is read, the age refusal applies, and then only
+    its config bundle is extracted, under every check :func:`_extract_config_members` applies. An
+    archive that carries a store is refused on this route, at its first tar member where the store
+    leads it (:class:`_StoreMemberGuard`), and after the decrypt in any case, by the store member
+    itself: its store is the restore. One whose manifest does not mark it config-only is refused
+    there too."""
     import sqlite3
 
     from messagefoundry.store.store import (
@@ -3624,6 +3653,11 @@ def _restore_blocking(
         write_restore_marker,
     )
 
+    # Where the staging directory goes: beside the store, or on the config-only route beside the
+    # bundle's directory, for the same reason (the decrypted archive stays on the destination volume).
+    anchor = dest_store_path if dest_store_path is not None else config_dest
+    if anchor is None:
+        raise BackupError("destination", RESTORE_NEEDS_A_DESTINATION)
     if not Path(archive_path).is_file():
         raise BackupError("archive", f"no archive at {archive_path}")
     _refuse_existing_destination(dest_store_path, config_dest)
@@ -3659,7 +3693,20 @@ def _restore_blocking(
             "restores only on a box with no store key configured.",
         )
 
-    dest_store_path.parent.mkdir(parents=True, exist_ok=True)
+    # The config-only route stages in the RESOLVED parent: an unresolved `.` (or `""`) is its own
+    # parent, which would stage the decrypted archive inside the bundle's own directory.
+    staging_parent = anchor.parent if dest_store_path is not None else anchor.resolve().parent
+    if dest_store_path is None and staging_parent == anchor.resolve():
+        raise BackupError(
+            "destination",
+            f"--config-to {anchor} is a filesystem root, so there is no directory beside it to stage "
+            "the decrypted archive in; choose a directory below it",
+        )
+    # The directories this call creates, for its staging and for the bundle, read before the first
+    # mkdir, so a restore that does not complete removes them again: a refusal that says nothing was
+    # written must not leave a new --config-to, or a new ancestor of it or of --to, behind (vault
+    # BACKLOG #5233). A directory that was already there is never in this list.
+    made_dirs = _missing_dirs(staging_parent, config_dest)
     # The rollback's three facts, kept outside the staging block so the `finally` can read them after
     # it: whether the store was published (before that, every refusal already leaves nothing behind),
     # which config paths this restore created, and whether the restore itself completed. `finally`
@@ -3677,6 +3724,9 @@ def _restore_blocking(
     config_written: list[Path] = []
     staging: Path | None = None
     try:
+        # Inside the `try`, so a parent that cannot be made meets the `staging is None` refusal
+        # below, and the `finally` removes what the mkdir made before it failed.
+        staging_parent.mkdir(parents=True, exist_ok=True)
         # Stage on the DESTINATION volume, not the system temp dir: the extracted store is then placed
         # by a hard link rather than a second multi-GB copy, and the decrypted PHI never lands on a
         # shared temp volume that may be less protected than the store's own.
@@ -3693,14 +3743,18 @@ def _restore_blocking(
         # a file carries the temp directory's entries explicitly (it removes inherited entries only;
         # measured on the hosted runners, CI run 36039014999). A hard-linked placement then shares the
         # published DACL. A follow-up recorded in ADR 0163.
-        with tempfile.TemporaryDirectory(
-            prefix="mefor-restore-", dir=dest_store_path.parent
-        ) as tmp:
+        with tempfile.TemporaryDirectory(prefix="mefor-restore-", dir=staging_parent) as tmp:
             staging = Path(tmp)
             tar_path = staging / "archive.tar"
-            with open(archive_path, "rb") as raw_src, open(tar_path, "wb") as dst:
+            with open(archive_path, "rb") as raw_src, open(tar_path, "wb") as tar_fh:
                 src = _HashingReader(raw_src)
                 _secure_file(tar_path)
+                # On the config-only route a store-carrying archive is refused at its first tar
+                # member, not after the whole store is decrypted beside --config-to only to be
+                # refused after it; the checks after the decrypt stay the authority (vault BACKLOG
+                # #5233).
+                guard = _StoreMemberGuard(tar_fh) if dest_store_path is None else None
+                dst: BinaryIO = cast(BinaryIO, guard) if guard is not None else tar_fh
                 if match_key is not None:
                     # A failed GCM tag is the point of the AEAD framing, so it is an ORDINARY outcome
                     # here, not a bug: refuse the way the destination check does rather than escape as
@@ -3745,6 +3799,8 @@ def _restore_blocking(
                                 "destination volume",
                             )
                         dst.write(buf)
+                if guard is not None:
+                    guard.finish()
 
             # `_read_manifest_from_tar` reports every way the manifest can be unusable -- absent, a
             # directory, over the cap, not UTF-8, not JSON, not an object -- as `tarfile.TarError`
@@ -3759,12 +3815,60 @@ def _restore_blocking(
                 raise BackupError(
                     "restore", f"archive manifest could not be read: {safe_exc(exc)}"
                 ) from exc
-            if manifest.get("config_only"):
+            config_only = bool(manifest.get("config_only"))
+            if dest_store_path is None:
+                # The members themselves, then the manifest's word: a manifest that says config-only
+                # over an archive that carries a store is refused too, not restored with its store
+                # dropped.
+                if _tar_has_member(tar_path, _STORE_MEMBER):
+                    raise BackupError("destination", _CARRIES_A_STORE_REFUSAL)
+                if not config_only:
+                    # No store, and no word that there should be none: neither route restores it,
+                    # so the refusal does not send the operator to --to.
+                    raise BackupError(
+                        "restore",
+                        "the archive's manifest does not mark it CONFIG-ONLY, yet it carries no "
+                        f"{_STORE_MEMBER}; refusing to restore it on either route",
+                    )
+                # The age refusal binds here too: an old bundle brings back old credentials and old
+                # router and handler code, and --max-age-days / --allow-old-archive say what they
+                # say on every route (BACKLOG #2614).
+                archive_created_at = _manifest_time(manifest)
+                if max_age_seconds is not None:
+                    _refuse_an_old_archive(
+                        archive_created_at=archive_created_at,
+                        last_audit_at=None,
+                        max_age_seconds=max_age_seconds,
+                        now=time.time(),
+                        config_only=True,
+                    )
+                # `published` before the first write, as the store route sets it once the store is
+                # placed: from here a failure leaves files this restore made, and the `finally`
+                # removes exactly the ones `config_written` records.
+                published = True
+                config_files = _restore_config_members(tar_path, anchor, written=config_written)
+                result = RestoreResult(
+                    archive_path=archive_path,
+                    store_path=None,
+                    store_bytes=0,
+                    row_counts={},
+                    encrypted=encrypted,
+                    key_id=key_id,
+                    config_dir=str(anchor),
+                    config_files=config_files,
+                    archive_sha256=src.digest.hexdigest(),
+                    archive_created_at=archive_created_at,
+                )
+                # The restore is whole from here, as on the store route below.
+                completed = True
+                return result
+            if config_only:
                 raise BackupError(
                     "restore",
                     "this is a CONFIG-ONLY archive (a server-DB store's backup is DBA-delegated, "
                     "BACKLOG #52) — it carries no store to restore; restore the database from the "
-                    "DBA's own backup and use --config-to for the config bundle",
+                    "DBA's own backup, and restore the config bundle with this command's "
+                    "--config-to <dir> and no --to",
                 )
             # Before the store is extracted, let alone published: a config member aimed at the store's
             # own path is a destination refusal, and finding it here costs neither the extract nor a
@@ -3856,29 +3960,59 @@ def _restore_blocking(
             # The restore is whole from here. Nothing after this line may roll it back.
             completed = True
     except OSError as exc:
+        if staging is None:
+            # The staging directory itself could not be made (an unwritable parent, say), so
+            # nothing was decrypted or written: a refusal line, not a traceback.
+            raise BackupError("destination", _staging_refusal(staging_parent, anchor, exc)) from exc
         if not completed:
-            raise
+            # A refusal already leaving the block, found anywhere in the chain: an OSError raised
+            # on its way out (the staging teardown, whose rmtree retry chains its own first
+            # failure, or a close-time flush) would otherwise replace it with a traceback.
+            refusal = _refusal_in_flight(exc)
+            if refusal is None:
+                # No refusal behind it: the OSError is the failure itself, such as a full volume
+                # mid-decrypt. A refusal line rather than a traceback, on both routes; the
+                # `finally` still rolls back what was published.
+                raise BackupError("restore", f"the restore failed: {safe_exc(exc)}") from exc
+            if not staging.exists():
+                raise refusal from exc
+            # The teardown failed, and the directory holds decrypted archive content.
+            raise BackupError(
+                refusal.kind,
+                f"{str(refusal).rstrip('.')}. Separately, the restore's own staging directory "
+                f"{staging}, beside the destination, could not be removed ({safe_exc(exc)}) and "
+                "still holds decrypted archive content: delete it by hand once nothing holds it "
+                "open",
+            ) from refusal
         # Only the staging directory's teardown runs after `completed`, so an OSError here IS that
         # teardown failing (on Windows, a scanner or the indexer still holding the extracted store
         # open). The store and bundle are intact; what is left is the plaintext staging directory,
         # which its own remover just failed to delete. A BackupError, so the CLI prints a refusal
         # line rather than a traceback, and a kind of its own, so the line does not read as the
         # restore having failed. The `finally` below sees `completed` and leaves the restore alone.
-        bundle = f", and the config bundle at {config_dest}" if config_dest is not None else ""
+        intact: list[str] = []
+        if dest_store_path is not None:
+            intact.append(f"the restored store at {dest_store_path}")
+        if config_dest is not None:
+            intact.append(f"the config bundle at {config_dest}")
+        held = "archive and store" if dest_store_path is not None else "archive"
         raise BackupError(
             "cleanup",
             f"the restore completed, but its staging directory {staging} could not be removed: "
-            f"{safe_exc(exc)}. Intact: the restored store at {dest_store_path}{bundle}. The staging "
-            "directory still holds the decrypted archive and store: delete it by hand once nothing "
+            f"{safe_exc(exc)}. Intact: {', and '.join(intact)}. The staging "
+            f"directory still holds the decrypted {held}: delete it by hand once nothing "
             "holds it open. Do not re-run the restore; the destination is now in use.",
         ) from exc
     finally:
         if published and not completed:
             _discard_partial_restore(dest_store_path, config_written)
+        if not completed:
+            # After the staging directory's own teardown and the rollback, so each is empty again.
+            _remove_made_dirs(made_dirs)
 
     return RestoreResult(
         archive_path=archive_path,
-        store_path=str(dest_store_path),
+        store_path=str(dest_store_path) if dest_store_path is not None else None,
         store_bytes=store_bytes,
         row_counts=row_counts,
         encrypted=encrypted,
@@ -3892,7 +4026,157 @@ def _restore_blocking(
     )
 
 
-def _discard_partial_restore(dest_store_path: Path, written: list[Path]) -> None:
+def _staging_refusal(parent: Path, anchor: Path, exc: OSError) -> str:
+    """The refusal for a restore that could not make ``parent``, or its staging directory in it."""
+    return (
+        f"could not create {parent}, or the restore's staging directory in it ({safe_exc(exc)}). "
+        f"The restore stages the decrypted archive there, beside {anchor}, so that directory must "
+        "exist or be creatable, and be writable. Nothing was decrypted"
+    )
+
+
+def _refusal_in_flight(exc: BaseException) -> BackupError | None:
+    """The first :class:`BackupError` in ``exc``'s ``__context__`` chain, or ``None``."""
+    seen: set[int] = set()
+    link = exc.__context__
+    while link is not None and id(link) not in seen:
+        if isinstance(link, BackupError):
+            return link
+        seen.add(id(link))
+        link = link.__context__
+    return None
+
+
+def _missing_dirs(*paths: Path | None) -> list[Path]:
+    """Each of ``paths`` that is not ``None``, and each of their ancestors, that does not exist yet,
+    resolved and deepest first: what a ``mkdir(parents=True)`` of each is about to create."""
+    missing: set[Path] = set()
+    for path in paths:
+        if path is None:
+            continue
+        probe = path.resolve()
+        while probe != probe.parent and not probe.exists():
+            missing.add(probe)
+            probe = probe.parent
+    return sorted(missing, key=lambda p: len(p.parts), reverse=True)
+
+
+def _remove_made_dirs(dirs: list[Path]) -> None:
+    """Remove the directories :func:`_missing_dirs` recorded, deepest first, each only while it is
+    empty. Best-effort, like :func:`_discard_partial_restore`, because it runs while a failure is
+    already propagating. A directory that holds something stays, and so do its ancestors, because
+    ``rmdir`` refuses each of them in turn."""
+    for path in dirs:
+        # A path the mkdir never got to (an ancestor is a regular file, say) is not a directory,
+        # and there is nothing of this restore's to remove or to report there.
+        if not path.is_dir():
+            continue
+        try:
+            path.rmdir()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            log.warning("left the directory %s this restore created: %s", path, safe_exc(exc))
+
+
+class _StoreMemberGuard:
+    """Writes the decrypted tar through to ``raw``, and refuses before any of it lands when its first
+    member is the store (vault BACKLOG #5233). Used only on the config-only route, where a
+    store-carrying archive is refused anyway: the backup writes the store first, so this catches it
+    at the first frames instead of after a multi-GB decrypt. The member scan after the decrypt stays
+    the authority, for an archive that puts its store anywhere else.
+
+    It HOLDS every write until :data:`_GUARD_HEAD_BYTES` have arrived (or :meth:`finish` is called
+    at the end of a shorter stream), then reads the first member from them with :mod:`tarfile`, not
+    from the first 512-byte block, because ``tar.add`` can open with a PAX extended header that
+    carries the member's real name (measured on Windows). Holding is what makes "before any of it
+    lands" true whatever frame size the archive was sealed with. A head that does not parse is left
+    to the checks after the decrypt.
+
+    It offers :meth:`write` and :meth:`finish` and nothing else, so any other file method raises
+    ``AttributeError``. It once forwarded the rest to the raw file, which would answer without the
+    held bytes: ``writelines`` would land bytes past the check, and ``tell`` would report a position
+    short of what was written. Nothing called them: the decrypt and the plaintext copy only write."""
+
+    def __init__(self, raw: BinaryIO) -> None:
+        self._raw = raw
+        self._held: list[bytes] = []
+        self._held_bytes = 0
+        self._released = False
+
+    def write(self, data: bytes) -> int:
+        if self._released:
+            return self._raw.write(data)
+        self._held.append(bytes(data))
+        self._held_bytes += len(data)
+        if self._held_bytes >= _GUARD_HEAD_BYTES:
+            self._release()
+        return len(data)
+
+    def finish(self) -> None:
+        """Check and write what is still held: the end of a stream shorter than the head."""
+        if not self._released:
+            self._release()
+
+    def _release(self) -> None:
+        self._released = True
+        head = b"".join(self._held)
+        self._held = []
+        if _first_member_name(head) == _STORE_MEMBER:
+            raise BackupError("destination", _CARRIES_A_STORE_REFUSAL)
+        self._raw.write(head)
+
+
+def _first_member_name(head: bytes) -> str | None:
+    """The name of the first member of the tar that ``head`` opens, or ``None`` if it does not parse."""
+    try:
+        with tarfile.open(fileobj=io.BytesIO(head), mode="r:") as tar:
+            first = tar.next()
+    except (tarfile.TarError, OSError, ValueError) as exc:
+        # The type alone, never the message: these bytes are decrypted archive content, and a
+        # parse error's message is not known never to quote them.
+        log.debug(
+            "the config-only restore could not read the decrypted tar's first member (%s); the "
+            "checks after the decrypt decide whether it carries a store",
+            type(exc).__name__,
+        )
+        return None
+    return None if first is None else first.name
+
+
+def _tar_has_member(tar_path: Path, name: str) -> bool:
+    """Does the tar at ``tar_path`` carry a member of exactly ``name``? Looked up the way
+    :func:`_extract_member` looks the store up, so the two cannot disagree."""
+    try:
+        with tarfile.open(tar_path, "r:") as tar:
+            tar.getmember(name)
+    except KeyError:
+        return False
+    except (tarfile.TarError, OSError) as exc:
+        raise BackupError("restore", safe_exc(exc)) from exc
+    return True
+
+
+#: How much of the decrypted tar :class:`_StoreMemberGuard` reads its first member from: room for a
+#: PAX extended header and the header after it, many times over.
+_GUARD_HEAD_BYTES = 64 * 1024
+
+
+#: A restore given neither destination (vault BACKLOG #5233). The CLI checks it before it loads
+#: any settings; this primitive refuses it for every other caller.
+RESTORE_NEEDS_A_DESTINATION = (
+    "a restore needs --to <new store path>, or --config-to <dir> alone for a CONFIG-ONLY "
+    "archive's config bundle"
+)
+
+#: The config-only route's refusal of an archive that carries a store (vault BACKLOG #5233).
+_CARRIES_A_STORE_REFUSAL = (
+    "this archive carries a store, so restoring it needs --to <new store path>; --config-to "
+    "alone restores only a CONFIG-ONLY archive's config bundle"
+)
+
+
+def _discard_partial_restore(dest_store_path: Path | None, written: list[Path]) -> None:
     """Remove what a failed :func:`_restore_blocking` published -- the store it placed, then every
     config member and directory it recorded creating, newest first -- so the destination is left as the
     restore found it and the retry is the same command again.
@@ -3908,16 +4192,22 @@ def _discard_partial_restore(dest_store_path: Path, written: list[Path]) -> None
 
     The store is unlinked, never overwritten-and-truncated: :func:`_place_restored_store` creates it
     exclusively, so a file at that path when this runs is one the failed restore made. ``config_dest``
-    itself is never in the ledger (see :func:`_restore_config_members`). A directory this restore
+    itself is never in the ledger (see :func:`_extract_config_members`). A directory this restore
     created is removed only while empty; one that gained a stranger's file since is kept and logged.
 
     Best-effort by construction. It runs while an exception is already propagating, so a cleanup error
     must never replace the failure the operator needs to read -- it is logged and swallowed. A restore
-    that could not clean up is a worse report, not a different outcome."""
-    try:
-        dest_store_path.unlink(missing_ok=True)
-    except OSError as exc:
-        log.warning("could not remove the partially restored store at %s: %s", dest_store_path, exc)
+    that could not clean up is a worse report, not a different outcome.
+
+    ``dest_store_path`` is ``None`` on the config-only route, which places no store (vault BACKLOG
+    #5233), so only the recorded config paths are removed."""
+    if dest_store_path is not None:
+        try:
+            dest_store_path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning(
+                "could not remove the partially restored store at %s: %s", dest_store_path, exc
+            )
     for path in reversed(written):
         try:
             if path.is_dir() and not path.is_symlink():
@@ -4011,20 +4301,24 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
     return row_counts
 
 
-def _refuse_existing_destination(dest_store_path: Path, config_dest: Path | None) -> None:
+def _refuse_existing_destination(dest_store_path: Path | None, config_dest: Path | None) -> None:
     """Refuse every destination that already holds something, BEFORE any decrypt work. Restoring over a
     live store is unrecoverable and a CLI cannot ask for permission, so the answer is no and the message
     names the path the operator must move or choose differently.
 
     The last arm refuses a pair of destinations that are individually empty and still collide, because
     this restore writes BOTH of them: see :func:`_refuse_config_dest_under_the_store`. Its mirror image
-    needs the archive's member list and so runs later, in :func:`_refuse_colliding_config_members`."""
-    for path in (
-        dest_store_path,
-        *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
-    ):
-        if path.exists():
-            raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))
+    needs the archive's member list and so runs later, in :func:`_refuse_colliding_config_members`.
+
+    ``dest_store_path`` is ``None`` on the config-only route (vault BACKLOG #5233): there is no store
+    to place, so only the config destination is checked."""
+    if dest_store_path is not None:
+        for path in (
+            dest_store_path,
+            *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
+        ):
+            if path.exists():
+                raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))
     if config_dest is not None:
         # is_file() BEFORE iterdir(): a --config-to that names an existing FILE is a typo to report, and
         # iterdir() on one raises NotADirectoryError, which escapes the CLI's BackupError handler as a
@@ -4041,7 +4335,8 @@ def _refuse_existing_destination(dest_store_path: Path, config_dest: Path | None
                 f"refusing to restore the config bundle into the non-empty directory {config_dest} — "
                 "choose an empty or absent --config-to path",
             )
-        _refuse_config_dest_under_the_store(dest_store_path, config_dest)
+        if dest_store_path is not None:
+            _refuse_config_dest_under_the_store(dest_store_path, config_dest)
 
 
 def _refuse_config_dest_under_the_store(dest_store_path: Path, config_dest: Path) -> None:
@@ -4088,7 +4383,7 @@ def _refuse_colliding_config_members(
     Run before the store is extracted, so a refusal costs neither the extract nor a half-finished
     restore. Traversal names are compared like any other: a ``../store.db`` member resolving back onto
     the store is the same collision, and refusing it here beats refusing it after placement. The
-    exclusive create in :func:`_restore_config_members` is the backstop under this, not the control."""
+    exclusive create in :func:`_extract_config_members` is the backstop under this, not the control."""
     published = {
         _norm_for_compare(p)
         for p in (
@@ -4096,11 +4391,23 @@ def _refuse_colliding_config_members(
             *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
         )
     }
+    seen: set[str] = set()
     try:
         with tarfile.open(tar_path, "r:") as tar:
             for member in tar.getmembers():
-                if not member.isfile() or not member.name.startswith(_CONFIG_PREFIX):
+                if not _is_config_payload_member(member):
                     continue
+                # A hard link the extractor will refuse is refused here, before the store is
+                # extracted, verified and placed only to be rolled back (vault BACKLOG #5233).
+                # The whole restore is refused, store included; the refusal says the store alone
+                # restores, because this check runs only when --config-to was given.
+                if member.islnk() and member.linkname not in seen:
+                    raise BackupError(
+                        "restore",
+                        f"{_dangling_link_refusal(member)}. The store alone restores: run the "
+                        "same command without --config-to",
+                    )
+                seen.add(member.name)
                 out = config_dest / member.name[len(_CONFIG_PREFIX) :]
                 if _norm_for_compare(out) not in published:
                     continue
@@ -4117,6 +4424,23 @@ def _refuse_colliding_config_members(
         # this reads ATTACKER-SUPPLIED member names into ``Path``: a name the platform cannot parse
         # must be a refusal, not a traceback out of a check whose whole job is to refuse.
         raise BackupError("restore", safe_exc(exc)) from exc
+
+
+def _dangling_link_refusal(member: tarfile.TarInfo) -> str:
+    """The refusal for a hard-link config member that names no config file extracted before it."""
+    return (
+        f"archive carries a config member {member.name!r} that is a hard link to "
+        f"{member.linkname!r}, which names no config member earlier in the archive; "
+        "refusing to restore it rather than leave that name out"
+    )
+
+
+def _is_config_payload_member(member: tarfile.TarInfo) -> bool:
+    """Is ``member`` one the restore writes into the config bundle: a ``config/`` member that is a
+    regular file or a hard link (vault BACKLOG #5233)? One predicate, because the pre-extract
+    collision check (:func:`_refuse_colliding_config_members`) must see every member the extractor
+    (:func:`_extract_config_members`) writes."""
+    return (member.isfile() or member.islnk()) and member.name.startswith(_CONFIG_PREFIX)
 
 
 def _norm_for_compare(path: Path) -> Path:
@@ -4184,14 +4508,33 @@ def _place_restored_store(src: Path, dest: Path) -> int:
 def _restore_config_members(
     tar_path: Path, config_dest: Path, *, written: list[Path] | None = None
 ) -> int:
+    """:func:`_extract_config_members`, with an ``OSError``, ``ValueError`` or ``tarfile.TarError``
+    it does not word itself made a refusal (vault BACKLOG #5233). At least these are covered: a
+    ``PermissionError`` from a ``mkdir``, a full volume, and a member that ends early. Any other
+    exception type still escapes as it did. Unguarded, each left the restore as a CLI
+    traceback, on the config-only route and the store route alike. The caller's ``finally`` still
+    rolls back what ``written`` records."""
+    try:
+        return _extract_config_members(tar_path, config_dest, written=written)
+    except (OSError, ValueError, tarfile.TarError) as exc:
+        raise BackupError(
+            "restore", f"could not restore the config bundle into {config_dest}: {safe_exc(exc)}"
+        ) from exc
+
+
+def _extract_config_members(
+    tar_path: Path, config_dest: Path, *, written: list[Path] | None = None
+) -> int:
     """Extract the archive's ``config/`` members into ``config_dest`` and return how many files landed.
 
     ``written`` is the caller's ledger of what this call created -- every directory it made under
     ``config_dest`` and every file it opened, each appended BEFORE any bytes land in it and in creation
     order, so :func:`_discard_partial_restore` can walk it backwards. ``config_dest`` itself is never
-    recorded: an absent one is re-created by a retry, and one the operator prepared may carry ACLs
-    worth more than the tidiness of deleting it. A file the exclusive create refused is not recorded
-    either, because it is not this call's to remove.
+    recorded: one the operator prepared may carry ACLs worth more than the tidiness of deleting it.
+    An absent one that a failed restore created is removed while still empty, by
+    :func:`_restore_blocking` from its own list of the directories it made (vault BACKLOG #5233). A
+    file the exclusive create refused is not recorded either, because it is not this call's to
+    remove.
 
     It cannot reuse :func:`_extract_member`, which streams ONE member to a single fixed output name;
     a config bundle is many files that must keep their relative layout. It carries the same ASVS 5.2.3
@@ -4206,6 +4549,19 @@ def _restore_config_members(
 
     The restored bundle can carry secrets (``connections.toml``), so each file is locked to its owner.
 
+    **A hard-link member is restored, never skipped (vault BACKLOG #5233).** ``tar.add`` stores the
+    second name of a hard-linked file as a link member (``LNKTYPE``) naming the first, and this loop
+    used to take regular members alone, so that name was silently missing from the restored bundle.
+    It now lands as its own regular file, a copy of the bytes of the member it names, under every
+    check a regular member gets: the name gate and the containment backstop on its OWN name, the size
+    caps on the bytes it carries, and the exclusive create. The bytes are read only from a regular
+    config member this call has ALREADY extracted, looked up by exact name, so the link cannot reach
+    the store, the manifest, a later member, or anything outside the archive, and no OS link is made
+    in the destination. A link member naming anything else is refused, naming both names. Any other
+    member type (a directory, a symlink, a device) is still not extracted. A link carries no bytes of
+    its own, so a few link headers can write a large member several times over: what bounds that is
+    the bundle's aggregate byte and member-count caps below, which count every landed copy.
+
     An archive with no config member is a REFUSAL, not a quiet empty directory — see :func:`run_restore`.
     """
     from messagefoundry.parsing.sniff import archive_member_name_reason
@@ -4215,9 +4571,12 @@ def _restore_config_members(
     root = config_dest.resolve()
     landed = 0
     total = 0
+    # Each config member extracted so far, by its exact name, mapped to the regular member whose
+    # bytes it carries. A hard-link member reads its bytes from here and nowhere else.
+    extracted: dict[str, tarfile.TarInfo] = {}
     with tarfile.open(tar_path, "r:") as tar:
         for member in tar.getmembers():
-            if not member.isfile() or not member.name.startswith(_CONFIG_PREFIX):
+            if not _is_config_payload_member(member):
                 continue
             if landed >= _MAX_CONFIG_MEMBERS:
                 raise BackupError(
@@ -4237,12 +4596,21 @@ def _restore_config_members(
                     "archive carries a config member that resolves outside the destination; "
                     "refusing to extract it",
                 )
-            if member.size > _MAX_RESTORE_MEMBER_BYTES:
+            data = member
+            if member.islnk():
+                # Looked up by exact name among members already extracted, never through tarfile's
+                # own link resolution, which normalizes the name and would hand back any earlier
+                # member it matches, the store included.
+                target = extracted.get(member.linkname)
+                if target is None:
+                    raise BackupError("restore", _dangling_link_refusal(member))
+                data = target
+            if data.size > _MAX_RESTORE_MEMBER_BYTES:
                 raise BackupError(
                     "restore",
                     f"config member exceeds the restore extract cap ({_MAX_RESTORE_MEMBER_BYTES} bytes)",
                 )
-            src = tar.extractfile(member)
+            src = tar.extractfile(data)
             if src is None:
                 continue
             # The directories this member's mkdir is about to CREATE, deepest first, read before the
@@ -4319,10 +4687,15 @@ def _restore_config_members(
                     fh.write(buf)
             total += streamed
             landed += 1
+            extracted[member.name] = data
     if landed == 0:
+        # "At least": the two settings are not the only causes (vault BACKLOG #5233). A backup whose
+        # walk of the config dir adds no regular file also writes an archive with no config member.
         raise BackupError(
             "restore",
-            "the archive carries no config bundle, so there is nothing for --config-to to restore "
-            "(the backup was taken with [backup].include_config=false, or with no config dir loaded)",
+            "the archive carries no config bundle, so there is nothing for --config-to to restore. "
+            "At least these leave an archive with none: the backup was taken with "
+            "[backup].include_config=false, or with no config dir loaded, or its walk of the config "
+            "dir added no regular file, such as a dir that is empty or holds only symbolic links",
         )
     return landed

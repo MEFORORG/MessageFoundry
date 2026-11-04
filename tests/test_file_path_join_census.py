@@ -701,6 +701,13 @@ SITES: dict[str, Site] = {
         "Display path for a directory listed by descriptor; every open goes by name relative to "
         "the parent's descriptor with O_NOFOLLOW, never through this path (BACKLOG #2420).",
     ),
+    "messagefoundry/pipeline/dr_backup.py::_extract_config_members": Site(
+        1,
+        GUARDED,
+        "Each archive member name passes the guard, then a resolved-path containment backstop.",
+        "messagefoundry/parsing/sniff.py::archive_member_name_reason",
+        called=True,
+    ),
     "messagefoundry/pipeline/dr_backup.py::_extract_member": Site(
         1, INTERNAL, "A fixed name in a destination this module chose."
     ),
@@ -717,13 +724,6 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/pipeline/dr_backup.py::_restore_blocking": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."
-    ),
-    "messagefoundry/pipeline/dr_backup.py::_restore_config_members": Site(
-        1,
-        GUARDED,
-        "Each archive member name passes the guard, then a resolved-path containment backstop.",
-        "messagefoundry/parsing/sniff.py::archive_member_name_reason",
-        called=True,
     ),
     "messagefoundry/pipeline/dr_backup.py::_staging_root_for": Site(
         1, INTERNAL, "A fixed directory name under the operator's destination."
