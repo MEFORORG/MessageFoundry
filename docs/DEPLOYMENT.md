@@ -671,7 +671,7 @@ self-signed placeholder).
 | **SOAP destination** | dials URL | **HTTPS by default** — reuses the REST client + no-redirect opener; per-connection client-cert mTLS; ≥TLS 1.2 in the mTLS context | optional WS-Security `UsernameToken` (Nonce + Timestamp) | `[egress].allowed_http` |
 | **FHIR destination** (ADR 0024/0043) | dials URL | **HTTPS by default** — `verify_tls=true` default (downgrade refused without the escape); reuses the REST client | SMART Backend Services bearer (signed `client_assertion`), or static bearer / basic — refused over plaintext | `[egress].allowed_http` — **and the SMART token endpoint host is checked against the same list** |
 | **DICOMweb destination** (STOW-RS, ADR 0025) | dials URL | **HTTPS by default** — `verify_tls=true` default (downgrade refused without the escape); reuses the REST client | optional bearer / basic, refused over plaintext | `[egress].allowed_http` |
-| **DICOM C-STORE SCU** (`DICOM()`, ADR 0025) | dials host:port (default `104`) | **Yes** — per-connection opt-in `tls=true`; **chain and hostname are always verified** (there is no `tls_verify=false` on this connector), but **expiry checking is relaxable per connection** via `tls_allow_expired` — see the note below; opt-in client-cert mTLS. **Plaintext by default** | calling / called AE title (DIMSE has no transport auth of its own) | `[egress].allowed_tcp` (a raw socket) |
+| **DICOM C-STORE SCU** (`DICOM()`, ADR 0025) | dials host:port (default `104`) | **Yes** — per-connection opt-in `tls=true`; **chain and hostname are always verified** (there is no `tls_verify=false` on this connector), but **expiry checking is relaxable per connection** via `tls_allow_expired`, which skips at least the intermediates' and the trust anchor's validity periods and a CRL's own window, not the leaf's alone — see the note below; opt-in client-cert mTLS. **Plaintext by default** | calling / called AE title (DIMSE has no transport auth of its own) | `[egress].allowed_tcp` (a raw socket) |
 | **EMAIL destination** (SMTP, ADR 0029) | dials host:port (default `587`) | **STARTTLS by default** (`use_tls=true`; implicit TLS on `465`). `use_tls=false` routes through the cleartext-hop authority; SMTP AUTH credentials are refused over cleartext **either way** | optional SMTP AUTH | `[egress].allowed_smtp` (relay) + `[egress].allowed_recipient_domains` (recipients and the sender's domain) |
 | **Direct destination** (S/MIME HISP relay, ADR 0085) | dials HISP relay host:port (default `587`) | **STARTTLS by default** (`use_tls=true`); the body is S/MIME signed + encrypted regardless. `use_tls=false` is gated by the clamped `MEFOR_ALLOW_INSECURE_TLS`, read directly — it does **not** route through the cleartext-hop authority, so `tls_hop_attested` and `cleartext_accepted` are not read (AUTH credentials stay refused). CORRECTED 2026-10-13: this row said the raw variable, not clamped | S/MIME cert trust + optional SMTP AUTH | `[egress].allowed_direct` |
 | **DATABASE destination** | dials server:port | **Dialect-dependent** — `dialect='sqlserver'` (default): `Encrypt=yes` **default**, `TrustServerCertificate=false` default (weakened only via the escape). **WARNING:** `dialect='generic'` (ODBC to Postgres/Oracle/MySQL): TLS is the **driver's** own keyword in `odbc_params` and is **never engine-verified** — a hop with no TLS mode, **or one pinned to a no-TLS value** (at least `SSLmode=disable`/`allow`/`prefer`, `Encrypt=no`/`optional`; the full list is in the TLS note under [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling)), logs a WARNING naming the connection at construction, is **reported** by `security_loosenings()` / `GET /security/posture` / `messagefoundry check`, and is refused off-loopback on an enforcing instance unless the connection declares `tls_hop_attested` with its reason, or `cleartext_accepted`, which warns and audits; a hop whose mode is set on the keyword, and at a spelling, its driver family reads is delegated to the driver, not gated, and not on the `generic-db-tls` line; on a driver name the engine cannot place no mode counts (BACKLOG #5053; the families are in [CONNECTIONS.md, *The `SSLmode` spelling*](CONNECTIONS.md#the-sslmode-spelling)) | ODBC `sql` / `integrated` / `entra` | `[egress].allowed_db` |
@@ -739,9 +739,12 @@ in either posture it changes the revocation guard's answer, as the end of this s
 the `Ftp` (FTPS) inbound poller, which dials out through the same context. The six are **MLLP,
 REST, SOAP, FHIR, DICOM C-STORE SCU, and RemoteFile FTPS** (a factory parameter, and therefore also a
 `connections.toml` `[settings]` key and a GUI field — the connection schema is derived from the factory
-signatures). It relaxes **only** the certificate validity-period check: an **expired** server
-certificate is accepted **indefinitely**, while the **chain and key usage are still fully verified**,
-and the **hostname** too unless the connection also sets `tls_check_hostname = false` (ADR 0094).
+signatures). It relaxes the validity-period checks: an **expired** server certificate is accepted
+**indefinitely**, and at least the validity periods of the intermediates and the trust anchor, and a
+CRL's own validity window, go unchecked too. The **chain's signatures and key usage are still
+verified**, and the **hostname** too unless the connection also sets `tls_check_hostname = false`
+(ADR 0094). CORRECTED 2026-11-03 (vault BACKLOG #5089): this said it relaxes only the certificate
+validity-period check and that the chain is still fully verified.
 CORRECTED 2026-10-01: this said the hostname is verified without condition, which is false on an MLLP
 or hand-built FTPS hop that also turns the name check off. It is genuinely narrower than `tls_verify=false` — that is the point of it — but:
 
@@ -1247,10 +1250,12 @@ posture gate refuses the setting itself — **reported is not gated**, and the t
 either implied the other (a `dialect='generic'` DATABASE hop with a mode outside the no-TLS deny-list is
 not gated and not on the `generic-db-tls` line, so name it as that). `tls_allow_expired` is not inert to the revocation guard, though: it also
 skips a CRL's own validity window, so a hop that sets it must earn **no CRL credit**. Its call site
-hands the guard no context or opener when the setting is on (`skips_validity_period` reads it off the
-context), as MLLP, the DICOM C-STORE SCU, REST, SOAP, FHIR and both FTPS directions do, and a new call
-site names `EXPIRY_RELAXED_WAYS_ACROSS` as its remedy (ADR 0173 §13). A connector that takes the
-setting and hands the guard its relaxed context lets a stale CRL admit the hop. CORRECTED 2026-10-30:
+says so when the setting is on: at least MLLP, the DICOM C-STORE SCU and both FTPS directions pass
+the context they dial with and `expiry_relaxed=True` to `RevocationHopGuard.capture`, which drops the
+CRL credit and names `EXPIRY_RELAXED_WAYS_ACROSS` as the remedy, and at least REST, SOAP and FHIR hand
+the guard no context or opener (ADR 0173 §13 and its §4.3 note of 2026-11-03). A new call site passes
+the flag. A connector that takes the setting and hands the guard its relaxed context without the flag
+lets a stale CRL admit the hop (vault BACKLOG #5086). CORRECTED 2026-10-30:
 this said `tls_allow_expired` must be listed "even though no refusal keys on it", which stopped being
 true once the call sites handed the guard no context or opener for such a hop, so it earns no CRL
 credit (on MLLP and the DICOM C-STORE SCU since vault BACKLOG #2978); and a field with no factory parameter and no `connections.toml`

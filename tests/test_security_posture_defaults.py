@@ -2778,6 +2778,16 @@ def test_the_expiry_entry_no_longer_promises_the_hostname_unconditionally() -> N
     assert "tls_check_hostname=false" in risk
 
 
+def test_the_expiry_entry_no_longer_claims_the_whole_chain_is_verified() -> None:
+    """CORRECTED 2026-11-03 (vault BACKLOG #5089): the entry said "the chain signature and key usage
+    are still fully verified". The relaxation also skips at least the other chain certificates'
+    validity periods and a CRL's own window, and the entry now says so."""
+    risk = dict(_pairs(expiry_hops=("OB_X",)))["tls_allow_expired"]
+    assert "still fully verified" not in risk
+    assert "validity periods of the intermediates and the trust anchor" in risk
+    assert "a CRL's own validity window" in risk
+
+
 def test_the_revocation_attestation_is_actually_wired() -> None:
     """Another REPORTED entry, driven the same way as the ones above: through its reader AND through
     `security_loosenings`. ADR 0173 made the pair authorable on an outbound, so the reader must see it

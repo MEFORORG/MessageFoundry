@@ -10781,9 +10781,11 @@ def security_loosenings(
                 "tls_allow_expired",
                 f"{len(expiry_relaxed_hops)} connection(s) accept an EXPIRED server "
                 f"certificate ({named}) — indefinitely, with nothing that expires the relaxation or "
-                "re-checks it; the chain signature and key usage are still fully verified, and so is "
-                "the hostname match unless the same connection also sets tls_check_hostname=false "
-                "(listed under its own entry), so this is narrower than verify-off",
+                "re-checks it, and at least the validity periods of the intermediates and the "
+                "trust anchor, and a CRL's own validity window, go unchecked too; the chain's "
+                "signatures and key usage are still verified, and so is the hostname match unless "
+                "the same connection also sets tls_check_hostname=false (listed under its own "
+                "entry), so this is narrower than verify-off",
             )
         )
     if hostname_unchecked_hops:

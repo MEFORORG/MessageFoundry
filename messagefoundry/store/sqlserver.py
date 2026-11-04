@@ -2973,7 +2973,8 @@ def _build_pool_executor(settings: StoreSettings, maxsize: int | None = None) ->
     WHY THE STORE NEEDS ITS OWN. aioodbc runs EVERY pyodbc call through
     ``loop.run_in_executor(self._executor, ...)`` and passes ``executor=None`` unless told otherwise, so
     by default every connection in this pool shares the event loop's DEFAULT ThreadPoolExecutor. CPython
-    sizes that at ``min(32, cpu_count + 4)`` -- eight threads on a four-vCPU runner -- and that width is
+    sizes that at ``min(32, (os.process_cpu_count() or 1) + 4)`` -- eight threads on a runner whose
+    process may use four CPUs -- and that width is
     INDEPENDENT of ``[store].pool_size``. So the configured pool silently cannot exceed the loop default.
 
     WHY THAT DEADLOCKS RATHER THAN MERELY THROTTLING, which is the part worth keeping. A write like
