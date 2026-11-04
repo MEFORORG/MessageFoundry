@@ -27,8 +27,10 @@ body. The dry-run runs the decode, NUL, frame-byte and size guards through :func
 runs itself: the stored ``parse error`` text differs, and the dry-run catches only ``HL7PeekError``
 where the listener catches every peek-read fault. The detach's refusals of an escaped ``OBX-5.5``
 document (:class:`~messagefoundry.parsing.binary.EscapedDocumentError`), of a received document
-handle or marker (:class:`~messagefoundry.parsing.binary.InboundDocRefError`) and of a document
-under a base64 delimiter (:class:`~messagefoundry.parsing.binary.Base64DelimiterError`), each an
+handle or marker (:class:`~messagefoundry.parsing.binary.InboundDocRefError`), of a document
+under a base64 delimiter (:class:`~messagefoundry.parsing.binary.Base64DelimiterError`) and of a
+document the splice would not set back verbatim
+(:class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError`), each an
 ``ERROR`` row on a streaming inbound, which the dry-run never raises because it never detaches. A ``str`` body, which
 only the dry-run accepts: it has nothing to decode, so :func:`decode_body` never tries the codec
 name, and a name that would refuse every received byte body passes. Bytes go through the one name

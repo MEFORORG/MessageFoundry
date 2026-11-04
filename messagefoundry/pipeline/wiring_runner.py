@@ -940,6 +940,7 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     DocRefError,
     EscapedDocumentError,
     InboundDocRefError,
+    NonVerbatimDocumentError,
 )
 
 
@@ -8229,10 +8230,11 @@ class RegistryRunner:
         :class:`~messagefoundry.store.StreamingAttachmentsUnsupported` on a backend without streaming
         support (SQL Server / Postgres in Phase 1a), and
         :class:`~messagefoundry.parsing.binary.EscapedDocumentError` when a document's ``OBX-5.5``
-        holds an HL7 escape (vault BACKLOG #2809), and
+        holds an HL7 escape (vault BACKLOG #2809),
         :class:`~messagefoundry.parsing.binary.InboundDocRefError` for a received handle or marker,
-        or for a document delivery's splice would not set back verbatim (BACKLOG #5099) — each, as
-        one of :data:`_DETACH_REFUSALS`, is turned
+        and :class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError` for a document
+        delivery's splice would not set back verbatim (BACKLOG #5099) — each, as one of
+        :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
         size = len(text)
@@ -8596,12 +8598,12 @@ class RegistryRunner:
                 # message itself and fails the same way every time, so AR (vault BACKLOG #2809).
                 if isinstance(exc, EscapedDocumentError):
                     nak_code, nak_text = "AR", "escaped document in OBX-5.5"
-                elif isinstance(exc, Base64DelimiterError):
-                    # Checked before its base class: the body's delimiters, not a marker.
-                    nak_code, nak_text = "AR", "document under base64 delimiters"
                 elif isinstance(exc, NonVerbatimDocumentError):
                     # A document's own value, which the splice would escape, not a marker.
                     nak_code, nak_text = "AR", "document delivery would alter"
+                elif isinstance(exc, Base64DelimiterError):
+                    # Checked before its base class: the body's delimiters, not a marker.
+                    nak_code, nak_text = "AR", "document under base64 delimiters"
                 elif isinstance(exc, InboundDocRefError):
                     # Either shape: a handle in OBX-5.5, or the marker elsewhere in a body
                     # with a document to detach.
@@ -9163,9 +9165,10 @@ class RegistryRunner:
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
         except UnreattachableDocumentError as exc:
-            # Only failures the MESSAGE causes: the payload does not parse as HL7, or its MSH-1 and
-            # MSH-2 do not name its separators (vault BACKLOG #2809), or a handle is malformed, names
-            # an attachment its message does not hold, or sits outside the splice (BACKLOG #5099).
+            # Only failures the MESSAGE causes, at least: the payload does not parse as HL7, or its
+            # MSH-1 and MSH-2 do not name its separators (vault BACKLOG #2809), or a handle is
+            # malformed, names an attachment its message does not hold, or sits outside the
+            # splice, or the splice would escape a character of its stored value (BACKLOG #5099).
             # The same payload fails the same way on every attempt, so a retry could never succeed:
             # refuse it permanently,
             # which dead-letters this row alone. Any other ValueError is not caught here, so an engine

@@ -1619,15 +1619,40 @@ async def test_a_streaming_document_the_splice_would_alter_is_refused_before_the
     assert await _ingress_count(store, ic.name) == 0
 
 
-async def test_a_stored_document_the_splice_would_alter_is_refused_at_egress(
+async def test_a_non_ed_value_holding_the_separator_is_carried_as_before(
     store: MessageStore,
 ) -> None:
-    """The backstop for a row stored before the detach refused such a value: the stored value
-    holds ``&``, so setting it back would send ``\\T\\``. The re-attach refuses it once the read
-    returns it, and the row dead-letters at once with nothing sent (BACKLOG #5099)."""
+    """The control for the value check: only an ED Base64 value is ever detached, so a large
+    ``TX`` value holding ``&`` in a streaming body over the threshold is accepted AA and stored
+    as it came, with nothing detached."""
+    body = (
+        "MSH|^~\\&|APP|FAC|RCV|RCVF|20260101120000||MDM^T02|MSGID002|P|2.5\r"
+        f"OBX|1|TX|NOTE||^^^^{'Q' * 400}&{'R' * 400}||||||F\r"
+    )
+    assert "&" in (Message.parse(body).field("OBX-5.5") or "")
+    ic = _streaming_ic()
+    assert len(body) >= (ic.stream_threshold_bytes or 0)
+    runner = _runner(store, ic)
+
+    assert _ack_code(await runner._handle_inbound(ic, body.encode("utf-8"))) == "AA"
+    assert await _attachment_count(store) == 0
+    cur = await store._db.execute(
+        "SELECT payload FROM queue WHERE channel_id=? AND stage='ingress'", (ic.name,)
+    )
+    assert [r[0] for r in await cur.fetchall()] == [body]
+
+
+@pytest.mark.parametrize("odd", ["&", "\x01"], ids=["subcomponent-separator", "control"])
+async def test_a_stored_document_the_splice_would_alter_is_refused_at_egress(
+    store: MessageStore, odd: str
+) -> None:
+    """The backstop for a value the detach did not check under these delimiters: the stored
+    value holds a character the splice escapes, so setting it back would alter it. The
+    re-attach refuses it once the read returns it, and the row dead-letters at once with nothing
+    sent (BACKLOG #5099)."""
     from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
 
-    stored = "Q" * 400 + "&" + "R" * 400
+    stored = "Q" * 400 + odd + "R" * 400
     ref = await store.put_attachment(chunk_b64(stored), "application/pdf")
     payload = _hl7(make_doc_ref(ref, "Application"))
     reader = _Reader({ref: stored})

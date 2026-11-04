@@ -78,6 +78,7 @@ from messagefoundry.parsing.binary import (
     DocRefError,
     EscapedDocumentError,
     InboundDocRefError,
+    NonVerbatimDocumentError,
     extract_obx_document,
     is_doc_ref,
     iter_obx_documents,
@@ -660,8 +661,9 @@ def _binary_carriage(data: bytes) -> None:
       here would abort the whole pass, not just skip one row. Its docstring promises that a body it
       does not strip comes back unchanged;
     * after ``Message.parse`` (``HL7PeekError`` is its refusal), ``iter_obx_documents`` -- the ingress
-      document-detach scan, whose refusals are ``EscapedDocumentError`` and, for a handle a sender
-      wrote into ``OBX-5.5``, ``InboundDocRefError`` (BACKLOG #5099) -- and ``extract_obx_document``
+      document-detach scan, whose refusals are ``EscapedDocumentError``, for a handle a sender
+      wrote into ``OBX-5.5`` ``InboundDocRefError``, and for a value the splice would not set back
+      verbatim ``NonVerbatimDocumentError`` (BACKLOG #5099) -- and ``extract_obx_document``
       on every OBX, whose refusal is ``BinaryCarriageError``.
 
     The HL7 half carries the only carve-outs in this file, one per registered known finding: see
@@ -689,7 +691,7 @@ def _strip_and_scan_hl7(text: str) -> None:
         message = Message.parse(text)
     except HL7PeekError:
         return
-    with contextlib.suppress(EscapedDocumentError, InboundDocRefError):
+    with contextlib.suppress(EscapedDocumentError, InboundDocRefError, NonVerbatimDocumentError):
         list(iter_obx_documents(message, received=text))
     for occurrence in range(1, message.count_segments("OBX") + 1):
         with contextlib.suppress(BinaryCarriageError):
