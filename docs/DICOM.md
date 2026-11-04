@@ -71,6 +71,7 @@ in the order the SCP applies them.
 | `calling_ae_allowlist` and `require_called_ae_title` | when the association request is read | the association is rejected. No object is sent |
 | `max_pdu_size` | for each PDU after the association request, on the length the PDU declares, before its body is read | an A-ABORT, and the association ends |
 | twice the effective `max_object_bytes` | for each object, as its fragments arrive, before pynetdicom holds them | an A-ABORT, and the association ends. No status is sent for that object |
+| the deadline for each message | for each DIMSE message, as its fragments arrive, from the first one | an A-ABORT, and the association ends. No status is sent for that message |
 | the effective `max_object_bytes` | for each C-STORE, once the object has been received and before it is decoded | status `0xC010`, below |
 
 The 10 second handshake bound is a deadline for the whole handshake. It is the same constant the
@@ -104,7 +105,8 @@ each read has `timeout_seconds`, however slowly the bytes arrive. A peer that st
 a PDU is ended there. This is a deadline per read, not per object, so at the default 30 seconds a
 sender sending PDUs of the shipped 16 KiB `max_pdu_size` has to keep up about 0.5 KiB per second.
 Raising `max_pdu_size`, or lowering `timeout_seconds`, raises that floor. A peer that keeps finishing
-PDUs is not ended by this. Each send has a `timeout_seconds` deadline for the whole send too, so a
+PDUs is not ended by this, and pynetdicom's idle timer restarts on each PDU; the deadline for each
+message, below, is what ends one that never finishes its message. Each send has a `timeout_seconds` deadline for the whole send too, so a
 peer that stops reading, or reads a little at a time, is ended. Once the SCP is stopping, a send has
 at most 1.5 seconds more, so that the status for an object committed as the stop began still goes
 out.
@@ -134,6 +136,28 @@ data set fragment before its command, a command set pynetdicom cannot read, and 
 item that completes a message; pynetdicom would log each with a traceback, or lose its thread to
 it. So is any command but a C-STORE or C-ECHO request, the two the SCP serves, since pynetdicom
 serves some others on a thread of their own, outside the hold below.
+
+**Each DIMSE message has a deadline too** (BACKLOG #5080). From the PDU that brings a message's first
+fragment, the SCP allows `timeout_seconds` plus the message's data set bytes so far at 64 KiB a
+second. A message still incomplete past that ends the association with an A-ABORT. The check runs
+as each P-DATA-TF lands, so the end can come as late as the next PDU's header and body reads, each
+of which has `timeout_seconds`. A peer that sends no next PDU is ended by the read deadline. A
+message whose last fragment arrives is served however long it took, and the next message's clock
+starts at its own first fragment. The 64 KiB a second is a constant, not a setting. The bound is
+per message, not per association. At least these limits apply:
+
+- The SCP counts at most twice the effective `max_object_bytes` of one object, and the effective
+  cap is at most 16 MiB, so one message lasts at most
+  `timeout_seconds + 2 * min(max_object_bytes, 16 MiB) / (64 KiB a second)` before the next PDU's
+  reads: 30 + 512 seconds, about 9 minutes, at the defaults.
+- A link slower than 64 KiB a second has its larger objects cut. At a link rate of `r` bytes a
+  second, an object is cut once its data set is over `timeout_seconds * r * 64 KiB / (64 KiB - r)`.
+  At the default 30 seconds that is objects over about 2 MiB at 32 KiB a second, and over about
+  640 KiB at 16 KiB a second. A link that slow sees a failed association, which this engine's own
+  C-STORE client reads as transient and retries.
+- A peer that sends small complete messages one after another, such as a C-ECHO every few seconds,
+  still holds a `max_associations` slot for as long as it keeps sending. Each of its messages
+  completes, so no deadline ends it, and this bound does not close that case.
 
 While a whole object waits for the SCP to serve the one before it, the SCP reads nothing more on
 that association, and TCP holds the peer back. A peer that sends objects without waiting for their

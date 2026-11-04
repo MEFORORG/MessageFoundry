@@ -301,6 +301,12 @@ _MAX_COMMAND_SET_BYTES = 64 * 1024
 #: :data:`_STOP_POLL_SECONDS`, so a stop waits on a send for this plus that, 1.5 seconds, at most.
 _ANSWER_SEND_SECONDS = 1.0
 
+#: The least rate, in data set bytes a second, at which one DIMSE message has to arrive once its
+#: first fragment has (vault BACKLOG #5080); :class:`_ReceiptTally` says how the deadline is built
+#: from it, and docs/DICOM.md section 3 states the bound it gives. A constant, not a setting, chosen
+#: far under any real link: 64 KiB a second is a quarter of a 2 Mbit/s line.
+_MIN_MESSAGE_BYTES_PER_SECOND = 64 * 1024
+
 #: The least and the most ``max_pdu_size`` the SCP takes. pynetdicom fragments an object into PDVs
 #: of six bytes less than the size a peer offers, so a size of six or less breaks its senders, and
 #: 4096 is DCMTK's own least. The most bounds what one read holds before the SCP has counted any of
@@ -471,11 +477,28 @@ class _ReceiptTally:
     message; a data set fragment before its command set is whole; and anything in a PDU after the
     item that completes a message, which pynetdicom drops unread. pynetdicom would log each at ERROR
     with a traceback, or lose its DUL thread to it, or count it apart from what is counted here. The
-    fragments are read through a ``memoryview``, so counting one copies nothing."""
+    fragments are read through a ``memoryview``, so counting one copies nothing.
 
-    def __init__(self, *, max_data_set_bytes: int) -> None:
+    A message also has a deadline, from the PDU that brings its first fragment (vault BACKLOG #5080):
+    ``timeout_seconds`` plus its data set bytes so far at :data:`_MIN_MESSAGE_BYTES_PER_SECOND`. It
+    is checked as each P-DATA-TF is counted, so a message that is past it ends the association when
+    its next PDU lands, and a peer that sends no next PDU is ended by the read deadline instead. A
+    message that completes is never ended by it, and the clock starts again with the next one."""
+
+    def __init__(
+        self,
+        *,
+        max_data_set_bytes: int,
+        timeout_seconds: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         #: Past this the association is ended: twice the SCP's effective ``max_object_bytes``.
         self.max_data_set_bytes = max_data_set_bytes
+        #: The fixed part of a message's deadline: the SCP's ``timeout_seconds``.
+        self.timeout_seconds = timeout_seconds
+        self._clock = clock
+        #: When the message in progress began, on ``clock``, or ``None`` between messages.
+        self.began: float | None = None
         #: The data set bytes of the message in progress.
         self.data_set_bytes = 0
         #: The command set of the message in progress, kept whole so that its last fragment can be
@@ -501,13 +524,28 @@ class _ReceiptTally:
                 return _ABORT_INVALID_MESSAGE, "a P-DATA-TF item does not decode"
             control, fragment = view[start], view[start + 1 : end]
             offset = end
+            if self.began is None:  # a new message's first fragment
+                self.began = self._clock()
             if control & 0x01:
                 ended = self._take_command(fragment, last=bool(control & 0x02))
             else:
                 ended = self._take_data(fragment, last=bool(control & 0x02))
             if ended is not None:
                 return ended
-        return None
+        return self._past_deadline()
+
+    def _past_deadline(self) -> tuple[tuple[int, int], str] | None:
+        """The end for a message still in progress past its deadline, else ``None``. The reason
+        names the bound, never a byte count or a time the peer's sending made."""
+        if self.began is None:  # the PDU completed its message
+            return None
+        allowed = self.timeout_seconds + self.data_set_bytes / _MIN_MESSAGE_BYTES_PER_SECOND
+        if self._clock() - self.began <= allowed:
+            return None
+        return _ABORT_OVER_LIMIT, (
+            "a message did not arrive within timeout_seconds plus its data set at "
+            f"{_MIN_MESSAGE_BYTES_PER_SECOND} bytes a second"
+        )
 
     def _take_command(
         self, fragment: memoryview, *, last: bool
@@ -553,6 +591,7 @@ class _ReceiptTally:
         self.command_set.clear()
         self.command_whole = False
         self.completed = True
+        self.began = None
 
 
 def _require_association_seams(handler: type[Any], association_socket: type[Any]) -> None:
@@ -861,11 +900,13 @@ def _admitting_server_class() -> type[Any]:
             accepted this association, so it is not a refused connection, and it must not use up an
             address's refusal line. ``_read_pdu`` hands the DUL an empty header for a short body,
             so either short read is silent in the DUL. It is a deadline per read and not per
-            object. **A peer that keeps a message incomplete, finishing a small fragment's PDU
-            inside each deadline, is not bounded by this, by :class:`_ReceiptTally`, or by
-            pynetdicom's timers**: each PDU restarts pynetdicom's idle timer, and the tally ends
-            only on size. Such a peer holds a ``max_associations`` slot for as long as it keeps
-            sending, and enough of them fill it. No per-message deadline is built here."""
+            object. A peer that keeps a message incomplete, finishing a small fragment's PDU
+            inside each deadline, is not bounded by this or by pynetdicom's timers, since each PDU
+            restarts pynetdicom's idle timer. :class:`_ReceiptTally` bounds it instead, with a
+            deadline per message (vault BACKLOG #5080). That bound is per message, not per
+            association: a peer that sends small complete messages one after another, such as a
+            C-ECHO every few seconds, still holds a ``max_associations`` slot for as long as it
+            keeps sending, and enough of them fill it."""
             seconds = cast(float, self.ae.network_timeout)
             expired = _RefusedPeer(f"no complete PDU within {seconds:g}s")
             restore = sock.gettimeout()  # None: pynetdicom reads a blocking socket
@@ -1253,7 +1294,7 @@ def _admitting_server_class() -> type[Any]:
             them. An object up to twice ``max_object_bytes`` reaches the C-STORE handler, which
             answers ``0xC010``. One past that ends the association with an A-ABORT, so that what
             the SCP holds of one object stays bounded (owner ruling B462-R3). So does a P-DATA-TF
-            pynetdicom would fail on.
+            pynetdicom would fail on, and one that lands after its message's deadline.
 
             Reading the body here also means a body cut short never reaches the DUL, which would
             log it at ERROR. An empty header read is its silent closed connection, and that is what
@@ -1334,7 +1375,10 @@ def _admitting_server_class() -> type[Any]:
             sock.replay = bytearray(first_pdu)
             sock.server = server
             sock.host = host
-            sock.tally = _ReceiptTally(max_data_set_bytes=2 * server.max_object_bytes)
+            sock.tally = _ReceiptTally(
+                max_data_set_bytes=2 * server.max_object_bytes,
+                timeout_seconds=cast(float, server.ae.network_timeout),
+            )
             assoc.start()
 
     return _AdmittingAssociationServer
