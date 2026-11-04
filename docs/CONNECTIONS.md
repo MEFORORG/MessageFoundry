@@ -1486,6 +1486,20 @@ poll/write shape against a remote server, selected by an internal `protocol` set
     `_FtpClient.publish` states why. The check costs one more directory listing per delivery.
 
   With `overwrite = true`, nothing changes: the rename replaces any entry of the same name.
+- **An error names the server's reply code, never its reply text (BACKLOG #5026).** A refusal can
+  quote the path it refused, and on an upload that path ends in a name rendered from message
+  fields, so the reply text never reaches `last_error`, the alert detail or the log. An FTP or FTPS
+  error reads like `FTP rejected the operation: reply 550 (file unavailable, such as not found or no
+  access)`: the code and a fixed meaning for at least the common codes, and the code alone for any
+  other. An SFTP error names the exception's type and errno, such as `SFTP path not found:
+  FileNotFoundError, errno 2 (ENOENT)`. paramiko keeps three SFTP statuses apart: no such file, as
+  that `FileNotFoundError`; permission denied, as `SFTP operation failed: PermissionError, errno 13
+  (EACCES)`; and end of file, as `SFTP connection closed: EOFError`. It raises any other status as
+  an `OSError` carrying the server's text alone, so that reads as a bare `SFTP operation failed:
+  OSError`. A TLS failure names OpenSSL's reason and, for a certificate
+  check, its verify message, which are this engine's own wording. To see the server's own wording,
+  read the server's log. One exception: an SFTP connect refusal keeps paramiko's text, and
+  `_SftpClient._connect` says why. `_RemoteError` in `transports/remotefile.py` states the rule.
 - **Mostly the same file policy as `File(...)`.** A remote source is one of the *directory sources* the
   [file handling & quarantine policy](#file-handling--quarantine-policy-asvs-511) above governs — the
   content-type-aware magic-byte sniff (a drop whose leading bytes contradict its declared `content_type` is
