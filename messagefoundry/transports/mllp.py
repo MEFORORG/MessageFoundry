@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import logging
 import socket
 import ssl
@@ -1642,17 +1643,27 @@ def _lost_its_transport(writer: asyncio.StreamWriter) -> bool:
 _ACCEPT_RETRY_DELAY = 1.0
 
 
+#: What binding an address reports where its family is not enabled on the host, for example ``::1``
+#: with IPv6 disabled. ``asyncio.start_server`` skips such an address; so does `_bind_tcp`.
+_FAMILY_NOT_ENABLED = frozenset({errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT})
+
+
 async def _bind_tcp(host: str, port: int) -> list[socket.socket]:
     """Listening sockets for ``host``:``port``, bound as ``asyncio.start_server`` binds them: one per
     address ``host`` resolves to, with ``socket.create_server``'s options (``SO_REUSEADDR`` on
-    POSIX, an IPv6 socket IPv6-only) and a backlog of 100."""
+    POSIX, an IPv6 socket IPv6-only) and a backlog of 100. As there, an address whose family the
+    host has not enabled is skipped rather than failing the whole start (bpo-30945)."""
     infos = await asyncio.get_running_loop().getaddrinfo(
         host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )
     sockets: list[socket.socket] = []
     try:
         for family, _kind, _proto, _canonname, address in dict.fromkeys(infos):
-            sockets.append(socket.create_server(address, family=family, backlog=100))
+            try:
+                sockets.append(socket.create_server(address, family=family, backlog=100))
+            except OSError as exc:
+                if exc.errno not in _FAMILY_NOT_ENABLED:
+                    raise
         if not sockets:
             raise OSError(f"MLLP listener: {host!r} resolved to no address to bind")
     except BaseException:
@@ -1662,6 +1673,19 @@ async def _bind_tcp(host: str, port: int) -> list[socket.socket]:
     for sock in sockets:
         sock.setblocking(False)
     return sockets
+
+
+class _HandshakeProtocol(asyncio.StreamReaderProtocol):
+    """A stream protocol that records whether the TLS layer ever connected it, which it does only
+    once the handshake completes. A transport that comes back closed is ambiguous without this: a
+    handshake ended by a clean close, or one that completed and was closed after it, whose reader
+    may already hold a whole frame."""
+
+    connected = False
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.connected = True
+        super().connection_made(transport)
 
 
 class _AcceptedPeer:
@@ -1678,10 +1702,13 @@ class _AcceptedPeer:
 
 
 def _closer(sock: socket.socket) -> Callable[[asyncio.Task[None]], None]:
-    """A done callback that closes ``sock``, whatever the task's outcome."""
+    """A done callback for an accept loop: close its listening socket ``sock`` whatever the task's
+    outcome, and log a fault that ended it, since nothing else would record that it stopped."""
 
-    def close(_done: asyncio.Task[None]) -> None:
+    def close(done: asyncio.Task[None]) -> None:
         sock.close()
+        if not done.cancelled() and (exc := done.exception()) is not None:
+            logger.error("MLLP listener accept loop failed and stopped: %s", safe_exc(exc))
 
     return close
 
@@ -1726,6 +1753,10 @@ class _AcceptingServer:
                 await asyncio.sleep(_ACCEPT_RETRY_DELAY)
                 continue
             on_socket(conn)
+            # A selector loop's accept completes at once while connections are queued, and an
+            # await on a finished future does not yield; one turn per accept keeps a flood from
+            # starving the loop, the admission tasks above included.
+            await asyncio.sleep(0)
 
     def close(self) -> None:
         """Stop accepting. Each listening socket closes once its accept loop has finished."""
@@ -2064,8 +2095,9 @@ class MLLPSource(SourceConnector):
         # with TLS on means `_AcceptingServer` instead.
         self._upgrade_tls = False
         # Failed TLS handshakes and their throttled `tls_handshake_failed` events (vault BACKLOG
-        # #2613), on every loop since #3302: `_start_tls` counts where this listener runs the
-        # handshake, and the context's hook (`HandshakeFailures.watch`) where the loop does.
+        # #2613), on every loop since #3302, counted with the peer: by `_start_tls` on the stdlib
+        # loop, and by `_handshake_accepted` under `_AcceptingServer` (BACKLOG #1606). This
+        # listener never hooks the context (`HandshakeFailures.watch`).
         self._tls_failures = HandshakeFailures(self._emit_tls_failure)
         # The in-flight frame slots, `max_inflight_frames` of them; None when the bound is off.
         # Built at start() rather than here, so a slot a straggler from the previous run never
@@ -2144,8 +2176,9 @@ class MLLPSource(SourceConnector):
         stop() included. A failure is logged and counted as `_start_tls` does it, with the peer.
 
         A connection closed CLEANLY during the handshake completes the wait with a result rather
-        than an error, as `_start_tls` describes, so the transport comes back already closed. That
-        is a handshake that did not complete, and it is not counted.
+        than an error, as `_start_tls` describes, so the transport comes back closed and never
+        connected to the reader. That is a handshake that did not complete, and it is not counted.
+        One that completed and was then closed is connected, so a frame it delivered is still read.
         """
         assert self._ssl is not None
         try:
@@ -2164,7 +2197,7 @@ class MLLPSource(SourceConnector):
         try:
             loop = asyncio.get_running_loop()
             reader = asyncio.StreamReader()
-            protocol = asyncio.StreamReaderProtocol(reader)
+            protocol = _HandshakeProtocol(reader)
             task = asyncio.current_task()
             assert task is not None  # always: `_on_tls_socket` runs this as a task
             self._handshakes.add(task)
@@ -2188,7 +2221,7 @@ class MLLPSource(SourceConnector):
                 return
             finally:
                 self._handshakes.discard(task)
-            if transport.is_closing():
+            if not protocol.connected:
                 logger.debug(
                     "TLS connection on MLLP from %s closed during its handshake",
                     peer.get_extra_info("peername"),
