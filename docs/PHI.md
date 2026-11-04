@@ -2416,13 +2416,15 @@ A bare id from a later HL7 version than MSH-12 names is refused too: `SFT` came 
 bare `SFT` in a 2.3 message is not an empty segment. That holds for a line ahead of the header
 too. Every line is judged against the version in the header's own MSH-12.
 
-With no readable version in MSH-12, no version says which ids are empty segments, so every bare
-line is refused unless a rule that rewrites a field names its segment. That holds at any field
-count of the header, so a three-field `MSH|^~\&|` header with a real 2.3 header behind it does
-not let a bare `SFT` through. A `keep` does not count. To get such a line through, give the
-header its version, or map a field of the segment with a rule that rewrites. A rule on `MSH-12`
-does not help, because the version of the input is the one judged (vault BACKLOG #3001, #3004).
-The report still prints any id that some HL7 version defines in a field's address.
+With no readable version in the header's own MSH-12, no version says which ids are empty
+segments, so every bare line is refused unless a rule that rewrites a field names its segment.
+That holds at any field count of the header, so a three-field `MSH|^~\&|` header with a real 2.3
+header behind it does not let a bare `SFT` through. A `keep` does not count. To get such a line
+through, give the header its version, or map a field of the segment with a rule that rewrites. A
+rule on `MSH-12` does not help, because the anonymizer and `anonymize_checked` judge the version
+of the input (vault BACKLOG #3001, #3004). The report still prints any id that some HL7 version
+defines in a field's address. Only the header's MSH-12 is read: the MSH-12 of a later `MSH`
+line in the same text does not change which bare line passes.
 
 `anonymize_checked` judges a bare line by the HL7 version of its input, so a rule on `MSH-12`
 does not change which bare line passes. A caller that runs `anonymize` and then `leak_check` or

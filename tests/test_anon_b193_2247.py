@@ -165,8 +165,9 @@ _REPAIR = (
     "Repair the line no rule can reach: give it a well-formed segment id, or give a header line "
     "the separator after its encoding characters. For a line with no fields under a header whose "
     "MSH-12 holds no HL7 version, give the header its version, or map a field of that segment "
-    "with a rule that rewrites. A rule on MSH-12 does not help: the input's version is the one "
-    "judged."
+    "with a rule that rewrites. A rule on MSH-12 does not help: the anonymizer and "
+    "anonymize_checked judge the input's version, and a direct leak check judges it when given "
+    "version=message_version(raw)."
 )
 _EXTEND = "Extend the rule map so the field that carries it is scrubbed."
 _KEEP = "Add a rule for each field named, or a keep for one you reviewed."
@@ -302,6 +303,10 @@ def test_an_odd_hl7_version_never_raises_out_of_the_check(version: str) -> None:
         assert version not in str(exc.value)
         refusals.append(str(exc.value))
     assert refusals[0] == refusals[1]
+    # The emitting control: a line with fields under the same header is still emitted, and the
+    # two sides still agree on the output.
+    emitted = "\r".join((_HEADER.replace("2.5.1", version), _PID, "PV2|||WARD"))
+    assert engine_anonymize(emitted, salt=_SALT) == tee_anonymize(emitted, salt=_SALT)
 
 
 def test_a_blank_line_is_dropped_and_the_lines_around_it_are_kept() -> None:

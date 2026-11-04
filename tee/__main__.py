@@ -796,7 +796,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         )
         steps = [
             "Extend the rule map or add a keep in an anon.toml overlay, or repair each "
-            f"{MALFORMED_LINE_HIT}, then retry."
+            f"{MALFORMED_LINE_HIT} (a keep does not clear one), then retry."
         ]
         if residue_reports:
             # A keep is the wrong advice here: it would leave the whole field.

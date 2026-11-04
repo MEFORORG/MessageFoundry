@@ -160,8 +160,9 @@ MALFORMED_LINE_ADVICE = (
     "Repair the line no rule can reach: give it a well-formed segment id, or give a header line "
     "the separator after its encoding characters. For a line with no fields under a header whose "
     "MSH-12 holds no HL7 version, give the header its version, or map a field of that segment "
-    "with a rule that rewrites. A rule on MSH-12 does not help: the input's version is the one "
-    "judged."
+    "with a rule that rewrites. A rule on MSH-12 does not help: the anonymizer and "
+    "anonymize_checked judge the input's version, and a direct leak check judges it when given "
+    "version=message_version(raw)."
 )
 #: The stand-in segment id for a well-formed id that the message's HL7 version does not define and
 #: that is not a Z-segment. A segment id is untrusted text too -- a wrapped ``KIM|F`` looks like a
@@ -185,8 +186,8 @@ def _bare_line_address(seg_id: str, line: int) -> str:
 
 
 def _is_bare_line(address: str) -> bool:
-    """True for a :func:`_bare_line_address`. No other address ends in :data:`BARE_LINE`: a
-    field address ends in its field number."""
+    """True for a :func:`_bare_line_address`, and for the key :class:`CoverageTally` folds it
+    to. No other address ends in :data:`BARE_LINE`: a field address ends in its field number."""
     return address.endswith(BARE_LINE)
 
 
@@ -328,8 +329,9 @@ def _version_segments(version: str) -> frozenset[str] | None:
 def known_segments(version: str) -> frozenset[str]:
     """The segment ids HL7 ``version`` (MSH-12) defines: the newest table at or below it. An empty or
     unparseable version, or one older than every table, gets the ids that ANY version defines, which
-    names more than the message's own version would. A version with a run of more than
-    :data:`_VERSION_PART_MAX_DIGITS` digits raises a body-free :class:`AnonError`."""
+    names more than the message's own version would. The walk prints a field's address by it;
+    it judges a bare line by the version's own table alone (BACKLOG #3001). A version with a run
+    of more than :data:`_VERSION_PART_MAX_DIGITS` digits raises a body-free :class:`AnonError`."""
     chosen = _version_segments(version)
     return chosen if chosen is not None else _ANY_VERSION_SEGMENTS
 
@@ -488,7 +490,7 @@ def _walk(
     version_ids = _version_segments(version)
     # The ids a field's address may print. With no readable version that is every version's ids,
     # so the addresses of a versionless message keep their segment ids.
-    nameable = (_ANY_VERSION_SEGMENTS if version_ids is None else version_ids) | rule_ids
+    nameable = known_segments(version) | rule_ids
     # The ids a bare line may stand for. With no readable version, only an id a rule names: the
     # union of every version would let a bare ``SFT`` through a 2.3 message (BACKLOG #3001).
     defined = rule_ids if version_ids is None else nameable

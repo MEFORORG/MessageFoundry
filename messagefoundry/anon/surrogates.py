@@ -469,7 +469,7 @@ def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
     the anonymizer and the leak-check judge a bare rule-named id (``ZPD``) the same way. A caller
     with no rules passes nothing, and then only a version-defined id may stand bare."""
     # Imported here because ``leak`` imports this module; the one definition of such a line is there.
-    from .leak import MALFORMED_LINE_HIT, has_unreachable_line
+    from .leak import MALFORMED_LINE_ADVICE, MALFORMED_LINE_HIT, has_unreachable_line
 
     text = raw.replace("\x0b", "").replace("\x1c", "")
     text = text.replace("\r\n", "\r").replace("\n", "\r")
@@ -478,9 +478,8 @@ def normalized_message(raw: str, mapped_paths: tuple[str, ...] = ()) -> str:
     )
     if has_unreachable_line(text, mapped_paths):
         raise AnonError(
-            f"message has a {MALFORMED_LINE_HIT} — refusing to emit; repair the line, give the "
-            "header its version, or map a field of that segment with a rule that rewrites (a rule "
-            "on MSH-12 does not help: the input's version is the one judged), then retry"
+            f"message has a {MALFORMED_LINE_HIT} — refusing to emit. {MALFORMED_LINE_ADVICE} "
+            "Then retry."
         )
     return text
 
