@@ -2144,8 +2144,8 @@ _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 #: ``O_NONBLOCK`` where the platform has it, for the teardown's re-mark (see :func:`_teardown_staging`).
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 #: The bit a Windows reparse tag carries when it names another path (a symbolic link, a junction),
-#: read by :func:`_owner_of`, by :func:`_names_another_path`, and by :func:`_stat_names_another_path`,
-#: which :func:`_is_dir_link` calls.
+#: read at least by :func:`_owner_of`, :func:`_names_another_path` and :func:`_stat_names_another_path`.
+#: :func:`_truncate_unfollowed` reads the same bit as ``_NAME_SURROGATE``.
 _WIN_NAME_SURROGATE = _NAME_SURROGATE
 
 # The Windows half of the fail-safe opens, holds and checks through `transports/file.py`'s own
