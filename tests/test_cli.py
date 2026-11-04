@@ -2111,9 +2111,9 @@ def test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads(
     "BY CONFIG FILE" IS A REAL NARROWING, NOT THROAT-CLEARING. ``--host`` is merged AFTER
     ``_desugar_security`` (see ``load_settings``), so ``serve --host 0.0.0.0`` reaches this same gate
     from a file that sets neither key -- and there the old prescription did not die at load, it simply
-    did nothing. This test drives the FILE route only. The CLI route is a separate, unfixed gap:
-    the message names no flag, so an operator who bound off-box with ``--host`` is told to edit a file
-    that is already correct.
+    did nothing. This test drives the FILE route only. The CLI route is
+    ``test_serve_ui_offloopback_refusal_names_the_host_flag`` below: since BACKLOG #4636 the message
+    names the lever in effect, ``serve --host`` on that route.
 
     A test that read the message could not have caught it -- the old text named a real, correctly-spelled
     [security] field. Only running the prescribed config finds it.
@@ -2169,6 +2169,28 @@ def test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads(
     assert rc == 0, fixed_err
     assert _UI_OFFLOOPBACK_REFUSAL not in fixed_err
     assert "is not a loopback address" not in fixed_err
+
+
+def test_serve_ui_offloopback_refusal_names_the_host_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1361 route 2, #4636: off-box by ``serve --host`` from a file that sets no bind key,
+    the /ui refusal names the flag, the lever that is in effect, not a listen_address edit alone."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    (tmp_path / "messagefoundry.toml").write_text(
+        _UI_OFFLOOPBACK_STANDDOWNS + "security.serve_web_console = true\n"
+        "security.block_unlisted_outbound = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    argv = ["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev", "--host", "0.0.0.0"]
+    assert main(argv) == 2
+    refusal = next(
+        (ln for ln in capsys.readouterr().err.splitlines() if _UI_OFFLOOPBACK_REFUSAL in ln), ""
+    )
+    assert "serve --host, which overrides [security].listen_address" in refusal, refusal
 
 
 def test_serve_ui_offloopback_certificate_remedy_starts_with_the_attestation(

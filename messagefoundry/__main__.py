@@ -343,7 +343,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "unencrypted. Prefer [api].tls_cert_file (+ tls_key_file), which off loopback also needs "
         "MEFOR_TLS_REVOCATION_ATTESTED=1 (docs/SECURITY.md, API revocation gate), and "
         "per-connection tls where the connector has it (raw-TCP and X12 have none). It relaxes no "
-        "other API refusal, at least the no-auth, /ui, plaintext proxy hop, revocation and proxy "
+        "other API refusal, at least the /ui, plaintext proxy hop, revocation and proxy "
         "declaration refusals.",
     )
 
@@ -3492,10 +3492,8 @@ def _serve(args: argparse.Namespace) -> int:
                 "so a remote client can authenticate the engine only by pinning that exact "
                 "certificate, handed over out of band; --allow-insecure-bind cannot relax that under strict "
                 "enforcement (#200), and neither can [security].require_encryption_for_remote=false. "
-                "Configure [api].tls_cert_file for in-process TLS "
-                "(off loopback also MEFOR_TLS_REVOCATION_ATTESTED=1 in serve's environment, "
-                "docs/SECURITY.md, API revocation gate; "
-                "with [api].tls_terminated_upstream + trusted_proxies beside it if a proxy "
+                f"Either {off_loopback_certificate_remedy()} (docs/SECURITY.md, API revocation "
+                "gate; with [api].tls_terminated_upstream + trusted_proxies beside it if a proxy "
                 "terminates TLS and re-encrypts to the engine, BACKLOG #4636), or set "
                 "[security].enforcement=warn to accept serving on the placeholder on a "
                 "trusted, firewalled network.",
@@ -3508,10 +3506,9 @@ def _serve(args: argparse.Namespace) -> int:
                 f"{settings.api.host!r} without an operator certificate. The only certificate "
                 "available is the engine's generated self-signed placeholder, which no trust store "
                 "vouches for, so a remote client can authenticate the engine only by pinning that "
-                "exact certificate, handed over out of band. Configure "
-                "[api].tls_cert_file for in-process TLS (off loopback also "
-                "MEFOR_TLS_REVOCATION_ATTESTED=1 in serve's environment, docs/SECURITY.md, API "
-                "revocation gate; with [api].tls_terminated_upstream + trusted_proxies beside it if "
+                "exact certificate, handed over out of band. Either "
+                f"{off_loopback_certificate_remedy()} (docs/SECURITY.md, API revocation gate; with "
+                "[api].tls_terminated_upstream + trusted_proxies beside it if "
                 "a proxy terminates TLS and re-encrypts to the engine, BACKLOG #4636), or, under "
                 "[security].enforcement=warn, pass --allow-insecure-bind to accept serving on the "
                 "placeholder on a trusted, firewalled network.",
@@ -3814,8 +3811,9 @@ def _serve(args: argparse.Namespace) -> int:
             "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, "
             "[api].trusted_proxies, or [security].web_console_public_address is set), so the console "
             "is NOT served. To serve the console off-box set [security].serve_web_console=true with "
-            "TLS + [security].web_console_public_address (see "
-            "docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
+            "an operator certificate ([api].tls_cert_file) or a proxy in front of a loopback "
+            "engine, + [security].web_console_public_address (see docs/SECURITY.md, Off-loopback "
+            "browser console, and docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
             file=sys.stderr,
         )
         settings.api.serve_ui = False
@@ -3866,7 +3864,8 @@ def _serve(args: argparse.Namespace) -> int:
             "the /ui surface requires an operator certificate; --allow-insecure-bind does not cover "
             "it, and neither does [security].require_encryption_for_remote=false. Either bind the "
             f"engine to loopback ({loopback_levers}) for local access, or "
-            f"{off_loopback_certificate_remedy()}. A reverse proxy on this machine in front of a "
+            f"{off_loopback_certificate_remedy()}, or set [security].serve_web_console = false "
+            "to serve the JSON API alone. A reverse proxy on this machine in front of a "
             "loopback engine owes what docs/SECURITY.md, Plaintext proxy hop, lists; "
             "docs/SECURITY.md, API revocation gate, says what the attestation means.",
             file=sys.stderr,

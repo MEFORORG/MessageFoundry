@@ -347,7 +347,10 @@ def off_loopback_certificate_remedy() -> str:
     and, because off loopback that bind meets the API revocation gate, the attestation. Shared by
     :func:`plaintext_upstream_hop_off_loopback_remedy` and ``serve``'s /ui refusal, so the two
     cannot drift on what a certificate bind needs."""
-    return f"set [api].tls_cert_file, set {TLS_REVOCATION_ATTESTED_ENV}=1 in serve's environment"
+    return (
+        "set [api].tls_cert_file (and [api].tls_key_file unless the key is in that PEM), set "
+        f"{TLS_REVOCATION_ATTESTED_ENV}=1 in serve's environment"
+    )
 
 
 @dataclass(frozen=True)
@@ -378,7 +381,8 @@ class ApiTlsPlan:
 
         ``http`` only for a DECLARED upstream terminator: the proxy holds the protected hop and the
         engine speaks plaintext behind it. That hop is the deploying site's to secure, so ``serve``
-        requires ``[api].plaintext_upstream_hop_acknowledged`` for it and ``security_loosenings()``
+        requires a loopback bind and ``[api].plaintext_upstream_hop_acknowledged`` for it
+        (BACKLOG #4636) and ``security_loosenings()``
         lists it (BACKLOG #1179). A client that hardcodes https breaks exactly that topology, which
         is why this is reported rather than assumed.
         """

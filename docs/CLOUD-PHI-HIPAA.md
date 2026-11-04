@@ -162,7 +162,10 @@ PHI at rest is protected in **two layers**, and the engine layer is **fail-close
   default). Do **not** enable the plaintext UDP/TCP forwarder for PHI-adjacent log metadata; if you must,
   front it with a TLS sidecar/collector first.
 - **In-engine TLS revocation is delegated** ([ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md)).
-  For enforced OCSP/CRL revocation, terminate with an **OCSP-must-staple** proxy (Topology B).
+  For enforced OCSP/CRL revocation, terminate with an **OCSP-must-staple** proxy in front of a
+  loopback-bound engine (the same-pod sidecar in [`../docker/README.md`](../docker/README.md)). An
+  off-loopback certificate bind meets the [API revocation gate](SECURITY.md#api-revocation-gate)
+  whether or not a proxy is in front.
 - **API cert rotation needs a pod restart** (uvicorn builds the TLS context once; MLLP certs hot-reload on
   `/config/reload`, except a key the shipped manifests' `copy-tls` copies, which needs a new pod too:
   [`docker/README.md`](../docker/README.md), *Cert rotation*). Plan a rolling restart for API-cert renewal.

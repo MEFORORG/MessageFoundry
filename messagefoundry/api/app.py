@@ -4514,8 +4514,8 @@ def create_app(
         else webauthn_rp_from_request
     )
     # L5b off-loopback hardening (ADR 0068 §8 — the fill1 proxy-scheme trap): exposure_protected
-    # is the OPERATOR'S declaration that the browser-facing scheme is https (in-process TLS or a
-    # declared terminator). It forces the session cookie's Secure flag and HSTS regardless of the
+    # is the OPERATOR'S declaration that the browser-facing scheme is https (an operator
+    # certificate or a declared terminator; the minted placeholder does not count). It forces the session cookie's Secure flag and HSTS regardless of the
     # per-request scheme — the scheme is computed ONCE at login and a proxy that omits
     # X-Forwarded-Proto would otherwise poison the cookie for the whole session.
     # tls_terminated_upstream additionally arms the one-shot /ui cleartext-scheme tripwire.

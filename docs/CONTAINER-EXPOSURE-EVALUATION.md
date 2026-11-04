@@ -138,8 +138,8 @@ bind host is all that matters.
 | Topology | Bind address in container (`[security].listen_address`) | API gate outcome | Required config |
 |---|---|---|---|
 | (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`), plus `MEFOR_TLS_REVOCATION_ATTESTED=1` ([API revocation gate](SECURITY.md#api-revocation-gate)); sign-in is always on (vault BACKLOG #2719) |
-| (b) same-pod sidecar | `127.0.0.1` (loopback) | **gate not triggered** (`is_loopback`) | `trusted_proxies=[127.0.0.1]` (for correct client IP) **and** `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055); no in-process cert needed |
-| (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) **and** an operator `tls_cert_file` ([Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)); also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b; [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) says when a missing one refuses); and `MEFOR_TLS_REVOCATION_ATTESTED=1` ([API revocation gate](SECURITY.md#api-revocation-gate)) |
+| (b) same-pod sidecar | `127.0.0.1` (loopback) | **gate not triggered** (`is_loopback`) | `trusted_proxies=[127.0.0.1]` (for correct client IP) **and** `tls_terminated_upstream=true` + `plaintext_upstream_hop_acknowledged=true` (BACKLOG #2055), plus `[security].web_console_public_address` ([Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) says what a proxy owes); no in-process cert needed |
+| (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) **and** an operator `tls_cert_file` ([Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop)); also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b; [Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) says when a missing one refuses); `[security].web_console_public_address`; and `MEFOR_TLS_REVOCATION_ATTESTED=1` ([API revocation gate](SECURITY.md#api-revocation-gate)) |
 | (c) loopback publish, no shared netns | `0.0.0.0` (forced — see §1) | same as (a)/(b-separate); `127.0.0.1` bind would be unreachable | same as (a) or (b-separate) |
 
 MLLP gate (`check_mllp_tls_exposure`), per inbound's resolved host (`[inbound].bind_host`, typically
@@ -186,6 +186,7 @@ tls_key_file  = "/etc/mefor/tls/api.key"     # tls_key_password via MEFOR_API_TL
 [security]
 local_access_only = false
 listen_address = "0.0.0.0"
+web_console_public_address = "https://mefor.example.org"  # the proxy's origin; refused without it under enforce
 
 [api]
 port = 8765

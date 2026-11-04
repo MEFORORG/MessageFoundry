@@ -1576,21 +1576,22 @@ def enforce_phi_read_hop(request: Request) -> None:
     the instance posture + whether the serve hop is loopback / operator certificate / proxy-terminated) and
     stashed it on ``app.state``. When it is :attr:`~HopDisposition.REFUSE` — a production-PHI instance
     whose serve hop is NOT proven secure — a PHI-read is refused with a PHI-free 403 rather than putting a
-    body / summary on the clear. ALLOW / WARN (the loopback-dev / non-prod-PHI / synthetic / TLS cases)
+    body / summary on a hop no trust store vouches for. ALLOW / WARN (the loopback-dev / non-prod-PHI / synthetic / TLS cases)
     return silently, so a legitimate lane is byte-identical. Unset (an app built before this seam) → ALLOW.
 
     Call it from the PHI-read routes (folded into :func:`require_phi_read`; the step-up search route calls
     it directly). It reads only ``app.state`` — no I/O, no PHI — so it is safe on every request."""
     disposition = getattr(request.app.state, "phi_read_hop_disposition", HopDisposition.ALLOW)
     if disposition is HopDisposition.REFUSE:
+        from messagefoundry.api.tls import off_loopback_certificate_remedy
+
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "PHI read refused: this production-PHI instance's API serve hop is not proven secure "
             "(no loopback bind, operator certificate, or declared TLS-terminating proxy), so PHI is not "
             "emitted over it (posture-keyed refusal, #200/ADR 0092). Bind the engine to loopback "
-            "([security].listen_address or serve --host), or set [api].tls_cert_file, which off "
-            "loopback also needs MEFOR_TLS_REVOCATION_ATTESTED=1. See docs/SECURITY.md, Enforcement "
-            "model and API revocation gate.",
+            f"([security].listen_address or serve --host), or {off_loopback_certificate_remedy()}. "
+            "See docs/SECURITY.md, Enforcement model and API revocation gate.",
         )
 
 

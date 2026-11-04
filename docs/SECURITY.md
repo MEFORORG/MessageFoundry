@@ -157,7 +157,8 @@ ran as one shared system identity, so the audit trail named no person, and it co
 account, because with no auth service the account and audit routes answer 503. A config that still
 sets `[security].require_sign_in` is refused at load. Even with auth enabled, a
 non-loopback bind needs an **operator certificate**, `[api].tls_cert_file` (WP-13a), whether or
-not a proxy terminates TLS in front of it (WP-15), with one dev escape. With no certificate and no declared proxy, `serve`
+not a proxy terminates TLS in front of it (WP-15). The one dev escape below covers only a bind with
+no declared proxy. With no certificate and no declared proxy, `serve`
 refuses: the only certificate left is the engine's self-signed placeholder (ADR 0172), which no trust
 store vouches for. `serve --allow-insecure-bind`, or its config twin `[security].require_encryption_for_remote = false`, accepts it only under `[security].enforcement = warn` (ADR 0092). With a declared proxy and no certificate,
 [Plaintext proxy hop](#plaintext-proxy-hop) applies. With a certificate,
