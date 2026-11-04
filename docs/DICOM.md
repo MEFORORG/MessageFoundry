@@ -329,12 +329,17 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   reach a site's own install: the `[dicom]` extra pins pynetdicom exactly but lets pydicom resolve to any
   release from 3.0.2 below 3.1, and the tests run only the release the lock names. Known shapes not covered
   yet, at least: the exception pynetdicom logs when a received DIMSE message does not convert, which only the
-  SCU can reach, since the SCP ends such an association first; and a flagged UID that spells a name in
-  pydicom's UID dictionary, which a dump field keeps. The SCP reads each association
+  SCU can reach, since the SCP ends such an association first; a flagged UID that spells a name in
+  pydicom's UID dictionary, which a dump field keeps; pydicom's `Incorrect value for Specific Character Set`
+  and `Value "<value>" is not valid for elements with a VR of` lines, which name the value whole; and
+  pynetdicom's `No presentation context for` line, on `pynetdicom.association`, which the filter is not on,
+  and which names the SOP class of an object the SCU sends. The SCP reads each association
   request and command set once before pynetdicom does. What that read writes on the loggers the SCP filters is
-  written only where pynetdicom will not read the same bytes again; a line on any other logger is written twice.
-  pydicom also raises each of its lines as a `UserWarning`, which would carry the value to stderr. A warnings
-  filter, installed at import and again at each SCP start, ignores that copy; a host that resets the process's
+  written only where the command set itself ends the association. Where a later PDU ends it, before
+  pynetdicom reads the message, that read's lines are written nowhere. A line on any other logger is written
+  twice. pydicom also raises its invalid value line as a `UserWarning`, which would carry the value to stderr.
+  A warnings filter, installed at import and again at each SCP start, ignores that copy and no other pydicom
+  warning; a host that resets the process's
   warnings filters after that brings the copy back. The engine's
   own C-STORE lines name an object's SOP class and instance UIDs only when they are conformant, and `[redacted]`
   otherwise.
