@@ -46,10 +46,15 @@
   be from A4's boot when A4 reported. Either signal shows a reboot: Windows' boot counter
   (PrefetchParameters BootId) changed, or the tick count went down (it resets only at a boot) while
   the boot time (clock minus uptime) moved later. An unmoved counter shows the same boot only where
-  the tick count did not go down and the boot times are within 60 seconds. With no counter in a
+  the tick count did not go down and the boot times are within 60 seconds, so both reports must
+  carry a tick count and a boot time; with either empty or missing, an unmoved counter shows
+  nothing. With no counter in a
   report, a tick count that went down shows a reboot alone, and so does a boot time 60 seconds or
-  more later. A5 also counts as rebooted when A4 shows the reboot and A5 is from A4's boot. The judge prints every report's raw counter, tick count and
-  boot time on its boots line.
+  more later. A counter that is not a whole number counts as no counter. A5 also counts as
+  rebooted when A4 shows the reboot and A5 is shown, by those same readings, to be from A4's boot.
+  So no survival verdict reads without a reboot shown for both A4 and A5: a report whose readings
+  are empty or missing shows none, and its arm reads INCONCLUSIVE. The judge prints every report's
+  raw counter, tick count and boot time on its boots line.
 
   Each arm reads YES, NO, INVALID or INCONCLUSIVE. INVALID is a report showing a broken instrument:
   a user-scope blob refused as damaged (win32=13), a value that opened but did not match, or a
@@ -66,6 +71,8 @@
   and A4 reads NO; DOES NOT SURVIVE when A5 reads NO and A4 did not open it; INCONCLUSIVE, A4
   OPENED AND A5 DID NOT for that contradiction; and INCONCLUSIVE otherwise, naming A4's and A5's
   readings, A5 opening with A4 missing included. A NO here is always the key-state refusal above.
+  Payload mode runs no reboot, so its verdict is INVALID or one of the two pre-reboot INCONCLUSIVE
+  readings above where those apply, and NOT RUN only once A1 to A3 pass.
 
   THREE MODES.
     -Mode Host     On MEFORHV01, elevated, by the owner. Refuses unless REVTEST01 is Off, reverts it
@@ -82,7 +89,11 @@
     -Mode Payload  Inside the VM, through the hvtest harness (entry.ps1 beside this file). Runs A1 to
                    A3. hvtest cannot reboot a VM inside a run (one PowerShell Direct session per run,
                    and every run starts by reverting the checkpoint), so A4 and A5 read NOT RUN.
-    -Mode Guest    One step inside the VM. Host mode calls it over PowerShell Direct; run it by hand
+                   hvtest runs the payload under PowerShell 7, but PowerShell Direct opens Windows
+                   PowerShell 5.1, so the payload runs each guest step as its own powershell.exe
+                   process in -Mode Guest, the code and the PowerShell Host mode's steps run on.
+    -Mode Guest    One step inside the VM. Host mode calls it over PowerShell Direct, and Payload
+                   mode as a Windows PowerShell 5.1 process; run it by hand
                    only to clean up: -Mode Guest -Step Uninstall.
 
   CIRCUIT BREAKERS (CLAUDE.md section 5). Host mode checks [Environment]::MachineName is MEFORHV01.
@@ -177,6 +188,8 @@ if ($Mode -eq 'Host') {
 
 $ErrorActionPreference = 'Stop'
 
+# This file, which Payload mode runs again under Windows PowerShell 5.1 for each guest step.
+$RigPath = $PSCommandPath
 $ServiceName = 'MeforDpapiReboot'
 $Account = "NT SERVICE\$ServiceName"
 $Root = 'C:\mefor-dpapi-reboot'
@@ -713,7 +726,12 @@ function Get-Verdict($Report, [string]$Action, [string]$Extra, [string]$Plain) {
 
 function Get-BootReading($Report) {
     # @(boot_id or '', uptime as UInt64 or $null, boot time as UTC DateTime or $null). A field that
-    # does not parse is $null, never 0, so a damaged report cannot pass for a fresh boot.
+    # does not parse is $null, never 0, so a damaged report cannot pass for a fresh boot. A counter
+    # that is not a whole number is '', as absent: two boot_id lines read "7; 8", which would
+    # otherwise differ from every other report's counter and pass for a reboot.
+    $count = [UInt64]0
+    $id = ''
+    if ([UInt64]::TryParse([string]$Report['boot_id'], [ref]$count)) { $id = [string]$count }
     $uptime = [UInt64]0
     $up = $null
     if ([UInt64]::TryParse([string]$Report['uptime_ms'], [ref]$uptime)) { $up = $uptime }
@@ -721,7 +739,7 @@ function Get-BootReading($Report) {
     $boot = $null
     if ([DateTime]::TryParse([string]$Report['boot_utc'], [Globalization.CultureInfo]::InvariantCulture,
             [Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$parsed)) { $boot = $parsed }
-    @([string]$Report['boot_id'], $up, $boot)
+    @($id, $up, $boot)
 }
 
 function Get-BootRelation($Earlier, $Later) {
@@ -733,7 +751,9 @@ function Get-BootRelation($Earlier, $Later) {
     # down shows a reboot whatever the clock says (a clock read early at boot can put the boot time
     # back); else a boot time 60 s or more LATER shows one, and boot times within 60 s show the same
     # boot. Those last rest on the guest clock. Signals that disagree read 'unknown', a boot time
-    # that moved back beside a tick count that went up included.
+    # that moved back beside a tick count that went up included. 'same' always needs both reports'
+    # tick counts and boot times: the judge carries a reboot report-A4 shows over to report-A5 on a
+    # 'same', so an unmoved counter beside an empty reading must not make one.
     $e = Get-BootReading $Earlier
     $l = Get-BootReading $Later
     $idKnown = [bool]($e[0] -and $l[0])
@@ -745,9 +765,10 @@ function Get-BootRelation($Earlier, $Later) {
     if ($idKnown -and $e[0] -ne $l[0]) { return 'rebooted' }
     if ($tickDown -and $bootKnown -and $gap -gt 0) { return 'rebooted' }
     if ($idKnown) {
-        # An unmoved counter shows the same boot only where the tick count and the clock agree:
-        # a boot time 60 s or more later may be a second boot the counter missed.
-        if ($tickDown -or ($null -ne $gap -and [Math]::Abs($gap) -ge 60)) { return 'unknown' }
+        # An unmoved counter shows the same boot only where the tick count and the clock both
+        # agree: a boot time 60 s or more later may be a second boot the counter missed, and a
+        # missing reading agrees with nothing.
+        if (-not ($tickKnown -and $bootKnown) -or $tickDown -or [Math]::Abs($gap) -ge 60) { return 'unknown' }
         return 'same'
     }
     if (-not $tickKnown) { return 'unknown' }
@@ -830,11 +851,13 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
             $restart = ($a -in 'A1', 'A2') -or ($a -eq 'A3' -and -not $unloaded)
             if ($v[$a][0] -eq 'INVALID' -or ($v[$a][0] -eq 'NO' -and $restart)) { "$a $($v[$a][0])" }
         })
+    # Without a reboot (Payload mode) the two INCONCLUSIVE readings below still apply, so the
+    # verdict word matches the exit code; NOT RUN is left only for a pass the reboot arms would read.
     $overall = 'NOT RUN'
     if ($broken.Count) { $overall = "INVALID ($($broken -join ', '): the instrument or the setup failed)" }
-    elseif ($Rebooted -and $v['A3'][0] -eq 'NO') {
+    elseif ($v['A3'][0] -eq 'NO') {
         $overall = 'INCONCLUSIVE (A3 NO after a seen profile unload: the blob did not survive the reload, so the reboot arms are not read)'
-    } elseif ($Rebooted -and -not $prePass) {
+    } elseif (-not $prePass) {
         $overall = 'INCONCLUSIVE (A1 to A3 did not all open the blob, so the instrument is not shown working before the reboot)'
     } elseif ($Rebooted) {
         # A5 is the survival question: a demand start, once boot is over. A4 can only narrow it,
@@ -852,9 +875,20 @@ function Invoke-Judge([string]$Dir, [bool]$Rebooted) {
 # --- payload mode (hvtest) ----------------------------------------------------------------------
 
 function Invoke-PayloadStep([string]$Log, [string]$Name, [string]$ArmName) {
+    # hvtest runs the payload under PowerShell 7, but Host mode runs each guest step over PowerShell
+    # Direct, which opens Windows PowerShell 5.1. So each step runs here as its own Windows
+    # PowerShell 5.1 process in -Mode Guest, as Host mode runs it, and this route measures the code
+    # Host mode will run. Named by path, not PATH. A failed step's output is in Invoke-Native's
+    # error, so it goes to the log before the step fails.
     "----- guest step $Name $ArmName -----" | Add-Content -LiteralPath $Log -Encoding ASCII
-    $script:Arm = $ArmName
-    Invoke-GuestStep $Name | ForEach-Object { [string]$_ } | Add-Content -LiteralPath $Log -Encoding ASCII
+    $ps = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\v1.0\powershell.exe'
+    $params = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $RigPath, '-Mode', 'Guest', '-Step', $Name)
+    if ($ArmName) { $params += '-Arm', $ArmName }
+    try { Invoke-Native $ps $params | Add-Content -LiteralPath $Log -Encoding ASCII }
+    catch [System.Management.Automation.RuntimeException] {
+        $_.Exception.Message | Add-Content -LiteralPath $Log -Encoding ASCII
+        throw "the guest step $("$Name $ArmName".TrimEnd()) failed under $ps; its output is in $Log"
+    }
 }
 
 function Invoke-Payload {

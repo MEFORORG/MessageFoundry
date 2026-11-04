@@ -26,6 +26,10 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 _RIG = _REPO / "scripts" / "research" / "dpapi-reboot-spike" / "dpapi_reboot_spike.ps1"
 _PWSH = shutil.which("pwsh")
+# Windows PowerShell 5.1, which PowerShell Direct opens in the guest: Host mode's guest steps run on
+# it, and Payload mode runs each guest step on it too.
+_WINPS = shutil.which("powershell.exe") if sys.platform == "win32" else None
+_NEEDS_WINPS = pytest.mark.skipif(_WINPS is None, reason="Windows PowerShell 5.1 not on PATH")
 
 pytestmark = pytest.mark.skipif(_PWSH is None, reason="pwsh not on PATH")
 
@@ -64,12 +68,13 @@ def _lift(*functions: str, variables: tuple[str, ...] = ()) -> str:
     )
 
 
-def _run_pwsh(driver: Path, arg: Path, timeout: int) -> str:
-    """Runs a lifting driver against the rig; returns its stdout, and fails on a non-zero exit."""
-    assert _PWSH is not None
+def _run_pwsh(driver: Path, arg: Path, timeout: int, shell: str | None = _PWSH) -> str:
+    """Runs a lifting driver against the rig, under pwsh unless ``shell`` names another; returns
+    its stdout, and fails on a non-zero exit."""
+    assert shell is not None
     proc = subprocess.run(
         [
-            _PWSH,
+            shell,
             "-NoProfile",
             "-NonInteractive",
             "-File",
@@ -323,6 +328,42 @@ SCENARIOS: dict[str, Scenario] = {
     "not_rebooted_a2_refused": Scenario(
         _all(A2=_report("A2", **REFUSED), A4=None, A5=None), rebooted=False
     ),
+    # The review's case: the counter stuck at one value, report-A4 a real reboot, and report-A5's
+    # uptime and boot time empty. Nothing shows A5 after a reboot, nor from A4's boot.
+    "stuck_id_a5_empty_clock": Scenario(
+        _all(
+            A4=_report("A4", **STUCK_ID),
+            A5=_report("A5", uptime_ms="", boot_utc="", **STUCK_ID),
+        )
+    ),
+    # The same with report-A4 empty instead: A5 shows its reboot, A4 shows none.
+    "stuck_id_a4_empty_clock": Scenario(
+        _all(
+            A4=_report("A4", uptime_ms="", boot_utc="", **STUCK_ID),
+            A5=_report("A5", **STUCK_ID),
+        )
+    ),
+    # A counter that moved, and report-A5's clock empty: A5's own counter shows the reboot, but
+    # nothing shows it from report-A4's boot, so A4 cannot narrow it.
+    "a5_empty_clock": Scenario(_all(A5=_report("A5", uptime_ms="", boot_utc=""))),
+    # Two boot_id lines in report-A4 and in report-A5 read "7; 7", which once differed from
+    # report-A3's "7" and passed for a changed counter. It is no counter at all.
+    "a5_two_counters": Scenario(
+        _all(
+            A4=_report("A4", boot_id="7; 7"),
+            A5=_report("A5", boot_id="7; 7", uptime_ms="", boot_utc=""),
+        )
+    ),
+    # Payload mode runs no reboot, and its verdict word still says INCONCLUSIVE where the
+    # pre-reboot arms do not pass.
+    "payload_a3_refused_unloaded": Scenario(
+        _all(A3=_report("A3", **REFUSED), A4=None, A5=None),
+        profile="loaded_before_start=False profile=x",
+        rebooted=False,
+    ),
+    "payload_a2_failed": Scenario(
+        _all(A2=_report("A2", user_unprotect="FAIL win32=5"), A4=None, A5=None), rebooted=False
+    ),
 }
 
 # Refusals that are not the key-state refusal: access denied, the RPC server unavailable, a FAIL
@@ -360,8 +401,14 @@ def _parse(stdout: str) -> dict[str, dict[str, str]]:
     return out
 
 
+def _write_report(path: Path, report: dict[str, str]) -> None:
+    """Writes a report as the service does: one key=value line each."""
+    path.write_text("".join(f"{k}={v}\n" for k, v in report.items()), encoding="ascii")
+
+
 @pytest.fixture(scope="module")
-def judged(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, str]]:
+def judge_input(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A folder holding each scenario's reports, the list of them, and the judging driver."""
     root = tmp_path_factory.mktemp("dpapi-reboot-judge")
     rows = []
     for name, sc in SCENARIOS.items():
@@ -369,15 +416,18 @@ def judged(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, str]
         d.mkdir()
         for arm, r in sc.reports.items():
             if r is not None:
-                (d / f"report-{arm}.txt").write_text(
-                    "".join(f"{k}={v}\n" for k, v in r.items()), encoding="ascii"
-                )
+                _write_report(d / f"report-{arm}.txt", r)
         (d / "crosscheck.txt").write_text(sc.crosscheck + "\n", encoding="ascii")
         (d / "profile-A3.txt").write_text(sc.profile + "\n", encoding="ascii")
         rows.append(f"{name}|{d}|{'1' if sc.rebooted else '0'}")
     (root / "list.txt").write_text("\n".join(rows) + "\n", encoding="ascii")
     (root / "driver.ps1").write_text(_DRIVER, encoding="ascii")
-    out = _parse(_run_pwsh(root / "driver.ps1", root / "list.txt", 300))
+    return root
+
+
+@pytest.fixture(scope="module")
+def judged(judge_input: Path) -> dict[str, dict[str, str]]:
+    out = _parse(_run_pwsh(judge_input / "driver.ps1", judge_input / "list.txt", 300))
     assert set(out) == set(SCENARIOS)
     return out
 
@@ -436,6 +486,13 @@ _OVERALL: list[tuple[str, str]] = [
     ("no_id_clock_back", "INCONCLUSIVE"),
     ("a1_dpapi_down", "INCONCLUSIVE"),
     ("not_rebooted_a2_refused", "INVALID"),
+    ("stuck_id_a5_empty_clock", "INCONCLUSIVE"),
+    ("stuck_id_a4_empty_clock", "INCONCLUSIVE"),
+    ("a5_empty_clock", "INCONCLUSIVE"),
+    ("a5_two_counters", "INCONCLUSIVE"),
+    ("payload_a3_refused_unloaded", "INCONCLUSIVE"),
+    ("payload_a2_failed", "INCONCLUSIVE"),
+    ("a3_no_report", "INCONCLUSIVE"),
 ]
 
 
@@ -619,6 +676,116 @@ def test_the_boots_line_carries_the_raw_readings(judged: Judged) -> None:
 def test_a5_opening_without_a4_is_not_a_survival_verdict(judged: Judged) -> None:
     assert _v(judged, "a4_missing_a5_opened", "A4") == "INCONCLUSIVE"
     assert _v(judged, "a4_missing_a5_opened", "A5") == "YES"
+
+
+_NO_REBOOT_SHOWN = "no reboot shown between report-A3 and report-{}: unknown"
+_NOT_A4S_BOOT = "not shown to be from the boot report-A4 is from: unknown"
+
+
+@pytest.mark.parametrize(
+    ("scenario", "arm", "verdict", "why"),
+    [
+        # The review's case: an unmoved counter beside report-A5's empty uptime and boot time once
+        # read as "same boot as A4", which carried A4's reboot over to A5 and read SURVIVES.
+        ("stuck_id_a5_empty_clock", "A4", "YES", "user_unprotect OK match"),
+        ("stuck_id_a5_empty_clock", "A5", "INCONCLUSIVE", _NO_REBOOT_SHOWN.format("A5")),
+        # The same for A4: A5 shows its own reboot, but not that it is from report-A4's boot.
+        ("stuck_id_a4_empty_clock", "A4", "INCONCLUSIVE", _NO_REBOOT_SHOWN.format("A4")),
+        ("stuck_id_a4_empty_clock", "A5", "INCONCLUSIVE", _NOT_A4S_BOOT),
+        # A moved counter shows A5's reboot, but not that A5 is from A4's boot.
+        ("a5_empty_clock", "A5", "INCONCLUSIVE", _NOT_A4S_BOOT),
+        # Two counters in one report are no counter, not a changed one.
+        ("a5_two_counters", "A5", "INCONCLUSIVE", _NO_REBOOT_SHOWN.format("A5")),
+    ],
+)
+def test_an_empty_reading_never_shows_a_reboot(
+    judged: Judged, scenario: str, arm: str, verdict: str, why: str
+) -> None:
+    # Their overall verdicts are in _OVERALL, beside the positive controls stuck_id_tick_down and
+    # stuck_id_a5_late: the same stuck counter with the readings present still reads SURVIVES.
+    assert _v(judged, scenario, arm) == verdict
+    assert why in judged[scenario][arm], judged[scenario][arm]
+
+
+def test_the_payload_verdict_word_matches_its_exit_code(judged: Judged) -> None:
+    # Payload mode judges with no reboot, and its exit code is the prepass. The overall words are
+    # in _OVERALL; a payload that passes still reads NOT RUN there (not_rebooted).
+    verdict = judged["payload_a3_refused_unloaded"]["VERDICT"]
+    assert "A3 NO after a seen profile unload" in verdict, verdict
+    assert judged["payload_a3_refused_unloaded"]["prepass"].endswith("False")
+    verdict = judged["payload_a2_failed"]["VERDICT"]
+    assert "did not all open the blob" in verdict, verdict
+    assert judged["payload_a2_failed"]["prepass"].endswith("False")
+    for arm in ("A4", "A5"):
+        assert _v(judged, "payload_a2_failed", arm) == "NOT RUN"
+    assert judged["not_rebooted"]["prepass"].endswith("True")
+
+
+@_NEEDS_WINPS
+def test_the_judge_reads_the_same_under_windows_powershell(
+    judge_input: Path, judged: Judged
+) -> None:
+    # The rig parses under 5.1 (the lift throws on a parse error), and its judge reads every
+    # scenario as pwsh 7 does.
+    out = _parse(_run_pwsh(judge_input / "driver.ps1", judge_input / "list.txt", 300, _WINPS))
+    assert out == judged
+
+
+_REPORT_DRIVER = (
+    _lift("Show-File", "Step-Report")
+    + r"""
+$Work = $Arg
+Step-Report
+"""
+)
+
+
+@_NEEDS_WINPS
+def test_the_report_step_prints_under_windows_powershell(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    _write_report(work / "report-A1.txt", _report("A1"))
+    (work / "crosscheck.txt").write_text(CROSS_OK + "\n", encoding="ascii")
+    (work / "plain.bin").write_bytes(b"not a report")
+    driver = tmp_path / "report.ps1"
+    driver.write_text(_REPORT_DRIVER, encoding="ascii")
+    out = _run_pwsh(driver, work, 120, _WINPS)
+    # Every .txt in name order, each under its own header, and nothing else.
+    assert out.splitlines() == [
+        "===== crosscheck.txt =====",
+        CROSS_OK,
+        "===== report-A1.txt =====",
+        *(f"{k}={v}" for k, v in _report("A1").items()),
+    ]
+
+
+_PAYLOAD_STEP_DRIVER = (
+    _lift("Invoke-Native", "Invoke-PayloadStep")
+    + r"""
+$RigPath = $Rig
+$log = Join-Path $Arg 'step.txt'
+try { Invoke-PayloadStep $log 'Report' ''; 'step=RETURNED' } catch { "step=$($_.Exception.Message)" }
+foreach ($line in Get-Content -LiteralPath $log) { "log=$line" }
+"""
+)
+
+
+@_NEEDS_WINPS
+def test_a_payload_step_runs_the_rig_under_windows_powershell(tmp_path: Path) -> None:
+    # Run under pwsh 7, as hvtest runs the payload. The step's child is the rig itself under
+    # powershell.exe, whose breaker refuses this machine and exits 1, so the parent fails the step.
+    driver = tmp_path / "step.ps1"
+    driver.write_text(_PAYLOAD_STEP_DRIVER, encoding="ascii")
+    lines = _run_pwsh(driver, tmp_path, 120).splitlines()
+    step = next(line for line in lines if line.startswith("step="))
+    winps = "windowspowershell\\v1.0\\powershell.exe"
+    assert step.startswith("step=the guest step Report failed under "), step
+    assert f"{winps}; its output is in " in step.lower(), step
+    assert step.endswith(str(tmp_path / "step.txt")), step
+    log = [line[len("log=") :] for line in lines if line.startswith("log=")]
+    assert log[0] == "----- guest step Report  -----", log
+    assert any(f"{winps} -noprofile" in line.lower() and "exited '1'" in line for line in log), log
+    assert any("STOP     this must run inside the VM REVTEST01" in line for line in log), log
 
 
 _LOCK_DRIVER = (
