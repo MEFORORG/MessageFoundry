@@ -115,7 +115,7 @@ from messagefoundry.connection_names import (
     is_connection_name,
 )
 from messagefoundry.controlchars import scrub_control_chars, scrub_log_argument
-from messagefoundry.credential import QUALIFIED_CERT_NAME
+from messagefoundry.credential import QUALIFIED_CERT_NAME, unmatchable_san_reason
 from messagefoundry.exception_origin import (
     exception_chain,
     raise_statement_file,
@@ -219,8 +219,10 @@ __all__ = [
     "query_credential_hops",
     "revocation_attested_hops",
     "unverified_generic_db_hops",
+    "server_unread_generic_db_hops",
     "POSSIBLY_GENERIC_DB_HOP",
     "UNRESOLVED_DRIVER_REASON",
+    "UNRESOLVED_SERVER_DRIVER_REASON",
     "overbroad_smart_scopes",
     "OAuthRequestAdvisories",
     "oauth_request_advisories",
@@ -2557,6 +2559,8 @@ def MLLP(
     | None = None,  # BOTH: SHA-256 of tls_ca_file; a mismatch refuses (BACKLOG #1142, #2371)
     tls_crl_file: str
     | None = None,  # INBOUND: opt-in CRL for mTLS client certs (#1005): a bare PEM CRL (#1890)
+    tls_client_subjects: Mapping[str, Sequence[str]]
+    | None = None,  # INBOUND: expected senders: issuing CA's DN -> QUALIFIED "SAN:DNS:<v>" / "CN:<v>"
     tls_verify: bool = True,  # OUTBOUND: verify the server cert (false is MITM-able, and is refused unless MEFOR_ALLOW_INSECURE_TLS is set at [security].enforcement = warn)
     tls_check_hostname: bool = True,  # OUTBOUND: require the server cert to match `host`
     # OUTBOUND: honour an EXPIRED server cert (#129). The chain's signatures are still verified, and
@@ -2707,7 +2711,17 @@ def MLLP(
     forward-secret, encrypting, peer-authenticating, 128-bit floor) and then applied, so opting in
     NARROWS this one hop. A rejected string fails loud at construction, surfaced by
     ``messagefoundry check`` / dry-run. Any OpenSSL ``@`` directive is refused too, for being one:
-    ``@SECLEVEL=0`` lowers the security level without naming a suite (BACKLOG #2106)."""
+    ``@SECLEVEL=0`` lowers the security level without naming a suite (BACKLOG #2106).
+
+    ``tls_client_subjects`` (**inbound only**, BACKLOG #4907) names the senders this listener
+    expects. ``tls_ca_file`` alone admits any certificate its CAs ever signed; this binds each
+    sender to a name under the CA that issued it, in the same table ``Http``'s
+    ``intake_client_subjects`` takes: ``{"CN=Acme CA,O=Acme": ["SAN:DNS:partner.example"]}``. A
+    verified certificate with no listed name under the loaded CA whose key signed it is refused:
+    each message its first read completes is recorded as ``ERROR``, then answered ``AR`` where the
+    inbound replies in HL7, and the connection closes. ``docs/CONNECTIONS.md`` states which names count
+    and how they match. It needs ``tls=True`` and ``tls_ca_file``; unset, nothing changes."""
+    client_subjects = _mllp_client_subjects(tls_client_subjects, tls=tls, tls_ca_file=tls_ca_file)
     return ConnectionSpec(
         ConnectorType.MLLP,
         {
@@ -2741,12 +2755,67 @@ def MLLP(
             "tls_ca_file": tls_ca_file,
             "tls_ca_pin": tls_ca_pin,
             "tls_crl_file": tls_crl_file,
+            "tls_client_subjects": client_subjects,
             "tls_verify": tls_verify,
             "tls_check_hostname": tls_check_hostname,
             "tls_allow_expired": tls_allow_expired,
             "tls_ciphers": tls_ciphers,
         },
     )
+
+
+def _mllp_client_subjects(value: Any, *, tls: Any, tls_ca_file: Any) -> dict[str, list[str]] | None:
+    """``MLLP``'s ``tls_client_subjects`` checked at factory time, or ``None`` when unset (#4907).
+
+    The table's shape is ``Http``'s ``intake_client_subjects``, checked by the same function. Then
+    each rule refuses a setting that would be inert, refuse everyone with no start-time error, or
+    admit a class of certificates: an empty table, a listener with no client CA (no certificate is
+    requested, so none is listed), a name that is not ``CN:<value>`` / ``SAN:<type>:<value>``, and
+    a ``SAN:`` name :func:`~messagefoundry.credential.unmatchable_san_reason` says
+    ``cert_name_candidates`` can never yield: at least a type ``ssl`` never reports or spells
+    otherwise (``SAN:IP:...`` for ``SAN:IP Address:...``, ``SAN:dns:`` for ``SAN:DNS:``), a
+    placeholder ``ssl`` reports for a name it cannot render (``SAN:othername:<unsupported>``, the
+    X400Name and EdiPartyName forms), a value ``ssl`` may have cut short, and an IP address,
+    DirName or othername in a form ``ssl`` never writes. A placeholder or a cut-short value is
+    refused because it stands for every certificate carrying such a name, not one sender.
+    ``Http``'s ``intake_client_subjects`` checks shape only."""
+    if value is None:
+        return None
+    setting = "MLLP tls_client_subjects"
+    subjects = _intake_subjects_by_issuer(value, factory="MLLP", key="tls_client_subjects")
+    if not subjects:
+        raise WiringError(
+            f"{setting} names no issuing CA; omit the setting to leave the allowlist off, since an "
+            "empty one would read as a control that admits no one"
+        )
+    if not tls or not tls_ca_file:
+        raise WiringError(
+            f"{setting} needs tls=True and tls_ca_file: without a client CA the listener requests "
+            "no certificate, so no sender could be listed. It is an inbound setting; an outbound "
+            "connection refuses it whatever else is set"
+        )
+    unqualified = [
+        n for names in subjects.values() for n in names if not QUALIFIED_CERT_NAME.fullmatch(n)
+    ]
+    if unqualified:
+        raise WiringError(
+            f"{setting} entries must be qualified: {len(unqualified)} are not "
+            "'SAN:<type>:<value>' / 'CN:<value>', each part non-empty. A certificate's names are "
+            "matched as 'SAN:DNS:<value>' and 'CN:<value>', so any other name matches nothing and "
+            "would refuse the sender it names"
+        )
+    reasons = [
+        reason
+        for names in subjects.values()
+        for n in names
+        if (reason := unmatchable_san_reason(n)) is not None
+    ]
+    if reasons:
+        raise WiringError(
+            f"{setting} has {len(reasons)} SAN entr{'y' if len(reasons) == 1 else 'ies'} a "
+            f"certificate's names can never match as written; the first is {reasons[0]}"
+        )
+    return subjects
 
 
 def Tcp(
@@ -2946,6 +3015,13 @@ def X12(
     )
 
 
+#: ``Http()``'s failed-attempt budget defaults, per minute (ADR 0154 D6): per peer, and across all
+#: peers. The MLLP listener's ``tls_client_subjects`` refusals are charged to the same budget at
+#: these figures (BACKLOG #4907), so the two read one pair of numbers.
+INTAKE_AUTH_RATE_LIMIT_DEFAULT = 10
+INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT = 60
+
+
 def Http(
     *,
     port: int | EnvRef,
@@ -2994,9 +3070,9 @@ def Http(
         "require", "allow"
     ] = "require",  # whether GET/HEAD probes need the credential too
     intake_auth_rate_limit: int
-    | None = 10,  # FAILED intake-auth attempts per minute per peer (0/None disables)
+    | None = INTAKE_AUTH_RATE_LIMIT_DEFAULT,  # FAILED intake-auth attempts per minute per peer (0/None disables)
     intake_auth_rate_limit_global: int
-    | None = 60,  # FAILED intake-auth attempts per minute across all peers
+    | None = INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,  # FAILED intake-auth attempts per minute across all peers
     # --- Synchronous captured-downstream reply (ADR 0154 D4) — reply_from's presence is the switch ---
     reply_from: str
     | None = None,  # names the outbound whose CAPTURED reply becomes this request's HTTP body
@@ -3394,8 +3470,13 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
         )
 
 
-def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
+def _intake_subjects_by_issuer(
+    value: Any, *, factory: str = "Http", key: str = "intake_client_subjects"
+) -> dict[str, list[str]] | None:
     """``Http``'s ``intake_client_subjects`` checked for shape, or ``None`` when unset (#2287).
+
+    ``MLLP``'s ``tls_client_subjects`` (BACKLOG #4907) has the same shape and is checked here too;
+    ``factory`` and ``key`` name the setting in every refusal.
 
     The setting is a table: the DN of each issuing CA, as ``cryptography``'s ``rfc4514_string()``
     renders that CA's subject, mapped to a list of qualified subject names. This mirrors
@@ -3411,7 +3492,7 @@ def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
     with the shape to write, and there is no compatibility shim, because nothing is deployed."""
     if value is None:
         return None
-    setting = "Http intake_client_subjects"
+    setting = f"{factory} {key}"
     # An EnvRef only. In connections.toml, parse_env_setting has already turned any top-level table
     # whose keys fit {env, default, cast} into an EnvRef (refused here) or refused it itself, so no
     # raw marker arrives from a file. A code-first dict keyed "env" is not decoded; it reaches the
@@ -3425,8 +3506,9 @@ def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
         raise WiringError(
             f"{setting} must be a table keyed by the DN of the CA that issues each partner's "
             "certificate, each naming that CA's subjects, e.g. "
-            "{'CN=Acme CA,O=Acme': ['CN:partner.example']}; a flat list of subjects is no longer "
-            "read, because it let any CA in tls_ca_file issue a listed subject (BACKLOG #2287)"
+            "{'CN=Acme CA,O=Acme': ['CN:partner.example']}; a flat list of subjects is not "
+            "read, because it would let any CA in tls_ca_file issue a listed subject (BACKLOG "
+            "#2287)"
         )
     if not value:
         return None
@@ -3455,7 +3537,7 @@ def _intake_subjects_by_issuer(value: Any) -> dict[str, list[str]] | None:
                 "['CN:partner.example'], not a single value"
             )
         # The item scan first, so no message below can quote an item that is a reference.
-        _reject_envref_in_lists("Http", **{f"intake_client_subjects {issuer!r}": names})
+        _reject_envref_in_lists(factory, **{f"{key} {issuer!r}": names})
         if not names:
             raise WiringError(f"{setting} issuer {issuer!r} names no subjects")
         for index, name in enumerate(names):
@@ -4053,6 +4135,21 @@ def Direct(
     )
 
 
+class _RoleDefault:
+    """The type of :data:`_ROLE_DEFAULT`, so ``help(DICOM)`` and a signature show what it means."""
+
+    def __repr__(self) -> str:
+        return "<each role's default>"
+
+
+#: ``DICOM(max_object_bytes=...)`` left unset. One factory builds both roles and each has its own
+#: default (``transports/dicom.py``; vault BACKLOG #4908), so the factory writes no value it was not
+#: given. Typed ``Any`` so that the parameter's annotation stays ``int | None``, which is what an
+#: author may pass. DICOM is not a connections.toml transport today, so no file reads this default.
+#: Not ``_UNSET``, which is ``env()``'s.
+_ROLE_DEFAULT: Any = _RoleDefault()
+
+
 def DICOM(
     *,
     ae_title: str
@@ -4087,9 +4184,10 @@ def DICOM(
     tls_ciphers: str
     | EnvRef
     | None = None,  # BOTH: opt-in OpenSSL cipher string for THIS hop; unset = the inherited default (ADR 0188)
-    max_object_bytes: int | None = 128 * 1024 * 1024,  # per-C-STORE-object cap; over-cap → DIMSE
-    # failure BEFORE the object is decoded, and so before the durable commit (the X12
-    # max_interchange_bytes analog; OOM/DoS guard, §9)
+    max_object_bytes: int | None = _ROLE_DEFAULT,  # per-C-STORE-object cap; unset → each role's
+    # default (SCP: 16 MiB, never above it; outbound SCU: 32 MiB). SCP: over-cap → DIMSE failure
+    # BEFORE the object is decoded, and so before the durable commit (the X12
+    # max_interchange_bytes analog; OOM/DoS guard, §9). SCU: over-cap → refused before dialing
     max_associations: int = 10,  # cap concurrent associations
     max_associations_per_second: float | None = None,  # SCP: sustained association-ACCEPTANCE rate
     # (ASVS 2.4.1 / #1114). None = no bound, the shipped default — deliberately, like the listen
@@ -4120,7 +4218,10 @@ def DICOM(
     ``[egress].allowed_tcp`` (a raw socket, like X12). The destination recovers the outgoing object's
     bytes from the base64 carriage (ADR 0028), runs the blocking association **off the event loop**, and
     classifies the C-STORE status onto the retry model (out-of-resources → retry; a hard refusal →
-    dead-letter). ``test_connection`` issues a **C-ECHO** (the DIMSE reachability ping). The modern HTTP
+    dead-letter). Its ``max_object_bytes`` defaults to 32 MiB, the most an engine SCP holds of one
+    object before it aborts the association, and a raised or removed cap re-sends an object over that
+    which ends with no response a bounded number of times before it dead-letters (vault BACKLOG
+    #4908). ``test_connection`` issues a **C-ECHO** (the DIMSE reachability ping). The modern HTTP
     imaging lane is the sibling :func:`DICOMweb` STOW-RS destination.
 
     **Association-rate pacing (SCP, ASVS 2.4.1 / 15.2.2, BACKLOG #1114).**
@@ -4154,34 +4255,33 @@ def DICOM(
         presentation_contexts=presentation_contexts,
         calling_ae_allowlist=calling_ae_allowlist,
     )
-    return ConnectionSpec(
-        ConnectorType.DIMSE,
-        {
-            "ae_title": ae_title,
-            "host": host,
-            "port": port,
-            "called_ae_title": called_ae_title,
-            "presentation_contexts": presentation_contexts,
-            "calling_ae_allowlist": calling_ae_allowlist,
-            "require_called_ae_title": require_called_ae_title,
-            "tls": tls,
-            "tls_cert_file": tls_cert_file,
-            "tls_key_file": tls_key_file,
-            "tls_key_password": tls_key_password,
-            "tls_ca_file": tls_ca_file,
-            "tls_ca_pin": tls_ca_pin,
-            "tls_crl_file": tls_crl_file,
-            "tls_allow_expired": tls_allow_expired,
-            "tls_ciphers": tls_ciphers,
-            "max_object_bytes": max_object_bytes,
-            "max_associations": max_associations,
-            "max_associations_per_second": max_associations_per_second,
-            "association_burst": association_burst,
-            "max_pdu_size": max_pdu_size,
-            "timeout_seconds": timeout_seconds,
-            "connect_timeout": connect_timeout,
-        },
-    )
+    settings: dict[str, Any] = {
+        "ae_title": ae_title,
+        "host": host,
+        "port": port,
+        "called_ae_title": called_ae_title,
+        "presentation_contexts": presentation_contexts,
+        "calling_ae_allowlist": calling_ae_allowlist,
+        "require_called_ae_title": require_called_ae_title,
+        "tls": tls,
+        "tls_cert_file": tls_cert_file,
+        "tls_key_file": tls_key_file,
+        "tls_key_password": tls_key_password,
+        "tls_ca_file": tls_ca_file,
+        "tls_ca_pin": tls_ca_pin,
+        "tls_crl_file": tls_crl_file,
+        "tls_allow_expired": tls_allow_expired,
+        "tls_ciphers": tls_ciphers,
+        "max_associations": max_associations,
+        "max_associations_per_second": max_associations_per_second,
+        "association_burst": association_burst,
+        "max_pdu_size": max_pdu_size,
+        "timeout_seconds": timeout_seconds,
+        "connect_timeout": connect_timeout,
+    }
+    if max_object_bytes is not _ROLE_DEFAULT:
+        settings["max_object_bytes"] = max_object_bytes
+    return ConnectionSpec(ConnectorType.DIMSE, settings)
 
 
 def DICOMweb(
@@ -4386,10 +4486,12 @@ def Database(
     """A SQL database endpoint (**outbound only** today; via the ``[sqlserver]`` extra's ``aioodbc``).
 
     ``dialect='sqlserver'`` (default) is the **production / supported** SQL Server preset over ODBC Driver
-    18. ``dialect='generic'`` (#66) targets any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL): name
-    it in ``odbc_driver`` and pass driver-specific keywords (``PORT``, ``SSLmode``, …) via ``odbc_params``;
-    credentials stay in ``username``/``password`` (emitted under ``odbc_user_key``/``odbc_password_key`` —
-    default ``UID``/``PWD``). **On the generic path configure TLS via the driver's own keyword** (e.g.
+    18. ``dialect='generic'`` (#66) targets an OS-installed ODBC driver that reads ``SERVER`` as its
+    target (PostgreSQL / MySQL; docs/CONNECTIONS.md, *Accepted odbc_params keywords*, says what is
+    reported for a driver the engine cannot place): name it in ``odbc_driver`` and pass
+    driver-specific keywords (``PORT``, ``SSLmode``, …) via ``odbc_params``; credentials stay in
+    ``username``/``password`` (emitted under ``odbc_user_key``/``odbc_password_key`` — default
+    ``UID``/``PWD``). **On the generic path configure TLS via the driver's own keyword** (e.g.
     ``odbc_driver="PostgreSQL Unicode", odbc_params={"SSLmode": "verify-full"}``; ``odbc_driver``
     defaults to Microsoft's driver, which refuses ``SSLmode``) — the SQL-Server weakened-TLS refusal
     does not apply there.
@@ -4501,9 +4603,9 @@ def DatabasePoll(
     ``mark_statement`` to take a handled row out of ``poll_statement``'s predicate, which is the shape
     this connector already requires. Pass None/0 for the unbounded fetch.
 
-    ``dialect='generic'`` (#66) polls any OS-installed ODBC driver (PostgreSQL / Oracle / MySQL) — name it
-    in ``odbc_driver``, pass driver keywords via ``odbc_params``, and configure TLS through the driver's own
-    keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
+    ``dialect='generic'`` (#66) polls through an OS-installed ODBC driver that reads ``SERVER`` as its
+    target (PostgreSQL / MySQL; as for ``Database``) — name it in ``odbc_driver``, pass driver
+    keywords via ``odbc_params``, and configure TLS through the driver's own keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
     ``username``/``password`` (under ``odbc_user_key``/``odbc_password_key``, default ``UID``/``PWD``).
 
     At least a ``poll_statement`` of a writing shape is refused: a literal one here, when declared
@@ -6906,6 +7008,11 @@ POSSIBLY_GENERIC_DB_HOP = "possibly generic: dialect is an unresolved env() refe
 #: set (BACKLOG #5053). Where none would, the hop gets the reason every family gives instead.
 UNRESOLVED_DRIVER_REASON = "possibly delegated: odbc_driver is an unresolved env() reference"
 
+#: Opens the reason :func:`server_unread_generic_db_hops` gives when ``odbc_driver`` is an
+#: ``env()`` reference it cannot resolve, so whether the driver reads ``SERVER`` is unknown
+#: (BACKLOG #5163).
+UNRESOLVED_SERVER_DRIVER_REASON = "possibly unread: odbc_driver is an unresolved env() reference"
+
 
 #: What :func:`_db_setting` returns for an ``env()`` reference it cannot resolve.
 _UNRESOLVED = object()
@@ -7049,6 +7156,70 @@ def unverified_generic_db_hops(
                 out.append(
                     (record_name(conn.name), f"{reason} ({_peer_label(conn.spec.settings)})")
                 )
+    return sorted(out)
+
+
+def server_unread_generic_db_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
+    """The generic-ODBC ``DATABASE`` connections whose ``odbc_driver`` the engine cannot place as
+    a family documented to read ``SERVER`` as its target, as ``(name, reason)`` (BACKLOG #5163).
+
+    What that costs ``[egress].allowed_db`` is stated once, in docs/CONNECTIONS.md, *Accepted
+    odbc_params keywords*. The construction WARNING
+    (``transports.database._warn_generic_server_unread``) is this list's other surface, and both
+    read :func:`~messagefoundry.transports.database.odbc_driver_reads_server`, imported lazily for
+    the one-way rule. Listed is not a finding that the driver ignores ``SERVER``, only that the
+    engine cannot place it; refusing such a name is BACKLOG #5041, not this.
+
+    Read as :func:`unverified_generic_db_hops` reads the graph: both connection tables, inbound
+    names prefixed ``inbound:``; an ``env()`` dialect resolved against ``env_values`` when given and
+    otherwise read as possibly generic; a ``deployed=False`` connection with an ``env()`` dialect
+    skipped (ADR 0111 AC-1). An ``env()`` ``odbc_driver`` is resolved as that function resolves
+    it, never on a ``deployed=False`` connection, and one left unresolved is listed as possibly
+    unread, naming the reference's key and never its value. ``registry.lookups`` is not walked, for
+    the reason that function gives: ``DatabaseLookup`` and ``DatabaseRef`` take no dialect.
+
+    Pure -- it reads the loaded graph and touches nothing else."""
+    from messagefoundry.transports.database import SERVER_UNREAD_REASON, odbc_driver_reads_server
+
+    def unread(settings: Mapping[str, Any], *, deployed: bool) -> str | None:
+        dialect = _db_dialect(settings, env_values)
+        if dialect is not None and dialect != "generic":
+            return None
+        raw_driver = settings.get("odbc_driver")
+        # ADR 0111 AC-1: a not-deployed connection's env() values are never resolved, so its
+        # env() driver stays unread and is listed as such, as unverified_generic_db_hops lists it.
+        driver = _db_setting(settings, "odbc_driver", None, env_values if deployed else None)
+        # Only an env() reference resolves to _UNRESOLVED, so raw_driver has a key to name.
+        if driver is _UNRESOLVED and isinstance(raw_driver, EnvRef):
+            reason = (
+                f"{UNRESOLVED_SERVER_DRIVER_REASON} (env({raw_driver.key})); if it names no "
+                "driver family documented to read SERVER, the host checks on server may not bind"
+            )
+        elif odbc_driver_reads_server(driver):
+            return None
+        else:
+            reason = SERVER_UNREAD_REASON
+        if dialect is not None:
+            return reason
+        key = settings["dialect"].key
+        return f"{POSSIBLY_GENERIC_DB_HOP} (env({key})); if it is generic, {reason}"
+
+    out: list[tuple[str, str]] = []
+    for record_name, table in (
+        (_outbound_record_name, registry.outbound),
+        (inbound_record_name, registry.inbound),
+    ):
+        for conn in table.values():
+            if conn.spec.type is not ConnectorType.DATABASE or _dark_env_dialect(conn):
+                continue
+            reason = unread(conn.spec.settings, deployed=conn.deployed)
+            if reason is not None:
+                # The server alone: the generic string never sends the ``port`` setting, so the
+                # label must not print its 1433 default as the endpoint.
+                peer = _peer_label({"server": conn.spec.settings.get("server")})
+                out.append((record_name(conn.name), f"{reason} ({peer})"))
     return sorted(out)
 
 
@@ -8071,6 +8242,14 @@ def build_outbound_connection(
     refuse_capture_conflicts(
         spec.type, spec.settings, f"outbound connection {name!r}", batched=batch is not None
     )
+    if spec.settings.get("tls_client_subjects"):
+        # BACKLOG #4907: an inbound control. A destination never reads it, so an outbound that sets
+        # it would read as pinning the downstream server's identity while pinning nothing.
+        raise WiringError(
+            f"outbound connection {name!r}: tls_client_subjects names the senders an inbound "
+            "listener admits; a destination never reads it, so it is refused here. To pin the "
+            "downstream server, use tls_ca_file (and tls_ca_pin)."
+        )
     # ADR 0015: WS-* / mutual-TLS validity for SOAP, at `check`/dry-run time (no store). The url-scheme
     # checks (https required for a client cert, cleartext-credential refusal) need the resolved url and
     # run in SoapDestination.__init__; the structural ones below work on the unresolved spec (an EnvRef

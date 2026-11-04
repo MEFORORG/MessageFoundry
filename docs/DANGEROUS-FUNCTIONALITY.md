@@ -799,6 +799,9 @@ or compression library:
   gzipped. A sanitized SVG inside is served gzipped again. The inflated bytes stay in memory; nothing
   is written to disk, and the stored attachment is never changed.
 - `support/bundle.py` only writes a zip, the support bundle. It reads none.
+- `transports/dicom.py` imports `zlib` only for its CRC-32 and Adler-32 checksums. The DICOM SCU's
+  `_unanswered_key` keys its count of unanswered stores by an outbound object's length and both
+  checksums. It decompresses nothing and opens no archive, so it has nothing to bound.
 
 ---
 

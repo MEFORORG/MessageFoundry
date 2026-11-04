@@ -96,6 +96,8 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
 )
 from messagefoundry.config.wiring import (
+    INTAKE_AUTH_RATE_LIMIT_DEFAULT,
+    INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,
     FhirLookupSpec,
     InboundConnection,
     OutboundConnection,
@@ -164,6 +166,7 @@ from messagefoundry.pipeline.ingress_guards import (
     check_declared_type,
     check_decoded,
     decode_body,
+    ingress_encoding,
     peek_max_bytes,
     reingress_size_error,
     streaming_over_threshold,
@@ -242,6 +245,7 @@ from messagefoundry.transports.admission import RefusalLog
 from messagefoundry.transports.base import (
     ENCODING_CODE,
     ConnectionEventSink,
+    InboundHandler,
     IntakeAuditSink,
     IntakeGate,
     IntakeRateLimiter,
@@ -349,6 +353,9 @@ class _IntakeRateLimiter:
         if self._global is None or self._authenticated_recently(peer):
             return True
         return self._global.would_allow(peer)
+
+    def check_peer(self, peer: str) -> bool:
+        return self._per_peer.would_allow(peer)
 
     def charge_failure(self, peer: str) -> None:
         self._per_peer.allow(peer)
@@ -621,6 +628,31 @@ _REFUSAL_LOG_MAX_PAIRS = 4096
 
 # Most message ids one STOP dead-letter line names; past this it names the first ones and a count.
 _STOP_LINE_MAX_MESSAGES = 10
+
+
+async def _forget_dead_payload(
+    connector: DestinationConnector, sent: str | None, failed: FailOutcome
+) -> None:
+    """Tell ``connector`` to forget ``sent`` once a transient failure dead-lettered its row at the
+    retry cap (vault BACKLOG #4908). The row has left the lane, so a connector's memory of its sends
+    would only shorten a replay of it. ``sent`` is ``None`` when no live send was attempted. By
+    ``getattr``, as ``consumes_metadata`` is read, so a stand-in connector without the hook is still
+    a connector. Best effort: it runs after the DEAD write, inside the arm that still has the alert
+    checks to run, so a failure is logged by type and goes no further."""
+    if not failed.dead or sent is None:
+        return
+    forget = getattr(connector, "forget_payload", None)
+    if forget is None:
+        return
+    try:
+        await forget(sent)
+    except Exception as exc:  # noqa: BLE001 - a connector's cache hook must not skip the alert checks
+        log.warning(
+            "delivery worker: %s.forget_payload failed after a dead-letter (%s); its memory of that "
+            "row's sends is kept",
+            type(connector).__name__,
+            type(exc).__name__,
+        )
 
 
 def _note_stop_dead_letter(worker: str, name: str, failed: FailOutcome, stage: str) -> None:
@@ -1056,6 +1088,34 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     DocRefError,
     EscapedDocumentError,
 )
+
+#: BACKLOG #4907: the stored reason, and the MSA-3 text, for a message from a sender whose verified
+#: certificate is not on its inbound's allowlist. Fixed strings, because a certificate subject can
+#: name a person and neither the row nor the reply may carry one.
+_UNLISTED_SENDER_ERROR = (
+    "sender refused: its verified certificate is not on this inbound's certificate-subject "
+    "allowlist under its issuing CA"
+)
+_UNLISTED_SENDER_NAK_TEXT = "sender not permitted"
+#: How far into a refused body the AR's header echo looks for the end of MSH, so a large refused
+#: body is never parsed whole to echo it. The MLLP listener's handler-fault NAK bounds its own scan
+#: separately, at a larger figure; an MSH longer than this is echoed from its first part only.
+_UNLISTED_SENDER_HEADER_SCAN_BYTES = 4096
+
+
+def _header_segment(raw: bytes, encoding: str) -> str:
+    """The first segment of a refused body, decoded in the inbound's charset, for the AR's echo.
+
+    Bounded and lenient: nothing past the first segment break is read, and a segment that does not
+    decode strictly gives ``""``, so ``build_ack`` falls back to its own header defaults. Strict, not
+    ``errors="replace"``: a U+FFFD echoed into the AR would not re-encode under a charset such as
+    ``ascii``, and the reply would then fail to frame after the row was written."""
+    prefix = raw[:_UNLISTED_SENDER_HEADER_SCAN_BYTES].lstrip()
+    breaks = [i for i in (prefix.find(b"\r"), prefix.find(b"\n")) if i >= 0]
+    try:
+        return prefix[: min(breaks, default=len(prefix))].decode(encoding)
+    except (LookupError, UnicodeDecodeError):
+        return ""
 
 
 def _detach_refusal_kind(exc: Exception) -> RefusalKind:
@@ -2291,6 +2351,13 @@ class RegistryRunner:
             and str(ic.spec.settings.get("intake_auth") or "none") != "none"
         )
 
+    def _sender_allowlist_enabled(self, ic: InboundConnection) -> bool:
+        # BACKLOG #4907: the MLLP listener's tls_client_subjects refuses a peer at intake on the
+        # same decision as HTTP's mtls_subject, so it gets the same audit sink and budget.
+        return ic.spec.type is ConnectorType.MLLP and bool(
+            ic.spec.settings.get("tls_client_subjects")
+        )
+
     def _make_intake_audit_sink(self, ic: InboundConnection) -> IntakeAuditSink | None:
         """The per-inbound tamper-evident audit sink for intake-auth refusals (ADR 0154 D6).
 
@@ -2302,7 +2369,7 @@ class RegistryRunner:
         This is the engine's first internal writer of ``record_audit(client=)`` (ADR 0150), and the
         column's "NULL means no client was in scope" docstring is exactly why: here one demonstrably is.
         """
-        if not self._intake_auth_enabled(ic):
+        if not (self._intake_auth_enabled(ic) or self._sender_allowlist_enabled(ic)):
             return None
         # The runner holds its store as the narrower QueueStore; record_audit lives on AuditStore
         # (Store = QueueStore + AuditStore + AuthStore), which all three shipped backends implement.
@@ -2372,7 +2439,14 @@ class RegistryRunner:
         return dict(self._sync_reply_metrics)
 
     def _make_intake_rate_limiter(self, ic: InboundConnection) -> IntakeRateLimiter | None:
-        """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled."""
+        """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled.
+
+        An MLLP inbound with ``tls_client_subjects`` (BACKLOG #4907) has no budget settings of its
+        own and gets the ``Http()`` factory's defaults."""
+        if self._sender_allowlist_enabled(ic):
+            return _IntakeRateLimiter(
+                per_peer=INTAKE_AUTH_RATE_LIMIT_DEFAULT, glob=INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT
+            )
         if not self._intake_auth_enabled(ic):
             return None
         per_peer = int(ic.spec.settings.get("intake_auth_rate_limit") or 0)
@@ -5037,7 +5111,8 @@ class RegistryRunner:
         # drops only, so a legitimate X12/DICOM/binary drop is not wrongly rejected.
         source.content_type = ic.content_type
         # Inject the intake-auth seams (ADR 0154 D6) the same runtime way. Both are None unless this
-        # inbound actually authenticates, so every other connection stays byte-identical. The audit
+        # inbound actually authenticates, or is an MLLP inbound with tls_client_subjects (BACKLOG
+        # #4907), so every other connection stays byte-identical. The audit
         # sink keeps transports/ store-free; the limiter is a SYNCHRONOUS predicate, so transports/
         # gains no auth/ edge either — pipeline/ owns both, which is the only layer allowed to.
         source.on_intake_audit = self._make_intake_audit_sink(ic)
@@ -5059,6 +5134,13 @@ class RegistryRunner:
         # measurement. A source consults it BEFORE it reads: a listener before its next socket read,
         # the DICOM SCP before it accepts a new association, a poll source or timer at its tick.
         source.intake_gate = self._intake_gate
+        # BACKLOG #4907: the refusal a listener hands a message from a sender whose verified
+        # certificate is not on its allowlist, injected the same runtime way. None unless this
+        # inbound keeps one, like the intake-auth seams above, so every other inbound is
+        # byte-identical.
+        source.refuse_unlisted_sender = (
+            self._make_unlisted_sender_refusal(ic) if self._sender_allowlist_enabled(ic) else None
+        )
         # Vault BACKLOG #2608: a poll source's refusals are stored whole, never as a head, because the
         # file it deletes or the row it marks was the only copy. Keyed on the transport's own declared
         # contract, not on a connector type (CLAUDE.md section 4).
@@ -8027,6 +8109,59 @@ class RegistryRunner:
 
         return on_message
 
+    def _make_unlisted_sender_refusal(self, ic: InboundConnection) -> InboundHandler:
+        # BACKLOG #4907: the source's `refuse_unlisted_sender` seam, bound to this inbound.
+        async def refuse(raw: bytes) -> str | None:
+            return await self._refuse_unlisted_sender(ic, raw)
+
+        return refuse
+
+    async def _refuse_unlisted_sender(self, ic: InboundConnection, raw: bytes) -> str | None:
+        """Record a message from a sender outside the inbound's certificate-subject allowlist as
+        ``ERROR``, then return the ``AR`` reply, or ``None`` where the inbound sends none (BACKLOG
+        #4907).
+
+        The order is the one #2607's closing step 5 set: the row is committed before the reply is
+        built, so the message is counted and logged, never accepted and dropped. ``AR``, not ``AE``,
+        because the same sender is refused the same way on every resend; the engine's own MLLP
+        destination dead-letters an ``AR`` at once. Nothing from the certificate reaches the row, the
+        reply or the log: the reason and the MSA-3 text are fixed, because a subject can name a
+        person. The body is kept under the refused-body allowance, as every other refusal's is.
+
+        On an inbound that is not HL7 v2, or whose acknowledgements are off, there is no HL7 reply
+        to give, so this returns ``None`` and the listener closes the connection with no reply; the
+        close, with nothing written, is that feed's refusal. The body is stored as received, before
+        any decode, and the message is never routed. On an HL7 v2 inbound that replies, only its
+        first segment is then decoded, in the inbound's charset and bounded to the first
+        ``_UNLISTED_SENDER_HEADER_SCAN_BYTES``, and parsed by ``build_ack`` for the ``AR``'s header
+        echo; nothing past that segment is decoded or parsed."""
+        hl7v2 = ic.content_type is ContentType.HL7V2
+        mid = await self._record_refused(
+            ic,
+            raw,
+            None,
+            error=_UNLISTED_SENDER_ERROR,
+            message_type=None if hl7v2 else ic.content_type.value,
+        )
+        if not hl7v2 or ic.ack_mode is AckMode.NONE:
+            return None
+        ack = build_ack(
+            _header_segment(raw, ingress_encoding(ic)),
+            code="AR",
+            text=_UNLISTED_SENDER_NAK_TEXT,
+            ack_mode=ic.ack_mode,
+        )
+        if self._capture_ack_enabled(ic):
+            await self._capture_ack(
+                mid,
+                ic.name,
+                ack_code="AR",
+                ack_phase="ingest",
+                ack_body=None,
+                detail=_UNLISTED_SENDER_ERROR,
+            )
+        return ack
+
     def _make_http_handler(self, ic: InboundConnection):  # type: ignore[no-untyped-def]
         # The HTTP listen source (ADR 0023) needs the engine message_id back so its 202 respond-with-
         # receipt can carry it (AC-2) — distinct from the MLLP/TCP handler, whose str return is a wire
@@ -9303,6 +9438,9 @@ class RegistryRunner:
                 1,
             )
             return _ItemOutcome.STOPPED, None
+        # The payload handed to connector.send, for forget_payload once a transient failure
+        # dead-letters the row at the retry cap. None until a live send is attempted.
+        sent: str | None = None
         try:
             if self._simulate.get(name, False):
                 # Shadow / parallel-run (#15): suppress the real egress entirely — no bytes/
@@ -9345,7 +9483,7 @@ class RegistryRunner:
                 # before the send (BEFORE the send timer — a store read, not the partner round-trip). A
                 # payload with no handle is returned byte-identical; a missing attachment raises a
                 # DeliveryError (caught below → retry), so a handle NEVER reaches the connector.
-                payload = await self._hydrate_payload(item.payload)
+                payload = sent = await self._hydrate_payload(item.payload)
                 _send_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
                 if getattr(connector, "consumes_metadata", False):
                     # #68: an opted-in outbound (REST/FHIR with dynamic_headers) gets this message's
@@ -9396,6 +9534,7 @@ class RegistryRunner:
                 failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
                 retry_until = failed.retry_at
                 self._note_retry_exhausted(name, exc, failed, message_id=item.message_id)
+                await _forget_dead_payload(connector, sent, failed)
                 await self._delivery_failure_alert_checks(name)
         except CellTagError as exc:
             # BACKLOG #2593: the dynamic_headers metadata read met a cell that fails its channel
@@ -9424,6 +9563,7 @@ class RegistryRunner:
             failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
             retry_until = failed.retry_at
             self._note_retry_exhausted(name, exc, failed, message_id=item.message_id)
+            await _forget_dead_payload(connector, sent, failed)
             await self._delivery_failure_alert_checks(name)
             # #46: edge-trigger connection_lost (+ throttled alert) on the lane going down.
             self._note_lane_unhealthy(name, item.id, exc)
@@ -10441,7 +10581,24 @@ class RegistryRunner:
         # Peek the reply body for the loopback's content_type (in pipeline/, not the store), then
         # hand off in one atomic transaction. response_body_for_work_row reads the same immutable
         # artifact ingress_handoff re-reads for the message raw, so peek and raw always agree.
-        body = await self.store.response_body_for_work_row(item.id) or ""
+        try:
+            body = await self.store.response_body_for_work_row(item.id) or ""
+        except CipherError as exc:
+            # BACKLOG #4995: an undecryptable reply body fails on every pass, so the fault arm
+            # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a claim
+            # does an unopenable payload; the token keeps its reference for a replay. The handoff
+            # below is not wrapped: its encrypt's invocation ceiling is a deliberate hard stop, so
+            # any CipherError the handoff raises still takes the fault arm.
+            log.warning(
+                "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
+                name,
+                item.id,
+                type(exc).__name__,
+            )
+            await self.store.dead_letter_now(
+                item.id, f"undecryptable re-ingress reply: {safe_exc(exc)}"
+            )
+            return _ItemOutcome.PROCESSED, None
         # BACKLOG #1914: the engine ceiling the listeners enforce (SEC-017), checked before the peek so
         # an oversize non-HL7 body is recorded ERROR with the listener's wording and never routed. An
         # HL7 body meets the same ceiling inside Peek.parse.

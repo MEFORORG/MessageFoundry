@@ -53,7 +53,7 @@ from messagefoundry.auth.service import AuthService, _directory_login_refusal
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.settings import ApiSettings, AuthSettings
 from messagefoundry.config.tls_policy import HopPosture
-from messagefoundry.config.wiring import Http, WiringError
+from messagefoundry.config.wiring import MLLP, Http, WiringError
 from messagefoundry.pipeline.wiring_runner import check_inbound_revocation
 from messagefoundry.store.store import LockoutCounter, UserRecord, lockout_escalates
 from tests._ast_sites import call_sites
@@ -72,7 +72,10 @@ _LOGIN_ENTRY_POINTS = frozenset(
 #: Row token -> the setting whose existence proves the pathway still ships: a settings-model field, or
 #: a parameter of a connector factory. ``None`` = always available (Local needs no switch). ``mTLS`` is
 #: the fifth pathway and the first non-interactive one; HTTP intake authentication is the sixth, on the
-#: ingest plane (owner ruling 2026-09-23: ``intake_auth`` IS an authentication pathway).
+#: ingest plane (owner ruling 2026-09-23: ``intake_auth`` IS an authentication pathway). MLLP intake
+#: authentication, ``tls_client_subjects``, is the seventh, counted by the record's criterion rather
+#: than by that ruling, which named ``intake_auth`` only: a connector-factory parameter that
+#: authenticates a submitting peer by a subject list is a pathway (BACKLOG #4907).
 _PATHWAY_ANCHORS: dict[str, tuple[Callable[..., Any], str] | None] = {
     "**Local**": None,
     "**AD**": (AuthSettings, "ad_enabled"),
@@ -80,14 +83,20 @@ _PATHWAY_ANCHORS: dict[str, tuple[Callable[..., Any], str] | None] = {
     "**OIDC federation**": (AuthSettings, "oidc_enabled"),
     "**mTLS service identity**": (ApiSettings, "tls_client_cert_identities"),
     "**HTTP intake authentication**": (Http, "intake_auth"),
+    "**MLLP intake authentication**": (MLLP, "tls_client_subjects"),
 }
 
 #: Pathways that live on the INGEST plane rather than the engine API. Neither the ``AuthService``
 #: derivation nor the ``api.security`` factory derivation can see them, so the set is checked against
-#: the ``config.wiring`` factories that take an ``intake_auth`` parameter instead (see
+#: the ``config.wiring`` factories that take one of :data:`_INGEST_AUTH_PARAMETERS` instead (see
 #: ``test_ingest_plane_pathways_are_derived_from_the_connector_factories``).
-_INGEST_PLANE_PATHWAYS = frozenset({"**HTTP intake authentication**"})
-_INGEST_PLANE_FACTORIES = frozenset({"Http"})
+_INGEST_PLANE_PATHWAYS = frozenset(
+    {"**HTTP intake authentication**", "**MLLP intake authentication**"}
+)
+_INGEST_PLANE_FACTORIES = frozenset({"Http", "MLLP"})
+#: The connector-factory parameters that authenticate a submitting peer: ``Http``'s ``intake_auth``
+#: and ``MLLP``'s ``tls_client_subjects`` (BACKLOG #4907).
+_INGEST_AUTH_PARAMETERS = frozenset({"intake_auth", "tls_client_subjects"})
 
 #: Companion-table row labels, in the primary table's order. The two tables label rows differently,
 #: so the order check needs the mapping rather than a string compare.
@@ -98,10 +107,19 @@ _COMPANION_LABELS = (
     "**OIDC**",
     "**mTLS**",
     "**HTTP intake**",
+    "**MLLP intake**",
 )
 
 #: Tokens the numbered-6.1.3 paragraph must enumerate — it is the artefact that cites the requirement.
-_PARAGRAPH_TOKENS = ("Local", "AD", "Kerberos", "OIDC", "mTLS", "intake_auth")
+_PARAGRAPH_TOKENS = (
+    "Local",
+    "AD",
+    "Kerberos",
+    "OIDC",
+    "mTLS",
+    "intake_auth",
+    "tls_client_subjects",
+)
 
 #: Every public dependency factory in ``messagefoundry.api.security``. The interactive derivation
 #: above covers ``AuthService``; this covers the NON-interactive plane, which is where a new
@@ -204,8 +222,8 @@ def test_row_count_tracks_the_login_entry_points_in_code() -> None:
     )
     # complete_oidc_login + authenticate_oidc are two legs of ONE pathway, so 4 entry points collapse
     # to 3 interactive pathways beyond Local; +Local +mTLS = 5 API-plane rows, +HTTP intake on the
-    # ingest plane = 6 (owner ruling 2026-09-23).
-    assert len(_PATHWAY_ANCHORS) == 6
+    # ingest plane = 6 (owner ruling 2026-09-23), +MLLP intake on the ingest plane = 7 (#4907).
+    assert len(_PATHWAY_ANCHORS) == 7
     # BLIND SPOT CLOSED. The public-coroutine derivation above cannot see a new pathway added
     # through the EXISTING public entry point: ``login()`` dispatches on ``AuthProvider`` into a
     # PRIVATE ``_login_<provider>`` coroutine, so a new enum member + ``_login_saml`` would change
@@ -276,17 +294,19 @@ def test_companion_table_covers_the_remaining_strength_dimensions() -> None:
 
 def test_ingest_plane_pathways_are_derived_from_the_connector_factories() -> None:
     """RULE: a connector factory that takes ``intake_auth`` authenticates a submitting peer, which
-    the owner ruled (2026-09-23) is an authentication pathway. A second one needs its own row."""
+    the owner ruled (2026-09-23) is an authentication pathway. A second one needs its own row.
+    ``MLLP``'s ``tls_client_subjects`` is the second (BACKLOG #4907)."""
     import messagefoundry.config.wiring as wiring
 
     factories = {
         name
         for name, member in inspect.getmembers(wiring, inspect.isfunction)
         if member.__module__ == wiring.__name__
-        and "intake_auth" in inspect.signature(member).parameters
+        and _INGEST_AUTH_PARAMETERS & set(inspect.signature(member).parameters)
     }
     assert factories == _INGEST_PLANE_FACTORIES, (
-        f"the connector factories taking intake_auth changed: {sorted(factories)}. Each is an "
+        f"the connector factories taking {sorted(_INGEST_AUTH_PARAMETERS)} changed: "
+        f"{sorted(factories)}. Each is an "
         "ingest-plane authentication pathway -- give it a comparative-strength row in "
         "docs/SECURITY.md and update _INGEST_PLANE_PATHWAYS in the same change (ASVS 6.1.3)."
     )
@@ -514,7 +534,7 @@ def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> N
     block = _section()
     paragraph = block[block.index("ASVS 6.1.3") :]
     assert token in paragraph, (
-        "the ASVS 6.1.3 paragraph must name the switch that strips three of the six pathways of "
+        "the ASVS 6.1.3 paragraph must name the switch that strips three of the seven pathways of "
         "their engine-side throttles — that is the comparative-strength answer the requirement wants."
     )
 

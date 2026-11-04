@@ -1425,7 +1425,7 @@ release-tools = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aioodbc", marker = "extra == 'sqlserver'", specifier = ">=0.5" },
+    { name = "aioodbc", marker = "extra == 'sqlserver'", specifier = "==0.5.0" },
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "argon2-cffi", specifier = ">=23.1" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.30" },

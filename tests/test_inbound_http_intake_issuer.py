@@ -192,6 +192,9 @@ class _Ledger:
     def check(self, peer: str) -> bool:
         return True
 
+    def check_peer(self, peer: str) -> bool:
+        return True
+
     def charge_failure(self, peer: str) -> None:
         self.charges.append(peer)
 
