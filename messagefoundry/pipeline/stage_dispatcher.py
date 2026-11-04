@@ -295,6 +295,12 @@ class _LaneState:
     # BACKLOG #2074: consecutive claimer deaths raised while this lane was being dispatched. Reset
     # by a serializer handoff, by the stop itself and by every re-arm; see _stop_claimer_killer.
     claimer_deaths: int = 0
+    # BACKLOG #4607: consecutive serializer deaths on this lane with no terminal transition between
+    # them, which pace the respawn in _on_lane_task_done. Reset by the terminal transition.
+    serializer_deaths: int = 0
+    # BACKLOG #4607: rows the lane's serializer claimed outside its prefix (a batching outbound's
+    # coalesced members) and was killed holding (note_held). Its replacement re-pends them too.
+    held_extra_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1369,40 +1375,159 @@ class StageDispatcher:
     # --- lane serializer (T9, T13-T17) --------------------------------------
 
     def _spawn_serializer(self, lane: str, items: list[OutboxItem]) -> None:
+        # BACKLOG #1611: the lease these rows were claimed under, read right after the claim.
+        fence = RependFence.capture(self._is_leader, self._current_epoch)
+        st = self._states.get(lane)
+        if st is not None:
+            st.held_extra_ids.clear()  # a fresh claim: nothing a dead serializer held is left
+        self._start_serializer(lane, items, fence)
+
+    def note_held(self, lane: str, ids: list[str]) -> None:
+        """Record rows the serializer of ``lane`` claimed beyond its prefix and is dying holding,
+        before the ``BaseException`` that kills it propagates, so the replacement re-pends them with
+        the prefix (BACKLOG #4607). The batching outbound body calls it for its coalesced members,
+        which it claims itself. Synchronous and write-free, because nothing may be awaited on that
+        path."""
+        st = self._states.get(lane)
+        if st is not None:
+            st.held_extra_ids.extend(ids)
+
+    def _start_serializer(
+        self,
+        lane: str,
+        items: list[OutboxItem],
+        fence: RependFence,
+        *,
+        recover: bool = False,
+        delay: float = 0.0,
+    ) -> None:
         if lane in self._lane_tasks:
             self._busy_violations += 1  # a live serializer already owns this lane — invariant break
-        task = asyncio.create_task(self._run_lane(lane, items), name=f"lane:{lane}")
-        task.add_done_callback(functools.partial(self._on_lane_task_done, lane))
+        task = asyncio.create_task(
+            self._run_lane(lane, items, fence=fence, recover=recover, delay=delay),
+            name=f"lane:{lane}",
+        )
+        task.add_done_callback(functools.partial(self._on_lane_task_done, lane, items, fence))
         self._lane_tasks[lane] = task
 
-    def _on_lane_task_done(self, lane: str, task: asyncio.Task[None]) -> None:
-        """Supervise the serializer — the one otherwise-unsupervised task class. ``_run_lane`` pops
-        ``_lane_tasks`` itself on the normal path; this is an idempotent safety net that also SURFACES a
-        swallowed terminal-transition bug (the synchronous transition in ``_run_lane`` runs outside a
-        try, so a stray error there would otherwise vanish and wedge the lane in PROCESSING)."""
+    def _on_lane_task_done(
+        self, lane: str, items: list[OutboxItem], fence: RependFence, task: asyncio.Task[None]
+    ) -> None:
+        """Supervise the serializer. ``_run_lane`` pops ``_lane_tasks`` itself on the normal path;
+        this is an idempotent safety net, and it RESPAWNS a serializer that died before its
+        terminal transition (BACKLOG #4607).
+
+        A serializer that dies that way, at least by a ``BaseException`` that is not an
+        ``Exception`` (``_drain_lane`` and the holds catch ``Exception`` only), leaves its lane
+        PROCESSING with its slot held, and the rows it had not resolved INFLIGHT. Before #4607 the
+        lane then stayed that way until a restart. The replacement owns the lane from this callback
+        on, so no claim can take a later row in the meantime, and it runs no body: it re-pends the
+        dead serializer's whole prefix, dated, then applies the terminal transition, exactly as a
+        T17 fault at the head does (:meth:`_dead_serializer_outcome`). Every write is guarded
+        ``status='inflight'``, so a row the dead serializer had already resolved is untouched; the
+        fence is the one its rows were claimed under, so the retries are gated as a T17 head's are.
+
+        A lane whose dead serializer had already left PROCESSING (its terminal transition raised
+        part way) is only logged, as before: what it holds is no longer this prefix. A replacement
+        that dies too is respawned after a backoff, ``serializer_deaths`` counting the deaths with
+        no terminal transition between them. A row that kills every serializer at its head is
+        bounded the way a T17 fault is: each recovery is a zero-progress infra fault, so the
+        lane's ``infra_error_streak`` grows, its park backs off, and ``infra_fault_policy`` STOPs
+        it or pages ``lane_stuck``. A stop, a cancel and the teardown are not respawned; their rows
+        wait for the next start, as a cancelled serializer's do."""
         if self._lane_tasks.get(lane) is task:
             self._lane_tasks.pop(lane, None)
         if task.cancelled() or self._stop.is_set():
             return
         exc = task.exception()
-        if exc is not None:
+        if exc is None:
+            return
+        st = self._states.get(lane)
+        if st is None or st.phase is not _LanePhase.PROCESSING or lane in self._lane_tasks:
             log.error(
                 "StageDispatcher %s lane %s serializer task crashed (state may be inconsistent)",
                 self._stage.value,
                 lane,
                 exc_info=exc,
             )
+            return
+        st.serializer_deaths += 1
+        delay = (
+            0.0
+            if st.serializer_deaths == 1
+            else _capped_backoff(
+                _RESPAWN_BACKOFF_BASE_SECONDS,
+                st.serializer_deaths - 2,
+                _RESPAWN_BACKOFF_CAP_SECONDS,
+            )
+        )
+        log.error(
+            "StageDispatcher %s lane %s serializer died holding %d claimed row(s); respawning it "
+            "to re-pend them before the lane claims again (consecutive death %d, delay %.2fs)",
+            self._stage.value,
+            lane,
+            len(items),
+            st.serializer_deaths,
+            delay,
+            exc_info=exc,
+        )
+        self._start_serializer(lane, items, fence, recover=True, delay=delay)
 
-    async def _run_lane(self, lane: str, items: list[OutboxItem]) -> None:
+    def _dead_serializer_outcome(
+        self, lane: str, items: list[OutboxItem]
+    ) -> tuple[_LaneOutcome, list[str], list[str], float]:
+        """What a replacement for a dead serializer applies (:meth:`_on_lane_task_done`): the T17
+        outcome of a zero-progress fault at the head, as ``_drain_lane``'s ``except`` arm builds it,
+        with every claimed row re-pended to the same date rather than the head alone.
+
+        The dead serializer left no record of where it stopped, so every row is dated, with the rows
+        it claimed beyond the prefix and recorded before it died (:meth:`note_held`): the ones it
+        resolved are not INFLIGHT and the write leaves them alone, and a row it had not reached
+        keeps its ``seq`` and waits behind the head anyway. Releasing the tail past-due instead
+        would let the sweep re-ready the lane at its cadence whenever the dead row was not the
+        first, the spin fix A collapses. Returns ``(outcome, tail, rows to date, date)``."""
+        st = self._states.get(lane)
+        streak = st.infra_error_streak if st is not None else 0
+        park_until = self._clock() + self._infra_backoff(streak)
+        outcome = _LaneOutcome(
+            LaneResultKind.RETRY, park_until, is_infra_fault=True, made_progress=False
+        )
+        held = [it.id for it in items] + (list(st.held_extra_ids) if st is not None else [])
+        return outcome, [], held, park_until
+
+    async def _run_lane(
+        self,
+        lane: str,
+        items: list[OutboxItem],
+        *,
+        fence: RependFence | None = None,
+        recover: bool = False,
+        delay: float = 0.0,
+    ) -> None:
         """Drain the claimed prefix strictly oldest-first (K fully resolved before K+1 — ADR 0058's
         in-batch head-of-line), then apply the terminal transition. The unprocessed tail is
         ``release_claimed``'d (attempts restored, FIFO-neutral) on a park/stop/exception. The final
         state mutation runs synchronously after the (async) tail release so it is atomic on the loop
-        (no double-dispatch window)."""
+        (no double-dispatch window).
+
+        ``recover`` is the replacement for a serializer that DIED holding ``items``
+        (:meth:`_on_lane_task_done`): it runs no body, waits ``delay`` first, and treats the whole
+        prefix as a T17 head (:meth:`_dead_serializer_outcome`)."""
         # BACKLOG #1611: the lease these rows were claimed under, read before the body runs, so a
-        # lease change during the body or the first re-pend still fences the retries.
-        fence = RependFence.capture(self._is_leader, self._current_epoch)
-        outcome, tail_ids, head_reschedule = await self._drain_lane(lane, items)
+        # lease change during the body or the first re-pend still fences the retries. A dispatched
+        # serializer is handed the one read at its spawn, which its replacement reuses.
+        if fence is None:
+            fence = RependFence.capture(self._is_leader, self._current_epoch)
+        head_ids: list[str] = []
+        when = 0.0
+        if recover:
+            if delay > 0.0 and await self._slept_into_stop(delay):
+                return  # teardown: the rows stay INFLIGHT for the next start
+            outcome, tail_ids, head_ids, when = self._dead_serializer_outcome(lane, items)
+        else:
+            outcome, tail_ids, head_reschedule = await self._drain_lane(lane, items)
+            if head_reschedule is not None:
+                head_ids, when = [head_reschedule[0]], head_reschedule[1]
         # Fix A (ADR 0070): re-pend the T17 head with a DURABLE backoff BEFORE the tail release.
         # This is NOT release_claimed: it dates the head into the future so it reads not-due (collapsing
         # the ~4×/s spin) rather than past-due (which re-readies it at the sweep cadence).
@@ -1420,8 +1545,7 @@ class StageDispatcher:
         # held now; when the head's hold did not land, it is sent once, as before step 2, and only
         # under the fence. _land_while_holding says the rest.
         head = tail = HoldResult.LANDED
-        if head_reschedule is not None:
-            head_id, when = head_reschedule
+        if head_ids:
             # The head is dated `when`, and _drain_lane parks its RETRY outcome until that same
             # date. Only a retry that runs past it dates the head from now instead, by the same
             # escalated span, so it never lands past-due and fix A's backoff is kept; the lane then
@@ -1433,11 +1557,14 @@ class StageDispatcher:
                 nonlocal dated
                 now = self._clock()
                 dated = when if now < when else now + span
-                return self._store.reschedule_claimed([head_id], dated)
+                return self._store.reschedule_claimed(head_ids, dated)
 
-            head = await self._land_while_holding(
-                lane, "reschedule_claimed of the head", reschedule_head, fence
+            what = (
+                f"reschedule_claimed of {len(head_ids)} row(s) a dead serializer held"
+                if recover
+                else "reschedule_claimed of the head"
             )
+            head = await self._land_while_holding(lane, what, reschedule_head, fence)
             outcome = replace(outcome, park_until=dated)
         if tail_ids:
             release = functools.partial(self._store.release_claimed, tail_ids)
@@ -1445,7 +1572,7 @@ class StageDispatcher:
             if head is HoldResult.LANDED:
                 # Not on leader loss alone: the demotion drain relies on this release (zero rows
                 # INFLIGHT at quiesce), as before step 2. Only a lease another node took skips it.
-                if head_reschedule is not None and fence.moved():
+                if head_ids and fence.moved():
                     tail = HoldResult.SUPERSEDED
                 else:
                     tail = await self._land_while_holding(lane, what, release, fence)
@@ -1453,7 +1580,7 @@ class StageDispatcher:
                 tail = HoldResult.SUPERSEDED
             else:
                 tail = await self._write_once(lane, what, release, head)
-        unlanded = (head is not HoldResult.LANDED) + (
+        unlanded = (len(head_ids) if head is not HoldResult.LANDED else 0) + (
             len(tail_ids) if tail is not HoldResult.LANDED else 0
         )
         if HoldResult.STOPPED in (head, tail):
@@ -1495,6 +1622,8 @@ class StageDispatcher:
         if st is None:  # torn down under us: stop() already returned every slot, nothing to book
             return
         self._release_lane_slot(st)
+        st.serializer_deaths = 0  # a serializer reached the terminal transition
+        st.held_extra_ids.clear()
         # Consume the stamp UNCONDITIONALLY: whichever branch runs below, this episode is over, and a
         # stamp that survived it could be mis-booked onto the lane's NEXT episode.
         _episode_start_ns = st.episode_start_ns
