@@ -164,8 +164,8 @@ def test_the_cli_prints_the_coverage_line_when_the_level_hides_info(
 _REPAIR = (
     "Repair the line no rule can reach: give it a well-formed segment id, or give a header line "
     "the separator after its encoding characters. For a line with no fields under a header whose "
-    "MSH-12 holds no HL7 version, give the header its version, or map a field of that segment "
-    "with a rule that rewrites. A rule on MSH-12 does not help: the anonymizer and "
+    "MSH-12 holds no readable HL7 version, give the header a readable version (2.1 or later), or "
+    "map a field of that segment with a rule that rewrites. A rule on MSH-12 does not help: the anonymizer and "
     "anonymize_checked judge the input's version, and a direct leak check judges it when given "
     "version=message_version(raw)."
 )
@@ -300,7 +300,9 @@ def test_an_odd_hl7_version_never_raises_out_of_the_check(version: str) -> None:
         with pytest.raises(ValueError, match="a line no rule can reach") as exc:
             side(raw, salt=_SALT)
         assert type(exc.value).__name__ == "AnonError"
-        assert version not in str(exc.value)
+        # A one-letter ASCII needle would match ordinary words of the refusal, so it proves nothing.
+        if not version.isascii() or len(version) > 1:
+            assert version not in str(exc.value)
         refusals.append(str(exc.value))
     assert refusals[0] == refusals[1]
     # The emitting control: a line with fields under the same header is still emitted, and the

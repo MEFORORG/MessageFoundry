@@ -428,7 +428,7 @@ def test_a_bare_line_under_a_header_with_no_readable_version_is_refused(
     message, so a bare line no rule names is refused (Manager decision d20261104T072138416-0d18f5)."""
     with pytest.raises(side.anon.AnonError, match="no rule can reach") as exc:
         side.anon.anonymize(message, salt=_SALT, rules=_rules(side))
-    assert "a line with no fields under a header whose MSH-12 holds no HL7 version" in str(
+    assert "a line with no fields under a header whose MSH-12 holds no readable HL7 version" in str(
         exc.value
     )
     assert side.leak.has_unreachable_line(message) is True
@@ -478,6 +478,16 @@ def test_a_keep_does_not_let_the_bare_line_stand(side: Any, message: str) -> Non
     seg = message.split("\r")[-1]
     with pytest.raises(side.anon.AnonError, match="no rule can reach"):
         side.anon.anonymize(message, salt=_SALT, rules=_rules(side, (f"{seg}-3", "keep")))
+
+
+@_SIDES
+def test_a_keep_handed_straight_to_the_message_adapter_does_not_count(side: Any) -> None:
+    """``anonymize`` drops keeps before it calls ``anonymize_message``; a direct caller may not.
+    The adapter drops them too, so a keep passed straight to it still unlocks no bare line."""
+    keyer = side.anon.keying.Keyer(_SALT)
+    rules = _rules(side, ("SFT-3", "keep"))
+    with pytest.raises(side.anon.AnonError, match="no rule can reach"):
+        side.anon.hl7.anonymize_message(_BYPASS, keyer, rules)
 
 
 @pytest.mark.parametrize(

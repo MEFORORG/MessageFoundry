@@ -641,7 +641,7 @@ def test_a_malformed_segment_line_is_refused_and_its_text_is_never_named(
     assert report.hits == [
         "line no rule can reach (a malformed segment id, a header line with no separator "
         "after its encoding characters, or a line with no fields under a header whose MSH-12 "
-        "holds no HL7 version)"
+        "holds no readable HL7 version)"
     ]
     assert "(malformed segment)-0" in report.unmapped_fields
     assert all(needle not in a for a in report.unmapped_fields)

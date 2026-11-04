@@ -471,6 +471,6 @@ def test_the_tee_error_line_names_a_short_header_line(
     assert code == 1
     assert (
         f"repair each line no rule can reach (a malformed segment id, {_SHORT_HEADER}, or a line "
-        "with no fields under a header whose MSH-12 holds no HL7 version)" in text
+        "with no fields under a header whose MSH-12 holds no readable HL7 version)" in text
     )
     assert _NOT_COUNTED.format(n=1) in text
