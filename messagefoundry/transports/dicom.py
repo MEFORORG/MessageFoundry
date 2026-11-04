@@ -2260,7 +2260,9 @@ def _client_ssl_context(
     harden_cipher_suites(ctx, connector=connector)  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of the peer's server cert (ASVS 12.1.4)
     # #129 (ADR 0094): opt-in granular expiry-only relaxation — honour an expired downstream PACS cert
-    # while STILL validating chain + hostname (verification stays ON; default off = byte-identical).
+    # while STILL validating the chain's signatures, the hostname and key usage. At least the
+    # intermediates' and the trust anchor's validity periods, and a CRL's own window, go unchecked too
+    # (vault BACKLOG #5089). Verification stays ON; default off = byte-identical.
     if s.get("tls_allow_expired"):
         relax_verify_expiry(ctx, host=str(s.get("host", "")))
     return ctx

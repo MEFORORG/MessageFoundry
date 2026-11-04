@@ -491,7 +491,10 @@ def _attested_guard(context: ssl.SSLContext | None, **over: Any) -> RevocationHo
 
 #: A phrase only the expiry-relaxed record carries; ``EXPIRY_RELAXED_WAYS_ACROSS`` does not hold it,
 #: so it tells the new wording from that remedy text (BACKLOG #5089).
-_RELAXED_DETAIL = "chain is verified but not its validity period"
+_RELAXED_DETAIL = (
+    "at least the validity periods of the peer certificate, the intermediates and the trust anchor "
+    "are not"
+)
 
 #: The attested crossing's lead on a hop that sets ``tls_allow_expired`` (BACKLOG #5089).
 _RELAXED_CROSSING = (

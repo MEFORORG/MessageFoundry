@@ -784,17 +784,21 @@ attestation stays visible elsewhere: `messagefoundry check` lists a connection's
 **Note 2026-11-03 (BACKLOG #5089):** on at least the MLLP destination, the DICOM SCU and both
 FTPS directions, the kept line on a `tls_allow_expired` hop now says what it lacks. Each passes
 `RevocationHopGuard.capture` the context it dials with and `expiry_relaxed=True`. That one flag
-settles both halves of §13's rule, so a caller cannot set one without the other: `crl_checked` is
-False whatever CRL the context loads, and the record names `EXPIRY_RELAXED_WAYS_ACROSS` where the
-caller passes no remedy of its own. Before this note those hops handed the guard no context
+settles both halves of §13's rule where the caller passes no remedy of its own: `crl_checked` is
+False whatever CRL the context loads, and the record names `EXPIRY_RELAXED_WAYS_ACROSS`. A remedy
+the caller does pass is used as given, so it could still name the CRL whose credit the flag
+dropped; nothing in `capture` refuses that. Before this note those hops handed the guard no context
 instead, which gave the same disposition; where an older passage of this ADR says one of them hands
 the guard no context, read this note. The line then reads *crossed without a revocation check the
-guard credits*: the chain is verified but not the validity period, and a CRL, where one reaches the
-hop, is read without its own validity window. The refusal and the WARNING on such a hop use the
-same words. Only the flag sets them. A guard handed a context that skips time validity without the
-flag still credits that context's CRL, so it keeps the unrelaxed words, which do not contradict
-that ALLOW, and keeps the line, by `crl_is_a_check`; whether such a context's CRL should admit the
-hop is not decided here (vault BACKLOG #5086). The AI broker writes its own records, not the
+guard credits*: the chain's signatures are verified, but at least the validity periods of the peer
+certificate, the intermediates and the trust anchor are not, and a CRL, where one reaches the hop,
+is read without its own validity window. The refusal and the WARNING on such a hop use the same
+words. Only the flag sets them. **An open limit, tracked by vault BACKLOG #5086:** a guard handed
+a context that skips time validity without the flag still credits that context's CRL, so it can
+ALLOW on that CRL. It keeps the unrelaxed words and, by `crl_is_a_check`, the attested line, so on
+an attested hop its record says no certificate revocation checking (OCSP/CRL) is performed while
+the guard credits a CRL that the handshake still consults. That record and that ALLOW contradict
+each other. Whether such a context's CRL should admit the hop is not decided here. The AI broker writes its own records, not the
 guard's, and its line keeps the unrelaxed words: no context that skips time validity reaches it,
 because it dials rest.py's shared opener, which never relaxes. The
 REST, SOAP and FHIR hops pass no such flag, so their line keeps the partial over-statement this

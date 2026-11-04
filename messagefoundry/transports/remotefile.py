@@ -766,8 +766,10 @@ def _ftps_ssl_context(
     if verify:  # nothing to strict-validate on the CERT_NONE path (ASVS 12.1.4)
         harden_verify_flags(ctx)
         # #129 (ADR 0094): opt-in granular expiry-only relaxation — accept an expired server cert while
-        # STILL validating the chain, and the hostname unless tls_check_hostname=false (verify path
-        # only; default off = byte-identical).
+        # STILL validating the chain's signatures and key usage, and the hostname unless
+        # tls_check_hostname=false. At least the intermediates' and the trust anchor's validity periods,
+        # and a CRL's own window, go unchecked too (vault BACKLOG #5089). Verify path only; default off
+        # = byte-identical.
         if settings.get("tls_allow_expired"):
             relax_verify_expiry(ctx, host=str(settings.get("host", "")))
     return ctx

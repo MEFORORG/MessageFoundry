@@ -2643,7 +2643,8 @@ _NO_REVOCATION_CHECK = (
 #: such a hop still refuses a leaf certificate it lists at the handshake, so "NO revocation
 #: checking" would say less was checked than was; what the hop lacks is a check the guard credits.
 _EXPIRY_RELAXED_NO_CHECK = (
-    "the peer certificate's chain is verified but not its validity period (tls_allow_expired), "
+    "the peer certificate chain's signatures are verified, but at least the validity periods of the "
+    "peer certificate, the intermediates and the trust anchor are not (tls_allow_expired), "
     "and the hop has no revocation check the guard credits: stdlib ssl has no OCSP, and a CRL, "
     "where one reaches this hop, is read without its own validity window (ASVS 12.1.4, ADR 0173 "
     "section 13)."
@@ -2771,11 +2772,13 @@ class RevocationHopGuard:
         connection's flag.
 
         ``expiry_relaxed=True`` says this hop skips validity-period checks (``tls_allow_expired``,
-        ADR 0173 §13), and by itself it settles both halves of that rule, so a caller cannot pass
-        one without the other. Its context earns no CRL credit: ``crl_checked`` is False whatever
+        ADR 0173 §13), and by itself it settles both halves of that rule unless the caller also
+        passes a remedy. Its context earns no CRL credit: ``crl_checked`` is False whatever
         CRL the context loads, because the relaxation also skips the CRL's own validity window.
         And an omitted ``ways_across`` becomes :data:`EXPIRY_RELAXED_WAYS_ACROSS`, so the record
-        never offers the CRL it has just refused to credit. A caller passes the context it dials
+        does not offer the CRL it has just refused to credit. A ``ways_across`` the caller passes is
+        used as given, so it can still name a CRL whose credit the flag dropped; nothing here
+        refuses that. A caller passes the context it dials
         with and this flag. A context that skips the check without the flag keeps its CRL credit
         and the unrelaxed wording, and only :attr:`crl_is_a_check` reads it; whether such a
         context's CRL should admit the hop is not decided here (vault BACKLOG #5086)."""
