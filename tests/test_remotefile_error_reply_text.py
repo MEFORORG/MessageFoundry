@@ -39,7 +39,6 @@ from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.remotefile import (
     RemoteFileDestination,
     _fault_detail,
-    _ftp_size,
     _FtpClient,
     _RemoteError,
 )
@@ -241,7 +240,12 @@ def test_an_sftp_status_text_stays_out_of_the_error(
 
 def test_a_reply_code_is_ascii_digits_only() -> None:
     # Non-ASCII decimal digits are the server's characters, not a reply code.
-    assert _fault_detail(ftplib.error_perm("5٥٠ x")) == "error_perm, a reply with no code"
+    digits = chr(0x665) + chr(0x660)  # ARABIC-INDIC FIVE, ZERO
+    assert _fault_detail(ftplib.error_perm(f"5{digits} x")) == "error_perm, a reply with no code"
+    # A server that writes another separator after the code still sent that code.
+    assert _fault_detail(ftplib.error_perm("550:denied")) == (
+        "reply 550 (file unavailable, such as not found or no access)"
+    )
 
 
 def test_a_tls_failure_keeps_the_tls_library_reason() -> None:
@@ -268,33 +272,69 @@ def test_a_name_lookup_failure_names_its_getaddrinfo_code() -> None:
     assert _fault_detail(OSError(987654, "server text")) == "OSError, errno 987654"
 
 
-def test_a_size_reply_that_is_no_number_reads_as_no_size() -> None:
-    """``ftplib.FTP.size`` raises a ``ValueError`` quoting the reply when ``213`` carries no number.
-    That is the server not saying, so it reads as ``None`` rather than escaping ``_op`` unmapped."""
+def _junk_size() -> ftplib.FTP:
+    """A real ``ftplib.FTP`` whose ``SIZE`` reply is ``213`` and a path, not a number."""
     ftp = ftplib.FTP()  # no host: never connects
-    reply = f"213 /in/{NAME}"
-    ftp.sendcmd = lambda cmd: reply  # type: ignore[method-assign]
-    with pytest.raises(ValueError, match=MRN):  # CONTROL: ftplib's own error quotes the reply
-        ftplib.FTP.size(ftp, "/in/x")
-    assert _ftp_size(ftp, "/in/x") is None
+    ftp.sendcmd = lambda cmd: f"213 /in/{NAME}"  # type: ignore[method-assign]
+    return ftp
 
 
-class _JunkSizeFtp(_ScriptedFtp):
-    """An ``MLSD`` that lists a file whose ``size`` fact quotes a path, not a number."""
+#: Replies ``ftplib`` or the client cannot read, each raising a ``ValueError`` that quotes them.
+_UNREADABLE: dict[str, Callable[[], BaseException]] = {
+    "size-no-number": lambda: _raised(lambda: _junk_size().size("/in/x")),
+    "mlsd-size-no-number": lambda: _raised(lambda: int(f"/in/{NAME}")),
+    "not-utf-8": lambda: _raised(lambda: f"550 /in/{NAME} \xe9".encode("latin-1").decode()),
+}
+
+
+def _raised(fn: Callable[[], object]) -> BaseException:
+    try:
+        fn()
+    except ValueError as exc:
+        return exc
+    raise AssertionError("no ValueError")
+
+
+class _UnreadableFtp(_ScriptedFtp):
+    """An ``MLSD`` that raises the ``ValueError`` an unreadable reply gives."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__({})
+        self.error = error
 
     def mlsd(self, path: str = "", facts: Any = ()) -> Iterator[tuple[str, dict[str, str]]]:
-        return iter([("a.hl7", {"type": "file", "size": f"/in/{NAME}"})])
+        raise self.error
 
 
-def test_an_mlsd_size_that_is_no_number_fails_the_listing_as_fixed_text(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("case", list(_UNREADABLE))
+def test_an_unreadable_reply_fails_transient_by_its_type(
+    monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
+    error = _UNREADABLE[case]()
+    # Positive control: the library's error quotes the reply, in its text or its bytes.
+    assert MRN in str(error) or MRN.encode() in getattr(error, "object", b"")
     with pytest.raises(_RemoteError) as caught:
-        _ftp_client(_JunkSizeFtp({}), monkeypatch).list_entries("/in")
-    assert str(caught.value) == "FTP MLSD listing gave a size that is not a number"
+        _ftp_client(_UnreadableFtp(error), monkeypatch).list_entries("/in")
+    assert str(caught.value) == f"FTP operation failed: {type(error).__name__}"
     assert caught.value.permanent is False
     assert caught.value.__context__ is None and caught.value.__cause__ is None
     assert MRN not in _traceback(caught.value)
+
+
+def test_an_unreadable_greeting_fails_the_connect_transient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = _UNREADABLE["not-utf-8"]()
+
+    def connect(self: ftplib.FTP, *args: object, **kwargs: object) -> str:
+        raise error
+
+    monkeypatch.setattr(ftplib.FTP, "connect", connect)
+    with pytest.raises(_RemoteError) as caught:
+        _FtpClient({"host": "ftp.example.com"}, tls=False)._connect()
+    assert str(caught.value) == "FTP connect failed: UnicodeDecodeError"
+    assert caught.value.permanent is False
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
 
 
 def test_a_failed_first_publish_listing_carries_no_reply(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -352,6 +392,10 @@ _ALLOWED = {
     "_SftpClient._connect",
     # A configuration refusal at construction, before any connection.
     "_anon_ftp_guard",
+    # Logs a scan hook's or the store hand-off's failure, not a server's, through safe_exc.
+    "RemoteFileSource._poll_once",
+    # Logs a connection-event observer's failure through safe_exc.
+    "RemoteFileSource._emit_event",
 }
 
 
@@ -365,12 +409,40 @@ def _caught(node: ast.expr | None) -> set[str]:
     }
 
 
+#: The logger methods whose arguments reach the log.
+_LOG_METHODS = frozenset({"debug", "info", "warning", "error", "exception", "critical", "log"})
+
+
+def _quotes(node: ast.AST, bound: tuple[str, ...]) -> bool:
+    """Whether ``node`` uses a name in ``bound`` other than as ``_fault_detail``'s argument."""
+    if isinstance(node, ast.Call) and callee_name(node, bare_only=True) == "_fault_detail":
+        return False
+    if isinstance(node, ast.Name) and node.id in bound:
+        return True
+    return any(_quotes(child, bound) for child in ast.iter_child_nodes(node))
+
+
+def _carries_text(call: ast.Call) -> bool:
+    """A ``_RemoteError(...)``, or a ``logger.<level>(...)``: where a caught exception's text would
+    reach ``last_error``, the alert detail or the log."""
+    if callee_name(call, bare_only=True) == "_RemoteError":
+        return True
+    func = call.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr in _LOG_METHODS
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "logger"
+    )
+
+
 def _breaks(source: str) -> set[tuple[str, int, str]]:
     """Every site, as (function, line, what), that raises inside a handler of a foreign exception
-    type, or interpolates that exception into a ``_RemoteError`` other than through
+    type, or puts that exception into a ``_RemoteError`` or a log call other than through
     ``_fault_detail``. A raise inside the handler chains the caught exception on ``__context__``,
-    and the caught exception's text is the server's (BACKLOG #5026). At least one indirection is
-    not seen: text read from the exception into a local first, as ``_ftp_connect_refusal`` does."""
+    and the caught exception's text is the server's (BACKLOG #5026). At least these are not seen:
+    text read from the exception into a local first, as ``_ftp_connect_refusal`` does, and a helper
+    called from a handler that raises."""
     found: set[tuple[str, int, str]] = set()
 
     def visit(node: ast.AST, qual: str, bound: tuple[str, ...]) -> None:
@@ -385,18 +457,12 @@ def _breaks(source: str) -> set[tuple[str, int, str]]:
                 b = (*bound, child.name or "")
             if isinstance(child, ast.Raise) and child.exc is not None and bound:
                 found.add((q, child.lineno, "raise inside a handler"))
-            if isinstance(child, ast.Call) and callee_name(child, bare_only=True) == "_RemoteError":
-                for sub in ast.walk(child):
-                    if not isinstance(sub, ast.FormattedValue):
-                        continue
-                    v = sub.value
-                    if (
-                        isinstance(v, ast.Call)
-                        and callee_name(v, bare_only=True) == "_fault_detail"
-                    ):
-                        continue
-                    if any(isinstance(n, ast.Name) and n.id in bound for n in ast.walk(v)):
-                        found.add((q, child.lineno, "interpolates the caught exception"))
+            if (
+                isinstance(child, ast.Call)
+                and _carries_text(child)
+                and any(_quotes(arg, bound) for arg in (*child.args, *child.keywords))
+            ):
+                found.add((q, child.lineno, "quotes the caught exception"))
             visit(child, q, b)
 
     visit(parse_source(source), "", ())
@@ -412,16 +478,26 @@ def test_the_scan_sees_both_shapes() -> None:
         "        ftp.go()\n"
         "    except ftplib.error_perm as exc:\n"
         "        raise _RemoteError(f'refused: {exc}', permanent=True) from exc\n"
+        "def worse(ftp):\n"
+        "    try:\n"
+        "        ftp.go()\n"
+        "    except OSError as err:\n"
+        "        logger.warning('could not: %s', err)\n"
+        "        fault = _RemoteError('refused: ' + str(err), permanent=False)\n"
+        "    raise fault\n"
         "def good(ftp):\n"
         "    try:\n"
         "        ftp.go()\n"
         "    except ftplib.error_perm as exc:\n"
+        "        logger.warning('could not: %s', _fault_detail(exc))\n"
         "        fault = _RemoteError(f'refused: {_fault_detail(exc)}', permanent=True)\n"
         "    raise fault\n"
     )
     assert _breaks(source) == {
         ("bad", 5, "raise inside a handler"),
-        ("bad", 5, "interpolates the caught exception"),
+        ("bad", 5, "quotes the caught exception"),
+        ("worse", 10, "quotes the caught exception"),
+        ("worse", 11, "quotes the caught exception"),
     }
 
 

@@ -262,13 +262,13 @@ def _where(host: str, path: str) -> str:
 
 
 #: A fixed meaning for each FTP reply code an operation or a login commonly fails with (RFC 959, and
-#: RFC 2228 for 534 and 536). 430 is in no RFC; several servers send it for a refused login, so its
-#: meaning here is that convention's. A code not listed is reported by its number alone.
+#: RFC 2228 for 534 and 536). A code not listed is reported by its number alone, 430 among them: no
+#: RFC defines it, and a server that sends it may mean a refused login or a session limit, which
+#: the engine tells apart by the reply text it does not show.
 _FTP_REPLY_MEANINGS = {
     "421": "service not available",
     "425": "cannot open the data connection",
     "426": "connection closed, transfer aborted",
-    "430": "invalid user name or password",
     "450": "file unavailable, such as busy",
     "451": "local error in processing",
     "452": "insufficient storage",
@@ -288,9 +288,16 @@ _FTP_REPLY_MEANINGS = {
 }
 
 #: An FTP reply code where ``ftplib`` puts it, at the start of the reply. A digit run longer than
-#: three, or one not followed by a space, a ``-`` or the end, is no reply code. ASCII digits only:
-#: ``\d`` would also take a server's non-ASCII digits into the error text.
-_FTP_REPLY_CODE = re.compile(r"[1-5][0-9][0-9](?=[ -]|$)")
+#: three is no reply code; any other character may follow, since a server that writes ``550:``
+#: still sent a 550. ASCII digits only: ``\d`` would also take a server's non-ASCII digits into
+#: the error text.
+_FTP_REPLY_CODE = re.compile(r"[1-5][0-9][0-9](?![0-9])")
+
+#: What an FTP session raises that a retry may clear: ``ftplib``'s own errors, and a
+#: ``ValueError``, which ``ftplib`` raises where it parses a reply it cannot read, such as an
+#: ``EPSV`` port or a ``SIZE`` that is no number, or a reply that is not UTF-8. Its text quotes the
+#: reply, so it is mapped like the rest rather than escaping as an internal error (BACKLOG #5026).
+_FTP_TRANSIENT: tuple[type[BaseException], ...] = (*ftplib.all_errors, ValueError)
 
 #: ``getaddrinfo``'s own codes, which a ``socket.gaierror`` carries as its errno and which
 #: ``errno.errorcode`` does not name. Read from this platform's ``socket`` module.
@@ -522,25 +529,11 @@ def _ftp_size(ftp: ftplib.FTP, path: str) -> int | None:
 
     A #116 caller sends ``TYPE I`` first on its session: several common servers refuse ``SIZE`` in
     ASCII mode, and the binary size is the one ``retrbinary`` reads. A transient reply still raises,
-    for ``_op`` to map. A ``213`` reply whose value is not a number is the server not saying
-    either: ``ftplib`` raises a ``ValueError`` that quotes the reply, which would otherwise escape
-    ``_op`` unmapped, its text the server's (BACKLOG #5026)."""
+    for ``_op`` to map, and so does a ``213`` whose value is no number (:data:`_FTP_TRANSIENT`)."""
     try:
         return ftp.size(path)
-    except (ftplib.error_perm, ftplib.error_proto, ValueError):
+    except (ftplib.error_perm, ftplib.error_proto):
         return None
-
-
-def _mlsd_size(facts: Mapping[str, str]) -> int:
-    """An ``MLSD`` entry's ``size`` fact, 0 where it is absent. A value that is not a number fails
-    the listing transient, as a fixed text: ``int()``'s own ``ValueError`` quotes the server's
-    value, and :meth:`_FtpClient._op` does not map it (BACKLOG #5026)."""
-    try:
-        return int(facts.get("size", 0))
-    except ValueError:
-        pass
-    # Outside the handler, so the server's value is not chained.
-    raise _RemoteError("FTP MLSD listing gave a size that is not a number", permanent=False)
 
 
 #: The one permanent ``NLST`` reply read as an empty directory rather than a failure (BACKLOG
@@ -1119,7 +1112,7 @@ class _FtpClient(_RemoteClient):
                 )
             else:
                 fault = _RemoteError(f"FTP connect failed: {_fault_detail(exc)}", permanent=False)
-        except ftplib.all_errors as exc:  # connect/timeout/4xx/protocol/OSError -- transient
+        except _FTP_TRANSIENT as exc:  # connect/timeout/4xx/protocol/OSError/unreadable reply
             fault = _RemoteError(f"FTP connect failed: {_fault_detail(exc)}", permanent=False)
         except BaseException:
             ftp.close()
@@ -1146,7 +1139,7 @@ class _FtpClient(_RemoteClient):
                 # RFC 3659 fact values are case-insensitive; _names lowercases them too.
                 if name in (".", "..") or facts.get("type", "").lower() != "file":
                     continue
-                out.append(_Listed(name, _mlsd_size(facts), facts.get("modify") or None))
+                out.append(_Listed(name, int(facts.get("size", 0)), facts.get("modify") or None))
             return out
         except (ftplib.error_perm, ftplib.error_proto):
             pass
@@ -1319,8 +1312,9 @@ class _FtpClient(_RemoteClient):
     def _op(self, fn: Callable[[ftplib.FTP], _T]) -> _T:
         """Connect, run ``fn(ftp)``, always close. A connect fault arrives already classified from
         :meth:`_connect`. An operation fault is mapped here: a permanent reply (``error_perm`` --
-        no-such-file, no-perm) is permanent; a connect/IO/timeout/protocol error is transient. The
-        error carries the reply code, never the reply (BACKLOG #5026)."""
+        no-such-file, no-perm) is permanent; a connect/IO/timeout/protocol error, or a reply it
+        cannot read (:data:`_FTP_TRANSIENT`), is transient. The error carries the reply code, never
+        the reply (BACKLOG #5026)."""
         ftp = self._connect()
         try:
             return fn(ftp)
@@ -1328,7 +1322,7 @@ class _FtpClient(_RemoteClient):
             fault = _RemoteError(
                 f"FTP rejected the operation: {_fault_detail(exc)}", permanent=True
             )
-        except ftplib.all_errors as exc:
+        except _FTP_TRANSIENT as exc:
             fault = _RemoteError(f"FTP operation failed: {_fault_detail(exc)}", permanent=False)
         finally:
             try:
@@ -2495,9 +2489,9 @@ class RemoteFileDestination(DestinationConnector):
         tmp = posixpath.join(self._remote_dir, f".{name}.{uuid.uuid4().hex}.part")
         # Every cleanup and raise below runs outside the handlers (BACKLOG #5026), so a cleanup
         # that raises something other than a _RemoteError does not carry the caught error on
-        # __context__. The failure is raised as the client raised it: its text never quotes the
-        # server's reply (_RemoteError states the rule), and it chains none, except an SFTP
-        # connect refusal, which keeps paramiko's text and chain (_SftpClient._connect says why).
+        # __context__. The failure is raised as the client raised it: neither its text nor its
+        # chain carries the server's reply (_RemoteError states the rule), except an SFTP connect
+        # refusal, which keeps paramiko's text and chain (_SftpClient._connect says why).
         failed: _RemoteError | None = None
         try:
             self._client.store(tmp, data)

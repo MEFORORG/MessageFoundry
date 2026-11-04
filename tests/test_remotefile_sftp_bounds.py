@@ -374,8 +374,9 @@ def test_a_transfer_longer_than_the_bound_still_completes(monkeypatch: pytest.Mo
     )
 
 
-def test_a_fast_open_failure_keeps_its_own_message(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A refusal inside the bound is reported as itself, not relabelled as a timeout.
+def test_a_fast_open_failure_keeps_its_own_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A refusal inside the bound is reported as its own exception type, not relabelled as a
+    timeout. Its text is not kept (BACKLOG #5026).
 
     Its classification is whatever ``_op`` gave it before #1936; this test does not pin it.
     """
