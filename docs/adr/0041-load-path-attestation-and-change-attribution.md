@@ -119,23 +119,21 @@ open:** `environments/*.toml` is hashed under the config directory, as before. T
 serve start reads its value file, which sits under `[environments].base_dir`; binding the value file
 by its resolved path is the remainder of #2596 step 1. The `v2` text above is kept as the record of
 what was decided on its date.
-*Amended 2026-11-03 (vault BACKLOG #2596, the rest of step 1): the scheme is now `mefor-cfg-fp:v4`.*
+*Amended 2026-11-03 (vault BACKLOG #2596, the rest of step 1): the scheme stays `mefor-cfg-fp:v3`.*
 The value file the engine's value provider reads, `<base_dir>/<dir>/<env>.toml` resolved wherever
-`[environments].base_dir` puts it, is read by the path an open resolves and folded into at least
-the approval, reload, provenance and start digests, as `@value-file/<name>` (`<env>.toml` for
-`serve`; a provider may name any file) when it is outside
-the config directory's `environments/` folder: the file name and not the path, so the digest stays
-independent of where the bundle sits. A reload reads it into the snapshot it loads, after vetting
-the file, its folder and the folder of each link along a chain of file links from it, and the
-provider parses those bytes, so a dual-control release checks and applies the same value bytes. A
-value file the reload cannot read refuses it; one that is not there is folded as absent. A start still reads its values when the engine is built, so the start
-digest reads the file again afterwards and can name later bytes. Every engine shard and cluster
-node is assumed to read the same value file, though nothing checks it and sharing the config
-directory does not share a value file outside it; outside that
-directory only the active environment's file is folded, so nodes on different `--env` names
-compare as a config change. The DR backup digest describes
-the archive and does not fold it. A sandbox worker is not sent it: it resolves no value. The `v3`
-text above is kept as the record of what was decided on its date.
+`[environments].base_dir` puts it, is read by the path an open resolves into a reload's snapshot as
+`@value-file/<name>` when it is outside the config directory's `environments/` folder (`<env>.toml`
+for `serve`; a provider may name any file). A reload reads it after vetting the file, its folder and
+the folder of each link along a chain of file links from it, and the provider parses those bytes. A
+value file the reload cannot read refuses it; one that is not there is held as absent. **No digest
+this ADR publishes folds it.** The D1 digest is unkeyed and published in provenance, audit rows and
+a hold's params, and the file can hold credentials, so folding it would let a reader test a guess
+at a secret offline. A dual-control hold binds it instead with an HMAC-SHA256 under a key derived
+from the store key, and the release checks the snapshot's bytes against that binding, so the
+release still checks and applies the same value bytes. A store with no in-process key binds
+nothing. [SECURITY.md](../SECURITY.md) states once what the published digest does and does not
+reveal. A sandbox worker is not sent the value file: it resolves no value. The `v3` text above is
+kept as the record of what was decided on its date.
 
 This binds "reviewed-and-merged in git" to "what actually loaded," makes two reloads with different
 on-disk code distinguishable, defeats attribution-laundering (the audit now shows *which code* a given

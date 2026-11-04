@@ -1,15 +1,12 @@
-- **The config digest covers the environment value file wherever `[environments].base_dir` puts
-  it.** In the default layout the value file sits outside the config directory, so an edit to it
-  left the digest unchanged, and a released reload read it from disk after the check. A reload now
-  folds the value file into the digest, and `serve` parses the values from the snapshot's bytes. A
-  value file outside the config directory's `environments/` folder is read into that snapshot
-  after vetting the file, its folder and the folder of each link along a chain of file links from
-  it, and where it alone cannot be read the reload is refused, released or not, rather than
-  reading it again from disk. Where the config directory cannot be read whole, a value file in its `environments/` folder
-  included, a released reload is refused and an ungated one still reads the values from disk. A
-  start refuses a value file it cannot stat rather than reading no values. A dual-control release
-  so checks and applies the same value bytes, and refuses a value file edited, created or removed
-  since its approval. The start's provenance digest folds it too, read after the start resolved
-  its values, so it can name later bytes. The fingerprint scheme is now `mefor-cfg-fp:v4`, so a
-  digest recorded before this change reads as not comparable rather than as a changed config.
-  (vault `BACKLOG #2596`)
+- **A released reload checks the environment value file wherever `[environments].base_dir` puts
+  it.** In the default layout the value file sits outside the config directory, so a released
+  reload read it from disk after the digest check, and an edit to it applied under the approved
+  digest. A reload now reads that value file into its snapshot, after vetting the file, its folder
+  and the folder of each link along a chain of file links from it, and `serve` parses the values
+  from those bytes. Where it alone cannot be read, the reload is refused, released or not, rather
+  than reading it again from disk. A dual-control hold binds the file with an HMAC-SHA256 under a
+  key derived from the store key, and the release refuses a value file edited, created or removed
+  since the request. No published config digest folds that file, since it can hold credentials and
+  those digests are unkeyed; the fingerprint scheme stays `mefor-cfg-fp:v3`. A store with no
+  in-process key binds nothing, and the release logs a WARNING. A start refuses a value file it
+  cannot stat rather than reading no values. (vault `BACKLOG #2596`)

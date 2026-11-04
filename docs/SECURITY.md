@@ -2540,10 +2540,12 @@ that snapshot's digest against the approved one before any config module runs. T
 and runs that same snapshot, and the `config_reload` row records its digest. So the config
 modules, helpers and tables checked are the ones the loader runs, and an edit to them on disk
 during the load is neither run nor recorded. The limits below name at least one import that runs
-from disk instead. The digest covers `serve`'s environment value file wherever
-`[environments].base_dir` puts it: in the config directory's `environments/` folder, or elsewhere,
-where the release reads it into the snapshot after vetting the file, its folder, and the folder of
-each link along a chain of file links from it. That vet misses at least these: a directory link
+from disk instead. The approval covers `serve`'s environment value file wherever
+`[environments].base_dir` puts it. In the config directory's `environments/` folder the digest
+folds it. Elsewhere, the default layout, the release reads it into the snapshot after vetting the
+file, its folder, and the folder of each link along a chain of file links from it, and checks it
+against a keyed binding the hold took at request time, which the next paragraph describes. That
+vet misses at least these: a directory link
 in the path to the value file, or to any link along that chain, is resolved rather than walked,
 so the folder that holds it is not vetted, and on Windows the link objects themselves are not
 vetted (`Engine._value_file_folders` in [`pipeline/engine.py`](../messagefoundry/pipeline/engine.py)).
@@ -2555,12 +2557,9 @@ it from the same snapshot, so an edit to it during the load does not apply, and 
 created or removed since the snapshot is refused. Every engine shard and cluster node shares one
 config directory by contract, and is expected to read the same value file too. Nothing checks
 that, and a value file outside the config directory is not shared with it. A node whose value file
-differs pages `config_changed` on its starts, because a start compares its digest with the
-store's newest one, whichever node wrote it. It also refuses as `digest_mismatch` a hold filed
-through another node, as the cluster limit below says. In the `environments/` folder every
-`*.toml` is folded; outside it, only the active environment's file is, so there nodes started
-with different `--env` names have different digests too. Otherwise, at least where an embedded engine has
-another value provider, the
+there differs refuses as `digest_mismatch` a hold filed through another node, as the cluster limit
+below says, and so does a node started with another `--env` name. Otherwise, at least where an
+embedded engine has another value provider, the
 release reads the values from disk and then takes the digest again, which refuses a change made in
 between to a file the digest covers. If the digest differs, nothing loads and nothing swaps. The running graph keeps
 the environment values it had. A reload applies the values it re-read only with the swap, and a
@@ -2571,6 +2570,24 @@ params carry no digest is refused the same way, with reason `no_approved_digest`
 cannot take the digest now is refused with reason `digest_unavailable`, and the engine logs the
 cause at WARNING. The requester asks again, and a second approver reviews the new bytes.
 
+**What the published config digest does and does not reveal (vault BACKLOG #2596).** The ADR 0041
+D1 digest is an unkeyed SHA-256 fold, published at least in `GET /config/provenance`, in the
+`config_loaded`, `config_reload` and `config_reload_failed` audit rows, and in a held reload's
+`params`, which every approver sees. Anyone holding a candidate file can recompute it, so it
+reveals whether a reader's guess at every covered file's bytes is right. It never folds the
+environment value file a reload reads from outside the config directory, which can hold
+credentials, so no published digest changes with that file's bytes. A held reload binds that file
+instead with `params.value_file`, an HMAC-SHA256 under a key HKDF derives from the store key (the
+`Reload hold value-file binding` row in
+[ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md)). A reader without the store key cannot
+test a guess against it; anyone with the key can. A release whose value file is not the one bound
+is refused as `digest_mismatch` with `value_file_check` set to `mismatch`, and the two published
+fingerprints in that row are equal. A store with no in-process key, a keyless store or a Vault
+Transit cipher, binds nothing: the release then applies whatever value file it reads, as it did
+before the file was read into the snapshot, and logs a WARNING naming the file. A value file
+inside the config directory's `environments/` folder is still folded into the published digest,
+so there the digest is a test of a guess at its secrets.
+
 **A release refused before the digest check never reaches it.** At least the settings preflight
 and the config source's trust check run before it. So where the trust check refuses rather than
 warns, a tamper that also loosens the permissions on a file it covers, such as a config module,
@@ -2580,7 +2597,8 @@ digest, and `approval_digest_check` set to `not_reached`, and no `current_finger
 digest was taken. A missing, unlistable or disallowed directory is refused before the check too,
 with its own reason and neither field. A refusal after the digest check passed carries neither
 field either, whether the approved bytes caused it or an input the digest does not cover, such as
-a `MEFOR_VALUE_*` variable or a connection's CA file. The second
+a `MEFOR_VALUE_*` variable or a connection's CA file. The value-file binding is checked with the
+digest, so its refusal carries both fields and `value_file_check`. The second
 digest above is the exception: it refuses as `digest_mismatch` with both fields, or as at least
 `digest_unavailable` or `not_found`, as the first check does.
 
@@ -2646,11 +2664,11 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   at release unless the edit is reverted, and then it can be released;
 - in a cluster, the release compares the digest with the disk of the node that handles the approve,
   which may not be the node that took it;
-- a start's `config_loaded` digest may name value-file bytes the start did not apply. A start
-  resolves its environment values when the engine is built, and its digest reads the value file
-  later: in the load's snapshot where the file is in the `environments/` folder, and from disk
-  again where it is outside it. So an edit in between is in the digest and not in the running
-  values;
+- a start's `config_loaded` digest may name value-file bytes the start did not apply, where the
+  value file is in the `environments/` folder. A start resolves its environment values when the
+  engine is built, and its digest reads that folder later, in the load's snapshot. So an edit in
+  between is in the digest and not in the running values. A value file outside the config
+  directory is in no start digest, so a start records nothing about it;
 - a restart, a cluster convergence reload, a DR activation and a sandbox worker respawn check no
   approved digest. Whether a restart under dual control refuses an unapproved digest is an open
   owner question.
