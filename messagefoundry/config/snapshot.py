@@ -36,6 +36,7 @@ __all__ = [
     "NotInSnapshot",
     "config_py_files",
     "is_missing_directory",
+    "is_regular_file",
     "read_config_snapshot",
     "with_value_file",
 ]
@@ -134,6 +135,10 @@ def _covered_name(folder: str, name: str) -> bool:
         return os.path.normcase(name).endswith(".py") and not name.startswith(".")
     if folder == CODESETS_DIR_NAME:
         return is_code_set_name(name)
+    if folder == _VALUE_FILE_DIR:
+        # Whatever a provider names (SnapshotEnvValuesProvider.value_file): no listing returns
+        # this folder and no load reads it, so its name selects nothing a load runs.
+        return True
     return Path(name).suffix.lower() == ".toml"
 
 
@@ -258,6 +263,12 @@ class ConfigSnapshot:
             return _VALUE_FILE_DIR
         return None
 
+    def _held_path(self, folder: str, name: str) -> Path:
+        """Where this snapshot read the value file it holds as ``<folder>/<name>``."""
+        if folder == _VALUE_FILE_DIR and self.value_file is not None:
+            return self.value_file.parent / name
+        return self.directory / _ENVIRONMENTS_DIR / name
+
     def environment_file(self, path: str | Path) -> bytes | None:
         """The bytes this snapshot read for the value file ``path``, which
         :meth:`covers_environment_file` must accept, or ``None`` when it read no such file and none
@@ -276,17 +287,27 @@ class ConfigSnapshot:
         want = os.path.normcase(prefix + value_file.name)
         if any(rel == folder or os.path.normcase(rel) == want for rel in self.unreadable):
             raise OSError(errno.EACCES, "the config snapshot could not read this value file")
-        # A regular file, following links, as a start judges it (``Path.is_file``) and as the
-        # snapshot read it: a folder or a dangling link by that name is no value file to either.
-        present = os.path.isfile(value_file)
+        # A regular file, following links, as a start judges it and as the snapshot read it
+        # (is_regular_file): a folder or a dangling link by that name is no value file to either,
+        # and a fault stating it raises.
+        present = is_regular_file(value_file)
         data = self.files.get(prefix + value_file.name)
-        if data is None and present and os.path.normcase("A") != "A":
-            # Windows names files without case, so the open of this path reads a file the listing
-            # spelled otherwise. Only where the path names a file now: in a folder set to tell case
-            # apart, it does not, and a start would read no file.
-            data = next(
-                (data for rel, data in self.files.items() if os.path.normcase(rel) == want), None
+        if data is None and os.path.normcase("A") != "A":
+            # Windows names files without case, so the open of this path reads a file the snapshot
+            # held under another spelling.
+            held = next(
+                ((rel, d) for rel, d in self.files.items() if os.path.normcase(rel) == want), None
             )
+            if held is not None:
+                held_path = self._held_path(folder, held[0][len(prefix) :])
+                if present:
+                    data = held[1]
+                elif not is_regular_file(held_path):
+                    # Gone under the spelling it was read by too, so never no file: the bytes the
+                    # snapshot holds stood for a file that is not there now.
+                    raise OSError(errno.ENOENT, "the value file the config snapshot read is gone")
+                # Else a folder set to tell case apart holds the file the snapshot read, and none
+                # by this spelling, so a start reads no file either.
         if data is None and present:
             raise OSError(errno.EEXIST, "the value file was created after the config snapshot")
         if data is not None and not present:
@@ -324,9 +345,10 @@ def with_value_file(
     ``environments/`` folder, which the snapshot already read, or is the file the snapshot already
     holds, unless ``strict`` and the held read was a fault. A file that is not there is held as
     absent, so creating one changes the digest. With ``strict`` a fault reading it raises its
-    ``OSError``; without, it is named in :attr:`ConfigSnapshot.unreadable`. A name that is not a
-    ``.toml`` file raises ``ValueError``. Its access list is not vetted here: a caller that gates
-    on the bytes vets the file and its folder before this read."""
+    ``OSError``; without, it is named in :attr:`ConfigSnapshot.unreadable`. Absent and faulted are
+    judged by :func:`is_regular_file`. Any file name is held, under ``@value-file/<name>``. Its
+    access list is not vetted here: a caller that gates on the bytes vets the file and its folder
+    before this read."""
     if value_file is None:
         return snapshot
     path = Path(value_file).absolute()
@@ -415,13 +437,13 @@ def _read_into(
     try:
         # A stat that fails for any reason but absence is an unreadable file, not a missing
         # one: Path.is_file would answer False and the file would drop out unremarked.
-        if _is_file(path):
+        if is_regular_file(path):
             files[rel] = _read(path)
     except OSError as exc:
         if strict:
             raise
-        # Absent means removed since the listing: gone, as _is_file judges a gone path.
-        if not _is_absent(exc):
+        # Absent means removed since the listing: gone, as is_regular_file judges a gone path.
+        if not is_missing_directory(exc):
             unreadable.add(rel)
 
 
@@ -476,20 +498,25 @@ def _same_folder(one: Path, other: Path) -> bool:
         return False
 
 
-def _is_file(path: Path) -> bool:
-    """Whether ``path`` is a regular file, following links. ``Path.is_file`` answers ``False`` for a
-    path it cannot stat, so this stats it instead and raises that error. A path that is gone (a
-    dangling link, or a file removed since the listing) is not a file."""
+def is_regular_file(path: str | Path) -> bool:
+    """Whether ``path`` is a regular file, following links: the one judgement of absent against
+    faulted that a start's value read, a snapshot's read and :meth:`ConfigSnapshot.environment_file`
+    share (vault BACKLOG #2596). ``Path.is_file`` answers ``False`` for a path it cannot stat, so a
+    fault would read as no file; this stats it instead. ``False`` where no file can be opened by
+    that path, as :func:`is_missing_directory` judges a folder: nothing by that name (a dangling
+    link, or a file removed since a listing), a folder in the path that is a file, a name too long,
+    or one Windows refuses. Any other error is raised, at least access denied and a share Windows
+    cannot reach."""
     try:
-        return stat.S_ISREG(path.stat().st_mode)
+        return stat.S_ISREG(Path(path).stat().st_mode)
     except OSError as exc:
-        if _is_absent(exc):
+        if is_missing_directory(exc):
             return False
         raise
 
 
 def _read(path: Path) -> bytes:
-    """The bytes of ``path``, which :func:`_is_file` just accepted. ``open`` reports the C runtime's
+    """The bytes of ``path``, which :func:`is_regular_file` just accepted. ``open`` reports the C runtime's
     errno and no Windows error, so a share lost since the stat fails as a plain file-not-found. A
     second stat tells them apart: it raises the Windows error for a lost share and absence for a
     file removed since. One that finds the file there means the read failed and the file is not

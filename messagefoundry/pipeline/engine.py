@@ -2818,9 +2818,37 @@ class Engine:
 
         The value file this engine reads (:meth:`_value_file`) is read into the snapshot too,
         wherever ``[environments].base_dir`` puts it, after the same trust check a value read
-        makes, of the file and its folder. So the digest covers it, and the provider parses those
-        bytes rather than the file as it is later."""
+        makes, of the file and the folders :meth:`_value_file_folders` names. So the digest covers
+        it, and the provider parses those bytes rather than the file as it is later. A file that is
+        not there is held as none; one that cannot be read raises ``WiringError`` naming it, so no
+        reload, gated or not, falls back to reading it from disk."""
         return await asyncio.to_thread(self._reload_snapshot_blocking, path, self._value_file())
+
+    @staticmethod
+    def _value_file_folders(value_file: Path) -> list[Path]:
+        """The folders a reload vets before it reads ``value_file``: its own, the folder of every
+        link along a chain of file links from it, and the folder the chain ends in. Each one's
+        writer could re-point the link it holds, or replace the file, between the vet and the read
+        (vault BACKLOG #2596). Walked rather than refused, so a ConfigMap-style chain still reads.
+        A folder above one of these is not vetted, as for the value file itself
+        (:func:`~messagefoundry.config.wiring.assert_trusted_start_paths`). A loop of links stops
+        the walk, and the read then fails and refuses the reload."""
+        folders = [value_file.parent]
+        hop = value_file
+        # Past every platform's own bound on a chain (40 on Linux, 63 on Windows).
+        for _ in range(64):
+            if not os.path.islink(hop):
+                break
+            text = os.readlink(hop)
+            # Windows answers an absolute target in its \\?\ form; the plain form names the same
+            # folder and compares with the others.
+            if os.name == "nt" and text.startswith("\\\\?\\"):
+                text = "\\\\" + text[8:] if text[4:8].upper() == "UNC\\" else text[4:]
+            target = Path(text)
+            hop = target if target.is_absolute() else hop.parent / target
+            folders.append(hop.parent)
+        folders.append(Path(os.path.realpath(value_file)).parent)
+        return list(dict.fromkeys(folders))
 
     @staticmethod
     def _reload_snapshot_blocking(
@@ -2847,29 +2875,28 @@ class Engine:
             return None
         if value_file is None or snapshot.covers_environment_file(value_file):
             return snapshot
+        refusal: str | None = None
         try:
             # Vetted before it is read, as the config directory is: the bytes read here are the
-            # ones a reload applies (vault BACKLOG #2596, step 4). The folder a link leads to too,
-            # since its writer could replace the target between this check and the read.
-            folders = [value_file.parent]
-            target = Path(os.path.realpath(value_file)).parent
-            if target != value_file.parent:
-                folders.append(target)
+            # ones a reload applies (vault BACKLOG #2596, step 4).
             assert_trusted_start_paths(
-                [value_file], lead="refusing to read environment values from", folders=folders
+                [value_file],
+                lead="refusing to read environment values from",
+                folders=Engine._value_file_folders(value_file),
             )
             return with_value_file(snapshot, value_file, strict=True)
         except WiringError:
             raise  # the trust check's refusal, which is a ValueError too
         except (OSError, ValueError) as exc:
-            # ValueError: a provider's value file not named ``*.toml``, which no snapshot holds.
-            log.warning(
-                "environment value file %s could not be read into the reload's snapshot: %s. "
-                "A released reload is refused; any other reload reads the values from disk",
-                scrub_log_argument(str(value_file)),
-                safe_exc(exc),
-            )
-            return None
+            # A fault, never absence, which with_value_file holds as no file. Refused rather than
+            # read again from disk, where the same fault can read as no file and env() defaults
+            # apply, under a digest of bytes from another read. ValueError: a name no snapshot
+            # can hold.
+            refusal = safe_exc(exc)
+        raise WiringError(
+            f"could not read the environment value file {value_file} into the reload's "
+            f"snapshot, so the reload is refused and the live graph is unchanged: {refusal}"
+        )
 
     async def _existing_reload_target(self, config_dir: str | Path | None) -> Path:
         """The directory a reload of ``config_dir`` loads: resolved and confined by

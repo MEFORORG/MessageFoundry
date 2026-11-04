@@ -80,7 +80,8 @@ class SnapshotEnvValuesProvider(ABC):
         """The value file this provider reads, wherever ``[environments].base_dir`` puts it, or
         ``None`` when it reads none. The engine reads the file into each reload's snapshot and
         folds it into the config digest, so an approval covers it and :meth:`from_snapshot` can
-        parse it from those bytes (vault BACKLOG #2596)."""
+        parse it from those bytes (vault BACKLOG #2596). Any file name serves; the snapshot holds
+        it as ``@value-file/<name>``. A reload that cannot read it is refused."""
         return None
 
 
@@ -210,12 +211,18 @@ def load_environment_values(
     Reads ``<base_dir>/<dir_name>/<environment>.toml`` (a flat table of scalars and arrays with no
     table in them) if present, then overlays ``MEFOR_VALUE_<KEY>`` env vars (env wins), then a ``MEFOR_VALUE_<KEY>`` file in the secrets
     directory (the directory wins; :mod:`messagefoundry.engine_secrets`). A missing file is **not** an error here —
-    referenced-but-undefined keys fail loud when a connector is built, not at gather time.
+    referenced-but-undefined keys fail loud when a connector is built, not at gather time. A file
+    that cannot be stated or read raises its ``OSError``
+    (:func:`~messagefoundry.config.snapshot.is_regular_file` says which is which).
     :func:`environment_values_from_bytes` says what it refuses.
     """
+    from messagefoundry.config.snapshot import is_regular_file
+
     path = values_file_path(base_dir, dir_name, environment)
+    # Absent against faulted as a reload's snapshot judges it, so a stat fault, such as a lost
+    # share, raises rather than reads as no file (vault BACKLOG #2596).
     return environment_values_from_bytes(
-        path.read_bytes() if path.is_file() else None, path=path, environ=environ
+        path.read_bytes() if is_regular_file(path) else None, path=path, environ=environ
     )
 
 

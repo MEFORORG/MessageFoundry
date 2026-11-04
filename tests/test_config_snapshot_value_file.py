@@ -14,6 +14,7 @@ Synthetic values only."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, cast
 
@@ -225,11 +226,14 @@ def test_a_sandbox_worker_is_not_sent_the_value_file(tmp_path: Path) -> None:
     assert [rel for rel, _ in node["files"]] == list(loaded.files)
 
 
-def test_a_snapshot_names_no_value_file_path_a_listing_could_return() -> None:
-    with pytest.raises(ValueError):
-        ConfigSnapshot(directory=Path("cfg"), files={"@value-file/x.py": b""})
+def test_a_snapshot_holds_one_value_file_by_a_plain_name() -> None:
     with pytest.raises(ValueError):
         ConfigSnapshot(directory=Path("cfg"), files={"@value-file/a/b.toml": b""})
+    with pytest.raises(ValueError):
+        ConfigSnapshot(directory=Path("cfg"), files={"@value-file/..": b""})
+    held = ConfigSnapshot(directory=Path("cfg"), files={"@value-file/x.py": b""})
+    # Any name, and never a module: a load runs none of it.
+    assert held.files and held.modules == () and held.loaded().files == {}
     assert ConfigSnapshot(directory=Path("cfg"), files={"@value-file/dev.toml": b""}).files
 
 
@@ -277,6 +281,10 @@ def test_the_reload_snapshot_vets_the_value_file_before_it_reads_it(
         Engine._reload_snapshot_blocking(cfg, value_file)
     assert vetted == [([value_file], [value_file.parent])]
     assert value_file not in read
+    # The control: with the vet passing, the same recorder sees the value file read.
+    _vet_nothing(monkeypatch)
+    assert Engine._reload_snapshot_blocking(cfg, value_file) is not None
+    assert value_file in read
 
 
 # --- a dual-control release ------------------------------------------------------------------------
@@ -393,3 +401,176 @@ async def test_the_start_digest_folds_the_value_file_as_a_reload_does(tmp_path: 
         assert bundle["fingerprint"] == reloaded["fingerprint"]
     finally:
         await engine.stop()
+
+
+# --- review repairs, round 2 ---------------------------------------------------------------------
+
+
+def _fail_value_file_read(monkeypatch: pytest.MonkeyPatch, value_file: Path) -> None:
+    """Make the snapshot's read of ``value_file`` fail as a lost share does, and nothing else."""
+    from messagefoundry.config import snapshot as snapshot_module
+
+    real_read = snapshot_module._read
+
+    def _read(path: Path) -> bytes:
+        if path == value_file.absolute():
+            raise OSError(5, "the share went away", str(path))
+        return real_read(path)
+
+    monkeypatch.setattr(snapshot_module, "_read", _read)
+
+
+def _vet_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.engine.assert_trusted_start_paths", lambda *_a, **_k: None
+    )
+
+
+def test_a_value_file_read_fault_refuses_the_reload_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before, the whole snapshot was dropped and an ungated reload read the values from disk,
+    where the same fault can read as no file."""
+    cfg, value_file = _layout(tmp_path)
+    _vet_nothing(monkeypatch)
+    _fail_value_file_read(monkeypatch, value_file)
+    with pytest.raises(WiringError, match="dev.toml"):
+        Engine._reload_snapshot_blocking(cfg, value_file)
+
+
+def test_an_absent_value_file_is_no_value_file_not_a_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg, value_file = _layout(tmp_path, None)
+    _vet_nothing(monkeypatch)
+    snapshot = Engine._reload_snapshot_blocking(cfg, value_file)
+    assert snapshot is not None and snapshot.value_file == value_file.absolute()
+    assert snapshot.environment_file(value_file) is None
+
+
+async def test_an_ungated_reload_refuses_a_value_file_it_cannot_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before, the ungated reload read the value file again from disk, so it went through on
+    values from a second read the reload row's digest did not name."""
+    cfg, value_file = _layout(tmp_path)
+    engine = await _engine(tmp_path, cfg)
+    try:
+        approved_values = {"host": "approved.example.invalid"}
+        await engine.reload_detail(dry_run=False)
+        runner = engine.registry_runner
+        value_file.write_text(_UNREVIEWED, encoding="utf-8")
+        _fail_value_file_read(monkeypatch, value_file)
+        with pytest.raises(WiringError, match="dev.toml"):
+            await engine.reload_detail(dry_run=False)
+        assert engine.registry_runner is runner
+        assert cast(Any, engine)._env_values == approved_values
+    finally:
+        await engine.stop()
+
+
+def test_every_folder_along_a_link_chain_is_vetted_before_the_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writer of an intermediate link's folder could re-point that link between the vet and
+    the read, so that folder is vetted too, not only the first and the last."""
+    cfg, value_file = _layout(tmp_path, None)
+    final = tmp_path / "data" / "values.toml"
+    middle = tmp_path / "hop" / "middle.toml"
+    final.parent.mkdir()
+    middle.parent.mkdir()
+    final.write_bytes(_APPROVED.encode())
+    try:
+        middle.symlink_to(final)
+        value_file.symlink_to(middle)
+    except OSError:
+        pytest.skip("this account cannot create a file link")
+    vetted: list[str] = []
+
+    def _record(files: Any, *, lead: str = "", folders: Any = ()) -> None:
+        vetted.extend(os.path.normcase(os.path.realpath(f)) for f in folders)
+
+    monkeypatch.setattr("messagefoundry.pipeline.engine.assert_trusted_start_paths", _record)
+    snapshot = Engine._reload_snapshot_blocking(cfg, value_file)
+    assert snapshot is not None and snapshot.environment_file(value_file) == _APPROVED.encode()
+    for folder in (value_file.parent, middle.parent, final.parent):
+        assert os.path.normcase(os.path.realpath(folder)) in vetted
+
+
+@pytest.mark.skipif(os.path.normcase("A") == "A", reason="Windows names files without case")
+@pytest.mark.parametrize("outside", [True, False])
+def test_a_held_value_file_removed_under_another_case_is_gone_not_none(
+    tmp_path: Path, outside: bool
+) -> None:
+    """Before, asking by another case after the file was removed answered ``None``, so a release
+    could apply values without the file its approval covered."""
+    cfg, held = _layout(tmp_path, None)
+    if not outside:
+        held = cfg / "environments" / "dev.toml"
+        held.parent.mkdir()
+    held = held.with_name("DEV.toml")
+    held.write_bytes(_APPROVED.encode())
+    snapshot = with_value_file(read_config_snapshot(cfg, strict=True), held, strict=True)
+    asked = held.with_name("dev.toml")
+    assert snapshot.environment_file(asked) == _APPROVED.encode()  # control: held under any case
+    held.unlink()
+    with pytest.raises(OSError, match="gone"):
+        snapshot.environment_file(asked)
+
+
+def test_a_value_file_of_any_name_is_held(tmp_path: Path) -> None:
+    """Before, a provider whose value file was not ``*.toml`` failed every digest."""
+    cfg, _ = _layout(tmp_path)
+    value_file = tmp_path / "environments" / "dev.json"
+    value_file.write_bytes(b"{}")
+    before = config_fingerprint(cfg, strict=True, value_file=value_file)
+    snapshot = with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=True)
+    assert snapshot.files["@value-file/dev.json"] == b"{}"
+    value_file.write_bytes(b'{"a": 1}')
+    assert config_fingerprint(cfg, strict=True, value_file=value_file) != before
+
+
+def test_a_path_no_file_can_be_opened_by_is_no_value_file_to_a_start_or_a_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A folder in the path that is a file (ENOTDIR on POSIX), or on Windows a name it refuses
+    (error 123), read as absent at start and as a fault in the snapshot before."""
+    from messagefoundry.config.environments import load_environment_values
+
+    cfg, _ = _layout(tmp_path)
+    (tmp_path / "afile").write_text("", encoding="utf-8")
+    cases = [("afile", "x")] + ([("environments", "bad?name")] if os.name == "nt" else [])
+    for dir_name, environment in cases:
+        path = tmp_path / dir_name / f"{environment}.toml"
+        assert (
+            load_environment_values(
+                base_dir=tmp_path, dir_name=dir_name, environment=environment, environ={}
+            )
+            == {}
+        )
+        snapshot = with_value_file(read_config_snapshot(cfg, strict=True), path, strict=True)
+        assert snapshot.environment_file(path) is None
+
+
+def test_a_stat_fault_on_the_value_file_is_a_fault_to_a_start_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before, ``Path.is_file`` answered ``False`` and a start read no values from a value file it
+    could not stat, while the snapshot raised."""
+    from messagefoundry.config.environments import load_environment_values
+
+    cfg, value_file = _layout(tmp_path)
+    real_stat = Path.stat
+
+    def _stat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.name == value_file.name:
+            raise PermissionError(13, "denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _stat)
+    with pytest.raises(PermissionError):
+        load_environment_values(
+            base_dir=tmp_path, dir_name="environments", environment="dev", environ={}
+        )
+    with pytest.raises(PermissionError):
+        with_value_file(read_config_snapshot(cfg, strict=True), value_file, strict=True)
