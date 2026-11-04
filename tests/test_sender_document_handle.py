@@ -1565,3 +1565,138 @@ async def test_a_raw_marker_under_a_short_msh2_is_refused_at_both_listeners(
     assert len(errors) == 2
     assert all(e.endswith(DOC_REF_MARKER_REFUSED_REASON) for e in errors)
     assert await _ingress_count(store, ic.name) == 1
+
+
+# --- a document is detached only if the splice sets it back verbatim (BACKLOG #5099) ----------
+
+#: A streaming body whose ED Base64 value is not base64 and holds ``&``, the subcomponent
+#: separator under ``^~\\&``. A component read takes the whole component, ``&`` included, so the
+#: detach would store it, and delivery's ``Message.set`` would send it back as ``\\T\\``.
+_AMP_DOCUMENT = _hl7("Q" * 400 + "&" + "R" * 400)
+
+
+@pytest.mark.parametrize("odd", ["&", "\x01"], ids=["subcomponent-separator", "control"])
+def test_the_detach_scan_refuses_a_document_the_splice_would_alter(odd: str) -> None:
+    from messagefoundry.parsing.binary import Base64DelimiterError, NonVerbatimDocumentError
+
+    body = _hl7("Q" * 400 + odd + "R" * 400)
+    message = Message.parse(body)
+    value = message.field("OBX-5.5") or ""
+    assert odd in value
+    assert Message._escape_leaf(value, *message._encoding_chars()) != value
+    scan = iter_obx_documents(message, received=body, min_b64_len=500)
+    with pytest.raises(NonVerbatimDocumentError) as caught:
+        next(scan)  # refused before the first document is yielded, so none is stored
+    assert not isinstance(caught.value, Base64DelimiterError)
+    assert value not in str(caught.value)
+    # Below the threshold nothing is detached, so the value rides inline as the sender sent it.
+    assert list(iter_obx_documents(message, received=body, min_b64_len=10_000)) == []
+
+
+async def test_a_streaming_document_the_splice_would_alter_is_refused_before_the_ack(
+    store: MessageStore,
+) -> None:
+    """Under ordinary delimiters, a non-base64 value holding ``&`` over the threshold is refused
+    at the detach, with nothing stored, an ERROR row, an AR on MLLP and a permanent refusal on
+    HTTP, rather than ACKed AA and delivered with ``&`` turned into ``\\T\\`` (BACKLOG #5099)."""
+    from messagefoundry.transports.receipt import RefusalKind
+
+    body = _AMP_DOCUMENT
+    ic = _streaming_ic()
+    assert len(body) >= (ic.stream_threshold_bytes or 0)
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+    receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
+
+    assert _ack_code(ack) == "AR"
+    assert ack is not None and "document delivery would alter" in ack
+    assert receipt.refusal is RefusalKind.PERMANENT
+    rows = await _rows(store, ic.name)
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
+    assert all("streaming detach failed: NonVerbatimDocumentError" in str(r["error"]) for r in rows)
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
+async def test_a_stored_document_the_splice_would_alter_is_refused_at_egress(
+    store: MessageStore,
+) -> None:
+    """The backstop for a row stored before the detach refused such a value: the stored value
+    holds ``&``, so setting it back would send ``\\T\\``. The re-attach refuses it once the read
+    returns it, and the row dead-letters at once with nothing sent (BACKLOG #5099)."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    stored = "Q" * 400 + "&" + "R" * 400
+    ref = await store.put_attachment(chunk_b64(stored), "application/pdf")
+    payload = _hl7(make_doc_ref(ref, "Application"))
+    reader = _Reader({ref: stored})
+    with pytest.raises(UnreattachableDocumentError, match="would escape") as caught:
+        await reattach_documents_in_hl7(payload, reader, bound=frozenset({ref}))
+    assert reader.calls == [ref]
+    assert stored not in str(caught.value)
+
+    runner = _runner(store)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+    rows = await _deliver_holding(store, runner, payload, ref)
+
+    assert col.deliveries == []
+    assert _dead_lettered_at_once(rows)
+    assert stored not in str(rows[0]["last_error"])
+
+
+async def test_an_ordinary_base64_document_is_detached_and_spliced_back_byte_identical(
+    store: MessageStore,
+) -> None:
+    """The control: a base64 document under ``^~\\&`` holds no character the splice escapes, so
+    it is detached, ACKed AA, and delivered as the very body the sender sent."""
+    body = _hl7(_EVERY_BASE64_CHARACTER)
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+    assert _ack_code(await runner._handle_inbound(ic, body.encode("utf-8"))) == "AA"
+    assert await _attachment_count(store) == 1
+    cur = await store._db.execute("SELECT raw FROM messages WHERE channel_id=?", (ic.name,))
+    row = await cur.fetchone()
+    assert row is not None
+    skeleton = str(row[0])
+    handle = Message.parse(skeleton).field("OBX-5.5") or ""
+    assert is_doc_ref(handle)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    await _deliver_holding(store, runner, skeleton, parse_doc_ref(handle)[0])
+
+    assert col.deliveries == [body]
+
+
+# --- a fault in the marker check's read is a peek fault (BACKLOG #1594, #5099) ----------------
+
+
+async def test_a_fault_in_the_marker_check_records_error_and_naks_at_both_listeners(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker check reads the parsed header after the peek. A parser fault there is recorded
+    ERROR and refused like any other peek read fault, never an exception that drops the
+    connection with no row (count-and-log)."""
+    from messagefoundry.pipeline import ingress_guards
+    from messagefoundry.transports.receipt import RefusalKind
+
+    def _fault(*_args: object) -> bool:
+        raise IndexError("parser fault in the marker read")
+
+    monkeypatch.setattr(ingress_guards, "marker_under_base64_delimiters", _fault)
+    body = _copy_in_nte_component("|", "^~\\&", "plain").encode("utf-8")
+    ic = _plain_ic()
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body)
+    receipt = await runner._handle_inbound_http(ic, body)
+
+    assert _ack_code(ack) == "AR"
+    assert ack is not None and "peek read failed" in ack
+    assert receipt.refusal is RefusalKind.PERMANENT
+    rows = await _rows(store, ic.name)
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
+    assert all("peek read failed (IndexError)" in str(r["error"]) for r in rows)
+    assert await _ingress_count(store, ic.name) == 0

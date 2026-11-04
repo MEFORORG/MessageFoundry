@@ -137,6 +137,7 @@ from messagefoundry.parsing.binary import (
     DocRefError,
     EscapedDocumentError,
     InboundDocRefError,
+    NonVerbatimDocumentError,
     UnreattachableDocumentError,
     chunk_b64,
     iter_obx_documents,
@@ -8053,6 +8054,9 @@ class RegistryRunner:
         try:
             peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             fields = _read_ingress_fields(peek)
+            # The marker check reads the header too, so a fault in it is a peek fault: ERROR, not
+            # an escape from the listener (BACKLOG #1594, #5099).
+            marker_refused = doc_ref_marker_refusal(peek, text)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
             # Over the peek's max_bytes is over-size, as the engine ceiling is on any other body; every
             # other parse refusal is about the body's content.
@@ -8069,7 +8073,7 @@ class RegistryRunner:
                     else _peek_read_fault(ic, exc)
                 ),
             )
-        if (marker_refused := doc_ref_marker_refusal(peek, text)) is not None:
+        if marker_refused is not None:
             # Delivery refuses any handle marker under these delimiters, so the body would be
             # accepted and then dead-letter on every outbound; refused here instead, at any size
             # (BACKLOG #5099). The same body fails the same way every time.
@@ -8225,7 +8229,10 @@ class RegistryRunner:
         :class:`~messagefoundry.store.StreamingAttachmentsUnsupported` on a backend without streaming
         support (SQL Server / Postgres in Phase 1a), and
         :class:`~messagefoundry.parsing.binary.EscapedDocumentError` when a document's ``OBX-5.5``
-        holds an HL7 escape (vault BACKLOG #2809) — each, as one of :data:`_DETACH_REFUSALS`, is turned
+        holds an HL7 escape (vault BACKLOG #2809), and
+        :class:`~messagefoundry.parsing.binary.InboundDocRefError` for a received handle or marker,
+        or for a document delivery's splice would not set back verbatim (BACKLOG #5099) — each, as
+        one of :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
         size = len(text)
@@ -8444,6 +8451,9 @@ class RegistryRunner:
             peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             # Every peek read the ingress commit needs, taken inside this guard (BACKLOG #1594).
             fields = _read_ingress_fields(peek)
+            # The marker check reads the header too, so a fault in it records ERROR and NAKs here
+            # rather than dropping the connection (BACKLOG #5099).
+            marker_refused = doc_ref_marker_refusal(peek, text)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
             if isinstance(exc, HL7PeekError):
                 # One rule for the reason and the AR text, on every listener (BACKLOG #2085): the
@@ -8467,7 +8477,7 @@ class RegistryRunner:
                 )
             return ack
 
-        if (marker_refused := doc_ref_marker_refusal(peek, text)) is not None:
+        if marker_refused is not None:
             # Delivery refuses any handle marker under these delimiters, so an AA here would be
             # followed by a dead-letter on every outbound; refused here instead, at any size, and
             # AR since the same body fails the same way every time (BACKLOG #5099).
@@ -8589,6 +8599,9 @@ class RegistryRunner:
                 elif isinstance(exc, Base64DelimiterError):
                     # Checked before its base class: the body's delimiters, not a marker.
                     nak_code, nak_text = "AR", "document under base64 delimiters"
+                elif isinstance(exc, NonVerbatimDocumentError):
+                    # A document's own value, which the splice would escape, not a marker.
+                    nak_code, nak_text = "AR", "document delivery would alter"
                 elif isinstance(exc, InboundDocRefError):
                     # Either shape: a handle in OBX-5.5, or the marker elsewhere in a body
                     # with a document to detach.

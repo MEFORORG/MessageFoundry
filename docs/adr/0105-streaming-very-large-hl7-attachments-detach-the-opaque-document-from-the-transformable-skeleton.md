@@ -324,6 +324,11 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   handle to splice or a marker, now dead-letters at delivery: under a subcomponent separator in
   the alphabet it would have reached the partner with its document escaped, and under a field,
   component or repetition separator it may have been delivered as it came.
+  A document is detached only if splicing it back reproduces it exactly, so the detach also
+  refuses a document whose own value `Message._escape_leaf` would change under the message's
+  delimiters, such as a non-base64 value holding `&` under `|^~\&` (`NonVerbatimDocumentError`,
+  the base of `Base64DelimiterError`), and the re-attach refuses such a stored value after its read
+  and before the splice, the backstop for an older row or a Handler that moved `MSH-2`.
   *Out of scope:* an outbound `encoding_characters` override, which the transport applies after
   hydration, is operator configuration. An uppercased marker `MFDOC:V1:REF:` is not a handle, since
   `is_doc_ref` is case-sensitive. A marker hidden behind `\Xhh\` escapes is not something the
