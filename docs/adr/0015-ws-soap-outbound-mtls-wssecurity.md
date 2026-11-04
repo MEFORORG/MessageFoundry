@@ -282,9 +282,8 @@ The token credentials are dedicated `ws_username` / `ws_password` settings (fall
 
 ### 5. Response / error capture + classification (Q5) — reuse ADR 0013, extend the fault map
 
-Capture is **already built** and stays regex-based (no XML parser; §2a) *(corrected 2026-11-04:
-classification is regex plus `str.find`, and `soap.py` does import an XML parser; the correction in
-§2a says where)*. `_classify_soap`
+Capture is **already built** and stays regex-based (no XML parser; §2a) *(corrected 2026-11-04: see the
+correction in §2a)*. `_classify_soap`
 ([`soap.py`](../../messagefoundry/transports/soap.py)) distinguishes Sender(permanent) /
 Receiver(transient) / HTTP; the `capture_response` branch of `SoapDestination.send`
 ([`soap.py`](../../messagefoundry/transports/soap.py)) returns `DeliveryResponse`
@@ -307,8 +306,9 @@ WS-Security fault codes — `wsse:FailedAuthentication`, `wsse:InvalidSecurityTo
 `wsse:MessageExpired` — to **permanent** (`NegativeAckError`, `permanent=True`). A cert/credential reject
 or an expired timestamp **won't fix on a retry**, so it must **dead-letter** rather than loop the FIFO
 lane forever — consistent with the existing "unrecognized fault → permanent" stance
-([`soap.py:82`](../../messagefoundry/transports/soap.py)). Fault bodies are still **not** echoed into
-errors/logs (they may carry PHI; [`soap.py:16`](../../messagefoundry/transports/soap.py)).
+(`_classify_soap`, [`soap.py`](../../messagefoundry/transports/soap.py)). Fault bodies are still **not**
+echoed into errors/logs (they may carry PHI; the [`soap.py`](../../messagefoundry/transports/soap.py)
+module docstring).
 
 ### 6. Invariants (Q6) — inherited by staying `ConnectorType.SOAP`
 
