@@ -4,14 +4,56 @@
 
 Shared here rather than imported as a private name from one test module.
 ``tests/test_batch_claim_locking.py`` built them for the pooled external-lock schedules, and
-``tests/test_adr0114_claim_proc_live.py`` uses them to lock a head and CALL the ``_v2`` claim proc."""
+``tests/test_adr0114_claim_proc_live.py`` uses them to lock a head and CALL the ``_v2`` claim proc.
+``claim_past_empty_yield`` is the one copy of the EMPTY-all retry those two files and
+``tests/test_claim_fifo_heads.py`` each carried (BACKLOG #4915)."""
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-from messagefoundry.store import Stage
+from messagefoundry.odbc_call_gate import install_call_gate
+from messagefoundry.store import ClaimAbortPhase, ClaimedHeads, Stage
+
+# The cap and backoff of claim_past_empty_yield.
+_CLAIM_YIELD_RETRIES = 16
+_CLAIM_YIELD_BACKOFF = 0.01
+
+
+def _did_something(res: ClaimedHeads) -> bool:
+    return bool(res.by_lane or res.rearm)
+
+
+async def claim_past_empty_yield(
+    claim: Callable[[], Awaitable[ClaimedHeads]],
+    *,
+    done: Callable[[ClaimedHeads], bool] = _did_something,
+) -> ClaimedHeads:
+    """Run ``claim`` and re-issue it past a transient EMPTY-all, for a site asserting a NON-empty
+    outcome. Returns as soon as ``done`` holds, by default once the claim did anything: a non-empty
+    ``by_lane`` or ``rearm``. A site with another goal, such as a claim that did not abort on 1222,
+    passes its own ``done``; the result is the last attempt either way.
+
+    Why it is needed: ``claim_fifo_heads`` on SQL Server runs under ``SET LOCK_TIMEOUT 0`` (ADR 0066
+    section 9, never-block), so a transient lock can fail the WHOLE claim closed to EMPTY-all, rolled
+    back with nothing consumed. That yield is contract-legal but flakes a single-shot assertion; on
+    the SQL Server leg it was once a 1-in-40 ``KeyError`` on ``res.by_lane[...]``.
+
+    Why it masks nothing: EMPTY-all is a full rollback, so a retry cannot double-claim, and a claim
+    that did anything never retries. A GENUINELY unclaimable head stays EMPTY-all on every pass and
+    still fails the caller's assertion after the cap. A real BLOCK raised through
+    :func:`claim_heads_no_block` is an exception, not a return, so it is never retried. A site whose
+    assertion IS the EMPTY-all calls the claim once, directly: that answer is immune to the yield.
+    SQLite serializes and Postgres skips locked rows, so neither yields and the loop is a no-op there."""
+    res = await claim()
+    for _ in range(_CLAIM_YIELD_RETRIES):
+        if done(res):
+            break
+        await asyncio.sleep(_CLAIM_YIELD_BACKOFF)
+        res = await claim()
+    return res
 
 
 async def ss_hold_row_lock(ss_store: Any, message_id: str, stage: str) -> tuple[Any, Any]:
@@ -30,8 +72,11 @@ async def ss_hold_row_lock(ss_store: Any, message_id: str, stage: str) -> tuple[
     READPAST-skip this row via the PROVEN path (the uncommitted-INSERT fan-in test already exercises
     that skip on CI). All callers are INGRESS (channel_id lane)."""
     conn = await ss_store._pool.acquire()
-    cur = await conn.cursor()
+    # The store's own call gate (BACKLOG #2049), so the discard below can never free a handle under a
+    # statement a cancellation left running. Idempotent: a connection the store has lent is gated.
+    install_call_gate(conn)
     try:
+        cur = await conn.cursor()
         # Resolve the row's fifo-index coordinates first (a plain read via ix_queue_message); seq is
         # globally unique (IDENTITY), so (stage, channel_id, status, seq) pins exactly one row. Fully
         # drained before BEGIN TRAN (no-MARS).
@@ -51,14 +96,19 @@ async def ss_hold_row_lock(ss_store: Any, message_id: str, stage: str) -> tuple[
             (stage, channel_id, status, seq),
         )
         assert len(await cur.fetchall()) == 1  # the U-lock MUST land on the intended row
-    except Exception:
+    except BaseException:
         # The callers' try/finally starts only once this returns, so a failure here must release
         # what it took itself: a leaked open transaction would hold its lock against the next
         # test's cleanup DELETE, which waits at the default LOCK_TIMEOUT -1.
+        #
+        # BaseException, so a cancellation is covered too (BACKLOG #4915). The connection is
+        # discarded with the store's own quarantine rather than rolled back and recycled: closing it
+        # ends the session, which rolls the transaction back server-side, and it needs no rollback
+        # or cursor close that could itself raise and skip the release, or run beside a statement a
+        # cancellation left on an executor thread. A failing path pays one reconnect.
         try:
-            await conn.rollback()
+            await ss_store._release_dirty(conn)
         finally:
-            await cur.close()
             await ss_store._pool.release(conn)
         raise
     return conn, cur
@@ -115,10 +165,13 @@ def assert_skip_named(res: Any, lane: str, *, abort_ok: bool) -> None:
     """BACKLOG #1270: a lane EMPTY behind a held head must NAME its route, never read as "no work".
 
     The completed claim names the lane in ``head_skipped``. On SQL Server alone the whole attempt may
-    instead abort on 1222 (``lock_timeout``) and read no row, which names the route without the lane;
-    ``abort_ok`` admits that, and only that. Either way a silent EMPTY fails here."""
-    if abort_ok and res.lock_timeout is not None:
-        assert res.head_skipped == frozenset()  # an aborted claim read no row, so it names none
+    instead abort on 1222 (``lock_timeout``) before its fetch, a HEAD-phase abort, and read no row,
+    which names the route without the lane; ``abort_ok`` admits that, and only that. A FINALIZE-phase
+    abort comes AFTER the fetch, so the skip it read rides out and the lane must still be named
+    (BACKLOG #4915). Either way a silent EMPTY fails here."""
+    timeout = res.lock_timeout
+    if abort_ok and timeout is not None and timeout.phase is ClaimAbortPhase.HEAD:
+        assert res.head_skipped == frozenset()  # a HEAD-phase abort read no row, so it names none
         return
     assert res.head_skipped == frozenset({lane}), (
         f"the locked head's lane came back EMPTY without being named: {res.head_skipped!r}"

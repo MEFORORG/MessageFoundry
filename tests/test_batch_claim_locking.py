@@ -35,6 +35,7 @@ from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from tests._claim_lock_helpers import (
     assert_skip_named,
     claim_heads_no_block,
+    claim_past_empty_yield,
     ss_hold_row_lock,
     ss_lane_pending,
 )
@@ -252,31 +253,13 @@ async def _pg_lane_pending(pg_store: Any, channel: str) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
-# claim_fifo_heads' SQL Server path opens with SET LOCK_TIMEOUT 0 (ADR 0066 §9 never-block), so a
-# transient lock can fail-close the WHOLE batch to EMPTY-all — by_lane AND rearm both empty, the claim
-# rolled back, nothing consumed. That yield is contract-legal (the pooled caller self-heals on retry)
-# but flakes a single-shot assertion. _claim_heads_until re-issues past a transient EMPTY-all while
-# keeping claim_heads_no_block's segfault-safe shield, for the sites here that assert a NON-empty
-# outcome — an after-release head, or a sibling/committed-successor lane claimed while ANOTHER row is
-# locked. Masks nothing: EMPTY-all is a full roll-back (a retry cannot double-claim; a successful claim
-# never retries), and a GENUINELY unclaimable head stays EMPTY-all every pass and still fails after the
-# cap. A real BLOCK still raises TimeoutError through the shield (not a return), so it is never retried.
-# Sites that assert EMPTY-all itself (a locked head with no free sibling) keep calling
-# claim_heads_no_block directly — that answer is already EMPTY-all and immune to the yield.
-_CLAIM_YIELD_RETRIES = 16
-_CLAIM_YIELD_BACKOFF = 0.01
-
-
 async def _claim_heads_until(store: Any, *args: Any, **kwargs: Any) -> Any:
-    """claim_heads_no_block (same shield + timeout) re-issued past a transient EMPTY-all yield; see
-    the note above. Returns as soon as the claim did ANYTHING (a non-empty by_lane or rearm)."""
-    res = await claim_heads_no_block(store, *args, **kwargs)
-    for _ in range(_CLAIM_YIELD_RETRIES):
-        if res.by_lane or res.rearm:
-            break
-        await asyncio.sleep(_CLAIM_YIELD_BACKOFF)
-        res = await claim_heads_no_block(store, *args, **kwargs)
-    return res
+    """claim_heads_no_block (same shield + timeout) re-issued past a transient EMPTY-all yield, for the
+    sites here that assert a NON-empty outcome: an after-release head, or a sibling/committed-successor
+    lane claimed while ANOTHER row is locked. :func:`claim_past_empty_yield` says why that masks
+    nothing. Sites that assert EMPTY-all itself (a locked head with no free sibling) keep calling
+    claim_heads_no_block directly — that answer is already EMPTY-all and immune to the yield."""
+    return await claim_past_empty_yield(lambda: claim_heads_no_block(store, *args, **kwargs))
 
 
 # --- 1a: true T6 — locked head => lane EMPTY, no lock-wait, N claimed first after
