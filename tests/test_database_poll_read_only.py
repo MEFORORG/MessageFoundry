@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A DATABASE source refuses a ``poll_statement`` that could write (BACKLOG #2178).
+"""A DATABASE source refuses at least a ``poll_statement`` of a writing shape (BACKLOG #2178), but
+not every writing poll: at least a ``SELECT`` that calls a function which writes, and a T-SQL
+second statement with no ``;`` whose verb the test does not list, pass.
 
 Why, and what is refused: ``transports.database._read_only_poll_refusal``. ``DatabasePoll`` tests a
 literal statement when declared, and ``DatabaseSource`` tests every statement when built."""
@@ -59,6 +61,9 @@ _WRITING_POLLS = [
     pytest.param("EXEC dbo.claim_next_batch", id="exec"),
     pytest.param("{CALL dbo.claim_next_batch}", id="odbc-call"),
     pytest.param("SELECT id, payload FROM mf_inbox; UPDATE mf_inbox SET status='X'", id="chained"),
+    # BACKLOG #4954: T-SQL second statements with no `;` that the shared keyword list now refuses.
+    pytest.param("SELECT id, payload FROM mf_inbox BEGIN TRAN", id="begin-tran"),
+    pytest.param("SELECT 1 RECEIVE TOP (1) * FROM mf_inbox_queue", id="receive"),
     # Decided, not accidental: the lock ends with the statement on the autocommit pool, so refusing a
     # FOR UPDATE locking read loses nothing, and the message says so.
     pytest.param(

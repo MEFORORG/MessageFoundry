@@ -4464,10 +4464,12 @@ def DatabasePoll(
     keyword (the SQL-Server weakened-TLS refusal does not apply on that path). Credentials stay in
     ``username``/``password`` (under ``odbc_user_key``/``odbc_password_key``, default ``UID``/``PWD``).
 
-    A ``poll_statement`` that could write is refused: a literal one here, when declared (as
-    ``generic`` while the dialect is an ``env()`` value), and every
+    At least a ``poll_statement`` of a writing shape is refused: a literal one here, when declared
+    (as ``generic`` while the dialect is an ``env()`` value), and every
     one, an ``env()`` value included, when the source is built (BACKLOG #2178;
-    ``transports.database._read_only_poll_refusal`` says what and why)."""
+    ``transports.database._read_only_poll_refusal`` says what and why). Not every writing poll is
+    refused: at least a ``SELECT`` that calls a function which writes, and a T-SQL second statement
+    with no ``;`` whose verb the test does not list, pass."""
     _reject_envref_odbc_params(odbc_params)
     # Refused at declaration, as DatabaseRef's statement is (BACKLOG #2617), because
     # `messagefoundry check` builds connectors only with a messagefoundry.toml. An empty statement is
