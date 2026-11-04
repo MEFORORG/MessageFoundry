@@ -907,6 +907,9 @@ def test_generic_guard_is_none_off_the_arm() -> None:
         ("[::1]remote.example", {}, ("[::1]remote.example", 0)),
         ("[::1]:5432x", {}, ("[::1]:5432x", 0)),
         ("127.0.0.1 : 5432", {}, ("127.0.0.1 : 5432", 0)),
+        # An empty bracketed host is read whole: the loopback check reads an empty host as on-box.
+        ("[]", {}, ("[]", 0)),
+        ("[]:5432", {}, ("[]:5432", 0)),
     ],
 )
 def test_generic_hop_endpoint_splits(
@@ -922,13 +925,18 @@ def test_generic_hop_endpoint_splits(
         ("127.0.0.1,1433", {}, True, ("127.0.0.1", 1433)),
         ("[::1],1433", {}, True, ("::1", 1433)),
         ("db.example,1433", {"PORT": "5432"}, True, ("db.example", 1433)),
-        ("127.0.0.1,01433", {}, True, ("127.0.0.1", 1433)),
+        # Microsoft's driver ignores PORT, so it is never read as that driver's port.
+        ("127.0.0.1", {"PORT": "5432"}, True, ("127.0.0.1", 0)),
+        ("127.0.0.1,remote.example", {"PORT": "5432"}, True, ("127.0.0.1,remote.example", 0)),
         # Anything else holding a comma is read whole on that driver too.
         ("127.0.0.1,remote.example", {}, True, ("127.0.0.1,remote.example", 0)),
         ("127.0.0.1,1433,x", {}, True, ("127.0.0.1,1433,x", 0)),
         ("127.0.0.1,1433,1433", {}, True, ("127.0.0.1,1433,1433", 0)),
         ("127.0.0.1,99999", {}, True, ("127.0.0.1,99999", 0)),
         ("127.0.0.1,0", {}, True, ("127.0.0.1,0", 0)),
+        # A leading zero is refused, as the egress reading refuses it in PORT.
+        ("127.0.0.1,01433", {}, True, ("127.0.0.1,01433", 0)),
+        ("[],1433", {}, True, ("[],1433", 0)),
         ("127.0.0.1, 1433", {}, True, ("127.0.0.1, 1433", 0)),
         ("127.0.0.1 ,1433", {}, True, ("127.0.0.1 ,1433", 0)),
         ("127.0.0.1,\u00b9433", {}, True, ("127.0.0.1,\u00b9433", 0)),

@@ -3484,6 +3484,48 @@ def test_the_tls_reader_resolves_an_env_driver_as_the_build_does() -> None:
     assert off.startswith("TLS is explicitly not required: SSLmode=disable")
 
 
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        # At risk on every family: the reason they all give, never "possibly delegated".
+        ({}, "no TLS keyword is set in odbc_params"),
+        ({"sslcert": "client.pem"}, "a TLS keyword is set in odbc_params, but no TLS mode"),
+        ({"SSLmode": "on"}, "no TLS mode is set in odbc_params that any driver family"),
+        # Some family counts the mode set, so the hop is possibly delegated.
+        ({"SSLmode": "verify-full"}, "possibly delegated"),
+        ({"Encrypt": "yes"}, "possibly delegated"),
+    ],
+)
+def test_an_unread_env_driver_is_possibly_delegated_only_where_a_family_clears_it(
+    params: dict[str, str], expected: str
+) -> None:
+    """Review of BACKLOG #5053. An unresolved ``env()`` ``odbc_driver`` was labelled possibly
+    delegated whatever ``odbc_params`` held, so a hop with no TLS keyword, at risk on every driver,
+    read as one whose risk depended on the driver."""
+    from messagefoundry.config.wiring import (
+        Database,
+        Registry,
+        build_outbound_connection,
+        env,
+        unverified_generic_db_hops,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_UNREAD",
+            Database(
+                server="db.example.invalid",
+                dialect="generic",
+                odbc_driver=env("ob_unread_driver"),  # type: ignore[arg-type]
+                odbc_params=params,
+                statement="INSERT INTO r (a) VALUES (:a)",
+            ),
+        )
+    )
+    assert expected in dict(unverified_generic_db_hops(reg))["OB_UNREAD"]
+
+
 def test_db_readers_never_resolve_a_not_deployed_env_dialect() -> None:
     """ADR 0111 AC-1: a ``deployed=False`` connection's ``env()`` values are never resolved on any
     path. Both DATABASE readers resolved the dialect before anything skipped the connection, so an

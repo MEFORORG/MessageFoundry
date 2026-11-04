@@ -4355,7 +4355,9 @@ def Database(
     it in ``odbc_driver`` and pass driver-specific keywords (``PORT``, ``SSLmode``, …) via ``odbc_params``;
     credentials stay in ``username``/``password`` (emitted under ``odbc_user_key``/``odbc_password_key`` —
     default ``UID``/``PWD``). **On the generic path configure TLS via the driver's own keyword** (e.g.
-    ``odbc_params={"SSLmode": "verify-full"}``) — the SQL-Server weakened-TLS refusal does not apply there.
+    ``odbc_driver="PostgreSQL Unicode", odbc_params={"SSLmode": "verify-full"}``; ``odbc_driver``
+    defaults to Microsoft's driver, which refuses ``SSLmode``) — the SQL-Server weakened-TLS refusal
+    does not apply there.
 
     The Handler produces a JSON-object body; the connector binds its keys to the ``:name`` parameters in
     ``statement`` (translated to positional ``?`` — always parameterized, never string-built) and runs it. A
@@ -6802,7 +6804,8 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
 POSSIBLY_GENERIC_DB_HOP = "possibly generic: dialect is an unresolved env() reference"
 
 #: The generic-hop reason when ``odbc_driver`` is an ``env()`` reference the reader cannot resolve,
-#: so its driver family is unknown (BACKLOG #5053).
+#: so its driver family is unknown, and at least one family the engine places would count the mode
+#: set (BACKLOG #5053). Where none would, the hop gets the reason every family gives instead.
 UNRESOLVED_DRIVER_REASON = "possibly delegated: odbc_driver is an unresolved env() reference"
 
 
@@ -6899,8 +6902,8 @@ def unverified_generic_db_hops(
 
     Pure — it reads the loaded graph and touches nothing else."""
     from messagefoundry.transports.database import (
-        UNPLACED_DRIVER_REASON,
         generic_odbc_tls_unenforced,
+        generic_odbc_tls_unenforced_unread,
     )
 
     def unenforced(settings: Mapping[str, Any], *, deployed: bool) -> str | None:
@@ -6916,10 +6919,13 @@ def unverified_generic_db_hops(
         # A not-deployed connection's env() values are never resolved (ADR 0111 AC-1), so its
         # env() driver stays unread; a no-TLS value beside it is still reported.
         driver = _db_setting(settings, "odbc_driver", None, env_values if deployed else None)
-        unread = driver is _UNRESOLVED
-        reason = generic_odbc_tls_unenforced(params, driver=None if unread else driver)
-        if unread and reason == UNPLACED_DRIVER_REASON:
-            reason = UNRESOLVED_DRIVER_REASON
+        # Possibly delegated only where some family would clear the params: a hop at risk on
+        # every driver keeps the reason they all give.
+        reason: str | None
+        if driver is _UNRESOLVED:
+            reason = generic_odbc_tls_unenforced_unread(params) or UNRESOLVED_DRIVER_REASON
+        else:
+            reason = generic_odbc_tls_unenforced(params, driver=driver)
         if reason is None or dialect is not None:
             return reason
         # Unresolved: read as possibly generic rather than as not generic. A SQL Server value would

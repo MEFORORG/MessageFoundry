@@ -103,13 +103,15 @@ def _exact_split(text: str) -> tuple[str, str] | None:
     """:func:`split_generic_server` of ``text``, or ``None`` unless ``text`` is a host,
     ``host:port`` or ``[v6]:port`` written exactly, with a usable port where it carries one.
 
-    Anything else, at least ``[::1]remote``, ``[::1]:5432x`` and ``127.0.0.1 : 5432``, gets
-    ``None``, so no text the split would drop can sit behind a loopback host."""
+    Anything else, at least ``[::1]remote``, ``[::1]:5432x``, ``127.0.0.1 : 5432`` and ``[]``,
+    gets ``None``, so no text the split would drop can sit behind a loopback host. An empty host
+    from a non-empty ``text`` is refused because the loopback check reads an empty host as on-box,
+    while the driver is handed the text, not an empty one."""
     host, in_server = split_generic_server(text)
     written = (f"[{host}]" if text.startswith("[") else host) + (
         f":{in_server}" if in_server else ""
     )
-    if written != text or (in_server and not port_or_zero(in_server)):
+    if written != text or (in_server and not port_or_zero(in_server)) or (text and not host):
         return None
     return host, in_server
 
@@ -141,30 +143,34 @@ def generic_hop_endpoint(
     host ``5432``. The whole text is never an address or ``localhost``, so the loopback check reads
     it as remote. Before this, the host was the text before the first comma, so such a value
     counted as on-box under the empty-allowlist opt-out. On psqlODBC and MySQL the port goes in the
-    ``PORT`` keyword, which both read, as the egress reading's remedy says.
+    ``PORT`` keyword, which both read.
 
     **The exception is ``reads_comma_port``**, which the caller sets only for a driver it places as
     Microsoft's ODBC Driver for SQL Server. That driver reads ``SERVER=host,port`` as one host and
     its port, its own documented spelling, and ignores ``PORT``, so ``host,port`` is the only port
-    spelling it reads on this dialect. There, and only for exactly one comma followed by ASCII digits
-    that make a port, the text before the comma is read as the rest of this function reads a
-    ``server`` with no comma; it must name a host and carry no port of its own. Anything else
-    holding a comma, ``127.0.0.1,remote`` and ``127.0.0.1,1433,x`` included, is still read whole.
+    spelling it reads on this dialect, and ``PORT`` is never read as its port here. There, and only
+    for exactly one comma followed by ASCII digits that make a port with no leading zero, the text
+    before the comma is read as the rest of this function reads a ``server`` with no comma; it must
+    name a host and carry no port of its own. Anything else holding a comma, ``127.0.0.1,remote``
+    and ``127.0.0.1,1433,x`` included, is still read whole.
 
     The egress reading still refuses that ``server`` on every driver, and the two differ on
-    purpose. The hop guard asks only whether the hop leaves the box, and a wrong ``no`` there only
-    refuses. The egress reading matches ``server`` whole against an ``allowed_db`` entry and reads
-    the generic port from ``PORT`` alone, so it has no reading of a SQL Server driver's port on this
-    dialect, and for that driver it points at the SQL Server preset, which sends ``host,port``
-    itself. With an empty allowlist it refuses nothing, so the hop guard is then the only reader."""
-    keyword = str(odbc_param(params, "port") or "")
+    purpose. The hop guard asks only whether the hop leaves the box, and a wrong ``yes`` there only
+    refuses; a wrong ``no`` would let a cleartext hop cross, which is why only the driver's own
+    exact spelling is split. The egress reading matches ``server`` whole against an
+    ``allowed_db`` entry and reads the generic port from ``PORT`` alone, so it has no reading of a
+    SQL Server driver's port on this dialect; the SQL Server preset, which sends ``host,port``
+    itself, is the spelling it reads a port from for that driver. With an empty allowlist it
+    refuses nothing, so the hop guard is then the only reader."""
+    keyword = "" if reads_comma_port else str(odbc_param(params, "port") or "")
     text = server.strip()
     if "," in text:
         head, _, tail = text.partition(",")
-        if reads_comma_port and tail.isascii() and tail.isdecimal() and port_or_zero(tail):
+        port = port_or_zero(tail) if tail.isascii() and tail.isdecimal() else 0
+        if reads_comma_port and port and not tail.startswith("0"):
             split = _exact_split(head)
             if split is not None and split[0] and not split[1]:
-                return split[0], port_or_zero(tail)
+                return split[0], port
         return text, port_or_zero(keyword)
     split = _exact_split(text)
     if split is None:

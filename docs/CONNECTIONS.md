@@ -2106,8 +2106,8 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > **The exception is Microsoft's ODBC Driver for SQL Server**, placed by its registered name
 > `ODBC Driver <n> for SQL Server`. That driver reads `host,port` as one host and its port, its own
 > documented spelling, and ignores `PORT`. On that name only, `server` written as a host, one comma
-> and a port in ASCII digits, such as `127.0.0.1,1433`, is read as that host and port, so a
-> loopback host stays on-box. Anything else holding a comma, at least `127.0.0.1,remote` and
+> and a port in ASCII digits with no leading zero, such as `127.0.0.1,1433`, is read as that host
+> and port, so a loopback host stays on-box. Anything else holding a comma, at least `127.0.0.1,remote` and
 > `127.0.0.1,1433,x`, is still read whole. The `[egress].allowed_db` check still refuses a comma in
 > a generic `server` on every driver, so with a non-empty allowlist that spelling is refused there;
 > for Microsoft's driver use the SQL Server preset, which sends `server,port` itself.

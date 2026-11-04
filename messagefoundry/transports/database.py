@@ -511,10 +511,30 @@ def generic_odbc_tls_unenforced(params: Mapping[str, Any], *, driver: object) ->
     the log line, the operator report and the refusal can never disagree about which hops are at risk —
     but widening it now widens a refusal, which the deny-list's deliberate narrowness should be read
     against."""
+    return _family_tls_verdict(params, _driver_family(driver))
+
+
+def generic_odbc_tls_unenforced_unread(params: Mapping[str, Any]) -> str | None:
+    """:func:`generic_odbc_tls_unenforced` for a driver name the caller has not read, such as an
+    unresolved ``env()`` ``odbc_driver``: ``None`` when at least one driver family the engine
+    places would clear ``params``, so the hop is possibly delegated, and otherwise the reason every
+    such family gives. Where the families give different reasons, none of which clears the hop,
+    the reason says no family reads the mode set. So a hop at risk on every driver is never
+    labelled possibly delegated."""
+    verdicts = {_family_tls_verdict(params, family) for family in _DRIVER_FAMILIES}
+    if None in verdicts:
+        return None
+    if len(verdicts) == 1:
+        return verdicts.pop()
+    return "no TLS mode is set in odbc_params that any driver family the engine places reads"
+
+
+def _family_tls_verdict(params: Mapping[str, Any], family: str | None) -> str | None:
+    """:func:`generic_odbc_tls_unenforced` for the family key ``family``, or ``None`` for a name
+    the engine cannot place."""
     disabling = generic_odbc_no_tls_params(params)
     if disabling:
         return "TLS is explicitly not required: " + ", ".join(sorted(disabling))
-    family = _driver_family(driver)
     if family is None:
         return UNPLACED_DRIVER_REASON
     if _sets_tls_mode(params, family):
@@ -679,6 +699,10 @@ class _DriverFamily(NamedTuple):
     #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
     #: keyword never brings an unmeasured escape with it.
     brace_escape: bool
+    #: Whether the driver reads ``SERVER=host,port`` as one host and its port, and ignores
+    #: ``PORT``: Microsoft's driver alone (:func:`~messagefoundry.transports.db_endpoint.generic_hop_endpoint`,
+    #: BACKLOG #4874).
+    reads_comma_port: bool = False
 
 
 # The three driver families the engine can place, by whole registered name in any case but spelled
@@ -719,6 +743,7 @@ _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
         None,
         "Encrypt=yes",
         brace_escape=True,
+        reads_comma_port=True,
     ),
 }
 
@@ -1601,12 +1626,13 @@ def generic_cleartext_hop_guard(
     reason = generic_odbc_tls_unenforced(params, driver=settings.get("odbc_driver"))
     if reason is None:
         return None
-    # Microsoft's driver alone reads ``host,port`` as one host and its port; generic_hop_endpoint
-    # says why that spelling is split for it and read whole for every other driver (BACKLOG #4874).
+    # generic_hop_endpoint says why ``host,port`` is split only for a family that reads it, and
+    # read whole for every other driver (BACKLOG #4874).
+    family = _driver_family(settings.get("odbc_driver"))
     host, port = generic_hop_endpoint(
         str(settings.get("server") or ""),
         params,
-        reads_comma_port=_driver_family(settings.get("odbc_driver")) == "msodbc",
+        reads_comma_port=family is not None and _DRIVER_FAMILIES[family].reads_comma_port,
     )
     return InsecureHopGuard.capture(
         host=host,
