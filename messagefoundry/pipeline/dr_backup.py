@@ -601,14 +601,11 @@ class BackupRunner:
         # the run is short, and this run's own directory's owner sweeps once it is open. A run whose
         # open fails still sweeps. Off the loop, like the rest.
         staging_root, secure = self._staging_root(dest_dir)
+        process_owner = await asyncio.to_thread(_process_owner)
         probed = await asyncio.to_thread(_probe_owner, staging_root)
         root_owner = probed
         if root_owner is None:
-            log.warning(
-                "DR staging: could not learn the owner a new entry in %s gets from a probe there",
-                staging_root,
-            )
-            root_owner = await asyncio.to_thread(_fallback_root_owner, staging_root)
+            root_owner = await asyncio.to_thread(_fallback_root_owner, staging_root, process_owner)
         swept_by: list[object] = []
         if root_owner is not None:
             swept_by.append(root_owner)
@@ -619,7 +616,6 @@ class BackupRunner:
         # with that owner, whatever owner a share's server gives this run's staging directory. On
         # Windows that read is a probe in the OS temp dir, and when it answers None this sweep is
         # off for this run.
-        process_owner = await asyncio.to_thread(_process_owner)
         await asyncio.to_thread(_sweep_os_temp, process_owner)
         # After those sweeps, which free what dead runs left when they ran, and before this run's
         # directory is opened or any of its bytes is staged. It is not before every write: the
@@ -632,9 +628,9 @@ class BackupRunner:
             config_only=config_only,
             config_dir=config_dir,
         )
-        if shortfall is not None and probed is None:
-            # The early probe answered None, so the early sweep may have missed what this account's
-            # killed run left, and it would refuse every later run until someone deleted it. Probe
+        if shortfall is not None:
+            # The early sweep may have missed what this account's killed run left, as when its probe
+            # answered None, and it would refuse every later run until someone deleted it. Probe
             # once more and, only when that owner is not one a sweep above already went by, sweep by
             # it and check once more whatever the sweep counted: a leftover it emptied but could not
             # remove is not counted, yet frees the space. No run directory is open yet, so a refusal
@@ -2179,8 +2175,9 @@ def _discard_verify_staging(staging: Path) -> str | None:
 _BACKUP_STAGING_PREFIX = "mefor-backup-"
 _VERIFY_STAGING_PREFIX = "mefor-verify-"
 _SWEPT_PREFIXES = (_BACKUP_STAGING_PREFIX, _VERIFY_STAGING_PREFIX)
-#: The bare directory :func:`_probe_owner` makes to learn the owner a new directory gets. Never a
-#: staging directory; a leaked one is empty, and the sweep removes it by ``rmdir`` alone.
+#: The probe :func:`_probe_owner` makes to learn the owner a new entry gets: an empty file on POSIX,
+#: a bare directory on Windows. Never a staging directory; a leaked one is empty, and the sweep
+#: removes it, a directory by ``rmdir`` alone and a file only while it is empty.
 _OWNER_PROBE_PREFIX = "mefor-owner-probe-"
 
 #: The server-DB staging root, a dot-prefixed directory under the backup destination.
@@ -2597,9 +2594,13 @@ def _probe_owner(root: Path | None) -> object | None:
     try:
         return _owner_of_fd(fd, Path(name))
     finally:
-        os.close(fd)
+        # Removed only while its name still names the object it created: after a rename swap the
+        # name holds someone else's object, which is theirs to remove.
         with contextlib.suppress(OSError):
-            os.unlink(name)
+            made, named = os.fstat(fd), os.lstat(name)
+            if (made.st_dev, made.st_ino) == (named.st_dev, named.st_ino):
+                os.unlink(name)
+        os.close(fd)
 
 
 def _owner_of_fd(fd: int, opened_as: Path) -> object | None:
@@ -2616,27 +2617,34 @@ def _owner_of_fd(fd: int, opened_as: Path) -> object | None:
         return None
 
 
-def _fallback_root_owner(root: Path) -> object | None:
+def _fallback_root_owner(root: Path, process: object | None) -> object | None:
     """The owner the backup's early staging-root sweep goes by when :func:`_probe_owner` of ``root``
-    answers ``None``, such as on a volume a killed run filled: the process's own owner, as
-    :func:`_process_owner` reads it, and only when ``root`` itself carries that owner. ``None``
-    otherwise, and the early sweep is then off.
+    answers ``None``, such as on a volume a killed run filled: ``process``, the process's own owner
+    as :func:`_process_owner` reads it, and only when ``root`` itself carries that owner. ``None``
+    otherwise, and the early sweep is then off. A root that does not exist answers ``None`` with no
+    log line, since there is nothing to sweep; any other refused probe is logged at WARNING.
 
     The gate is what keeps BACKLOG #4988 closed. On a share whose server sets the owner, what this
     account makes there, its staging root among it, carries the server's choice, so the gate fails
     and no directory carrying the process's own owner, which another principal may have made there,
     is swept by it. Where a new entry gets the process's owner, a root this account made carries it,
     so the sweep frees a killed run's leftover before the space check, as it did before the probe.
-    On POSIX the root is opened with ``O_NOFOLLOW`` and read with ``fstat``; on Windows it is read
-    by path. What it leaves open: a staging root another principal made on such a share, carrying
-    the process's owner, passes the gate."""
-    process = _process_owner()
+    On POSIX the root is opened, following a link as the sweep and the staging open do, and read
+    with ``fstat``; on Windows it is read by path. What it leaves open: a staging root another
+    principal made on such a share, carrying the process's owner, passes the gate; and a root
+    another account owns, such as a data dir the root account made, fails it, so there the early sweep is off
+    on a volume no probe can be created on."""
+    if not os.path.isdir(root):
+        return None
+    log.warning(
+        "DR staging: could not learn the owner a new entry in %s gets from a probe there", root
+    )
     if process is None:
         return None
     if sys.platform == "win32":
         return process if _owner_of(root) == process else None
     try:
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError:
         return None
     try:
@@ -2923,7 +2931,9 @@ def _decode_store_key(key_b64: str) -> bytes:
     except ValueError as exc:
         reason = str(exc)
     else:
-        return bytes(decoded)
+        key = bytes(decoded)
+        decoded[:] = bytes(len(decoded))  # best effort: the decoder's copy exists to be wiped
+        return key
     raise StoreCipherConfigError(reason)
 
 
