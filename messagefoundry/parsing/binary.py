@@ -366,8 +366,11 @@ def _delimits_with_base64(separators: Iterable[str]) -> bool:
     :data:`_BASE64_ALPHABET` (BACKLOG #5099).
 
     The one delimiter-class rule. ``Message.set`` escapes a delimiter wherever it occurs in a
-    value, so under such delimiters a document set back into ``OBX-5.5`` is not the sender's
-    base64, and the content address after a copied marker may not read as one. So the ingress
+    value, so a subcomponent separator in the alphabet is escaped inside a document set back into
+    ``OBX-5.5``, and any of them may be inside a copied content address, which then may not read
+    as one. A field, component or repetition separator in the alphabet instead splits a document
+    across fields, components or repetitions, so the detach would store a fragment of it. So the
+    ingress
     detach refuses a body it would detach a document from (:class:`Base64DelimiterError`), both
     listeners refuse a body that holds the marker (:func:`marker_under_base64_delimiters`), and
     the delivery re-attach refuses a handle it would splice and any marker it finds
@@ -393,13 +396,16 @@ def marker_under_base64_delimiters(message: Message, text: str) -> bool:
     delivery re-attach refuses any marker under these delimiters, so it would be ACKed and then
     dead-letter on every outbound.
 
-    ``message`` is ``text`` parsed. A body whose MSH-1 and MSH-2 name no delimiters is False here.
-    For ordinary delimiters the cost is the header read alone; otherwise at most two substring
-    scans of ``text``."""
+    ``message`` is ``text`` parsed. A body whose MSH-1 and MSH-2 name no delimiters counts when it
+    holds the raw marker, as delivery refuses that too. For ordinary delimiters the cost is the
+    header read alone; otherwise at most two substring scans of ``text``. A marker hidden behind
+    a hex escape is not looked for: the engine never writes one."""
     try:
         separators = message._encoding_chars()
     except ValueError:
-        return False
+        # Delivery refuses a raw marker under such a header (reattach_documents_in_hl7), so it is
+        # refused here too, before the ACK.
+        return DOC_REF_MARKER in text
     if not _delimits_with_base64(separators):
         return False
     return any(m in text for m in _marker_forms(separators))
@@ -572,7 +578,8 @@ def iter_obx_documents(
         if detachable:
             documents.append(occ)
             value_holds_marker = value_holds_marker or holds_marker
-    if documents and _detach_delimits_with_base64(message):
+    # The OBX reads above already raised on delimiters that cannot be read, so this read cannot.
+    if documents and _delimits_with_base64(message._encoding_chars()):
         raise Base64DelimiterError(
             "a delimiter of the body is a base64 character, so a detached document could not be "
             "set back verbatim; refusing the detach"
@@ -623,16 +630,6 @@ def _scan_obx(message: Message, occ: int, min_b64_len: int) -> tuple[bool, bool,
     return True, detachable, holds_marker
 
 
-def _detach_delimits_with_base64(message: Message) -> bool:
-    """Whether ``message``'s delimiters break the detach's round trip (:func:`_delimits_with_base64`).
-    Fails closed: delimiters that cannot be read are refused, as :func:`_received_holds_marker`
-    refuses them."""
-    try:
-        return _delimits_with_base64(message._encoding_chars())
-    except ValueError:
-        return True
-
-
 def _received_holds_marker(message: Message, received: str) -> bool:
     """Whether ``received`` holds the handle marker anywhere, raw or escaped by the message's
     delimiters: where a detach would leave it for delivery's after-the-splice guard to find
@@ -640,13 +637,13 @@ def _received_holds_marker(message: Message, received: str) -> bool:
     if DOC_REF_MARKER in received:
         return True
     try:
-        escaped = message._escape_leaf(DOC_REF_MARKER, *message._encoding_chars())
+        separators = message._encoding_chars()
     except ValueError:
         # Fail closed: a body whose separators cannot be read cannot be checked for the escaped
         # form, so it is refused rather than detached unchecked. The OBX reads before this call
         # already raise on such a header, so the branch only guards a reorder.
         return True
-    return escaped in received
+    return any(m in received for m in _marker_forms(separators))
 
 
 def chunk_b64(b64: str, chunk_len: int = DETACH_CHUNK_BYTES) -> Iterator[str]:

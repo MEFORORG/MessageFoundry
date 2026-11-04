@@ -64,8 +64,13 @@ from messagefoundry.config.wiring import InboundConnection, _is_text_codec
 from messagefoundry.framing import MLLP_CODEC
 from messagefoundry.parsing import RawMessage, normalize
 from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
-from messagefoundry.parsing.binary import BinaryCarriageError, is_marked
+from messagefoundry.parsing.binary import (
+    BinaryCarriageError,
+    is_marked,
+    marker_under_base64_delimiters,
+)
 from messagefoundry.parsing.binary import decode as decode_carriage
+from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import (
     DEFAULT_MAX_MESSAGE_BYTES,
     HL7PeekError,
@@ -79,6 +84,7 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.framing import declared_encoding
 
 __all__ = [
+    "DOC_REF_MARKER_REFUSED_REASON",
     "FRAME_BYTE_REJECTED_REASON",
     "INGRESS_MAX_BYTES",
     "MULTIPLE_MESSAGES_REJECTED_REASON",
@@ -99,6 +105,7 @@ __all__ = [
     "check_decoded",
     "decode_body",
     "decode_ingress",
+    "doc_ref_marker_refusal",
     "ingress_encoding",
     "ingress_size_error",
     "peek_max_bytes",
@@ -120,6 +127,23 @@ __all__ = [
 # The listener reads it as ``wiring_runner._STRICT_VALIDATE_TIMEOUT_SECONDS``; it lives here so the
 # resend (BACKLOG #1911) and the listener resolve it by one rule.
 STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
+
+#: The stored reason for an HL7 body refused because it holds the document handle marker under a
+#: delimiter in the base64 alphabet (BACKLOG #5099). It names no byte of the body.
+DOC_REF_MARKER_REFUSED_REASON = (
+    "document handle refused: the body holds the handle marker and a delimiter is a base64 "
+    "character"
+)
+
+
+def doc_ref_marker_refusal(peek: Peek, text: str) -> str | None:
+    """The reason to refuse a parsed HL7 body before the ACK, or ``None`` to go on: one that holds
+    the document handle marker under a delimiter in the base64 alphabet, which delivery would
+    refuse on every outbound (:func:`~messagefoundry.parsing.binary.marker_under_base64_delimiters`,
+    BACKLOG #5099). Pure, so both listeners and the dry-run run the one check."""
+    if marker_under_base64_delimiters(Message(peek.message), text):
+        return DOC_REF_MARKER_REFUSED_REASON
+    return None
 
 
 def strict_validate_timeout(ic: InboundConnection) -> float | None:

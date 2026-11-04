@@ -300,14 +300,17 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   delimiter wherever it occurs in a value. So when a message's delimiters, read as
   `Message._encoding_chars` reads them (`MSH-1` and the first four `MSH-2` characters of the first
   `MSH`; a fifth, truncation character does not count), include a character of the base64
-  alphabet `A-Za-z0-9+/=`, a document set back into `OBX-5.5` is not the sender's base64, and the
-  content address after a copied marker may not read as one. The rule is applied in four places,
-  all through `_delimits_with_base64`:
+  alphabet `A-Za-z0-9+/=`: a subcomponent separator in it is escaped inside a document set back
+  into `OBX-5.5`, a field, component or repetition separator in it splits the document so the
+  detach would store a fragment, and the content address after a copied marker may not read as
+  one. The rule is applied in four places, all through `_delimits_with_base64`:
   1. *Ingress detach refusal.* Where a document would be detached, the detach refuses the body
      before anything is stored (`Base64DelimiterError`, an `InboundDocRefError`).
   2. *Ingress marker refusal.* Both listeners refuse a body of any size that holds the handle
-     marker, raw or as its delimiters escape it (`marker_under_base64_delimiters`). The cost is a
-     header read, plus two substring scans only under such delimiters.
+     marker, raw or as its delimiters escape it (`marker_under_base64_delimiters`, through
+     `ingress_guards.doc_ref_marker_refusal`, which the dry-run runs too). A body whose `MSH-1`
+     and `MSH-2` name no delimiters is refused when it holds the raw marker, as delivery refuses
+     it. The cost is a header read, plus two substring scans only under such delimiters.
   3. *Egress splice refusal.* The re-attach refuses a handle it would splice before any read, so
      a Handler that changed `MSH-2` after the detach cannot corrupt the document.
   4. *Egress copy refusal.* The re-attach refuses any marker it finds with no handle to splice.
@@ -316,13 +319,18 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
 
   Each ingress refusal is an `ERROR` row before any ingress row, an `AR` on MLLP and a permanent
   refusal on HTTP. Ordinary delimiters, `|^~\&` and variants such as a `#` or `!`, hold no base64
-  character and are unaffected. A row ingested before this rule under such delimiters now
-  dead-letters at delivery rather than reaching the partner corrupted.
+  character and are unaffected. A row ingested before this rule under such delimiters, with a
+  handle to splice or a marker, now dead-letters at delivery: under a subcomponent separator in
+  the alphabet it would have reached the partner with its document escaped, and under a field,
+  component or repetition separator it may have been delivered as it came.
   *Out of scope:* an outbound `encoding_characters` override, which the transport applies after
   hydration, is operator configuration. An uppercased marker `MFDOC:V1:REF:` is not a handle, since
   `is_doc_ref` is case-sensitive. A marker hidden behind `\Xhh\` escapes is not something the
-  engine writes. Reserving the marker at every listener under ordinary delimiters is a policy
-  change left to the owner.
+  engine writes, so the listeners do not look for one; delivery parses `OBX-5.5` and refuses
+  such a handle under these delimiters, so that body is ACKed and then dead-letters. Reserving the
+  marker at every listener under ordinary delimiters is a policy change left to the owner. The
+  operator resend's admission (`admit_resubmission`) is unchanged, and delivery's copy refusal is
+  its backstop.
   A pass-through child, an edit-and-resubmit child and an edit-and-resend child each carry a body
   under a new message id, so the store links each child to the parent's documents a handle in its
   `OBX-5.5` names, read as delivery reads one (behind its gate), with one reference of its own, in

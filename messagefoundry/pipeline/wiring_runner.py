@@ -141,7 +141,6 @@ from messagefoundry.parsing.binary import (
     chunk_b64,
     iter_obx_documents,
     make_doc_ref,
-    marker_under_base64_delimiters,
     may_hold_doc_ref,
     reattach_documents_in_hl7,
 )
@@ -166,6 +165,7 @@ from messagefoundry.pipeline.ingress_guards import (
     check_declared_type,
     check_decoded,
     decode_body,
+    doc_ref_marker_refusal,
     peek_max_bytes,
     reingress_size_error,
     streaming_over_threshold,
@@ -939,13 +939,6 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     DocRefError,
     EscapedDocumentError,
     InboundDocRefError,
-)
-
-#: The stored reason both listeners record when they refuse a body that holds the document handle
-#: marker under a delimiter in the base64 alphabet (BACKLOG #5099). It names no byte of the body.
-_MARKER_UNDER_BASE64_DELIMITERS = (
-    "document handle refused: the body holds the handle marker and a delimiter is a base64 "
-    "character"
 )
 
 
@@ -8076,17 +8069,12 @@ class RegistryRunner:
                     else _peek_read_fault(ic, exc)
                 ),
             )
-        if marker_under_base64_delimiters(Message(peek.message), text):
+        if (marker_refused := doc_ref_marker_refusal(peek, text)) is not None:
             # Delivery refuses any handle marker under these delimiters, so the body would be
             # accepted and then dead-letter on every outbound; refused here instead, at any size
             # (BACKLOG #5099). The same body fails the same way every time.
             return await self._refuse(
-                ic,
-                raw,
-                text,
-                RefusalKind.PERMANENT,
-                error=_MARKER_UNDER_BASE64_DELIMITERS,
-                peek=peek,
+                ic, raw, text, RefusalKind.PERMANENT, error=marker_refused, peek=peek
             )
         if ic.validation.strict and streaming_over:
             # Whole-body strict validation is downgraded to header-only over the streaming threshold (the
@@ -8479,13 +8467,11 @@ class RegistryRunner:
                 )
             return ack
 
-        if marker_under_base64_delimiters(Message(peek.message), text):
+        if (marker_refused := doc_ref_marker_refusal(peek, text)) is not None:
             # Delivery refuses any handle marker under these delimiters, so an AA here would be
             # followed by a dead-letter on every outbound; refused here instead, at any size, and
             # AR since the same body fails the same way every time (BACKLOG #5099).
-            mid = await self._record_refused(
-                ic, raw, text, error=_MARKER_UNDER_BASE64_DELIMITERS, peek=peek
-            )
+            mid = await self._record_refused(ic, raw, text, error=marker_refused, peek=peek)
             ack = (
                 build_ack(
                     peek, code="AR", text="handle marker under base64 delimiters", ack_mode=ack_mode
@@ -8500,7 +8486,7 @@ class RegistryRunner:
                     ack_code="AR",
                     ack_phase="ingest",
                     ack_body=None,
-                    detail=_MARKER_UNDER_BASE64_DELIMITERS,
+                    detail=marker_refused,
                 )
             return ack
 

@@ -49,6 +49,8 @@ from messagefoundry.parsing.binary import (
     parse_doc_ref,
 )
 from messagefoundry.parsing.message import Message
+from messagefoundry.pipeline.dryrun import dry_run
+from messagefoundry.pipeline.ingress_guards import DOC_REF_MARKER_REFUSED_REASON
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 
@@ -1426,10 +1428,12 @@ async def test_a_streaming_document_under_a_base64_delimiter_is_refused_before_t
     receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
 
     assert _ack_code(ack) == "AR"
+    assert ack is not None and "document under base64 delimiters" in ack
     assert receipt.refusal is RefusalKind.PERMANENT
     rows = await _rows(store, ic.name)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
-    assert all("base64" in str(r["error"]) for r in rows)
+    # The detach refused it, not the listener's marker check: the body holds no marker.
+    assert all("streaming detach failed: Base64DelimiterError" in str(r["error"]) for r in rows)
     assert await _attachment_count(store) == 0
     assert await _ingress_count(store, ic.name) == 0
 
@@ -1464,10 +1468,13 @@ async def test_a_marker_under_a_base64_delimiter_is_refused_at_both_listeners(
     receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
 
     assert _ack_code(ack) == "AR"
+    if "/" in msh2:  # a lowercase delimiter splits the echoed text; "/" leaves it whole
+        assert ack is not None and "handle marker under base64 delimiters" in ack
     assert receipt.refusal is RefusalKind.PERMANENT
     rows = await _rows(store, ic.name)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
-    assert all("handle marker" in str(r["error"]) for r in rows)
+    # The listener's marker check refused it, before any detach could.
+    assert all(DOC_REF_MARKER_REFUSED_REASON in str(r["error"]) for r in rows)
     assert await _ingress_count(store, ic.name) == 0
     assert await _attachment_count(store) == 0
 
@@ -1509,4 +1516,52 @@ async def test_a_streaming_document_under_ordinary_delimiters_is_still_detached(
 
     assert _ack_code(ack) == "AA"
     assert await _attachment_count(store) == 1
+    assert await _ingress_count(store, ic.name) == 1
+
+
+@pytest.mark.parametrize(
+    ("msh2", "refused"),
+    [("^~\\/", True), ("m~\\&", True), ("^~\\&", False), ("^~\\&/", False)],
+    ids=["slash", "m-escaped", "ordinary", "fifth-char-slash"],
+)
+def test_the_dry_run_refuses_the_marker_as_the_listeners_do(msh2: str, refused: bool) -> None:
+    """``messagefoundry check`` and the Test Bench preview what the listener answers: the marker
+    refusal is pure, so the dry-run runs the same check with the same reason (BACKLOG #5099)."""
+    body = _copy_in_nte_component("|", msh2, DOC_REF_MARKER + "x")
+    reg = Registry()
+    reg.add_inbound(_plain_ic())
+    reg.add_router("r", lambda m: [])
+
+    result = dry_run(reg, body.encode("utf-8"))
+
+    if refused:
+        assert result.disposition is MessageStatus.ERROR
+        assert result.error == DOC_REF_MARKER_REFUSED_REASON
+    else:
+        assert result.error != DOC_REF_MARKER_REFUSED_REASON
+
+
+async def test_a_raw_marker_under_a_short_msh2_is_refused_at_both_listeners(
+    store: MessageStore,
+) -> None:
+    """``Message._encoding_chars`` names no delimiters for a three-character MSH-2, though the
+    parser fills the fourth in. Delivery refuses a raw marker under such a header, so the
+    listeners refuse it before the ACK rather than ACK it and dead-letter it (BACKLOG #5099). The
+    same header with no marker is accepted as before."""
+    from messagefoundry.transports.receipt import RefusalKind
+
+    head = "MSH|^~\\|APP|FAC|RCV|RCVF|20260101120000||ADT^A01|MSGID003|P|2.5\r"
+    ic = _plain_ic()
+    runner = _runner(store, ic)
+
+    marked = (head + f"NTE|1||{DOC_REF_MARKER}x\r").encode("utf-8")
+    assert _ack_code(await runner._handle_inbound(ic, marked)) == "AR"
+    assert (await runner._handle_inbound_http(ic, marked)).refusal is RefusalKind.PERMANENT
+    plain = (head + "NTE|1||plain\r").encode("utf-8")
+    assert _ack_code(await runner._handle_inbound(ic, plain)) == "AA"
+
+    rows = await _rows(store, ic.name)
+    errors = [str(r["error"]) for r in rows if r["status"] == MessageStatus.ERROR.value]
+    assert len(errors) == 2
+    assert all(e.endswith(DOC_REF_MARKER_REFUSED_REASON) for e in errors)
     assert await _ingress_count(store, ic.name) == 1
