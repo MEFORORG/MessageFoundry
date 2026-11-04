@@ -1542,7 +1542,8 @@ _SQL_OTHER_LINE_BREAKS = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 # `INTO` is here because `SELECT ... INTO copy` writes a table while still opening with `SELECT`; the
 # CTE-terminal forms (`WITH c AS (...) DELETE ...`) fall to the same scan. DDL is included for the
 # reason a chained `DROP` is refused: a lookup has no business carrying it. `RECEIVE` dequeues a
-# Service Broker message and `UPDATETEXT`/`WRITETEXT` write a text column. `BEGIN` is refused as a
+# Service Broker message (a bare one needs a `;` before it, per the T-SQL docs, but one inside
+# `WAITFOR (RECEIVE ...)` needs none) and `UPDATETEXT`/`WRITETEXT` write a text column. `BEGIN` is refused as a
 # bare word, which covers every `BEGIN TRAN` form: `SELECT 1 BEGIN TRAN` would leave
 # `@@TRANCOUNT` at 1 on a pooled autocommit connection. An unquoted name spelled like one of these
 # words is refused too, failing closed: at least a PostgreSQL column `begin` on the generic dialect,

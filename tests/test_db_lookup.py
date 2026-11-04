@@ -778,12 +778,14 @@ def test_mysql_comment_reads_are_still_admitted_on_the_generic_dialect(stmt: str
 # --- T-SQL statements the keyword list lacked (BACKLOG #4954) ------------------------------------
 #
 # Each row is `(statement, the keyword it must be refused for)`. Every statement opens with SELECT
-# and carries no `;`, because T-SQL needs none between statements. `BEGIN` is refused as a bare
-# word, so each BEGIN TRAN form is refused for that one word. The #1658 rows of
+# and carries no `;`, because T-SQL needs none between most statements. A bare RECEIVE needs one
+# before it, per the T-SQL docs (read, not run against a server), so its row chains it inside
+# WAITFOR, which needs none. `BEGIN` is refused as a bare word, so each BEGIN TRAN form is refused
+# for that one word. The #1658 rows of
 # test_write_shaped_select_and_cte_rejected test the same no-`;` shape for verbs listed before.
 
 _TSQL_VERBS_THE_LIST_LACKED = [
-    ("SELECT 1 RECEIVE TOP (1) * FROM dbo.inbound_queue", "RECEIVE"),
+    ("SELECT 1 WAITFOR (RECEIVE TOP (1) * FROM dbo.inbound_queue), TIMEOUT 0", "RECEIVE"),
     ("SELECT 1 BEGIN TRAN", "BEGIN"),
     ("SELECT 1 BEGIN TRANSACTION", "BEGIN"),
     ("SELECT 1 begin tran t1", "BEGIN"),

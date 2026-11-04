@@ -63,7 +63,7 @@ _WRITING_POLLS = [
     pytest.param("SELECT id, payload FROM mf_inbox; UPDATE mf_inbox SET status='X'", id="chained"),
     # BACKLOG #4954: T-SQL second statements with no `;` that the shared keyword list now refuses.
     pytest.param("SELECT id, payload FROM mf_inbox BEGIN TRAN", id="begin-tran"),
-    pytest.param("SELECT 1 RECEIVE TOP (1) * FROM mf_inbox_queue", id="receive"),
+    pytest.param("SELECT 1 WAITFOR (RECEIVE TOP (1) * FROM mf_inbox_queue)", id="receive"),
     # Decided, not accidental: the lock ends with the statement on the autocommit pool, so refusing a
     # FOR UPDATE locking read loses nothing, and the message says so.
     pytest.param(
