@@ -38,6 +38,7 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.store import DiskFreeStatus, load_audit_chain
+from tests._claim_lock_helpers import claim_past_empty_yield
 from tests._erased_reply_contract import CASES as ERASED_REPLY_CASES
 from tests._keyed_reopen_contract import (
     CONTROL_CELL,
@@ -77,15 +78,9 @@ _ACK_AA = "MSH|^~\\&|C|D|A|B|20260101||ACK^A01|MSG1|P|2.5.1\rMSA|AA|MSG1\r"
 # re-issues past a transient EMPTY-all for the sites that assert a NON-empty outcome; a successful claim
 # never retries, and a genuinely-unclaimable head stays EMPTY-all every pass and still fails after the
 # cap (masks nothing). Sites that assert EMPTY-all itself (a fenced ex-leader) call claim_fifo_heads
-# directly. Mirrors _claim_heads in test_claim_fifo_heads.py (the fix for this same never-block class).
+# directly. tests/_claim_lock_helpers.py holds the loop.
 async def _claim_until(store: Any, *args: Any, **kwargs: Any) -> Any:
-    res = await store.claim_fifo_heads(*args, **kwargs)
-    for _ in range(16):
-        if res.by_lane or res.rearm:
-            break
-        await asyncio.sleep(0.01)
-        res = await store.claim_fifo_heads(*args, **kwargs)
-    return res
+    return await claim_past_empty_yield(lambda: store.claim_fifo_heads(*args, **kwargs))
 
 
 @pytest.fixture
