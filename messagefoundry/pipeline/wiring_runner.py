@@ -529,7 +529,12 @@ class _LaneClaims:
     ``deaths`` is the lane's run of deaths with no settled pass between them. It backs off the
     death's traceback in the supervisor and paces a replacement that follows a repeat death.
     :meth:`settle` closes it, on a pass that resolved its batch, and so does a replacement that
-    reads one of the dead worker's rows written (:meth:`RegistryRunner._dead_worker_wrote`). Not on
+    reads the row the dead worker died on written (:meth:`RegistryRunner._dead_worker_wrote`). On
+    an UNORDERED lane a settled pass closes it only once it has resolved every row the run's
+    deaths held in common (``suspects``): fresh rows sort ahead of a re-pended row there, so a pass
+    that never reached the row killing the workers would otherwise close the run at every death,
+    with no backoff and no page. A row the dead worker wrote before it died stays a suspect until
+    the next death drops it, so such a run may stay open until the quiet gap below. Not on
     a claim that finds nothing:
     a replacement's re-pend dates its rows into the future, so the lane reads empty until the row
     that killed the workers is due again. A death that comes :data:`_DEATH_RUN_QUIET_SECONDS` or
@@ -544,14 +549,25 @@ class _LaneClaims:
     # A replacement has sent a re-pend of ``ids``, so a later replacement cannot tell the dead
     # worker's writes from that one by the in-flight count (_dead_worker_wrote).
     repend_sent: bool = False
+    # The rows every death of the run held, less those a settled pass resolved since (see above).
+    suspects: set[str] = field(default_factory=set)
 
-    def settle(self, worker: str, name: str) -> None:
-        """A pass resolved its whole claimed batch: nothing is held, and a run of deaths ends."""
+    def note_death(self) -> None:
+        """A death holding ``ids``: narrow the run's suspects to the rows it held too."""
+        if held := set(self.ids):
+            self.suspects = (self.suspects & held) or held
+
+    def settle(self, worker: str, name: str, *, ordered: bool = True) -> None:
+        """A pass resolved its whole claimed batch: nothing is held, and a run of deaths ends,
+        on an unordered lane only once no suspect is left."""
+        if not ordered:
+            self.suspects.difference_update(self.ids)
         self.ids.clear()
-        if self.deaths.count:
+        if self.deaths.count and (ordered or not self.suspects):
             self.close_deaths(worker, name)
 
     def close_deaths(self, worker: str, name: str) -> None:
+        self.suspects.clear()
         self.deaths = self.deaths.clear(
             log,
             "%s worker %r: respawn",
@@ -6791,6 +6807,7 @@ class RegistryRunner:
         if claims.deaths.count and now - claims.last_death >= _DEATH_RUN_QUIET_SECONDS:
             claims.close_deaths(kind, name)  # far apart: an unrelated death starts a new run
         claims.last_death = now
+        claims.note_death()
         claims.deaths = claims.deaths.record(
             log,
             exc,
@@ -6851,6 +6868,7 @@ class RegistryRunner:
                 deaths=old.deaths,
                 last_death=old.last_death,
                 repend_sent=old.repend_sent,
+                suspects=set(old.suspects),
             )
         else:
             claims = _LaneClaims()
@@ -6982,15 +7000,21 @@ class RegistryRunner:
         await run(name, claims=claims)
 
     async def _dead_worker_wrote(self, kind: str, name: str, claims: _LaneClaims) -> bool:
-        """Whether a dead per-lane worker wrote EVERY row it died holding, ``claims.ids``, the one
-        it died on included (BACKLOG #4607). A run of deaths otherwise closes only on a settled
-        pass, so a worker that dies after delivering its row, every time, would read as stuck on it.
+        """Whether a dead per-lane worker wrote the row it died on (BACKLOG #4607). A run of
+        deaths otherwise closes only on a settled pass, so a worker that dies after delivering its
+        row, every time, would read as stuck on it.
 
-        Measured as the pooled twin measures it (``StageDispatcher._dead_rows_in_flight``): none
-        of the lane's rows in flight at this stage. Not merely fewer than it held: on an UNORDERED
-        lane fresh rows sort ahead of a re-pended poison row, so each batch writes some rows before
-        the poison row kills its worker, and counting that as progress would reset the run at
-        every death, with no backoff and no page. A read that fails, another holder of the lane's
+        Measured as the pooled twin measures it (``StageDispatcher._dead_rows_in_flight``), from
+        the lane's rows in flight at this stage. On a router or transform lane, which claims a
+        strictly ordered batch and hands its rows off one at a time in order, fewer in flight than
+        the ``claims.ids`` it held means a row was written; the rows before the one that killed it
+        are written first, and after its re-pend that row is the lane's head, so a death on it
+        writes none and the run stays open. Any other row of the lane in flight only raises the
+        count. On a delivery lane only NONE in flight counts: on an UNORDERED lane fresh rows sort
+        ahead of a re-pended poison row, so each batch writes some rows before the poison row
+        kills its worker, and a batching outbound writes or dead-letters coalesced members on
+        their own while its head kills it, so counting either as progress would reset the run at
+        every death, with no backoff and no page. A response lane holds one row. A read that fails, another holder of the lane's
         rows, or a replacement's re-pend of them already sent (``_LaneClaims.repend_sent``), whose
         landing would read as a write, reads as not written. The except arm's own re-pend is not
         marked: a worker that dies after that write lands and before it clears ``ids`` reads as
@@ -7014,7 +7038,10 @@ class RegistryRunner:
                 exc_info=True,
             )
             return False
-        return inflight.get(name, (0, 0.0))[0] == 0
+        in_flight = inflight.get(name, (0, 0.0))[0]
+        if kind in ("router", "transform"):
+            return in_flight < len(claims.ids)
+        return in_flight == 0
 
     @staticmethod
     def _log_left_in_flight(kind: str, name: str, ids: Sequence[str]) -> None:
@@ -9251,7 +9278,8 @@ class RegistryRunner:
                 # claim that RAISES is not timed (the worker's outer except logs it and backs off); a
                 # timeout-capped duration would distort the claim-latency figure this measures.
                 _claim_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
-                if self._lane_ordering(name) is OrderingMode.FIFO:
+                ordered = self._lane_ordering(name) is OrderingMode.FIFO
+                if ordered:
                     # FIFO: claim only the due head; the head blocks the lane while it backs off. Under
                     # active-passive HA the graph runs on the leader ONLY, so one node drains this lane;
                     # the Postgres claim also reclaims a prior leader's stranded head for failover FIFO.
@@ -9332,7 +9360,7 @@ class RegistryRunner:
                 if unsent:  # released, not resolved: a run of deaths stays open
                     claimed.clear()
                 else:  # #1844: resolved, before anything else can raise
-                    claims.settle("delivery", name)
+                    claims.settle("delivery", name, ordered=ordered)
                 faults.healthy()
             except asyncio.CancelledError:
                 raise

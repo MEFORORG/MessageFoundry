@@ -795,9 +795,10 @@ async def test_a_per_lane_worker_that_died_after_writing_its_rows_closes_its_run
     """R4-3, per-lane half. A per-lane run of deaths closed only on a settled pass, so a worker
     that died after delivering its row, every time, read as stuck on it: backed off, and paged at
     the bound. The replacement now reads whether any row it inherited is still in flight; with
-    none, the row it died on was written too, so the run closes. R5-1 (round 2): a batch with one
-    row written and one still in flight is not progress, since on an UNORDERED lane fresh rows
-    sort ahead of a poison row and are written before it kills the worker every time."""
+    none, the row it died on was written too, so the run closes. Round 6 (U1/U2): a router batch
+    is handed off strictly in order, so one row written and one still in flight closes it too;
+    the delivery half, where that reading is not progress, is
+    ``test_only_an_ordered_per_lane_batch_counts_fewer_rows_in_flight_as_progress``."""
     runner = RegistryRunner(_registry(tmp_path), db, egress=EgressSettings(deny_by_default=False))
     # A written row is no longer in flight; an id the store never claimed reads the same.
     ids = ["written-row"]
@@ -821,7 +822,7 @@ async def test_a_per_lane_worker_that_died_after_writing_its_rows_closes_its_run
     monkeypatch.setattr(runner, "_repend_claimed_on_fault", repend)
     claims = _LaneClaims(ids, _leading(), deaths=_dead_run(3))
     await asyncio.wait_for(runner._recover_then_run("router", "IB", claims, run), timeout=5.0)
-    assert claims.deaths.count == (0 if case == "every-row-written" else 3)
+    assert claims.deaths.count == (3 if case == "row-in-flight" else 0)
     backoff = wiring_runner._WORKER_ERROR_BACKOFF_SECONDS
     assert sleeps == [backoff, backoff, backoff]  # the repeat-death backoff runs before the read
 
@@ -936,3 +937,119 @@ async def test_a_per_lane_reading_after_a_replacement_sent_its_re_pend_is_not_pr
     assert not await runner._dead_worker_wrote("router", "IB", claims)
     claims.repend_sent = False
     assert await runner._dead_worker_wrote("router", "IB", claims)
+
+
+# --- the round-6 review repairs (U1/U2, U5, U8) ---------------------------------------------------
+
+
+async def _claimed_ingress_rows(store: MessageStore, n: int) -> list[str]:
+    """``n`` rows of lane IB claimed at INGRESS as one ordered batch."""
+    for _ in range(n):
+        await store.enqueue_ingress(channel_id="IB", raw=RAW, now=1.0)
+    items = await store.claim_next_fifo_batch("IB", stage=Stage.INGRESS.value, limit=n, now=2.0)
+    assert len(items) == n
+    return [it.id for it in items]
+
+
+@pytest.mark.parametrize("case", ["head-written", "head-in-flight", "head-written-beside-an-extra"])
+async def test_a_pooled_prefix_that_wrote_the_row_it_died_on_recovers_as_progress(
+    case: str, db: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """U1/U2 (round 6). A pooled prefix of 2 or more whose serializer wrote the row it died on and
+    then died read as zero progress, because only an empty in-flight reading counted, so under
+    ``stop`` a lane that wrote one row at every death was STOPped. The body drains the prefix in
+    order, so fewer rows in flight than it held from ``drain_index`` on means that row was
+    written: the recovery made progress, the run of deaths closes, and the rows it had not
+    reached are released. Beside a noted coalesced row the count says nothing about which row
+    was written, so that reading stays the zero-progress fault it was."""
+    dispatcher, st = _processing_dispatcher(db, infra_fault_stop_after=3)
+    st.serializer_deaths = _dead_run(2)
+    if case == "head-in-flight":
+        ids = await _claimed_ingress_rows(db, 2)
+    else:
+        ids = ["written-row", *await _claimed_ingress_rows(db, 1)]
+    if case == "head-written-beside-an-extra":
+        dispatcher.note_held("IB", ["coalesced-row"])
+    outcomes = _capture_retries(dispatcher, monkeypatch)
+    await dispatcher._run_lane("IB", [], fence=_leading(), recover_ids=ids)
+    (outcome,) = outcomes
+    progress = case == "head-written"
+    assert outcome.made_progress is progress
+    assert st.serializer_deaths.count == (0 if progress else 2)
+    assert await _ingress_inflight(db) == 0  # every row it held is pending again either way
+
+
+@pytest.mark.parametrize(
+    ("kind", "progress"), [("router", True), ("transform", True), ("delivery", False)]
+)
+async def test_only_an_ordered_per_lane_batch_counts_fewer_rows_in_flight_as_progress(
+    kind: str, progress: bool, db: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """U1/U2 (round 6), per-lane half. A router or transform batch is handed off in order one row
+    at a time, so a dead worker holding two rows with one still in flight wrote the one it died
+    on. A delivery batch is an unordered claim or a batching outbound's coalesced rows, where a
+    row written beside the one that kills the worker says nothing, so only none in flight
+    counts."""
+    runner = RegistryRunner(_registry(tmp_path), db, egress=EgressSettings(deny_by_default=False))
+    name = "OB" if kind == "delivery" else "IB"
+
+    async def one_in_flight(*, stage: str) -> dict[str, tuple[int, float]]:
+        return {name: (1, 0.0)}
+
+    monkeypatch.setattr(db, "inflight_by_lane", one_in_flight)
+    claims = _LaneClaims(["r1", "r2"], _leading(), deaths=_dead_run(3))
+    assert await runner._dead_worker_wrote(kind, name, claims) is progress
+    claims.ids = ["r1"]  # the control: one row held and one in flight is not written, any kind
+    assert await runner._dead_worker_wrote(kind, name, claims) is False
+
+
+async def test_an_unordered_pass_that_never_reached_the_poison_row_keeps_the_run_open(
+    db: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """U5 (round 6). On an unordered lane fresh rows sort ahead of a re-pended poison row, so a
+    pass that settled without reaching it closed the run of deaths at every death: no backoff,
+    no page, and a traceback at every death. A settled unordered pass now closes the run only once
+    it has resolved every row the run's deaths held in common; the poison row, which every death
+    held, never is, so the deaths add up and page once. An ordered pass still closes it."""
+    runner = RegistryRunner(_registry(tmp_path), db, egress=EgressSettings(deny_by_default=False))
+    pages: list[str] = []
+    monkeypatch.setattr(runner, "_infra_fault_stop_after", 3)
+    monkeypatch.setattr(
+        runner._alert_sink, "lane_stuck", lambda name, *, detail: pages.append(name)
+    )
+    claims = _LaneClaims()
+    runner._lane_claims[("delivery", "OB")] = claims
+    for fresh in ("f1", "f2", "f3"):
+        claims.ids[:] = [fresh, "poison"]  # the fresh row is written, then the poison row kills
+        runner._log_worker_death("delivery", "OB", await _dead_task())
+        claims.ids[:] = [f"{fresh}-next"]  # a later pass of fresh rows only, which settles
+        claims.settle("delivery", "OB", ordered=False)
+    assert claims.deaths.count == 3
+    assert claims.suspects == {"poison"}
+    assert pages == ["OB"]
+    claims.ids[:] = ["poison"]  # the control: a pass that resolves it closes the run
+    claims.settle("delivery", "OB", ordered=False)
+    assert (claims.deaths.count, claims.suspects) == (0, set())
+    claims.ids[:] = ["f9", "poison"]
+    runner._log_worker_death("delivery", "OB", await _dead_task())
+    claims.ids[:] = ["f9-next"]
+    claims.settle("delivery", "OB")  # an ordered pass closes it whatever it resolved
+    assert claims.deaths.count == 0
+
+
+async def test_a_pooled_replacement_that_owes_no_write_does_not_wait_on_leadership(
+    db: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """U8 (round 6). A replacement whose dead serializer had written every row it held owes no
+    write, yet it held its lane in the not-the-leader wait, stalling it until this node led again
+    or stopped. It now reads the fence only when it owes a write."""
+    flap = _Flap(lost=None)  # never the leader again
+    dispatcher, _ = _processing_dispatcher(db)
+    outcomes = _capture_retries(dispatcher, monkeypatch)
+    await asyncio.wait_for(
+        dispatcher._run_lane("IB", [], fence=flap.fence(), recover_ids=["written-row"]),
+        timeout=5.0,
+    )
+    (outcome,) = outcomes
+    assert outcome.made_progress
+    assert flap.reads == 0

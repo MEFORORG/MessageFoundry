@@ -1580,12 +1580,10 @@ class StageDispatcher:
         would be STOPped.
 
         Measured, not inferred: returns how many of the lane's rows are in flight at this stage.
-        Only ZERO proves the row it died on was written (:meth:`_dead_serializer_outcome`): then
-        none of the rows it held, from ``drain_index`` on with the noted extras, is in flight. A
-        count merely below the rows held says some row was written, never which: a batch writes or
-        dead-letters coalesced members on their own while its head is the row that kills it, and
-        taking that as progress would let such a head reset its streak at every death and never
-        reach the STOP or the page. None, read as zero progress as before, when the body had finished, when a recovery of
+        ZERO proves the row it died on was written; so, with no noted extras, does a count below
+        the prefix rows it held from ``drain_index`` on (:meth:`_dead_serializer_outcome` says
+        why, and why noted extras make any other count zero progress). None, read as zero
+        progress as before, when the body had finished, when a recovery of
         these rows has already sent a write (``_LaneState.recovery_wrote``), whose landed re-pend
         would read as progress, or when the read fails. Another holder of the lane's rows reads as
         not written too. A body that re-pended the row itself before dying (``mark_failed``) reads
@@ -1629,7 +1627,13 @@ class StageDispatcher:
         ``in_flight`` is :meth:`_dead_rows_in_flight`'s reading. At zero every row the dead
         serializer held was written, the one it died on included, so the recovery made progress,
         nothing is dated, and the lane parks until now rather than for a backoff, since nothing
-        failed. Any other reading is the zero-progress fault it was, every held row dated.
+        failed. With no noted extras, a reading below the ``len(ids) - i`` rows held from ``i`` on
+        says the same of row ``i``: the body drains the prefix strictly in order and had not
+        reached a later row, and any other row of the lane in flight only raises the count. The
+        rows after it are released, FIFO-neutral, since nothing failed on them. With noted extras
+        a count says nothing about which row was written, since a batch writes or dead-letters
+        coalesced members on their own while its head is the row that kills it, so any reading
+        but zero is the zero-progress fault it was, every held row dated, as is a missing one.
 
         Pure: a serializer that died INSIDE its terminal transition may already have counted its
         fault on the streak, so the streak read is the one that transition found
@@ -1643,11 +1647,13 @@ class StageDispatcher:
             park_until = self._clock() + self._infra_backoff(streak)
             return replace(outcome, park_until=park_until), [head[0]], list(tail)
         i = min(st.drain_index, max(len(ids) - 1, 0))
-        if in_flight == 0:
+        if in_flight == 0 or (
+            in_flight is not None and not st.held_extra_ids and in_flight < len(ids) - i
+        ):
             outcome = _LaneOutcome(
                 LaneResultKind.RETRY, self._clock(), is_infra_fault=True, made_progress=True
             )
-            return outcome, [], []
+            return outcome, [], (ids[i:] if in_flight else [])
         streak = _found_streak(st) if i == 0 else 0
         park_until = self._clock() + self._infra_backoff(streak)
         outcome = _LaneOutcome(
@@ -1673,8 +1679,8 @@ class StageDispatcher:
         ``recover_ids`` makes this the replacement for a serializer that DIED holding those rows
         (:meth:`_on_lane_task_done`): it runs no body and holds no item. It returns the lane's slot
         at once, since it holds no decrypted payload and its wait can last up to the respawn cap,
-        waits ``delay``, then holds the lane while this node is not the leader, as a hold's retries
-        do (:func:`wait_to_retry`), and treats the whole prefix as a T17 head
+        waits ``delay``, then, if it owes a write, holds the lane while this node is not the
+        leader, as a hold's retries do (:func:`wait_to_retry`), and treats the whole prefix as a T17 head
         (:meth:`_dead_serializer_outcome`)."""
         recover = recover_ids is not None
         claimed = len(recover_ids if recover_ids is not None else items)
@@ -1705,7 +1711,12 @@ class StageDispatcher:
             )
             if held is None and self._stop.is_set():
                 held = HoldResult.STOPPED
-            if held is None and not fence.may_write():
+            outcome, head_ids, tail_ids = self._dead_serializer_outcome(
+                lane, recover_ids, in_flight=in_flight
+            )
+            # Only a recovery that owes a write waits on the fence: one that owes none holds no row
+            # a later claim could overtake, so holding its lane would only stall it.
+            if held is None and (head_ids or tail_ids) and not fence.may_write():
                 # Retries of the dead serializer's writes, not its first, so fenced as a hold's
                 # retries are: a successor may own these rows, and every write is guarded only by
                 # status='inflight'. Not the leader, the lane stays held, so a flap under the same
@@ -1730,9 +1741,10 @@ class StageDispatcher:
                         claimed + (len(st_r.held_extra_ids) if st_r is not None else 0),
                     ),
                 )
-            outcome, head_ids, tail_ids = self._dead_serializer_outcome(
-                lane, recover_ids, in_flight=in_flight
-            )
+                # Dated from the end of the wait, not its start.
+                outcome, head_ids, tail_ids = self._dead_serializer_outcome(
+                    lane, recover_ids, in_flight=in_flight
+                )
             if st_r is not None and held is None and (head_ids or tail_ids):
                 st_r.recovery_wrote = True  # from here a write of these rows may land
             if st_r is not None and st_r.transition_streak is not None:
