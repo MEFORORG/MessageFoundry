@@ -5,8 +5,10 @@
 #4988: the backup's early sweep of its staging root went by the process's own owner. On a share
 whose server sets the owner, a directory there carrying the process's owner may have been made by
 another principal, and the sweep would have removed it, while docs/PHI.md said every sweep takes
-only what a new directory of the run's account gets. The early sweep now goes by the owner a bare
-probe directory in the staging root gets.
+only what a new directory of the run's account gets. The early sweep now goes by the owner a probe
+in the staging root gets, read on POSIX through the descriptor that created it. When the probe
+cannot be created, as on a full volume, it goes by the process's owner only where the staging root
+itself carries that owner.
 
 #4989: an entry whose ``is_dir`` raised was listed as a file, so a directory the walk could not type
 was never walked, the fail-safe's ``lstat`` found no regular file, and the teardown logged that every
@@ -16,8 +18,12 @@ Every test uses synthetic bytes only. Severity is conditional (CLAUDE.md section
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
+import shutil
+import sys
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -67,23 +73,148 @@ async def test_the_early_sweep_leaves_a_directory_carrying_the_process_owner_on_
     assert not any(p.name.startswith("mefor-owner-probe-") for p in data.iterdir())
 
 
-async def test_a_failed_staging_root_probe_does_not_fall_back_to_the_process_owner(
+async def test_a_failed_probe_on_a_share_does_not_fall_back_to_the_process_owner(
     tmp_path, monkeypatch
 ) -> None:
-    """When the probe in the staging root answers None, the early sweep is off rather than keyed on
-    the process's owner. This run's own directory's owner still sweeps once it is open."""
+    """When the probe in the staging root answers None and the root itself carries the share's
+    owner, as one this account made there does, the early sweep is off rather than keyed on the
+    process's owner, so another principal's directory carrying that owner survives the run. This
+    run's own directory's owner still sweeps this account's leftover once it is open."""
     store, runner = await _store_and_runner(tmp_path, monkeypatch)
     data = (tmp_path / "data").absolute()
-    dead = _abandoned(data, "mefor-backup-")
+    ours = _abandoned(data, "mefor-backup-")
+    other = _abandoned(data, "mefor-backup-")
+    _share_owner_for(data, monkeypatch, made_by_another=other, root_too=True)
     _root_probe_answers_none(data, monkeypatch, first=None)
-    dead_at_open = _exists_at_open(monkeypatch, dead)
+    ours_at_open = _exists_at_open(monkeypatch, ours)
     try:
         result = await runner.run_once(now=1.0)
     finally:
         await store.close()
-    assert result is not None
-    assert dead_at_open[0] is True
-    assert not dead.exists()  # swept by this run's own directory's owner
+    assert result is not None and result.verify is not None and result.verify.ok
+    assert ours_at_open[0] is True  # the early sweep was off
+    assert not ours.exists()  # swept by this run's own directory's owner
+    assert (other / "archive.tar").read_bytes() == b"synthetic plaintext"
+
+
+def _probe_creation_fails_in(data: Path, monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Creating an owner probe in ``data`` fails with ENOSPC, as on a volume a killed run filled:
+    ``mkstemp`` is the POSIX probe, ``mkdtemp`` the Windows one. Returns the refused attempts."""
+    refused: list[Path] = []
+    real_mkstemp = tempfile.mkstemp
+    real_mkdtemp = tempfile.mkdtemp
+
+    def refuses(prefix: Any, where: Any) -> bool:
+        if (
+            prefix == dr_backup._OWNER_PROBE_PREFIX
+            and where is not None
+            and Path(where).absolute() == data
+        ):
+            refused.append(Path(where))
+            return True
+        return False
+
+    def mkstemp(*args: Any, **kwargs: Any) -> Any:
+        if refuses(kwargs.get("prefix"), kwargs.get("dir")):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_mkstemp(*args, **kwargs)
+
+    def mkdtemp(*args: Any, **kwargs: Any) -> Any:
+        if refuses(kwargs.get("prefix"), kwargs.get("dir")):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(tempfile, "mkstemp", mkstemp)
+    monkeypatch.setattr(tempfile, "mkdtemp", mkdtemp)
+    return refused
+
+
+async def test_a_full_volume_still_frees_a_killed_runs_leftover_before_space_refuses(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """On a volume a killed run filled, no probe can be created there. The early sweep goes by the
+    process's owner, which the staging root carries, as it did before the probe, so the leftover
+    goes before the space check and the run proceeds instead of refusing with `space`. The failed
+    probe is logged."""
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
+    data = (tmp_path / "data").absolute()
+    dead = _abandoned(data, "mefor-backup-")
+    refused = _probe_creation_fails_in(data, monkeypatch)
+
+    class _Usage:
+        def __init__(self, free: int) -> None:
+            self.free = free
+
+    # The leftover is what fills the volume: while it exists there is no room.
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: _Usage(1 if dead.exists() else 1 << 40))
+    dead_at_open = _exists_at_open(monkeypatch, dead)
+    try:
+        with caplog.at_level(logging.WARNING, logger=dr_backup.__name__):
+            result = await runner.run_once(now=1.0)
+    finally:
+        await store.close()
+    assert result is not None and result.verify is not None and result.verify.ok
+    assert refused  # the control: the probe really was refused
+    assert dead_at_open[0] is False  # freed before this run's directory was opened
+    assert any(
+        r.levelno == logging.WARNING and "could not learn the owner" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the descriptor-read probe is POSIX only")
+def test_the_probe_owner_comes_from_the_descriptor_not_a_later_path_read(
+    tmp_path, monkeypatch
+) -> None:
+    """An account that can rename entries in the staging root swaps another object in at the
+    probe's name right after it is created. The owner still comes from the descriptor that created
+    the probe, and a path read of the name, which here would answer the swapped object's owner, is
+    never made."""
+    root = tmp_path / "root"
+    root.mkdir()
+    real_mkstemp = tempfile.mkstemp
+    created: list[int] = []
+
+    def swapping_mkstemp(*args: Any, **kwargs: Any) -> Any:
+        fd, name = real_mkstemp(*args, **kwargs)
+        created.append(os.fstat(fd).st_ino)
+        os.rename(name, root / "moved-away")
+        Path(name).write_bytes(b"")  # the swapped-in object, at the probe's name
+        return fd, name
+
+    def path_read(path: Path) -> object | None:
+        return "swapped-owner"
+
+    seen: list[int] = []
+    real_fd_owner = dr_backup._owner_of_fd
+
+    def fd_owner(fd: int, opened_as: Path) -> object | None:
+        seen.append(os.fstat(fd).st_ino)
+        return real_fd_owner(fd, opened_as)
+
+    monkeypatch.setattr(tempfile, "mkstemp", swapping_mkstemp)
+    monkeypatch.setattr(dr_backup, "_owner_of", path_read)
+    monkeypatch.setattr(dr_backup, "_owner_of_fd", fd_owner)
+    assert dr_backup._probe_owner(root) == os.geteuid()  # type: ignore[attr-defined,unused-ignore]
+    # The descriptor read the object the probe created, not what the name held afterwards.
+    assert seen == created
+    assert (root / "moved-away").stat().st_ino == created[0]
+
+
+def test_a_leaked_probe_file_is_swept_and_a_nonempty_one_is_kept(tmp_path) -> None:
+    """A POSIX probe file whose removal failed is empty and holds no lock. The sweep of its root by
+    its owner removes it, and leaves a probe-named file that holds anything."""
+    root = tmp_path / "root"
+    root.mkdir()
+    leaked = root / f"{dr_backup._OWNER_PROBE_PREFIX}leaked"
+    leaked.write_bytes(b"")
+    kept = root / f"{dr_backup._OWNER_PROBE_PREFIX}kept"
+    kept.write_bytes(b"synthetic")
+    owner = dr_backup._owner_of(leaked)
+    assert owner is not None
+    dr_backup._sweep_owned(root, owner, own=None)
+    assert not leaked.exists()
+    assert kept.read_bytes() == b"synthetic"
 
 
 # --- #4989: a directory the walk took for a file is reported ------------------------------------

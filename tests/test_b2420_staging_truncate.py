@@ -373,29 +373,43 @@ async def test_a_backup_that_will_not_fit_opens_no_staging_directory(tmp_path, m
 
 
 def _share_owner_for(
-    data: Path, monkeypatch: pytest.MonkeyPatch, *, made_by_another: Path | None = None
+    data: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    made_by_another: Path | None = None,
+    root_too: bool = False,
 ) -> None:
     """A server-owner stand-in: everything made under ``data`` reports the share's owner, not the
     process's, as on an SMB or NFS share whose server sets the owner. ``made_by_another`` is a
     directory another principal made there that carries the owner this process's own directories
-    get elsewhere, as SYSTEM on the file server can."""
+    get elsewhere, as SYSTEM on the file server can. ``root_too`` has ``data`` itself report the
+    share's owner, as a staging root this account made on such a share does. It drives both the
+    path read and the descriptor read, which a POSIX owner probe uses."""
     real_owner = dr_backup._owner_of
+    real_fd_owner = dr_backup._owner_of_fd
+
+    def on_share(path: Path) -> bool:
+        p = Path(path).absolute()
+        if p == data:
+            return root_too
+        return p != made_by_another and p.is_relative_to(data)
 
     def owner(path: Path) -> object | None:
-        p = Path(path).absolute()
-        if p != made_by_another and p != data and p.is_relative_to(data):
-            return "share-owner"
-        return real_owner(path)
+        return "share-owner" if on_share(path) else real_owner(path)
+
+    def fd_owner(fd: int, opened_as: Path) -> object | None:
+        return "share-owner" if on_share(opened_as) else real_fd_owner(fd, opened_as)
 
     monkeypatch.setattr(dr_backup, "_owner_of", owner)
+    monkeypatch.setattr(dr_backup, "_owner_of_fd", fd_owner)
 
 
 def _root_probe_answers_none(
     data: Path, monkeypatch: pytest.MonkeyPatch, *, first: int | None = 1
-) -> None:
+) -> list[Path]:
     """The probe of ``data`` answers None for its ``first`` calls (every call when ``None``), as
-    when a sibling shard's sweep removes it before its owner is read. The early sweep is then off
-    (BACKLOG #4988 keyed it on the staging root's probed owner)."""
+    when it cannot be created there. The early sweep then goes by ``_fallback_root_owner`` (BACKLOG
+    #4988). Returns the calls, one per probe of ``data``."""
     real_probe = dr_backup._probe_owner
     calls: list[Path] = []
 
@@ -407,6 +421,7 @@ def _root_probe_answers_none(
         return real_probe(root)
 
     monkeypatch.setattr(dr_backup, "_probe_owner", probe)
+    return calls
 
 
 def _exists_at_open(monkeypatch: pytest.MonkeyPatch, path: Path) -> list[bool]:
@@ -510,14 +525,16 @@ async def test_a_leftover_emptied_but_not_removed_by_the_probe_sweep_still_lets_
 async def test_a_genuinely_short_volume_on_a_server_owner_share_still_refuses(
     tmp_path, monkeypatch
 ) -> None:
-    """The control: with the same stand-in, a volume that is short even once the leftover is swept
-    still refuses with `space`, opens no run directory, and leaves no probe behind."""
+    """The control: with the same stand-in and the same failed first probe, a volume that is short
+    even once the second probe's sweep takes the leftover still refuses with `space`, opens no run
+    directory, and leaves no probe behind."""
     import shutil
 
     store, runner = await _store_and_runner(tmp_path, monkeypatch)
     data = (tmp_path / "data").absolute()
     dead = _abandoned(data, "mefor-backup-")
     _share_owner_for(data, monkeypatch)
+    probes = _root_probe_answers_none(data, monkeypatch)
 
     class _Usage:
         free = 1
@@ -531,6 +548,8 @@ async def test_a_genuinely_short_volume_on_a_server_owner_share_still_refuses(
         await store.close()
     assert caught.value.kind == "space"
     assert opened == []
+    # Probed twice: the leftover went by the second probe's owner, the path this test controls.
+    assert len(probes) == 2
     assert not dead.exists()  # swept by the probed owner before the refusal
     assert not any(
         p.name.startswith(("mefor-owner-probe-", "mefor-backup-")) for p in data.iterdir()
