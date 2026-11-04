@@ -1299,10 +1299,19 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     cipher_audit.add_argument("--json", action="store_true", help="emit JSON")
 
+    # BACKLOG #5094: the epilog is the one statement of what a restore rolls back, whole, so
+    # `messagefoundry restore --help` prints it on any installed engine; the store_restored alert
+    # and the age refusal point here. An import-free leaf, so the parser can build from it; the
+    # startup import budget names it. HelpFormatter, because the default breaks an epilog at a
+    # hyphen and the notice names hyphenated commands an operator copies.
+    from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
+
     restore = sub.add_parser(
         "restore",
         help="restore a .mfbak archive's store to a NEW destination path: verify -> decrypt -> write "
         "the store (and optionally the config bundle). REFUSES to overwrite anything (ADR 0049, #60)",
+        epilog=RESTORE_ROLLBACK_NOTICE,
+        formatter_class=HelpFormatter,
     )
     restore.add_argument("archive", help="path to the .mfbak archive to restore")
     restore.add_argument(
@@ -1338,9 +1347,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     restore.add_argument(
         "--allow-old-archive",
         action="store_true",
-        help="restore an archive older than --max-age-days, or of unknown age, anyway. Every "
-        "disable, delete, role change and reset made after its newest audit row must then be "
-        "re-applied by hand",
+        help="restore an archive older than --max-age-days, or of unknown age, anyway. The end of "
+        "this help says what a restore rolls back, which must then be re-applied by hand",
     )
     restore.add_argument("--json", action="store_true", help="emit JSON")
 
@@ -11369,6 +11377,7 @@ def _restore(args: argparse.Namespace) -> int:
 
     from messagefoundry.pipeline.alerts import utc_or_unknown
     from messagefoundry.pipeline.dr_backup import restored_accounts_notice
+    from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
 
     payload = {
         "archive": result.archive_path,
@@ -11376,6 +11385,9 @@ def _restore(args: argparse.Namespace) -> int:
         "archive_created_at": utc_or_unknown(result.archive_created_at),
         "last_audit_at": utc_or_unknown(result.last_audit_at),
         "sessions_revoked": result.sessions_revoked,
+        # BACKLOG #5094: a scripted restore reads what to re-apply here, as the text summary
+        # prints it.
+        "rollback_notice": RESTORE_ROLLBACK_NOTICE,
         "store": result.store_path,
         "store_bytes": result.store_bytes,
         "encrypted": result.encrypted,
