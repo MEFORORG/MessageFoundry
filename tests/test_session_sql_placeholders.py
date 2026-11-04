@@ -133,7 +133,7 @@ def _reads_session_row(sql: str) -> bool:
 
 class _MssqlCursor:
     """Records each statement. Reports one affected row; answers a session row read with one live
-    row, an account epoch read with 0, and everything else with no result rows."""
+    row, the global epoch read with 0, and everything else with no result rows."""
 
     def __init__(self, seen: list[tuple[str, tuple[Any, ...]]]) -> None:
         self._seen = seen
@@ -150,7 +150,7 @@ class _MssqlCursor:
     async def fetchall(self) -> list[Any]:
         if _reads_session_row(self._last):
             return [_LIVE_SESSION]
-        if self._last.startswith(("SELECT session_epoch", _GLOBAL_EPOCH_READ)):
+        if self._last.startswith(_GLOBAL_EPOCH_READ):
             return [(0,)]
         return self._other_rows()
 
@@ -263,7 +263,8 @@ async def test_sqlserver_revoke_user_sessions_counts_its_output_rowset(revoked: 
         seen.append(("raise the epoch", (user_id,)))
 
     store._bump_session_epoch = bump
-    assert await store.revoke_user_sessions("u", except_token_hash=_HASH, now=_NOW) == revoked
+    result = await store.revoke_user_sessions("u", except_token_hash=_HASH, now=_NOW)
+    assert result.count == revoked
     # The account's epoch is raised first (BACKLOG #2592); the sweep is the statement that counts.
     assert seen[0][0] == "raise the epoch"
     assert "OUTPUT inserted.token_hash" in seen[1][0]
@@ -356,8 +357,6 @@ class _PgConn:
         self._seen.append((sql, args))
         if _reads_session_row(sql):
             return dict(zip(_SESSION_COLUMNS, _LIVE_SESSION, strict=True))
-        if sql.startswith("SELECT session_epoch"):
-            return {"session_epoch": 0}
         return None
 
     async def fetchval(self, sql: str, *args: Any) -> Any:

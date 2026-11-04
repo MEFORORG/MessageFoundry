@@ -11440,7 +11440,7 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         try:
             _refuse_an_unauditable_write(store)
             try:
-                revoked = await store.revoke_all_sessions()
+                revoked = (await store.revoke_all_sessions()).count
             except AUDIT_WRITE_DEFECTS:
                 raise  # a bug, not a refused write
             except store_call_errors() as exc:
