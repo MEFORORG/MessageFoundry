@@ -212,6 +212,7 @@ __all__ = [
     "revocation_attested_hops",
     "unverified_generic_db_hops",
     "POSSIBLY_GENERIC_DB_HOP",
+    "UNRESOLVED_DRIVER_REASON",
     "overbroad_smart_scopes",
     "OAuthRequestAdvisories",
     "oauth_request_advisories",
@@ -4369,7 +4370,9 @@ def Database(
     it in ``odbc_driver`` and pass driver-specific keywords (``PORT``, ``SSLmode``, …) via ``odbc_params``;
     credentials stay in ``username``/``password`` (emitted under ``odbc_user_key``/``odbc_password_key`` —
     default ``UID``/``PWD``). **On the generic path configure TLS via the driver's own keyword** (e.g.
-    ``odbc_params={"SSLmode": "verify-full"}``) — the SQL-Server weakened-TLS refusal does not apply there.
+    ``odbc_driver="PostgreSQL Unicode", odbc_params={"SSLmode": "verify-full"}``; ``odbc_driver``
+    defaults to Microsoft's driver, which refuses ``SSLmode``) — the SQL-Server weakened-TLS refusal
+    does not apply there.
 
     The Handler produces a JSON-object body; the connector binds its keys to the ``:name`` parameters in
     ``statement`` (translated to positional ``?`` — always parameterized, never string-built) and runs it. A
@@ -6871,6 +6874,32 @@ def revocation_attested_hops(registry: Registry) -> list[tuple[str, str]]:
 #: text rather than state the hop is generic.
 POSSIBLY_GENERIC_DB_HOP = "possibly generic: dialect is an unresolved env() reference"
 
+#: The generic-hop reason when ``odbc_driver`` is an ``env()`` reference the reader cannot resolve,
+#: so its driver family is unknown, and at least one family the engine places would count the mode
+#: set (BACKLOG #5053). Where none would, the hop gets the reason every family gives instead.
+UNRESOLVED_DRIVER_REASON = "possibly delegated: odbc_driver is an unresolved env() reference"
+
+
+#: What :func:`_db_setting` returns for an ``env()`` reference it cannot resolve.
+_UNRESOLVED = object()
+
+
+def _db_setting(
+    settings: Mapping[str, Any], key: str, default: object, env_values: Mapping[str, Any] | None
+) -> object:
+    """A DATABASE connection's ``key`` setting, an ``env()`` reference resolved as the build
+    resolves it with :func:`resolve_env_settings`, or :data:`_UNRESOLVED` when it cannot be: no
+    values, or a key the values do not hold and no default."""
+    value = settings.get(key, default)
+    if not isinstance(value, EnvRef):
+        return value
+    if env_values is None:
+        return _UNRESOLVED
+    try:
+        return resolve_env_settings({key: value}, env_values)[key]
+    except WiringError:
+        return _UNRESOLVED
+
 
 def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | None) -> str | None:
     """A DATABASE connection's dialect in lower case, or ``None`` when it is an ``env()`` reference
@@ -6880,16 +6909,8 @@ def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | Non
     values, so a reader handed those values resolves it the same way, default included. With no
     values, or a key the values do not hold and no default, the answer is ``None``: a reader must not
     guess an arm, since each arm reads the same settings differently."""
-    dialect = settings.get("dialect", "sqlserver")
-    if not isinstance(dialect, EnvRef):
-        return str(dialect).lower()
-    if env_values is None:
-        return None
-    try:
-        resolved = resolve_env_settings({"dialect": dialect}, env_values)
-    except WiringError:
-        return None
-    return str(resolved["dialect"]).lower()
+    dialect = _db_setting(settings, "dialect", "sqlserver", env_values)
+    return None if dialect is _UNRESOLVED else str(dialect).lower()
 
 
 def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
@@ -6918,10 +6939,14 @@ def unverified_generic_db_hops(
 
     The exemption itself is narrower since BACKLOG #1178: a hop this function reports is also refused at
     connector construction on an enforcing instance off-loopback, through the shared cleartext-hop
-    authority. This lists what that classifier flags, not every delegated hop: one whose usable mode
-    value (see ``transports.database._sets_tls_mode``) is outside the no-TLS deny-list is absent. A
-    blank, padded or non-string mode value is flagged and listed. A hop can appear here and still be crossed legitimately, on-box or under a declared
-    attestation or acceptance, so never read it as "who is crossing in the clear".
+    authority. This lists what that classifier flags, not every delegated hop: one whose mode value
+    counts for its driver family (see ``transports.database._sets_tls_mode``) and is outside the
+    no-TLS deny-list is absent. A mode counts only on the keyword the family placed from
+    ``odbc_driver`` reads, and for psqlODBC and MySQL only at that family's own spellings, so a mode
+    keyword the named driver does not read, and any hop whose ``odbc_driver`` the engine cannot
+    place, is flagged and listed (BACKLOG #5053). A blank, padded or non-string mode value is
+    flagged and listed too. A hop can appear here and still be crossed legitimately, on-box or
+    under a declared attestation or acceptance, so never read it as "who is crossing in the clear".
 
     It walks **both** connection tables, unlike :func:`accepted_cleartext_hops`: a ``DatabasePoll``
     inbound crosses the same hop in the same dialect with the same credential in the same DSN, so
@@ -6951,16 +6976,31 @@ def unverified_generic_db_hops(
     surfaces, never on the hot path.
 
     Pure — it reads the loaded graph and touches nothing else."""
-    from messagefoundry.transports.database import generic_odbc_tls_unenforced
+    from messagefoundry.transports.database import (
+        generic_odbc_tls_unenforced,
+        generic_odbc_tls_unenforced_unread,
+    )
 
-    def unenforced(settings: Mapping[str, Any]) -> str | None:
+    def unenforced(settings: Mapping[str, Any], *, deployed: bool) -> str | None:
         dialect = _db_dialect(settings, env_values)
         if dialect is not None and dialect != "generic":
             return None
         params = settings.get("odbc_params") or {}
         if not isinstance(params, Mapping):
             return None
-        reason = generic_odbc_tls_unenforced(params)
+        # The classifier reads the driver family from odbc_driver (BACKLOG #5053), resolved as the
+        # dialect is. An unresolved one places no family, so the hop is listed, the safe direction
+        # for an advisory list, under a reason that says the name was not read.
+        # A not-deployed connection's env() values are never resolved (ADR 0111 AC-1), so its
+        # env() driver stays unread; a no-TLS value beside it is still reported.
+        driver = _db_setting(settings, "odbc_driver", None, env_values if deployed else None)
+        # Possibly delegated only where some family would clear the params: a hop at risk on
+        # every driver keeps the reason they all give.
+        reason: str | None
+        if driver is _UNRESOLVED:
+            reason = generic_odbc_tls_unenforced_unread(params) or UNRESOLVED_DRIVER_REASON
+        else:
+            reason = generic_odbc_tls_unenforced(params, driver=driver)
         if reason is None or dialect is not None:
             return reason
         # Unresolved: read as possibly generic rather than as not generic. A SQL Server value would
@@ -6977,7 +7017,7 @@ def unverified_generic_db_hops(
         for conn in table.values():
             if conn.spec.type is not ConnectorType.DATABASE or _dark_env_dialect(conn):
                 continue
-            reason = unenforced(conn.spec.settings)
+            reason = unenforced(conn.spec.settings, deployed=conn.deployed)
             if reason is not None:
                 out.append(
                     (record_name(conn.name), f"{reason} ({_peer_label(conn.spec.settings)})")
