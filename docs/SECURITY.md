@@ -3279,8 +3279,8 @@ re-syncs them. Otherwise it behaves as the refusals above, audited with the outc
 `directory_roles_demoted`. Channel scope is not compared on these legs. When the AD group-to-role
 map fails its seal, no role can be judged, so these legs and the IdP step-up leg below refuse an
 account that holds a role with `directory_role_map_unsealed` instead. That is not a demotion:
-nothing changed in the directory, a new sign-in reads the same map, and the fix is an administrator saving
-the map again. So it is never told to sign out.
+nothing changed in the directory, a new sign-in reads the same map, and the fix is an
+administrator saving the map again. So it is never told to sign out.
 
 **The caller is told which fix clears the refusal, and not its cause (BACKLOG #3082).** The precise
 cause stays on the audit row. A demotion is told to sign out and sign in again. A new sign-in clears
@@ -3297,10 +3297,11 @@ text names a group, a role or a directory detail.
 **The IdP step-up leg makes the same role test (BACKLOG #2154).** `complete_oidc_step_up` already
 looks the account up by its directory object id. It now judges the groups that lookup returns by
 the test stated in the paragraph above that opens "Both legs also refuse a present account that
-lost a role in the directory". It refuses only; the session stays as it was, with no window and
-no grant, and no roles are written. The `auth.reauth` row carries
-`reason=directory_roles_demoted`, and the refusal tells the operator to sign in again, which
-takes the roles the current groups grant.
+lost a role in the directory", and refuses an account that fails it, a failing role map
+included. It refuses only; the session stays as it was, with no window and no grant, and no
+roles are written. The `auth.reauth` row carries `reason=directory_roles_demoted`, and the
+refusal tells the operator to sign in again, which takes the roles the current groups grant. A
+failing map is refused as `directory_role_map_unsealed` and is not told to sign in again.
 Channel scope is not compared on this leg either.
 
 **The password re-bind makes the same role test (BACKLOG #3081).** A good re-bind (`POST
@@ -4846,8 +4847,10 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
     at sign-in. The password re-bind this leg replaces would have failed for a deleted account.
     The answer must carry that same id before its groups are trusted, or the leg refuses with
     `directory_object_id_missing` or `directory_identity_conflict` (BACKLOG #3174);
-  - every role stored on the account is among the roles its current directory groups map to
-    (BACKLOG #2154). Otherwise the leg refuses with `reason=directory_roles_demoted`.
+  - the account lost no role in the directory, by the role test in the paragraph that opens
+    "Both legs also refuse a present account that lost a role in the directory" (BACKLOG
+    #2154). Otherwise the leg refuses with `reason=directory_roles_demoted`, or with
+    `reason=directory_role_map_unsealed` when the role map fails its seal.
 
   It then elevates through the same path as the password leg: `reauth_at` is stamped, the session
   is rotated (ASVS 7.2.4) and keeps its `mfa_verified_at`, and a single-use action grant is minted
