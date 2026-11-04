@@ -3170,7 +3170,9 @@ class AuthStore(Protocol):
     ) -> int:
         """How many sessions :meth:`revoke_user_sessions` would end, given the same ``user_id`` and
         ``except_token_hash``: every unrevoked row of the account, idle or expired ones included,
-        but for the excepted one (BACKLOG #3393).
+        but for the excepted one (BACKLOG #3393). Where the revoke declines to re-stamp the
+        excepted session it ends that one too and counts it (``RevokeResult.ended_kept``), so its
+        ``count`` is then one more than this; its ``others`` is this number.
 
         Deliberately the revoke's predicate and not :meth:`list_sessions`'s, so the number an offer
         to sign out the other sessions shows is the number the revoke then ends. Each backend

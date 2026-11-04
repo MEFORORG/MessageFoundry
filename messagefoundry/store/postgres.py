@@ -10599,7 +10599,13 @@ class PostgresStore:
 
     async def _global_session_epoch(self, conn: Any) -> int:
         """The store's global session epoch (BACKLOG #5091), read inside ``conn``'s transaction."""
-        return global_epoch_or_refuse(await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"))
+        return global_epoch_or_refuse(await self._global_session_epoch_value(conn))
+
+    async def _global_session_epoch_value(self, conn: Any) -> int | None:
+        """The global session epoch, ``None`` where the row is missing, read as
+        :meth:`_global_session_epoch` reads it but not refused."""
+        value = await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
+        return None if value is None else int(value)
 
     def row_sealer(self) -> RowSealer | None:
         """This store's row sealer, or ``None`` on a keyless store (BACKLOG #2592). See
@@ -10724,7 +10730,8 @@ class PostgresStore:
         runs first, so it takes the account row's lock before any session row is touched, the order
         ``create_session`` takes them in. The kept session is checked against the global epoch
         too, read here without a lock clause as every reader of it is, and without refusing a
-        missing row (store.py's ``global_epoch_unmoved``), and ended where it is declined (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
+        missing row (store.py's ``global_epoch_unmoved``), and ended where it is declined
+        (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
         :meth:`_after_commit_txn`'s, for the reason it gives."""
         now = time.time() if now is None else now
         async with self._after_commit_txn() as conn:
@@ -10737,9 +10744,7 @@ class PostgresStore:
             )
             if except_token_hash is None:
                 return RevokeResult(_rowcount(status))
-            unmoved = global_epoch_unmoved(
-                await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
-            )
+            unmoved = global_epoch_unmoved(await self._global_session_epoch_value(conn))
             return await self._keep_or_end_session(
                 conn,
                 _rowcount(status),

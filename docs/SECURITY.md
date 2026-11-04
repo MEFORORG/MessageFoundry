@@ -4739,8 +4739,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   the row is missing, at least these refuse with an error naming it: a read of an existing
   account's user record that a sign-in or a session check makes, and every every-account revoke.
   A request that returns before that read is refused as it would be anyway.
-  **A revoke that keeps a missed session does not make it usable again: it ends it** (BACKLOG
-  #4975 and its follow-up). At least two cases reach this: a request from that session to end the
+  **A revoke asked to keep a missed session does not make it usable again: it ends it**
+  (BACKLOG #4975 and its follow-up). At least two cases reach this: a request from that session to end the
   user's other sessions, accepted just before the sweep commits, which waits for it and then runs,
   and an every-account revoke that keeps a session an earlier sweep missed. A revoke that keeps a
   session, the per-account one or the every-account one, stamps the new epochs onto it only when

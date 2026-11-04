@@ -1346,8 +1346,9 @@ GLOBAL_SESSION_EPOCH_SQL: Final = "(SELECT epoch FROM global_session_epoch WHERE
 #: The head of every user reader, on every backend: the row, and the global epoch beside it.
 USER_READ_SQL: Final = f"SELECT *, {GLOBAL_SESSION_EPOCH_SQL} AS global_session_epoch FROM users"
 #: Raised by every read or raise of the global epoch that finds no row, so a sign-in, a session
-#: check and an every-account revoke all refuse the same way; a revoke rolls back. Each schema
-#: seeds the row.
+#: check and an every-account revoke all refuse the same way; a revoke rolls back. The one read
+#: that does not raise is the per-account revoke's check of the session it keeps, which logs this
+#: and ends that session instead (``global_epoch_unmoved``). Each schema seeds the row.
 GLOBAL_SESSION_EPOCH_MISSING: Final = (
     "the store's global_session_epoch row is missing, so no session can be stamped or checked and"
     " the every-account session revoke cannot end every session"
@@ -2889,7 +2890,7 @@ def global_epoch_raise(after: int) -> EpochRaise:
     return EpochRaise(after - 1, after)
 
 
-def global_epoch_unmoved(current: Any) -> EpochRaise | None:
+def global_epoch_unmoved(current: int | None) -> EpochRaise | None:
     """The store's global session epoch as a per-account revoke sees it: ``current``, read in
     that revoke's own transaction, which raises no global epoch (follow-up to BACKLOG #4975).
 
@@ -2897,8 +2898,12 @@ def global_epoch_unmoved(current: Any) -> EpochRaise | None:
     session behind on the global epoch alone is declined, and ended, as one behind on its
     account's epoch is. ``None`` where the read found no row (:data:`GLOBAL_SESSION_EPOCH_MISSING`
     says what refuses then): nothing can be checked against it, so the kept session is declined
-    and ended, and the revoke still ends the rest rather than roll back and keep them live."""
-    return None if current is None else EpochRaise(int(current), int(current))
+    and ended, and the revoke still ends the rest rather than roll back and keep them live. The
+    missing row is logged, since every other read of it refuses loudly."""
+    if current is None:
+        log.warning("%s; the kept session is ended with the rest", GLOBAL_SESSION_EPOCH_MISSING)
+        return None
+    return EpochRaise(current, current)
 
 
 @dataclass(frozen=True, slots=True)
@@ -18285,8 +18290,9 @@ class MessageStore:
         :meth:`_write_session`, under the new epoch only when it carried the epoch the raise
         replaced and the current global epoch, read in this transaction without refusing a
         missing row (:func:`global_epoch_unmoved`, :class:`KeptSessionRestamp`, BACKLOG #4975);
-        otherwise it is ended with the rest and counted (:meth:`_keep_or_end_session`). If its own seal does not verify, that raises
-        :class:`RowSealError` and the whole transaction, revokes included, rolls back."""
+        otherwise it is ended with the rest and counted (:meth:`_keep_or_end_session`). If its
+        own seal does not verify, that raises :class:`RowSealError` and the whole transaction,
+        revokes included, rolls back."""
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             raised = await self._bump_session_epoch(user_id)
@@ -18462,12 +18468,12 @@ class MessageStore:
         the caller's transaction."""
         return global_epoch_or_refuse(await self._global_session_epoch_value())
 
-    async def _global_session_epoch_value(self) -> Any:
-        """The global session epoch's raw value, ``None`` where the row is missing, read as
+    async def _global_session_epoch_value(self) -> int | None:
+        """The global session epoch, ``None`` where the row is missing, read as
         :meth:`_global_session_epoch` reads it but not refused."""
         cur = await self._db.execute(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
         row = await cur.fetchone()
-        return None if row is None else row[0]
+        return None if row is None or row[0] is None else int(row[0])
 
     async def _bump_session_epoch(self, user_id: str) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside the caller's writer

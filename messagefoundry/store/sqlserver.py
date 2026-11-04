@@ -14070,12 +14070,12 @@ class SqlServerStore:
         transaction."""
         return global_epoch_or_refuse(await self._global_session_epoch_value(cur))
 
-    async def _global_session_epoch_value(self, cur: Any) -> Any:
-        """The global session epoch's raw value, ``None`` where the row is missing, read as
+    async def _global_session_epoch_value(self, cur: Any) -> int | None:
+        """The global session epoch, ``None`` where the row is missing, read as
         :meth:`_global_session_epoch` reads it but not refused."""
         await cur.execute(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
         rows = await cur.fetchall()
-        return rows[0][0] if rows else None
+        return None if not rows or rows[0][0] is None else int(rows[0][0])
 
     async def _bump_session_epoch(self, cur: Any, user_id: str) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, on ``cur`` inside an open
@@ -15590,8 +15590,9 @@ class SqlServerStore:
         (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
         runs first, so it takes the account row's lock before any session row, the order
         ``create_session`` takes them in. The kept session is checked against the global epoch
-        too, read while the account row is held, as ``create_session`` reads it, without refusing a
-        missing row (store.py's ``global_epoch_unmoved``), and ended where it is declined (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
+        too, read while the account row is held, as ``create_session`` reads it, without refusing
+        a missing row (store.py's ``global_epoch_unmoved``), and ended where it is declined
+        (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
         :meth:`_acquire_after_commit`'s, for the reason it gives (BACKLOG #3023)."""
         now = time.time() if now is None else now
         async with self._acquire_after_commit() as conn, self._cursor(conn) as cur:
