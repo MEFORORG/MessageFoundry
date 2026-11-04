@@ -15,6 +15,9 @@ import hashlib
 import pytest
 
 from messagefoundry.parsing.binary import (
+    _HEX64,
+    _HEX_DIGITS,
+    _SHA256_HEX_LEN,
     DOC_REF_MARKER,
     DocRefError,
     _copy_names_address,
@@ -86,6 +89,19 @@ def test_parse_doc_ref_rejects_non_ref_and_malformed() -> None:
         parse_doc_ref(f"{DOC_REF_MARKER}{SHA}")  # missing content-type
     with pytest.raises(DocRefError):
         parse_doc_ref(f"{DOC_REF_MARKER}deadbeef:application/pdf")  # content address not 64-hex
+
+
+def test_the_content_address_shape_is_defined_once() -> None:
+    # _HEX64 is a literal so the ReDoS scan reads it, which leaves three spellings of one shape:
+    # the length, the alphabet and the pattern. They must agree, or the copy guard and the handle
+    # parser read addresses differently.
+    assert len(set(_HEX_DIGITS)) == len(_HEX_DIGITS) == 16
+    for code in range(128):
+        c = chr(code)
+        assert bool(_HEX64.fullmatch(c * _SHA256_HEX_LEN)) is (c in _HEX_DIGITS), repr(c)
+    assert not _HEX64.fullmatch("0" * (_SHA256_HEX_LEN - 1))
+    assert not _HEX64.fullmatch("0" * (_SHA256_HEX_LEN + 1))
+    assert len(SHA) == _SHA256_HEX_LEN
 
 
 def test_copy_names_address_needs_64_lowercase_hex_right_after_the_marker() -> None:

@@ -990,24 +990,54 @@ async def _no_read(_sha256: str) -> str | None:
     raise AssertionError("nothing is bound, so no attachment may be read")
 
 
-def _copy_in_nte_component(msh2: str, value: str) -> str:
-    """A payload in ``msh2`` with plain text in ``OBX-5.5`` and ``value`` set into ``NTE-3.1``: a
-    component set, which escapes every delimiter in the value."""
-    msg = Message.parse(_hl7("plain text", msh2=msh2))
-    msg.add_segment("NTE|1")
+def _copy_in_nte_component(field_sep: str, msh2: str, value: str) -> str:
+    """A well-formed MDM^T02 under MSH-1 ``field_sep`` and MSH-2 ``msh2``, with a small ED Base64
+    document in ``OBX-5.5`` and ``value`` set into ``NTE-3.1``. Every field is written with
+    ``Message.set``, so a delimiter that is a letter or digit is escaped in the fixed text too and
+    the OBX keeps its shape. ``NTE-3.1`` is a component set, which escapes every delimiter in
+    ``value``."""
+    msg = Message.parse(f"MSH{field_sep}{msh2}{field_sep}\rOBX{field_sep}1{field_sep}ED\r")
+    for path, text in [
+        ("MSH-7", "20260101120000"),
+        ("MSH-9.1", "MDM"),
+        ("MSH-9.2", "T02"),
+        ("MSH-10", "MSGID001"),
+        ("MSH-12", "2.5"),
+        ("OBX-3", "PDF"),
+        ("OBX-5.2", "Application"),
+        ("OBX-5.3", "PDF"),
+        ("OBX-5.4", "Base64"),
+        ("OBX-5.5", _b64(10)),
+        ("OBX-11", "F"),
+    ]:
+        msg.set(path, text)
+    msg.add_segment(f"NTE{field_sep}1")
     msg.set("NTE-3.1", value)
-    return msg.encode()
+    payload = msg.encode()
+    parsed = Message.parse(payload)
+    assert (parsed.field("OBX-5.4"), parsed.field("OBX-5.5")) == ("Base64", _b64(10))
+    assert parsed.field("NTE-3.1") == value
+    return payload
 
 
 @pytest.mark.parametrize(
-    "msh2",
-    ["a~\\&", "d~\\&", "^a\\&", "^~0&", "^~\\a"],
-    ids=["component-a", "component-d", "repetition-a", "escape-0", "subcomponent-a"],
+    ("field_sep", "msh2"),
+    [
+        ("a", "^~\\&"),
+        ("|", "a~\\&"),
+        ("|", "d~\\&"),
+        ("|", "^a\\&"),
+        ("|", "^~0&"),
+        ("|", "^~\\a"),
+    ],
+    ids=["field-a", "component-a", "component-d", "repetition-a", "escape-0", "subcomponent-a"],
 )
-async def test_a_copy_whose_delimiters_escape_its_address_is_refused(msh2: str) -> None:
-    """A delimiter or escape character that is a hex digit is escaped inside the copied content
-    address too, so the address no longer reads as 64 hex. With nothing bound the copy must still
-    be refused, never carried to the partner as text (BACKLOG #5099)."""
+async def test_a_copy_whose_delimiters_escape_its_address_is_refused(
+    field_sep: str, msh2: str
+) -> None:
+    """A separator or escape character that is a lowercase hex digit is escaped inside the copied
+    content address too, so the address no longer reads as 64 hex. With nothing bound the copy
+    must still be refused, never carried to the partner as text (BACKLOG #5099)."""
     from messagefoundry.parsing.binary import (
         UnreattachableDocumentError,
         _copy_names_address,
@@ -1015,23 +1045,29 @@ async def test_a_copy_whose_delimiters_escape_its_address_is_refused(msh2: str) 
     )
 
     handle = make_doc_ref(hashlib.sha256(b"copied").hexdigest(), "Application")
-    payload = _copy_in_nte_component(msh2, handle)
+    payload = _copy_in_nte_component(field_sep, msh2, handle)
     escaped = Message._escape_leaf(DOC_REF_MARKER, *Message.parse(payload)._encoding_chars())
     # The leak's premise: the copy is in the payload, but neither marker reads an address after it.
-    assert Message.parse(payload).field("NTE-3.1") == handle
     assert not any(_copy_names_address(payload, m) for m in (escaped, DOC_REF_MARKER))
 
     with pytest.raises(UnreattachableDocumentError):
         await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
 
 
-@pytest.mark.parametrize("msh2", ["^~\\&", ":~\\&"], ids=["default", "colon-component"])
-async def test_a_bare_marker_under_ordinary_delimiters_is_carried_as_text(msh2: str) -> None:
-    """The control: no delimiter is a hex digit, nothing is bound, and the marker names no
-    address, so the payload is carried unchanged."""
+@pytest.mark.parametrize(
+    "msh2",
+    ["^~\\&", ":~\\&", "A~\\&", "^~\\B"],
+    ids=["default", "colon-component", "uppercase-component", "uppercase-subcomponent"],
+)
+async def test_a_bare_marker_under_delimiters_with_no_lowercase_hex_is_carried_as_text(
+    msh2: str,
+) -> None:
+    """The control: no delimiter is a lowercase hex digit, nothing is bound, and the marker names
+    no address, so the payload is carried unchanged. An uppercase hex delimiter escapes nothing in
+    a lowercase address, so it does not count."""
     from messagefoundry.parsing.binary import reattach_documents_in_hl7
 
-    payload = _copy_in_nte_component(msh2, DOC_REF_MARKER + "x")
+    payload = _copy_in_nte_component("|", msh2, DOC_REF_MARKER + "x")
     escaped = Message._escape_leaf(DOC_REF_MARKER, *Message.parse(payload)._encoding_chars())
     assert escaped in payload  # the marker the guard looks for is there
 

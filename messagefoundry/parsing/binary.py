@@ -763,8 +763,8 @@ async def reattach_documents_in_hl7(
     refused before ``reader`` runs, so a value the sender wrote cannot name another message's
     document. The handle marker, raw or as this payload's delimiters escape it, anywhere the
     splice does not reach is refused too where ``bound`` is not empty, the copy names a content
-    address, or a delimiter is a hex digit and so may have escaped one, so a handle a Handler
-    copied elsewhere is never emitted."""
+    address, or a delimiter is a lowercase hex digit and so may have escaped one, so a handle a
+    Handler copied elsewhere is never emitted."""
     # Local imports. message.py imports binary.py, never the reverse, so the cycle is broken here,
     # exactly as _strip_obx_ed does. asyncio stays out of the module scope: a sandbox worker refuses an
     # import of it once its guard is up (DEFAULT_FORBIDDEN_MODULES), this module has to stay importable
@@ -825,8 +825,9 @@ async def reattach_documents_in_hl7(
         separators = message._encoding_chars()
         marker = Message._escape_leaf(DOC_REF_MARKER, *separators)
         markers = (marker, DOC_REF_MARKER) if marker != DOC_REF_MARKER else (marker,)
-        # A separator or escape character that is a hex digit is escaped inside a copied content
-        # address too, so the address after a marker cannot be read: every marker counts as a copy.
+        # A separator or escape character that is a lowercase hex digit is escaped inside a copied
+        # content address too, so the address after a marker cannot be read: every marker counts
+        # as a copy. An uppercase one escapes nothing in an address, which is lowercase.
         address_unreadable = any(c in _HEX_DIGITS for c in separators)
         if (
             not found
@@ -855,7 +856,8 @@ async def reattach_documents_in_hl7(
     if not handles:
         # No handle in any OBX-5.5 — return the ORIGINAL text unchanged (byte-identical). The caller's
         # gate may open on a header alone, or on a bare marker outside OBX-5.5 in a message that
-        # holds no document; that names no document, so it is carried through verbatim.
+        # holds no document under delimiters with no lowercase hex digit (_handles refuses the
+        # rest); that names no document, so it is carried through verbatim.
         return text
     for occ, sha256 in handles:
         verbatim = await reader(sha256)

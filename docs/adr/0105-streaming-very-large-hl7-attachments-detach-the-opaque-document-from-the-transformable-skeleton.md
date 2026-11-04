@@ -280,8 +280,9 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   malformed or names any other address raises `UnreattachableDocumentError` before any read. A
   copy of the handle marker, raw or as the payload's delimiters escape it, where the splice does
   not reach (`NTE-3`, a second `OBX-5.5` repetition) raises it too: before the splice where the
-  message holds a document or the copy names a content address, and after the splice wherever the
-  message also carries a bound handle. Either way the row dead-letters alone rather than
+  message holds a document, the copy names a content address, or a separator or the escape
+  character is a lowercase hex digit (the payload's escaping then breaks up a copied address, so
+  it cannot be read), and after the splice wherever the message also carries a bound handle. Either way the row dead-letters alone rather than
   re-pending on a strict-FIFO lane. A handle the payload hides behind any other escape does not
   open the gate by itself, so on its own it is carried as the sender's text and resolves nothing.
   Where the gate opens for another reason, the re-attach reads it as it reads any handle, so it
