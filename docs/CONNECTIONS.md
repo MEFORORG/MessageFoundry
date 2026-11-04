@@ -1938,10 +1938,13 @@ Two limits follow from this:
   a driver reads. It places three families documented to read `SERVER`, by the registered names
   [*The `SSLmode` spelling*](#the-sslmode-spelling) lists: psqlODBC, MySQL Connector/ODBC and
   Microsoft's `ODBC Driver <n> for SQL Server`. No driver was run to confirm it (vault BACKLOG
-  #2705). For any other `odbc_driver` name, building the connection logs a WARNING naming it, and
-  `messagefoundry check`'s advisory `generic-db-server` line lists it (BACKLOG #5163). Neither
-  refuses the connection. To clear it, name a driver of one of those families by its registered
-  name, or reach that database another way than the generic dialect.
+  #2705), and a placed family is the documentation's claim, not proof that the check binds the
+  address the driver dials. For any other `odbc_driver` name, building the connection logs a
+  WARNING naming the connection, not the driver, and `messagefoundry check`'s advisory
+  `generic-db-server` line lists the connection with its `server` (BACKLOG #5163). Neither refuses
+  the connection. To clear it, name psqlODBC or MySQL Connector/ODBC by its registered name, use
+  `dialect="sqlserver"` for SQL Server, whose driver ignores `PORT` on this dialect, or reach that
+  database another way than the generic dialect.
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
   libpq still reads its CA from its default location or from the `PGSSLROOTCERT` environment

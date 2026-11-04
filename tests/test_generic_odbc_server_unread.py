@@ -3,10 +3,10 @@
 """BACKLOG #5163: a generic-ODBC driver the engine cannot place as reading ``SERVER`` is reported.
 
 The generic connection string sends its target as ``SERVER`` alone, and ``[egress].allowed_db``
-checks that host. A driver that takes its target from another keyword would dial a host the check
-never saw. Before this the reliance was prose only: such a driver built with no report. It now gets
-a construction WARNING and a line on ``messagefoundry check``'s advisory ``generic-db-server``.
-Neither refuses anything; the refusal is BACKLOG #5041. Synthetic hosts only.
+checks that host (docs/CONNECTIONS.md, *Accepted odbc_params keywords*). Before this, such a driver
+was reported only for its TLS mode (BACKLOG #5053). It now also gets a construction WARNING and a
+line on ``messagefoundry check``'s advisory ``generic-db-server``. Neither refuses anything; the
+refusal is BACKLOG #5041. Synthetic hosts only.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from messagefoundry.transports import build_destination, build_source
 from messagefoundry.transports.database import (
     _DRIVER_FAMILIES,
     SERVER_UNREAD_REASON,
+    SERVER_UNREAD_REMEDY,
     _build_odbc_dsn,
     odbc_driver_reads_server,
 )
@@ -124,16 +125,36 @@ def test_the_warning_survives_the_log_scrub(monkeypatch: pytest.MonkeyPatch) -> 
             connection="OB_ELSEWHERE",
         )
     assert SERVER_UNREAD_REASON in sink.text, sink.text
+    assert SERVER_UNREAD_REMEDY in sink.text, sink.text
     assert "OB_ELSEWHERE" in sink.text, sink.text
 
 
 def test_every_placed_family_records_whether_it_reads_server() -> None:
-    """The record is per family, so a family placed later for its TLS keyword decides this rather
-    than inheriting it. Each of the three is documented to read it; none was run."""
-    assert all(family.reads_server for family in _DRIVER_FAMILIES.values())
+    """The documented record, per family: each of the three is documented to read ``SERVER`` and
+    none was run. A family added to the table must be added here, which is the review the field's
+    missing default asks for."""
+    assert {key: family.reads_server for key, family in _DRIVER_FAMILIES.items()} == {
+        "psqlodbc": True,
+        "mysql": True,
+        "msodbc": True,
+    }
     assert all(odbc_driver_reads_server(name) for name in _PLACED)
     assert not any(odbc_driver_reads_server(name) for name in _UNPLACED)
     assert not odbc_driver_reads_server(None)
+
+
+def test_a_placed_family_that_does_not_read_server_still_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Placing a family for its TLS keyword must not clear this warning by itself. Red mutation:
+    drop the ``reads_server`` term from ``odbc_driver_reads_server`` and no warning is logged."""
+    monkeypatch.setitem(
+        _DRIVER_FAMILIES, "psqlodbc", _DRIVER_FAMILIES["psqlodbc"]._replace(reads_server=False)
+    )
+    assert not odbc_driver_reads_server(_PSQL)
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        _build_odbc_dsn({"odbc_driver": _PSQL, "server": "db.example.invalid"})
+    assert len(_server_warnings(caplog)) == 1
 
 
 def _outbound(reg: Registry, name: str, *, deployed: bool = True, **settings: Any) -> None:
@@ -150,7 +171,7 @@ def test_the_reader_walks_both_tables_and_skips_the_preset() -> None:
     reg = Registry()
     _outbound(reg, "OB_PG", dialect="generic", odbc_driver="PostgreSQL Unicode")
     _outbound(reg, "OB_ORACLE", dialect="generic", odbc_driver="Oracle in OraDB19Home1")
-    # The SQL Server preset sends its own SERVER under Microsoft's driver, whatever the name says.
+    # Not this reader's arm. The preset also sends a named odbc_driver; that is not covered here.
     _outbound(reg, "OB_PRESET", database="MFDB", odbc_driver="Oracle in OraDB19Home1")
     reg.add_inbound(
         build_inbound_connection(
@@ -201,8 +222,10 @@ def test_the_reader_reads_an_env_dialect_and_an_env_driver_as_possibly() -> None
     )
     _outbound(reg, "OB_DARK_DIALECT", deployed=False, dialect=env("dark_dialect"))
     hops = dict(server_unread_generic_db_hops(reg))
-    # Not deployed with an env() reference: never resolved, never built, never listed.
-    assert set(hops) == {"OB_ENV_DIALECT", "OB_ENV_DRIVER"}
+    # Not deployed: an env() dialect is skipped, and an env() driver is never resolved, so it is
+    # listed as unread, as the TLS reader lists it (ADR 0111 AC-1).
+    assert set(hops) == {"OB_ENV_DIALECT", "OB_ENV_DRIVER", "OB_DARK_DRIVER"}
+    assert hops["OB_DARK_DRIVER"].startswith(UNRESOLVED_SERVER_DRIVER_REASON)
     assert hops["OB_ENV_DIALECT"].startswith(POSSIBLY_GENERIC_DB_HOP)
     assert "env(db_dialect)" in hops["OB_ENV_DIALECT"]
     assert hops["OB_ENV_DRIVER"].startswith(UNRESOLVED_SERVER_DRIVER_REASON)
@@ -216,12 +239,12 @@ def test_the_reader_reads_an_env_dialect_and_an_env_driver_as_possibly() -> None
         "dark_dialect": "generic",
     }
     resolved = dict(server_unread_generic_db_hops(reg, env_values=values))
-    assert set(resolved) == {"OB_ENV_DIALECT"}
+    assert set(resolved) == {"OB_ENV_DIALECT", "OB_DARK_DRIVER"}
+    assert resolved["OB_DARK_DRIVER"].startswith(UNRESOLVED_SERVER_DRIVER_REASON)
     assert resolved["OB_ENV_DIALECT"].startswith(SERVER_UNREAD_REASON)
     assert cast_ran == ["PostgreSQL Unicode"]
-    assert (
-        server_unread_generic_db_hops(reg, env_values={**values, "db_dialect": "sqlserver"}) == []
-    )
+    preset = server_unread_generic_db_hops(reg, env_values={**values, "db_dialect": "sqlserver"})
+    assert [name for name, _ in preset] == ["OB_DARK_DRIVER"]
 
 
 _CHECK_MODULE = """

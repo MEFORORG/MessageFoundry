@@ -3053,12 +3053,11 @@ def _check_generic_db_server(config_dir: str | Path) -> CheckResult:
     """Surface the generic-ODBC ``DATABASE`` connections whose ``odbc_driver`` is not a family
     documented to read ``SERVER`` as its target (BACKLOG #5163).
 
-    The generic connection string sends the target as ``SERVER`` alone, and ``[egress].allowed_db``
-    checks that host, so a driver that takes its target elsewhere would dial a host the check never
-    saw. The construction WARNING was the only other report. ``required=False`` on purpose: the
-    engine cannot tell what a driver it cannot place reads, and refusing such a name is BACKLOG
-    #5041's driver allow-list, a separate decision. SKIPs when the graph will not load, as
-    ``generic-db-tls`` does."""
+    What that costs ``[egress].allowed_db`` is stated once, in docs/CONNECTIONS.md, *Accepted
+    odbc_params keywords*; the construction WARNING is the other report of it. ``required=False``
+    on purpose: the engine cannot tell what a driver it cannot place reads, and refusing such a
+    name is BACKLOG #5041's driver allow-list, a separate decision. SKIPs when the graph will not
+    load, as ``generic-db-tls`` does."""
     from messagefoundry.config.wiring import (
         WiringError,
         load_config,

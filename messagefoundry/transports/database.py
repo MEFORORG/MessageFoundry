@@ -703,11 +703,10 @@ class _DriverFamily(NamedTuple):
     #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
     #: keyword never brings an unmeasured escape with it.
     brace_escape: bool
-    #: Whether the family's own documentation names ``SERVER`` as the keyword for its target host,
-    #: the one keyword the generic connection string sends a target under and the host
-    #: ``[egress].allowed_db`` checks (BACKLOG #5163). Documented, never measured: no driver was run
-    #: for it (BACKLOG #2705). Its own field, with no default, so a family placed later for its TLS
-    #: keyword says whether it reads ``SERVER`` rather than inheriting it.
+    #: Whether the family's own documentation names ``SERVER`` as the keyword for its target host
+    #: (:func:`odbc_driver_reads_server`, BACKLOG #5163). Documented, never measured. Its own field,
+    #: with no default, so a family placed later for its TLS keyword says whether it reads
+    #: ``SERVER`` rather than inheriting it.
     reads_server: bool
     #: Whether the driver reads ``SERVER=host,port`` as one host and its port, and ignores
     #: ``PORT``: Microsoft's driver alone (:func:`~messagefoundry.transports.db_endpoint.generic_hop_endpoint`,
@@ -790,9 +789,11 @@ SERVER_UNREAD_REASON = (
     "[egress].allowed_db does not bind this hop if the driver takes its target from another keyword"
 )
 #: What to do about :data:`SERVER_UNREAD_REASON`, shared by the warning and the check line.
+#: Microsoft's driver is not offered: on this dialect it ignores ``PORT``, and its own remedy is
+#: ``dialect="sqlserver"`` (:func:`~messagefoundry.transports.db_endpoint.generic_hop_endpoint`).
 SERVER_UNREAD_REMEDY = (
-    "name psqlODBC, MySQL Connector/ODBC or Microsoft's driver by its registered name, or reach "
-    "this database another way (see Generic ODBC in docs/CONNECTIONS.md)"
+    "name psqlODBC or MySQL Connector/ODBC by its registered name, use dialect sqlserver for SQL "
+    "Server, or reach this database another way (see Generic ODBC in docs/CONNECTIONS.md)"
 )
 
 
@@ -800,9 +801,9 @@ def odbc_driver_reads_server(driver: object) -> bool:
     """Whether ``driver``, an ``odbc_driver`` setting as written, places a family
     :data:`_DRIVER_FAMILIES` records as documented to read ``SERVER`` as its target (BACKLOG
     #5163). ``False`` is not a finding that the driver ignores ``SERVER``, only that the engine
-    cannot place it: the generic connection string sends its target as ``SERVER`` alone, and
-    ``[egress].allowed_db`` checks that host, so a driver that takes its target from another keyword
-    dials a host the check never saw. Pure."""
+    cannot place it. Why that matters to ``[egress].allowed_db`` is stated once, in
+    docs/CONNECTIONS.md, *Accepted odbc_params keywords*. ``True`` is the documentation's claim,
+    not proof that the check binds the address the driver dials. Pure."""
     family = _driver_family(driver)
     return family is not None and _DRIVER_FAMILIES[family].reads_server
 
@@ -1555,9 +1556,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
 
 
 def _warn_generic_server_unread(driver: str, *, connection: str | None = None) -> None:
-    """A WARNING when ``driver`` is not documented to read ``SERVER`` as its target
-    (:func:`odbc_driver_reads_server`, BACKLOG #5163), so the ``[egress].allowed_db`` check on
-    ``server`` may bind nothing for the hop.
+    """A WARNING when :func:`odbc_driver_reads_server` cannot place ``driver`` (BACKLOG #5163).
 
     Visibility, not a control: it never gates or changes the connection. Refusing such a name is
     BACKLOG #5041's driver allow-list, not this. ``messagefoundry check``'s advisory

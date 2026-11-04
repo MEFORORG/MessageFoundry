@@ -213,6 +213,7 @@ __all__ = [
     "server_unread_generic_db_hops",
     "POSSIBLY_GENERIC_DB_HOP",
     "UNRESOLVED_DRIVER_REASON",
+    "UNRESOLVED_SERVER_DRIVER_REASON",
     "overbroad_smart_scopes",
     "OAuthRequestAdvisories",
     "oauth_request_advisories",
@@ -6967,9 +6968,8 @@ def server_unread_generic_db_hops(
     """The generic-ODBC ``DATABASE`` connections whose ``odbc_driver`` the engine cannot place as
     a family documented to read ``SERVER`` as its target, as ``(name, reason)`` (BACKLOG #5163).
 
-    The generic connection string sends its target as ``SERVER`` alone, and ``[egress].allowed_db``
-    checks that host. A driver that takes its target from another keyword dials a host the check
-    never saw, so the check binds nothing for that hop. The construction WARNING
+    What that costs ``[egress].allowed_db`` is stated once, in docs/CONNECTIONS.md, *Accepted
+    odbc_params keywords*. The construction WARNING
     (``transports.database._warn_generic_server_unread``) is this list's other surface, and both
     read :func:`~messagefoundry.transports.database.odbc_driver_reads_server`, imported lazily for
     the one-way rule. Listed is not a finding that the driver ignores ``SERVER``, only that the
@@ -6978,11 +6978,10 @@ def server_unread_generic_db_hops(
     Read as :func:`unverified_generic_db_hops` reads the graph: both connection tables, inbound
     names prefixed ``inbound:``; an ``env()`` dialect resolved against ``env_values`` when given and
     otherwise read as possibly generic; a ``deployed=False`` connection with an ``env()`` dialect
-    skipped (ADR 0111 AC-1). An ``env()`` ``odbc_driver`` is resolved the same way, and one this
-    reader cannot resolve is listed as possibly unread, naming the reference's key and never its
-    value; on a ``deployed=False`` connection it is skipped instead, since its value is never read
-    and the hop is never built. ``registry.lookups`` is not walked, for the reason that function
-    gives: ``DatabaseLookup`` and ``DatabaseRef`` take no dialect.
+    skipped (ADR 0111 AC-1). An ``env()`` ``odbc_driver`` is resolved as that function resolves
+    it, never on a ``deployed=False`` connection, and one left unresolved is listed as possibly
+    unread, naming the reference's key and never its value. ``registry.lookups`` is not walked, for
+    the reason that function gives: ``DatabaseLookup`` and ``DatabaseRef`` take no dialect.
 
     Pure -- it reads the loaded graph and touches nothing else."""
     from messagefoundry.transports.database import SERVER_UNREAD_REASON, odbc_driver_reads_server
@@ -6992,10 +6991,9 @@ def server_unread_generic_db_hops(
         if dialect is not None and dialect != "generic":
             return None
         raw_driver = settings.get("odbc_driver")
-        if isinstance(raw_driver, EnvRef) and not deployed:
-            # ADR 0111 AC-1: never resolved, and the hop is never built.
-            return None
-        driver = _db_setting(settings, "odbc_driver", None, env_values)
+        # ADR 0111 AC-1: a not-deployed connection's env() values are never resolved, so its
+        # env() driver stays unread and is listed as such, as unverified_generic_db_hops lists it.
+        driver = _db_setting(settings, "odbc_driver", None, env_values if deployed else None)
         # Only an env() reference resolves to _UNRESOLVED, so raw_driver has a key to name.
         if driver is _UNRESOLVED and isinstance(raw_driver, EnvRef):
             reason = (
