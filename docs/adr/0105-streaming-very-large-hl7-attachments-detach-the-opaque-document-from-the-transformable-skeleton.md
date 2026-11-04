@@ -313,7 +313,7 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
      it. The cost is a header read, plus up to two substring scans under such delimiters or
      the raw-marker scan under such a header.
   3. *Egress splice refusal.* The re-attach refuses a handle it would splice before any read, so
-     a Handler that changed `MSH-2` after the detach cannot corrupt the document.
+     a Handler that changed `MSH-1` or `MSH-2` after the detach cannot corrupt the document.
   4. *Egress copy refusal.* The re-attach refuses any marker it finds with no handle to splice.
      This is the backstop for a copy a Handler made and for an operator edit-and-resubmit or
      resend.
@@ -328,9 +328,11 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   if splicing it back under the delimiters it arrived with reproduces it exactly, so the detach
   also refuses an ED Base64 document whose own value `Message._escape_leaf` would change under
   them, such as a non-base64 value holding `&` or a control character under `|^~\&`
-  (`NonVerbatimDocumentError`), the same way. The re-attach refuses a stored value holding a
-  delimiter the payload's `MSH-2` names after its read and before the splice, so a Handler that
-  moved `MSH-2` after the detach dead-letters the row rather than send an altered document; a
+  (`NonVerbatimDocumentError`), the same way. A streaming body with an `OBX` whose `MSH-1` and
+  `MSH-2` name no delimiters is refused at the detach the same way too
+  (`UnreadableDelimitersError`), since no `OBX-5.5` of it can be read. The re-attach refuses a stored value holding a
+  delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that
+  moved `MSH-1` or `MSH-2` after the detach dead-letters the row rather than send an altered document; a
   stored control character is an engine fault for the internal-error policy, as a CR or LF is.
   *Out of scope:* an outbound `encoding_characters` override, which the transport applies after
   hydration, is operator configuration. An uppercased marker `MFDOC:V1:REF:` is not a handle, since
