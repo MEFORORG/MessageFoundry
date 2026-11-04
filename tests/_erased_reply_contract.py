@@ -282,7 +282,7 @@ async def assert_purge_concurrent_with_replay_of_a_delivery_row_keeps_the_invari
                 assert row["payload"] == "", first  # the purge won and erased the body
 
 
-async def assert_missing_artifact_row_is_a_corrupt_reference(
+async def assert_missing_artifact_row_dead_letters_under_its_own_error(
     store: Any, fetch: RawFetch, raw: RawSql
 ) -> None:
     """Retention keeps the ``response`` row and NULLs its body, so a row that is gone is damage, not
@@ -346,6 +346,8 @@ CASES = [
         assert_purge_concurrent_with_replay_of_a_delivery_row_keeps_the_invariant,
         id="concurrent_delivery",
     ),
-    pytest.param(assert_missing_artifact_row_is_a_corrupt_reference, id="missing_artifact"),
+    pytest.param(
+        assert_missing_artifact_row_dead_letters_under_its_own_error, id="missing_artifact"
+    ),
     pytest.param(assert_dead_letter_purge_clears_the_blanked_token, id="dead_letter_purge"),
 ]

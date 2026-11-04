@@ -9430,8 +9430,9 @@ class MessageStore:
         marker while the setting is on. Turning it off again restores the refusal on every marked
         surface.
 
-        NULL and blank ``''`` are not sealed: ``''`` is what every purge path writes. **The one
-        exception is a live empty queue row on a surface that is still unsealed (BACKLOG #3495).** A
+        NULL and blank ``''`` are not sealed: ``''`` is what every purge path writes. **The exception
+        is a live empty queue row on a surface that is still unsealed (BACKLOG #3495), or on any
+        surface under the opt-out (BACKLOG #4994).** A
         keyless store writes an empty body as ``''``, and :func:`open_queue_cell` refuses a blank on
         a keyed store, so that row would dead-letter with a false ``integrity_drift`` alarm the first
         time it was claimed. This open seals it under its own tag instead, in the marker's
@@ -9555,8 +9556,8 @@ class MessageStore:
         queue payload's routing tag, BACKLOG #2593). ``blank_where``, when given, names the blank
         values that are real rows (BACKLOG #3495, :meth:`_encrypt_existing_rows`). Without the
         opt-out they are sealed only by the open that writes the marker on a surface holding no
-        ciphertext; under it, on any surface (BACKLOG #4994). They count as something to seal, so
-        this open never writes the marker over them and leaves them blank. All identifiers
+        ciphertext; under it, on any surface (BACKLOG #4994). On a surface this open finds unsealed
+        they count as something to seal, so the marker is never written over them unsealed. All identifiers
         are code constants from :meth:`_encrypt_existing_rows`; only the marker pattern is a
         parameter.
 
