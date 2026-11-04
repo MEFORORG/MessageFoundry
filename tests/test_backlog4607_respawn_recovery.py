@@ -25,6 +25,7 @@ import pytest
 from messagefoundry.config.models import BatchConfig
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.stage_dispatcher import (
     HoldResult,
     LaneResultKind,
@@ -710,3 +711,16 @@ async def test_a_zero_delay_wait_reads_a_stop_that_is_already_set(tmp_path: Path
         assert held is HoldResult.STOPPED  # None would send the write
     finally:
         await db.close()
+
+
+def test_the_logged_lane_stuck_line_does_not_name_a_policy_the_page_may_not_be_under(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """R4-7. ``lane_stuck`` now also pages a run of worker deaths, under ``stop`` as well as
+    ``retry_forever``, so the default sink's line no longer hardcodes ``(retry_forever)``; the
+    detail names the case, and the retry_forever pages carry it in their own detail."""
+    caplog.set_level(logging.WARNING, logger="messagefoundry.pipeline.alerts")
+    LoggingAlertSink().lane_stuck("IB", detail="router worker died 3 times with no pass settling")
+    (record,) = [r for r in caplog.records if "lane_stuck" in r.getMessage()]
+    assert "retry_forever" not in record.getMessage()
+    assert "router worker died 3 times" in record.getMessage()

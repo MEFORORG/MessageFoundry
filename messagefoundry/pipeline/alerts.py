@@ -338,7 +338,9 @@ class AlertSink(Protocol):
         retrying, look at the dependency" signal apart from a halted lane. ``name`` is the stage-lane
         label; ``detail`` is a PHI-free reason (stage + streak). Emitted by the ``StageDispatcher``.
         Under ``retry_forever`` it also fires for a serializer HOLDING its lane while the re-pend of
-        its claimed rows keeps failing (BACKLOG #1611), which the ADR 0070 streak cannot reach."""
+        its claimed rows keeps failing (BACKLOG #1611), which the ADR 0070 streak cannot reach.
+        Under **either** policy it also fires for a run of ``infra_fault_stop_after`` deaths of a
+        lane's per-lane worker or pooled serializer (BACKLOG #4607), whose ``detail`` says so."""
         ...
 
     def message_stall(self, name: str, *, oldest_age_seconds: float) -> None:
@@ -1087,7 +1089,9 @@ class LoggingAlertSink:
 
     def lane_stuck(self, name: str, *, detail: str) -> None:
         log.warning(
-            "ALERT lane_stuck: lane %r retrying a persistent infra fault (retry_forever): %s",
+            # Not "(retry_forever)": a run of worker or serializer deaths pages this under either
+            # infra-fault policy (BACKLOG #4607), so the detail says which case it is.
+            "ALERT lane_stuck: lane %r is held by a persistent fault: %s",
             name,
             detail,
         )
