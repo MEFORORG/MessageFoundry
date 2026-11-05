@@ -20,11 +20,19 @@ need it, and a production host is better without it.
 ## Use
 
 ```text
-messagefoundry-toolkit adr-analyze --adr-dir docs/adr --json   # ADR acceptance-criteria coverage
-messagefoundry-toolkit --help                                  # every toolkit command
+messagefoundry-toolkit init ./my-config-repo                     # scaffold a config repo
+messagefoundry-toolkit generate --type ADT --count 5 --out ./adt # synthetic HL7, no real PHI
+messagefoundry-toolkit lens parse ./config/IB_DEMO.py --json     # the VS Code Steps view's rows
+messagefoundry-toolkit import corepoint ./export.xml --out ./cfg # a Corepoint action-list import
+messagefoundry-toolkit impact --config ./config router my_router # who references an object
+messagefoundry-toolkit hl7schema --json                          # the HL7 v2.5.1 field schema
+messagefoundry-toolkit adr-analyze --adr-dir docs/adr --json     # ADR acceptance-criteria coverage
+messagefoundry-toolkit --help                                    # every toolkit command
 ```
 
-From a source checkout, run `python -m messagefoundry_toolkit` instead.
+From a source checkout, run `python -m messagefoundry_toolkit` instead. The VS Code extension runs
+the Steps view and Generate Samples that way, with the interpreter it is set to use, so that
+interpreter needs the toolkit too.
 
-The toolkit's commands move out of the engine one at a time. A command that has moved is refused by
-the engine's `messagefoundry` command, with a line naming `messagefoundry-toolkit <command>`.
+The engine's `messagefoundry` command refuses each of these commands with a line naming
+`messagefoundry-toolkit <command>`.

@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""CLI introspection subcommands (validate/graph/dryrun/hl7schema) emit JSON for the IDE."""
+"""CLI introspection subcommands (validate/graph/dryrun) emit JSON for the IDE.
+
+The process-wide properties of the engine's command (the last-resort hooks, the dispatch floor, the
+stderr log sink) are probed through ``ai-policy``: a production command that runs offline, takes no
+argument, has a ``--json`` mode and writes nothing. Before ADR 0201 slice 4 the probe was
+``hl7schema``, which is a toolkit command now; a property of the engine's command needs an engine
+command to measure it on."""
 
 from __future__ import annotations
 
@@ -484,7 +490,10 @@ def test_dryrun_missing_messages_path(capsys: pytest.CaptureFixture[str]) -> Non
 
 
 def test_hl7schema_emits_segments(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["hl7schema", "--json"]) == 0
+    # A toolkit command since ADR 0201 slice 4, so it runs on the toolkit's command.
+    from messagefoundry_toolkit.__main__ import main as toolkit_main
+
+    assert toolkit_main(["hl7schema", "--json"]) == 0
     schema = _out_json(capsys)
     assert schema["version"] == "2.5.1"
     assert "PID" in schema["segments"]
@@ -1285,7 +1294,7 @@ def _expose_toml(
     relax: str | None = None,
     public_origin: str | None = None,
 ) -> None:
-    """A non-loopback bind (exposed via a declared TLS-terminating proxy) with egress locked down.
+    """An exposed instance (a loopback bind behind a declared TLS-terminating proxy) with egress locked down.
 
     Exposed via Posture-B (``tls_terminated_upstream`` + ``trusted_proxies``) rather than a cleartext
     ``--allow-insecure-bind``: #200 (ADR 0092) clamped that flag so it can no longer wave a
@@ -1309,9 +1318,9 @@ def _expose_toml(
     # Pass every non-MFA exposure gate (Posture-B declarations + egress deny-by-default + the #186/#188
     # secure retention + SMTP-alert channels) so require_mfa is the ONLY posture under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        enforce_line + relax_line + "security.local_access_only = false\n"
-        'security.listen_address = "0.0.0.0"\n'
-        f"security.require_mfa = {auth}\n"
+        # A LOOPBACK bind behind the declared terminator. It is still an exposed instance, and
+        # BACKLOG #4636 refuses the plaintext proxy-to-engine hop off loopback.
+        enforce_line + relax_line + f"security.require_mfa = {auth}\n"
         "security.block_unlisted_outbound = true\n"
         "security.delete_message_bodies_after_days = 30\n"
         # The at-rest gate, acked here with the rest of the non-MFA plumbing. These callers run
@@ -1523,8 +1532,7 @@ def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # passes the keyless gate
     (tmp_path / "messagefoundry.toml").write_text(
-        "security.local_access_only = false\n"
-        'security.listen_address = "0.0.0.0"\n'
+        # Loopback behind the declared terminator, as in _expose_toml (BACKLOG #4636).
         "security.require_mfa = false\n"
         "security.allow_single_factor_admin_when_exposed = true\n"
         "security.block_unlisted_outbound = true\n"
@@ -1668,9 +1676,8 @@ def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
     (tmp_path / "messagefoundry.toml").write_text(
         # Exposed via a declared TLS-terminating proxy (Posture-B) — #200 clamped --allow-insecure-bind
         # so it can no longer wave a prod-PHI cleartext bind past the exposed-gate; the MFA gate is
-        # reached through a real TLS-terminated bind instead.
-        "security.local_access_only = false\n"
-        'security.listen_address = "0.0.0.0"\n'
+        # reached through a real TLS-terminated bind instead. Loopback behind it, as in
+        # _expose_toml (BACKLOG #4636).
         "security.require_mfa = false\n"
         "security.block_unlisted_outbound = true\n"
         '[api]\ntls_terminated_upstream = true\nplaintext_upstream_hop_acknowledged = true\ntrusted_proxies = ["10.0.0.1"]\n'
@@ -2113,9 +2120,9 @@ def test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads(
     "BY CONFIG FILE" IS A REAL NARROWING, NOT THROAT-CLEARING. ``--host`` is merged AFTER
     ``_desugar_security`` (see ``load_settings``), so ``serve --host 0.0.0.0`` reaches this same gate
     from a file that sets neither key -- and there the old prescription did not die at load, it simply
-    did nothing. This test drives the FILE route only. The CLI route is a separate, unfixed gap:
-    the message names no flag, so an operator who bound off-box with ``--host`` is told to edit a file
-    that is already correct.
+    did nothing. This test drives the FILE route only. The CLI route is
+    ``test_serve_ui_offloopback_refusal_names_the_host_flag`` below: since BACKLOG #4636 the message
+    names the lever in effect, ``serve --host`` on that route.
 
     A test that read the message could not have caught it -- the old text named a real, correctly-spelled
     [security] field. Only running the prescribed config finds it.
@@ -2171,6 +2178,75 @@ def test_serve_ui_offloopback_refusal_prescribes_a_config_that_loads(
     assert rc == 0, fixed_err
     assert _UI_OFFLOOPBACK_REFUSAL not in fixed_err
     assert "is not a loopback address" not in fixed_err
+
+
+def test_serve_ui_offloopback_refusal_names_the_host_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #1361 route 2, #4636: off-box by ``serve --host`` from a file that sets no bind key,
+    the /ui refusal names the flag, the lever that is in effect, not a listen_address edit alone."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    (tmp_path / "messagefoundry.toml").write_text(
+        _UI_OFFLOOPBACK_STANDDOWNS + "security.serve_web_console = true\n"
+        "security.block_unlisted_outbound = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    argv = ["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev", "--host", "0.0.0.0"]
+    assert main(argv) == 2
+    refusal = next(
+        (ln for ln in capsys.readouterr().err.splitlines() if _UI_OFFLOOPBACK_REFUSAL in ln), ""
+    )
+    assert "serve --host, which overrides [security].listen_address" in refusal, refusal
+    # The remedy the message names, applied: change the flag to loopback, and serve starts.
+    argv[-1] = "127.0.0.1"
+    rc = main(argv)
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert _UI_OFFLOOPBACK_REFUSAL not in err
+
+
+def test_serve_ui_offloopback_certificate_remedy_starts_with_the_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #4636: the /ui refusal's certificate remedy names the revocation attestation, because
+    off loopback a certificate alone is refused by the API revocation gate. Applied as named, it
+    starts; without the attestation it is refused there, which is the control."""
+    from tests.test_api_tls import _self_signed
+
+    base = (
+        _UI_OFFLOOPBACK_STANDDOWNS + "security.serve_web_console = true\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.local_access_only = false\n"
+        'security.listen_address = "0.0.0.0"\n'
+    )
+    monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
+    assert _l5b_serve(tmp_path, monkeypatch, base) == 2
+    refusal = next(
+        (ln for ln in capsys.readouterr().err.splitlines() if _UI_OFFLOOPBACK_REFUSAL in ln), ""
+    )
+    from messagefoundry.api.tls import off_loopback_certificate_remedy
+
+    for spelling in (
+        "[security].listen_address or serve --host",
+        off_loopback_certificate_remedy(),
+    ):
+        assert spelling in refusal, refusal
+    assert "MEFOR_TLS_REVOCATION_ATTESTED=1" in off_loopback_certificate_remedy()
+
+    cert, key = _self_signed(tmp_path)
+    fixed = (
+        f'{base}api.tls_cert_file = "{cert.as_posix()}"\napi.tls_key_file = "{key.as_posix()}"\n'
+    )
+    assert _l5b_serve(tmp_path, monkeypatch, fixed) == 2
+    assert "in-process TLS on non-loopback" in capsys.readouterr().err
+    monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
+    rc = _l5b_serve(tmp_path, monkeypatch, fixed)
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert _UI_OFFLOOPBACK_REFUSAL not in err
 
 
 def test_serve_ui_warns_on_undeclared_proxy_signal(
@@ -3732,7 +3808,7 @@ def test_audit_verify_exits_2_on_a_file_that_is_not_a_database(tmp_path: Path) -
 
 
 def test_a_non_serve_subcommand_installs_both_last_resort_hooks(
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Both hooks, because `install_thread_excepthook` had the identical serve-only gap: a non-main
     thread's escaping exception goes to `threading.excepthook` and nowhere else, so installing the
@@ -3751,8 +3827,10 @@ def test_a_non_serve_subcommand_installs_both_last_resort_hooks(
     try:
         sys.excepthook, threading.excepthook = sys.__excepthook__, threading.__excepthook__
 
-        assert main(["hl7schema", "--json"]) == 0
-        capsys.readouterr()  # the schema payload is not what this test is about
+        # Away from the checkout, so no stray ./messagefoundry.toml decides the probe's exit.
+        monkeypatch.chdir(tmp_path)
+        assert main(["ai-policy", "--json"]) == 0
+        capsys.readouterr()  # the policy payload is not what this test is about
 
         assert sys.excepthook is last_resort._excepthook, (
             "a non-serve subcommand ran with the stock sys.excepthook: an uncaught exception would "
@@ -3787,13 +3865,13 @@ def test_an_uncaught_exception_in_a_non_serve_subcommand_prints_no_traceback(
     import subprocess
     import sys
 
-    argv = ["hl7schema", "--json"] if as_json else ["hl7schema"]
+    argv = ["ai-policy", "--json"] if as_json else ["ai-policy"]
     driver = tmp_path / "raise_in_a_subcommand.py"
     driver.write_text(
         "import messagefoundry.__main__ as m\n"
         "def _boom(args):\n"
         "    raise RuntimeError('synthetic failure PID|1||123456^^^MRN||DOE^JANE')\n"
-        "m._DISPATCH['hl7schema'] = _boom\n"
+        "m._DISPATCH['ai-policy'] = _boom\n"
         f"raise SystemExit(m.main({argv!r}))\n",
         encoding="utf-8",
     )
@@ -3841,9 +3919,9 @@ def test_the_dispatch_floor_catches_exception_but_not_base_exception(
     def _raise(_args: object) -> int:
         raise raised
 
-    monkeypatch.setitem(cli._DISPATCH, "hl7schema", _raise)
+    monkeypatch.setitem(cli._DISPATCH, "ai-policy", _raise)
     with pytest.raises(expected):
-        main(["hl7schema", "--json"])
+        main(["ai-policy", "--json"])
     assert capsys.readouterr().out == ""
 
 
@@ -3854,8 +3932,12 @@ def test_lens_rewrite_counts_as_a_json_command_for_an_uncaught_exception(
     it there). Its subparser sets `json=True` so `main`'s dispatch floor (BACKLOG #1863) emits a
     JSON error for it too, rather than the text-mode empty stdout.
 
-    RED when: the `set_defaults(json=True)` on the rewrite subparser is dropped."""
-    from messagefoundry import lens
+    RED when: the `set_defaults(json=True)` on the rewrite subparser is dropped.
+
+    `lens rewrite` is a toolkit command since ADR 0201 slice 4, so the floor measured is the shared
+    `run_cli` one under the toolkit's command, with the toolkit's floor code."""
+    from messagefoundry_toolkit import lens
+    from messagefoundry_toolkit.__main__ import main
 
     def _boom(*_args: object, **_kwargs: object) -> str:
         raise RuntimeError("synthetic rewrite failure")
@@ -4428,8 +4510,8 @@ def test_a_real_cli_process_starts_with_no_root_handler_and_redacts(tmp_path: Pa
         "    print('handlers-at-dispatch', len(logging.getLogger().handlers), flush=True)\n"
         + _CHILD_PROBE
         + "    return 0\n"
-        "m._DISPATCH['hl7schema'] = _probe\n"
-        "raise SystemExit(m.main(['hl7schema']))\n",
+        "m._DISPATCH['ai-policy'] = _probe\n"
+        "raise SystemExit(m.main(['ai-policy']))\n",
         returncode=0,
         handlers_line="handlers-at-dispatch 1",
     )

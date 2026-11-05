@@ -37,6 +37,10 @@ round-trips and the same scan on every restart — just without the convoy.
    that runs before the marker is written and refuses the open when the schema is short of what the
    build declares. SQL Server folds in `_SCHEMA_CHECK_REV` for it; Postgres still folds in
    `_MIGRATION_REV`, which moved to 8 with it.
+
+   *Note (2026-11-03, BACKLOG #5062):* the check's revision is now one constant,
+   `SCHEMA_CHECK_REV` in `messagefoundry/store/server_schema_verify.py`, which both backends fold
+   into the hash. Postgres keeps `_MIGRATION_REV` for its migration body alone.
 2. **Index-seekable startup recovery.** `reset_stale_inflight(stage=None)` now issues one UPDATE per
    `Stage` (single transaction) with a plain `(status, stage)` equality pair — seekable on the
    existing `ix_queue_ready(stage, status, next_attempt_at)` on all three backends — instead of one

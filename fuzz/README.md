@@ -204,7 +204,7 @@ Seeds are the committed synthetic samples under `samples/messages/` plus small i
 **Do not seed from captured traffic.** libFuzzer prints and writes the input it crashed on, so a
 real corpus would put payload content into a CI log and into a crash artifact. De-identify first
 (`messagefoundry/anon/`, ADR 0030) and keep such a run local. Synthetic messages come from
-`messagefoundry generate`; that corpus is git-ignored and should stay so.
+`messagefoundry-toolkit generate`; that corpus is git-ignored and should stay so.
 
 ## Reproducing a finding from a CI run
 
@@ -268,14 +268,22 @@ from an MSH it cannot always find. They are registered separately because their 
 consequences differ:
 
 * **An MSH-led body whose MSH-2 carries fewer than four encoding characters.** `Peek.parse` and
-  `Message.parse` accept it and `build_ack` answers it `AA`; then `strip_documents`,
-  `iter_obx_documents` and `extract_obx_document` all let the `ValueError` out. The retention
-  document-strip pass calls `strip_documents` with no `try`, so on first deployment one such stored
-  body would abort that pass on every run.
+  `Message.parse` accept it and `build_ack` answers it `AA`; then `extract_obx_document` lets the
+  `ValueError` out, so a Handler that called it on such a body would get a bare `ValueError` on
+  first deployment, not the `BinaryCarriageError` that function documents. `strip_documents` no
+  longer raises on it: it returns such a body unchanged, so the retention document-strip pass,
+  which calls it with no `try`, skips the row rather than aborting (BACKLOG #5099).
 * **An FHS- or BHS-led body with no MSH.** `Peek.parse` refuses it but `Message.parse` accepts it,
-  and `iter_obx_documents` and `extract_obx_document` then raise. A Handler that parsed such a body
+  and `extract_obx_document` then raises. A Handler that parsed such a body
   with `Message.parse` would get a bare `ValueError` from `extract_obx_document` on first deployment,
-  not the `BinaryCarriageError` that function documents. `strip_documents` is not affected.
+  not the `BinaryCarriageError` that function documents. `strip_documents` is not affected: it
+  returns a body with no MSH unchanged (BACKLOG #5099).
+
+On either shape `iter_obx_documents` no longer lets the bare `ValueError` out: a body with an OBX
+and no MSH, or an MSH-2 shorter than four characters, is its named refusal, `UnreadableDelimitersError`, a
+`ValueError` subclass (BACKLOG #5099). Only the first shape reaches the over-threshold ingress
+detach, which records a body of it that has an OBX as `ERROR`; the listener's parse refuses the
+second before any detach.
 
 Each carve-out swallows an error only when it is a bare `ValueError` with that message AND the input
 has that entry's shape; tests plant a different `ValueError` on each reproducer, and the engine's
@@ -306,7 +314,7 @@ out" says why it does not.
 | `transports/http_listener.py` header-mode authentication (`_authorize_head`) | ruled out, for now | Needs a configured `HttpSource` with credentials. The next candidate on this surface. |
 | `parsing/compression.py`, all four decompressors | target `compression` | `gzip_decompress` runs on a File feed with `decompress="gzip"`; the rest are Handler-facing. |
 | `parsing/binary.py`: carriage `decode`, `parse_doc_ref`, `strip_documents`, `iter_obx_documents`, `extract_obx_document` | target `binary_carriage` | Produced both known findings above. |
-| `parsing/binary.py` `reattach_documents_in_hl7` | ruled out | Delivery side: it runs on a skeleton the engine wrote, through an async store reader. |
+| `parsing/binary.py` `reattach_documents_in_hl7`, `may_hold_doc_ref`, `doc_ref_addresses_in_hl7` | not yet a target | Delivery side, through an async store reader. It is not out of reach of untrusted input: a sender's `OBX-5.5` text and its MSH, FHS and BHS headers reach all three (BACKLOG #5099). The candidate next to `binary_carriage`. |
 | `parsing/sniff.py` | ruled out as a target of its own | Prefix tests with no exception path. The archive-member checks run inside `zip_decompress`, so `compression` reaches them. |
 | `parsing/split.py` `split_batch` (File ingress batch split) | ruled out | A regex split and string operations on a `str`, with no exception path. |
 | `mllpcodec.build_ack` | ruled out | Its reads are the `Peek` accessors `hl7_peek` sweeps, and it wraps them in `except PEEK_READ_FAULTS`. |

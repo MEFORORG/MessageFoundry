@@ -2868,7 +2868,11 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
     The filters are read with the ``\\b`` start this pattern keeps, which is its one stated
     exception (BACKLOG #2999). The texts that exception covers are counted apart: this pattern with
     the escape start added must match each one, so the exception cannot hide any other shape, and
-    there must be some, or the corpus no longer reaches it."""
+    there must be some, or the corpus no longer reaches it.
+
+    The connection-string member pass (BACKLOG #5030) is the second exception, read without it and
+    counted apart the same way: each text only it changes must hold its match, and there must be
+    some. This pattern leaves it out on purpose; ``_CREDENTIAL_AHEAD``'s comment says why."""
     fragments = (
         *secretscrub._CREDENTIAL_WORDS,
         *secretscrub._TOKEN_WORDS,
@@ -2876,7 +2880,7 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
         *logging_setup._CREDENTIAL_QUERY_KEYS,
         "MEFOR_X", "Basic", "Digest", "db_", "a.b-", "://", "postgres", "user", "host", "abc123",
         ":", "=", " ", " ", "\n", "\t", '"', "'", "{", "}", "@", "/", "?", "&", ";", ",", "x", "9",
-        "_", ".", "-", "%7C", "%2C",
+        "_", ".", "-", "%7C", "%2C", ";sslpwd=",
     )  # fmt: skip
     widened = _widened_mirror()
     rand = random.Random(2011)
@@ -2884,25 +2888,42 @@ def test_the_credential_pattern_matches_every_text_a_credential_filter_changes(
         "".join(rand.choice(fragments) for _ in range(rand.randint(2, 9))) for _ in range(20_000)
     ]
     shipped = [secretscrub.scrub_credentials(text) != text for text in texts]
-    changed = unmatched = escape_only = 0
+    member_shape = re.compile(
+        r"(?i);[A-Za-z0-9_]*(?:password|passwd|passphrase|pass|pwd|secret|credential|token)="
+    )
+    # Which texts the shipped filters change with the escape start kept and only the member pass
+    # off, so a text the escape start alone changes cannot be counted as the member's.
+    with monkeypatch.context() as patched:
+        patched.setattr(secretscrub, "_CONNECTION_STRING_MEMBER", re.compile(r"(?!)"))
+        without_member = [secretscrub.scrub_credentials(text) != text for text in texts]
+    changed = unmatched = escape_only = member_only = 0
     with monkeypatch.context() as patched:
         _start_labels_at_a_word_boundary_alone(patched)
-        for text, shipped_changed in zip(texts, shipped, strict=True):
+        patched.setattr(secretscrub, "_CONNECTION_STRING_MEMBER", re.compile(r"(?!)"))
+        for text, shipped_changed, escape_changed in zip(
+            texts, shipped, without_member, strict=True
+        ):
             if (
                 secretscrub.scrub_credentials(text) != text
                 or logging_setup._scrub_credential_query(text) != text
             ):
                 changed += 1
                 assert redaction._CREDENTIAL_AHEAD.search(text) is not None, repr(text)
-            elif shipped_changed:
+            elif escape_changed:
                 escape_only += 1
                 assert widened.search(text) is not None, repr(text)
+            elif shipped_changed:
+                member_only += 1
+                # The exception is the member shape and nothing wider: spelled here, not read from
+                # the module, so a member pattern that grew past it would go red.
+                assert member_shape.search(text) is not None, repr(text)
             elif redaction._CREDENTIAL_AHEAD.search(text) is None:
                 unmatched += 1
-    assert changed > 500 and unmatched > 2_000 and escape_only > 5, (
+    assert changed > 500 and unmatched > 2_000 and escape_only > 5 and member_only > 5, (
         changed,
         unmatched,
         escape_only,
+        member_only,
     )
 
 

@@ -187,7 +187,7 @@ These are the routes, and this section is where they are recorded:
   details in a public post.
 
 Never paste real PHI or customer data anywhere public. Use synthetic HL7 from
-`messagefoundry generate`, and redact hostnames, IP addresses and partner names.
+`messagefoundry-toolkit generate`, and redact hostnames, IP addresses and partner names.
 [docs/BACKLOG.md](docs/BACKLOG.md) explains the `BACKLOG #N` citations you will see here.
 
 ### Working on two things at once
@@ -295,7 +295,7 @@ version in the three files of item 5.
 ## PHI / safety
 
 This engine carries PHI in real deployments. **Never** commit real patient data — tests and
-fixtures use only **synthetic, PHI-free** HL7 (`python -m messagefoundry generate`). Don't redirect
+fixtures use only **synthetic, PHI-free** HL7 (`python -m messagefoundry_toolkit generate`). Don't redirect
 `dryrun`/`generate` output (which can contain full message bodies) into committed files or CI logs.
 See [docs/PHI.md](docs/PHI.md).
 

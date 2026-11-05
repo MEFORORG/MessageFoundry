@@ -22,7 +22,7 @@ from messagefoundry.config import wiring
 from messagefoundry.config.connections_edit import upsert_connection
 from messagefoundry.config.impact import plan_rename
 from messagefoundry.config.wiring import WiringError, load_config
-from messagefoundry.corepoint_import import import_corepoint
+from messagefoundry_toolkit.corepoint_import import import_corepoint
 from tests.test_api_input_validation import _accepts
 from tests.test_connections_file import LOGIC_PY, _config
 
@@ -240,7 +240,7 @@ def test_a_corepoint_import_keeps_legal_names_and_non_ascii_handlers(tmp_path: P
 
 
 def test_a_corepoint_xml_package_with_a_long_name_still_loads(tmp_path: Path) -> None:
-    from messagefoundry.corepoint_import import parse_package
+    from messagefoundry_toolkit.corepoint_import import parse_package
 
     xml = '<Package Name="' + "P" * 300 + '"><ActionList Name="t"></ActionList></Package>'
     channels = parse_package(xml)

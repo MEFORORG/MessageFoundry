@@ -11,7 +11,6 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.lens import CONTRACT_V2, parse_source, rewrite_source
 from messagefoundry.parsing.x12 import (
     X12FrameError,
     X12FrameReader,
@@ -23,6 +22,7 @@ from messagefoundry.parsing.x12 import (
     find_isa_start,
     split,
 )
+from messagefoundry_toolkit.lens import CONTRACT_V2, parse_source, rewrite_source
 
 
 def isa(

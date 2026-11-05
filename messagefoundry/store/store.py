@@ -97,6 +97,8 @@ from messagefoundry.config.settings import (
     StoreBackend,
 )
 from messagefoundry.connection_events import check_connection_event_kind
+from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7 as _doc_ref_addresses_in_hl7
+from messagefoundry.parsing.binary import may_hold_doc_ref as _may_hold_doc_ref
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.service_status import _system_exe
@@ -144,7 +146,11 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_reseal_likes,
 )
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
-from messagefoundry.store.document_strip import StripResult, cutoff_for
+from messagefoundry.store.document_strip import (
+    StripResult,
+    cutoff_for,
+    log_unreadable_skips,
+)
 from messagefoundry.store.gcm_bound import (
     bind_store_salt,
     bounded_cipher,
@@ -1034,6 +1040,58 @@ _NOT_PT_MARKER_Q = _NOT_PT_MARKER.replace("stage", "q.stage").replace(
 )
 
 
+def attachments_named(held: Iterable[str], body: str) -> list[str]:
+    """The content addresses in ``held`` that a document handle in ``body``'s ``OBX-5.5`` names, for
+    a child message that inherits its parent's documents (BACKLOG #5099). Read as delivery reads a
+    handle (:func:`~messagefoundry.parsing.binary.doc_ref_addresses_in_hl7`), so an escaped handle
+    still counts, and an address the body carries anywhere else, bare or as a copied handle, does
+    not: delivery never resolves one there. Only a named document is inherited: a child whose
+    Handler dropped the document holds none, so the child's channel cannot download it, and
+    retention is not kept waiting on a document no row of the child can deliver. The body is parsed
+    only when the parent holds a document and delivery's own gate
+    (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`) would open on it, so a handle that gate
+    would pass over unresolved is not inherited, and a large body with no handle is not parsed
+    inside the caller's write transaction."""
+    held = list(held)
+    if not held or not _may_hold_doc_ref(body):
+        return []
+    named = _doc_ref_addresses_in_hl7(body)
+    return [ref for ref in held if ref in named]
+
+
+def inheritance_plan(
+    held: Iterable[str], children: Iterable[tuple[str, str]]
+) -> list[tuple[str, list[str]]]:
+    """For every content address in ``held`` that some child's body names (:func:`attachments_named`),
+    the ids of the children that name it, in content-address order (BACKLOG #5099). ``children`` is
+    ``(child_id, body)`` for each child one ``transform_handoff`` makes: one with several
+    pass-through Sends makes several. The caller increfs each address once, by the number of
+    children naming it, in this order. So on Postgres and SQL Server, where one transaction runs
+    one ``transform_handoff``, the transaction takes each document's header lock once, in the order
+    the ingress increfs and the retention decrefs take them, however many children it makes. The
+    order is Python's, on the lowercase hex addresses, as those paths sort them too, so no
+    database collation decides it. A body several children carry is parsed once."""
+    held = list(held)
+    named_by_body: dict[str, list[str]] = {}
+    naming: dict[str, list[str]] = {}
+    for child_id, body in children:
+        refs = named_by_body.get(body)
+        if refs is None:
+            refs = named_by_body[body] = attachments_named(held, body)
+        for ref in refs:
+            naming.setdefault(ref, []).append(child_id)
+    return sorted(naming.items())
+
+
+def inheriting_children(children: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The ``(child_id, body)`` pairs whose body delivery's gate
+    (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`) would open on: only these can name a
+    document a child inherits (:func:`attachments_named`). A caller that finds none skips the read
+    of the parent's documents, so a pass-through of a body with no handle costs no extra round
+    trip in the write transaction (BACKLOG #5099)."""
+    return [(child_id, body) for child_id, body in children if _may_hold_doc_ref(body)]
+
+
 @dataclass(frozen=True)
 class ReingressOutcome:
     """The result of a :meth:`QueueStore.reingress` (edit-and-resubmit re-route, ADR 0090 §9,
@@ -1346,8 +1404,9 @@ GLOBAL_SESSION_EPOCH_SQL: Final = "(SELECT epoch FROM global_session_epoch WHERE
 #: The head of every user reader, on every backend: the row, and the global epoch beside it.
 USER_READ_SQL: Final = f"SELECT *, {GLOBAL_SESSION_EPOCH_SQL} AS global_session_epoch FROM users"
 #: Raised by every read or raise of the global epoch that finds no row, so a sign-in, a session
-#: check and an every-account revoke all refuse the same way; a revoke rolls back. Each schema
-#: seeds the row.
+#: check and an every-account revoke all refuse the same way; a revoke rolls back. The one read
+#: that does not raise is the per-account revoke's check of the session it keeps, which logs this
+#: and ends that session instead (``global_epoch_unmoved``). Each schema seeds the row.
 GLOBAL_SESSION_EPOCH_MISSING: Final = (
     "the store's global_session_epoch row is missing, so no session can be stamped or checked and"
     " the every-account session revoke cannot end every session"
@@ -1926,6 +1985,16 @@ _COUNT_USER_SESSIONS_SQL: Final = (
 )
 #: The clause ``revoke_user_sessions`` and ``count_user_sessions`` add for ``except_token_hash``.
 _EXCEPT_TOKEN_HASH_SQL: Final = " AND token_hash != ?"
+#: Ends the session a revoke was asked to keep but declined to re-stamp (``KeptSessionRestamp``),
+#: in the revoke's own transaction and as its sweep ends the rest (follow-up to BACKLOG #4975).
+#: The per-account sweep's own statement, narrowed to the one token, so it ends only a session
+#: that sweep's clause would have ended. Binds ``(now, user_id, token_hash)``. A plain literal, as
+#: the count beside the sweep is, so the transaction-verb guard can read it; keep it in step with
+#: :data:`_REVOKE_USER_SESSIONS_SQL`.
+_END_DECLINED_KEPT_SESSION_SQL: Final = (
+    "UPDATE sessions SET revoked_at=?, seal='' WHERE user_id=? AND revoked_at IS NULL"
+    " AND token_hash=?"
+)
 
 
 @dataclass(frozen=True)
@@ -2839,7 +2908,9 @@ UserChange = Callable[[UserAuthzRecord], UserAuthzRecord | None]
 
 class EpochRaise(NamedTuple):
     """One raise of a session epoch: the value it replaced and the value it wrote (BACKLOG #4975).
-    A revoke re-stamps the session it keeps only when that session carried :attr:`before`."""
+    A revoke re-stamps the session it keeps only when that session carried :attr:`before`. An
+    epoch a revoke checks but does not raise is one with :attr:`before` equal to :attr:`after`
+    (:func:`global_epoch_unmoved`)."""
 
     before: int
     after: int
@@ -2877,58 +2948,94 @@ def global_epoch_raise(after: int) -> EpochRaise:
     return EpochRaise(after - 1, after)
 
 
+def global_epoch_unmoved(current: int | None) -> EpochRaise | None:
+    """The store's global session epoch as a per-account revoke sees it: ``current``, read in
+    that revoke's own transaction, which raises no global epoch (follow-up to BACKLOG #4975).
+
+    The kept session must carry it to be stamped, and its global stamp is left at it, so a
+    session behind on the global epoch alone is declined, and ended, as one behind on its
+    account's epoch is. ``None`` where the read found no row (:data:`GLOBAL_SESSION_EPOCH_MISSING`
+    says what refuses then): nothing can be checked against it, so the kept session is declined
+    and ended, and the revoke still ends the rest rather than roll back and keep them live. The
+    missing row is logged, since every other read of it refuses loudly."""
+    if current is None:
+        log.warning(
+            "%s; the session this revoke was asked to keep is not re-stamped, and if it is a live"
+            " session of this account it will be ended with the rest",
+            GLOBAL_SESSION_EPOCH_MISSING,
+        )
+        return None
+    return EpochRaise(current, current)
+
+
 @dataclass(frozen=True, slots=True)
 class RevokeResult:
     """What ``revoke_user_sessions`` and ``revoke_all_sessions`` did (BACKLOG #4975).
 
-    :attr:`count` is how many sessions the revoke ended. :attr:`kept` is True only when the
-    revoke re-stamped the session it was asked to keep, in its own transaction, with the epochs
-    it raised (:class:`KeptSessionRestamp`); a revoke given no session to keep reports False. It
-    says what the revoke did, not what a later request sees: the gate's other checks, such as
-    expiry, still apply to a kept session, and a later revoke can still end it."""
+    :attr:`count` is how many sessions the revoke ended, the one it was asked to keep included
+    when it ended that one. :attr:`kept` is True only when the revoke re-stamped the session it
+    was asked to keep, in its own transaction, with the epochs it raised
+    (:class:`KeptSessionRestamp`); a revoke given no session to keep reports False. It says what
+    the revoke did, not what a later request sees: the gate's other checks, such as expiry, still
+    apply to a kept session, and a later revoke can still end it. :attr:`ended_kept` is True when
+    the revoke declined to re-stamp that session and ended it instead, in the same transaction
+    (follow-up to BACKLOG #4975); that row is in :attr:`count`."""
 
     count: int
-    kept: bool
+    kept: bool = False
+    ended_kept: bool = False
+
+    @property
+    def others(self) -> int:
+        """How many sessions the revoke ended besides the one it was asked to keep."""
+        return self.count - self.ended_kept
 
 
 class KeptSessionRestamp:
     """The change a revoke applies to the session it keeps (BACKLOG #2592, #4975, #5091).
 
     The new epochs go onto the kept session only when it is ``user_id``'s and carried the epochs
-    the revoke raised from: its account's (``raised``), and, where the revoke raised the store's
-    global epoch too (``global_raised``), that one as well. A kept session an earlier sweep missed
-    is behind on one of them; stamping it would make it valid again, so it is left as it is and
-    the gate refuses it the next time it is presented. With no account raise, as where the
-    account's record fails its seal, nothing is stamped. A revoke that raises no global epoch
-    leaves the session's global stamp as it is, so a session behind on it stays refused.
+    the revoke raised from: its account's (``raised``) and the store's global one
+    (``global_epoch``). The every-account revoke raises the global epoch and passes
+    :func:`global_epoch_raise`; the per-account revoke raises none and passes
+    :func:`global_epoch_unmoved`, so the session keeps its global stamp and must already carry the
+    current one. A kept session an earlier sweep missed is behind on one of them; stamping it
+    would make it valid again. With no account raise, as where the account's record fails its
+    seal, or no global epoch read, nothing is stamped. A session of ``user_id`` this declines is
+    then ended by the revoke in the same transaction (follow-up to BACKLOG #4975); a session of
+    another account, which that revoke's sweep does not reach, is declined and left as it is.
 
     A backend passes it to ``_write_session`` and reports :meth:`kept` with what that returned,
     so the revoke says whether it stamped the session from the same transaction that did it."""
 
     def __init__(
-        self, user_id: str, raised: EpochRaise | None, global_raised: EpochRaise | None = None
+        self, user_id: str, raised: EpochRaise | None, global_epoch: EpochRaise | None
     ) -> None:
         self._user_id = user_id
         self._raised = raised
-        self._global_raised = global_raised
+        self._global_epoch = global_epoch
         self._stamped = False
 
+    @property
+    def user_id(self) -> str:
+        """The account whose session this stamps; a revoke ends a declined session only if it is
+        this account's."""
+        return self._user_id
+
     def __call__(self, s: SessionRecord) -> SessionRecord:
-        raised, global_raised = self._raised, self._global_raised
+        raised, global_epoch = self._raised, self._global_epoch
         self._stamped = False
-        if raised is None or s.user_id != self._user_id:
-            return s
-        if global_raised is None:
-            if s.user_epoch != raised.before:
-                return s
-            self._stamped = True
-            return replace(s, user_epoch=raised.after)
-        if not session_epochs_current(
-            s, user_epoch=raised.before, global_epoch=global_raised.before
+        if (
+            raised is None
+            or global_epoch is None
+            or s.user_id != self._user_id
+            or not session_epochs_current(
+                s, user_epoch=raised.before, global_epoch=global_epoch.before
+            )
         ):
             return s
         self._stamped = True
-        return replace(s, user_epoch=raised.after, global_epoch=global_raised.after)
+        return replace(s, user_epoch=raised.after, global_epoch=global_epoch.after)
 
     def kept(self, written: SessionRecord | None) -> bool:
         """Whether the write ``_write_session`` reported carried the new epochs: False when it
@@ -6277,8 +6384,13 @@ _OWNER_ONLY = stat.S_IRUSR | stat.S_IWUSR  # 0o600
 
 
 def _current_user() -> str | None:
-    """The current OS user for an owner-only DACL, with a fallback when ``%USERNAME%`` is empty
-    (some NSSM/service contexts) — ``getpass.getuser`` consults the process token, not just env."""
+    """The current OS user for an owner-only DACL: ``%USERNAME%``, or when that is empty (some
+    NSSM/service contexts) ``getpass.getuser``. That reads ``LOGNAME``, ``USER``, ``LNAME`` and
+    ``USERNAME`` from the environment, in that order; on Windows it has no ``pwd`` database to fall
+    back on, so with none of them set it raises ``OSError`` and this returns ``None``. So on
+    Windows, the one platform :func:`_secure_file` calls this on, every source is an environment
+    variable, never the process token, and an inherited or overridden variable names whoever it
+    says."""
     user = os.environ.get("USERNAME")
     if user:
         return user
@@ -8300,9 +8412,13 @@ CREATE TABLE IF NOT EXISTS attachment_chunk (
 -- rows referencing it. Logical refs (no FK — mirrors attachment_chunk.attachment_id / queue.body_ref); the
 -- messages row is kept by retention (Mirth Data-Pruner), so a dangling message_id never occurs in normal
 -- flow. SQLite only in Phase 3a; SQL Server / Postgres gain the whole attachment substrate at Phase 4.
+-- `inherited` is 1 on a link a child message took from its parent (BACKLOG #5099,
+-- _inherit_attachments): it lets delivery resolve the child's handle and holds a reference, but it
+-- grants no download, so the child's channel reads nothing the parent's channel stored.
 CREATE TABLE IF NOT EXISTS message_attachment (
     message_id    TEXT NOT NULL,    -- logical ref to messages.id
     attachment_id TEXT NOT NULL,    -- logical ref to attachment.id
+    inherited     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (message_id, attachment_id)
 );
 
@@ -11169,20 +11285,29 @@ class MessageStore:
                     aad=cell_aad("attachment_chunk", "ciphertext", ref, row["seq"]),
                 )
 
-    async def attachments_for(self, message_id: str) -> list[dict[str, Any]]:
+    async def attachments_for(
+        self, message_id: str, *, include_inherited: bool = False
+    ) -> list[dict[str, Any]]:
         """The distinct attachments ``message_id`` holds — the operator read surface (#149, ADR 0105
         Phase 3b). JOINs the ``message_attachment`` linkage to its ``attachment`` header and returns one
         row per attachment carrying ``attachment_id`` (the sha256 content address), ``content_type``, and
         ``total_bytes``. **Metadata only** — the chunk ciphertext is never touched/decrypted here (the
         bytes ride :meth:`read_attachment`), so it stays cheap for the message-detail view. Returns ``[]``
-        for a message with no detached document."""
+        for a message with no detached document.
+
+        A link a child message inherited from its parent (BACKLOG #5099) is left out unless
+        ``include_inherited`` is set. The operator surfaces read without it, so an inherited link
+        grants no download: a user scoped only to the child's channel reads nothing the parent's
+        channel stored. Delivery's handle binding sets it, since the child must resolve the
+        documents its body carries."""
         if not self.supports_streaming_attachments:
             return []
+        own_only = "" if include_inherited else " AND ma.inherited = 0"
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT a.id AS attachment_id, a.content_type, a.total_bytes "
                 "FROM message_attachment ma JOIN attachment a ON a.id = ma.attachment_id "
-                "WHERE ma.message_id=? ORDER BY a.id",
+                f"WHERE ma.message_id=?{own_only} ORDER BY a.id",
                 (message_id,),
             )
             return [dict(r) for r in await cur.fetchall()]
@@ -11282,6 +11407,46 @@ class MessageStore:
             f"{msg_col} AND (q.status IN (?, ?) OR "
             f"(q.status = ? AND ({_REPLAYABLE_BODY_Q}) AND {_NOT_PT_MARKER_Q})))"
         )
+
+    async def _inherit_attachments(
+        self, parent_id: str, children: Sequence[tuple[str, str]]
+    ) -> None:
+        """Link each ``(child_id, body)`` in ``children`` to each attachment ``parent_id`` holds
+        that its body names, and incref it, in the CALLER's transaction (BACKLOG #5099). A
+        pass-through, edit-and-resubmit or edit-and-resend child carries its parent's skeleton under
+        a new message id, and delivery resolves a handle only against the row's own message, so the
+        child must hold the documents it carries. Each holder keeps its own reference, so purging
+        either releases only its own and ``refcount`` still equals the live linkage rows.
+        :func:`attachments_named` says why only a named document is inherited. The link is written
+        ``inherited``, so it serves delivery and retention but grants no download
+        (:meth:`attachments_for`). Every child one ``transform_handoff`` makes comes in one call,
+        the shape the server backends need (:func:`inheritance_plan`). Here group commit can put
+        several handoffs, so several calls, in one transaction; SQLite's database-wide write lock
+        makes the order moot, so that is harmless."""
+        children = inheriting_children(children)
+        if not children:
+            return
+        # ORDER BY as the server backends read it; inheritance_plan sorts what it returns anyway.
+        cur = await self._db.execute(
+            "SELECT attachment_id FROM message_attachment WHERE message_id=? ORDER BY attachment_id",
+            (parent_id,),
+        )
+        held = [str(r["attachment_id"]) for r in await cur.fetchall()]
+        for ref, child_ids in inheritance_plan(held, children):
+            # The incref first, and the links only where it found the header: a purge that
+            # collected the document after the read above would otherwise leave a link to no
+            # header, and refcount would no longer equal the live linkage rows. The child then
+            # holds nothing, and delivery refuses its handle.
+            cur = await self._db.execute(
+                "UPDATE attachment SET refcount = refcount + ? WHERE id=?", (len(child_ids), ref)
+            )
+            if cur.rowcount != 1:
+                continue
+            await self._db.executemany(
+                "INSERT INTO message_attachment (message_id, attachment_id, inherited) "
+                "VALUES (?,?,1)",
+                [(child_id, ref) for child_id in child_ids],
+            )
 
     async def release_message_attachments(self, message_id: str) -> None:
         """Release (decref + delete the linkage rows for) every attachment a SINGLE message holds, in ONE
@@ -11902,6 +12067,7 @@ class MessageStore:
                     loaded = json.loads(pmeta_json)
                     if isinstance(loaded, dict):
                         parent_meta = loaded
+                inherits: list[tuple[str, str]] = []
                 for pt_name, body in pt_deliveries:
                     produced = await self._insert_passthrough_child(
                         routed_id,
@@ -11911,6 +12077,7 @@ class MessageStore:
                         parent_meta,
                         correlation_depth_cap,
                         now,
+                        inherits,
                     )
                     # The parent's disposition for this Send: a marker outbound row keyed by the PT
                     # inbound, already terminal (DONE = delivered into the PT, or DEAD = depth-cap
@@ -11918,6 +12085,8 @@ class MessageStore:
                     # claims take PENDING rows only), so it is inert; it exists solely so the
                     # finalizer counts the Send as delivered/errored rather than collapsing FILTERED.
                     await self._insert_passthrough_marker(message_id, pt_name, produced, now)
+                # Every child's documents in one pass, after the children exist (BACKLOG #5099).
+                await self._inherit_attachments(message_id, inherits)
             # JSON-encode + apply each declared state write in the SAME transaction as the outbound
             # rows. Encoding is done up front so a (shouldn't-happen) serialization error aborts the
             # whole handoff cleanly rather than after some rows were inserted. SetState validated
@@ -12936,13 +13105,16 @@ class MessageStore:
         parent_meta: dict[str, Any],
         correlation_depth_cap: int,
         now: float,
+        inherits: list[tuple[str, str]],
     ) -> bool:
         """Produce one PT child INGRESS row + message inside the caller's transaction (ADR 0013, gen.).
 
         Returns ``True`` if a child was produced, ``False`` if the depth cap was breached (no child; the
-        caller records the parent ``ERROR`` instead). The child is a **new, independent** message
-        (``source_type='passthrough'``, its own content-addressed id, status ``RECEIVED`` per
-        count-and-log), correlated to the parent (``correlation_id``/``correlation_root_id``/
+        caller records the parent ``ERROR`` instead). A child it makes is appended to ``inherits`` as
+        ``(child_id, body)``, for the caller to link to the parent's documents once every child of
+        the handoff is made (:meth:`_inherit_attachments`, BACKLOG #5099). The child is a **new,
+        independent** message (``source_type='passthrough'``, its own content-addressed id, status
+        ``RECEIVED`` per count-and-log), correlated to the parent (``correlation_id``/``correlation_root_id``/
         ``correlation_depth``). The PT inbound's own router worker drains the INGRESS row and re-routes
         it. Idempotent re-run: the content-addressed id is pre-checked, so a partial-then-recovered run
         does not double-inject the message. Bounds internal loops by ``correlation_depth`` (mirrors
@@ -12992,6 +13164,9 @@ class MessageStore:
                 now=now,
                 origin=MessageOrigin.REINGRESS,
             )
+            # Linked by the caller once every child of this transaction is made
+            # (_inherit_attachments, BACKLOG #5099).
+            inherits.append((new_mid, body))
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059)
             ingress_created = now
             # Hoist the row id so the ingress payload binds to its own row tag.
@@ -14339,6 +14514,7 @@ class MessageStore:
                     origin=MessageOrigin.OPERATOR_EDIT,
                     origin_actor=actor,
                 )
+                await self._inherit_attachments(message_id, [(child_mid, body)])
                 await self._event(
                     child_mid, "received", None, f"edit-resend from {message_id}", now
                 )
@@ -14545,6 +14721,7 @@ class MessageStore:
                     origin=MessageOrigin.OPERATOR_EDIT,
                     origin_actor=actor,
                 )
+                await self._inherit_attachments(origin_message_id, [(new_mid, raw)])
                 # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
                 # Hoist the row id so the payload binds to its own row tag.
                 resubmit_row_id = uuid4().hex
@@ -18245,17 +18422,19 @@ class MessageStore:
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
     ) -> RevokeResult:
         """Revoke a user's active sessions; with ``except_token_hash`` set, all **but** that one (the
-        caller's current session — "sign out everywhere else"). Returns the number revoked and
+        caller's current session — "sign out everywhere else"), which is kept only when it is
+        re-stamped below and is otherwise ended too. Returns the number revoked and
         whether the kept session was re-stamped (:class:`RevokeResult`, BACKLOG #4975).
 
         Raises the account's session epoch in the same transaction (BACKLOG #2592), so an older copy
         of any of those rows resolves to nothing. The kept session is re-sealed through
         :meth:`_write_session`, under the new epoch only when it carried the epoch the raise
-        replaced (:class:`KeptSessionRestamp`, BACKLOG #4975); if its own seal does not verify,
-        that raises :class:`RowSealError` and the whole transaction, revokes included, rolls
-        back."""
+        replaced and the current global epoch, read in this transaction without refusing a
+        missing row (:func:`global_epoch_unmoved`, :class:`KeptSessionRestamp`, BACKLOG #4975);
+        otherwise it is ended with the rest and counted (:meth:`_keep_or_end_session`). If its
+        own seal does not verify, that raises :class:`RowSealError` and the whole transaction,
+        revokes included, rolls back."""
         now = time.time() if now is None else now
-        kept = False
         async with _writer_txn(self._db, self._lock):
             raised = await self._bump_session_epoch(user_id)
             if except_token_hash is None:
@@ -18266,11 +18445,31 @@ class MessageStore:
                     (now, user_id, except_token_hash),
                 )
             revoked = int(cur.rowcount)
-            if except_token_hash is not None:
-                restamp = KeptSessionRestamp(user_id, raised)
-                kept = restamp.kept(await self._write_session(except_token_hash, restamp))
+            if except_token_hash is None:
+                result = RevokeResult(revoked)
+            else:
+                unmoved = global_epoch_unmoved(await self._global_session_epoch_value())
+                result = await self._keep_or_end_session(
+                    revoked, except_token_hash, KeptSessionRestamp(user_id, raised, unmoved), now
+                )
             await self._commit()
-        return RevokeResult(revoked, kept)
+        return result
+
+    async def _keep_or_end_session(
+        self, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float
+    ) -> RevokeResult:
+        """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, inside the
+        revoke's writer transaction (follow-up to BACKLOG #4975). ``revoked`` is the sweep's count;
+        an ended kept session is added to it. A declined session left live would be refused at
+        its next request anyway, but meanwhile it would hold a slot under the session cap and its
+        refusal would read as a seal failure, so it is ended here, as the sweep ends the rest."""
+        if restamp.kept(await self._write_session(token_hash, restamp)):
+            return RevokeResult(revoked, kept=True)
+        cur = await self._db.execute(
+            _END_DECLINED_KEPT_SESSION_SQL, (now, restamp.user_id, token_hash)
+        )
+        ended = cur.rowcount == 1
+        return RevokeResult(revoked + ended, kept=False, ended_kept=ended)
 
     async def count_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None
@@ -18306,7 +18505,8 @@ class MessageStore:
         The store's global session epoch is raised first (BACKLOG #5091), then every account's
         epoch, as :meth:`revoke_user_sessions` raises one, then one sweep ends the rows and the kept
         row is re-sealed under its own account's new epoch and the new global one, when it carried
-        both epochs those raises replaced (:class:`KeptSessionRestamp`, BACKLOG #4975).
+        both epochs those raises replaced (:class:`KeptSessionRestamp`, BACKLOG #4975), and is
+        otherwise ended and counted (:meth:`_keep_or_end_session`).
 
         The first statement is a write, which takes SQLite's write lock, so the reads below run
         under it: another process (an engine shard, or the engine beside
@@ -18330,18 +18530,20 @@ class MessageStore:
         )
         revoked = int(cur.rowcount)
         if except_token_hash is None:
-            return RevokeResult(revoked, kept=False)
+            return RevokeResult(revoked)
         cur = await self._db.execute(
             "SELECT user_id FROM sessions WHERE token_hash=?", (except_token_hash,)
         )
         owner = await cur.fetchone()
         if owner is None:
-            return RevokeResult(revoked, kept=False)
+            return RevokeResult(revoked)
         user_id = str(owner[0])
         global_raised = global_epoch_raise(await self._global_session_epoch())
-        restamp = KeptSessionRestamp(user_id, raised.get(user_id), global_raised)
-        return RevokeResult(
-            revoked, restamp.kept(await self._write_session(except_token_hash, restamp))
+        return await self._keep_or_end_session(
+            revoked,
+            except_token_hash,
+            KeptSessionRestamp(user_id, raised.get(user_id), global_raised),
+            now,
         )
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
@@ -18405,9 +18607,14 @@ class MessageStore:
     async def _global_session_epoch(self) -> int:
         """The store's global session epoch (BACKLOG #5091), read on the writer connection inside
         the caller's transaction."""
+        return global_epoch_or_refuse(await self._global_session_epoch_value())
+
+    async def _global_session_epoch_value(self) -> int | None:
+        """The global session epoch, ``None`` where the row is missing, read as
+        :meth:`_global_session_epoch` reads it but not refused."""
         cur = await self._db.execute(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
         row = await cur.fetchone()
-        return global_epoch_or_refuse(None if row is None else row[0])
+        return None if row is None or row[0] is None else int(row[0])
 
     async def _bump_session_epoch(self, user_id: str) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside the caller's writer
@@ -18776,6 +18983,7 @@ class MessageStore:
         reclaimed = 0
         updates: list[tuple[str, float, str]] = []
         failures: list[CellTagError] = []
+        unreadable: list[object] = []
         for row in rows:
             cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
             if row["received_at"] >= cutoff:
@@ -18809,6 +19017,7 @@ class MessageStore:
                 pruned_at=now,
                 min_bytes=min_bytes,
                 content_type=content_types.get(row["channel_id"]),
+                on_unreadable=functools.partial(unreadable.append, row["id"]),
             )
             if n_docs == 0:
                 continue  # no embedded document in this body — leave it (and its NULL flag) untouched
@@ -18827,6 +19036,8 @@ class MessageStore:
             msgs += 1
             docs += n_docs
             reclaimed += n_bytes
+        # Before the write, so a failed write does not lose the record of the skips.
+        log_unreadable_skips(unreadable)
         if updates:
             async with _writer_txn(self._db, self._lock):
                 await self._db.executemany(

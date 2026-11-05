@@ -39,6 +39,7 @@ from messagefoundry.parsing.x12.errors import X12FrameError, X12PeekError
 from messagefoundry.parsing.x12.interchange import X12FrameReader
 from messagefoundry.parsing.x12.message import X12Message
 from messagefoundry.parsing.x12.peek import X12Peek
+from messagefoundry.proactor_accept import guard_accepts
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.admission import FrameClock, ListenerAdmission
 from messagefoundry.transports.base import (
@@ -715,6 +716,7 @@ class X12Source(SourceConnector):
         # there is no shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
         self._admission.stopping = False  # a restart of this same instance serves again
+        guard_accepts()  # see messagefoundry.proactor_accept
         self._server = await asyncio.start_server(self._on_client, self.host, self.port)
 
     @property

@@ -982,10 +982,10 @@ def test_the_engine_takes_no_gating_digest_of_a_bundle_on_a_lost_share(
     """Both of the engine's strict reads answer ``None``, which a release refuses as
     ``digest_unavailable``. Before, each went on without the folder."""
     cfg = _config(tmp_path / "cfg")
-    assert Engine._content_digest_blocking(cfg) is not None  # the control
+    assert Engine._content_snapshot_blocking(cfg) is not None  # the control
     assert Engine._reload_snapshot_blocking(cfg) is not None  # the control
     _lost_share(monkeypatch, cfg / folder)
-    assert Engine._content_digest_blocking(cfg) is None
+    assert Engine._content_snapshot_blocking(cfg) is None
     assert Engine._reload_snapshot_blocking(cfg) is None
 
 

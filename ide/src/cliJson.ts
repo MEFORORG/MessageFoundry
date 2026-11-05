@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-// Turning one `messagefoundry ... --json` result into a value or an error. No `vscode` import, so the
+// Turning one `messagefoundry ... --json` or `messagefoundry-toolkit ... --json` result into a value
+// or an error. No `vscode` import, so the
 // unit suite runs it; cli.ts wraps it around the real child process.
 //
 // PHI (ASVS 14.2.6, vault BACKLOG #1187, ground d2). A failure here becomes text the user sees: a
@@ -45,6 +46,56 @@ export interface CliResult {
   stdout: string;
   stderr: string;
   code: number;
+}
+
+/**
+ * The Python module each command runs under. The engine's own commands run `python -m messagefoundry`.
+ * The authoring commands the extension uses, `lens` and `generate`, moved to the separate
+ * `messagefoundry-toolkit` distribution (ADR 0201 slice 4), whose module is `messagefoundry_toolkit`.
+ */
+export type CliModule = "messagefoundry" | "messagefoundry_toolkit";
+export const ENGINE_MODULE: CliModule = "messagefoundry";
+export const TOOLKIT_MODULE: CliModule = "messagefoundry_toolkit";
+
+/** The command a user types in a terminal to run what `python -m <module>` ran. A Record, so a new
+ *  module does not compile until it names its command. */
+const COMMAND_NAMES: Record<CliModule, string> = {
+  messagefoundry: "messagefoundry",
+  messagefoundry_toolkit: "messagefoundry-toolkit",
+};
+
+export function commandName(module: CliModule): string {
+  return COMMAND_NAMES[module];
+}
+
+/** What the user is told when the selected interpreter has no toolkit. Our text, never the CLI's. */
+export const TOOLKIT_MISSING_MESSAGE =
+  "the selected Python interpreter has no messagefoundry-toolkit, which the Steps view and Generate " +
+  "Samples run. Install it in that interpreter at the engine's own version: pip install " +
+  "messagefoundry-toolkit==<version>, where <version> is what `python -m messagefoundry --version` prints.";
+
+/**
+ * Python's refusal of `-m messagefoundry_toolkit` when the package is absent. The lookahead keeps a
+ * missing SUBMODULE (`messagefoundry_toolkit.lens`) out: that is a broken install, not a missing one,
+ * and keeps the CLI's own path. Python quotes the name in one wording and not in the other.
+ */
+const TOOLKIT_NOT_FOUND = /No module named '?messagefoundry_toolkit'?(?![\w.])/;
+
+/**
+ * A toolkit run whose interpreter has no toolkit, rewritten into the CLI's own error contract with
+ * {@link TOOLKIT_MISSING_MESSAGE}: an `{"error": ...}` body on stdout, which `parseJsonResult` and the
+ * Steps view's rewrite parser both surface, and the same line on stderr, which a raw caller shows.
+ * Any other result is returned unchanged.
+ */
+export function explainMissingToolkit(res: CliResult): CliResult {
+  if (res.code === 0 || !TOOLKIT_NOT_FOUND.test(res.stderr)) {
+    return res;
+  }
+  return {
+    stdout: JSON.stringify({ error: TOOLKIT_MISSING_MESSAGE }),
+    stderr: TOOLKIT_MISSING_MESSAGE,
+    code: res.code,
+  };
 }
 
 /** The synthetic stderr cli.ts returns, without running anything, in an untrusted workspace. */
@@ -94,17 +145,17 @@ const USAGE_ON_STDOUT = /^\s*usage:/i;
 /**
  * Parse a `--json` CLI result's stdout. An `{"error": ...}` body throws an `Error` carrying the CLI's
  * composed message. Every other failure throws a {@link CliOutputError} whose message quotes nothing
- * the CLI printed.
+ * the CLI printed, and names the command `module` ran.
  */
-export function parseJsonResult<T>(res: CliResult, args: string[]): T {
-  const label = commandLabel(args);
+export function parseJsonResult<T>(res: CliResult, args: string[], module: CliModule): T {
+  const label = `${commandName(module)} ${commandLabel(args)}`;
   const text = res.stdout.trim();
   if (!text) {
     if (res.stderr.trim() === UNTRUSTED_WORKSPACE_STDERR) {
       throw new CliOutputError(UNTRUSTED_WORKSPACE_STDERR, false); // our own text, not the CLI's
     }
     throw new CliOutputError(
-      `messagefoundry ${label} exited with code ${res.code} and printed no JSON. Its error output ` +
+      `${label} exited with code ${res.code} and printed no JSON. Its error output ` +
         `(${byteLength(res.stderr)} bytes) is not shown here because it can quote message data. Run ` +
         "the same command with --json in a terminal to read it.",
       looksLikeUnknownArgument(res.stderr),
@@ -116,7 +167,7 @@ export function parseJsonResult<T>(res: CliResult, args: string[]): T {
     parsed = JSON.parse(text);
   } catch {
     throw new CliOutputError(
-      `messagefoundry ${label} exited with code ${res.code} and printed ${byteLength(res.stdout)} ` +
+      `${label} exited with code ${res.code} and printed ${byteLength(res.stdout)} ` +
         "bytes that are not valid JSON. The output is not shown here because it can quote message " +
         "data. One cause is a print() at the top level of a config module. Run the same command " +
         "with --json in a terminal to read it.",

@@ -57,6 +57,7 @@ from messagefoundry.credential import (
     client_cert_principal_under_issuer,
     constant_time_match_any,
 )
+from messagefoundry.proactor_accept import guard_accepts
 from messagefoundry.redaction import safe_exc
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import ListenerAdmission
@@ -82,7 +83,6 @@ from messagefoundry.transports.mllp import (
     _pacing_settings,
     _peer_host,
     _set_tcp_nodelay,
-    _upgrades_tls_itself,
 )
 from messagefoundry.transports.receipt import ReceiptHandler, RefusalKind, require_receipt
 
@@ -100,6 +100,21 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def _upgrades_tls_itself(loop: asyncio.AbstractEventLoop) -> bool:
+    """Whether this TLS listener on ``loop`` accepts plain TCP and upgrades each socket itself, so
+    its caps, its allowlist and ``max_handshakes_per_host`` run before the handshake (BACKLOG #2479).
+    True for ``asyncio.BaseEventLoop`` and its subclasses, which the stdlib loops are.
+
+    ``mllp._upgrades_tls_itself`` gives the reading behind the upgrade and why uvloop is kept off it.
+    The MLLP listener matches the stdlib loop classes exactly (vault BACKLOG #4552), because its own
+    accept loop admits before the handshake on any other loop. This listener has no such loop, so on
+    the loop's handshake its caps would apply only after it and ``max_handshakes_per_host`` never.
+    It keeps trusting a subclass rather than lose those controls there.
+    """
+    return isinstance(loop, asyncio.BaseEventLoop)
+
 
 # Resource caps (DoS guards), HTTP analogs of the MLLP frame/connection/idle caps. All overridable per
 # connection via Http() settings; None/0 (in any spelling) disables a cap explicitly where noted.
@@ -814,9 +829,9 @@ class HttpSource(SourceConnector):
             on_client_ca=loaded_client_ca.append,
         )
         # Failed TLS handshakes and their throttled `tls_handshake_failed` events (vault BACKLOG
-        # #3302), counted as the MLLP listener counts them: `_start_tls` where this listener runs
-        # the handshake, and the context's hook (`HandshakeFailures.watch`, armed at start()) where
-        # the loop does. The peer is known only in the first case.
+        # #3302): `_start_tls` counts where this listener runs the handshake, as the MLLP
+        # listener's does, and the context's hook (`HandshakeFailures.watch`, armed at start())
+        # where the loop does. The peer is known only in the first case.
         self._tls_failures = HandshakeFailures(self._emit_tls_failure)
         # True while this listener runs TLS handshakes itself, after admission (BACKLOG #2479); set
         # at start() from the running loop, see `_upgrades_tls_itself`.
@@ -926,6 +941,7 @@ class HttpSource(SourceConnector):
         # require_receipt refuses any other handler here, before a single message is accepted.
         self._handler = require_receipt(handler, source="HTTP source")
         self._admission.stopping = False  # a restart of this same instance serves again
+        guard_accepts()  # see messagefoundry.proactor_accept
         self._tls_failures.open()
         # BACKLOG #2479, the shape BACKLOG #1606 fixed on MLLP. On the stdlib loop a TLS listener
         # accepts PLAIN TCP and upgrades each admitted socket itself, so the allowlist and both

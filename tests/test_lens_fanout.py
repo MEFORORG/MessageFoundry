@@ -27,9 +27,9 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.lens import LensRewriteError, parse_source, rewrite_source
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.dryrun import transform_one
+from messagefoundry_toolkit.lens import LensRewriteError, parse_source, rewrite_source
 
 # --- helpers -----------------------------------------------------------------
 

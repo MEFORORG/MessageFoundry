@@ -1606,7 +1606,11 @@ def test_parser_table_drift_is_reported() -> None:
     )
     # An orphaned listing: the page names a module the scan does not find.
     assert _parser_drift(
-        _replace_once(text, "| `corepoint_import.py` |", "| `corepoint_import.py`, `nope.py` |"),
+        _replace_once(
+            text,
+            "| `messagefoundry_toolkit/corepoint_import.py` |",
+            "| `messagefoundry_toolkit/corepoint_import.py`, `nope.py` |",
+        ),
         live,
     )
     # One site in both tables.

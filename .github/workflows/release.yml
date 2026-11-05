@@ -655,6 +655,42 @@ jobs:
               echo "::error::messagefoundry/py.typed missing from the wheel — the py.typed marker (WS-3) must merge before tagging a release"; exit 1
             fi
           fi
+          # EXPOSURE, ASVS 15.2.3 clause (b), measured on the artifact a tag would publish (ADR 0201
+          # section 4, AC-2). This venv holds the built engine wheel and its dependencies and NO
+          # toolkit, so the parser the installed engine builds is the command surface a deploying
+          # operator gets. It must register exactly the production rows of CLI_TIERS. `-I` for the
+          # reason above: the checkout's own messagefoundry/ and messagefoundry_toolkit/ must not answer.
+          /tmp/relsmoke/bin/python -I - <<'PYEXPOSE'
+          import argparse
+          import importlib.util
+
+          from messagefoundry.__main__ import _build_parser
+          from messagefoundry.cli_surface import CLI_TIERS
+
+
+          def paths(parser, prefix=""):
+              found = set()
+              for action in parser._actions:
+                  if isinstance(action, argparse._SubParsersAction):
+                      for name, child in action.choices.items():
+                          path = f"{prefix} {name}".lstrip()
+                          found |= {path} | paths(child, path)
+              return found
+
+
+          # The control first: a venv that could import the toolkit would measure nothing. It also
+          # means the engine cannot have loaded toolkit code, since there is none to find.
+          if importlib.util.find_spec("messagefoundry_toolkit") is not None:
+              raise SystemExit("::error::the engine smoke venv can import messagefoundry_toolkit, so the exposure check measures nothing")
+          registered = paths(_build_parser()[0])
+          production = {row for row, tier in CLI_TIERS.items() if tier == "production"}
+          if registered != production:
+              raise SystemExit(
+                  "::error::the built engine registers rows other than the production rows of CLI_TIERS: "
+                  f"extra {sorted(registered - production)}, missing {sorted(production - registered)}"
+              )
+          print(f"exposure check: the built engine registers exactly the {len(production)} production rows")
+          PYEXPOSE
 
       # THE TOOLKIT DISTRIBUTION RIDES THIS JOB, NOT A JOB OF ITS OWN (ADR 0201 section 1, BACKLOG #1192).
       # `messagefoundry-toolkit` carries the authoring commands the engine wheel no longer ships, and

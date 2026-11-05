@@ -33,8 +33,13 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.__main__ import main
-from messagefoundry.lens import LensRewriteError, _validated_expr, parse_source, rewrite_source
+from messagefoundry_toolkit.__main__ import main
+from messagefoundry_toolkit.lens import (
+    LensRewriteError,
+    _validated_expr,
+    parse_source,
+    rewrite_source,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = REPO_ROOT / "samples" / "config"

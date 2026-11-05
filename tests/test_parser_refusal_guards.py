@@ -23,10 +23,10 @@ from typing import Any
 import pytest
 
 import messagefoundry.checks as checks
-import messagefoundry.lens as lens
+import messagefoundry_toolkit.lens as lens
 from messagefoundry.config.graph import _parse_module
 from messagefoundry.config.impact import _scan_declaration_span
-from messagefoundry.lens import LensParseError, LensRewriteError
+from messagefoundry_toolkit.lens import LensParseError, LensRewriteError
 
 
 def _elif_chain(branches: int = 8000) -> str:

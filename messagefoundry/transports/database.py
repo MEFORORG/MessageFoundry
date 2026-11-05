@@ -116,11 +116,13 @@ from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import prints_a_codec_error, safe_exc
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
+    POLL_STOP_GRACE_S,
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
     InboundHandler,
     NegativeAckError,
+    PollStopGuard,
     SourceConnector,
     count_setting,
     float_setting,
@@ -133,8 +135,12 @@ from messagefoundry.transports.base import (
     resolve_poll_ceiling,
 )
 from messagefoundry.transports.db_endpoint import (
+    COMMA_PORT_FAMILIES,
+    GENERIC_DRIVER_FAMILIES,
+    GENERIC_DRIVER_REFUSAL,
     SQLSERVER_DEFAULT_DRIVER,
     SQLSERVER_DEFAULT_PORT,
+    generic_driver_family,
     generic_hop_endpoint,
     is_remote_spelling,
     odbc_keyword_name,
@@ -717,10 +723,10 @@ _MYSQL_SSL_MODES = ("DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_ID
 
 
 class _DriverFamily(NamedTuple):
-    """What the engine knows of one driver family, placed from the ``odbc_driver`` name."""
+    """What the engine knows of one driver family on the generic driver allowlist
+    (:data:`~messagefoundry.transports.db_endpoint.GENERIC_DRIVER_FAMILIES`), placed from the
+    ``odbc_driver`` name."""
 
-    #: The whole registered names, in lower case.
-    names: re.Pattern[str]
     #: The keyword the family reads as its TLS mode, in the form :func:`odbc_keyword_name` gives.
     tls_keyword: str
     #: The values of that keyword that count as a mode, or ``None`` where any usable value counts
@@ -735,69 +741,40 @@ class _DriverFamily(NamedTuple):
     #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
     #: keyword never brings an unmeasured escape with it.
     brace_escape: bool
-    #: Whether the family's own documentation names ``SERVER`` as the keyword for its target host
-    #: (:func:`odbc_driver_reads_server`, BACKLOG #5163). Documented; no run was designed to test
-    #: it. Its own field, with no default, so a family placed later for its TLS keyword says
-    #: whether it reads ``SERVER`` rather than inheriting it.
-    reads_server: bool
-    #: Whether the driver reads ``SERVER=host,port`` as one host and its port, and ignores
-    #: ``PORT``: Microsoft's driver alone (:func:`~messagefoundry.transports.db_endpoint.generic_hop_endpoint`,
-    #: BACKLOG #4874).
-    reads_comma_port: bool = False
 
 
-# The three driver families the engine can place, by whole registered name in any case but spelled
-# with single spaces (BACKLOG #2705, #5029, #5053). psqlODBC's include the bare ``PostgreSQL``, the
-# section name RHEL registers it under. A vendor driver whose name merely mentions a database, a
-# library path, an odbcinst alias such as RHEL's bare ``MySQL``, or another registered name that
-# only folds to one of these is not placed. An unplaced name still builds, but no TLS mode counts
-# on it, so on an enforcing instance its hop is refused off-loopback unless it is attested: a
-# change to these patterns is a change to that control, and is reviewed as one.
+# What the engine knows of each family on the generic driver allowlist, keyed as
+# ``GENERIC_DRIVER_FAMILIES`` keys it (BACKLOG #2705, #5029, #5053, #5041). The allowlist and its
+# names are in ``transports.db_endpoint``, and why each family is on it is in docs/CONNECTIONS.md;
+# the build refuses any other name, so every hop that is built places one of these. A change here is
+# a change to the TLS gate and the password rule, and is reviewed as one.
 #
 # psqlODBC's keyword parser and MySQL Connector/ODBC's parameter page have no ``encrypt``, and
 # Microsoft's ODBC Driver for SQL Server reads no ``sslmode``, so each family counts one keyword
-# (BACKLOG #5053). An unplaced name has no keyword that counts.
+# (BACKLOG #5053).
 #
 # The escape list is the families with ``brace_escape`` set, whose password is always sent braced
 # with the ODBC ``}}`` escape (:func:`_odbc_password`, BACKLOG #2705): psqlODBC and MySQL, measured
 # on 2026-10-30 to read that escape, and Microsoft's, not probed then but relied on for the same
-# escape by the SQL Server preset and the store. The legacy name ``SQL Server`` is left out: on
-# Linux it is commonly a FreeTDS alias, which has not been measured.
-#
-# Each family is documented to read ``SERVER`` as its target host (``reads_server``, BACKLOG
-# #5163), read from its own source on 2026-11-03: psqlODBC's ``dlg_specific.h`` defines
-# ``SPEC_SERVER`` as the connection-string keyword ``server``; MySQL Connector/ODBC's
-# *Connector/ODBC Connection Parameters* page lists ``server`` as the host name of the server; and
-# Microsoft's *ODBC DSN and Connection String Keywords* page lists ``Server``. The 2026-10-30
-# probes (BACKLOG #2705) connected psqlODBC 18.00.0005, and ran MySQL Connector/ODBC, through
-# engine-built strings that name the host only in ``SERVER``, which is consistent with that; no
-# run was designed to test it, and Microsoft's driver was not run. Any other name gets the warning
-# :func:`_warn_generic_server_unread` logs.
+# escape by the SQL Server preset and the store.
 _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
     "psqlodbc": _DriverFamily(
-        re.compile(r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"),
         "sslmode",
         frozenset(_LIBPQ_SSL_MODES),
         ("SSLmode", "verify-full"),
         brace_escape=True,
-        reads_server=True,
     ),
     "mysql": _DriverFamily(
-        re.compile(r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"),
         "sslmode",
         frozenset(_MYSQL_SSL_MODES),
         ("SSLMODE", "VERIFY_IDENTITY"),
         brace_escape=True,
-        reads_server=True,
     ),
     "msodbc": _DriverFamily(
-        re.compile(r"odbc driver [0-9]+ for sql server"),
         "encrypt",
         None,
         ("Encrypt", "yes"),
         brace_escape=True,
-        reads_server=True,
-        reads_comma_port=True,
     ),
 }
 
@@ -806,77 +783,35 @@ _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
 # count. docs/CONNECTIONS.md records what the drivers read so far do with one.
 _ODBC_TLS_MODE_KEYWORDS = frozenset(family.tls_keyword for family in _DRIVER_FAMILIES.values())
 
+# Fail at import, not with a KeyError mid-build, if a family is on one table and not the other.
+if set(_DRIVER_FAMILIES) != set(GENERIC_DRIVER_FAMILIES):
+    raise RuntimeError("_DRIVER_FAMILIES and GENERIC_DRIVER_FAMILIES must name the same families")
 
-def _driver_family(driver: object) -> str | None:
-    """The key in :data:`_DRIVER_FAMILIES` of the family ``driver``, an ``odbc_driver`` setting as
-    written, names whole, or ``None`` where the engine cannot place it. The name is read trimmed
-    and in any case, as :func:`_build_odbc_dsn` reads it, never the library it loads."""
-    name = str(driver or "").strip().lower()
-    return next(
-        (key for key, family in _DRIVER_FAMILIES.items() if family.names.fullmatch(name)), None
-    )
-
-
-#: Why a generic hop's ``odbc_driver`` is reported as possibly not reading ``SERVER`` (BACKLOG
-#: #5163). The one wording the construction warning and ``messagefoundry check`` share.
-SERVER_UNREAD_REASON = (
-    "odbc_driver names no driver family documented to read SERVER as its target, so the host "
-    "checks on server, at least [egress].allowed_db and the on-box test of the cleartext-hop guard, "
-    "do not bind this hop if the driver takes its target from another keyword"
-)
-#: What to do about :data:`SERVER_UNREAD_REASON`, shared by the warning and the check line.
-#: Microsoft's driver is not offered: on this dialect it ignores ``PORT``, and its own remedy is
-#: ``dialect="sqlserver"`` (:func:`~messagefoundry.transports.db_endpoint.generic_hop_endpoint`).
-SERVER_UNREAD_REMEDY = (
-    "name psqlODBC or MySQL Connector/ODBC by its registered name, use dialect sqlserver with "
-    "Microsoft's driver for SQL Server, or reach this database another way (see Generic ODBC in "
-    "docs/CONNECTIONS.md)"
-)
+#: The one classifier of a generic ``odbc_driver`` name, shared with the ``[egress].allowed_db``
+#: check (BACKLOG #5041): the key in :data:`_DRIVER_FAMILIES` of the family the name places, or
+#: ``None`` for a name off the allowlist. The name is read trimmed and in any case, as
+#: :func:`_build_odbc_dsn` reads it, never the library it loads.
+_driver_family = generic_driver_family
 
 
-def odbc_driver_reads_server(driver: object) -> bool:
-    """Whether ``driver``, an ``odbc_driver`` setting as written, places a family
-    :data:`_DRIVER_FAMILIES` records as documented to read ``SERVER`` as its target (BACKLOG
-    #5163). ``False`` is not a finding that the driver ignores ``SERVER``, only that the engine
-    cannot place it. Why that matters to ``[egress].allowed_db`` is stated once, in
-    docs/CONNECTIONS.md, *Accepted odbc_params keywords*. ``True`` is the documentation's claim,
-    not proof that the check binds the address the driver dials. Pure."""
-    family = _driver_family(driver)
-    return family is not None and _DRIVER_FAMILIES[family].reads_server
+def _refuse_unread_sslmode(text: str, *, family: str, connection: str | None) -> None:
+    """A ValueError when an ``sslmode`` value is not one the driver family ``family`` reads,
+    exactly (BACKLOG #2705, #5029, #5035). The keyword is matched in any case, as the build matches
+    every keyword; the value is not.
 
-
-def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) -> None:
-    """A ValueError when an ``sslmode`` value is not one the named driver family reads, exactly
-    (BACKLOG #2705, #5029, #5035). The keyword is matched in any case, as the build matches every
-    keyword; the value is not.
-
-    The rule depends on the family :func:`_driver_family` places from the ``odbc_driver`` name.
-    MySQL Connector/ODBC takes only :data:`_MYSQL_SSL_MODES`. psqlODBC, and any name the engine
-    cannot place, take only :data:`_LIBPQ_SSL_MODES`, as before. Microsoft's driver reads no
-    ``sslmode``, so on that name any value is refused and the refusal says to set ``Encrypt``.
-
-    For a name it cannot place, the refusal advises no value at all, whatever was given: it says
-    the family could not be placed and names the registered names that place psqlODBC and MySQL.
-    Offering libpq's list there would steer a MySQL driver under another name, such as RHEL's bare
-    ``MySQL``, to a value that builds and that MySQL ignores (BACKLOG #5029). A libpq value on such
-    a name still builds, for psqlODBC under a library path, but
-    :func:`generic_odbc_tls_unenforced` counts no mode on it, so the hop stays gated. Each refusal
-    leads with what an operator needs, as a stored failure keeps about its first 200 characters,
-    and none quotes the value given.
+    ``family`` is the key :func:`_driver_family` places from the ``odbc_driver`` name; the build
+    refuses a name it places in none before this runs (BACKLOG #5041). MySQL Connector/ODBC takes
+    only :data:`_MYSQL_SSL_MODES`, and psqlODBC only :data:`_LIBPQ_SSL_MODES`. Microsoft's driver
+    reads no ``sslmode``, so on that name any value is refused and the refusal says to set
+    ``Encrypt``. Each refusal leads with what an operator needs, as a stored failure keeps about
+    its first 200 characters, and none quotes the value given.
 
     The MySQL list is joined with ``or``: two upper case words joined by a comma or a blank are a
     name run to the log redaction, which would blank them."""
-    family = _driver_family(driver)
-    entry = _DRIVER_FAMILIES[family] if family is not None else None
-    # The table decides, as it does for the gate: a placed family takes its own sslmode spellings,
-    # or none when it reads another keyword; an unplaced name takes libpq's.
-    if entry is None:
-        accepted: frozenset[str] = frozenset(_LIBPQ_SSL_MODES)
-    elif entry.tls_keyword == "sslmode" and entry.tls_spellings is not None:
-        accepted = entry.tls_spellings
-    else:
-        accepted = frozenset()
-    if text in accepted:
+    entry = _DRIVER_FAMILIES[family]
+    # The table decides, as it does for the gate: a family takes its own sslmode spellings, or
+    # none when it reads another keyword.
+    if entry.tls_keyword == "sslmode" and text in (entry.tls_spellings or ()):
         return
     database = f"{hop_name_prefix(connection)}DATABASE"
     where = f"{database} odbc_params value for 'sslmode'"
@@ -889,36 +824,30 @@ def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) ->
     if family == "mysql":
         mysql = " or ".join(_MYSQL_SSL_MODES)
         raise ValueError(f"{where} must be one of {mysql}, in upper case, for MySQL {see}")
-    if family is not None:
-        libpq = ", ".join(_LIBPQ_SSL_MODES)
-        raise ValueError(f"{where} must be one of {libpq}, in lower case {see}")
-    raise ValueError(
-        f"{database} cannot place the odbc_driver family; name it PostgreSQL Unicode or ANSI, "
-        f"or MySQL ODBC <version> Unicode or ANSI Driver, as registered, and no 'sslmode' counts "
-        f"until then {see}"
-    )
+    libpq = ", ".join(_LIBPQ_SSL_MODES)
+    raise ValueError(f"{where} must be one of {libpq}, in lower case {see}")
 
 
-def _odbc_password(password: object, *, driver: str, connection: str | None) -> str:
+def _odbc_password(password: object, *, family: str, connection: str | None) -> str:
     """``password`` as the generic connection string sends it, or a ValueError (BACKLOG #2705).
 
-    For a driver :func:`_driver_family` places, it is ALWAYS braced, with the ``}}``
-    escape, whatever it holds. psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space and
+    ``family`` is the key :func:`_driver_family` places from ``odbc_driver``; the build refuses a
+    name it places in none before this runs (BACKLOG #5041). For a family on the escape list, which
+    today is every family, it is ALWAYS braced, with the ``}}`` escape, whatever it holds. psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space and
     ``%XX`` a byte; ``dlg_specific.c``, ``decode_or_remove_braces``) and takes a braced one
     literally, so only the braced form sends the password as written.
 
-    For any other driver it is sent plain, and only when it holds none of ``;``, ``{``, ``}`` or a
-    quote character and has no leading or trailing space: a driver that reads no braces (the Access
-    driver) takes it only that way, and one that does not read the escape would end a braced value
-    at the first ``}`` and read the rest as further keywords. Any other password is refused for
-    such a driver. A driver missing from the list is unmeasured, not known to be unsafe.
+    A family off the escape list would get it plain, and only when it holds none of ``;``, ``{``,
+    ``}`` or a quote character and has no leading or trailing space: a driver that reads no braces
+    (the Access driver) takes it only that way, and one that does not read the escape would end a
+    braced value at the first ``}`` and read the rest as further keywords. Any other password is
+    refused for such a family.
 
     A password must be printable ASCII whatever the driver. A refusal names the setting and never
     describes the value beyond saying the driver cannot carry it."""
     text = str(password)
     _refuse_unsafe_text(text, what="password", connection=connection, refused="")
-    family = _driver_family(driver)
-    if family is not None and _DRIVER_FAMILIES[family].brace_escape:
+    if _DRIVER_FAMILIES[family].brace_escape:
         return odbc_brace(text)
     if not any(ch in ";{}\"'" for ch in text) and text == text.strip():
         return text
@@ -1487,11 +1416,12 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     (vault BACKLOG #2577, BACKLOG #2705; docs/CONNECTIONS.md, *Accepted ``odbc_params`` keywords*). An ``odbc_params`` keyword
     must be on :data:`_ODBC_PARAM_ALLOWLIST`, and a credential keyword that is sent on its own short list, or
     the build is refused with the keyword and the connection named. An ``odbc_params`` keyword given
-    twice is refused. A driver may take its target under a keyword other than ``SERVER``; the
-    engine cannot see that, and warns (:func:`_warn_generic_server_unread`, BACKLOG #5163) for any
-    name it cannot place as a family documented to read ``SERVER``. The egress check runs outside
-    this builder, at least in ``build_source`` and ``build_destination`` (``transports.base``).
-    This builder sends ``server`` as written.
+    twice is refused. A driver may take its target under a keyword other than ``SERVER``, which
+    the engine cannot see, so ``odbc_driver`` must name a family on the generic driver allowlist,
+    each documented to read ``SERVER``, or the build is refused (BACKLOG #5041; the list and its
+    evidence are in :data:`~messagefoundry.transports.db_endpoint.GENERIC_DRIVER_FAMILIES`). The
+    egress check runs outside this builder, at least in ``build_source`` and ``build_destination``
+    (``transports.base``), and refuses the same names. This builder sends ``server`` as written.
 
     Every value must be printable ASCII (STORE-5 injection guard). ``database``, ``username`` and
     every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
@@ -1499,8 +1429,8 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     or trailing space. ``server`` and every ``odbc_params`` value also refuse ``None``, an
     ``odbc_params`` value refuses a boolean, and ``sslmode`` takes only the spellings
     :func:`_refuse_unread_sslmode` accepts for the driver. ``odbc_driver`` is braced and
-    refuses ``;``, ``{`` and ``}``. ``password`` is always braced with the ``}}`` escape for a driver
-    on the escape list, and otherwise sent plain when it can be and refused when it cannot
+    refuses ``;``, ``{`` and ``}``, and must be on the generic driver allowlist. ``password`` is
+    always braced with the ``}}`` escape, as every family on the list reads it
     (:func:`_odbc_password`).
 
     **TLS is the operator's responsibility on this path.** MessageFoundry cannot introspect an arbitrary
@@ -1515,8 +1445,8 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     TLS is **not required**, or set no mode its driver family reads, is refused off-loopback on an
     enforcing instance by :func:`generic_cleartext_hop_guard` (BACKLOG #1178), which the connectors
     call beside this builder. A mode counts only on the keyword the family :func:`_driver_family`
-    places reads, and for psqlODBC and MySQL only at that family's own spellings; a name the engine
-    cannot place has no mode that counts (BACKLOG #5053, :func:`generic_odbc_tls_unenforced`). What
+    places reads, and for psqlODBC and MySQL only at that family's own spellings (BACKLOG #5053,
+    :func:`generic_odbc_tls_unenforced`); a name off the allowlist is refused above. What
     stays delegated is the case this path genuinely cannot judge: the family's mode keyword IS set,
     and the engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
     driver = str(s.get("odbc_driver") or "").strip()
@@ -1535,6 +1465,11 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     # The driver name stays braced: names hold spaces and parentheses, and no probe found a driver
     # manager that reads a braced DRIVER wrongly. The delimiters are still refused, not escaped.
     _refuse_unsafe_text(driver, what="odbc_driver", connection=connection, refused=";{}")
+    # BACKLOG #5041: before anything reads the driver for its family, so every check below sees a
+    # family on the allowlist.
+    family = _driver_family(driver)
+    if family is None:
+        raise ValueError(f"{where}DATABASE {GENERIC_DRIVER_REFUSAL}")
     parts = [f"DRIVER={odbc_brace(driver)}", f"SERVER={server}"]
     if s.get("database"):
         database = _odbc_literal(s["database"], what="database", connection=connection)
@@ -1555,7 +1490,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             _ODBC_PASSWORD_KEYS,
             connection=connection,
         )
-        secret = _odbc_password(password, driver=driver, connection=connection)
+        secret = _odbc_password(password, family=family, connection=connection)
         parts.append(f"{pwd_key}={secret}")
     params = s.get("odbc_params") or {}
     if not isinstance(params, Mapping):
@@ -1591,7 +1526,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             value, what=f"odbc_params value for '{name}'", connection=connection
         )
         if name == "sslmode":
-            _refuse_unread_sslmode(literal, driver=driver, connection=connection)
+            _refuse_unread_sslmode(literal, family=family, connection=connection)
         parts.append(f"{k}={literal}")
     # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
     # Each file keyword is judged once, here, and every check below reads that judgement.
@@ -1599,31 +1534,12 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     _refuse_weak_driver_key(named, connection=connection, verdicts=verdicts)
     _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
     _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
-    _warn_generic_tls_unenforced(params, driver=driver, connection=connection)
-    _warn_generic_server_unread(driver, connection=connection)
+    _warn_generic_tls_unenforced(params, family=family, connection=connection)
     return ";".join(parts) + ";"
 
 
-def _warn_generic_server_unread(driver: str, *, connection: str | None = None) -> None:
-    """A WARNING when :func:`odbc_driver_reads_server` cannot place ``driver`` (BACKLOG #5163).
-
-    Visibility, not a control: it never gates or changes the connection. Refusing such a name is
-    BACKLOG #5041's driver allow-list, not this. ``messagefoundry check``'s advisory
-    ``generic-db-server`` line reports the same hops from the graph, through the same predicate.
-    The connection is named with :func:`hop_name_prefix`, whose ``;`` keeps the log scrub from
-    reading a keyword and what follows it as a credential pair."""
-    if odbc_driver_reads_server(driver):
-        return
-    logger.warning(
-        "%sDATABASE generic dialect; %s; %s",
-        hop_name_prefix(connection),
-        SERVER_UNREAD_REASON,
-        SERVER_UNREAD_REMEDY,
-    )
-
-
 def _warn_generic_tls_unenforced(
-    params: Mapping[str, Any], *, driver: str, connection: str | None = None
+    params: Mapping[str, Any], *, family: str, connection: str | None = None
 ) -> None:
     """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
     path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
@@ -1646,15 +1562,15 @@ def _warn_generic_tls_unenforced(
     It stays optional because :func:`_build_odbc_dsn` is also called directly (tests, DSN-shape checks)
     where there is no connection to name; every engine construction path supplies it.
 
-    The remedy's example is the named driver family's own spelling, and for a name the engine
-    cannot place it names none, so the line never steers a driver to a value it ignores (BACKLOG
-    #5029)."""
+    ``family`` is the key :func:`_driver_family` placed; the build refuses a name it places in
+    none before this runs (BACKLOG #5041). The remedy's example is that family's own spelling, so
+    the line never steers a driver to a value it ignores (BACKLOG #5029)."""
     where = (
         f"DATABASE connection {connection!r} (generic ODBC dialect)"
         if connection
         else "DATABASE generic ODBC dialect"
     )
-    reason = generic_odbc_tls_unenforced(params, driver=driver)
+    reason = _family_tls_verdict(params, family)
     if reason is None:
         logger.debug(
             "%s: TLS is delegated to the driver (a TLS mode is set in odbc_params); "
@@ -1662,19 +1578,14 @@ def _warn_generic_tls_unenforced(
             where,
         )
         return
-    family = _driver_family(driver)
-    if family is not None:
-        keyword, value = _DRIVER_FAMILIES[family].tls_example
-        remedy = f"via the driver's own keyword (e.g. {keyword}={value})"
-    else:
-        remedy = "with a driver named by a registered name the engine places"
+    keyword, value = _DRIVER_FAMILIES[family].tls_example
     logger.warning(
         "%s: TLS verification is NOT enforced by MessageFoundry on this path and %s — configure "
         "verifying TLS %s so PHI is not sent in plaintext; tls_hop_attested is only for a hop "
         "secured by other means",
         where,
         reason,
-        remedy,
+        f"via the driver's own keyword (e.g. {keyword}={value})",
     )
 
 
@@ -1745,7 +1656,7 @@ def generic_cleartext_hop_guard(
     host, port = generic_hop_endpoint(
         str(settings.get("server") or ""),
         params,
-        reads_comma_port=family is not None and _DRIVER_FAMILIES[family].reads_comma_port,
+        reads_comma_port=family in COMMA_PORT_FAMILIES,
     )
     return InsecureHopGuard.capture(
         host=host,
@@ -3071,7 +2982,8 @@ async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = Non
     reload would otherwise wait as long as that call runs. With no connection held back, an
     in-flight call is an ordinary one, and the close waits for it as it did before #2394, however
     long it takes. ``bound`` instead stops the wait at that many seconds whatever the count: the
-    source's stop after a cancel (BACKLOG #1620) passes it.
+    source's stop after a cancel (BACKLOG #1620), or after it cut a blocked poll (BACKLOG #4685),
+    passes it.
 
     **Stopping the wait frees nothing.** The close is waited on through :func:`asyncio.wait`, which
     never cancels it, so a close cut halfway never leaves a connection's handle for aioodbc's
@@ -3503,16 +3415,18 @@ _MAX_SKIPPED_ROWS_PER_POLL = 64
 #: them (BACKLOG #1620). It bounds the cancel; a step that outlasts it is hung and is cut, and its
 #: row re-emits as the at-least-once duplicate a failed mark already makes.
 _ROW_STEP_GRACE_S = 2.0
-#: How long a cancelled DatabaseSource.stop() waits for the poll task it cut to finish (BACKLOG
-#: #1620). A cut task can still be held by a driver call on an executor thread, such as a cursor
-#: close behind a hung statement; stop() then returns with the task still referenced, so the next
-#: stop() joins it before closing the pool under it.
+#: How long a DatabaseSource.stop() waits for the poll task it cut to finish, after a cancel
+#: (BACKLOG #1620) or after an ordinary stop's grace (BACKLOG #4685). A cut task can still be held
+#: by a driver call on an executor thread, such as a cursor close behind a hung statement; stop()
+#: then returns with the task still referenced, so the next stop() joins it before closing the pool
+#: under it.
 _CUT_JOIN_TIMEOUT_S = 2.0
 #: How long a pool close waits once it has a reason to stop waiting (:func:`_close_pool_bounded`).
 #: A pool waits for every connection in use to come back, so one a hung driver call holds would make
 #: it wait forever. A cancelled DatabaseSource.stop() waits this long whatever its pool holds
-#: (BACKLOG #1620). Every other close of a DATABASE pool, the source's ordinary stop, the
-#: destination's, the db_lookup executor's and a DatabaseRef sync's teardown, waits this long only
+#: (BACKLOG #1620), and so does an ordinary one that cut its poll task (BACKLOG #4685). Every other
+#: close of a DATABASE pool, the source's other ordinary stops, the destination's, the db_lookup
+#: executor's and a DatabaseRef sync's teardown, waits this long only
 #: while a connection is held back behind a cancelled borrow (BACKLOG #2394), and otherwise waits
 #: for its in-flight calls without a bound.
 _POOL_CLOSE_TIMEOUT_S = 2.0
@@ -3697,6 +3611,8 @@ class DatabaseSource(SourceConnector):
         self._task: asyncio.Task[None] | None = None
         # The poll task inside a row's hand-off and mark; a cancelled stop() gives it a grace.
         self._row_step_task: asyncio.Task[Any] | None = None
+        # The poll task inside a hand-off, which an ordinary stop() never cuts (BACKLOG #4685).
+        self._stop_guard = PollStopGuard()
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -3728,20 +3644,33 @@ class DatabaseSource(SourceConnector):
         referenced, and the next stop() joins it. A close failure after a cancel is logged, never
         raised over it.
 
-        **An ordinary stop() waits for the pool as before, unless a borrow was cancelled.** It
-        waits for an in-flight call without a bound, but stops at :data:`_POOL_CLOSE_TIMEOUT_S` once
-        a connection is held back behind a cancelled borrow (BACKLOG #2394), such as a
-        ``test_connection`` probe whose ``SELECT 1`` was cancelled while it hung.
+        **An ordinary stop() gives up on a blocked driver call after** :data:`POLL_STOP_GRACE_S`
+        (BACKLOG #4685), as ``FileSource.stop()`` does on a blocked share call. The poll task sees
+        ``_stop`` between rows and between polls, so it usually returns at once. At least a select,
+        a pool borrow or a mark hung on an unresponsive server is cut after the grace, logged, and
+        from then on handled as a cut after a cancel: the join and the pool close are bounded as
+        above. A cut ends only the await: a mark already running on its driver thread can still
+        commit there. A row whose mark does not commit re-emits on the next start, the duplicate a
+        failed mark makes.
+        **This bound never cuts a hand-off**; :class:`PollStopGuard` says how long stop() then
+        waits. A cancelled stop() can, as above.
+
+        **An ordinary stop() the poll task finished in time waits for the pool as before, unless a
+        borrow was cancelled.** It waits for an in-flight call without a bound, but stops at
+        :data:`_POOL_CLOSE_TIMEOUT_S` once a connection is held back behind a cancelled borrow
+        (BACKLOG #2394), such as a ``test_connection`` probe whose ``SELECT 1`` was cancelled while
+        it hung.
         """
         self._stop.set()
         task = self._task
+        cut = False
         try:
             if task is not None:
-                await self._join_poll(task)
+                cut = await self._join_poll(task)
         except (asyncio.CancelledError, Exception):
             await self._finish_stop(task, interrupted=True)
             raise
-        await self._finish_stop(task, interrupted=False)
+        await self._finish_stop(task, interrupted=cut)
 
     async def _finish_stop(self, task: asyncio.Task[None] | None, *, interrupted: bool) -> None:
         """Clear a finished poll task, log its fault, and close the pool, bounded if interrupted."""
@@ -3762,38 +3691,53 @@ class DatabaseSource(SourceConnector):
             if not interrupted:
                 raise
             logger.warning(
-                "DATABASE source pool close failed during a cancel: %s", _safe_db_error(exc)
+                "DATABASE source pool close failed after a cancel or a cut: %s", _safe_db_error(exc)
             )
 
-    async def _join_poll(self, task: asyncio.Task[None]) -> None:
-        """Wait for the poll task; on a cancel, apply stop()'s row-step grace, then cut and join."""
+    async def _join_poll(self, task: asyncio.Task[None]) -> bool:
+        """Wait for the poll task, bounded outside a hand-off; on a cancel, apply stop()'s row-step
+        grace, then cut and join. Returns whether an ordinary stop() gave up on the task and cut it."""
         current = asyncio.current_task()
         # Read before the wait, so a cancel this task already carried does not count as a second.
         before = current.cancelling() if current is not None else 0
         try:
-            # wait, not gather: a cancelled wait leaves the task alone, so the arm below decides.
-            await asyncio.wait({task})
+            # A cancelled join leaves the task alone, so the arm below decides.
+            if await self._stop_guard.join(task, POLL_STOP_GRACE_S):
+                return False
         except asyncio.CancelledError:
             try:
                 again = current is not None and current.cancelling() - before > 1
                 if self._row_step_task is task and not again:
                     await self._row_grace(task)
             finally:
-                task.cancel()  # a no-op once the task has finished
-                if self._row_step_task is task:
-                    # Cut: a later cancelled stop() must not grant this task a grace again while it
-                    # only finishes a cursor close.
-                    self._row_step_task = None
-                # wait, not gather, again: a further cancel is not forwarded into the task, and the
-                # timeout bounds a task a driver call holds.
-                await asyncio.wait({task}, timeout=_CUT_JOIN_TIMEOUT_S)
-                if not task.done():
-                    logger.warning(
-                        "DATABASE source poll task still running %.1fs after a cancelled stop() "
-                        "cut it; it stays registered and the next stop() joins it",
-                        _CUT_JOIN_TIMEOUT_S,
-                    )
+                await self._cut(task, "a cancelled stop()")
             raise
+        logger.warning(
+            "DATABASE source poll task did not stop within %.1fs, most likely a driver call "
+            "blocked on an unresponsive server; cancelled it. A row it had handed off whose mark "
+            "does not then commit re-emits on the next start.",
+            POLL_STOP_GRACE_S,
+        )
+        await self._cut(task, "an ordinary stop()")
+        return True
+
+    async def _cut(self, task: asyncio.Task[None], by: str) -> None:
+        """Cancel the poll task and join it for at most :data:`_CUT_JOIN_TIMEOUT_S`."""
+        task.cancel()  # a no-op once the task has finished
+        if self._row_step_task is task:
+            # Cut: a later cancelled stop() must not grant this task a grace again while it only
+            # finishes a cursor close.
+            self._row_step_task = None
+        # wait, not gather: a further cancel is not forwarded into the task, and the timeout bounds
+        # a task a driver call holds.
+        await asyncio.wait({task}, timeout=_CUT_JOIN_TIMEOUT_S)
+        if not task.done():
+            logger.warning(
+                "DATABASE source poll task still running %.1fs after %s cut it; it stays "
+                "registered and the next stop() joins it",
+                _CUT_JOIN_TIMEOUT_S,
+                by,
+            )
 
     async def _row_grace(self, task: asyncio.Task[None]) -> None:
         """Wait up to :data:`_ROW_STEP_GRACE_S` for the row step, while this node leads.
@@ -3950,7 +3894,8 @@ class DatabaseSource(SourceConnector):
         so the step is NOT atomic under shutdown."""
         assert self._handler is not None
         try:
-            await self._handler(raw)
+            with self._stop_guard.store_call():  # an ordinary stop() never cuts it (#4685)
+                await self._handler(raw)
         except Exception as exc:
             # The handler records every message-level outcome itself (parse/route → ERROR) and
             # returns, so an exception here is usually an infrastructure failure (the durable store

@@ -115,11 +115,12 @@ async def test_the_reattach_parses_splices_and_encodes_off_the_loop(
 ) -> None:
     runner, ic = _runner(store)
     text = _hl7(_doc(b"C", 3000), _doc(b"D", 3000))
-    skeleton, _ = await runner._detach_documents(ic, text)
+    skeleton, refs = await runner._detach_documents(ic, text)
+    mid = await store.enqueue_ingress(channel_id=ic.name, raw=skeleton, attachment_refs=refs)
     threads = _watch(monkeypatch, store)
     loop_thread = threading.get_ident()
 
-    hydrated = await runner._hydrate_payload(skeleton)
+    hydrated = await runner._hydrate_payload(skeleton, mid)
 
     assert hydrated == text  # byte-for-byte, as before
     assert {"parse", "field", "set", "encode"} <= set(threads.seen)
@@ -133,4 +134,5 @@ async def test_a_body_with_no_document_is_still_returned_unchanged(store: Messag
     text = "MSH|^~\\&|APP|FAC|RCV|RCVF|20260101120000||ADT^A01|M2|P|2.5\rPID|1||" + "X" * 900 + "\r"
     assert await runner._detach_documents(ic, text) == (text, [])
     marker_outside_obx = text.replace("PID|1||", "PID|1||mfdoc:v1:ref:")
-    assert await runner._hydrate_payload(marker_outside_obx) == marker_outside_obx
+    mid = await store.enqueue_ingress(channel_id=ic.name, raw=marker_outside_obx)
+    assert await runner._hydrate_payload(marker_outside_obx, mid) == marker_outside_obx

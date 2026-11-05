@@ -237,28 +237,32 @@ does not cap the frame — owner ruling 1) receives the exact document the sende
 owner's two end-to-end shapes: (A) a doc detached at ingress round-trips **byte-identically** to delivery,
 and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM delivers it inline.
 
-- **The pure splice-back helper** `parsing/binary.reattach_documents_in_hl7(text, reader)` — the
+- **The pure splice-back helper** `parsing/binary.reattach_documents_in_hl7(text, reader, *, bound)` — the
   delivery-side inverse of `strip_documents_in_hl7`. It scans each `OBX-5.5`, and for every live
   `mfdoc:v1:ref:` handle it parses the content address, `await`s the injected `reader(sha256)` for the
   stored VERBATIM base64, and splices it back into `OBX-5.5` **byte-for-byte** (Approach B — no
   decode/re-encode). `reader` is an injected async callable so the helper stays **pure** and
   unit-testable; `pipeline/` supplies the async store read. **Fail-loud:** a value that looks like a
   handle but whose `reader` returns `None` / raises (attachment missing or GC'd) raises `DocRefError` — it
-  **never** emits the raw `mfdoc:v1:ref:` text. A body with no handle is returned **byte-identical**.
+  **never** emits the raw `mfdoc:v1:ref:` text. A body with no handle is returned unchanged unless
+  refused (the delimiter-class rule below).
 - **The delivery seam** `RegistryRunner._hydrate_payload` runs **before** `connector.send` on both the
-  single-item (`_process_delivery_item`) and batch (`_process_delivery_batch`, per member) paths. A single
-  `DOC_REF_MARKER` substring check short-circuits the common no-handle case to a **byte-identical**
-  passthrough with **no store read** — so below-threshold, no-detach, and Handler-built (never-detached)
+  single-item (`_process_delivery_item`) and batch (`_process_delivery_batch`, per member) paths. A cheap
+  gate (`may_hold_doc_ref`: the `DOC_REF_MARKER` substring, or an `MSH-1`/`MSH-2` that names a character
+  of the marker and so escapes it, BACKLOG #5099) short-circuits the common no-handle case to a
+  **byte-identical** passthrough with **no store read** — so below-threshold, no-detach, and Handler-built (never-detached)
   deliveries are unchanged. When a handle is present it hydrates via `reattach_documents_in_hl7` with an
   async reader over `store.read_attachment` (off the event loop, chunk-by-chunk). **Fail-loud:** a missing
-  / GC'd attachment (`KeyError`), a malformed handle (`DocRefError`), or an unsupported backend
-  (`StreamingAttachmentsUnsupported`) is turned into a retryable `DeliveryError` — exactly like the
+  attachment the message holds whose read then fails (`KeyError`, or `StreamingAttachmentsUnsupported`
+  at read time) is turned into a retryable `DeliveryError` — exactly like the
   pre-send `encoding_characters` / `hl7_raw_separators` failures — so the row takes the normal
   ERROR/retry/dead-letter path and **the connector never receives an un-hydrated handle** (which would
   deliver `mfdoc:v1:ref:…` into the partner's `OBX-5.5` = silent corruption).
-- **Which re-attach failures are permanent (vault BACKLOG #2809, added 2026-11-01).** Two are
-  refused permanently: the payload does not parse as HL7, or its `MSH-1` and `MSH-2` do not name its
-  separators. Either raises `UnreattachableDocumentError`, which `_hydrate_payload` turns into a
+- **Which re-attach failures are permanent (vault BACKLOG #2809, added 2026-11-01).** At least
+  these are refused permanently: the payload does not parse as HL7, or it holds the raw handle
+  marker and its separators cannot be read because it has no `MSH` or its first `MSH`'s `MSH-2` is
+  shorter than four characters (with no raw marker, such a payload is carried as it is). Each of
+  these raises `UnreattachableDocumentError`, which `_hydrate_payload` turns into a
   permanent `NegativeAckError` (code `reattach`), so that row dead-letters alone, under either
   `internal_error` policy. On a batched outbound that member is dead-lettered alone and the rest of the
   batch goes out, provided every other member hydrates. A stored
@@ -269,7 +273,105 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   policy judges it, as it judges a parser fault: `continue` dead-letters, and `stop` stops the
   connection with a `connection_stopped` alert. On a batched outbound that policy applies to the
   whole batch, so under `continue` every member of the batch still present is dead-lettered with it.
-  A missing attachment or a malformed handle stays the retryable `DeliveryError` above.
+  A held attachment whose read fails stays the retryable `DeliveryError` above. One GC'd with its
+  header, or on a backend without the substrate, is linked to no message, so its handle is refused
+  permanently by the binding below.
+- **A handle resolves only to its own message's attachment (BACKLOG #5099, added 2026-11-03).** The
+  delivery seam reads the content addresses the row's message holds (`attachments_for` with
+  `include_inherited`, the `message_attachment` linkage; replay and an unedited resend keep the
+  message id) and passes them to the re-attach as `bound`. A handle in an `OBX-5.5` that is
+  malformed or names any other address raises `UnreattachableDocumentError` before any read. A
+  copy of the handle marker, raw or as the payload's delimiters escape it, where the splice does
+  not reach (`NTE-3`, a second `OBX-5.5` repetition) raises it too: before the splice where the
+  message holds a document, the copy names a content address in either case (as `parse_doc_ref`
+  reads one), or a delimiter is a base64 character (the delimiter-class rule below), and after
+  the splice wherever the message also carries a bound handle. Either way the row dead-letters
+  alone rather than re-pending on a strict-FIFO lane. A handle the payload hides behind any other
+  escape does not open the gate by itself, so on its own it is carried as the sender's text and
+  resolves nothing.
+  Where the gate opens for another reason, the re-attach reads it as it reads any handle, so it
+  still resolves only to an attachment the message holds.
+  The ingress detach refuses a received body whose `OBX-5.5` already holds a handle instead of
+  skipping it as already detached. Where a document would be detached, it also refuses a body
+  holding the marker anywhere else, raw or escaped, a document's value past its start included:
+  delivery would refuse that marker after the splice, so the body would be ACKed and then
+  dead-letter on every outbound. No base64 value holds the marker, since base64 has no `:`. Each
+  refusal is an `InboundDocRefError`: an `ERROR` row, an `AR` on MLLP and a permanent refusal on
+  HTTP, before the ACK.
+  **One delimiter-class rule (BACKLOG #5099, added 2026-11-04).** `Message.set` escapes a
+  delimiter wherever it occurs in a value. So when a message's delimiters, read as
+  `Message._encoding_chars` reads them (`MSH-1` and the first four `MSH-2` characters of the first
+  `MSH`; a fifth, truncation character does not count), include a character of the base64
+  alphabet `A-Za-z0-9+/=`: a subcomponent separator in it is escaped inside a document set back
+  into `OBX-5.5`, a field, component or repetition separator in it splits the document so the
+  detach would store a fragment, and the content address after a copied marker may not read as
+  one. The rule is applied in at least these places, all through `_delimits_with_base64`:
+  1. *Ingress detach refusal.* Where a document would be detached, the detach refuses the body
+     before anything is stored (`Base64DelimiterError`, an `InboundDocRefError`).
+  2. *Ingress marker refusal.* Both listeners refuse a body of any size that holds the handle
+     marker, raw or as its delimiters escape it (`marker_under_base64_delimiters`, through
+     `ingress_guards.doc_ref_marker_refusal`, which the dry-run runs too). A body whose delimiters
+     cannot be read, because its first `MSH`'s `MSH-2` is shorter than four characters, is refused
+     when it holds the raw marker, as delivery refuses it. A body with no `MSH` never reaches this
+     check: `Peek.parse` refuses it first. The cost is a header read, plus up to two substring scans under such delimiters or
+     the raw-marker scan under such a header.
+  3. *Egress splice refusal.* The re-attach refuses a handle it would splice before any read, so
+     a Handler that changed `MSH-1` or `MSH-2` after the detach cannot corrupt the document.
+  4. *Egress copy refusal.* The re-attach refuses any marker it finds with no handle to splice.
+     This is the backstop for a copy a Handler made and for an operator edit-and-resubmit or
+     resend.
+
+  Each ingress refusal is an `ERROR` row before any ingress row, an `AR` on MLLP and a permanent
+  refusal on HTTP. Ordinary delimiters, `|^~\&` and variants such as a `#` or `!`, hold no base64
+  character and are unaffected by this rule. A row ingested before this rule under such delimiters, with a
+  handle to splice or a marker, now dead-letters at delivery: under a subcomponent separator in
+  the alphabet it would have reached the partner with its document escaped, and under a field,
+  component or repetition separator it may have been delivered as it came.
+  **Beside that rule, under any delimiters, ordinary ones included:** a document is detached only
+  if splicing it back under the delimiters it arrived with reproduces it exactly, so the detach
+  also refuses an ED Base64 document whose own value `Message._escape_leaf` would change under
+  them, such as a non-base64 value holding `&` or a control character under `|^~\&`
+  (`NonVerbatimDocumentError`), the same way. A streaming body with an `OBX` and a first `MSH`
+  whose `MSH-2` is shorter than four characters is refused at the detach the same way too
+  (`UnreadableDelimitersError`), since no `OBX-5.5` of it can be read; a body with no `MSH` never
+  reaches the detach, since `Peek.parse` refuses it first. The re-attach refuses a stored value holding a
+  delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that
+  moved `MSH-1` or `MSH-2` after the detach dead-letters the row rather than send an altered document; a
+  stored control character is an engine fault for the internal-error policy, as a CR or LF is.
+  *Out of scope:* an outbound `encoding_characters` override, which the transport applies after
+  hydration, is operator configuration. An uppercased marker `MFDOC:V1:REF:` is not a handle, since
+  `is_doc_ref` is case-sensitive. A marker hidden behind `\Xhh\` escapes is not something the
+  engine writes, so the listeners do not look for one: it is the sender's text, carried as text
+  unless delivery's gate opens for another reason, as the paragraph above says, and where it does
+  open delivery refuses such a handle under these delimiters after the ACK. Reserving the
+  marker at every listener under ordinary delimiters is a policy change left to the owner. The
+  operator resend's admission (`admit_resubmission`) is unchanged, and delivery's copy refusal is
+  its backstop.
+  A pass-through child, an edit-and-resubmit child and an edit-and-resend child each carry a body
+  under a new message id, so the store links each child to the parent's documents a handle in its
+  `OBX-5.5` names, read as delivery reads one (behind its gate), with one reference of its own, in
+  the commit that makes it (`_inherit_attachments`). An address the body carries anywhere else,
+  bare or as a copied handle, is not linked. A document whose header a purge collected first is
+  not linked either, so `refcount` still equals the live linkage rows. Purging either message then
+  releases only its own reference. A handle naming a document the parent does not hold is not
+  linked, and is refused at delivery. A transform with several pass-through Sends makes several
+  children in one transaction, so the store links them all in one pass once they exist
+  (`inheritance_plan`): each named document is increfed once, by the number of children naming
+  it, in content-address order. On Postgres and SQL Server each incref holds the document's header
+  row lock until commit, and the ingress increfs and the retention decrefs now take those locks in
+  the same order, so an inheritance, an ingress and a purge take the documents' header locks in one
+  order. SQLite needs no such order, since a write transaction there holds the database-wide write
+  lock; it shares the one-pass shape so the three backends stay twins, and its group commit can put
+  several handoffs, so several passes, in one transaction, which that lock makes harmless. A
+  child whose body delivery's gate would not open on is skipped before the parent's documents are
+  read, so a pass-through of a body with no handle costs no extra round trip.
+  **An inherited link grants no download.** It is written with `inherited` set, and
+  `attachments_for` leaves it out unless the caller asks for it, which only delivery does. So the
+  download route and the message detail's attachment list read through the child exactly as
+  before the child held the link: a user scoped only to the pass-through inbound's channel reads
+  nothing the parent's channel stored, while a user scoped to the parent's channel still downloads
+  it through the parent. An operator upload and a loopback reply are new bodies, not a parent's,
+  and inherit nothing. A `mfdoc:v1:pruned:` tombstone resolves nothing and is carried as text.
 - **Delivery is a pure READ — never a decref.** A message fans out to multiple outbounds and is
   replayable, so each send **reads** the immutable, content-addressed attachment per-send and leaves the
   refcount untouched; the refcount is released **only** at retention/purge (below). This makes retry
@@ -488,7 +590,8 @@ permission), and **API + web console only** (the PySide6 desktop console is depr
       per-source knobs), so no global default change is needed.
 - [x] Phase-1b: re-attach is a **pure splice-back** (`reattach_documents_in_hl7`, injected async reader,
       VERBATIM) hydrated at the terminal egress on both the single-item and batch delivery paths; a missing
-      attachment / handle is **fail-loud** (retryable `DeliveryError`, never a handle on the wire).
+      attachment / handle is **fail-loud** (never a handle on the wire: a retryable `DeliveryError` for
+      an attachment the message holds, a permanent refusal for any other handle, BACKLOG #5099).
 - [x] Phase-1b: the outbound MLLP **send is uncapped** (the large hydrated / Handler-built MDM streams
       inline); `max_frame_bytes` bounds only the ACK read — no new knob.
 - [x] Phase-3a (built 2026-07-13): retention/purge now **decrefs** a purged message's attachment refs — a

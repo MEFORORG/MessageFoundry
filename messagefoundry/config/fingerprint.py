@@ -34,7 +34,9 @@ from messagefoundry.config.snapshot import (
     ConfigDirMissing,
     ConfigSnapshot,
     is_missing_directory,
+    is_value_file_entry,
     read_config_snapshot,
+    value_file_rel,
 )
 from messagefoundry.credential import constant_time_equal
 
@@ -52,6 +54,7 @@ __all__ = [
     "left_out_of",
     "same_digest",
     "snapshot_fingerprint",
+    "value_file_material",
 ]
 
 # Version the scheme so a future change to *what* is hashed (or *how*) is itself detectable in the
@@ -87,8 +90,11 @@ UNREADABLE_FILES_KEY = "unreadable_files"
 # file a serve start reads sits
 # under ``[environments].base_dir``; where that is this folder, a reload parses the very bytes
 # hashed here (``ConfigSnapshot.environment_file``), so dropping them from the fold would let a
-# released reload apply values its digest does not cover. ``__pycache__`` is never read:
-# the loader compiles the source itself.
+# released reload apply values its digest does not cover. Elsewhere, the default layout, a reload's
+# snapshot holds it as ``@value-file/<name>`` and parses those bytes, but no digest here folds it:
+# it can hold credentials, and these digests are published unkeyed. A dual-control hold binds it
+# with a keyed MAC instead (:func:`value_file_material`; vault BACKLOG #2596). ``__pycache__`` is
+# never read: the loader compiles the source itself.
 
 
 def _entries(snapshot: ConfigSnapshot) -> list[tuple[str, bytes]]:
@@ -96,8 +102,13 @@ def _entries(snapshot: ConfigSnapshot) -> list[tuple[str, bytes]]:
 
     Sorting by relpath makes the fold order-independent (filesystem enumeration order can vary);
     keying on the *relative* path (not absolute) makes the digest location-independent, so two
-    byte-identical bundles at different paths fingerprint identically."""
-    return sorted((rel, hashlib.sha256(data).digest()) for rel, data in snapshot.files.items())
+    byte-identical bundles at different paths fingerprint identically. The value file a reload's
+    snapshot holds from outside the config directory is left out (:func:`value_file_material`)."""
+    return sorted(
+        (rel, hashlib.sha256(data).digest())
+        for rel, data in snapshot.files.items()
+        if not is_value_file_entry(rel)
+    )
 
 
 def _fold(entries: list[tuple[str, bytes]]) -> str:
@@ -122,6 +133,35 @@ def snapshot_fingerprint(snapshot: ConfigSnapshot) -> str:
     on it checks :attr:`~messagefoundry.config.snapshot.ConfigSnapshot.unreadable` first, or reads
     the snapshot strictly."""
     return _fold(_entries(snapshot))
+
+
+#: Leads :func:`value_file_material`, so its bytes are never those of another construction.
+_VALUE_FILE_SCHEME = b"mefor-cfg-value-file:v1\n"
+
+
+def value_file_material(snapshot: ConfigSnapshot) -> bytes | None:
+    """What a dual-control hold binds of the value file ``snapshot`` read from outside the config
+    directory (:func:`~messagefoundry.config.snapshot.with_value_file`), or ``None`` when it read
+    none (vault BACKLOG #2596): its name, whether it was there, and its bytes, so creating,
+    removing or editing it each change the material.
+
+    No digest above folds that file, since it can hold credentials and they are published unkeyed.
+    The engine MACs this material under a key derived from the store key
+    (:func:`~messagefoundry.store.crypto.config_value_file_mac`) and never publishes it bare. A
+    value file the snapshot could not read raises ``ValueError``, since the material would then
+    claim it was not there, and so does one held under any name but its own, whose bytes no reload
+    would serve under that name."""
+    held = snapshot.value_file
+    if held is None:
+        return None
+    if any(is_value_file_entry(rel) for rel in snapshot.unreadable):
+        raise ValueError("the config snapshot could not read the environment value file")
+    rel = value_file_rel(held.name)
+    if any(is_value_file_entry(other) and other != rel for other in snapshot.files):
+        raise ValueError("the config snapshot holds a value file under another name")
+    data = snapshot.files.get(rel)
+    material = _VALUE_FILE_SCHEME + held.name.encode("utf-8", "surrogatepass") + b"\0"
+    return material + (b"\0" if data is None else b"\1" + data)
 
 
 def config_fingerprint(directory: str | Path, *, strict: bool = False) -> str:
@@ -166,8 +206,9 @@ def config_fingerprint_detail(
         "scheme": FINGERPRINT_SCHEME,
         "files": len(entries),
     }
-    if snapshot.unreadable:
-        detail[UNREADABLE_FILES_KEY] = list(snapshot.unreadable)
+    left_out = [rel for rel in snapshot.unreadable if not is_value_file_entry(rel)]
+    if left_out:
+        detail[UNREADABLE_FILES_KEY] = left_out
     head = _git_head(base)
     if head is not None:
         detail["git_head"] = head

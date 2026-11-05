@@ -86,6 +86,7 @@ from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import codec_safe_str, safe_text
+from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
@@ -138,7 +139,11 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_cipher,
     rotation_fingerprint_reseal_likes,
 )
-from messagefoundry.store.document_strip import StripResult, cutoff_for
+from messagefoundry.store.document_strip import (
+    StripResult,
+    cutoff_for,
+    log_unreadable_skips,
+)
 from messagefoundry.store.gcm_bound import (
     bind_store_salt,
     checkpoint_invocations,
@@ -180,13 +185,19 @@ from messagefoundry.store.row_seal import (
     RowSealer,
     RowSealError,
 )
-from messagefoundry.store.schema_verify import IndexShape, SchemaShape
+from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
     sealed_reference_set,
 )
-from messagefoundry.store.server_schema_verify import declared_schema, refuse_short_schema
+from messagefoundry.store.server_schema_verify import (
+    ColumnShape,
+    ServerSchemaShape,
+    declared_schema,
+    mssql_live_type,
+    refuse_short_schema,
+)
 from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
@@ -319,8 +330,11 @@ from messagefoundry.store.store import (
     full_authentication_clear,
     global_epoch_or_refuse,
     global_epoch_raise,
+    global_epoch_unmoved,
     held_approval_tombstone,
     if_applied,
+    inheritance_plan,
+    inheriting_children,
     judge_totp,
     load_audit_chain,
     lockout_clear,
@@ -736,6 +750,9 @@ _MSSQL_EXCEPT_TOKEN_HASH_SQL: Final = " AND token_hash != ?"
 _MSSQL_REVOKE_ALL_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=?, seal='' OUTPUT inserted.token_hash WHERE revoked_at IS NULL"
 )
+#: store.py's ``_END_DECLINED_KEPT_SESSION_SQL``: the per-account sweep narrowed to one token,
+#: counted from ``OUTPUT`` as the sweeps are (follow-up to BACKLOG #4975).
+_MSSQL_END_DECLINED_KEPT_SESSION_SQL: Final = _MSSQL_REVOKE_USER_SESSIONS_SQL + " AND token_hash=?"
 #: Whether the account holds at least one passkey.
 _MSSQL_WEBAUTHN_ANY_FOR_USER: Final = (
     "SELECT TOP (1) 1 AS present FROM webauthn_credentials WHERE user_id=?"
@@ -928,6 +945,24 @@ _SQL_SELECT_MESSAGE_STATUS: Final[str] = (
 )
 _SQL_UPDATE_MESSAGE_STATUS: Final[str] = "UPDATE messages SET status=? WHERE id=?"
 _SQL_SELECT_MESSAGE_EXISTS: Final[str] = "SELECT 1 FROM messages WHERE id=?"
+# A child message inherits the documents its body names (BACKLOG #5099, _inherit_attachments).
+# Each incref takes the attachment header's row lock until commit, so two transactions that incref
+# the same documents must take them in one order, or each can wait on the other. inheritance_plan
+# sorts what this reads, across every child of the transaction, into the order the ingress increfs
+# and the retention decrefs take.
+_SQL_SELECT_MESSAGE_ATTACHMENTS: Final[str] = (
+    "SELECT attachment_id FROM message_attachment WHERE message_id=? ORDER BY attachment_id"
+)
+# Written inherited: the link serves delivery and retention, and grants no download.
+_SQL_INSERT_MESSAGE_ATTACHMENT: Final[str] = (
+    "INSERT INTO message_attachment (message_id, attachment_id, inherited) VALUES (?,?,1)"
+)
+# Reports through OUTPUT, which a session-wide SET NOCOUNT ON cannot hide, so the caller links
+# only an attachment whose header the incref found. One incref per document, by the number of
+# children of the transaction that name it.
+_SQL_INCREF_ATTACHMENT: Final[str] = (
+    "UPDATE attachment SET refcount = refcount + ? OUTPUT inserted.id WHERE id=?"
+)
 # The channel rides along because the metadata cell is bound to it (BACKLOG #2593).
 _SQL_SELECT_METADATA: Final[str] = "SELECT channel_id, metadata FROM messages WHERE id=?"
 _SQL_UPDATE_METADATA: Final[str] = (
@@ -2002,8 +2037,11 @@ _SCHEMA: list[str] = [
     """IF OBJECT_ID('attachment_chunk','U') IS NULL CREATE TABLE attachment_chunk (
         attachment_id NVARCHAR(64) NOT NULL, seq INT NOT NULL, ciphertext NVARCHAR(MAX) NOT NULL,
         CONSTRAINT pk_attachment_chunk PRIMARY KEY (attachment_id, seq))""",
+    # `inherited` marks a link a child message took from its parent (BACKLOG #5099): it serves
+    # delivery and retention, and grants no download (attachments_for).
     """IF OBJECT_ID('message_attachment','U') IS NULL CREATE TABLE message_attachment (
         message_id NVARCHAR(64) NOT NULL, attachment_id NVARCHAR(64) NOT NULL,
+        inherited BIT NOT NULL CONSTRAINT DF_message_attachment_inherited DEFAULT 0,
         CONSTRAINT pk_message_attachment PRIMARY KEY (message_id, attachment_id))""",
     """IF INDEXPROPERTY(OBJECT_ID('queue'),'ix_queue_ready','IndexID') IS NULL
         CREATE INDEX ix_queue_ready ON queue(stage, status, next_attempt_at)""",
@@ -2758,29 +2796,24 @@ _SCHEMA: list[str] = [
 ]
 
 
-# The revision of the live-schema check _ensure_schema runs after the batch and before the marker
-# (BACKLOG #1720). That check is Python, so the content hash cannot see it, and a store marked before
-# it existed would take the fast path past it forever. Bump this when the check changes what it
-# refuses. It is NOT for migrations: those still live in _SCHEMA, which moves the hash on its own.
-# 1 (BACKLOG #1720): the check is added.
-_SCHEMA_CHECK_REV = 1
-
-
 def _schema_hash() -> str:
     """Content hash of the shipped DDL batch, plus the live-schema check's revision. The
     ``schema_meta`` marker stores it; a match at open means this exact batch already ran and passed
     that check, so the batch (and its exclusive applock) is skipped. Any edit to ``_SCHEMA`` — new
     table, new index, a B10-style guarded migration — changes the hash and forces one full
     (idempotent) run, so a migration has no version constant to forget to bump. On-open migrations
-    MUST therefore live in ``_SCHEMA`` itself, never in separate open-path code. Only the check,
-    which cannot live there, has ``_SCHEMA_CHECK_REV``."""
-    payload = "\n".join(_SCHEMA) + f"\nschema_check_rev={_SCHEMA_CHECK_REV}"
+    MUST therefore live in ``_SCHEMA`` itself, never in separate open-path code. Only the
+    live-schema check, which cannot live there, has a revision: ``SCHEMA_CHECK_REV``, defined once
+    in :mod:`~messagefoundry.store.server_schema_verify` for both server backends (BACKLOG #5062).
+    It is NOT for migrations: those still live in ``_SCHEMA``, which moves the hash on its own."""
+    payload = "\n".join(_SCHEMA) + f"\nschema_check_rev={server_schema_verify.SCHEMA_CHECK_REV}"
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _declared_schema() -> SchemaShape:
-    """What the live-schema check expects: every object the batch declares (BACKLOG #1720)."""
-    return declared_schema(tuple(_SCHEMA))
+def _declared_schema() -> ServerSchemaShape:
+    """What the live-schema check expects: every object the batch declares (BACKLOG #1720), with
+    each column's type, nullability, numbering and declared collation (BACKLOG #5085)."""
+    return declared_schema(tuple(_SCHEMA), "sqlserver")
 
 
 def _object_kind_label(type_desc: object) -> str | None:
@@ -2802,10 +2835,13 @@ def _live_columns_sql(count: int) -> str:
 
     ``OBJECT_ID`` resolves each name the way the batch's unqualified DDL did, in the login's default
     schema and then ``dbo``. The object's type is read too, so a name held by something other than a
-    user table is named as such. The placeholder list is built from a count, never from a name."""
+    user table is named as such. Each column's type, size, nullability, identity and collation are
+    read for :func:`~messagefoundry.store.server_schema_verify.mssql_live_type` (BACKLOG #5085). The
+    placeholder list is built from a count, never from a name; the caller runs none for zero."""
     values = ", ".join(["(?)"] * count)
     return (
-        "SELECT v.name, o.type_desc, c.name"
+        "SELECT v.name, o.type_desc, c.name, TYPE_NAME(c.user_type_id), c.max_length, c.precision,"
+        " c.scale, c.is_nullable, c.is_identity, c.collation_name"
         f" FROM (VALUES {values}) AS v(name)"
         " LEFT JOIN sys.objects AS o ON o.object_id = OBJECT_ID(v.name)"
         " LEFT JOIN sys.columns AS c ON c.object_id = o.object_id AND o.type = 'U'"
@@ -4752,6 +4788,9 @@ class SqlServerStore:
                         raise StoreNotFoundError.server_schema(
                             self.backend, self._settings.database
                         )
+                # Read before the applock and the batch, so DDL the live-schema check cannot read
+                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process.
+                _declared_schema()
                 # pyodbc copies the connection timeout into a cursor only when it creates the cursor,
                 # so each step below runs on its own cursor, opened after the connection timeout is set
                 # for that step, and closed before the next opens (no MARS: one active statement per
@@ -4877,19 +4916,36 @@ class SqlServerStore:
         what is not. Reads only."""
         expected = _declared_schema()
         tables = sorted(expected.columns)
-        await cur.execute(_live_columns_sql(len(tables)), tables)
-        # Lower-cased, as the DDL reader spells a name for this backend's default collations.
-        column_rows = [
-            (table, _object_kind_label(kind), None if column is None else str(column).lower())
-            for table, kind, column in await cur.fetchall()
-        ]
+        column_rows: list[tuple[str, str | None, str | None, ColumnShape | None]] = []
+        # `VALUES ()` is a syntax error, so a batch that declared nothing reads nothing.
+        if tables:
+            await cur.execute(_live_columns_sql(len(tables)), tables)
+            for row in await cur.fetchall():
+                table, kind, column, type_name, length, precision, scale = row[:7]
+                nullable, identity, collation = row[7:]
+                shape = (
+                    None
+                    if type_name is None
+                    else ColumnShape(
+                        mssql_live_type(str(type_name), int(length), int(precision), int(scale)),
+                        bool(nullable),
+                        bool(identity),
+                        None if collation is None else str(collation),
+                    )
+                )
+                # Lower-cased, as the DDL reader spells a name for this backend's collations.
+                name = None if column is None else str(column).lower()
+                column_rows.append((table, _object_kind_label(kind), name, shape))
         names = sorted(expected.named_indexes)
         pairs = [v for name in names for v in (expected.named_indexes[name].table, name)]
-        await cur.execute(_live_indexes_sql(len(names)), pairs)
+        index_rows: list[Any] = []
+        if names:
+            await cur.execute(_live_indexes_sql(len(names)), pairs)
+            index_rows = list(await cur.fetchall())
         taken: dict[str, str] = {}
         unusable: dict[str, str] = {}
         found: dict[str, tuple[bool, bool, dict[int, str]]] = {}
-        for row in await cur.fetchall():
+        for row in index_rows:
             name, index_id, unique, has_filter, disabled, hypothetical, stats_id = row[:7]
             ordinal, column, desc = row[7:]
             if index_id is None:
@@ -6341,12 +6397,13 @@ class SqlServerStore:
         parent_meta: dict[str, Any],
         correlation_depth_cap: int,
         now: float,
+        inherits: list[tuple[str, str]],
     ) -> bool:
         """Produce one PT child INGRESS row + message inside the caller's transaction (ADR 0013, gen.).
 
-        SQL Server twin of :meth:`MessageStore._insert_passthrough_child`. Returns ``True`` if a child
-        was produced, ``False`` if the depth cap was breached (no child; the caller records the parent
-        ``ERROR`` via a dead marker). The child is a new, independent message (``source_type=
+        SQL Server twin of :meth:`MessageStore._insert_passthrough_child`, which says what
+        ``inherits`` collects. Returns ``True`` if a child was produced, ``False`` if the depth cap
+        was breached (no child; the caller records the parent ``ERROR`` via a dead marker). The child is a new, independent message (``source_type=
         'passthrough'``, its own content-addressed id, status ``RECEIVED`` per count-and-log), correlated
         to the parent. Idempotent re-run: the content-addressed id is pre-checked so a partial-then-
         recovered run does not double-inject. Depth is computed purely from the parent's immutable
@@ -6392,6 +6449,9 @@ class SqlServerStore:
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
+            # Linked by the caller once every child of this transaction is made
+            # (_inherit_attachments, BACKLOG #5099).
+            inherits.append((new_mid, body))
             pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own row tag
             await cur.execute(
                 _SQL_INSERT_QUEUE_INGRESS,
@@ -6442,6 +6502,7 @@ class SqlServerStore:
         parent_meta: dict[str, Any],
         correlation_depth_cap: int,
         now: float,
+        inherits: list[tuple[str, str]],
     ) -> bool:
         """Synchronous twin of :meth:`_insert_passthrough_child_mssql` (ADR 0071 B5). Same depth math,
         same content-addressed child id, same constant + builder sequence over a synchronous cursor."""
@@ -6483,6 +6544,7 @@ class SqlServerStore:
                     origin=MessageOrigin.REINGRESS,
                 ),
             )
+            inherits.append((new_mid, body))  # linked by the caller, as the async twin says
             pt_ingress_id = uuid4().hex  # hoisted so the payload binds to its own row tag
             cur.execute(
                 _SQL_INSERT_QUEUE_INGRESS,
@@ -6619,7 +6681,9 @@ class SqlServerStore:
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
         # (== its live join rows), so a later release decrefs by the same count.
-        refs = list(dict.fromkeys(attachment_refs or ()))
+        # Sorted, so the increfs below take the attachment header locks in content-address order,
+        # the order a child's inheritance takes them in (BACKLOG #5099, _inherit_attachments).
+        refs = sorted(set(attachment_refs or ()))
         # BACKLOG #2624: an operator's inject passes an ``audit``; a live receipt passes none and
         # takes no audit lock.
         async with AuditedWrite(now) as written, self._acquire() as conn:
@@ -7071,6 +7135,7 @@ class SqlServerStore:
                         )
                 if pt_deliveries:
                     parent_meta = _parent_meta_from_row(pmeta_dec)
+                    inherits: list[tuple[str, str]] = []
                     for pt_name, body in pt_deliveries:
                         produced = await self._insert_passthrough_child_mssql(
                             cur,
@@ -7081,10 +7146,13 @@ class SqlServerStore:
                             parent_meta,
                             correlation_depth_cap,
                             now,
+                            inherits,
                         )
                         await self._insert_passthrough_marker_mssql(
                             cur, message_id, pt_name, produced, now
                         )
+                    # Every child's documents in one pass, in content-address order (BACKLOG #5099).
+                    await self._inherit_attachments(cur, message_id, inherits)
                 # SetMeta (ADR 0081, #150): merge the user bag under messages.metadata."user" in THIS
                 # same transaction — crash before commit leaves no metadata; a re-run re-derives it.
                 if meta_ops:
@@ -7278,6 +7346,7 @@ class SqlServerStore:
                     )
             if pt_deliveries:
                 parent_meta = _parent_meta_from_row(pmeta_dec)
+                inherits: list[tuple[str, str]] = []
                 for pt_name, body in pt_deliveries:
                     produced = self._insert_passthrough_child_mssql_sync(
                         cur,
@@ -7288,10 +7357,13 @@ class SqlServerStore:
                         parent_meta,
                         correlation_depth_cap,
                         now,
+                        inherits,
                     )
                     self._insert_passthrough_marker_mssql_sync(
                         cur, message_id, pt_name, produced, now
                     )
+                # Every child's documents in one pass, in content-address order (BACKLOG #5099).
+                self._inherit_attachments_sync(cur, message_id, inherits)
             # SetMeta (ADR 0081, #150): merge the user bag under messages.metadata."user" in THIS txn.
             if meta_ops:
                 merged = merge_user_metadata(pmeta_dec, meta_ops)
@@ -9551,6 +9623,7 @@ class SqlServerStore:
         reclaimed = 0
         updates: list[tuple[str, float, str]] = []
         failures: list[CellTagError] = []
+        unreadable: list[object] = []
         for row in rows:
             cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
             if row["received_at"] >= cutoff:
@@ -9584,6 +9657,7 @@ class SqlServerStore:
                 pruned_at=now,
                 min_bytes=min_bytes,
                 content_type=content_types.get(row["channel_id"]),
+                on_unreadable=partial(unreadable.append, row["id"]),
             )
             if n_docs == 0:
                 continue
@@ -9602,6 +9676,8 @@ class SqlServerStore:
             msgs += 1
             docs += n_docs
             reclaimed += n_bytes
+        # Before the write, so a failed write does not lose the record of the skips.
+        log_unreadable_skips(unreadable)
         if updates:
             async with self._acquire() as conn, self._cursor(conn) as cur:
                 try:
@@ -11467,20 +11543,25 @@ class SqlServerStore:
                 r["ciphertext"], aad=cell_aad("attachment_chunk", "ciphertext", ref, r["seq"])
             )
 
-    async def attachments_for(self, message_id: str) -> list[dict[str, Any]]:
+    async def attachments_for(
+        self, message_id: str, *, include_inherited: bool = False
+    ) -> list[dict[str, Any]]:
         """The distinct attachments ``message_id`` holds — the operator read surface (#149, ADR 0105
         Phase 3b, SQL Server parity). JOINs ``message_attachment`` to its ``attachment`` header and
         returns one row per attachment carrying ``attachment_id`` (the sha256 content address),
         ``content_type``, and ``total_bytes``. **Metadata only** — the chunk ciphertext is never
-        touched/decrypted. Returns ``[]`` for a message with no detached document."""
+        touched/decrypted. Returns ``[]`` for a message with no detached document. An inherited link
+        is left out unless ``include_inherited`` is set, so it grants no download (BACKLOG #5099; the
+        SQLite twin says why)."""
         if not self.supports_streaming_attachments:
             return []
+        own_only = "" if include_inherited else " AND ma.inherited = 0"
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
                     "SELECT a.id AS attachment_id, a.content_type, a.total_bytes "
                     "FROM message_attachment ma JOIN attachment a ON a.id = ma.attachment_id "
-                    "WHERE ma.message_id=? ORDER BY a.id",
+                    f"WHERE ma.message_id=?{own_only} ORDER BY a.id",
                     (message_id,),
                 )
                 cols = [c[0] for c in cur.description]
@@ -11548,16 +11629,19 @@ class SqlServerStore:
         no double-decref, no refcount underflow, no premature GC of an attachment a SIBLING message still
         holds. ``where`` is a code-controlled fragment (never user input); ``params`` binds it identically
         in both statements."""
+        # The decrefs take the header locks in content-address order, as the ingress and
+        # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle. Sorted
+        # in Python as those are, so the database collation does not decide the order.
         await cur.execute(
             f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment"
-            f" WHERE {where} GROUP BY attachment_id",
+            f" WHERE {where} GROUP BY attachment_id ORDER BY attachment_id",
             params,
         )
         cols = [c[0] for c in cur.description]
         releases = [dict(zip(cols, r)) for r in await cur.fetchall()]  # noqa: B905
         if not releases:
             return
-        for row in releases:
+        for row in sorted(releases, key=lambda r: str(r["attachment_id"])):
             await self._decref_attachment(cur, row["attachment_id"], int(row["n"]))
         # Delete the just-released join rows so a re-run of the purge decrefs nothing (idempotent GC).
         await cur.execute(f"DELETE FROM message_attachment WHERE {where}", params)
@@ -11576,6 +11660,42 @@ class SqlServerStore:
             "(q.status = ? AND (q.payload <> '' OR q.body_ref IS NOT NULL)"
             f" AND {_NOT_PT_MARKER_Q})))"
         )
+
+    async def _inherit_attachments(
+        self, cur: Any, parent_id: str, children: Sequence[tuple[str, str]]
+    ) -> None:
+        """Link each ``(child_id, body)`` in ``children`` to each attachment ``parent_id`` holds
+        that its body names, and incref it, in the CALLER's transaction (BACKLOG #5099). SQL Server
+        twin of :meth:`MessageStore._inherit_attachments`, which says why."""
+        children = inheriting_children(children)
+        if not children:
+            return
+        await cur.execute(_SQL_SELECT_MESSAGE_ATTACHMENTS, (parent_id,))
+        held = [str(r[0]) for r in await cur.fetchall()]
+        for ref, child_ids in inheritance_plan(held, children):
+            # The incref first, and the links only where it found the header (the SQLite twin
+            # says why): under READ COMMITTED a purge can collect it after the read above.
+            await cur.execute(_SQL_INCREF_ATTACHMENT, (len(child_ids), ref))
+            if await cur.fetchone() is None:
+                continue
+            for child_id in child_ids:
+                await cur.execute(_SQL_INSERT_MESSAGE_ATTACHMENT, (child_id, ref))
+
+    def _inherit_attachments_sync(
+        self, cur: Any, parent_id: str, children: Sequence[tuple[str, str]]
+    ) -> None:
+        """Synchronous twin of :meth:`_inherit_attachments` (ADR 0071 B5)."""
+        children = inheriting_children(children)
+        if not children:
+            return
+        cur.execute(_SQL_SELECT_MESSAGE_ATTACHMENTS, (parent_id,))
+        held = [str(r[0]) for r in cur.fetchall()]
+        for ref, child_ids in inheritance_plan(held, children):
+            cur.execute(_SQL_INCREF_ATTACHMENT, (len(child_ids), ref))
+            if cur.fetchone() is None:
+                continue
+            for child_id in child_ids:
+                cur.execute(_SQL_INSERT_MESSAGE_ATTACHMENT, (child_id, ref))
 
     async def release_message_attachments(self, message_id: str) -> None:
         """Release (decref + delete the linkage rows for) every attachment a SINGLE message holds, in ONE
@@ -12036,6 +12156,7 @@ class SqlServerStore:
                             ),
                         )
                         self.body_copies += 1  # A1: the child messages.raw copy
+                        await self._inherit_attachments(cur, message_id, [(child_mid, body)])
                         await self._event(
                             cur, child_mid, "received", None, f"edit-resend from {message_id}", now
                         )
@@ -12292,6 +12413,7 @@ class SqlServerStore:
                                 actor,
                             ),
                         )
+                        await self._inherit_attachments(cur, origin_message_id, [(new_mid, raw)])
                         # Hoist the row id so the payload binds to its own row tag.
                         resubmit_row_id = uuid4().hex
                         await cur.execute(
@@ -14128,9 +14250,14 @@ class SqlServerStore:
     async def _global_session_epoch(self, cur: Any) -> int:
         """The store's global session epoch (BACKLOG #5091), read on ``cur`` inside an open
         transaction."""
+        return global_epoch_or_refuse(await self._global_session_epoch_value(cur))
+
+    async def _global_session_epoch_value(self, cur: Any) -> int | None:
+        """The global session epoch, ``None`` where the row is missing, read as
+        :meth:`_global_session_epoch` reads it but not refused."""
         await cur.execute(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
         rows = await cur.fetchall()
-        return global_epoch_or_refuse(rows[0][0] if rows else None)
+        return None if not rows or rows[0][0] is None else int(rows[0][0])
 
     async def _bump_session_epoch(self, cur: Any, user_id: str) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, on ``cur`` inside an open
@@ -15644,10 +15771,12 @@ class SqlServerStore:
         Raises the account's session epoch and re-seals the kept session in the same transaction
         (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
         runs first, so it takes the account row's lock before any session row, the order
-        ``create_session`` takes them in. The borrow is :meth:`_acquire_after_commit`'s, for the
-        reason it gives (BACKLOG #3023)."""
+        ``create_session`` takes them in. The kept session is checked against the global epoch
+        too, read while the account row is held, as ``create_session`` reads it, without refusing
+        a missing row (store.py's ``global_epoch_unmoved``), and ended where it is declined
+        (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
+        :meth:`_acquire_after_commit`'s, for the reason it gives (BACKLOG #3023)."""
         now = time.time() if now is None else now
-        kept = False
         async with self._acquire_after_commit() as conn, self._cursor(conn) as cur:
             try:
                 raised = await self._bump_session_epoch(cur, user_id)
@@ -15659,14 +15788,35 @@ class SqlServerStore:
                         (now, user_id, except_token_hash),
                     )
                 revoked = len(await cur.fetchall())
-                if except_token_hash is not None:
-                    restamp = KeptSessionRestamp(user_id, raised)
-                    kept = restamp.kept(await self._write_session(cur, except_token_hash, restamp))
+                if except_token_hash is None:
+                    result = RevokeResult(revoked)
+                else:
+                    unmoved = global_epoch_unmoved(await self._global_session_epoch_value(cur))
+                    result = await self._keep_or_end_session(
+                        cur,
+                        revoked,
+                        except_token_hash,
+                        KeptSessionRestamp(user_id, raised, unmoved),
+                        now,
+                    )
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return RevokeResult(revoked, kept)
+        return result
+
+    async def _keep_or_end_session(
+        self, cur: Any, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float
+    ) -> RevokeResult:
+        """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, on ``cur``
+        inside an open transaction (follow-up to BACKLOG #4975); store.py's
+        ``MessageStore._keep_or_end_session`` states the contract. The end is counted from its
+        ``OUTPUT`` rowset, as the sweep is (BACKLOG #2283)."""
+        if restamp.kept(await self._write_session(cur, token_hash, restamp)):
+            return RevokeResult(revoked, kept=True)
+        await cur.execute(_MSSQL_END_DECLINED_KEPT_SESSION_SQL, (now, restamp.user_id, token_hash))
+        ended = len(await cur.fetchall()) == 1
+        return RevokeResult(revoked + ended, kept=False, ended_kept=ended)
 
     async def count_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None
@@ -15692,8 +15842,9 @@ class SqlServerStore:
         it finds, then raises the store's global session epoch (BACKLOG #5091), which ends every
         session minted before it whatever account it belongs to, and re-seals the kept session
         under both new epochs, when it carried both epochs those raises replaced
-        (:class:`KeptSessionRestamp`, BACKLOG #4975); docs/SECURITY.md, *Limits of the session
-        sweep*, says what that leaves.
+        (:class:`KeptSessionRestamp`, BACKLOG #4975), and otherwise ends and counts it
+        (:meth:`_keep_or_end_session`); docs/SECURITY.md, *Limits of the session sweep*, says what
+        that leaves.
 
         LOCK ORDER. The global row is the LAST lock this takes, so it never waits on another lock
         while holding that row. Taken first, as on Postgres, it would close a cycle wherever the
@@ -15707,10 +15858,24 @@ class SqlServerStore:
         account row first, and this transaction already holds it. Every reader of the global row
         takes no hint, so under READ_COMMITTED_SNAPSHOT it never waits, and without it holds its
         shared lock only for the read. A session minted between the sweep and the commit read the
-        old value, so it ends when this commits. Read from the code and not run against a server
-        that has READ_COMMITTED_SNAPSHOT off."""
+        old value, so it ends when this commits.
+
+        The per-account :meth:`revoke_user_sessions` reads the global row too (follow-up to
+        BACKLOG #4975), with no hint, while it holds its account row (``UPDLOCK`` from the epoch
+        raise's read, then the raise's own write) and the X locks of the session rows its sweep
+        ended. That closes no cycle with this method. Each takes the account row before any
+        session row or the global row, and this method takes the row of every account its list
+        read returned before it raises the global epoch. On such an account, whichever takes the
+        account row first goes on, and the other waits on that row while holding nothing the
+        first needs: this method before it holds the global row, the per-account revoke before it
+        holds any session row. A per-account revoke of an account the list read did not return
+        takes no row this method waits on once it holds the global row, since the only row left
+        then is the kept session's. On ``DELETE /sessions`` that is the caller's own, signed in
+        before this transaction began, so its account is one that read returned; a direct store
+        call that names a session of an account created after that read is outside this
+        reasoning. Read from the code and not run against a server that has
+        READ_COMMITTED_SNAPSHOT off."""
         now = time.time() if now is None else now
-        kept = False
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute("SELECT id FROM users ORDER BY id")
@@ -15725,7 +15890,7 @@ class SqlServerStore:
                         _MSSQL_REVOKE_ALL_SESSIONS_SQL + _MSSQL_EXCEPT_TOKEN_HASH_SQL,
                         (now, except_token_hash),
                     )
-                revoked = len(await cur.fetchall())
+                result = RevokeResult(len(await cur.fetchall()))
                 await cur.execute(
                     "UPDATE global_session_epoch SET epoch = epoch + 1"
                     " OUTPUT inserted.epoch WHERE id = 1"
@@ -15741,15 +15906,18 @@ class SqlServerStore:
                     owners = await cur.fetchall()
                     if owners:
                         owner = str(owners[0][0])
-                        restamp = KeptSessionRestamp(owner, raised.get(owner), global_raised)
-                        kept = restamp.kept(
-                            await self._write_session(cur, except_token_hash, restamp)
+                        result = await self._keep_or_end_session(
+                            cur,
+                            result.count,
+                            except_token_hash,
+                            KeptSessionRestamp(owner, raised.get(owner), global_raised),
+                            now,
                         )
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()
                 raise
-        return RevokeResult(revoked, kept)
+        return result
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
         """Always ``None``: ``restore`` places only a SQLite store, and a SQL Server database's

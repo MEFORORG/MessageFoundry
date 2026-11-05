@@ -332,7 +332,8 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > variable cannot say which hop's PKI was reviewed. Routing egress through a revocation-checking
 > proxy does **not** change the decision: the authority has no input for one. Anything else is a
 > *posture change* rather than a fix: `[security].enforcement = warn` downgrades it to a WARN.
-> Nothing silences it instance-wide any more — the synthetic declaration that did was retired in [ADR 0186](adr/0186-retire-the-synthetic-data-declaration-every-instance-carries-patient-data.md).
+> What `MEFOR_TLS_REVOCATION_ATTESTED` does to an outbound hop under `warn` is item 1 of *The ways
+> across* in [DEPLOYMENT.md §Revocation-guard behavior](DEPLOYMENT.md#revocation-guard-behavior).
 >
 > **Some of the engine's other verifying TLS hops are not gated at all** —
 > the `Database(...)` destination / `DatabasePoll(...)` source, the SQL Server store
@@ -1241,9 +1242,11 @@ ceilings bound it, and they bound different things:
   such bodies in flight at once is uncapped until an operator sets this. A detach that would cross a
   positive budget is refused with backpressure, `ERROR`-ed rather than accepted-and-dropped.
 
-Permitted **types** on this path are whatever the inbound declared. Outside the handful of families
-with a leading magic signature, a detached document's type is accepted as sent
-(`messagefoundry/parsing/sniff.py`), so this stage is not a content gate and must not be read as one.
+Permitted **types** on this path are whatever the inbound declared. A detached document's OBX-5.2
+label is stored as `application/octet-stream` when the document contradicts a family with a leading
+magic signature (`messagefoundry/parsing/sniff.py`), or when some store backend could not hold the
+label: wider than 256 UTF-16 code units, or holding a NUL. No other test is made of the label, so
+this stage is not a content gate and must not be read as one.
 
 The **directory
 source's** handling of an untrusted drop directory is fixed policy (the HTTP uploaded-logs surface has
@@ -1946,8 +1949,8 @@ outbound(
 #### Generic ODBC (PostgreSQL / MySQL)
 
 `dialect="generic"` (#66) targets **a database whose ODBC driver reads `SERVER` as its target**
-(see [*Accepted `odbc_params` keywords*](#accepted-odbc_params-keywords), which says what the
-engine reports for a driver it cannot place) without a new Python dependency: the
+(see [*The generic driver allowlist*](#the-generic-driver-allowlist), which names the drivers
+the engine accepts and refuses every other) without a new Python dependency: the
 connector still rides the already-present `aioodbc` driver — you install the *target's* **ODBC driver at
 the OS level** (e.g. psqlODBC, MySQL Connector/ODBC) and name it in
 `odbc_driver`. The parameterized-`:name` binding, error classification and pooling are identical to
@@ -1956,12 +1959,68 @@ differently: see [*The port an `allowed_db` entry binds*](#the-port-an-allowed_d
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver` |
+| `odbc_driver` | — (required for `generic`) | the **exact OS-registered ODBC driver name**, e.g. `PostgreSQL Unicode`, `MySQL ODBC 8.0 Unicode Driver`. It must be on [the generic driver allowlist](#the-generic-driver-allowlist); any other name is **refused when the connection is built** |
 | `odbc_params` | — | a mapping of **driver-specific ODBC keywords** → values, e.g. `{"PORT": 5432, "SSLmode": "verify-full"}`. Values are **literals** (not `env()`-resolved — put per-env/secret values in the top-level fields) and are sent **without braces** (see [*Values*](#values-on-the-generic-dialect)). Keys must come from the [accepted keyword list](#accepted-odbc_params-keywords) below; any other keyword is **refused when the connection is built**, and so is a value holding a delimiter (see [*Values*](#values-on-the-generic-dialect)). An `env()` reference here is **refused at load** — as a code-first `env(...)` value, as a `connections.toml` inline table (`PWD = { env = "acme_pw" }`), and as one naming the whole table (`odbc_params = { env = "..." }`). |
 | `odbc_user_key` | `UID` | ODBC keyword the top-level `username` is emitted under (some drivers want `USER`). One of `UID`, `USER`, `Username` or `User ID`, in any case; anything else is **refused** |
 | `odbc_password_key` | `PWD` | ODBC keyword the top-level `password` is emitted under (some drivers want `PASSWORD`). `PWD` or `PASSWORD`, in any case; anything else is **refused** |
 
 The DSN is built as `DRIVER={<odbc_driver>};SERVER=<server>;[DATABASE=<database>;][<user>=<username>;<pwd>=<password>;]<odbc_params…>`, where only the driver name is braced, and the password for the drivers [*Values*](#values-on-the-generic-dialect) lists. `server` is emitted as the near-universal `SERVER` keyword.
+
+##### The generic driver allowlist
+
+The generic dialect accepts an `odbc_driver` only when it is one of these whole registered
+names, in any case but spelled with single spaces (BACKLOG #5041):
+
+| Family | Registered names |
+|---|---|
+| psqlODBC | `PostgreSQL Unicode` or `PostgreSQL ANSI`, either with `(x64)`, or the bare `PostgreSQL`, the section name RHEL registers it under |
+| MySQL Connector/ODBC | `MySQL ODBC <version> Unicode Driver` or `MySQL ODBC <version> ANSI Driver`, where the version is digits and dots |
+| Microsoft ODBC Driver for SQL Server | `ODBC Driver <n> for SQL Server`, where `<n>` is digits alone |
+
+Any other name is **refused**, inbound `DatabasePoll` and outbound `Database` alike, on every
+posture, and no declaration lifts that: not `tls_hop_attested`, not `cleartext_accepted`, and not
+an on-box `server`. Where both `dialect` and `odbc_driver` are written as literals, it is refused
+where the connection is declared, code-first or in `connections.toml`, so the config does not
+load and `messagefoundry check`'s required `validate` fails, with or without a
+`messagefoundry.toml`. Every other case is refused when the connection is built: that fails a
+dry run, a reload and the required `build-check` where it runs (it skips with no
+`messagefoundry.toml` and no `MEFOR_AI_ENVIRONMENT`), and in the live build at `serve` start it
+fails that connection. The `[egress].allowed_db` check refuses the same name, whatever its entry for
+the host says. An `env()` `dialect` or `odbc_driver` is resolved when the connection is built,
+and refused unless the driver resolves to a name above. `messagefoundry check` reads the graph
+without the values, so its advisory `generic-db-driver` line lists such a hop as possibly
+refused, naming the reference's key and never its value.
+
+Refused, at least: a library path, which a driver manager may load as given; an odbcinst alias
+such as RHEL's bare `MySQL`; a file-based driver such as SQLite's or Microsoft Access's, which
+reads no `SERVER`; another vendor's driver for the same database, MariaDB Connector/ODBC
+included; another database's driver, such as Oracle's; a registered name with a doubled space;
+the legacy `SQL Server` name, on Linux commonly a FreeTDS alias; and Microsoft's
+`ODBC Driver 13.1 for SQL Server` and `SQL Server Native Client <n>`. The SQL Server preset,
+`dialect="sqlserver"`, still takes those last two.
+
+Why a list. The engine sends the target as `SERVER` and nothing else, and at least
+`[egress].allowed_db` and the cleartext-hop guard's on-box test read the host in `server`. A
+driver that takes its target from another keyword dials a host neither judged, so a `server` of
+`127.0.0.1` would pass the on-box test while it dialled elsewhere. Each family on the list is
+documented to read `SERVER` as its target host, read from its own source on 2026-11-03:
+psqlODBC's `dlg_specific.h` defines `SPEC_SERVER` as the keyword `server`; MySQL's
+*Connector/ODBC Connection Parameters* page lists `server`; Microsoft's *ODBC DSN and Connection
+String Keywords* page lists `Server`. In the 2026-10-30 probes under BACKLOG #2705, psqlODBC
+18.00.0005 connected, and MySQL Connector/ODBC was run, through engine-built strings that name
+the host only in `SERVER`, which is consistent with that. No run was designed to test it, and
+Microsoft's driver was not run, so a family on the list is the documentation's claim, not proof
+that either check binds the address the driver dials.
+
+What the list cannot do. The engine reads the driver **name**, never the library it loads. A
+driver manager entry that registers another library under a name on the list, a file-based
+driver included, is taken at its word, and is judged as that family. Keep the driver manager's
+own configuration, `odbcinst.ini` on unixODBC or the ODBC Data Source Administrator on Windows,
+under the same change control as the engine's configuration.
+
+The list is not extensible by configuration. To reach a database whose driver is not on it, use
+another connector, or open an issue that names the driver, its registered name, and where its
+documentation says it reads `SERVER`.
 
 ##### The port an `allowed_db` entry binds
 
@@ -2021,8 +2080,9 @@ host.
   Linux that last name is commonly a FreeTDS alias. FreeTDS reads `,<port>` as the port. But
   nothing shows it reads the preset's TLS keywords, `Encrypt` and `TrustServerCertificate`. A hop
   the engine reports as verifying TLS could then not verify.
-- For another driver, use `dialect="generic"` on `Database` or `DatabasePoll`. `DatabaseLookup`
-  and `DatabaseRef` take only a Microsoft driver.
+- For psqlODBC or MySQL Connector/ODBC, use `dialect="generic"` on `Database` or
+  `DatabasePoll`, which takes only [its allowlist](#the-generic-driver-allowlist).
+  `DatabaseLookup` and `DatabaseRef` take only a Microsoft driver.
 - `server` must hold no comma, since the preset adds its own `,<port>`. Put the port in `port`.
 - `server` must hold no `\`. The preset always sends a port, so an instance name there is not what
   the driver dials; a driver that reads the instance in place of the port, as FreeTDS does, would
@@ -2040,16 +2100,15 @@ An entry with no port admits its host at any port. On the generic dialect the eg
   could read as octal. A pin in an entry may keep a leading zero: the engine alone reads it.
 - No port can be read, and the entry for that host pins one. A `PORT` value that is not a number
   from 1 to 65535 in decimal digits counts as no port. Set `PORT` to the port in the entry.
-- The `odbc_driver` name is not one the engine knows reads `PORT`, and the entry pins a port.
-  The engine knows a name holding `postgres`, `psqlodbc`, `mysql` or `mariadb`, in any case,
-  unless it also holds `msodbcsql` or `sql server`: those mark a SQL Server driver, which ignores
-  `PORT`. For a name the preset accepts, use
-  `dialect="sqlserver"`. The default `ODBC Driver 18 for SQL Server` is one. A host-only entry
-  still admits any driver.
+- The `odbc_driver` name is not on [the generic driver allowlist](#the-generic-driver-allowlist),
+  whatever the entry says (BACKLOG #5041). The build refuses the same name.
+- The `odbc_driver` names Microsoft's driver, which ignores `PORT`, and the entry pins a port. Use
+  `dialect="sqlserver"`. The default `ODBC Driver 18 for SQL Server` is that driver. A host-only
+  entry still admits it.
 
-The check reads the driver **name** as written, an odbcinst alias or a library path included, and
-cannot see which library that name loads. A name that misdescribes its driver, such as a path
-holding `mysql` to a library that ignores `PORT`, is outside what the check can catch.
+The check reads the port from `PORT` on psqlODBC and MySQL Connector/ODBC, the two families on the
+list that read it. It reads the driver **name** as written, and cannot see which library that
+name loads.
 
 A `host:port` or `[v6]:port` `server` is never a listed host: an entry splits at its first colon,
 so no entry can name it, and it is refused as unlisted.
@@ -2171,22 +2230,12 @@ Two limits follow from this:
 - **A driver may take its target under another keyword.** The engine sends the target as `SERVER`
   and nothing else, and at least `[egress].allowed_db` and the cleartext-hop guard's on-box test
   read the host in `server`. A driver that takes its target from another keyword dials a host
-  neither judged, so neither binds that hop: a `server` of `127.0.0.1` passes the on-box test
-  while such a driver dials elsewhere. Oracle's ODBC driver documents `DBQ` for its target, and
-  `DBQ` is refused. Whether that driver also reads `SERVER` has not been tested. The engine cannot see which keyword
-  a driver reads. It places three families documented to read `SERVER`, by the registered names
-  [*The `SSLmode` spelling*](#the-sslmode-spelling) lists: psqlODBC, MySQL Connector/ODBC and
-  Microsoft's `ODBC Driver <n> for SQL Server`. In the 2026-10-30 probes under BACKLOG #2705,
-  psqlODBC 18.00.0005 connected, and MySQL Connector/ODBC was run, through engine-built strings
-  that name the host only in `SERVER`, which is consistent with that. No run was designed to test
-  whether `SERVER` is read, and Microsoft's driver was not run. A placed family is the
-  documentation's claim, not proof that either check binds the address the driver dials. For
-  any other `odbc_driver` name, building the connection logs a WARNING naming the connection,
-  not the driver, and `messagefoundry check`'s advisory `generic-db-server` line lists the connection with its `server` (BACKLOG #5163). Neither refuses
-  the connection. To clear it, name psqlODBC or MySQL Connector/ODBC by its registered name, or
-  reach that database another way than the generic dialect. For SQL Server that is
-  `dialect="sqlserver"` with Microsoft's driver, since on the generic dialect Microsoft's driver
-  ignores `PORT`.
+  neither judged. Oracle's ODBC driver documents `DBQ` for its target, and `DBQ` is refused. The
+  engine cannot see which keyword a driver reads, so it accepts only the drivers on
+  [the generic driver allowlist](#the-generic-driver-allowlist), each documented to read
+  `SERVER`, and refuses every other name when the connection is built (BACKLOG #5041). Until
+  then any name built, with a WARNING and an advisory line (BACKLOG #5163). That section says
+  what the list rests on and what it cannot see.
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
   libpq still reads its CA from its default location or from the `PGSSLROOTCERT` environment
@@ -2202,10 +2251,10 @@ built, and the error names the setting and never the value:
 | Setting | Sent as | Rule |
 |---|---|---|
 | `database`, `username`, every `odbc_params` value (`PORT` and `SSLmode` included) | plain, `SSLmode=verify-full` | printable ASCII; none of `;`, `{`, `}`, `=`, `"`, `'`; not empty or blank; no leading or trailing space. An `odbc_params` value of `None` is refused, never sent as the text `None`; leave the keyword out instead. An `odbc_params` value of `true` or `false` is refused, never sent as the text `True` or `False`; write the driver's own spelling as a string. An unset `database` or `username` is left out of the string |
-| `SSLmode`, in any case of the keyword | plain | for MySQL Connector/ODBC under its registered name, exactly one of `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case; refused on Microsoft's `ODBC Driver <n> for SQL Server`, which reads `Encrypt` instead; for every other driver, exactly one of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`, in lower case. See [*The `SSLmode` spelling*](#the-sslmode-spelling) |
+| `SSLmode`, in any case of the keyword | plain | for MySQL Connector/ODBC under its registered name, exactly one of `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case; refused on Microsoft's `ODBC Driver <n> for SQL Server`, which reads `Encrypt` instead; for psqlODBC, exactly one of `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`, in lower case. See [*The `SSLmode` spelling*](#the-sslmode-spelling) |
 | `odbc_driver` | braced, `DRIVER={PostgreSQL Unicode}` | printable ASCII, and none of `;`, `{`, `}` |
 | `server` | plain | printable ASCII, and none of `;`, `{`, `}`, `=`, `"`, `'`; `None` is refused |
-| `password` | braced for a listed driver, otherwise plain | printable ASCII. See below |
+| `password` | braced, with the `}}` escape | printable ASCII. See below |
 
 Why no braces. On 2026-10-30, the engine's braced strings were measured against real drivers.
 psqlODBC did not honour `SSLmode={verify-full}` or `SSLmode={require}`: each connected with no TLS
@@ -2223,18 +2272,18 @@ plaintext. A padded value is refused because one driver may trim it and another 
 psqlODBC's source reads an `SSLmode` value by its first character, and only a lower-case one
 names a mode, so `Require`, `VERIFY-FULL`, `REQUIRED`, `on`, `1` and `True` mean `disable` to it.
 This was read in the source, not measured against a server. The engine's no-TLS check would count
-each of those as TLS addressed. So under a psqlODBC name, and under a name the engine cannot
-place, an `SSLmode` value must be exactly one of libpq's six modes, in lower case, or the
-connection is refused when it is built. Other driver families follow the table below.
+each of those as TLS addressed. So under a psqlODBC name an `SSLmode` value must be exactly one
+of libpq's six modes, in lower case, or the connection is refused when it is built. Other driver
+families follow the table below.
 
-The rule depends on the driver family, read from the `odbc_driver` name. The engine places a name
-only when it is a whole registered name, in any case but spelled with single spaces:
+The rule depends on the driver family, read from the `odbc_driver` name by
+[the generic driver allowlist](#the-generic-driver-allowlist):
 
-| Family | Registered names | `SSLmode` values accepted | The keyword counted as a TLS mode |
-|---|---|---|---|
-| psqlODBC | `PostgreSQL Unicode` or `PostgreSQL ANSI`, either with `(x64)`, or the bare `PostgreSQL` | libpq's six, in lower case | `SSLmode`, at one of those six |
-| MySQL Connector/ODBC | `MySQL ODBC <version> Unicode Driver` or `... ANSI Driver` | `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case | `SSLMODE`, at one of those five |
-| Microsoft ODBC Driver for SQL Server | `ODBC Driver <n> for SQL Server` | none: the driver reads no `SSLmode`, so any value is refused, with a pointer to `Encrypt` | `Encrypt`, at any value the no-TLS list does not name |
+| Family, by the names [the allowlist](#the-generic-driver-allowlist) gives | `SSLmode` values accepted | The keyword counted as a TLS mode |
+|---|---|---|
+| psqlODBC | libpq's six, in lower case | `SSLmode`, at one of those six |
+| MySQL Connector/ODBC | `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`, in upper case | `SSLMODE`, at one of those five |
+| Microsoft ODBC Driver for SQL Server | none: the driver reads no `SSLmode`, so any value is refused, with a pointer to `Encrypt` | `Encrypt`, at any value the no-TLS list does not name |
 
 MySQL takes the same keyword with its own upper-case values. Per engine PR 2691, a value it does
 not recognize leaves it at `PREFERRED`, which can fall back to plaintext, so under a MySQL name
@@ -2242,44 +2291,29 @@ any other value is refused when the connection is built (BACKLOG #5035). The fiv
 the ones MySQL's parameter page documents. **No MySQL driver was run for this rule**, and whether
 the driver reads another case was not measured, so only the documented upper case is accepted.
 
-**A name the engine cannot place**, at least a library path, an odbcinst alias such as RHEL's
-bare `MySQL` section, another vendor's driver for the same database, or a registered name with a
-doubled space, takes the libpq spellings at build, as before. The engine cannot tell which
-spelling such a driver reads, so a refusal there advises no value at all: whatever value was
-given, it says the engine cannot place the driver family and names the psqlODBC and MySQL
-registered names above (BACKLOG #5029). Offering libpq's list there would steer a MySQL driver
-under such a name to a value that builds and that MySQL ignores. **No `SSLmode` on such a name counts as a TLS mode**, so its
-hop is gated as one with no mode (see the TLS note below). To have a driver's TLS mode counted,
-name it by one of the registered names above. Otherwise declare the hop with `tls_hop_attested`
-if it is secured by other means, or, on an outbound, accept it with `cleartext_accepted`. The
-engine reads the name, never the library it loads, so registering another library under one of
-these names would have the engine judge it as that family.
+**A name off the allowlist**, at least a library path, an odbcinst alias such as RHEL's bare
+`MySQL` section, another vendor's driver for the same database, or a registered name with a
+doubled space, is refused before its `SSLmode` is read (BACKLOG #5041). The refusal names the
+families to use and advises no `SSLmode` value, so it never steers a MySQL driver under another
+name to a libpq spelling that MySQL ignores (BACKLOG #5029). The engine reads the name, never the
+library it loads, so registering another library under one of these names would have the engine
+judge it as that family.
 
-**The password.** When `odbc_driver` is, in any case but spelled with single spaces, the whole
-registered name of one of these drivers, the password is **always** sent braced, with the ODBC
-`}}` escape, whatever it holds:
-
-- psqlODBC, measured to read the escape: `PostgreSQL Unicode` or `PostgreSQL ANSI`, either with
-  `(x64)`, or the bare `PostgreSQL`, the section name RHEL registers it under;
-- MySQL Connector/ODBC, measured to read it: `MySQL ODBC <version> Unicode Driver` or
-  `... ANSI Driver`;
-- Microsoft's `ODBC Driver <n> for SQL Server`, not probed for this item but relied on for the
-  same escape by the SQL Server preset and the store.
+**The password.** For every family on [the allowlist](#the-generic-driver-allowlist) the
+password is **always** sent braced, with the ODBC `}}` escape, whatever it holds: psqlODBC and
+MySQL Connector/ODBC were measured to read the escape, and Microsoft's driver, not probed for this
+item, is relied on for the same escape by the SQL Server preset and the store.
 
 Braces matter even for a password with no delimiter in it. psqlODBC URL-decodes an unbraced `PWD`,
 so `+` becomes a space and `%41` becomes `A`, and takes a braced one literally (its
 `dlg_specific.c`, where `copyConnAttributes` calls `decode_or_remove_braces`). The braced form is
 the only one that sends such a password as written.
 
-For any other driver name, the password is sent plain when it holds none of `;`, `{`, `}`, `"`
-or `'` and has no leading or trailing space. Any other password is refused when the connection is built,
-with an error that says only that this driver cannot carry it, so change the password. This
-covers a library path, another vendor's driver for the same database, and the legacy name
-`SQL Server`, which is not on the list: on Linux it is commonly a FreeTDS alias, which has not been
-measured. The engine reads the driver name as written, never the library it loads, so a driver
-manager alias that reuses a listed name is taken at its word. The Microsoft Access driver (ACE)
-is one that does not read the escape: it refused even a braced password with no brace in it, and
-a `}` let password text set another keyword.
+Any other name is refused before its password is read (BACKLOG #5041). Until then a password was sent plain to such a driver when it could be. The Microsoft
+Access driver (ACE) is one reason: it does not read the escape, it refused even a braced password
+with no brace in it, and a `}` let password text set another keyword. The engine reads the
+driver name as written, never the library it loads, so a driver manager alias that reuses a
+listed name is taken at its word.
 
 ASCII only, because a driver manager may convert the string for the driver, and some
 conversions turn a non-ASCII character into a delimiter.
@@ -2298,8 +2332,9 @@ To have a keyword added, open an issue that names the driver and what the keywor
 > deny-list. **The engine counts only `SSLmode` and `Encrypt` as a mode** (BACKLOG #2483), and
 > only the one the `odbc_driver` family reads, at that family's own spellings (BACKLOG #5053,
 > #5035; the table under [*The `SSLmode` spelling*](#the-sslmode-spelling)). So `Encrypt=yes`
-> counts on Microsoft's driver alone, and on a name the engine cannot place no keyword counts, so
-> such a hop always reads as at risk. The warning's example is the family's own spelling. No other
+> counts on Microsoft's driver alone. A name off the allowlist is refused whatever its TLS, so
+> the posture readers and the `generic-db-tls` line do not list it as a TLS loosening;
+> `generic-db-driver` lists it instead. The warning's example is the family's own spelling. No other
 > TLS keyword counts, at least
 > `SSLKEY`, `SSLCERT`, `SSLCA`, `SSLCAPATH` and `SSLCIPHER`, so one of them alone reads as no mode.
 > So does a blank mode, or one with a blank at either end; since BACKLOG #2705 the build refuses
@@ -4691,12 +4726,12 @@ reading this page already applies to a file the scan never opened.
 
 | Service/hop | Timeout setting + default | Release procedure | Failure handling | Retry posture |
 |---|---|---|---|---|
-| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds how long a frame may take to complete, on the clock the `receive_timeout` bullet under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) describes, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against. With `tls = true`, a new connection has a fixed 10 s to finish its TLS handshake or the listener aborts it, and a connection the listener closes has a fixed 5 s for the TLS close exchange (on stop, the socket is closed as soon as its close notice is sent, except under uvloop, below). On the stdlib event loop (always on Windows), `source_ip_allowlist`, `max_connections` and `max_connections_per_host` apply **before** the handshake (BACKLOG #1606): the listener accepts plain TCP, refuses or admits the socket exactly as a plaintext listener does, and only then starts TLS. So a socket still in its handshake holds a real slot, and a peer outside the allowlist never gets a handshake. **Under uvloop the loop still runs the handshake, and all three apply only after it**, so there the handshake bound limits how long such a socket lives, not how many a peer can open. The engine runs on uvloop wherever it is installed, which the engine's own `uvloop` dependency does for CPython outside Windows. Neither TLS bound is operator-configurable: both are engine-fixed work with nothing partner-sized in them | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace; stop also closes a socket still in its TLS handshake. Under uvloop, whose server offers no `close_clients()`, stop leaves such a socket to the 10 s bound and refuses it unread if it finishes the handshake after stop began, and stop can also wait up to the 5 s close-exchange bound for a peer that does not answer its close notice | a TLS handshake over its bound, or one that fails, is aborted; on the standard asyncio loop with a DEBUG line, giving its slot back, and under uvloop before any slot is taken. A failed one is recorded as a throttled `tls_handshake_failed` connection event on any loop; [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) says what it counts and when it names the peer (vault BACKLOG #2613, #3302); a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
+| MLLP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds how long a frame may take to complete, on the clock the `receive_timeout` bullet under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) describes, which is what reaches a peer that trickles bytes and is therefore never idle; the ACK **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. That write bound is not operator-configurable — an ACK is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against. With `tls = true`, a new connection has a fixed 10 s to finish its TLS handshake or the listener aborts it, and a connection the listener closes has a fixed 5 s for the TLS close exchange (on stop, the socket is closed as soon as its close notice is sent, except under uvloop, below). On every event loop, `source_ip_allowlist`, `max_connections` and `max_connections_per_host` apply **before** the handshake (BACKLOG #1606): the listener accepts plain TCP, refuses or admits the socket exactly as a plaintext listener does, and only then starts TLS. On the stdlib event loop (always on Windows) it upgrades the admitted socket itself; under uvloop, or any other loop, it runs its own accept loop and hands the admitted socket to the loop's TLS layer before anything reads it. So a socket still in its handshake holds a real slot, and a peer outside the allowlist never gets a handshake. The engine runs on uvloop wherever its own `uvloop` dependency installs it; the environment marker on that dependency in [`pyproject.toml`](../pyproject.toml) says where. Neither TLS bound is operator-configurable: both are engine-fixed work with nothing partner-sized in them | the client handler's outer `finally` closes the writer, with a 5 s shutdown grace; stop also closes a socket still in its TLS handshake, on every loop. Under uvloop stop can wait up to the 5 s close-exchange bound for a peer that does not answer its close notice | a TLS handshake over its bound, or one that fails, is aborted with a DEBUG line, giving its slot back. A failed one is recorded as a throttled `tls_handshake_failed` connection event on any loop; [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) says what it counts and when it names the peer (vault BACKLOG #2613, #3302); a decode/parse/validate failure NAKs synchronously and records `ERROR` before any ingress row; a frame over its deadline closes with a `frame_deadline` reason, having received nothing to drop; an ACK over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is answered with a fixed-text `AE` (`CE` in enhanced mode), then the connection closes and the event is `handler_error`; an inbound that sends no replies keeps the socket and sends nothing. That NAK has no message row, so the ACK capture stream does not hold it; the `handler_error` event is its record (BACKLOG #1619) | n/a — the sender retries |
 | MLLP destination | `connect_timeout` 10 s, `timeout_seconds` 30 s (drain + ACK read) | the socket is closed per delivery, or reused and aged out via `idle_timeout_seconds` / `max_connection_age_seconds` when `persistent` | transient errors re-queue; a `NegativeAckError` (AR) dead-letters immediately | `RetryPolicy` — **default `retry_max_attempts` is 100, finite**; lower it, or set `None` to retry forever |
 | Raw TCP listener (inbound) | `receive_timeout` 60 s bounds an idle read (slow-loris) and `max_frame_seconds` 60 s bounds one frame on the same clock as MLLP's (vault BACKLOG #2606 and #2847), which is what reaches a peer that trickles bytes; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable — a reply is engine-generated and receipt-sized, so there is no partner-sized body to size a budget against | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; a reply over its write bound drops the connection as a `peer_reset`; a fault inside the inbound handler, such as a store outage at the ingress commit, is `handler_error`, never `framing_error`. An HL7 inbound with acknowledgements on records it at once and closes with no reply, so its sender resends. Any other holds the frame and retries until it is recorded or the listener stops, and records `handler_error` only for a fault that outlasts several attempts or one a stop ends; a fault an earlier retry clears logs WARNING lines and no event. A stop during the hold gets one last attempt; if that fails too, or stop cancels it, the held frame and every frame behind it on that connection are lost. The held frames are only in memory, so the process dying during the hold loses them too. The `hold_and_retry` docstring in [`transports/base.py`](../messagefoundry/transports/base.py) states how (BACKLOG #5022) | n/a |
 | X12 listener (inbound) | `receive_timeout` 60 s; `max_frame_seconds` 60 s bounds how long one interchange may take to complete, on the same clock as MLLP's (vault BACKLOG #2606); `max_interchange_bytes` bounds one ISA/IEA frame; the reply **write** carries its own fixed 5 s bound, so a peer that takes the bytes and then stops reading cannot hold the connection either. Not operator-configurable, for the same reason as the raw-TCP row | as MLLP — handler `finally` closes the socket with a shutdown grace | parse failures record `ERROR` on the ingress path; an allow-list refusal emits `peer_not_allowlisted` plus a WARNING log, and a capacity refusal emits `at_capacity`; a reply over its write bound drops the connection on a logged warning **and** the `peer_reset` its release path already carries; a fault inside the inbound handler is handled as on the raw-TCP row above. This listener emits the same kinds as the raw-TCP row above (BACKLOG #1665, #5022) | n/a |
 | Raw TCP / X12 destination | `connect_timeout` 10 s, `timeout_seconds` 30 s | a fresh connection per delivery, closed in `finally` | transient vs permanent classification as MLLP | `RetryPolicy` |
-| HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408`. With `tls = true`, the MLLP listener row's fixed 10 s handshake bound applies, and so does its admission order on each event loop (BACKLOG #2479): on the stdlib loop at least `source_ip_allowlist`, `max_connections`, `max_connections_per_host` and `max_handshakes_per_host` act **before** the handshake, and a socket they refuse there is closed with no answer, since a TLS client cannot read a plaintext `403` or `503`. The TLS close exchange keeps asyncio's 30 s default here, since a `reply_from` answer can be partner-sized | handler `finally` closes the connection with a shutdown grace; stop also closes a socket still in its TLS handshake on the stdlib loop | an over-size body is refused before buffering; a TLS handshake over its bound, or one that fails, is aborted, as on the MLLP row | n/a |
+| HTTP web-service listener (inbound) | `receive_timeout` 60 s bounds the **whole** request read; over budget returns `408`. With `tls = true`, the MLLP listener row's fixed 10 s handshake bound applies, but its admission order differs from the MLLP row's (BACKLOG #2479): on the stdlib loop, or any subclass of `asyncio.BaseEventLoop`, at least `source_ip_allowlist`, `max_connections`, `max_connections_per_host` and `max_handshakes_per_host` act **before** the handshake, and a socket they refuse there is closed with no answer, since a TLS client cannot read a plaintext `403` or `503`. Under uvloop the HTTP listener has no accept loop of its own, so the loop runs the handshake: `source_ip_allowlist`, `max_connections` and `max_connections_per_host` apply only after it, and `max_handshakes_per_host` never applies, since no socket it sees is still in its handshake. The TLS close exchange keeps asyncio's 30 s default here, since a `reply_from` answer can be partner-sized | handler `finally` closes the connection with a shutdown grace; stop also closes a socket still in its TLS handshake on the stdlib loop | an over-size body is refused before buffering; a TLS handshake over its bound, or one that fails, is aborted, as on the MLLP row | n/a |
 | File endpoint — local filesystem | **none** — filesystem I/O is unbounded by design | file handles are context-managed; the source file is moved/deleted/left per `after_read` | an unreadable/oversize file is skipped or moved to `error_subdir` | `RetryPolicy` on the outbound write |
 | File endpoint — UNC / SMB share | **none engine-owned** — bounded only by the OS SMB redirector | the impersonation token is reverted (`RevertToSelf`) and the worker thread is per-endpoint isolated | a share failure surfaces as a transient poll/delivery error | `RetryPolicy` |
 | SFTP (remote-file) | 30 s on the TCP connect, the SSH banner exchange and authentication (`timeout`, `banner_timeout` and `auth_timeout` on `paramiko.SSHClient.connect`), plus 120 s on opening the SFTP session (BACKLOG #1936), on **each read** from the established SFTP channel, and on each step of an upload that stops making progress (BACKLOG #2082). All are hard-coded in `transports/remotefile.py`; `Sftp()` exposes no timeout argument, so none is operator-configurable. The bounds are **not complete**: the "Timeouts are per-connector, not universal" paragraph under [Resource management & limits](#resource-management--limits-asvs-1312--1313--1326) says what each covers and where a gap is left | the `paramiko` session is closed in `finally` per poll or delivery | **Delivery:** at connect, a rejected host key is **permanent**, and an authentication refusal is permanent and flagged as a credential fault. A banner, key-exchange or authentication timeout, a connection dropped before the key exchange completes, and an `OSError`/`EOFError` are transient (BACKLOG #1999; the bullet under [Remote file](#remote-file--sftp--ftp) says where the rules are stated). After connect, a missing remote path is permanent, and at least the session-open and read timeouts are transient. With `validate_directory` on, the pre-upload directory check re-raises any failure but a credential refusal as transient, these included. A write that stops making progress for 120 s (`SFTP_WRITE_STALL_SECONDS`, per step, BACKLOG #2082), an `EOFError` and a helper thread that cannot start are transient; a `paramiko.SFTPError` is permanent. **Source:** the poller does not act on that split; a failed connect, listing or retrieve is logged and tried again on the next poll | `RetryPolicy` |

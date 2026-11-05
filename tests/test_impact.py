@@ -17,7 +17,6 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.__main__ import main
 from messagefoundry.config import codeset_edit
 from messagefoundry.config.code_sets import load_code_set
 from messagefoundry.config.impact import (
@@ -27,6 +26,7 @@ from messagefoundry.config.impact import (
 )
 from messagefoundry.config.reachability import Reference, build_reference_index
 from messagefoundry.config.wiring import WiringError, load_config
+from messagefoundry_toolkit.__main__ import main
 from tests._share_fault import unlistable_dir
 
 # --- fixtures ----------------------------------------------------------------

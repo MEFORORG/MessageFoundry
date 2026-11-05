@@ -306,7 +306,7 @@ This engine carries PHI, so security is built, not bolted on:
 | auth/ | Authn + RBAC core (no FastAPI): permissions/roles, Identity, passwords, tokens, ldap, totp. |
 | api/ | FastAPI app + models + auth — the engine's only external surface (serves the `/ui` web console same-origin). |
 | apiclient/ | Qt-free / FastAPI-free engine-client library (ADR 0088) — the shared HTTP client. |
-| generators/ | Conformant synthetic HL7 generators — messagefoundry generate. |
+| generators/ | Conformant synthetic HL7 generators — messagefoundry-toolkit generate. |
 | checks.py | messagefoundry check — commit/CI gate (validate + dryrun + advisory lint). |
 | ide/ | VS Code extension (TypeScript): setup, promote, test bench, AI commands. |
 | samples/ | Example Connection/Router/Handler modules + send_mllp.py sender. |
@@ -343,7 +343,7 @@ Keep the message store on a fast *local* disk, not a network share — the stage
 
 ## 13. Deployment & operations
 
-- **Install:** the supported production artifact is the signed, version-pinned PyPI wheel (`pip install "messagefoundry==<version>"`); then messagefoundry init scaffolds your own config repo (ADR 0017). Extras are opt-in: \[postgres\], \[sqlserver\], \[harness\] (the PySide6 test harness), \[sftp\], \[fhir\], \[dicom\], \[x12\], \[xml\], \[webauthn\], \[vault\], \[otel\]. The `/ui` web console installs alongside as the separate `messagefoundry-webconsole` distribution, published to PyPI on its own `webconsole-v*` cadence.
+- **Install:** the supported production artifact is the signed, version-pinned PyPI wheel (`pip install "messagefoundry==<version>"`); then messagefoundry-toolkit init scaffolds your own config repo (ADR 0017). Extras are opt-in: \[postgres\], \[sqlserver\], \[harness\] (the PySide6 test harness), \[sftp\], \[fhir\], \[dicom\], \[x12\], \[xml\], \[webauthn\], \[vault\], \[otel\]. The `/ui` web console installs alongside as the separate `messagefoundry-webconsole` distribution, published to PyPI on its own `webconsole-v*` cadence.
 
 - **Run headless:** python -P -X disable-remote-debug -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev — API on https://127.0.0.1:8765 (GET /connections, /messages, /stats, WS /ws/stats).
 
@@ -362,7 +362,7 @@ There are two separate git repositories in play, and your team works in only one
 | **Repository** | **Who works in it** | **What it holds** | **How you get it** |
 |----|----|----|----|
 | **Engine source repo** | MessageFoundry contributors only | The engine’s own Python code. | Installed as a pinned, signed PyPI wheel — **not cloned or modified**. |
-| **Your config repo** | Your integration developers & analysts | Connections / Routers / Handlers, \_-helpers, code sets, environments/\<env\>.toml, connections.toml, and test fixtures (the --config dir). | Scaffolded by messagefoundry init; versioned in your own git. |
+| **Your config repo** | Your integration developers & analysts | Connections / Routers / Handlers, \_-helpers, code sets, environments/\<env\>.toml, connections.toml, and test fixtures (the --config dir). | Scaffolded by messagefoundry-toolkit init; versioned in your own git. |
 
 **Almost no one at an adopter site touches the engine repo.** You install the engine as a read-only, version-pinned dependency and leave it alone; your developers and analysts don’t fork it, patch it, or read its source to do their jobs. (Upgrades are deliberate: bump the pinned version and re-run messagefoundry check. The future read-only component SDK — §10 — is the sanctioned way to customize behavior, not editing the engine.) All of your work lives in the config repo instead, separately versioned, so engine upgrades and config changes never entangle.
 

@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-// "Generate Samples" — a guided flow over the `messagefoundry generate` CLI: pick a message type
-// (from `generate --list`), choose triggers + a per-trigger count, and write a synthetic-but-
+// "Generate Samples" — a guided flow over the `messagefoundry-toolkit generate` CLI: pick a message
+// type (from `generate --list`), choose triggers + a per-trigger count, and write a synthetic-but-
 // conformant corpus into the Test Bench's message-sets folder. All data is synthetic — no PHI.
+// `generate` is a toolkit command (ADR 0201 slice 4), so both calls run `python -m messagefoundry_toolkit`.
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { messageSetsDir, run, runJson, workspaceDir } from "./cli";
+import { TOOLKIT_RUN, messageSetsDir, run, runJson, workspaceDir } from "./cli";
 
 function err(message: string): void {
   void vscode.window.showErrorMessage(`MessageFoundry: ${message}`);
@@ -20,7 +21,7 @@ export async function generateSamples(): Promise<void> {
 
   let listing: Record<string, string[]>;
   try {
-    listing = await runJson<Record<string, string[]>>(["generate", "--list"], ws);
+    listing = await runJson<Record<string, string[]>>(["generate", "--list"], ws, TOOLKIT_RUN);
   } catch (e) {
     err(`could not list message types — ${String(e)}`);
     return;
@@ -84,7 +85,7 @@ export async function generateSamples(): Promise<void> {
   await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Notification, title: `Generating ${type} messages…` },
     async () => {
-      const res = await run(args, ws);
+      const res = await run(args, ws, TOOLKIT_RUN);
       if (res.code !== 0) {
         err(`generate failed — ${(res.stderr || res.stdout).trim() || "unknown error"}`);
         return;

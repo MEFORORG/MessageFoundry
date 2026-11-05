@@ -472,6 +472,15 @@ _TOOLKIT_WHEEL = "messagefoundry_toolkit-0.4.0-py3-none-any.whl"
         "messagefoundry-0.4.0/messagefoundry/adr_analyze.py",  # sdist form
         "messagefoundry/ADR_Analyze.py",  # casefolded like every other rule
         "messagefoundry\\adr_analyze.py",  # a backslash separator
+        # The slice 4 retired paths, wheel form and sdist form.
+        "messagefoundry/scaffold.py",
+        "messagefoundry/lens.py",
+        "messagefoundry/lens_schema.py",
+        "messagefoundry/corepoint_import.py",
+        "messagefoundry-0.4.0/messagefoundry/scaffold.py",
+        "messagefoundry-0.4.0/messagefoundry/lens.py",
+        "messagefoundry-0.4.0/messagefoundry/lens_schema.py",
+        "messagefoundry-0.4.0/messagefoundry/corepoint_import.py",
         "messagefoundry_toolkit/__init__.py",  # the toolkit package inside the engine
         "messagefoundry-0.4.0/messagefoundry_toolkit/__main__.py",
         "messagefoundry_toolkit.py",  # the import name as a top-level module

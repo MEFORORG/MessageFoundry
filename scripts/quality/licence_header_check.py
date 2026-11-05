@@ -41,7 +41,7 @@ or workflow excludes it from anything header-related. The gap is drift, not poli
 
 The header must appear within the first ``HEAD_LINES`` lines and must be a COMMENT -- the line, once
 stripped, has to begin with the language's comment prefix. Requiring the comment form keeps a header
-string embedded in code from counting: ``messagefoundry/corepoint_import.py`` contains the literal
+string embedded in code from counting: ``messagefoundry_toolkit/corepoint_import.py`` contains the literal
 ``"# SPDX-License-Identifier: AGPL-3.0-or-later",`` because it GENERATES headers for imported
 configuration, and a substring check would read a header-emitting file as a headered one.
 

@@ -1063,13 +1063,20 @@ class QueueStore(StoreLifecycle, Protocol):
         byte-for-byte). Raises :class:`KeyError` if the attachment does not exist."""
         ...
 
-    async def attachments_for(self, message_id: str) -> Sequence[Row]:
+    async def attachments_for(
+        self, message_id: str, *, include_inherited: bool = False
+    ) -> Sequence[Row]:
         """The distinct attachments a single message holds — the operator read surface (#149, ADR 0105
         Phase 3b). One row per ``message_attachment`` linkage JOINed to its ``attachment`` header,
         carrying ``attachment_id`` (the sha256 content address), ``content_type``, and ``total_bytes``.
         **Metadata only — no chunk ciphertext is read or decrypted** (the bulky bytes ride
         :meth:`read_attachment`), so this stays cheap enough for the message-detail view. Returns ``[]``
-        for a message with no detached document (or on a backend without the substrate)."""
+        for a message with no detached document (or on a backend without the substrate).
+
+        A link a child message inherited from its parent (BACKLOG #5099) is left out unless
+        ``include_inherited`` is set, which only delivery's handle binding does. It grants no
+        download through the child. Retention still releases it, as it releases any link, by
+        reading the linkage itself rather than through this method."""
         ...
 
     async def attachment_incref(self, ref: str) -> None:
@@ -3158,8 +3165,11 @@ class AuthStore(Protocol):
         raising the account's session epoch in the same transaction (BACKLOG #2592). Returns how
         many it revoked and whether it re-stamped the kept session with the new epoch in that
         transaction (:class:`~messagefoundry.store.store.RevokeResult`, BACKLOG #4975): only when
-        that session is the account's and carried the epoch the raise replaced (store.py's
-        ``KeptSessionRestamp``). ``kept`` is False with no ``except_token_hash``."""
+        that session is the account's and carried the epoch the raise replaced and the store's
+        current global epoch, read in that transaction (store.py's ``KeptSessionRestamp``). A
+        session of the account it declines to re-stamp it ends in the same transaction and counts,
+        and reports ``ended_kept`` (follow-up to BACKLOG #4975). ``kept`` is False with no
+        ``except_token_hash``."""
         ...
 
     async def count_user_sessions(
@@ -3167,7 +3177,9 @@ class AuthStore(Protocol):
     ) -> int:
         """How many sessions :meth:`revoke_user_sessions` would end, given the same ``user_id`` and
         ``except_token_hash``: every unrevoked row of the account, idle or expired ones included,
-        but for the excepted one (BACKLOG #3393).
+        but for the excepted one (BACKLOG #3393). Where the revoke declines to re-stamp the
+        excepted session it ends that one too and counts it (``RevokeResult.ended_kept``), so its
+        ``count`` is then one more than this; its ``others`` is this number.
 
         Deliberately the revoke's predicate and not :meth:`list_sessions`'s, so the number an offer
         to sign out the other sessions shows is the number the revoke then ends. Each backend
@@ -3188,8 +3200,9 @@ class AuthStore(Protocol):
         account its read of the account list returns, ends the sessions it finds, and re-seals the
         kept session under its account's new epoch and the new global one, only when it carried
         both epochs those raises replaced (store.py's ``KeptSessionRestamp``, BACKLOG #4975): a
-        kept session an earlier sweep missed is left unstamped, so it is refused when next
-        presented, and ``kept`` is False. The order of the first three is each backend's, and its
+        kept session an earlier sweep missed, or one whose account's record failed its seal, is
+        ended in the same transaction and counted instead, ``kept`` is False and ``ended_kept``
+        True (follow-up to BACKLOG #4975). The order of the first three is each backend's, and its
         own docstring states it. store.py's
         ``GLOBAL_SESSION_EPOCH_SQL`` says what the global epoch decides, and docs/SECURITY.md,
         *Limits of the session sweep*, says what the revoke still leaves. A kept session whose seal

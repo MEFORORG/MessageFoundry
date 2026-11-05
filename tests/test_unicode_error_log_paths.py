@@ -46,12 +46,6 @@ from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.connections_file import load_connections_file
 from messagefoundry.config.snapshot import ConfigSnapshot
 from messagefoundry.config.wiring import Registry, Send, WiringError
-from messagefoundry.corepoint_import import (
-    CorepointImportError,
-    _assert_encodable,
-    import_corepoint,
-)
-from messagefoundry.lens import LensParseError, parse_module, rewrite_module
 from messagefoundry.logging_setup import (
     ControlCharScrubFilter,
     JsonFormatter,
@@ -68,6 +62,12 @@ from messagefoundry.pipeline._sandbox_codec import (
 from messagefoundry.pipeline.ingress_guards import IngressGuardError, admit_resubmitted_body
 from messagefoundry.redaction import codec_safe_str, prepare_log_record, safe_traceback
 from messagefoundry.tray.logscrub import TrayLogScrubFilter
+from messagefoundry_toolkit.corepoint_import import (
+    CorepointImportError,
+    _assert_encodable,
+    import_corepoint,
+)
+from messagefoundry_toolkit.lens import LensParseError, parse_module, rewrite_module
 from tests._ast_sites import callee_name
 from tests._content_free import SECRET_CHAR, escapes
 from tests.test_db_lookup import _sandbox_kind, sandbox_run_one  # noqa: F401 - a fixture

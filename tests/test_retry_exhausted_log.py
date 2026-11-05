@@ -588,7 +588,7 @@ async def test_a_store_read_fault_on_a_vanished_row_does_not_claim_a_dead_letter
     await _enqueue(store, 1)
     item = await _claim(store)
 
-    async def fault(payload: str) -> str:
+    async def fault(payload: str, message_id: str) -> str:
         await store._db.execute("DELETE FROM queue WHERE id=?", (item.id,))
         await store._db.commit()
         raise wiring_runner._StoreReadFault("attachment read failed")
@@ -614,7 +614,7 @@ async def test_a_store_read_fault_that_reaches_the_cap_writes_the_retry_cap_line
     await _enqueue(store, 1)
     item = await _claim(store)
 
-    async def fault(payload: str) -> str:
+    async def fault(payload: str, message_id: str) -> str:
         raise wiring_runner._StoreReadFault("attachment read failed")
 
     monkeypatch.setattr(runner, "_hydrate_payload", fault)

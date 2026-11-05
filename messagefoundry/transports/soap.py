@@ -136,15 +136,30 @@ logger = logging.getLogger(__name__)
 # faults routinely are) with HTTP 200 reads as SUCCESS. That is a wrong disposition on a real delivery,
 # not a cosmetic miss. Kept identical to _HEADER_EL_RE below, which already had it right.
 _FAULT_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Fault[\s/>]", re.IGNORECASE)
+# The SOAP Body start tag. BACKLOG #2827: a SOAP 1.1 or 1.2 fault is a Body child, so _classify_soap
+# searches for the Fault, and for a WS-Security code, from the first one; _find_fault says when it
+# searches the whole reply instead.
+_BODY_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Body[\s/>]", re.IGNORECASE)
 _SENDER_RE = re.compile(r"client|sender", re.IGNORECASE)
 _RECEIVER_RE = re.compile(r"server|receiver", re.IGNORECASE)
 # WS-Security fault codes that are PERMANENT (a retry won't fix a rejected/expired credential).
 _WSSE_FAULT_RE = re.compile(
     r"FailedAuthentication|InvalidSecurityToken|MessageExpired", re.IGNORECASE
 )
-# SOAP 1.1 <faultcode>…</faultcode>; SOAP 1.2 <Code><Value>…</Value></Code>.
-_FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b[^>]*>(.*?)</", re.IGNORECASE | re.DOTALL)
-_CODEVALUE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b[^>]*>(.*?)</", re.IGNORECASE | re.DOTALL)
+# SOAP 1.1 <faultcode>…</faultcode>; SOAP 1.2 <Code><Value>…</Value></Code>. Only the start tag's
+# NAME is a regex. BACKLOG #2827: the former `[^>]*>(.*?)</` tail rescanned to the end of the reply
+# from every start tag lacking a close, so a partner reply of repeated start tags cost the square of
+# its length. _code_text finds the `>` and `</` with str.find, once, from the leftmost name, and only
+# inside the Fault _FAULT_RE matched, up to that Fault's close tag (_FAULT_END_RE) or the reply's end.
+_FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b", re.IGNORECASE)
+_CODEVALUE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b", re.IGNORECASE)
+# The close tags, with the start tags' optional prefix. Literal, so tests/test_security_static.py
+# can read them.
+_FAULTCODE_END_RE = re.compile(r"</\s*(?:[\w.\-]+:)?faultcode\s*>", re.IGNORECASE)
+_CODEVALUE_END_RE = re.compile(r"</\s*(?:[\w.\-]+:)?Value\s*>", re.IGNORECASE)
+_FAULT_END_RE = re.compile(r"</\s*(?:[\w.\-]+:)?Fault\s*>", re.IGNORECASE)
+# A `<` that opens neither a comment, a CDATA section nor a processing instruction: another element.
+_TAG_OPEN_RE = re.compile(r"<(?![!?])")
 # A <…:Header> element (any/no namespace prefix) smuggled into a <Body> fragment (purity-leak lint).
 _HEADER_EL_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Header[\s/>]", re.IGNORECASE)
 
@@ -167,20 +182,88 @@ _ENV_OPEN = (
 )
 
 
-def _fault_code(body: str) -> str:
-    """The fault code text (e.g. ``soap:Client`` / ``soap:Receiver``), SOAP 1.1 or 1.2, or ``""``."""
-    m = _FAULTCODE_RE.search(body) or _CODEVALUE_RE.search(body)
-    return m.group(1) if m else ""
+def _code_text(m: re.Match[str], end_re: re.Pattern[str], body: str, end: int) -> str:
+    """The text from the ``>`` of the start tag ``m`` begins to the next ``</``, before ``end``, or
+    ``""`` when there is none or the element cannot hold a code.
+
+    The capture is the one the former ``name[^>]*>(.*?)</`` DOTALL search took. BACKLOG #2827: the
+    element cannot hold a code when it is self-closing, when the capture holds another element's
+    start tag, or when the ``</`` is not ``end_re``, its own close tag. The capture would then be
+    another element's text, such as ``<faultstring>Server busy`` after ``<faultcode/>``."""
+    gt = body.find(">", m.end(), end)
+    close = -1 if gt < 0 else body.find("</", gt + 1, end)
+    # Cheapest first: the scan for a nested start tag is the only check that reads the whole text.
+    if (
+        close < 0
+        or body[gt - 1] == "/"
+        or not end_re.match(body, close, end)
+        or _TAG_OPEN_RE.search(body, gt + 1, close)
+    ):
+        return ""
+    return body[gt + 1 : close]
+
+
+def _find_fault(body: str) -> tuple[re.Match[str] | None, int]:
+    """The first ``_FAULT_RE`` match from where the fault searches start, and that start: the end of
+    the first ``_BODY_RE`` match where a Fault follows it, else ``0``, the whole reply.
+
+    BACKLOG #2827: so a Fault-named element before the Body, in the Header or a comment say, does
+    not decide the class of the Body's fault. The first Body start tag is taken even when it sits in
+    a comment, a CDATA section or the Header. With no Body start tag, or no Fault after it, the
+    reply is searched whole, as it was before the anchor: a Fault reply with no envelope may carry a
+    Body-named element in its detail, and a Fault found only before the Body still reads as one."""
+    m = _BODY_RE.search(body)
+    if m is not None:
+        fault = _FAULT_RE.search(body, m.end())
+        if fault is not None:
+            return fault, m.end()
+        # Any Fault is before the Body start tag, so the whole-reply search need not pass it again.
+        return _FAULT_RE.search(body, 0, m.start()), 0
+    return _FAULT_RE.search(body), 0
+
+
+def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
+    """The fault code text (e.g. ``soap:Client`` / ``soap:Receiver``), SOAP 1.1 or 1.2, or ``""``.
+
+    BACKLOG #2827: read only inside ``fault``, the ``_FAULT_RE`` match (:func:`_find_fault`'s when
+    not given), from its start tag to its close tag or, with none, the reply's end, so a ``faultcode``
+    or ``Value`` outside it, in the Header say, does not decide the fault's class. A self-closing
+    Fault holds no code. The first ``faultcode`` or ``Value`` start tag in that range is the code
+    element: SOAP 1.2's Code/Value and SOAP 1.1's faultcode come before a Detail that may carry an
+    element of the other name. Only that first tag is read. Where it has no ``>`` or no ``</``
+    after it, no later one has either, since a later start tag's ``>`` is no earlier than its.
+    Where it cannot hold a code, a later tag is still not tried: that is a choice, so the code
+    stays the Fault's first code element."""
+    if fault is None:
+        fault, _ = _find_fault(body)
+        if fault is None:
+            return ""
+    start = fault.end()
+    gt = body.find(">", start - 1)
+    if gt < 0 or body[gt - 1] == "/":
+        return ""
+    fault_end = _FAULT_END_RE.search(body, start)
+    end = len(body) if fault_end is None else fault_end.start()
+    faultcode = _FAULTCODE_RE.search(body, start, end)
+    value = _CODEVALUE_RE.search(body, start, end if faultcode is None else faultcode.start())
+    if value is not None:
+        return _code_text(value, _CODEVALUE_END_RE, body, end)
+    if faultcode is not None:
+        return _code_text(faultcode, _FAULTCODE_END_RE, body, end)
+    return ""
 
 
 def _classify_soap(status: int, body: str) -> DeliveryError | None:
     """``None`` if delivered, else the classified failure. A WS-Security fault (auth/expiry) →
     permanent; a SOAP fault is classified by its code (Sender/Client → permanent; Receiver/Server →
     transient; unrecognized → permanent so a rejected request can't loop the lane); a fault-less
-    response falls back to the HTTP status."""
-    if _FAULT_RE.search(body):
-        code = _fault_code(body)
-        if _WSSE_FAULT_RE.search(code) or _WSSE_FAULT_RE.search(body):
+    response falls back to the HTTP status. The Fault and the WS-Security code are searched for from
+    where :func:`_find_fault` starts."""
+    fault, start = _find_fault(body)
+    if fault:
+        code = _fault_code(body, fault)
+        # The code is a slice of the reply after start, so this search covers it too.
+        if _WSSE_FAULT_RE.search(body, start):
             return NegativeAckError(
                 f"WS-Security fault (HTTP {status})", code="wssecurity", permanent=True
             )
@@ -780,21 +863,11 @@ class SoapDestination(DestinationConnector):
         # so the wire (and any detached JWS over those bytes) carries the secret while the store still
         # holds only the token. No-op / byte-identical when no body_secrets are configured.
         payload = self._apply_body_secrets(payload)
-        body, status, headers = await asyncio.to_thread(self._post, payload)
-        # A fault can arrive inside a 2xx body, so classify it. Transport-level faults (non-2xx,
-        # URL/timeout) already raised inside _post, for both modes. Classify the RAW reply — a partner
-        # fault names none of OUR secrets, and _WSSE_FAULT_RE must see the unscrubbed text.
-        failure = _classify_soap(status, body)
+        body, status, headers, failure = await asyncio.to_thread(self._post_and_classify, payload)
         if not self.capture_response:
             if failure is not None:
                 raise failure  # byte-identical: a 2xx <Fault> still dead-letters/retries
             return None
-        # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any
-        # echoed secret before it leaves this method (a validating registry may echo a bad credential in
-        # its <Fault>). Guarded so a no-body_secrets connection is byte-identical.
-        if self._body_secrets:
-            body = self._scrub_body_secrets(body)
-            headers = {k: self._scrub_body_secrets(v) for k, v in headers.items()}
         if failure is not None:
             # Capturing: record the application <Fault> as a rejected reply rather than raising, so the
             # row is delivered-with-a-rejection (operators reconcile from the captured response).
@@ -857,6 +930,41 @@ class SoapDestination(DestinationConnector):
                 f"SOAP {_redact_url(self.url)} sent a malformed HTTP reply ({type(exc).__name__})"
             ) from exc
 
+    def _post_and_classify(
+        self, payload: str
+    ) -> tuple[str, int, dict[str, str], DeliveryError | None]:
+        """:meth:`_post`, then the 2xx reply's classification and capture scrub, in the caller's
+        worker thread.
+
+        A fault can arrive inside a 2xx body, so the reply is classified. Transport-level faults
+        (non-2xx, URL/timeout) already raised inside _post, for both modes. The RAW reply is
+        classified: a partner fault names none of OUR secrets, and _WSSE_FAULT_RE must see the
+        unscrubbed text. BACKLOG #2827: both passes read up to the 16 MiB reply cap, so they run here
+        rather than on the loop's thread, as the non-2xx scan inside _post already did.
+
+        THIS DOES NOT MAKE THE LOOP IMMUNE TO THE SCAN. On the default CPython build, at least each
+        ``re`` search, each ``str.find``, each ``str`` replace and ``_code_text``'s slice copy of up
+        to 16 MiB is one C call that holds the GIL until it returns, so the loop waits while one
+        runs, and can wait out several in turn while several worker threads scan. What bounds each
+        wait is the scan being linear: each call is one pass over at most the 16 MiB reply, and
+        which call is longest depends on the reply's shape. On one 16-core desktop (Ryzen 9 9950X,
+        CPython 3.14.7, 2026-11-04, shared with other work), crafted replies took about 2 to 2.6 s
+        in ``_classify_soap`` alone, without the decode in _post or the capture scrub. The longest
+        single call, about 0.7 to 1.5 s, was a ``_FAULTCODE_RE`` or ``_CODEVALUE_RE`` name scan over
+        a reply of ``<Fault>`` followed by one long run of ``<``. On a bare run of ``<``,
+        ``_FAULT_RE`` finds nothing and the name scans never run. Those are that machine's readings,
+        not a bound on another. Later #2827 changes added scans, at least ``_find_fault``'s and the
+        code-element checks in ``_code_text``, so they are not a reading of this code."""
+        body, status, headers = self._post(payload)
+        failure = _classify_soap(status, body)
+        # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any
+        # echoed secret before send() returns it (a validating registry may echo a bad credential in
+        # its <Fault>). Guarded so a no-body_secrets connection is byte-identical.
+        if self.capture_response and self._body_secrets:
+            body = self._scrub_body_secrets(body)
+            headers = {k: self._scrub_body_secrets(v) for k, v in headers.items()}
+        return body, status, headers, failure
+
     def _post(self, payload: str) -> tuple[str, int, dict[str, str]]:
         # #200 (ADR 0092 decision 4): zero-I/O send-time re-assertion of a permitted insecure hop before
         # a byte crosses (a None guard — secure/loopback — is byte-identical).
@@ -906,8 +1014,8 @@ class SoapDestination(DestinationConnector):
                 # ASVS 15.2.2: bounded on the socket read. One SOAP response envelope sits far under
                 # the 16 MiB ceiling, so this refuses only a peer that is broken or hostile.
                 # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
-                # re-send. A Fault can sit inside a 2xx, so send() reads this body in both capture
-                # modes, and the refusal is permanent.
+                # re-send. A Fault can sit inside a 2xx, so _post_and_classify reads this body in both
+                # capture modes, and the refusal is permanent.
                 body = read_2xx_reply_text(
                     resp, connector=self._hop, encoding=self.encoding, body_is_needed=True
                 )

@@ -633,7 +633,7 @@ jobs:
           mapfile -t FILES < shard-files.txt
           echo "shard ${SHARD} of ${SHARDS}: ${#FILES[@]} test files"
           RC=0
-          pytest -q -n 4 --dist loadfile --max-worker-restart=0 -m 'not tooling' --cov=messagefoundry --cov-report= --durations=20 "${FILES[@]}" || RC=$?
+          pytest -q -n 4 --dist loadfile --max-worker-restart=0 -m 'not tooling' --cov=messagefoundry --cov=messagefoundry_toolkit --cov-report= --durations=20 "${FILES[@]}" || RC=$?
           echo "pytest exited ${RC}"
           # 0 is all passed and 1 is some failed; both ran every file, so the data is whole. Any
           # other code (interrupted, internal error, usage error, nothing collected) can leave a

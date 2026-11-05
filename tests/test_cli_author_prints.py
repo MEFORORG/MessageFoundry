@@ -189,8 +189,11 @@ def test_check_sends_every_loads_print_and_the_routers_to_stderr(
 def test_impact_sends_a_config_modules_print_to_stderr(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    # A toolkit command since ADR 0201 slice 4; the toolkit runs the same shared run_cli seam.
+    from messagefoundry_toolkit.__main__ import main as toolkit_main
+
     cfg = _config(tmp_path, PRINTING_CONFIG)
-    assert main(["impact", "--config", cfg, "router", "r", "--json"]) == 0
+    assert toolkit_main(["impact", "--config", cfg, "router", "r", "--json"]) == 0
     assert isinstance(_no_print_on_stdout(capsys, MARKER), dict)
 
 

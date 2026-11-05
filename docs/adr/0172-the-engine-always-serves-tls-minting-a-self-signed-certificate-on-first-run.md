@@ -96,6 +96,10 @@ none configured the engine mints a self-signed pair on first run, persists it, a
    proxy terminating TLS *in front* of the engine and speaking plaintext to it. Minting there
    would break the proxy's own hop rather than harden anything. **"Always serves TLS" means the
    engine never leaves a hop unprotected — not that it terminates TLS in every deployment.**
+   *(Note 2026-11-04, BACKLOG #4636: the bold sentence keeps its original wording, and its first
+   half overstates. The engine does nothing to protect the plaintext proxy-to-engine hop; the site
+   does, and `serve` accepts that hop only on a loopback bind with an acknowledgement.
+   [SECURITY.md, Plaintext proxy hop](../SECURITY.md#plaintext-proxy-hop) states the rule.)*
 4. **The generated pair is a placeholder to be replaced.** Self-signed, so no chain of trust:
    strictly better than cleartext, strictly worse than an operator chain. A browser shows a trust
    interstitial until it is imported.

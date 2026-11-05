@@ -5,7 +5,7 @@
 
 A thin wrapper. The implementation, the 2026-10-17 measurement and the reasoning live in
 ``messagefoundry/security/audit_all_platforms.py``, which ships in the wheel so the ``audit-pin`` job
-``messagefoundry init`` generates for an adopter runs the same code as this repository's gate. This
+``messagefoundry-toolkit init`` generates for an adopter runs the same code as this repository's gate. This
 path stays the entry point ``security.yml`` calls, because those jobs install only the scanner lock,
 not the engine: the module is stdlib only, and the checkout is put on ``sys.path`` to import it.
 """

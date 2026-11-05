@@ -28,6 +28,7 @@ from messagefoundry.audit_write import write_audit_soft
 from messagefoundry.auth.trust_anchors import api_client_anchor_spec, verified_anchor_cadata
 from messagefoundry.config.settings import ApiSettings
 from messagefoundry.config.tls_policy import (
+    TLS_REVOCATION_ATTESTED_ENV,
     apply_operator_tls_ciphers,
     harden_cipher_suites,
     harden_crl_check,
@@ -54,7 +55,10 @@ __all__ = [
     "build_api_ssl_context",
     "ensure_api_tls_material",
     "generated_state_dir",
+    "off_loopback_certificate_remedy",
     "plan_api_tls_material",
+    "plaintext_upstream_hop_off_loopback",
+    "plaintext_upstream_hop_off_loopback_remedy",
     "plaintext_upstream_hop_unacknowledged",
     "record_generated_pair_replacements",
 ]
@@ -302,6 +306,55 @@ def plaintext_upstream_hop_unacknowledged(api: ApiSettings) -> bool:
     return api.serves_plaintext_upstream_hop and not api.plaintext_upstream_hop_acknowledged
 
 
+def plaintext_upstream_hop_off_loopback(api: ApiSettings) -> bool:
+    """True when ``serve`` refuses to start on BACKLOG #4636: the engine serves the proxy-to-engine
+    hop in plaintext and binds a host that is not loopback, so that hop would cross a network.
+
+    The acknowledgement accepts the plaintext hop only from a proxy on the same machine, with the
+    engine bound to loopback (owner ruling R1 of 2026-10-27 on BACKLOG #1179). Off loopback no
+    acknowledgement covers it, so this is decided without reading one, and ``serve`` checks it
+    before :func:`plaintext_upstream_hop_unacknowledged`: an operator is never told to set an
+    acknowledgement that would then be refused. An operator ``tls_cert_file`` makes the hop TLS,
+    so it is not refused here.
+
+    Loopback is :attr:`ApiSettings.is_loopback`, the definition the exposed-bind gate reads: the
+    exact hosts ``127.0.0.1``, ``::1`` and ``localhost``. Any other spelling, another
+    ``127.0.0.0/8`` address and the empty host included, is refused. ``localhost`` is taken as a
+    name, unresolved, so a hosts file that maps it off the box is not seen here.
+
+    Shared by ``serve``'s exposed-bind gate and the ``upstream-hop-ack`` leg of
+    ``messagefoundry check``.
+    """
+    return api.serves_plaintext_upstream_hop and not api.is_loopback
+
+
+def plaintext_upstream_hop_off_loopback_remedy(loopback_lever: str) -> str:
+    """The two ways out of the :func:`plaintext_upstream_hop_off_loopback` refusal, as one sentence.
+
+    ``serve`` and the ``upstream-hop-ack`` check leg both print it. ``loopback_lever`` names how to
+    bind loopback: ``serve`` adds ``serve --host``, which the check cannot see. The certificate remedy names the revocation
+    attestation because off loopback that bind is in-process TLS (docs/SECURITY.md, *API revocation
+    gate*)."""
+    return (
+        f"Either bind the engine to loopback ({loopback_lever}) behind a proxy on the same "
+        "machine and set [api].plaintext_upstream_hop_acknowledged = true, or "
+        f"{off_loopback_certificate_remedy()}, and point the proxy at https"
+    )
+
+
+def off_loopback_certificate_remedy() -> str:
+    """The certificate half of an off-loopback API remedy, as one clause: an operator certificate
+    AND, because off loopback that bind meets the API revocation gate, the attestation. The two
+    steps are joined inside the clause so a caller's own "either ... or" list cannot split them.
+    Every refusal that prescribes a certificate uses it: at least the two exposed-bind refusals,
+    :func:`plaintext_upstream_hop_off_loopback_remedy`, the /ui refusal and warnings in ``serve``,
+    and the PHI-read 403. Keep it free of any proxy step, since most of them have no proxy."""
+    return (
+        "set [api].tls_cert_file (and [api].tls_key_file unless the key is in that PEM) and set "
+        f"{TLS_REVOCATION_ATTESTED_ENV}=1 in serve's environment"
+    )
+
+
 @dataclass(frozen=True)
 class ApiTlsPlan:
     """What the API bind **will** serve with, decided without reading or writing a single file.
@@ -330,7 +383,8 @@ class ApiTlsPlan:
 
         ``http`` only for a DECLARED upstream terminator: the proxy holds the protected hop and the
         engine speaks plaintext behind it. That hop is the deploying site's to secure, so ``serve``
-        requires ``[api].plaintext_upstream_hop_acknowledged`` for it and ``security_loosenings()``
+        requires a loopback bind and ``[api].plaintext_upstream_hop_acknowledged`` for it
+        (BACKLOG #4636) and ``security_loosenings()``
         lists it (BACKLOG #1179). A client that hardcodes https breaks exactly that topology, which
         is why this is reported rather than assumed.
         """
@@ -639,10 +693,12 @@ def ensure_api_tls_material(
     # The branch order lives in plan_api_tls_material, so the read-only reporter and the minting
     # path cannot disagree about which certificate the bind presents. Two of the three branches
     # need no disk at all: an operator's material is passed through UNCHANGED (tls_key_file's None
-    # included -- see the key_path note above), and a DECLARED UPSTREAM TERMINATOR IS NOT AN
-    # UNPROTECTED HOP, so minting there would break the proxy's own plaintext hop rather than
-    # harden anything. "Always serves TLS" means the engine never leaves a hop unprotected, NOT
-    # that it terminates TLS in every topology. Neither branch is ever renewed.
+    # included -- see the key_path note above), and behind a DECLARED UPSTREAM TERMINATOR minting
+    # would break the proxy's own plaintext hop rather than harden anything. That hop is plaintext
+    # and the engine does nothing to protect it, so serve accepts it only on a loopback bind with
+    # an acknowledgement (docs/SECURITY.md, Plaintext proxy hop). "Always serves TLS" means the
+    # engine mints wherever no operator certificate or terminator is configured, NOT that it
+    # terminates TLS in every topology. Neither branch is ever renewed.
     plan = plan_api_tls_material(api, state_dir=state_dir)
     if plan.source != "generated":
         return plan.material()

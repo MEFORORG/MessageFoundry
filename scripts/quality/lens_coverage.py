@@ -12,7 +12,7 @@ nobody has re-run it. Whether to build the next Steps-view increment, or to stop
 number.
 
 WHAT IT MEASURES, AND WHY NOT WITH ITS OWN PARSER. ADR 0089's original scan classified statements
-with its own `ast` walk. This one drives the SHIPPED `messagefoundry lens parse --json` instead, so
+with its own `ast` walk. This one drives the SHIPPED `messagefoundry-toolkit lens parse --json` instead, so
 the answer describes what the Steps view REALLY renders today rather than a second implementation
 of the grammar that could drift from it. The lens is the product surface under evaluation; asking
 it directly is the only way the number stays honest as the grammar moves.
@@ -81,7 +81,7 @@ def parse_module(py: Path, python: str, cwd: Path, contract: int = 1) -> tuple[d
     config modules are UTF-8, so the decode raises inside subprocess's reader thread and stdout
     comes back None -- a refusal that reads as "this estate has no handlers".
     """
-    argv = [python, "-m", "messagefoundry", "lens", "parse", str(py), "--json"]
+    argv = [python, "-m", "messagefoundry_toolkit", "lens", "parse", str(py), "--json"]
     if contract != 1:
         # Only a non-default contract is passed, so the default argv is exactly what it always was.
         argv += ["--contract", str(contract)]
@@ -177,7 +177,11 @@ def _label(py: Path, root: Path, anonymize: bool, seen: dict[str, str]) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("config_dir", type=Path, help="directory of config modules to scan")
-    ap.add_argument("--python", default=sys.executable, help="interpreter with messagefoundry")
+    ap.add_argument(
+        "--python",
+        default=sys.executable,
+        help="interpreter with messagefoundry and messagefoundry-toolkit",
+    )
     ap.add_argument("--cwd", type=Path, default=Path.cwd(), help="working dir for the CLI call")
     ap.add_argument(
         "--strict-control",

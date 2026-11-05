@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from messagefoundry.lens import parse_source
+from messagefoundry_toolkit.lens import parse_source
 
 
 def _handler(body: str) -> dict[str, object]:

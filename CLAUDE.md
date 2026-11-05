@@ -196,7 +196,7 @@ messagefoundry/
   auth/            # authn + RBAC core (no FastAPI): permissions/roles, Identity, passwords, tokens, ldap, service.py
   api/             # FastAPI app.py + models.py + security.py (auth deps) + auth_routes.py (the engine's only external surface)
   apiclient/       # Qt-free / FastAPI-free engine-client library (ADR 0088) — the shared HTTP client (httpx)
-  generators/      # conformant synthetic HL7 generators (adt.py, …) — `messagefoundry generate`; corpus git-ignored
+  generators/      # conformant synthetic HL7 generators (adt.py, …) — `messagefoundry-toolkit generate`; corpus git-ignored
   security/        # security assets shipped in the wheel (ADR 0144)
   support/         # support-bundle assembly + redaction (bundle.py, redact.py)
   verify/          # deployment verifier — `messagefoundry verify` (checks.py, smoke.py, federation.py)

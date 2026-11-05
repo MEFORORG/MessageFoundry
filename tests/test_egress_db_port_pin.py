@@ -16,6 +16,7 @@ what the shipped code did; each of them fails on it.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -26,6 +27,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Database, DatabasePoll, WiringError
 from messagefoundry.transports.database import _build_odbc_dsn
 from messagefoundry.transports.db_endpoint import (
+    GENERIC_DRIVER_REFUSAL,
     database_dial_endpoint,
     generic_hop_endpoint,
 )
@@ -236,9 +238,7 @@ def test_generic_port_keyword_with_a_leading_zero_is_refused(check: Check, entry
         )
 
 
-#: The generic remedy for a driver the engine does not know reads ``PORT``, and the one for a name
-#: the SQL Server preset accepts (BACKLOG #4873).
-KNOWN_DRIVER_REMEDY = r"use a driver known to read the PORT keyword \(psqlODBC, MySQL or MariaDB\)"
+#: The generic remedy for Microsoft's driver, which ignores ``PORT`` (BACKLOG #4873).
 PRESET_REMEDY = "use dialect sqlserver, or a driver that reads the PORT"
 
 
@@ -248,45 +248,53 @@ def test_generic_with_a_sql_server_driver_reads_no_port(check: Check) -> None:
     kw: dict[str, Any] = {"dialect": "generic", "server": HOST, "odbc_params": {"PORT": "5432"}}
     with pytest.raises(WiringError, match=PRESET_REMEDY):
         check(kw, PINNED)
-    for driver in (
-        "sql server native client 11.0",
-        "ODBC Driver 17 for SQL Server",
-        "ODBC Driver 13.1 for SQL Server",
-    ):
-        with pytest.raises(WiringError, match=PRESET_REMEDY):
-            check({**kw, "odbc_driver": driver}, PINNED)
+    with pytest.raises(WiringError, match=PRESET_REMEDY):
+        check({**kw, "odbc_driver": "ODBC Driver 17 for SQL Server"}, PINNED)
     check(kw, HOST_ONLY)  # a host-only entry still admits it
     check({**kw, "odbc_driver": "PostgreSQL Unicode"}, PINNED)  # a driver that reads PORT
 
 
 @pytest.mark.parametrize(
-    ("driver", "remedy"),
+    "driver",
     [
-        ("MSSQL18", KNOWN_DRIVER_REMEDY),
-        ("/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.so", PRESET_REMEDY),
-        ("Oracle 21", KNOWN_DRIVER_REMEDY),
-        # A name holding `sql server` that the preset refuses too: the remedy never names the
-        # preset for it (BACKLOG #4873).
-        ("SQL Server", KNOWN_DRIVER_REMEDY),
-        ("FreeTDS SQL Server", KNOWN_DRIVER_REMEDY),
-        ("DataDirect 8.0 SQL Server Wire Protocol", KNOWN_DRIVER_REMEDY),
-        ("ODBC Driver 18 for SQL  Server", KNOWN_DRIVER_REMEDY),
+        "MSSQL18",
+        "/opt/microsoft/msodbcsql18/lib64/libmsodbcsql-18.so",
+        "Oracle 21",
+        "SQL Server",
+        "FreeTDS SQL Server",
+        "DataDirect 8.0 SQL Server Wire Protocol",
+        "ODBC Driver 18 for SQL  Server",
+        # Names the preset accepts, which the generic dialect's allowlist does not hold.
+        "sql server native client 11.0",
+        "ODBC Driver 13.1 for SQL Server",
+        # Names the shipped code read as reading PORT, by a word in them.
+        "psqlodbcw.so",
+        "MariaDB ODBC 3.1",
+        "/opt/mysql-compat/libmsodbcsql-18.so",
+        "PostgreSQL via SQL Server gateway",
+        "MSODBCSQL-mariadb",
     ],
 )
-def test_generic_with_a_driver_not_known_to_read_port_reads_no_port(
-    check: Check, driver: str, remedy: str
+def test_generic_with_a_driver_off_the_allowlist_is_refused_whatever_the_entry(
+    check: Check, driver: str
 ) -> None:
-    # A name with no known word reads no port, whatever it loads. main refused these against
-    # db:5432 (it read the defaulted port), so admitting them would loosen it. Fail closed.
+    # BACKLOG #5041: the egress check refuses the name the build refuses, so a host-only entry no
+    # longer admits it. The shipped code admitted each of these against a host-only entry, and
+    # admitted the last group against a pin too, by a word in the name.
     kw = _generic(server=HOST, odbc_driver=driver, odbc_params={"PORT": "5432"})
-    with pytest.raises(WiringError, match=remedy):
-        check(kw, PINNED)
-    check(kw, HOST_ONLY)
+    for egress in (PINNED, HOST_ONLY):
+        with pytest.raises(WiringError, match=re.escape(GENERIC_DRIVER_REFUSAL)):
+            check(kw, egress)
 
 
 @pytest.mark.parametrize(
     "driver",
-    ["PostgreSQL ANSI", "psqlodbcw.so", "MySQL ODBC 8.0 Unicode Driver", "MariaDB ODBC 3.1"],
+    [
+        "PostgreSQL ANSI",
+        "postgresql",
+        "MySQL ODBC 8.0 Unicode Driver",
+        "mysql odbc 9.1 ansi driver",
+    ],
 )
 def test_generic_with_a_driver_known_to_read_port_is_admitted(check: Check, driver: str) -> None:
     # The check reads the name as written: it cannot see which library a name loads.
@@ -370,24 +378,3 @@ def test_egress_refuses_the_sql_server_comma_port_the_hop_guard_splits() -> None
     )
     assert endpoint.conflict is not None and "comma" in endpoint.conflict
     assert generic_hop_endpoint(server, {}, reads_comma_port=True) == ("127.0.0.1", 1433)
-
-
-@pytest.mark.parametrize(
-    ("driver", "remedy"),
-    [
-        ("/opt/mysql-compat/libmsodbcsql-18.so", PRESET_REMEDY),
-        ("PostgreSQL via SQL Server gateway", KNOWN_DRIVER_REMEDY),
-        ("MSODBCSQL-mariadb", KNOWN_DRIVER_REMEDY),
-    ],
-)
-def test_a_sql_server_word_wins_over_a_known_driver_word(
-    check: Check, driver: str, remedy: str
-) -> None:
-    # The reviewer's path shape: a name holding mysql but naming msodbcsql. A SQL Server word in the
-    # name reads no port, so the pin refuses it; a host-only entry still admits it. The remedy
-    # names the preset only for a name the preset accepts, here the Microsoft library file
-    # (BACKLOG #4873).
-    kw = _generic(server=HOST, odbc_driver=driver, odbc_params={"PORT": "5432"})
-    with pytest.raises(WiringError, match=remedy):
-        check(kw, PINNED)
-    check(kw, HOST_ONLY)

@@ -7,7 +7,7 @@ recognizes back as an editable step, so the `.py` file stays the only artifact a
 (#26). Placeholders below (`<…>`) are what you fill in via the item's prompts / inline fields.
 
 > **Source of truth:** [`ide/src/stepsModel.ts`](../ide/src/stepsModel.ts) → `ADD_MENU_CATALOG` (the labels,
-> ops, and pickers) and [`messagefoundry/lens.py`](../messagefoundry/lens.py) (the codegen). If an item
+> ops, and pickers) and [`messagefoundry_toolkit/lens.py`](../messagefoundry_toolkit/lens.py) (the codegen). If an item
 > changes there, update this table. Palette design: [ADR 0106](adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md);
 > Send fan-out: [ADR 0108](adr/0108-steps-view-accumulator-send-fan-out-copy-on-send-authoring.md).
 
