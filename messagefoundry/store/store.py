@@ -126,6 +126,7 @@ from messagefoundry.store.crypto import (
     AUDIT_SCHEME_TRANSIT,
     AUDIT_SCHEME_UNNAMED_IN_HEAP,
     AUDIT_SCHEME_UNNAMED_TRANSIT,
+    STORE_ID_BYTES,
     AesGcmCipher,
     AuditKeyVersionRefusedError,
     AuditMacFn,
@@ -4997,6 +4998,9 @@ def audit_scheme_refusal(key_id: str, scheme: AuditScheme | None) -> str | None:
 
 #: The fields a genesis or range record names its scheme in (BACKLOG #3420).
 _AUDIT_SCHEME_FIELDS: Final = frozenset({"mac", "kdf"})
+#: What a record of a shape no release writes reads as: a scheme no release holds, so
+#: :func:`audit_scheme_refusal` refuses it.
+_AUDIT_SCHEME_REFUSED: Final = AuditScheme(mac="", kdf="")
 
 
 def _audit_record_scheme(obj: Mapping[str, Any], fields: frozenset[str]) -> AuditScheme | None:
@@ -5016,7 +5020,7 @@ def _audit_record_scheme(obj: Mapping[str, Any], fields: frozenset[str]) -> Audi
         return None
     mac, kdf = obj.get("mac"), obj.get("kdf")
     if keys != fields | _AUDIT_SCHEME_FIELDS or not (isinstance(mac, str) and isinstance(kdf, str)):
-        return AuditScheme(mac="", kdf="")  # a shape no release writes, refused as such
+        return _AUDIT_SCHEME_REFUSED
     return AuditScheme(mac=mac, kdf=kdf)
 
 
@@ -5196,15 +5200,63 @@ def audit_seal_next(
     return seq, row_hash
 
 
-def audit_genesis_detail(key_id: str) -> str:
+#: A genesis record writes a store id (vault BACKLOG #3411) as the lowercase hex of its bytes.
+_AUDIT_STORE_ID_FIELD: Final = "store_id"
+_AUDIT_STORE_ID_HEX: Final = re.compile(rf"[0-9a-f]{{{2 * STORE_ID_BYTES}}}")
+_ABSENT: Final = object()
+
+
+def audit_genesis_detail(key_id: str, store_id: bytes | None = None) -> str:
     """The ``detail`` of the genesis row: a typed record naming the key the first range is MAC'd
     under, and the scheme it is sealed with (BACKLOG #3420). JSON, so a later field can be added
-    beside them."""
-    scheme = _audit_scheme_fields(audit_scheme_for(key_id))
-    return json.dumps({"genesis": 1, "key_id": key_id, **scheme}, sort_keys=True)
+    beside them.
+
+    ``store_id``, when given, is recorded as a label (vault BACKLOG #3411): the row MAC covers it,
+    and no key is derived from it. Without one the record has today's shape. No caller passes one
+    yet. Raises ``ValueError`` for a store id that is not :data:`STORE_ID_BYTES` long."""
+    record: dict[str, object] = {"genesis": 1, "key_id": key_id}
+    record.update(_audit_scheme_fields(audit_scheme_for(key_id)))
+    if store_id is not None:
+        if len(store_id) != STORE_ID_BYTES:
+            raise ValueError(f"a store id is {STORE_ID_BYTES} bytes, not {len(store_id)}")
+        record[_AUDIT_STORE_ID_FIELD] = store_id.hex()
+    return json.dumps(record, sort_keys=True)
 
 
 _AUDIT_GENESIS_FIELDS: Final = frozenset({"genesis", "key_id"})
+
+
+def _parse_audit_genesis(detail: object) -> tuple[str, AuditScheme | None, bytes | None] | None:
+    """``(key_id, scheme, store_id)`` from a genesis row's ``detail``; see
+    :func:`parse_audit_genesis_record`. ``store_id`` is ``None`` when the record names none.
+
+    A ``store_id`` field that is not the lowercase hex of :data:`STORE_ID_BYTES` bytes reads as a
+    genesis record naming a scheme no release holds, so :func:`audit_scheme_refusal` refuses it, as
+    it refuses a field beyond the record. Read as no record instead, a malformed store id would turn
+    a keyed chain's genesis row into none (:func:`_audit_record_scheme` says why that matters)."""
+    if not isinstance(detail, str):
+        return None
+    try:
+        obj = json.loads(detail)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    raw_store_id = obj.pop(_AUDIT_STORE_ID_FIELD, _ABSENT)
+    try:
+        scheme = _audit_record_scheme(obj, _AUDIT_GENESIS_FIELDS)
+    except ValueError:
+        return None
+    marker, key_id = obj["genesis"], obj["key_id"]
+    if isinstance(marker, bool) or marker != 1:
+        return None
+    if not isinstance(key_id, str) or not key_id:
+        return None
+    if raw_store_id is _ABSENT:
+        return key_id, scheme, None
+    if isinstance(raw_store_id, str) and _AUDIT_STORE_ID_HEX.fullmatch(raw_store_id):
+        return key_id, scheme, bytes.fromhex(raw_store_id)
+    return key_id, _AUDIT_SCHEME_REFUSED, None
 
 
 def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None] | None:
@@ -5214,24 +5266,18 @@ def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None]
     scheme still reads as a genesis row, and its chain as keyed.
 
     Total over attacker-written input, like :func:`parse_audit_epoch`: a malformed value is ``None``,
-    never an exception. Exactly the fields a genesis record has, so a range row's detail (which
-    carries ``closes`` and ``handover``) is never read as one."""
-    if not isinstance(detail, str):
-        return None
-    try:
-        obj = json.loads(detail)
-    except (ValueError, RecursionError):
-        return None
-    if not isinstance(obj, dict):
-        return None
-    try:
-        scheme = _audit_record_scheme(obj, _AUDIT_GENESIS_FIELDS)
-    except ValueError:
-        return None
-    marker, key_id = obj["genesis"], obj["key_id"]
-    if isinstance(marker, bool) or marker != 1:
-        return None
-    return (key_id, scheme) if isinstance(key_id, str) and key_id else None
+    never an exception. Exactly the fields a genesis record has, with or without a ``store_id``, so a
+    range row's detail (which carries ``closes`` and ``handover``) is never read as one."""
+    parsed = _parse_audit_genesis(detail)
+    return None if parsed is None else parsed[:2]
+
+
+def parse_audit_genesis_store_id(detail: object) -> bytes | None:
+    """The store id a genesis row's ``detail`` records (vault BACKLOG #3411), or ``None`` when it
+    records none, records a malformed one, or ``detail`` is not a genesis record. A label: the copy
+    in the database is not a pin, and nothing is keyed from it."""
+    parsed = _parse_audit_genesis(detail)
+    return None if parsed is None else parsed[2]
 
 
 def parse_audit_genesis(detail: object) -> str | None:
@@ -8699,6 +8745,26 @@ CREATE TABLE IF NOT EXISTS transit_bound_attestation (
     attested_at REAL NOT NULL,
     audit_seq   INTEGER NOT NULL,
     audit_hash  TEXT NOT NULL
+);
+
+-- The keyring (vault BACKLOG #3411; the key-custody draft's rules 4 and 6). One row per wrapped key:
+-- in S3 only the recovery wrap, which is the master key sealed under a key derived from the recovery
+-- key, and whether that recovery key is proved. S4 adds its data, index and backup keys and its master
+-- handover row in this same shape, so it needs no second migration. NOTHING WRITES IT YET. `wrapped`
+-- is for a SEALED key only, never a plain one, and the store id a seal binds is read from the host
+-- blob, never from this table. Not the in-memory `audit_mac_keyring`. No PHI.
+CREATE TABLE IF NOT EXISTS keyring (
+    key_id      TEXT PRIMARY KEY,           -- the wrapped key's id, a one-way fingerprint
+    purpose     TEXT NOT NULL,              -- what the key is for, such as the recovery wrap
+    key_class   TEXT NOT NULL DEFAULT '',   -- a data key's class, period or standing (S4); '' for none
+    state       TEXT NOT NULL,              -- where the key is in its life, such as pending or active
+    period_from REAL,                       -- the period a period key seals for (S4); NULL for none
+    period_to   REAL,
+    wrapped_by  TEXT NOT NULL,              -- the id of the key `wrapped` is sealed under
+    wrapped     TEXT NOT NULL DEFAULT '',   -- the key, sealed; '' when the row holds none
+    created_at  REAL NOT NULL,
+    state_at    REAL NOT NULL,              -- when `state` last changed
+    proved_at   REAL                        -- recovery wrap: when the key last came back and opened it
 );
 
 -- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per upload IN
