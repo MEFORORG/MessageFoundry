@@ -7478,8 +7478,8 @@ service account could be such a process. It would then run Python inside the eng
 everything the engine holds.
 
 The first control is a start refusal under `enforce`, in `serve` and `supervise` only, which
-`[security].allow_remote_debugging` lifts (vault BACKLOG #2700). The other commands neither
-refuse nor report. When it fires is stated once, in
+`[security].allow_remote_debugging` lifts (vault BACKLOG #2700). No other command makes that
+refusal. When it fires is stated once, in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
 Three further controls answer it, and they differ in strength:
 
