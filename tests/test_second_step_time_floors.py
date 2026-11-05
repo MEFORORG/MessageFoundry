@@ -712,3 +712,31 @@ async def test_a_step_up_callback_just_inside_the_floor_is_refused_and_just_past
         assert served.elevation.ok and served.elevation.token is not None, served
     finally:
         await store.close()
+
+
+async def test_the_step_up_callbacks_own_store_reads_do_not_count_as_the_persons_time(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: ``complete_oidc_step_up`` reads the callback's age after the store reads that name
+    the refusal's account (vault BACKLOG #3221 item K5). The callback arrives inside the floor and
+    each session read then takes longer than the floor. The age is read as the flow is redeemed,
+    so a slow store cannot carry a too-early callback past the floor."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, clock = await _floored_federated_service(store, rsa_key, monkeypatch)
+        signed_in = await _oidc_login(service, monkeypatch, rsa_key)
+        assert signed_in.ok and signed_in.token is not None
+        flow_id, _url = await _begin(service, signed_in.token)
+        real_load = service._load_session
+
+        async def slow_load(token_hash: str) -> Any:
+            clock[0] += 2 * OIDC_FLOOR
+            return await real_load(token_hash)
+
+        monkeypatch.setattr(service, "_load_session", slow_load)
+        clock[0] += OIDC_FLOOR / 2
+        early = await _return_from_idp(service, monkeypatch, rsa_key, flow_id)
+        assert not early.elevation.ok and early.reason == TOO_EARLY, early
+        assert not await service.has_recent_step_up(signed_in.token)
+    finally:
+        await store.close()

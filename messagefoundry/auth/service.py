@@ -6591,8 +6591,10 @@ class AuthService:
 
         Checks, in order, each failing CLOSED with nothing elevated: the flow exists and ``state``
         matches; it is a step-up flow; the callback is not too soon after the flow started (BACKLOG
-        #2301), a check that moves after the exchange when ``oidc_callback_floor_exempt_amr`` is set,
-        because only the exchange yields the ``amr`` it exempts by (BACKLOG #2388), so a too-early
+        #2301), its age read as the flow is redeemed so no store read counts as the person's time
+        (BACKLOG #3221), a check that moves after the exchange when
+        ``oidc_callback_floor_exempt_amr`` is set, because only the exchange yields the ``amr`` it
+        exempts by (BACKLOG #2388), so a too-early
         callback whose exchange fails is then refused with that failure's reason, not ``too_early``,
         on a row that carries ``callback_floor_deferred`` (BACKLOG #3728);
         the code exchange and the whole claims ladder pass (the nonce, the pinned issuer,
@@ -6627,6 +6629,10 @@ class AuthService:
         flow = await self._redeem_step_up_flow(flow_id, state, client=client)
         if isinstance(flow, OidcStepUp):
             return flow
+        # BACKLOG #2301, #3221: the callback's age is read as the flow is redeemed, before the actor
+        # lookup's two store reads below, so store latency never counts as time the person spent and
+        # cannot carry a too-early callback past the floor. The refusal itself comes further down.
+        arrived_too_early = self._oidc_callback_too_early(flow)
         return_to = flow.return_to
         actor = await self._step_up_actor(flow)
         token_hash = flow.step_up_session_hash
@@ -6639,11 +6645,10 @@ class AuthService:
         )
         # BACKLOG #2301 (ASVS 2.4.2): max_age=0 and prompt=login make the person authenticate at the
         # IdP, so a step-up callback faster than a person can do that is refused. Before the code is
-        # redeemed, so the refused flow spends nothing at the token endpoint.
+        # redeemed, so the refused flow spends nothing at the token endpoint. The age was read above.
         # BACKLOG #2388: with oidc_callback_floor_exempt_amr set, the exemption needs the verified
         # amr, which only the exchange yields, so an opted-in site pays for the exchange and the
         # refusal waits for it below. With the list empty (the default) nothing changes here.
-        arrived_too_early = self._oidc_callback_too_early(flow)
         exempt_values = (
             self._oidc_callback_floor_exempt_values() if arrived_too_early else frozenset()
         )
