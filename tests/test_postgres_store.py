@@ -1151,6 +1151,13 @@ async def test_webauthn_store_contract(store) -> None:
     await _assert_webauthn_store_contract(store)
 
 
+async def test_a_session_for_a_missing_account_is_refused(store) -> None:
+    """BACKLOG #2733 on Postgres: the session's user foreign key, as on SQLite and SQL Server."""
+    from tests._webauthn_store_contract import assert_a_session_for_a_missing_account_is_refused
+
+    await assert_a_session_for_a_missing_account_is_refused(store)
+
+
 async def test_webauthn_conditional_bind_contract(store) -> None:
     """BACKLOG #3014, #3690 item 1 on the real Postgres backend: the conditional passkey insert,
     checked with the account row held under FOR UPDATE."""
