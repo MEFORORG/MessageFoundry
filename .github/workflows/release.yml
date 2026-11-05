@@ -104,13 +104,17 @@
 # the image would then run holding the publish job's `id-token: write` under the `pypi` environment.
 # The tag has already moved once in ordinary operation: upstream's `release/v1` and `release/v1.14`
 # build runs both pushed it for the same commit. So each upload step names, by its `sha256:` digest,
-# the image that commit's tag resolved to when this pin was taken, and calls the image directly.
-# That skips the composite, which also supplied the image's input defaults. The image's entry script
-# reads its inputs under `set -u`, so each upload step passes every input the composite passed, at
-# the composite's own default value. Leaving out the user name or the password input would abort
-# the step; leaving out the repository URL would turn PEP 740 attestations off and still upload.
-# The token user name with an empty password is how the image selects Trusted Publishing; neither
-# carries a secret. tests/test_release_pipeline.py pins the image spelling, one digest at every
+# the image that COMMIT's tag resolved to when this pin was taken, and calls the image directly.
+# That is the image the action itself would have run. Upstream's `:v1.14.3` tag names a different
+# build of the same commit, with a different digest, so do not check the pin against that tag.
+# Calling the image skips the composite, which also supplied the image's input defaults, so each
+# upload step passes every input the composite passed, at the composite's own default value. The
+# image's entry script runs under `set -u` and reads at least the user name, password and verbose
+# inputs directly, so leaving one out fails the step; its token exchange reads the repository URL
+# with no default, so leaving that out fails it too. A repository URL other than PyPI's would send
+# the OIDC token to that index and turn PEP 740 attestations off. The token user name with an empty
+# password is how the image selects Trusted Publishing; neither carries a secret.
+# tests/test_release_pipeline.py pins the image spelling, one digest and one comment at every
 # site, and every input's value.
 # DEPENDABOT DOES NOT MOVE THIS DIGEST, and no longer sees the action at all: its github-actions
 # parser skips a `docker://` reference, and its docker entry scans /docker only. A bump is a hand
@@ -1333,7 +1337,7 @@ jobs:
       # on, not the pending publisher (ADR 0201, To resolve on acceptance, records the reading).
       - name: Publish messagefoundry-toolkit to PyPI before the engine (Trusted Publishing / OIDC)
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
-        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # v1.14.3, commit 7245906fb61fa33a13554f9d5fb856fe61758086; the header says why
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # commit 7245906fb61fa33a13554f9d5fb856fe61758086 (v1.14.3), its commit tag's image; the header says why
         with:
           packages-dir: toolkit-dist/
           skip-existing: true
@@ -1359,7 +1363,7 @@ jobs:
       # version==tag smoke check already prevents a wrong-version upload).
       - name: Publish to PyPI (Trusted Publishing / OIDC)
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
-        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # v1.14.3, commit 7245906fb61fa33a13554f9d5fb856fe61758086; the header says why
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # commit 7245906fb61fa33a13554f9d5fb856fe61758086 (v1.14.3), its commit tag's image; the header says why
         with:
           packages-dir: dist-pub/
           skip-existing: true
@@ -1382,7 +1386,7 @@ jobs:
       - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
         id: harness-upload
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-harness.outputs.publish-harness == 'true' && vars.PUBLISH_HARNESS == 'true' }}
-        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # v1.14.3, commit 7245906fb61fa33a13554f9d5fb856fe61758086; the header says why
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # commit 7245906fb61fa33a13554f9d5fb856fe61758086 (v1.14.3), its commit tag's image; the header says why
         with:
           packages-dir: harness-dist/
           skip-existing: true
@@ -1846,7 +1850,7 @@ jobs:
       - name: Publish messagefoundry-webconsole to PyPI (Trusted Publishing / OIDC)
         id: webconsole-upload
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-webconsole.outputs.publish-webconsole == 'true' && vars.PUBLISH_WEBCONSOLE == 'true' }}
-        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # v1.14.3, commit 7245906fb61fa33a13554f9d5fb856fe61758086; the header says why
+        uses: docker://ghcr.io/pypa/gh-action-pypi-publish@sha256:411241df99067c98b6d08fd8e26d14e86740a22460599c2af571e6dc26e27ffc # commit 7245906fb61fa33a13554f9d5fb856fe61758086 (v1.14.3), its commit tag's image; the header says why
         with:
           packages-dir: webconsole-dist/
           skip-existing: true

@@ -57,7 +57,7 @@ from _bash_resolver import bash_candidates, explain_returncode, require_bash
 
 from tests._force_include import hatch_build
 from tests._verify_softeners import verification_softeners
-from tests._workflow_contexts import WORKFLOWS, jobs_of, needs_of
+from tests._workflow_contexts import WORKFLOWS, jobs_of, load_workflow, needs_of
 
 _REPO = Path(__file__).resolve().parents[1]
 PYPROJECT = _REPO / "pyproject.toml"
@@ -532,12 +532,10 @@ def _is_pinned_publish(uses: str) -> bool:
 #: The upload steps: toolkit, engine and harness in `publish-pypi`, the console's in its own job.
 _PYPI_UPLOAD_SITES = 4
 
-#: Every input of an upload step but `packages-dir`, at the one value each may take (BACKLOG #5046).
-#: The image route skips the composite action.yml that used to supply these as defaults, and the
-#: image's twine-upload.sh then reads each one itself. The values are the composite's defaults at
-#: v1.14.3, plus the three this file always set. `repository-url` above all is fixed: the OIDC token
-#: goes wherever it points, and an index other than PyPI also turns attestations off. `user` with an
-#: empty `password` is how the image selects Trusted Publishing; section (5) exempts those two lines.
+#: Every input of an upload step but `packages-dir`, at the one value each may take (BACKLOG #5046):
+#: the composite's defaults at v1.14.3, plus the three this file always set. Why each must be passed,
+#: and what a missing or other value does, is in release.yml's header. Section (5) exempts the
+#: `user` and `password` lines from its token ban.
 _PUBLISH_FIXED_INPUTS: dict[str, object] = {
     "repository-url": "https://upload.pypi.org/legacy/",
     "user": "__token__",
@@ -3993,12 +3991,21 @@ def test_every_pypi_publish_runs_in_a_publish_only_job_that_names_the_environmen
                         f"not exactly {sorted(_PUBLISH_INPUTS)}"
                     )
                 # A step `env:` reaches the image as well, past the fixed inputs, and the image's
-                # entry script reads at least `DEBUG`, which turns on a shell trace.
+                # entry script reads at least `DEBUG`, which turns on a shell trace. The workflow
+                # `env:` and a `$GITHUB_ENV` write reach it the same way; both are refused below.
                 if "env" in step:
                     problems.append(f"{key}: {step.get('name')!r} sets a step `env:`")
+            if any(f in str(step.get("run") or "") for f in ("GITHUB_ENV", "GITHUB_PATH")):
+                problems.append(
+                    f"{key}: {step.get('name')!r} writes the environment of later steps"
+                )
         for key_word in ("env", "defaults", "continue-on-error"):
             if key_word in job:
                 problems.append(f"{key} sets job-level `{key_word}:`")
+    if "env" in load_workflow(RELEASE_YML.name):
+        problems.append(
+            "release.yml sets a workflow-level `env:`, which reaches every publish step"
+        )
     assert not problems, "\n".join(problems)
 
 
@@ -4038,46 +4045,67 @@ def test_only_the_publish_jobs_can_reach_pypi() -> None:
 
 # --- (14b) every PyPI upload runs the publish image by digest, with every input set (BACKLOG #5046) ---
 
+#: An upload line and its comment, which names the upstream commit (and its release) whose
+#: action.yml and twine-upload.sh the inputs were checked against. `- ` admits `uses:` as a step's
+#: first key. Group 1 is the whole line from `uses:` on, so the sites can be compared.
 _PINNED_PUBLISH_LINE = re.compile(
-    rf"^[ ]+uses: ({_PINNED_PUBLISH.pattern}) # v\d+\.\d+\.\d+, commit [0-9a-f]{{40}};",
+    rf"^[ ]+(?:- )?(uses: {_PINNED_PUBLISH.pattern} # commit [0-9a-f]{{40}} \(v\d+\.\d+\.\d+\), "
+    r"its commit tag's image;.*)$",
     flags=re.MULTILINE,
 )
 
 
-def test_every_pypi_upload_runs_one_digest_pinned_image() -> None:
-    """The action form runs its image by a repointable ghcr tag, so every upload in every workflow
-    names the image by `sha256:` digest, all by the same one, each with a comment naming the
-    release and commit the digest was read from.
+def _publish_sites() -> list[tuple[str, str]]:
+    """``(where, uses)`` for every step under .github/ that `_is_publish_action` matches: each
+    workflow's jobs, and each local action's composite steps, which a workflow could call to reach
+    the action form by a path no `uses:` check here would read as a publish."""
+    import yaml
 
-    Mutation: put one site back on `pypa/gh-action-pypi-publish@<commit>`, name the image by a tag,
-    shorten a digest, give one site a different digest, or drop its comment. Red here.
-    """
+    github = _REPO / ".github"
     sites: list[tuple[str, str]] = []
-    for path in sorted(WORKFLOWS.glob("*.y*ml")):
+    for path in sorted([*WORKFLOWS.glob("*.y*ml"), *(github / "actions").rglob("action.y*ml")]):
+        text = path.read_text(encoding="utf-8")
         # Only a file whose text names the action can hold a step `_is_publish_action` matches, so
         # the others are not parsed.
-        if "gh-action-pypi-publish" not in path.read_text(encoding="utf-8").lower():
+        if "gh-action-pypi-publish" not in text.lower():
             continue
-        for key, job in jobs_of(path.name).items():
-            for step in job.get("steps") or []:
+        if path.parent == WORKFLOWS:
+            groups = {key: job.get("steps") for key, job in jobs_of(path.name).items()}
+        else:
+            groups = {"runs": (yaml.safe_load(text).get("runs") or {}).get("steps")}
+        for key, steps in groups.items():
+            for step in steps or []:
                 uses = str((step or {}).get("uses") or "")
                 if _is_publish_action(uses):
-                    sites.append((f"{path.name}:{key}", uses))
+                    sites.append((f"{path.relative_to(github).as_posix()}:{key}", uses))
+    return sites
+
+
+def test_every_pypi_upload_runs_one_digest_pinned_image() -> None:
+    """The action form runs its image by a repointable ghcr tag, so every upload anywhere under
+    .github/ names the image by `sha256:` digest, all by the same one, each with one and the same
+    comment naming the commit the digest was read from.
+
+    Mutation: put one site back on `pypa/gh-action-pypi-publish@<commit>`, name the image by a tag,
+    shorten a digest, give one site a different digest, or drop or change one site's comment. Red
+    here. That the comment's commit is the digest's own is not checked: no test here reaches ghcr.
+    """
+    sites = _publish_sites()
     assert len(sites) == _PYPI_UPLOAD_SITES, sites
     unpinned = [site for site in sites if not _is_pinned_publish(site[1])]
     assert not unpinned, f"PyPI uploads not on the digest-pinned image: {unpinned}"
     assert len({uses for _, uses in sites}) == 1, f"the upload sites name different images: {sites}"
     commented = _PINNED_PUBLISH_LINE.findall(_release())
     assert len(commented) == _PYPI_UPLOAD_SITES, (
-        f"{len(commented)} upload lines carry the version-and-commit comment, not {_PYPI_UPLOAD_SITES}"
+        f"{len(commented)} upload lines carry the commit comment, not {_PYPI_UPLOAD_SITES}"
     )
+    assert len(set(commented)) == 1, f"the upload lines differ: {sorted(set(commented))}"
 
 
 def test_every_pypi_upload_passes_each_input_the_composite_defaulted() -> None:
-    """The image route skips the composite action.yml, so its defaults no longer apply. Missing,
-    `user` or `password` would abort the image's entry script under `set -u`; a missing or other
-    `repository-url` would turn attestations off and still upload, or send the OIDC token
-    elsewhere. Each value is pinned here, and section (14) refuses any other input.
+    """The image route skips the composite action.yml, so its defaults no longer apply; release.yml's
+    header says what each missing or other value does. Each value is pinned here, and section (14)
+    refuses any other input.
 
     Mutation: drop `repository-url` from one step, point it at another index, or set
     `attestations: false` or `verbose: false`. Red here.
