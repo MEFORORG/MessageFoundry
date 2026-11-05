@@ -66,24 +66,41 @@ def test_a_marker_from_before_the_live_schema_check_takes_the_slow_path() -> Non
     """BACKLOG #1720: both server backends check the live schema before they write the marker, and
     that check is Python the content hash cannot see. A marker written by a build without it must
     not match, or the store takes the fast path past the check, and past the Postgres migration's
-    scoped catalog reads, forever. Each marker below is the hash as that earlier build wrote it."""
+    scoped catalog reads, forever. Each marker below is the hash as that earlier build wrote it.
+
+    No revision is pinned to a literal (BACKLOG #5062), so a later bump edits no test: each marker
+    is rebuilt from the revision before the current one."""
     import hashlib
 
-    from messagefoundry.store import postgres, sqlserver
+    from messagefoundry.store import postgres, server_schema_verify, sqlserver
 
-    assert postgres._MIGRATION_REV == 8
+    rev = server_schema_verify.SCHEMA_CHECK_REV
+    assert postgres._MIGRATION_REV >= 8 and rev >= 1  # floors: #1720 set both
     rev7 = "\n".join(postgres._SCHEMA) + "\nmigration_rev=7"
     assert hashlib.sha256(rev7.encode()).hexdigest() != postgres._schema_hash()
-    assert sqlserver._SCHEMA_CHECK_REV == 1
+    # The Postgres marker before the shared check revision joined its hash input.
+    pg_before = "\n".join(postgres._SCHEMA) + f"\nmigration_rev={postgres._MIGRATION_REV}"
+    assert hashlib.sha256(pg_before.encode()).hexdigest() != postgres._schema_hash()
     unchecked = "\n".join(sqlserver._SCHEMA)  # the hash input before the check revision joined it
     assert hashlib.sha256(unchecked.encode()).hexdigest() != sqlserver._schema_hash()
+    # The control: each hash is exactly its batch plus the current revision, so the marker one
+    # revision back can differ only by that revision, and dropping it from the input fails here.
+    pg_input = pg_before + f"\nschema_check_rev={rev}"
+    assert hashlib.sha256(pg_input.encode()).hexdigest() == postgres._schema_hash()
+    ms_input = unchecked + f"\nschema_check_rev={rev}"
+    assert hashlib.sha256(ms_input.encode()).hexdigest() == sqlserver._schema_hash()
+    # SQL Server alone wrote a revision before this one; Postgres's earlier marker is pg_before.
+    previous = "\n".join(sqlserver._SCHEMA) + f"\nschema_check_rev={rev - 1}"
+    assert hashlib.sha256(previous.encode()).hexdigest() != sqlserver._schema_hash()
 
 
 def test_sqlserver_schema_hash_tracks_the_check_revision(monkeypatch: pytest.MonkeyPatch) -> None:
-    from messagefoundry.store import sqlserver
+    from messagefoundry.store import server_schema_verify, sqlserver
 
     h1 = sqlserver._schema_hash()
-    monkeypatch.setattr(sqlserver, "_SCHEMA_CHECK_REV", sqlserver._SCHEMA_CHECK_REV + 1)
+    monkeypatch.setattr(
+        server_schema_verify, "SCHEMA_CHECK_REV", server_schema_verify.SCHEMA_CHECK_REV + 1
+    )
     assert sqlserver._schema_hash() != h1
 
 

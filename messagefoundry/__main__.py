@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Command-line entrypoint for the MessageFoundry engine + IDE tooling.
+"""Command-line entrypoint for the MessageFoundry engine.
 
     python -P -X disable-remote-debug -m messagefoundry serve --config ./samples/config --db ./messagefoundry.db  # engine + API
     messagefoundry validate  --config ./samples/config --json                     # report problems
@@ -9,14 +9,11 @@
     messagefoundry check     --config ./samples/config --messages ./msgs          # commit/CI gate
     messagefoundry connection upsert --config ./samples/config --data '{...}'      # edit connections.toml
     messagefoundry codeset upsert --config ./samples/config --data '{...}'         # edit codesets/*.csv
-    messagefoundry generate  --type ADT --count 5 --out ./out/adt                 # synthetic HL7
-    messagefoundry hl7schema --json                                               # HL7 field schema
-    messagefoundry lens schema --json                                             # Steps-view param widget schema
-    messagefoundry init      ./my-config-repo                                      # scaffold a config repo
 
-The introspection subcommands (validate/graph/dryrun/check/hl7schema/lens schema) print to stdout
-for the VS Code extension / git hooks; they touch no network and start no server. Heavy imports are
-deferred per-command so a quick `validate`/`hl7schema`/`lens schema` call doesn't pay for FastAPI/uvicorn.
+The introspection subcommands (validate/graph/dryrun/check) print to stdout for the VS Code extension
+/ git hooks; they touch no network and start no server. Heavy imports are deferred per-command so a
+quick `validate` call doesn't pay for FastAPI/uvicorn. The authoring commands (scaffolding, synthetic
+HL7, the Steps view, importers) are not here: they run from the separate toolkit command (ADR 0201).
 """
 
 from __future__ import annotations
@@ -71,6 +68,7 @@ from messagefoundry.cli_common import (  # noqa: E402  # the shared CLI shell an
     _OperatorJsonError,
     _print_json,
     _safe_print,
+    argv_refusal_code,
     argv_wants_json,
     first_command,
     run_cli,
@@ -94,8 +92,8 @@ from messagefoundry.logging_setup import (  # noqa: E402
 from messagefoundry.odbc_env import disable_driver_manager_pooling  # noqa: E402
 
 if TYPE_CHECKING:
-    # Type-only, so the settings module still loads lazily per command: a quick `validate` /
-    # `hl7schema` call must not pay for it (see the module docstring on deferred heavy imports).
+    # Type-only, so the settings module still loads lazily per command: a quick `validate`
+    # call must not pay for it (see the module docstring on deferred heavy imports).
     import asyncio
 
     from messagefoundry.auth.service import AuthService
@@ -153,6 +151,9 @@ def main(argv: list[str] | None = None) -> int:
     # `run_cli` below hardens again, which is a no-op the second time. This call stays the FIRST
     # statement of main() anyway, because tests/test_cp1252_console_safety.py reads it here.
     harden_console_streams()
+    # BACKLOG #3768: before parsing, so a record no handler takes from here until a subcommand's
+    # handlers exist meets the filter chain. docs/PHI.md section 7 row 1 says what it misses.
+    install_filtered_last_resort()
     # A PROCESS property too, and only honoured before pyodbc's first ODBC use in the process, so it
     # is set here, ahead of config loading and every subcommand (BACKLOG #2049; see odbc_env.py).
     disable_driver_manager_pooling()
@@ -167,20 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         _build_parser,
         configures_own_logging=_CONFIGURES_OWN_LOGGING,
         author_prints_keep_stdout=_AUTHOR_PRINTS_KEEP_STDOUT,
-        floor_code=_floor_error_code,
     )
-
-
-def _floor_error_code(args: argparse.Namespace) -> str | None:
-    """The ``"code"`` run_cli's JSON error floor adds for an exception no arm named, or None.
-
-    ``lens rewrite`` promises a code on every refusal, for the IDE to branch on (BACKLOG #237), so its
-    floor payload carries the generic one. Every other subcommand's floor payload carries none."""
-    if args.command == "lens" and getattr(args, "lens_command", None) == "rewrite":
-        from messagefoundry.lens import REFUSAL_GENERIC
-
-        return REFUSAL_GENERIC
-    return None
 
 
 @functools.cache
@@ -212,18 +200,21 @@ def _refuse_toolkit_command(command: str, argv: Sequence[str]) -> int:
 
     Exit 2, the argparse usage-error code, because the engine does not have this command at all.
     ``_emit_error`` writes JSON to stdout or one line to stderr, never both, and its own return value
-    is 1, so it is not returned. ``argv_wants_json`` is the one pre-parse JSON rule both commands use.
+    is 1, so it is not returned. ``argv_wants_json`` and ``argv_refusal_code`` are the pre-parse
+    rules both commands use, so a refused ``lens rewrite`` still carries the ``"code"`` the IDE
+    branches on (BACKLOG #237).
 
-    The line names no install command. It was written while the toolkit name was unclaimed on PyPI,
-    when tests/test_install_instruction_provenance.py refused shipped text telling a user to
-    install it by name. ADR 0201 slice 3 recorded the name as claimed; the docs that give a
-    bare-name install arrive with slice 4.
+    The line names the install command too. ADR 0201 slice 3 recorded the toolkit name as claimed on
+    PyPI, so shipped text may give a bare-name install of it
+    (tests/test_install_instruction_provenance.py). The pin is this engine's own version, because the
+    toolkit runs only beside the engine it was released with.
     """
     _emit_error(
         f"`{command}` is not a messagefoundry command. It is an authoring command: run it as "
         f"`{TOOLKIT_COMMAND} {command}`, from the separate {TOOLKIT_COMMAND} distribution at "
-        f"this engine's version, {__version__}.",
+        f"this engine's version, {__version__} (pip install {TOOLKIT_COMMAND}=={__version__}).",
         as_json=argv_wants_json(argv),
+        code=argv_refusal_code(argv),
     )
     return 2
 
@@ -335,13 +326,15 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         action="store_true",
         help="a dev override for a trusted, firewalled network, honoured only under "
         "[security].enforcement=warn. For the API it permits a non-loopback bind with NO operator "
-        "certificate: the engine then serves TLS on its generated self-signed placeholder, which no "
-        "trust store vouches for, so a remote client can authenticate the engine only by pinning "
-        "that exact certificate, handed over out of band. For inbound MLLP, HTTP, DICOM SCP, raw-TCP and "
+        "certificate and no declared upstream terminator: the engine then serves TLS on its "
+        "generated self-signed placeholder, which no trust store vouches for, so a remote client "
+        "can authenticate the engine only by pinning that exact certificate, handed over out of "
+        "band. For inbound MLLP, HTTP, DICOM SCP, raw-TCP and "
         "X12 listeners it permits a non-loopback CLEARTEXT bind, and PHI crosses the network "
-        "unencrypted. Prefer [api].tls_cert_file (+ tls_key_file), which is allowed off-loopback "
-        "without this flag, and per-connection tls where the connector has it (raw-TCP and X12 have "
-        "none). Does not relax the no-auth refuse or the /ui refuse.",
+        "unencrypted. Prefer [api].tls_cert_file (+ tls_key_file; off loopback it also needs "
+        "MEFOR_TLS_REVOCATION_ATTESTED=1, docs/SECURITY.md, API revocation gate), and "
+        "per-connection tls where the connector has it (raw-TCP and X12 have none). It relaxes no "
+        "other API refusal, at least the /ui, plaintext proxy hop and revocation refusals.",
     )
 
     supervise = sub.add_parser(
@@ -509,37 +502,6 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     codeset.add_argument("--json", action="store_true", help="emit JSON")
 
-    impact = sub.add_parser(
-        "impact",
-        help="reverse-dependency pre-flight for a rename/delete (#152): report who references an "
-        "object, or plan/apply a rename that rewrites every referent (tokenize-safe; dry-run by default)",
-    )
-    impact.add_argument("--config", default="samples/config", help="config modules directory")
-    impact.add_argument(
-        "kind",
-        choices=sorted(_IMPACT_KINDS),
-        help="the object kind to analyze (router/handler/outbound/code_set/…)",
-    )
-    impact.add_argument("name", help="the object's current name")
-    impact.add_argument(
-        "--rename-to",
-        default=None,
-        metavar="NEW",
-        help="plan a rename to NEW: print the concrete literal edits that rewrite the object + its "
-        "referents (dry-run unless --apply)",
-    )
-    impact.add_argument(
-        "--delete",
-        action="store_true",
-        help="delete pre-flight: list the live referrers that would dangle if the object were removed",
-    )
-    impact.add_argument(
-        "--apply",
-        action="store_true",
-        help="with --rename-to: actually write the edits to disk (otherwise a dry-run that writes nothing)",
-    )
-    impact.add_argument("--json", action="store_true", help="emit JSON")
-
     alert = sub.add_parser(
         "alert",
         help="manage [[alerts.rules]] in the service-settings TOML — list / add / remove "
@@ -575,147 +537,6 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "switch to its secure default",
     )
     security.add_argument("--json", action="store_true", help="emit JSON")
-
-    generate = sub.add_parser(
-        "generate", help="generate conformant synthetic HL7 messages (no real PHI)"
-    )
-    generate.add_argument("--type", default=None, help="message type, e.g. ADT, ORU (see --list)")
-    generate.add_argument(
-        "--triggers", default="", help="comma-separated subset (default: all for the type)"
-    )
-    generate.add_argument("--count", type=int, default=50, help="messages per trigger (default 50)")
-    generate.add_argument(
-        "--out", default=None, help="output root (default: samples/messages/<type>)"
-    )
-    generate.add_argument("--seed", default=None, help="RNG seed for reproducible output")
-    generate.add_argument("--list", action="store_true", help="list registered message types")
-    generate.add_argument("--json", action="store_true", help="emit JSON")
-
-    schema = sub.add_parser("hl7schema", help="print HL7 v2.5.1 segment/field schema")
-    schema.add_argument("--json", action="store_true", help="emit JSON")
-
-    structures = sub.add_parser(
-        "hl7structures",
-        help="print HL7 v2.5.1 message-structure metadata (trigger->structure + structure->segments; "
-        "ADR 0104 §2.3 field-picker scope) — regenerate ide/media/hl7structures.json",
-    )
-    structures.add_argument("--json", action="store_true", help="emit JSON")
-
-    lens = sub.add_parser(
-        "lens",
-        help="structured Steps view over Handlers (ADR 0076): statically parse a config module "
-        "into the per-@handler row contract (the VS Code Steps editor shells this)",
-    )
-    lens_sub = lens.add_subparsers(dest="lens_command", required=True)
-    lens_parse = lens_sub.add_parser(
-        "parse",
-        help="statically parse one config module into its element row contract (never imports or "
-        "executes the module; @router defs are projected at --contract 2 and above)",
-    )
-    lens_parse.add_argument(
-        "module",
-        help="config module .py file to parse, or '-' to read the source from stdin (the IDE re-projects "
-        "the live buffer this way after a structural edit)",
-    )
-    lens_parse.add_argument("--json", action="store_true", help="emit JSON")
-    lens_parse.add_argument(
-        "--contract",
-        type=int,
-        default=1,
-        help="the row-contract version to emit (default 1). 1 is the shipped grammar; 2 adds the "
-        "'note' and 'route' row kinds and projects @router defs (ADR 0076 Amendments A + D). A "
-        "consumer asks for the version it can RENDER, so a client that omits this can never be handed "
-        "a kind it has no renderer for",
-    )
-
-    lens_rewrite = lens_sub.add_parser(
-        "rewrite",
-        help="apply one row edit to a Handler and print the rewritten module source (ADR 0076 phase 3): "
-        "op is set_params (edit a param, incl. a literal arg of a multi-line call), delete_row, "
-        "insert_row, or move_row; every untouched byte is preserved and the result is re-parsed (invalid "
-        "Python is refused with zero change); never imports or executes the module",
-    )
-    lens_rewrite.add_argument(
-        "module",
-        help="config module .py file to rewrite, or '-' to read the source from stdin (the IDE passes "
-        "the live editor buffer this way)",
-    )
-    lens_rewrite.add_argument(
-        "--edit",
-        help="the edit spec as a JSON object; op defaults to set_params. Examples: "
-        '\'{"line_start":53,"line_end":53,"op":"set_params","params":{"to":"OB_NEW"}}\', '
-        '\'{"line_start":7,"line_end":7,"op":"delete_row"}\', '
-        '\'{"line_start":6,"line_end":6,"op":"insert_row","position":"after","action":"set_field",'
-        '"params":{"path":"MSH-3","value":"MEFOR"}}\', '
-        '\'{"line_start":7,"line_end":7,"op":"move_row","direction":"up"}\'; '
-        "omit to read the edit spec from stdin (only when 'module' is a file path, not '-')",
-    )
-    lens_rewrite.add_argument(
-        "--contract",
-        type=int,
-        default=1,
-        help="the row-contract version the row coordinates were PROJECTED with (default 1) - it must "
-        "match the 'lens parse --contract' that produced them, so a v1 client's coordinates resolve "
-        "against the v1 partition and a v2 client's against the v2 one",
-    )
-    lens_rewrite.add_argument(
-        "--typed-only",
-        action="store_true",
-        help="refuse at least the edits known to carry raw Python source - a 'paste_block', an "
-        "if/elif 'test', and a move or delete of code not shown as typed steps (default off; an "
-        "analyst-facing editor must set it)",
-    )
-    # `lens rewrite` has no --json flag, yet every error it reports is JSON on stdout. Setting the
-    # attribute lets `main` treat it as a --json command: its logging goes to stderr (BACKLOG #1489),
-    # and an uncaught exception still yields `{"error": ...}` (#1863). `_lens_rewrite` never reads it.
-    lens_rewrite.set_defaults(json=True)
-
-    lens_schema = lens_sub.add_parser(
-        "schema",
-        help="emit the transform-vocabulary parameter schema as JSON (op -> params with "
-        "kind/choices/required/keyword_only), derived from the action + diagnostic signatures; "
-        "the Steps editor drives its per-param input widgets from it (never imports/executes a "
-        "module, starts no server)",
-    )
-    lens_schema.add_argument("--json", action="store_true", help="emit compact JSON")
-
-    import_cmd = sub.add_parser(
-        "import",
-        help="deterministically import a legacy integration export into code-first config modules "
-        "(ADR 0086): parse the export -> emit @router/@handler modules calling the ADR 0076 vocabulary; "
-        "unmapped actions become in-place TODO stubs (never silently dropped)",
-    )
-    import_sub = import_cmd.add_subparsers(dest="import_format", required=True)
-    import_corepoint = import_sub.add_parser(
-        "corepoint",
-        help="import a Corepoint action-list export (the validated <Package> XML schema, ADR 0086; "
-        "the superseded synthetic JSON model still parses) into one config module per channel",
-    )
-    import_corepoint.add_argument(
-        "export", help="path to the Corepoint action-list export (<Package> XML, or legacy JSON)"
-    )
-    import_corepoint.add_argument(
-        "--out", required=True, help="config directory to write the generated modules into"
-    )
-    import_corepoint.add_argument(
-        "--force",
-        action="store_true",
-        help="replace modules already in --out under the names this import writes (without it, an "
-        "existing module is refused and nothing is written)",
-    )
-    import_corepoint.add_argument("--json", action="store_true", help="emit a JSON import summary")
-
-    init = sub.add_parser(
-        "init",
-        help="scaffold a new config repo (starter feed + environments + CI + a pinned engine)",
-    )
-    init.add_argument("dir", nargs="?", default=".", help="target directory (default: current dir)")
-    init.add_argument(
-        "--force",
-        action="store_true",
-        help="scaffold into a non-empty directory (existing files are left untouched)",
-    )
-    init.add_argument("--json", action="store_true", help="emit JSON")
 
     support_bundle = sub.add_parser(
         "support-bundle",
@@ -1309,29 +1130,36 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     restore = sub.add_parser(
         "restore",
         help="restore a .mfbak archive's store to a NEW destination path: verify -> decrypt -> write "
-        "the store (and optionally the config bundle). REFUSES to overwrite anything (ADR 0049, #60)",
+        "the store (and optionally the config bundle), or with --config-to alone a CONFIG-ONLY "
+        "archive's config bundle. REFUSES to overwrite anything (ADR 0049, #60)",
         epilog=RESTORE_ROLLBACK_NOTICE,
         formatter_class=HelpFormatter,
     )
     restore.add_argument("archive", help="path to the .mfbak archive to restore")
+    # Vault BACKLOG #5233: --to is not argparse-required, because a CONFIG-ONLY archive (a server-DB
+    # store's backup) carries no store for it to name. `_restore` refuses a run with neither.
     restore.add_argument(
         "--to",
-        required=True,
+        default=None,
         help="destination store path to write. It must NOT already exist — restoring over a live store "
-        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused",
+        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused. Required, "
+        "except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
+        "whose bundle --config-to restores alone",
     )
     restore.add_argument(
         "--config-to",
         default=None,
         help="also restore the archive's config bundle into this directory (must be empty or absent). "
-        "Refused when the archive carries no config bundle, or when one of its members would be "
-        "written over the store this restore places at --to",
+        "Without --to, restore ONLY the config bundle of a CONFIG-ONLY archive (backup --config-only, "
+        "or a server-DB store's backup); an archive that carries a store is then refused. Refused "
+        "when the archive carries no config bundle, or when one of its members would be written over "
+        "the store this restore places at --to",
     )
     restore.add_argument(
         "--service-config",
         default=None,
         help="service settings TOML (default: ./messagefoundry.toml if present) — the store key source. "
-        "There is deliberately no --db here (unlike backup / restore-verify): --to IS the store path "
+        "There is deliberately no --db here (unlike backup / restore-verify): --to, when given, IS the store path "
         "this writes, and the decrypt key comes from [store] regardless of any path",
     )
     # BACKLOG #2614: a restore undoes every account change made after the archive was taken, so an
@@ -2608,8 +2436,9 @@ def _read_environment_values(
 
     With ``snapshot``, the value file is parsed from the bytes the snapshot read and never read
     from disk, so a file edited after that read does not apply, and one created or removed since is
-    refused (vault BACKLOG #2596). A value file outside the snapshot's ``environments/`` folder
-    raises :class:`~messagefoundry.config.snapshot.NotInSnapshot` instead."""
+    refused (vault BACKLOG #2596). A value file the snapshot does not cover, outside its
+    ``environments/`` folder and not the value file the engine read into it, raises
+    :class:`~messagefoundry.config.snapshot.NotInSnapshot` instead."""
     import os
 
     from messagefoundry.config.environments import (
@@ -2651,7 +2480,7 @@ def _read_environment_values(
     env_file = values_file_path(base_dir, dir_name, environment)
     if snapshot is not None and not snapshot.covers_environment_file(env_file):
         # Before the vetting below, so the plain read the engine then makes vets the file once.
-        raise NotInSnapshot(f"{env_file} is not in the config snapshot's environments folder")
+        raise NotInSnapshot(f"{env_file} is not a value file the config snapshot read")
     # With a snapshot, its folder is vetted even when the file has gone: the bytes that apply were
     # read earlier, and whoever can write the folder could have planted them (vault BACKLOG #2596).
     assert_trusted_start_paths(
@@ -2788,10 +2617,6 @@ def _serve(args: argparse.Namespace) -> int:
     # A no-op where the interpreter was started with remote debugging disabled, which is every
     # engine shard under `supervise`.
     install_remote_debug_guard()
-    # BACKLOG #3768: configure_logging runs only after the gates below, so until then a record no
-    # handler takes goes to `logging.lastResort`. This gives it the filter chain; the function
-    # says what else it keeps. The comments below that name the filtered lastResort rely on it.
-    install_filtered_last_resort()
 
     import uvicorn
 
@@ -2835,7 +2660,7 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # APPLIED here, REPORTED after configure_logging (below). The call must run before PHI can be
     # resident; the report must not, because in a real process the root logger still has no
-    # handlers here and every record is serviced by the filtered logging.lastResort above — which
+    # handlers here and every record is serviced by main()'s filtered logging.lastResort — which
     # drops < WARNING at ANY --log-level and reaches none of the handlers or the off-box forwarder
     # the operator configured. A hardened
     # container (RLIMIT_MEMLOCK=0) would otherwise print a WARNING to stderr on every start that no
@@ -3300,6 +3125,7 @@ def _serve(args: argparse.Namespace) -> int:
         attested_hops=(),
         revocation_attested_hops=(),
         path_form_fhir_hops=(),
+        ech_cleartext_sidecar_hops=(),
         api=settings.api,
         approvals=settings.approvals,
         cert_monitor=settings.cert_monitor,
@@ -3320,7 +3146,9 @@ def _serve(args: argparse.Namespace) -> int:
             "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, tls_check_hostname, "
             "url_query_credential, "
             "generic-ODBC "
-            "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173) and FHIR update_url_form declarations are NOT in this list — the graph is not loaded yet; they are "
+            "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173), FHIR update_url_form "
+            "and http ECH sidecar (ADR 0139) declarations are NOT in this list — the graph is not "
+            "loaded yet; they are "
             "reported by `messagefoundry check` and GET /security/posture, and most also by the "
             "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
@@ -3406,6 +3234,21 @@ def _serve(args: argparse.Namespace) -> int:
     # "a non-loopback bind REFUSES to serve until a real certificate is configured." So this gate
     # keeps keying on tls_enabled (an OPERATOR certificate) rather than on the minted pair, and the
     # messages say why.
+    from messagefoundry.api.tls import (
+        off_loopback_certificate_remedy,
+        plaintext_upstream_hop_off_loopback,
+        plaintext_upstream_hop_off_loopback_remedy,
+        plaintext_upstream_hop_unacknowledged,
+    )
+
+    # The loopback levers a refusal names. `serve --host` overrides the file, so when it is set,
+    # editing [security].listen_address changes nothing and the refusal names the flag alone
+    # (the BACKLOG #1361 trap the /ui refusal below records).
+    loopback_levers = (
+        "serve --host, which overrides [security].listen_address"
+        if args.host is not None
+        else "[security].listen_address or serve --host"
+    )
     if not settings.api.is_loopback:
         if settings.api.tls_enabled:
             # WP-13a: TLS terminates in-process, so tokens + PHI are encrypted on the wire and HSTS
@@ -3413,17 +3256,36 @@ def _serve(args: argparse.Namespace) -> int:
             logging.getLogger(__name__).info(
                 "API on non-loopback host %r with in-process TLS (https/wss).", settings.api.host
             )
-        elif settings.api.tls_terminated_upstream:
-            # WP-15: a reverse proxy terminates TLS in front; trust forwarded headers only from the
-            # declared proxies (the validator guarantees trusted_proxies is set here). The log names
-            # the CONFIGURED list; uvicorn_trusted_hosts says what serve adds to it for uvicorn.
-            logging.getLogger(__name__).info(
-                "API on non-loopback host %r behind a TLS-terminating proxy; trusting forwarded "
-                "headers from %s (an IPv4 entry is also trusted in its ::ffff:-mapped spelling, "
-                "and an entry inside ::ffff:0:0/96 in its plain IPv4 one).",
-                settings.api.host,
-                settings.api.trusted_proxies,
+            if settings.api.tls_terminated_upstream:
+                # WP-15: a reverse proxy terminates TLS in front and re-encrypts to this listener;
+                # trust forwarded headers only from the declared proxies (the validator guarantees
+                # trusted_proxies is set here). The log names the CONFIGURED list;
+                # uvicorn_trusted_hosts says what serve adds to it for uvicorn.
+                logging.getLogger(__name__).info(
+                    "API on non-loopback host %r behind a TLS-terminating proxy; trusting forwarded "
+                    "headers from %s (an IPv4 entry is also trusted in its ::ffff:-mapped spelling, "
+                    "and an entry inside ::ffff:0:0/96 in its plain IPv4 one).",
+                    settings.api.host,
+                    settings.api.trusted_proxies,
+                )
+        elif plaintext_upstream_hop_off_loopback(settings.api):
+            # BACKLOG #4636: a declared terminator with no operator certificate serves the
+            # proxy-to-engine hop in plaintext, and owner ruling R1 of 2026-10-27 on BACKLOG #1179
+            # accepts that hop from a same-machine proxy only. So off loopback it is refused,
+            # acknowledged or not, in every mode, ahead of the acknowledgement arm below. The
+            # predicate is shared with `messagefoundry check`.
+            remedy = plaintext_upstream_hop_off_loopback_remedy(loopback_levers)
+            print(
+                "error: refusing to serve a PLAINTEXT proxy-to-engine hop on the non-loopback API "
+                f"bind host {settings.api.host!r}. With [api].tls_terminated_upstream and no "
+                "[api].tls_cert_file the engine serves that hop in plaintext, which serve accepts "
+                "only on a loopback bind (127.0.0.1, ::1 or localhost); off loopback the "
+                "acknowledgement does not clear it. "
+                f"{remedy}, trusting that certificate. See docs/SECURITY.md, Plaintext proxy hop "
+                "(BACKLOG #4636).",
+                file=sys.stderr,
             )
+            return 2
         elif insecure_bind_ok and not enforcing:
             # The engine goes on to serve https on the minted placeholder (ADR 0172), which
             # tests/test_api_tls.py::test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder
@@ -3436,7 +3298,7 @@ def _serve(args: argparse.Namespace) -> int:
                 "engine only by pinning that exact certificate, handed over out of band; any other "
                 "client cannot tell the engine from an on-path attacker presenting a certificate of "
                 "its own. "
-                "Configure [api].tls_cert_file (+ tls_key_file) for real remote access.",
+                f"For real remote access, {off_loopback_certificate_remedy()}.",
                 file=sys.stderr,
             )
         elif insecure_bind_ok:
@@ -3455,9 +3317,10 @@ def _serve(args: argparse.Namespace) -> int:
                 "so a remote client can authenticate the engine only by pinning that exact "
                 "certificate, handed over out of band; --allow-insecure-bind cannot relax that under strict "
                 "enforcement (#200), and neither can [security].require_encryption_for_remote=false. "
-                "Configure [api].tls_cert_file for in-process "
-                "TLS, set [api].tls_terminated_upstream (+ trusted_proxies) if a proxy terminates "
-                "TLS, or set [security].enforcement=warn to accept serving on the placeholder on a "
+                f"Either {off_loopback_certificate_remedy()} (docs/SECURITY.md, API revocation "
+                "gate; with [api].tls_terminated_upstream + trusted_proxies beside it if a proxy "
+                "terminates TLS and re-encrypts to the engine, BACKLOG #4636), or set "
+                "[security].enforcement=warn to accept serving on the placeholder on a "
                 "trusted, firewalled network.",
                 file=sys.stderr,
             )
@@ -3468,9 +3331,10 @@ def _serve(args: argparse.Namespace) -> int:
                 f"{settings.api.host!r} without an operator certificate. The only certificate "
                 "available is the engine's generated self-signed placeholder, which no trust store "
                 "vouches for, so a remote client can authenticate the engine only by pinning that "
-                "exact certificate, handed over out of band. Configure "
-                "[api].tls_cert_file for in-process TLS, set [api].tls_terminated_upstream "
-                "(+ trusted_proxies) if a proxy terminates TLS, or, under "
+                "exact certificate, handed over out of band. Either "
+                f"{off_loopback_certificate_remedy()} (docs/SECURITY.md, API revocation gate; with "
+                "[api].tls_terminated_upstream + trusted_proxies beside it if "
+                "a proxy terminates TLS and re-encrypts to the engine, BACKLOG #4636), or, under "
                 "[security].enforcement=warn, pass --allow-insecure-bind to accept serving on the "
                 "placeholder on a trusted, firewalled network.",
                 file=sys.stderr,
@@ -3481,38 +3345,42 @@ def _serve(args: argparse.Namespace) -> int:
     # documented delegation). WHEN the engine terminates TLS IN-PROCESS (uvicorn, [api].tls_cert_file)
     # on a network-reachable host, a REVOKED-but-unexpired server (or mTLS client) certificate is still
     # accepted: stdlib `ssl` performs no OCSP/CRL fetch and the engine deliberately attempts none (on-
-    # prem, offline-by-default; CLAUDE.md §2). Revocation must be PROVEN IN FRONT — a declared TLS-
-    # terminating reverse proxy (tls_terminated_upstream + trusted_proxies, WP-15, which does its own
-    # OCSP-must-staple / CRL revocation) OR an explicit operator attestation
-    # (MEFOR_TLS_REVOCATION_ATTESTED=1) that the terminator/PKI enforces revocation. Absent both, refuse
-    # fail-closed. Loopback and proxy-terminated deployments never reach this — they start byte-
-    # identically (the predicate short-circuits). Layered AFTER the §0 exposed-bind ladder above
-    # (extend-never-weaken), like the keyless-store / open-egress / MFA-at-exposure gates.
-    proxy_terminated = settings.api.tls_terminated_upstream and bool(settings.api.trusted_proxies)
+    # prem, offline-by-default; CLAUDE.md §2). So refuse fail-closed unless the operator attests
+    # (MEFOR_TLS_REVOCATION_ATTESTED=1) that its PKI enforces revocation; a declared terminator does
+    # not exempt the bind (BACKLOG #4636; docs/SECURITY.md, API revocation gate, says why). Layered
+    # AFTER the §0 exposed-bind ladder above (extend-never-weaken), like the keyless-store /
+    # open-egress / MFA-at-exposure gates.
     if in_process_tls_revocation_refused(
         tls_enabled=settings.api.tls_enabled,
         is_loopback=settings.api.is_loopback,
-        proxy_terminated=proxy_terminated,
         attested=tls_revocation_attested(),
     ):
+        terminator_note = (
+            "The declared [api].tls_terminated_upstream does not exempt this bind: the engine still "
+            "terminates the proxy-to-engine hop's TLS itself (BACKLOG #4636). "
+            if settings.api.tls_terminated_upstream
+            else ""
+        )
         print(
             "error: refusing to serve the API with in-process TLS on non-loopback host "
             f"{settings.api.host!r}: the engine terminates TLS itself but performs NO certificate "
             "revocation check (stdlib ssl has no OCSP/CRL fetch; the engine is offline-by-default), so "
-            "a revoked-but-unexpired certificate would still be accepted (ASVS 12.1.4). Terminate TLS "
-            "at a revocation-checking reverse proxy (set [api].tls_terminated_upstream + "
-            "[api].trusted_proxies; e.g. OCSP-must-staple at IIS/nginx/Caddy), or set "
-            "MEFOR_TLS_REVOCATION_ATTESTED=1 to attest that your TLS terminator/PKI enforces "
-            "revocation. See docs/adr/0078-certificate-revocation-posture.md.",
+            "a revoked-but-unexpired certificate would still be accepted (ASVS 12.1.4). "
+            f"{terminator_note}Set "
+            "MEFOR_TLS_REVOCATION_ATTESTED=1 to attest that your PKI enforces revocation for the "
+            "certificates this engine serves and accepts, or bind the engine to loopback "
+            f"({loopback_levers}) behind a revocation-checking reverse proxy on the same machine. "
+            "See docs/SECURITY.md, API revocation gate (ADR 0078).",
             file=sys.stderr,
         )
         return 2
 
     # --- #200 Posture-B (upstream TLS termination) fail-closed gate (ASVS 4.2.1/4.4.1, 11.6.2) ------
     # When a reverse proxy terminates TLS in front (settings.api.tls_terminated_upstream), the exposed-
-    # gate above ALLOWS the off-loopback bind unconditionally — but two properties are then UNVERIFIABLE
-    # by the engine: (a) the proxy→engine internal hop is a plaintext segment, so a rogue peer on that
-    # segment could impersonate the proxy unless the hop is authenticated; and (b) the engine terminates
+    # gate above ALLOWS the off-loopback bind once an operator certificate serves the proxy→engine hop
+    # (BACKLOG #4636 refuses a plaintext one there) — but two properties are then UNVERIFIABLE by the
+    # engine: (a) a rogue peer on the proxy→engine segment could impersonate the proxy unless the hop
+    # is authenticated; and (b) the engine terminates
     # no browser TLS, so it cannot observe the proxy's negotiated version/KEX floor (11.6.2). The engine
     # cannot inspect either, so it requires the operator to AFFIRMATIVELY DECLARE them (attestations made
     # fail-closed) before an off-loopback Posture-B bind may start under enforcement. The split is
@@ -3534,7 +3402,8 @@ def _serve(args: argparse.Namespace) -> int:
     # refusal.
     # ONE EXCEPTION, and it is not dial-governed: the BACKLOG #1179 plaintext-hop acknowledgement at the
     # top of the block refuses in EVERY mode. Do not move it under `enforcing` to match the paragraphs
-    # above; the owner ruled that hop the deploying site's to secure, whatever the dial says.
+    # above; the owner ruled that hop the deploying site's to secure, whatever the dial says. Its
+    # BACKLOG #4636 sibling, which refuses that hop off loopback, sits in the exposed-bind gate above.
     if settings.api.tls_terminated_upstream:
         # BACKLOG #1179: with no operator certificate the engine mints nothing here (ADR 0172 decision
         # 3 -- serving https would break the proxy's own hop), so the proxy-to-engine hop is PLAINTEXT
@@ -3542,22 +3411,21 @@ def _serve(args: argparse.Namespace) -> int:
         # it on. Keyed on api_tls_source, the same branch order that decides what the listener serves:
         # an operator tls_cert_file wins over the no-mint branch, so with one the hop is TLS and there
         # is nothing to acknowledge. Unlike the attestations below this refuses in EVERY mode,
-        # enforcing or warn, loopback or not: it asks nothing the engine could check, only who owns a
+        # enforcing or warn: it asks nothing the engine could check, only who owns a
         # hop the engine leaves unprotected. The predicate is shared with `messagefoundry check`.
-        from messagefoundry.api.tls import plaintext_upstream_hop_unacknowledged
-
         if plaintext_upstream_hop_unacknowledged(settings.api):
             print(
                 "error: refusing to serve behind an upstream TLS terminator "
                 "([api].tls_terminated_upstream) without [api].plaintext_upstream_hop_acknowledged. "
                 "The reverse proxy terminates TLS and no [api].tls_cert_file is set, so the engine "
                 "serves the proxy-to-engine hop in PLAINTEXT by design and does nothing to protect "
-                "it. Securing that hop (for example a same-host loopback hop, an isolated network "
-                "segment, or a host firewall) is the deploying site's job. Set "
+                "it. Securing that hop, which is accepted only from a proxy on this same machine, is "
+                "the deploying site's job. Set "
                 "[api].plaintext_upstream_hop_acknowledged = true to acknowledge that you have taken "
                 "it on. Or set [api].tls_cert_file so the engine serves that hop over TLS, and then "
                 "point the proxy at https and have it trust that certificate: a proxy still speaking "
-                "http to an https listener fails every request. See docs/SECURITY.md (ADR 0172).",
+                "http to an https listener fails every request. See docs/SECURITY.md, Plaintext "
+                "proxy hop (ADR 0172).",
                 file=sys.stderr,
             )
             return 2
@@ -3768,15 +3636,18 @@ def _serve(args: argparse.Namespace) -> int:
             "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, "
             "[api].trusted_proxies, or [security].web_console_public_address is set), so the console "
             "is NOT served. To serve the console off-box set [security].serve_web_console=true with "
-            "TLS + [security].web_console_public_address (see "
-            "docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
+            "an operator certificate (off loopback: "
+            f"{off_loopback_certificate_remedy()}) or a proxy in front of a loopback "
+            "engine, + [security].web_console_public_address (see docs/SECURITY.md, Off-loopback "
+            "browser console, and docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
             file=sys.stderr,
         )
         settings.api.serve_ui = False
 
     # The browser ops dashboard ([api].serve_ui, ADR 0065) is a STRICTER surface than the JSON API: it
     # puts an HttpOnly session cookie and PHI-rendering HTML on the wire. An off-loopback /ui bind
-    # therefore REQUIRES exposure_protected (in-process TLS or a declared upstream terminator) and is
+    # therefore REQUIRES exposure_protected, which off loopback means an operator tls_cert_file: the
+    # plaintext-hop arm above already refused a terminator with no certificate (BACKLOG #4636). It is
     # refused even under --allow-insecure-bind (that dev override covers only the JSON API served on
     # the self-signed placeholder, never the browser surface; BACKLOG #1672). The loopback default
     # never trips this. The hop here is NOT cleartext: the non-loopback gate above has already
@@ -3784,7 +3655,7 @@ def _serve(args: argparse.Namespace) -> int:
     # declared proxy, where the engine would serve https on the minted placeholder (ADR 0172). The
     # message says that, rather than "without TLS" (BACKLOG #1672).
     # The local-only remediation names [security].listen_address, NOT local_access_only=true (BACKLOG
-    # #1361). This gate is reachable TWO ways, and the remediation below is verified on only one:
+    # #1361). This gate is reachable TWO ways, and each remediation is verified by a test:
     #  1. BY CONFIG: [security].local_access_only=false with a non-loopback listen_address. The loader
     #     REFUSES local_access_only=true beside a non-loopback listen_address, so an operator who only
     #     set listen_address never gets here, and adding local_access_only=true to the config that
@@ -3799,9 +3670,15 @@ def _serve(args: argparse.Namespace) -> int:
     #     view -- that is not what the operator wrote. Applying the prescribed edit on this route
     #     (local_access_only=false, listen_address="127.0.0.1", with --host 0.0.0.0 still on the
     #     command line) leaves this refusal firing, rc 2, because the flag still wins. Measured
-    #     2026-09-21. The fix on this route is to drop or change the flag, which the message does not
-    #     yet say. The test above drives the FILE route only and says so; do not read it as covering
-    #     this one.
+    #     2026-09-21. The fix on this route is to drop or change the flag. The message names it
+    #     through loopback_levers, which on this route reads "serve --host, which overrides
+    #     [security].listen_address".
+    #     tests/test_cli.py::test_serve_ui_offloopback_refusal_names_the_host_flag drives this route
+    #     and the remedy back through serve.
+    # The certificate remedy is off_loopback_certificate_remedy, which names the revocation
+    # attestation: off loopback a certificate bind meets the API revocation gate above. The loopback
+    # remedy is for local access; a same-machine proxy in front of it owes what docs/SECURITY.md,
+    # Plaintext proxy hop, lists, and the message points there rather than restating it.
     if (
         settings.api.serve_ui
         and not settings.api.is_loopback
@@ -3809,14 +3686,16 @@ def _serve(args: argparse.Namespace) -> int:
     ):
         print(
             "error: refusing to serve the browser ops dashboard ([security].serve_web_console) on "
-            f"non-loopback host {settings.api.host!r} without an operator certificate or a "
-            "declared TLS-terminating proxy. The only certificate available is the engine's "
-            "generated self-signed placeholder, which no trust store vouches for. The /ui surface "
-            "requires in-process TLS on an operator certificate ([api].tls_cert_file) or a declared "
-            "TLS-terminating proxy ([api].tls_terminated_upstream + trusted_proxies); "
-            "--allow-insecure-bind does not cover it, and neither does "
-            "[security].require_encryption_for_remote=false. Set [security].listen_address to a loopback "
-            "address (127.0.0.1) for local-only access, or configure one of those two.",
+            f"non-loopback host {settings.api.host!r} without an operator certificate. The only "
+            "certificate available is the engine's "
+            "generated self-signed placeholder, which no trust store vouches for, and off loopback "
+            "the /ui surface requires an operator certificate; --allow-insecure-bind does not cover "
+            "it, and neither does [security].require_encryption_for_remote=false. Either bind the "
+            f"engine to loopback ({loopback_levers}) for local access, or "
+            f"{off_loopback_certificate_remedy()}, or set [security].serve_web_console = false "
+            "to serve the JSON API alone. A reverse proxy on this machine in front of a "
+            "loopback engine owes what docs/SECURITY.md, Plaintext proxy hop, lists; "
+            "docs/SECURITY.md, API revocation gate, says what the attestation means.",
             file=sys.stderr,
         )
         return 2
@@ -5049,7 +4928,7 @@ def _serve(args: argparse.Namespace) -> int:
         loopback=settings.api.is_loopback,
         tls_terminated_upstream=settings.api.tls_terminated_upstream,
         # #200 residual (ADR 0092): the API PHI-read data-path guard keys on whether the serve hop is
-        # proven secure — a loopback bind (on-box), in-process TLS, or a declared TLS-terminating proxy
+        # proven secure — a loopback bind (on-box), an operator certificate, or a declared TLS-terminating proxy
         # (exposure_protected). A prod-PHI instance whose serve hop is none of these refuses to emit PHI
         # over the response path, mirroring the transport-cell posture-keyed refusal.
         phi_read_hop_secure=settings.api.is_loopback or settings.api.exposure_protected,
@@ -5912,237 +5791,6 @@ def _dryrun(args: argparse.Namespace) -> int:
     except (ValueError, KeyError) as exc:  # e.g. ambiguous/unknown --inbound
         return _emit_error(_dryrun_loop_error(exc), as_json=args.json)
     _print_json(out, compact=args.json)
-    return 0
-
-
-def _hl7schema(args: argparse.Namespace) -> int:
-    from messagefoundry.hl7schema import hl7_schema
-
-    _print_json(hl7_schema(), compact=args.json)
-    return 0
-
-
-def _hl7structures(args: argparse.Namespace) -> int:
-    from messagefoundry.hl7structures import to_json
-
-    _print_json(to_json(), compact=args.json)
-    return 0
-
-
-def _lens(args: argparse.Namespace) -> int:
-    """Statically parse or rewrite a config module's @handler rows (ADR 0076 §3 / §5).
-
-    The module is never imported/executed (static ``ast`` only), so a module whose top level would raise
-    still parses/rewrites. An unparseable file / refused edit is a clean ``{"error": …}`` + non-zero
-    exit, matching the IDE's degradation-to-text-editor behavior."""
-    if args.lens_command == "rewrite":
-        return _lens_rewrite(args)
-    if args.lens_command == "schema":
-        return _lens_schema(args)
-    return _lens_parse(args)
-
-
-def _lens_schema(args: argparse.Namespace) -> int:
-    """``lens schema`` — emit the transform-vocabulary param schema (ADR 0076 §5) the Steps editor's
-    per-param input widgets consume.
-
-    Derived from the action + diagnostic signatures via stdlib ``inspect``/``typing`` only (no new
-    runtime dependency, ADR 0076 §6.5); lazy-imported inside the handler like ``_hl7schema`` so a
-    quick call never pays for FastAPI/uvicorn. Starts no server; imports/executes no config module."""
-    from messagefoundry.lens_schema import op_param_schema
-
-    _print_json(op_param_schema(), compact=args.json)
-    return 0
-
-
-def _lens_parse(args: argparse.Namespace) -> int:
-    """``lens parse`` — emit the per-@handler row contract (ADR 0076 §3).
-
-    Reads the source from the ``module`` file, or from stdin when it is ``-`` (the IDE re-projects the
-    live buffer this way after a structural edit shifts every row coordinate). Static-only either way."""
-    import sys
-
-    from messagefoundry.lens import LensParseError, parse_module, parse_source
-
-    try:
-        if args.module == "-":
-            # Raw UTF-8 (never the Windows locale codepage) so the buffer's non-ASCII round-trips exactly.
-            module_label = "<stdin>"
-            handlers = parse_source(
-                sys.stdin.buffer.read().decode("utf-8"),
-                module=module_label,
-                contract=args.contract,
-            )
-        else:
-            module_label = args.module
-            handlers = parse_module(args.module, contract=args.contract)
-    except LensParseError as exc:
-        return _emit_error(str(exc), as_json=args.json)
-    _print_json({"module": module_label, "handlers": handlers}, compact=args.json)
-    return 0
-
-
-def _lens_rewrite(args: argparse.Namespace) -> int:
-    """``lens rewrite`` — apply one row param-edit and print the rewritten module source (ADR 0076 §5).
-
-    Reads the source from ``module`` (or stdin when it is ``-``) and the edit spec from ``--edit`` (or
-    stdin otherwise); prints the rewritten source (byte-identical outside the edited row) on success, or
-    ``{"error": …}`` + exit 1 on any refusal — never a partial/lossy write."""
-    import sys
-
-    from messagefoundry.lens import (
-        REFUSAL_GENERIC,
-        LensParseError,
-        LensRewriteError,
-        rewrite_module,
-        rewrite_source,
-    )
-    from messagefoundry.redaction import safe_exc
-
-    # Read stdin as raw UTF-8 (never the Windows locale codepage) so source bytes round-trip exactly —
-    # byte-stability (gate 2) would break if a non-ASCII char (the samples carry — and → in comments)
-    # were re-encoded through cp1252.
-    def _read_stdin() -> str:
-        return sys.stdin.buffer.read().decode("utf-8")
-
-    # Every refusal here carries a code, the generic one where no specific family applies, so a
-    # consumer branching on "code" never meets a payload without it (BACKLOG #237). main()'s floor
-    # adds the same generic code for an exception this function does not name.
-    if args.edit is None and args.module == "-":
-        return _emit_error(
-            "provide the edit spec via --edit when the source is read from stdin ('-')",
-            as_json=True,
-            code=REFUSAL_GENERIC,
-        )
-    # Stdin carries either the edit spec or the source, never both, and it is decoded HERE, before
-    # the rewrite runs, so this arm can only ever describe the operator's stdin. The message names
-    # the position only: the exception's ``object`` is the whole input, which is never echoed.
-    try:
-        edit_text = args.edit if args.edit is not None else _read_stdin()
-        stdin_source = _read_stdin() if args.module == "-" else None
-    except UnicodeDecodeError as exc:
-        return _emit_error(
-            f"<stdin>: cannot read (not UTF-8: {safe_exc(exc)})",
-            as_json=True,
-            code=REFUSAL_GENERIC,
-        )
-    try:
-        edit = _load_operator_json(edit_text, "--edit JSON")
-    except _OperatorJsonError as exc:
-        return _emit_error(str(exc), as_json=True, code=REFUSAL_GENERIC)
-    if not isinstance(edit, dict):
-        return _emit_error(
-            "the edit spec must be a JSON object", as_json=True, code=REFUSAL_GENERIC
-        )
-
-    try:
-        if stdin_source is not None:
-            rewritten = rewrite_source(
-                stdin_source,
-                edit,
-                module="<stdin>",
-                contract=args.contract,
-                typed_only=args.typed_only,
-            )
-        else:
-            rewritten = rewrite_module(
-                args.module, edit, contract=args.contract, typed_only=args.typed_only
-            )
-    except LensRewriteError as exc:
-        # The code is the refusal family the IDE branches on (BACKLOG #237); the message stays prose.
-        return _emit_error(str(exc), as_json=True, code=exc.code)
-    except LensParseError as exc:
-        return _emit_error(str(exc), as_json=True, code=REFUSAL_GENERIC)
-    # The rewritten module source is file content, not a JSON report — write the exact UTF-8 bytes to
-    # stdout (not sys.stdout.write, which would re-encode through the console codepage and corrupt
-    # non-ASCII, defeating byte-stability).
-    sys.stdout.buffer.write(rewritten.encode("utf-8"))
-    sys.stdout.buffer.flush()
-    return 0
-
-
-def _import(args: argparse.Namespace) -> int:
-    """``import corepoint`` — translate a Corepoint action-list export into code-first config (ADR 0086).
-
-    Writes one ``@router``/``@handler`` module per channel into ``--out`` and reports the count-and-log
-    summary (mapped vs. unmapped actions). The export is untrusted data — a malformed export is a clean
-    error + exit 1, never a traceback. A module already in ``--out`` under a name this import writes
-    is refused (exit 1, naming each file, nothing written) unless ``--force`` is given."""
-    from messagefoundry.corepoint_import import CorepointImportError, import_corepoint
-
-    try:
-        result = import_corepoint(args.export, args.out, force=args.force)
-    except (CorepointImportError, OSError, RecursionError) as exc:
-        return _emit_error(str(exc), as_json=args.json)
-
-    if args.json:
-        _print_json(result.to_json(), compact=True)
-        return 0
-    disabled_total = (
-        f", {result.total_disabled} disabled kept as comments" if result.total_disabled else ""
-    )
-    print(
-        f"Imported {len(result.channels)} channel(s) into {args.out} "
-        f"({result.total_mapped} action(s) mapped, {result.total_unmapped} left as TODO stubs"
-        f"{disabled_total}):"
-    )
-    for c in result.channels:
-        note = (
-            f" — {c.unmapped} unmapped: {', '.join(sorted(set(c.unmapped_classes)))}"
-            if c.unmapped
-            else ""
-        )
-        renamed = (
-            f" [renamed from {c.renamed_from} to avoid a filename collision]"
-            if c.renamed_from
-            else ""
-        )
-        disabled = (
-            f" — {c.disabled} @Disabled element(s) preserved as comments" if c.disabled else ""
-        )
-        print(f"  {c.filename} ({c.mapped} mapped){note}{disabled}{renamed}")
-    if result.total_unmapped:
-        print(
-            "\nReview the `# TODO: Corepoint ...` markers in the generated modules and hand-finish them, "
-            "then run: messagefoundry check --config " + str(args.out)
-        )
-    # Every generated endpoint is undeployed, whatever mapped (BACKLOG #1130), so say so every time:
-    # a fully mapped import would otherwise read as ready to run while the engine binds nothing.
-    # The wording holds for both layers: an XML endpoint is a placeholder to replace, a JSON one is
-    # export text to review, and the generated module's own TODO says which.
-    print(
-        "\nEvery endpoint is emitted deployed=False and binds nothing. Follow the endpoint TODO in "
-        "each generated module, then drop deployed=False."
-    )
-    return 0
-
-
-def _init(args: argparse.Namespace) -> int:
-    """Scaffold a new config repo into ``args.dir`` (starter feed + environments + CI + a pinned engine)."""
-    from pathlib import Path
-
-    from messagefoundry.scaffold import scaffold
-
-    target = Path(args.dir)
-    try:
-        written = scaffold(target, force=args.force)
-    except (FileExistsError, NotADirectoryError, OSError) as exc:
-        return _emit_error(str(exc), as_json=args.json)
-
-    rels = [str(p.relative_to(target)) for p in written]
-    if args.json:
-        _print_json({"target": str(target), "written": rels}, compact=True)
-        return 0
-    if not written:
-        print(f"Nothing written — {target} already has every scaffold file.")
-        return 0
-    print(f"Scaffolded a config repo in {target} ({len(written)} files):")
-    for rel in rels:
-        print(f"  {rel}")
-    print("\nNext steps:")
-    print("  pip install -r requirements.txt        # the pinned engine (a read-only dependency)")
-    print("  messagefoundry check --config config --messages messages/sets")
-    print("  python -P -X disable-remote-debug -m messagefoundry serve --config config --env dev")
     return 0
 
 
@@ -8705,6 +8353,56 @@ _PROVISION_AUTH_REFUSALS = {
 _NOTHING_PROVISIONED = "Refusing to provision; nothing was written"
 
 
+def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str | None:
+    """What a refused store open left behind, when that is more than "nothing was written"
+    (BACKLOG #5067), or ``None`` when nothing was.
+
+    ``None`` for every refusal but the schema one below; the callers then say "nothing was
+    written", meaning no row. Not every other refusal comes before the database is touched: at
+    least a keyless-chain refusal on a server store comes after a full open, which under ``auto``
+    has run the same option switches and committed the schema, and this does not describe that.
+    A server store whose live schema falls short of this build's DDL batch (``ServerSchemaMismatchError``, BACKLOG #1720), raised itself or as the cause
+    of a :class:`_StoreOpenRefused`, is refused after the open has touched the database. The open
+    rolls its batch back and writes no schema marker. But on SQL Server under
+    ``[store].schema_management = auto`` a writable open first switches the database's
+    READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options on
+    (``SqlServerStore._ensure_database_options``), outside that batch, and the refusal does not
+    switch them back. So for that refusal it says the batch was rolled back and, there, that those
+    options may already have changed: sentences, the last with no full stop, so a caller can end
+    it."""
+    from messagefoundry.config.settings import SchemaManagement, StoreBackend
+    from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
+
+    if not any(isinstance(e, ServerSchemaMismatchError) for e in (exc, exc.__cause__)):
+        return None
+    left = (
+        "The open rolled its schema batch back and wrote no schema marker, and this command wrote "
+        "no row"
+    )
+    if (
+        store.backend is StoreBackend.SQLSERVER
+        and store.resolved_schema_management() is SchemaManagement.AUTO
+    ):
+        left += (
+            ". Under [store].schema_management = auto the open may already have switched the "
+            "database's READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options on, before "
+            "that batch; the refusal does not switch them back"
+        )
+    return left
+
+
+def _provision_open_refusal(exc: BaseException, store: StoreSettings) -> str:
+    """``provision-admin``'s text for a refused store open: the refusal, then what it left
+    behind (:func:`_open_refusal_left_behind`, BACKLOG #5067). Through ``codec_safe_str``, as
+    every other command prints an open refusal: a key source's codec error quotes a byte of what
+    it decoded (BACKLOG #2532)."""
+    from messagefoundry.redaction import codec_safe_str
+
+    left = _open_refusal_left_behind(exc, store)
+    tail = _NOTHING_PROVISIONED if left is None else f"Refusing to provision. {left}"
+    return f"{_sentence(codec_safe_str(exc))} {tail}"
+
+
 def _sentence(message: object) -> str:
     """``message`` as a sentence ending in one full stop, so a clause can follow it."""
     return str(message).rstrip().rstrip(".") + "."
@@ -8840,6 +8538,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         keyless_opt_out_refusal,
     )
     from messagefoundry.last_resort import run_guarded
+    from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.base import KeylessAuditChainRefused, open_store
 
     cli: dict[str, dict[str, object]] = {}
@@ -8981,22 +8680,22 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # Either way the store could not be opened, so exit 2, as the keyless checks beside it
         # exit (BACKLOG #2124, a seat decision under owner delegation 2026-10-08, not an owner
         # ruling).
-        _emit_error(f"{_sentence(exc)} Nothing was written", as_json=args.json)
+        # Through codec_safe_str, as every open refusal this command prints (#2532, #5067).
+        _emit_error(f"{_sentence(codec_safe_str(exc))} Nothing was written", as_json=args.json)
         return 2
     except KeylessAuditChainRefused as exc:  # #1916: could not start, as the write below exits
         _emit_error(str(exc), as_json=args.json)
         return 2
-    except key_unresolved as exc:
-        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
-        return 2
-    except (InsecureHopRefused, ServerSchemaMismatchError) as exc:
-        # The store hop, refused at the open as `serve` refuses it now that the posture is passed:
-        # a server store off-box with no revocation check, or a weakened-TLS escape, at `enforce`.
-        # Its text names the hop and the setting that clears it. Or (BACKLOG #1720) a server
+    except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
+        # A store key that could not be resolved (the comment above `key_unresolved`). Or the
+        # store hop, refused at the open as `serve` refuses it now that the posture is passed: a
+        # server store off-box with no revocation check, or a weakened-TLS escape, at `enforce`
+        # (#5000). Its text names the hop and the setting that clears it. Or (BACKLOG #1720) a server
         # store's live schema falls short of this build's DDL batch: the open rolled the batch back
-        # and wrote no marker, and the text lists the differences and the remedy. Exit 2: could not
-        # start, never the dispatch floor's 1, this command's refusal.
-        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
+        # and wrote no marker, and the text lists the differences and the remedy, then says what
+        # the open may have changed before it (#5067). Exit 2: could not start, never the
+        # dispatch floor's 1, this command's refusal.
+        _emit_error(_provision_open_refusal(exc, settings.store), as_json=args.json)
         return 2
     except TrustAnchorError as exc:
         return _emit_trust_anchor_refusal(exc, as_json=args.json)
@@ -9042,6 +8741,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
     if violations:
         return _emit_error("; ".join(violations), as_json=args.json)
 
+    try:
+        # Before the key is shown, as `admin-reset-totp` names it: a shell whose OS user cannot be
+        # named fails here, not after the operator has added an entry for a seed never stored.
+        actor = f"cli:{getpass.getuser()}"
+    except OSError as exc:
+        return _emit_error(
+            f"cannot name the OS user for the audit row ({exc}); refusing to provision, and "
+            "nothing was written",
+            as_json=args.json,
+        )
+
     # ADR 0197 Amendment A (N-A): the first Administrator is born with an authenticator app, so
     # option E's combined sign-in is its way past a lock anyone who knows the username can set.
     totp_secret: str | None = None
@@ -9062,9 +8772,36 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except _PasswordEntryRefused as exc:
             return _emit_error(str(exc), as_json=args.json)
 
-    actor = f"cli:{getpass.getuser()}"
+    # Set just before the service's write, which stores the seed (BACKLOG #5067).
+    write_started = False
+
+    def after_the_key(refusal: str, before_write: str) -> str:
+        """The text for a refusal the write's arms catch, after the key was shown (BACKLOG #5067).
+        ``refusal`` is the refusal alone; ``before_write`` is the arm's whole text for one raised
+        before the service's write, which wrote nothing.
+
+        Before the write, ``before_write``, and under a shown key it then names the entry the
+        operator may have added, as ``admin-reset-totp`` does, or the app keeps an entry for a seed
+        that was never stored; under ``--no-totp`` no key was shown. Once the write has started,
+        whatever class reached the arm, neither: the account and its seed may then be stored, so
+        it says so, as an integrity refusal does, and never to delete the entry, which would leave
+        the Administrator without its factor."""
+        if write_started:
+            return (
+                f"{_sentence(refusal)} The write had started, so the Administrator may be missing "
+                "or incomplete. Once the refusal is cleared, run the command again: it completes a "
+                "partly written account, or says why it cannot."
+            )
+        if totp_secret is None:
+            return before_write
+        return (
+            f"{_sentence(before_write)} If you added the entry this run showed to the "
+            "authenticator app, delete it: its seed was never stored, and a run that succeeds "
+            "shows a new key."
+        )
 
     async def run() -> tuple[ProvisionedAdministrator, str]:
+        nonlocal write_started
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
         store = await open_store(
             settings.store,
@@ -9102,6 +8839,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
             if security_notifier is not None:
                 security_notifier.start()
             try:
+                write_started = True
                 outcome = await service.provision_first_administrator(
                     username=args.username,
                     password=password,
@@ -9149,16 +8887,30 @@ def _provision_admin(args: argparse.Namespace) -> int:
     try:
         outcome, store_path = run_guarded(run())
     except FirstAdministratorRefused as exc:
+        # The service's own text says what to do with the entry it showed, where that is known: a
+        # refusal can follow a grant that may have landed (#5067 leaves these as they are).
         return _emit_error(str(exc), as_json=args.json)
     except (_KeylessProvisionRefused, KeylessAuditChainRefused, _UnauditableWrite) as exc:
-        # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it
-        _emit_error(str(exc), as_json=args.json)
+        # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it.
+        # Each is raised before the write, so the shown key's entry has no seed (#5067).
+        _emit_error(after_the_key(str(exc), str(exc)), as_json=args.json)
         return 2
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         # Refused before the prompt already; one that changed since is refused the same way. A
         # short server schema (#1720) can first arrive here: with no `schema_meta` table the
-        # pre-check finds no store, and only this create=True open runs the DDL batch.
-        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
+        # pre-check finds no store, and only this create=True open runs the DDL batch. The text
+        # says what the open may have changed, and that the shown key's entry has no seed (#5067).
+        text = after_the_key(codec_safe_str(exc), _provision_open_refusal(exc, settings.store))
+        _emit_error(text, as_json=args.json)
+        return 2
+    except (StoreKeylessError, CipherError) as exc:
+        # A key or cipher refusal before the write, at its open or a read before it, which the
+        # pre-check exits 2 on too: the shown key's entry has no seed (#5067). One from the
+        # write itself may follow a row it wrote, so it reaches the floor as it did.
+        if write_started:
+            raise
+        text = after_the_key(codec_safe_str(exc), _provision_open_refusal(exc, settings.store))
+        _emit_error(text, as_json=args.json)
         return 2
     except sqlite3.IntegrityError as exc:
         # BACKLOG #2697. Ahead of the arm below, which it subclasses: a write the store refused is
@@ -9643,11 +9395,11 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         ``hint`` follows the message once the key has been shown. The texts of the first two
         families are the engine's own and name settings, files, tables or key ids, never a value.
         Each goes through ``codec_safe_str``: a key source's codec error quotes a byte of what it
-        decoded (BACKLOG #2532)."""
+        decoded (BACKLOG #2532). A short server schema says what the open may have changed before
+        it (BACKLOG #5067)."""
         if isinstance(exc, could_not_start):
-            _emit_error(
-                f"{_sentence(codec_safe_str(exc))} Nothing was written.{hint}", as_json=args.json
-            )
+            left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
+            _emit_error(f"{_sentence(codec_safe_str(exc))} {left}.{hint}", as_json=args.json)
             return 2
         if isinstance(exc, (StoreKeylessError, CipherError)):
             return _emit_error(
@@ -10239,7 +9991,8 @@ def _audit_verify(args: argparse.Namespace) -> int:
     try:
         verdict = run_guarded(run())
     # #1916; #1780: a server database with no store; #2725: no key; #2532: a store hop the posture
-    # refuses. Could not start.
+    # refuses; #5000: the hop's own TLS settings the open refuses (`StoreTlsRefused` lists them).
+    # Could not start, never the broken chain's 1.
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
@@ -10618,7 +10371,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
     key, which docs/PHI.md states. A re-run then finds the roll a verified no-op, and the stamp and
     the close follow. A run that stops
     short leaves the record open, so no ``serve`` start stamps its key, unless one already did before
-    this run: that start's stamp stands and no record opens.
+    this run: that start's stamp stands and no record opens. On a keyed audit chain a start does not
+    stamp a changed key the chain has not rolled to; it opens the record instead (BACKLOG #4942), so
+    that exception needs a store with no keyed chain. A roll that refuses for good holds the record
+    open for good; the refusal names the way out (BACKLOG #4934, #4935).
     """
     from pathlib import Path
 
@@ -10626,6 +10382,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import StoreNotFoundError, open_store, resolve_active_key
     from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.store import audit_roll_refused_for_good
     from messagefoundry.uploads import ResealResult, UploadStore
 
     cli: dict[str, dict[str, object]] = {}
@@ -10719,7 +10476,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    async def run() -> tuple[int, ResealResult, tuple[bool, str]]:
+    async def run() -> tuple[int, ResealResult, tuple[bool, str], bool]:
         import datetime
 
         from messagefoundry.pipeline.secret_rotation import (
@@ -10739,8 +10496,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
             key_id = store.cipher_info().active_key_id
             # BACKLOG #3737: before either data pass, so a kill or an abort in one leaves it open too.
             # The store open above can already have written under this key.
+            # Whether it names this key: a run with the key already in use opens none.
+            record_named = False
             if isinstance(store, SecretRotationMetaStore) and key_id:
-                await open_rotation_record(store, key_id, today)
+                record_named = await open_rotation_record(store, key_id, today)
             count = await store.reencrypt_to_active()
             # BACKLOG #1169: the uploaded-file store is the OTHER surface this cipher covers, and it
             # had no rotation of any kind — a rotation re-sealed every database cell and left every
@@ -10816,7 +10575,12 @@ def _rotate_key(args: argparse.Namespace) -> int:
                             last_rotated=today,
                         )
                 await close_rotation_record(store, today)
-            return count, uploads, rolled
+            # BACKLOG #4934, #4935: some chains no run can roll, under any key, a new one
+            # included, and the rotation record then holds a changed key's stamp for good. Name a
+            # way out only then: a run with the key already stamped opens no record, and a
+            # refusal a re-run or a restored key clears has its own remedy in the roll's error.
+            way_out = record_named and not rolled[0] and audit_roll_refused_for_good(rolled[1])
+            return count, uploads, rolled, way_out
         finally:
             await store.close()
 
@@ -10830,7 +10594,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
         *_key_unresolved(),
     )
     try:
-        count, uploads, (rolled_ok, rolled_msg) = run_guarded(run())
+        count, uploads, (rolled_ok, rolled_msg), name_way_out = run_guarded(run())
     except CipherError as exc:
         # A value couldn't be decrypted by any supplied key — the prior key is missing — or it was an
         # unmarked value the cipher refuses (#1169); the message names which, and the cell. Nothing is
@@ -10945,6 +10709,19 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "without this error.",
             file=sys.stderr,
         )
+        if name_way_out:  # BACKLOG #4934, #4935, decided in run()
+            print(
+                "note: no run will roll this audit chain, under any key, a new one included, "
+                "because the roll verifies the whole chain first. A start on the new key alone "
+                "before a roll is one way to break it. The rotation record stays open, so no serve "
+                "start stamps this key, and its age runs from the prior rotation date, or from the "
+                "date the record opened where there is none. The ways out include at least "
+                "[secret_rotation].store_key_last_rotated, set to the date of a run that re-sealed "
+                "the data with no skip, which then dates this key at every start until you change "
+                "it, and [secret_rotation].enforce_store_key_expiry = false, which lifts only the "
+                "start refusal and is a named security loosening.",
+                file=sys.stderr,
+            )
         return 1
     print(f"{'OK' if complete else 'note'}: {rolled_msg}")
     if uploads.skipped:
@@ -11069,6 +10846,10 @@ def _backup(args: argparse.Namespace) -> int:
         "snapshot_method": result.snapshot_method,
         "key_id": result.key_id,
         "config_fingerprint": result.config_fingerprint,
+        # With `config_skipped_files` below, what says whether the archive holds every config file
+        # the walk listed (vault BACKLOG #5233).
+        "config_bundled": result.config_bundled,
+        "config_bundle_error": result.config_bundle_error,
         "snapshot_sha256": result.snapshot_sha256,
         "row_counts": result.row_counts,
         "verify": result.verify.status if result.verify is not None else "skipped",
@@ -11078,6 +10859,9 @@ def _backup(args: argparse.Namespace) -> int:
         payload["staging_leftover"] = result.staging_leftover
     if result.config_unreadable_files:  # vault BACKLOG #3765: the digest covers the rest
         payload["config_unreadable_files"] = list(result.config_unreadable_files)
+    if result.config_skipped_files:  # vault BACKLOG #5233: what the archive does not carry
+        payload["config_skipped_files"] = list(result.config_skipped_files)
+        payload["config_skipped_count"] = result.config_skipped_count
     if args.json:
         _print_json(payload, compact=True)
     else:
@@ -11086,17 +10870,23 @@ def _backup(args: argparse.Namespace) -> int:
             f"  encrypted={result.encrypted} config_only={result.config_only} key_id={result.key_id}"
         )
         print(f"  verify={payload['verify']} row_counts={result.row_counts} pruned={result.pruned}")
+        print(
+            f"  config_bundled={result.config_bundled} "
+            f"config_bundle_error={result.config_bundle_error}"
+        )
         if result.staging_leftover is not None:
             print(f"WARNING: {result.staging_leftover}", file=sys.stderr)
-        if result.config_unreadable_files:
-            from messagefoundry.config.fingerprint import describe_left_out
-            from messagefoundry.controlchars import scrub_log_argument
+        from messagefoundry.config.fingerprint import describe_left_out
+        from messagefoundry.controlchars import scrub_log_argument
 
-            left_out = describe_left_out(result.config_unreadable_files)
-            print(
-                f"WARNING: the config fingerprint left out {scrub_log_argument(left_out)}",
-                file=sys.stderr,
-            )
+        for what, files, total in (
+            ("fingerprint", result.config_unreadable_files, len(result.config_unreadable_files)),
+            ("bundle", result.config_skipped_files, result.config_skipped_count),
+        ):
+            if files:
+                left_out = scrub_log_argument(describe_left_out(files))
+                more = f" ({total} in all)" if total > len(files) else ""
+                print(f"WARNING: the config {what} left out {left_out}{more}", file=sys.stderr)
     return 0
 
 
@@ -11417,7 +11207,7 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         try:
             _refuse_an_unauditable_write(store)
             try:
-                revoked = await store.revoke_all_sessions()
+                revoked = (await store.revoke_all_sessions()).count
             except AUDIT_WRITE_DEFECTS:
                 raise  # a bug, not a refused write
             except store_call_errors() as exc:
@@ -11468,16 +11258,28 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
 
 
 def _restore(args: argparse.Namespace) -> int:
-    """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``).
+    """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``),
+    or with ``--config-to`` and no ``--to`` the config bundle of a CONFIG-ONLY archive (vault BACKLOG
+    #5233).
 
     The engine could write an archive and verify one, and had no way to restore one; ADR 0048's cold seed
     is the consumer (restore here, then activate onto the restored store). Verifies the archive first and
-    refuses anything but a ``PASS``, then decrypts it and writes the store to ``--to``. **Never
-    overwrites:** an existing destination is refused rather than clobbered. PHI-safe output (paths,
-    counts, fingerprints — never a body or key bytes)."""
+    refuses anything but a ``PASS``, then decrypts it and writes the store to ``--to``. A config-only
+    archive carries no store, so ``--to`` refuses one, and ``--config-to`` alone writes its config
+    bundle instead. **Never overwrites:** an existing destination is refused rather than clobbered.
+    PHI-safe output (paths, counts, fingerprints — never a body or key bytes)."""
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.pipeline.dr_backup import BackupError, run_restore
+    from messagefoundry.pipeline.dr_backup import (
+        RESTORE_NEEDS_A_DESTINATION,
+        BackupError,
+        run_restore,
+    )
 
+    # Before the settings load, so a broken service config cannot hide this usage error.
+    if args.to is None and args.config_to is None:
+        return _emit_error(
+            f"restore failed (destination): {RESTORE_NEEDS_A_DESTINATION}", as_json=args.json
+        )
     # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
     settings, detail = _load_service_settings(args.service_config)
     if settings is None:
@@ -11522,6 +11324,8 @@ def _restore(args: argparse.Namespace) -> int:
         "sessions_revoked": result.sessions_revoked,
         # BACKLOG #5094: a scripted restore reads what to re-apply here, as the text summary
         # prints it.
+        # Carried on the config-only route too (vault BACKLOG #5233): it places no store, but the
+        # store it sends the operator to restore by other means rolls back the same changes.
         "rollback_notice": RESTORE_ROLLBACK_NOTICE,
         "store": result.store_path,
         "store_bytes": result.store_bytes,
@@ -11533,6 +11337,18 @@ def _restore(args: argparse.Namespace) -> int:
     }
     if args.json:
         _print_json(payload, compact=True)
+    elif result.store_path is None:
+        print(
+            f"OK: restored the config bundle of the CONFIG-ONLY archive {args.archive}: "
+            f"{result.config_files} file(s) into {result.config_dir}"
+        )
+        print(f"  encrypted={result.encrypted} key_id={result.key_id}")
+        print(f"  archive taken {payload['archive_created_at']}")
+        print(
+            "  It carries no store. Restore the store by other means: a whole-store archive with "
+            "--to, or on a server-DB store the DBA's own backup. That restore rolls back the store: "
+            f"{RESTORE_ROLLBACK_NOTICE}"
+        )
     else:
         print(f"OK: restored {result.store_path} ({result.store_bytes} bytes) from {args.archive}")
         print(
@@ -11664,55 +11480,6 @@ def _cluster_vip(args: argparse.Namespace) -> int:
         "release_grace_seconds": vip.release_grace_seconds,
     }
     _print_json(payload, compact=args.json)
-    return 0
-
-
-def _generate(args: argparse.Namespace) -> int:
-    from messagefoundry.generators import (
-        _core,
-        all_types,  # noqa: F401  (registers every built-in type)
-    )
-
-    if args.list:
-        listing = {code: _core.triggers_for(code) for code in _core.message_codes()}
-        if args.json:
-            _print_json(listing, compact=True)
-        else:
-            for code, trigs in listing.items():
-                print(f"{code}: {len(trigs)} trigger(s) ({', '.join(trigs)})")
-        return 0
-
-    if not args.type:
-        print("error: --type is required (or use --list to see types)", file=sys.stderr)
-        return 2
-
-    code = args.type.upper()
-    triggers = [t.strip().upper() for t in args.triggers.split(",") if t.strip()] or None
-    out = args.out or f"samples/messages/{code.lower()}"
-    seed = args.seed or _core.DEFAULT_SEED
-    try:
-        result = _core.write_corpus(code, triggers=triggers, count=args.count, out=out, seed=seed)
-    except KeyError as exc:
-        print(f"error: {exc.args[0] if exc.args else exc}", file=sys.stderr)
-        return 2
-    except _core.GenerationError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-    if args.json:
-        _print_json(
-            {
-                "type": result.code,
-                "out": result.out_dir,
-                "total": result.total,
-                "by_trigger": result.by_trigger,
-            },
-            compact=True,
-        )
-    else:
-        for trig, n in result.by_trigger.items():
-            print(f"{code}^{trig}: {n}")
-        print(f"Generated {result.total} message(s) into {result.out_dir}/")
     return 0
 
 
@@ -12013,91 +11780,6 @@ def _codeset(args: argparse.Namespace) -> int:
         return _emit_error(str(exc), as_json=args.json)
     _print_json(result, compact=args.json)
     return 0
-
-
-#: The object kinds `messagefoundry impact` accepts (mirrors config.impact.RENAMEABLE_KINDS; kept as a
-#: literal so building the argparse choices doesn't import the engine on every CLI invocation).
-_IMPACT_KINDS = frozenset(
-    {"inbound", "router", "handler", "outbound", "code_set", "reference", "lookup", "fhir_lookup"}
-)
-
-
-def _impact(args: argparse.Namespace) -> int:
-    """Reverse-dependency pre-flight (#152): report referrers, or plan/apply a rename that rewrites an
-    object AND every referent. Offline — loads the config graph, touches no network, starts no server.
-    A rename is a **dry-run** (prints the edits) unless ``--apply`` writes them; ``--delete`` lists the
-    live referrers that would dangle. Rename/delete are mutually exclusive."""
-    from messagefoundry.config.impact import apply_rename, delete_impact, plan_rename
-    from messagefoundry.config.reachability import build_reference_index
-    from messagefoundry.config.wiring import WiringError, load_config
-
-    if args.rename_to is not None and args.delete:
-        return _emit_error("--rename-to and --delete are mutually exclusive", as_json=args.json)
-    if args.apply and args.rename_to is None:
-        return _emit_error("--apply is only valid with --rename-to", as_json=args.json)
-
-    try:
-        # allow_empty: `impact` is the CLI front door to the SAME rename/delete pre-flight
-        # `codeset_edit` runs (BACKLOG #1648), and reverse-dependency analysis over Routers,
-        # Handlers and code sets needs no connection. Exempting the pre-flight and refusing here
-        # would leave the two disagreeing about the same config.
-        registry = load_config(args.config, allow_empty=True)
-    except (WiringError, FileNotFoundError, OSError) as exc:
-        return _emit_error(str(exc), as_json=args.json)
-
-    index = build_reference_index(registry)
-
-    if args.rename_to is not None:
-        try:
-            plan = plan_rename(registry, args.config, args.kind, args.name, args.rename_to)
-        except (WiringError, OSError) as exc:
-            return _emit_error(str(exc), as_json=args.json)
-        result = plan.as_dict()
-        if args.apply:
-            try:
-                applied = apply_rename(plan)
-            except OSError as exc:
-                return _emit_error(str(exc), as_json=args.json)
-            result["applied"] = len(applied)
-            result["dry_run"] = False
-        else:
-            result["dry_run"] = True
-        _print_json(result, compact=args.json)
-        return 0
-
-    if args.delete:
-        referrers = delete_impact(index, args.kind, args.name)
-        result = {
-            "op": "delete",
-            "kind": args.kind,
-            "name": args.name,
-            "referrers": [_reference_dict(r) for r in referrers],
-            "would_dangle": len(referrers),
-        }
-        _print_json(result, compact=args.json)
-        return 0
-
-    referrers = index.referrers(args.kind, args.name)
-    _print_json(
-        {
-            "kind": args.kind,
-            "name": args.name,
-            "referrers": [_reference_dict(r) for r in referrers],
-            "count": len(referrers),
-        },
-        compact=args.json,
-    )
-    return 0
-
-
-def _reference_dict(ref: Any) -> dict[str, str]:
-    """JSON view of a :class:`~messagefoundry.config.reachability.Reference` (referrer -> target edge)."""
-    return {
-        "referrer_kind": ref.referrer_kind,
-        "referrer": ref.referrer,
-        "target_kind": ref.target_kind,
-        "target": ref.target,
-    }
 
 
 def _verify(args: argparse.Namespace) -> int:
@@ -12411,6 +12093,7 @@ def _security(args: argparse.Namespace) -> int:
                 attested_hops=(),
                 revocation_attested_hops=(),
                 path_form_fhir_hops=(),
+                ech_cleartext_sidecar_hops=(),
                 api=_api,
                 approvals=_approvals,
                 cert_monitor=_cert_monitor,
@@ -12452,7 +12135,8 @@ def _security(args: argparse.Namespace) -> int:
             "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
             "generic-ODBC database TLS, "
             "tls_hop_attested, "
-            "tls_revocation_attested and FHIR update_url_form declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
+            "tls_revocation_attested, FHIR update_url_form and http ECH sidecar declarations are "
+            "NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). Nor are the engine process's remote-debugging "
             "reading, its start-up reading (launch flags, start-up code, writable site "
@@ -12552,8 +12236,9 @@ def _emit_key_unresolved(exc: Exception, *, as_json: bool) -> int:
 
 class _StoreOpenRefused(RuntimeError):
     """The store open refused, so the command could not start: the key the settings name could not
-    be resolved (vault BACKLOG #2725), the posture refused the store hop (BACKLOG #2532), or a
-    server store's live schema falls short of this build's DDL batch (BACKLOG #1720). Its text is
+    be resolved (vault BACKLOG #2725), the posture refused the store hop (BACKLOG #2532) or the
+    hop's own TLS settings refused it (BACKLOG #5000), or a server store's live schema falls short
+    of this build's DDL batch (BACKLOG #1720). Its text is
     the refusal's, which names settings, variables, files, the hop's host, or the tables, columns
     and indexes that differ."""
 
@@ -12627,8 +12312,9 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     ``rotate-key``, where it is an aborted rotation's (BACKLOG #2109). The schema refusal rolls the
     open's DDL batch back and writes no schema marker, and the command has written no store row,
     so it could not start, exit 2. Not "changed
-    nothing": a SQL Server open under ``auto`` may already have switched the database's RCSI
-    option on, before the batch. Its text lists the tables, columns and indexes that differ and
+    nothing": a SQL Server open under ``auto`` may already have switched database options on,
+    before the batch; :func:`_open_refusal_left_behind` names them, and at least
+    ``provision-admin`` and ``admin-reset-totp`` print it, not every caller. Its text lists the tables, columns and indexes that differ and
     the remedy, and names no row's content. ``audit-verify`` and ``audit-anchor`` open read-only,
     which runs no DDL batch and so never raises it. Only the
     OPEN is wrapped. ``open_store`` resolves the key, builds the cipher and judges the store hop
@@ -12639,8 +12325,10 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
     one can raise a class caught here was not traced, so read "before a row" as the intent for at
     least the key and the store hop. A malformed key is
     caught as ``StoreCipherConfigError`` and an unrevoked hop as ``InsecureHopRefused``, never as
-    the bare ``ValueError`` the open raises for other reasons too. A weakened-TLS refusal is one of
-    those bare ones, so it still reaches the dispatch floor.
+    the bare ``ValueError`` the open raises for other reasons too. A refusal of the hop's own TLS
+    settings, at least a weakened hop and a SQL Server pin (``StoreTlsRefused`` lists them), is an
+    ``InsecureHopRefused``, so it is caught here too (BACKLOG #5000). Each was bare, and reached
+    the dispatch floor's 1.
 
     The text goes through ``codec_safe_str``, never ``str(exc)``: a key source's codec error quotes
     a byte of what it decoded, and every caller prints this text.
@@ -12843,10 +12531,10 @@ def _emit_trust_anchor_refusal(exc: TrustAnchorError, *, as_json: bool) -> int:
 #: Adding a name here takes a subcommand OUT of that default. `tests/test_cli.py` pins this set and
 #: checks that each member really calls `configure_logging`.
 #:
-#: `serve` calls `configure_logging` only after its settings, key and egress gates run. For that
-#: window `_serve` calls `install_filtered_last_resort` near its start (BACKLOG #3768), whose
-#: docstring says what it covers. `supervise` calls
-#: `configure_logging` on its first line, so it has no such window.
+#: Neither has a handler before its own `configure_logging` call: `serve` makes it only after its
+#: settings, key and egress gates run, and `supervise` after its remote-debug guard and imports.
+#: For that window main() calls `install_filtered_last_resort` before parsing (BACKLOG #3768); its
+#: docstring says what it covers, and docs/PHI.md section 7 row 1 what it misses.
 _CONFIGURES_OWN_LOGGING = frozenset({"serve", "supervise"})
 
 #: The subcommands `run_cli` does NOT mark as carrying a result on stdout, so a print() in a config
@@ -12863,21 +12551,14 @@ _AUTHOR_PRINTS_KEEP_STDOUT = frozenset({"serve", "supervise"})
 _DISPATCH = {
     "serve": _serve,
     "supervise": _supervise,
-    "import": _import,
-    "init": _init,
     "validate": _validate,
     "graph": _graph,
     "dryrun": _dryrun,
     "check": _check,
     "connection": _connection,
     "codeset": _codeset,
-    "impact": _impact,
     "alert": _alert,
     "security": _security,
-    "generate": _generate,
-    "hl7schema": _hl7schema,
-    "hl7structures": _hl7structures,
-    "lens": _lens,
     "gen-key": _gen_key,
     "cert": _cert,
     "protect-key": _protect_key,

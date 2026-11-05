@@ -28,7 +28,6 @@ from pathlib import Path
 import pytest
 
 from messagefoundry import redaction
-from messagefoundry.api.app import _REFUSAL_LOG_LIMIT
 from messagefoundry.config.settings import BackupSettings, DrSettings, EgressSettings, StoreSettings
 from messagefoundry.config.wiring import Registry, WiringError, load_config
 from messagefoundry.controlchars import scrub_log_argument
@@ -358,7 +357,7 @@ async def test_the_reload_refusal_names_engine_shards_past_the_log_redaction(
     # What the reload route passes to the log, at the route's own limit, and then the PHI pass the
     # log handler runs over the line.
     logged = redaction.redact(
-        scrub_log_argument(redaction.safe_exc(refused.value, limit=_REFUSAL_LOG_LIMIT))
+        scrub_log_argument(redaction.safe_exc(refused.value, limit=redaction.REFUSAL_LOG_LIMIT))
     )
     assert all(name in logged for name in names), logged
     assert f"({east} / {west} -> {east} / {north} / {west})" in logged

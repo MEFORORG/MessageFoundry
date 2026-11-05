@@ -57,7 +57,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
 | 4 | Starting processes | 13 modules | Varies, see below |
-| 5 | Calling native libraries | 21 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 22 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -109,11 +109,13 @@ inert.
 
 **Some tools write Python into a config directory, and the loader then runs it.** At least these:
 
-- `messagefoundry import corepoint`, in `corepoint_import.py`, turns a Corepoint export into one
-  module per channel in the `--out` folder. It reads the export with `defusedxml`, and checks that
-  each generated module compiles before writing it. `compile` here only parses the source; nothing
-  runs until the engine loads that folder.
-- `messagefoundry init` scaffolds a new config repository with a starter feed.
+- `messagefoundry-toolkit import corepoint`, in the toolkit's `corepoint_import.py`, turns a
+  Corepoint export into one module per channel in the `--out` folder. It reads the export with
+  `defusedxml`, and checks that each generated module compiles before writing it. `compile` here
+  only parses the source; nothing runs until the engine loads that folder.
+- `messagefoundry-toolkit init` scaffolds a new config repository with a starter feed.
+  Both are toolkit commands, from the separate `messagefoundry-toolkit` distribution (ADR 0201), so
+  a host that installs the engine alone carries neither.
 - `messagefoundry restore --config-to` writes a backup's config files into a folder, so a restore
   is only as trusted as the backup it reads. Section 7 says what holds that read.
 - The VS Code extension's new-route command writes a new module into your config directory.
@@ -459,17 +461,32 @@ reach one:
 
 ## 5. Native library calls
 
-21 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+22 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
   material in memory so it is not paged to disk, and to wipe it after use
 - File owner and permission checks: `config/wiring.py`, `auth/anchor_path.py`, `store/store.py`
+- Backup staging owner probe: `pipeline/dr_backup.py`, which on Windows creates the probe it learns
+  a staging root's owner from with `kernel32`'s `CreateFileW`, with a protected access list built by
+  `advapi32` attached and `CREATE_NEW`, and reads that probe's owner, a staging root's, and its own
+  lock file's from the open handle with `advapi32`'s `GetSecurityInfo`, never by path, so a rename
+  in the staging root cannot choose the owner a sweep goes by (BACKLOG #4988). POSIX needs no
+  `ctypes` for this; it reads `fstat` of each one's open descriptor
 - Key file creation: `restricted_file.py`, which on Windows calls `kernel32`'s `CreateFileW` with
   the file's access list attached and `CREATE_NEW`, so a file that holds a key is restricted in
   the call that creates it and an existing file or link is refused. It asks `advapi32` to build
   that list and to resolve an account name to its SID. POSIX needs no `ctypes` for this; it
-  creates the file with `O_CREAT | O_EXCL` and mode `0o600`
+  creates the file with `O_CREAT | O_EXCL` and mode `0o600`, and on Linux removes a POSIX access
+  control list the file inherits from its directory before writing to it
+- Key custody file reads: `store/custody.py`, which on Windows opens a host or handoff key file with
+  `kernel32`'s `CreateFileW`, `FILE_FLAG_OPEN_REPARSE_POINT` and a share mode that admits only other
+  readers, so a link is opened as itself and the file at that name cannot be replaced while its
+  access list is read, and `GetFileType` refuses anything but a disk file (vault BACKLOG #3411). The
+  access list is still read by name, so a link in a parent directory re-pointed in between is not
+  caught. Nothing calls these reads yet. Linux needs no `ctypes` for this; it opens the file with
+  `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list from the open
+  descriptor. Any other POSIX host opens none of these files
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
@@ -488,14 +505,14 @@ pure-Python equivalent:
   `GetFinalPathNameByHandleW` to confirm where the file it opened really is (BACKLOG #2507, #2535).
   It then moves and deletes the file through that handle with `SetFileInformationByHandle`, so the
   act cannot be redirected after the check. POSIX needs no `ctypes` for this; it opens each path part
-  with `O_NOFOLLOW` and acts relative to the opened directory
-- Backup staging fail-safe: `pipeline/dr_backup.py`, which empties the files a failed backup left in
-  its staging directory. On Windows it opens each directory and file with `kernel32`'s `CreateFileW`
-  and `FILE_FLAG_OPEN_REPARSE_POINT`, so a link or junction is opened as itself,
-  `GetFileInformationByHandleEx` to refuse one, and `GetFinalPathNameByHandleW` to confirm the
-  object lies under the staging directory before it is truncated through that handle (BACKLOG
-  #2420). POSIX needs no `ctypes` for this; it opens each directory and file with `O_NOFOLLOW`
-  relative to its directory's descriptor
+  with `O_NOFOLLOW` and acts relative to the opened directory. The disaster-recovery backup's
+  staging fail-safe, which empties the files a failed backup left in its staging directory, calls
+  these same helpers on Windows rather than `ctypes` of its own. It holds each directory, opens each
+  file as itself, and refuses a link or junction. It confirms that file lies under the staging
+  directory before its filter serves it, except in the cases the backup staging row of
+  [PHI.md section 2](PHI.md#2-where-phi-lives--data-at-rest-inventory) names, where the filter
+  serves first. A deduplicated, cloud or tiered file is then truncated through a second open by
+  name, which must reach the same file (BACKLOG #2420, #4992)
 - Service, tray and shell integration: `service.py`, `service_status.py`, `tray/app.py`,
   `tray/winsvc.py`, `tray/winshell.py`, `tray/instance.py`, `tray/branding.py`
 - Diagnostics: `crashdump.py`
@@ -613,8 +630,9 @@ the first table. The rule places at least these modules:
 - `transports/loopback.py` and `transports/passthrough.py`, second. They hand their bodies to the
   engine's intake.
 - `__main__.py`, second. It hands at least dry-run fixtures to `pipeline/dryrun.py` and
-  `pipeline/dryrun_trace.py`, a Corepoint export to `corepoint_import.py`, and a backup to
-  `pipeline/dr_backup.py`.
+  `pipeline/dryrun_trace.py`, and a backup to `pipeline/dr_backup.py`. The toolkit's
+  `messagefoundry_toolkit/__main__.py` hands a Corepoint export to
+  `messagefoundry_toolkit/corepoint_import.py` the same way.
 - `auth/service.py`, second. It hands an identity provider's token to `auth/oidc/`, and a passkey
   response to `auth/webauthn.py`. The first table's identity provider and passkey rows cover them.
 
@@ -641,7 +659,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | Input | Where it comes from | Modules |
 |---|---|---|
 | Inbound connectors | Whatever a sender or a polled source delivers. `transports/http_listener.py` reads the HTTP request line and headers itself. | `transports/file.py`, `transports/http_listener.py`, `transports/remotefile.py`, `transports/tcp.py`, `transports/x12.py`, `transports/database.py` |
-| The intake path | Every received body. `pipeline/wiring_runner.py` is the shared ingress code. It hands each body to the decode and size guards, and an HL7 body to the peek, then to the parsers below. The live router and transform workers call the routing and transform core in `pipeline/dryrun.py` (`route_only`, `transform_one`), which hands each body to the parser for its content type. `pipeline/refused_body.py` decides what is stored of a body the listener refused, whole or as a head, and hands it to `pipeline/ingress_guards.py` and `parsing/` to build that form (vault BACKLOG #2608). The scan's match in `pipeline/refused_body.py` is different: JSON the engine wrote itself, in the message's metadata. | `pipeline/wiring_runner.py`, `pipeline/dryrun.py`, `pipeline/refused_body.py` |
+| The intake path | Every received body. `pipeline/wiring_runner.py` is the shared ingress code. It hands each body to the decode and size guards, and an HL7 body to the peek, then to the parsers below. The live router and transform workers call the routing and transform core in `pipeline/dryrun.py` (`route_only`, `transform_one`), which hands each body to the parser for its content type. `pipeline/refused_body.py` decides what is stored of a body the listener refused, or a captured reply a loopback re-ingress refused, whole or as a head, and hands it to `pipeline/ingress_guards.py` and `parsing/` to build that form (vault BACKLOG #2608, #4796). The scan's match in `pipeline/refused_body.py` is different: JSON the engine wrote itself, in the message's metadata. | `pipeline/wiring_runner.py`, `pipeline/dryrun.py`, `pipeline/refused_body.py` |
 | Dry-run fixtures | The sample and batch files a dry run reads, such as the `--messages` files of `messagefoundry dryrun`. A fixture may be captured traffic. `read_fixture` reads each file, and `split_messages` hands a batch file to `parsing/split.py` to split. The scan's match in this module is different: a JSON decode of a value it encoded a moment before. | `pipeline/dryrun.py` |
 | A stored message body, when retention strips its documents | The body a sender delivered, decrypted from the store. Each backend's retention pass hands it to `parsing/binary.py`, in the hand-read table below, to strip its embedded documents. The scan's matches here are different: JSON the engine wrote itself. | `store/store.py`, `store/postgres.py`, `store/sqlserver.py` |
 | HL7 v2 | An inbound connection. Strict validation is opt-in. The tolerant parser is hand-written, so it is in the hand-read table below. | `parsing/message.py`, `parsing/validate.py` |
@@ -664,16 +682,16 @@ The scan leaves some parsing out on purpose, and it has limits:
 | A TLS client's certificate | The certificate a TLS client presents, read again to find its issuer. The same module also decodes an operator's PKCS #12 file and certificate revocation lists. | `pki.py` |
 | A partner's certificate | The recipient certificate a Direct outbound encrypts to. An operator names the file, but the partner issued what is in it. The module decodes it first, then checks it against the operator's trust anchor. It also reads the operator's own signing key. | `transports/direct.py` |
 | Web console requests | The form bodies a browser posts, and the Content Security Policy reports it sends | `messagefoundry_webconsole/routes/_common.py`, `messagefoundry_webconsole/routes/connection_writes.py`, `messagefoundry_webconsole/routes/core.py`, `messagefoundry_webconsole/routes/monitoring_writes.py`, `messagefoundry_webconsole/routes/oidc.py` |
-| A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `corepoint_import.py` |
+| A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `messagefoundry_toolkit/corepoint_import.py` |
 | A backup | The manifest and encrypted blocks `messagefoundry restore` reads. The archive list below says what bounds them. | `pipeline/dr_backup.py`, `store/backup_codec.py` |
 
 **Parse sites left out, and why.**
 
 | Why it is left out | Modules |
 |---|---|
-| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
+| It reads rows or files the engine wrote itself: its store, the key custody host blob and the recovery wrap kept in its store (no command reads a wrap from an archive yet), audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/custody.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py`, `api/protocol_floor_selftest.py` |
-| It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
+| It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file, the trust anchor files it chooses to trust, a systemd credential and a recovery key a person types | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py`, `store/custody.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
 | It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py` |
 | It reads a URL an operator configures, never a received body: an outbound's or a `FhirLookup`'s `url` setting, the value its `env()` reference resolves to, and, for the settings views, any URL-named setting such as `proxy_url` and an `env()` default. It splits the query string with `urllib.parse` to name the parameters that look like credentials. At least the ASVS 14.2.1 warning and loosening entry, the `verify_tls = false` credential refusal (vault BACKLOG #3230) and the off-box cleartext credential refusal (vault BACKLOG #3533) use those names. For the settings views it also splits the whole URL by hand, with one regular expression, at every `?`, `&`, `#` and `;`, and percent-decodes each segment's name; a URL it finds a credential name in is withheld whole. It runs at least when a `Rest`, `Soap`, `FHIR`, `DICOMweb` or `FhirLookup` connection is built, in `messagefoundry check`, on `GET /security/posture` on a running engine and on each settings view (`GET /metadata`, `graph --json`). The warning, the reports and the views put no bound on the URL's length, because the operator wrote it. Some refusals read it only after `enforce_outbound_length_limits` has refused one over `MAX_OUTBOUND_URL_LEN`, and some before, at least a `FhirLookup`'s off-box cleartext refusal. It returns parameter names, never values, and returns nothing rather than raising on a URL it cannot parse. | `secretscrub.py` |
@@ -799,6 +817,9 @@ or compression library:
   gzipped. A sanitized SVG inside is served gzipped again. The inflated bytes stay in memory; nothing
   is written to disk, and the stored attachment is never changed.
 - `support/bundle.py` only writes a zip, the support bundle. It reads none.
+- `transports/dicom.py` imports `zlib` only for its CRC-32 and Adler-32 checksums. The DICOM SCU's
+  `_unanswered_key` keys its count of unanswered stores by an outbound object's length and both
+  checksums. It decompresses nothing and opens no archive, so it has nothing to bound.
 
 ---
 

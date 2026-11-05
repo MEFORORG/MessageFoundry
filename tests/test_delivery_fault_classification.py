@@ -23,6 +23,7 @@ import base64
 import json
 import logging
 import math
+import re
 import sqlite3
 import time
 from collections.abc import AsyncIterator
@@ -69,9 +70,26 @@ async def _skeleton(store: MessageStore, control_id: str = "MSG1") -> str:
     ref = await store.put_attachment(chunk_b64(b64), "application/pdf")
     await store.attachment_incref(ref)
     skeleton = _hl7(make_doc_ref(ref, "application/pdf"), control_id)
-    return await store.enqueue_message(
+    mid = await store.enqueue_message(
         channel_id="IB", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
     )
+    await _hold_named(store, mid, skeleton)
+    return mid
+
+
+_HANDLE_REF = re.compile(r"mfdoc:v1:ref:([0-9a-f]{64})")
+
+
+async def _hold_named(store: MessageStore, message_id: str, *texts: str) -> None:
+    """Link ``message_id`` to every attachment a handle in ``texts`` names, as the ingress commit
+    links a document it detached. Delivery resolves a handle only to an attachment its own message
+    holds (BACKLOG #5099), so a message these tests model as detached must hold its documents."""
+    for ref in {m for text in texts for m in _HANDLE_REF.findall(text)}:
+        await store._db.execute(
+            "INSERT OR IGNORE INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
+            (message_id, ref),
+        )
+    await store._db.commit()
 
 
 class _Sender:
@@ -283,7 +301,7 @@ async def test_control_a_code_bug_in_the_read_path_still_dead_letters(
     mid = await _skeleton(store)
     runner = _runner(store, _Sender())
 
-    async def buggy(payload: str) -> str:
+    async def buggy(payload: str, message_id: str) -> str:
         raise TypeError("a bug in the re-attach")
 
     monkeypatch.setattr(runner, "_hydrate_payload", buggy)
@@ -297,13 +315,17 @@ async def test_control_a_code_bug_in_the_read_path_still_dead_letters(
 
 
 async def test_control_a_missing_attachment_is_still_a_retryable_delivery_error(
-    store: MessageStore,
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A content fault from the re-attach keeps its old arm: mark_failed with backoff."""
-    skeleton = _hl7(make_doc_ref("0" * 64, "application/pdf"))
-    mid = await store.enqueue_message(
-        channel_id="IB", raw=skeleton, deliveries=[(DEST, skeleton)], now=100.0
-    )
+    """A content fault from the re-attach keeps its old arm: mark_failed with backoff. The message
+    holds the attachment, so the handle is bound (BACKLOG #5099), and its read then finds nothing."""
+    mid = await _skeleton(store)
+
+    async def _lost(ref: str) -> AsyncIterator[str]:
+        raise KeyError(ref)
+        yield ""  # an async generator, as read_attachment is
+
+    monkeypatch.setattr(store, "read_attachment", _lost)
     sender = _Sender()
     runner = _runner(store, sender)
     item = await store.claim_next_fifo(DEST)

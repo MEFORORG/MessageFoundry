@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 #: The port the SQL Server preset's connection string uses when ``port`` is not set.
@@ -84,8 +85,11 @@ def split_generic_server(server: str) -> tuple[str, str]:
     """Split a generic-dialect ``server`` into its host and the text after a port separator, which
     is ``""`` when it carries none and is not necessarily a port (:func:`port_or_zero` decides).
 
-    ``host,port`` (the SQL Server spelling), ``host:port``, and ``[v6]:port`` are split. A bare IPv6
-    literal carries more than one colon and is left whole."""
+    ``host:port`` and ``[v6]:port`` are split. A bare IPv6 literal carries more than one colon and
+    is left whole. A comma is NOT split on (BACKLOG #4874): libpq reads a comma in a host as a list
+    of hosts, so the text before it need not be the only host dialled. Both callers deal with a
+    comma before they get here: the egress reading refuses it, and :func:`generic_hop_endpoint`
+    reads it as its docstring says."""
     host = server.strip()
     in_server = ""
     if host.startswith("["):  # a bracketed IPv6 literal, optionally followed by ":port"
@@ -93,21 +97,38 @@ def split_generic_server(server: str) -> tuple[str, str]:
         if close != -1:
             host, rest = host[1:close], host[close + 1 :]
             in_server = rest[1:] if rest.startswith(":") else ""
-    elif "," in host:  # the SQL-Server-style "host,port"
-        host, _, in_server = host.partition(",")
     elif host.count(":") == 1:  # "host:port" — a bare IPv6 literal carries more than one colon
         host, _, in_server = host.partition(":")
     return host.strip(), in_server.strip()
 
 
-def generic_hop_endpoint(server: str, params: Mapping[str, Any]) -> tuple[str, int]:
+def _exact_split(text: str) -> tuple[str, str] | None:
+    """:func:`split_generic_server` of ``text``, or ``None`` unless ``text`` is a host,
+    ``host:port`` or ``[v6]:port`` written exactly, with a usable port where it carries one.
+
+    Anything else, at least ``[::1]remote``, ``[::1]:5432x``, ``127.0.0.1 : 5432`` and ``[]``,
+    gets ``None``, so no text the split would drop can sit behind a loopback host. An empty host
+    from a non-empty ``text`` is refused because the loopback check reads an empty host as on-box,
+    while the driver is handed the text, not an empty one."""
+    host, in_server = split_generic_server(text)
+    written = (f"[{host}]" if text.startswith("[") else host) + (
+        f":{in_server}" if in_server else ""
+    )
+    if written != text or (in_server and not port_or_zero(in_server)) or (text and not host):
+        return None
+    return host, in_server
+
+
+def generic_hop_endpoint(
+    server: str, params: Mapping[str, Any], *, reads_comma_port: bool
+) -> tuple[str, int]:
     """Split a generic-dialect ``server`` setting into ``(host, port)`` for the hop guard.
 
     The loopback carve-out is decided on the HOST alone and
     :func:`~messagefoundry.config.tls_policy.is_loopback_hop_host` never resolves DNS, so a
-    ``host,port`` / ``host:port`` / ``[v6]:port`` suffix has to come off first: left on,
-    ``"127.0.0.1,5432"`` parses as a name rather than an address, is treated as remote, and a genuinely
-    on-box dev hop is refused.
+    ``host:port`` / ``[v6]:port`` suffix has to come off first: left on, ``"127.0.0.1:5432"``
+    parses as a name rather than an address, is treated as remote, and a genuinely on-box dev hop
+    is refused.
 
     A port the ``server`` string does not carry is read from the documented generic ``PORT`` keyword,
     and falls back to 0 when neither says. In the hop guard the port is report-only: it never changes
@@ -117,11 +138,49 @@ def generic_hop_endpoint(server: str, params: Mapping[str, Any]) -> tuple[str, i
     are the ones :func:`database_dial_endpoint` reads for ``[egress].allowed_db``, through
     :func:`split_generic_server` and :func:`port_or_zero`. A change to either changes what that
     allowlist admits, so it is reviewed as a change to a control, not to a log line. This function
-    alone reads a port in the ``server`` text; the egress reading refuses such a ``server``."""
-    host, in_server = split_generic_server(server)
+    alone reads a port in the ``server`` text; the egress reading refuses such a ``server``.
+
+    **A ``server`` holding a comma is read whole, as the host** (BACKLOG #4874), with one
+    exception below. libpq reads a comma in a host as a list of hosts, so ``127.0.0.1,remote``,
+    ``[::1]:5432,remote`` and ``127.0.0.1,5432`` each name a host after the comma, the last one the
+    host ``5432``. The whole text is never an address or ``localhost``, so the loopback check reads
+    it as remote. Before this, the host was the text before the first comma, so such a value
+    counted as on-box under the empty-allowlist opt-out. On psqlODBC and MySQL the port goes in the
+    ``PORT`` keyword, which both read.
+
+    **The exception is ``reads_comma_port``**, which the caller sets only for a driver it places as
+    Microsoft's ODBC Driver for SQL Server. That driver reads ``SERVER=host,port`` as one host and
+    its port, its own documented spelling, and ignores ``PORT``, so ``host,port`` is the only port
+    spelling it reads on this dialect, and ``PORT`` is never read as its port here. There, and only
+    for exactly one comma followed by ASCII digits that make a port with no leading zero, the text
+    before the comma is read as the rest of this function reads a ``server`` with no comma; it must
+    name a host and carry no port of its own. Anything else holding a comma, ``127.0.0.1,remote``
+    and ``127.0.0.1,1433,x`` included, is still read whole.
+
+    The egress reading still refuses that ``server`` on every driver, and the two differ on
+    purpose. The hop guard asks only whether the hop leaves the box, and a wrong ``yes`` there only
+    refuses; a wrong ``no`` would let a cleartext hop cross, which is why only the driver's own
+    exact spelling is split. The egress reading matches ``server`` whole against an
+    ``allowed_db`` entry and reads the generic port from ``PORT`` alone, so it has no reading of a
+    SQL Server driver's port on this dialect; the SQL Server preset, which sends ``host,port``
+    itself, is the spelling it reads a port from for that driver. With an empty allowlist it
+    refuses nothing, so the hop guard is then the only reader."""
+    keyword = "" if reads_comma_port else str(odbc_param(params, "port") or "")
+    text = server.strip()
+    if "," in text:
+        head, _, tail = text.partition(",")
+        port = port_or_zero(tail) if tail.isascii() and tail.isdecimal() else 0
+        if reads_comma_port and port and not tail.startswith("0"):
+            split = _exact_split(head)
+            if split is not None and split[0] and not split[1]:
+                return split[0], port
+        return text, port_or_zero(keyword)
+    split = _exact_split(text)
+    if split is None:
+        return text, port_or_zero(keyword)
+    host, in_server = split
     # A usable port in `server` wins; otherwise the PORT keyword; otherwise unknown. 0 is the "neither
     # said" value, so `or` reads correctly here — a port is never legitimately 0.
-    keyword = str(odbc_param(params, "port") or "")
     return host, port_or_zero(in_server) or port_or_zero(keyword)
 
 
@@ -142,15 +201,56 @@ class DialEndpoint(NamedTuple):
     remedy: str = "set the port setting to the pinned port"
 
 
-#: Words in an ``odbc_driver`` name that mark a driver the engine knows reads the ``PORT`` keyword:
-#: psqlODBC, MySQL Connector/ODBC and MariaDB Connector/ODBC. A list of what is KNOWN, on purpose: a
-#: name with none of these words reads no port, whatever driver it names.
-_PORT_KEYWORD_DRIVERS = ("postgres", "psqlodbc", "mysql", "mariadb")
+# The generic dialect's driver allowlist (BACKLOG #5041): the ONE classifier of an ``odbc_driver``
+# name on that dialect. The connection-string build refuses any other name, the
+# ``[egress].allowed_db`` check refuses it as a conflict, and the TLS gate, the password rule and
+# the port reading in :mod:`messagefoundry.transports.database` and here place a family by it.
+#
+# Each family is a network database driver documented to read ``SERVER`` as its target host. The
+# evidence for each, and what the list refuses and cannot see, are stated once, in
+# docs/CONNECTIONS.md, *The generic driver allowlist*. A family is added here only on the same
+# evidence, and with an entry in ``transports.database._DRIVER_FAMILIES`` saying what the engine
+# knows of its TLS keyword and password escape (that module refuses to import without one): adding
+# one admits a driver to a hop the egress check and the cleartext-hop guard judge by ``server``, so
+# it is a change to both controls and is reviewed as one. Whole registered names, in any case but
+# spelled with single spaces. Read-only against an edit in place; that is not a boundary
+# against code loaded in-process, which can still rebind this module's name.
+GENERIC_DRIVER_FAMILIES: Mapping[str, re.Pattern[str]] = MappingProxyType(
+    {
+        "psqlodbc": re.compile(r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"),
+        "mysql": re.compile(r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"),
+        "msodbc": re.compile(r"odbc driver [0-9]+ for sql server"),
+    }
+)
 
-#: Words that mark a Microsoft SQL Server driver, which ignores ``PORT``. On the generic dialect
-#: they win over the words above, so a name holding both reads no port. The SQL Server preset
-#: reads whole names instead (:data:`_PRESET_DRIVER_NAMES`).
-_SQLSERVER_DRIVER_WORDS = ("msodbcsql", "sql server")
+#: The families on the allowlist that read ``SERVER=host,port`` as one host and its port, and
+#: ignore the ``PORT`` keyword: Microsoft's driver alone (BACKLOG #4874). Every other family reads
+#: ``PORT``. The one record of how a family takes its port, read by the egress port reading here and
+#: by :func:`generic_hop_endpoint`'s caller, the cleartext-hop guard.
+COMMA_PORT_FAMILIES = frozenset({"msodbc"})
+if not COMMA_PORT_FAMILIES.issubset(GENERIC_DRIVER_FAMILIES):
+    # A renamed family would silently read PORT for a driver that ignores it.
+    raise RuntimeError("COMMA_PORT_FAMILIES names a family GENERIC_DRIVER_FAMILIES does not")
+
+#: Why the generic dialect refuses an ``odbc_driver`` off :data:`GENERIC_DRIVER_FAMILIES`: cause,
+#: then the registered-name shapes, kept short since a stored failure keeps about 200 characters
+#: and each raise site adds the connection's name. Microsoft's driver is not offered here, since
+#: on this dialect it ignores ``PORT``; it is accepted all the same.
+GENERIC_DRIVER_REFUSAL = (
+    "odbc_driver is not one the generic dialect accepts; name PostgreSQL Unicode or ANSI, or "
+    "MySQL ODBC <n> Unicode or ANSI Driver, or use dialect sqlserver (docs/CONNECTIONS.md)"
+)
+
+
+def generic_driver_family(driver: object) -> str | None:
+    """The key in :data:`GENERIC_DRIVER_FAMILIES` of the family ``driver``, an ``odbc_driver``
+    setting as written, names whole, or ``None`` where it names none. Read trimmed and in any
+    case, as the generic connection string sends it. Pure."""
+    name = str(driver or "").strip().lower()
+    return next(
+        (key for key, names in GENERIC_DRIVER_FAMILIES.items() if names.fullmatch(name)), None
+    )
+
 
 #: The driver the SQL Server preset names when ``odbc_driver`` is not set.
 SQLSERVER_DEFAULT_DRIVER = "ODBC Driver 18 for SQL Server"
@@ -239,8 +339,8 @@ def sqlserver_preset_refusal(settings: Mapping[str, Any]) -> str | None:
         return "odbc_driver must not hold ';', '{', '}' or '=' (ODBC injection risk)"
     if not _preset_driver(driver):
         return (
-            'name a Microsoft SQL Server driver, or on Database or DatabasePoll use dialect="generic": '
-            "another driver can misread the server,port the preset sends"
+            'name a Microsoft SQL Server driver, or on Database or DatabasePoll use dialect="generic" '
+            "with psqlODBC or MySQL: others misread the server,port it sends"
         )
     server = str(settings.get("server", ""))
     if "," in server:
@@ -254,20 +354,6 @@ def sqlserver_preset_refusal(settings: Mapping[str, Any]) -> str | None:
             "sends the port, so the instance name in server is not what is dialled"
         )
     return None
-
-
-def _reads_port_keyword(name: object) -> bool:
-    """Whether ``odbc_driver``, as written, names a driver the engine knows reads ``PORT``, in any
-    case and spacing (:data:`_PORT_KEYWORD_DRIVERS`), and not a SQL Server driver.
-
-    The engine reads the driver NAME, not the driver. An odbcinst alias or a library path is read
-    by its words like any name; which library it loads is not visible here. A name that misdescribes
-    its driver, such as a path holding ``mysql`` to a library that ignores ``PORT``, is outside what
-    this check can catch."""
-    folded = odbc_keyword_name(str(name or ""))
-    return not any(word in folded for word in _SQLSERVER_DRIVER_WORDS) and any(
-        word in folded for word in _PORT_KEYWORD_DRIVERS
-    )
 
 
 def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> DialEndpoint:
@@ -290,11 +376,11 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
     ``[v6]:port`` is refused too. ``PORT`` given twice, in any case, is refused, as the build
     refuses it, and so is a ``PORT`` value with a leading zero, which a driver could read as octal.
     With no usable ``PORT`` the port is ``None``: the engine does not know the port the driver then
-    uses. The port is ``None`` too when the ``odbc_driver`` name, as written, is not one the
-    engine knows reads ``PORT`` (:func:`_reads_port_keyword`, which says what a name cannot tell).
-    The factory default, ``ODBC Driver 18 for SQL Server``, is one: the SQL Server drivers ignore
-    ``PORT`` and dial their own default, and the generic dialect gives them no way to send a port,
-    so for a name the preset accepts the remedy names the SQL Server preset.
+    uses. An ``odbc_driver`` off the generic driver allowlist (:data:`GENERIC_DRIVER_FAMILIES`) is
+    a conflict, as the build refuses it (BACKLOG #5041). On Microsoft's driver the port is ``None``
+    too, and the factory default, ``ODBC Driver 18 for SQL Server``, is that driver: it ignores
+    ``PORT`` and dials its own default, and the generic dialect gives it no way to send a port, so
+    the remedy names the SQL Server preset.
 
     The host is the whole ``server`` text on both dialects, as the check read it before this
     change, so an entry is matched on its host as written."""
@@ -305,6 +391,9 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
             _preset_port(settings.get("port", SQLSERVER_DEFAULT_PORT)),
             conflict=sqlserver_preset_refusal(settings),
         )
+    family = generic_driver_family(settings.get("odbc_driver"))
+    if family is None:
+        return DialEndpoint(host, None, conflict=GENERIC_DRIVER_REFUSAL)
     params = settings.get("odbc_params")
     # A table that is not a mapping is the build's own refusal; read it as giving no keyword.
     keywords = [
@@ -342,20 +431,13 @@ def database_dial_endpoint(settings: Mapping[str, Any], *, dialect: str) -> Dial
             None,
             conflict="give the PORT keyword without a leading zero: a driver can read it as octal",
         )
-    driver = settings.get("odbc_driver")
-    if not _reads_port_keyword(driver):
-        # Point at the preset only for a name the preset accepts, so neither dialect's remedy
-        # names the other for a mixed name that both refuse.
-        sqlserver = _preset_driver(driver)
+    if family in COMMA_PORT_FAMILIES:
         return DialEndpoint(
             host,
             None,
             remedy=(
                 "use dialect sqlserver, or a driver that reads the PORT keyword; a SQL Server "
                 "driver ignores it"
-                if sqlserver
-                else "use a driver known to read the PORT keyword (psqlODBC, MySQL or MariaDB), "
-                "or a host-only entry"
             ),
         )
     return DialEndpoint(

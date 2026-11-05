@@ -11,7 +11,7 @@ parameters. The transport rides **``aioodbc``** (ADR 0003) — the ``[sqlserver]
 Driver 18, T-SQL-flavoured DSN with the ``Encrypt``/``TrustServerCertificate`` TLS posture and its
 weakened-TLS refusal (:func:`_build_dsn`); **production / supported**, exercised by the CI SQL Server
 job. ``dialect='generic'`` is a **generic ODBC path** decoupled from Driver-18/T-SQL: the operator names
-any OS-installed ODBC driver (PostgreSQL / MySQL) + supplies driver keywords via ``odbc_params``
+an OS-installed ODBC driver that reads ``SERVER`` (PostgreSQL / MySQL) + supplies driver keywords via ``odbc_params``
 (:func:`_build_odbc_dsn`), so no new Python DB-driver dependency is needed. ``odbc_params`` takes a fixed
 list of keywords (:data:`_ODBC_PARAM_ALLOWLIST`): the list is hand-chosen, no keyword is on it in order to
 name a host, and a file keyword's value is screened separately: by its spelling, and on Windows
@@ -61,9 +61,15 @@ from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from functools import partial
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeGuard
 
-from messagefoundry.auth.anchor_path import WinProbe, _win_probe, windows_chain
+from messagefoundry.auth.anchor_path import (
+    SHARE_CAUSE,
+    WinProbe,
+    _win_probe,
+    subst_target,
+    windows_chain,
+)
 from messagefoundry.auth.trust_anchors import (
     ENCRYPTION_HEADER_SCOPE,
     PRIVATE_KEY_SCOPE,
@@ -97,17 +103,26 @@ from messagefoundry.config.wiring import _is_text_codec
 from messagefoundry.connection_names import inbound_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
-from messagefoundry.odbc_call_gate import CallGate, call_gate, install_call_gate
+from messagefoundry.odbc_call_gate import (
+    CallGate,
+    call_gate,
+    drop_handle,
+    install_call_gate,
+    raw_cursor,
+    report_once,
+)
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import prints_a_codec_error, safe_exc
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
+    POLL_STOP_GRACE_S,
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
     InboundHandler,
     NegativeAckError,
+    PollStopGuard,
     SourceConnector,
     count_setting,
     float_setting,
@@ -120,8 +135,12 @@ from messagefoundry.transports.base import (
     resolve_poll_ceiling,
 )
 from messagefoundry.transports.db_endpoint import (
+    COMMA_PORT_FAMILIES,
+    GENERIC_DRIVER_FAMILIES,
+    GENERIC_DRIVER_REFUSAL,
     SQLSERVER_DEFAULT_DRIVER,
     SQLSERVER_DEFAULT_PORT,
+    generic_driver_family,
     generic_hop_endpoint,
     is_remote_spelling,
     odbc_keyword_name,
@@ -369,17 +388,6 @@ _ODBC_PASSWORD_KEYS = frozenset({"pwd", "password"})
 # screens. A path keyword added to the list above belongs here too; a test holds this a subset.
 _ODBC_PATH_KEYS = frozenset({"sslca", "sslcapath", "sslcert", "sslkey"})
 
-# The ONLY keywords the engine counts as setting a generic hop's TLS mode, in the form
-# :func:`odbc_keyword_name` compares them in (BACKLOG #2483). A value on one of these is what counts
-# as the operator owning TLS. A key, certificate or CA file, or a cipher list, does not count.
-# docs/CONNECTIONS.md records what the drivers read so far do with one.
-#
-# `encrypt` IS UNPROVEN. It is here for a driver that reads it. docs/CONNECTIONS.md records that
-# neither psqlODBC's keyword parser nor MySQL Connector/ODBC's parameter page has it. On a driver
-# that ignores it, `Encrypt=yes` would clear this gate and leave the driver at its own default, so
-# treat that spelling as the operator's claim, not a tested control.
-_ODBC_TLS_MODE_KEYWORDS = frozenset({"sslmode", "encrypt"})
-
 # Names an odbc_params keyword as about TLS at all (anything ssl/tls/encrypt-ish). A name says nothing
 # about the hop, so presence is never ownership: this picks which keywords' values are read against
 # :data:`_ODBC_NO_TLS_VALUES`, and tells "no TLS keyword" from "no TLS mode" in the reason an operator
@@ -399,10 +407,9 @@ _ODBC_TLS_HINT_RE = re.compile(r"ssl|tls|encrypt", re.IGNORECASE)
 #   assorted `Encrypt`  : no / 0 / false / off
 #   Microsoft ODBC `Encrypt` : optional (version 18 documents it as a synonym for `no`)
 #
-# Since BACKLOG #2705 the build also holds `sslmode` to libpq's six lower-case spellings on every
-# driver but MySQL Connector/ODBC (_refuse_unread_sslmode), so for a built hop this list's open end
-# matters for `encrypt`, and for `sslmode` on MySQL's driver. The posture readers classify specs
-# that were never built, so they still apply the list alone.
+# Since BACKLOG #5053 and #5035 a mode counts only on the keyword the driver family reads, and for
+# psqlODBC and MySQL only at one of that family's own spellings (_DRIVER_FAMILIES), so this list's
+# open end matters only for `encrypt` on Microsoft's driver.
 #
 # KNOWN RESIDUAL, written down rather than implied: an ENCRYPTED-BUT-UNVERIFIED value — psqlODBC
 # `require`, MySQL `REQUIRED`, `Encrypt=yes` beside a trust-everything keyword — is NOT on this list and
@@ -449,11 +456,15 @@ def _is_tls_keyword(name: str) -> bool:
     return bool(_ODBC_TLS_HINT_RE.search(name)) and not _ODBC_SECRET_KEY_RE.search(name)
 
 
-def _sets_tls_mode(params: Mapping[str, Any]) -> bool:
-    """True when a keyword in :data:`_ODBC_TLS_MODE_KEYWORDS` has a non-blank string value with no
-    blank at either end. Anything else sets nothing: the engine has no evidence of how a driver reads
-    it, and :func:`_no_tls_label` cannot see a no-TLS word inside a list. Whether the value is a good
-    one is :func:`generic_odbc_no_tls_params`'s question, not this one.
+def _sets_tls_mode(params: Mapping[str, Any], family: str) -> bool:
+    """True when the keyword ``family`` reads as its TLS mode (:data:`_DRIVER_FAMILIES`) has a
+    non-blank string value with no blank at either end, and, where that table lists the family's
+    spellings, one of them exactly. Anything else sets nothing: the engine has no evidence of how
+    the driver reads it, and :func:`_no_tls_label` cannot see a no-TLS word inside a list. Whether
+    a counted value is a good one is :func:`generic_odbc_no_tls_params`'s question, not this one.
+
+    The spellings are checked here as well as at build (:func:`_refuse_unread_sslmode`), because
+    the posture readers classify specs that were never built (BACKLOG #5035).
 
     A padded value does not count because a driver that does not trim would read something other
     than the word judged here: psqlODBC switches on the first character, so ``" require"`` would
@@ -464,13 +475,20 @@ def _sets_tls_mode(params: Mapping[str, Any]) -> bool:
     Every key is read, not the first spelling of each, so the answer for a table that names a mode
     keyword twice in different case does not depend on key order. The build refuses such a table;
     the posture readers classify specs that were never built."""
+    entry = _DRIVER_FAMILIES[family]
+    spellings = entry.tls_spellings
     return any(
-        odbc_keyword_name(str(key)) in _ODBC_TLS_MODE_KEYWORDS
-        and isinstance(value, str)
-        and value.strip()
-        and value == value.strip()
+        odbc_keyword_name(str(key)) == entry.tls_keyword
+        and _usable_mode_value(value)
+        and (spellings is None or value in spellings)
         for key, value in params.items()
     )
+
+
+def _usable_mode_value(value: object) -> TypeGuard[str]:
+    """Whether ``value`` is a non-blank string with no blank at either end: the only shape a mode
+    value can count in (:func:`_sets_tls_mode` says why)."""
+    return isinstance(value, str) and bool(value.strip()) and value == value.strip()
 
 
 def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
@@ -499,31 +517,77 @@ def generic_odbc_no_tls_params(params: Mapping[str, Any]) -> list[str]:
     return found
 
 
-def generic_odbc_tls_unenforced(params: Mapping[str, Any]) -> str | None:
-    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when :func:`_sets_tls_mode`
-    finds a usable mode value and no TLS keyword holds a no-TLS word. A blank, padded or non-string
-    mode value is not usable, so it does not clear the hop.
+#: The reason a hop gets when its ``odbc_driver`` name places no driver family (BACKLOG #5053).
+#: Short, because it rides in a refusal ahead of the host, and a stored failure keeps about 200
+#: characters.
+UNPLACED_DRIVER_REASON = "odbc_driver names no driver family whose TLS keyword the engine reads"
 
-    Three ways to be at risk, and they read differently to an operator, so they are reported
-    differently: a TLS keyword pinned to a no-TLS value (this names the offenders), a TLS keyword with
-    no mode beside it, such as a lone ``sslcert`` or a blank ``sslmode`` (BACKLOG #2483), or no TLS
-    keyword at all. Only :data:`_ODBC_TLS_MODE_KEYWORDS` can clear a hop. Shares
+
+def generic_odbc_tls_unenforced(params: Mapping[str, Any], *, driver: object) -> str | None:
+    """Why this generic-ODBC hop may cross in plaintext, or ``None`` when :func:`_sets_tls_mode`
+    finds a usable mode value for the family ``driver`` names and no TLS keyword holds a no-TLS
+    word. A blank, padded or non-string mode value is not usable, so it does not clear the hop.
+
+    ``driver`` is the ``odbc_driver`` setting, as written; :func:`_driver_family` places it. It is
+    required, so no caller can judge a keyword without saying which driver reads it (BACKLOG #5053).
+
+    Four ways to be at risk, and they read differently to an operator, so they are reported
+    differently: a TLS keyword pinned to a no-TLS value (this names the offenders), a driver name
+    the engine cannot place, so no keyword counts (BACKLOG #5053), a TLS keyword with no mode the
+    family reads beside it, such as a lone ``sslcert``, a blank ``sslmode``, or ``Encrypt=yes`` on
+    psqlODBC (BACKLOG #2483, #5053), or no TLS keyword at all. Only the keyword
+    :data:`_DRIVER_FAMILIES` names for the family can clear a hop. Shares
     :func:`generic_odbc_no_tls_params` with the construction reminder — see the comment above
     :data:`_ODBC_NO_TLS_VALUES` for why a value deny-list, and for the encrypted-but-unverified residual
-    this deliberately does not classify. An unrecognized mode value stays delegated here for the same
-    reason, though since BACKLOG #2705 the build refuses an ``sslmode`` spelling
-    :func:`_refuse_unread_sslmode` rejects before this verdict is used.
+    this deliberately does not classify. That deny-list reads every TLS keyword whatever the family,
+    since it can only add a reason. For psqlODBC and MySQL Connector/ODBC a mode value must be one
+    of the family's own spellings to count; Microsoft's ``Encrypt`` value stays delegated, judged
+    by the deny-list alone.
 
     Since BACKLOG #1178 this predicate also decides whether the hop is GATED, not just reported: a
     non-``None`` reason is what builds :func:`generic_cleartext_hop_guard`. Same single definition, so
     the log line, the operator report and the refusal can never disagree about which hops are at risk —
     but widening it now widens a refusal, which the deny-list's deliberate narrowness should be read
     against."""
+    return _family_tls_verdict(params, _driver_family(driver))
+
+
+def generic_odbc_tls_unenforced_unread(params: Mapping[str, Any]) -> str | None:
+    """:func:`generic_odbc_tls_unenforced` for a driver name the caller has not read, such as an
+    unresolved ``env()`` ``odbc_driver``: ``None`` when at least one driver family the engine
+    places would clear ``params``, so the hop is possibly delegated, and otherwise the reason every
+    such family gives. Where the families give different reasons, none of which clears the hop,
+    the reason says no family reads the mode set. So a hop at risk on every driver is never
+    labelled possibly delegated."""
+    verdicts = {_family_tls_verdict(params, family) for family in _DRIVER_FAMILIES}
+    if None in verdicts:
+        return None
+    if len(verdicts) == 1:
+        return verdicts.pop()
+    return "no TLS mode is set in odbc_params that any driver family the engine places reads"
+
+
+def _family_tls_verdict(params: Mapping[str, Any], family: str | None) -> str | None:
+    """:func:`generic_odbc_tls_unenforced` for the family key ``family``. ``family`` is ``None``
+    for a name the engine cannot place, and that never returns ``None``: it returns the no-TLS
+    reason when a TLS keyword holds a no-TLS word, and :data:`UNPLACED_DRIVER_REASON` otherwise,
+    so an unplaced name can never clear the guard (BACKLOG #5053)."""
     disabling = generic_odbc_no_tls_params(params)
     if disabling:
         return "TLS is explicitly not required: " + ", ".join(sorted(disabling))
-    if _sets_tls_mode(params):
+    if family is None:
+        return UNPLACED_DRIVER_REASON
+    if _sets_tls_mode(params, family):
         return None
+    if any(
+        odbc_keyword_name(str(k)) in _ODBC_TLS_MODE_KEYWORDS and _usable_mode_value(v)
+        for k, v in params.items()
+    ):
+        # A value that would count on another family's keyword or spelling: say which one this
+        # driver reads, since the value itself is not what is wrong.
+        entry = _DRIVER_FAMILIES[family]
+        spelled = ", at its own spellings" if entry.tls_spellings is not None else ""
+        return f"a TLS mode is set that this driver does not read; it reads {entry.tls_keyword}{spelled}"
     if any(_is_tls_keyword(str(k)) for k in params):
         return "a TLS keyword is set in odbc_params, but no TLS mode has a usable value"
     return "no TLS keyword is set in odbc_params"
@@ -645,70 +709,145 @@ def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     return text
 
 
-# MySQL Connector/ODBC's registered names, in lower case. The escape list below holds them, and
-# they alone keep MySQL's own ``SSLMODE`` spellings (:func:`_refuse_unread_sslmode`).
-_MYSQL_ODBC_DRIVER_NAME = r"mysql odbc [0-9.]+ (?:unicode|ansi) driver"
-_MYSQL_ODBC_DRIVERS = re.compile(_MYSQL_ODBC_DRIVER_NAME)
-
-# The ``odbc_driver`` names, in lower case, of the drivers whose password is always sent braced,
-# with the ODBC ``}}`` escape (BACKLOG #2705): psqlODBC's and MySQL Connector/ODBC's registered
-# names, measured on 2026-10-30 to read that escape, and Microsoft's ``ODBC Driver <n> for SQL
-# Server``, not probed then but relied on for the same escape by the SQL Server preset and the
-# store. psqlODBC's names include the bare ``PostgreSQL``, the section name RHEL registers it
-# under. The legacy name ``SQL Server`` is left out: on Linux it is commonly a FreeTDS alias, which
-# has not been measured. Whole names, spacing included, on purpose: a vendor driver whose name
-# merely mentions a database, a library path, or another registered name that only folds to one of
-# these is unmeasured and does not match.
-_ODBC_BRACE_ESCAPE_DRIVERS = re.compile(
-    r"postgresql(?: (?:unicode|ansi)(?:\(x64\))?)?"
-    rf"|{_MYSQL_ODBC_DRIVER_NAME}"
-    r"|odbc driver [0-9]+ for sql server"
-)
-
-# The ``sslmode`` values the generic dialect sends for any driver but MySQL Connector/ODBC: libpq's
-# six modes, exactly, in lower case (BACKLOG #2705). psqlODBC's source reads an ``SSLmode`` value by
-# its first byte, and only a lower case one names a mode, so ``Require``, ``VERIFY-FULL``,
-# ``REQUIRED``, ``on`` or ``1`` would mean disable to it, while :func:`generic_odbc_tls_unenforced`
-# counts each as TLS addressed. Only these spellings mean the same thing to both.
+# The ``sslmode`` values psqlODBC reads: libpq's six modes, exactly, in lower case (BACKLOG #2705).
+# psqlODBC's source reads an ``SSLmode`` value by its first byte, and only a lower case one names a
+# mode, so ``Require``, ``VERIFY-FULL``, ``REQUIRED``, ``on`` or ``1`` would mean disable to it,
+# while the gate would count each as TLS addressed. Only these spellings mean the same thing to both.
 _LIBPQ_SSL_MODES = ("disable", "allow", "prefer", "require", "verify-ca", "verify-full")
 
+# The ``SSLMODE`` values MySQL Connector/ODBC documents, in the documented upper case (BACKLOG
+# #5035). Per engine PR 2691, a value it does not recognize leaves the driver at ``PREFERRED``,
+# which can fall back to plaintext. No MySQL driver was run for this list: whether the driver reads
+# another case was not measured, so only the documented spelling is accepted.
+_MYSQL_SSL_MODES = ("DISABLED", "PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY")
 
-def _refuse_unread_sslmode(text: str, *, driver: str, connection: str | None) -> None:
-    """A ValueError when an ``sslmode`` value is not one of :data:`_LIBPQ_SSL_MODES`, exactly
-    (BACKLOG #2705). The keyword is matched in any case, as the build matches every keyword.
 
-    The rule depends on the driver family, read from the ``odbc_driver`` name: MySQL Connector/ODBC
-    sends the same keyword with its own upper case values (``REQUIRED``, ``VERIFY_IDENTITY``), so a
-    name :data:`_MYSQL_ODBC_DRIVERS` matches whole is left to MySQL's spellings, as before. Every
-    other driver, psqlODBC under any name included, takes the libpq spellings only. The refusal
-    lists the accepted values and never the value given."""
-    if _MYSQL_ODBC_DRIVERS.fullmatch(driver.lower()) or text in _LIBPQ_SSL_MODES:
+class _DriverFamily(NamedTuple):
+    """What the engine knows of one driver family on the generic driver allowlist
+    (:data:`~messagefoundry.transports.db_endpoint.GENERIC_DRIVER_FAMILIES`), placed from the
+    ``odbc_driver`` name."""
+
+    #: The keyword the family reads as its TLS mode, in the form :func:`odbc_keyword_name` gives.
+    tls_keyword: str
+    #: The values of that keyword that count as a mode, or ``None`` where any usable value counts
+    #: and the deny-list alone judges it.
+    tls_spellings: frozenset[str] | None
+    #: The verifying mode a warning gives as its example, as its keyword and value, so it never
+    #: names a spelling this family would ignore (BACKLOG #5029). Kept apart and joined only where
+    #: the warning is rendered, so this table holds no connection-string part: odbc_dsn is the one
+    #: module that writes those (tests/test_odbc_dsn.py).
+    tls_example: tuple[str, str]
+    #: Whether the family is on the escape list: its password is always sent braced, with the ODBC
+    #: ``}}`` escape (:func:`_odbc_password`). Its own field, so placing a family for its TLS
+    #: keyword never brings an unmeasured escape with it.
+    brace_escape: bool
+
+
+# What the engine knows of each family on the generic driver allowlist, keyed as
+# ``GENERIC_DRIVER_FAMILIES`` keys it (BACKLOG #2705, #5029, #5053, #5041). The allowlist and its
+# names are in ``transports.db_endpoint``, and why each family is on it is in docs/CONNECTIONS.md;
+# the build refuses any other name, so every hop that is built places one of these. A change here is
+# a change to the TLS gate and the password rule, and is reviewed as one.
+#
+# psqlODBC's keyword parser and MySQL Connector/ODBC's parameter page have no ``encrypt``, and
+# Microsoft's ODBC Driver for SQL Server reads no ``sslmode``, so each family counts one keyword
+# (BACKLOG #5053).
+#
+# The escape list is the families with ``brace_escape`` set, whose password is always sent braced
+# with the ODBC ``}}`` escape (:func:`_odbc_password`, BACKLOG #2705): psqlODBC and MySQL, measured
+# on 2026-10-30 to read that escape, and Microsoft's, not probed then but relied on for the same
+# escape by the SQL Server preset and the store.
+_DRIVER_FAMILIES: dict[str, _DriverFamily] = {
+    "psqlodbc": _DriverFamily(
+        "sslmode",
+        frozenset(_LIBPQ_SSL_MODES),
+        ("SSLmode", "verify-full"),
+        brace_escape=True,
+    ),
+    "mysql": _DriverFamily(
+        "sslmode",
+        frozenset(_MYSQL_SSL_MODES),
+        ("SSLMODE", "VERIFY_IDENTITY"),
+        brace_escape=True,
+    ),
+    "msodbc": _DriverFamily(
+        "encrypt",
+        None,
+        ("Encrypt", "yes"),
+        brace_escape=True,
+    ),
+}
+
+# The ONLY keywords the engine counts as setting a generic hop's TLS mode (BACKLOG #2483), each
+# only on the family that reads it. A key, certificate or CA file, or a cipher list, does not
+# count. docs/CONNECTIONS.md records what the drivers read so far do with one.
+_ODBC_TLS_MODE_KEYWORDS = frozenset(family.tls_keyword for family in _DRIVER_FAMILIES.values())
+
+# Fail at import, not with a KeyError mid-build, if a family is on one table and not the other.
+if set(_DRIVER_FAMILIES) != set(GENERIC_DRIVER_FAMILIES):
+    raise RuntimeError("_DRIVER_FAMILIES and GENERIC_DRIVER_FAMILIES must name the same families")
+
+#: The one classifier of a generic ``odbc_driver`` name, shared with the ``[egress].allowed_db``
+#: check (BACKLOG #5041): the key in :data:`_DRIVER_FAMILIES` of the family the name places, or
+#: ``None`` for a name off the allowlist. The name is read trimmed and in any case, as
+#: :func:`_build_odbc_dsn` reads it, never the library it loads.
+_driver_family = generic_driver_family
+
+
+def _refuse_unread_sslmode(text: str, *, family: str, connection: str | None) -> None:
+    """A ValueError when an ``sslmode`` value is not one the driver family ``family`` reads,
+    exactly (BACKLOG #2705, #5029, #5035). The keyword is matched in any case, as the build matches
+    every keyword; the value is not.
+
+    ``family`` is the key :func:`_driver_family` places from the ``odbc_driver`` name; the build
+    refuses a name it places in none before this runs (BACKLOG #5041). MySQL Connector/ODBC takes
+    only :data:`_MYSQL_SSL_MODES`, and psqlODBC only :data:`_LIBPQ_SSL_MODES`. Microsoft's driver
+    reads no ``sslmode``, so on that name any value is refused and the refusal says to set
+    ``Encrypt``. Each refusal leads with what an operator needs, as a stored failure keeps about
+    its first 200 characters, and none quotes the value given.
+
+    The MySQL list is joined with ``or``: two upper case words joined by a comma or a blank are a
+    name run to the log redaction, which would blank them."""
+    entry = _DRIVER_FAMILIES[family]
+    # The table decides, as it does for the gate: a family takes its own sslmode spellings, or
+    # none when it reads another keyword.
+    if entry.tls_keyword == "sslmode" and text in (entry.tls_spellings or ()):
         return
-    raise ValueError(
-        f"{hop_name_prefix(connection)}DATABASE odbc_params value for 'sslmode' must be one of "
-        f"{', '.join(_LIBPQ_SSL_MODES)}, in lower case (see Generic ODBC in docs/CONNECTIONS.md)"
-    )
+    database = f"{hop_name_prefix(connection)}DATABASE"
+    where = f"{database} odbc_params value for 'sslmode'"
+    see = "(see Generic ODBC in docs/CONNECTIONS.md)"
+    if family == "msodbc":
+        raise ValueError(
+            f"{database} 'sslmode' is not read by Microsoft's driver for SQL Server, which "
+            f"odbc_driver names or defaults to; name your driver, or set Encrypt {see}"
+        )
+    if family == "mysql":
+        mysql = " or ".join(_MYSQL_SSL_MODES)
+        raise ValueError(f"{where} must be one of {mysql}, in upper case, for MySQL {see}")
+    libpq = ", ".join(_LIBPQ_SSL_MODES)
+    raise ValueError(f"{where} must be one of {libpq}, in lower case {see}")
 
 
-def _odbc_password(password: object, *, driver: str, connection: str | None) -> str:
+def _odbc_password(password: object, *, family: str, connection: str | None) -> str:
     """``password`` as the generic connection string sends it, or a ValueError (BACKLOG #2705).
 
-    For a driver :data:`_ODBC_BRACE_ESCAPE_DRIVERS` names, it is ALWAYS braced, with the ``}}``
-    escape, whatever it holds. psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space and
+    ``family`` is the key :func:`_driver_family` places from ``odbc_driver``; the build refuses a
+    name it places in none before this runs (BACKLOG #5041). For a family on the escape list, which
+    today is every family, it is ALWAYS braced, with the ``}}`` escape, whatever it holds. psqlODBC URL-decodes an unbraced ``PWD`` (``+`` becomes a space and
     ``%XX`` a byte; ``dlg_specific.c``, ``decode_or_remove_braces``) and takes a braced one
     literally, so only the braced form sends the password as written.
 
-    For any other driver it is sent plain, and only when it holds none of ``;``, ``{``, ``}`` or a
-    quote character and has no leading or trailing space: a driver that reads no braces (the Access
-    driver) takes it only that way, and one that does not read the escape would end a braced value
-    at the first ``}`` and read the rest as further keywords. Any other password is refused for
-    such a driver. A driver missing from the list is unmeasured, not known to be unsafe.
+    A family off the escape list would get it plain, and only when it holds none of ``;``, ``{``,
+    ``}`` or a quote character and has no leading or trailing space: a driver that reads no braces
+    (the Access driver) takes it only that way, and one that does not read the escape would end a
+    braced value at the first ``}`` and read the rest as further keywords. Any other password is
+    refused for such a family.
 
     A password must be printable ASCII whatever the driver. A refusal names the setting and never
     describes the value beyond saying the driver cannot carry it."""
     text = str(password)
     _refuse_unsafe_text(text, what="password", connection=connection, refused="")
-    if _ODBC_BRACE_ESCAPE_DRIVERS.fullmatch(driver.lower()):
+    if _DRIVER_FAMILIES[family].brace_escape:
         return odbc_brace(text)
     if not any(ch in ";{}\"'" for ch in text) and text == text.strip():
         return text
@@ -722,10 +861,6 @@ def _odbc_password(password: object, *, driver: str, connection: str | None) -> 
 _DRIVE_REMOTE = 4
 _DRIVE_NO_ROOT_DIR = 1
 _DRIVE_UNKNOWN = 0
-
-#: The first component of a rooted, driveless link target that names the NT object namespace
-#: (``\Device\Mup\host\share``), which ``windows_chain`` would read as a folder on the link's drive.
-_NT_OBJECT_ROOTS = frozenset({"device", "global??", "??"})
 
 
 class _LeavesHost(Exception):
@@ -752,10 +887,10 @@ def _windows_drive_type(root: str) -> int:
 
 
 def _windows_drive_target(drive: str) -> str | None:
-    """The folder a ``subst`` drive stands for, or ``None`` for a real volume or no device at all,
-    as ``anchor_path.windows_host_readers`` reads it: ``QueryDosDeviceW`` answers ``\\??\\C:\\...``
-    for a substituted drive. Any other failure of the query raises ``OSError``, so the walk does
-    not clear the path: a subst drive it could not read would hide the links behind it."""
+    """The folder a ``subst`` drive stands for, whole, or ``None`` for a real volume or no device
+    at all, as ``anchor_path.windows_host_readers`` reads it (``anchor_path.subst_target``). Any
+    other failure of the query raises ``OSError``, so the walk does not clear the path: a subst
+    drive it could not read would hide the links behind it."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the drive target is read only on Windows")
     import ctypes
@@ -769,7 +904,7 @@ def _windows_drive_target(drive: str) -> str | None:
         if error == _ERROR_FILE_NOT_FOUND:  # no such device: the drive type then says no volume
             return None
         raise OSError(f"the drive {drive} could not be read (winerror {error})")
-    return buf.value[4:] if buf.value.startswith("\\??\\") else None
+    return subst_target(buf.value)
 
 
 #: ``QueryDosDeviceW``'s answer for a drive letter with no device behind it.
@@ -786,11 +921,16 @@ def _windows_path_verdict(
 ) -> bool | None:
     """The best-effort verdict on whether a Windows ``path`` leads off this host, from a walk of it
     with :func:`~messagefoundry.auth.anchor_path.windows_chain`. ``True``: the walk found the path
-    leads to another host. ``None``: the walk could not finish, and its cause is logged at DEBUG.
+    leads to another host. ``None``: the walk could not finish; a path-free class of its cause is
+    logged at WARNING and the whole cause, which can name the path, at DEBUG (:func:`_not_cleared`).
     ``False``: the walk found nothing that leads off the host, which is not proof the path is
     local. ``probe``, ``drive_type``, ``drive_target`` and ``cwd`` are the walk's inputs, passed in
     so a test can stand in for the file system. ``docs/CONNECTIONS.md``, Generic ODBC, states the
-    check's limits."""
+    check's limits.
+
+    A walk that reaches a share (``anchor_path.SHARE_CAUSE``), such as through a ``subst`` drive
+    onto one, is ``True`` (vault BACKLOG #5197 item 11). A link whose target is rooted with no drive
+    is ``None``, as ``windows_chain`` answers it (item 9)."""
 
     def volume_cause(root: str) -> str | None:
         kind = drive_type(root)
@@ -813,8 +953,6 @@ def _windows_path_verdict(
             text = target.strip()
             if is_remote_spelling(text) and not _LOCAL_DEVICE_TARGET.match(text):
                 raise _LeavesHost
-            if text[:1] in "\\/" and text.lstrip("\\/").split("\\")[0].lower() in _NT_OBJECT_ROOTS:
-                raise OSError("the link names an NT object path")  # the walk reports it: unclear
         return kind, target
 
     try:
@@ -825,13 +963,27 @@ def _windows_path_verdict(
         return True
     except _PathEnds:
         return False
-    except OSError as exc:  # a reader the walk does not guard, such as drive_target
-        logger.debug("DATABASE file keyword path not cleared: %s", exc)
+    except OSError as exc:  # a reader the walk does not guard: cwd, or the drive type
+        _not_cleared(
+            f"a drive or the working directory could not be read: {type(exc).__name__}", exc
+        )
         return None
+    if cause is not None and cause.kind == SHARE_CAUSE:
+        return True  # the walk reached a share, as through a subst drive onto \??\UNC\host\share
     if cause is not None:
-        logger.debug("DATABASE file keyword path not cleared: %s", cause)
+        _not_cleared(cause.kind, cause)
         return None
     return False
+
+
+def _not_cleared(kind: str, detail: object) -> None:
+    """Log why the walk did not clear a file keyword path: ``kind``, which names no path, at
+    WARNING, so the operator who meets the refusal sees a reason, and ``detail``, which can name
+    the path, at DEBUG only (``docs/PHI.md``; vault BACKLOG #5197 item 22)."""
+    logger.warning(
+        "DATABASE file keyword path not cleared: %s (the path, if any, is logged at DEBUG)", kind
+    )
+    logger.debug("DATABASE file keyword path not cleared: %s", detail)
 
 
 #: A link target :func:`is_remote_spelling` matches that :func:`_windows_path_verdict` does not
@@ -856,7 +1008,7 @@ def _path_verdict(text: str) -> bool | None:
             cwd=os.getcwd,
         )
     except (OSError, ValueError) as exc:
-        logger.debug("DATABASE file keyword path not cleared: %s", type(exc).__name__)
+        _not_cleared(f"the check could not run: {type(exc).__name__}", type(exc).__name__)
         return None
 
 
@@ -866,12 +1018,17 @@ def _path_verdict(text: str) -> bool | None:
 FileVerdicts = Mapping[str, bool | None]
 
 
+def _sent_text(value: object) -> str:
+    """The text the build sends for a file keyword's ``value``: its ``str()``, so ``0`` is judged
+    and read as the ``"0"`` the driver gets, where truthiness skipped it (vault BACKLOG #5197 item
+    15). Empty for ``None``, which the build refuses rather than sends."""
+    return "" if value is None else str(value)
+
+
 def file_keyword_verdicts(value: object) -> FileVerdicts:
-    """:data:`FileVerdicts` for ``value``, empty for a falsy one. A spelling the spelling check
-    refuses is ``True`` and is not walked."""
-    if not value:
-        return {}
-    raw = str(value)
+    """:data:`FileVerdicts` for ``value``, empty when no text is sent (:func:`_sent_text`). A
+    spelling the spelling check refuses is ``True`` and is not walked."""
+    raw = _sent_text(value)
     return {
         p: True if is_remote_spelling(p) else _path_verdict(p)
         for p in dict.fromkeys((raw, raw.strip()))
@@ -882,29 +1039,30 @@ def file_keyword_verdicts(value: object) -> FileVerdicts:
 def names_another_host(value: object, verdicts: FileVerdicts | None = None) -> bool:
     """Whether a file keyword's ``value`` must be refused. ``True`` when any spelling's verdict is
     ``True``, or the trimmed spelling's verdict is ``None``. ``False`` otherwise, including for a
-    falsy value and for a padded spelling whose verdict alone is ``None``. ``False`` is not proof
-    the path is local. ``verdicts`` are this value's (:func:`file_keyword_verdicts`) when the
-    caller already has them; otherwise they are computed here. ``docs/CONNECTIONS.md``, Generic
-    ODBC, states the check's limits."""
-    if not value:
+    value that sends no text (:func:`_sent_text`) and for a padded spelling whose verdict alone is
+    ``None``. ``False`` is not proof the path is local. ``verdicts`` are this value's
+    (:func:`file_keyword_verdicts`) when the caller already has them; otherwise they are computed
+    here. ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
+    sent = _sent_text(value)
+    if not sent:
         return False
     if verdicts is None:
         verdicts = file_keyword_verdicts(value)
-    trimmed = str(value).strip()
+    trimmed = sent.strip()
     return True in verdicts.values() or (bool(trimmed) and verdicts.get(trimmed) is None)
 
 
 def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -> tuple[str, ...]:
     """The spellings of a driver file keyword's value the engine checks: as sent, then trimmed,
-    since a driver may trim it. Empty for a falsy value and for a value :func:`names_another_host`
-    refuses; otherwise every spelling in ``verdicts``. A returned spelling is not proof the path is
+    since a driver may trim it. Empty for a value that sends no text (:func:`_sent_text`) and for
+    a value :func:`names_another_host` refuses; otherwise every spelling in ``verdicts``. A returned spelling is not proof the path is
     local (``docs/CONNECTIONS.md``, Generic ODBC). Any value, a ``Path`` too, is read as its
     ``str()``, the text the build sends.
 
     ``verdicts`` are the value's, from the judgement that decided whether it is refused; pass them
     whenever there is one, so the path is judged once. Without them they are computed here, and a
     caller must treat an empty answer for a set value as its own refusal."""
-    if not value:
+    if not _sent_text(value):
         return ()
     if verdicts is None:
         verdicts = file_keyword_verdicts(value)
@@ -1117,7 +1275,7 @@ def _driver_file_spellings(
     are computed here."""
     setting = f"{hop_name_prefix(connection)}DATABASE odbc_params {keyword}"
     value = named.get(keyword)
-    if not value:
+    if not _sent_text(value):
         return
     given = file_keyword_verdicts(value) if verdicts is None else verdicts[keyword]
     if names_another_host(value, given):
@@ -1258,10 +1416,12 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     (vault BACKLOG #2577, BACKLOG #2705; docs/CONNECTIONS.md, *Accepted ``odbc_params`` keywords*). An ``odbc_params`` keyword
     must be on :data:`_ODBC_PARAM_ALLOWLIST`, and a credential keyword that is sent on its own short list, or
     the build is refused with the keyword and the connection named. An ``odbc_params`` keyword given
-    twice is refused. A driver may take its target under a keyword other than ``SERVER``, and the
-    engine does not detect that. The egress check runs outside this builder, at least in
-    ``build_source`` and ``build_destination`` (``transports.base``). This builder sends ``server``
-    as written.
+    twice is refused. A driver may take its target under a keyword other than ``SERVER``, which
+    the engine cannot see, so ``odbc_driver`` must name a family on the generic driver allowlist,
+    each documented to read ``SERVER``, or the build is refused (BACKLOG #5041; the list and its
+    evidence are in :data:`~messagefoundry.transports.db_endpoint.GENERIC_DRIVER_FAMILIES`). The
+    egress check runs outside this builder, at least in ``build_source`` and ``build_destination``
+    (``transports.base``), and refuses the same names. This builder sends ``server`` as written.
 
     Every value must be printable ASCII (STORE-5 injection guard). ``database``, ``username`` and
     every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
@@ -1269,8 +1429,8 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     or trailing space. ``server`` and every ``odbc_params`` value also refuse ``None``, an
     ``odbc_params`` value refuses a boolean, and ``sslmode`` takes only the spellings
     :func:`_refuse_unread_sslmode` accepts for the driver. ``odbc_driver`` is braced and
-    refuses ``;``, ``{`` and ``}``. ``password`` is always braced with the ``}}`` escape for a driver
-    on the escape list, and otherwise sent plain when it can be and refused when it cannot
+    refuses ``;``, ``{`` and ``}``, and must be on the generic driver allowlist. ``password`` is
+    always braced with the ``}}`` escape, as every family on the list reads it
     (:func:`_odbc_password`).
 
     **TLS is the operator's responsibility on this path.** MessageFoundry cannot introspect an arbitrary
@@ -1282,10 +1442,13 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     one to a no-TLS value, DEBUG otherwise.
 
     Delegating TLS is not the same as declining to gate the hop. A connection whose ``odbc_params`` say
-    TLS is **not required**, or set no mode at all, is refused off-loopback on an enforcing instance by
-    :func:`generic_cleartext_hop_guard` (BACKLOG #1178), which the connectors call beside this builder.
-    What stays delegated is the case this path genuinely cannot judge: a mode keyword IS set, and the
-    engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
+    TLS is **not required**, or set no mode its driver family reads, is refused off-loopback on an
+    enforcing instance by :func:`generic_cleartext_hop_guard` (BACKLOG #1178), which the connectors
+    call beside this builder. A mode counts only on the keyword the family :func:`_driver_family`
+    places reads, and for psqlODBC and MySQL only at that family's own spellings (BACKLOG #5053,
+    :func:`generic_odbc_tls_unenforced`); a name off the allowlist is refused above. What
+    stays delegated is the case this path genuinely cannot judge: the family's mode keyword IS set,
+    and the engine cannot tell whether its value verifies anything. See docs/CONNECTIONS.md."""
     driver = str(s.get("odbc_driver") or "").strip()
     where = hop_name_prefix(connection)
     if not driver:
@@ -1302,6 +1465,11 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     # The driver name stays braced: names hold spaces and parentheses, and no probe found a driver
     # manager that reads a braced DRIVER wrongly. The delimiters are still refused, not escaped.
     _refuse_unsafe_text(driver, what="odbc_driver", connection=connection, refused=";{}")
+    # BACKLOG #5041: before anything reads the driver for its family, so every check below sees a
+    # family on the allowlist.
+    family = _driver_family(driver)
+    if family is None:
+        raise ValueError(f"{where}DATABASE {GENERIC_DRIVER_REFUSAL}")
     parts = [f"DRIVER={odbc_brace(driver)}", f"SERVER={server}"]
     if s.get("database"):
         database = _odbc_literal(s["database"], what="database", connection=connection)
@@ -1322,7 +1490,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             _ODBC_PASSWORD_KEYS,
             connection=connection,
         )
-        secret = _odbc_password(password, driver=driver, connection=connection)
+        secret = _odbc_password(password, family=family, connection=connection)
         parts.append(f"{pwd_key}={secret}")
     params = s.get("odbc_params") or {}
     if not isinstance(params, Mapping):
@@ -1358,7 +1526,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
             value, what=f"odbc_params value for '{name}'", connection=connection
         )
         if name == "sslmode":
-            _refuse_unread_sslmode(literal, driver=driver, connection=connection)
+            _refuse_unread_sslmode(literal, family=family, connection=connection)
         parts.append(f"{k}={literal}")
     # After the loop on purpose: these open the key and CA files, so the keywords are settled first.
     # Each file keyword is judged once, here, and every check below reads that judgement.
@@ -1366,12 +1534,12 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     _refuse_weak_driver_key(named, connection=connection, verdicts=verdicts)
     _refuse_weak_driver_cert(named, connection=connection, verdicts=verdicts)
     _refuse_encrypted_driver_ca(named, connection=connection, verdicts=verdicts)
-    _warn_generic_tls_unenforced(params, connection=connection)
+    _warn_generic_tls_unenforced(params, family=family, connection=connection)
     return ";".join(parts) + ";"
 
 
 def _warn_generic_tls_unenforced(
-    params: Mapping[str, Any], *, connection: str | None = None
+    params: Mapping[str, Any], *, family: str, connection: str | None = None
 ) -> None:
     """Fail-safe visibility for the generic ODBC dialect (#66 review): unlike the SQL Server preset, this
     path **cannot introspect the driver's TLS posture**, so the posture-keyed weakened-TLS refusal
@@ -1392,27 +1560,33 @@ def _warn_generic_tls_unenforced(
     ``connection`` names the declaring connection (#333). Without it a site running several generic DB
     connections gets a line it cannot act on — the remedy is per-connection, so the report must be too.
     It stays optional because :func:`_build_odbc_dsn` is also called directly (tests, DSN-shape checks)
-    where there is no connection to name; every engine construction path supplies it."""
+    where there is no connection to name; every engine construction path supplies it.
+
+    ``family`` is the key :func:`_driver_family` placed; the build refuses a name it places in
+    none before this runs (BACKLOG #5041). The remedy's example is that family's own spelling, so
+    the line never steers a driver to a value it ignores (BACKLOG #5029)."""
     where = (
         f"DATABASE connection {connection!r} (generic ODBC dialect)"
         if connection
         else "DATABASE generic ODBC dialect"
     )
-    reason = generic_odbc_tls_unenforced(params)
+    reason = _family_tls_verdict(params, family)
     if reason is None:
         logger.debug(
             "%s: TLS is delegated to the driver (a TLS mode is set in odbc_params); "
             "MessageFoundry does not enforce or verify it on this path",
             where,
         )
-    else:
-        logger.warning(
-            "%s: TLS verification is NOT enforced by MessageFoundry on this path and %s — configure "
-            "verifying TLS via the driver's own keyword (e.g. SSLmode=verify-full) so PHI is not sent "
-            "in plaintext",
-            where,
-            reason,
-        )
+        return
+    keyword, value = _DRIVER_FAMILIES[family].tls_example
+    logger.warning(
+        "%s: TLS verification is NOT enforced by MessageFoundry on this path and %s — configure "
+        "verifying TLS %s so PHI is not sent in plaintext; tls_hop_attested is only for a hop "
+        "secured by other means",
+        where,
+        reason,
+        f"via the driver's own keyword (e.g. {keyword}={value})",
+    )
 
 
 # --- the generic-ODBC dialect's cleartext hop, GATED (BACKLOG #1178) ---------------------------
@@ -1473,10 +1647,17 @@ def generic_cleartext_hop_guard(
         # A malformed odbc_params is :func:`_build_odbc_dsn`'s own ValueError, not a hop decision —
         # guessing a disposition off a value that will not load would report the wrong cause.
         return None
-    reason = generic_odbc_tls_unenforced(params)
+    reason = generic_odbc_tls_unenforced(params, driver=settings.get("odbc_driver"))
     if reason is None:
         return None
-    host, port = generic_hop_endpoint(str(settings.get("server") or ""), params)
+    # generic_hop_endpoint says why ``host,port`` is split only for a family that reads it, and
+    # read whole for every other driver (BACKLOG #4874).
+    family = _driver_family(settings.get("odbc_driver"))
+    host, port = generic_hop_endpoint(
+        str(settings.get("server") or ""),
+        params,
+        reads_comma_port=family in COMMA_PORT_FAMILIES,
+    )
     return InsecureHopGuard.capture(
         host=host,
         port=port,
@@ -1553,10 +1734,17 @@ _SQL_OTHER_LINE_BREAKS = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 # Write/authority keywords refused anywhere outside a string literal, a quoted identifier or a comment.
 # `INTO` is here because `SELECT ... INTO copy` writes a table while still opening with `SELECT`; the
 # CTE-terminal forms (`WITH c AS (...) DELETE ...`) fall to the same scan. DDL is included for the
-# reason a chained `DROP` is refused: a lookup has no business carrying it.
+# reason a chained `DROP` is refused: a lookup has no business carrying it. `RECEIVE` dequeues a
+# Service Broker message (a bare one needs a `;` before it, per the T-SQL docs, but one inside
+# `WAITFOR (RECEIVE ...)` needs none) and `UPDATETEXT`/`WRITETEXT` write a text column. `BEGIN` is refused as a
+# bare word, which covers every `BEGIN TRAN` form: `SELECT 1 BEGIN TRAN` would leave
+# `@@TRANCOUNT` at 1 on a pooled autocommit connection. An unquoted name spelled like one of these
+# words is refused too, failing closed: at least a PostgreSQL column `begin` on the generic dialect,
+# and on any dialect a column `receive`, which T-SQL does not reserve.
 _SQL_WRITE_KEYWORDS = frozenset(
     {
         "ALTER",
+        "BEGIN",
         "CREATE",
         "DELETE",
         "DENY",
@@ -1567,9 +1755,12 @@ _SQL_WRITE_KEYWORDS = frozenset(
         "INSERT",
         "INTO",
         "MERGE",
+        "RECEIVE",
         "REVOKE",
         "TRUNCATE",
         "UPDATE",
+        "UPDATETEXT",
+        "WRITETEXT",
     }
 )
 
@@ -1747,8 +1938,9 @@ def _require_read_only(
     identifiers are skipped, and then three rules apply:
 
     1. it must *begin* (after comments and whitespace) with the word ``SELECT`` or ``WITH``;
-    2. no write or authority keyword (at least ``INSERT``/``UPDATE``/``DELETE``/``MERGE``/``INTO``/
-       ``EXEC``, plus DDL — :data:`_SQL_WRITE_KEYWORDS`) may appear outside a literal or a comment;
+    2. no keyword :data:`_SQL_WRITE_KEYWORDS` lists (at least ``INSERT``/``UPDATE``/``DELETE``/
+       ``MERGE``/``INTO``/``EXEC``, DDL and the ``BEGIN`` of ``BEGIN TRAN``) may appear outside a
+       literal or a comment; a write or transaction-control verb it does not list passes;
     3. nothing may follow a ``;`` (no chained second statement); a trailing one is fine.
 
     Rule 2 also refuses a ``CALL`` word inside an open ODBC ``{`` escape (``{call p}``,
@@ -2177,10 +2369,24 @@ def _set_and_read_autocommit(raw: Any) -> bool:
 
 
 def _unwinding_a_cancel() -> bool:
-    """Whether the running task has a cancellation in flight, as when a ``finally`` runs because a
-    statement's await was cancelled. That statement may still be running on its worker thread."""
-    task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
+    """Whether the caller is unwinding a cancellation now: the exception in flight through the
+    ``finally`` that awaits this is a ``CancelledError``, or another ``BaseException`` that is not
+    an ``Exception``. A statement whose await was cancelled may still be running on its worker
+    thread, and every caller's ``except Exception`` rollback was skipped.
+
+    **Read from the exception in flight, not from ``Task.cancelling()``** (BACKLOG #5004). That
+    count has no baseline here. A task that once absorbed a cancel without ``uncancel()`` keeps it
+    above zero, so every later borrow in that task took the cancel path: an extra rollback, a
+    detached return and a held-back count. An ``uncancel()`` before the ``finally`` brought it back
+    to zero while the cancel still unwound, so the close waited, through ``shield``, on a statement
+    with no time limit. The exception in flight is this borrow's own, whatever the count says.
+
+    **What this does not see, at least.** A borrow made inside an ``except CancelledError`` handler
+    reads that handler's cancellation as its own. A cancellation a call site turns into an ordinary
+    exception before its ``finally``, as ``asyncio.timeout`` does, reads as that exception; no call
+    site in this module or ``pipeline/reference_sync.py`` does either."""
+    exc = sys.exc_info()[1]
+    return exc is not None and not isinstance(exc, Exception)
 
 
 async def _return_to_pool(pool: Any, conn: Any) -> None:
@@ -2191,12 +2397,74 @@ async def _return_to_pool(pool: Any, conn: Any) -> None:
     A connection whose autocommit was not confirmed is returned, not closed. It is not marked
     confirmed, so its next borrow sets autocommit again before any statement runs on it, and refuses
     again if the driver still rejects the set. Closing it would add nothing to that rule, and
-    aioodbc's own release of an open connection is what wakes a borrower waiting for a free slot."""
+    aioodbc's own release of an open connection is what wakes a borrower waiting for a free slot.
+    A connection discarded after a failed rollback is returned closed, and :func:`_release` wakes
+    the pool for it (BACKLOG #5010)."""
     try:
-        await pool.release(conn)
+        await _release(pool, conn)
     except Exception as exc:  # noqa: BLE001 - no borrower is left to tell
         # WARNING, not DEBUG: a failed return leaks a pool slot, and main logged it so (PR 2560).
         logger.warning("DATABASE: returning a pooled connection failed: %s", _safe_db_error(exc))
+
+
+async def _release(pool: Any, conn: Any) -> None:
+    """``pool.release(conn)``, then, for a connection already closed, wake the pool as aioodbc's
+    release does for an open one (BACKLOG #5010).
+
+    aioodbc 0.5.0's ``Pool.release`` drops a closed connection from its in-use set and wakes
+    nobody, so a borrower waiting for a free slot, or a ``wait_closed``, would sleep on although
+    the slot is free. A closed connection reaches here at least when this module discarded it after
+    a failed rollback (:func:`_close_and_release`, :func:`_close_after_a_cancel`), and when a borrow
+    found it with no driver handle (:func:`_driver_connection`); each frees a slot, so each wakes.
+    ``closed`` is read before the release, because aioodbc closes an open connection released into
+    a closing pool and wakes the pool itself then. Only a literal ``True`` counts, so a stand-in
+    whose ``closed`` is some other object is not read as closed.
+
+    **A wake that fails or is cancelled counts as holding a connection back, for good**, as a pool
+    with no ``_wakeup`` does in :func:`_wake`: nothing else will wake a ``wait_closed`` already
+    asleep on the freed slot, so the count lets :func:`_close_pool_bounded` stop at its bound. A
+    failed wake is logged, not raised, since this runs in callers' ``finally`` blocks and must not
+    mask their outcome; a cancellation still propagates."""
+    discarded = getattr(conn, "closed", False) is True
+    await pool.release(conn)
+    if not discarded:
+        return
+    try:
+        await _wake(pool)
+    except Exception as exc:  # noqa: BLE001 - the release succeeded; nobody is left to raise to
+        _hold_back(pool)
+        logger.warning(
+            "DATABASE: waking the pool for a closed connection failed; a waiting borrower waits "
+            "until its acquire_timeout, and a close of the pool stops at its bound: %s",
+            _safe_db_error(exc),
+        )
+    except BaseException:
+        _hold_back(pool)
+        raise
+
+
+async def _wake(pool: Any) -> None:
+    """Wake one waiter on ``pool``, as aioodbc 0.5.0's own release does, through its
+    ``Pool._wakeup`` (a private name; ``pyproject.toml`` pins aioodbc for it, BACKLOG #5005).
+
+    **A pool with no ``_wakeup`` is counted as holding a connection back, for good.** Nothing then
+    wakes a ``wait_closed`` on it, so :func:`_close_pool_bounded` would wait for ever; the count
+    makes that close stop at its bound instead. A borrower waiting for a slot still waits until its
+    ``acquire_timeout``, then retries, and that retry opens a new connection. Logged at ERROR once
+    per process for the aioodbc pool's type, never the :class:`_AutocommitPool` wrapper's
+    (:func:`~messagefoundry.odbc_call_gate.report_once`)."""
+    wakeup = getattr(pool, "_wakeup", None)
+    if callable(wakeup):
+        await wakeup()
+        return
+    _hold_back(pool)
+    report_once(
+        "_wakeup",
+        _pool_key(pool),
+        "odbc: the connection pool %s has no _wakeup, so a connection discarded after a failed "
+        "rollback wakes no waiter; a close of such a pool stops waiting at its bound, and a "
+        "waiting borrower at its acquire_timeout",
+    )
 
 
 #: Connections returned after their borrower stopped waiting. The loop holds a task only weakly
@@ -2211,9 +2479,13 @@ def _detach(coro: Coroutine[Any, Any, None]) -> None:
     task.add_done_callback(_DETACHED_SETTLES.discard)
 
 
-#: How many connections each pool has held back behind a cancelled borrow (BACKLOG #2394): ones
-#: :func:`_return_when_settled` or an abandoned autocommit set keeps out of the pool until a driver
-#: call returns. Keyed by the aioodbc pool itself, never the :class:`_AutocommitPool` wrapper, so a
+#: How many connections each pool counts as held back. At least two kinds count. One is a
+#: connection held back behind a cancelled borrow (BACKLOG #2394): one :func:`_return_when_settled`
+#: or an abandoned autocommit set keeps out of the pool until a driver call returns, counted until
+#: it goes back. The other is a connection discarded after a failed rollback whose wake never came
+#: (BACKLOG #5010): a pool with no ``_wakeup``, or a wake that failed or was cancelled
+#: (:func:`_release`, :func:`_wake`). Nothing would then wake a ``wait_closed`` for the freed slot,
+#: so that count is never taken back. Keyed by the aioodbc pool itself, never the :class:`_AutocommitPool` wrapper, so a
 #: borrow and a close of one pool read one count whichever object each holds (:func:`_pool_key`).
 #: Weak, so a pool nothing else holds drops out. :func:`_close_pool_bounded` stops waiting at a bound
 #: only while this is above zero.
@@ -2242,7 +2514,7 @@ def _adjust_held(pool: Any, delta: int) -> None:
 
 
 def _hold_back(pool: Any) -> None:
-    """Count one more connection of ``pool`` held back behind a cancelled borrow."""
+    """Count one more connection of ``pool`` held back (:data:`_HELD_BACK` says which count)."""
     _adjust_held(pool, 1)
 
 
@@ -2252,7 +2524,7 @@ def _settle_held(pool: Any) -> None:
 
 
 def _holds_back(pool: Any) -> int:
-    """How many connections of ``pool`` are held back behind a cancelled borrow now."""
+    """How many connections of ``pool`` are counted as held back now (:data:`_HELD_BACK`)."""
     try:
         return _HELD_BACK.get(_pool_key(pool), 0)
     except TypeError:
@@ -2387,7 +2659,8 @@ class _AutocommitPool:
             if work.done() and isinstance(exc, Exception):
                 # The thread resolved ``work`` with a driver error, so no call is running on it.
                 # Returned open, not closed: a close here is itself a worker-thread call that a
-                # cancellation could abandon, and aioodbc wakes no waiter for a closed connection.
+                # cancellation could abandon, and a driver error on a set does not leave a
+                # transaction open the way a failed rollback can (BACKLOG #5010).
                 await _return_to_pool(self._pool, conn)
             else:
                 # The borrower left (a cancel, or the coroutine closed) while the thread may still
@@ -2521,7 +2794,7 @@ async def _close_cursor(cur: Any) -> None:
         logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
 
 
-async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
+async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = False) -> None:
     """Close ``cur``, then return ``conn`` to ``pool``, and never return it while the close may
     still be running on its worker thread (PR 2593 Lander hold).
 
@@ -2529,8 +2802,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
     driver may discard unread rows. A cancellation that lands during it ends the await and leaves
     the thread running. Releasing then, as a ``finally`` did, hands the connection to the next
     borrower while another thread is still inside the driver on it. So the close runs on
-    :func:`_thread_settled` against aioodbc's raw pyodbc cursor (``_impl``, as ``store/sqlserver.py``
-    reads it), and is shielded: the caller's cancellation goes through at once, and the connection
+    :func:`_thread_settled` against aioodbc's raw pyodbc cursor (read by
+    :func:`~messagefoundry.odbc_call_gate.raw_cursor`, as the store's pooled cursor reads it), and
+    is shielded: the caller's cancellation goes through at once, and the connection
     goes back only when the thread has resolved the close. No task cancel can resolve it, loop
     teardown's included, so the connection always does go back, and a later ``wait_closed`` waits
     only for the close itself.
@@ -2541,8 +2815,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
     running call, so it runs only once that call has returned, and the connection goes back only
     after the close. On that path the same job then rolls back what the cancelled statement may
     have left open (:func:`_close_after_a_cancel`), since the caller's own ``except Exception``
-    rollback never ran. The cancelled task waits for none of it: while a cancellation is in flight,
-    the return is handed to :func:`_return_when_settled` at once. Until the running call returns,
+    rollback never ran. The cancelled task waits for none of it: while a cancellation unwinds
+    through the caller (:func:`_unwinding_a_cancel`, BACKLOG #5004), the return is handed to
+    :func:`_return_when_settled` at once. Until the running call returns,
     the connection keeps its pool slot, and counts as held back, so a close of the pool stops
     waiting for it at a bound (:func:`_close_pool_bounded`). Nothing in the engine bounds that time,
     because this connector sets no statement timeout (ADR 0159, amendment of 2026-10-30).
@@ -2554,33 +2829,46 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
     before that call entered the gate finds no call running, so the close is not handed to it: the
     two race for the gate, the close may run first, and the connection can go back while that call
     is still to run. A connection with no gate (a test double) closes its cursor beside a running
-    call, as before. A cursor with no ``_impl`` (a test double, or an aioodbc that renamed it) is closed
-    through its own ``close()`` as a task, and a teardown cancel of that task keeps the connection
-    out of the pool (:func:`_return_when_settled`)."""
-    if cur is None:
-        await pool.release(conn)
-        return
-    raw_cur = getattr(cur, "_impl", None)
+    call, as before. A cursor with no raw pyodbc cursor (a test double, or an aioodbc that renamed
+    ``_impl``, which :func:`~messagefoundry.odbc_call_gate.raw_cursor` logs once) is closed through
+    its own ``close()`` as a task, and a teardown cancel of that task keeps the connection out of
+    the pool (:func:`_return_when_settled`).
+
+    **``discard`` closes the connection instead of returning it open (BACKLOG #5010).** A caller
+    whose own rollback failed passes it, since the transaction may still be open on a live session
+    and the next borrower's commit would commit it. The handle is dropped here, before any await,
+    so no path below can lend the connection again; the job that closes the cursor then closes the
+    handle, and the pool gets the connection back closed (:func:`_release`). Where the executor is
+    shut down, no job runs, and the handle is left for pyodbc to close when it is collected."""
     cancelled = _unwinding_a_cancel()
+    dropped = drop_handle(conn) if discard else None  # first: no await may come before it
+    if cur is None and dropped is None:
+        await _release(pool, conn)
+        return
+    raw_cur = None if cur is None else raw_cursor(cur)
+    gate = call_gate(conn)
     work: asyncio.Future[Any]
-    if raw_cur is not None:
-        gate = call_gate(conn)
-        # Only inside a gate: on an ungated connection a rollback would run beside the statement.
-        close = (
-            partial(_close_after_a_cancel, conn, raw_cur)
-            if cancelled and gate is not None
-            else partial(_close_raw_cursor, raw_cur)
-        )
+    if raw_cur is not None or cur is None:
+        if dropped is not None:
+            close = partial(_close_and_discard, raw_cur, dropped)
+        elif cancelled and gate is not None:
+            # Only inside a gate: on an ungated connection a rollback would run beside the statement.
+            close = partial(_close_after_a_cancel, conn, raw_cur)
+        else:
+            close = partial(_close_raw_cursor, raw_cur)
         try:
             work = _thread_settled(close, gate=gate)
         except RuntimeError as exc:
             # The default executor is shut down: no close thread started, so none runs on it.
             # Not raised: this runs in callers' finally blocks, and must not mask their outcome.
+            # A dropped handle is left for pyodbc to close when it is collected.
             logger.debug("DATABASE: cursor close not run, executor shut down: %s", exc)
-            await pool.release(conn)
+            await _release(pool, conn)
             return
     else:
-        work = asyncio.ensure_future(_close_cursor(cur))
+        work = asyncio.ensure_future(
+            _close_cursor(cur) if dropped is None else _close_cursor_then_drop(cur, dropped, gate)
+        )
         # The loop holds a task only weakly; keep this one alive until its done-callback has run.
         _DETACHED_SETTLES.add(work)
         work.add_done_callback(_DETACHED_SETTLES.discard)
@@ -2593,7 +2881,19 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any) -> None:
     except BaseException:
         _return_when_settled(pool, conn, work, "a cursor close")
         raise
-    await pool.release(conn)
+    await _release(pool, conn)
+
+
+async def _close_cursor_then_drop(cur: Any, raw: Any, gate: CallGate | None) -> None:
+    """The discard for a cursor with no raw pyodbc cursor: close it through its own ``close()``,
+    then close the dropped handle on a worker thread, through the gate. Never raises."""
+    await _close_cursor(cur)
+    try:
+        closing = _thread_settled(partial(_close_dropped, raw), gate=gate)
+    except RuntimeError as exc:  # the executor is shut down: pyodbc closes it when collected
+        logger.debug("DATABASE: discarded connection not closed, executor shut down: %s", exc)
+        return
+    await closing
 
 
 def _close_raw_cursor(raw_cur: Any) -> None:
@@ -2614,11 +2914,14 @@ def _close_after_a_cancel(conn: Any, raw_cur: Any) -> None:
     uncommitted, with its locks, for the next send's commit or rollback to settle. On an autocommit
     connection the rollback has nothing to undo. Never raises.
 
-    **A failed rollback is logged, and the connection still goes back.** Discarding it would drop
-    its handle, and aioodbc wakes neither a waiting borrower nor a waiting ``wait_closed`` for a
-    closed connection, so that wait could last until something else woke it. A rollback usually
-    fails because the session is gone, and its transaction with it. A session still alive keeps
-    the transaction until the next borrower's own commit or rollback, as before this function."""
+    **A failed rollback discards the connection (BACKLOG #5010).** A rollback usually fails because
+    the session is gone, and its transaction with it, but not always. Before #5010 the connection
+    went back to the pool anyway, and on a session still alive the next send's commit would have
+    committed the cancelled INSERT with its own, a row the engine counts as not sent and whose
+    retry would write it again. It is dropped and closed here, still inside the gate,
+    and the return that follows hands the pool a closed connection, which :func:`_release` wakes
+    the pool for. The close need not end the server's session; :func:`_close_dropped` says what
+    that leaves."""
     _close_raw_cursor(raw_cur)
     raw = getattr(conn, "_conn", None)
     if raw is None:
@@ -2627,15 +2930,50 @@ def _close_after_a_cancel(conn: Any, raw_cur: Any) -> None:
         raw.rollback()
     except Exception as exc:  # noqa: BLE001 - every driver fault; nobody is left to raise to
         logger.warning(
-            "DATABASE: rollback after a cancelled statement failed; the connection goes back to "
-            "its pool: %s",
+            "DATABASE: rollback after a cancelled statement failed; the connection is discarded "
+            "rather than returned to its pool: %s",
+            _safe_db_error(exc),
+        )
+        _close_dropped(drop_handle(conn))
+
+
+def _close_and_discard(raw_cur: Any, raw: Any) -> None:
+    """On a worker thread, inside the connection's call gate when it has one: close the cursor,
+    if there is one, then the driver connection :func:`drop_handle` took off it, because its
+    transaction could not be rolled back (BACKLOG #5010). Never raises."""
+    if raw_cur is not None:
+        _close_raw_cursor(raw_cur)
+    _close_dropped(raw)
+
+
+def _close_dropped(raw: Any) -> None:
+    """On a worker thread, with no other pyodbc call running on its connection: close a driver
+    connection :func:`~messagefoundry.odbc_call_gate.drop_handle` took off it; ``None`` is a no-op.
+
+    **What the discard guarantees, and what it does not.** No later borrower can commit on this
+    connection, so no later send commits the abandoned INSERT with its own: that is the BACKLOG
+    #5010 fix. It does not guarantee the server drops the transaction. pyodbc's close rolls back
+    before it disconnects, but here a rollback has just failed; per ODBC a disconnect with an open
+    transaction fails, and pyodbc ignores both failures, so the session, with its transaction and
+    locks, can stay open until the server ends it (ADR 0159, the 2026-10-30 residual). A retry on
+    a fresh connection can wait on those locks, and this connector sets no statement timeout. A
+    close that does raise is logged, not raised; pyodbc's own close is not expected to."""
+    if raw is None:
+        return
+    try:
+        raw.close()
+    except Exception as exc:  # noqa: BLE001 - every driver fault; nobody is left to raise to
+        logger.warning(
+            "DATABASE: closing a discarded connection failed; the server may hold its transaction "
+            "until the session ends: %s",
             _safe_db_error(exc),
         )
 
 
 async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = None) -> None:
     """Close ``pool``. Wait for its connections in use as an unbounded ``wait_closed`` would, but
-    stop waiting once a connection of it is held back behind a cancelled borrow (BACKLOG #2394).
+    stop waiting once a connection of it is counted as held back (BACKLOG #2394): behind a
+    cancelled borrow, or discarded with no wake to come (BACKLOG #5010; :data:`_HELD_BACK`).
 
     **The bound applies only while that count is above zero** (:func:`_holds_back`), read at the end
     of each tick of :data:`_POOL_CLOSE_TIMEOUT_S`: a close that starts with one held back waits one
@@ -2644,7 +2982,8 @@ async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = Non
     reload would otherwise wait as long as that call runs. With no connection held back, an
     in-flight call is an ordinary one, and the close waits for it as it did before #2394, however
     long it takes. ``bound`` instead stops the wait at that many seconds whatever the count: the
-    source's stop after a cancel (BACKLOG #1620) passes it.
+    source's stop after a cancel (BACKLOG #1620), or after it cut a blocked poll (BACKLOG #4685),
+    passes it.
 
     **Stopping the wait frees nothing.** The close is waited on through :func:`asyncio.wait`, which
     never cancels it, so a close cut halfway never leaves a connection's handle for aioodbc's
@@ -2679,8 +3018,9 @@ async def _close_pool_bounded(pool: Any, what: str, *, bound: float | None = Non
     waited = loop.time() - started
     if held:
         logger.warning(
-            "%s pool did not close in %.1fs of waiting; %d connection(s) held behind a cancelled "
-            "call go back when that call returns, and the close goes on meanwhile",
+            "%s pool did not close in %.1fs of waiting; %d connection(s) counted as held back, "
+            "behind a cancelled call that goes back when it returns or discarded with no wake to "
+            "come, and the close goes on meanwhile",
             what,
             waited,
             held,
@@ -2900,6 +3240,7 @@ class DatabaseDestination(DestinationConnector):
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
         cur: Any = None
+        discard = False
         try:
             cur = await conn.cursor()
             try:
@@ -2910,13 +3251,32 @@ class DatabaseDestination(DestinationConnector):
                 captured = await self._capture(cur) if self.capture_response else None
                 await conn.commit()
             except Exception as exc:
-                await conn.rollback()
                 state = _sqlstate(exc)
+                try:
+                    await conn.rollback()
+                except Exception as rollback_exc:
+                    # BACKLOG #5010: the INSERT may still be open on a live session, and the next
+                    # send's commit would commit it with its own, so the connection is closed
+                    # instead of returned.
+                    discard = True
+                    logger.warning(
+                        "DATABASE: rollback after a failed send failed; the connection is "
+                        "discarded rather than returned to its pool: %s",
+                        _safe_db_error(rollback_exc),
+                    )
+                    if state is None:
+                        raise  # the send's failure is no driver error: the rollback's propagates
+                    # Classified by the send's own error, as it would be had the rollback passed,
+                    # never by the rollback's: the send's error is the best evidence of the
+                    # message's fate, and a transient rollback state overriding a permanent one
+                    # would retry a poison message for as long as the retry budget lasts. A
+                    # dead-letter can be replayed. The rollback's error stays the context.
+                    raise _classify_db_error(state, str(exc)) from exc
                 if state is None:
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
                 raise _classify_db_error(state, str(exc)) from exc
         finally:
-            await _close_and_release(pool, conn, cur)
+            await _close_and_release(pool, conn, cur, discard=discard)
         return captured
 
     async def _capture(self, cur: Any) -> DeliveryResponse:
@@ -3055,16 +3415,18 @@ _MAX_SKIPPED_ROWS_PER_POLL = 64
 #: them (BACKLOG #1620). It bounds the cancel; a step that outlasts it is hung and is cut, and its
 #: row re-emits as the at-least-once duplicate a failed mark already makes.
 _ROW_STEP_GRACE_S = 2.0
-#: How long a cancelled DatabaseSource.stop() waits for the poll task it cut to finish (BACKLOG
-#: #1620). A cut task can still be held by a driver call on an executor thread, such as a cursor
-#: close behind a hung statement; stop() then returns with the task still referenced, so the next
-#: stop() joins it before closing the pool under it.
+#: How long a DatabaseSource.stop() waits for the poll task it cut to finish, after a cancel
+#: (BACKLOG #1620) or after an ordinary stop's grace (BACKLOG #4685). A cut task can still be held
+#: by a driver call on an executor thread, such as a cursor close behind a hung statement; stop()
+#: then returns with the task still referenced, so the next stop() joins it before closing the pool
+#: under it.
 _CUT_JOIN_TIMEOUT_S = 2.0
 #: How long a pool close waits once it has a reason to stop waiting (:func:`_close_pool_bounded`).
 #: A pool waits for every connection in use to come back, so one a hung driver call holds would make
 #: it wait forever. A cancelled DatabaseSource.stop() waits this long whatever its pool holds
-#: (BACKLOG #1620). Every other close of a DATABASE pool, the source's ordinary stop, the
-#: destination's, the db_lookup executor's and a DatabaseRef sync's teardown, waits this long only
+#: (BACKLOG #1620), and so does an ordinary one that cut its poll task (BACKLOG #4685). Every other
+#: close of a DATABASE pool, the source's other ordinary stops, the destination's, the db_lookup
+#: executor's and a DatabaseRef sync's teardown, waits this long only
 #: while a connection is held back behind a cancelled borrow (BACKLOG #2394), and otherwise waits
 #: for its in-flight calls without a bound.
 _POOL_CLOSE_TIMEOUT_S = 2.0
@@ -3133,10 +3495,13 @@ class DatabaseSource(SourceConnector):
 
     The File source's *process-then-mark-done* shape (at-least-once), with a query instead of a
     directory: a cooperatively-cancellable background loop runs the operator-declared ``poll_statement``
-    (a read-only ``SELECT`` of the next batch; a writing poll is refused at construction, BACKLOG
-    #2178), hands each row to the handler as a body, and — **only after the
-    handler returns** — runs the optional ``mark_statement`` (an ``UPDATE``/``DELETE`` bound from that
-    row's columns) so the row isn't re-read. A crash before the mark re-emits the row next poll
+    (a read-only ``SELECT`` of the next batch; at least a poll of a writing shape is refused at
+    construction, BACKLOG #2178, but not every writing poll: at least a ``SELECT`` that calls a
+    function which writes, and a T-SQL second statement with no ``;`` whose verb the test does not
+    list, pass, see :func:`_read_only_poll_refusal`), hands each row to the
+    handler as a body, and — **only after the handler returns** — runs the optional
+    ``mark_statement`` (an ``UPDATE``/``DELETE`` bound from that row's columns) so the row isn't
+    re-read. A crash before the mark re-emits the row next poll
     (at-least-once); the downstream pipeline must tolerate duplicates. Poll errors are logged-not-fatal
     (a bad poll never kills the poller, mirroring the File source).
 
@@ -3150,7 +3515,9 @@ class DatabaseSource(SourceConnector):
     that bounds the leadership-transition duplicate window, the engine can't enforce row claim/mark
     atomicity here: it's on the operator's SQL. The claim is ``mark_statement``, run per row after the
     handler returns, so a row both nodes read in the brief transition window is a duplicate, the same
-    at-least-once class as a crash mid-poll, never a loss. ``poll_statement`` must not claim; see
+    at-least-once class as a crash mid-poll, and not a loss, **provided** ``poll_statement`` writes
+    nothing and ``mark_statement`` marks only the row it was bound from. A poll that claims rows as
+    it reads them can lose a row it claimed and never handed off. ``poll_statement`` must not claim; see
     :func:`_read_only_poll_refusal`.
     """
 
@@ -3244,6 +3611,8 @@ class DatabaseSource(SourceConnector):
         self._task: asyncio.Task[None] | None = None
         # The poll task inside a row's hand-off and mark; a cancelled stop() gives it a grace.
         self._row_step_task: asyncio.Task[Any] | None = None
+        # The poll task inside a hand-off, which an ordinary stop() never cuts (BACKLOG #4685).
+        self._stop_guard = PollStopGuard()
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -3275,20 +3644,33 @@ class DatabaseSource(SourceConnector):
         referenced, and the next stop() joins it. A close failure after a cancel is logged, never
         raised over it.
 
-        **An ordinary stop() waits for the pool as before, unless a borrow was cancelled.** It
-        waits for an in-flight call without a bound, but stops at :data:`_POOL_CLOSE_TIMEOUT_S` once
-        a connection is held back behind a cancelled borrow (BACKLOG #2394), such as a
-        ``test_connection`` probe whose ``SELECT 1`` was cancelled while it hung.
+        **An ordinary stop() gives up on a blocked driver call after** :data:`POLL_STOP_GRACE_S`
+        (BACKLOG #4685), as ``FileSource.stop()`` does on a blocked share call. The poll task sees
+        ``_stop`` between rows and between polls, so it usually returns at once. At least a select,
+        a pool borrow or a mark hung on an unresponsive server is cut after the grace, logged, and
+        from then on handled as a cut after a cancel: the join and the pool close are bounded as
+        above. A cut ends only the await: a mark already running on its driver thread can still
+        commit there. A row whose mark does not commit re-emits on the next start, the duplicate a
+        failed mark makes.
+        **This bound never cuts a hand-off**; :class:`PollStopGuard` says how long stop() then
+        waits. A cancelled stop() can, as above.
+
+        **An ordinary stop() the poll task finished in time waits for the pool as before, unless a
+        borrow was cancelled.** It waits for an in-flight call without a bound, but stops at
+        :data:`_POOL_CLOSE_TIMEOUT_S` once a connection is held back behind a cancelled borrow
+        (BACKLOG #2394), such as a ``test_connection`` probe whose ``SELECT 1`` was cancelled while
+        it hung.
         """
         self._stop.set()
         task = self._task
+        cut = False
         try:
             if task is not None:
-                await self._join_poll(task)
+                cut = await self._join_poll(task)
         except (asyncio.CancelledError, Exception):
             await self._finish_stop(task, interrupted=True)
             raise
-        await self._finish_stop(task, interrupted=False)
+        await self._finish_stop(task, interrupted=cut)
 
     async def _finish_stop(self, task: asyncio.Task[None] | None, *, interrupted: bool) -> None:
         """Clear a finished poll task, log its fault, and close the pool, bounded if interrupted."""
@@ -3309,38 +3691,53 @@ class DatabaseSource(SourceConnector):
             if not interrupted:
                 raise
             logger.warning(
-                "DATABASE source pool close failed during a cancel: %s", _safe_db_error(exc)
+                "DATABASE source pool close failed after a cancel or a cut: %s", _safe_db_error(exc)
             )
 
-    async def _join_poll(self, task: asyncio.Task[None]) -> None:
-        """Wait for the poll task; on a cancel, apply stop()'s row-step grace, then cut and join."""
+    async def _join_poll(self, task: asyncio.Task[None]) -> bool:
+        """Wait for the poll task, bounded outside a hand-off; on a cancel, apply stop()'s row-step
+        grace, then cut and join. Returns whether an ordinary stop() gave up on the task and cut it."""
         current = asyncio.current_task()
         # Read before the wait, so a cancel this task already carried does not count as a second.
         before = current.cancelling() if current is not None else 0
         try:
-            # wait, not gather: a cancelled wait leaves the task alone, so the arm below decides.
-            await asyncio.wait({task})
+            # A cancelled join leaves the task alone, so the arm below decides.
+            if await self._stop_guard.join(task, POLL_STOP_GRACE_S):
+                return False
         except asyncio.CancelledError:
             try:
                 again = current is not None and current.cancelling() - before > 1
                 if self._row_step_task is task and not again:
                     await self._row_grace(task)
             finally:
-                task.cancel()  # a no-op once the task has finished
-                if self._row_step_task is task:
-                    # Cut: a later cancelled stop() must not grant this task a grace again while it
-                    # only finishes a cursor close.
-                    self._row_step_task = None
-                # wait, not gather, again: a further cancel is not forwarded into the task, and the
-                # timeout bounds a task a driver call holds.
-                await asyncio.wait({task}, timeout=_CUT_JOIN_TIMEOUT_S)
-                if not task.done():
-                    logger.warning(
-                        "DATABASE source poll task still running %.1fs after a cancelled stop() "
-                        "cut it; it stays registered and the next stop() joins it",
-                        _CUT_JOIN_TIMEOUT_S,
-                    )
+                await self._cut(task, "a cancelled stop()")
             raise
+        logger.warning(
+            "DATABASE source poll task did not stop within %.1fs, most likely a driver call "
+            "blocked on an unresponsive server; cancelled it. A row it had handed off whose mark "
+            "does not then commit re-emits on the next start.",
+            POLL_STOP_GRACE_S,
+        )
+        await self._cut(task, "an ordinary stop()")
+        return True
+
+    async def _cut(self, task: asyncio.Task[None], by: str) -> None:
+        """Cancel the poll task and join it for at most :data:`_CUT_JOIN_TIMEOUT_S`."""
+        task.cancel()  # a no-op once the task has finished
+        if self._row_step_task is task:
+            # Cut: a later cancelled stop() must not grant this task a grace again while it only
+            # finishes a cursor close.
+            self._row_step_task = None
+        # wait, not gather: a further cancel is not forwarded into the task, and the timeout bounds
+        # a task a driver call holds.
+        await asyncio.wait({task}, timeout=_CUT_JOIN_TIMEOUT_S)
+        if not task.done():
+            logger.warning(
+                "DATABASE source poll task still running %.1fs after %s cut it; it stays "
+                "registered and the next stop() joins it",
+                _CUT_JOIN_TIMEOUT_S,
+                by,
+            )
 
     async def _row_grace(self, task: asyncio.Task[None]) -> None:
         """Wait up to :data:`_ROW_STEP_GRACE_S` for the row step, while this node leads.
@@ -3497,7 +3894,8 @@ class DatabaseSource(SourceConnector):
         so the step is NOT atomic under shutdown."""
         assert self._handler is not None
         try:
-            await self._handler(raw)
+            with self._stop_guard.store_call():  # an ordinary stop() never cuts it (#4685)
+                await self._handler(raw)
         except Exception as exc:
             # The handler records every message-level outcome itself (parse/route → ERROR) and
             # returns, so an exception here is usually an infrastructure failure (the durable store

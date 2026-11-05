@@ -761,7 +761,7 @@ def test_every_attestation_verify_command_pins_the_release_workflow_and_ref() ->
         "docs/MENTAL-MODEL.md",
         "docs/SUPPLY-CHAIN.md",
         ".github/workflows/release.yml",
-        "messagefoundry/scaffold.py",
+        "messagefoundry_toolkit/scaffold.py",
     }
     assert expected <= files, f"the sweep missed {sorted(expected - files)}; found {sorted(files)}"
     # Eight commands across those seven files: INSTALL-GUIDE.md carries two.

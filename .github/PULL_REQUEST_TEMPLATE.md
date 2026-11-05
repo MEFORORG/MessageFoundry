@@ -26,7 +26,7 @@ Implements: BACKLOG #
 - [ ] If this touches the reliability invariants, store/queue, staged pipeline, auth/RBAC, or the
       code-first graph model, I **discussed it first** (see [GOVERNANCE.md](../GOVERNANCE.md)).
 - [ ] **No real PHI or customer data** anywhere in the diff, tests, fixtures, screenshots, or commit
-      messages — synthetic HL7 only (`python -m messagefoundry generate`).
+      messages — synthetic HL7 only (`python -m messagefoundry_toolkit generate`).
 - [ ] Tests added/updated for new behavior.
 - [ ] **Any new dependency was verified before adding it** — real, reputable, and the *exact* intended
       distribution — then re-locked (`uv lock` / `uv export`), with a dated vet note beside it in

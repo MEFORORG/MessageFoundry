@@ -13,8 +13,10 @@ blocked for that: ``GET /ui/sso``, ``GET /ui/oidc/callback``, and ``GET /ui/oidc
 interstitial is needed. Each case below sends a GET with NEITHER header and asserts the answer the
 route gave before the rule existed. The values were measured on ``origin/main`` with this file.
 
-The last two tests are the other side: the same start leg still refuses what it refused before on
-a GET, and a POST with neither header is still refused.
+The last tests are the other side: the same start leg still refuses what it refused before on a
+GET, it refuses a GET whose ``Sec-Fetch-Site`` is empty or unknown beside a foreign ``Origin``
+(B291-R1 of the vault file ``OWNER-RULINGS-2026-10-17-BATCH291.md``), and a POST with neither
+header is still refused.
 """
 
 from __future__ import annotations
@@ -140,8 +142,21 @@ async def test_oidc_start_get_with_neither_header_redirects_to_the_idp(engine: E
         ({"Sec-Fetch-Site": "cross-site"}, "cross-site request rejected"),
         ({"Sec-Fetch-Site": "same-site"}, "cross-site request rejected"),
         ({"Origin": "http://evil.example"}, "cross-origin request rejected"),
+        # B291-R1: an empty or unknown value counts as absent on a GET, so Origin decides
+        (
+            {"Sec-Fetch-Site": "", "Origin": "http://evil.example"},
+            "cross-origin request rejected",
+        ),
+        (
+            {"Sec-Fetch-Site": "x", "Origin": "http://evil.example"},
+            "cross-origin request rejected",
+        ),
+        (
+            {"Sec-Fetch-Site": "same-origin, none", "Origin": "http://evil.example"},
+            "cross-origin request rejected",
+        ),
     ],
-    ids=["cross-site", "same-site", "foreign-origin"],
+    ids=["cross-site", "same-site", "foreign-origin", "empty", "unknown", "folded"],
 )
 async def test_oidc_start_get_still_refuses_what_it_refused(
     engine: Engine, headers: dict[str, str], detail: str
@@ -169,6 +184,31 @@ async def test_oidc_start_get_still_refuses_what_it_refused(
     assert r.headers["content-type"].startswith("application/json"), r.text
     assert r.json() == {"detail": detail}
     assert "set-cookie" not in r.headers
+
+
+@pytest.mark.parametrize("site", ["", "x", "same-origin, none"], ids=["empty", "unknown", "folded"])
+async def test_oidc_start_get_with_an_unknown_site_and_no_foreign_origin_redirects(
+    engine: Engine, site: str
+) -> None:
+    """The control for the B291-R1 rows above: the same unrecognised ``Sec-Fetch-Site`` with a
+    matching ``Origin``, or with none, goes on to the identity provider, so those refusals are the
+    foreign ``Origin`` and not the value itself."""
+    service = await _service(engine, held=Role.OPERATOR, bind=True)
+    async with _client(engine, service, interstitial=False) as c:
+        # The client's public origin is the one Origin that matches; the Host does not.
+        for extra in ({}, {"Origin": "https://ops.example"}):
+            r = await c.get(
+                "/ui/oidc/start",
+                headers={
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Site": site,
+                    **extra,
+                },
+                follow_redirects=False,
+            )
+            assert r.status_code == 303, (extra, r.text)
+            assert r.headers["location"].startswith("https://idp.example/authorize?")
 
 
 async def test_oidc_start_post_with_neither_header_is_still_refused(engine: Engine) -> None:

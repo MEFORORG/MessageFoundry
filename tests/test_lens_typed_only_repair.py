@@ -15,8 +15,8 @@ from typing import Any
 
 import pytest
 
-from messagefoundry import lens
-from messagefoundry.lens import LensRewriteError, rewrite_source
+from messagefoundry_toolkit import lens
+from messagefoundry_toolkit.lens import LensRewriteError, rewrite_source
 
 TYPED_ONLY = "typed-only mode"
 REFUSED = "not a value a Steps edit may write"

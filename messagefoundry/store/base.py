@@ -84,6 +84,7 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    DeadLetterPurge,
     FailOutcome,
     FederatedUnbind,
     LatencyHistogram,
@@ -108,6 +109,7 @@ from messagefoundry.store.store import (
     ResendSourceEmpty,
     ResendSourceNotFound,
     RestoreRecord,
+    RevokeResult,
     RoleGrant,
     SessionRecord,
     SignCountAnswer,
@@ -149,6 +151,7 @@ __all__ = [
     "ResendSourceEmpty",
     "ResendSourceNotFound",
     "RestoreRecord",
+    "RevokeResult",
     "Row",
     "SearchSpec",
     "SearchTarget",
@@ -186,6 +189,14 @@ class DbaDelegatedError(RuntimeError):
     reimplemented in the engine, so the snapshot raises this rather than producing a half-baked copy. The
     BackupRunner / ``backup`` CLI catch it and fall back to a config-only backup (or skip) per
     ``[backup].config_only_on_server_db``."""
+
+
+class ReferenceKeyCollision(ValueError):
+    """Two keys of one reference snapshot differ only by trailing spaces, which SQL Server compares
+    as equal (BACKLOG #4917), so its ``write_reference_snapshot`` refuses before the transaction.
+
+    The message holds the set name and the two keys' ordinals, never a key or a hash of one, so
+    ``reference_sync`` logs it whole where it logs any other source error by class name only."""
 
 
 class Row(Protocol):
@@ -847,6 +858,8 @@ class QueueStore(StoreLifecycle, Protocol):
         summary: str | None,
         peek_failed: bool = False,
         peek_error: str | None = None,
+        refused_raw: str | None = None,
+        refused_metadata: Mapping[str, Any] | None = None,
         now: float | None = None,
     ) -> bool:
         """Consume one INFLIGHT ``Stage.RESPONSE`` work-row and produce the re-ingressed message+ingress
@@ -854,15 +867,22 @@ class QueueStore(StoreLifecycle, Protocol):
         work-row is the exactly-once commit, so a committed run is an idempotent no-op (``False``). The
         re-ingress worker peeks the loopback body and passes the derived metadata in. ``peek_error`` is
         the ERROR reason a ``peek_failed`` child records; ``None`` keeps the HL7-peek wording (BACKLOG
-        #1914 passes the oversize reason). It must carry no byte of the body. Returns ``True`` if this
-        call performed the handoff."""
+        #1914 passes the oversize reason). It must carry no byte of the body.
+
+        ``refused_raw`` and ``refused_metadata`` are what the refused-body allowance decided to store
+        for a ``peek_failed`` child (vault BACKLOG #4796): its ``raw`` in place of the whole reply,
+        and keys merged into its engine-internal metadata. ``None`` stores the whole reply and adds
+        nothing, as before. Both are ignored unless ``peek_failed``. Neither moves the child's
+        content-addressed id, which still hashes the whole reply. Returns ``True`` if this call
+        performed the handoff."""
         ...
 
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
         """The decrypted artifact body a ``Stage.RESPONSE`` work-row references (ADR 0013 Increment 2) —
         read by the re-ingress worker to HL7-peek the reply (in ``pipeline/``) before
-        :meth:`ingress_handoff`. ``None`` if the row is gone or its reference is malformed, ``""``
-        if the artifact is gone."""
+        :meth:`ingress_handoff`. ``None`` if the row is gone or its reference is malformed. ``""``
+        if the artifact row is missing, its body was erased, or the reply was empty: the peek needs
+        no more, and :meth:`ingress_handoff` tells those three apart itself (BACKLOG #4996)."""
         ...
 
     async def mark_failed(
@@ -1051,13 +1071,20 @@ class QueueStore(StoreLifecycle, Protocol):
         byte-for-byte). Raises :class:`KeyError` if the attachment does not exist."""
         ...
 
-    async def attachments_for(self, message_id: str) -> Sequence[Row]:
+    async def attachments_for(
+        self, message_id: str, *, include_inherited: bool = False
+    ) -> Sequence[Row]:
         """The distinct attachments a single message holds — the operator read surface (#149, ADR 0105
         Phase 3b). One row per ``message_attachment`` linkage JOINed to its ``attachment`` header,
         carrying ``attachment_id`` (the sha256 content address), ``content_type``, and ``total_bytes``.
         **Metadata only — no chunk ciphertext is read or decrypted** (the bulky bytes ride
         :meth:`read_attachment`), so this stays cheap enough for the message-detail view. Returns ``[]``
-        for a message with no detached document (or on a backend without the substrate)."""
+        for a message with no detached document (or on a backend without the substrate).
+
+        A link a child message inherited from its parent (BACKLOG #5099) is left out unless
+        ``include_inherited`` is set, which only delivery's handle binding does. It grants no
+        download through the child. Retention still releases it, as it releases any link, by
+        reading the linkage itself rather than through this method."""
         ...
 
     async def attachment_incref(self, ref: str) -> None:
@@ -1672,13 +1699,14 @@ class QueueStore(StoreLifecycle, Protocol):
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Null dead-lettered bodies updated before ``older_than`` (their own window), at **every
         stage** — a dead ``ingress``/``routed`` row carries the full raw body and is reached here
         (#1188, ASVS 14.2.7), not only a dead ``outbound`` row. ``connection_cutoffs`` (#34, ADR 0027)
         optionally overrides the cutoff per ``destination_name`` (``float('-inf')`` = keep forever);
         default empty ⇒ a single global cutoff. A row with a NULL ``destination_name`` (ingress, routed,
-        response) always takes the global window. Returns the number purged."""
+        response) always takes the global window. Returns a :class:`DeadLetterPurge` (BACKLOG
+        #4996)."""
         ...
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
@@ -3140,14 +3168,26 @@ class AuthStore(Protocol):
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int: ...
+    ) -> RevokeResult:
+        """Revoke the account's unrevoked sessions, but ``except_token_hash`` when it is given,
+        raising the account's session epoch in the same transaction (BACKLOG #2592). Returns how
+        many it revoked and whether it re-stamped the kept session with the new epoch in that
+        transaction (:class:`~messagefoundry.store.store.RevokeResult`, BACKLOG #4975): only when
+        that session is the account's and carried the epoch the raise replaced and the store's
+        current global epoch, read in that transaction (store.py's ``KeptSessionRestamp``). A
+        session of the account it declines to re-stamp it ends in the same transaction and counts,
+        and reports ``ended_kept`` (follow-up to BACKLOG #4975). ``kept`` is False with no
+        ``except_token_hash``."""
+        ...
 
     async def count_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None
     ) -> int:
         """How many sessions :meth:`revoke_user_sessions` would end, given the same ``user_id`` and
         ``except_token_hash``: every unrevoked row of the account, idle or expired ones included,
-        but for the excepted one (BACKLOG #3393).
+        but for the excepted one (BACKLOG #3393). Where the revoke declines to re-stamp the
+        excepted session it ends that one too and counts it (``RevokeResult.ended_kept``), so its
+        ``count`` is then one more than this; its ``others`` is this number.
 
         Deliberately the revoke's predicate and not :meth:`list_sessions`'s, so the number an offer
         to sign out the other sessions shows is the number the revoke then ends. Each backend
@@ -3158,15 +3198,20 @@ class AuthStore(Protocol):
 
     async def revoke_all_sessions(
         self, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
+    ) -> RevokeResult:
         """Revoke the unrevoked sessions it finds, but ``except_token_hash`` when it is given, and
-        return how many it revoked (BACKLOG #2614).
+        return how many it revoked and whether it re-stamped the kept session
+        (:class:`~messagefoundry.store.store.RevokeResult`; BACKLOG #2614, #4975).
 
         In one transaction it raises the store's global session epoch (BACKLOG #5091), which ends
         every session minted before it whatever account it belongs to, raises the epoch of each
         account its read of the account list returns, ends the sessions it finds, and re-seals the
-        kept session under its account's new epoch and the new global one. The order of the
-        first three is each backend's, and its own docstring states it. store.py's
+        kept session under its account's new epoch and the new global one, only when it carried
+        both epochs those raises replaced (store.py's ``KeptSessionRestamp``, BACKLOG #4975): a
+        kept session an earlier sweep missed, or one whose account's record failed its seal, is
+        ended in the same transaction and counted instead, ``kept`` is False and ``ended_kept``
+        True (follow-up to BACKLOG #4975). The order of the first three is each backend's, and its
+        own docstring states it. store.py's
         ``GLOBAL_SESSION_EPOCH_SQL`` says what the global epoch decides, and docs/SECURITY.md,
         *Limits of the session sweep*, says what the revoke still leaves. A kept session whose seal
         does not verify raises :class:`~messagefoundry.store.row_seal.RowSealError`, a store with

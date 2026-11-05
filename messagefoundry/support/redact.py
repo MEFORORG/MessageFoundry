@@ -49,7 +49,11 @@ from __future__ import annotations
 import re
 
 from messagefoundry.redaction import redact as _redact_phi
-from messagefoundry.secretscrub import scrub_credentials
+from messagefoundry.secretscrub import (
+    _CONNECTION_STRING_MEMBER,
+    _mask_member,
+    scrub_credentials,
+)
 
 __all__ = [
     "redact_log_line",
@@ -570,7 +574,9 @@ def redact_log_line(line: str) -> str:
     stored-error PHI coverage (DELTA-07). Then the write-time credential vocabulary
     (:func:`messagefoundry.secretscrub.scrub_credentials`) runs over the text between the placeholders
     so far, or over the whole line when the line arrived holding the placeholder text (BACKLOG
-    #2694). A final long-base64 sweep catches any residual key/token run.
+    #2694); its last pass masks the words of a connection-string member's value. Then that member
+    mask runs once more over the whole joined line (BACKLOG #5030). A final long-base64 sweep catches
+    any residual key/token run.
     The leading log timestamp is carved off first so the engine's date pass doesn't scrub it. This errs
     toward over-redaction (e.g. a capitalized two-word phrase in ordinary log text may be scrubbed) —
     the correct trade-off for a file that leaves the box."""
@@ -592,6 +598,14 @@ def redact_log_line(line: str) -> str:
     body = REDACTION_PLACEHOLDER.join(
         scrub_credentials(piece, placeholder=REDACTION_PLACEHOLDER) for piece in pieces
     )
+    # A connection-string member, its value's words masked to the next ";" (BACKLOG #5030).
+    # secretscrub's own pattern and mask, not a copy, run LAST of the credential passes: after the PHI
+    # pass and the second layer, so it reads what they left, and over the whole joined body, since
+    # this module's placeholder can sit inside the value (``;PWD=[REDACTED] kx,Pw&mv;``), where the
+    # split above cut it. It masks words only, so the PHI pass and the labels of a later redaction of
+    # this line read the same separators; secretscrub's comment on the pattern says why that matters.
+    if ";" in body:
+        body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
     return prefix + body
 

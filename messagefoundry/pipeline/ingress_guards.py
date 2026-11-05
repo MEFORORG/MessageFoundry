@@ -25,9 +25,16 @@ body. The dry-run runs the decode, NUL, frame-byte and size guards through :func
 
 **The two callers still differ in at least these places.** The HL7 parse step, which each caller
 runs itself: the stored ``parse error`` text differs, and the dry-run catches only ``HL7PeekError``
-where the listener catches every peek-read fault. The detach's refusal of an escaped ``OBX-5.5``
-document (:class:`~messagefoundry.parsing.binary.EscapedDocumentError`, an ``ERROR`` row on a
-streaming inbound), which the dry-run never raises because it never detaches. A ``str`` body, which
+where the listener catches every peek-read fault. The detach's refusals of an escaped ``OBX-5.5``
+document (:class:`~messagefoundry.parsing.binary.EscapedDocumentError`), of a received document
+handle or marker (:class:`~messagefoundry.parsing.binary.InboundDocRefError`), of a document
+under a base64 delimiter (:class:`~messagefoundry.parsing.binary.Base64DelimiterError`) and of a
+document the splice would not set back verbatim
+(:class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError`) and of a body with an OBX
+whose MSH-2 is shorter than four characters
+(:class:`~messagefoundry.parsing.binary.UnreadableDelimitersError`; a body with no MSH never
+reaches the detach, since ``Peek.parse`` refuses it first), each an
+``ERROR`` row on a streaming inbound, which the dry-run never raises because it never detaches. A ``str`` body, which
 only the dry-run accepts: it has nothing to decode, so :func:`decode_body` never tries the codec
 name, and a name that would refuse every received byte body passes. Bytes go through the one name
 rule on both, :func:`ingress_encoding` (BACKLOG #2431). How a slow strict validate is cut off, in
@@ -35,8 +42,11 @@ the next paragraph. And the live guards after it.
 
 **The strict-validation timeout is mirrored by measurement.** The listener runs ``hl7apy`` off the
 event loop under :func:`strict_validate_timeout` and records ``ERROR`` on expiry. What the sender
-hears differs: ``_handle_inbound`` builds an ``AE`` for a source that takes a reply (MLLP, TCP),
-while ``_handle_inbound_http`` returns a permanent refusal, which the HTTP listener answers ``422``. The
+hears depends on whether the validate began (BACKLOG #5078, owner ruling of 2026-11-03, decision
+log d20261104T032854299-7235a9, stamped in UTC): one that began
+is final, an ``AR`` from ``_handle_inbound`` for a source that takes a reply (MLLP, TCP) and a
+permanent refusal from ``_handle_inbound_http``, which the HTTP listener answers ``422``; one that
+never began (no worker thread ran it inside the timeout) is temporary, an ``AE`` or a ``503``. The
 dry-run stays synchronous: it runs the same validate inline, measures its elapsed time against the
 same timeout, and reports a validate that took longer as an ``ERROR`` preview carrying the
 listener's text (BACKLOG #1689). Unlike the listener it does not abandon the validate at the
@@ -64,8 +74,13 @@ from messagefoundry.config.wiring import InboundConnection, _is_text_codec
 from messagefoundry.framing import MLLP_CODEC
 from messagefoundry.parsing import RawMessage, normalize
 from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
-from messagefoundry.parsing.binary import BinaryCarriageError, is_marked
+from messagefoundry.parsing.binary import (
+    BinaryCarriageError,
+    is_marked,
+    marker_under_base64_delimiters,
+)
 from messagefoundry.parsing.binary import decode as decode_carriage
+from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import (
     DEFAULT_MAX_MESSAGE_BYTES,
     HL7PeekError,
@@ -79,6 +94,7 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.framing import declared_encoding
 
 __all__ = [
+    "DOC_REF_MARKER_REFUSED_REASON",
     "FRAME_BYTE_REJECTED_REASON",
     "INGRESS_MAX_BYTES",
     "MULTIPLE_MESSAGES_REJECTED_REASON",
@@ -93,12 +109,14 @@ __all__ = [
     "IngressTooLarge",
     "admit_resubmission",
     "admit_resubmitted_body",
+    "canonical_carried_size",
     "carry_binary_ingress",
     "check_binary_size",
     "check_declared_type",
     "check_decoded",
     "decode_body",
     "decode_ingress",
+    "doc_ref_marker_refusal",
     "ingress_encoding",
     "ingress_size_error",
     "peek_max_bytes",
@@ -120,6 +138,25 @@ __all__ = [
 # The listener reads it as ``wiring_runner._STRICT_VALIDATE_TIMEOUT_SECONDS``; it lives here so the
 # resend (BACKLOG #1911) and the listener resolve it by one rule.
 STRICT_VALIDATE_TIMEOUT_SECONDS = 5.0
+
+#: The stored reason for an HL7 body refused because it holds the document handle marker and a
+#: delimiter is a base64 character, or its delimiters cannot be read because its MSH-2 is shorter
+#: than four characters (BACKLOG #5099). A body with no MSH never reaches this check: ``Peek.parse``
+#: refuses it first. It names no byte of the body.
+DOC_REF_MARKER_REFUSED_REASON = (
+    "document handle refused: the body holds the handle marker, and either a delimiter is a "
+    "base64 character or the delimiters are unreadable"
+)
+
+
+def doc_ref_marker_refusal(peek: Peek, text: str) -> str | None:
+    """The reason to refuse a parsed HL7 body before the ACK, or ``None`` to go on: one that holds
+    the document handle marker under a delimiter in the base64 alphabet, or the raw marker under
+    an MSH-2 shorter than four characters, which delivery would refuse on every outbound (:func:`~messagefoundry.parsing.binary.marker_under_base64_delimiters`,
+    BACKLOG #5099). Pure, so both listeners and the dry-run run the one check."""
+    if marker_under_base64_delimiters(Message(peek.message), text):
+        return DOC_REF_MARKER_REFUSED_REASON
+    return None
 
 
 def strict_validate_timeout(ic: InboundConnection) -> float | None:
@@ -214,7 +251,7 @@ def ingress_size_error(size: int) -> str | None:
 _CANONICAL_B64 = re.compile(r"[A-Za-z0-9+/]*={0,2}")
 
 
-def _canonical_carried_size(payload: str) -> int | None:
+def canonical_carried_size(payload: str) -> int | None:
     """The byte count ``payload`` carries if it is canonical base64, else ``None``.
 
     Whitespace is not stripped first. A decoder tolerates it, but here it would let padding of any
@@ -245,7 +282,7 @@ def reingress_size_error(ic: InboundConnection, body: str) -> str | None:
             # No base64 this short can carry more than the ceiling, and whitespace only shortens it.
             # That also bounds a padded or corrupt carriage to the length of a ceiling-size one.
             return None
-        carried = _canonical_carried_size(payload)
+        carried = canonical_carried_size(payload)
         if carried is not None:
             return ingress_size_error(carried)
     return ingress_size_error(len(body))
@@ -464,8 +501,9 @@ def decode_body(raw: str | bytes, ic: InboundConnection) -> str:
 class IngressCodecUnusable(IngressGuardError):
     """A ``decode``-phase refusal caused by the inbound's codec NAME, not by the body: it names no
     text codec, or one that refuses every conversion (BACKLOG #2431). Every body would fail the same
-    way until the configuration changes, so the MLLP listener answers ``AE`` (resend later) where a
-    body invalid in a usable charset gets ``AR``."""
+    way until the configuration changes, so it is a configuration refusal (BACKLOG #5102): the MLLP
+    listener answers ``AE`` (resend later) where a body invalid in a usable charset gets ``AR``, and
+    ``_guard_refusal_kind`` in ``pipeline/wiring_runner.py`` classes it for both listeners."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason, phase="decode")

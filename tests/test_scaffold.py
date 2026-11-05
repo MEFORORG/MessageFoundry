@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""`messagefoundry init` scaffolds a standalone config repo whose starter config passes `check`."""
+"""`messagefoundry-toolkit init` scaffolds a standalone config repo whose starter config passes `check`."""
 
 from __future__ import annotations
 
@@ -24,12 +24,14 @@ from messagefoundry.checks import CheckResult, run_checks
 from messagefoundry.config.retention_classification import warn_only_windows
 from messagefoundry.config.settings import load_settings, security_loosenings
 from messagefoundry.remotedebug import RemoteDebugPosture, remote_debug_refusal
-from messagefoundry.scaffold import scaffold
+from messagefoundry_toolkit.__main__ import main as toolkit_main
+from messagefoundry_toolkit.scaffold import scaffold
 from scripts.release.tag_spelling import allowed
 
 _EXPECTED = {
     "README.md",
     "requirements.txt",
+    "requirements-dev.txt",
     ".gitignore",
     ".gitattributes",
     ".vscode/settings.json",
@@ -54,6 +56,9 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
         assert (repo / rel).is_file()
     # the engine is pinned to the running version (a read-only dependency)
     assert (repo / "requirements.txt").read_text() == f"messagefoundry=={__version__}\n"
+    # and the toolkit beside it at the same version, in a file of its own so a deploy that installs
+    # requirements.txt carries no development tooling (ADR 0201 section 6)
+    assert (repo / "requirements-dev.txt").read_text() == f"messagefoundry-toolkit=={__version__}\n"
     # the fixture keeps HL7 CR segment separators (write_text newline="" wrote them verbatim);
     # read the raw bytes (Path.read_text gained `newline` only in 3.13; the engine targets 3.11+).
     assert b"\r" in (repo / "messages" / "sets" / "example_adt.hl7").read_bytes()
@@ -676,7 +681,7 @@ def test_scaffolded_config_passes_check(tmp_path: Path) -> None:
 def test_init_command_writes_and_reports(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    rc = main(["init", str(tmp_path / "repo"), "--json"])
+    rc = toolkit_main(["init", str(tmp_path / "repo"), "--json"])
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     written = {r.replace("\\", "/") for r in out["written"]}
@@ -685,7 +690,7 @@ def test_init_command_writes_and_reports(
 
 def test_init_refuses_nonempty_dir(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     (tmp_path / "x.txt").write_text("hi", encoding="utf-8")
-    rc = main(["init", str(tmp_path)])
+    rc = toolkit_main(["init", str(tmp_path)])
     assert rc == 1
     # text-mode errors go to stderr (BACKLOG #1673)
     assert "not empty" in capsys.readouterr().err
@@ -698,7 +703,7 @@ def test_every_serve_start_init_names_disables_remote_debugging(
     interpreter's remote debugging on, so a start ``init`` prints or scaffolds that leaves it on
     would refuse. Each one starts the interpreter the way the refusal names."""
     repo = tmp_path / "repo"
-    assert main(["init", str(repo)]) == 0
+    assert toolkit_main(["init", str(repo)]) == 0
     printed = capsys.readouterr().out
     readme = (repo / "README.md").read_text(encoding="utf-8")
     starts = [
@@ -752,7 +757,7 @@ def test_no_commented_line_in_the_template_is_a_relocated_key(tmp_path: Path) ->
     """
     import re
 
-    from messagefoundry.scaffold import _SERVICE_TOML
+    from messagefoundry_toolkit.scaffold import _SERVICE_TOML
 
     lines = _SERVICE_TOML.splitlines()
     section: str | None = None
@@ -935,6 +940,7 @@ def test_the_scaffold_names_one_loosening_and_it_is_the_state_acknowledgement(
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=settings.api,
             approvals=settings.approvals,
             cert_monitor=settings.cert_monitor,

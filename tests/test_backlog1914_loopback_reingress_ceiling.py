@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ContentType
-from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.settings import REFUSED_BODY_HEAD_BYTES, EgressSettings
 from messagefoundry.config.wiring import Loopback, Registry, build_inbound_connection
 from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -124,7 +124,14 @@ async def test_an_oversize_decoded_binary_reply_is_refused_on_its_length(
     body = "é" * (CEILING + 1)
     _, child = await _reingress(store, content_type, body)
     assert child["status"] == MessageStatus.ERROR.value
-    assert child["error"] == f"ingress exceeds max size ({CEILING + 1} > {CEILING} bytes)"
+    # Vault BACKLOG #4796: its UTF-8 is 32 MiB and two bytes, past the loopback's whole default
+    # refused-body allowance, so only the head is stored and the allowance note leads the reason.
+    utf8 = 2 * (CEILING + 1)
+    assert child["error"] == (
+        f"[refused-body allowance spent: stored only the head of a {utf8:,}-byte body] "
+        f"ingress exceeds max size ({CEILING + 1} > {CEILING} bytes)"
+    )
+    assert body.startswith(child["raw"]) and len(child["raw"].encode()) <= REFUSED_BODY_HEAD_BYTES
     assert await _ingress_depth(store) == 0
 
 

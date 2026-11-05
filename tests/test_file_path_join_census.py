@@ -585,8 +585,15 @@ SITES: dict[str, Site] = {
         "Reads the git metadata of the operator's own config checkout; read only, to a commit hash.",
     ),
     "messagefoundry/config/impact.py::_validate_new_name": Site(1, OPERATOR, _CODESETS),
-    "messagefoundry/config/snapshot.py::ConfigSnapshot.covers_environment_file": Site(
+    "messagefoundry/config/snapshot.py::ConfigSnapshot._folder_of": Site(
         1, OPERATOR, _CONFIG_FIXED
+    ),
+    "messagefoundry/config/snapshot.py::ConfigSnapshot._held_path": Site(
+        2,
+        REVIEWED,
+        "The folder a value file was read from, or the operator's config directory's fixed "
+        "environments folder, joined to a name the snapshot holds, which _check_rel holds to one "
+        "plain name; stated, never opened or written (vault BACKLOG #2596).",
     ),
     "messagefoundry/config/snapshot.py::_list_folders": Site(1, OPERATOR, _CONFIG_FIXED),
     "messagefoundry/config/snapshot.py::config_py_files": Site(
@@ -628,14 +635,14 @@ SITES: dict[str, Site] = {
         "snapshot holds (checked a plain name, compiled under and never opened), and to an "
         "unreadable file's relative path, which only names it in a diagnostic.",
     ),
-    "messagefoundry/corepoint_import.py::_replace_modules": Site(
+    "messagefoundry_toolkit/corepoint_import.py::_replace_modules": Site(
         1, INTERNAL, "A pid temp name beside a target the importer already built."
     ),
-    "messagefoundry/corepoint_import.py::import_corepoint": Site(
+    "messagefoundry_toolkit/corepoint_import.py::import_corepoint": Site(
         1,
         GUARDED,
         "The module stem from an export's inbound name is folded through the guard (BACKLOG #1130).",
-        "messagefoundry/corepoint_import.py::_sanitize",
+        "messagefoundry_toolkit/corepoint_import.py::_sanitize",
     ),
     "messagefoundry/engine_secrets.py::SecretsDirectory._read_file": Site(
         1,
@@ -689,17 +696,37 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::BackupRunner._preflight_destination": Site(
         1, OPERATOR, "A fixed probe name in the operator's backup destination."
     ),
+    "messagefoundry/pipeline/dr_backup.py::_Staging.owner": Site(
+        1,
+        INTERNAL,
+        "The fixed lock name in this run's staging directory, never opened: the owner is read "
+        "from the descriptor (BACKLOG #4988).",
+    ),
     "messagefoundry/pipeline/dr_backup.py::_empty_files_in_place": Site(
         3,
         INTERNAL,
         "Names from walking a staging directory this module made, never through a link; each "
         "file is then opened without following one (BACKLOG #2420).",
     ),
+    "messagefoundry/pipeline/dr_backup.py::_win_held_walk": Site(
+        1,
+        INTERNAL,
+        "A subdirectory name listed from a staging directory this module made, while that "
+        "directory is held; the child is then opened as itself and refused if it names another "
+        "path (BACKLOG #4992).",
+    ),
     "messagefoundry/pipeline/dr_backup.py::_fd_walk": Site(
         1,
         REVIEWED,
         "Display path for a directory listed by descriptor; every open goes by name relative to "
         "the parent's descriptor with O_NOFOLLOW, never through this path (BACKLOG #2420).",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_extract_config_members": Site(
+        1,
+        GUARDED,
+        "Each archive member name passes the guard, then a resolved-path containment backstop.",
+        "messagefoundry/parsing/sniff.py::archive_member_name_reason",
+        called=True,
     ),
     "messagefoundry/pipeline/dr_backup.py::_extract_member": Site(
         1, INTERNAL, "A fixed name in a destination this module chose."
@@ -718,13 +745,6 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::_restore_blocking": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."
     ),
-    "messagefoundry/pipeline/dr_backup.py::_restore_config_members": Site(
-        1,
-        GUARDED,
-        "Each archive member name passes the guard, then a resolved-path containment backstop.",
-        "messagefoundry/parsing/sniff.py::archive_member_name_reason",
-        called=True,
-    ),
     "messagefoundry/pipeline/dr_backup.py::_staging_root_for": Site(
         1, INTERNAL, "A fixed directory name under the operator's destination."
     ),
@@ -738,6 +758,12 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::_tree_size": Site(
         1, INTERNAL, "Names from walking a directory this module measures; lstat only."
     ),
+    "messagefoundry/pipeline/dr_backup.py::_win_create_owner_probe": Site(
+        1,
+        INTERNAL,
+        "A fixed prefix and random hex under the root its caller names; CREATE_NEW with "
+        "FILE_FLAG_OPEN_REPARSE_POINT refuses a name already taken, by a file or a link.",
+    ),
     "messagefoundry/pipeline/dr_backup.py::_verify_in_staging": Site(
         1, INTERNAL, "A fixed name in a staging directory this module made."
     ),
@@ -748,10 +774,19 @@ SITES: dict[str, Site] = {
         "it for a link or a junction and, when pruned, named in the caller's WARNING (BACKLOG "
         "#5221).",
     ),
+    "messagefoundry/pipeline/engine.py::Engine._value_file_folders": Site(
+        2,
+        REVIEWED,
+        "A file link's own target, joined to the real folder holding the link, and that hop's "
+        "name re-joined to its own resolved folder, to name the folder the vet checks before "
+        "the value file is read. The walk lstats each joined hop and reads its link target "
+        "before that vet runs; no file's contents are read or written through either join "
+        "(vault BACKLOG #2596).",
+    ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
         1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."
     ),
-    "messagefoundry/scaffold.py::scaffold": Site(
+    "messagefoundry_toolkit/scaffold.py::scaffold": Site(
         1, INTERNAL, "Template paths from the module's own table, under the operator's target."
     ),
     "messagefoundry/security/__init__.py::handler_semgrep_rules": Site(
@@ -777,6 +812,12 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/startupcode.py::_pth_items": Site(
         1, INTERNAL, "`.pth` names from listing a site-packages directory, to inventory them."
+    ),
+    "messagefoundry/store/custody.py::read_systemd_credential": Site(
+        1,
+        OPERATOR,
+        "The credential name the caller configures, refused unless it is a plain file name, under "
+        "the directory systemd names in $CREDENTIALS_DIRECTORY.",
     ),
     "messagefoundry/store/store.py::MessageStore._db_size_bytes": Site(
         1, OPERATOR, _SQLITE_SIDECARS
@@ -966,7 +1007,7 @@ IDE_SITES: dict[str, Site] = {
     ),
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/sourceControl.ts": Site(7, OPERATOR, _IDE_WORKSPACE),
-    "ide/src/statusBar.ts": Site(2, OPERATOR, _IDE_WORKSPACE),
+    "ide/src/statusBar.ts": Site(4, OPERATOR, _IDE_WORKSPACE),
     "ide/src/stepsView.ts": Site(3, OPERATOR, _IDE_WORKSPACE + " Two are fixed media names."),
     "ide/src/symbolIndex.ts": Site(
         1, OPERATOR, "Names from listing the operator's config directory."

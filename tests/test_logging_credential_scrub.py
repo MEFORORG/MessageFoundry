@@ -198,7 +198,12 @@ QUOTED_FAMILIES: tuple[Family, ...] = tuple(
         name=f"quoted_{case.name}",
         line=case.line,
         secret=case.fragments[-1],
-        patterns=("_CREDENTIAL_KV",),
+        # An ODBC line's ``;PWD=`` member is hidden by the connection-string member pass too (BACKLOG
+        # #5030), so a family over one declares both, or disabling one leaves the other doing the work.
+        patterns=(
+            "_CREDENTIAL_KV",
+            *(("_CONNECTION_STRING_MEMBER",) if ";PWD=" in case.line else ()),
+        ),
     )
     for case in QUOTED_VALUES
 )
@@ -271,7 +276,14 @@ FAMILIES: tuple[Family, ...] = (
         name="odbc_pwd",
         line="odbc conn Driver={ODBC Driver 18};UID=svc;PWD=wt-0dbc_Pass-60;",
         secret="wt-0dbc_Pass-60",
-        patterns=("_CREDENTIAL_KV",),
+        patterns=("_CREDENTIAL_KV", "_CONNECTION_STRING_MEMBER"),
+    ),
+    Family(
+        # A key glued to its credential word, which no label pattern reads (BACKLOG #5030).
+        name="connection_string_member",
+        line="odbc conn Driver={ODBC Driver 18};UID=svc;sslpassword=wt-Ss1_Memb-92 x;Server=db",
+        secret="wt-Ss1_Memb-92",
+        patterns=("_CONNECTION_STRING_MEMBER",),
     ),
     Family(
         name="dsn_inline_password",
@@ -310,7 +322,11 @@ def test_the_production_filter_chain_scrubs_every_credential_family(fam: Family)
     """The value must not survive the chain, and the reader must see that redaction happened."""
     out = run_chain(fam.line).getMessage()
     assert fam.secret not in out, f"{fam.name}: the credential survived the chain -- got {out!r}"
-    assert CREDENTIAL_PLACEHOLDER in out, f"{fam.name}: nothing was marked redacted -- got {out!r}"
+    # The member pass masks each word of a value with a bare word and no brackets, so a later pass
+    # reads the same separators (BACKLOG #5030); that word after the "=" is its mark.
+    member_only = fam.patterns == ("_CONNECTION_STRING_MEMBER",)
+    marker = f"={secretscrub._MEMBER_MASK}" if member_only else CREDENTIAL_PLACEHOLDER
+    assert marker in out, f"{fam.name}: nothing was marked redacted -- got {out!r}"
 
 
 @pytest.mark.parametrize("fam", FAMILIES, ids=lambda f: f.name)

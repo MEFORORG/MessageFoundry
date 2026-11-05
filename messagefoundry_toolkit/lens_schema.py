@@ -6,10 +6,10 @@ The analyst-facing half of ADR 0076 §5 (editable params): the Steps editor rend
 per editable call argument. Rather than hand-maintain a per-op input table IDE-side (a second source
 of truth that drifts from the signatures), the engine emits the widget schema **derived from the
 action + diagnostic signatures** — the same "the engine owns the grammar so it lives beside the
-vocabulary; the IDE consumes the JSON contract only" split :mod:`messagefoundry.lens` already follows.
+vocabulary; the IDE consumes the JSON contract only" split :mod:`messagefoundry_toolkit.lens` already follows.
 
 The schema is a sibling of :mod:`messagefoundry.hl7schema` — a stdout JSON-schema emitter, shelled by
-the IDE as ``messagefoundry lens schema --json``. It adds **no runtime dependency** (ADR 0076 §6.5
+the IDE as ``messagefoundry-toolkit lens schema --json``. It adds **no runtime dependency** (ADR 0076 §6.5
 forbids one in phases 1-2): stdlib :mod:`inspect` + :mod:`typing` only.
 
 Two sources are covered, so no row kind bypasses the schema-driven renderer:

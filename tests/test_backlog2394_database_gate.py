@@ -81,14 +81,6 @@ class _ClosingPool(Pool):
         assert await wait_until(lambda: self.returned), "the borrowed connection never came back"
 
 
-class _RollbackRefused(RawConn):
-    """A connection whose rollback the stand-in server refuses."""
-
-    def rollback(self) -> None:
-        self.note("rollback:refused")
-        raise RuntimeError("refused by the stand-in server")
-
-
 @dataclass
 class _Rig:
     executor: ThreadPoolExecutor
@@ -118,13 +110,18 @@ async def rig() -> AsyncIterator[_Rig]:
 
 
 def _aioodbc_serving(
-    monkeypatch: pytest.MonkeyPatch, rig: _Rig, *, gateable: bool = True, **raw_kw: Any
+    monkeypatch: pytest.MonkeyPatch,
+    rig: _Rig,
+    *,
+    gateable: bool = True,
+    pool_type: type[_ClosingPool] = _ClosingPool,
+    **raw_kw: Any,
 ) -> None:
-    """Stand ``aioodbc`` in: each ``create_pool`` hands out a pool over one aioodbc-shaped
+    """Stand ``aioodbc`` in: each ``create_pool`` hands out a ``pool_type`` over one aioodbc-shaped
     connection on ``rig``'s executor, recorded in ``rig.pools``."""
 
     async def create_pool(**kwargs: Any) -> _ClosingPool:
-        pool = _ClosingPool(AioConn(rig.raw(**raw_kw), rig.executor, gateable=gateable))
+        pool = pool_type(AioConn(rig.raw(**raw_kw), rig.executor, gateable=gateable))
         rig.pools.append(pool)
         return pool
 
@@ -216,28 +213,6 @@ async def test_a_cancelled_source_mark_frees_nothing_until_its_statement_returns
     _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == _MARK)
     await _cancel_mid_statement(monkeypatch, rig, _source()._mark({"code": "A", "value": "1"}))
     assert rig.log.index("autocommit:end") < rig.log.index("execute:start"), rig.log
-
-
-async def test_a_cancelled_send_whose_rollback_fails_still_returns_its_connection(
-    monkeypatch: pytest.MonkeyPatch, rig: _Rig, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A refused rollback is logged, and the connection still goes back open: dropping its handle
-    would leave a waiting borrower or pool close unwoken, since aioodbc wakes neither for a
-    closed connection."""
-    _aioodbc_serving(monkeypatch, rig, raw_type=_RollbackRefused, blocks=lambda s: s == _INSERT)
-    task = await cancel_once_started(rig.started, _destination().send('{"a": 1}'))
-    done, _pending = await asyncio.wait({task}, timeout=1.0)
-    assert done, "the cancellation waited for the running statement"
-
-    with caplog.at_level("WARNING", logger="messagefoundry.transports.database"):
-        rig.release.set()
-        assert await wait_until(lambda: rig.pools[0].free == [rig.conn]), "it never went back"
-
-    assert USE_AFTER_FREE not in rig.log, rig.log
-    end = rig.log.index("execute:end")
-    assert end < rig.log.index("cursor.close") < rig.log.index("rollback:refused"), rig.log
-    assert not rig.conn.closed and "conn.close" not in rig.log, rig.log
-    assert "rollback after a cancelled statement failed" in caplog.text
 
 
 async def test_an_ungated_connection_gets_no_rollback_beside_its_statement(

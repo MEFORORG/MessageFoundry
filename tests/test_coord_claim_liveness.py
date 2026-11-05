@@ -345,6 +345,42 @@ def test_the_third_state_does_not_recommend_force_on_a_release(
     assert "Safe to take over" not in proc.stdout
 
 
+R8_POINTER = "OWNER RULING R8"
+
+
+def test_the_third_state_names_ledger_ruling_R8_and_still_refuses(
+    repo_with_occupancy: Path, tmp_path: Path
+) -> None:
+    """Ledger ruling R8 (owner-signed 2026-11-04) is pointed at where no session was placed.
+
+    The pointer is help text, not a licence: both verbs still refuse, and no runnable -Force recipe
+    appears beside it.
+    """
+    peer_holding(repo_with_occupancy, tmp_path, "k")
+    for verb in (["-Take", "k", "-Note", "mine now"], ["-Release", "k"]):
+        proc = claim(repo_with_occupancy, *verb)
+        assert proc.returncode != 0
+        assert "A DIRECTORY, NOT A SESSION" in proc.stdout
+        assert R8_POINTER in proc.stdout, proc.stdout
+        assert "-Release k -Force" not in proc.stdout
+
+
+def test_ledger_ruling_R8_is_not_named_where_occupancy_is_unknown_or_the_holder_is_gone(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The polarity rule: a probe that could not look must not earn the pointer, and a vanished
+    holder already has its own remedy."""
+    peer = peer_holding(repo, tmp_path, "k")
+    for verb in (["-Take", "k", "-Note", "mine now"], ["-Release", "k"]):
+        proc = claim(repo, *verb)
+        assert "OCCUPANCY UNKNOWN" in proc.stdout
+        assert R8_POINTER not in proc.stdout, proc.stdout
+    orphan(repo, peer)
+    proc = claim(repo, "-Take", "k", "-Note", "mine now")
+    assert "HOLDER GONE" in proc.stdout
+    assert R8_POINTER not in proc.stdout, proc.stdout
+
+
 def test_a_vanished_holder_still_outranks_the_third_state(
     repo_with_occupancy: Path, tmp_path: Path
 ) -> None:

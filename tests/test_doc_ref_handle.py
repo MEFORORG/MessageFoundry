@@ -10,13 +10,20 @@ three-way discrimination (ref vs pruned-tombstone vs plain value). Mirrors ``tes
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import string
 
 import pytest
 
 from messagefoundry.parsing.binary import (
+    _BASE64_ALPHABET,
+    _HEX64,
+    _HEX64_ANYCASE,
+    _SHA256_HEX_LEN,
     DOC_REF_MARKER,
     DocRefError,
+    _copy_names_address,
     is_doc_ref,
     is_document_tombstone,
     is_marked,
@@ -24,6 +31,7 @@ from messagefoundry.parsing.binary import (
     make_document_tombstone,
     parse_doc_ref,
 )
+from messagefoundry.parsing.message import Message
 
 SHA = hashlib.sha256(b"a base64 pdf the partner sent, verbatim").hexdigest()
 
@@ -84,3 +92,61 @@ def test_parse_doc_ref_rejects_non_ref_and_malformed() -> None:
         parse_doc_ref(f"{DOC_REF_MARKER}{SHA}")  # missing content-type
     with pytest.raises(DocRefError):
         parse_doc_ref(f"{DOC_REF_MARKER}deadbeef:application/pdf")  # content address not 64-hex
+
+
+def test_the_content_address_shape_is_defined_once() -> None:
+    # _HEX64 and _HEX64_ANYCASE are literals so the ReDoS scan reads them, which leaves several
+    # spellings of one shape: the length and the two patterns. They must agree with the handle
+    # parser: _HEX64 is what make_doc_ref and parse_doc_ref accept after lowercasing, and
+    # _HEX64_ANYCASE is what parse_doc_ref accepts before it, which the copy scan reads.
+    for code in range(128):
+        c = chr(code)
+        assert bool(_HEX64.fullmatch(c * _SHA256_HEX_LEN)) is (c in "0123456789abcdef"), repr(c)
+        anycase = bool(_HEX64_ANYCASE.fullmatch(c * _SHA256_HEX_LEN))
+        assert anycase is (c in string.hexdigits), repr(c)
+    for pattern in (_HEX64, _HEX64_ANYCASE):
+        assert not pattern.fullmatch("0" * (_SHA256_HEX_LEN - 1))
+        assert not pattern.fullmatch("0" * (_SHA256_HEX_LEN + 1))
+    assert len(SHA) == _SHA256_HEX_LEN
+
+
+def test_the_base64_alphabet_is_what_the_encoder_writes() -> None:
+    # The delimiter-class rule (BACKLOG #5099) refuses a message naming any character a base64
+    # value or a content address can hold. Every byte value, in every position of a group of
+    # three, plus the padding, covers the whole alphabet the encoder writes.
+    written = set(base64.b64encode(bytes(range(256)) * 3).decode("ascii"))
+    written |= set(base64.b64encode(b"x").decode("ascii"))  # "=" padding
+    assert written == _BASE64_ALPHABET
+    assert set(string.hexdigits) <= _BASE64_ALPHABET
+    # The ordinary delimiters, and the common fifth MSH-2 characters, are outside it.
+    assert _BASE64_ALPHABET.isdisjoint("|^~\\&#!")
+
+
+def test_copy_names_address_needs_64_hex_right_after_the_marker() -> None:
+    # The scan delivery uses to tell a handle copy from a bare marker (BACKLOG #5099): the marker,
+    # at any occurrence, immediately followed by 64 hex characters in either case, since
+    # parse_doc_ref lowercases an address before it reads it.
+    assert _copy_names_address(f"x {DOC_REF_MARKER}{SHA} y", DOC_REF_MARKER)
+    assert _copy_names_address(f"{DOC_REF_MARKER}{SHA}0", DOC_REF_MARKER)  # no terminator needed
+    assert not _copy_names_address(f"{DOC_REF_MARKER}{SHA[:63]}", DOC_REF_MARKER)
+    assert not _copy_names_address(f"{DOC_REF_MARKER}{SHA[:63]}:x", DOC_REF_MARKER)
+    assert _copy_names_address(f"{DOC_REF_MARKER}{SHA.upper()}", DOC_REF_MARKER)
+    assert parse_doc_ref(f"{DOC_REF_MARKER}{SHA.upper()}:x")[0] == SHA  # the same address
+    assert not _copy_names_address(f"{DOC_REF_MARKER}{SHA.upper()[:63]}G", DOC_REF_MARKER)
+    assert not _copy_names_address(f"a {SHA} b", DOC_REF_MARKER)  # marker absent
+    assert not _copy_names_address(f"{DOC_REF_MARKER} {SHA}", DOC_REF_MARKER)
+    # A first hit naming no address does not hide a later one that does.
+    assert _copy_names_address(
+        f"{DOC_REF_MARKER}nothing then {DOC_REF_MARKER}{SHA}", DOC_REF_MARKER
+    )
+    # Overlapping hits are each checked: in "a:a:a<sha>" the marker "a:a" starts at 0, followed by
+    # ":a", and again at 2, followed by the address. A scan resuming past the first hit misses it.
+    assert _copy_names_address(f"a:a:a{SHA}", "a:a")
+    # The marker as a payload's delimiters escape it, which is what delivery passes: under a ":"
+    # component separator the copy carries the escaped marker. A raw marker beside it naming no
+    # address is not a copy, so only the escaped search finds one.
+    escaped = Message._escape_leaf(DOC_REF_MARKER, "|", ":", "~", "\\", "&")
+    assert escaped != DOC_REF_MARKER
+    body = f"NTE|1||{DOC_REF_MARKER}x|{escaped}{SHA}\\S\\application/pdf"
+    assert _copy_names_address(body, escaped)
+    assert not _copy_names_address(body, DOC_REF_MARKER)

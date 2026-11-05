@@ -542,6 +542,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # DEK with the store salt in `info`, computed as its RFC 5869 HMAC steps so the cipher keeps an
     # OpenSSL HMAC context rather than the DEK; still the same two imports.
     "messagefoundry/store/crypto.py": frozenset({"hashlib", "cryptography"}),
+    # Vault BACKLOG #3411 (key custody, slice S3): the custody primitives. cryptography = the
+    # recovery wrap, AES-256-GCM under HKDF-SHA256 of the recovery key with the store id in the
+    # associated data; hashlib = the SHA-256 recovery-key checksum; hmac = compare_digest for that
+    # checksum and for key equality. The master key is minted from os.urandom.
+    "messagefoundry/store/custody.py": frozenset({"cryptography", "hashlib", "hmac"}),
     # ASVS 11.3.4 (#301): the persisted per-key_id AES-GCM invocation bound (cipher_meta table) reads
     # the cipher reserve-block size + AesGcmCipher/Cipher types through the store.crypto seam. ADR 0196
     # adds the store-salt bind at open, which draws a candidate salt through new_store_salt.
@@ -900,7 +905,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # alert_sinks also imports smtplib: the alert SMTP hop's STARTTLS posture. This is the file
     # BACKLOG #1323 named as the worked example of a seam the store-only set could not match.
     "messagefoundry/pipeline/alert_sinks.py": frozenset({"messagefoundry.config.tls_policy"}),
-    "messagefoundry/pipeline/engine.py": frozenset({"messagefoundry.config.tls_policy"}),
+    # Vault BACKLOG #2596: engine.py also reaches store.crypto for the keyed binding a reload hold
+    # takes of the environment value file. See its operation row.
+    "messagefoundry/pipeline/engine.py": frozenset(
+        {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto"}
+    ),
     # Vault BACKLOG #2354: stamps the instance hop posture around the DatabaseRef DSN build, so the
     # weakened-TLS escape is clamped exactly as the db_lookup executor's is. Builds no context.
     "messagefoundry/pipeline/reference_sync.py": frozenset({"messagefoundry.config.tls_policy"}),
@@ -1035,6 +1044,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:ssl.create_default_context",
         }
     ),
+    # ADR 0201 slice 4: the toolkit's `impact` loads the config graph with load_config, which digests
+    # each module it loads (vault BACKLOG #2724). The toolkit computes no digest of its own.
+    "messagefoundry_toolkit/__main__.py": frozenset({"hash:via messagefoundry.config.wiring"}),
     # ADR 0197 Amendment A (N-A): provision-admin generates the first Administrator's TOTP secret
     # and checks the code read back at the terminal, through the first-party totp module (the
     # secret from the CSPRNG, the code by HMAC and a constant-time compare), before any store write.
@@ -1104,6 +1116,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/api/security.py": frozenset(
         {"key_cert:via messagefoundry.pipeline.cert_expiry"}
     ),
+    # BACKLOG #4907: the mTLS shim reads a client leaf's DER through pki.peer_othernames_intact, so
+    # an otherName ssl cut at a NUL is never matched. A public certificate only; no key.
+    "messagefoundry/api/tls_client_cert.py": frozenset({"key_cert:via messagefoundry.pki"}),
     "messagefoundry/api/tls.py": frozenset(
         {
             "sign_verify:via messagefoundry.config.tls_policy",
@@ -1381,6 +1396,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "compare:hmac.compare_digest",
             "compare:via messagefoundry.store.backup_codec",  # BACKLOG #1167: the key_id match
             "csprng:via messagefoundry.store.backup_codec",
+            # BACKLOG #4988: the Windows owner probe's name, unguessable so another account cannot
+            # pre-create every candidate and keep the probe from being made. No key material.
+            "csprng:os.urandom",
             "hash:hashlib.sha256",
             "hash:via messagefoundry.config.fingerprint",
             "hash:via messagefoundry.store.backup_codec",
@@ -1402,6 +1420,17 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:via messagefoundry.pipeline.secret_rotation",
             "csprng:via messagefoundry.pipeline.secret_rotation",
             "mac:via messagefoundry.pipeline.secret_rotation",
+            # BACKLOG #4942: audit_chain_rolled names the active audit key by its one-way id
+            # (audit_active_key_id) to compare it with the chain's newest range. No key leaves it.
+            "hash:via messagefoundry.store.store",
+            # Vault BACKLOG #2596: a dual-control reload hold binds the environment value file with
+            # config_value_file_mac (HKDF off the audit-chain key, then HMAC-SHA256; the hash is
+            # audit_key_id), and a release checks it with verify_config_value_file_mac. The
+            # INVENTORY row "Reload hold value-file binding" says why it is keyed.
+            "hash:via messagefoundry.store.crypto",
+            "kdf:via messagefoundry.store.crypto",
+            "mac:via messagefoundry.store.crypto",
+            "sign_verify:via messagefoundry.store.crypto",
         }
     ),
     "messagefoundry/pipeline/sandbox.py": frozenset({"csprng:secrets.token_hex"}),
@@ -1513,6 +1542,21 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.encrypt_data()",
             "mac:.generate_hmac()",
             "tls_context:via messagefoundry.store.keyprovider_vault",
+        }
+    ),
+    # Vault BACKLOG #3411: mints the master key, store id and recovery key (os.urandom); wraps and
+    # opens the master key under AES-256-GCM keyed by HKDF-SHA256 of the recovery key; checks a
+    # typed recovery key's SHA-256 checksum and compares keys in constant time.
+    "messagefoundry/store/custody.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:cryptography.hazmat.primitives.ciphers.aead.AESGCM",
+            "compare:hmac.compare_digest",
+            "csprng:os.urandom",
+            "hash:hashlib.sha256",
+            "kdf:.derive()",
+            "kdf:cryptography.hazmat.primitives.kdf.hkdf.HKDF[sha256]",
         }
     ),
     # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.
@@ -1701,6 +1745,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.credential",
             # BACKLOG #1142, slice 3: the listener's mTLS CA goes through mllp's context builder.
             "hash:via messagefoundry.transports.mllp",
+            # BACKLOG #4907: pki.peer_othernames_intact reads the client leaf's DER for the
+            # intake_client_subjects match. A public certificate only; no key.
+            "key_cert:via messagefoundry.pki",
             "key_cert:via messagefoundry.transports.mllp",
             "tls_context:via messagefoundry.transports.mllp",
         }
@@ -1713,10 +1760,16 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.auth.trust_anchors",
             "key_cert:via messagefoundry.config.tls_policy",
             "key_cert:via messagefoundry.keywrap",
+            # BACKLOG #4907: pki.peer_othernames_intact reads the sender leaf's DER for the
+            # tls_client_subjects match. A public certificate only; no key.
+            "key_cert:via messagefoundry.pki",
             "tls_context:.check_hostname =",
             "tls_context:.check_hostname = False",
             "tls_context:.load_verify_locations()",
             "tls_context:.minimum_version = TLSv1_2",
+            # BACKLOG #4907: the inbound listener with tls_client_subjects refuses renegotiation,
+            # so a TLS 1.2 client cannot present another certificate after the subject check.
+            "tls_context:.options |= OP_NO_RENEGOTIATION",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:.verify_mode = CERT_REQUIRED",
             "tls_context:ssl.SSLContext",

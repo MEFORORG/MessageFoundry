@@ -13,6 +13,7 @@ Three layers, each with a control that must give the opposite answer:
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import sys
@@ -196,6 +197,14 @@ def test_an_access_list_that_could_not_be_read_is_a_problem() -> None:
     assert "in full" in str(
         restricted_file._windows_access_problem(_WinPathSecurity(owner_sid=_CREATOR))
     )
+
+
+def test_a_package_sid_is_told_apart_from_an_account() -> None:
+    # Vault BACKLOG #3411: a key file is never granted to an AppContainer package or capability.
+    assert restricted_file._is_package_sid("S-1-15-2-1")
+    assert restricted_file._is_package_sid("s-1-15-3-1024-1")
+    assert not restricted_file._is_package_sid("S-1-5-19")  # the control: LOCAL SERVICE
+    assert not restricted_file._is_package_sid("S-1-5-80-1234")  # a service SID
 
 
 def test_the_posix_check_is_the_group_and_other_read_and_write_bits() -> None:
@@ -421,6 +430,21 @@ def test_posix_raises_and_leaves_nothing_when_the_mode_does_not_read_back(
 
 
 @posix_only
+def test_posix_raises_restricted_and_leaves_nothing_when_the_mode_cannot_be_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # vfat and exFAT keep no modes and refuse the chmod with a plain OSError.
+    def refusing(fd: int, mode: int) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "fchmod", refusing)
+    path = tmp_path / "store.key"
+    with pytest.raises(RestrictedFileError, match="mode could not be set"):
+        write_restricted_file(path, b"KEY-MATERIAL-STAND-IN")
+    assert not path.exists()
+
+
+@posix_only
 def test_posix_refuses_a_read_grant_it_cannot_honour(tmp_path: Path) -> None:
     path = tmp_path / "store.key"
     with pytest.raises(RestrictedFileError, match="Windows only"):
@@ -513,18 +537,18 @@ def test_the_protected_store_key_is_written_through_the_restricted_create(
     _secure_file_must_not_run(monkeypatch)
     seen = _allow_the_create(monkeypatch)
     out = tmp_path / "store.key.dpapi"
-    dpapi_mod.protect_key_to_file("QUJD", out, read_grants=["*S-1-5-18"])
+    dpapi_mod.protect_key_to_file("QUJD", out, machine_scope=True, read_grants=["*S-1-5-18"])
     assert out.read_bytes() == b"BLOB:QUJD"
     assert seen["grants"] == ["*S-1-5-18"]
 
     # An existing file is refused and left as it was, where the old write replaced it.
     with pytest.raises(FileExistsError):
-        dpapi_mod.protect_key_to_file("WFla", out)
+        dpapi_mod.protect_key_to_file("WFla", out, machine_scope=True)
     assert out.read_bytes() == b"BLOB:QUJD"
 
     _refuse_the_create(monkeypatch)
     with pytest.raises(RestrictedFileError):
-        dpapi_mod.protect_key_to_file("QUJD", tmp_path / "refused.dpapi")
+        dpapi_mod.protect_key_to_file("QUJD", tmp_path / "refused.dpapi", machine_scope=True)
 
 
 # --- protect-key ----------------------------------------------------------------------------------

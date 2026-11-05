@@ -117,6 +117,7 @@ __all__ = [
     "RestDestination",
     "ech_readdressed_request",
     "capture_response_headers",
+    "ech_sidecar_is_cleartext",
     "ech_sidecar_url_from_settings",
     "egress_route_from_settings",
     "proxy_auth_handler_from_settings",
@@ -475,11 +476,13 @@ def _expiry_relaxed_opener(
     *extra_handlers: urllib.request.BaseHandler,
     trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
 ) -> urllib.request.OpenerDirector:
-    """A no-redirect opener that verifies chain + hostname but tolerates an EXPIRED server cert (#129,
-    ADR 0094). Built per connection (not the shared module-level verifying opener) only when
-    ``tls_allow_expired=true``: it starts from the same verifying default context (OS trust store,
-    ``check_hostname=True``) and relaxes ONLY the validity-period check via
-    :func:`~messagefoundry.config.tls_policy.relax_verify_expiry`. Verification stays ON, so this is the
+    """A no-redirect opener that verifies the chain's signatures + hostname but tolerates an EXPIRED
+    server cert (#129, ADR 0094). Built per connection (not the shared module-level verifying opener)
+    only when ``tls_allow_expired=true``: it starts from the same verifying default context (OS trust
+    store, ``check_hostname=True``) and relaxes the validity-period checks via
+    :func:`~messagefoundry.config.tls_policy.relax_verify_expiry` -- at least the leaf's, the
+    intermediates' and the trust anchor's, and a CRL's own window (vault BACKLOG #5089), not the
+    leaf's alone. Verification stays ON, so this is the
     granular alternative to ``verify_tls=false`` — a MITM-able peer (wrong host / untrusted chain) is
     still rejected. Shared verbatim by the SOAP destination.
 
@@ -488,7 +491,8 @@ def _expiry_relaxed_opener(
     tolerance and anchor narrowing are independent — relaxing the validity window never widens the
     trust store, and vice versa."""
     ctx = build_verifying_client_context(trust_anchor)
-    relax_verify_expiry(ctx, host=host)  # chain + hostname stay enforced; only expiry is relaxed
+    # The chain's signatures + hostname stay enforced; the validity windows do not (BACKLOG #5089).
+    relax_verify_expiry(ctx, host=host)
     narrow_to_approved_suites(ctx)  # approved AEAD default (BACKLOG #300)
     harden_cipher_suites(ctx, connector="HTTP-family destination (expired-certificate tolerance)")
     return build_strict_opener(
@@ -1587,7 +1591,9 @@ def refuse_unrevoked_verified_hop(
       the loopback sidecar and the sidecar verifies the real peer, so no context the engine holds
       checks that peer's certificate (vault BACKLOG #2188 for the REST destination, #2169 for the
       SMART and OAuth2 token hop).
-    - An opener built with ``tls_allow_expired`` (ADR 0094). ``None`` is required there too.
+    - An opener built with ``tls_allow_expired`` (ADR 0094). ``None`` was required there too until
+      vault BACKLOG #5086, since when ``capture`` gives such a context's CRL no credit itself, so
+      passing the opener gives the same disposition; the shipped callers still pass ``None``.
       :func:`~messagefoundry.config.tls_policy.relax_verify_expiry` sets
       ``X509_V_FLAG_NO_CHECK_TIME`` on its context, and OpenSSL applies that flag to a CRL's
       validity window as well as the certificate's: a CRL past ``nextUpdate`` is then accepted at
@@ -2076,8 +2082,10 @@ class ProxyConfig:
             return LoopbackDirectProxyHandler()  # reads getproxies() (+ system no_proxy) fresh
         # A credential is here only because it passed the posture-keyed guard in
         # proxy_auth_handler_from_settings, so the handler may let that caller-set header across a
-        # cleartext proxy leg: the one exception bounded_read.ProxyCredentialsRefusedError states
-        # (vault BACKLOG #3416). An unverified TLS leg is refused regardless.
+        # cleartext proxy leg or a TLS leg that fully verifies the proxy: the one exception
+        # bounded_read.ProxyCredentialsRefusedError states (vault BACKLOG #3416). On that TLS leg
+        # every other credential is refused (vault BACKLOG #4909). An unverified TLS leg is
+        # refused regardless.
         return LoopbackDirectProxyHandler(
             dict(self.proxies),
             caller_header_admitted=admitted and bool(self.auth_header or self.digest),
@@ -2225,8 +2233,9 @@ def proxy_auth_handler_from_settings(
     CONNECT tunnel; digest-over-CONNECT is unsupported). NTLM/Windows → **refused** (deferred, ADR 0126).
     So the credential is judged as crossing in cleartext whatever the proxy's scheme, by the ONE
     posture-keyed authority (:func:`_enforce_shipped_hop`), REGARDLESS of destination
-    scheme (vault BACKLOG #3416). A credential that passes it may cross the cleartext proxy leg at
-    send, the one exception ``bounded_read.ProxyCredentialsRefusedError`` states. Unlike the
+    scheme (vault BACKLOG #3416). A credential that passes it may cross the proxy leg at send, a
+    cleartext one or a TLS one that fully verifies the proxy: the one exception
+    ``bounded_read.ProxyCredentialsRefusedError`` states. Unlike the
     destination's own credentials (:func:`refuse_cleartext_credential_hop`, vault BACKLOG #3533
     item 4), this leg can be declared, with ``cleartext_accepted`` and a reason alone.
     ``docs/CONNECTIONS.md`` states the owner's rulings on this credential (vault BACKLOG #3007)."""
@@ -2523,10 +2532,11 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     recovers it — ADR 0139.) It is
     NOT a forward proxy: a proxy would tunnel ``https`` via CONNECT and the engine's own non-ECH
     ClientHello would still leak the SNI. Instead the REST destination sends its request to the sidecar
-    over **cleartext loopback** with the real destination in the ``Host`` header (see
+    over **loopback** with the real destination in the ``Host`` header (see
     :meth:`RestDestination._ech_request`), and the sidecar re-originates the ``https`` + ECH connection —
     verifying the upstream cert. So **destination TLS (verification + ECH) is delegated to the sidecar**;
-    the engine→sidecar hop is same-host cleartext (ADR 0092 loopback posture).
+    the engine→sidecar hop is same-host (ADR 0092 loopback posture), and cleartext on an ``http``
+    sidecar, a listed loosening (:func:`ech_sidecar_is_cleartext`).
 
     Config fails closed: ``ech_egress`` set with no ``ech_sidecar`` raises, and a **non-loopback** sidecar
     is refused (a remote "sidecar" would leak the SNI on the hop to it, defeating the purpose).
@@ -2559,6 +2569,18 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
             "sidecar would leak the SNI on the hop to it, defeating the purpose) (ADR 0139)"
         )
     return sidecar.rstrip("/")
+
+
+def ech_sidecar_is_cleartext(sidecar: str) -> bool:
+    """Whether a sidecar URL :func:`ech_sidecar_url_from_settings` accepted is cleartext ``http``.
+
+    The one rule the construction WARNING in :class:`RestDestination` and the
+    ``config.wiring.ech_cleartext_sidecar_hops`` reader apply. It reads the scheme by the split the
+    resolver used, never a string prefix, so the two cannot read one value differently. What such
+    a hop carries, and why it is listed although it is loopback, is in
+    ``docs/SECURITY-LOOSENING.md``."""
+    parsed = _split_or_refuse(sidecar, "ech_sidecar", use=_URL_CREDENTIAL_USE, error=ValueError)
+    return parsed.scheme == "http"
 
 
 def ech_readdressed_request(
@@ -2760,8 +2782,9 @@ class RestDestination(DestinationConnector):
             )
         verify = bool_setting(s, "verify_tls", default=True)
         if verify:
-            # #129 (ADR 0094): granular expiry-only relaxation — verify chain + hostname but tolerate an
-            # expired server cert (opt-in; default off = the shared verifying opener, byte-identical). It
+            # #129 (ADR 0094): granular expiry-only relaxation — verify the chain's signatures + hostname
+            # but tolerate an expired server cert, and at least the other chain certificates' and a CRL's
+            # validity windows (opt-in; default off = the shared verifying opener, byte-identical). It
             # keeps verification ON, so it is NOT an insecure hop in the #200 sense (no refusal keys on it).
             # #1180 (ADR 0093): the client trust anchor for this https hop.
             anchor = http_family_trust_anchor(
@@ -2825,8 +2848,9 @@ class RestDestination(DestinationConnector):
         self._connection_name = config.name
         self._header_rule = dynamic_header_rule(scheme, self.url, verify_tls=verify)
         if self._ech_sidecar is not None:
-            # ECH mode (ADR 0139): the engine->sidecar hop is cleartext http over loopback (the sidecar
-            # owns destination TLS + ECH + cert verification), so a plain no-redirect opener carries it —
+            # ECH mode (ADR 0139): the engine->sidecar hop is loopback, cleartext on an http sidecar (the
+            # sidecar owns destination TLS + ECH + cert verification), so a plain no-redirect opener
+            # carries it —
             # never the verify/proxy/insecure opener built above for a direct destination hop.
             # The empty proxy map keeps any proxy handler off this opener (vault BACKLOG #2579). The
             # loopback rule alone already dials every accepted sidecar direct, so this adds no
@@ -2853,6 +2877,18 @@ class RestDestination(DestinationConnector):
                 opener=None if no_crl_evidence else self._opener,
                 ways_across=ECH_HOP_WAYS_ACROSS if self._ech_sidecar is not None else None,
                 connection=config.name,
+            )
+        if self._ech_sidecar is not None and ech_sidecar_is_cleartext(self._ech_sidecar):
+            # After every refusal above, so only a connection that builds is recorded. Names the
+            # connection and never a header value (docs/SECURITY-LOOSENING.md, `ech_sidecar`).
+            logger.warning(
+                "cleartext ECH sidecar hop — connection %s; the engine-to-sidecar hop is http on "
+                "this host, so the request body and every request header, any credential included, "
+                "cross it unencrypted, and on a SMART or OAuth2 connection so does the token-endpoint "
+                "request with its client credential; the sidecar does the partner TLS (ADR 0139). "
+                "An https sidecar listener encrypts this hop; see docs/SECURITY-LOOSENING.md, "
+                "ech_sidecar",
+                audit_connection_name(config.name),
             )
 
     def _ech_request(

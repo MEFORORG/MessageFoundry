@@ -71,7 +71,7 @@ Work through them in order the first time; afterward, jump to the task you need.
 
 This section takes you from a clean machine to a running engine and an attached console. It covers the **developer / checkout** path (running the bundled `samples/config`) and points at the **pinned-wheel** consumer path where they differ.
 
-> Two install styles exist. To **try MessageFoundry against the sample config** (this guide's running example), install from a checkout (`pip install -e .`). To **deploy your own interfaces**, install the pinned wheel and scaffold a config repo with `messagefoundry init` — the full consumer model is [INSTALL-GUIDE.md](INSTALL-GUIDE.md).
+> Two install styles exist. To **try MessageFoundry against the sample config** (this guide's running example), install from a checkout (`pip install -e .`). To **deploy your own interfaces**, install the pinned wheel and scaffold a config repo with `messagefoundry-toolkit init` — the full consumer model is [INSTALL-GUIDE.md](INSTALL-GUIDE.md).
 
 ### 1. Check prerequisites
 
@@ -127,7 +127,7 @@ python -P -X disable-remote-debug -m messagefoundry serve --config samples/confi
 
 When the engine runs from somewhere other than the repo root (e.g. under the service), anchor the value files with `--project-root <repo-root>` so `env()` values don't silently resolve empty — see [INSTALL-GUIDE.md](INSTALL-GUIDE.md).
 
-**Network / auth posture.** The API binds **`127.0.0.1:8765`**, serves HTTPS, and **always requires sign-in**: no setting turns it off. With no `[api].tls_cert_file` configured, the engine mints a self-signed certificate on first run ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). That certificate serves loopback, but it does not satisfy the startup gate for a non-loopback bind. On the shipped posture, exposing the API takes your own certificate (`[api].tls_cert_file`) or a trusted upstream TLS terminator, plus the further gates [DEPLOYMENT.md](DEPLOYMENT.md) lists. Details: [SECURITY.md](SECURITY.md).
+**Network / auth posture.** The API binds **`127.0.0.1:8765`**, serves HTTPS, and **always requires sign-in**: no setting turns it off. With no `[api].tls_cert_file` configured, the engine mints a self-signed certificate on first run ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)). That certificate serves loopback, but it does not satisfy the startup gate for a non-loopback bind. On the shipped posture, exposing the API takes your own certificate (`[api].tls_cert_file`) or a declared proxy in front of a loopback engine, plus the further gates [DEPLOYMENT.md](DEPLOYMENT.md) lists. Details: [SECURITY.md](SECURITY.md).
 
 **Store encryption.** Every instance carries patient data, so `serve` **refuses to start** with no store encryption key configured — on `dev` as much as on `prod`. Mint one with `messagefoundry gen-key` (set it as `MEFOR_STORE_ENCRYPTION_KEY`), or on Windows DPAPI-protect it to a file with `messagefoundry protect-key --generate --out <file>` and point `[store].encryption_key_file` at it. To run keyless anyway, set `[security].allow_unencrypted_phi = true` — and under the shipped `[security].enforcement = enforce`, `allow_unencrypted_phi_under_strict_enforcement = true` as well. The dial alone does not clear this refusal. Both acks are audited at every start. The full key story is in [PHI.md](PHI.md).
 
@@ -142,11 +142,12 @@ curl.exe --cacert .\api-generated-cert.pem https://127.0.0.1:8765/health
 When you're ready to author real interfaces, scaffold a standalone, `check`-green config repo instead of editing the samples:
 
 ```powershell
-messagefoundry init ./my-config-repo
+pip install "messagefoundry-toolkit==<version>"   # the authoring commands, at the engine's version
+messagefoundry-toolkit init ./my-config-repo
 cd my-config-repo
 ```
 
-It writes a runnable starter feed under `config/`, `environments/dev.toml` + `prod.toml`, a synthetic fixture under `messages/sets/`, a `messagefoundry.toml`, a `requirements.txt` pinning the engine, and a CI `check.yml`. Validate and run it:
+It writes a runnable starter feed under `config/`, `environments/dev.toml` + `prod.toml`, a synthetic fixture under `messages/sets/`, a `messagefoundry.toml`, a `requirements.txt` pinning the engine, a `requirements-dev.txt` pinning the toolkit for authoring machines, and a CI `check.yml`. Validate and run it:
 
 ```powershell
 pip install -r requirements.txt
@@ -210,7 +211,7 @@ The complete procedure — least-privilege accounts, locking down the config/log
 
 ### A note on PHI-emitting commands
 
-`messagefoundry dryrun` and `messagefoundry generate` print **full message bodies** to stdout/stderr (`dryrun` only with `--show-phi`; redacted otherwise). Run them against **synthetic HL7 only** — never real PHI — and never redirect their output into a committed file, ticket, or CI log. See [PHI.md](PHI.md).
+`messagefoundry dryrun` and `messagefoundry-toolkit generate` print **full message bodies** to stdout/stderr (`dryrun` only with `--show-phi`; redacted otherwise). Run them against **synthetic HL7 only** — never real PHI — and never redirect their output into a committed file, ticket, or CI log. See [PHI.md](PHI.md).
 
 ### Command options that depend on each other
 
@@ -576,7 +577,7 @@ The pages hang off a **top nav** of hover/focus dropdowns: **Traffic** (Connecti
 
 The extension is a thin TypeScript UI that shells out to the `messagefoundry` CLI; it authors and tests interfaces, and can start/stop/restart a local engine and show its status — but **operating** and **monitoring** traffic is the web console's job. What it gives a config author:
 
-- **Setup / scaffolding** — a **Home** launchpad with a **New Route Wizard** (Inbound → Router → Handler → Outbound generated as one module), **New Connection** (form → generates a `[TYPE]_[PARTNER]_[MESSAGE]` module like `IB_ACME_ADT`), New Router/Handler, **Generate Samples** (writes a synthetic, conformant corpus via `messagefoundry generate` — no PHI), and **Set Up Version Control & Checks** (puts the project under git with a `messagefoundry check` pre-commit hook).
+- **Setup / scaffolding** — a **Home** launchpad with a **New Route Wizard** (Inbound → Router → Handler → Outbound generated as one module), **New Connection** (form → generates a `[TYPE]_[PARTNER]_[MESSAGE]` module like `IB_ACME_ADT`), New Router/Handler, **Generate Samples** (writes a synthetic, conformant corpus via `messagefoundry-toolkit generate` — no PHI), and **Set Up Version Control & Checks** (puts the project under git with a `messagefoundry check` pre-commit hook).
 - **Validate + graph** — *Validate on save* surfaces problems in the Problems panel; the **Components** view renders the wired graph (`messagefoundry graph`) by convention name, with **Filter** and **Group** controls and a row **⚙ gear** to open a connection's `MLLP()`/`File()` settings in code.
 - **Translation tables** — a **Translation Tables** view with a grid editor to create / edit / rename / delete a translation table (code set); it shells the `messagefoundry codeset` CLI (validate-on-save, atomic write) and offers **Promote** to apply. See [CODESETS.md](CODESETS.md).
 - **Test Bench** — load `.hl7` files (each may hold many messages, split on `MSH`), **dry-run** them through the config without sending, and see each message's disposition, with a **Before/After** diff and a **Debug** step-through under `debugpy`. The load dialog opens to `messagefoundry.messageSetsDir` (default `samples/messages`).
@@ -585,7 +586,7 @@ The extension is a thin TypeScript UI that shells out to the `messagefoundry` CL
 
 Full feature and settings reference: [ide/README.md](../ide/README.md).
 
-> PHI note: `messagefoundry generate` and `dryrun` (which the Test Bench uses) print full message bodies to stdout/stderr — run them only against synthetic HL7 (e.g. [samples/messages/adt_a01.hl7](../samples/messages/adt_a01.hl7)), and never redirect their output to a committed file, ticket, or CI log.
+> PHI note: `messagefoundry-toolkit generate` and `dryrun` (which the Test Bench uses) print full message bodies to stdout/stderr — run them only against synthetic HL7 (e.g. [samples/messages/adt_a01.hl7](../samples/messages/adt_a01.hl7)), and never redirect their output to a committed file, ticket, or CI log.
 
 ---
 

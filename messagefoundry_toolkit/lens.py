@@ -39,8 +39,8 @@ partition (beyond the def's ``node.end_lineno``, which the AST fixes to the last
 line); at :data:`CONTRACT_V2` the partition is extended over that trailing comment run so it projects
 as a ``note`` row instead of vanishing (Amendment A §A.3 defect 1).
 
-The engine owns the grammar so it lives beside the vocabulary; the IDE consumes the JSON contract
-only (``messagefoundry lens parse <module.py> --json``). This module adds **no runtime dependency** —
+The grammar lives in Python beside the vocabulary it projects (since ADR 0201 slice 4 in the toolkit,
+which imports the engine's vocabulary); the IDE consumes the JSON contract only (``messagefoundry-toolkit lens parse <module.py> --json``). This module adds **no runtime dependency** —
 stdlib ``ast`` only.
 """
 

@@ -17,8 +17,8 @@ import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.config.wiring import Send, load_config
-from messagefoundry.lens import CONTRACT_V2, parse_module, parse_source, rewrite_module
 from messagefoundry.parsing.message import Message
+from messagefoundry_toolkit.lens import CONTRACT_V2, parse_module, parse_source, rewrite_module
 
 SAMPLES = Path(__file__).resolve().parents[1] / "samples" / "config"
 ROUTER = SAMPLES / "IB_STEPS_ORU_router.py"

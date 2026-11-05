@@ -567,7 +567,8 @@ def test_the_two_fixed_refusals_name_the_key_the_loader_accepts() -> None:
         "the OIDC refusal still names the relocated spelling, which the loader REFUSES as file/env input"
     )
 
-    scaffold_src = (_ENGINE / "scaffold.py").read_text(encoding="utf-8")
+    # The scaffold is a toolkit module since ADR 0201 slice 4.
+    scaffold_src = (_ROOT / "messagefoundry_toolkit" / "scaffold.py").read_text(encoding="utf-8")
     for (section, key), replacement in _RELOCATED_TO_SECURITY.items():
         if section == "ai":
             assert f"[{section}].{key}" not in scaffold_src, (

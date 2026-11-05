@@ -8,7 +8,7 @@ an operator wires over their own config repo. See ``docs/security/SECURING-HANDL
 
 And :mod:`messagefoundry.security.audit_all_platforms`, the dependency auditor that audits every pin
 of a hashed lock whatever its environment marker. The engine's own CI and the ``audit-pin`` job
-``messagefoundry init`` generates both run it.
+``messagefoundry-toolkit init`` generates both run it.
 """
 
 from __future__ import annotations

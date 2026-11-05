@@ -13,15 +13,15 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.__main__ import main
-from messagefoundry.corepoint_import import (
+from messagefoundry.parsing.message import Message
+from messagefoundry_toolkit.__main__ import main
+from messagefoundry_toolkit.corepoint_import import (
     CorepointImportError,
     generate_module,
     import_corepoint,
     parse_export,
     parse_package,
 )
-from messagefoundry.parsing.message import Message
 
 _HAND_FINISHED = "# hand-finished by an operator\n"
 

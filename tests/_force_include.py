@@ -43,11 +43,16 @@ shared reader exists to get right once.
 
 **READ, NOT INFERRED, because three places in this repository had asserted hatchling's behaviour and
 none could check it** -- the backend is a build-isolation dependency and is installed in no
-interpreter here. At the pinned ``hatchling==1.32.4`` every ``[build-system]`` table names (re-read
-at the move from 1.32.0: ``builders/config.py`` is byte-identical, so its lines did not move, and
-``plugin/interface.py`` gained nine lines of example code in the ``BuilderInterface`` docstring above
-these sites, plus typing and docstring edits elsewhere, so each ``interface.py`` line cited here moved
-by nine and none changed):
+interpreter here. At the pinned ``hatchling==1.33.0`` every ``[build-system]`` table names (re-read
+at the move from 1.32.0 to 1.32.4: ``builders/config.py`` is byte-identical, so its lines did not
+move, and ``plugin/interface.py`` gained nine lines of example code in the ``BuilderInterface``
+docstring above these sites, plus typing and docstring edits elsewhere, so each ``interface.py`` line
+cited here moved by nine and none changed; re-read again at the move from 1.32.4 to 1.33.0 on
+2026-11-04, from the two PyPI wheels, unpacked and never installed or run: ``builders/config.py`` and
+``plugin/interface.py`` are byte-identical, across the whole ``hatchling`` package only
+``__about__.py``'s version string differs, so no line cited here moved, and the dist-info
+``METADATA`` differs only in ``Version:`` and one added ``Programming Language :: Python :: 3.15``
+classifier, so no ``Requires-Dist`` or ``Requires-Python`` moved):
 
 * ``src/hatchling/builders/config.py:679`` is the ``in self.target_config`` test above;
 * ``src/hatchling/builders/plugin/interface.py`` calls ``include_path`` at exactly two sites, ``:213``
@@ -69,9 +74,14 @@ populates that **from the force-include map itself** -- so the third filter is d
 author's own configuration, just not from an include/exclude option. Its job there is to stop a mapped
 DIRECTORY walk re-adding a path another entry already claims.
 
-Re-read it the same way if the pin moves, rather than trusting the line numbers above::
+Re-read it the same way if the pin moves, rather than trusting the line numbers above. Fetch the
+WHEEL, into a fresh empty directory, and unzip it rather than installing it: an sdist download makes
+pip prepare metadata by running the fetched hatchling's own build backend, which executes the code
+under review. The wheel is also the artifact a build-isolation install actually imports; it lays
+the modules out at ``hatchling/...`` where the sdist has ``src/hatchling/...``, so the paths cited
+above drop their ``src/`` prefix there::
 
-    pip download hatchling==1.32.4 --no-deps --no-binary :all: -d .
+    pip download hatchling==1.33.0 --no-deps --only-binary :all: -d <fresh-empty-dir-outside-the-repo>
 
 **Not covered here, deliberately:** which distributions exist. The two force-include readers each
 glob ``packaging/*`` for their own reasons, written down where they happen, and folding those

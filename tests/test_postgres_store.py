@@ -23,6 +23,7 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -56,12 +57,16 @@ from tests._keyed_reopen_contract import (
     server_keyed_reopen_report,
 )
 from tests._keyless_blank_contract import CASES as KEYLESS_BLANK_CASES
+from tests._keyless_blank_contract import keyed_cipher
+from tests._queue_tag_contract import RawFetch, RawSql
+from tests._reingress_refused_body_contract import CASES as REINGRESS_REFUSED_BODY_CASES
 from tests._replay_settle_contract import CASES as REPLAY_SETTLE_CASES
 from tests._replay_settle_contract import (
     assert_replayed_ingress_row_is_received,
     assert_replayed_routed_row_settles,
 )
 from tests._store_audit import ALERT_AUDIT, no_operator_audit, no_purge_audit
+from tests._undecryptable_reply_contract import SPOILS as UNDECRYPTABLE_REPLY_SPOILS
 from tests.audit_chain_cases import CASES, ChainBackend, server_chain_backend
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
@@ -537,6 +542,13 @@ async def test_ingress_handoff_parity(store) -> None:
         )
         is False
     )
+
+
+@pytest.mark.parametrize("case", REINGRESS_REFUSED_BODY_CASES)
+async def test_reingress_refused_body_contract(store, case) -> None:
+    """Vault BACKLOG #4796: a refused loopback re-ingress is charged to the refused-body allowance,
+    the same contract the SQLite suite runs: past it only the head is stored, inside it the whole."""
+    await case(store)
 
 
 async def test_ingress_handoff_peek_error_is_the_recorded_reason(store) -> None:
@@ -1366,7 +1378,6 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
 
     The shared body is the one the SQL Server suite runs. The probe reads ``pg_locks``: a lock
     request not yet granted whose blocker, per ``pg_blocking_pids``, is the bind's backend."""
-    from typing import Any
 
     from tests._federated_unbind_store_contract import (
         _assert_bind_and_user_delete_take_one_lock_order,
@@ -1789,11 +1800,16 @@ async def test_staged_pipeline_processes_to_delivered(store) -> None:
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
 
-async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
+@pytest.mark.parametrize("verbosity", ["all", "errors", "off"])
+async def test_mark_done_writes_reply_dropped_with_the_delivery(store, verbosity: str) -> None:
     """BACKLOG #3462: the Postgres twin of the SQLite test of the same name. ``reply_dropped``
     rides the DONE flip beside ``delivered``. Controls: a vanished row writes nothing and returns
     False, and a plain ``mark_done`` writes no ``reply_dropped``. Events are read through
-    ``events_for``, which decrypts ``detail``."""
+    ``events_for``, which decrypts ``detail``. Parametrized over the event verbosity as the
+    SQLite test is (BACKLOG #4917): ``delivered`` is thinned below ``all`` and ``reply_dropped``
+    is not. Set on the fixture's store, since each backend reads it at write time."""
+    store._message_events = verbosity
+    delivered = [("delivered", "OB1", None)] if verbosity == "all" else []
     detail = "HTTP 200; reply body over the 64-byte bound"
 
     async def _to_outbound(now: float):
@@ -1820,7 +1836,7 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
     mid, out = await _to_outbound(100.0)
     assert await store.mark_done(out.id, now=110.0, reply_dropped=detail) is True
     after_drop = await store.events_for(mid)
-    assert _tail(after_drop) == [("delivered", "OB1", None), ("reply_dropped", "OB1", detail)]
+    assert _tail(after_drop) == [*delivered, ("reply_dropped", "OB1", detail)]
     assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
 
     async def _dropped_anywhere():
@@ -1838,7 +1854,7 @@ async def test_mark_done_writes_reply_dropped_with_the_delivery(store) -> None:
 
     plain, other = await _to_outbound(120.0)
     assert await store.mark_done(other.id, now=130.0) is True
-    assert _tail(await store.events_for(plain)) == [("delivered", "OB1", None)]
+    assert _tail(await store.events_for(plain)) == delivered
     assert await _dropped_anywhere() == 1
 
 
@@ -3990,7 +4006,7 @@ async def test_attachment_dead_purge_releases_after_body_purge(store) -> None:
     assert await store.purge_message_bodies(older_than=10 * DAY) == 1
     assert await _a_refcount(store, ref) == 1
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _a_row_payload(store, oid) == ""
     assert await _a_refcount(store, ref) is None
     assert await _a_joins(store, mid) == 0
@@ -4000,7 +4016,7 @@ async def test_attachment_dead_purge_releases_when_run_first(store) -> None:
     ref = await store.put_attachment(_A_CHUNKS, "application/pdf")
     mid, oid = await _a_dead_deliver(store, now=0.0, ref=ref)
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
     assert await _a_row_payload(store, oid) == ""
     assert await _a_refcount(store, ref) is None
     assert await _a_joins(store, mid) == 0
@@ -4016,8 +4032,8 @@ async def test_attachment_dead_purge_idempotent_no_underflow(store) -> None:
     m2, _ = await _a_dead_deliver(store, now=20 * DAY, ref=ref, dest="OB_2")
     assert await _a_refcount(store, ref) == 2
 
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 1
-    assert await store.purge_dead_letters(older_than=10 * DAY) == 0
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY)).bodies == 0
 
     assert await _a_refcount(store, ref) == 1
     assert await _a_chunks(store, ref) == len(_A_CHUNKS)
@@ -5257,7 +5273,7 @@ async def test_over_max_message_bytes_naks_ar_pg(store) -> None:
     assert await _attachment_count(store) == 0
 
 
-async def test_stream_inflight_budget_naks_ae_pg(store) -> None:
+async def test_stream_inflight_budget_naks_ar_pg(store) -> None:
     b64 = _big_b64(2000)
     raw = _hl7_with_doc(b64)
     ic = _streaming_ic(threshold=500)
@@ -5270,7 +5286,8 @@ async def test_stream_inflight_budget_naks_ae_pg(store) -> None:
 
     ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
 
-    assert _stream_ack_code(ack) == "AE"  # detach refused (backpressure) → NAK AE
+    # The body alone is over the whole budget, so no re-send could fit: final, AR (BACKLOG #5078).
+    assert _stream_ack_code(ack) == "AR"
     row = await _only_message(store)
     assert row["status"] == MessageStatus.ERROR.value
     assert "streaming detach failed" in row["error"]
@@ -5550,7 +5567,8 @@ async def test_a_sign_in_committing_inside_an_every_account_revoke_ends_with_it(
     connection, after the revoke read the account list and ran its sweep and before it commits.
     The sweep cannot see that session and the account loop never raised its epoch, so before the
     global epoch it stayed live. It now carries the global epoch the revoke is replacing. The hook
-    is the kept session's epoch read, which runs between the sweep and the commit."""
+    is the kept session's re-seal, which runs between the sweep and the commit (the epoch read it
+    used to hook went with BACKLOG #4975, which takes the epochs from the raises)."""
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.tokens import hash_token
     from messagefoundry.config.settings import AuthSettings, load_settings
@@ -5567,15 +5585,15 @@ async def test_a_sign_in_committing_inside_an_every_account_revoke_ends_with_it(
         await _user(keyed, owner)
         kept = await _mint(keyed, owner)
         minted: list[str] = []
-        original = keyed._session_epoch
+        original = keyed._write_session
 
-        async def between_sweep_and_commit(conn: object, user_id: str) -> int:
+        async def between_sweep_and_commit(conn: Any, token_hash: str, change: Any) -> Any:
             if not minted:
                 await _user(keyed, late)
                 minted.append(await _mint(keyed, late))
-            return await original(conn, user_id)
+            return await original(conn, token_hash, change)
 
-        monkeypatch.setattr(keyed, "_session_epoch", between_sweep_and_commit)
+        monkeypatch.setattr(keyed, "_write_session", between_sweep_and_commit)
         await keyed.revoke_all_sessions(except_token_hash=hash_token(kept))
         monkeypatch.undo()
         assert minted, "the hook did not run inside the revoke"
@@ -5697,7 +5715,7 @@ async def test_rotation_moves_an_approval_tombstone_to_the_active_key(store) -> 
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.postgres import PostgresStore
     from tests._approval_seal_contract import assert_tombstone_reseal_contract
-    from tests._session_seal_contract import RawSql, dollar_placeholders
+    from tests._session_seal_contract import dollar_placeholders
 
     async def open_store(key: str, retired: tuple[str, ...]) -> PostgresStore:
         return await PostgresStore.open(
@@ -5763,8 +5781,8 @@ async def test_queue_tag_contract(store) -> None:
         await keyed.close()
 
 
-def _raw_adapters(s) -> tuple[object, object]:
-    """``(raw, fetch)`` for the two contracts below, on pooled connections, outside the store."""
+def _raw_adapters(s) -> tuple[RawSql, RawFetch]:
+    """``(raw, fetch)`` for the contracts below, on pooled connections, outside the store."""
     from tests._session_seal_contract import dollar_placeholders
 
     async def raw(sql: str, params: tuple[object, ...]) -> None:
@@ -5799,6 +5817,24 @@ async def test_erased_reply_contract(store, case, keyed) -> None:
         await sealed.close()
 
 
+@pytest.mark.parametrize("spoil", UNDECRYPTABLE_REPLY_SPOILS, ids=lambda s: s.__name__)
+async def test_undecryptable_reply_contract(store, spoil) -> None:
+    """BACKLOG #4995: a reply body that does not decrypt is dead-lettered with its reference kept and
+    the loopback lane moves, the same contract the SQLite suite runs, on a keyed handle."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests import _undecryptable_reply_contract as contract
+
+    raw, fetch = _raw_adapters(store)
+    sealed = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        await contract.assert_lane_moves_past_an_undecryptable_reply(sealed, fetch, raw, spoil)
+    finally:
+        await sealed.close()
+
+
 @pytest.mark.parametrize("case", KEYLESS_BLANK_CASES, ids=lambda c: c.__name__)
 async def test_keyless_blank_contract(store, case) -> None:
     """BACKLOG #3495: the first keyed open seals a live empty row, the same contract the SQLite suite
@@ -5808,9 +5844,10 @@ async def test_keyless_blank_contract(store, case) -> None:
 
     key = generate_key()
 
-    async def open_keyed() -> PostgresStore:
+    async def open_keyed(**kw: Any) -> PostgresStore:
         return await PostgresStore.open(
-            load_settings(environ=os.environ).store, cipher=make_cipher(key, write_v2=True)
+            load_settings(environ=os.environ).store,
+            cipher=keyed_cipher(make_cipher, key, **kw),
         )
 
     raw, fetch = _raw_adapters(store)

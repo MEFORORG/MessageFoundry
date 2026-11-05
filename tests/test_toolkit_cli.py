@@ -10,6 +10,7 @@ installed copy, because an installed copy of a force-included tree is frozen at 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -145,6 +146,44 @@ def test_toolkit_help_names_its_commands_and_encodes_on_a_legacy_codepage(
         pytest.fail(f"toolkit --help is not cp1252-encodable: U+{ord(bad):04X} {bad!r}")
 
 
+# --- BACKLOG #3768: the toolkit's main() filters the window before its handlers too ---------------
+
+
+def _warn_while_the_toolkit_parses(tmp_path: Path, *, prefix: str = "", leaks: bool) -> None:
+    """Run the engine tests' child driver against the toolkit: one WARNING carrying the synthetic
+    segment, logged while the toolkit's ``main()`` builds its parser with no root handler, which
+    then exits 3 there. ``prefix`` runs first, so a control can take the install out."""
+    from tests.test_cli import _child_window_probe, _run_warning_driver
+
+    _run_warning_driver(
+        tmp_path,
+        "warn_while_the_toolkit_parses.py",
+        prefix + _child_window_probe("parsing") + "    raise SystemExit(3)\n"
+        "m._build_parser = _probe\n"
+        "raise SystemExit(m.main(['adr-analyze']))\n",
+        returncode=3,
+        handlers_line="parsing 0 " + ("_StderrHandler" if leaks else "_FilteredLastResort"),
+        leaks=leaks,
+        module="messagefoundry_toolkit.__main__",
+    )
+
+
+def test_a_real_toolkit_process_redacts_a_warning_while_it_parses(tmp_path: Path) -> None:
+    """The toolkit runs the same ``run_cli`` shell as the engine, so its ``main()`` installs the
+    filtered ``lastResort`` first too, and a WARNING logged while it parses reaches stderr
+    redacted."""
+    _warn_while_the_toolkit_parses(tmp_path, leaks=False)
+
+
+def test_a_real_toolkit_process_without_the_install_leaks(tmp_path: Path) -> None:
+    """The control for the test above, through the same child: with the install taken out, the
+    same WARNING meets the stdlib's own ``lastResort`` and the synthetic segment reaches stderr
+    whole, so the absence above is the filter's doing and not a record that never arrived."""
+    _warn_while_the_toolkit_parses(
+        tmp_path, prefix="m.install_filtered_last_resort = lambda: None\n", leaks=True
+    )
+
+
 #: One fresh interpreter answers two questions, because a cold start is the cost here. It runs the
 #: package the way ``python -m`` does (``runpy.run_module`` IS what ``-m`` calls), then reports which
 #: engine modules that loaded. A fresh process, because this one already imported the engine CLI.
@@ -175,3 +214,49 @@ def test_python_dash_m_runs_the_toolkit_without_the_engine_cli_module() -> None:
     assert "messagefoundry-toolkit" in proc.stdout and "adr-analyze" in proc.stdout
     # --help exits 0. The last value is the control: the probe sees the modules the toolkit imports.
     assert "PROBE 0 False True" in proc.stderr, proc.stderr
+
+
+def test_the_toolkit_command_installs_the_remote_debug_guard_on_import() -> None:
+    """ADR 0201 slice 4 moved commands that run config modules (``impact``) and read operator input
+    (``lens rewrite``, ``import corepoint``) off the engine's command, which installs the guard
+    against an injected script at import (vault BACKLOG #2742). The toolkit's command must install
+    it too. A fresh process each, because this one has already imported the engine's command."""
+
+    # The guard installs only where the interface is on, so the child must not inherit a switch that
+    # turns it off, and a build without the interface has nothing to guard.
+    env = {k: v for k, v in os.environ.items() if k != "PYTHON_DISABLE_REMOTE_DEBUG"}
+
+    def answers(imports: str) -> str:
+        probe = f"{imports}import messagefoundry.remotedebug as r;print(r._guard_answers())"
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=_REPO,
+            env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout.strip()
+
+    enabled = subprocess.run(
+        [sys.executable, "-c", "import sys;print(sys.is_remote_debug_enabled())"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+    ).stdout.strip()
+    if enabled != "True":
+        pytest.skip("this interpreter has remote debugging off, so there is nothing to guard")
+    # Control: the guard module alone installs nothing, so a True below is the toolkit's doing.
+    assert answers("") == "False"
+    assert answers("import messagefoundry_toolkit.__main__;") == "True"
+
+
+def test_the_impact_kinds_are_the_engines_renameable_kinds() -> None:
+    """``impact``'s argparse choices are a literal so ``--help`` need not import the engine's
+    config package, which makes them a hand copy of ``RENAMEABLE_KINDS``. A kind added to one and
+    not the other would be refused by argparse or by ``plan_rename``, so the copies must agree."""
+    from messagefoundry.config.impact import RENAMEABLE_KINDS
+
+    assert toolkit_cli._IMPACT_KINDS == RENAMEABLE_KINDS

@@ -11,10 +11,11 @@ routing/transform/delivery failure happens *after* the ``202`` and is **not** re
 status — it surfaces only as the message's ``ERROR``/dead-letter disposition + the AlertSink, exactly
 as a post-ACK MLLP failure does. A body the pipeline handler refuses at ingress (recorded ``ERROR``,
 no ingress row) is never answered ``202``: a temporary refusal is answered ``503`` with
-``Retry-After``, an over-size one ``413``, and any other ``422``, each naming the ``ERROR`` row as
-``refused_message_id`` (ADR 0154 amendments 2026-09-26 and 2026-10-30). A refusal the inbound's own
-configuration caused, an unusable codec name, is temporary: it clears once the operator fixes the
-name (BACKLOG #2431).
+``Retry-After``, an over-size one ``413``, a permanent one ``422``, and a configuration one ``503``
+with no ``Retry-After``, each naming the ``ERROR`` row as ``refused_message_id`` (ADR 0154
+amendments 2026-09-26, 2026-10-30 and 2026-11-04). A configuration refusal is one the inbound's own
+configuration caused, at least an unusable codec name: it clears only once an operator fixes the
+configuration (BACKLOG #2431, #5102).
 
 **Why this lives in ``transports/`` and not ``api/``.** The one-way dependency rule (CLAUDE.md §2/§4)
 forbids ``transports/`` from importing ``api/``. The engine's FastAPI app stays the admin/RBAC surface;
@@ -52,14 +53,17 @@ from typing import TYPE_CHECKING, Any, ClassVar, assert_never, cast
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.credential import (
+    OTHERNAMES_INTACT_KEY,
     VERIFIED_ISSUER_KEY,
     client_cert_principal_under_issuer,
     constant_time_match_any,
 )
+from messagefoundry.proactor_accept import guard_accepts
 from messagefoundry.redaction import safe_exc
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import ListenerAdmission
 from messagefoundry.transports.base import (
+    INTAKE_AUDIT_ACTIONS,
     InboundHandler,
     InboundReply,
     ReplyOutcome,
@@ -80,7 +84,6 @@ from messagefoundry.transports.mllp import (
     _pacing_settings,
     _peer_host,
     _set_tcp_nodelay,
-    _upgrades_tls_itself,
 )
 from messagefoundry.transports.receipt import ReceiptHandler, RefusalKind, require_receipt
 
@@ -89,6 +92,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_MAX_BODY_BYTES",
+    "DEFAULT_MAX_HANDSHAKES_PER_HOST",
     "DEFAULT_MAX_HEADER_BYTES",
     "HttpRequest",
     "HttpRequestError",
@@ -98,6 +102,21 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+
+def _upgrades_tls_itself(loop: asyncio.AbstractEventLoop) -> bool:
+    """Whether this TLS listener on ``loop`` accepts plain TCP and upgrades each socket itself, so
+    its caps, its allowlist and ``max_handshakes_per_host`` run before the handshake (BACKLOG #2479).
+    True for ``asyncio.BaseEventLoop`` and its subclasses, which the stdlib loops are.
+
+    ``mllp._upgrades_tls_itself`` gives the reading behind the upgrade and why uvloop is kept off it.
+    The MLLP listener matches the stdlib loop classes exactly (vault BACKLOG #4552), because its own
+    accept loop admits before the handshake on any other loop. This listener has no such loop, so on
+    the loop's handshake its caps would apply only after it and ``max_handshakes_per_host`` never.
+    It keeps trusting a subclass rather than lose those controls there.
+    """
+    return isinstance(loop, asyncio.BaseEventLoop)
+
+
 # Resource caps (DoS guards), HTTP analogs of the MLLP frame/connection/idle caps. All overridable per
 # connection via Http() settings; None/0 (in any spelling) disables a cap explicitly where noted.
 DEFAULT_MAX_BODY_BYTES = (
@@ -106,6 +125,15 @@ DEFAULT_MAX_BODY_BYTES = (
 DEFAULT_MAX_HEADER_BYTES = (
     64 * 1024
 )  # cap the request line + headers (a header-flood / slow-loris guard)
+#: The most sockets one peer address may hold a ``max_connections`` slot with while still in
+#: their TLS handshake (vault BACKLOG #4888), which happens only where this listener upgrades TLS
+#: itself (`_upgrades_tls_itself`). 32 is an eighth of :data:`DEFAULT_MAX_CONNECTIONS`, the ratio
+#: the other listeners' per-host cap ships at, so at the default ``max_connections`` a stalling
+#: address could hold at most an eighth of the listener. The budget does not scale with
+#: ``max_connections``: at 32 slots or fewer, ``max_connections`` refuses first and one stalling
+#: address could hold every slot. ``docs/DEPLOYMENT.md``, *Per-address listener caps behind the VIP*, holds the
+#: rationale and the L4 load-balancer counter-case.
+DEFAULT_MAX_HANDSHAKES_PER_HOST = 32
 _HEADER_CAP_OFF_HINT = (
     "this cap cannot be switched off; leave it unset or None for the 64 KiB default"
 )
@@ -113,16 +141,6 @@ _HEADER_CAP_OFF_HINT = (
 # On stop()/reload, established clients are closed and their handlers given this long to finish an
 # in-flight commit before the connection tasks are cancelled (mirrors MLLPSource; bounds shutdown).
 _CLIENT_SHUTDOWN_GRACE = 5.0
-
-#: ``connection_event`` kind -> ``audit_log`` action for an intake-auth refusal (ADR 0154 D6). The
-#: kinds double as the connection_event vocabulary, which CI derives from these literal call sites and
-#: asserts against ``docs/PHI.md`` §7 and ``CONNECTION_EVENT_KINDS`` as an exact set — so adding a kind
-#: here without those two is a build failure, by design.
-_INTAKE_AUDIT_ACTIONS = {
-    "intake_auth_failed": "intake.auth_failed",
-    "auth_subject_denied": "intake.auth_subject_denied",
-    "auth_rate_limited": "intake.auth_rate_limited",
-}
 
 
 class HttpRequestError(Exception):
@@ -240,18 +258,23 @@ _NOT_ACCEPTED = "message was not accepted"
 TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS = 5
 
 
-def _refusal_status(kind: RefusalKind) -> int:
-    """The status a refusal of ``kind`` is answered with (ADR 0154 amendment 2026-10-30). Only a
-    temporary refusal invites a re-send; an over-size body answers the same ``413`` as one over
-    ``max_body_bytes``. A ``match`` with ``assert_never``, so mypy refuses a new kind left unmapped
-    rather than a ``KeyError`` answering ``500`` after the ``ERROR`` row was written."""
+def _refusal_status(kind: RefusalKind) -> tuple[int, dict[str, str] | None]:
+    """The status a refusal of ``kind`` is answered with, and its extra headers (ADR 0154
+    amendments 2026-10-30 and 2026-11-04). Only a temporary refusal invites a re-send soon, with
+    ``Retry-After``; a configuration refusal is the same ``503`` without it, since it clears only
+    when an operator acts (BACKLOG #5102). An over-size body answers the same ``413`` as one over
+    ``max_body_bytes``. One ``match`` with ``assert_never`` decides both, so mypy refuses a new kind
+    left unmapped rather than a ``KeyError`` answering ``500`` after the ``ERROR`` row was written,
+    and no kind gets its header from a second test."""
     match kind:
         case RefusalKind.TEMPORARY:
-            return 503
+            return 503, {"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)}
+        case RefusalKind.CONFIGURATION:
+            return 503, None
         case RefusalKind.OVERSIZE:
-            return 413
+            return 413, None
         case RefusalKind.PERMANENT:
-            return 422
+            return 422, None
         case _:
             assert_never(kind)
 
@@ -814,9 +837,9 @@ class HttpSource(SourceConnector):
             on_client_ca=loaded_client_ca.append,
         )
         # Failed TLS handshakes and their throttled `tls_handshake_failed` events (vault BACKLOG
-        # #3302), counted as the MLLP listener counts them: `_start_tls` where this listener runs
-        # the handshake, and the context's hook (`HandshakeFailures.watch`, armed at start()) where
-        # the loop does. The peer is known only in the first case.
+        # #3302): `_start_tls` counts where this listener runs the handshake, as the MLLP
+        # listener's does, and the context's hook (`HandshakeFailures.watch`, armed at start())
+        # where the loop does. The peer is known only in the first case.
         self._tls_failures = HandshakeFailures(self._emit_tls_failure)
         # True while this listener runs TLS handshakes itself, after admission (BACKLOG #2479); set
         # at start() from the running loop, see `_upgrades_tls_itself`.
@@ -871,12 +894,20 @@ class HttpSource(SourceConnector):
             knob="max_connections_per_host",
             transport="HTTP source",
         )
+        # vault BACKLOG #4888: the per-host bound that DOES ship on, for the handshake phase only.
+        self.max_handshakes_per_host: int | None = positive_cap(
+            s.get("max_handshakes_per_host", DEFAULT_MAX_HANDSHAKES_PER_HOST),
+            int,
+            knob="max_handshakes_per_host",
+            transport="HTTP source",
+        )
         self._admission = ListenerAdmission(
             transport="HTTP",
             max_connections=self.max_connections,
             max_connections_per_host=self.max_connections_per_host,
             source_ip_allowlist=self.source_ip_allowlist,
             name=config.name or "",
+            max_handshakes_per_host=self.max_handshakes_per_host,
         )
         # Live client writers + handler tasks so stop()/reload can actively close established
         # connections and bound the wait (mirrors MLLPSource, review H-2 / #55).
@@ -918,6 +949,7 @@ class HttpSource(SourceConnector):
         # require_receipt refuses any other handler here, before a single message is accepted.
         self._handler = require_receipt(handler, source="HTTP source")
         self._admission.stopping = False  # a restart of this same instance serves again
+        guard_accepts()  # see messagefoundry.proactor_accept
         self._tls_failures.open()
         # BACKLOG #2479, the shape BACKLOG #1606 fixed on MLLP. On the stdlib loop a TLS listener
         # accepts PLAIN TCP and upgrades each admitted socket itself, so the allowlist and both
@@ -1171,7 +1203,14 @@ class HttpSource(SourceConnector):
                 peer,
                 HttpRequestError(401, "intake authentication required", kind="intake_auth_failed"),
             )
-        verified = {**peercert, VERIFIED_ISSUER_KEY: self._verified_issuer(ssl_object)}
+        # Lazy, as _client_issuer_index's: pki pulls in cryptography.
+        from messagefoundry.pki import peer_othernames_intact
+
+        verified = {
+            **peercert,
+            VERIFIED_ISSUER_KEY: self._verified_issuer(ssl_object),
+            OTHERNAMES_INTACT_KEY: peer_othernames_intact(ssl_object),
+        }
         if client_cert_principal_under_issuer(verified, self._intake_subjects) is None:
             # A chain a trusted CA signed, carrying a subject nobody allow-listed under THAT CA — an
             # AUTHORIZATION failure, and deliberately distinct from the 401 above (deny-by-default).
@@ -1283,7 +1322,7 @@ class HttpSource(SourceConnector):
         length. The peer address and the mode are what an operator needs; the credential is what an
         attacker would need.
         """
-        action = _INTAKE_AUDIT_ACTIONS.get(exc.kind)
+        action = INTAKE_AUDIT_ACTIONS.get(exc.kind)
         if action is None:
             return
         # The reason is a fixed string at every call site, never request data, so it is safe to log.
@@ -1331,7 +1370,7 @@ class HttpSource(SourceConnector):
             # vault BACKLOG #2606: stop, allowlist, global cap and per-host cap, decided in one place
             # for every socket listener (transports/admission.py). Refused before a request byte,
             # and, where this listener upgrades TLS itself, before any TLS byte (BACKLOG #2479).
-            refusal = self._admission.check(writer, peer_host)
+            refusal = self._admission.check(writer, peer_host, handshake=self._upgrade_tls)
             if refusal is not None:
                 if refusal.kind is None:
                     return  # the listener is stopping: close unread, with no answer
@@ -1350,9 +1389,13 @@ class HttpSource(SourceConnector):
                 # The handshake runs inside an admitted slot (BACKLOG #2479), so a socket that never
                 # sends a ClientHello is counted against both caps until the handshake bound ends
                 # it, and the finally below gives the slot back however the handshake ends.
+                # It also counts against the handshake budget until the handshake ends, however
+                # it ends (vault BACKLOG #4888).
                 epoch = self._admission.admit(peer_host)
                 handshaking = True
-                if not await self._start_tls(reader, writer, peer_host):
+                with self._admission.handshake(peer_host, epoch):
+                    upgraded = await self._start_tls(reader, writer, peer_host)
+                if not upgraded:
                     return  # never a session: no `established`, so no `closed` either
                 handshaking = False
                 answerable = True
@@ -1511,22 +1554,21 @@ class HttpSource(SourceConnector):
             # owner ruling of 2026-09-30 answers a temporary refusal 503 with Retry-After and keeps a
             # permanent one at 422. Which refusals are temporary, the one 413 for over-size and the
             # ERROR row's id in the body are Manager decision d20261030T155119571-255c98 (BACKLOG #2105);
-            # the unusable codec name joined the temporary class later, under BACKLOG #2431. Returns False:
+            # a strict-validation timeout that never began (BACKLOG #5078) joined the temporary class
+            # later. A configuration refusal, at least the unusable codec name (BACKLOG #2431), is the
+            # same 503 with no Retry-After, because it clears only when an operator acts (Manager
+            # decision d20261104T003342588-cbb49e, BACKLOG #5102). Returns False:
             # this is a post-record refusal with no connection-event kind of its own, so the outer
             # ``closed`` still fires. The drain gets the receipt-sized budget in both modes: this is a
             # fixed few dozen bytes, never the partner-sized body reply_write_timeout exists for.
-            retry = (
-                {"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)}
-                if receipt.refusal is RefusalKind.TEMPORARY
-                else None
-            )
+            status, headers = _refusal_status(receipt.refusal)
             # ``refused_message_id``, never ``message_id``: where this listener's own answer carries
             # ``message_id``, it names a committed message, so a refusal must not read as one. A
             # proxied reply_from 200 or 502 carries the partner's own bytes, which may hold its own.
             refused = json.dumps({"error": _NOT_ACCEPTED, "refused_message_id": message_id})
             await self._respond(
                 writer,
-                build_response(_refusal_status(receipt.refusal), refused, extra_headers=retry),
+                build_response(status, refused, extra_headers=headers),
                 budget=_CLIENT_SHUTDOWN_GRACE,
             )
             return False

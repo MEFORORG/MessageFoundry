@@ -295,17 +295,22 @@ def test_no_engine_code_names_the_bootstrap_credential_file() -> None:
     hit is the scaffold's generated ``.gitignore`` line, which ADR 0183 keeps as a guard: a
     development checkout that ran ``serve`` before Wave 2 can still hold a live file.
     """
-    package = _REPO / "messagefoundry"
+    # The scaffold moved into the toolkit package (ADR 0201 slice 4), so the scan reads both trees.
+    sources = [
+        p
+        for pkg in ("messagefoundry", "messagefoundry_toolkit")
+        for p in (_REPO / pkg).rglob("*.py")
+    ]
     hits: dict[str, int] = {}
     scanned = 0
-    for source in sorted(package.rglob("*.py")):
+    for source in sorted(sources):
         tree = ast.parse(source.read_text(encoding="utf-8"))
         scanned += 1
         count = sum("bootstrap-admin.txt" in s for s in _string_constants_outside_docstrings(tree))
         if count:
             hits[source.relative_to(_REPO).as_posix()] = count
     assert scanned > 100, f"control: the scan read only {scanned} files"
-    assert hits == {"messagefoundry/scaffold.py": 1}, hits
+    assert hits == {"messagefoundry_toolkit/scaffold.py": 1}, hits
 
 
 @pytest.mark.parametrize("columns", ["31", "61", "80", "10000"])

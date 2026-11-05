@@ -148,6 +148,8 @@ class SandboxReading:
     ``warmup_first_delivery_max_ms`` is an UPPER BOUND on the slowest spawn, to read beside
     ``startup_seconds`` (a spawn past that bound fails, and its message dead-letters). It is not a
     spawn time on its own: the ``off`` arm's figure is the same path with no spawn in it.
+    Both first-delivery figures read each send's FIRST arrival only: a redelivery, or a fan-out
+    copy of a send already seen, does not enter them.
     """
 
     requested: str

@@ -56,10 +56,17 @@ invariants can't silently regress.
   outside :data:`_XML_PARSER_MODULES`. The one *import-free* route that exists in this tree —
   ``parsing/xml/_deps.py``'s lazy loaders — is covered by its own clause
   (:data:`_XML_DEPS_CONSUMERS`) rather than left to the module-name matcher. Separately,
-  ``transports/soap.py`` triages SOAP faults with regexes over the XML response body
-  (``_FAULT_RE``/``_FAULTCODE_RE``/``_CODEVALUE_RE``) — an ad-hoc same-type extraction that is
-  deliberately out of the clause's scope, because it drives only retry-vs-dead-letter classification,
-  never a security decision.
+  ``transports/soap.py`` triages SOAP faults with regexes and ``str.find`` over the XML response
+  body. Its fault-code patterns, ``_FAULTCODE_RE``/``_CODEVALUE_RE``, each match a ``<``, optional
+  whitespace, an optional prefix of word characters, dots and hyphens ending in ``:``, and the name
+  ``faultcode`` or ``Value`` in any case with no word character after it. So they also match a
+  longer name that goes on with at least ``.``, ``-`` or ``:``, such as ``<faultcode.detail>`` or
+  ``<Value-x>``.
+  ``_code_text`` takes the text from the next ``>`` after a match to the next ``</``. Which match,
+  inside the Fault ``_FAULT_RE`` matched, and when the code is empty instead, its docstring and
+  ``_fault_code``'s say. That is an ad-hoc same-type extraction, deliberately out of the clause's scope, as are at least
+  ``_FAULT_RE``, ``_WSSE_FAULT_RE``, ``_SENDER_RE`` and ``_RECEIVER_RE``. The fault-code text drives
+  at least retry versus dead-letter.
 """
 
 from __future__ import annotations
@@ -82,7 +89,7 @@ import pytest
 # * ``_SOURCE_ROOTS`` — messagefoundry/ + messagefoundry_webconsole/ + messagefoundry_toolkit/ +
 #   harness/ + tee/, the first-party Python the ReDoS and single-parser clauses walk. The toolkit
 #   joined before any code moved into it (ADR 0201 section 4): code that leaves messagefoundry/ must
-#   not leave these clauses, and ``corepoint_import`` parses untrusted Corepoint XML once it moves.
+#   not leave these clauses, and ``corepoint_import`` parses untrusted Corepoint XML there since slice 4.
 #   ``tee/`` belongs here on the same footing as the rest: it parses untrusted HL7 off the wire (``tee/mllp.py``'s segment split over
 #   decoded MLLP frames, ``tee/anon/*`` over message fields), which is exactly the class these clauses
 #   score. Measured before adding: zero nested-quantifier offenders, zero unscannable patterns, no
@@ -691,10 +698,6 @@ _UNSCANNABLE_RE_PATTERNS = {
     "messagefoundry/auth/trust_anchors.py": (
         r"""''.join((re.escape(ch) if ch.isascii() else '..' if ord(ch) > 65535 else '.' for ch in anchor_path)) + '(?:\\s+|$)'""",
     ),
-    # BACKLOG #2814 -- _RemoteError.without_names. Unresolvable BY CONSTRUCTION: the alternatives are
-    # the file names this upload rendered, known only at runtime. Every alternative is re.escape'd
-    # literal text, so the pattern holds no quantifier from input: a plain alternation of literals.
-    "messagefoundry/transports/remotefile.py": ("'|'.join(map(re.escape, bases))",),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py
@@ -1013,7 +1016,7 @@ _XML_PARSER_ALLOWLIST = {
         "the vendored defusedxml copy (messagefoundry/_vendor/defusedxml) ElementTree.fromstring with "
         "forbid_dtd/forbid_entities/forbid_external in RawMessage.xml(); the xml.etree import beside it is TYPE_CHECKING-only (Element, for hints)"
     ),
-    "messagefoundry/corepoint_import.py": (
+    "messagefoundry_toolkit/corepoint_import.py": (
         "the vendored defusedxml copy's ElementTree.fromstring with forbid_dtd/forbid_entities/"
         "forbid_external, isolated "
         "in _hardened_fromstring() so tests/test_xml_parser_consistency.py drives THAT surface "

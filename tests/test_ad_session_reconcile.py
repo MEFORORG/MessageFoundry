@@ -67,6 +67,7 @@ from messagefoundry.store.store import (
     SCOPE_SOURCE_AD,
     SCOPE_SOURCE_MANUAL,
     MessageStore,
+    RevokeResult,
     UserRecord,
     VerifiedUser,
     audit_row_hash,
@@ -5536,13 +5537,13 @@ async def _absent_pass_with_sessions_gone_first(
         notifier.sent.clear()
         real_revoke = store.revoke_user_sessions
 
-        async def sessions_gone_first(user_id: str) -> int:
+        async def sessions_gone_first(user_id: str) -> RevokeResult:
             ended = await real_revoke(user_id)  # the other reconciler, or the user's sign-out
             if other_reconciler_row:
                 await service._audit(
                     "auth.ad_session_revoked",
                     actor="jdoe",
-                    detail=json.dumps({"reason": "directory_absent", "sessions": ended}),
+                    detail=json.dumps({"reason": "directory_absent", "sessions": ended.count}),
                 )
             return await real_revoke(user_id)
 

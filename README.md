@@ -97,7 +97,8 @@ dependency**, then scaffold your own config repo ([ADR 0017](https://github.com/
 
 ```bash
 pip install "messagefoundry==<version>"   # pin the exact engine version (core runtime, SQLite store)
-messagefoundry init ./my-config-repo      # scaffold a standalone config repo
+pip install "messagefoundry-toolkit==<version>"   # the authoring commands, same version; not for a production host
+messagefoundry-toolkit init ./my-config-repo   # scaffold a standalone config repo
 cd ./my-config-repo
 messagefoundry provision-admin --username <name> --email <address>   # the first administrator
 python -P -X disable-remote-debug -m messagefoundry serve --config config --env dev
@@ -206,10 +207,10 @@ certificate on first run and saves it beside the store database as `api-generate
 browser warns about that certificate, and other clients reject it, until you import it into the
 trust store or configure your own. The engine renews it at startup once less than a third of its
 lifetime is left, so import it again after a renewal. The one exception is a declared TLS-terminating proxy in front
-(`[api].tls_terminated_upstream`): the engine then speaks plain HTTP to the proxy, and you browse to
-the proxy's address. Securing that hop is your job. So `serve` refuses to start there until you set
-`[api].plaintext_upstream_hop_acknowledged = true`. With your own certificate the hop is TLS instead,
-and the proxy must speak https to the engine. See [docs/SECURITY.md](docs/SECURITY.md).
+(`[api].tls_terminated_upstream`) with no certificate of your own: the engine then speaks plain HTTP
+to the proxy, and you browse to the proxy's address.
+[docs/SECURITY.md, Plaintext proxy hop](docs/SECURITY.md#plaintext-proxy-hop) says when `serve`
+accepts that.
 
 Then open the admin console in a browser (install the web console alongside the engine with
 `pip install -e packaging/messagefoundry-webconsole`; it is on by default for a loopback bind, so

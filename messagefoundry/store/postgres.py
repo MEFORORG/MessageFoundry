@@ -86,7 +86,9 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.tls_policy import (
     HopPosture,
+    InsecureHopRefused,
     RevocationHopGuard,
+    StoreTlsRefused,
     current_hop_posture,
     harden_cipher_suites,
     harden_crl_check,
@@ -95,6 +97,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
+from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
@@ -108,6 +111,7 @@ from messagefoundry.store.base import (
     SchemaProvisionResult,
     StoreGrantsMissingError,
     StoreNotFoundError,
+    _carries_a_codec_error,
     acquire_pooled,
     driver_sqlstate,
     warm_pool_connections,
@@ -147,7 +151,11 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_cipher,
     rotation_fingerprint_reseal_likes,
 )
-from messagefoundry.store.document_strip import StripResult, cutoff_for
+from messagefoundry.store.document_strip import (
+    StripResult,
+    cutoff_for,
+    log_unreadable_skips,
+)
 from messagefoundry.store.gcm_bound import (
     bind_store_salt,
     checkpoint_invocations,
@@ -188,13 +196,15 @@ from messagefoundry.store.row_seal import (
     RowSealer,
     RowSealError,
 )
-from messagefoundry.store.schema_verify import IndexShape, SchemaShape
+from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
     sealed_reference_set,
 )
 from messagefoundry.store.server_schema_verify import (
+    ColumnShape,
+    ServerSchemaShape,
     declared_schema,
     key_column,
     refuse_short_schema,
@@ -214,6 +224,8 @@ from messagefoundry.store.store import (
     NOT_DEPLOYED_EVENT,
     PASSTHROUGH_MARKER_HANDLER,
     REINGRESS_ARTIFACT_ERASED,
+    REINGRESS_ARTIFACT_MISSING,
+    REINGRESS_PEEK_FAILED,
     REINGRESS_TARGET_PREFIX,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
@@ -239,11 +251,15 @@ from messagefoundry.store.store import (
     ConnectionEventWrite,
     ConnectionMetrics,
     DbStatus,
+    DeadLetterPurge,
     DestinationMetrics,
     DiskFreeStatus,
+    EpochBump,
+    EpochRaise,
     FailOutcome,
     FederatedUnbind,
     InboundMetrics,
+    KeptSessionRestamp,
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
@@ -266,6 +282,7 @@ from messagefoundry.store.store import (
     ResendSourceEmpty,
     ResendSourceNotFound,
     RestoreRecord,
+    RevokeResult,
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
@@ -309,8 +326,12 @@ from messagefoundry.store.store import (
     first_sealed_approval,
     full_authentication_clear,
     global_epoch_or_refuse,
+    global_epoch_raise,
+    global_epoch_unmoved,
     held_approval_tombstone,
     if_applied,
+    inheritance_plan,
+    inheriting_children,
     judge_totp,
     load_audit_chain,
     lockout_clear,
@@ -632,9 +653,12 @@ _SCHEMA: list[str] = [
         ciphertext    TEXT NOT NULL,
         PRIMARY KEY (attachment_id, seq)
     )""",
+    # `inherited` marks a link a child message took from its parent (BACKLOG #5099): it serves
+    # delivery and retention, and grants no download (attachments_for).
     """CREATE TABLE IF NOT EXISTS message_attachment (
         message_id    TEXT NOT NULL,
         attachment_id TEXT NOT NULL,
+        inherited     BOOLEAN NOT NULL DEFAULT FALSE,
         PRIMARY KEY (message_id, attachment_id)
     )""",
     # ix_queue_lease (the reclaim sweep's index) is created in _migrate_lease_columns, AFTER the lease
@@ -1286,13 +1310,21 @@ _FIFO_OUT_SEQ_INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS ix_queue_fifo_out_seq"
     " ON queue(stage, destination_name, status, seq)"
 )
-#: What the live-schema check expects: the batch, then every index the migration builds. The
-#: migration's columns are in the batch's CREATE TABLE statements already, so it adds none here.
+# The pre-ADR-0060 FIFO index names the migration drops once their seq-trailing successors exist.
+# Constants for the same reason as the builds above: the check reads what the migration runs, so a
+# name dropped here is not expected (BACKLOG #5062).
+_FIFO_IN_DROP_DDL = "DROP INDEX IF EXISTS ix_queue_fifo_in"
+_FIFO_OUT_DROP_DDL = "DROP INDEX IF EXISTS ix_queue_fifo_out"
+#: What the live-schema check expects: the batch, then every index the migration builds or drops, in
+#: the order it runs them. The migration's columns are in the batch's CREATE TABLE statements
+#: already, so it adds none here; a test holds each ADD's type and nullability to that CREATE TABLE.
 _MIGRATION_INDEX_DDL: Final = (
     _BODY_REF_INDEX_DDL,
     _LEASE_INDEX_DDL,
     _FIFO_IN_SEQ_INDEX_DDL,
     _FIFO_OUT_SEQ_INDEX_DDL,
+    _FIFO_IN_DROP_DDL,
+    _FIFO_OUT_DROP_DDL,
     _RECEIVED_INDEX_DDL,
 )
 
@@ -1300,16 +1332,29 @@ _MIGRATION_INDEX_DDL: Final = (
 # Each name is resolved the way the batch's unqualified DDL resolved it: a table through the search
 # path, and an index in the namespace of the table it is declared on, which is where CREATE INDEX IF
 # NOT EXISTS looked for it. The relkind is read too, so a name held by another kind of relation is
-# named as such. Every name travels as a bound array, never spliced.
+# named as such. Every name travels as a bound array, never spliced. Each column's type is read as
+# format_type() prints it, with its NOT NULL and whether the server numbers it, an identity or a
+# SERIAL's nextval() default (BACKLOG #5085). Every row carries current_schema(), the schema the
+# batch's unqualified DDL resolved into, for the refusal to name.
 _LIVE_COLUMNS_SQL = (
-    "SELECT t.name AS tbl, c.relkind::text AS kind, a.attname::text AS col"
+    "SELECT t.name AS tbl, c.relkind::text AS kind, a.attname::text AS col,"
+    " pg_catalog.format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS notnull,"
+    " (a.attidentity <> '' OR pg_catalog.pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval(%')"
+    " AS numbered, pg_catalog.current_schema()::text AS schema_name"
     " FROM pg_catalog.unnest($1::text[]) AS t(name)"
     " LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(t.name)"
     " LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0"
     " AND NOT a.attisdropped AND c.relkind IN ('r', 'p')"
+    " LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum"
 )
-# indnkeyatts leaves out INCLUDE columns; bit 0 of indoption is DESC. pg_get_indexdef with a column
-# number prints that key column alone: its name, or the expression. The two arrays are zipped with
+# indnkeyatts leaves out INCLUDE columns; bit 0 of indoption is DESC and bit 1 NULLS FIRST.
+# pg_get_indexdef with a column number prints that key column alone, its name or the expression, and
+# none of its options, so a collation other than the column's, an operator class that is not its
+# type's default, and a NULLS order other than the direction's default are added after it (BACKLOG
+# #5062). The DDL reader refuses all three, so a live key carrying one compares unequal. A collation
+# is added only after a column (indkey nonzero): an expression's own collation lives in indexprs,
+# which SQL cannot read, so one is not compared rather than printed for an expression whose natural
+# collation it is. Each vector is zero-based, so key k is at k - 1. The two name arrays are zipped with
 # ROWS FROM and one unnest each: the parser rewrites a multi-argument unnest in FROM into that form
 # only when the name is unqualified, so pg_catalog.unnest($1, $2) finds no such function.
 _LIVE_INDEXES_SQL = (
@@ -1317,7 +1362,16 @@ _LIVE_INDEXES_SQL = (
     " i.indisunique AS uniq, (i.indpred IS NOT NULL) AS partial,"
     " (i.indisvalid AND i.indisready) AS usable, am.amname::text AS method,"
     " ARRAY(SELECT pg_catalog.pg_get_indexdef(i.indexrelid, k, true)"
+    "   || COALESCE((SELECT ' COLLATE ' || pg_catalog.quote_ident(co.collname::text)"
+    "     FROM pg_catalog.pg_collation co WHERE co.oid = i.indcollation[k - 1]"
+    "     AND i.indkey[k - 1] <> 0"
+    "     AND co.oid IS DISTINCT FROM (SELECT ka.attcollation FROM pg_catalog.pg_attribute ka"
+    "       WHERE ka.attrelid = i.indrelid AND ka.attnum = i.indkey[k - 1])), '')"
+    "   || COALESCE((SELECT ' ' || oc.opcname::text FROM pg_catalog.pg_opclass oc"
+    "     WHERE oc.oid = i.indclass[k - 1] AND NOT oc.opcdefault), '')"
     "   || CASE WHEN (i.indoption[k - 1]::int & 1) = 1 THEN ' DESC' ELSE '' END"
+    "   || CASE (i.indoption[k - 1]::int & 3) WHEN 2 THEN ' NULLS FIRST'"
+    "     WHEN 1 THEN ' NULLS LAST' ELSE '' END"
     "   FROM pg_catalog.generate_series(1, i.indnkeyatts::int) AS k ORDER BY k) AS cols"
     " FROM ROWS FROM (pg_catalog.unnest($1::text[]), pg_catalog.unnest($2::text[]))"
     " AS q(name, tbl)"
@@ -1328,7 +1382,6 @@ _LIVE_INDEXES_SQL = (
     " LEFT JOIN pg_catalog.pg_class t ON t.oid = i.indrelid"
     " LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam"
 )
-_CURRENT_SCHEMA_SQL = "SELECT pg_catalog.current_schema()::text AS schema_name"
 _RELKINDS: Final = MappingProxyType(
     {
         "r": "table",
@@ -1353,17 +1406,23 @@ def _relkind_label(kind: str | None, wanted: tuple[str, ...], label: str) -> str
     return label if kind in wanted else _RELKINDS.get(kind, f"relation of kind {kind!r}")
 
 
-def _declared_schema() -> SchemaShape:
-    """What the live-schema check expects: the batch, then every index the migration builds."""
-    return declared_schema((*_SCHEMA, *_MIGRATION_INDEX_DDL))
+def _declared_schema() -> ServerSchemaShape:
+    """What the live-schema check expects: the batch, then every index the migration builds or drops,
+    with each column's type and nullability as PostgreSQL's catalog spells them."""
+    return declared_schema((*_SCHEMA, *_MIGRATION_INDEX_DDL), "postgres")
 
 
 def _schema_hash() -> str:
     """Content hash of the shipped DDL batch + the migration revision. The ``schema_meta`` marker
     stores it; a match at open means this exact batch (and migration pass) already ran, so both —
     and the schema advisory lock — are skipped (ADR 0064). Any edit to ``_SCHEMA`` changes the hash
-    automatically; a change to ``_migrate_lease_columns`` must bump ``_MIGRATION_REV``."""
-    payload = "\n".join(_SCHEMA) + f"\nmigration_rev={_MIGRATION_REV}"
+    automatically; a change to ``_migrate_lease_columns`` must bump ``_MIGRATION_REV``, and a change
+    to what the live-schema check refuses bumps the one ``SCHEMA_CHECK_REV`` both backends hash."""
+    payload = (
+        "\n".join(_SCHEMA)
+        + f"\nmigration_rev={_MIGRATION_REV}"
+        + f"\nschema_check_rev={server_schema_verify.SCHEMA_CHECK_REV}"
+    )
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -1430,6 +1489,9 @@ _PG_REVOKE_ALL_SESSIONS_SQL: Final = (
     "UPDATE sessions SET revoked_at=$1, seal='' WHERE revoked_at IS NULL"
     " AND ($2::text IS NULL OR token_hash != $2)"
 )
+#: The `$n` twin of store.py's ``_END_DECLINED_KEPT_SESSION_SQL`` (follow-up to BACKLOG #4975):
+#: the per-account sweep narrowed to one token.
+_PG_END_DECLINED_KEPT_SESSION_SQL: Final = _PG_REVOKE_USER_SESSIONS_SQL + " AND token_hash=$3"
 #: Whether the account holds at least one passkey.
 _PG_WEBAUTHN_ANY_FOR_USER: Final = "SELECT 1 FROM webauthn_credentials WHERE user_id=$1 LIMIT 1"
 
@@ -1555,7 +1617,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     if (
         settings.trust_server_certificate or not settings.encrypt
     ) and not weakened_tls_escape_permitted(posture):
-        raise ValueError(
+        raise StoreTlsRefused(
             "Postgres TLS is weakened (trust_server_certificate=true or encrypt=false), which is "
             f"MITM-able. Use a trusted server certificate, or set {INSECURE_TLS_ESCAPE_ENV}=1 on an "
             "instance at [security].enforcement = warn to allow it for a trusted-network dev/test "
@@ -1582,7 +1644,7 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # disjoint conditions so one hop is never refused twice).
     # settings.server is str | None; an empty host reads as loopback (is_loopback_hop_host) → ALLOW, so a
     # missing server (a Postgres config that would fail elsewhere) never trips the revocation refusal.
-    ctx = _verifying_context(settings)
+    ctx = _verifying_context_at_open(settings)
     # The guard runs LAST and takes the FINISHED context, which is the whole point of `context=`: an
     # ssl_crl_file that really loaded sets VERIFY_CRL_CHECK_LEAF on the context, and the guard reads
     # that flag rather than the setting. The pool builds a fresh context per connection through the
@@ -1590,6 +1652,40 @@ def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) ->
     # so the verdict reached here holds for every connection the pool opens.
     _refuse_store_revocation(host=settings.server or "", posture=posture, context=ctx)
     return ctx
+
+
+def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
+    """:func:`_verifying_context`, with its ``ValueError`` typed as :class:`StoreTlsRefused`
+    (BACKLOG #5000), for :func:`_build_ssl` at the open only. The pool's per-connection rebuild
+    calls the builder directly, so a refusal there is not typed.
+
+    The builder refuses the hop's own TLS settings with a ``ValueError``, at least for the pin
+    file, the CRL file and its dates, and the suites; typed, such a refusal is could not start
+    rather than the CLI floor's exit 1. Not an ``OSError`` that is also a ``ValueError``, such as a
+    CRL staging copy that failed: that is a fault of the host, not a verdict on the settings, and
+    keeps its own type. Nor an ``OSError`` alone, such as a CRL file the engine may not read, which
+    this does not catch (a pin file it may not read arrives as a ``ValueError`` naming the setting,
+    and is typed).
+
+    **A codec error is neither quoted nor chained**, as
+    :func:`~messagefoundry.store.base.build_store_cipher` does not chain one (BACKLOG #2532,
+    #3471): its text names a byte of what it decoded. A ``ValueError`` that is one, holds one, or
+    has one on its chain is refused with a fixed text naming the settings and the class, raised
+    outside the handler. Not its ``codec_safe_str`` rendering: the CRL judge re-raises a codec
+    error as a ``ValueError`` whose own text already quotes the byte, which that rendering prints
+    whole. Every other ``ValueError`` keeps its text and its chain."""
+    try:
+        return _verifying_context(settings)
+    except ValueError as exc:
+        if isinstance(exc, (InsecureHopRefused, OSError)):
+            raise
+        if not _carries_a_codec_error(exc):
+            raise StoreTlsRefused(str(exc)) from exc
+        kind = type(exc).__name__
+    raise StoreTlsRefused(
+        "the PostgreSQL store's TLS context could not be built from [store].ssl_root_cert, "
+        f"[store].ssl_crl_file or the system trust store: a {kind} from a codec error, not quoted"
+    )
 
 
 def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
@@ -1608,6 +1704,7 @@ def _verifying_context(settings: StoreSettings) -> ssl.SSLContext:
         except OSError as exc:
             # A missing file raises a bare FileNotFoundError with no path. Name the setting, since the
             # pool re-reads this file on every new connection and it can vanish after the load check.
+            # A ValueError: `_build_ssl` types it at the open (#5000); a pool connect leaves it be.
             raise ValueError(
                 f"[store].ssl_root_cert ({settings.ssl_root_cert!r}) could not be read: {exc}"
             ) from exc
@@ -2149,6 +2246,9 @@ class PostgresStore:
                 # commits or rolls back, or once the server sees the holder's session end, which
                 # for a crashed host can take as long as TCP keepalive allows. A role- or
                 # database-configured lock_timeout (or transaction_timeout) can still end it sooner.
+                # Read before the lock and the batch, so DDL the live-schema check cannot read
+                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process.
+                _declared_schema()
                 log.info("postgres: waiting for the schema lock to apply the DDL batch")
                 wait = self._settings.schema_lock_timeout
                 lock = self._lock_key(_SCHEMA_LOCK)
@@ -2310,10 +2410,18 @@ class PostgresStore:
         are tolerated. :mod:`messagefoundry.store.server_schema_verify` says what is compared and
         what is not. Reads only."""
         expected = _declared_schema()
-        column_rows = [
-            (r["tbl"], _relkind_label(r["kind"], ("r", "p"), "table"), r["col"])
-            for r in await conn.fetch(_LIVE_COLUMNS_SQL, sorted(expected.columns))
-        ]
+        column_rows: list[tuple[str, str | None, str | None, ColumnShape | None]] = []
+        live_columns = await conn.fetch(_LIVE_COLUMNS_SQL, sorted(expected.columns))
+        schema = live_columns[0]["schema_name"] if live_columns else None
+        for r in live_columns:
+            shape = (
+                None
+                if r["type"] is None
+                else ColumnShape(str(r["type"]), not r["notnull"], bool(r["numbered"]))
+            )
+            column_rows.append(
+                (r["tbl"], _relkind_label(r["kind"], ("r", "p"), "table"), r["col"], shape)
+            )
         names = sorted(expected.named_indexes)
         tables = [expected.named_indexes[name].table for name in names]
         taken: dict[str, str] = {}
@@ -2338,10 +2446,8 @@ class PostgresStore:
                 bool(r["uniq"]),
                 bool(r["partial"]),
             )
-        # The schema the batch's unqualified DDL resolved into, for the refusal to name: with
+        # schema is the one the batch's unqualified DDL resolved into, for the refusal to name: with
         # [store].db_schema unset that is the search path's first schema, which the settings omit.
-        schema_rows = await conn.fetch(_CURRENT_SCHEMA_SQL)
-        schema = schema_rows[0]["schema_name"] if schema_rows else None
         refuse_short_schema(
             self.backend.value,
             self._settings.database,
@@ -2404,8 +2510,8 @@ class PostgresStore:
         # neutral (the claim orders by seq and names no index, ADR 0059) — pure speed restoration.
         await conn.execute(_FIFO_IN_SEQ_INDEX_DDL, timeout=float("inf"))
         await conn.execute(_FIFO_OUT_SEQ_INDEX_DDL, timeout=float("inf"))
-        await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_in", timeout=float("inf"))
-        await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_out", timeout=float("inf"))
+        await conn.execute(_FIFO_IN_DROP_DDL, timeout=float("inf"))
+        await conn.execute(_FIFO_OUT_DROP_DDL, timeout=float("inf"))
         await conn.execute(_RECEIVED_INDEX_DDL, timeout=float("inf"))
         # Step-up re-verification (ASVS 7.5.3) adds sessions.reauth_at; pre-existing rows get NULL.
         sessions_has_reauth = await conn.fetch(
@@ -3966,12 +4072,13 @@ class PostgresStore:
         parent_meta: dict[str, Any],
         correlation_depth_cap: int,
         now: float,
+        inherits: list[tuple[str, str]],
     ) -> bool:
         """Produce one PT child INGRESS row + message inside the caller's transaction (ADR 0013, gen.).
 
-        Postgres twin of :meth:`MessageStore._insert_passthrough_child`. Returns ``True`` if a child was
-        produced, ``False`` if the depth cap was breached (no child; the caller records the parent
-        ``ERROR`` via a dead marker). The child is a new, independent message (``source_type=
+        Postgres twin of :meth:`MessageStore._insert_passthrough_child`, which says what
+        ``inherits`` collects. Returns ``True`` if a child was produced, ``False`` if the depth cap
+        was breached (no child; the caller records the parent ``ERROR`` via a dead marker). The child is a new, independent message (``source_type=
         'passthrough'``, its own content-addressed id, status ``RECEIVED`` per count-and-log), correlated
         to the parent. Idempotent re-run: the content-addressed id is pre-checked so a partial-then-
         recovered run does not double-inject. Depth is computed purely from the parent's immutable
@@ -4017,6 +4124,9 @@ class PostgresStore:
                 now=now,
                 origin=MessageOrigin.REINGRESS,
             )
+            # Linked by the caller once every child of this transaction is made
+            # (_inherit_attachments, BACKLOG #5099).
+            inherits.append((new_mid, body))
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created = now
             # Hoist the row id so the payload binds to its own row tag.
@@ -4237,7 +4347,9 @@ class PostgresStore:
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
         # (== its live join rows), so a later release decrefs by the same count.
-        refs = list(dict.fromkeys(attachment_refs or ()))
+        # Sorted, so the increfs below take the attachment header locks in content-address order,
+        # the order a child's inheritance takes them in (BACKLOG #5099, _inherit_attachments).
+        refs = sorted(set(attachment_refs or ()))
         async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             await self._insert_message(
                 conn,
@@ -4471,6 +4583,7 @@ class PostgresStore:
                         loaded = json.loads(pmeta_json)
                         if isinstance(loaded, dict):
                             parent_meta = loaded
+                    inherits: list[tuple[str, str]] = []
                     for pt_name, body in pt_deliveries:
                         produced = await self._insert_passthrough_child_pg(
                             conn,
@@ -4481,10 +4594,13 @@ class PostgresStore:
                             parent_meta,
                             correlation_depth_cap,
                             now,
+                            inherits,
                         )
                         await self._insert_passthrough_marker_pg(
                             conn, message_id, pt_name, produced, now
                         )
+                    # Every child's documents in one pass, in content-address order (BACKLOG #5099).
+                    await self._inherit_attachments(conn, message_id, inherits)
                 for namespace, key, value in state_ops:
                     value_json = json.dumps(value)
                     await self._apply_state_op(conn, namespace, key, value_json, message_id, now)
@@ -5563,6 +5679,8 @@ class PostgresStore:
         summary: str | None,
         peek_failed: bool = False,
         peek_error: str | None = None,
+        refused_raw: str | None = None,
+        refused_metadata: Mapping[str, Any] | None = None,
         now: float | None = None,
     ) -> bool:
         """Postgres twin of :meth:`MessageStore.ingress_handoff` (ADR 0013 Increment 2) — the same
@@ -5638,17 +5756,17 @@ class PostgresStore:
                         dest,
                         seq,
                     )
-                    # A missing row is a corrupt reference. A NULL body means retention erased the
-                    # reply (BACKLOG #1560): a replay that re-pended this token after the purge's
-                    # snapshot made the purge's token blank skip it, while the same statement still
-                    # erased the reply. This branch is the only control for that, and the reply
-                    # must never become a child message. A missing row is damage, not an erasure,
-                    # so that token is not blanked: its sealed reference is the evidence.
+                    # A NULL body means retention erased the reply (BACKLOG #1560): a replay that
+                    # re-pended this token after the purge's snapshot made the purge's token blank
+                    # skip it, while the same statement still erased the reply. This branch is the
+                    # only control for that, and the reply must never become a child message. A
+                    # missing row is damage, not an erasure, so that token is not blanked: its
+                    # sealed reference is the evidence.
                     if art is None:
                         return await _consume_dead(
                             "ingress_handoff(missing-artifact)",
-                            "re-ingress work-row reference is corrupt/unparseable",
-                            "re-ingress ref corrupt",
+                            REINGRESS_ARTIFACT_MISSING,
+                            "re-ingress reply missing",
                         )
                     if art["body"] is None:
                         return await _consume_dead(
@@ -5729,6 +5847,8 @@ class PostgresStore:
                     if exists is None:
                         child_meta = json.dumps(
                             {
+                                # First, so the lineage keys win (vault BACKLOG #4796).
+                                **(refused_metadata if peek_failed and refused_metadata else {}),
                                 "correlation_id": origin_id,
                                 "correlation_root_id": root,
                                 "correlation_depth": child_depth,
@@ -5739,7 +5859,7 @@ class PostgresStore:
                             conn,
                             new_mid,
                             channel_id=loopback_channel_id,
-                            raw=body,
+                            raw=refused_raw if peek_failed and refused_raw is not None else body,
                             status=(
                                 MessageStatus.ERROR.value
                                 if peek_failed
@@ -5750,11 +5870,7 @@ class PostgresStore:
                             source_type="reingress",
                             summary=summary,
                             metadata=child_meta,
-                            error=(
-                                (peek_error or "re-ingress body failed HL7 peek")
-                                if peek_failed
-                                else None
-                            ),
+                            error=((peek_error or REINGRESS_PEEK_FAILED) if peek_failed else None),
                             now=now,
                             origin=MessageOrigin.REINGRESS,
                         )
@@ -6986,19 +7102,24 @@ class PostgresStore:
                 r["ciphertext"], aad=cell_aad("attachment_chunk", "ciphertext", ref, r["seq"])
             )
 
-    async def attachments_for(self, message_id: str) -> list[dict[str, Any]]:
+    async def attachments_for(
+        self, message_id: str, *, include_inherited: bool = False
+    ) -> list[dict[str, Any]]:
         """The distinct attachments ``message_id`` holds — the operator read surface (#149, ADR 0105
         Phase 3b, Postgres parity). JOINs ``message_attachment`` to its ``attachment`` header and returns
         one row per attachment carrying ``attachment_id`` (the sha256 content address), ``content_type``,
         and ``total_bytes``. **Metadata only** — the chunk ciphertext is never touched/decrypted. Returns
-        ``[]`` for a message with no detached document."""
+        ``[]`` for a message with no detached document. An inherited link is left out unless
+        ``include_inherited`` is set, so it grants no download (BACKLOG #5099; the SQLite twin says
+        why)."""
         if not self.supports_streaming_attachments:
             return []
+        own_only = "" if include_inherited else " AND NOT ma.inherited"
         async with self._timed_acquire() as conn:
             rows = await conn.fetch(
                 "SELECT a.id AS attachment_id, a.content_type, a.total_bytes "
                 "FROM message_attachment ma JOIN attachment a ON a.id = ma.attachment_id "
-                "WHERE ma.message_id=$1 ORDER BY a.id",
+                f"WHERE ma.message_id=$1{own_only} ORDER BY a.id",
                 message_id,
             )
         return [dict(r) for r in rows]
@@ -7044,14 +7165,17 @@ class PostgresStore:
         join rows gone and decrefs nothing — no double-decref, no refcount underflow, no premature GC of
         an attachment a SIBLING message still holds. ``where`` is a code-controlled ``$N`` fragment
         (numbered from ``$1``); ``params`` binds it identically in both statements."""
+        # The decrefs take the header locks in content-address order, as the ingress and
+        # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle. Sorted
+        # in Python as those are, so the database collation does not decide the order.
         rows = await conn.fetch(
             f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment"
-            f" WHERE {where} GROUP BY attachment_id",
+            f" WHERE {where} GROUP BY attachment_id ORDER BY attachment_id",
             *params,
         )
         if not rows:
             return
-        for r in rows:
+        for r in sorted(rows, key=lambda r: str(r["attachment_id"])):
             await self._decref_attachment(conn, r["attachment_id"], int(r["n"]))
         # Delete the just-released join rows so a re-run of the purge decrefs nothing (idempotent GC).
         await conn.execute(f"DELETE FROM message_attachment WHERE {where}", *params)
@@ -7116,6 +7240,39 @@ class PostgresStore:
             OutboxStatus.DEAD.value,
         ]
         return where, params
+
+    async def _inherit_attachments(
+        self, conn: Any, parent_id: str, children: Sequence[tuple[str, str]]
+    ) -> None:
+        """Link each ``(child_id, body)`` in ``children`` to each attachment ``parent_id`` holds
+        that its body names, and incref it, in the CALLER's transaction (BACKLOG #5099). Postgres
+        twin of :meth:`MessageStore._inherit_attachments`, which says why."""
+        children = inheriting_children(children)
+        if not children:
+            return
+        rows = await conn.fetch(
+            "SELECT attachment_id FROM message_attachment WHERE message_id=$1"
+            " ORDER BY attachment_id",
+            parent_id,
+        )
+        # Each incref below takes the attachment header's row lock until commit, so two
+        # transactions that incref the same documents must take them in one order, or each can wait
+        # on the other. inheritance_plan gives every child of this transaction one pass in
+        # content-address order, the order the ingress increfs and the retention decrefs take.
+        held = [str(r["attachment_id"]) for r in rows]
+        for ref, child_ids in inheritance_plan(held, children):
+            # The incref first, and the links only where it found the header (the SQLite twin
+            # says why): under READ COMMITTED a purge can collect it after the read above.
+            status = await conn.execute(
+                "UPDATE attachment SET refcount = refcount + $1 WHERE id=$2", len(child_ids), ref
+            )
+            if _rowcount(status) != 1:
+                continue
+            await conn.executemany(
+                "INSERT INTO message_attachment (message_id, attachment_id, inherited)"
+                " VALUES ($1,$2,TRUE)",
+                [(child_id, ref) for child_id in child_ids],
+            )
 
     async def release_message_attachments(self, message_id: str) -> None:
         """Release (decref + delete the linkage rows for) every attachment a SINGLE message holds, in ONE
@@ -7592,6 +7749,7 @@ class PostgresStore:
                         origin=MessageOrigin.OPERATOR_EDIT,
                         origin_actor=actor,
                     )
+                    await self._inherit_attachments(conn, message_id, [(child_mid, body)])
                     await self._event(
                         conn, child_mid, "received", None, f"edit-resend from {message_id}", now
                     )
@@ -7781,6 +7939,7 @@ class PostgresStore:
                         origin=MessageOrigin.OPERATOR_EDIT,
                         origin_actor=actor,
                     )
+                    await self._inherit_attachments(conn, origin_message_id, [(new_mid, raw)])
                     # Hoist the row id so the payload binds to its own row tag.
                     resubmit_row_id = uuid4().hex
                     await conn.execute(
@@ -9394,14 +9553,17 @@ class PostgresStore:
             await self._write_user(conn, user_id, lambda r: r.changed(cred_digest=digest))
         return count
 
-    async def _bump_session_epoch(self, conn: Any, user_id: str) -> None:
+    async def _bump_session_epoch(self, conn: Any, user_id: str) -> EpochRaise | None:
         """Raise the account's session epoch through the write helper, inside ``conn``'s
-        transaction (BACKLOG #2592); store.py's ``MessageStore._bump_session_epoch`` says why a
-        record that fails its seal does not stop the revoke that called this."""
+        transaction (BACKLOG #2592), and report the raise (BACKLOG #4975); store.py's
+        ``MessageStore._bump_session_epoch`` says why a record that fails its seal does not stop
+        the revoke that called this, and reports no raise."""
+        bump = EpochBump()
         try:
-            await self._write_user(conn, user_id, UserAuthzRecord.bump_epoch)
+            return bump.raised(await self._write_user(conn, user_id, bump))
         except RowSealError:
             log.warning("an account's record failed its integrity seal; its sessions end anyway")
+            return None
 
     async def reseal_user_records(self) -> tuple[int, int]:
         """Re-seal every user record under the active key, for ``rotate-key`` (BACKLOG #2592);
@@ -10585,12 +10747,13 @@ class PostgresStore:
 
     async def _global_session_epoch(self, conn: Any) -> int:
         """The store's global session epoch (BACKLOG #5091), read inside ``conn``'s transaction."""
-        return global_epoch_or_refuse(await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"))
+        return global_epoch_or_refuse(await self._global_session_epoch_value(conn))
 
-    async def _session_epoch(self, conn: Any, user_id: str) -> int:
-        """The account's session epoch, read inside ``conn``'s transaction (BACKLOG #2592)."""
-        row = await conn.fetchrow("SELECT session_epoch FROM users WHERE id=$1", user_id)
-        return 0 if row is None else int(row["session_epoch"])
+    async def _global_session_epoch_value(self, conn: Any) -> int | None:
+        """The global session epoch, ``None`` where the row is missing, read as
+        :meth:`_global_session_epoch` reads it but not refused."""
+        value = await conn.fetchval(f"SELECT {GLOBAL_SESSION_EPOCH_SQL}")
+        return None if value is None else int(value)
 
     def row_sealer(self) -> RowSealer | None:
         """This store's row sealer, or ``None`` on a keyless store (BACKLOG #2592). See
@@ -10706,31 +10869,51 @@ class PostgresStore:
 
     async def revoke_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
-        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count.
+    ) -> RevokeResult:
+        """Revoke a user's active sessions (all, or all but ``except_token_hash``). Returns the count
+        and whether the kept session was re-stamped (:class:`RevokeResult`, BACKLOG #4975).
 
         Raises the account's session epoch and re-seals the kept session in the same transaction
         (BACKLOG #2592); store.py's ``MessageStore.revoke_user_sessions`` says why. The epoch bump
         runs first, so it takes the account row's lock before any session row is touched, the order
-        ``create_session`` takes them in. The borrow is :meth:`_after_commit_txn`'s, for the reason
-        it gives."""
+        ``create_session`` takes them in. The kept session is checked against the global epoch
+        too, read here without a lock clause as every reader of it is, and without refusing a
+        missing row (store.py's ``global_epoch_unmoved``), and ended where it is declined
+        (:meth:`_keep_or_end_session`, follow-up to BACKLOG #4975). The borrow is
+        :meth:`_after_commit_txn`'s, for the reason it gives."""
         now = time.time() if now is None else now
         async with self._after_commit_txn() as conn:
-            await self._bump_session_epoch(conn, user_id)
+            raised = await self._bump_session_epoch(conn, user_id)
             status = await conn.execute(
                 _PG_REVOKE_USER_SESSIONS_SQL + " AND ($3::text IS NULL OR token_hash != $3)",
                 now,
                 user_id,
                 except_token_hash,
             )
-            if except_token_hash is not None:
-                epoch = await self._session_epoch(conn, user_id)
-                await self._write_session(
-                    conn,
-                    except_token_hash,
-                    lambda s: replace(s, user_epoch=epoch) if s.user_id == user_id else s,
-                )
-        return _rowcount(status)
+            if except_token_hash is None:
+                return RevokeResult(_rowcount(status))
+            unmoved = global_epoch_unmoved(await self._global_session_epoch_value(conn))
+            return await self._keep_or_end_session(
+                conn,
+                _rowcount(status),
+                except_token_hash,
+                KeptSessionRestamp(user_id, raised, unmoved),
+                now,
+            )
+
+    async def _keep_or_end_session(
+        self, conn: Any, revoked: int, token_hash: str, restamp: KeptSessionRestamp, now: float
+    ) -> RevokeResult:
+        """Re-stamp the session a revoke keeps, or end it where ``restamp`` declines, inside
+        ``conn``'s transaction (follow-up to BACKLOG #4975); store.py's
+        ``MessageStore._keep_or_end_session`` states the contract."""
+        if restamp.kept(await self._write_session(conn, token_hash, restamp)):
+            return RevokeResult(revoked, kept=True)
+        status = await conn.execute(
+            _PG_END_DECLINED_KEPT_SESSION_SQL, now, restamp.user_id, token_hash
+        )
+        ended = _rowcount(status) == 1
+        return RevokeResult(revoked + ended, kept=False, ended_kept=ended)
 
     async def count_user_sessions(
         self, user_id: str, *, except_token_hash: str | None = None
@@ -10743,14 +10926,17 @@ class PostgresStore:
 
     async def revoke_all_sessions(
         self, *, except_token_hash: str | None = None, now: float | None = None
-    ) -> int:
+    ) -> RevokeResult:
         """Revoke the sessions it finds but ``except_token_hash`` (BACKLOG #2614); see
         :meth:`AuthStore.revoke_all_sessions`.
 
         Raises the store's global session epoch first (BACKLOG #5091), which ends every session
         minted before it whatever account it belongs to, then the epoch of each account its read of
         the account list returns, then ends the sessions it finds and re-seals the kept one under
-        both new epochs; docs/SECURITY.md, *Limits of the session sweep*, says what that leaves.
+        both new epochs, when it carried both epochs those raises replaced
+        (:class:`KeptSessionRestamp`, BACKLOG #4975), and otherwise ends and counts it
+        (:meth:`_keep_or_end_session`); docs/SECURITY.md, *Limits of the session sweep*, says what
+        that leaves.
 
         The raise is first so a second revoke of every account waits on that one row, holding
         nothing, until this one commits. Nothing else locks the row: every reader of the global
@@ -10758,30 +10944,43 @@ class PostgresStore:
         so holding it while the loop below waits on account rows cannot close a cycle."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
-            current = global_epoch_or_refuse(
-                await conn.fetchval(
-                    "UPDATE global_session_epoch SET epoch = epoch + 1 WHERE id = 1 RETURNING epoch"
+            global_raised = global_epoch_raise(
+                global_epoch_or_refuse(
+                    await conn.fetchval(
+                        "UPDATE global_session_epoch SET epoch = epoch + 1 WHERE id = 1"
+                        " RETURNING epoch"
+                    )
                 )
             )
-            for row in await conn.fetch("SELECT id FROM users ORDER BY id"):
-                await self._bump_session_epoch(conn, str(row["id"]))
+            raised = {
+                str(row["id"]): await self._bump_session_epoch(conn, str(row["id"]))
+                for row in await conn.fetch("SELECT id FROM users ORDER BY id")
+            }
             status = await conn.execute(_PG_REVOKE_ALL_SESSIONS_SQL, now, except_token_hash)
-            if except_token_hash is not None:
-                owner = await conn.fetchval(
-                    "SELECT user_id FROM sessions WHERE token_hash=$1", except_token_hash
-                )
-                if owner is not None:
-                    epoch = await self._session_epoch(conn, str(owner))
-                    await self._write_session(
-                        conn,
-                        except_token_hash,
-                        lambda s: replace(s, user_epoch=epoch, global_epoch=current),
-                    )
-        return _rowcount(status)
+            revoked = _rowcount(status)
+            if except_token_hash is None:
+                return RevokeResult(revoked)
+            owner = await conn.fetchval(
+                "SELECT user_id FROM sessions WHERE token_hash=$1", except_token_hash
+            )
+            if owner is None:
+                return RevokeResult(revoked)
+            owner = str(owner)
+            return await self._keep_or_end_session(
+                conn,
+                revoked,
+                except_token_hash,
+                KeptSessionRestamp(owner, raised.get(owner), global_raised),
+                now,
+            )
 
     async def consume_restore_record(self, *, now: float | None = None) -> RestoreRecord | None:
         """Always ``None``: ``restore`` places only a SQLite store, and a Postgres database's
-        restore is the DBA's (BACKLOG #52, #2614). See :meth:`AuthStore.consume_restore_record`."""
+        restore is the DBA's (BACKLOG #52, #2614). See :meth:`AuthStore.consume_restore_record`.
+
+        So a DBA restore of this store is not recorded at start: no session is ended, and no
+        ``store_restored`` row or alert is written. docs/SECURITY.md, *A restored store brings its
+        sessions back*, names the steps an operator takes by hand (BACKLOG #5092)."""
         return None
 
     async def enforce_session_cap(
@@ -10976,6 +11175,7 @@ class PostgresStore:
             reclaimed = 0
             updates: list[tuple[str, float, str]] = []
             failures: list[CellTagError] = []
+            unreadable: list[object] = []
             for row in rows:
                 cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
                 if row["received_at"] >= cutoff:
@@ -11009,6 +11209,7 @@ class PostgresStore:
                     pruned_at=now,
                     min_bytes=min_bytes,
                     content_type=content_types.get(row["channel_id"]),
+                    on_unreadable=functools.partial(unreadable.append, row["id"]),
                 )
                 if n_docs == 0:
                     continue
@@ -11027,6 +11228,8 @@ class PostgresStore:
                 msgs += 1
                 docs += n_docs
                 reclaimed += n_bytes
+            # Before the write, so a failed write does not lose the record of the skips.
+            log_unreadable_skips(unreadable)
             if updates:
                 async with conn.transaction():
                     await conn.executemany(
@@ -11114,10 +11317,10 @@ class PostgresStore:
         older_than: float,
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
-    ) -> int:
+    ) -> DeadLetterPurge:
         """Null the bodies of dead-lettered rows last updated before ``older_than`` (their own
         retention window). Keeps the row + ``dead`` status; blanks ``payload`` + ``last_error``.
-        Ported, not stubbed. Returns the number of dead rows purged.
+        Ported, not stubbed. Returns a :class:`DeadLetterPurge` (BACKLOG #4996).
 
         **Every stage, not only outbound** (#1188, ASVS 14.2.7) — mirrors the SQLite backend. A dead
         ``ingress``/``routed`` row holds the full raw body and is neither pending nor inflight, so its
@@ -11139,14 +11342,22 @@ class PostgresStore:
         )
         async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
+                # As on SQLite: two statements, one count each (BACKLOG #4996).
                 result = await conn.execute(
-                    "UPDATE queue SET payload='', last_error=NULL"
-                    f" WHERE status=$1 AND (payload <> '' OR last_error IS NOT NULL)"
-                    f" AND updated_at < {cutoff_sql}",
+                    "UPDATE queue SET payload=''"
+                    f" WHERE status=$1 AND payload <> '' AND updated_at < {cutoff_sql}",
                     OutboxStatus.DEAD.value,
                     *cutoff_params,
                 )
                 purged = _rowcount(result)
+                cleared = _rowcount(
+                    await conn.execute(
+                        "UPDATE queue SET last_error=NULL"
+                        f" WHERE status=$1 AND last_error IS NOT NULL AND updated_at < {cutoff_sql}",
+                        OutboxStatus.DEAD.value,
+                        *cutoff_params,
+                    )
+                )
                 # #149 Phase 4 (mirrors SQLite Phase 3a): a dead row just lost its payload + body_ref, so
                 # it can no longer be replayed. If that was the message's LAST replayable row, release its
                 # streaming attachment here — the deferred half of the per-MESSAGE dead-row split with
@@ -11157,7 +11368,7 @@ class PostgresStore:
                     older_than, connection_cutoffs
                 )
                 await self._release_message_attachments(conn, rel_where, rel_params)
-        return purged
+        return DeadLetterPurge(bodies=purged, errors_cleared=cleared)
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state entries last written before ``older_than`` (ADR 0005 retention) and

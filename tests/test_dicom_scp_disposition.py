@@ -29,6 +29,7 @@ from messagefoundry.config.models import ConnectorType, ContentType, Source  # n
 from messagefoundry.config.wiring import (  # noqa: E402
     DICOM,
     ConnectionSpec,
+    InboundConnection,
     Registry,
     build_inbound_connection,
 )
@@ -94,12 +95,16 @@ async def _rows(store: MessageStore) -> list[dict]:
     return [dict(r) for r in await cur.fetchall()]
 
 
-async def _send_through_runner(store: MessageStore, data: bytes) -> int:
+async def _send_through_runner(
+    store: MessageStore, data: bytes, *, inbound: InboundConnection | None = None
+) -> int:
     """Start a real runner with one DICOM inbound on an ephemeral loopback port, send ``data`` over a
-    real association, and return the status. The runner binds the handler exactly as production does."""
+    real association, and return the status. The runner binds the handler exactly as production does.
+    ``inbound`` replaces the default ``dicom`` one, named ``_NAME``."""
     reg = Registry()
     reg.add_inbound(
-        build_inbound_connection(
+        inbound
+        or build_inbound_connection(
             _NAME,
             DICOM(ae_title=_SCP_AE, port=0, timeout_seconds=120.0),
             router="r",
@@ -152,6 +157,45 @@ async def test_a_handler_refusal_is_a_dimse_failure_and_keeps_its_error_row(
     rows = await _rows(store)
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
     assert "ingress exceeds max size" in (rows[0]["error"] or "")
+
+
+@pytest.mark.parametrize(
+    ("encoding", "kind"),
+    [
+        pytest.param("not-a-real-codec", "configuration", id="unusable_codec_name"),
+        # The premise behind the final class: with the name fixed, the same object is still refused,
+        # as the body's own fault.
+        pytest.param("utf-8", "permanent", id="name_fixed"),
+    ],
+)
+async def test_a_configuration_refusal_through_the_scp_is_final_not_a_resend(
+    store: MessageStore, encoding: str, kind: str
+) -> None:
+    """BACKLOG #5102, the Lander's hold on engine PR 2787: on the SCP a configuration refusal arises
+    only on an inbound that declares a text ``content_type``, here with a codec name that sets up no
+    decode. Even once the name is fixed the object is refused, so Out of Resources would have the
+    sender re-send it forever, one ERROR row per attempt. The wiring refuses such an inbound at
+    build; this one is built past that check, as a graph that skipped it would be, and the SCP's
+    answer is the final class, with the ERROR row kept."""
+    inbound = InboundConnection(
+        _NAME,
+        ConnectionSpec(
+            ConnectorType.DIMSE,
+            {
+                **DICOM(ae_title=_SCP_AE, port=0, timeout_seconds=120.0).settings,
+                "encoding": encoding,
+            },
+        ),
+        router="r",
+        content_type=ContentType.TEXT,
+    )
+
+    status = await _send_through_runner(store, make_sr_part10(), inbound=inbound)
+
+    assert status == _CANNOT_UNDERSTAND
+    rows = await _rows(store)
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
+    assert (rows[0]["error"] or "").startswith(f"[refusal kind: {kind}] "), rows[0]["error"]
 
 
 async def test_a_committed_object_still_answers_success(store: MessageStore) -> None:

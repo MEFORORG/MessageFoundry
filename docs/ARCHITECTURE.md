@@ -228,9 +228,9 @@ three, and none of them is a guarantee:
 | `messagefoundry.api` | Localhost FastAPI surface (`app.py` + response `models.py`) — the engine's only external interface. The `/ui` browser web console mounts onto this app from a separate wheel (see below) via `mount_ui`, pinned against the `api/_ui_seam.py` contract ([WEBCONSOLE-PACKAGE.md](WEBCONSOLE-PACKAGE.md)) |
 | `messagefoundry.apiclient` | Qt-free / FastAPI-free engine-client library (ADR 0088) — a small typed httpx wrapper over the API, shared by the test harness and any future client |
 | `messagefoundry.auth` | Authn + RBAC core (no FastAPI): permissions/roles, `Identity`, password hashing, opaque session tokens, LDAP/Kerberos (`service.py`) — enforced by `api` |
-| `messagefoundry.generators` | Conformant synthetic HL7 generators (ADT, ORM, ORU, …) behind `messagefoundry generate` |
+| `messagefoundry.generators` | Conformant synthetic HL7 generators (ADT, ORM, ORU, …) behind `messagefoundry-toolkit generate` |
 | `messagefoundry.service` | Local Windows service control (`messagefoundry service {install,start,stop,status}`; ADR 0088), wrapping the NSSM scripts |
-| `__main__.py`, `checks.py` | CLI entrypoint (`serve` / `generate` / `check` / `service`) + the `check` commit/CI gate |
+| `__main__.py`, `checks.py` | CLI entrypoint (`serve` / `check` / `service`; the authoring commands are `messagefoundry_toolkit/__main__.py`, ADR 0201) + the `check` commit/CI gate |
 
 Dependency direction is one-way: `pipeline` / `transports` / `parsing` / `store` / `config`
 never import `api`. The API depends on the engine; the clients (web console, harness) depend on the API
@@ -259,7 +259,7 @@ Some also carry an upper bound, and at least uvicorn and websockets are pinned e
 - `hl7apy` — version-aware validation + profiles (opt-in strict path)
 - `pydantic` — config / connector models and validation
 - `aiosqlite` — async SQLite for the message store / queue
-- `fastapi` + `uvicorn` (with `httptools`, `websockets` and, outside Windows, `uvloop`) — localhost engine API
+- `fastapi` + `uvicorn` (with `httptools`, `websockets` and `uvloop`, the last wherever its environment marker in `pyproject.toml` allows) — localhost engine API
 - `argon2-cffi` — argon2id password hashing
 - `cryptography` — AES-256-GCM at-rest encryption for the store
 - `ldap3` + `pyspnego` — Active Directory / LDAP auth and Windows SSO (Kerberos)

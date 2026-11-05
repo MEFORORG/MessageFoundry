@@ -31,7 +31,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.lens import LensRewriteError, parse_source, rewrite_source
+from messagefoundry_toolkit.lens import LensRewriteError, parse_source, rewrite_source
 
 SOURCE = """\
 OB_DEST = "OB_X"
@@ -405,7 +405,7 @@ def _cli(module: Path, edit: dict[str, Any], *flags: str) -> subprocess.Complete
         [
             sys.executable,
             "-m",
-            "messagefoundry",
+            "messagefoundry_toolkit",
             "lens",
             "rewrite",
             str(module),

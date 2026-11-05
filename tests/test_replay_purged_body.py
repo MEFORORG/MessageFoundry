@@ -198,7 +198,7 @@ async def test_replay_of_a_mixed_message_requeues_the_kept_row_and_skips_the_era
     await store.dead_letter_now(rows["d_new"], "permanent reject", now=100 * DAY)
 
     # Only the older dead row falls inside the window.
-    assert await store.purge_dead_letters(older_than=10 * DAY, now=50 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY, now=50 * DAY)).bodies == 1
     assert (await _row(store, rows["d_old"]))["payload"] == ""
     assert (await _row(store, rows["d_new"]))["payload"] != ""
 
@@ -246,7 +246,7 @@ async def test_replay_dead_skips_erased_rows_and_leaves_their_message_in_error(
     purged_mid, purged_row = await _dead(store, now=0.0, body=BODY, control="CID-DL-P")
     kept_mid, kept_row = await _dead(store, now=100 * DAY, body=BODY, control="CID-DL-K")
 
-    assert await store.purge_dead_letters(older_than=10 * DAY, now=50 * DAY) == 1
+    assert (await store.purge_dead_letters(older_than=10 * DAY, now=50 * DAY)).bodies == 1
     assert await _status(store, purged_mid) == MessageStatus.ERROR.value
     assert await _status(store, kept_mid) == MessageStatus.ERROR.value
 
@@ -462,7 +462,7 @@ class TestPostgresParity:
     ) -> None:
         purged_mid, _ = await _dead(pg, now=0.0, body=BODY, control="PG-DL-P")
         kept_mid, _ = await _dead(pg, now=100 * DAY, body=BODY, control="PG-DL-K")
-        assert await pg.purge_dead_letters(older_than=10 * DAY, now=50 * DAY) == 1
+        assert (await pg.purge_dead_letters(older_than=10 * DAY, now=50 * DAY)).bodies == 1
 
         assert await pg.replay_dead(now=110 * DAY, audit=no_operator_audit) == 1
         assert (await pg.get_message(purged_mid))["status"] == MessageStatus.ERROR.value
@@ -508,7 +508,7 @@ class TestSqlServerParity:
     ) -> None:
         purged_mid, _ = await _dead(ss, now=0.0, body=BODY, control="SS-DL-P")
         kept_mid, _ = await _dead(ss, now=100 * DAY, body=BODY, control="SS-DL-K")
-        assert await ss.purge_dead_letters(older_than=10 * DAY, now=50 * DAY) == 1
+        assert (await ss.purge_dead_letters(older_than=10 * DAY, now=50 * DAY)).bodies == 1
 
         assert await ss.replay_dead(now=110 * DAY, audit=no_operator_audit) == 1
         assert (await ss.get_message(purged_mid))["status"] == MessageStatus.ERROR.value

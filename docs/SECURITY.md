@@ -156,10 +156,13 @@ bind with no declared terminator to run with sign-in off. That mode was removed:
 ran as one shared system identity, so the audit trail named no person, and it could not repair an
 account, because with no auth service the account and audit routes answer 503. A config that still
 sets `[security].require_sign_in` is refused at load. Even with auth enabled, a
-non-loopback bind requires an **operator certificate**: in-process (`[api].tls_cert_file`, WP-13a) or
-TLS terminated at a trusted upstream proxy (`tls_terminated_upstream` + `trusted_proxies`, WP-15). With
-neither, `serve` refuses: the only certificate left is the engine's self-signed placeholder (ADR 0172), which no trust
-store vouches for. `serve --allow-insecure-bind`, or its config twin `[security].require_encryption_for_remote = false`, accepts it only under `[security].enforcement = warn` (ADR 0092). So there is no way to be accidentally served with silent,
+non-loopback bind needs an **operator certificate**, `[api].tls_cert_file` (WP-13a), whether or
+not a proxy terminates TLS in front of it (WP-15). The one dev escape below covers only a bind with
+no declared proxy. With no certificate and no declared proxy, `serve`
+refuses: the only certificate left is the engine's self-signed placeholder (ADR 0172), which no trust
+store vouches for. `serve --allow-insecure-bind`, or its config twin `[security].require_encryption_for_remote = false`, accepts it only under `[security].enforcement = warn` (ADR 0092). With a declared proxy and no certificate,
+[Plaintext proxy hop](#plaintext-proxy-hop) applies. With a certificate,
+[API revocation gate](#api-revocation-gate) applies. So there is no way to be accidentally served with silent,
 unauthenticated full access — or to silently void the loopback assumption by changing
 `[security].local_access_only` / `listen_address` (SYS-1).
 
@@ -248,21 +251,48 @@ that the gate is correct.
 The route walk in `scripts/security/route_gates.py` reads the same mark. `tests/test_route_deny_default.py`
 checks that every shipped route declares itself and still answers an anonymous caller as before.
 
-**The proxy-to-engine hop is yours to secure, and `serve` makes you say so (BACKLOG #1179).** With
-`tls_terminated_upstream`, the proxy terminates TLS and the engine mints no certificate
+**A trusted proxy must be declared, or the engine must hold your certificate (BACKLOG #2055).** The
+pairing runs both ways. A non-empty `[api].trusted_proxies` without `tls_terminated_upstream` is
+refused at load, unless you set `[api].tls_cert_file`. uvicorn takes the request scheme from a
+trusted peer's `X-Forwarded-Proto`. On the generated placeholder, a proxy that forwarded `http`
+would have made the web console issue its session cookie without `Secure` (ASVS 3.3.1 and 3.3.3).
+Either key sets `exposure_protected`, which forces `Secure` whatever the proxy forwards. A proxy
+that re-encrypts to the engine keeps working with your own `tls_cert_file`.
+
+### Plaintext proxy hop
+
+With `[api].tls_terminated_upstream = true` and no `[api].tls_cert_file`, the engine mints no certificate
 ([ADR 0172](adr/0172-the-engine-always-serves-tls-minting-a-self-signed-certificate-on-first-run.md)
-decision 3). Unless you also supply `[api].tls_cert_file`, the hop from the proxy to the engine is
-**plaintext by design**, and the engine does nothing to protect it. Keeping it private is the
-deploying site's job: a same-host loopback hop, an isolated network segment, or a host firewall. So
-`serve` refuses to start that topology (exit 2) until `[api].plaintext_upstream_hop_acknowledged =
-true` is set. It refuses in **every** mode, under `enforce` or `warn`, on a loopback bind or not. The
-setting records that the operator took the hop on; it secures nothing by itself. It is a listed
-loosening, and [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how each start reports it. With an operator
-`tls_cert_file` the engine serves that hop over TLS, so nothing needs acknowledging and the setting is
-not required. The proxy must then speak https to the engine and trust that certificate, or every
-request through it fails. Setting the acknowledgement without `tls_terminated_upstream` is refused at
-load. `messagefoundry check` runs the same test as a required check, `upstream-hop-ack`, against the
-`messagefoundry.toml` it finds, so the commit/CI gate catches the refusal before `serve` does. With
+decision 3) and serves the hop from the proxy to the engine in **plaintext**. It does nothing to
+protect that hop. `serve` accepts it only on a loopback bind, which is for a proxy on the same
+machine (owner ruling R1 of 2026-10-27 on BACKLOG #1179; BACKLOG #4636). Loopback is exactly `127.0.0.1`, `::1` or
+`localhost`, the hosts `ApiSettings.is_loopback` reads, so another `127.0.0.0/8` address and an
+empty host are not loopback.
+
+- **On a loopback bind**, `serve` refuses to start (exit 2), in every enforcement mode, until
+  `[api].plaintext_upstream_hop_acknowledged = true` records that the site has taken the hop on.
+  The setting secures nothing. It is a listed loosening, and
+  [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) says how a start reports it. Setting it without
+  `tls_terminated_upstream` is refused at load.
+- **On any other bind host**, `serve` refuses to start (exit 2), in every enforcement mode,
+  acknowledged or not, and names the host.
+
+Two ways out keep the proxy in front. Bind the engine to loopback, with `[security].listen_address` or
+`serve --host`, and set the acknowledgement. Or set `[api].tls_cert_file`: the engine then serves the
+hop over TLS and needs no acknowledgement, and the proxy must speak https to it and trust that
+certificate, or every request through it fails. Off loopback that bind is in-process TLS, so the
+[API revocation gate](#api-revocation-gate) applies to it.
+
+The refusal reads the engine's bind host only. It cannot see a forwarder on the same machine (a port
+proxy, `socat`, an SSH tunnel) that relays a remote proxy's plaintext to the loopback listener, so
+ruling that out stays the site's job. With the proxy on that machine, `trusted_proxies` names the
+address the engine sees it connect from, usually `127.0.0.1`.
+
+`messagefoundry check` runs both refusals as a required check, `upstream-hop-ack`, against the
+`messagefoundry.toml` it finds, so the commit/CI gate catches them before `serve` does, for the bind
+host that file names. A bind host given only as `serve --host` is not in that file, so the
+check judges the file's host. The shipped service installer always passes `--host`, so on that path
+the check and `serve` can disagree on the bind host. With
 no file and no `--service-config`, it reads the environment instead. That needs
 `MEFOR_AI_ENVIRONMENT` to name the instance, and the line says so. At least these cases keep the
 skip. A `--service-config` naming a missing file is one, because `serve` refuses that file.
@@ -272,13 +302,45 @@ names that file. A third is no file and no `MEFOR_AI_ENVIRONMENT`. So a terminat
 `MEFOR_API_*` variables alone, for example on a site that names its environment only with
 `serve --env`, still reaches `serve` and not the check.
 
-**A trusted proxy must be declared, or the engine must hold your certificate (BACKLOG #2055).** The
-pairing runs both ways. A non-empty `[api].trusted_proxies` without `tls_terminated_upstream` is
-refused at load, unless you set `[api].tls_cert_file`. uvicorn takes the request scheme from a
-trusted peer's `X-Forwarded-Proto`. On the generated placeholder, a proxy that forwarded `http`
-would have made the web console issue its session cookie without `Secure` (ASVS 3.3.1 and 3.3.3).
-Either key sets `exposure_protected`, which forces `Secure` whatever the proxy forwards. A proxy
-that re-encrypts to the engine keeps working with your own `tls_cert_file`.
+**What else a proxy in front owes.** `serve` checks these after the refusals above, whether the hop
+is plaintext or TLS, and `--allow-insecure-bind` covers none of them.
+
+- **A declared terminator** owes `[api].proxy_intra_service_auth` and `[api].proxy_tls_min_version`,
+  with or without `[api].tls_cert_file`. If either is missing, `serve` refuses to start (exit 2) under
+  `[security].enforcement = enforce` on a bind host that is not loopback, and warns otherwise.
+- **A proxy in `[api].trusted_proxies` with no declared terminator** re-encrypts to your
+  `[api].tls_cert_file`. It owes `[api].proxy_tls_min_version` on the same terms, and not
+  `proxy_intra_service_auth`.
+- **Any proxy in `[api].trusted_proxies`**, in either shape, owes `[security].web_console_public_address`
+  under `enforce`, on a loopback bind too: without it, `serve` refuses to start. The ASVS 12.1.1 probe
+  dials that address at start under `enforce`, and `serve` refuses at least when it cannot reach it, when it
+  accepts TLS 1.0 or 1.1, or when it does not negotiate TLS 1.3.
+- **The web console behind a declared terminator** needs `[security].web_console_public_address` in
+  every enforcement mode: `serve` refuses to start without it. Behind a declared
+  terminator the console is served only when `[security].serve_web_console = true` is set.
+
+### API revocation gate
+
+This section covers the `[api]` listener. Nothing in the engine checks whether the certificate it serves is revoked: stdlib `ssl` fetches no OCSP or CRL,
+and the engine, offline by default, attempts no fetch
+([ADR 0078](adr/0078-certificate-revocation-posture.md), ASVS 12.1.4). It checks a client
+certificate against a CRL only when `[api].tls_client_crl_file` is set. So `serve` refuses to start
+(exit 2), in every enforcement mode, when `[api].tls_cert_file` is set and the bind host is not
+loopback (the same three hosts as above), unless `MEFOR_TLS_REVOCATION_ATTESTED` is `1`, `true`,
+`yes` or `on` in `serve`'s own environment. Setting it is your attestation that your PKI enforces
+revocation for the certificates the engine serves and accepts. The engine checks nothing behind it.
+
+- **What clears it:** the attestation, or a loopback bind. It does not refuse a bind with no
+  `[api].tls_cert_file`; the exposed-bind rule in [Enforcement model](#enforcement-model) and
+  [Plaintext proxy hop](#plaintext-proxy-hop) decide that bind.
+- **What does not:** a declared upstream terminator (BACKLOG #4636). The declaration says a proxy
+  terminates the browser's TLS. It does not say the proxy checks the revocation of the engine's
+  certificate on the hop behind it, and the engine cannot observe whether it does. Nor does
+  `[api].tls_client_crl_file`, which the gate does not read.
+- `messagefoundry check` has no leg for this gate, so a green check does not mean `serve` passes it.
+
+The same variable is read by outbound hops too, with a different effect;
+[DEPLOYMENT.md](DEPLOYMENT.md#revocation-guard-behavior) says what it does there.
 
 ### Provisioning the first administrator (ASVS 6.3.2)
 
@@ -1501,7 +1563,7 @@ tuple: they act only on the caller's own account.
 | `PATCH` | `/users/{user_id}` | `users:manage` | `require_step_up_action` (action `admin_user_update`) |
 | `DELETE` | `/users/{user_id}` | `users:manage` | `require_step_up` |
 | `DELETE` | `/users/{user_id}/sessions` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) -- end your own from `DELETE /me/sessions` and sign-out instead |
-| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends the sessions it finds and keeps the caller's current session, except at least when that session's seal fails, when it is ended too. Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614). What it may miss: *Limits of the session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
+| `DELETE` | `/sessions` | `users:manage` | `require_step_up_action` (action `revoke_all_sessions`). Ends the sessions it finds and keeps the caller's current session, except at least when that session's seal fails, when it is ended too, and when the revoke declines to re-stamp it, because an earlier revoke's sweep missed it or its account's record fails its seal, when the revoke ends it in the same transaction (BACKLOG #4975 and its follow-up). Whether it kept that session, in the reply and in the audit row's scope, is the store's answer from the revoke's own transaction, not a read made after it (BACKLOG #4975). Writes one `auth.session_revoked` row with the count, even a zero (BACKLOG #2614); the count includes the caller's own session wherever the call ended it. What it may miss: *Limits of the session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). `messagefoundry admin-revoke-sessions` is the same act from the host, for when the API is not trusted |
 | `PUT` | `/users/{user_id}/roles` | `users:manage` | `require_step_up`; **refuses (400) when `user_id` is the caller's own** (BACKLOG #1149) |
 | `POST` | `/users/{user_id}/reset-password` | `users:manage` | `require_step_up_action` (action `admin_reset_password`) |
 | `GET` | `/users/{user_id}/federated-identity` | `users:manage` | `require` (a read on the `users:manage` tier, like `GET /users/{user_id}/channel-scope`). The account's stored `issuer`/`subject`, the issuer a bind would use, and whether the account carries its directory id: the pair the console's federated-identity screen shows, for a JSON caller to send back as `expected_issuer`/`expected_subject` (BACKLOG #2331). No step-up, so it spends no grant. Audited as every satisfied route is, by its `auth.permission_granted` row, as the channel-scope read is. The console page of the same pair asks for the step-up window, because it also offers the link and unlink forms. 404 for an unknown user |
@@ -2103,7 +2165,11 @@ the same permission set on the same method reds CI until it is listed here.
 > look the named inbound up in the whole config, which `messagefoundry check` reads: an inbound
 > that exists and that the actor's scope lists was asked of the wrong engine shard, or was removed
 > by a reload. That case was read from the code, not run on more than one engine shard (BACKLOG
-> #3031).
+> #3031). A row naming an in-scope inbound has at least one more cause, on any deployment: a
+> flag request refused for its direction. Such a row's detail carries
+> `"flag_direction_not_inbound": true`, so a row without that marker was not refused for its
+> direction (BACKLOG #3378). `POST /connections/{name}/flag` writes it for a direction of
+> `outbound`, and the web console's flag route for any direction other than `inbound`.
 > With an engine bound but not started there is no graph and no name exists. Every route still
 > checks the scope first, so a name outside it gets the 403. A name inside it gets 503 from the
 > first three routes and 404 from the control routes, with no denial row. With no engine bound at
@@ -2113,10 +2179,19 @@ the same permission set on the same method reds CI until it is listed here.
 > `POST /connections/{name}/flag` refuses the same way (BACKLOG #1152). A scoped caller flags only
 > an inbound in its own scope, and every other target gets that 403, before the engine looks the
 > name up. An in-scope inbound the graph holds, or any in-scope name when no graph is loaded,
-> reaches the engine, which answers 409 for a name the running graph does not have.
+> reaches the engine, which answers 409 for a name the running graph does not have. The JSON
+> route validates the body before any of this, so a direction other than `inbound` or `outbound`
+> gets a 422 there with no denial row, scoped caller or not. The web console's twin reads the
+> direction itself: for such a direction it gives a scoped caller the 403 and a denial row, and an
+> all-channels caller 404 with no row (BACKLOG #3378).
 > `GET /alerts/rules` shows a scoped caller
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
-> scope, and `control_target` is unset or in it. When it withholds at least one rule, it writes an
+> scope, and `control_target` is unset or in it. Each rule it shows has a null `id` (BACKLOG
+> #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
+> connection name in it, and nothing here reliably tells a label that names one from one that
+> does not. An
+> all-channels caller reads every id. A withheld id writes no audit row, since the rule itself is
+> shown. When it withholds at least one rule, it writes an
 > `alert_rules_withheld` audit row. The row holds two counts, shown and withheld, and no rule
 > contents. The write is best-effort. A withholding read tries one row. A row the store refuses,
 > or a defect in `AUDIT_WRITE_DEFECTS` loses, is logged at ERROR and the read still answers. A row
@@ -2527,10 +2602,28 @@ that snapshot's digest against the approved one before any config module runs. T
 and runs that same snapshot, and the `config_reload` row records its digest. So the config
 modules, helpers and tables checked are the ones the loader runs, and an edit to them on disk
 during the load is neither run nor recorded. The limits below name at least one import that runs
-from disk instead. Where the environment value file sits in the config directory's
-`environments/` folder, `serve` parses it from the same snapshot, so an edit to it during the load
-does not apply, and a value file created or removed there since the snapshot is refused. Otherwise,
-at least where the value file sits elsewhere or an embedded engine has another value provider, the
+from disk instead. On a store that holds an in-process key, the approval covers `serve`'s
+environment value file wherever `[environments].base_dir` puts it. A store with none binds a value
+file outside the config directory to nothing, as a later paragraph says. In the config directory's
+`environments/` folder the digest
+folds it. Elsewhere, the default layout, the release reads it into the snapshot after vetting the
+file, its folder, and the folder of each link along a chain of file links from it, and checks it
+against a keyed binding the hold took at request time, which the next paragraph describes. That
+vet misses at least these: a directory link
+in the path to the value file, or to any link along that chain, is resolved rather than walked,
+so the folder that holds it is not vetted, and on Windows the link objects themselves are not
+vetted (`Engine._value_file_folders` in [`pipeline/engine.py`](../messagefoundry/pipeline/engine.py)).
+Where that value file alone cannot be read, the
+reload is refused, released or not, rather than reading it again from disk. Where the config
+directory cannot be read whole, a value file in its `environments/` folder included, a released
+reload is refused and an ungated one still reads the values from disk. `serve` parses
+it from the same snapshot, so an edit to it during the load does not apply, and a value file
+created or removed since the snapshot is refused. Every engine shard and cluster node shares one
+config directory by contract, and is expected to read the same value file too. Nothing checks
+that, and a value file outside the config directory is not shared with it. A node whose value file
+there differs refuses as `digest_mismatch` a hold filed through another node, as the cluster limit
+below says, and so does a node started with another `--env` name. Otherwise, at least where an
+embedded engine has another value provider, the
 release reads the values from disk and then takes the digest again, which refuses a change made in
 between to a file the digest covers. If the digest differs, nothing loads and nothing swaps. The running graph keeps
 the environment values it had. A reload applies the values it re-read only with the swap, and a
@@ -2541,6 +2634,25 @@ params carry no digest is refused the same way, with reason `no_approved_digest`
 cannot take the digest now is refused with reason `digest_unavailable`, and the engine logs the
 cause at WARNING. The requester asks again, and a second approver reviews the new bytes.
 
+**What the published config digest does and does not reveal (vault BACKLOG #2596).** The ADR 0041
+D1 digest is an unkeyed SHA-256 fold, published at least in `GET /config/provenance`, in the
+`config_loaded`, `config_reload` and `config_reload_failed` audit rows, and in a held reload's
+`params`, which every approver sees. Anyone holding a candidate file can recompute it, so it
+reveals whether a reader's guess at every covered file's bytes is right. It never folds the
+environment value file a reload reads from outside the config directory, which can hold
+credentials, so no published digest changes with that file's bytes. A held reload binds that file
+instead with `params.value_file`, an HMAC-SHA256 under a key HKDF derives from the store key (the
+`Reload hold value-file binding` row in
+[ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md)). A reader without the store key cannot
+test a guess against it; anyone with the key can. A release whose value file is not the one bound
+is refused as `digest_mismatch` with `value_file_check` set to `mismatch`, and the two published
+fingerprints in that row are equal. A binding no key the store holds can check, as after a
+rotation drops the retired key, is refused as `digest_unavailable`. A store with no in-process key, a keyless store or a Vault
+Transit cipher, binds nothing: the release then applies whatever value file it reads, as it did
+before the file was read into the snapshot, and logs a WARNING naming the file. A value file
+inside the config directory's `environments/` folder is still folded into the published digest,
+so there the digest is a test of a guess at its secrets.
+
 **A release refused before the digest check never reaches it.** At least the settings preflight
 and the config source's trust check run before it. So where the trust check refuses rather than
 warns, a tamper that also loosens the permissions on a file it covers, such as a config module,
@@ -2550,7 +2662,8 @@ digest, and `approval_digest_check` set to `not_reached`, and no `current_finger
 digest was taken. A missing, unlistable or disallowed directory is refused before the check too,
 with its own reason and neither field. A refusal after the digest check passed carries neither
 field either, whether the approved bytes caused it or an input the digest does not cover, such as
-an environment value file outside the config directory or a connection's CA file. The second
+a `MEFOR_VALUE_*` variable or a connection's CA file. The value-file binding is checked with the
+digest, so its refusal carries both fields and `value_file_check`. The second
 digest above is the exception: it refuses as `digest_mismatch` with both fields, or as at least
 `digest_unavailable` or `not_found`, as the first check does.
 
@@ -2585,10 +2698,11 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   integrity seal, so a writer to the `pending_approvals` table who replaces the digest leaves a
   request the gate refuses. The seal does not stop an older sealed copy of the row being put back,
   and a keyless store checks nothing (vault BACKLOG #2592);
-- the digest covers what `config/fingerprint.py` hashes and no more. The release reads a value
-  file outside the config directory's `environments/` folder after the digest check, and a
-  `MEFOR_VALUE_*` variable too, so an edit to either changes the values a release applies under an
-  unchanged digest. The second digest samples the files, so where an embedded engine's other value
+- the digest covers what `config/fingerprint.py` hashes and no more. The release reads a
+  `MEFOR_VALUE_*` variable and the secrets directory after the digest check, so an edit to either
+  changes the values a release applies under an unchanged digest. So does an edit to the value
+  file outside the config directory on a store with no in-process key, which binds no value file,
+  as the paragraph on what the published digest reveals says. The second digest samples the files, so where an embedded engine's other value
   provider reads a value file under the config directory, an edit to it reverted before that digest
   is not seen. The second digest also refuses an edit to any covered file made after the first,
   though the load runs the snapshot the first one checked.
@@ -2602,10 +2716,11 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   removed between the two is left out of the digest;
 - a directory moved away during a release is recorded as `not_found`, not as an edit, unless the
   move lands while a digest is reading it;
-- a value file read from disk on a network share the engine cannot reach would read as absent, not
-  as a fault, so an `env()` reference with a default would take that default, with no refusal. A
-  config directory on a drive letter this process does not have reads as absent too, even where the
-  letter is mapped in another session;
+- a value file, or a config directory, on a drive letter this process does not have reads as
+  absent, not as a fault, even where the letter is mapped in another session. For a value file an
+  `env()` reference with a default then takes that default, with no refusal. A share Windows
+  reports it cannot reach (errors 53 and 67) is a fault, and a start or a reload that reads the
+  value file there is refused;
 - a DR backup bundle's config digest is a separate, ordinary read, not the digest above, and it
   can be partial. `include_config` under
   [`[backup]`](CONFIGURATION.md#backup--scheduled-dr-backup--restore-verify) gives at least part
@@ -2616,6 +2731,11 @@ unchanged. An ungated reload takes no request-time digest. At least these limits
   at release unless the edit is reverted, and then it can be released;
 - in a cluster, the release compares the digest with the disk of the node that handles the approve,
   which may not be the node that took it;
+- a start's `config_loaded` digest may name value-file bytes the start did not apply, where the
+  value file is in the `environments/` folder. A start resolves its environment values when the
+  engine is built, and its digest reads that folder later, in the load's snapshot. So an edit in
+  between is in the digest and not in the running values. A value file outside the config
+  directory is in no start digest, so a start records nothing about it;
 - a restart, a cluster convergence reload, a DR activation and a sandbox worker respawn check no
   approved digest. Whether a restart under dual control refuses an unapproved digest is an open
   owner question.
@@ -3266,21 +3386,28 @@ the rotation that follows refuses an expired session, but only after the counter
 Closing the window would take store writes conditional on the state the re-read saw, which no leg
 has. The re-read narrows it from the whole proof check to those writes.
 
-**Both legs also refuse a present account that lost a role in the directory (BACKLOG #2240).** The
-lookup returns the account's groups, and the engine maps them to roles as the reconciliation pass
-does. If any role stored on the account is not among those, the leg refuses. Without this, an
-operator demoted in the directory since sign-in would renew its window or clear the MFA gate with
-the old roles until the reconciliation pass revoked it. An added role is not refused, because the
-account then holds fewer roles than the directory grants. The check compares the roles themselves,
-not the permissions they grant. So a move from one role to another refuses, even when the new role
-grants more. A lookup whose groups map to no role refuses every directory account that holds a
-role. The refusal writes no roles; the next reconciliation pass, when it runs, or the next sign-in
-re-syncs them. Otherwise it behaves as the refusals above, audited with the outcome
-`directory_roles_demoted`. Channel scope is not compared on these legs. When the AD group-to-role
-map fails its seal, no role can be judged, so these legs and the IdP step-up leg below refuse an
-account that holds a role with `directory_role_map_unsealed` instead. That is not a demotion: nothing
-changed in the directory, a new sign-in reads the same map, and the fix is an administrator saving
-the map again. So it is never told to sign out.
+**A directory step-up or enrolment leg refuses a present account that lost a role in the directory
+(BACKLOG #2240).** At least the code and passkey legs above, the two enrolment legs, the IdP
+step-up leg and the password re-bind below make this test. Each judges the groups a directory
+answer returns: the directory lookup's on the code, passkey, enrolment and IdP legs, and the
+bind's on the re-bind. The engine maps those groups to
+roles as the reconciliation pass does. If any role stored on the account is not among those, the
+leg refuses. Without this, an operator demoted in the directory since sign-in would renew its
+window, clear the MFA gate, or be minted an action-bound grant with the old roles until the
+reconciliation pass revoked it. An added role is not refused, because the account then holds
+fewer roles than the directory grants. The check compares the roles themselves, not the
+permissions they grant. So a move from one role to another refuses, even when the new role grants
+more. A lookup whose groups map to no role refuses every directory account that holds a role. The
+refusal writes no roles; the next reconciliation pass, when it runs, or the next sign-in re-syncs
+them. It is audited as `directory_roles_demoted`: as the `outcome` beside
+`reason=directory_unconfirmed` on the code, passkey and enrolment legs, which otherwise behave as
+the refusals above, and as the `auth.reauth` row's `reason` on the IdP and re-bind legs. Channel
+scope is not compared on any of these legs. When the AD group-to-role map fails its seal, no role
+can be judged, so each of these legs refuses an account that holds a role with
+`directory_role_map_unsealed` instead, whether or not a role was lost, and an account with no role
+passes. That is not a demotion: nothing changed in the directory, a new sign-in reads the same
+map, and the fix is an administrator saving the map again. So it is never told to sign out. Every
+one of these legs calls one shared comparison rather than writing it out.
 
 **The caller is told which fix clears the refusal, and not its cause (BACKLOG #3082).** The precise
 cause stays on the audit row. A demotion is told to sign out and sign in again. A new sign-in clears
@@ -3295,19 +3422,20 @@ password re-bind makes the role test too (below), so it gives a demoted account 
 text names a group, a role or a directory detail.
 
 **The IdP step-up leg makes the same role test (BACKLOG #2154).** `complete_oidc_step_up` already
-looks the account up by its directory object id. It now maps the groups that lookup returns to
-roles, and refuses when a stored role is not among them. It refuses only; the session stays as it
-was, with no window and no grant, and no roles are written. The `auth.reauth` row carries
-`reason=directory_roles_demoted`, and the refusal tells the operator to sign in again, which
-takes the roles the current groups grant.
-Channel scope is not compared on this leg either.
+looks the account up by its directory object id. It now judges the groups that lookup returns by
+the test stated in the paragraph above that opens "A directory step-up or enrolment leg refuses a
+present account that lost a role in the directory", and refuses an account that fails it. It
+refuses only; the session stays as it was, with no window and no grant, and no roles are written.
+For a lost role the `auth.reauth` row carries `reason=directory_roles_demoted`, and the refusal
+tells the operator to sign in again, which takes the roles the current groups grant. The
+failing-map case is the cited paragraph's.
 
 **The password re-bind makes the same role test (BACKLOG #3081).** A good re-bind (`POST
 /me/reauth` and the `/ui/reauth` password leg) returns the account's current groups with the bind,
 so the test costs no extra directory read. The test is the one stated in the paragraph above that
-opens "Both legs also refuse a present account that lost a role in the directory", judged on
-those groups, reading the stored roles after the bind returns, as the other legs read theirs. A
-row whose directory object id or provider moved during the bind is refused as
+opens "A directory step-up or enrolment leg refuses a present account that lost a role in the
+directory", judged on those groups, reading the stored roles after the bind returns, as the other
+legs read theirs. A row whose directory object id or provider moved during the bind is refused as
 `directory_identity_conflict` instead, because the groups vouch only for the object the bind was
 keyed on. The password was right, so the refusal is charged to neither the lockout nor the
 session's re-proof budget, and clears neither. No window is renewed, no action-bound grant is
@@ -3315,10 +3443,7 @@ minted, and no roles are written. The `auth.reauth` row carries `reason=director
 and the caller gets the demotion answer: 403 on `POST /me/reauth`, telling it to sign out and sign
 in again (BACKLOG #3082); what else clears that refusal is in the paragraph on telling the caller
 the fix, above. A role map that fails its seal is refused as `directory_role_map_unsealed` and
-gets the answer for a directory that could not confirm the account, as on the other legs. Channel
-scope is not compared on this leg either. The enrolment legs make the test too, through the code
-leg's directory check (BACKLOG #3061). The code, passkey, IdP and re-bind legs call one shared
-comparison rather than each writing it out.
+gets the answer for a directory that could not confirm the account, as on the other legs.
 
 **The password re-bind gives the code and passkey legs' answer when the directory could not judge
 the password (BACKLOG #2027).** That covers at least a row with no directory object id, no enabled entry for the row's
@@ -3729,8 +3854,10 @@ warning rather than tripping the exposure ladder, so a previously-working expose
 turned into a start failure. An **explicit** `serve_web_console = true` off-box is left on and still runs
 the full ladder (unchanged).
 
-Exposing `/ui` off-box is a supported, **gated** posture. Beyond the existing TLS-or-refuse exposure
-gate (refused even under `--allow-insecure-bind`), `serve` runs the **L5b exposure ladder** for an
+Exposing `/ui` off-box is a supported, **gated** posture. Beyond the existing exposure gate, which
+refuses an off-loopback console without an operator certificate in every enforcement mode, even
+under `--allow-insecure-bind` (the engine's self-signed placeholder does not count, and a
+terminator alone is refused first, as [Plaintext proxy hop](#plaintext-proxy-hop) says), `serve` runs the **L5b exposure ladder** for an
 explicitly-enabled console: with a **declared reverse proxy** (`tls_terminated_upstream`), `serve`
 **refuses to start without `[security].web_console_public_address`** (behind a proxy the Host header
 is client-forwardable — the exact origin anchors the same-origin CSRF check and the WebAuthn rp_id);
@@ -4270,8 +4397,8 @@ slack.
 | Admin-write rate, per actor | `identity.user_id` × request method | **non-GET only**; > 12 writes (`admin_write_rate_limit_per_actor`) per 15 s (`admin_write_rate_limit_window_seconds`), or a write less than 0.15 s after the actor's last admitted one (`admin_write_min_interval_seconds`, BACKLOG #2301), both provisional human-timing defaults; no global dimension (`glob=0`) | **THROTTLE** 429 + a `Retry-After` naming the actor's wait, the same on the JSON API and on `/ui`. Charged on the JSON API and on `/ui`, which re-applies it. WARNING-logged on the JSON API; the `/ui` refusal is not (see *The console's refusal differs from the JSON floor's*) | on, 12 writes / 15 s | `[auth].admin_write_rate_limit_enabled` |
 | Time from sign-in to the second factor | `session.created_at` vs the service's wall clock, while `session.mfa_verified_at` is unset | a TOTP or recovery code (`verify_mfa`), a passkey assertion, or an enrolment (`confirm_mfa_enrollment`, `finish_webauthn_registration`, BACKLOG #2389) that completes an MFA-pending session less than 1 s after the session was minted (`mfa_verify_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a session whose factor is already satisfied, or that owes none, is not floored | **DENY** with the leg's ordinary failure, which says nothing about timing, though a caller that knows its proof is good, or resubmits it, can tell the floor fired (the answers per leg, and the tells, are under *Two second steps have a time floor too*); audited `auth.mfa_failed` or `auth.webauthn_failed` with `reason=too_early`, and `phase=enroll` on an enrolment; no lockout count, no code or challenge spent, though under the default `require_action_step_up` a TOTP enrolment confirm's route has already spent its password step-up | on, 1 s | `[auth].mfa_verify_min_elapsed_seconds` (`0` = off) |
 | Time from a federated start to its callback | at least the flow cache's monotonic clock when the flow was staged vs at the callback, and the verified ID token's `auth_time` (sign-in) and `amr` | a step-up callback less than 1 s after its `POST /ui/reauth/oidc` start (`oidc_callback_min_elapsed_seconds`, BACKLOG #2301), a provisional human-timing default; a sign-in callback likewise, **only** when the verified `auth_time` is at or after the flow's start, because an IdP holding a live single sign-on session answers with no human step; on either leg the floor does not apply when a verified `amr` value is in `oidc_callback_floor_exempt_amr` (empty by default; what an exempted pass records is under *What these floors do not do*) | **DENY** with the leg's ordinary failure: `federated sign-in failed`, audited `auth.login_failed` with `reason=too_early`, or the generic step-up refusal, audited `auth.reauth` with `reason=too_early`. The step-up is refused before its code is redeemed, unless `oidc_callback_floor_exempt_amr` is set (BACKLOG #2388): a callback whose verified `amr` names a listed value is then exempt, and the refusal waits for the code exchange | on, 1 s | `[auth].oidc_callback_min_elapsed_seconds` (`0` = off), `[auth].oidc_callback_floor_exempt_amr` |
-| Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor in-process TLS, nor a declared TLS-terminating proxy. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
-| Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (an off-loopback bind, a declared terminator, **or** a set `trusted_proxies`, vault BACKLOG #2251) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | at least: `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with neither in-process TLS nor a declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file` and no `[api].plaintext_upstream_hop_acknowledged`, in every mode (BACKLOG #1179). `serve` has no arm for sign-in off: the settings loader and the settings model refuse `[auth].enabled`, and nothing reads that key (vault BACKLOG #2719, #2825) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the `/ui`-exposure and plaintext-hop-acknowledgement arms refuse **unconditionally**, and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared or trusted (`trusted_proxies` empty, BACKLOG #2116) | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed` |
+| Serve-hop security posture | `[security].enforcement` × (`api.is_loopback` **or** `exposure_protected`), via `phi_read_hop_disposition` | disposition is REFUSE — an instance under `enforcement = enforce` whose serve hop is neither loopback, nor on an operator `[api].tls_cert_file`, nor behind a declared TLS-terminating proxy (`exposure_protected`; the minted placeholder does not count). CORRECTED 2026-11-04 (BACKLOG #4636): this read "nor in-process TLS", which the minted placeholder also is. Setting `[security].enforcement = warn` turns the refusal into WARN-and-serve. **No data-class value switches it off**: BACKLOG #1279 deleted that axis | **DENY** 403 (PHI-free message) on every **JSON-API** PHI-read route (`require_phi_read`, plus the step-up bulk routes), **before** any identity work — and on the `/ui` PHI routes through `require_ui`'s `phi=True` arm, **after** identity work, so an unauthenticated visit still gets its login redirect instead of a 403 disclosing the posture (BACKLOG #1738). Two tests, and they pin different things: `test_ui_plane_states_the_phi_read_hop_gap` pins the DISCLOSURE both ways, by comparing this document against the console's call sites — it issues no request and cannot see ordering; the ORDER is pinned by the console suite's `test_the_refusal_lands_after_identity_so_a_visitor_still_gets_the_login_page` | ALLOW on loopback | `[security].enforcement`, `[api].tls_cert_file`, `tls_terminated_upstream` + `trusted_proxies` |
+| Bind / exposure posture — refusing arms | `settings.api.host` loopback-ness, `tls_terminated_upstream`, `trusted_proxies`, `settings.api.public_origin`; derived `instance_exposed` (an off-loopback bind, a declared terminator, **or** a set `trusted_proxies`, vault BACKLOG #2251) and `admin_exposed`, plus `ui_exposed` for the `/ui` arms only; `[security].enforcement` | at least: `/ui` exposed without the required origin/TLS declarations; a non-loopback bind with no `[api].tls_cert_file` and no declared terminator, where `enforce` clamps both `--allow-insecure-bind` and `[security].require_encryption_for_remote = false` shut; `admin_exposed` + `enforcing` + `require_mfa` explicitly opted out; a declared terminator with no `[api].tls_cert_file`, as [Plaintext proxy hop](#plaintext-proxy-hop) states; a non-loopback `[api].tls_cert_file` bind without the attestation, as [API revocation gate](#api-revocation-gate) states. CORRECTED 2026-11-04 (BACKLOG #4636): this cell read "neither in-process TLS nor a declared terminator", which counted the minted placeholder as in-process TLS and read as if a terminator could stand in for a certificate off loopback. `serve` has no arm for sign-in off: the settings loader and the settings model refuse `[auth].enabled`, and nothing reads that key (vault BACKLOG #2719, #2825) | **DENY at startup** — `serve` prints an error and exits **2**. The refuse/warn dial is `[security].enforcement` (default `enforce`), **not** `production`: the `/ui`-exposure, plaintext-hop and API revocation arms refuse **unconditionally** (BACKLOG #4636: this read "plaintext-hop-acknowledgement arms" and named no revocation arm), and the `require_mfa` arm refuses on enforcement `enforce` alone — no data-class term narrows it, so `dev` and `staging` are gated exactly as `prod` is — and warns otherwise. `[security].allow_single_factor_admin_when_exposed = true` downgrades that one arm to permitted-but-audited. **`admin_exposed` is `instance_exposed`, and reads no console flag** (BACKLOG #326): the ADR 0143 degrade arms rewrite `settings.api.serve_ui` in place earlier in the same startup, so deriving an exposure decision from it made this arm and the dual-control arm below miss a declared-proxy instance whose console had been degraded or disabled — while the ASVS 11.7.1 arm called that same boot exposed. The same attributes force the session cookie's `Secure` flag + HSTS, and permit WebAuthn `rp_id` derivation from the request URL **only** on a loopback bind with no proxy declared or trusted (`trusted_proxies` empty, BACKLOG #2116) | loopback, nothing declared | `[security].local_access_only`, `listen_address`, `serve_web_console`, `web_console_public_address`, `require_mfa`, `require_encryption_for_remote`, `[api].tls_cert_file`, `tls_terminated_upstream`, `plaintext_upstream_hop_acknowledged`, `trusted_proxies`, `[security].enforcement`, `[security].allow_single_factor_admin_when_exposed`, the `MEFOR_TLS_REVOCATION_ATTESTED` environment variable (API revocation arm) |
 | Bind / exposure posture — dual-control arm | `admin_exposed` (= `instance_exposed`: an off-loopback bind, a declared TLS terminator, **or** a set `trusted_proxies` (vault BACKLOG #2251) — never the console flag, BACKLOG #326) × `[approvals].enabled` and `[approvals].operations` | `admin_exposed` **and** either `[approvals].enabled` off, or on with an `[approvals].operations` list that leaves out a default operation or holds none, which `_approvals_loosenings` reads (vault BACKLOG #3474) — high-value actions complete on one caller's authority | **LOG** — a startup **WARNING only, on every instance including production**; `serve` does **not** refuse. The refuse arm is an explicit unresolved owner fork recorded in `__main__.py`, not a shipped control | approvals off | `[approvals].enabled`, `[approvals].operations` |
 | Pending federated-login flows, per client IP | the `client_ip` recorded on each staged flow | ≥ **16** pending flows from this address (`DEFAULT_PER_IP_CAP`, no knob), or ≥ `oidc_flow_cache_max` (**512**) engine-wide; 300 s TTL; **reject-when-full, never evict** (evict-oldest would turn a start-leg flood into a login DoS) | **DENY** the start leg — `FlowCacheFullError` → **303** to `/ui/login?e=rate_limited` on the sign-in start, or a **429** that re-renders the step-up page on `POST /ui/reauth/oidc`, whose `begin_oidc_step_up` stages into the same cache; WARNING-logged, deliberately **never** audited so a flood cannot amplify into `audit_log` growth | 16 / 512 / 300 s | `[auth].oidc_flow_cache_max`, `oidc_flow_ttl_seconds` |
 | `Sec-Fetch-Mode` on the federated sign-in legs | the browser fetch-metadata header on `GET /ui/sso`, `POST /ui/oidc/start`, `GET /ui/oidc/callback`, and `GET /ui/oidc/start` when its interstitial is skipped, because that GET then runs the POST leg | header **present** and not `navigate` (absent = allowed by this check. On `POST /ui/oidc/start` the `Sec-Fetch-Site` row below runs first and refuses a POST with neither `Sec-Fetch-Site` nor `Origin`, with a 403 and no audit row, BACKLOG #1116, #1124. The skipped-interstitial GET runs that row too, but as a GET: a request with neither header is **not** refused there, under owner rulings R4 and R4b of 2026-09-28). Distinct from the `Sec-Fetch-Site` row below: a different header, a different surface, and `assert_same_origin` deliberately does **not** run on the callback leg, whose `Sec-Fetch-Site` is legitimately cross-site | **DENY** — 303 → `/ui/login?e=sso_failed`\|`oidc_failed`, plus an **audited** `auth.login_failed` row carrying the closed-set slug `non_navigation_fetch`. Evaluated **after** each leg's limiter, so the audit write is itself rate-bounded: the login limiter, or on a step-up return to the callback the per-user ceremony key (BACKLOG #3374) and, for the row alone, the step-up return audit budget, kept per user with a backstop across all sources that pages when it stops a row (control 11 of the 6.1.1 protection set, BACKLOG #3965) | on | (no knob) |
@@ -4329,7 +4456,8 @@ listen source. The refusal action differs materially per listener, so each has i
 | **X12** | peer socket address | not in `source_ip_allowlist` | **DENY** — as MLLP (refuse, log, `peer_not_allowlisted` event); BACKLOG #1665 |
 | **HTTP** | peer socket address | not in `source_ip_allowlist` | **DENY** — a real `403 {"error":"forbidden"}` is written to the peer, then close; WARNING log + `peer_not_allowlisted` event. With `tls = true` on the standard asyncio loop the check runs before the handshake, so the socket is closed with no answer and no TLS byte (BACKLOG #2479) |
 | **DICOM C-STORE SCP** | peer socket address at accept; `event.assoc.requestor.address` in the C-STORE backstop | not in `source_ip_allowlist` | **DENY** — the connection is closed at accept, before any TLS handshake or association; WARNING log naming the peer IP, at most one line per address per 60 s and at most 20 addresses per 60 s in all; **no connection event**. The backstop answers DIMSE status **`0x0124` (Not Authorized)** **before any durable commit** and logs each refusal with the calling AE; [DICOM.md](DICOM.md) section 3 says why a sender should not see it |
-| **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails. On MLLP and HTTP where the event loop runs the handshake (uvloop), the connection **never reaches the accept path**, so there is no allow-list evaluation. On MLLP and HTTP on the standard asyncio loop the allow-list and both connection caps run BEFORE the handshake (BACKLOG #1606, #2479). Either way the only connection event is a throttled `tls_handshake_failed`, which [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) describes (vault BACKLOG #2613, #3302). The DICOM SCP accepts the connection first, checks its allow-list, and only then runs the handshake, so a peer outside the list is refused before any handshake; a failed handshake writes **no** connection event there either. The SCP counts it and logs a throttled WARNING naming the peer instead, as [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) states (vault BACKLOG #3784). `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
+| **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails. On HTTP where the event loop runs the handshake (uvloop), the connection **never reaches the accept path**, so there is no allow-list evaluation. On MLLP on every loop, and on HTTP on the standard asyncio loop or any subclass of `asyncio.BaseEventLoop`, the allow-list and both connection caps run BEFORE the handshake (BACKLOG #1606, #2479), and on HTTP so does the per-address handshake budget `max_handshakes_per_host`, which counts the socket until its handshake ends (vault BACKLOG #4888). MLLP has no handshake budget. Either way the only connection event is a throttled `tls_handshake_failed`, which [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) describes (vault BACKLOG #2613, #3302). The DICOM SCP accepts the connection first, checks its allow-list, and only then runs the handshake, so a peer outside the list is refused before any handshake; a failed handshake writes **no** connection event there either. The SCP counts it and logs a throttled WARNING naming the peer instead, as [PHI.md section 7, row 7](PHI.md#7-logging--phi-redaction) states (vault BACKLOG #3784). `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
+| **MLLP** — expected sender (`tls_client_subjects`, BACKLOG #4907) | the verified client certificate's qualified `SAN:<type>:` / `CN:` names, read after the handshake | `tls_client_subjects` is set and none of the certificate's names is listed under the loaded `tls_ca_file` CA whose key signed the leaf; matched exactly and case-sensitively, through the matcher the HTTP row below uses, so a second CA in `tls_ca_file` issuing a listed name is refused. Unset by default, and then a verified certificate from any loaded CA is admitted as any sender | **DENY** — each message the connection's first read completes is recorded as an `ERROR` row, then answered `AR` with MSA-3 `sender not permitted` on an HL7 v2 inbound that acknowledges, and the connection closes; on any other inbound it closes with nothing written. If a row cannot be written no `AR` is sent: an HL7 inbound that replies sends the handler-fault `AE`, and any other inbound closes with nothing written and no row. The row's reason, the reply and the WARNING log line (throttled per address) carry no certificate field. Each refusal is audited `intake.auth_subject_denied` with an `auth_subject_denied` connection event, and charged to the HTTP listener's failed-attempt budget at the `Http()` defaults, with no setting of its own; an address that has spent its own budget is closed unread before its certificate is compared, and the global budget closes only a sender whose certificate the compare has refused, never a listed one; each close is audited `intake.auth_rate_limited`. TLS renegotiation is refused on this listener. [CONNECTIONS.md](CONNECTIONS.md#expected-senders-tls_client_subjects) states the design |
 | **HTTP** — intake authentication (`intake_auth`, ADR 0154 D6) | the credential a peer presents: the `intake_api_key_header` header (default `x-api-key`) under `api_key`, `Authorization: Bearer` under `bearer`, or the verified client certificate's `CN:` / `SAN:` names under `mtls_subject` | `intake_auth` is not `none` and the key or token is missing or wrong, or the certificate's names are not in `intake_client_subjects` under the loaded `tls_ca_file` CA whose key signed it (vault BACKLOG #2287; the refusals include at least these, and the list is not complete: a listed name is refused when the loaded CA that signed the leaf is not the one the name is listed under, and a leaf signed by an intermediate the client sends is refused unless that intermediate is itself loaded in `tls_ca_file` and the name is listed under it; no certificate is admitted under a CA that `tls_ca_file` holds twice with one DN and different keys, as during a key rollover, or under one whose certificate cannot be parsed, and the listener warns about both at start). **The default is `intake_auth = "none"`, which checks no credential: a default HTTP inbound admits any peer the rows above admit.** Under `api_key` / `bearer`, `GET`/`HEAD` probes are inside the check unless `intake_auth_health = "allow"`. Under `mtls_subject` the certificate is checked at accept, before the method is known, so no probe is exempt. A peer with no certificate from `tls_ca_file` never reaches this row: it fails the handshake in the peer-client-certificate row above | **DENY** — `401` for a missing or wrong key or token (read before any body byte), `400` for a credential header sent more than once, even with identical copies, and with `_` read as `-` in the header name, since the engine would keep the last copy while a front end may read the first (BACKLOG #2051; refused before any comparison, charged to the failed-attempt budget and audited `intake.auth_failed`), `403` for a verified certificate whose subject is not listed under the loaded CA that signed it; nothing is committed. Audited `intake.auth_failed` / `intake.auth_subject_denied`, plus a connection event |
 | **HTTP** — intake failed-attempt budget (ADR 0154 D6) | the peer address, and the listener's failed-attempt count across all peers | the peer has spent `intake_auth_rate_limit` failed attempts in the window, or all peers together have spent `intake_auth_rate_limit_global` (defaults and the `0`/`None` off switch in [CONNECTIONS.md](CONNECTIONS.md)). A peer that authenticated inside the window is exempt from the global budget, so a flood cannot lock out a working partner. Counted in-process, so each engine shard keeps its own count | **THROTTLE** — `429` + `Retry-After: 60` before any credential is compared; audited `intake.auth_rate_limited`. A successful authentication never spends budget |
 | **HTTP** — peer-control start gate (ADR 0154 D7) | the listener's bind host × the presence of an **effective** peer control | non-loopback bind, `[security].enforcement = enforce` (the default), and **no** effective peer control: `intake_auth` is `none`, and `source_ip_allowlist` is unset or has an entry wider than a /8 (IPv4) or a /32 (IPv6), so `0.0.0.0/0` does not count. `tls` + `tls_ca_file` alone does not count either, because it binds no subject | **DENY at start** (`WiringError`); the connection degrades per ADR 0031 startup fault isolation. Loopback binds are exempt |
@@ -4703,10 +4831,11 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   its own table-wide statement of the same `UPDATE ... OUTPUT` shape, so treat it as having this
   limit too. That is a reading by likeness to the per-account sweep, not one traced for the
   table-wide statement, and the lock-order bullet below does not cover its every-account lock
-  footprint. **A missed session is refused the next time it is presented** (BACKLOG #2592), with
-  at least the exception below. Each of these raises the account's session epoch in the same
-  transaction, and a rotation keeps the epoch the session was sealed under. So the gate refuses
-  and ends the session, and the user's own session list hides it and ends it the same way.
+  footprint. **A missed session is refused the next time it is presented** (BACKLOG #2592),
+  within the limits the rest of this bullet states. Each of these raises the
+  account's session epoch in the same transaction, and a rotation keeps the epoch the session was
+  sealed under. So the gate refuses and ends the session, and the user's own session list hides
+  it and ends it the same way.
   **The every-account revoke also raises the store's global session epoch, on all three stores
   (BACKLOG #5091).** Every session is stamped with that epoch when it is minted and resolves
   only while it is current, so the revoke ends a session whatever its read of the account list
@@ -4733,12 +4862,46 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   the row is missing, at least these refuse with an error naming it: a read of an existing
   account's user record that a sign-in or a session check makes, and every every-account revoke.
   A request that returns before that read is refused as it would be anyway.
-  **The exception,** for every sweep this bullet names: a request from a missed session to end
-  the user's other sessions, accepted just before the sweep commits, waits for it and then stamps
-  the session with the account's new epoch, so it stays usable. Against the every-account revoke
-  that request stamps the account's epoch alone, so the session still ends. There at least a
-  second every-account revoke keeps a missed session, which needs `users:manage` and a step-up,
-  because that revoke stamps the global epoch.
+  **A revoke asked to keep a missed session does not make it usable again: it ends it**
+  (BACKLOG #4975 and its follow-up). At least two cases reach this: a request from that session to end the
+  user's other sessions, accepted just before the sweep commits, which waits for it and then runs,
+  and an every-account revoke that keeps a session an earlier sweep missed. A revoke that keeps a
+  session, the per-account one or the every-account one, stamps the new epochs onto it only when
+  it carried both epochs that revoke checks. One is its account's epoch, taken from the record the
+  raise read under the account's lock. The other is the global epoch: for the every-account revoke
+  the value its raise replaced, and for the per-account revoke, which raises no global epoch, the
+  value read in its own transaction, which it leaves on the session as it is. Where the account's
+  record fails its seal, its epoch cannot be raised and nothing is stamped; where the per-account
+  revoke finds the global epoch's row missing, nothing is checked against it and nothing is
+  stamped either, and the revoke goes on rather than roll back. **A kept session of an account
+  the revoke sweeps, which it does not stamp, is ended in the same transaction**, as the sweep
+  ends the rest, and counted with them: at least one behind on either epoch, as a missed session
+  is, and one whose account's record failed its seal. A kept session of another account, which
+  only a direct store call could name, is outside the per-account sweep and is left as it is.
+  The revoke still ends the user's other sessions, current ones included. All three stores do
+  this. Because it is ended there, a declined session no longer holds a place
+  under the session cap, and presenting it again is refused as an ended session, not reported as a
+  seal failure. **Each revoke reports whether it stamped the kept session, and whether it ended
+  it, from the transaction that did so** (`RevokeResult` in `messagefoundry/store/store.py`), and
+  the service takes "kept" from that answer and from nothing read afterwards. So a declined session
+  is not called kept, and it was in fact ended: `DELETE /sessions` answers "this session was ended
+  too" and audits scope `all`, and ending the user's other sessions audits scope `self_all`, even
+  with nothing else ended. "Kept" says what the revoke wrote, not what the gate will answer: the
+  gate's expiry checks still apply, and a later revoke can still end the session. The count in
+  the reply and the audit row of `DELETE /sessions` includes the caller's own session wherever the
+  call ended it: in the revoke, as above, or in its fallback sweep where that session failed its
+  own seal. The reply and the audit row of `DELETE /me/sessions` count only the user's other
+  sessions, wherever the caller's own ended. `tests/_session_seal_contract.py` tests the
+  per-account revoke, on a session behind on its account's epoch and on one whose account's record
+  fails its seal; `tests/test_b2614_revoke_all.py` the every-account revoke on a session behind on
+  both epochs, on one behind on its account's epoch alone and on one whose account's record fails
+  its seal; and `tests/test_b5091_global_session_epoch.py` both revokes on one behind on the global
+  epoch alone, and on SQLite only, the per-account revoke with the global epoch's row missing.
+  Each declined case sits beside a control where the kept session is current and stays live. Each runs on SQLite and on the server legs `.github/workflows/ci.yml` runs from
+  `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py`. Each of those three also
+  checks the store's kept answer. `tests/test_session_seal.py` tests that the service's counts and
+  audit scope follow that answer, and that a read failing after the revoke cannot change them, and
+  `tests/test_b2614_revoke_all_route_cli.py` that both routes' replies do; both run on SQLite only.
   **A request that straddles a revoke's commit can still end the session the revoke kept, and
   reports a seal failure either way.** The gate and the session list read a session before its
   account, so such a request can see a session's old stamps beside the account's new epochs. On
@@ -4845,8 +5008,10 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
     at sign-in. The password re-bind this leg replaces would have failed for a deleted account.
     The answer must carry that same id before its groups are trusted, or the leg refuses with
     `directory_object_id_missing` or `directory_identity_conflict` (BACKLOG #3174);
-  - every role stored on the account is among the roles its current directory groups map to
-    (BACKLOG #2154). Otherwise the leg refuses with `reason=directory_roles_demoted`.
+  - the account passes the role test in the paragraph that opens "A directory step-up or
+    enrolment leg refuses a present account that lost a role in the directory" (BACKLOG #2154,
+    #3082). Otherwise the leg refuses with the reason that paragraph names,
+    `reason=directory_roles_demoted` or `reason=directory_role_map_unsealed`.
 
   It then elevates through the same path as the password leg: `reauth_at` is stamped, the session
   is rotated (ASVS 7.2.4) and keeps its `mfa_verified_at`, and a single-use action grant is minted
@@ -5385,9 +5550,11 @@ engine bounds its own sessions with short caps, and the reconciler carries direc
   others, but asks for a fresh step-up first. With `[auth].require_action_step_up` on (the
   default), a Kerberos session can give that step-up only by password. So a Kerberos session on a
   passwordless or smartcard-only account cannot end its other sessions this way;
-- end sessions in bulk with `DELETE /sessions`, which keeps the caller's current session, or from
-  the host with `messagefoundry admin-revoke-sessions`, which keeps none (BACKLOG #2614). What
-  these and the per-account revokes above may miss: *Limits of the session sweep* under
+- end sessions in bulk with `DELETE /sessions`, which keeps the caller's current session only when
+  the revoke re-stamps it and otherwise ends it too, or from the host with
+  `messagefoundry admin-revoke-sessions`, which keeps none (BACKLOG #2614). What these and the
+  per-account revokes above may miss, and when a revoke ends the session it was asked to keep:
+  *Limits of the session sweep* under
   [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142).
 
 [CONFIGURATION.md](CONFIGURATION.md) documents each setting.
@@ -5403,8 +5570,12 @@ Users and admins can see and revoke individual sessions (ASVS 7.5.2 / 7.4.5):
   user's id returns 404, never revealing or touching it). **Gated on a fresh password re-proof bound
   to the `session_terminate` action** (ASVS 7.5.2 — see the route table above): the sign-in you
   already hold does not unlock a terminate, and the grant is single-use.
-- **`DELETE /me/sessions`** — "sign out everywhere else": revoke all your sessions except the current.
-  Same `session_terminate` re-proof gate.
+- **`DELETE /me/sessions`** — "sign out everywhere else": revoke all your other sessions. The
+  current one is kept only when the revoke re-stamps it. Otherwise it is ended too, in the
+  revoke's own transaction, or, where its own seal fails, by the seal-failure handler before a
+  fallback sweep ends the rest; *Limits of the session sweep* under
+  [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says when. Same
+  `session_terminate` re-proof gate.
 - **`DELETE /users/{id}/sessions`** (`users:manage`) — admin force-sign-out of a user (offboarding /
   suspected compromise).
 
@@ -5601,6 +5772,46 @@ step-up. So an id shown on a sessions page can go stale. The console's revoke sa
 revoked" when the id no longer matches, rather than reporting a revoke that did not happen, and
 `DELETE /me/sessions/{id}` answers 404.
 
+### A restored store brings its sessions back, and only `messagefoundry restore` records it
+
+A store restored from a backup brings back the whole store as it was when the backup was taken,
+accounts and sessions included. **The engine records a restore only when `messagefoundry restore`
+placed a SQLite store** (BACKLOG #2614). That command ends every session in the store it places
+and writes a marker into it, and the first `serve` on that store ends every session again, writes
+one `store_restored` audit row and raises a `store_restored` alert. The
+[early-adopter guide](EARLY-ADOPTER-GUIDE.md#10-backup-restore--disaster-recovery) says what an
+operator sees, and what a restore rolls back.
+
+**Every other restore writes no marker** (BACKLOG #5092). At least these: a PostgreSQL or SQL
+Server store restored with the database's own tools, such as `pg_restore`, point-in-time recovery
+or `RESTORE DATABASE`, and a SQLite store put back by copying its files. Neither server backend
+holds a marker (`consume_restore_record` returns nothing there). So the first `serve` ends no
+session, writes no `store_restored` row and raises no `store_restored` alert, and the backup's
+sessions are accepted until they expire or are revoked.
+
+**One start-up signal that can catch such a restore is the audit anchor's, and only where it is
+set up.** With `[integrity].audit_verify_on_start = true` and `[integrity].audit_anchor_file`
+holding an anchor taken after the backup, the start-up audit walk reports the restored log as
+truncated and raises an `integrity_drift` alert
+([CONFIGURATION.md](CONFIGURATION.md#integrity) says how). That alert ends no session and writes
+no `store_restored` row. Both settings are off by default, the anchor file is only as recent as
+the operator keeps it, and it catches the restore only if audit rows were written between the
+backup and the anchor. Other start-up signals may follow from what the restore rolled back, at
+least a `config_changed` alert against the store's older baseline, but none of them records the
+restore as one.
+
+**After such a restore, before the first `serve`, an operator must by hand** (an in-place restore
+under running engines skips that moment, so stop every engine process and cluster node on the
+store before the restore):
+
+- run `messagefoundry admin-revoke-sessions` against the restored store. It ends the sessions it
+  finds, of every account, and writes one `auth.session_revoked` audit row; *Limits of the session
+  sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says what it
+  may miss;
+- re-apply the changes the restore undid. `messagefoundry restore --help` prints the statement of
+  what a restore rolls back, and the guide lists its classes; it applies to these restores too.
+  The source's audit log, or its off-host copy, lists the changes themselves.
+
 ### Security-event notifications (WP-L3-05, ASVS 6.3.5 / 6.3.7)
 
 Users are notified of security-relevant changes to their account through **two** channels:
@@ -5755,14 +5966,22 @@ neither of these is part of it:
 
 ### Authentication pathways — comparative strength
 
-**Six** authentication pathways ship: **three** interactive sign-ins (Local, Kerberos/SPNEGO,
+**Seven** authentication pathways ship: **three** interactive sign-ins (Local, Kerberos/SPNEGO,
 OIDC), the **AD directory bind** — retained for step-up re-authentication after its sign-in was
-retired — and **two** non-interactive planes: the mTLS service-identity plane on the engine API, and
-**HTTP intake authentication** (`intake_auth`) on the ingest plane. The first five authenticate a
-caller to the engine API. The sixth authenticates a partner submitting messages to one inbound HTTP
-connection; it mints no identity, opens no session and grants no read. It counts as a pathway by owner
-ruling (2026-09-23). **Its default is `intake_auth = "none"`: a default HTTP inbound checks no
-credential and admits any peer the network rules let through** (see its row below and
+retired — and **three** non-interactive planes: the mTLS service-identity plane on the engine API,
+and, on the ingest plane, **HTTP intake authentication** (`intake_auth`) and **MLLP intake
+authentication** (`tls_client_subjects`, BACKLOG #4907). The first five authenticate a caller to the
+engine API. The sixth authenticates a partner submitting messages to one inbound HTTP connection, and
+the seventh a sender on one inbound MLLP connection; neither mints an identity, opens a session or
+grants a read. The sixth counts as a pathway by owner ruling (2026-09-23), which named `intake_auth`
+only. The seventh is counted by the criterion this record applies, not by that ruling: a
+connector-factory parameter that authenticates a submitting peer by a subject list counts as a
+pathway, and `tls_client_subjects` is one, a client-certificate check with a subject list.
+`tests/test_docs_security_pathways.py` anchors each ingest-plane row to the factory parameter that
+turns it on. **Their defaults check no credential:
+with `intake_auth = "none"`, the default, an HTTP inbound admits any peer the network rules let
+through, and with `tls_client_subjects` unset, the default, an MLLP inbound admits any certificate
+its `tls_ca_file` verifies, or any peer at all without one** (see their rows below and
 [Table B](#table-b--data-plane-ingest-listeners)). The count covers mechanisms that check a
 credential naming a caller or a partner. It does not count the network-level peer controls in
 Table B, such as `source_ip_allowlist` or a listener's client-certificate check with no subject
@@ -5776,6 +5995,7 @@ list, which admits any certificate its CA ever signed.
 | **OIDC federation** (browser only, hybrid AD-backed) | IdP-asserted, gated on a **signature-verified** `amr`/`acr` claim (`[auth].oidc_require_mfa_claim` defaults **on**) — an assertion, not a proof | no engine credential to guess on the federated leg, so that leg feeds no per-account lockout, though a lock another leg set on the account row refuses this sign-in (BACKLOG #1638); both legs (`POST /ui/oidc/start`, `GET /ui/oidc/callback`) charge the sign-in window, and so does `GET /ui/oidc/start` when its interstitial is skipped (see the [Route → limiter map](#route--limiter-map)) (`[auth].login_rate_limit_enabled`, default on — **off leaves the federated leg with no engine-side control at all**, though the bounded pending-flow cache still caps concurrent start legs), plus the IdP's own lockout. The **step-up leg** checks no engine credential either, so a refused IdP step-up feeds no lockout and no per-session re-proof cap, and neither account lock refuses it. Its start, `POST /ui/reauth/oidc`, and the IdP's return to `GET /ui/oidc/callback` both draw the per-actor ceremony limiter, the return under a key of its own for the user the staged flow names (BACKLOG #3374) | hybrid-only: a federated principal with no on-prem AD object is refused. Roles come from LDAP, never from a token claim. When `[auth].oidc_username_strip_domain` is on (default), the claim's UPN suffix must match `oidc_allowed_username_domains` (or `[auth].ad_domain`); with stripping **off** the claim is used verbatim and no suffix check applies. Either way the claim selects no account: the bound (issuer, sub) pair does (ADR 0184). The session's absolute lifetime is capped at the verified `id_token.exp` and at `auth_time + [auth].oidc_max_age_seconds`; minted with no step-up window. **Its step-up goes back to the IdP and never to a password** (BACKLOG #296, ADR 0142 Amendment B). `POST /ui/reauth/oidc` sends the browser to the IdP with `max_age=0` and `prompt=login`, and `complete_oidc_step_up` checks the answer before it elevates the session. Among its checks, the verified (issuer, sub) pair must still be the account's, and the new `auth_time` must be no earlier than the moment the flow was staged, less `oidc_clock_skew_seconds`, and later than the IdP `auth_time` the session holds (BACKLOG #2143). The full list, in order, is under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). It then stamps `reauth_at`, rotates the session, and mints the action-bound grant when the action the operator started from takes one and the session is not refused it (a pending session on an account with a factor, for a factor-binding or session-terminate action, a save that ends the caller's own sessions (BACKLOG #3401), or ending every session (BACKLOG #2614)). Console only: `POST /me/reauth` refuses an `oidc` session, and the JSON plane has no federated step-up |
 | **mTLS service identity** (non-interactive, ADR 0083) | a **verified** client certificate mapped through a deny-by-default, name-space-qualified allow-list (`CN:` / `SAN:<type>:`) | **not applicable** — no guessable secret and no lockout; admission requires a chain verifying to the pinned client CA plus a listed qualified name | no session, no MFA, no step-up — which is why it is **PHI-fenced**: `require_service_cert` raises at **app construction** if asked to gate a PHI-view permission. One route only (`GET /service/identity`); every success is audited `service_cert_auth` |
 | **HTTP intake authentication** (non-interactive, ingest plane, ADR 0154 D6) | per inbound `Http()` connection, `intake_auth` picks one of `none`, `api_key`, `bearer` or `mtls_subject`. **The default is `none`: no credential is checked, so any peer the network rules admit may submit.** `api_key` and `bearer` compare a shared secret (`intake_api_key`, `env()` only, with an `intake_api_key_next` rotation slot) in constant time; `mtls_subject` maps a client certificate already verified against `tls_ca_file` through the qualified `intake_client_subjects` allow-list, keyed by the loaded CA whose key signed the certificate | **per-peer and global failed-attempt budgets** (defaults `intake_auth_rate_limit` 10/min, `intake_auth_rate_limit_global` 60/min, then `429`; see Table B); a successful attempt never spends budget, and a peer that authenticated inside the window is exempt from the global one. **No per-account lockout** — there is no account | authorises *submitting* only: no session, no MFA, no step-up, no read. Under `api_key` / `bearer` a missing or wrong credential gets `401` before any body byte is read, or `400` if it sends the credential header twice (Table B). Under `mtls_subject` a peer with no certificate from `tls_ca_file` fails the TLS handshake and is never seen by the engine, and a verified certificate whose subject is not listed under the loaded CA that signed it gets `403`. The refusals the engine sees are audited `intake.auth_failed` / `intake.auth_subject_denied` / `intake.auth_rate_limited`. Off loopback, a listener with no effective peer control is refused at start under `[security].enforcement = enforce` (Table B) |
+| **MLLP intake authentication** (non-interactive, ingest plane, BACKLOG #4907) | per inbound `MLLP()` connection, `tls_client_subjects` maps a client certificate already verified against `tls_ca_file` through a qualified (`CN:` / `SAN:<type>:`) allow-list, keyed by the loaded CA whose key signed the certificate, through the matcher `mtls_subject` uses. **The default is unset: no subject is checked, so any certificate `tls_ca_file` verifies is admitted as any sender.** It needs `tls` and `tls_ca_file` | **per-peer and global failed-attempt budgets** at the `Http()` defaults (10/min per address, 60/min in all), with no setting of its own to change or turn them off. The per-address budget is read before the certificate is compared, and an address that has spent it is closed unread; the global one is read only once the compare has refused, so a listed sender never spends budget and is never closed by the global one. **No per-account lockout** — there is no account | authorises *submitting* only: no session, no MFA, no step-up, no read. A peer with no certificate from `tls_ca_file` fails the TLS handshake before the `tls_client_subjects` allowlist is read, leaving only the throttled `tls_handshake_failed` connection event (Table B). A verified certificate whose names are not listed under the loaded CA that signed it has each message of its first read recorded as an `ERROR` row, then answered `AR` on an HL7 v2 inbound that acknowledges, and the connection closes. The refusals are audited `intake.auth_subject_denied` / `intake.auth_rate_limited`, and the listener refuses TLS renegotiation. [CONNECTIONS.md](CONNECTIONS.md#expected-senders-tls_client_subjects) states the design (Table B) |
 
 Comparative properties on the dimensions the table's four columns cannot carry:
 
@@ -5787,6 +6007,7 @@ Comparative properties on the dimensions the table's four columns cannot carry:
 | **OIDC** | the federated leg: the IdP's, not the engine's. At sign-in the engine asks for its own factor, where a passkey is phishing-resistant, only when the session is minted MFA-pending, which happens with `oidc_require_mfa_claim` off, and then only while `[security].require_mfa` is on or the account has enrolled one | strongest of the four interactive and directory pathways: server-side PKCE verifier + `state` (constant-time compare) + `nonce`, single-use flow, a `__Host-`-prefixed browser-binding cookie the callback requires, and a `typ`/kid/alg/signature/`events`/`iss`/`aud`/`exp`/`iat`/`nbf`/`auth_time`/`nonce`/`sub` ladder under a bounded clock skew — `typ` and `events` assert the token **class** (an access token or a logout token carries the same issuer and key), and `sub`/`iat`/`auth_time` are required rather than optional. The IdP step-up leg runs the same flow and ladder, then refuses a token whose `auth_time` predates the staged flow by more than `oidc_clock_skew_seconds`. It also refuses one whose `auth_time` is not later than the IdP `auth_time` the session holds (BACKLOG #2143). **Residual:** an IdP that ignores `max_age=0` still passes when the user signed in at the IdP again after that stored value, inside that skew | **none** — only the confidential-client credential: the client secret (by policy from env or a `[secrets]` reference, resolved eagerly at startup; a value in the config file is still accepted, with a WARNING at load), or under `private_key_jwt` a signing key loaded the same way (BACKLOG #296) | asserted via `amr`/`acr` **and enforced** — with `[auth].oidc_require_mfa_claim` on (default) a token carrying no configured `amr`/`acr` is refused at claims validation, and only then is the session minted MFA-verified; switch it off and the federated session is minted **un**verified, which `mfa_satisfied` refuses while `[security].require_mfa` is on or once the account has enrolled a factor. This is the one directory leg whose directory-side factor claim the engine checks, by verifying the signed `amr`/`acr`; that is still an assertion, not a proof. A Kerberos session's factor is the engine's own, which the engine verifies directly | as AD, plus the `id_token.exp` and `auth_time + max_age` caps; no refresh tokens and no RP-initiated logout |
 | **mTLS** | n/a (no interactive ceremony) | n/a | **none** — the engine holds only the client CA, the name map and, if set, the CRL file | none, structurally | **opt-in CRL checking, off by default** — `VERIFY_X509_STRICT` is strict path validation and checks no revocation, so with `[api].tls_client_crl_file` unset a revoked but chain-valid client certificate is accepted. Set it and a revoked client certificate fails the handshake (BACKLOG #1005; the [CONFIGURATION.md `[api]` row](CONFIGURATION.md#api) is the source of record). No OCSP. Engine-side: remove the allow-list entry (config change → restart) or disable the mapped account |
 | **HTTP intake** | `api_key` / `bearer`: none, the shared secret is phishable like any password; `mtls_subject`: the client certificate's | `api_key` / `bearer`: none beyond TLS, and a listener without `tls` sends the secret in cleartext; `mtls_subject`: the TLS handshake | `api_key` / `bearer`: **the raw shared secret**, held in process memory and compared as-is, not hashed like a Local password. `intake_api_key` / `intake_api_key_next` must be `env()` references, never inline, and nothing writes them to the store. `mtls_subject`: only `tls_ca_file` and the subject list | none, structurally | change the `env()` secret (the `intake_api_key_next` slot avoids an outage) or drop the subject from `intake_client_subjects`; either takes effect only once the connection is rebuilt, which a restart does, because the listener reads both at construction. Under `[security].enforcement = enforce` an `mtls_subject` listener, like any intake listener with `tls` and `tls_ca_file`, is refused at start unless it also sets `tls_crl_file` or declares `tls_revocation_attested = true` with a `tls_revocation_attested_reason` (an `inbound()` keyword or a top-level `connections.toml` key, not under `[settings]`). The attestation checks no revocation in the engine: the listener starts, and each start logs a WARNING that reads `on operator attestation` and carries the reason ([ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)). Prefer `tls_crl_file` |
+| **MLLP intake** | the client certificate's | the TLS handshake | **none** — only `tls_ca_file` and the subject list | none, structurally | drop the name from `tls_client_subjects`; it takes effect only once the connection is rebuilt, which a restart does, because the listener reads the table at construction. The `tls_crl_file` or `tls_revocation_attested` start rule in the row above applies to this listener too, as to any intake listener with `tls` and `tls_ca_file` |
 
 **Where each pathway is enforced, and what turns it on:** Local → `POST /auth/login` + `POST /ui/login`
 (always available); AD → the step-up re-bind at `POST /me/reauth` + `POST /ui/reauth`
@@ -5798,7 +6019,9 @@ which returns through that same callback, all registered **only** when `[auth].o
 off, and it additionally requires `ad_enabled`); mTLS → `GET /service/identity`, active only when
 `[api].tls_client_cert_identities` **and** `[api].tls_client_ca_file` are both set (default `{}` = off);
 HTTP intake → the inbound `Http()` listener's own socket, per connection, active only when that
-connection sets `intake_auth` to something other than its default `none`.
+connection sets `intake_auth` to something other than its default `none`; MLLP intake → the inbound
+`MLLP()` listener's own socket, per connection, active only when that connection sets
+`tls_client_subjects` (unset by default) with `tls` and `tls_ca_file`.
 
 **A second gate applies to the three browser legs.** `POST /ui/login`, `GET /ui/sso` and the three
 `/ui/oidc/*` routes are registered by the separately versioned web-console wheel, which is mounted
@@ -5935,7 +6158,8 @@ no guessable secret at all, so no rate limit or lockout applies to it. HTTP inta
 (`intake_auth`) has no account to lock, so its `api_key` / `bearer` secret is bounded only by its own
 per-peer and global failed-attempt budgets. Those are set per connection, not under `[auth]`, and
 `0` or `None` turns either one off. With both off, nothing in the engine bounds guessing of that
-secret. **An engine second factor
+secret. MLLP intake authentication (`tls_client_subjects`) has no guessable secret; its refusals
+are charged to the same two budgets, at the `Http()` defaults, with no off switch. **An engine second factor
 is built for every account, directory ones included** (BACKLOG #1144) — TOTP (WP-14) *and* WebAuthn
 passkeys (WP-14b), the latter being the only phishing-resistant factor shipped. A directory
 account (Kerberos or OIDC) enrolls on the same routes a local account uses. An earlier revision said
@@ -6027,8 +6251,8 @@ The key's row is in the `[auth]` table of
 
 **What this fallback does not cover.** An `amr` or `acr` value that does arrive is the identity
 provider's assertion, not a proof, and the IdP step-up keeps its stated skew residual; both are in
-[Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). The mTLS service-identity plane
-and HTTP intake authentication open no interactive session and carry no MFA, as the tables above say.
+[Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142). The mTLS service-identity plane,
+HTTP intake authentication and MLLP intake authentication open no interactive session and carry no MFA, as the tables above say.
 So there is no strength to fall back from. SMART Backend Services is outbound: there the engine asks
 for a token, so it is not a sign-in leg.
 
@@ -6416,7 +6640,7 @@ additionally front the API with a proxy/WAF limiter and TLS.
 | Egress response body | *(module constants in `transports/bounded_read.py`: `DEFAULT_MAX_RESPONSE_BYTES`, `MAX_TOKEN_RESPONSE_BYTES` — no knobs)* | 16 MiB; 256 KiB on a token endpoint | per response | no | no | no | **stateless** — a per-response test carrying no budget, applied at every outbound HTTP read: REST, SOAP, FHIR write, the `fhir_lookup` live read, DICOMweb STOW-RS, the OAuth2 and SMART token endpoints, the AI broker and the alert webhook, plus each of their reachability probes | the read stops at the bound plus one byte and raises `ResponseTooLargeError`, a `DeliveryError`. Where that surfaces inside a delivery, as it does when a delivery mints its token, the message retries and then dead-letters like any other reply the engine could not read. At least a probe and the AI broker report it to their own caller instead, and nothing retries those. The alert webhook counts an over-cap body after a 2xx as delivered and logs a WARNING that carries no reply byte, because nothing reads that body (owner ruling 2026-10-12, vault BACKLOG #3040 item 1). **A REST, SOAP, FHIR or DICOMweb delivery that already holds a 2xx does not retry either** (vault BACKLOG #2180, owner ruling 2026-10-05): a retry would send again a request the partner answered 2xx, so an over-cap body there is either dropped or refused for good with the code `reply-too-large`. The table under REST in [`CONNECTIONS.md`](CONNECTIONS.md) says which destination and mode does which. The ruling names the principle, which is to judge the body by who reads it, and not the FHIR cases that refuse; refusing those is a reading of it made when this was built, which the owner may reverse, and the note under that table says which rows it covers. A 2xx body cut short of its declared length, or misframed, follows the same rule with the code `reply-truncated` or `reply-misframed` (BACKLOG #2989; ADR 0095 Amendment B.1 records who decided it). A `fhir_lookup` refusal is a `FhirLookupError` the Handler sees directly, and the two HTTP-error-body reads instead WARNING-log and classify on the status alone. 16 MiB is not a new number — it is `parsing/peek.DEFAULT_MAX_MESSAGE_BYTES`, the engine's existing one-message ceiling, so no honest clinical reply is refused. **Egress only:** this bounds a reply to a request the engine made, never a received message, so it cannot drop one (BACKLOG #1191) |
 | OIDC pending flows | `[auth].oidc_flow_cache_max` (global), `DEFAULT_PER_IP_CAP` (per-IP, no knob), `oidc_flow_ttl_seconds` | 512 / 16 / 300 s | 300 s TTL | no | **yes** (512) | **yes** (16) | **in-process** — `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its interstitial is skipped, and the step-up start `POST /ui/reauth/oidc` (`begin_oidc_step_up`) — reject-when-full, never evict | 303 → `/ui/login?e=rate_limited` on the sign-in start; 429 re-rendering the step-up page, no `Retry-After`, on `POST /ui/reauth/oidc`; WARNING-logged, **never** audited |
 | WebAuthn pending ceremonies | `GLOBAL_PENDING_CAP`, `PER_USER_PENDING_CAP`, `CHALLENGE_TTL_SECONDS` (module constants, no knobs) | 4096 / 16 / 120 s | 120 s TTL | **yes** (16) | **yes** (4096) | no | **in-process** — every passkey registration + assertion ceremony | per-user: evicts that user's **own** oldest pending ceremony (silent); global: `ChallengeCacheFullError` naming the cause + the `admin_reset_mfa` recovery path |
-| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The pacer waits before reading the association request and never refuses one itself. A waiting connection does hold one of the SCP's slots for connections with no association yet, and a connection over those caps is closed ([DICOM.md](DICOM.md) section 3). The engine-wide intake pause is a separate control that does refuse a new association as busy while it holds (BACKLOG #290; the `[inbound].max_staged_depth` row of [CONFIGURATION.md](CONFIGURATION.md) says how). An established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `poll_max_files` (the `File`, `Sftp` and `Ftp` sources) and `poll_max_rows` (the `DatabasePoll` source) cap how many items one **poll tick** takes, not how many it lists, and both **ship ON at 500**. That is the opposite default, deliberately, because a poll source has no sender to back-pressure. The excess is **deferred, not refused**: it stays in the drop directory or the table for a later tick. That holds on the Database source only under conditions, and a file source can still spend the cap on a file it leaves in place; [CONNECTIONS.md §*Per-tick poll ceilings*](CONNECTIONS.md#per-tick-poll-ceilings) states both, with what spends the cap on each source, why 500 and when to raise it. A negative or non-numeric value is **refused when the connection is built**, before it starts. **Still not covered even when set:** any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP, raw-TCP and X12 listeners** — `max_connections_per_host` (32). BACKLOG #1725 added it to MLLP, and vault BACKLOG #2606 to the other two. It is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The HTTP listener takes the same key but **ships it off**. Behind a reverse proxy every partner arrives from one address, so a cap there would be the listener's whole capacity. The DICOM intake has no such key. It caps only connections with no association yet, per host and per listener, by constant, and it gives each one a deadline ([DICOM.md](DICOM.md) section 3). **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP, raw-TCP and X12 listeners' `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `poll_max_files` and `poll_max_rows` (500, on the poll sources), `source_ip_allowlist`. On the MLLP, raw-TCP and X12 listeners `receive_timeout` resets on every byte received, so it bounds only silence; `max_frame_seconds` bounds the frame. Bytes outside a frame count toward that deadline too (vault BACKLOG #2847 brought MLLP into line). [CONNECTIONS.md](CONNECTIONS.md#resource-management--limits-asvs-1312--1313--1326) states when its clock starts and stops. |
+| **Ingest plane** | `max_messages_per_second`, `message_burst` (MLLP, raw-TCP, X12 and HTTP inbounds) | **off** (unset = no rate bound) | per message | no | no | no | **in-process** — one bucket per MLLP / raw-TCP / X12 **connection** and one per HTTP **listener**, so it neither coordinates across engine shards nor aggregates per peer | **Ships OFF, and the off default is ruled rather than accidental** — a rate on a clinical interface is only safe at a number taken from a real feed profile. **So a default install has NO message-RATE bound on the ingest plane**, and that is a deliberate posture, not a gap in the control. Both keys are parameters of the `MLLP()`, `Tcp()`, `X12()` and `Http()` factories, so **the code-first surface expresses them on all four**. `connections.toml` desugars through those same factories, so **the TOML surface expresses them on three of the four**: `X12` is absent from that loader's `_TRANSPORTS` map entirely, so **no** X12 setting is expressible in `connections.toml` and the pacing keys are not a special case of that. Closing it means adding the transport, which is a separate decision from this control; the gap is pinned with its own positive control at `tests/test_ingress_message_pacing.py::test_x12_has_no_toml_surface_at_all_which_is_a_separate_gap` (BACKLOG #1249 for MLLP, BACKLOG #1114 for the other three — until #1249 landed the pacer was built and no documented configuration could turn it on, and until #1114 landed the other three intakes had no rate control in **any** configuration, which is a different and worse thing than being off). *What it does when set:* the listener **pauses reading before its next read** so TCP back-pressures the sender; no message is dropped, refused, NAK'd, 429'd or reordered — the count-and-log invariant forbids accept-and-drop, so a discarding limiter was never available. **The HTTP bucket is listener-wide, not per-connection**, because that connector answers one request per connection; a `GET`/`HEAD` probe waits behind an outstanding debt but charges nothing. **Two SIBLING intake bounds on different units, added by BACKLOG #1114 — read them as separate controls, not as this row's keys reaching further.** (1) `max_associations_per_second` / `association_burst` bound the **DICOM C-STORE SCP**, and the unit is an **association**, not a message: `pynetdicom` owns the read loop, so by the time a C-STORE reaches the engine the object has already been read and decoded, and a pace after decode would delay a message the count-and-log invariant has already obliged us to account for. The pacer waits before reading the association request and never refuses one itself. A waiting connection does hold one of the SCP's slots for connections with no association yet, and a connection over those caps is closed ([DICOM.md](DICOM.md) section 3). The engine-wide intake pause is a separate control that does refuse a new association as busy while it holds (BACKLOG #290; the `[inbound].max_staged_depth` row of [CONFIGURATION.md](CONFIGURATION.md) says how). An established association is still **unbounded in the objects it may push** (`max_object_bytes` and `timeout_seconds` bound those instead). It **ships OFF**, for the reason in bold above, so it does not soften the sentence about a default install. (2) `poll_max_files` (the `File`, `Sftp` and `Ftp` sources) and `poll_max_rows` (the `DatabasePoll` source) cap how many items one **poll tick** takes, not how many it lists, and both **ship ON at 500**. That is the opposite default, deliberately, because a poll source has no sender to back-pressure. The excess is **deferred, not refused**: it stays in the drop directory or the table for a later tick. That holds on the Database source only under conditions, and a file source can still spend the cap on a file it leaves in place; [CONNECTIONS.md §*Per-tick poll ceilings*](CONNECTIONS.md#per-tick-poll-ceilings) states both, with what spends the cap on each source, why 500 and when to raise it. A negative or non-numeric value is **refused when the connection is built**, before it starts. **Still not covered even when set:** any **per-message** bound on the DICOM SCP, and any **per-peer MESSAGE-RATE** bound (MLLP, TCP and X12 peers are unauthenticated, so the only key would be source IP, which NAT collapses). **A per-peer CONNECTION bound does now ship on the MLLP, raw-TCP and X12 listeners** — `max_connections_per_host` (32). BACKLOG #1725 added it to MLLP, and vault BACKLOG #2606 to the other two. It is a different unit: it caps concurrent sockets from one address, refusing pre-ingress, and never bounds how fast an admitted peer may send. It keys on source IP, so the NAT objection still applies to it and is recorded at its constant; behind a source-NAT proxy set it to `None`/`0`. The HTTP listener takes the same key but **ships it off**. Behind a reverse proxy every partner arrives from one address, so a cap there would be the listener's whole capacity. It does ship `max_handshakes_per_host` (32) on. That is not a per-host connection cap: it counts only the sockets one address holds while their TLS handshake runs, and only with `tls = true` on the stdlib loop (vault BACKLOG #4888; [DEPLOYMENT.md](DEPLOYMENT.md#per-address-listener-caps-behind-the-vip)). The DICOM intake has no such key. It caps only connections with no association yet, per host and per listener, by constant, and it gives each one a deadline ([DICOM.md](DICOM.md) section 3). **Resource bounds that DO ship on** — at least `max_connections` (256), the MLLP, raw-TCP and X12 listeners' `max_connections_per_host` (32) and `max_frame_seconds` (60.0 s), the HTTP listener's `max_handshakes_per_host` (32, with `tls = true` on the stdlib loop only), `receive_timeout` (60.0 s), `max_frame_bytes` (16 MiB), per-connection `max_message_bytes`, `poll_max_files` and `poll_max_rows` (500, on the poll sources), `source_ip_allowlist`. On the MLLP, raw-TCP and X12 listeners `receive_timeout` resets on every byte received, so it bounds only silence; `max_frame_seconds` bounds the frame. Bytes outside a frame count toward that deadline too (vault BACKLOG #2847 brought MLLP into line). [CONNECTIONS.md](CONNECTIONS.md#resource-management--limits-asvs-1312--1313--1326) states when its clock starts and stops. |
 
 **What these limits defend, and what they do not.** The full inventory of resource-demanding
 functionality — including the surfaces that remain **unbounded** at this release — is

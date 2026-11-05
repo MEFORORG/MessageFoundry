@@ -35,6 +35,7 @@ from messagefoundry.transports.database import (
     _ODBC_NO_TLS_VALUES,
     _ODBC_PARAM_ALLOWLIST,
     _ODBC_TLS_MODE_KEYWORDS,
+    UNPLACED_DRIVER_REASON,
     DatabaseDestination,
     DatabaseSource,
     _bind_params,
@@ -479,10 +480,19 @@ def test_the_no_tls_word_copy_matches_the_deny_list() -> None:
     assert set(_NO_TLS_WORDS) == set(_ODBC_NO_TLS_VALUES)
 
 
-def _generic_dsn_logs(params: dict[str, str], caplog: pytest.LogCaptureFixture) -> str:
+#: One registered name per driver family the engine places (BACKLOG #5053). The classifier judges a
+#: TLS keyword by the family, so every call names one.
+_PSQL = "PostgreSQL Unicode"
+_MYSQL = "MySQL ODBC 8.0 Unicode Driver"
+_MSODBC = "ODBC Driver 18 for SQL Server"
+
+
+def _generic_dsn_logs(
+    params: dict[str, str], caplog: pytest.LogCaptureFixture, driver: str = _PSQL
+) -> str:
     settings = {
         "dialect": "generic",
-        "odbc_driver": "PostgreSQL Unicode",
+        "odbc_driver": driver,
         "server": "db.test",
         "odbc_params": params,
     }
@@ -502,7 +512,9 @@ def test_an_sslpassword_spelled_like_a_no_tls_value_never_reaches_a_report(
     classifier still names a real no-TLS keyword beside it."""
     params = {"SSLmode": "disable", "sslpassword": word}
     assert generic_odbc_no_tls_params(params) == ["SSLmode=disable"]
-    assert generic_odbc_tls_unenforced(params) == "TLS is explicitly not required: SSLmode=disable"
+    assert generic_odbc_tls_unenforced(params, driver=_PSQL) == (
+        "TLS is explicitly not required: SSLmode=disable"
+    )
     logged = _generic_dsn_logs(params, caplog)
     assert "SSLmode=disable" in logged
     assert "sslpassword" not in logged.lower()
@@ -517,12 +529,12 @@ def test_a_sentinel_sslpassword_never_appears_in_the_captured_log(
         {"sslpassword": sentinel},
     ):
         logged = _generic_dsn_logs(dict(params), caplog)
-        reason = generic_odbc_tls_unenforced(params) or ""
+        reason = generic_odbc_tls_unenforced(params, driver=_PSQL) or ""
         assert caplog.records, "the probe logged nothing, so an absence would prove nothing"
         assert sentinel not in logged and sentinel not in reason
     # The classifier alone. `PWD_SSL` is not an accepted odbc_params keyword, so the builder refuses
     # it before anything is logged (vault BACKLOG #2577) and only the classifier can be handed it.
-    reason = generic_odbc_tls_unenforced({"PWD_SSL": "off", "Encrypt": "no"}) or ""
+    reason = generic_odbc_tls_unenforced({"PWD_SSL": "off", "Encrypt": "no"}, driver=_MSODBC) or ""
     assert "PWD_SSL" not in reason and "Encrypt=no" in reason
 
 
@@ -530,10 +542,11 @@ def test_a_sentinel_sslpassword_never_appears_in_the_captured_log(
 def test_a_lone_sslpassword_is_not_tls_ownership(password: str) -> None:
     # A passphrase keyword sets no TLS mode, so on its own the hop reads as "no TLS keyword": it is
     # still reported and gated. SSLmode=verify-full beside it is the control that clears the hop.
-    assert generic_odbc_tls_unenforced({"sslpassword": password}) == (
+    assert generic_odbc_tls_unenforced({"sslpassword": password}, driver=_PSQL) == (
         "no TLS keyword is set in odbc_params"
     )
-    assert generic_odbc_tls_unenforced({"sslpassword": password, "SSLmode": "verify-full"}) is None
+    params = {"sslpassword": password, "SSLmode": "verify-full"}
+    assert generic_odbc_tls_unenforced(params, driver=_PSQL) is None
 
 
 #: Every accepted keyword named like TLS that can set no mode. Read from the allowlist, so a TLS
@@ -544,6 +557,9 @@ _TLS_KEYWORDS_WITH_NO_MODE = sorted(
     if _is_tls_keyword(keyword)
 )
 _NO_MODE_REASON = "a TLS keyword is set in odbc_params, but no TLS mode has a usable value"
+#: The opening of the reason for a usable mode value on a keyword or spelling the family does not
+#: read (BACKLOG #5053); the classifier adds the keyword the family does read.
+_UNREAD_MODE = "a TLS mode is set that this driver does not read; it reads"
 
 
 def test_the_no_mode_table_is_not_empty_and_every_mode_keyword_is_accepted() -> None:
@@ -555,15 +571,21 @@ def test_the_no_mode_table_is_not_empty_and_every_mode_keyword_is_accepted() -> 
     assert _ODBC_TLS_MODE_KEYWORDS <= _ODBC_PARAM_ALLOWLIST
 
 
+def test_the_mode_keywords_are_the_two_the_families_read() -> None:
+    # BACKLOG #5053: the set is derived from the family table, so a derivation that went empty
+    # would leave the no-mode table above holding every TLS keyword and pass every test below.
+    assert {"sslmode", "encrypt"} == _ODBC_TLS_MODE_KEYWORDS
+
+
 @pytest.mark.parametrize("keyword", _TLS_KEYWORDS_WITH_NO_MODE)
 def test_a_lone_tls_keyword_that_sets_no_mode_is_not_tls_ownership(keyword: str) -> None:
     """BACKLOG #2483. A key or certificate path with no mode beside it does not count as a mode. A
     real mode beside it is the control."""
     for spelling in (keyword, keyword.upper()):
-        assert generic_odbc_tls_unenforced({spelling: "fixture"}) == _NO_MODE_REASON
-    assert generic_odbc_tls_unenforced({keyword: "fixture", "sslmode": "require"}) is None
-    assert generic_odbc_tls_unenforced({keyword: "fixture", "SSLmode": "verify-full"}) is None
-    assert generic_odbc_tls_unenforced({keyword: "fixture", "sslmode": "prefer"}) == (
+        assert generic_odbc_tls_unenforced({spelling: "fixture"}, driver=_PSQL) == _NO_MODE_REASON
+    for params in ({"sslmode": "require"}, {"SSLmode": "verify-full"}):
+        assert generic_odbc_tls_unenforced({keyword: "fixture"} | params, driver=_PSQL) is None
+    assert generic_odbc_tls_unenforced({keyword: "fixture", "sslmode": "prefer"}, driver=_PSQL) == (
         "TLS is explicitly not required: sslmode=prefer"
     )
 
@@ -571,9 +593,10 @@ def test_a_lone_tls_keyword_that_sets_no_mode_is_not_tls_ownership(keyword: str)
 def test_a_lone_sslrootcert_is_not_ownership() -> None:
     # The ledger row names this keyword. The build refuses it (it is not on the allowlist), so the
     # table above never reads it and only the classifier can be handed it.
-    assert generic_odbc_tls_unenforced({"sslrootcert": "ca.pem"}) == _NO_MODE_REASON
+    assert generic_odbc_tls_unenforced({"sslrootcert": "ca.pem"}, driver=_PSQL) == _NO_MODE_REASON
 
 
+@pytest.mark.parametrize("driver", [_PSQL, _MYSQL, _MSODBC])
 @pytest.mark.parametrize(
     "params",
     [
@@ -590,25 +613,27 @@ def test_a_lone_sslrootcert_is_not_ownership() -> None:
         {"sslmode": 1},
     ],
 )
-def test_a_mode_keyword_with_no_non_blank_string_sets_no_mode(params: dict[str, object]) -> None:
+def test_a_mode_keyword_with_no_non_blank_string_sets_no_mode(
+    params: dict[str, object], driver: str
+) -> None:
     # connections.toml refuses a non-string value, so only a code-first table can hand one in.
-    assert generic_odbc_tls_unenforced(params) == _NO_MODE_REASON
+    assert generic_odbc_tls_unenforced(params, driver=driver) == _NO_MODE_REASON
 
 
-@pytest.mark.parametrize("value", [" require", "require ", "\tverify-full", "yes\n"])
-def test_a_padded_mode_value_sets_no_mode(value: str) -> None:
+@pytest.mark.parametrize("value", [" require", "require ", "\tverify-full", "verify-ca\n"])
+@pytest.mark.parametrize(("keyword", "driver"), [("sslmode", _PSQL), ("Encrypt", _MSODBC)])
+def test_a_padded_mode_value_sets_no_mode(keyword: str, driver: str, value: str) -> None:
     # psqlODBC switches on a value's first character, so a leading blank would select the driver's
     # default. The build refuses a padded value outright since BACKLOG #2705; this pins the
     # classifier the posture readers use on specs that were never built. The unpadded spelling is
-    # the control.
-    for keyword in ("sslmode", "Encrypt"):
-        assert generic_odbc_tls_unenforced({keyword: value}) == _NO_MODE_REASON
-        assert generic_odbc_tls_unenforced({keyword: value.strip()}) is None
+    # the control, each keyword on a driver family that reads it.
+    assert generic_odbc_tls_unenforced({keyword: value}, driver=driver) == _NO_MODE_REASON
+    assert generic_odbc_tls_unenforced({keyword: value.strip()}, driver=driver) is None
 
 
 def test_a_padded_no_tls_value_is_still_named() -> None:
     # Padding never hides the deny-list: that check reads the value trimmed.
-    assert generic_odbc_tls_unenforced({"sslmode": " disable"}) == (
+    assert generic_odbc_tls_unenforced({"sslmode": " disable"}, driver=_PSQL) == (
         "TLS is explicitly not required: sslmode=disable"
     )
 
@@ -617,21 +642,127 @@ def test_a_mode_keyword_named_twice_reads_the_same_in_either_order() -> None:
     # The build refuses the duplicate, but the posture readers classify specs never built.
     first: dict[str, object] = {"sslmode": "verify-full", "SSLMODE": ""}
     second: dict[str, object] = {"SSLMODE": "", "sslmode": "verify-full"}
-    assert generic_odbc_tls_unenforced(first) is None
-    assert generic_odbc_tls_unenforced(second) is None
+    assert generic_odbc_tls_unenforced(first, driver=_PSQL) is None
+    assert generic_odbc_tls_unenforced(second, driver=_PSQL) is None
 
 
 def test_one_blank_mode_keyword_does_not_void_the_other() -> None:
-    assert generic_odbc_tls_unenforced({"sslmode": "", "Encrypt": "yes"}) is None
-    assert generic_odbc_tls_unenforced({"sslmode": "verify-full", "Encrypt": ""}) is None
+    assert generic_odbc_tls_unenforced({"sslmode": "", "Encrypt": "yes"}, driver=_MSODBC) is None
+    assert (
+        generic_odbc_tls_unenforced({"sslmode": "verify-full", "Encrypt": ""}, driver=_PSQL) is None
+    )
 
 
-@pytest.mark.parametrize("value", ["bogus", "1", "VERIFY_IDENTITY"])
-def test_a_mode_value_the_deny_list_does_not_name_stays_delegated(value: str) -> None:
-    # A deny-list on purpose (see the comment above _ODBC_NO_TLS_VALUES). This pins the classifier
-    # only: since BACKLOG #2705 the build refuses an sslmode outside libpq's spellings on every
-    # driver but MySQL Connector/ODBC.
-    assert generic_odbc_tls_unenforced({"sslmode": value}) is None
+@pytest.mark.parametrize("value", ["bogus", "1", "mandatory", "strict"])
+def test_an_encrypt_value_the_deny_list_does_not_name_stays_delegated(value: str) -> None:
+    # A deny-list on purpose (see the comment above _ODBC_NO_TLS_VALUES), for the one family whose
+    # mode values the engine does not list: Microsoft's Encrypt.
+    assert generic_odbc_tls_unenforced({"Encrypt": value}, driver=_MSODBC) is None
+
+
+@pytest.mark.parametrize(
+    ("driver", "value"),
+    [
+        (_PSQL, "bogus"),
+        (_PSQL, "1"),
+        (_PSQL, "VERIFY_IDENTITY"),
+        (_PSQL, "Require"),
+        (_MYSQL, "verify-full"),
+        (_MYSQL, "require"),
+        (_MYSQL, "yes"),
+        (_MYSQL, "required"),
+        (_MYSQL, "Verify_Identity"),
+    ],
+)
+def test_an_sslmode_the_family_does_not_spell_is_no_mode(driver: str, value: str) -> None:
+    """BACKLOG #5035, #5053. Red on the previous head, which counted each as TLS addressed: a value
+    psqlODBC reads by its first lower case byte, or one MySQL Connector/ODBC does not document,
+    which per engine PR 2691 leaves it at PREFERRED. The build refuses these; this pins the
+    classifier the posture readers use on specs that were never built. The reason names the
+    keyword the family reads, since the value is a real mode spelling for some driver."""
+    assert generic_odbc_tls_unenforced({"SSLMODE": value}, driver=driver) == (
+        f"{_UNREAD_MODE} sslmode, at its own spellings"
+    )
+
+
+@pytest.mark.parametrize(
+    ("driver", "value"),
+    [
+        (_PSQL, "require"),
+        (_PSQL, "verify-full"),
+        (_MYSQL, "REQUIRED"),
+        (_MYSQL, "VERIFY_CA"),
+        (_MYSQL, "VERIFY_IDENTITY"),
+        ("mysql odbc 9.1 ansi driver", "VERIFY_IDENTITY"),
+        ("PostgreSQL ANSI(x64)", "verify-ca"),
+    ],
+)
+def test_an_sslmode_the_family_spells_is_a_mode(driver: str, value: str) -> None:
+    # The control for the test above: same keyword, the family's own spelling.
+    assert generic_odbc_tls_unenforced({"SSLMODE": value}, driver=driver) is None
+
+
+@pytest.mark.parametrize("driver", [_PSQL, _MYSQL, "PostgreSQL", "mysql odbc 9.1 ansi driver"])
+@pytest.mark.parametrize("value", ["yes", "strict", "mandatory"])
+def test_encrypt_on_a_driver_that_does_not_read_it_is_no_mode(driver: str, value: str) -> None:
+    """BACKLOG #5053. psqlODBC's keyword parser and MySQL Connector/ODBC's parameter page have no
+    Encrypt keyword, so Encrypt=yes cleared the hop while the driver stayed at its own default. Red
+    on the previous head, which counted Encrypt on every driver. Microsoft's driver is the control."""
+    assert generic_odbc_tls_unenforced({"Encrypt": value}, driver=driver) == (
+        f"{_UNREAD_MODE} sslmode, at its own spellings"
+    )
+    assert generic_odbc_tls_unenforced({"Encrypt": value}, driver=_MSODBC) is None
+
+
+def test_sslmode_on_microsofts_driver_is_no_mode() -> None:
+    # The mirror: Microsoft's ODBC Driver for SQL Server reads Encrypt and no sslmode.
+    params = {"SSLmode": "verify-full"}
+    assert generic_odbc_tls_unenforced(params, driver=_MSODBC) == f"{_UNREAD_MODE} encrypt"
+    assert generic_odbc_tls_unenforced(params, driver=_PSQL) is None
+
+
+_UNPLACED = [
+    "MySQL",  # RHEL's bare section name for MySQL Connector/ODBC
+    "/usr/lib64/libmyodbc8w.so",
+    "/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so",
+    "MariaDB ODBC 3.1 Driver",
+    "SQLite3 ODBC Driver",
+    "SQL Server",
+    "MySQL  ODBC 8.0 Unicode Driver",  # two blanks: not the registered name
+    "",
+    None,
+]
+
+
+@pytest.mark.parametrize("driver", _UNPLACED)
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"SSLmode": "verify-full"},
+        {"SSLMODE": "VERIFY_IDENTITY"},
+        {"Encrypt": "yes"},
+        {"SSLmode": "require", "Encrypt": "yes"},
+        {},
+        {"sslcert": "c.pem"},
+    ],
+)
+def test_a_driver_the_engine_cannot_place_has_no_mode(
+    driver: str | None, params: dict[str, str]
+) -> None:
+    """BACKLOG #5053, #5029. The engine cannot tell which keyword, or which spelling, such a driver
+    reads, so none counts and the hop is reported and gated. Red on the previous head, which cleared
+    each table that set a mode, on any name."""
+    reason = generic_odbc_tls_unenforced(params, driver=driver)
+    assert reason == UNPLACED_DRIVER_REASON
+
+
+@pytest.mark.parametrize("driver", _UNPLACED)
+def test_an_unplaced_driver_still_hears_a_no_tls_value(driver: str | None) -> None:
+    # The deny-list reads every TLS keyword whatever the family: it can only add a reason, and the
+    # offending keyword is the more useful thing to name.
+    assert generic_odbc_tls_unenforced({"SSLmode": "disable"}, driver=driver) == (
+        "TLS is explicitly not required: SSLmode=disable"
+    )
 
 
 def test_a_lone_certificate_keyword_warns_and_names_the_remedy(
@@ -645,19 +776,40 @@ def test_a_lone_certificate_keyword_warns_and_names_the_remedy(
 
 
 @pytest.mark.parametrize(
-    "params",
+    ("driver", "example", "absent"),
     [
-        {"SSLmode": "require", "sslpassword": "0"},
-        {"SSLmode": "verify-full", "sslpassword": "off"},
-        {"Encrypt": "yes", "SSL_PWD": "no"},
-        {"Encrypt": "yes", "ssl_token": "false"},
+        (_PSQL, "SSLmode=verify-full", "VERIFY_IDENTITY"),
+        (_MYSQL, "SSLMODE=VERIFY_IDENTITY", "verify-full"),
+        (_MSODBC, "Encrypt=yes", "verify-full"),
     ],
 )
-def test_a_passphrase_spelling_no_longer_decides_the_hop(params: dict[str, str]) -> None:
+def test_the_warning_names_the_family_s_own_spelling(
+    caplog: pytest.LogCaptureFixture, driver: str, example: str, absent: str
+) -> None:
+    """BACKLOG #5029. The warning's example was psqlODBC's on every driver, so it told a MySQL
+    operator to set a value MySQL ignores. Each family now gets its own. A name the engine
+    cannot place is refused at build since BACKLOG #5041, so it reaches no warning."""
+    logged = _generic_dsn_logs({}, caplog, driver=driver)
+    assert "TLS verification is NOT enforced" in logged
+    assert example in logged and absent not in logged
+
+
+@pytest.mark.parametrize(
+    ("driver", "params"),
+    [
+        (_PSQL, {"SSLmode": "require", "sslpassword": "0"}),
+        (_PSQL, {"SSLmode": "verify-full", "sslpassword": "off"}),
+        (_MSODBC, {"Encrypt": "yes", "SSL_PWD": "no"}),
+        (_MSODBC, {"Encrypt": "yes", "ssl_token": "false"}),
+    ],
+)
+def test_a_passphrase_spelling_no_longer_decides_the_hop(
+    driver: str, params: dict[str, str]
+) -> None:
     # Deliberate, and the one place this change clears a hop the earlier code refused: the refusal
     # was keyed on how a SECRET was spelled, which both leaked it and gated on it. The TLS-mode
     # keyword beside it now decides, exactly as it does for any other passphrase.
-    assert generic_odbc_tls_unenforced(params) is None
+    assert generic_odbc_tls_unenforced(params, driver=driver) is None
 
 
 def test_a_no_tls_value_is_rendered_as_the_constant_it_matched() -> None:

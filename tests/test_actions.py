@@ -12,7 +12,7 @@ from typing import Literal
 import pytest
 
 import messagefoundry.actions as actions_mod
-import messagefoundry.lens as lens_mod
+import messagefoundry_toolkit.lens as lens_mod
 from messagefoundry import (
     append_to_field,
     arith_field,
