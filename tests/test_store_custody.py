@@ -882,7 +882,38 @@ def _engine_sid() -> str:
     return sid
 
 
+def _is_elevated() -> bool:
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
+#: The handoff is written owned by Administrators, which only an elevated administrator or SYSTEM may
+#: make a file's owner, so a test that writes one needs that token. The hosted Windows legs run
+#: elevated; off-admin, :func:`test_windows_a_handoff_is_refused_up_front_off_admin` runs instead.
+elevated_only = pytest.mark.skipif(
+    not _is_elevated(),
+    reason="writing a handoff needs an elevated administrator, as provision-admin",
+)
+
+
 @windows_only
+@pytest.mark.skipif(_is_elevated(), reason="the off-admin arm; an elevated token may write it")
+def test_windows_a_handoff_is_refused_up_front_off_admin(
+    tmp_path: Path, dpapi_scopes: list[bool]
+) -> None:
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="must be owned by Administrators") as excinfo:
+        custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    assert not path.exists()
+    assert dpapi_scopes == []  # refused before the blob was protected, let alone written
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@windows_only
+@elevated_only
 def test_windows_handoff_carries_exactly_the_drafts_descriptor(
     tmp_path: Path, dpapi_scopes: list[bool]
 ) -> None:
@@ -895,10 +926,11 @@ def test_windows_handoff_carries_exactly_the_drafts_descriptor(
 
 
 @windows_only
+@elevated_only
 def test_windows_a_handoff_made_for_another_account_is_refused(tmp_path: Path) -> None:
     path = tmp_path / "handoff.key"
     custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
-    # Off-admin the open itself is denied; elevated, the list names another account. Both refuse.
+    # The list names another account, so the engine's own account is refused.
     with pytest.raises(CustodyError) as excinfo:
         custody.read_handoff_file(path)
     assert not _leaks(str(excinfo.value), _MASTER)
@@ -916,6 +948,7 @@ def test_windows_a_handoff_for_a_shared_service_account_is_not_written(
 
 
 @windows_only
+@elevated_only
 def test_windows_an_engine_on_a_shared_service_account_reads_no_handoff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -935,6 +968,7 @@ def test_windows_an_engine_on_a_shared_service_account_reads_no_handoff(
 
 
 @windows_only
+@elevated_only
 def test_windows_a_handoff_made_for_this_account_round_trips(tmp_path: Path) -> None:
     path = tmp_path / "handoff.key"
     me = _engine_sid()
@@ -950,14 +984,6 @@ def _os_handle(fd: int) -> int:
     import msvcrt
 
     return msvcrt.get_osfhandle(fd)
-
-
-def _is_elevated() -> bool:
-    if sys.platform != "win32":
-        return False
-    import ctypes
-
-    return bool(ctypes.windll.shell32.IsUserAnAdmin())
 
 
 @windows_only
@@ -997,6 +1023,7 @@ def test_windows_a_key_file_with_an_extra_entry_is_refused(tmp_path: Path) -> No
         "*S-1-15-2-3624051433-2125758914-1423191267-1740899205-1073925389-3782572162-737981194",
     ],
 )
+@elevated_only
 def test_windows_handoff_refuses_a_package_sid(tmp_path: Path, package: str) -> None:
     path = tmp_path / "handoff.key"
     with pytest.raises(RestrictedFileError, match="application package"):
@@ -1023,6 +1050,7 @@ def test_windows_a_key_file_widened_to_a_package_after_creation_is_refused(
 
 
 @windows_only
+@elevated_only
 def test_windows_a_blob_of_the_other_scope_is_refused(tmp_path: Path) -> None:
     from messagefoundry.secrets_dpapi import dpapi_protect
 

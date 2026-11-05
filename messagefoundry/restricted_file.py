@@ -729,13 +729,72 @@ def replace_generated(staged: Path, live: Path) -> None:
 # --- creating the file ----------------------------------------------------------------------------
 
 
+class _OwnerRefused(RestrictedFileError):
+    """The file could not be created owned by the account asked for, so nothing was written to it."""
+
+
+#: ERROR_INVALID_OWNER: the creating token may not make the SID asked for a new object's owner.
+_WINERROR_INVALID_OWNER = 1307
+_READ_CONTROL = 0x00020000
+
+
+def _administrators_enabled() -> bool:
+    """Whether this process's token holds Administrators as an enabled group, so it may make
+    Administrators a new file's owner: an elevated administrator or SYSTEM does, a filtered token
+    (an administrator not elevated, where the group is deny-only) does not. Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise RestrictedFileError("a token's groups are read on Windows only")
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    advapi32.CheckTokenMembership.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    advapi32.CheckTokenMembership.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    sid = ctypes.c_void_p()
+    if not advapi32.ConvertStringSidToSidW(ADMINISTRATORS_SID, ctypes.byref(sid)):
+        raise RestrictedFileError(
+            f"the group to check could not be built (Win32 error {ctypes.get_last_error()})"
+        )
+    try:
+        member = wintypes.BOOL()
+        # A null token: the thread's impersonation token, else a copy of the process's own.
+        if not advapi32.CheckTokenMembership(None, sid, ctypes.byref(member)):
+            raise RestrictedFileError(
+                f"this process's groups could not be read (Win32 error {ctypes.get_last_error()})"
+            )
+        return bool(member.value)
+    finally:
+        kernel32.LocalFree(sid)
+
+
 def write_restricted_file(
-    path: Path, data: bytes, *, read_grants: Sequence[str] = (), creator_access: bool = True
+    path: Path,
+    data: bytes,
+    *,
+    read_grants: Sequence[str] = (),
+    creator_access: bool = True,
+    owner: str | None = None,
 ) -> None:
     """Create ``path`` restricted, confirm its access, then write ``data`` to it.
 
     ``read_grants`` (Windows only) names further accounts to grant read: an account name such as
     ``NT SERVICE\\MessageFoundry``, or a SID, with or without a leading ``*``.
+
+    ``owner`` (Windows only) is a SID the file is created owned by, in the call that creates it,
+    and read back through the creating handle before a byte is written. A token that may not make
+    that SID an owner, or a file that reads back owned by anyone else, raises
+    :class:`RestrictedFileError` and leaves no file. Left out, the owner is the creating token's
+    default.
 
     ``creator_access`` (Windows only to turn off) gives the creating account full control. With it
     off the list is SYSTEM and Administrators with full control and each read grant with read, and
@@ -753,7 +812,7 @@ def write_restricted_file(
     # The exclusive create sits OUTSIDE the cleanup guard on purpose: a name that is taken raises
     # FileExistsError HERE, and that file belongs to someone. Unlinking it would be the overwrite
     # the exclusive create exists to prevent.
-    fd = _create_restricted(path, read_grants, creator_access=creator_access)
+    fd = _create_restricted(path, read_grants, creator_access=creator_access, owner=owner)
     try:
         try:
             handle = os.fdopen(fd, "wb")
@@ -795,17 +854,23 @@ def _remove_failed(path: Path, failure: BaseException) -> None:
     raise RestrictedFileError(f"{left}. It was left by this failure: {failure}") from failure
 
 
-def _create_restricted(path: Path, read_grants: Sequence[str], *, creator_access: bool) -> int:
+def _create_restricted(
+    path: Path, read_grants: Sequence[str], *, creator_access: bool, owner: str | None
+) -> int:
     """Exclusively create ``path`` restricted and return a write-only descriptor for it.
 
     The access is confirmed here, while the file is still empty, so no byte is ever written to a
     file whose access was not what was asked for. A file that fails that check is removed."""
     if sys.platform == "win32":
-        return _create_restricted_windows(path, read_grants, creator_access=creator_access)
+        return _create_restricted_windows(
+            path, read_grants, creator_access=creator_access, owner=owner
+        )
     if read_grants:
         raise RestrictedFileError("a read grant for another account is supported on Windows only")
     if not creator_access:
         raise RestrictedFileError("a file without its creator's access is made on Windows only")
+    if owner is not None:
+        raise RestrictedFileError("a file owned by another account is made on Windows only")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(path, flags, 0o600)
     try:
@@ -862,7 +927,7 @@ def _drop_inherited_acl(path: Path, fd: int) -> None:
 
 
 def _create_restricted_windows(
-    path: Path, read_grants: Sequence[str], *, creator_access: bool
+    path: Path, read_grants: Sequence[str], *, creator_access: bool, owner: str | None
 ) -> int:
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise RestrictedFileError("the Windows create runs only on Windows")
@@ -936,8 +1001,11 @@ def _create_restricted_windows(
     flags_and_attributes = 0x00000080 | 0x00200000
     invalid_handle = wintypes.HANDLE(-1).value
 
+    # With an owner, the handle also takes READ_CONTROL, so that owner is read back through it.
+    desired_access = generic_write | (_READ_CONTROL if owner is not None else 0)
+    sddl_text = ("" if owner is None else f"O:{owner}") + _protected_sddl(expected)
     descriptor = ctypes.c_void_p()
-    if not convert(_protected_sddl(expected), 1, ctypes.byref(descriptor), None):
+    if not convert(sddl_text, 1, ctypes.byref(descriptor), None):
         raise RestrictedFileError(
             f"{path} was not created: its access list could not be built (Win32 error "
             f"{ctypes.get_last_error()})"
@@ -949,7 +1017,7 @@ def _create_restricted_windows(
         # Share mode 0: until this handle closes, nothing else can open the file for data.
         handle = kernel32.CreateFileW(
             str(path),
-            generic_write,
+            desired_access,
             0,
             ctypes.byref(attributes),
             create_new,
@@ -957,8 +1025,14 @@ def _create_restricted_windows(
             None,
         )
         if handle is None or handle == invalid_handle:
+            error = ctypes.get_last_error()
+            if owner is not None and error == _WINERROR_INVALID_OWNER:
+                raise _OwnerRefused(
+                    f"{path} was not created: this process may not make {describe_sid(owner)} "
+                    "the owner of a new file"
+                )
             # ERROR_FILE_EXISTS and ERROR_ALREADY_EXISTS both arrive as FileExistsError.
-            raise ctypes.WinError(ctypes.get_last_error())
+            raise ctypes.WinError(error)
     finally:
         kernel32.LocalFree(descriptor)
 
@@ -970,6 +1044,18 @@ def _create_restricted_windows(
         )
         if mismatch is not None:
             raise RestrictedFileError(f"{path} could not be created restricted: {mismatch}")
+        if owner is not None:
+            security = _read_handle_security(handle)
+            if security.error is not None or security.owner_sid is None:
+                raise _OwnerRefused(
+                    f"{path} could not be created owned by {describe_sid(owner)}: its owner could "
+                    f"not be read back ({security.error or 'none was returned'})"
+                )
+            if security.owner_sid != owner:
+                raise _OwnerRefused(
+                    f"{path} could not be created owned by {describe_sid(owner)}: it reads back "
+                    f"owned by {_who(security.owner_sid)}"
+                )
         return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
     except BaseException as failure:
         kernel32.CloseHandle(handle)

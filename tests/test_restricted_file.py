@@ -420,6 +420,57 @@ def test_windows_creates_the_drafts_descriptor_without_the_creators_entry(tmp_pa
     assert (_ALLOW, _FULL, creator) in _windows_access(default)[1]
 
 
+def _is_elevated() -> bool:
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
+@windows_only
+def test_windows_creates_the_file_owned_as_asked_or_not_at_all(tmp_path: Path) -> None:
+    path = tmp_path / "handoff.key"
+    grants = [f"*{_SERVICE}"]
+    if not _is_elevated():
+        # A filtered token holds Administrators deny-only, so the create itself is refused.
+        with pytest.raises(RestrictedFileError, match="may not make"):
+            write_restricted_file(
+                path, b"k", read_grants=grants, creator_access=False, owner=_ADMINS
+            )
+        assert not path.exists()
+        return
+    write_restricted_file(path, b"k", read_grants=grants, creator_access=False, owner=_ADMINS)
+    parsed = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(path, owner=True) or "")
+    assert parsed is not None and parsed.owner == _ADMINS
+
+
+@windows_only
+def test_windows_a_file_that_reads_back_owned_by_another_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    # Any token may make its own account the owner, so this runs off-admin too.
+    me = _win32_config_source_probes().self_sid
+    assert me is not None
+    control = tmp_path / "control.key"
+    write_restricted_file(control, b"k", owner=me)  # the control: read back as asked, so kept
+    assert control.read_bytes() == b"k"
+    real = restricted_file._read_handle_security
+
+    def _foreign(handle: int) -> Any:
+        read = real(handle)
+        assert read.owner_sid == me  # the real read, through the creating handle, saw the owner
+        return type(read)(owner_sid=_SERVICE)
+
+    monkeypatch.setattr(restricted_file, "_read_handle_security", _foreign)
+    path = tmp_path / "store.key"
+    with pytest.raises(RestrictedFileError, match="reads back owned by"):
+        write_restricted_file(path, b"k", owner=me)
+    assert not path.exists()
+
+
 @windows_only
 def test_windows_the_exact_check_reads_a_real_handle(tmp_path: Path) -> None:
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
@@ -632,6 +683,9 @@ def test_posix_refuses_a_read_grant_it_cannot_honour(tmp_path: Path) -> None:
     assert not path.exists()
     with pytest.raises(RestrictedFileError, match="Windows only"):
         write_restricted_file(path, b"k", creator_access=False)
+    assert not path.exists()
+    with pytest.raises(RestrictedFileError, match="Windows only"):
+        write_restricted_file(path, b"k", owner=_ADMINS)
     assert not path.exists()
 
 

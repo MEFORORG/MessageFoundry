@@ -856,11 +856,13 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
     the handoff lives only from install to the service's first start (draft rule 3).
 
     :func:`read_handoff_file` accepts the file only when SYSTEM, Administrators or the service owns
-    it. This writes no owner, so the owner is the creating token's default: an elevated
-    administrator's file is owned by Administrators under the Windows default, but where the policy
+    it, so this makes Administrators its owner in the call that creates it, whatever the policy
     *System objects: Default owner for objects created by members of the Administrators group*
-    names the object creator, the administrator owns it, and the read refuses it. So does it, at
-    least, for a caller that is not elevated and is not SYSTEM or the service.
+    names, and reads that owner back through the creating handle before a byte is written. Only a
+    token that holds Administrators enabled may make it the owner, an elevated administrator or
+    SYSTEM, so any other caller is refused with :class:`CustodyError` before the blob is protected
+    or a file is created: a handoff the read would refuse is never written. A file that reads back
+    owned by anyone else is removed and refused with :class:`CustodyError` too.
 
     A ``service_account`` many services share (LOCAL SERVICE, NETWORK SERVICE) is refused with
     :class:`CustodyError` before anything is written: the read grant would reach all of them.
@@ -872,21 +874,36 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
 
     if sys.platform != "win32":
         raise DpapiUnavailable("the handoff blob is Windows-only; a POSIX host needs no handoff")
-    from messagefoundry.auth.anchor_path import _SHARED_SERVICE_SIDS
-    from messagefoundry.restricted_file import _resolve_sid
+    from messagefoundry.auth.anchor_path import _SHARED_SERVICE_SIDS, ADMINISTRATORS_SID
+    from messagefoundry.restricted_file import (
+        _administrators_enabled,
+        _OwnerRefused,
+        _resolve_sid,
+    )
 
     if _resolve_sid(service_account) in _SHARED_SERVICE_SIDS:
         raise CustodyError(
             f"{service_account!r} is an account many services share, so a handoff granted to it "
-            "is open to all of them; run the service as its own account (NT SERVICE\\<name>)"
+            "is open to all of them; run the service as its own virtual service account (a "
+            "per-service SID, S-1-5-80-...)"
         )
-    # write_restricted_file refuses a grant that resolves to a package SID or a broad group.
-    write_restricted_file(
-        path,
-        dpapi_protect(blob.serialize(), machine_scope=True),
-        read_grants=[service_account],
-        creator_access=False,
-    )
+    if not _administrators_enabled():
+        raise CustodyError(
+            "the handoff was not written: it must be owned by Administrators, which only an "
+            "elevated administrator or the SYSTEM account may make a file's owner, and this "
+            "process is neither; run it from an elevated prompt"
+        )
+    try:
+        # write_restricted_file refuses a grant that resolves to a package SID or a broad group.
+        write_restricted_file(
+            path,
+            dpapi_protect(blob.serialize(), machine_scope=True),
+            read_grants=[service_account],
+            creator_access=False,
+            owner=ADMINISTRATORS_SID,
+        )
+    except _OwnerRefused as exc:
+        raise CustodyError(f"the handoff was not written: {exc}") from exc
 
 
 def read_handoff_file(path: Path) -> HostBlob:

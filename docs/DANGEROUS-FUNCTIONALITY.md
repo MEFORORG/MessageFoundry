@@ -476,8 +476,11 @@ pure-Python equivalent:
 - Key file creation: `restricted_file.py`, which on Windows calls `kernel32`'s `CreateFileW` with
   the file's access list attached and `CREATE_NEW`, so a file that holds a key is restricted in
   the call that creates it and an existing file or link is refused. It asks `advapi32` to build
-  that list and to resolve an account name to its SID. Creating the file on POSIX needs no
-  `ctypes`; it creates the file with `O_CREAT | O_EXCL` and mode `0o600`, and on Linux removes a
+  that list and to resolve an account name to its SID. A handoff file is made owned by
+  Administrators in that same call, after `advapi32`'s `CheckTokenMembership` says this process
+  holds that group enabled, and its owner is read back through the creating handle with
+  `GetSecurityInfo`. Creating the file on POSIX needs no `ctypes`; it creates the file with
+  `O_CREAT | O_EXCL` and mode `0o600`, and on Linux removes a
   POSIX access control list the file inherits from its directory before writing to it. The module
   still loads the C library through `ctypes` on Linux for one read: `linux_file_system_type` calls
   `fstatfs` on an open descriptor, for the key custody file reads below
