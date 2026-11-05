@@ -379,9 +379,9 @@ def run_checks(
         # transports.egress.warn_url_query_credentials.
         _check_url_query_credentials(config_dir),
         _check_generic_db_tls(config_dir),
-        # BACKLOG #5163: a generic hop whose driver is not documented to read SERVER, where
-        # [egress].allowed_db may bind nothing. Advisory -- see the check.
-        _check_generic_db_server(config_dir),
+        # BACKLOG #5041: a generic hop whose odbc_driver is off the driver allowlist, which the
+        # build refuses. Advisory, since build-check is the required gate -- see the check.
+        _check_generic_db_driver(config_dir),
         # Owner ruling 2026-09-24: every attested hop, the one per-hop declaration that ALLOWs. Advisory.
         _check_hop_attested(config_dir),
         # ADR 0173: the per-connection revocation attestation, same shape and same reason. Its only
@@ -3068,7 +3068,8 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
     arms from the graph — a second, silently different definition of a decision that already has one.
     A hop with a usable mode value outside the no-TLS deny-list, on the keyword and at a spelling its
     driver family reads, is not reported here at all (a blank, padded or non-string mode value is,
-    and so is any mode on a driver name the engine cannot place, BACKLOG #5053): the engine cannot
+    BACKLOG #5053; a driver off the allowlist is refused and is on ``generic-db-driver`` instead,
+    BACKLOG #5041): the engine cannot
     prove that value verifies
     anything, and refusing on that would be guess-based and would break legitimate drivers, exactly
     what ADR 0092 declined. SKIPs when the graph will not load, same convention as its siblings."""
@@ -3114,52 +3115,47 @@ def _check_generic_db_tls(config_dir: str | Path) -> CheckResult:
     )
 
 
-def _check_generic_db_server(config_dir: str | Path) -> CheckResult:
-    """Surface the generic-ODBC ``DATABASE`` connections whose ``odbc_driver`` is not a family
-    documented to read ``SERVER`` as its target (BACKLOG #5163).
+def _check_generic_db_driver(config_dir: str | Path) -> CheckResult:
+    """Surface the generic-ODBC ``DATABASE`` connections whose ``odbc_driver`` is off the generic
+    dialect's driver allowlist, which the build refuses (BACKLOG #5041).
 
-    What that costs ``[egress].allowed_db`` is stated once, in docs/CONNECTIONS.md, *Accepted
-    odbc_params keywords*; the construction WARNING is the other report of it. ``required=False``
-    on purpose: the engine cannot tell what a driver it cannot place reads, and refusing such a
-    name is BACKLOG #5041's driver allow-list, a separate decision. SKIPs when the graph will not
-    load, as ``generic-db-tls`` does."""
-    from messagefoundry.config.wiring import (
-        WiringError,
-        load_config,
-        server_unread_generic_db_hops,
-    )
-    from messagefoundry.transports.database import SERVER_UNREAD_REMEDY
+    A literal generic dialect with a literal name off the list is refused where it is declared,
+    so the REQUIRED ``validate`` fails on it. Any other such hop is refused at construction, so the
+    REQUIRED ``build-check`` fails on it where it runs, which needs service settings;
+    ``[egress].allowed_db`` refuses it too. This line is the
+    graph's view of the hops whose ``env()`` dialect or driver only the build resolves, through the
+    same classifier. ``required=False`` because without the values each is only possibly refused. It replaced BACKLOG
+    #5163's advisory ``generic-db-server`` line, which listed the same names as a warning. SKIPs
+    when the graph will not load, as ``generic-db-tls`` does."""
+    from messagefoundry.config.wiring import WiringError, load_config, refused_generic_db_drivers
+    from messagefoundry.transports.db_endpoint import GENERIC_DRIVER_REFUSAL
 
     try:
         registry = load_config(config_dir)
     except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
         return CheckResult(
-            "generic-db-server",
+            "generic-db-driver",
             ok=True,
             required=False,
             skipped=True,
             detail=f"config did not load: {exc}",
         )
-    hops = server_unread_generic_db_hops(registry)
+    hops = refused_generic_db_drivers(registry)
     if not hops:
         return CheckResult(
-            "generic-db-server",
+            "generic-db-driver",
             ok=True,
             required=False,
-            detail=(
-                "no generic-ODBC database connection names a driver the engine cannot place as "
-                "reading SERVER; the families it places are documented to read it, and no run was "
-                "designed to test that"
-            ),
+            detail="no generic-ODBC database connection names a driver off the driver allowlist",
         )
     listed = "; ".join(f"{name}: {reason}" for name, reason in hops)
     return CheckResult(
-        "generic-db-server",
+        "generic-db-driver",
         ok=True,
         required=False,
         detail=(
-            f"{len(hops)} generic-ODBC database connection(s) name a driver the engine cannot place "
-            f"as reading SERVER -- {listed}; {SERVER_UNREAD_REMEDY}"
+            f"{len(hops)} generic-ODBC database connection(s) name a driver the build refuses or "
+            f"may refuse -- {listed}; {GENERIC_DRIVER_REFUSAL}"
         ),
     )
 

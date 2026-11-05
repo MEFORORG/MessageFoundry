@@ -3,12 +3,17 @@
 """A credential the generic ODBC dialect sends WITHOUT braces is hidden whole on every log surface
 (BACKLOG #5030).
 
-``transports/database.py`` sends a password plain for a driver it has not measured, and every
-``odbc_params`` value plain, ``sslpassword`` among them. Such a value may hold a space, ",", "&" and,
-for a password, "=". The plain value class of the log scrubbers stopped at the first three, so an
-echoed connection string printed the tail of the password, and ``sslpassword`` printed whole, since
-"ssl" glued to "password" leaves no word boundary for the label. The connection string here is the
-builder's own output, so the shape tested is the shape the engine would send."""
+``transports/database.py`` sends every ``odbc_params`` value plain, ``sslpassword`` among them. Such
+a value may hold a space, ",", "&" and, for a password, "=". The plain value class of the log
+scrubbers stopped at the first three, so an echoed connection string printed the tail of a plain
+password, and ``sslpassword`` printed whole, since "ssl" glued to "password" leaves no word boundary
+for the label.
+
+Since BACKLOG #5041 the builder accepts only drivers whose password it braces, so its own output no
+longer carries a plain ``PWD``. A plain one can still reach a log by other routes, at least a
+driver's own error text echoing a string, so the log surfaces are fed :data:`_UNBRACED_LINE`, the
+line the builder sent for an unplaced driver before #5041, built here. The builder's current output
+is checked too, as the shape the engine would send now."""
 
 from __future__ import annotations
 
@@ -34,11 +39,21 @@ _SSL_PASSWORD = "Sp4q wR2t,Lk8d&Hn6c"
 _FRAGMENTS = ("Qv7m", "kX4r", "Pw9z", "mT3y", "Yb8n", "Sp4q", "wR2t", "Lk8d", "Hn6c")
 
 
+#: Both credentials plain, as the builder sent them for a driver off the escape list before BACKLOG
+#: #5041. Built here, not by the builder, which now braces every password.
+_UNBRACED_LINE = (
+    "DRIVER={Acme Synthetic ODBC Driver};SERVER=db1.example;DATABASE=mf;UID=svc;"
+    f"PWD={_PASSWORD};sslmode=require;sslpassword={_SSL_PASSWORD};"
+)
+
+
 def _dsn() -> str:
+    """The builder's own output for a psqlODBC hop: ``sslmode`` and ``sslpassword`` are psqlODBC
+    keywords."""
     return _build_odbc_dsn(
         {
             "dialect": "generic",
-            "odbc_driver": "Acme Synthetic ODBC Driver",
+            "odbc_driver": "PostgreSQL Unicode",
             "server": "db1.example",
             "database": "mf",
             "username": "svc",
@@ -84,30 +99,46 @@ _SURFACES: tuple[tuple[str, Callable[[str], str]], ...] = (
 )
 
 
-def test_the_builder_sends_both_credentials_unbraced() -> None:
-    """The precondition. Were either braced, the braced forms would hide it and the tests below would
-    pass on them, proving nothing about the plain value."""
+def test_the_builder_braces_the_password_and_sends_sslpassword_unbraced() -> None:
+    """What the builder sends now (BACKLOG #5041): the password braced, as for every accepted
+    family, and ``sslpassword`` plain, as every ``odbc_params`` value is. So its output still
+    carries one plain credential, and :data:`_UNBRACED_LINE` stands in for the plain password."""
     dsn = _dsn()
-    assert f";PWD={_PASSWORD};" in dsn + ";"
-    assert f";sslpassword={_SSL_PASSWORD}" in dsn
+    assert f";PWD={{{_PASSWORD}}};" in dsn
+    assert f";PWD={_PASSWORD};" not in dsn
+    assert f";sslpassword={_SSL_PASSWORD};" in dsn
 
 
-@pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=[name for name, _ in _SURFACES])
-def test_no_fragment_of_an_unbraced_credential_reaches_a_log_surface(
-    surface: str, apply: Callable[[str], str]
-) -> None:
-    dsn = _dsn()
+def _assert_no_fragment_reaches(surface: str, apply: Callable[[str], str], line: str) -> None:
     # The count guard: an absence below means something only if the input carried every fragment.
-    planted = [fragment for fragment in _FRAGMENTS if fragment in dsn]
-    assert planted, f"no fragment to look for in {dsn!r}"
-    assert planted == list(_FRAGMENTS), f"the builder dropped some fragments -- {dsn!r}"
-    out = apply(dsn)
+    planted = [fragment for fragment in _FRAGMENTS if fragment in line]
+    assert planted, f"no fragment to look for in {line!r}"
+    assert planted == list(_FRAGMENTS), f"the line lacks some fragments -- {line!r}"
+    out = apply(line)
     survivors = [fragment for fragment in planted if fragment in out]
     assert not survivors, f"{surface}: {survivors} survived -- {out!r}"
     # The labels stay, so a reader still sees which credential it was, and the members around them
     # are not swallowed.
     for kept in ("PWD=", "sslpassword=", "SERVER=db1.example", "DATABASE=mf", "UID=svc"):
         assert kept in out, f"{surface}: {kept!r} was lost -- {out!r}"
+
+
+@pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=[name for name, _ in _SURFACES])
+def test_no_fragment_of_an_unbraced_credential_reaches_a_log_surface(
+    surface: str, apply: Callable[[str], str]
+) -> None:
+    # The precondition. Were either braced, the braced forms would hide it and this test would
+    # pass on them, proving nothing about the plain value.
+    assert f";PWD={_PASSWORD};" in _UNBRACED_LINE
+    assert f";sslpassword={_SSL_PASSWORD};" in _UNBRACED_LINE
+    _assert_no_fragment_reaches(surface, apply, _UNBRACED_LINE)
+
+
+@pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=[name for name, _ in _SURFACES])
+def test_no_fragment_of_the_builders_own_line_reaches_a_log_surface(
+    surface: str, apply: Callable[[str], str]
+) -> None:
+    _assert_no_fragment_reaches(surface, apply, _dsn())
 
 
 @pytest.mark.parametrize(("surface", "apply"), _SURFACES, ids=[name for name, _ in _SURFACES])
@@ -706,12 +737,14 @@ def test_the_mask_replaces_words_and_keeps_what_a_later_pass_reads(line: str, ma
     assert scrub_credentials(line) == masked
 
 
-def test_a_masked_member_is_masked_the_same_on_a_second_pass() -> None:
+@pytest.mark.parametrize("source", ["unbraced line", "builder"])
+def test_a_masked_member_is_masked_the_same_on_a_second_pass(source: str) -> None:
     """The mask keeps the placeholders it and the earlier passes wrote, so a second pass changes
     nothing it wrote."""
-    once = scrub_credentials(_dsn())
+    line = _UNBRACED_LINE if source == "unbraced line" else _dsn()
+    once = scrub_credentials(line)
     assert scrub_credentials(once) == once
-    bundled = redact_log_line(_dsn())
+    bundled = redact_log_line(line)
     assert redact_log_line(bundled) == bundled
 
 
