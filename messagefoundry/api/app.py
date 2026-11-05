@@ -496,6 +496,7 @@ from messagefoundry.pipeline.wiring_runner import (
     ShardLaneOwnershipError,
 )
 from messagefoundry.privilege_probes import probe_vault
+from messagefoundry.proactor_accept import guard_accepts
 from messagefoundry.redaction import REFUSAL_LOG_LIMIT as _REFUSAL_LOG_LIMIT
 from messagefoundry.redaction import json_loads_or_refusal, safe_exc, safe_text
 from messagefoundry.remotedebug import (
@@ -11906,6 +11907,9 @@ def create_managed_app(
         # through safe_exc → the log, so it can't escape as a raw traceback (possible PHI) or die
         # silently (ASVS 16.5.4). Here because set_exception_handler needs the running loop.
         install_loop_exception_handler()
+        # Here, before uvicorn binds the API socket after this startup, so the guard covers the
+        # API listener too; see messagefoundry.proactor_accept.
+        guard_accepts()
         # B11 connection-scale measurement hook (harness-only, env-gated): when the harness sets the
         # gate env var, install a DEFAULT-SIZED instrumented ThreadPoolExecutor as the loop's default
         # executor so the route/transform to_thread pool's queue-depth/busy become observable on /stats

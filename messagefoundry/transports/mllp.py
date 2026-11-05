@@ -97,6 +97,7 @@ from messagefoundry.parsing.peek import (
     normalize,
     starts_with_msh,
 )
+from messagefoundry.proactor_accept import guard_accepts
 from messagefoundry.redaction import clamp_untrusted, safe_exc
 from messagefoundry.tls_handshake_failures import (
     HUNG_UP,
@@ -2365,6 +2366,7 @@ class MLLPSource(SourceConnector):
         # shared-resource double-read to gate. Accepted only so the runner's call is uniform.
         self._handler = handler
         self._stopping = False  # a restart of this same instance serves again (see `_stopping`)
+        guard_accepts()  # see messagefoundry.proactor_accept
         self._tls_failures.open()
         self._inflight = (
             asyncio.Semaphore(self.max_inflight_frames) if self.max_inflight_frames else None
