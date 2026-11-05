@@ -13,9 +13,10 @@ each measured 2026-09-06 and each guarded below:
      joined this table on 2026-09-10, when the owner retired the Console (BACKLOG #1529). The
      SPECIAL seat joined on 2026-09-16, taking the table to six. On 2026-09-19 the owner retired
      the REGULATOR and added the WATCHDOG, which holds the table at six and is NOT its successor:
-     it measures whether reds are cleared and never says whose one is. The `elsewhere` bucket
-     emptied on 2026-09-16 by owner instruction, so the tests below guard its MECHANISM rather
-     than an occupant.
+     it measures whether reds are cleared and never says whose one is. On 2026-11-05 the owner
+     said the STEWARD had been retired months earlier, which takes the table to five. The
+     `elsewhere` bucket emptied on 2026-09-16 by owner instruction, so the tests below guard its
+     MECHANISM rather than an occupant.
   2. PUSH AUTHORITY. korus's cards say pushing needs the owner. Section 5 carries the opposite as an
      anchored ruling, `refs/liaison/owner-ruling-20260829-push`.
   3. PLAYBOOK PATHS. korus's cards cite `roles/COMMON.md`. No such path exists in this checkout.
@@ -50,9 +51,10 @@ SETTINGS = _REPO / ".claude" / "settings.json"
 MARKER_RELPATH = ".claude/seat.local.txt"
 ROLE_COPY_RELPATH = ".claude/ROLE.local.md"
 
-#: Section 5's table governs. SIX seats: SPECIAL joined 2026-09-16, and on 2026-09-19 the owner
-#: retired the REGULATOR and added the WATCHDOG, which is not its successor.
-EXPECTED_SEATS = frozenset({"manager", "builder", "watchdog", "steward", "lander", "special"})
+#: Section 5's table governs. FIVE seats: SPECIAL joined 2026-09-16, on 2026-09-19 the owner
+#: retired the REGULATOR and added the WATCHDOG, which is not its successor, and on 2026-11-05 the
+#: owner said the STEWARD had been retired months earlier.
+EXPECTED_SEATS = frozenset({"manager", "builder", "watchdog", "lander", "special"})
 
 #: Seats live in korus and absent here. They must resolve to a card-less explanation, never to
 #: silence. EMPTY SINCE 2026-09-16 by owner instruction, and empty is the correct state -- so any
@@ -1412,6 +1414,45 @@ class TheRegulatorRetirementDeniesTheWatchdogSucceededIt(unittest.TestCase):
             "the check cannot tell a bare retirement from one that denies the succession, so it "
             "guards nothing",
         )
+
+
+class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
+    """Owner statement 2026-11-05: the Steward seat had been retired months earlier.
+
+    The seat named the account with headroom, so a reader told only that it is gone can take the
+    usage limits to have gone with it. They did not: the usage watch hook and the Workflow gate
+    still bind. The notice has to say so, and it must not invent a date or a successor the tree
+    does not record.
+    """
+
+    #: Every spelling the alias map carried before the retirement.
+    SPELLINGS = frozenset({"steward", "steward1", "steward-1", "stewart"})
+
+    def test_every_steward_spelling_resolves_to_a_retirement(self):
+        missing = sorted(self.SPELLINGS - set(seats()["retired"]))
+        self.assertEqual(
+            [],
+            missing,
+            f"these Steward spellings resolve to nothing instead of a retirement: {missing}",
+        )
+
+    def test_no_steward_spelling_is_live_or_an_alias(self):
+        reachable = sorted(self.SPELLINGS & (set(seats()["live"]) | set(seats()["aliases"])))
+        self.assertEqual([], reachable, f"the Steward is still reachable as: {reachable}")
+
+    def test_the_notice_says_the_usage_controls_still_bind(self):
+        why = seats()["retired"]["steward"].lower()
+        self.assertIn("watch.py", why, "the notice never names the usage watch hook that stayed")
+        self.assertIn("workflow", why, "the notice never says the Workflow gate still binds")
+
+    def test_the_notice_invents_no_date_or_successor(self):
+        why = seats()["retired"]["steward"].lower()
+        self.assertIn("not recorded", why, "the notice no longer says the date is unrecorded")
+        self.assertNotRegex(why, r"retired 20\d\d-", "the notice states a retirement date")
+        self.assertIn("no successor", why, "the notice no longer denies a recorded successor")
+
+    def test_the_agreement_no_longer_carries_a_steward_row(self):
+        self.assertNotIn("| **Steward** |", read(AGREEMENT))
 
 
 if __name__ == "__main__":
