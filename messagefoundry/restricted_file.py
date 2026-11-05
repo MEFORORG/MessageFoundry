@@ -739,9 +739,14 @@ _READ_CONTROL = 0x00020000
 
 
 def _administrators_enabled() -> bool:
-    """Whether this process's token holds Administrators as an enabled group, so it may make
-    Administrators a new file's owner: an elevated administrator or SYSTEM does, a filtered token
-    (an administrator not elevated, where the group is deny-only) does not. Windows only."""
+    """Whether this process's token holds Administrators as an enabled group: at least an elevated
+    administrator's and SYSTEM's do, and a filtered token's (an administrator not elevated, where
+    the group is deny-only) does not.
+
+    A pre-check only, for a clear refusal before anything is made. Windows decides who may make a
+    SID a new file's owner by the group's owner attribute or an enabled restore privilege, not by
+    this answer, so the create's own refusal (ERROR_INVALID_OWNER) and the read-back of the owner
+    stay the binding checks. Windows only."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise RestrictedFileError("a token's groups are read on Windows only")
     import ctypes
@@ -790,17 +795,18 @@ def write_restricted_file(
     ``read_grants`` (Windows only) names further accounts to grant read: an account name such as
     ``NT SERVICE\\MessageFoundry``, or a SID, with or without a leading ``*``.
 
-    ``owner`` (Windows only) is a SID the file is created owned by, in the call that creates it,
-    and read back through the creating handle before a byte is written. A token that may not make
-    that SID an owner, or a file that reads back owned by anyone else, raises
-    :class:`RestrictedFileError` and leaves no file. Left out, the owner is the creating token's
+    ``owner`` (Windows only) is the account the file is created owned by, in the call that creates
+    it, named as ``read_grants`` are, and read back through the creating handle before a byte is
+    written. A token that may not make that account an owner, or a file that reads back owned by
+    anyone else, raises :class:`RestrictedFileError`. Left out, the owner is the creating token's
     default.
 
     ``creator_access`` (Windows only to turn off) gives the creating account full control. With it
     off the list is SYSTEM and Administrators with full control and each read grant with read, and
     nothing for the creating account: the key custody draft's descriptor (rule 5) when the one read
     grant is the service. The creator still writes the file through the handle that creates it, and
-    as its owner it can read the list back. Removing the file after a failure then takes the right
+    reads the list back as its owner, or through Administrators' entry when ``owner`` names
+    Administrators. Removing the file after a failure then takes the right
     to delete it from the directory, or Administrators' full control, so an elevated administrator
     is the caller this is for.
 
@@ -945,6 +951,9 @@ def _create_restricted_windows(
             "could not be restricted to it"
         )
     read_sids = [_resolve_sid(name) for name in read_grants]
+    # Resolved as a grant is, so only a SID Windows itself rendered reaches the descriptor, and the
+    # read-back compares like with like.
+    owner_sid = None if owner is None else _resolve_sid(owner)
     for name, sid in zip(read_grants, read_sids, strict=True):
         if _is_package_sid(sid):
             raise RestrictedFileError(
@@ -1002,8 +1011,8 @@ def _create_restricted_windows(
     invalid_handle = wintypes.HANDLE(-1).value
 
     # With an owner, the handle also takes READ_CONTROL, so that owner is read back through it.
-    desired_access = generic_write | (_READ_CONTROL if owner is not None else 0)
-    sddl_text = ("" if owner is None else f"O:{owner}") + _protected_sddl(expected)
+    desired_access = generic_write | (_READ_CONTROL if owner_sid is not None else 0)
+    sddl_text = ("" if owner_sid is None else f"O:{owner_sid}") + _protected_sddl(expected)
     descriptor = ctypes.c_void_p()
     if not convert(sddl_text, 1, ctypes.byref(descriptor), None):
         raise RestrictedFileError(
@@ -1026,9 +1035,9 @@ def _create_restricted_windows(
         )
         if handle is None or handle == invalid_handle:
             error = ctypes.get_last_error()
-            if owner is not None and error == _WINERROR_INVALID_OWNER:
+            if owner_sid is not None and error == _WINERROR_INVALID_OWNER:
                 raise _OwnerRefused(
-                    f"{path} was not created: this process may not make {describe_sid(owner)} "
+                    f"{path} was not created: this process may not make {describe_sid(owner_sid)} "
                     "the owner of a new file"
                 )
             # ERROR_FILE_EXISTS and ERROR_ALREADY_EXISTS both arrive as FileExistsError.
@@ -1044,16 +1053,16 @@ def _create_restricted_windows(
         )
         if mismatch is not None:
             raise RestrictedFileError(f"{path} could not be created restricted: {mismatch}")
-        if owner is not None:
+        if owner_sid is not None:
             security = _read_handle_security(handle)
             if security.error is not None or security.owner_sid is None:
                 raise _OwnerRefused(
-                    f"{path} could not be created owned by {describe_sid(owner)}: its owner could "
-                    f"not be read back ({security.error or 'none was returned'})"
+                    f"{path} could not be created owned by {describe_sid(owner_sid)}: its owner "
+                    f"could not be read back ({security.error or 'none was returned'})"
                 )
-            if security.owner_sid != owner:
+            if security.owner_sid != owner_sid:
                 raise _OwnerRefused(
-                    f"{path} could not be created owned by {describe_sid(owner)}: it reads back "
+                    f"{path} could not be created owned by {describe_sid(owner_sid)}: it reads back "
                     f"owned by {_who(security.owner_sid)}"
                 )
         return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)

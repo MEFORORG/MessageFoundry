@@ -858,11 +858,13 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
     :func:`read_handoff_file` accepts the file only when SYSTEM, Administrators or the service owns
     it, so this makes Administrators its owner in the call that creates it, whatever the policy
     *System objects: Default owner for objects created by members of the Administrators group*
-    names, and reads that owner back through the creating handle before a byte is written. Only a
-    token that holds Administrators enabled may make it the owner, an elevated administrator or
-    SYSTEM, so any other caller is refused with :class:`CustodyError` before the blob is protected
-    or a file is created: a handoff the read would refuse is never written. A file that reads back
-    owned by anyone else is removed and refused with :class:`CustodyError` too.
+    names, and reads that owner back through the creating handle before a byte is written. A
+    caller whose token does not hold Administrators enabled (at least an administrator who is not
+    elevated) is refused with :class:`CustodyError` before the blob is protected or a file is
+    created, so the owner a read would refuse is never written. A create Windows refuses that owner,
+    or a file that reads back owned by anyone else, is refused with :class:`CustodyError` too, and
+    no file is left; where the file cannot be removed, or the token's groups cannot be read,
+    :class:`~messagefoundry.restricted_file.RestrictedFileError` says so instead.
 
     A ``service_account`` many services share (LOCAL SERVICE, NETWORK SERVICE) is refused with
     :class:`CustodyError` before anything is written: the read grant would reach all of them.
@@ -889,9 +891,9 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
         )
     if not _administrators_enabled():
         raise CustodyError(
-            "the handoff was not written: it must be owned by Administrators, which only an "
-            "elevated administrator or the SYSTEM account may make a file's owner, and this "
-            "process is neither; run it from an elevated prompt"
+            "the handoff was not written: it must be owned by Administrators, and this process's "
+            "token does not hold that group enabled (an administrator who is not elevated holds "
+            "it for deny only); run it from an elevated prompt"
         )
     try:
         # write_restricted_file refuses a grant that resolves to a package SID or a broad group.

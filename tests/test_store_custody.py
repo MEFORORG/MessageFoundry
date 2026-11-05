@@ -913,6 +913,34 @@ def test_windows_a_handoff_is_refused_up_front_off_admin(
 
 
 @windows_only
+def test_windows_a_token_without_administrators_is_refused_up_front(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dpapi_scopes: list[bool]
+) -> None:
+    # The same refusal on an elevated leg, where the real pre-check would pass.
+    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: False)
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="must be owned by Administrators"):
+        custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    assert not path.exists()
+    assert dpapi_scopes == []
+
+
+@windows_only
+@pytest.mark.skipif(_is_elevated(), reason="the off-admin arm; an elevated token may set the owner")
+def test_windows_a_create_refused_its_owner_is_a_custody_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Past a pre-check that answered wrongly, Windows itself refuses the owner at the create.
+    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: True)
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="may not make") as excinfo:
+        custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    assert isinstance(excinfo.value.__cause__, RestrictedFileError)
+    assert not path.exists()
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@windows_only
 @elevated_only
 def test_windows_handoff_carries_exactly_the_drafts_descriptor(
     tmp_path: Path, dpapi_scopes: list[bool]

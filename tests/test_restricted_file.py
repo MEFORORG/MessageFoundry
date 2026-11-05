@@ -455,7 +455,8 @@ def test_windows_a_file_that_reads_back_owned_by_another_is_removed(
     me = _win32_config_source_probes().self_sid
     assert me is not None
     control = tmp_path / "control.key"
-    write_restricted_file(control, b"k", owner=me)  # the control: read back as asked, so kept
+    # The control: read back as asked, so kept. Named as a grant is, so the leading `*` resolves.
+    write_restricted_file(control, b"k", owner=f"*{me}")
     assert control.read_bytes() == b"k"
     real = restricted_file._read_handle_security
 
