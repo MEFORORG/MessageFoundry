@@ -1291,7 +1291,9 @@ def _strict_ca(
     if "authority-key-identifier-without-key-id" in defects:
         assert by is not None
         builder = builder.add_extension(
-            x509.AuthorityKeyIdentifier(None, [x509.DirectoryName(issuer)], by[0].serial_number),
+            x509.AuthorityKeyIdentifier(
+                None, [x509.DirectoryName(by[0].subject)], by[0].serial_number
+            ),
             critical=False,
         )
     elif akid and "no-authority-key-identifier" not in defects:
@@ -1909,49 +1911,58 @@ def _tbs_replaced(
 
 
 @pytest.mark.parametrize(
-    ("arm", "client_refused"),
+    ("akid", "issuer", "client_refused"),
     [
-        pytest.param("no-akid-issuer-loaded", True, id="no-akid-issuer-loaded"),
-        pytest.param("no-akid-issuer-absent", True, id="no-akid-issuer-absent"),
-        pytest.param("no-akid-self-signed", False, id="no-akid-self-signed-to-openssl"),
-        pytest.param("akid-issuer-loaded", False, id="akid-issuer-loaded"),
-        pytest.param("akid-issuer-absent", True, id="akid-issuer-absent"),
+        pytest.param("none", "loaded", True, id="no-akid-issuer-loaded"),
+        pytest.param("none", "absent", True, id="no-akid-issuer-absent"),
+        pytest.param("none", "self", False, id="no-akid-self-signed-to-openssl"),
+        pytest.param("no-key-id", "loaded", True, id="akid-without-key-id-issuer-loaded"),
+        pytest.param("no-key-id", "absent", True, id="akid-without-key-id-issuer-absent"),
+        pytest.param("key-id", "loaded", False, id="akid-issuer-loaded"),
+        pytest.param("key-id", "absent", True, id="akid-issuer-absent"),
     ],
 )
 async def test_what_a_ca_whose_issuer_cannot_be_read_does_to_its_clients_is_measured(
-    tmp_path: Path, arm: str, client_refused: bool
+    tmp_path: Path, akid: str, issuer: str, client_refused: bool
 ) -> None:
     """A CA whose issuer name ``cryptography`` cannot read, a T61String holding bytes that are not
     UTF-8, its warning read beside a namesake with a key identifier of its own, and its clients
     measured behind a real strict listener without the namesake, so each refusal is the CA's.
-    Measured on OpenSSL 3.5.7, which reads those bytes as Latin-1:
+    Each case asserts a version-3 client naming the CA's key and a version-1 client, both
+    refused or both admitted. This is the one record of these measurements; the code and
+    ``docs/SECURITY.md`` point here. Measured on OpenSSL 3.5.7, which reads those bytes as
+    Latin-1:
 
-    * with no authority key identifier and an issuer OpenSSL reads as another name, loaded or
-      not, every client is refused, a version-3 client naming the CA's key and a version-1 one;
+    * with no authority key identifier, or one carrying an issuer and serial number but no key
+      identifier, and an issuer OpenSSL reads as another name, loaded or not, both are refused;
     * with no authority key identifier and an issuer OpenSSL reads as the CA's own subject, so
-      self-signed to it, the version-3 client is admitted;
-    * with an authority key identifier carrying its issuer's key identifier, the version-3
-      client is admitted when the issuer is loaded, and every client is refused when it is
-      not, so with no issuer loaded the refusal is not the missing key identifier's.
+      self-signed to it, both are admitted (only that shape was measured self-signed);
+    * with an authority key identifier carrying its issuer's key identifier, both are admitted
+      when the issuer is loaded and both refused when it is not, so with no issuer loaded the
+      refusal is not the missing key identifier's.
 
-    So for a CA with no authority key identifier, where the check could not tell which of the
-    first two it is, the warning says it cannot tell whether the CA is self-signed and that every
-    client is refused if it is not, with its issuer loaded or not, giving each cause; it never
-    says every client is refused outright. The CA with
-    an authority key identifier needs no issuer read and gets the namesake wording alone
+    So for a CA whose authority key identifier fault needs its issuer name, where the check
+    cannot tell whether it is self-signed, the warning says so and that strict verification
+    refuses every client through it if it is not, with its issuer loaded or not, giving each
+    cause; it never says every client is refused outright. The CA with an authority key
+    identifier carrying a key identifier needs no issuer read and gets the namesake wording alone
     (BACKLOG #4948)."""
     root = _ca(_dn((NameOID.COMMON_NAME, b"Root \xe9\xe9".decode("latin-1"))))
     placeholder = x509.Name(
         [x509.NameAttribute(NameOID.COMMON_NAME, "Root ZZ", _ASN1Type.T61String)]
     )
-    if arm == "no-akid-self-signed":
+    if issuer == "self":
         subject = _dn((NameOID.COMMON_NAME, b"Acm\xe9 CA".decode("latin-1")))
         own = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "AcmZ CA", _ASN1Type.T61String)])
         made, key = _strict_ca(akid=False, subject=subject, issuer_name=own)
         der = _tbs_replaced(made, b"\x14\x07AcmZ CA", b"\x14\x07Acm\xe9 CA", key)
     else:
         subject = _dn((NameOID.COMMON_NAME, "Acme CA"))
-        defects = () if arm.startswith("akid") else ("no-authority-key-identifier",)
+        defects = {
+            "none": ("no-authority-key-identifier",),
+            "no-key-id": ("authority-key-identifier-without-key-id",),
+            "key-id": (),
+        }[akid]
         made, key = _strict_ca(*defects, by=root, issuer_name=placeholder)
         der = _tbs_replaced(made, b"\x14\x07Root ZZ", b"\x14\x07Root \xe9\xe9", root[1])
     ca = x509.load_der_x509_certificate(der)
@@ -1959,12 +1970,12 @@ async def test_what_a_ca_whose_issuer_cannot_be_read_does_to_its_clients_is_meas
         _ = ca.issuer
     namesake = _issued_no_ca(subject, root)
     trusted = _wrapped(der)
-    if arm in ("no-akid-issuer-loaded", "akid-issuer-loaded"):
+    if issuer == "loaded":
         trusted += _pem(root[0])
     loaded = trusted + _pem(namesake)
     (warning,) = IssuerIndex(loaded.decode("ascii")).namesake_warnings()
     assert "that CA issued with no authority key identifier" in warning, warning
-    assert (_CANNOT_TELL_ISSUER in warning) is (not arm.startswith("akid")), warning
+    assert (_CANNOT_TELL_ISSUER in warning) is (akid != "key-id"), warning
     # Measured without the namesake, which may refuse a version-1 client itself, so a refusal
     # here is the CA's.
     source = await _started(
@@ -1988,8 +1999,9 @@ async def test_a_root_whose_authority_key_identifier_names_another_serial_is_mea
     """A root whose issuer and subject are one name, with an authority key identifier carrying no
     key identifier but its issuer's name and a serial number. The self-signed read compares names
     only, so it names no fault either way. Measured on OpenSSL 3.5.7, a strict listener trusting
-    the root alone admits its client when that serial is the root's own and refuses it when it is
-    another, since OpenSSL then looks for an issuer it does not hold. This pins the gap
+    the root alone admits a version-3 and a version-1 client when that serial is the root's own
+    and refuses both when it is another, since OpenSSL then looks for an issuer it does not
+    hold. This pins the gap
     ``docs/SECURITY.md`` records; it changes no outcome (BACKLOG #4948)."""
     key = ec.generate_private_key(ec.SECP256R1())
     now = datetime.datetime.now(datetime.UTC)
@@ -2023,8 +2035,10 @@ async def test_a_root_whose_authority_key_identifier_names_another_serial_is_mea
     try:
         if serial == "own":
             assert await _admitted(source, _bundle(tmp_path, (root, key))) == 202
+            assert await _admitted(source, _v1_bundle(tmp_path, (root, key))) == 202
         else:
             assert await _handshake_refused(source, _bundle(tmp_path, (root, key)))
+            assert await _handshake_refused(source, _v1_bundle(tmp_path, (root, key)))
     finally:
         await source.stop()
 

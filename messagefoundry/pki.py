@@ -1864,9 +1864,10 @@ _UNREAD_CA_EXTENSIONS = (x509.DuplicateExtension, ValueError, UserWarning, *_UNR
 
 #: What :func:`_strict_ca_faults` could not read of a CA, and what the namesake warning adds for
 #: it, given the CA's block number ``n``. A CA whose issuer name is not read has no authority key
-#: identifier carrying a key identifier, and the two outcomes left were each measured on OpenSSL
-#: 3.5.7 behind a strict listener: every client refused when OpenSSL reads its issuer as another
-#: name, and its version-3 client admitted when it reads the CA as self-signed (BACKLOG #4948).
+#: identifier carrying a key identifier. What such a CA does to its clients was measured on
+#: OpenSSL 3.5.7, and the cases measured are listed once, in the docstring of
+#: ``test_what_a_ca_whose_issuer_cannot_be_read_does_to_its_clients_is_measured`` in
+#: ``tests/test_inbound_http_intake_issuer.py`` (BACKLOG #4948).
 _Unread = Literal["extensions", "issuer name", "name comparison"]
 _NOT_SELF_SIGNED = (
     ", so this check cannot tell whether block {n} is self-signed. If it is not, strict "
@@ -2088,8 +2089,8 @@ def _namesake_attribute(
 
 def _key_identifier(anchor: _Anchor) -> tuple[bytes | None, bool]:
     """``anchor``'s subject key identifier, or ``None`` when it has none or its extensions cannot
-    be read, and whether they were read. An unreadable one on the namesake or the CA gives the
-    wider warning, so it can only overstate it."""
+    be read, and whether they were read; no caller reads that flag now. An unreadable one on the
+    namesake or the CA gives the wider warning, so it can only overstate it."""
     try:
         return anchor.cert.extensions.get_extension_for_class(
             x509.SubjectKeyIdentifier
