@@ -170,7 +170,7 @@ def test_a_least_privilege_token_reads_clean_and_shows_no_secret() -> None:
     vault = _FakeVault(caps=_least_caps())
     hop = vault_hop(_STORE, _reading(vault))
     assert hop.state is HopState.CLEAN
-    assert "token policies [default, mefor-store], ttl 2764800s, renewable" in hop.detail
+    assert "token policies ['default', 'mefor-store'], ttl 2764800s, renewable" in hop.detail
     assert f"transit/decrypt/{_KEK}: update" in hop.detail
     assert _TOKEN not in _out(hop) and _ACCESSOR not in _out(hop)
     # The one capabilities read asked about the engine's paths and the administrative ones.
@@ -259,10 +259,36 @@ def test_a_policy_name_cannot_drive_the_terminal_or_reorder_the_line() -> None:
     hop = vault_hop(_STORE, _reading(_FakeVault(policies=(_HOSTILE,), caps=_least_caps())))
     shown = "\n".join(render_text([hop]))
     assert _clean(shown)
-    assert f"token policies [{_HOSTILE_SHOWN}]" in shown
+    assert f"token policies ['{_HOSTILE_SHOWN}']" in shown
     # The JSON output carries the name as the server sent it; json.dumps escapes it there.
-    assert f"token policies [{_HOSTILE}]" in hop.detail
+    assert f"token policies ['{_HOSTILE}']" in hop.detail
     assert _HOSTILE not in _out(hop)
+
+
+@pytest.mark.parametrize(
+    ("policies", "shown"),
+    [
+        # One name holding ", " would read as two policies, a second of them named root.
+        (("default, root",), "token policies ['default, root'], "),
+        # One name closing the list and appending a lifetime and renewability of its own.
+        (
+            ("mefor-store], no expiry, not renewable; ok",),
+            "token policies ['mefor-store], no expiry, not renewable; ok'], ",
+        ),
+        # A quote in the name cannot close its own quoting either.
+        (("x', 'root",), "token policies [\"x', 'root\"], "),
+    ],
+)
+def test_each_policy_name_is_quoted_so_one_name_cannot_read_as_several(
+    policies: tuple[str, ...], shown: str
+) -> None:
+    """BACKLOG #2891, PR 2390 note 4: the names in "token policies [...]" were joined bare, so the
+    reader could not tell where a server-chosen name ended."""
+    from messagefoundry.privilege_check import render_text
+
+    hop = vault_hop(_STORE, _reading(_FakeVault(policies=policies, caps=_least_caps())))
+    assert shown in hop.detail
+    assert shown in "\n".join(render_text([hop]))
 
 
 def test_a_hostile_policy_name_inside_a_granted_path_is_printed_and_logged_clean(

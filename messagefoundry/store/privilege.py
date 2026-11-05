@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -489,8 +489,12 @@ class StorePrivilegeReport:
         deviations arrive there as plain names)."""
         return StorePrivilegePosture(status=self.status, excess=self.excess, detail=self.detail)
 
-    def summary(self) -> str:
-        """One operator-readable line. The three statuses read differently ON PURPOSE."""
+    def summary(self, *, quote: Callable[[str], str] = repr) -> str:
+        """One operator-readable line. The three statuses read differently ON PURPOSE.
+
+        ``quote`` writes the principal and database names; ``repr`` by default. A caller that
+        escapes the whole line itself passes a quote with no escape of its own, or a control in a
+        name would be escaped twice (BACKLOG #2891)."""
         if self.status is StorePrivilegeStatus.NOT_APPLICABLE:
             return (
                 f"store privilege preflight: not applicable on {self.backend.value} — {self.detail}"
@@ -501,15 +505,16 @@ class StorePrivilegeReport:
                 f"principal's effective privileges — {self.detail}. This is NOT a clean result: the "
                 "documented least-privilege grant is UNVERIFIED on this instance"
             )
+        who = f"{quote(self.principal)} on {quote(self.database)}"
         if self.excess:
             return (
                 f"store privilege preflight: the {self.backend.value} store principal "
-                f"{self.principal!r} on {self.database!r} holds {len(self.excess)} privilege(s) "
+                f"{who} holds {len(self.excess)} privilege(s) "
                 f"BEYOND the documented least-privilege grant: {', '.join(self.excess)}"
             )
         return (
             f"store privilege preflight: OBSERVED the {self.backend.value} store principal "
-            f"{self.principal!r} on {self.database!r} — no privilege beyond the documented grant "
+            f"{who} — no privilege beyond the documented grant "
             f"(server roles: {', '.join(self.server_roles) or 'none'}; database roles: "
             f"{', '.join(self.database_roles) or 'none'})"
         )
