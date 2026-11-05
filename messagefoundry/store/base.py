@@ -1063,13 +1063,20 @@ class QueueStore(StoreLifecycle, Protocol):
         byte-for-byte). Raises :class:`KeyError` if the attachment does not exist."""
         ...
 
-    async def attachments_for(self, message_id: str) -> Sequence[Row]:
+    async def attachments_for(
+        self, message_id: str, *, include_inherited: bool = False
+    ) -> Sequence[Row]:
         """The distinct attachments a single message holds — the operator read surface (#149, ADR 0105
         Phase 3b). One row per ``message_attachment`` linkage JOINed to its ``attachment`` header,
         carrying ``attachment_id`` (the sha256 content address), ``content_type``, and ``total_bytes``.
         **Metadata only — no chunk ciphertext is read or decrypted** (the bulky bytes ride
         :meth:`read_attachment`), so this stays cheap enough for the message-detail view. Returns ``[]``
-        for a message with no detached document (or on a backend without the substrate)."""
+        for a message with no detached document (or on a backend without the substrate).
+
+        A link a child message inherited from its parent (BACKLOG #5099) is left out unless
+        ``include_inherited`` is set, which only delivery's handle binding does. It grants no
+        download through the child. Retention still releases it, as it releases any link, by
+        reading the linkage itself rather than through this method."""
         ...
 
     async def attachment_incref(self, ref: str) -> None:

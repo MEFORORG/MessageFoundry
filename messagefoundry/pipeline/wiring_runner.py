@@ -136,13 +136,17 @@ from messagefoundry.parsing import (
     validate,
 )
 from messagefoundry.parsing.binary import (
-    DOC_REF_MARKER,
+    Base64DelimiterError,
     DocRefError,
     EscapedDocumentError,
+    InboundDocRefError,
+    NonVerbatimDocumentError,
+    UnreadableDelimitersError,
     UnreattachableDocumentError,
     chunk_b64,
     iter_obx_documents,
     make_doc_ref,
+    may_hold_doc_ref,
     reattach_documents_in_hl7,
 )
 from messagefoundry.parsing.message import Message
@@ -166,6 +170,7 @@ from messagefoundry.pipeline.ingress_guards import (
     check_declared_type,
     check_decoded,
     decode_body,
+    doc_ref_marker_refusal,
     ingress_encoding,
     peek_max_bytes,
     reingress_size_error,
@@ -1103,13 +1108,17 @@ def _label_fits_every_backend(label: str) -> bool:
 
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
 #: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
-#: by one alone. Not every raise: a body the separator read refuses (a registered fuzz known finding,
-#: ``fuzz/targets.py``) still escapes as a bare ``ValueError``.
+#: by one alone. A body with an OBX and an MSH-2 shorter than four characters is one,
+#: :class:`UnreadableDelimitersError`, rather than the plain ``ValueError`` the OBX reads raise. A
+#: body with no MSH never reaches the detach: both listeners' ``Peek.parse`` refuses it first.
 _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     _StreamBudgetExceeded,
     StreamingAttachmentsUnsupported,
     DocRefError,
     EscapedDocumentError,
+    InboundDocRefError,
+    NonVerbatimDocumentError,
+    UnreadableDelimitersError,
 )
 
 #: BACKLOG #4907: the stored reason, and the MSA-3 text, for a message from a sender whose verified
@@ -1146,8 +1155,9 @@ def _detach_refusal_kind(exc: Exception) -> RefusalKind:
 
     Only the in-flight budget is the engine's own and clears as concurrent detaches finish, so only
     it invites a re-send, and only when the body would fit the budget once they have: one larger
-    than the whole budget is over-size. An unsupported backend, a malformed handle and an escaped
-    document refuse the same body every time. The receipt path answers the class as is; MLLP answers
+    than the whole budget is over-size. Every other refusal, at least an unsupported backend, a
+    malformed or received handle, an escaped document and one the splice would alter, refuses the
+    same body every time. The receipt path answers the class as is; MLLP answers
     ``AE`` for TEMPORARY and ``AR`` for every final class (owner ruling of 2026-11-03, decision log
     d20261104T032854299-7235a9, stamped in UTC)."""
     if isinstance(exc, _StreamBudgetExceeded):
@@ -8342,6 +8352,9 @@ class RegistryRunner:
         try:
             peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             fields = _read_ingress_fields(peek)
+            # The marker check reads the header too, so a fault in it is a peek fault: ERROR, not
+            # an escape from the listener (BACKLOG #1594, #5099).
+            marker_refused = doc_ref_marker_refusal(peek, text)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
             # Over the peek's max_bytes is over-size, as the engine ceiling is on any other body; every
             # other parse refusal is about the body's content.
@@ -8357,6 +8370,13 @@ class RegistryRunner:
                     if isinstance(exc, HL7PeekError)
                     else _peek_read_fault(ic, exc)
                 ),
+            )
+        if marker_refused is not None:
+            # Delivery refuses any handle marker under these delimiters, so the body would be
+            # accepted and then dead-letter on every outbound; refused here instead, at any size
+            # (BACKLOG #5099). The same body fails the same way every time.
+            return await self._refuse(
+                ic, raw, text, RefusalKind.PERMANENT, error=marker_refused, peek=peek
             )
         if ic.validation.strict and streaming_over:
             # Whole-body strict validation is downgraded to header-only over the streaming threshold (the
@@ -8489,7 +8509,14 @@ class RegistryRunner:
         :class:`~messagefoundry.store.StreamingAttachmentsUnsupported` on a backend without streaming
         support (SQL Server / Postgres in Phase 1a), and
         :class:`~messagefoundry.parsing.binary.EscapedDocumentError` when a document's ``OBX-5.5``
-        holds an HL7 escape (vault BACKLOG #2809) — each, as one of :data:`_DETACH_REFUSALS`, is turned
+        holds an HL7 escape (vault BACKLOG #2809),
+        :class:`~messagefoundry.parsing.binary.InboundDocRefError` for a received handle or marker,
+        and :class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError` for a document
+        delivery's splice would not set back verbatim, and
+        :class:`~messagefoundry.parsing.binary.UnreadableDelimitersError` for a body with an OBX
+        and an MSH-2 shorter than four characters (a body with no MSH never gets here: the caller's
+        ``Peek.parse`` refused it first; BACKLOG #5099) — each, as one of
+        :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
         size = len(text)
@@ -8512,12 +8539,15 @@ class RegistryRunner:
             # the longest event-loop stall fell from about 0.3 s to 0.03 s at a 15 MiB body and from
             # 1.5-2.0 s to 0.1-0.2 s at 64 MiB. What is left is the longest single string operation,
             # which holds the GIL in any thread. The scan yields one document at a time, as the budget
-            # assumes, but its first hop does the per-OBX reads for every OBX (OBX-2 and OBX-5.4, each
-            # a split of the field) and scans every raw OBX-5.5 for an escape, so a refusal comes
-            # before any document is stored (vault BACKLOG #2809). Only one thread touches `message`
-            # at a time: each hop is awaited.
+            # assumes, but its first hop does the per-OBX reads for every OBX (OBX-2, OBX-5.4 and
+            # OBX-5.5, each a split of the field, each value dropped before the next is read) and
+            # scans every raw OBX-5.5 for an escape, so a refusal comes before any document is
+            # stored (vault BACKLOG #2809, BACKLOG #5099). Only one thread touches `message` at a
+            # time: each hop is awaited.
             message = await asyncio.to_thread(Message.parse, text)
-            documents = iter_obx_documents(message)
+            # The received text rides along so a body holding the handle marker anywhere is refused
+            # here, before the ACK, rather than dead-lettered after the splice (BACKLOG #5099).
+            documents = iter_obx_documents(message, received=text)
 
             def _next_document() -> tuple[int, str, str] | None:
                 return next(documents, None)
@@ -8538,6 +8568,10 @@ class RegistryRunner:
                 ):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
                 ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
+                # Dropped once stored, before the splice below copies OBX-5 and before the scan
+                # reads the next document, so the loop holds one copy at a time, as the budget
+                # assumes (BACKLOG #5099).
+                del document, verbatim_b64
                 await asyncio.to_thread(
                     message.set, "OBX-5.5", make_doc_ref(ref, safe_ct), occurrence=occ
                 )
@@ -8705,6 +8739,9 @@ class RegistryRunner:
             peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
             # Every peek read the ingress commit needs, taken inside this guard (BACKLOG #1594).
             fields = _read_ingress_fields(peek)
+            # The marker check reads the header too, so a fault in it records ERROR and NAKs here
+            # rather than dropping the connection (BACKLOG #5099).
+            marker_refused = doc_ref_marker_refusal(peek, text)
         except PEEK_READ_FAULTS as exc:  # HL7PeekError is a ValueError, so it lands here too
             if isinstance(exc, HL7PeekError):
                 # One rule for the reason and the AR text, on every listener (BACKLOG #2085): the
@@ -8725,6 +8762,32 @@ class RegistryRunner:
             if ack is not None and self._capture_ack_enabled(ic):
                 await self._capture_ack(
                     mid, ic.name, ack_code="AR", ack_phase="parse", ack_body=None, detail=parse_err
+                )
+            return ack
+
+        if marker_refused is not None:
+            # Delivery refuses any handle marker under these delimiters, so an AA here would be
+            # followed by a dead-letter on every outbound; refused here instead, at any size, and
+            # AR since the same body fails the same way every time (BACKLOG #5099).
+            mid = await self._record_refused(ic, raw, text, error=marker_refused, peek=peek)
+            ack = (
+                build_ack(
+                    peek,
+                    code="AR",
+                    text="handle marker refused by its delimiters",
+                    ack_mode=ack_mode,
+                )
+                if reply
+                else None
+            )
+            if ack is not None and self._capture_ack_enabled(ic):
+                await self._capture_ack(
+                    mid,
+                    ic.name,
+                    ack_code="AR",
+                    ack_phase="ingest",
+                    ack_body=None,
+                    detail=marker_refused,
                 )
             return ack
 
@@ -8818,13 +8881,28 @@ class RegistryRunner:
                 # The receipt path's class decides MSA-1 (BACKLOG #5078): AE only for a budget held by
                 # concurrent detaches, which a re-send may clear, and AR for every refusal the
                 # receipt path answers as final, a body alone over the whole budget, an unsupported
-                # backend, a malformed handle and an escaped document (vault BACKLOG #2809) alike.
+                # backend, a malformed handle, an escaped document (vault BACKLOG #2809) and the
+                # BACKLOG #5099 shapes below alike. MSA-3 names the shape where it is the message's own.
                 nak_code = "AE" if _detach_refusal_kind(exc) is RefusalKind.TEMPORARY else "AR"
-                nak_text = (
-                    "escaped document in OBX-5.5"
-                    if isinstance(exc, EscapedDocumentError)
-                    else "streaming detach failed"
-                )
+                if isinstance(exc, EscapedDocumentError):
+                    nak_text = "escaped document in OBX-5.5"
+                elif isinstance(exc, NonVerbatimDocumentError):
+                    # A document's own value, which the splice would escape, not a marker.
+                    nak_text = "OBX-5.5 document holds a delimiter or control"
+                elif isinstance(exc, UnreadableDelimitersError):
+                    # The header, not a document: no OBX-5.5 of this body can be read. Only a
+                    # short MSH-2 reaches here, since the listener's parse refuses a body with no
+                    # MSH.
+                    nak_text = "MSH-2 shorter than four characters"
+                elif isinstance(exc, Base64DelimiterError):
+                    # Checked before its base class: the body's delimiters, not a marker.
+                    nak_text = "document under base64 delimiters"
+                elif isinstance(exc, InboundDocRefError):
+                    # Either shape: a handle in OBX-5.5, or the marker elsewhere in a body
+                    # with a document to detach.
+                    nak_text = "document handle marker in the body"
+                else:
+                    nak_text = "streaming detach failed"
                 ack = (
                     build_ack(peek, code=nak_code, text=nak_text, ack_mode=ack_mode)
                     if reply
@@ -9317,30 +9395,49 @@ class RegistryRunner:
             return None
         return {str(k): v for k, v in loaded.items() if isinstance(v, str)}
 
-    async def _hydrate_payload(self, payload: str) -> str:
+    async def _hydrate_payload(self, payload: str, message_id: str) -> str:
         """Re-attach any detached very-large document into ``payload`` at the terminal egress, just
         before it hits the wire (#149, ADR 0105 Phase 1b). A delivery/skeleton row carries a small
         ``mfdoc:v1:ref:`` handle in ``OBX-5.5``; splice the stored VERBATIM base64 back in (Approach B —
         no decode/encode) so the partner receives the full inline document (Epic's MLLP MDM receiver does
-        not cap the frame). A payload with **no** handle is returned byte-identical after a single
-        substring check — the below-threshold / no-detach / Handler-built (never-detached) delivery path
-        is untouched, and no store read happens.
+        not cap the frame). A payload with **no** handle is returned byte-identical after a cheap
+        gate (a substring check, plus an MSH-2 read) — the below-threshold / no-detach / Handler-built
+        (never-detached) delivery path is untouched, and no store read happens.
 
         Hydration is a **pure READ** off the immutable, content-addressed attachment; it does **not**
         decref (the message may fan out to several outbounds and is replayable — the refcount is released
         only on retention/purge, never on delivery), so every send and every retry re-derives the
-        IDENTICAL frame. **Fail-loud:** a missing / GC'd attachment (or a backend without streaming
-        support) is turned into a :class:`DeliveryError` so the row takes the normal ERROR/retry path and
-        the connector **never** receives an un-hydrated handle (which would deliver ``mfdoc:v1:ref:…``
-        into the partner's ``OBX-5.5`` = silent corruption). A malformed handle (:class:`DocRefError`) takes that
-        same retryable path. A failure the payload itself causes, an
+        IDENTICAL frame. **Fail-loud:** a held attachment whose read fails (a ``KeyError`` from the
+        read, or a ``StreamingAttachmentsUnsupported``) is turned into a :class:`DeliveryError` so the
+        row takes the normal ERROR/retry path and the connector **never** receives an un-hydrated
+        handle (which would deliver ``mfdoc:v1:ref:…`` into the partner's ``OBX-5.5`` = silent
+        corruption). A failure the payload itself causes, an
         :class:`~messagefoundry.parsing.binary.UnreattachableDocumentError`, is a permanent
         :class:`NegativeAckError` instead, since no retry could clear it (vault BACKLOG #2809). Any
         other ``ValueError`` propagates to the outbound's internal-error policy, a stored document
         holding a CR or LF included: no payload can cause one, so it is store corruption or an
-        engine bug."""
-        if DOC_REF_MARKER not in payload:
+        engine bug.
+
+        A handle resolves only to an attachment ``message_id`` holds, read from the store's
+        ``message_attachment`` linkage (BACKLOG #5099). The detach writes that linkage in the
+        ingress commit. Replay and an unedited resend keep the message id. A pass-through child, an
+        edit-and-resubmit child and an edit-and-resend child carry the body under a new id, and the
+        store links each to the parent's documents that body names, in the commit that makes it. So
+        every handle the engine wrote stays resolvable. A handle naming anything else, or a
+        malformed one, is the payload's text and a permanent refusal of this row alone, so it never
+        holds a strict-FIFO lane on retries. The gate opens on an escaped marker too
+        (:func:`~messagefoundry.parsing.binary.may_hold_doc_ref`), so a payload whose delimiters
+        escape the engine's own handle is re-attached rather than sent with the handle in it."""
+        if not may_hold_doc_ref(payload):
             return payload  # no detached document → byte-identical, no store read (the common path)
+        # A store fault here re-pends the row like the attachment read below (vault BACKLOG #2756).
+        held = await _read_from_store(
+            # A child's inherited links count here, and only here: they let it deliver what its
+            # body carries, and grant no download.
+            "attachment read",
+            lambda: self.store.attachments_for(message_id, include_inherited=True),
+        )
+        bound = {str(row["attachment_id"]) for row in held}
 
         async def _reader(sha256: str) -> str:
             # The store read runs off the event loop (aiosqlite), chunk-by-chunk, and the pieces
@@ -9351,17 +9448,23 @@ class RegistryRunner:
             return await _read_from_store("attachment read", _join)
 
         try:
-            return await reattach_documents_in_hl7(payload, _reader)
+            return await reattach_documents_in_hl7(payload, _reader, bound=bound)
         except (DocRefError, KeyError, StreamingAttachmentsUnsupported) as exc:
-            # A missing/GC'd attachment (KeyError), a malformed handle (DocRefError), or an unsupported
-            # backend — surface as a retryable DeliveryError (the message reached NEITHER wire nor peer),
+            # A held attachment whose read fails (KeyError, a race with the links read), or an
+            # unsupported backend at read time — surface as a retryable DeliveryError (the message
+            # reached NEITHER wire nor peer). An attachment GC'd with its header is not held, so it
+            # is the permanent refusal below.
             # exactly like the encoding-override / raw-separators pre-send failures. The row re-pends with
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
         except UnreattachableDocumentError as exc:
-            # Only these two failures, which the MESSAGE causes: the payload does not parse as HL7, or its
-            # MSH-1 and MSH-2 do not name its separators (vault BACKLOG #2809). The same payload fails
-            # the same way on every attempt, so a retry could never succeed: refuse it permanently,
+            # Only failures the MESSAGE causes, at least: the payload does not parse as HL7, or it
+            # holds the raw marker and its separators cannot be read: no MSH, or an MSH-2 shorter
+            # than four characters (vault BACKLOG #2809), or a handle is
+            # malformed, names an attachment its message does not hold, or sits outside the
+            # splice, or the splice would escape a character of its stored value (BACKLOG #5099).
+            # The same payload fails the same way on every attempt, so a retry could never succeed:
+            # refuse it permanently,
             # which dead-letters this row alone. Any other ValueError is not caught here, so an engine
             # fault in the re-attach, a stored document holding a CR or LF included, still reaches
             # the outbound's internal-error policy, and STOP still stops the lane. Raised after the
@@ -9494,7 +9597,9 @@ class RegistryRunner:
                 # live (vault #2756).
                 if _frames(connector):
                     try:
-                        connector.check_frame(await self._hydrate_payload(item.payload))
+                        connector.check_frame(
+                            await self._hydrate_payload(item.payload, item.message_id)
+                        )
                     except NegativeAckError:
                         raise
                     except DeliveryError as exc:
@@ -9513,7 +9618,7 @@ class RegistryRunner:
                 # before the send (BEFORE the send timer — a store read, not the partner round-trip). A
                 # payload with no handle is returned byte-identical; a missing attachment raises a
                 # DeliveryError (caught below → retry), so a handle NEVER reaches the connector.
-                payload = sent = await self._hydrate_payload(item.payload)
+                payload = sent = await self._hydrate_payload(item.payload, item.message_id)
                 _send_t0 = time.perf_counter_ns() if self._delivery_phase_timing else 0
                 if getattr(connector, "consumes_metadata", False):
                     # #68: an opted-in outbound (REST/FHIR with dynamic_headers) gets this message's
@@ -9901,7 +10006,7 @@ class RegistryRunner:
             unhydratable: list[_RefusedMember] = []
             for it in items:
                 try:
-                    hydrated.append(await self._hydrate_payload(it.payload))
+                    hydrated.append(await self._hydrate_payload(it.payload, it.message_id))
                 except NegativeAckError as exc:
                     unhydratable.append((it.id, safe_exc(exc), exc.with_traceback(None)))
                 else:
@@ -11954,7 +12059,8 @@ def _as_content_fault(exc: Exception | SystemExit) -> Exception:
 
 class _StoreReadFault(_RedactedFault):
     """A store READ that a delivery needed before its send failed in the store itself: the document
-    re-attach (``read_attachment``) or the ``dynamic_headers`` metadata (``message_metadata_json``).
+    re-attach (``read_attachment``, and ``attachments_for``, the linkage read that binds a handle to
+    its own message, BACKLOG #5099) or the ``dynamic_headers`` metadata (``message_metadata_json``).
     Vault BACKLOG #2756. Raised only by :func:`_read_from_store`.
 
     The classification is by ORIGIN, at the store call, not by exception type: a driver or pool error

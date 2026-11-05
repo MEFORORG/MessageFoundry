@@ -8013,6 +8013,9 @@ def create_app(
         # SECURITY CRUX: only serve an attachment that is LINKED to this message. Content-addressing
         # shares one physical blob across messages/tenants, so the linkage + the channel guard above are
         # what scope access — a guessed content address unlinked to an in-scope message is a 404.
+        # A link a child message inherited from its parent is not read here (attachments_for leaves
+        # it out), so it grants no download: it serves delivery and retention, never this route
+        # (BACKLOG #5099).
         linked = await engine.store.attachments_for(message_id)
         match = next((a for a in linked if a["attachment_id"] == attachment_id), None)
         if match is None:

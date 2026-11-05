@@ -42,6 +42,7 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.parsing.binary import (
     DocRefError,
+    InboundDocRefError,
     chunk_b64,
     is_doc_ref,
     iter_obx_documents,
@@ -134,17 +135,21 @@ def _ack_code(ack: str | None) -> str | None:
 
 def test_iter_obx_documents_yields_verbatim_and_content_type() -> None:
     b64 = _big_b64(64)
-    msg = Message.parse(_hl7_with_doc(b64, obx_type="Application"))
-    docs = list(iter_obx_documents(msg))
+    text = _hl7_with_doc(b64, obx_type="Application")
+    msg = Message.parse(text)
+    docs = list(iter_obx_documents(msg, received=text))
     assert docs == [(1, b64, "Application")]
 
 
-def test_iter_obx_documents_skips_already_detached() -> None:
-    # A skeleton whose OBX-5.5 already carries a ref handle yields nothing (re-scan is a no-op).
+def test_iter_obx_documents_refuses_a_received_handle() -> None:
+    # The scan runs on the received body only, so a handle there is the sender's text, never a
+    # document this engine detached: refused, not skipped as already detached (BACKLOG #5099).
     ref = hashlib.sha256(b"x").hexdigest()
     handle = make_doc_ref(ref, "Application")
-    msg = Message.parse(_hl7_with_doc(handle))
-    assert list(iter_obx_documents(msg)) == []
+    text = _hl7_with_doc(handle)
+    msg = Message.parse(text)
+    with pytest.raises(InboundDocRefError):
+        list(iter_obx_documents(msg, received=text))
 
 
 def test_chunk_b64_concatenates_to_input() -> None:
@@ -696,8 +701,9 @@ async def test_clean_base64_still_detaches_and_rehydrates_verbatim(store: Messag
 
     assert _ack_code(await runner._handle_inbound(ic, raw.encode("utf-8"))) == "AA"
 
-    skeleton = (await _messages(store))[0]["raw"]
-    hydrated = await runner._hydrate_payload(skeleton)
+    cur = await store._db.execute("SELECT id, raw FROM messages")
+    row = dict(await cur.fetchone() or {})
+    hydrated = await runner._hydrate_payload(row["raw"], row["id"])
     assert Message.parse(hydrated).field("OBX-5.5") == b64
 
 
@@ -705,8 +711,9 @@ def test_an_escape_outside_obx_5_5_does_not_refuse_the_document() -> None:
     """The check reads OBX-5.5 alone: an escape in another component of OBX-5 is the sender's
     ordinary HL7 and leaves the document detachable."""
     b64 = _big_b64(300)
-    msg = Message.parse(_hl7_with_doc(b64, obx_type="App\\T\\lication"))
-    assert [(occ, doc) for occ, doc, _ct in iter_obx_documents(msg)] == [(1, b64)]
+    text = _hl7_with_doc(b64, obx_type="App\\T\\lication")
+    msg = Message.parse(text)
+    assert [(occ, doc) for occ, doc, _ct in iter_obx_documents(msg, received=text)] == [(1, b64)]
 
 
 # --- MLLP detach refusals take the receipt path's class (BACKLOG #5078) ---------------------------

@@ -28,6 +28,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -69,8 +70,44 @@ DEST2 = "OB_EPIC_2"
 @pytest.fixture
 async def store(tmp_path: Path):
     s = await MessageStore.open(tmp_path / "reattach.db")
+    enqueue = s.enqueue_message
+
+    async def _enqueue_holding(**kwargs):  # type: ignore[no-untyped-def]
+        # Every message here models one the ingress detach wrote, so it holds the documents its
+        # handles name (BACKLOG #5099).
+        mid = await enqueue(**kwargs)
+        await _hold_named(s, mid, kwargs["raw"], *(p for _d, p in kwargs["deliveries"]))
+        return mid
+
+    s.enqueue_message = _enqueue_holding  # type: ignore[method-assign]
     yield s
     await s.close()
+
+
+_HANDLE_REF = re.compile(r"mfdoc:v1:ref:([0-9a-f]{64})")
+
+
+async def _hold_named(store: MessageStore, message_id: str, *texts: str) -> None:
+    """Link ``message_id`` to every attachment a handle in ``texts`` names, as the ingress commit
+    links a document it detached. Delivery resolves a handle only to an attachment its own message
+    holds (BACKLOG #5099), so a message these tests model as detached must hold its documents."""
+    for ref in {m for text in texts for m in _HANDLE_REF.findall(text)}:
+        await store._db.execute(
+            "INSERT OR IGNORE INTO message_attachment (message_id, attachment_id) VALUES (?,?)",
+            (message_id, ref),
+        )
+    await store._db.commit()
+
+
+def _named(text: str) -> set[str]:
+    """Every content address a handle in ``text`` names: the pure re-attach's ``bound``."""
+    return set(_HANDLE_REF.findall(text))
+
+
+async def _hydrate(runner: RegistryRunner, store: MessageStore, payload: str) -> str:
+    """Hydrate ``payload`` as the delivery of a message that holds every document it names."""
+    mid = await store.enqueue_message(channel_id="c1", raw=payload, deliveries=[], now=100.0)
+    return await runner._hydrate_payload(payload, mid)
 
 
 def _big_b64(nbytes: int) -> str:
@@ -147,7 +184,7 @@ async def test_reattach_splices_verbatim() -> None:
         assert sha == ref
         return b64
 
-    out = await reattach_documents_in_hl7(skeleton, reader)
+    out = await reattach_documents_in_hl7(skeleton, reader, bound=_named(skeleton))
     assert _obx5_5(out) == b64  # spliced back byte-for-byte
     assert DOC_REF_MARKER not in out  # no handle text survives
 
@@ -158,7 +195,7 @@ async def test_reattach_no_handle_byte_identical() -> None:
     async def reader(sha: str) -> str:  # pragma: no cover - must not be called
         raise AssertionError("reader must not be called when there is no handle")
 
-    out = await reattach_documents_in_hl7(plain, reader)
+    out = await reattach_documents_in_hl7(plain, reader, bound=set())
     assert out == plain  # returned UNCHANGED (byte-identical)
 
 
@@ -170,7 +207,7 @@ async def test_reattach_fail_loud_when_reader_returns_none() -> None:
         return None  # attachment missing / GC'd
 
     with pytest.raises(DocRefError):
-        await reattach_documents_in_hl7(skeleton, reader)
+        await reattach_documents_in_hl7(skeleton, reader, bound=_named(skeleton))
 
 
 async def test_reattach_fail_loud_when_reader_raises() -> None:
@@ -181,7 +218,7 @@ async def test_reattach_fail_loud_when_reader_raises() -> None:
         raise KeyError(sha)
 
     with pytest.raises(KeyError):
-        await reattach_documents_in_hl7(skeleton, reader)
+        await reattach_documents_in_hl7(skeleton, reader, bound=_named(skeleton))
 
 
 async def test_reattach_multiple_documents() -> None:
@@ -198,7 +235,7 @@ async def test_reattach_multiple_documents() -> None:
     async def reader(sha: str) -> str:
         return table[sha]
 
-    out = await reattach_documents_in_hl7(hl7, reader)
+    out = await reattach_documents_in_hl7(hl7, reader, bound=_named(hl7))
     msg = Message.parse(out)
     assert msg.field("OBX-5.5", occurrence=1) == a
     assert msg.field("OBX-5.5", occurrence=2) == b
@@ -210,24 +247,30 @@ async def test_reattach_multiple_documents() -> None:
 async def test_hydrate_no_handle_byte_identical(store: MessageStore) -> None:
     runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     plain = _hl7_with_value(_big_b64(20))
-    assert await runner._hydrate_payload(plain) == plain  # single substring check, no store read
+    assert await _hydrate(runner, store, plain) == plain  # single substring check, no store read
 
 
 async def test_hydrate_splices_verbatim(store: MessageStore) -> None:
     b64 = _big_b64(2000)
     ref = await _store_doc(store, b64)
     runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
-    hydrated = await runner._hydrate_payload(_hl7_with_value(make_doc_ref(ref, "application/pdf")))
+    hydrated = await _hydrate(runner, store, _hl7_with_value(make_doc_ref(ref, "application/pdf")))
     assert _obx5_5(hydrated) == b64
 
 
-async def test_hydrate_missing_attachment_raises_delivery_error(store: MessageStore) -> None:
-    # A handle whose attachment was never stored / has been GC'd → DeliveryError (retryable), never a
-    # payload carrying the raw handle. Fail-loud: the connector must NEVER see mfdoc:v1:ref:.
+async def test_hydrate_a_never_stored_attachment_is_a_permanent_refusal(
+    store: MessageStore,
+) -> None:
+    # A handle whose attachment was never stored, or has been GC'd with its header, is linked to no
+    # message (attachments_for joins the header), so it is refused permanently before any read
+    # (BACKLOG #5099), never a payload carrying the raw handle. Fail-loud: the connector must NEVER
+    # see mfdoc:v1:ref:. The retryable arm, a held attachment whose read fails, is
+    # test_delivery_fault_classification's control.
     missing = make_doc_ref(hashlib.sha256(b"gone").hexdigest(), "application/pdf")
     runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
-    with pytest.raises(DeliveryError):
-        await runner._hydrate_payload(_hl7_with_value(missing))
+    with pytest.raises(NegativeAckError) as ei:
+        await _hydrate(runner, store, _hl7_with_value(missing))
+    assert ei.value.permanent is True
 
 
 async def test_hydrate_retry_reads_identically_without_decref(store: MessageStore) -> None:
@@ -237,19 +280,28 @@ async def test_hydrate_retry_reads_identically_without_decref(store: MessageStor
     ref = await _store_doc(store, b64)
     runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     payload = _hl7_with_value(make_doc_ref(ref, "application/pdf"))
-    first = await runner._hydrate_payload(payload)
-    second = await runner._hydrate_payload(payload)
+    # One message, hydrated twice: a retry of the same row, not a second message.
+    mid = await store.enqueue_message(channel_id="c1", raw=payload, deliveries=[], now=100.0)
+    first = await runner._hydrate_payload(payload, mid)
+    second = await runner._hydrate_payload(payload, mid)
     assert first == second  # identical frame on every attempt
     assert await _refcount(store, ref) == 1  # NOT decref'd by delivery
 
 
-async def test_hydrate_unsupported_backend_raises_delivery_error(store: MessageStore) -> None:
+async def test_hydrate_unsupported_backend_refuses_the_handle_permanently(
+    store: MessageStore,
+) -> None:
+    # A backend without the substrate links no attachment to any message, so no handle there can
+    # be one the engine wrote: it is refused permanently, before any read, rather than re-pended on
+    # the lane until the retry cap (BACKLOG #5099).
     b64 = _big_b64(1000)
     ref = await _store_doc(store, b64)
     store.supports_streaming_attachments = False  # simulate a non-SQLite backend at read time
     runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
-    with pytest.raises(DeliveryError):
-        await runner._hydrate_payload(_hl7_with_value(make_doc_ref(ref, "application/pdf")))
+    with pytest.raises(NegativeAckError) as ei:
+        await _hydrate(runner, store, _hl7_with_value(make_doc_ref(ref, "application/pdf")))
+    assert ei.value.permanent is True
+    assert ei.value.code == "reattach"
 
 
 # --- _process_delivery_item: fan-out + a claimed row ----------------------------------------------
@@ -344,7 +396,7 @@ async def test_hydrate_a_reattach_the_payload_breaks_is_a_permanent_refusal(
     ref = await _store_doc(store, _big_b64(600))
     runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     with pytest.raises(NegativeAckError) as ei:
-        await runner._hydrate_payload(breaks(_hl7_with_value(make_doc_ref(ref, "application/pdf"))))
+        await _hydrate(runner, store, breaks(_hl7_with_value(make_doc_ref(ref, "application/pdf"))))
     assert ei.value.permanent is True
     assert ei.value.code == "reattach"
     assert ei.value.__cause__ is None and ei.value.__context__ is None
@@ -360,7 +412,7 @@ async def test_hydrate_a_stored_cr_or_lf_is_an_internal_error_not_a_refusal(
     ref = await _store_doc_with_a_cr(store, line_end)
     runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
     with pytest.raises(ValueError) as ei:
-        await runner._hydrate_payload(_hl7_with_value(make_doc_ref(ref, "application/pdf")))
+        await _hydrate(runner, store, _hl7_with_value(make_doc_ref(ref, "application/pdf")))
     assert type(ei.value) is ValueError
     assert "occurrence 1 holds a CR or LF" in str(ei.value)
 
@@ -381,7 +433,7 @@ async def test_a_non_hl7_payload_carrying_a_real_handle_is_never_delivered(
     runner._destinations[DEST] = col
 
     with pytest.raises((NegativeAckError, DeliveryError)):
-        await runner._hydrate_payload(payload)
+        await _hydrate(runner, store, payload)
     item = await store.claim_next_fifo(DEST)
     assert item is not None
     await runner._process_delivery_item(DEST, item)

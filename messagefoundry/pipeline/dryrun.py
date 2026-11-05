@@ -59,6 +59,7 @@ from messagefoundry.pipeline.ingress_guards import (
     IngressGuardError,
     carry_binary_ingress,
     decode_ingress,
+    doc_ref_marker_refusal,
     peek_max_bytes,
     store_safe_raw,
     strict_validate_timeout,
@@ -1066,6 +1067,18 @@ def dry_run(
         )
 
     mt, cid, summ = peek.message_type, peek.control_id, (summarize(peek) or None)
+
+    # The listener's marker refusal, at the same point after the parse (BACKLOG #5099).
+    if (marker_refused := doc_ref_marker_refusal(peek, text)) is not None:
+        return DryRunResult(
+            inbound=ic.name,
+            disposition=MessageStatus.ERROR,
+            raw=text,
+            message_type=mt,
+            control_id=cid,
+            summary=summ,
+            error=marker_refused,
+        )
 
     # strict_validation_due keeps the listener's header-only downgrade for a streaming body over its
     # threshold, so the preview never times a whole-body validate the engine does not run.
