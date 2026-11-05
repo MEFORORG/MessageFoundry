@@ -10332,7 +10332,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
     rotate. After it finishes the retired key can be removed. The store pass re-seals the
     secret-rotation fingerprint cells too, so no engine start needs the retired key to read them
-    (BACKLOG #3472, ADR 0213).
+    (BACKLOG #3472, ADR 0213). Under ``[store].cipher_provider = "vault_transit"`` it refuses before
+    it reads a key, dials Vault or opens the store, since no run there can finish (BACKLOG #2109).
 
     **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
     a store another connection holds, which is how a serving engine holds it; see
@@ -10392,6 +10393,23 @@ def _rotate_key(args: argparse.Namespace) -> int:
     settings, detail = _load_service_settings(args.service_config, cli=cli)
     if settings is None:
         print(f"error: {detail}", file=sys.stderr)
+        return 2
+    if settings.store.cipher_provider == "vault_transit":
+        # BACKLOG #2109. Every value is sealed inside Transit, and the re-encrypt pass refuses that
+        # cipher (BACKLOG #1165), so no run here can finish. Refuse before the key, the Vault hop
+        # and the writable open, each of which a run reached before it learned that, and before the
+        # "needs an active key" refusal below, which names a key this mode never reads.
+        print(
+            'error: rotate-key does not run under [store].cipher_provider = "vault_transit": the '
+            "store's values are sealed inside Vault Transit, and rotate-key re-encrypts only "
+            "under the in-process aesgcm cipher. To rotate the Transit data key, rotate it in Vault, "
+            "which makes a new version of the key named by MEFOR_STORE_TRANSIT_KEY; new values "
+            "are then sealed under that version, and values under an older version still read "
+            "while Vault keeps that version decryptable. No rotate-key run is needed for that. "
+            "No command moves Transit ciphertext between keys, or out of Transit (BACKLOG #2109). "
+            "Nothing was changed.",
+            file=sys.stderr,
+        )
         return 2
 
     posture = _command_hop_posture(settings)
@@ -10487,8 +10505,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         from messagefoundry.store.store import SecretRotationMetaStore
 
-        # BACKLOG #2109: in vault_transit mode the Transit key-type check runs inside this open, not
-        # at resolve_active_key above, so its refusal needs the same clean exit 2.
+        # A key the open cannot resolve, or a store hop the posture refuses, exits 2 as one at
+        # resolve_active_key above does. vault_transit mode never gets here (BACKLOG #2109).
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         store = await _open_store_or_refuse(open_store(settings.store, posture=posture))
         try:
