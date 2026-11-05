@@ -750,13 +750,14 @@ def _read_windows_checked(path: Path, *, engine_read_only: bool) -> bytes:
     owned and listed exactly as a key file is
     (:func:`~messagefoundry.restricted_file.key_file_handle_problem`).
 
-    The file stays open, unshared for writing, renaming and deleting, and its attributes, owner and
-    access list are read through that open handle, never by name, so a link or junction in a parent
-    directory re-pointed after the open does not change what is judged. ``engine_read_only`` is
+    The file stays open, unshared for writing, renaming and deleting, and its attributes, volume,
+    owner and access list are read through that open handle, never by name, so a link or junction
+    in a parent directory re-pointed after the open does not change what is judged. ``engine_read_only`` is
     whether the engine's own account holds read (the handoff) or full control (the host file).
     ``FileNotFoundError`` propagates as it is; every other failure is a :class:`CustodyError`."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise CustodyError("the Windows custody file read runs on Windows only")
+    import ctypes
     import msvcrt
 
     from messagefoundry.restricted_file import key_file_handle_problem
@@ -776,12 +777,20 @@ def _read_windows_checked(path: Path, *, engine_read_only: bool) -> bytes:
             reason = _os_reason(exc)
         if reason is not None:
             raise CustodyError(f"{path} could not be read: {reason}")
+        problem: str | None = None
         if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-            problem: str | None = "it is a link, and a custody file is read as itself"
+            problem = "it is a link, and a custody file is read as itself"
         else:
-            problem = key_file_handle_problem(
-                msvcrt.get_osfhandle(fd), engine_read_only=engine_read_only
-            )
+            try:
+                problem = key_file_handle_problem(
+                    msvcrt.get_osfhandle(fd), engine_read_only=engine_read_only
+                )
+            except (OSError, ctypes.ArgumentError) as exc:
+                reason = str(exc) or type(exc).__name__
+            if reason is not None:
+                raise CustodyError(
+                    f"{path} is refused: its owner and access list could not be read ({reason})"
+                )
         if problem is not None:
             raise CustodyError(f"{path} is refused: {problem}")
         return _read_capped(handle, path)
@@ -810,17 +819,13 @@ def write_host_file(path: Path, blob: HostBlob) -> None:
 def read_host_file(path: Path) -> HostBlob:
     """Read the host blob :func:`write_host_file` wrote, refusing a file others can reach.
 
-    Windows: refused before it is read, at least: a link, anything but a disk file, a file owned by
-    anyone but SYSTEM, Administrators or the engine's own account, and one whose protected access
-    list is not exactly SYSTEM, Administrators and the engine's own account with full control, the
-    list :func:`write_host_file` writes. A blob that is not user-scope DPAPI is refused after it is
-    read. Linux (draft rule 3b): at least these are refused: a link, anything but a regular file, a
-    file whose mode is not exactly ``0600``, one the engine's own account does not own, one that
-    carries a POSIX access control list at all, whatever it grants (:func:`write_host_file` writes
-    none), or whose list cannot be read, and one on a file system that keeps an access model of its
-    own (:func:`_read_posix_checked`). Any other POSIX host is refused, because this engine reads the
-    file's access control list on Linux only. Raises ``FileNotFoundError`` when there is no file,
-    and :class:`CustodyError` (or a DPAPI error on Windows) for every other refusal.
+    Windows: the file is judged before it is read by :func:`_read_windows_checked`, with the engine's
+    own account at full control, the list :func:`write_host_file` writes, and a blob that is not
+    user-scope DPAPI is refused after it is read. Linux: the file is judged by
+    :func:`_read_posix_checked` under the host file policy (draft rule 3b; mode exactly ``0600``
+    and no POSIX access control list, :data:`_HOST_FILE_POLICY`). Any other POSIX host is refused.
+    Raises ``FileNotFoundError`` when there is no file, and :class:`CustodyError` (or a DPAPI error
+    on Windows) for every other refusal.
 
     Not checked, at least: the containing directory's access, on either platform."""
     if sys.platform == "win32":
@@ -842,8 +847,11 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
     unprotect the blob, so that access list and the file's owner are the only controls, which is why
     the handoff lives only from install to the service's first start (draft rule 3).
 
-    Made by an elevated administrator, whose file Administrators owns. Another caller owns the file
-    itself, and :func:`read_handoff_file` refuses it unless that caller is the service.
+    :func:`read_handoff_file` accepts the file only when SYSTEM, Administrators or the service owns
+    it. An elevated administrator's file is owned by Administrators under the Windows default; where
+    the policy *System objects: Default owner for objects created by members of the Administrators
+    group* names the object creator instead, the administrator owns it, and the read refuses it.
+    Any other caller owns the file itself, and is refused unless it is the service.
 
     Windows only: raises :class:`~messagefoundry.secrets_dpapi.DpapiUnavailable` elsewhere, because
     a POSIX host needs no handoff."""
@@ -864,13 +872,13 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
 def read_handoff_file(path: Path) -> HostBlob:
     """Read a handoff blob as the service it was made for.
 
-    Refused before it is read, at least: a link, anything but a disk file, a file owned by anyone
-    but SYSTEM, Administrators or the engine's own account, and one whose protected access list is
-    not exactly the draft's descriptor with the engine's own account as the service, as
-    :func:`write_handoff_file` writes it. Machine scope opens for every account, so these checks are
-    what keep a handoff another local account made around a key it chose from being read: that
-    account owns its file, and cannot make Administrators or SYSTEM the owner. A blob that is not
-    machine-scope DPAPI is refused after it is read.
+    The file is judged before it is read by :func:`_read_windows_checked`, with the engine's own
+    account at read: the draft's descriptor with the engine's account as the service, as
+    :func:`write_handoff_file` writes it. Machine scope opens for every account, so the owner and
+    list checks are what keep a handoff another local account made around a key it chose from being
+    read: that account owns its file. They do not keep out an account that holds a privilege to set
+    any owner, such as the restore privilege Administrators and Backup Operators hold. A blob that
+    is not machine-scope DPAPI is refused after it is read.
 
     Raises ``FileNotFoundError`` when there is none, :class:`CustodyError` for each refusal above or
     a blob that is not a host blob, and the DPAPI errors of
@@ -904,14 +912,10 @@ def read_systemd_credential(name: str, *, environ: Mapping[str, str] | None = No
     caller does not fall back to a weaker provider: on any host but Linux, since systemd credentials
     are Linux-only, and for a directory that is not an absolute path or does not exist. It raises
     :class:`CustodyError` too for a name that is not a plain file name and content that is not a
-    host blob, and for every refusal :func:`_read_posix_checked` makes under the credential policy,
-    which :func:`_posix_file_problem` lists. Those include at least a link, anything but a regular
-    file, a file on a file system that keeps an access model of its own, a file owned by an account
-    other than root or the engine's own, group write or execute or any access for other accounts in
-    the mode, group read in the mode when there is no access control list, any access for the
-    file's group in the list's group entry, and any named user or group entry in the list but read
-    for the engine's own uid. The owner's own bits and the setuid, setgid and sticky bits are not
-    judged. systemd writes the credential owned by root at mode ``0400`` and grants a non-root
+    host blob, and for every refusal :func:`_read_posix_checked` makes under
+    :data:`_CREDENTIAL_POLICY`, which :func:`_posix_file_problem` lists; that policy fixes no mode,
+    so the owner's own bits and the setuid, setgid and sticky bits are not judged. systemd writes
+    the credential owned by root at mode ``0400`` and grants a non-root
     service user read through a named entry, which shows the mode as ``0440`` because the group
     bits are then the list's mask; where the file system takes no access control list it gives the
     file to the service user and group at mode ``0400`` instead. Neither form grants the file's

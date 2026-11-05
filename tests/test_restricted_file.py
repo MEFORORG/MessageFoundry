@@ -206,6 +206,46 @@ def test_the_exact_check_refuses_what_it_could_not_read_or_an_open_list() -> Non
     assert "does not block inheritance" in str(_exact(_held(*_EXACT_READ, protected=False)))
 
 
+_HandleVolume = restricted_file._HandleVolume
+
+
+def test_a_key_file_volume_must_be_local_ntfs_or_refs() -> None:
+    assert restricted_file._volume_problem(_HandleVolume(file_system="NTFS")) is None  # controls
+    assert restricted_file._volume_problem(_HandleVolume(file_system="ReFS")) is None
+    # A server or a user-mode file system reports the owner and list; this host keeps neither.
+    remote = _HandleVolume(file_system="NTFS", characteristics=0x10)
+    assert "network volume" in str(restricted_file._volume_problem(remote))
+    network = _HandleVolume(file_system="NTFS", device_type=0x14)
+    assert "network volume" in str(restricted_file._volume_problem(network))
+    assert "FAT32 volume" in str(
+        restricted_file._volume_problem(_HandleVolume(file_system="FAT32"))
+    )
+    assert "nameless volume" in str(restricted_file._volume_problem(_HandleVolume()))
+    failed = _HandleVolume(error="Win32 error 1")
+    assert "could not be read (Win32 error 1)" in str(restricted_file._volume_problem(failed))
+
+
+def test_the_foreign_file_system_list_cannot_be_changed_at_run_time() -> None:
+    with pytest.raises(TypeError):
+        restricted_file.LINUX_FOREIGN_ACCESS_MODEL_FILE_SYSTEMS[0x6969] = "x"  # type: ignore[index]
+
+
+def test_a_file_that_cannot_be_removed_after_a_failure_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _refuse(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(errno.EACCES, "Access is denied")
+
+    monkeypatch.setattr(Path, "unlink", _refuse)
+    with pytest.raises(RestrictedFileError, match="left behind") as excinfo:
+        try:
+            raise RestrictedFileError("the original failure")
+        except RestrictedFileError:
+            restricted_file._remove_failed(tmp_path / "store.key")
+    # The original failure is kept as the context, not replaced by the unlink error.
+    assert "the original failure" in str(excinfo.value.__context__)
+
+
 # --- pure policy: the read check ------------------------------------------------------------------
 
 

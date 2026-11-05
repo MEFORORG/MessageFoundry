@@ -483,7 +483,8 @@ pure-Python equivalent:
   `kernel32`'s `CreateFileW`, `FILE_FLAG_OPEN_REPARSE_POINT` and a share mode that admits only other
   readers, so a link is opened as itself and the file at that name cannot be replaced while it is
   checked, and `GetFileType` refuses anything but a disk file (vault BACKLOG #3411). Its owner and
-  access list are read through that handle with `advapi32`'s `GetSecurityInfo`
+  access list are read through that handle with `advapi32`'s `GetSecurityInfo`, and its volume
+  with `kernel32`'s `GetVolumeInformationByHandleW` and `ntdll`'s `NtQueryVolumeInformationFile`
   (`restricted_file.key_file_handle_problem`), never by name. Nothing calls these reads yet. On
   Linux it opens the file with `O_NOFOLLOW` and reads its mode, owner, group and POSIX access
   control list from the open descriptor, and calls the C library's `fstatfs` through `ctypes` on

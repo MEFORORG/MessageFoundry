@@ -791,6 +791,26 @@ def test_a_host_file_at_0400_is_refused_for_real(tmp_path: Path) -> None:
         custody.read_host_file(path)
 
 
+@linux_only
+def test_a_c_library_with_no_fstatfs_refuses_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ctypes
+
+    class _NoSymbols:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            pass
+
+        def __getattr__(self, name: str) -> object:
+            raise AttributeError(name)
+
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    monkeypatch.setattr(ctypes, "CDLL", _NoSymbols)
+    with pytest.raises(CustodyError, match="file system could not be read"):
+        custody.read_host_file(path)
+
+
 def test_the_file_system_type_is_read_on_linux_only(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "platform", "darwin")
     with pytest.raises(RestrictedFileError, match="Linux only"):
@@ -1022,6 +1042,21 @@ def test_windows_the_owner_and_list_are_read_through_the_open_handle(
     monkeypatch.setattr(restricted_file, "broad_access_problem", _by_name)
     assert custody.read_host_file(path) == _blob()
     assert len(handles) == 2 and handles[0] == handles[1]  # the handle opened is the one judged
+
+
+@windows_only
+def test_windows_a_check_that_cannot_run_is_a_custody_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())
+
+    def _fails(handle: int, *, engine_read_only: bool) -> str | None:
+        raise OSError(5, "Access is denied")
+
+    monkeypatch.setattr(restricted_file, "key_file_handle_problem", _fails)
+    with pytest.raises(CustodyError, match="owner and access list could not be read"):
+        custody.read_host_file(path)
 
 
 @windows_only
