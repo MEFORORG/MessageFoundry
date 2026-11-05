@@ -1060,7 +1060,7 @@ def verify_audit_body_digest(
 # refused body against a copy of it, an edit-resend audit row against the body it sent), so a match
 # across the two would claim an equality of bodies neither check made. The label keeps the keys
 # apart whatever bytes each covers: a listener's refusal is digested as received, a loopback
-# re-ingress refusal as the engine holds the reply (vault BACKLOG #4796).
+# re-ingress refusal as docs/CONFIGURATION.md states (vault BACKLOG #4796).
 _REFUSED_BODY_DIGEST_INFO = b"mefor/refused-body-digest/v1"
 #: The two HKDF-SHA256 steps a refused-body digest key takes from the DEK, as its record names them.
 REFUSED_BODY_DIGEST_KDF = (
@@ -1075,8 +1075,8 @@ def _derive_refused_body_digest_key(audit_key: bytes) -> bytes:
 
 def refused_body_digest(cipher: Cipher, wire: bytes) -> dict[str, str] | None:
     """A keyed digest of a refused body: one the listener refused before ingress, exactly as
-    received (vault BACKLOG #2608), or a captured reply a loopback re-ingress refused, as the engine
-    holds it (vault BACKLOG #4796). When the engine records it, and why it is keyed, is stated once in
+    received (vault BACKLOG #2608), or a captured reply a loopback re-ingress refused (vault
+    BACKLOG #4796). When the engine records it, and why it is keyed, is stated once in
     docs/CONFIGURATION.md under ``[inbound].refused_body_allowance_bytes``.
 
     Returns ``{"alg", "kdf", "key_id", "digest"}``: HMAC-SHA256 under a key HKDF-SHA256 derives from
