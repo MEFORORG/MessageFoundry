@@ -5555,6 +5555,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # `approval:listing` (vault BACKLOG #3747). Since vault BACKLOG #2254 also an
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
         "audit_write_failed",
+        # vault BACKLOG #3193 N1: an approval audit row the gate read back as stored, or most
+        # likely stored, whose off-box copy was never sent. Keyed `approval:<id>`, as above.
+        "audit_offbox_copy_missing",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
         # a pass left accounts unrevoked (the breaker tripped, or probes were referred, BACKLOG
         # #2538), and one principal's sessions were revoked.

@@ -680,7 +680,29 @@ class AlertSink(Protocol):
         every inline reload's into the one ``config_reload:inline`` instance, and every queue
         listing's into the one ``approval:listing`` instance, until an operator resolves it.
         Nothing resolves it automatically. Carries the key and the action name only:
-        no username, no params, no PHI."""
+        no username, no params, no PHI.
+
+        **A failed write is not proof the row is missing.** A COMMIT can land with its reply lost,
+        so the reason says the write failed and the row MAY be missing (vault BACKLOG #3193 item 4).
+        Where the gate has read back that the row is in the store, it raises
+        :meth:`audit_offbox_copy_missing` instead."""
+        ...
+
+    def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
+        """An audit row is in the store, or most likely is, but its off-box copy was never sent
+        (vault BACKLOG #3193 N1). The store tees a row off-box only after a COMMIT it saw succeed,
+        so when the write reported an error and its COMMIT landed anyway, the forwarded audit
+        stream lacks the row and nothing else reports the gap. Distinct from
+        :meth:`audit_write_failed`, whose row may be missing from the store too.
+
+        The approval gate raises it where it read the row back: a request whose write reported an
+        error and reads back held, with its ``approval.requested`` row in the same write; and an
+        outcome whose combined write reported an error while the row had already left
+        ``executing``, so that write most likely committed its row. ``name`` is
+        ``approval:<approval id>`` and ``action`` the row's audit action, as for
+        :meth:`audit_write_failed`. Not connection-scoped, so no rule's ``control_action`` fires on
+        it, and repeated raises on one key fold into one instance until an operator resolves it.
+        Carries the key and the action name only: no username, no params, no PHI."""
         ...
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:
@@ -1357,7 +1379,18 @@ class LoggingAlertSink:
 
     def audit_write_failed(self, name: str, *, action: str) -> None:
         log.warning(
-            "ALERT audit_write_failed: the %s audit row for %r was not written", action, name
+            "ALERT audit_write_failed: the write of the %s audit row for %r failed; the row may be "
+            "missing from the audit log",
+            action,
+            name,
+        )
+
+    def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
+        log.warning(
+            "ALERT audit_offbox_copy_missing: the %s audit row for %r is in the store or most "
+            "likely is, but its off-box copy was not written",
+            action,
+            name,
         )
 
     def administrator_granted(self, name: str, *, via: str, granted_by: str) -> None:

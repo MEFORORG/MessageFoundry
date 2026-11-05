@@ -1504,7 +1504,22 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "type": "audit_write_failed",
                 "connection": name,
                 "action": action,
-                "reason": f"the {action} audit row was not written",
+                # Not "was not written": a COMMIT can land with its reply lost (vault BACKLOG
+                # #3193 item 4), and a row read back as stored raises the alert below instead.
+                "reason": f"the write of the {action} audit row failed; it may be missing",
+            }
+        )
+
+    def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
+        # vault BACKLOG #3193 N1: the row is in the store, or most likely is, but the store tees
+        # off-box only after a COMMIT it saw succeed, so the forwarded copy was never sent. Keyed
+        # `approval:<id>`, as audit_write_failed is, and its own instance. No PHI.
+        self._emit(
+            {
+                "type": "audit_offbox_copy_missing",
+                "connection": name,
+                "action": action,
+                "reason": f"the {action} audit row's off-box copy was not written",
             }
         )
 

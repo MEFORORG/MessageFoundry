@@ -2787,8 +2787,8 @@ than to one request.
   caller and their address;
 - the `approval.approver_provenance` row a release or a resolution writes after it has gone ahead.
   The log line carries the row's detail;
-- the request or repeat write, including one that reads back as held, as below. The log line names
-  the actor and the operation, or is a WARNING for a held one;
+- the request or repeat write, except one that reads back as held, as below. The log line names
+  the actor and the operation;
 - a claim, a rejection or a resolution that answers 503, and a claim whose approve was cancelled.
   The log line carries the exception, not the row's detail.
 
@@ -2799,7 +2799,13 @@ start tries again.
 An outcome's combined write can fail while the status write that follows finds the row already
 moved. The combined write most likely committed, and only its reply was lost, so the gate writes
 no second row. It logs at ERROR and pages, because the store writes a row's off-box copy only
-after a commit it saw succeed (vault BACKLOG #3193).
+after a commit it saw succeed (vault BACKLOG #3193). The page is `audit_offbox_copy_missing`, not
+`audit_write_failed`: the row is most likely in the local audit log, and only its off-box copy is
+known to be missing (vault BACKLOG #3193 N1). It is keyed `approval:<id>` and carries the row's
+action name.
+
+The `audit_write_failed` alert's reason says the write failed and the row may be missing, never that
+it was not written: a COMMIT can land despite the error, as stated for the claim above.
 
 A call can be cancelled mid-write, for example by the request timeout. The gate then writes no
 ERROR line and no alert for at least two writes: a rejection, and a refusal's row. The gate
@@ -2826,8 +2832,9 @@ on a programming defect, rather than a store fault, is raised as it is.
 The request and its `approval.requested` row are one write, as above. When that write reports an
 error, the gate reads the request back by its id. If it is held and its seal holds, the COMMIT
 landed and only its reply was lost. The gate then answers the same **202** with that id, logs a
-WARNING, and still pages. Its row reaches the local audit log but not the off-box copy, which is
-written only after a commit the store saw succeed, and the page is what reports that gap. A cancel reaches the caller at once, while
+WARNING, and still pages, as `audit_offbox_copy_missing` (vault BACKLOG #3193 N1). Its row reaches
+the local audit log but not the off-box copy, which is written only after a commit the store saw
+succeed, and the page is what reports that gap. A cancel reaches the caller at once, while
 the write finishes on its own, and the shutdown drain waits for it.
 
 A retry can still file a second request. At least these cases leave the request held while the

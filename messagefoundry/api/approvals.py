@@ -900,7 +900,9 @@ class ApprovalGate:
                     )
                     # Still paged: the store tees off-box only after a commit it saw succeed, so
                     # the forwarded audit stream lacks this row and nothing else reports the gap.
-                    self._alert_lost_audit(approval_id, "approval.requested")
+                    # The row itself is stored, so the page says only the copy is missing (vault
+                    # BACKLOG #3193 N1).
+                    self._alert_lost_audit(approval_id, "approval.requested", stored=True)
                     return approval_id
                 state = {
                     "absent": "Reading it back found no such request, so most likely nothing is held",
@@ -1700,8 +1702,9 @@ class ApprovalGate:
 
         **When the combined write fails**, the status is written alone, so an audit outage never
         leaves the row ``executing``. If that status write finds the row already moved, the method
-        stops there. The combined write most likely committed. No second row is written, and
-        nothing pages. Otherwise the audit row is written alone. If that fails as well, the loss is
+        stops there. The combined write most likely committed. No second row is written, and it
+        pages ``audit_offbox_copy_missing``, since that row's off-box copy was never sent (vault
+        BACKLOG #3193 N1). Otherwise the audit row is written alone. If that fails as well, the loss is
         logged at ERROR with the detail and pages ``audit_write_failed``. If the status
         write fails too, the row may still read ``executing`` until this process restarts, when
         :meth:`reconcile_after_restart` moves it to ``interrupted`` (BACKLOG #2087 limb 4).
@@ -1756,7 +1759,8 @@ class ApprovalGate:
                 )
                 # Paged, as a request that reads back as held is (vault BACKLOG #3193): the store
                 # tees off-box only after a commit it saw succeed, so nothing else reports the gap.
-                self._alert_lost_audit(approval_id, action)
+                # As there, the page says the copy is missing, not the row (N1).
+                self._alert_lost_audit(approval_id, action, stored=True)
                 return
         else:
             if moved:
@@ -2032,18 +2036,27 @@ class ApprovalGate:
             "is still needed, run it again: it now runs without a second approver",
         )
 
-    def _alert_lost_audit(self, approval_id: str, action: str, *, key: str | None = None) -> None:
+    def _alert_lost_audit(
+        self, approval_id: str, action: str, *, key: str | None = None, stored: bool = False
+    ) -> None:
         """Page on an audit row the gate could not write (vault BACKLOG #2255).
 
         The caller logs the loss itself, with whatever detail it holds. This only raises the
         ``audit_write_failed`` alert, and is best effort by the sink's own contract. The key is
         ``approval:<id>`` unless ``key`` names another. A lost resolver flag passes
         ``approval:<id>:resolve``, so it cannot fold into a lost release flag (vault BACKLOG
-        #3438)."""
+        #3438). ``stored`` says the caller read back that the row is in the store, or most likely
+        is, so only its off-box copy is missing: that raises ``audit_offbox_copy_missing``
+        instead (vault BACKLOG #3193 N1)."""
+        name = key or f"approval:{approval_id}"
+        alert = "audit_offbox_copy_missing" if stored else "audit_write_failed"
         try:
-            self._alert_sink.audit_write_failed(key or f"approval:{approval_id}", action=action)
+            if stored:
+                self._alert_sink.audit_offbox_copy_missing(name, action=action)
+            else:
+                self._alert_sink.audit_write_failed(name, action=action)
         except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
-            log.exception("approval %s: the audit_write_failed alert failed to emit", approval_id)
+            log.exception("approval %s: the %s alert failed to emit", approval_id, alert)
 
     async def _approver_changes(self, approver_user_id: str, requested_at: float) -> list[str]:
         """Which of the approver account's credential facts changed AFTER the request (BACKLOG #315
