@@ -139,6 +139,10 @@ _NOT_HANDED_DOWN: dict[Row, str] = {
         "own rig store (vault BACKLOG #2354). If its settings ever named a Vault provider, an "
         "unattested off-box Vault would be warned there, not refused"
     ),
+    ("pipeline/engine.py", "Engine._reload_snapshot_blocking", "Engine", _BY_REFERENCE): (
+        "the class name read to reach its static helper _value_file_folders (BACKLOG #2596). No "
+        "Engine is built there and no posture is passed, so no link of the chain is reached"
+    ),
 }
 
 
@@ -364,6 +368,8 @@ _CENSUS: list[Row] = sorted(
         ("pipeline/dr_backup.py", "run_restore_verify", "_verify_archive_blocking", "posture"),
         ("pipeline/dr_backup.py", "run_restore_verify", "resolve_decrypt_keys", "posture"),
         ("pipeline/engine.py", "Engine.start", "BackupRunner", "self._hop_posture"),
+        # Not a call: `Engine._value_file_folders(...)` reads the class name (BACKLOG #2596).
+        ("pipeline/engine.py", "Engine._reload_snapshot_blocking", "Engine", _BY_REFERENCE),
         ("privilege_probes.py", "probe_vault", "secrets_vault_client", "posture"),
         ("privilege_probes.py", "probe_vault", "store_vault_client", "posture"),
         ("privilege_probes.py", "read_ldap_bind", "resolve_secret_provider", "posture"),

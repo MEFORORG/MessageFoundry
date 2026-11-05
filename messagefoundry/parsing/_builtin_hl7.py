@@ -70,6 +70,7 @@ __all__ = [
     "unescape",
     "unescape_separators",
     "escape_leaf",
+    "escape_leaf_alters",
     "escape_expansion_estimate",
     "EscapeScanLimitExceeded",
     "MAX_COUNTED_ESCAPE_OPENERS",
@@ -877,6 +878,27 @@ def escape_leaf(value: str, seps: tuple[str, str, str, str, str]) -> str:
     that holds it (``\\F\\`` under component separator ``F``) is split on re-parse. A hex escape of
     the character, or refusing the write, would avoid that; this function does neither yet."""
     return value.translate(_leaf_escape_table(seps))
+
+
+@lru_cache(maxsize=32)
+def _leaf_escaped_chars(seps: tuple[str, str, str, str, str]) -> tuple[str, ...]:
+    """Every character :func:`escape_leaf` rewrites under ``seps``: the keys of its table. The
+    delimiters come first, so a value holding one, the likelier refusal, is found on an early
+    pass rather than after one full pass per control character."""
+    keys = [chr(code) for code in _leaf_escape_table(seps)]
+    return tuple(sorted(keys, key=lambda ch: ch not in seps))
+
+
+def escape_leaf_alters(value: str, seps: tuple[str, str, str, str, str]) -> bool:
+    """Whether :func:`escape_leaf` would change ``value`` under ``seps``, without building the copy.
+
+    Exact by construction: :func:`escape_leaf` is one ``str.translate`` over a table that maps each
+    of its keys to an escape at least three characters long and leaves every other character as it
+    is, so the output differs from ``value`` exactly when ``value`` holds a key. One ``in`` scan per
+    key, a few dozen of them, so the cost is linear in ``value`` and no copy of it is made. The
+    translate itself is not: measured on hostile input it grew faster than the value (BACKLOG
+    #5099), which matters where a sender's value is checked before the ACK."""
+    return any(ch in value for ch in _leaf_escaped_chars(seps))
 
 
 def unescape_separators(value: str, seps: tuple[str, str, str, str, str]) -> str:

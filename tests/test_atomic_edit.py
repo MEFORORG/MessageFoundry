@@ -151,6 +151,39 @@ def test_a_refused_edit_keeps_the_owner_only_mode_and_the_bytes(
     assert _leftovers(path.parent) == []
 
 
+def _connections_remove(tmp_path: Path) -> tuple[Path, Edit]:
+    path = tmp_path / "connections.toml"
+    path.write_text(CONNECTIONS_TOML, encoding="utf-8")
+    return path, lambda v: connections_edit.remove_connection(tmp_path, "OB_TOML", validate=v)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [_security, _alerts, _codeset, _connections, _connections_remove],
+    ids=["security", "alert", "codeset", "conn", "conn-remove"],
+)
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+def test_a_refused_edit_leaves_the_file_byte_for_byte(
+    tmp_path: Path, make: Callable[[Path], tuple[Path, Edit]], ending: bytes
+) -> None:
+    """Vault BACKLOG #2944 item 3: after a REFUSED toggle, the old rollback rewrote a CRLF
+    connections.toml as LF. The toggle no longer writes the file (the flag lives in the store), so
+    this pins the same guarantee on at least these file-writing entry points (not alerts
+    ``remove_rule``). Both endings, because a text-mode rewrite flips one ending on each OS (CRLF
+    to LF on POSIX, LF to CRLF on Windows). No platform skip, so it runs on the Windows test legs."""
+    path, edit = make(tmp_path)
+    # Give every line `ending`: write_text and the CSV writer each pick their own.
+    path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", ending))
+    before = path.read_bytes()
+    lines = before.count(b"\n")
+    assert lines > 0 and before.count(b"\r\n") == (lines if ending == b"\r\n" else 0)
+    # The match pins the refusal to validate time, not an earlier read or parse of the file.
+    with pytest.raises(ValueError, match="simulated load failure"):
+        edit(_refuse)
+    assert path.read_bytes() == before
+    assert _leftovers(path.parent) == []
+
+
 @posix_only
 @EDITORS
 def test_a_successful_edit_leaves_the_file_owner_only(

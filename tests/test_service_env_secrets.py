@@ -366,6 +366,7 @@ def _registry_names(service_env: ServiceEnvPosture | None) -> list[str]:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),

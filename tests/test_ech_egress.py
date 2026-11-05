@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import threading
 import urllib.request
 from collections.abc import Callable
@@ -496,3 +497,83 @@ def test_ech_token_mint_lands_on_the_stub_sidecar() -> None:
         assert seen[0]["host"] == "auth.partner.example"
     finally:
         srv.shutdown()
+
+
+# --- the cleartext engine-to-sidecar hop is named (ADR 0139) ---------------------------------------
+
+#: The construction WARNING's marker, and a credential value that must never reach the log.
+_CLEARTEXT_MARKER = "cleartext ECH sidecar hop"
+_SYNTHETIC_BEARER = "Bearer SYNTHETIC-ECH-TOKEN-0001"
+
+
+def _sidecar_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if _CLEARTEXT_MARKER in r.getMessage()]
+
+
+def test_a_loopback_http_sidecar_warns_at_construction(caplog: pytest.LogCaptureFixture) -> None:
+    """A loopback sidecar passes every hop gate, so before this nothing said the hop is cleartext.
+    The WARNING names the connection and what crosses the hop, and never a header value.
+
+    Captured at DEBUG from every logger, so a header value logged at any level anywhere would be
+    seen. The probe line is the positive control: the capture does see a DEBUG line, and the token
+    in it, so the absence asserted after it is not the capture's blindness."""
+    rest_logger = "messagefoundry.transports.rest"
+    with caplog.at_level(logging.DEBUG), caplog.at_level(logging.DEBUG, logger=rest_logger):
+        logging.getLogger(rest_logger).debug("probe %s", _SYNTHETIC_BEARER)
+        assert _SYNTHETIC_BEARER in caplog.text
+        caplog.clear()
+        _rest(
+            ech_egress=True,
+            ech_sidecar="http://127.0.0.1:8123",
+            headers={"Authorization": _SYNTHETIC_BEARER},
+        )
+    [record] = _sidecar_records(caplog)
+    assert record.levelno == logging.WARNING
+    message = record.getMessage()
+    assert "'OB_REST'" in message
+    assert "request body and every request header" in message and "unencrypted" in message
+    assert "SYNTHETIC-ECH-TOKEN-0001" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"ech_egress": True, "ech_sidecar": "https://127.0.0.1:8123"}, {}],
+    ids=["https-sidecar", "no-ech"],
+)
+def test_an_https_sidecar_or_no_sidecar_does_not_warn(
+    caplog: pytest.LogCaptureFixture, extra: dict[str, Any]
+) -> None:
+    """The control for the test above: the same connection with an https sidecar, or with no ECH,
+    builds and writes no such line."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.rest"):
+        _rest(**extra)
+    assert _sidecar_records(caplog) == []
+
+
+_DECLARATIONS: list[dict[str, Any]] = [
+    {"cleartext_accepted": True, "cleartext_reason": "synthetic: accepted on a trusted segment"},
+    {"tls_hop_attested": True, "tls_hop_attested_reason": "synthetic: stunnel wraps the hop"},
+]
+
+
+@pytest.mark.parametrize("declaration", _DECLARATIONS, ids=["cleartext_accepted", "attested"])
+def test_a_non_loopback_sidecar_is_refused_whatever_the_declaration(
+    declaration: dict[str, Any],
+) -> None:
+    """ADR 0092's acknowledgements lift the cleartext-egress refusal on an off-box http hop. The
+    sidecar resolver refuses an off-box sidecar first, http or https, and neither declaration
+    lifts that, so no acknowledgement can send the sidecar hop off this host."""
+    settings = {**Rest(url="https://partner.example/ingest").settings, "ech_egress": True}
+
+    def build(sidecar: str) -> DestinationConnector:
+        resolved = {**settings, "ech_sidecar": sidecar}
+        return build_destination(
+            Destination(name="OB_REST", type=ConnectorType.REST, settings=resolved, **declaration),
+            egress=permitting(resolved),
+        )
+
+    with pytest.raises(ValueError, match="ech_sidecar must be a loopback address"):
+        build("http://sidecar.example.com:8123")
+    # Control: the same declaration on a loopback sidecar builds, so the refusal above is the
+    # sidecar's host and nothing else about the connection.
+    assert isinstance(build("http://127.0.0.1:8123"), RestDestination)

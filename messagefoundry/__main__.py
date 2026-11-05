@@ -338,13 +338,15 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         action="store_true",
         help="a dev override for a trusted, firewalled network, honoured only under "
         "[security].enforcement=warn. For the API it permits a non-loopback bind with NO operator "
-        "certificate: the engine then serves TLS on its generated self-signed placeholder, which no "
-        "trust store vouches for, so a remote client can authenticate the engine only by pinning "
-        "that exact certificate, handed over out of band. For inbound MLLP, HTTP, DICOM SCP, raw-TCP and "
+        "certificate and no declared upstream terminator: the engine then serves TLS on its "
+        "generated self-signed placeholder, which no trust store vouches for, so a remote client "
+        "can authenticate the engine only by pinning that exact certificate, handed over out of "
+        "band. For inbound MLLP, HTTP, DICOM SCP, raw-TCP and "
         "X12 listeners it permits a non-loopback CLEARTEXT bind, and PHI crosses the network "
-        "unencrypted. Prefer [api].tls_cert_file (+ tls_key_file), which is allowed off-loopback "
-        "without this flag, and per-connection tls where the connector has it (raw-TCP and X12 have "
-        "none). Does not relax the no-auth refuse or the /ui refuse.",
+        "unencrypted. Prefer [api].tls_cert_file (+ tls_key_file; off loopback it also needs "
+        "MEFOR_TLS_REVOCATION_ATTESTED=1, docs/SECURITY.md, API revocation gate), and "
+        "per-connection tls where the connector has it (raw-TCP and X12 have none). It relaxes no "
+        "other API refusal, at least the /ui, plaintext proxy hop and revocation refusals.",
     )
 
     supervise = sub.add_parser(
@@ -1312,29 +1314,36 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     restore = sub.add_parser(
         "restore",
         help="restore a .mfbak archive's store to a NEW destination path: verify -> decrypt -> write "
-        "the store (and optionally the config bundle). REFUSES to overwrite anything (ADR 0049, #60)",
+        "the store (and optionally the config bundle), or with --config-to alone a CONFIG-ONLY "
+        "archive's config bundle. REFUSES to overwrite anything (ADR 0049, #60)",
         epilog=RESTORE_ROLLBACK_NOTICE,
         formatter_class=HelpFormatter,
     )
     restore.add_argument("archive", help="path to the .mfbak archive to restore")
+    # Vault BACKLOG #5233: --to is not argparse-required, because a CONFIG-ONLY archive (a server-DB
+    # store's backup) carries no store for it to name. `_restore` refuses a run with neither.
     restore.add_argument(
         "--to",
-        required=True,
+        default=None,
         help="destination store path to write. It must NOT already exist — restoring over a live store "
-        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused",
+        "is unrecoverable, so an existing file (or SQLite -wal/-shm sidecar) is refused. Required, "
+        "except for a CONFIG-ONLY archive (backup --config-only, or a server-DB store's backup), "
+        "whose bundle --config-to restores alone",
     )
     restore.add_argument(
         "--config-to",
         default=None,
         help="also restore the archive's config bundle into this directory (must be empty or absent). "
-        "Refused when the archive carries no config bundle, or when one of its members would be "
-        "written over the store this restore places at --to",
+        "Without --to, restore ONLY the config bundle of a CONFIG-ONLY archive (backup --config-only, "
+        "or a server-DB store's backup); an archive that carries a store is then refused. Refused "
+        "when the archive carries no config bundle, or when one of its members would be written over "
+        "the store this restore places at --to",
     )
     restore.add_argument(
         "--service-config",
         default=None,
         help="service settings TOML (default: ./messagefoundry.toml if present) — the store key source. "
-        "There is deliberately no --db here (unlike backup / restore-verify): --to IS the store path "
+        "There is deliberately no --db here (unlike backup / restore-verify): --to, when given, IS the store path "
         "this writes, and the decrypt key comes from [store] regardless of any path",
     )
     # BACKLOG #2614: a restore undoes every account change made after the archive was taken, so an
@@ -2611,8 +2620,9 @@ def _read_environment_values(
 
     With ``snapshot``, the value file is parsed from the bytes the snapshot read and never read
     from disk, so a file edited after that read does not apply, and one created or removed since is
-    refused (vault BACKLOG #2596). A value file outside the snapshot's ``environments/`` folder
-    raises :class:`~messagefoundry.config.snapshot.NotInSnapshot` instead."""
+    refused (vault BACKLOG #2596). A value file the snapshot does not cover, outside its
+    ``environments/`` folder and not the value file the engine read into it, raises
+    :class:`~messagefoundry.config.snapshot.NotInSnapshot` instead."""
     import os
 
     from messagefoundry.config.environments import (
@@ -2654,7 +2664,7 @@ def _read_environment_values(
     env_file = values_file_path(base_dir, dir_name, environment)
     if snapshot is not None and not snapshot.covers_environment_file(env_file):
         # Before the vetting below, so the plain read the engine then makes vets the file once.
-        raise NotInSnapshot(f"{env_file} is not in the config snapshot's environments folder")
+        raise NotInSnapshot(f"{env_file} is not a value file the config snapshot read")
     # With a snapshot, its folder is vetted even when the file has gone: the bytes that apply were
     # read earlier, and whoever can write the folder could have planted them (vault BACKLOG #2596).
     assert_trusted_start_paths(
@@ -3299,6 +3309,7 @@ def _serve(args: argparse.Namespace) -> int:
         attested_hops=(),
         revocation_attested_hops=(),
         path_form_fhir_hops=(),
+        ech_cleartext_sidecar_hops=(),
         api=settings.api,
         approvals=settings.approvals,
         cert_monitor=settings.cert_monitor,
@@ -3319,7 +3330,9 @@ def _serve(args: argparse.Namespace) -> int:
             "Per-connection cleartext_accepted (ADR 0153), tls_allow_expired, tls_check_hostname, "
             "url_query_credential, "
             "generic-ODBC "
-            "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173) and FHIR update_url_form declarations are NOT in this list — the graph is not loaded yet; they are "
+            "database TLS, tls_hop_attested, tls_revocation_attested (ADR 0173), FHIR update_url_form "
+            "and http ECH sidecar (ADR 0139) declarations are NOT in this list — the graph is not "
+            "loaded yet; they are "
             "reported by `messagefoundry check` and GET /security/posture, and most also by the "
             "connector construction gate. Nor is the store-principal privilege observation (#1008) — the "
             "store is not open yet; the startup preflight logs and audits it moments from now.",
@@ -3405,6 +3418,21 @@ def _serve(args: argparse.Namespace) -> int:
     # "a non-loopback bind REFUSES to serve until a real certificate is configured." So this gate
     # keeps keying on tls_enabled (an OPERATOR certificate) rather than on the minted pair, and the
     # messages say why.
+    from messagefoundry.api.tls import (
+        off_loopback_certificate_remedy,
+        plaintext_upstream_hop_off_loopback,
+        plaintext_upstream_hop_off_loopback_remedy,
+        plaintext_upstream_hop_unacknowledged,
+    )
+
+    # The loopback levers a refusal names. `serve --host` overrides the file, so when it is set,
+    # editing [security].listen_address changes nothing and the refusal names the flag alone
+    # (the BACKLOG #1361 trap the /ui refusal below records).
+    loopback_levers = (
+        "serve --host, which overrides [security].listen_address"
+        if args.host is not None
+        else "[security].listen_address or serve --host"
+    )
     if not settings.api.is_loopback:
         if settings.api.tls_enabled:
             # WP-13a: TLS terminates in-process, so tokens + PHI are encrypted on the wire and HSTS
@@ -3412,17 +3440,36 @@ def _serve(args: argparse.Namespace) -> int:
             logging.getLogger(__name__).info(
                 "API on non-loopback host %r with in-process TLS (https/wss).", settings.api.host
             )
-        elif settings.api.tls_terminated_upstream:
-            # WP-15: a reverse proxy terminates TLS in front; trust forwarded headers only from the
-            # declared proxies (the validator guarantees trusted_proxies is set here). The log names
-            # the CONFIGURED list; uvicorn_trusted_hosts says what serve adds to it for uvicorn.
-            logging.getLogger(__name__).info(
-                "API on non-loopback host %r behind a TLS-terminating proxy; trusting forwarded "
-                "headers from %s (an IPv4 entry is also trusted in its ::ffff:-mapped spelling, "
-                "and an entry inside ::ffff:0:0/96 in its plain IPv4 one).",
-                settings.api.host,
-                settings.api.trusted_proxies,
+            if settings.api.tls_terminated_upstream:
+                # WP-15: a reverse proxy terminates TLS in front and re-encrypts to this listener;
+                # trust forwarded headers only from the declared proxies (the validator guarantees
+                # trusted_proxies is set here). The log names the CONFIGURED list;
+                # uvicorn_trusted_hosts says what serve adds to it for uvicorn.
+                logging.getLogger(__name__).info(
+                    "API on non-loopback host %r behind a TLS-terminating proxy; trusting forwarded "
+                    "headers from %s (an IPv4 entry is also trusted in its ::ffff:-mapped spelling, "
+                    "and an entry inside ::ffff:0:0/96 in its plain IPv4 one).",
+                    settings.api.host,
+                    settings.api.trusted_proxies,
+                )
+        elif plaintext_upstream_hop_off_loopback(settings.api):
+            # BACKLOG #4636: a declared terminator with no operator certificate serves the
+            # proxy-to-engine hop in plaintext, and owner ruling R1 of 2026-10-27 on BACKLOG #1179
+            # accepts that hop from a same-machine proxy only. So off loopback it is refused,
+            # acknowledged or not, in every mode, ahead of the acknowledgement arm below. The
+            # predicate is shared with `messagefoundry check`.
+            remedy = plaintext_upstream_hop_off_loopback_remedy(loopback_levers)
+            print(
+                "error: refusing to serve a PLAINTEXT proxy-to-engine hop on the non-loopback API "
+                f"bind host {settings.api.host!r}. With [api].tls_terminated_upstream and no "
+                "[api].tls_cert_file the engine serves that hop in plaintext, which serve accepts "
+                "only on a loopback bind (127.0.0.1, ::1 or localhost); off loopback the "
+                "acknowledgement does not clear it. "
+                f"{remedy}, trusting that certificate. See docs/SECURITY.md, Plaintext proxy hop "
+                "(BACKLOG #4636).",
+                file=sys.stderr,
             )
+            return 2
         elif insecure_bind_ok and not enforcing:
             # The engine goes on to serve https on the minted placeholder (ADR 0172), which
             # tests/test_api_tls.py::test_serve_insecure_bind_warn_path_serves_https_on_the_placeholder
@@ -3435,7 +3482,7 @@ def _serve(args: argparse.Namespace) -> int:
                 "engine only by pinning that exact certificate, handed over out of band; any other "
                 "client cannot tell the engine from an on-path attacker presenting a certificate of "
                 "its own. "
-                "Configure [api].tls_cert_file (+ tls_key_file) for real remote access.",
+                f"For real remote access, {off_loopback_certificate_remedy()}.",
                 file=sys.stderr,
             )
         elif insecure_bind_ok:
@@ -3454,9 +3501,10 @@ def _serve(args: argparse.Namespace) -> int:
                 "so a remote client can authenticate the engine only by pinning that exact "
                 "certificate, handed over out of band; --allow-insecure-bind cannot relax that under strict "
                 "enforcement (#200), and neither can [security].require_encryption_for_remote=false. "
-                "Configure [api].tls_cert_file for in-process "
-                "TLS, set [api].tls_terminated_upstream (+ trusted_proxies) if a proxy terminates "
-                "TLS, or set [security].enforcement=warn to accept serving on the placeholder on a "
+                f"Either {off_loopback_certificate_remedy()} (docs/SECURITY.md, API revocation "
+                "gate; with [api].tls_terminated_upstream + trusted_proxies beside it if a proxy "
+                "terminates TLS and re-encrypts to the engine, BACKLOG #4636), or set "
+                "[security].enforcement=warn to accept serving on the placeholder on a "
                 "trusted, firewalled network.",
                 file=sys.stderr,
             )
@@ -3467,9 +3515,10 @@ def _serve(args: argparse.Namespace) -> int:
                 f"{settings.api.host!r} without an operator certificate. The only certificate "
                 "available is the engine's generated self-signed placeholder, which no trust store "
                 "vouches for, so a remote client can authenticate the engine only by pinning that "
-                "exact certificate, handed over out of band. Configure "
-                "[api].tls_cert_file for in-process TLS, set [api].tls_terminated_upstream "
-                "(+ trusted_proxies) if a proxy terminates TLS, or, under "
+                "exact certificate, handed over out of band. Either "
+                f"{off_loopback_certificate_remedy()} (docs/SECURITY.md, API revocation gate; with "
+                "[api].tls_terminated_upstream + trusted_proxies beside it if "
+                "a proxy terminates TLS and re-encrypts to the engine, BACKLOG #4636), or, under "
                 "[security].enforcement=warn, pass --allow-insecure-bind to accept serving on the "
                 "placeholder on a trusted, firewalled network.",
                 file=sys.stderr,
@@ -3480,38 +3529,42 @@ def _serve(args: argparse.Namespace) -> int:
     # documented delegation). WHEN the engine terminates TLS IN-PROCESS (uvicorn, [api].tls_cert_file)
     # on a network-reachable host, a REVOKED-but-unexpired server (or mTLS client) certificate is still
     # accepted: stdlib `ssl` performs no OCSP/CRL fetch and the engine deliberately attempts none (on-
-    # prem, offline-by-default; CLAUDE.md §2). Revocation must be PROVEN IN FRONT — a declared TLS-
-    # terminating reverse proxy (tls_terminated_upstream + trusted_proxies, WP-15, which does its own
-    # OCSP-must-staple / CRL revocation) OR an explicit operator attestation
-    # (MEFOR_TLS_REVOCATION_ATTESTED=1) that the terminator/PKI enforces revocation. Absent both, refuse
-    # fail-closed. Loopback and proxy-terminated deployments never reach this — they start byte-
-    # identically (the predicate short-circuits). Layered AFTER the §0 exposed-bind ladder above
-    # (extend-never-weaken), like the keyless-store / open-egress / MFA-at-exposure gates.
-    proxy_terminated = settings.api.tls_terminated_upstream and bool(settings.api.trusted_proxies)
+    # prem, offline-by-default; CLAUDE.md §2). So refuse fail-closed unless the operator attests
+    # (MEFOR_TLS_REVOCATION_ATTESTED=1) that its PKI enforces revocation; a declared terminator does
+    # not exempt the bind (BACKLOG #4636; docs/SECURITY.md, API revocation gate, says why). Layered
+    # AFTER the §0 exposed-bind ladder above (extend-never-weaken), like the keyless-store /
+    # open-egress / MFA-at-exposure gates.
     if in_process_tls_revocation_refused(
         tls_enabled=settings.api.tls_enabled,
         is_loopback=settings.api.is_loopback,
-        proxy_terminated=proxy_terminated,
         attested=tls_revocation_attested(),
     ):
+        terminator_note = (
+            "The declared [api].tls_terminated_upstream does not exempt this bind: the engine still "
+            "terminates the proxy-to-engine hop's TLS itself (BACKLOG #4636). "
+            if settings.api.tls_terminated_upstream
+            else ""
+        )
         print(
             "error: refusing to serve the API with in-process TLS on non-loopback host "
             f"{settings.api.host!r}: the engine terminates TLS itself but performs NO certificate "
             "revocation check (stdlib ssl has no OCSP/CRL fetch; the engine is offline-by-default), so "
-            "a revoked-but-unexpired certificate would still be accepted (ASVS 12.1.4). Terminate TLS "
-            "at a revocation-checking reverse proxy (set [api].tls_terminated_upstream + "
-            "[api].trusted_proxies; e.g. OCSP-must-staple at IIS/nginx/Caddy), or set "
-            "MEFOR_TLS_REVOCATION_ATTESTED=1 to attest that your TLS terminator/PKI enforces "
-            "revocation. See docs/adr/0078-certificate-revocation-posture.md.",
+            "a revoked-but-unexpired certificate would still be accepted (ASVS 12.1.4). "
+            f"{terminator_note}Set "
+            "MEFOR_TLS_REVOCATION_ATTESTED=1 to attest that your PKI enforces revocation for the "
+            "certificates this engine serves and accepts, or bind the engine to loopback "
+            f"({loopback_levers}) behind a revocation-checking reverse proxy on the same machine. "
+            "See docs/SECURITY.md, API revocation gate (ADR 0078).",
             file=sys.stderr,
         )
         return 2
 
     # --- #200 Posture-B (upstream TLS termination) fail-closed gate (ASVS 4.2.1/4.4.1, 11.6.2) ------
     # When a reverse proxy terminates TLS in front (settings.api.tls_terminated_upstream), the exposed-
-    # gate above ALLOWS the off-loopback bind unconditionally — but two properties are then UNVERIFIABLE
-    # by the engine: (a) the proxy→engine internal hop is a plaintext segment, so a rogue peer on that
-    # segment could impersonate the proxy unless the hop is authenticated; and (b) the engine terminates
+    # gate above ALLOWS the off-loopback bind once an operator certificate serves the proxy→engine hop
+    # (BACKLOG #4636 refuses a plaintext one there) — but two properties are then UNVERIFIABLE by the
+    # engine: (a) a rogue peer on the proxy→engine segment could impersonate the proxy unless the hop
+    # is authenticated; and (b) the engine terminates
     # no browser TLS, so it cannot observe the proxy's negotiated version/KEX floor (11.6.2). The engine
     # cannot inspect either, so it requires the operator to AFFIRMATIVELY DECLARE them (attestations made
     # fail-closed) before an off-loopback Posture-B bind may start under enforcement. The split is
@@ -3533,7 +3586,8 @@ def _serve(args: argparse.Namespace) -> int:
     # refusal.
     # ONE EXCEPTION, and it is not dial-governed: the BACKLOG #1179 plaintext-hop acknowledgement at the
     # top of the block refuses in EVERY mode. Do not move it under `enforcing` to match the paragraphs
-    # above; the owner ruled that hop the deploying site's to secure, whatever the dial says.
+    # above; the owner ruled that hop the deploying site's to secure, whatever the dial says. Its
+    # BACKLOG #4636 sibling, which refuses that hop off loopback, sits in the exposed-bind gate above.
     if settings.api.tls_terminated_upstream:
         # BACKLOG #1179: with no operator certificate the engine mints nothing here (ADR 0172 decision
         # 3 -- serving https would break the proxy's own hop), so the proxy-to-engine hop is PLAINTEXT
@@ -3541,22 +3595,21 @@ def _serve(args: argparse.Namespace) -> int:
         # it on. Keyed on api_tls_source, the same branch order that decides what the listener serves:
         # an operator tls_cert_file wins over the no-mint branch, so with one the hop is TLS and there
         # is nothing to acknowledge. Unlike the attestations below this refuses in EVERY mode,
-        # enforcing or warn, loopback or not: it asks nothing the engine could check, only who owns a
+        # enforcing or warn: it asks nothing the engine could check, only who owns a
         # hop the engine leaves unprotected. The predicate is shared with `messagefoundry check`.
-        from messagefoundry.api.tls import plaintext_upstream_hop_unacknowledged
-
         if plaintext_upstream_hop_unacknowledged(settings.api):
             print(
                 "error: refusing to serve behind an upstream TLS terminator "
                 "([api].tls_terminated_upstream) without [api].plaintext_upstream_hop_acknowledged. "
                 "The reverse proxy terminates TLS and no [api].tls_cert_file is set, so the engine "
                 "serves the proxy-to-engine hop in PLAINTEXT by design and does nothing to protect "
-                "it. Securing that hop (for example a same-host loopback hop, an isolated network "
-                "segment, or a host firewall) is the deploying site's job. Set "
+                "it. Securing that hop, which is accepted only from a proxy on this same machine, is "
+                "the deploying site's job. Set "
                 "[api].plaintext_upstream_hop_acknowledged = true to acknowledge that you have taken "
                 "it on. Or set [api].tls_cert_file so the engine serves that hop over TLS, and then "
                 "point the proxy at https and have it trust that certificate: a proxy still speaking "
-                "http to an https listener fails every request. See docs/SECURITY.md (ADR 0172).",
+                "http to an https listener fails every request. See docs/SECURITY.md, Plaintext "
+                "proxy hop (ADR 0172).",
                 file=sys.stderr,
             )
             return 2
@@ -3767,15 +3820,18 @@ def _serve(args: argparse.Namespace) -> int:
             "instance is exposed off-box (a non-loopback host, a declared TLS-terminating proxy, "
             "[api].trusted_proxies, or [security].web_console_public_address is set), so the console "
             "is NOT served. To serve the console off-box set [security].serve_web_console=true with "
-            "TLS + [security].web_console_public_address (see "
-            "docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
+            "an operator certificate (off loopback: "
+            f"{off_loopback_certificate_remedy()}) or a proxy in front of a loopback "
+            "engine, + [security].web_console_public_address (see docs/SECURITY.md, Off-loopback "
+            "browser console, and docs/security/OFF-LOOPBACK-DEPLOYMENT.md).",
             file=sys.stderr,
         )
         settings.api.serve_ui = False
 
     # The browser ops dashboard ([api].serve_ui, ADR 0065) is a STRICTER surface than the JSON API: it
     # puts an HttpOnly session cookie and PHI-rendering HTML on the wire. An off-loopback /ui bind
-    # therefore REQUIRES exposure_protected (in-process TLS or a declared upstream terminator) and is
+    # therefore REQUIRES exposure_protected, which off loopback means an operator tls_cert_file: the
+    # plaintext-hop arm above already refused a terminator with no certificate (BACKLOG #4636). It is
     # refused even under --allow-insecure-bind (that dev override covers only the JSON API served on
     # the self-signed placeholder, never the browser surface; BACKLOG #1672). The loopback default
     # never trips this. The hop here is NOT cleartext: the non-loopback gate above has already
@@ -3783,7 +3839,7 @@ def _serve(args: argparse.Namespace) -> int:
     # declared proxy, where the engine would serve https on the minted placeholder (ADR 0172). The
     # message says that, rather than "without TLS" (BACKLOG #1672).
     # The local-only remediation names [security].listen_address, NOT local_access_only=true (BACKLOG
-    # #1361). This gate is reachable TWO ways, and the remediation below is verified on only one:
+    # #1361). This gate is reachable TWO ways, and each remediation is verified by a test:
     #  1. BY CONFIG: [security].local_access_only=false with a non-loopback listen_address. The loader
     #     REFUSES local_access_only=true beside a non-loopback listen_address, so an operator who only
     #     set listen_address never gets here, and adding local_access_only=true to the config that
@@ -3798,9 +3854,15 @@ def _serve(args: argparse.Namespace) -> int:
     #     view -- that is not what the operator wrote. Applying the prescribed edit on this route
     #     (local_access_only=false, listen_address="127.0.0.1", with --host 0.0.0.0 still on the
     #     command line) leaves this refusal firing, rc 2, because the flag still wins. Measured
-    #     2026-09-21. The fix on this route is to drop or change the flag, which the message does not
-    #     yet say. The test above drives the FILE route only and says so; do not read it as covering
-    #     this one.
+    #     2026-09-21. The fix on this route is to drop or change the flag. The message names it
+    #     through loopback_levers, which on this route reads "serve --host, which overrides
+    #     [security].listen_address".
+    #     tests/test_cli.py::test_serve_ui_offloopback_refusal_names_the_host_flag drives this route
+    #     and the remedy back through serve.
+    # The certificate remedy is off_loopback_certificate_remedy, which names the revocation
+    # attestation: off loopback a certificate bind meets the API revocation gate above. The loopback
+    # remedy is for local access; a same-machine proxy in front of it owes what docs/SECURITY.md,
+    # Plaintext proxy hop, lists, and the message points there rather than restating it.
     if (
         settings.api.serve_ui
         and not settings.api.is_loopback
@@ -3808,14 +3870,16 @@ def _serve(args: argparse.Namespace) -> int:
     ):
         print(
             "error: refusing to serve the browser ops dashboard ([security].serve_web_console) on "
-            f"non-loopback host {settings.api.host!r} without an operator certificate or a "
-            "declared TLS-terminating proxy. The only certificate available is the engine's "
-            "generated self-signed placeholder, which no trust store vouches for. The /ui surface "
-            "requires in-process TLS on an operator certificate ([api].tls_cert_file) or a declared "
-            "TLS-terminating proxy ([api].tls_terminated_upstream + trusted_proxies); "
-            "--allow-insecure-bind does not cover it, and neither does "
-            "[security].require_encryption_for_remote=false. Set [security].listen_address to a loopback "
-            "address (127.0.0.1) for local-only access, or configure one of those two.",
+            f"non-loopback host {settings.api.host!r} without an operator certificate. The only "
+            "certificate available is the engine's "
+            "generated self-signed placeholder, which no trust store vouches for, and off loopback "
+            "the /ui surface requires an operator certificate; --allow-insecure-bind does not cover "
+            "it, and neither does [security].require_encryption_for_remote=false. Either bind the "
+            f"engine to loopback ({loopback_levers}) for local access, or "
+            f"{off_loopback_certificate_remedy()}, or set [security].serve_web_console = false "
+            "to serve the JSON API alone. A reverse proxy on this machine in front of a "
+            "loopback engine owes what docs/SECURITY.md, Plaintext proxy hop, lists; "
+            "docs/SECURITY.md, API revocation gate, says what the attestation means.",
             file=sys.stderr,
         )
         return 2
@@ -5048,7 +5112,7 @@ def _serve(args: argparse.Namespace) -> int:
         loopback=settings.api.is_loopback,
         tls_terminated_upstream=settings.api.tls_terminated_upstream,
         # #200 residual (ADR 0092): the API PHI-read data-path guard keys on whether the serve hop is
-        # proven secure — a loopback bind (on-box), in-process TLS, or a declared TLS-terminating proxy
+        # proven secure — a loopback bind (on-box), an operator certificate, or a declared TLS-terminating proxy
         # (exposure_protected). A prod-PHI instance whose serve hop is none of these refuses to emit PHI
         # over the response path, mirroring the transport-cell posture-keyed refusal.
         phi_read_hop_secure=settings.api.is_loopback or settings.api.exposure_protected,
@@ -11197,6 +11261,10 @@ def _backup(args: argparse.Namespace) -> int:
         "snapshot_method": result.snapshot_method,
         "key_id": result.key_id,
         "config_fingerprint": result.config_fingerprint,
+        # With `config_skipped_files` below, what says whether the archive holds every config file
+        # the walk listed (vault BACKLOG #5233).
+        "config_bundled": result.config_bundled,
+        "config_bundle_error": result.config_bundle_error,
         "snapshot_sha256": result.snapshot_sha256,
         "row_counts": result.row_counts,
         "verify": result.verify.status if result.verify is not None else "skipped",
@@ -11206,6 +11274,9 @@ def _backup(args: argparse.Namespace) -> int:
         payload["staging_leftover"] = result.staging_leftover
     if result.config_unreadable_files:  # vault BACKLOG #3765: the digest covers the rest
         payload["config_unreadable_files"] = list(result.config_unreadable_files)
+    if result.config_skipped_files:  # vault BACKLOG #5233: what the archive does not carry
+        payload["config_skipped_files"] = list(result.config_skipped_files)
+        payload["config_skipped_count"] = result.config_skipped_count
     if args.json:
         _print_json(payload, compact=True)
     else:
@@ -11214,17 +11285,23 @@ def _backup(args: argparse.Namespace) -> int:
             f"  encrypted={result.encrypted} config_only={result.config_only} key_id={result.key_id}"
         )
         print(f"  verify={payload['verify']} row_counts={result.row_counts} pruned={result.pruned}")
+        print(
+            f"  config_bundled={result.config_bundled} "
+            f"config_bundle_error={result.config_bundle_error}"
+        )
         if result.staging_leftover is not None:
             print(f"WARNING: {result.staging_leftover}", file=sys.stderr)
-        if result.config_unreadable_files:
-            from messagefoundry.config.fingerprint import describe_left_out
-            from messagefoundry.controlchars import scrub_log_argument
+        from messagefoundry.config.fingerprint import describe_left_out
+        from messagefoundry.controlchars import scrub_log_argument
 
-            left_out = describe_left_out(result.config_unreadable_files)
-            print(
-                f"WARNING: the config fingerprint left out {scrub_log_argument(left_out)}",
-                file=sys.stderr,
-            )
+        for what, files, total in (
+            ("fingerprint", result.config_unreadable_files, len(result.config_unreadable_files)),
+            ("bundle", result.config_skipped_files, result.config_skipped_count),
+        ):
+            if files:
+                left_out = scrub_log_argument(describe_left_out(files))
+                more = f" ({total} in all)" if total > len(files) else ""
+                print(f"WARNING: the config {what} left out {left_out}{more}", file=sys.stderr)
     return 0
 
 
@@ -11596,16 +11673,28 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
 
 
 def _restore(args: argparse.Namespace) -> int:
-    """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``).
+    """Restore a ``.mfbak`` archive's store to a NEW path (ADR 0049, #60 — the other half of ``backup``),
+    or with ``--config-to`` and no ``--to`` the config bundle of a CONFIG-ONLY archive (vault BACKLOG
+    #5233).
 
     The engine could write an archive and verify one, and had no way to restore one; ADR 0048's cold seed
     is the consumer (restore here, then activate onto the restored store). Verifies the archive first and
-    refuses anything but a ``PASS``, then decrypts it and writes the store to ``--to``. **Never
-    overwrites:** an existing destination is refused rather than clobbered. PHI-safe output (paths,
-    counts, fingerprints — never a body or key bytes)."""
+    refuses anything but a ``PASS``, then decrypts it and writes the store to ``--to``. A config-only
+    archive carries no store, so ``--to`` refuses one, and ``--config-to`` alone writes its config
+    bundle instead. **Never overwrites:** an existing destination is refused rather than clobbered.
+    PHI-safe output (paths, counts, fingerprints — never a body or key bytes)."""
     from messagefoundry.last_resort import run_guarded
-    from messagefoundry.pipeline.dr_backup import BackupError, run_restore
+    from messagefoundry.pipeline.dr_backup import (
+        RESTORE_NEEDS_A_DESTINATION,
+        BackupError,
+        run_restore,
+    )
 
+    # Before the settings load, so a broken service config cannot hide this usage error.
+    if args.to is None and args.config_to is None:
+        return _emit_error(
+            f"restore failed (destination): {RESTORE_NEEDS_A_DESTINATION}", as_json=args.json
+        )
     # Rendered, never stringified (vault BACKLOG #2760): see `_load_service_settings`.
     settings, detail = _load_service_settings(args.service_config)
     if settings is None:
@@ -11650,6 +11739,8 @@ def _restore(args: argparse.Namespace) -> int:
         "sessions_revoked": result.sessions_revoked,
         # BACKLOG #5094: a scripted restore reads what to re-apply here, as the text summary
         # prints it.
+        # Carried on the config-only route too (vault BACKLOG #5233): it places no store, but the
+        # store it sends the operator to restore by other means rolls back the same changes.
         "rollback_notice": RESTORE_ROLLBACK_NOTICE,
         "store": result.store_path,
         "store_bytes": result.store_bytes,
@@ -11661,6 +11752,18 @@ def _restore(args: argparse.Namespace) -> int:
     }
     if args.json:
         _print_json(payload, compact=True)
+    elif result.store_path is None:
+        print(
+            f"OK: restored the config bundle of the CONFIG-ONLY archive {args.archive}: "
+            f"{result.config_files} file(s) into {result.config_dir}"
+        )
+        print(f"  encrypted={result.encrypted} key_id={result.key_id}")
+        print(f"  archive taken {payload['archive_created_at']}")
+        print(
+            "  It carries no store. Restore the store by other means: a whole-store archive with "
+            "--to, or on a server-DB store the DBA's own backup. That restore rolls back the store: "
+            f"{RESTORE_ROLLBACK_NOTICE}"
+        )
     else:
         print(f"OK: restored {result.store_path} ({result.store_bytes} bytes) from {args.archive}")
         print(
@@ -12539,6 +12642,7 @@ def _security(args: argparse.Namespace) -> int:
                 attested_hops=(),
                 revocation_attested_hops=(),
                 path_form_fhir_hops=(),
+                ech_cleartext_sidecar_hops=(),
                 api=_api,
                 approvals=_approvals,
                 cert_monitor=_cert_monitor,
@@ -12580,7 +12684,8 @@ def _security(args: argparse.Namespace) -> int:
             "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
             "generic-ODBC database TLS, "
             "tls_hop_attested, "
-            "tls_revocation_attested and FHIR update_url_form declarations are NOT included, and neither are the store-principal privilege and audit-chain keying "
+            "tls_revocation_attested, FHIR update_url_form and http ECH sidecar declarations are "
+            "NOT included, and neither are the store-principal privilege and audit-chain keying "
             "observations (#1008, #1905 — this command opens no store, and neither does `check`; "
             "GET /security/posture reports both). Nor are the engine process's remote-debugging "
             "reading, its start-up reading (launch flags, start-up code, writable site "

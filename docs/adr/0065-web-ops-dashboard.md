@@ -102,6 +102,12 @@ terminator) and is **refused even under `--allow-insecure-bind`** — the UI is 
 JSON API. M1 default is localhost; off-loopback is an explicit, TLS-gated opt-in. The WebAuthn #11 trigger
 and the ASVS 8.4.2 managed-host residual bind only on off-loopback exposure and are the owner's call.
 
+*(Note 2026-11-04, BACKLOG #4636: this section and the 2026-07-02 addendum below keep their
+original wording. Off loopback a declared terminator alone no longer reaches the `/ui` gate:
+`serve` refuses a terminator with no operator certificate there first, so an off-loopback `/ui`
+needs an operator `[api].tls_cert_file`.
+[SECURITY.md, Plaintext proxy hop](../SECURITY.md#plaintext-proxy-hop) states the rule.)*
+
 ## Options considered
 
 1. **Thin server-rendered, stdlib renderer, cookie, poll (CHOSEN).** Zero new runtime deps, secure-by-

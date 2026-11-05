@@ -15,8 +15,7 @@ Two parts, shared by the MLLP listener, the HTTP intake listener and the API:
 handshake never reaches the application: its protocol is built but never connected. The stdlib
 loop logs the failure at DEBUG, and uvloop at DEBUG too (0.23.0 ``sslproto.pyx``,
 ``_fatal_error``), and the loop's exception handler is called only in debug mode. So the HTTP intake
-listener and the API had no record on any loop, and the MLLP listener none on uvloop, which the
-engine installs outside Windows.
+listener and the API had no record on any loop, and the MLLP listener none on uvloop.
 
 **The hook is the context's ``sslobject_class``.** Both loops build the TLS object for every
 connection through ``SSLContext.wrap_bio`` (CPython 3.14 ``asyncio/sslproto.py``; uvloop 0.23.0
@@ -36,19 +35,19 @@ protocol class is replaced.
   protocol's private ``_transport``. uvloop was not measured, since it has no Windows build.
   Until the owner rules on #3302, the hook reads no private loop state to find the peer.
   Whether to build a peer report is an open owner question (vault BACKLOG #3302).
-* **A handshake past its bound, where the loop runs it. A known limit, declined by owner ruling
-  2026-10-26 (vault BACKLOG #3785 item 7).** The loop aborts the transport and never calls
+* **A handshake past its bound, where only the loop sees it. A known limit, declined by owner
+  ruling 2026-10-26 (vault BACKLOG #3785 item 7).** The loop aborts the transport and never calls
   ``do_handshake`` again, so nothing raises, and a peer that opens sockets and stays silent is not
-  counted there. Where a listener runs its own handshakes, it still counts that case itself: the
-  MLLP and HTTP listeners on the stdlib loop, and the DICOM SCP always. A certificate the client
-  refuses with a TLS alert, a missing client certificate, a protocol downgrade and plaintext on a
-  TLS port all raise, so all are counted. A client that refuses a certificate by closing the socket
-  with no alert, as asyncio's own client does, looks like a hang-up and is not counted.
+  counted there. Which listeners still count that case themselves is in ``docs/PHI.md`` section 7,
+  row 7. A certificate the client refuses with a TLS alert, a missing client certificate, a
+  protocol downgrade and plaintext on a TLS port all raise, so all are counted. A client that
+  refuses a certificate by closing the socket with no alert, as asyncio's own client does, looks
+  like a hang-up and is not counted.
 * **A peer that closes or resets the socket mid-handshake. A known limit, declined by owner ruling
   2026-10-26 (vault BACKLOG #3785 item 8).** That is what a load balancer's TCP health check does.
   The decline keeps the counting that came before #3785 and adds none. So the loop's hook counts
   each ``SSLError`` from ``do_handshake``, a close_notify after the ClientHello among them. The
-  MLLP and HTTP listeners, running their own handshakes, leave out only :data:`HUNG_UP`. The
+  MLLP and HTTP listeners leave out only :data:`HUNG_UP`. The
   DICOM SCP leaves out the same peer acts as its blocking socket reports them (``_HUNG_UP`` in
   ``transports/dicom.py``). Where the loop runs the handshake, a closed socket ends it without
   ``do_handshake`` raising, so nothing counts it.
@@ -236,9 +235,8 @@ class HandshakeFailures:
         watch_loop_handshakes(ctx, self._note_loop_failure)
 
     def unwatch(self, ctx: ssl.SSLContext) -> None:
-        """Count nothing more on ``ctx`` through the loop: the listener runs its handshakes itself
-        now and counts them there. Left hooked, its context would count each failure twice, since
-        ``loop.start_tls`` builds its TLS object from the same context."""
+        """Count nothing more on ``ctx`` through the loop: the listener counts its failures itself.
+        Left hooked, its context would count each failure twice."""
         ctx.sslobject_class = ssl.SSLObject
 
     def _note_loop_failure(self, cause: str) -> None:

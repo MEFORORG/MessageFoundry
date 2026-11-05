@@ -59,7 +59,10 @@ def anonymize_message(
     (``surrogate_field_recorded``), as the engine adapter does.
     """
     _refuse_unwritable_rules(rules)
-    text = normalized_message(raw, tuple(rule.path for rule in rules))
+    # A keep rewrites nothing, so it never makes a line reachable (BACKLOG #3001).
+    text = normalized_message(
+        raw, tuple(rule.path for rule in rules if rule.kind != SurrogateKind.KEEP)
+    )
     parsed = read_message_seps(text)
     if parsed is None:
         raise AnonError("message has no parseable MSH / encoding characters — refusing to emit")

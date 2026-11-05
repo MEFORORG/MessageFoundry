@@ -7,13 +7,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import errno
 import ipaddress
 import logging
+import socket
 import ssl
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 from cryptography import x509
@@ -26,6 +29,7 @@ from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.wiring import MLLP, WiringError, redacted_settings
 from messagefoundry.keywrap import KeyWrapRefused
 from messagefoundry.pipeline.wiring_runner import check_mllp_tls_exposure
+from messagefoundry.transports import http_listener as http_module
 from messagefoundry.transports import mllp as mllp_module
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.mllp import (
@@ -604,22 +608,36 @@ async def _close_raw(writer: asyncio.StreamWriter) -> None:
         await asyncio.wait_for(writer.wait_closed(), timeout=mllp_module._CLIENT_SHUTDOWN_GRACE)
 
 
+@pytest.fixture(params=["start_tls", "accept_loop"])
+def tls_path(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Both ways a TLS listener admits a socket before its handshake (BACKLOG #1606): upgrading it
+    with ``start_tls`` on the stdlib loop, and `_AcceptingServer`, which every other loop gets,
+    forced here so it runs on every platform. The uvloop tests below run it on the real loop."""
+    if request.param == "accept_loop":
+        monkeypatch.setattr(mllp_module, "_upgrades_tls_itself", lambda _loop: False)
+    return str(request.param)
+
+
 async def _accepted(source: MLLPSource, count: int) -> None:
     """Wait until asyncio has ACCEPTED ``count`` connections on the listener.
 
     A client-side connect returns once the kernel completes it, which can be before the event loop
     accepts it. A stop() racing that gap closes the listening socket instead, and the stop test
     would pass without exercising the path it names. ``Server._clients`` is CPython-private, so a
-    rename fails this loudly rather than letting the test pass vacuously."""
+    rename fails this loudly rather than letting the test pass vacuously. Under the listener's own
+    accept loop, an accepted socket waiting on its handshake is in ``_handshakes`` instead."""
     server = source._server
     assert server is not None
-    deadline = time.monotonic() + 5.0
-    while len(server._clients) < count:  # type: ignore[attr-defined]
-        if time.monotonic() > deadline:
-            pytest.fail(f"the listener never accepted {count} connection(s)")
-        await asyncio.sleep(0.01)
+
+    def accepted() -> int:
+        if isinstance(server, mllp_module._AcceptingServer):
+            return len(source._handshakes)
+        return len(server._clients)  # type: ignore[attr-defined]
+
+    await _until(lambda: accepted() >= count, f"the listener never accepted {count} connection(s)")
 
 
+@pytest.mark.usefixtures("tls_path")
 async def test_a_socket_that_never_handshakes_is_closed_at_the_handshake_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -669,6 +687,7 @@ async def test_a_socket_that_never_handshakes_is_closed_at_the_handshake_timeout
     assert received == [ADT.encode("utf-8")]
 
 
+@pytest.mark.usefixtures("tls_path")
 async def test_stop_closes_a_socket_still_waiting_on_its_handshake(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -702,24 +721,27 @@ async def test_stop_closes_a_socket_still_waiting_on_its_handshake(
             await source.stop()
 
 
-@pytest.mark.parametrize("mode", ["plain", "listener_tls", "loop_tls"])
+@pytest.mark.parametrize("mode", ["plain", "listener_tls", "accept_loop_tls"])
 async def test_the_tls_bounds_reach_whichever_side_runs_the_handshake(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     """On the stdlib loop the listener binds plain TCP and upgrades each admitted socket itself
     (BACKLOG #1606), so the handshake and close-exchange bounds reach ``start_tls``. On any other
-    loop (``loop_tls``, forced here, which is what uvloop gets) the loop runs the handshake and the
-    bounds reach ``start_server``. Without TLS neither sees them. A real TLS client gets a message
-    through in both TLS modes. The close-exchange bound has no behavioural test of its own: it needs
-    a peer that ignores close_notify, and asyncio's default of 30 s would make the red arm of such a
-    test slow."""
+    loop (``accept_loop_tls``, forced here, which is what uvloop gets) the listener runs its own
+    accept loop and the bounds reach ``connect_accepted_socket``. Without TLS neither sees them. A
+    real TLS client gets a message through in both TLS modes. The close-exchange bound has no
+    behavioural test of its own: it needs a peer that ignores close_notify, and asyncio's default of
+    30 s would make the red arm of such a test slow."""
     tls = mode != "plain"
-    if mode == "loop_tls":
+    if mode == "accept_loop_tls":
         monkeypatch.setattr(mllp_module, "_upgrades_tls_itself", lambda _loop: False)
     served: dict[str, object] = {}
     upgraded: list[dict[str, object]] = []
+    accepted: list[dict[str, object]] = []
     real_start_server = asyncio.start_server
     real_start_tls = asyncio.StreamWriter.start_tls
+    loop_class = type(asyncio.get_running_loop())
+    real_connect_accepted = loop_class.connect_accepted_socket
 
     async def spy_server(*args: object, **kwargs: object) -> asyncio.Server:
         served.update(kwargs)
@@ -729,8 +751,15 @@ async def test_the_tls_bounds_reach_whichever_side_runs_the_handshake(
         upgraded.append(kwargs)
         await real_start_tls(self, *args, **kwargs)  # type: ignore[arg-type]
 
+    async def spy_accepted(
+        self: asyncio.AbstractEventLoop, *args: object, **kwargs: object
+    ) -> object:
+        accepted.append(kwargs)
+        return await real_connect_accepted(self, *args, **kwargs)  # type: ignore[arg-type]
+
     monkeypatch.setattr(asyncio, "start_server", spy_server)  # mllp calls it through the module
     monkeypatch.setattr(asyncio.StreamWriter, "start_tls", spy_tls)
+    monkeypatch.setattr(loop_class, "connect_accepted_socket", spy_accepted)
     cert: str | None = None
     if tls:
         source, cert = _tls_source(tmp_path)
@@ -756,13 +785,15 @@ async def test_the_tls_bounds_reach_whichever_side_runs_the_handshake(
         "ssl_handshake_timeout": mllp_module._TLS_HANDSHAKE_TIMEOUT,
         "ssl_shutdown_timeout": mllp_module._TLS_SHUTDOWN_TIMEOUT,
     }
-    if mode == "loop_tls":
-        assert served["ssl"] is not None
-        assert {k: served[k] for k in bounds} == bounds
+    if mode == "accept_loop_tls":
+        assert served == {}  # the listener bound its own sockets
+        assert len(accepted) == 1 and accepted[0]["ssl"] is not None
+        assert {k: accepted[0][k] for k in bounds} == bounds
         assert upgraded == []
         return
     assert served.get("ssl") is None
     assert served.get("ssl_handshake_timeout") is None
+    assert accepted == []
     # The destination's own client-side handshake does not go through StreamWriter.start_tls, so
     # the one call seen is the listener's.
     assert upgraded == ([bounds] if tls else [])
@@ -770,24 +801,40 @@ async def test_the_tls_bounds_reach_whichever_side_runs_the_handshake(
 
 def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
     """uvloop's Loop is an AbstractEventLoop and not a BaseEventLoop, so this is what sends it to the
-    loop-level handshake; see `_upgrades_tls_itself` for why."""
+    listener's own accept loop; see `_upgrades_tls_itself` for why. A BaseEventLoop subclass goes
+    there too: its transports are not the ones the upgrade was read against (vault BACKLOG #4552).
+    The HTTP listener, which has no accept loop of its own, has its own predicate and keeps the
+    upgrade on such a subclass."""
 
     class _OtherLoop(asyncio.AbstractEventLoop):
         pass
 
+    class _SubclassedLoop(asyncio.SelectorEventLoop):
+        pass
+
     stdlib = asyncio.new_event_loop()
+    selector = asyncio.SelectorEventLoop()
+    subclassed = _SubclassedLoop()
     try:
-        assert mllp_module._upgrades_tls_itself(stdlib) is True
+        for predicate in (mllp_module._upgrades_tls_itself, http_module._upgrades_tls_itself):
+            assert predicate(stdlib) is True
+            assert predicate(selector) is True
+        assert mllp_module._upgrades_tls_itself(subclassed) is False
+        assert http_module._upgrades_tls_itself(subclassed) is True
     finally:
         stdlib.close()
+        selector.close()
+        subclassed.close()
     # Never run: the probe only asks which class the loop is, so its abstract methods stay unbound.
-    assert mllp_module._upgrades_tls_itself(_OtherLoop()) is False  # type: ignore[abstract]
+    other = _OtherLoop()  # type: ignore[abstract]
+    assert mllp_module._upgrades_tls_itself(other) is False
+    assert http_module._upgrades_tls_itself(other) is False
 
 
 # --- stop() on a loop whose server has no close_clients() (BACKLOG #1606) ------------------------
 #
-# uvicorn runs the engine on uvloop wherever it is installed, and the engine's own uvloop dependency
-# installs it for CPython outside Windows. uvloop's Server (0.22.1) has no close_clients(). stop()
+# uvicorn runs the engine on uvloop wherever it is installed (`_upgrades_tls_itself` says where
+# that is). uvloop's Server (0.22.1) has no close_clients(). stop()
 # called it unguarded, so on Linux every reload failed at its first listener: that listener stayed unbound and
 # none was restarted. The connscale smoke caught it on ubuntu only, as "connection(s) never came back
 # after the reload probe". The suite's own loop is the stdlib one on every platform, so without these
@@ -849,7 +896,7 @@ async def test_stop_works_when_the_server_has_no_close_clients() -> None:
     reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
     try:
         await _in_handler(source, 1)  # so stop() meets a live connection, not a kernel backlog
-        assert source._server is not None
+        assert isinstance(source._server, asyncio.Server)
         source._server = _ServerWithoutCloseClients(source._server)  # type: ignore[assignment]
         # Before the fix this raised AttributeError, after closing the listening socket.
         await source.stop()
@@ -865,8 +912,8 @@ async def test_stop_works_when_the_server_has_no_close_clients() -> None:
 
 
 async def test_a_connection_reaching_the_handler_after_stop_is_refused_unread() -> None:
-    """On uvloop stop() cannot close a socket still in its TLS handshake, so one can finish it after
-    stop() began and reach `_on_client`. It must be closed there, never counted, tracked or read."""
+    """A connection whose accept or TLS handshake completed in the same turn stop() began can still
+    reach `_on_client` after it. It must be closed there, never counted, tracked or read."""
     received: list[bytes] = []
 
     async def handler(raw: bytes) -> str:
@@ -905,25 +952,26 @@ async def test_a_connection_reaching_the_handler_after_stop_is_refused_unread() 
 def test_stop_and_restart_on_uvloop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls: bool
 ) -> None:
-    """The real loop, not a stand-in for it. It skips where uvloop is not installed. uvloop keeps the
-    loop-level TLS handshake (`_upgrades_tls_itself`), so with TLS a socket that never handshakes is
-    outside the listener's own set and stop() cannot close it there; the handshake bound, shortened
-    here, is what closes it. A real TLS client then gets a message through a TLS listener on this
-    loop, which is the check that the loop-level path still serves."""
+    """The real loop, not a stand-in for it. It skips where uvloop is not installed. On uvloop a TLS
+    listener runs its own accept loop (`_AcceptingServer`), so a socket that never handshakes holds
+    a slot and stop() closes it at once. The handshake bound is pinned far above the shutdown grace,
+    so only stop() can close it in time. A real TLS client then gets a message through a TLS
+    listener on this loop, which is the check that the accept-loop path serves."""
     uvloop = pytest.importorskip("uvloop")
-    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 0.5)
+    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
 
     async def scenario() -> None:
         source, cert = _tls_source(tmp_path) if tls else (_plain_source(), None)
         await source.start(_ack)
         assert source._upgrade_tls is False
+        assert isinstance(source._server, mllp_module._AcceptingServer) is tls
         reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
         try:
             if tls:
-                # Nothing public counts a socket still in its handshake, so give the loop a moment
-                # to accept it. On a runner too slow for that, the close below is the listening
-                # socket's reset rather than the bound, and the test passes without reaching it.
-                await asyncio.sleep(0.2)
+                await _until(
+                    lambda: source._admission.active == 1 and len(source._handshakes) == 1,
+                    "the socket was not admitted into its TLS handshake",
+                )
             else:
                 await _in_handler(source, 1)
             started = time.monotonic()
@@ -933,7 +981,7 @@ def test_stop_and_restart_on_uvloop(
         finally:
             await _close_raw(writer)
         if cert is not None:
-            # Restored first, so the real client never races the shortened bound.
+            # Back to the real bound for the real client.
             monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 10.0)
             await source.start(_ack)
             try:
@@ -1008,6 +1056,7 @@ async def _until(predicate: Callable[[], bool], what: str, *, within: float = 5.
     ],
     ids=["max_connections", "max_connections_per_host"],
 )
+@pytest.mark.usefixtures("tls_path")
 async def test_an_unhandshaken_socket_spends_a_connection_slot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caps: dict[str, int], reason: str | None
 ) -> None:
@@ -1042,6 +1091,7 @@ async def test_an_unhandshaken_socket_spends_a_connection_slot(
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
+@pytest.mark.usefixtures("tls_path")
 async def test_a_peer_outside_the_allowlist_is_refused_before_its_handshake(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1067,6 +1117,7 @@ async def test_a_peer_outside_the_allowlist_is_refused_before_its_handshake(
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
+@pytest.mark.usefixtures("tls_path")
 async def test_a_failed_handshake_gives_its_slot_back_and_emits_only_its_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1096,6 +1147,7 @@ async def test_a_failed_handshake_gives_its_slot_back_and_emits_only_its_failure
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
+@pytest.mark.usefixtures("tls_path")
 async def test_a_plaintext_peer_on_a_tls_listener_is_a_failed_handshake(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1119,6 +1171,235 @@ async def test_a_plaintext_peer_on_a_tls_listener_is_a_failed_handshake(
         assert reason is not None and "MSH" not in reason  # a class name, never the peer's bytes
     finally:
         await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+async def test_a_socket_the_tls_layer_never_took_is_closed_and_not_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Under the listener's own accept loop, ``connect_accepted_socket`` can fail before its
+    transport holds the socket. The socket is still the listener's then, so the listener closes it,
+    and no handshake ran, so nothing is counted. Before the fix it was dropped unclosed and an
+    ``SSLError`` raised there counted as a failed handshake. The control is a real failed handshake
+    through the real call, on the same listener, which is counted."""
+    monkeypatch.setattr(mllp_module, "_upgrades_tls_itself", lambda _loop: False)
+    monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
+    caplog.set_level(logging.DEBUG, logger="messagefoundry.transports.mllp")
+    loop_class = type(asyncio.get_running_loop())
+    real_connect_accepted = loop_class.connect_accepted_socket
+    refused: list[socket.socket] = []
+
+    async def refuse(
+        self: asyncio.AbstractEventLoop, factory: object, sock: socket.socket, **kwargs: object
+    ) -> tuple[asyncio.Transport, asyncio.BaseProtocol]:
+        refused.append(sock)
+        raise ssl.SSLError("synthetic: refused before the transport took the socket")
+
+    monkeypatch.setattr(loop_class, "connect_accepted_socket", refuse)
+    source, _cert_path = _tls_source(tmp_path)
+    events = _Events()
+    source.on_connection_event = events
+    await source.start(_ack)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            await _closed_by_listener(reader, within=5.0)
+        finally:
+            await _close_raw(writer)
+        await _until(lambda: source._admission.active == 0, "the slot was not released")
+        assert len(refused) == 1 and refused[0].fileno() == -1
+        assert source.tls_handshake_failures == 0
+        assert events.kinds() == []
+        assert "could not be handed to TLS" in caplog.text
+        # CONTROL: the same listener, through the real call, still counts a real failure.
+        monkeypatch.setattr(loop_class, "connect_accepted_socket", real_connect_accepted)
+        _r2, w2 = await asyncio.open_connection("127.0.0.1", source.sockport)
+        try:
+            w2.write(b"\x0bMSH|^~\\&|NOT|TLS\r\x1c\r" * 8)
+            await w2.drain()
+            await _until(lambda: "tls_handshake_failed" in events.kinds(), "no failure event")
+        finally:
+            await _close_raw(w2)
+        assert source.tls_handshake_failures == 1
+    finally:
+        await asyncio.wait_for(source.stop(), timeout=10.0)
+
+
+class _FailingAccept:
+    """A loop's ``sock_accept`` that fails at once without yielding, as a selector loop's does for a
+    fault ``accept()`` reports synchronously. After ``limit`` calls it raises ``RuntimeError``, which
+    no accept arm catches, so an accept loop that never yields ends rather than hanging the suite."""
+
+    limit = 200
+
+    def __init__(self, code: int) -> None:
+        self.code = code
+        self.calls = 0
+
+    async def __call__(self, sock: socket.socket) -> tuple[socket.socket, object]:
+        self.calls += 1
+        if self.calls >= self.limit:
+            raise RuntimeError("the accept loop never yielded")
+        raise OSError(self.code, "synthetic accept failure")
+
+
+def test_the_accept_loop_yields_after_a_failed_accept_it_skips() -> None:
+    """A run of accept failures that belong to one connection each must not spin the loop: the
+    accept loop yields a turn per failure and keeps its listening socket. The control shows the fake
+    never yields by itself, so a loop without a yield of its own runs it to the limit in one step."""
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        control = _FailingAccept(errno.ECONNABORTED)
+
+        async def no_yield(sock: socket.socket) -> None:
+            while True:
+                with contextlib.suppress(OSError):
+                    await control(sock)
+
+        with socket.socket() as unused:
+            spinner = loop.create_task(no_yield(unused))
+            await asyncio.sleep(0)
+        assert spinner.done() and control.calls == _FailingAccept.limit
+        assert isinstance(spinner.exception(), RuntimeError)
+        fake = _FailingAccept(errno.ECONNABORTED)
+        loop.sock_accept = fake  # type: ignore[method-assign]
+        listening = socket.socket()
+        server = mllp_module._AcceptingServer([listening], lambda _conn: None, name="IB_TEST")
+        try:
+            for _ in range(3):
+                await asyncio.sleep(0)
+            assert 1 <= fake.calls <= 4, "the accept loop did not yield per skipped failure"
+            assert listening.fileno() != -1, "a skipped failure stopped the accept loop"
+        finally:
+            server.close()
+            await server.wait_closed()
+        assert listening.fileno() == -1
+
+    asyncio.run(scenario())
+
+
+class _MappedWinError(OSError):
+    """An accept failure as CPython builds one on Windows from an error code it has no errno for:
+    errno EINVAL, with the real code in ``winerror``."""
+
+    def __init__(self, winerror: int) -> None:
+        super().__init__(errno.EINVAL, "synthetic Windows accept failure")
+        self._winerror = winerror
+
+    @property
+    def winerror(self) -> int:
+        return self._winerror
+
+
+def test_an_accept_fault_is_fatal_only_when_the_listening_socket_is_gone() -> None:
+    """A peer reset during AcceptEx (ERROR_NETNAME_DELETED, 64) arrives as EINVAL on Windows, and
+    must not stop the listener; WSAEINVAL, or EINVAL with no Windows code, means the socket is not
+    listening, and does."""
+    fatal = mllp_module._accept_fault_is_fatal
+    with socket.socket() as sock:
+        assert fatal(_MappedWinError(64), sock) is False
+        assert fatal(_MappedWinError(1236), sock) is False  # ERROR_CONNECTION_ABORTED
+        assert fatal(_MappedWinError(10022), sock) is True  # WSAEINVAL
+        assert fatal(_MappedWinError(10038), sock) is True  # WSAENOTSOCK
+        assert fatal(OSError(errno.EINVAL, "not listening"), sock) is True
+        assert fatal(OSError(errno.EBADF, "bad descriptor"), sock) is True
+        assert fatal(OSError(errno.ECONNABORTED, "peer gone"), sock) is False
+        assert fatal(OSError("no errno"), sock) is False
+    # Closed, whatever the error says.
+    assert fatal(OSError(errno.ECONNABORTED, "peer gone"), sock) is True
+
+
+def test_a_long_run_of_skipped_accepts_waits_and_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lasting fault the accept loop does not know would otherwise retry once per turn for as long
+    as it lasts, logged only at DEBUG. After a run of skips it waits the retry delay and warns. The
+    control: a peer's own dropped connections are never counted, so a peer resetting its sockets
+    cannot make the listener wait."""
+    monkeypatch.setattr(mllp_module, "_ACCEPT_SKIP_RUN", 3)
+    monkeypatch.setattr(mllp_module, "_ACCEPT_RETRY_DELAY", 60.0)
+
+    async def run(fake: _FailingAccept) -> None:
+        asyncio.get_running_loop().sock_accept = fake  # type: ignore[method-assign]
+        listening = socket.socket()
+        server = mllp_module._AcceptingServer([listening], lambda _conn: None, name="IB_TEST")
+        try:
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert listening.fileno() != -1
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    unknown = _FailingAccept(errno.EPROTO)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+        asyncio.run(run(unknown))
+    assert unknown.calls == 4, "the accept loop did not wait after skipping its run of three"
+    assert "IB_TEST accept failed, retrying in 60s" in caplog.text
+    caplog.clear()
+    dropped = _FailingAccept(errno.ECONNABORTED)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+        asyncio.run(run(dropped))
+    assert dropped.calls > 4, "a peer's dropped connections made the listener wait"
+    assert "retrying in" not in caplog.text
+
+
+def test_a_connection_the_listener_cannot_take_is_closed_and_accepting_goes_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A fault taking one accepted connection closes that socket and keeps the listener accepting,
+    rather than ending the accept loop and leaving the socket open."""
+
+    async def scenario() -> None:
+        accepted = socket.socket()
+        fails_after = _FailingAccept(errno.ECONNABORTED)
+        handed: list[socket.socket] = []
+
+        async def accept(sock: socket.socket) -> tuple[socket.socket, object]:
+            if not handed:
+                handed.append(accepted)
+                return accepted, ("127.0.0.1", 1)
+            return await fails_after(sock)
+
+        def on_socket(conn: socket.socket) -> None:
+            raise RuntimeError("synthetic: could not take the connection")
+
+        asyncio.get_running_loop().sock_accept = accept  # type: ignore[method-assign]
+        listening = socket.socket()
+        server = mllp_module._AcceptingServer([listening], on_socket, name="IB_TEST")
+        try:
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert accepted.fileno() == -1, "the connection it could not take was left open"
+            assert fails_after.calls >= 1, "the accept loop stopped after the fault"
+            assert listening.fileno() != -1
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.mllp"):
+        asyncio.run(scenario())
+    assert "IB_TEST could not take an accepted connection" in caplog.text
+
+
+def test_the_accept_loop_stops_on_a_fault_of_its_listening_socket(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """EBADF means the listening socket is unusable, so every later accept would fail the same way:
+    the accept loop stops at once, closes the socket and logs it, rather than skipping forever."""
+
+    async def scenario() -> None:
+        fake = _FailingAccept(errno.EBADF)
+        asyncio.get_running_loop().sock_accept = fake  # type: ignore[method-assign]
+        listening = socket.socket()
+        server = mllp_module._AcceptingServer([listening], lambda _conn: None, name="IB_TEST")
+        await asyncio.wait_for(server.wait_closed(), timeout=5.0)
+        assert fake.calls == 1
+        assert listening.fileno() == -1
+
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.mllp"):
+        asyncio.run(scenario())
+    assert "IB_TEST: accept loop failed and stopped" in caplog.text
 
 
 async def test_failed_handshakes_are_counted_and_their_events_throttled(
@@ -1213,9 +1494,9 @@ async def test_stop_closes_an_unhandshaken_socket_without_close_clients(
 ) -> None:
     """Where the listener upgrades TLS itself (the stdlib loop), a socket still in its handshake is
     tracked with every other client, so stop() closes it even on a server with no close_clients().
-    Before the fix only close_clients() could reach it. uvloop keeps the loop-level handshake and is
-    NOT covered by this: there stop() leaves such a socket to the handshake bound, which
-    `test_stop_and_restart_on_uvloop` pins."""
+    Before the fix only close_clients() could reach it. On any other loop the listener's own accept
+    loop tracks such a socket in ``_handshakes`` instead, which `tls_path` and
+    `test_stop_and_restart_on_uvloop` cover."""
     monkeypatch.setattr(mllp_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
     source, _cert_path = _tls_source(tmp_path)
     await source.start(_ack)
@@ -1229,7 +1510,7 @@ async def test_stop_closes_an_unhandshaken_socket_without_close_clients(
                 lambda: len(source._clients) == 1,
                 "a socket still in its TLS handshake is not tracked by the listener",
             )
-            assert source._server is not None
+            assert isinstance(source._server, asyncio.Server)
             source._server = _ServerWithoutCloseClients(source._server)  # type: ignore[assignment]
             started = time.monotonic()
             await source.stop()
@@ -1281,3 +1562,150 @@ async def test_the_reader_follows_the_socket_into_tls(tmp_path: Path) -> None:
     finally:
         await source.stop()
     assert seen == [True]
+
+
+# --- the listener's own accept loop on the real uvloop (BACKLOG #1606) ---------------------------
+#
+# The `tls_path` tests above run `_AcceptingServer` on the stdlib loop, forced. These run the same
+# scenarios on uvloop, the loop it exists for, where nothing has to force it. Each skips where
+# uvloop is not installed, so they run on CI's Linux legs only.
+
+
+_Scenario = Callable[[Path, pytest.MonkeyPatch, pytest.LogCaptureFixture], Awaitable[None]]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uvloop does not run on Windows")
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        pytest.param(
+            lambda p, m, _c: test_an_unhandshaken_socket_spends_a_connection_slot(
+                p, m, {"max_connections": 1, "max_connections_per_host": 0}, None
+            ),
+            id="max_connections",
+        ),
+        pytest.param(
+            lambda p, m, _c: test_an_unhandshaken_socket_spends_a_connection_slot(
+                p,
+                m,
+                {"max_connections": 0, "max_connections_per_host": 1},
+                "max_connections_per_host",
+            ),
+            id="max_connections_per_host",
+        ),
+        pytest.param(
+            lambda p, m, _c: test_a_peer_outside_the_allowlist_is_refused_before_its_handshake(
+                p, m
+            ),
+            id="allowlist",
+        ),
+        pytest.param(
+            lambda p, m, _c: test_a_failed_handshake_gives_its_slot_back_and_emits_only_its_failure(
+                p, m
+            ),
+            id="failed_handshake",
+        ),
+        pytest.param(test_stop_closes_a_socket_still_waiting_on_its_handshake, id="stop"),
+    ],
+)
+def test_admission_runs_before_the_handshake_on_uvloop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    scenario: _Scenario,
+) -> None:
+    uvloop = pytest.importorskip("uvloop")
+
+    async def run() -> None:
+        assert mllp_module._upgrades_tls_itself(asyncio.get_running_loop()) is False
+        await scenario(tmp_path, monkeypatch, caplog)
+
+    asyncio.run(run(), loop_factory=uvloop.new_event_loop)
+
+
+# --- why uvloop does not get the start_tls upgrade (vault BACKLOG #4552) -------------------------
+
+
+async def _plaintext_upgrade_probe(tmp_path: Path) -> tuple[int, bool]:
+    """Upgrade a plain-TCP server socket on the running loop the way `_on_tls_accept` and
+    `_start_tls` do, pausing reading inside ``connection_made`` and then calling
+    ``StreamWriter.start_tls``, against a real TLS client. Returns how many bytes reached the
+    plaintext reader despite the pause, and whether the handshake completed."""
+    cert, key = _cert(tmp_path)
+    server_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    server_ctx.load_cert_chain(cert, key)
+    client_ctx = ssl.create_default_context(cafile=cert)
+    loop = asyncio.get_running_loop()
+    outcome: asyncio.Future[tuple[int, bool]] = loop.create_future()
+    upgrades: set[asyncio.Task[None]] = set()
+
+    async def upgrade(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # The ClientHello reaches a loopback socket at once; half a second is generous for it to
+        # land in the reader where the loop reads despite the pause. The stdlib arm waits it out
+        # empty, which is the control.
+        deadline = time.monotonic() + 0.5
+        while not reader._buffer and time.monotonic() < deadline:  # type: ignore[attr-defined]
+            await asyncio.sleep(0.01)
+        buffered = len(reader._buffer)  # type: ignore[attr-defined]
+        try:
+            await writer.start_tls(server_ctx, ssl_handshake_timeout=1.0, ssl_shutdown_timeout=1.0)
+            completed = True
+        except (OSError, AttributeError):  # AttributeError: closed during it, see `_start_tls`
+            completed = False
+        except Exception as exc:  # any other fault fails the probe now, rather than as a timeout
+            outcome.set_exception(exc)
+            raise
+        outcome.set_result((buffered, completed))
+        with contextlib.suppress(AttributeError, OSError):
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+
+    def on_accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # What `_on_tls_accept` does: pause inside connection_made, then upgrade in a task.
+        cast(asyncio.Transport, writer.transport).pause_reading()
+        upgrades.add(loop.create_task(upgrade(reader, writer)))
+
+    async def client(port: int) -> None:
+        with contextlib.suppress(OSError):  # the uvloop arm's handshake fails
+            _reader, writer = await asyncio.open_connection(
+                "127.0.0.1", port, ssl=client_ctx, ssl_handshake_timeout=5.0
+            )
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+
+    server = await asyncio.start_server(on_accept, "127.0.0.1", 0)
+    try:
+        sender = loop.create_task(client(server.sockets[0].getsockname()[1]))
+        try:
+            return await asyncio.wait_for(outcome, timeout=10.0)
+        finally:
+            await asyncio.wait_for(sender, timeout=10.0)
+            await asyncio.gather(*upgrades, return_exceptions=True)
+    finally:
+        server.close()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(server.wait_closed(), timeout=5.0)
+
+
+@pytest.mark.parametrize("loop_name", ["stdlib", "uvloop"])
+def test_a_plaintext_upgrade_loses_the_client_hello_on_uvloop(
+    tmp_path: Path, loop_name: str
+) -> None:
+    """The reason `_upgrades_tls_itself` gives for keeping uvloop off the ``start_tls`` upgrade, as
+    a test (vault BACKLOG #4552 item 1). On uvloop the pause inside ``connection_made`` does nothing,
+    so the ClientHello lands in the plaintext reader, the TLS layer never sees it, and the handshake
+    waits out its bound. If a later uvloop keeps the ClientHello out, the uvloop arm fails: that is
+    the cue to re-read the three points in that docstring before giving uvloop the upgrade. The
+    stdlib arm is the control: the same pause keeps the reader empty, and the handshake completes.
+    The uvloop arm skips where uvloop is not installed, so it runs on CI's Linux legs only."""
+    factory: Callable[[], asyncio.AbstractEventLoop] = asyncio.new_event_loop
+    if loop_name == "uvloop":
+        if sys.platform == "win32":
+            pytest.skip("uvloop does not run on Windows")
+        factory = pytest.importorskip("uvloop").new_event_loop
+    buffered, completed = asyncio.run(_plaintext_upgrade_probe(tmp_path), loop_factory=factory)
+    if loop_name == "uvloop":
+        assert buffered > 0, "uvloop kept the ClientHello out of the plaintext reader"
+        assert completed is False
+    else:
+        assert (buffered, completed) == (0, True)

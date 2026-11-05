@@ -40,8 +40,9 @@ the wheel; and it is inert until a partner publishes an `ECHConfig`).
 
 A conforming sidecar is a **loopback TLS-terminating re-originator**, not a tunnel:
 
-1. Accept the engine's egress on a loopback listener (same-host → the cleartext loopback hop has no wire
-   exposure, the ADR 0092 same-host posture). The engine dials that listener direct. It uses no web
+1. Accept the engine's egress on a loopback listener (same-host, so the hop has no wire exposure, the
+   ADR 0092 same-host posture; an `http://` listener still leaves it cleartext on the host, a listed
+   loosening, see below). The engine dials that listener direct. It uses no web
    proxy on this hop, whatever the environment or the operating system names as one.
 2. For each destination, open a **new** TLS connection with **ECH enabled**, fetching the `ECHConfig` from
    the destination's DNS **HTTPS record over DoH/DoT** (so the hostname is not leaked in cleartext DNS
@@ -132,6 +133,11 @@ composes with the connection's TLS verify/allowlist/signing posture.
 connection uses OAuth2 client-credentials or SMART Backend Services — the **token-endpoint POST** are
 each re-addressed to it, so the authorization server's hostname is not left in a cleartext outer
 ClientHello while the payload hop is routed (BACKLOG #1176).
+
+**An `http://` sidecar leaves the hop to it cleartext on this host.** The engine logs a WARNING for
+each such connection and lists it as a loosening. What crosses that hop, and how it is reported, is
+stated once in
+[SECURITY-LOOSENING.md](../../docs/SECURITY-LOOSENING.md#ech_sidecar-at-an-http-url--the-hop-to-the-ech-sidecar-is-cleartext).
 
 **Every other connector REFUSES the key rather than ignoring it.** `ech_egress` is honoured only by the
 REST destination; on any other outbound, and on any inbound, construction fails loudly

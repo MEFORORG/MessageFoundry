@@ -62,6 +62,7 @@ from messagefoundry.framing import FrameDecoder
 from messagefoundry.mllpcodec import frame as mllp_frame
 from messagefoundry.parsing import HL7PeekError, Peek, compression
 from messagefoundry.parsing.binary import (
+    UnreadableDelimitersError,
     extract_obx_document,
     iter_obx_documents,
     strip_documents,
@@ -630,20 +631,32 @@ def test_the_compression_target_catches_a_wrong_deflate_tail(
 
 
 def test_the_short_msh2_finding_still_reproduces_through_the_raw_helpers() -> None:
-    """The first registered binary-carriage finding is still live in the engine.
+    """The first registered binary-carriage finding is still live in the engine, through
+    ``extract_obx_document``, and the two halves already fixed stay fixed.
 
-    **When this test fails, the defect is fixed.** That is the instruction to delete its
-    ``KNOWN_FINDINGS`` entry and its shape check in ``_is_known_binary_carriage_finding`` (and this
-    test), and to keep the reproducer on as a ``binary_carriage`` seed so the fix cannot quietly
-    regress -- the same retirement BACKLOG #1594's finding went through.
+    It pins three things on the reproducer. ``extract_obx_document`` still raises the bare
+    ``ValueError``: that is the live finding. ``strip_documents`` returns the body unchanged with
+    ``(text, 0, 0)`` and does not raise, so a regression of its unreadable-delimiters guard turns
+    this red. ``iter_obx_documents`` refuses it as ``UnreadableDelimitersError`` (BACKLOG #5099).
+
+    **When the extract assertion fails, the defect is fixed.** That is the instruction to delete its
+    ``KNOWN_FINDINGS`` entry and its shape check in ``_is_known_binary_carriage_finding``, to keep
+    this test's strip and detach assertions, and to keep the reproducer on as a ``binary_carriage``
+    seed so the fix cannot quietly regress -- the same retirement BACKLOG #1594's finding went
+    through.
     """
     assert any(f.reproducer == SHORT_MSH2_REPRODUCER for f in KNOWN_FINDINGS)
     text = SHORT_MSH2_REPRODUCER.decode("ascii")
     assert Peek.parse(text).control_id == "X1", "the listener-side parse no longer accepts it"
+    message = Message.parse(text)
     with pytest.raises(ValueError, match="cannot determine HL7 separators"):
-        strip_documents(text, pruned_at=0.0)
-    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
-        list(iter_obx_documents(Message.parse(text)))
+        extract_obx_document(message)
+    # The retention strip's half is fixed: it returns the body unchanged rather than raising, so
+    # the retention pass skips the row. The detach scan's half too: it refuses the body by name,
+    # which both listeners record (BACKLOG #5099). Only the extract above is still live.
+    assert strip_documents(text, pruned_at=0.0) == (text, 0, 0)
+    with pytest.raises(UnreadableDelimitersError):
+        list(iter_obx_documents(message, received=text))
     assert _is_short_msh2_shape(text)
     assert not _is_batch_header_shape(text)
 
@@ -658,8 +671,8 @@ def test_the_batch_header_finding_still_reproduces_through_the_raw_helpers() -> 
     with pytest.raises(HL7PeekError):
         Peek.parse(text)
     message = Message.parse(text)
-    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
-        list(iter_obx_documents(message))
+    with pytest.raises(UnreadableDelimitersError):
+        list(iter_obx_documents(message, received=text))
     with pytest.raises(ValueError, match="cannot determine HL7 separators"):
         extract_obx_document(message)
     assert _is_batch_header_shape(text)
@@ -686,13 +699,18 @@ def test_a_carve_out_does_not_swallow_the_engine_message_on_any_other_body(
     """The input half of the discriminator: right error, wrong shape, so it must escape.
 
     The planted error carries the engine's own separators message, on a body whose separators ARE
-    readable and that has neither registered shape.
+    readable and that has neither registered shape. It is planted in the detach scan, which runs
+    inside the carve-out's ``try``: a fault planted in ``Message`` would first fire in the bare
+    ``strip_documents`` call, which sits outside that ``try``, and escape before the shape check
+    ran, so a carve-out that swallowed every engine-message ``ValueError`` would still pass.
     """
     text = _OBX_ED_ADT.decode()
     assert not _is_short_msh2_shape(text) and not _is_batch_header_shape(text)
-    monkeypatch.setattr(
-        Message, "count_segments", _boom(ValueError("cannot determine HL7 separators: planted"))
-    )
+    planted = _boom(ValueError("cannot determine HL7 separators: planted"))
+    monkeypatch.setattr(fuzz_targets, "iter_obx_documents", planted)
+    # The control: the same plant on a registered shape is swallowed, which proves it sits inside
+    # the carve-out's try. Were the scan moved outside it, this call would raise.
+    TARGETS_BY_NAME["binary_carriage"].run(SHORT_MSH2_REPRODUCER)
     with pytest.raises(ValueError, match="planted"):
         TARGETS_BY_NAME["binary_carriage"].run(_OBX_ED_ADT)
 

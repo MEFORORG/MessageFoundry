@@ -270,6 +270,14 @@ false-premise defect:
    wired at `__main__.py:1722`. `serve` refuses an in-process off-loopback `[api]` TLS bind unless a
    declared TLS-terminating reverse proxy (WP-15) or `MEFOR_TLS_REVOCATION_ATTESTED` proves
    revocation in front. Loopback and proxy-terminated binds never trip it.
+   *(Note 2026-11-04: a declared proxy no longer exempts the bind, BACKLOG #4636, Manager decision
+   d20261104T080839080-981796. Since #4636 a plaintext proxy-to-engine hop is refused off loopback,
+   so a proxy in front of an off-loopback bind re-encrypts to the engine's own operator certificate,
+   and the declaration does not attest that the proxy checks that certificate's revocation. Such a
+   bind now needs
+   `MEFOR_TLS_REVOCATION_ATTESTED`. A plaintext proxy-terminated bind exists only on loopback, and
+   it still never trips the refusal. docs/SECURITY.md, *API revocation gate*, states the rule. The
+   item keeps its original wording.)*
 3. **Terminating mTLS listeners — `check_inbound_revocation`** (`pipeline/wiring_runner.py:6779`,
    body `:6800-6826`). Refuses an mTLS listener that verifies client certificates with no
    `tls_crl_file`, on an enforcing production-PHI instance.
@@ -606,7 +614,10 @@ and `settings.py:3675` defaults enforcement to `SecurityEnforcement.ENFORCE`. Th
 at `tls_policy.py:963-973` has no global audited-opt-out arm (`:958-960`), so the only relaxations are
 loopback, a proven terminator, an attestation, or a non-PHI posture. *(Note 2026-10-27: on an
 outbound hop the "proven terminator" arm is gone; the docstring of `revocation_hop_disposition`
-says why. The sentence keeps its original wording.)*
+says why. The sentence keeps its original wording.)* *(Note 2026-11-04, BACKLOG #4636: for the
+`[api]` in-process bind the sentence is wrong too. That gate reads no posture and no enforcement
+level, and no terminator clears it; [SECURITY.md, API revocation gate](../SECURITY.md#api-revocation-gate)
+states the rule.)*
 
 **One caveat, stated so nobody reads more coverage into it than exists:**
 `RevocationHopGuard.enforce_construction` **no-ops when the posture is unstamped** — a direct test
@@ -769,7 +780,31 @@ real check. A hop with `tls_allow_expired`, a CRL and the attestation keeps the 
 MLLP and the DICOM SCU (since §13), the REST, SOAP and FHIR hops (§4.3 above) and the FTPS hops
 (§7.1's note of 2026-10-28 on the inbound FTPS poll, and §13) hand the guard no context there, so such a hop crosses on its attestation alone. *(Note 2026-11-03: MLLP, the SCU and FTPS now pass their context with `expiry_relaxed=True` instead, which gives the same answer; the note below.)* **The guard's own
 disposition does not apply that reading:** it still admits a context that skips time validity on
-that context's CRL, with no attestation, so the rule rests on each caller passing no context. The
+that context's CRL, with no attestation, so the rule rests on each caller passing no context.
+*(Note 2026-11-04: no longer so. `crl_is_a_check` and the `context_skips_validity` field are
+gone, and the guard decides on one field, `crl_checked`, which the disposition, the line and the
+AI broker all read (vault BACKLOG #5086, owner ruling 2026-11-03). `capture()` sets it True only
+when the context checks a CRL, the context does not skip time validity, and the caller did not pass
+`expiry_relaxed=True`, so the flag can only take the credit away. A CRL on a context that skips time
+validity earns no credit with or without the flag, so such a hop is decided as one with no CRL:
+at least, off-box and unattested, it is refused under an enforcing posture, and warned on an
+instance that does not enforce unless `MEFOR_TLS_REVOCATION_ATTESTED` is set. Before it, a guard handed such a context without the flag
+admitted the hop on that CRL, the case §4.3's note of 2026-11-03 left open. A hop is relaxed for
+the record's words and for the remedy when the flag is set or the context skips time validity, so a
+caller that passes no `ways_across` there gets `EXPIRY_RELAXED_WAYS_ACROSS`. No shipped call site's
+disposition moved: MLLP, the DICOM SCU and FTPS pass their relaxed context with the flag (vault
+BACKLOG #5089), and at least REST, SOAP and FHIR hand the guard no context there. Tests in
+`tests/test_revocation_guard_census.py` pin the call sites as written:
+`test_every_reach_of_relax_verify_expiry_is_a_listed_builder_hop_or_exemption` lists each site in
+`messagefoundry/` that reaches the function by name, an import alias included, directly or through
+a builder that hands the relaxed context or opener on, such as REST's `_expiry_relaxed_opener`, and
+fails on a new site. `test_every_relaxed_hop_is_a_connection_whose_guard_call_cannot_credit_a_crl`
+checks that each listed hop is the `__init__` of a connector class, and that each of its guard
+calls, at the call or one wrapper down, hands `capture()` its relaxed context, passes
+`expiry_relaxed=True`, or hands no context. It reads code as written, not what it evaluates to, and
+a context relaxed by other means than `relax_verify_expiry` is outside both tests; such a context
+still earns no CRL credit at `capture()`, which reads the flag off the context itself. The rest of
+this paragraph is as of 2026-10-30.)* The
 choice is made at each call site: at least `RestDestination.__init__` (`transports/rest.py`),
 `SoapDestination.__init__` (`soap.py`), `FhirDestination.__init__` (`fhir.py`), FTPS's
 `_guard_ftps_revocation` (`remotefile.py`), and the MLLP and SCU sites §13 names.
@@ -802,7 +837,13 @@ each other. Whether such a context's CRL should admit the hop is not decided her
 guard's, and its line keeps the unrelaxed words: no context that skips time validity reaches it,
 because it dials rest.py's shared opener, which never relaxes. The
 REST, SOAP and FHIR hops pass no such flag, so their line keeps the partial over-statement this
-paragraph describes; their refusal text is left open in §13 too.
+paragraph describes; their refusal text is left open in §13 too. *(Note 2026-11-04: the open limit above is closed by
+vault BACKLOG #5086. `capture()` reads the time-validity flag off any context it is handed, so a
+context that skips time validity earns no CRL credit without the flag either, takes the relaxed
+words and, where the caller passes no remedy, `EXPIRY_RELAXED_WAYS_ACROSS`; "Only the flag sets
+them" no longer holds. Its attested line is kept on `crl_checked`, which is now False there, so the
+record and the disposition no longer contradict each other. `crl_is_a_check` is gone; §4.3's note
+of 2026-11-04 above says what replaced it.)*
 
 The Status paragraph and the two §7.1 rows that called #2188 and #2169 open defects carry a
 correction dated 2026-10-04.
@@ -1535,6 +1576,11 @@ on first deployment, with no attestation.
   field that feeds `crl_is_a_check`. `context_checks_revocation` itself is unchanged. The
   disposition on these hops is the same: refused under an enforcing posture unless attested. §4.3's
   note of 2026-11-03 says what the record now reads.)*
+  *(Note 2026-11-04, BACKLOG #5086: the `context_skips_validity` field and `crl_is_a_check` are
+  gone. `capture` reads `skips_validity_period` off any context it is handed and, on True, drops
+  the CRL credit and treats the hop as relaxed whether or not the caller passed the flag, so these
+  call sites are no longer the only place the flag is read. They still pass it. The disposition on
+  these hops is unchanged; §4.3's note of 2026-11-04 says what the guard now decides on.)*
 - The attested crossing still logs its audit line: with no CRL credit, the attestation is what
   crosses the hop.
 - On an instance that does not enforce, these hops used to cross on the CRL without the revocation
@@ -1559,6 +1605,10 @@ on first deployment, with no attestation.
   each of them, and on those callers the effect matches the reverted fix's. A caller that handed
   the guard such a context without that flag would differ only where the context loads a CRL:
   there `crl_checked` is True and `crl_is_a_check` is False. Where it loads none, both are False.)*
+  *(Note 2026-11-04: `crl_is_a_check` is gone, and the line's condition is `crl_checked` itself,
+  which the disposition reads too (vault BACKLOG #5086). `capture` leaves it False on a context that
+  skips time validity with or without the flag, so the difference the note above names for a
+  caller that omits the flag is gone.)*
 
 Pinned by `tests/test_revocation_guard_remaining_hops.py`, beside the FTPS arm of the same rule:
 refused with a CRL on the relaxed context, admitted and audited on the attestation with no CRL

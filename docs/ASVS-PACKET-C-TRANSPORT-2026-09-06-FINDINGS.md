@@ -63,6 +63,9 @@ topology, and deleting it would leave the two-box bench rig with no posture. It 
 unauthenticated reads on 2026-09-05 instead. Zero deployments removes migration cost, not design
 cost.
 
+*Note 2026-11-04 (BACKLOG #4636):* `serve` now refuses the two-box shape of that plaintext
+topology; [SECURITY.md, Plaintext proxy hop](SECURITY.md#plaintext-proxy-hop) states the rule.
+
 ## Deliberately not done
 
 **Did not build the strength-ordering check or the IDE cipher pin (#1175).** PR 809 is open against

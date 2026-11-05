@@ -781,15 +781,14 @@ def test_a_lone_certificate_keyword_warns_and_names_the_remedy(
         (_PSQL, "SSLmode=verify-full", "VERIFY_IDENTITY"),
         (_MYSQL, "SSLMODE=VERIFY_IDENTITY", "verify-full"),
         (_MSODBC, "Encrypt=yes", "verify-full"),
-        ("MySQL", "a registered name the engine places", "verify-full"),
     ],
 )
 def test_the_warning_names_the_family_s_own_spelling(
     caplog: pytest.LogCaptureFixture, driver: str, example: str, absent: str
 ) -> None:
     """BACKLOG #5029. The warning's example was psqlODBC's on every driver, so it told a MySQL
-    operator to set a value MySQL ignores. Each family now gets its own, and a name the engine
-    cannot place gets none."""
+    operator to set a value MySQL ignores. Each family now gets its own. A name the engine
+    cannot place is refused at build since BACKLOG #5041, so it reaches no warning."""
     logged = _generic_dsn_logs({}, caplog, driver=driver)
     assert "TLS verification is NOT enforced" in logged
     assert example in logged and absent not in logged

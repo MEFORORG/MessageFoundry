@@ -156,6 +156,7 @@ def _loosening_names(sec: SecuritySettings) -> list[str]:
             attested_hops=(),
             revocation_attested_hops=(),
             path_form_fhir_hops=(),
+            ech_cleartext_sidecar_hops=(),
             api=ApiSettings(),
             approvals=ApprovalsSettings(),
             cert_monitor=CertMonitorSettings(),
@@ -898,8 +899,9 @@ async def test_a_reload_is_judged_against_the_opt_outs_the_engine_started_with(
         "approval",
     ]
     # ``approval`` binds a dual-control reload to a config digest (BACKLOG #2596). It must carry
-    # the digest and nothing else, or a reload could pass in opt-outs the engine did not start with.
-    assert [f.name for f in dataclasses.fields(ApprovedConfig)] == ["fingerprint"]
+    # the digest and the keyed value-file binding, a MAC record the release only verifies, and
+    # nothing else, or a reload could pass in opt-outs the engine did not start with.
+    assert [f.name for f in dataclasses.fields(ApprovedConfig)] == ["fingerprint", "value_file"]
     cfg = tmp_path / "cfg"
     _write_graph(cfg, basic=True)
     with (cfg / "feed.py").open("a", encoding="utf-8") as f:

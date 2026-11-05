@@ -97,6 +97,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.connection_events import check_connection_event_kind
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
+from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
@@ -150,7 +151,11 @@ from messagefoundry.store.crypto import (
     rotation_fingerprint_cipher,
     rotation_fingerprint_reseal_likes,
 )
-from messagefoundry.store.document_strip import StripResult, cutoff_for
+from messagefoundry.store.document_strip import (
+    StripResult,
+    cutoff_for,
+    log_unreadable_skips,
+)
 from messagefoundry.store.gcm_bound import (
     bind_store_salt,
     checkpoint_invocations,
@@ -191,13 +196,15 @@ from messagefoundry.store.row_seal import (
     RowSealer,
     RowSealError,
 )
-from messagefoundry.store.schema_verify import IndexShape, SchemaShape
+from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
     new_reference_set,
     new_state_cache,
     sealed_reference_set,
 )
 from messagefoundry.store.server_schema_verify import (
+    ColumnShape,
+    ServerSchemaShape,
     declared_schema,
     key_column,
     refuse_short_schema,
@@ -322,6 +329,8 @@ from messagefoundry.store.store import (
     global_epoch_unmoved,
     held_approval_tombstone,
     if_applied,
+    inheritance_plan,
+    inheriting_children,
     judge_totp,
     load_audit_chain,
     lockout_clear,
@@ -643,9 +652,12 @@ _SCHEMA: list[str] = [
         ciphertext    TEXT NOT NULL,
         PRIMARY KEY (attachment_id, seq)
     )""",
+    # `inherited` marks a link a child message took from its parent (BACKLOG #5099): it serves
+    # delivery and retention, and grants no download (attachments_for).
     """CREATE TABLE IF NOT EXISTS message_attachment (
         message_id    TEXT NOT NULL,
         attachment_id TEXT NOT NULL,
+        inherited     BOOLEAN NOT NULL DEFAULT FALSE,
         PRIMARY KEY (message_id, attachment_id)
     )""",
     # ix_queue_lease (the reclaim sweep's index) is created in _migrate_lease_columns, AFTER the lease
@@ -1297,13 +1309,21 @@ _FIFO_OUT_SEQ_INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS ix_queue_fifo_out_seq"
     " ON queue(stage, destination_name, status, seq)"
 )
-#: What the live-schema check expects: the batch, then every index the migration builds. The
-#: migration's columns are in the batch's CREATE TABLE statements already, so it adds none here.
+# The pre-ADR-0060 FIFO index names the migration drops once their seq-trailing successors exist.
+# Constants for the same reason as the builds above: the check reads what the migration runs, so a
+# name dropped here is not expected (BACKLOG #5062).
+_FIFO_IN_DROP_DDL = "DROP INDEX IF EXISTS ix_queue_fifo_in"
+_FIFO_OUT_DROP_DDL = "DROP INDEX IF EXISTS ix_queue_fifo_out"
+#: What the live-schema check expects: the batch, then every index the migration builds or drops, in
+#: the order it runs them. The migration's columns are in the batch's CREATE TABLE statements
+#: already, so it adds none here; a test holds each ADD's type and nullability to that CREATE TABLE.
 _MIGRATION_INDEX_DDL: Final = (
     _BODY_REF_INDEX_DDL,
     _LEASE_INDEX_DDL,
     _FIFO_IN_SEQ_INDEX_DDL,
     _FIFO_OUT_SEQ_INDEX_DDL,
+    _FIFO_IN_DROP_DDL,
+    _FIFO_OUT_DROP_DDL,
     _RECEIVED_INDEX_DDL,
 )
 
@@ -1311,16 +1331,29 @@ _MIGRATION_INDEX_DDL: Final = (
 # Each name is resolved the way the batch's unqualified DDL resolved it: a table through the search
 # path, and an index in the namespace of the table it is declared on, which is where CREATE INDEX IF
 # NOT EXISTS looked for it. The relkind is read too, so a name held by another kind of relation is
-# named as such. Every name travels as a bound array, never spliced.
+# named as such. Every name travels as a bound array, never spliced. Each column's type is read as
+# format_type() prints it, with its NOT NULL and whether the server numbers it, an identity or a
+# SERIAL's nextval() default (BACKLOG #5085). Every row carries current_schema(), the schema the
+# batch's unqualified DDL resolved into, for the refusal to name.
 _LIVE_COLUMNS_SQL = (
-    "SELECT t.name AS tbl, c.relkind::text AS kind, a.attname::text AS col"
+    "SELECT t.name AS tbl, c.relkind::text AS kind, a.attname::text AS col,"
+    " pg_catalog.format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull AS notnull,"
+    " (a.attidentity <> '' OR pg_catalog.pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval(%')"
+    " AS numbered, pg_catalog.current_schema()::text AS schema_name"
     " FROM pg_catalog.unnest($1::text[]) AS t(name)"
     " LEFT JOIN pg_catalog.pg_class c ON c.oid = pg_catalog.to_regclass(t.name)"
     " LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0"
     " AND NOT a.attisdropped AND c.relkind IN ('r', 'p')"
+    " LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum"
 )
-# indnkeyatts leaves out INCLUDE columns; bit 0 of indoption is DESC. pg_get_indexdef with a column
-# number prints that key column alone: its name, or the expression. The two arrays are zipped with
+# indnkeyatts leaves out INCLUDE columns; bit 0 of indoption is DESC and bit 1 NULLS FIRST.
+# pg_get_indexdef with a column number prints that key column alone, its name or the expression, and
+# none of its options, so a collation other than the column's, an operator class that is not its
+# type's default, and a NULLS order other than the direction's default are added after it (BACKLOG
+# #5062). The DDL reader refuses all three, so a live key carrying one compares unequal. A collation
+# is added only after a column (indkey nonzero): an expression's own collation lives in indexprs,
+# which SQL cannot read, so one is not compared rather than printed for an expression whose natural
+# collation it is. Each vector is zero-based, so key k is at k - 1. The two name arrays are zipped with
 # ROWS FROM and one unnest each: the parser rewrites a multi-argument unnest in FROM into that form
 # only when the name is unqualified, so pg_catalog.unnest($1, $2) finds no such function.
 _LIVE_INDEXES_SQL = (
@@ -1328,7 +1361,16 @@ _LIVE_INDEXES_SQL = (
     " i.indisunique AS uniq, (i.indpred IS NOT NULL) AS partial,"
     " (i.indisvalid AND i.indisready) AS usable, am.amname::text AS method,"
     " ARRAY(SELECT pg_catalog.pg_get_indexdef(i.indexrelid, k, true)"
+    "   || COALESCE((SELECT ' COLLATE ' || pg_catalog.quote_ident(co.collname::text)"
+    "     FROM pg_catalog.pg_collation co WHERE co.oid = i.indcollation[k - 1]"
+    "     AND i.indkey[k - 1] <> 0"
+    "     AND co.oid IS DISTINCT FROM (SELECT ka.attcollation FROM pg_catalog.pg_attribute ka"
+    "       WHERE ka.attrelid = i.indrelid AND ka.attnum = i.indkey[k - 1])), '')"
+    "   || COALESCE((SELECT ' ' || oc.opcname::text FROM pg_catalog.pg_opclass oc"
+    "     WHERE oc.oid = i.indclass[k - 1] AND NOT oc.opcdefault), '')"
     "   || CASE WHEN (i.indoption[k - 1]::int & 1) = 1 THEN ' DESC' ELSE '' END"
+    "   || CASE (i.indoption[k - 1]::int & 3) WHEN 2 THEN ' NULLS FIRST'"
+    "     WHEN 1 THEN ' NULLS LAST' ELSE '' END"
     "   FROM pg_catalog.generate_series(1, i.indnkeyatts::int) AS k ORDER BY k) AS cols"
     " FROM ROWS FROM (pg_catalog.unnest($1::text[]), pg_catalog.unnest($2::text[]))"
     " AS q(name, tbl)"
@@ -1339,7 +1381,6 @@ _LIVE_INDEXES_SQL = (
     " LEFT JOIN pg_catalog.pg_class t ON t.oid = i.indrelid"
     " LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam"
 )
-_CURRENT_SCHEMA_SQL = "SELECT pg_catalog.current_schema()::text AS schema_name"
 _RELKINDS: Final = MappingProxyType(
     {
         "r": "table",
@@ -1364,17 +1405,23 @@ def _relkind_label(kind: str | None, wanted: tuple[str, ...], label: str) -> str
     return label if kind in wanted else _RELKINDS.get(kind, f"relation of kind {kind!r}")
 
 
-def _declared_schema() -> SchemaShape:
-    """What the live-schema check expects: the batch, then every index the migration builds."""
-    return declared_schema((*_SCHEMA, *_MIGRATION_INDEX_DDL))
+def _declared_schema() -> ServerSchemaShape:
+    """What the live-schema check expects: the batch, then every index the migration builds or drops,
+    with each column's type and nullability as PostgreSQL's catalog spells them."""
+    return declared_schema((*_SCHEMA, *_MIGRATION_INDEX_DDL), "postgres")
 
 
 def _schema_hash() -> str:
     """Content hash of the shipped DDL batch + the migration revision. The ``schema_meta`` marker
     stores it; a match at open means this exact batch (and migration pass) already ran, so both —
     and the schema advisory lock — are skipped (ADR 0064). Any edit to ``_SCHEMA`` changes the hash
-    automatically; a change to ``_migrate_lease_columns`` must bump ``_MIGRATION_REV``."""
-    payload = "\n".join(_SCHEMA) + f"\nmigration_rev={_MIGRATION_REV}"
+    automatically; a change to ``_migrate_lease_columns`` must bump ``_MIGRATION_REV``, and a change
+    to what the live-schema check refuses bumps the one ``SCHEMA_CHECK_REV`` both backends hash."""
+    payload = (
+        "\n".join(_SCHEMA)
+        + f"\nmigration_rev={_MIGRATION_REV}"
+        + f"\nschema_check_rev={server_schema_verify.SCHEMA_CHECK_REV}"
+    )
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -2198,6 +2245,9 @@ class PostgresStore:
                 # commits or rolls back, or once the server sees the holder's session end, which
                 # for a crashed host can take as long as TCP keepalive allows. A role- or
                 # database-configured lock_timeout (or transaction_timeout) can still end it sooner.
+                # Read before the lock and the batch, so DDL the live-schema check cannot read
+                # fails here, with no peer queued behind it (BACKLOG #5062). Cached per process.
+                _declared_schema()
                 log.info("postgres: waiting for the schema lock to apply the DDL batch")
                 wait = self._settings.schema_lock_timeout
                 lock = self._lock_key(_SCHEMA_LOCK)
@@ -2359,10 +2409,18 @@ class PostgresStore:
         are tolerated. :mod:`messagefoundry.store.server_schema_verify` says what is compared and
         what is not. Reads only."""
         expected = _declared_schema()
-        column_rows = [
-            (r["tbl"], _relkind_label(r["kind"], ("r", "p"), "table"), r["col"])
-            for r in await conn.fetch(_LIVE_COLUMNS_SQL, sorted(expected.columns))
-        ]
+        column_rows: list[tuple[str, str | None, str | None, ColumnShape | None]] = []
+        live_columns = await conn.fetch(_LIVE_COLUMNS_SQL, sorted(expected.columns))
+        schema = live_columns[0]["schema_name"] if live_columns else None
+        for r in live_columns:
+            shape = (
+                None
+                if r["type"] is None
+                else ColumnShape(str(r["type"]), not r["notnull"], bool(r["numbered"]))
+            )
+            column_rows.append(
+                (r["tbl"], _relkind_label(r["kind"], ("r", "p"), "table"), r["col"], shape)
+            )
         names = sorted(expected.named_indexes)
         tables = [expected.named_indexes[name].table for name in names]
         taken: dict[str, str] = {}
@@ -2387,10 +2445,8 @@ class PostgresStore:
                 bool(r["uniq"]),
                 bool(r["partial"]),
             )
-        # The schema the batch's unqualified DDL resolved into, for the refusal to name: with
+        # schema is the one the batch's unqualified DDL resolved into, for the refusal to name: with
         # [store].db_schema unset that is the search path's first schema, which the settings omit.
-        schema_rows = await conn.fetch(_CURRENT_SCHEMA_SQL)
-        schema = schema_rows[0]["schema_name"] if schema_rows else None
         refuse_short_schema(
             self.backend.value,
             self._settings.database,
@@ -2453,8 +2509,8 @@ class PostgresStore:
         # neutral (the claim orders by seq and names no index, ADR 0059) — pure speed restoration.
         await conn.execute(_FIFO_IN_SEQ_INDEX_DDL, timeout=float("inf"))
         await conn.execute(_FIFO_OUT_SEQ_INDEX_DDL, timeout=float("inf"))
-        await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_in", timeout=float("inf"))
-        await conn.execute("DROP INDEX IF EXISTS ix_queue_fifo_out", timeout=float("inf"))
+        await conn.execute(_FIFO_IN_DROP_DDL, timeout=float("inf"))
+        await conn.execute(_FIFO_OUT_DROP_DDL, timeout=float("inf"))
         await conn.execute(_RECEIVED_INDEX_DDL, timeout=float("inf"))
         # Step-up re-verification (ASVS 7.5.3) adds sessions.reauth_at; pre-existing rows get NULL.
         sessions_has_reauth = await conn.fetch(
@@ -4015,12 +4071,13 @@ class PostgresStore:
         parent_meta: dict[str, Any],
         correlation_depth_cap: int,
         now: float,
+        inherits: list[tuple[str, str]],
     ) -> bool:
         """Produce one PT child INGRESS row + message inside the caller's transaction (ADR 0013, gen.).
 
-        Postgres twin of :meth:`MessageStore._insert_passthrough_child`. Returns ``True`` if a child was
-        produced, ``False`` if the depth cap was breached (no child; the caller records the parent
-        ``ERROR`` via a dead marker). The child is a new, independent message (``source_type=
+        Postgres twin of :meth:`MessageStore._insert_passthrough_child`, which says what
+        ``inherits`` collects. Returns ``True`` if a child was produced, ``False`` if the depth cap
+        was breached (no child; the caller records the parent ``ERROR`` via a dead marker). The child is a new, independent message (``source_type=
         'passthrough'``, its own content-addressed id, status ``RECEIVED`` per count-and-log), correlated
         to the parent. Idempotent re-run: the content-addressed id is pre-checked so a partial-then-
         recovered run does not double-inject. Depth is computed purely from the parent's immutable
@@ -4066,6 +4123,9 @@ class PostgresStore:
                 now=now,
                 origin=MessageOrigin.REINGRESS,
             )
+            # Linked by the caller once every child of this transaction is made
+            # (_inherit_attachments, BACKLOG #5099).
+            inherits.append((new_mid, body))
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created = now
             # Hoist the row id so the payload binds to its own row tag.
@@ -4286,7 +4346,9 @@ class PostgresStore:
         mid = uuid4().hex
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
         # (== its live join rows), so a later release decrefs by the same count.
-        refs = list(dict.fromkeys(attachment_refs or ()))
+        # Sorted, so the increfs below take the attachment header locks in content-address order,
+        # the order a child's inheritance takes them in (BACKLOG #5099, _inherit_attachments).
+        refs = sorted(set(attachment_refs or ()))
         async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
             await self._insert_message(
                 conn,
@@ -4520,6 +4582,7 @@ class PostgresStore:
                         loaded = json.loads(pmeta_json)
                         if isinstance(loaded, dict):
                             parent_meta = loaded
+                    inherits: list[tuple[str, str]] = []
                     for pt_name, body in pt_deliveries:
                         produced = await self._insert_passthrough_child_pg(
                             conn,
@@ -4530,10 +4593,13 @@ class PostgresStore:
                             parent_meta,
                             correlation_depth_cap,
                             now,
+                            inherits,
                         )
                         await self._insert_passthrough_marker_pg(
                             conn, message_id, pt_name, produced, now
                         )
+                    # Every child's documents in one pass, in content-address order (BACKLOG #5099).
+                    await self._inherit_attachments(conn, message_id, inherits)
                 for namespace, key, value in state_ops:
                     value_json = json.dumps(value)
                     await self._apply_state_op(conn, namespace, key, value_json, message_id, now)
@@ -7035,19 +7101,24 @@ class PostgresStore:
                 r["ciphertext"], aad=cell_aad("attachment_chunk", "ciphertext", ref, r["seq"])
             )
 
-    async def attachments_for(self, message_id: str) -> list[dict[str, Any]]:
+    async def attachments_for(
+        self, message_id: str, *, include_inherited: bool = False
+    ) -> list[dict[str, Any]]:
         """The distinct attachments ``message_id`` holds — the operator read surface (#149, ADR 0105
         Phase 3b, Postgres parity). JOINs ``message_attachment`` to its ``attachment`` header and returns
         one row per attachment carrying ``attachment_id`` (the sha256 content address), ``content_type``,
         and ``total_bytes``. **Metadata only** — the chunk ciphertext is never touched/decrypted. Returns
-        ``[]`` for a message with no detached document."""
+        ``[]`` for a message with no detached document. An inherited link is left out unless
+        ``include_inherited`` is set, so it grants no download (BACKLOG #5099; the SQLite twin says
+        why)."""
         if not self.supports_streaming_attachments:
             return []
+        own_only = "" if include_inherited else " AND NOT ma.inherited"
         async with self._timed_acquire() as conn:
             rows = await conn.fetch(
                 "SELECT a.id AS attachment_id, a.content_type, a.total_bytes "
                 "FROM message_attachment ma JOIN attachment a ON a.id = ma.attachment_id "
-                "WHERE ma.message_id=$1 ORDER BY a.id",
+                f"WHERE ma.message_id=$1{own_only} ORDER BY a.id",
                 message_id,
             )
         return [dict(r) for r in rows]
@@ -7093,14 +7164,17 @@ class PostgresStore:
         join rows gone and decrefs nothing — no double-decref, no refcount underflow, no premature GC of
         an attachment a SIBLING message still holds. ``where`` is a code-controlled ``$N`` fragment
         (numbered from ``$1``); ``params`` binds it identically in both statements."""
+        # The decrefs take the header locks in content-address order, as the ingress and
+        # inheritance increfs do (BACKLOG #5099), so neither waits on the other in a cycle. Sorted
+        # in Python as those are, so the database collation does not decide the order.
         rows = await conn.fetch(
             f"SELECT attachment_id, COUNT(*) AS n FROM message_attachment"
-            f" WHERE {where} GROUP BY attachment_id",
+            f" WHERE {where} GROUP BY attachment_id ORDER BY attachment_id",
             *params,
         )
         if not rows:
             return
-        for r in rows:
+        for r in sorted(rows, key=lambda r: str(r["attachment_id"])):
             await self._decref_attachment(conn, r["attachment_id"], int(r["n"]))
         # Delete the just-released join rows so a re-run of the purge decrefs nothing (idempotent GC).
         await conn.execute(f"DELETE FROM message_attachment WHERE {where}", *params)
@@ -7165,6 +7239,39 @@ class PostgresStore:
             OutboxStatus.DEAD.value,
         ]
         return where, params
+
+    async def _inherit_attachments(
+        self, conn: Any, parent_id: str, children: Sequence[tuple[str, str]]
+    ) -> None:
+        """Link each ``(child_id, body)`` in ``children`` to each attachment ``parent_id`` holds
+        that its body names, and incref it, in the CALLER's transaction (BACKLOG #5099). Postgres
+        twin of :meth:`MessageStore._inherit_attachments`, which says why."""
+        children = inheriting_children(children)
+        if not children:
+            return
+        rows = await conn.fetch(
+            "SELECT attachment_id FROM message_attachment WHERE message_id=$1"
+            " ORDER BY attachment_id",
+            parent_id,
+        )
+        # Each incref below takes the attachment header's row lock until commit, so two
+        # transactions that incref the same documents must take them in one order, or each can wait
+        # on the other. inheritance_plan gives every child of this transaction one pass in
+        # content-address order, the order the ingress increfs and the retention decrefs take.
+        held = [str(r["attachment_id"]) for r in rows]
+        for ref, child_ids in inheritance_plan(held, children):
+            # The incref first, and the links only where it found the header (the SQLite twin
+            # says why): under READ COMMITTED a purge can collect it after the read above.
+            status = await conn.execute(
+                "UPDATE attachment SET refcount = refcount + $1 WHERE id=$2", len(child_ids), ref
+            )
+            if _rowcount(status) != 1:
+                continue
+            await conn.executemany(
+                "INSERT INTO message_attachment (message_id, attachment_id, inherited)"
+                " VALUES ($1,$2,TRUE)",
+                [(child_id, ref) for child_id in child_ids],
+            )
 
     async def release_message_attachments(self, message_id: str) -> None:
         """Release (decref + delete the linkage rows for) every attachment a SINGLE message holds, in ONE
@@ -7641,6 +7748,7 @@ class PostgresStore:
                         origin=MessageOrigin.OPERATOR_EDIT,
                         origin_actor=actor,
                     )
+                    await self._inherit_attachments(conn, message_id, [(child_mid, body)])
                     await self._event(
                         conn, child_mid, "received", None, f"edit-resend from {message_id}", now
                     )
@@ -7830,6 +7938,7 @@ class PostgresStore:
                         origin=MessageOrigin.OPERATOR_EDIT,
                         origin_actor=actor,
                     )
+                    await self._inherit_attachments(conn, origin_message_id, [(new_mid, raw)])
                     # Hoist the row id so the payload binds to its own row tag.
                     resubmit_row_id = uuid4().hex
                     await conn.execute(
@@ -11065,6 +11174,7 @@ class PostgresStore:
             reclaimed = 0
             updates: list[tuple[str, float, str]] = []
             failures: list[CellTagError] = []
+            unreadable: list[object] = []
             for row in rows:
                 cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
                 if row["received_at"] >= cutoff:
@@ -11098,6 +11208,7 @@ class PostgresStore:
                     pruned_at=now,
                     min_bytes=min_bytes,
                     content_type=content_types.get(row["channel_id"]),
+                    on_unreadable=functools.partial(unreadable.append, row["id"]),
                 )
                 if n_docs == 0:
                     continue
@@ -11116,6 +11227,8 @@ class PostgresStore:
                 msgs += 1
                 docs += n_docs
                 reclaimed += n_bytes
+            # Before the write, so a failed write does not lose the record of the skips.
+            log_unreadable_skips(unreadable)
             if updates:
                 async with conn.transaction():
                     await conn.executemany(

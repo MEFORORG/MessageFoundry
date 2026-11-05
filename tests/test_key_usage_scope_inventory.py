@@ -76,6 +76,9 @@ _KEY_MATERIAL = frozenset(
         # Vault BACKLOG #2608: an HMAC key HKDF-derived from the audit-chain key, keying the digest
         # of a refused inbound body. A derived key used for one property is what 11.1.2 scopes.
         "Refused inbound body digest",
+        # Vault BACKLOG #2596: an HMAC key HKDF-derived from the audit-chain key, binding a held
+        # reload to the environment value file outside the config directory.
+        "Reload hold value-file binding",
     }
 )
 

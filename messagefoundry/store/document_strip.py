@@ -15,10 +15,13 @@ three store backends and the retention runner without a cycle.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import logging
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-__all__ = ["StripResult", "cutoff_for"]
+__all__ = ["StripResult", "cutoff_for", "log_unreadable_skips"]
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -49,3 +52,21 @@ def cutoff_for(
         if override is not None:
             return override
     return global_cutoff
+
+
+def log_unreadable_skips(message_ids: Sequence[object]) -> None:
+    """Log, once per ``strip_embedded_documents`` call and at WARNING, the rows it skipped because
+    their HL7 delimiters could not be read (``strip_documents``' ``on_unreadable``, BACKLOG
+    #5099): a document such a row holds stays past its strip window, so the skip must not be
+    silent (CLAUDE.md section 6). One record per call rather than one per row, since the same rows
+    are selected again on every pass until their bodies are purged; the retention runner makes one
+    call per distinct ``min_bytes`` threshold, so a pass may log more than one. It names the count
+    and the first message id, never a byte of a body. Nothing is logged when none was skipped."""
+    if not message_ids:
+        return
+    log.warning(
+        "document strip skipped %d stored HL7 bodies whose delimiters could not be read (first: "
+        "message %s); any document they hold stays past the strip window",
+        len(message_ids),
+        message_ids[0],
+    )

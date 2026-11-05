@@ -31,7 +31,8 @@ import operator
 import os
 import re
 import ssl
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+import time
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -107,6 +108,8 @@ __all__ = [
     "peer_ip_allowed",
     "probe_tcp_reachable",
     "DEFAULT_MAX_ITEMS_PER_POLL",
+    "POLL_STOP_GRACE_S",
+    "PollStopGuard",
     "cap_setting",
     "count_setting",
     "float_setting",
@@ -1208,6 +1211,69 @@ def check_file_key(file_key: str, *, write: bool) -> None:
         raise FileKeyError("a dedup-ledger write carries a scheme tag other than today's")
     if not _HEX64.fullmatch(digest):
         raise FileKeyError("a dedup-ledger key's digest is not 64 lowercase hex")
+
+
+#: How long an ordinary stop() of a Database or RemoteFile source waits for its poll task before it
+#: gives up on a blocked external call (BACKLOG #4685). The figure is FileSource's own
+#: ``_STOP_GRACE_S`` (BACKLOG #1620), the bound this one mirrors.
+POLL_STOP_GRACE_S = 5.0
+
+
+class PollStopGuard:
+    """Bounds a poll source's ordinary stop() without ever cutting a store call (BACKLOG #4685).
+
+    The poll task wraps each store call, at least a pipeline hand-off or a processed-ledger read or
+    write, in :meth:`store_call`. :meth:`join` then waits for the task: a grace at a time while it
+    is inside a store call, and a full grace after the last one ended, so the task always gets a
+    whole grace to reach its next stop check. Once a grace passes outside a store call it returns False, and the
+    caller cancels the task. That is safe there because the task is blocked on an external call (at
+    least a listing, a retrieve or a driver call), and the next poll does that call's work again
+    (at-least-once). The wait is so bounded for a blocked external call, and only as bounded as the
+    store for a store call, as ``FileSource.stop()``'s is.
+
+    The inside mark is keyed by task, so a cut task unwinding late cannot clear the mark of a task
+    a later start() made. The end time is not: a late one can only lengthen a grace."""
+
+    def __init__(self) -> None:
+        self._inside: asyncio.Task[Any] | None = None
+        self._ended = 0.0
+
+    @contextlib.contextmanager
+    def store_call(self) -> Iterator[None]:
+        """Mark the current task as inside a store call, which :meth:`join` never gives up on."""
+        me = asyncio.current_task()
+        self._inside = me
+        try:
+            yield
+        finally:
+            if self._inside is me:
+                self._inside = None
+            self._ended = time.monotonic()
+
+    def inside(self, task: asyncio.Task[Any]) -> bool:
+        """Whether ``task`` is inside a store call now."""
+        return self._inside is task
+
+    async def join(self, task: asyncio.Task[Any], grace: float) -> bool:
+        """Wait for ``task``: True once it is done, False when the caller should give up on it.
+
+        Waits through :func:`asyncio.wait`, so a cancel of the caller is not forwarded into
+        ``task``; the caller decides what a cancel does to it."""
+        if grace <= 0:
+            raise ValueError("a stop grace must be positive")  # zero would spin in a store call
+        deadline = time.monotonic() + grace
+        while True:
+            done, _pending = await asyncio.wait(
+                {task}, timeout=max(0.0, deadline - time.monotonic())
+            )
+            if done:
+                return True
+            if self.inside(task):
+                deadline = time.monotonic() + grace  # never cut a store call; look again in a grace
+                continue
+            deadline = max(deadline, self._ended + grace)
+            if time.monotonic() >= deadline:
+                return False
 
 
 class DeliveryError(Exception):
