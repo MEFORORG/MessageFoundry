@@ -384,8 +384,10 @@ and fails on a new one. It also fails when a known one stops being reported. Eit
 was withdrawn, or the audit stopped seeing the package, and a person has to find out which. That
 check is what shows, on each run, that the audit still sees the known-vulnerable packages. *This paragraph used to say nothing in CI scans this closure;
 that was true until BACKLOG #1578's audit job landed.* The baseline's first entries were recorded as
-found, not triaged for reachability. Entries have since been triaged a few at a time, and the
-comment above each entry in the baseline says whether it has been, by whom, and on what reading.
+found, not triaged for reachability. Some have since been triaged, and the baseline's header says
+how to tell which: a triage comment names each advisory id it covers, and says who triaged it
+and on what reading. Among those still recorded as found are the three lodash advisories, and lodash's code
+is in the bundle.
 The exposure is bounded by where the bundle runs — CI only,
 never in a wheel, sdist or deployment — and `.github/dependabot.yml` records why no automated
 remediation lane exists for it.

@@ -403,8 +403,10 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
 #: - The 2026-11-05 triage (BACKLOG #2492): what it settles is stated in the header paragraph "THE
 #:   2026-11-05 TRIAGE" and in each triaged entry's comment. Re-run here are the probes those
 #:   comments name as re-run. Generic names they measured, such as @babel/helpers'
-#:   ``getDependencies`` and ``minVersion``, are left out. Package names that ordinary prose could
-#:   hold are kept, as minimatch's is above, for the same reason.
+#:   ``getDependencies`` and ``minVersion``, are left out. Some package names that ordinary prose
+#:   could hold are kept, as minimatch's is above, for the same reason. "semver" and "braces" are
+#:   not re-run: the words are common in other code's comments, and each package's own
+#:   identifiers above stand in for it.
 _ABSENT_FROM_BUNDLE = (
     re.compile("sprintf", re.IGNORECASE),  # sprintf-js
     re.compile("ArgumentParser"),  # argparse
@@ -420,8 +422,10 @@ _ABSENT_FROM_BUNDLE = (
     re.compile("loadPartialConfig"),  # @babel/core
     re.compile("NodePath"),  # @babel/traverse
     re.compile("browserslist", re.IGNORECASE),  # browserslist
-    re.compile("compareIdentifiers|MAX_SAFE_COMPONENT_LENGTH"),  # semver
-    re.compile("hookChildProcess|verifyENOENT"),  # cross-spawn
+    re.compile("compareIdentifiers"),  # semver
+    re.compile("MAX_SAFE_COMPONENT_LENGTH"),  # semver
+    re.compile("hookChildProcess"),  # cross-spawn
+    re.compile("verifyENOENT"),  # cross-spawn
     re.compile("joinCmd"),  # execa, cross-spawn's runtime parent
     re.compile("windowsRelease"),  # windows-release, execa's other parent
     re.compile("osName"),  # os-name, windows-release's parent
@@ -483,8 +487,10 @@ def test_the_recorded_bundle_reading_still_holds() -> None:
         ("export function* loadPartialConfig(", "loadPartialConfig"),
         ("// NodePath is split across many files.", "NodePath"),
         ("var BrowserslistError = require('./error')", "browserslist"),
-        ("var MAX_SAFE_COMPONENT_LENGTH = 16", "compareIdentifiers|MAX_SAFE_COMPONENT_LENGTH"),
-        ("function hookChildProcess(cp, parsed) {", "hookChildProcess|verifyENOENT"),
+        ("function compareIdentifiers (a, b) {", "compareIdentifiers"),
+        ("var MAX_SAFE_COMPONENT_LENGTH = 16", "MAX_SAFE_COMPONENT_LENGTH"),
+        ("function hookChildProcess(cp, parsed) {", "hookChildProcess"),
+        ("function verifyENOENT(status, parsed) {", "verifyENOENT"),
         ("function joinCmd(cmd, args) {", "joinCmd"),
         ("const windowsRelease = release => {", "windowsRelease"),
         ("const osName = (platform, release) => {", "osName"),
