@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Check that each runtime dependency is installed at the floor ``pyproject.toml`` declares.
+"""Check that each declared dependency is installed at the floor ``pyproject.toml`` declares.
 
 ``.github/workflows/dependency-floors.yml`` installs with uv's ``lowest-direct`` resolution, so its
 tests run against the oldest releases the engine claims to support (vault BACKLOG #3055). That run
 says something about the floors only if the install really landed on them. A resolver change, an
 override left in place after its reason went away, or a dependency that is not installed at all
 would each let the tests pass against something else. So this reads every ``[project].dependencies``
-entry whose marker applies here and compares the installed version with its ``>=`` bound.
+entry, and every entry of each extra ``--extra`` names, whose marker applies here, and compares the
+installed version with its ``>=`` bound.
+
+The extras read default to ``dev``, the one the workflow installs, so a ``[dev]`` floor the resolver
+skips (yanked, no wheel for this Python, or conflicting with another floor) reds the check the same
+way a runtime floor does (vault BACKLOG #3177). Naming ``--extra`` reads those extras instead of
+``dev``. An extra ``pyproject.toml`` does not declare is refused rather than read as empty.
 
 A dependency installed above its floor fails the check unless ``--raised NAME`` names it. The
 workflow passes none: a floor that cannot install on this Python is raised in ``pyproject.toml``
@@ -16,7 +22,8 @@ instead (vault BACKLOG #3177). A ``--raised`` name that sits at its floor after 
 an exception goes when its reason does.
 
 USAGE
-    python scripts/ci/check_dependency_floors.py [--pyproject PATH] [--raised NAME ...]
+    python scripts/ci/check_dependency_floors.py [--pyproject PATH] [--extra NAME ...]
+        [--raised NAME ...]
 """
 
 from __future__ import annotations
@@ -42,20 +49,40 @@ _ROOT = Path(__file__).resolve().parents[2]
 _FLOOR_OPERATORS = frozenset({">=", "~=", "=="})
 
 
-def declared_floors(pyproject: Path) -> dict[str, Version | None]:
-    """``{canonical name: floor}`` for each runtime dependency whose marker applies here. The floor
-    is ``None`` when no specifier gives one, or the specifiers exclude it (``>=1.0,!=1.0``), so
-    :func:`check` can refuse rather than skip it. Two lines for one name combine into one specifier
-    set before the floor is read, as a resolver combines them: a bare line adds no bound, and an
-    exclusion on one line applies to the floor another line declares."""
+#: The extras the workflow installs (``-e ".[dev]"``), read when ``--extra`` names none.
+DEFAULT_EXTRAS = ("dev",)
+
+
+def declared_floors(pyproject: Path, extras: Iterable[str] = ()) -> dict[str, Version | None]:
+    """``{canonical name: floor}`` for each runtime dependency, and each dependency of every extra in
+    ``extras``, whose marker applies here. The floor is ``None`` when no specifier gives one, or the
+    specifiers exclude it (``>=1.0,!=1.0``), so :func:`check` can refuse rather than skip it. Two
+    lines for one name combine into one specifier set before the floor is read, as a resolver
+    combines them, whether they are runtime lines, extra lines or one of each: a bare line adds no
+    bound, and an exclusion on one line applies to the floor another line declares.
+
+    Raises :class:`ValueError` for an extra ``pyproject.toml`` does not declare, so a misspelt or
+    removed extra cannot pass as one with nothing to check."""
     project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
+    declared_extras = {
+        canonicalize_name(extra): lines
+        for extra, lines in project.get("optional-dependencies", {}).items()
+    }
+    groups: list[tuple[str, list[str]]] = [("", project.get("dependencies", []))]
+    for extra in extras:
+        key = canonicalize_name(extra)
+        if key not in declared_extras:
+            raise ValueError(f"extra {extra!r} is not declared in {pyproject}")
+        groups.append((key, declared_extras[key]))
     specifiers: dict[str, SpecifierSet] = {}
-    for line in project.get("dependencies", []):
-        requirement = Requirement(line)
-        if requirement.marker is not None and not requirement.marker.evaluate():
-            continue
-        name = canonicalize_name(requirement.name)
-        specifiers[name] = specifiers.get(name, SpecifierSet()) & requirement.specifier
+    for extra, lines in groups:
+        for line in lines:
+            requirement = Requirement(line)
+            marker = requirement.marker
+            if marker is not None and not marker.evaluate({"extra": extra}):
+                continue
+            name = canonicalize_name(requirement.name)
+            specifiers[name] = specifiers.get(name, SpecifierSet()) & requirement.specifier
     return {name: _floor(specifier) for name, specifier in specifiers.items()}
 
 
@@ -86,7 +113,7 @@ def check(
     """``(report lines, failures)``. The check passes when ``failures`` is empty."""
     expected_raised = {canonicalize_name(name) for name in raised}
     lines: list[str] = []
-    failures: list[str] = [] if floors else ["no runtime dependency declares a floor; nothing read"]
+    failures: list[str] = [] if floors else ["no dependency declares a floor; nothing read"]
     for name in sorted(floors):
         floor, found = floors[name], installed(name)
         raised_on_purpose = name in expected_raised
@@ -120,6 +147,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--pyproject", type=Path, default=_ROOT / "pyproject.toml")
     parser.add_argument(
+        "--extra",
+        action="append",
+        metavar="NAME",
+        help=f"an extra whose floors to read; repeatable (default: {', '.join(DEFAULT_EXTRAS)})",
+    )
+    parser.add_argument(
         "--raised",
         action="append",
         default=[],
@@ -127,7 +160,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="a dependency deliberately installed above its floor; repeatable",
     )
     args = parser.parse_args(argv)
-    lines, failures = check(declared_floors(args.pyproject), args.raised)
+    extras = DEFAULT_EXTRAS if args.extra is None else args.extra
+    try:
+        floors = declared_floors(args.pyproject, extras)
+    except ValueError as exc:
+        print(f"FLOOR NOT MEASURED: {exc}", file=sys.stderr)
+        return 1
+    lines, failures = check(floors, args.raised)
     for line in lines:
         print(line)
     for failure in failures:

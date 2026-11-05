@@ -6,20 +6,30 @@ install sits somewhere other than the floors."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Sequence
+from importlib import metadata
 from pathlib import Path
 
+import pytest
 from packaging.version import Version
 
-from scripts.ci.check_dependency_floors import check, declared_floors, main
+from scripts.ci.check_dependency_floors import DEFAULT_EXTRAS, check, declared_floors, main
 
 _ROOT = Path(__file__).resolve().parents[1]
 
 
-def _pyproject(tmp_path: Path, *deps: str) -> Path:
-    body = ", ".join(f'"{d}"' for d in deps)
+def _toml_list(deps: Sequence[str]) -> str:
+    return "[" + ", ".join(f'"{d}"' for d in deps) + "]"
+
+
+def _pyproject(tmp_path: Path, *deps: str, **extras: Sequence[str]) -> Path:
+    body = f'[project]\nname = "x"\ndependencies = {_toml_list(deps)}\n'
+    if extras:
+        body += "[project.optional-dependencies]\n"
+        body += "".join(f"{name} = {_toml_list(lines)}\n" for name, lines in extras.items())
     path = tmp_path / "pyproject.toml"
-    path.write_text(f'[project]\nname = "x"\ndependencies = [{body}]\n', encoding="utf-8")
+    path.write_text(body, encoding="utf-8")
     return path
 
 
@@ -70,6 +80,73 @@ def test_the_shipped_pyproject_declares_the_fastapi_floor() -> None:
     assert floor is not None and floor >= Version("0.143.1")
 
 
+def test_the_named_extras_are_read_and_combine_with_the_runtime_lines(tmp_path: Path) -> None:
+    """BACKLOG #3177: a [dev] floor is read like a runtime one, and only the extras named."""
+    path = _pyproject(
+        tmp_path,
+        "shared>=1.0",
+        dev=[
+            "pytest>=9.0.3",
+            "shared>=1.2",
+            "only-when-dev>=2.0; extra == 'dev'",
+            "elsewhere>=1.0; sys_platform == 'never'",
+        ],
+        Other_Extra=["other>=3.0"],
+    )
+    assert declared_floors(path) == {"shared": Version("1.0")}
+    assert declared_floors(path, ["dev"]) == {
+        "shared": Version("1.2"),
+        "pytest": Version("9.0.3"),
+        "only-when-dev": Version("2.0"),
+    }
+    # Extra names compare canonicalized, as pip and uv compare them.
+    assert declared_floors(path, ["other-extra"]) == {
+        "shared": Version("1.0"),
+        "other": Version("3.0"),
+    }
+
+
+def test_an_undeclared_extra_is_refused_rather_than_read_as_empty(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _pyproject(tmp_path, dev=["pytest>=9.0.3"])
+    with pytest.raises(ValueError, match="'dve' is not declared"):
+        declared_floors(path, ["dve"])
+    assert main(["--pyproject", str(path), "--extra", "dve"]) == 1
+    assert "FLOOR NOT MEASURED: extra 'dve' is not declared" in capsys.readouterr().err
+
+
+def test_main_reads_the_dev_floors_unless_told_which_extras(tmp_path: Path) -> None:
+    """The workflow passes no ``--extra``, so the default is what makes it read [dev]. The runtime
+    floor is installed exactly, and the control names an empty extra instead and passes, so the
+    red comes from [dev]."""
+    installed = f"packaging=={metadata.version('packaging')}"
+    path = _pyproject(tmp_path, installed, dev=["not-a-real-distribution-3177>=1.0"], ok=[])
+    assert main(["--pyproject", str(path)]) == 1
+    assert main(["--pyproject", str(path), "--extra", "ok"]) == 0
+
+
+def test_the_shipped_pyproject_declares_a_readable_floor_for_every_dev_dependency() -> None:
+    """The control for the default: the real file's [dev] extra is read, and each of its lines
+    yields a floor the check can compare, so the leg reds on a [dev] floor off its mark."""
+    floors = declared_floors(_ROOT / "pyproject.toml", DEFAULT_EXTRAS)
+    runtime = declared_floors(_ROOT / "pyproject.toml")
+    dev_only = floors.keys() - runtime.keys()
+    assert {"pytest", "pytest-asyncio", "pyyaml"} <= dev_only
+    assert all(floors[name] is not None for name in dev_only)
+
+
+def test_the_default_extras_are_the_ones_the_workflow_installs() -> None:
+    """The workflow calls the check with no ``--extra``, so the default must name exactly the
+    extras its install step installs: one more reds as not installed, one fewer goes unread."""
+    workflow = (_ROOT / ".github" / "workflows" / "dependency-floors.yml").read_text(
+        encoding="utf-8"
+    )
+    installed = re.findall(r'-e "\.\[([^\]]*)\]"', workflow)
+    assert len(installed) == 1, installed
+    assert {e.strip() for e in installed[0].split(",")} == set(DEFAULT_EXTRAS)
+
+
 def _installed(versions: dict[str, str | None]) -> Callable[[str], Version | None]:
     def installed(name: str) -> Version | None:
         found = versions.get(name)
@@ -118,9 +195,14 @@ def test_each_verdict() -> None:
 
 
 def test_an_empty_floor_set_fails_rather_than_passes() -> None:
-    assert check({}, [])[1] == ["no runtime dependency declares a floor; nothing read"]
+    assert check({}, [])[1] == ["no dependency declares a floor; nothing read"]
 
 
-def test_main_exits_non_zero_on_a_failure(tmp_path: Path) -> None:
-    path = _pyproject(tmp_path, "not-a-real-distribution-3055>=1.0")
+def test_main_exits_non_zero_on_a_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = _pyproject(tmp_path, "not-a-real-distribution-3055>=1.0", dev=[])
     assert main(["--pyproject", str(path)]) == 1
+    assert "not-a-real-distribution-3055: declared >=1.0 but not installed" in (
+        capsys.readouterr().err
+    )
