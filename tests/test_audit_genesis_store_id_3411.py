@@ -135,14 +135,17 @@ def test_a_store_id_does_not_rescue_a_record_missing_its_own_fields() -> None:
     assert parse_audit_genesis_record(json.dumps({"store_id": _STORE_ID.hex()})) is None
 
 
+#: A range record's ``closes`` and the scheme this release holds for an in-heap key.
+_CLOSES = {"key_id": "a", "from_seq": 1, "to_seq": 1, "rows": 1, "digest": "", "prev_hash": ""}
+_HELD = {"mac": AUDIT_SCHEME_IN_HEAP.mac, "kdf": AUDIT_SCHEME_IN_HEAP.kdf}
+
+
 def test_a_range_record_carrying_a_store_id_is_not_yet_admitted() -> None:
     """Not yet, not never: until the key-custody restore slice lands, a store id on a range record
     is a field beyond the record, refused as such (ADR 0193 item 3, amended 2026-11-04). That
     draft's rule 4 restore appends a range row naming the new store id, and that slice changes this
     test. The control is the same record without it, which is held."""
-    closes = {"key_id": "a", "from_seq": 1, "to_seq": 1, "rows": 1, "digest": "", "prev_hash": ""}
-    held = {"mac": AUDIT_SCHEME_IN_HEAP.mac, "kdf": AUDIT_SCHEME_IN_HEAP.kdf}
-    record = {"key_id": _KEY_ID, "closes": closes, "handover": "t", **held}
+    record = {"key_id": _KEY_ID, "closes": _CLOSES, "handover": "t", **_HELD}
     epoch = parse_audit_epoch(json.dumps(record))
     assert epoch is not None and audit_scheme_refusal(epoch.key_id, epoch.scheme) is None
     epoch = parse_audit_epoch(json.dumps({**record, "store_id": _STORE_ID.hex()}))
@@ -153,9 +156,8 @@ def test_a_range_record_carrying_a_store_id_is_not_yet_admitted() -> None:
 
 #: A value anyone who can write the audit log could put in a record.
 _MARKER = "RECORD-SUPPLIED-TEXT"
-_CLOSES = {"key_id": "a", "from_seq": 1, "to_seq": 1, "rows": 1, "digest": "", "prev_hash": ""}
-_HELD = {"mac": AUDIT_SCHEME_IN_HEAP.mac, "kdf": AUDIT_SCHEME_IN_HEAP.kdf}
 _UNKNOWN = {"mac": _MARKER + "-mac", "kdf": _MARKER + "-kdf"}
+_KEYLESS = {"mac": AUDIT_KEYLESS_MAC, "kdf": _MARKER + "-kdf"}
 _KEY = _MARKER + "-key"
 _SCHEME = "names an audit scheme this release does not hold"
 
@@ -165,6 +167,11 @@ _SCHEME = "names an audit scheme this release does not hold"
     [
         (1, {"genesis": 1, "key_id": _KEY, **_UNKNOWN}, _SCHEME),
         (1, {"genesis": 1, "key_id": _KEY, **_UNKNOWN, "store_id": _MARKER}, _SCHEME),
+        (
+            1,
+            {"genesis": 1, "key_id": _KEY, **_KEYLESS, "store_id": _MARKER},
+            "names the keyless store mode, which no audit record may name",
+        ),
         (
             1,
             {"genesis": 1, "key_id": _KEY, **_HELD, "store_id": _MARKER},
@@ -183,7 +190,9 @@ async def test_the_one_row_check_names_the_refusal_class_in_fixed_words(
 ) -> None:
     """The Transit attestation gap and the one-row evidence read report a refused range in fixed
     words from a fixed set. The refusal's own words quote ``mac``, ``kdf`` and ``key_id``, which
-    anyone who can write the audit log chooses, so none of the record's text reaches the message."""
+    anyone who can write the audit log chooses, so none of the record's text reaches the message.
+    The marker check bites only where the refusal quotes the record (the control below); in the
+    other cases the exact phrase is what the test pins."""
     detail = json.dumps(record)
 
     async def fetch(sql: str, params: tuple[object, ...]) -> dict[str, Any] | None:

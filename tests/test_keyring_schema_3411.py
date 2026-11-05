@@ -4,10 +4,8 @@
 
 Schema only: nothing writes the keyring yet. These tests pin that the table exists on all three
 backends with one set of columns and one primary key, and that each live-schema check expects it.
-The key-custody draft's rule 6 names key id, purpose, class, state, period and the sealed key;
-``wrapped_by`` and the three times are the table's own. The primary key is the key id, the purpose
-and the wrapping key's id, because the draft has several rows wrapping one key: the recovery wrap
-and the master handover row both wrap a master key.
+Which columns come from the key-custody draft, and why the key spans three of them, is in the
+comment above the SQLite ``_SCHEMA``'s keyring.
 """
 
 from __future__ import annotations
@@ -65,6 +63,9 @@ async def test_a_sqlite_store_has_the_keyring_and_its_schema_check_passes(tmp_pa
     assert set(columns) == _KEYRING_COLUMNS
     assert columns["key_id"] == ("TEXT", True, True)  # NOT NULL, as on both server backends
     assert {name for name, (_, _, pk) in columns.items() if pk} == _KEYRING_KEY
+    # Every key column is NOT NULL: SQLite would let a NULL in, and a unique index treats NULLs as
+    # distinct, so the same wrap could be inserted twice.
+    assert all(columns[name][1] for name in _KEYRING_KEY)
     nullable = {name for name, (_, notnull, pk) in columns.items() if not notnull and not pk}
     assert nullable == {"period_from", "period_to", "proved_at"}
     store = await MessageStore.open(db)  # and a reopen passes the same check
@@ -135,7 +136,8 @@ async def test_a_sqlite_keyring_keyed_on_the_key_id_alone_is_refused(tmp_path: P
 
 
 async def test_a_sqlite_keyring_missing_a_column_is_refused(tmp_path: Path) -> None:
-    """The control for the check above: a keyring an older build left without a column is refused."""
+    """The control for the first test's open: a keyring an older build left without a column is
+    refused."""
     db = tmp_path / "short.db"
     conn = sqlite3.connect(db)
     try:

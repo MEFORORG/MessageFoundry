@@ -4979,12 +4979,53 @@ def _audit_unnamed_scheme(key_id: str) -> AuditScheme:
 @dataclass(frozen=True)
 class _AuditStoreIdRefused(AuditScheme):
     """What a genesis record whose ``store_id`` no release writes reads as (vault BACKLOG #3411): a
-    scheme no release holds, so :func:`audit_scheme_refusal` refuses it. It names the missing scheme
-    when the record names none, whatever the store id, and otherwise the store id. A class of its
-    own, so it never compares equal to a scheme a record names and no record can produce one.
-    ``named`` is the scheme the record named, ``None`` for none; ``mac`` and ``kdf`` are empty."""
+    scheme no release holds, so :func:`audit_scheme_refusal` refuses it. The refusal names the
+    missing scheme when the record names none, whatever the store id; else the named scheme's own
+    refusal when it is refused; else the store id. A class of its own, so it never compares equal
+    to a scheme a record names and no record can produce one. ``named`` is the scheme the record
+    named, ``None`` for none; ``mac`` and ``kdf`` are empty."""
 
     named: AuditScheme | None = None
+
+
+#: Each class of refusal, in fixed words, for a message that must carry no record-supplied text
+#: (vault BACKLOG #3411): a refusal's own words quote ``mac``, ``kdf`` and ``key_id``, which anyone
+#: who can write the audit log chooses. Each completes "audit row N's key range".
+_AUDIT_REFUSED_SCHEME: Final = "names an audit scheme this release does not hold"
+_AUDIT_REFUSED_KEYLESS: Final = "names the keyless store mode, which no audit record may name"
+_AUDIT_REFUSED_UNNAMED_STORE_ID: Final = (
+    "opens with a record that carries a store_id but names no scheme"
+)
+_AUDIT_REFUSED_STORE_ID: Final = "opens with a record that carries a malformed store_id"
+
+
+def _audit_refusal(key_id: str, scheme: AuditScheme | None) -> tuple[str, str] | None:
+    """``(class, text)`` of :func:`audit_scheme_refusal`, or ``None`` when the scheme is held. The
+    class is one of the fixed phrases above; the text may quote the record."""
+    if isinstance(scheme, _AuditStoreIdRefused):
+        # The scheme speaks first. A missing one is the real defect: every writer since BACKLOG
+        # #3420 names it, and the store id postdates that. A malformed label must not hide a record
+        # that also names the keyless mode or an unknown scheme.
+        if scheme.named is None:
+            return _AUDIT_REFUSED_UNNAMED_STORE_ID, (
+                "records a store_id but names no scheme: a genesis record carrying a store_id "
+                "names its scheme (vault BACKLOG #3411)"
+            )
+        return _audit_refusal(key_id, scheme.named) or (
+            _AUDIT_REFUSED_STORE_ID,
+            f"records a malformed store_id: a genesis record's store_id is the lowercase hex of "
+            f"{STORE_ID_BYTES} bytes, beside a named scheme (vault BACKLOG #3411)",
+        )
+    if scheme is None:
+        scheme = _audit_unnamed_scheme(key_id)
+    if scheme == audit_scheme_for(key_id):
+        return None
+    if scheme.mac == AUDIT_KEYLESS_MAC:
+        return _AUDIT_REFUSED_KEYLESS, _AUDIT_REFUSED_KEYLESS
+    return _AUDIT_REFUSED_SCHEME, (
+        f"names audit scheme {scheme.mac[:64]!r} with key derivation {scheme.kdf[:64]!r}; this "
+        f"release does not seal the range of audit key {key_id[:64]!r} with it"
+    )
 
 
 def audit_scheme_refusal(key_id: str, scheme: AuditScheme | None) -> str | None:
@@ -4996,49 +5037,8 @@ def audit_scheme_refusal(key_id: str, scheme: AuditScheme | None) -> str | None:
     one today, so verifying a range under the scheme its record names is: refuse every other name,
     then verify under that one. The keyless store mode is never among them, whatever ``kdf`` says,
     so no record can declare its chain keyless."""
-    if isinstance(scheme, _AuditStoreIdRefused):
-        # The scheme speaks first. A missing one is the real defect: every writer since BACKLOG
-        # #3420 names it, and the store id postdates that. A malformed label must not hide a record
-        # that also names the keyless mode or an unknown scheme.
-        if scheme.named is None:
-            return (
-                "records a store_id but names no scheme: a genesis record carrying a store_id "
-                "names its scheme (vault BACKLOG #3411)"
-            )
-        return audit_scheme_refusal(key_id, scheme.named) or (
-            f"records a malformed store_id: a genesis record's store_id is the lowercase hex of "
-            f"{STORE_ID_BYTES} bytes, beside a named scheme (vault BACKLOG #3411)"
-        )
-    if scheme is None:
-        scheme = _audit_unnamed_scheme(key_id)
-    if scheme == audit_scheme_for(key_id):
-        return None
-    if scheme.mac == AUDIT_KEYLESS_MAC:
-        return "names the keyless store mode, which no audit record may name"
-    return (
-        f"names audit scheme {scheme.mac[:64]!r} with key derivation {scheme.kdf[:64]!r}; this "
-        f"release does not seal the range of audit key {key_id[:64]!r} with it"
-    )
-
-
-#: Each class of :func:`audit_scheme_refusal`, in fixed words, for a message that must carry no
-#: record-supplied text (vault BACKLOG #3411): the refusal's own words quote ``mac``, ``kdf`` and
-#: ``key_id``, which anyone who can write the audit log chooses. Each completes "the key range".
-_AUDIT_REFUSED_SCHEME: Final = "names an audit scheme this release does not hold"
-_AUDIT_REFUSED_UNNAMED_STORE_ID: Final = (
-    "opens with a record that carries a store_id but names no scheme"
-)
-_AUDIT_REFUSED_STORE_ID: Final = "opens with a record that carries a malformed store_id"
-
-
-def _audit_refusal_class(key_id: str, scheme: AuditScheme | None) -> str | None:
-    """The class of :func:`audit_scheme_refusal`'s answer, as one of the fixed phrases above, or
-    ``None`` when the scheme is held. The same order: the scheme speaks before the store id."""
-    if isinstance(scheme, _AuditStoreIdRefused):
-        if scheme.named is None:
-            return _AUDIT_REFUSED_UNNAMED_STORE_ID
-        return _audit_refusal_class(key_id, scheme.named) or _AUDIT_REFUSED_STORE_ID
-    return None if audit_scheme_refusal(key_id, scheme) is None else _AUDIT_REFUSED_SCHEME
+    refused = _audit_refusal(key_id, scheme)
+    return None if refused is None else refused[1]
 
 
 #: The fields a genesis or range record names its scheme in (BACKLOG #3420).
@@ -5332,8 +5332,9 @@ class AuditGenesisStoreId(NamedTuple):
 
     #: The store id the record labels; ``None`` when it labels none, or when ``refused``.
     store_id: bytes | None
-    #: The walk refuses the record (:func:`audit_scheme_refusal`): its store id is malformed, or its
-    #: scheme is refused. So a caller comparing labels never reads such a record as one with none.
+    #: The walk refuses the record (:func:`audit_scheme_refusal`): its scheme is refused, it names
+    #: none beside a store id, or its store id is malformed. So a caller comparing labels never
+    #: reads such a record as one with none.
     refused: bool
 
 
@@ -7814,10 +7815,10 @@ async def _audit_row_mac_check(
         parsed = parse_audit_epoch(opening["detail"])
         if parsed is not None:
             key_id, scheme = parsed.key_id, parsed.scheme
-    if key_id is not None and (refused := _audit_refusal_class(key_id, scheme)) is not None:
+    if key_id is not None and (refused := _audit_refusal(key_id, scheme)) is not None:
         # BACKLOG #3420: a range sealed under a scheme this release does not hold proves nothing.
         # Fixed words naming the class, never the record's own text, which the refusal quotes.
-        return f"audit row {seq}'s key range {refused}"
+        return f"audit row {seq}'s key range {refused[0]}"
     if only_key_id is not None and key_id != only_key_id:
         return f"audit row {seq} is not sealed under the active audit key"
     secret: tuple[bytes | None, AuditMacFn | None] | None
