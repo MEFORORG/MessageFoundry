@@ -125,6 +125,10 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     # The store DEK and everything keyed on it or derived from it (the audit-chain HMAC subkey, the
     # rotation-fingerprint MAC, the GCM invocation bound, the DR archive codec).
     "messagefoundry/store/crypto.py": frozenset({_DEK}),
+    # Vault BACKLOG #3411: the key custody primitives mint the master key and the recovery key that
+    # will wrap the store key. Nothing calls them yet, and the lifecycle page has no row of their
+    # own; the DEK row is the one that governs the store key they are built to hold.
+    "messagefoundry/store/custody.py": frozenset({_DEK}),
     # BACKLOG #2592: the row-seal key is HKDF-derived from the DEK's authorization root.
     "messagefoundry/store/row_seal.py": frozenset({_DEK}),
     # BACKLOG #2593: opens queue payload cells, sealed under the DEK, under their routing tag.

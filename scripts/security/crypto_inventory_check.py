@@ -542,6 +542,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # DEK with the store salt in `info`, computed as its RFC 5869 HMAC steps so the cipher keeps an
     # OpenSSL HMAC context rather than the DEK; still the same two imports.
     "messagefoundry/store/crypto.py": frozenset({"hashlib", "cryptography"}),
+    # Vault BACKLOG #3411 (key custody, slice S3): the custody primitives. cryptography = the
+    # recovery wrap, AES-256-GCM under HKDF-SHA256 of the recovery key with the store id in the
+    # associated data; hashlib = the SHA-256 recovery-key checksum; hmac = compare_digest for that
+    # checksum and for key equality. The master key is minted from os.urandom.
+    "messagefoundry/store/custody.py": frozenset({"cryptography", "hashlib", "hmac"}),
     # ASVS 11.3.4 (#301): the persisted per-key_id AES-GCM invocation bound (cipher_meta table) reads
     # the cipher reserve-block size + AesGcmCipher/Cipher types through the store.crypto seam. ADR 0196
     # adds the store-salt bind at open, which draws a candidate salt through new_store_salt.
@@ -1534,6 +1539,21 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.encrypt_data()",
             "mac:.generate_hmac()",
             "tls_context:via messagefoundry.store.keyprovider_vault",
+        }
+    ),
+    # Vault BACKLOG #3411: mints the master key, store id and recovery key (os.urandom); wraps and
+    # opens the master key under AES-256-GCM keyed by HKDF-SHA256 of the recovery key; checks a
+    # typed recovery key's SHA-256 checksum and compares keys in constant time.
+    "messagefoundry/store/custody.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:cryptography.hazmat.primitives.ciphers.aead.AESGCM",
+            "compare:hmac.compare_digest",
+            "csprng:os.urandom",
+            "hash:hashlib.sha256",
+            "kdf:.derive()",
+            "kdf:cryptography.hazmat.primitives.kdf.hkdf.HKDF[sha256]",
         }
     ),
     # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.

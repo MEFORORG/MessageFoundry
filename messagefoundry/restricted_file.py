@@ -186,6 +186,17 @@ def _is_broad_group(sid: str) -> bool:
     return sid.startswith("S-1-5-21-") and sid.rsplit("-", 1)[-1] == _DOMAIN_COMPUTERS_RID
 
 
+#: APPLICATION PACKAGE AUTHORITY: every AppContainer package SID and capability SID starts here.
+_PACKAGE_SID_PREFIX = "S-1-15-"
+
+
+def _is_package_sid(sid: str) -> bool:
+    """Whether ``sid`` names an AppContainer package or capability. A package runs under the
+    account that starts it, so a read grant to one would let a confined worker read a key file
+    (vault BACKLOG #3411; the key custody ADR draft, rule 3). Refused on the create side only."""
+    return sid.upper().startswith(_PACKAGE_SID_PREFIX)
+
+
 def _windows_access_problem(security: _WinPathSecurity, mask: int = _REACH_MASK) -> str | None:
     """Why a broad group can read or change the file this access list belongs to, or ``None``.
 
@@ -379,6 +390,11 @@ def _create_restricted_windows(path: Path, read_grants: Sequence[str]) -> int:
         )
     read_sids = [_resolve_sid(name) for name in read_grants]
     for name, sid in zip(read_grants, read_sids, strict=True):
+        if _is_package_sid(sid):
+            raise RestrictedFileError(
+                f"{path} was not created: {name!r} is an application package, and a key file is "
+                "granted to the account the engine runs as, never to a package"
+            )
         if _is_broad_group(sid):
             # A grant that would make the file broadly readable is not a restricted create.
             raise RestrictedFileError(

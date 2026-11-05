@@ -198,6 +198,14 @@ def test_an_access_list_that_could_not_be_read_is_a_problem() -> None:
     )
 
 
+def test_a_package_sid_is_told_apart_from_an_account() -> None:
+    # Vault BACKLOG #3411: a key file is never granted to an AppContainer package or capability.
+    assert restricted_file._is_package_sid("S-1-15-2-1")
+    assert restricted_file._is_package_sid("s-1-15-3-1024-1")
+    assert not restricted_file._is_package_sid("S-1-5-19")  # the control: LOCAL SERVICE
+    assert not restricted_file._is_package_sid("S-1-5-80-1234")  # a service SID
+
+
 def test_the_posix_check_is_the_group_and_other_read_and_write_bits() -> None:
     assert restricted_file._posix_access_problem(stat.S_IFREG | 0o600) is None  # the control
     assert restricted_file._posix_access_problem(stat.S_IFREG | 0o400) is None
@@ -513,18 +521,18 @@ def test_the_protected_store_key_is_written_through_the_restricted_create(
     _secure_file_must_not_run(monkeypatch)
     seen = _allow_the_create(monkeypatch)
     out = tmp_path / "store.key.dpapi"
-    dpapi_mod.protect_key_to_file("QUJD", out, read_grants=["*S-1-5-18"])
+    dpapi_mod.protect_key_to_file("QUJD", out, machine_scope=True, read_grants=["*S-1-5-18"])
     assert out.read_bytes() == b"BLOB:QUJD"
     assert seen["grants"] == ["*S-1-5-18"]
 
     # An existing file is refused and left as it was, where the old write replaced it.
     with pytest.raises(FileExistsError):
-        dpapi_mod.protect_key_to_file("WFla", out)
+        dpapi_mod.protect_key_to_file("WFla", out, machine_scope=True)
     assert out.read_bytes() == b"BLOB:QUJD"
 
     _refuse_the_create(monkeypatch)
     with pytest.raises(RestrictedFileError):
-        dpapi_mod.protect_key_to_file("QUJD", tmp_path / "refused.dpapi")
+        dpapi_mod.protect_key_to_file("QUJD", tmp_path / "refused.dpapi", machine_scope=True)
 
 
 # --- protect-key ----------------------------------------------------------------------------------
