@@ -21,6 +21,7 @@ from messagefoundry.store.crypto import (
     STORE_ID_BYTES,
 )
 from messagefoundry.store.store import (
+    _AUDIT_STORE_ID_HEX,
     AUDIT_KEY_EPOCH_ACTION,
     AuditGenesisStoreId,
     _audit_row_mac_check,
@@ -72,6 +73,12 @@ def test_a_store_id_on_a_record_naming_no_scheme_is_refused_as_naming_no_scheme(
     assert refusal is not None and "names no scheme" in refusal, refusal
     assert "malformed" not in refusal, refusal
     assert parse_audit_genesis_store_id(legacy) == AuditGenesisStoreId(None, refused=True)
+
+
+def test_the_store_id_pattern_width_is_twice_the_store_id_length() -> None:
+    """The parser's pattern writes its width as a literal so the ReDoS scanner can read it; this pins
+    that literal to :data:`STORE_ID_BYTES`, so the two cannot drift apart."""
+    assert _AUDIT_STORE_ID_HEX.pattern == "[0-9a-f]{" + str(2 * STORE_ID_BYTES) + "}"
 
 
 @pytest.mark.parametrize("length", [1, STORE_ID_BYTES - 1, STORE_ID_BYTES + 1])
