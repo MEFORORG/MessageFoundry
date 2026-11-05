@@ -13,6 +13,7 @@ Three layers, each with a control that must give the opposite answer:
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import sys
@@ -425,6 +426,21 @@ def test_posix_raises_and_leaves_nothing_when_the_mode_does_not_read_back(
     with pytest.raises(RestrictedFileError, match="mode 0644"):
         write_restricted_file(path, b"KEY-MATERIAL-STAND-IN")
     assert forged  # control: the refusal read the forged status
+    assert not path.exists()
+
+
+@posix_only
+def test_posix_raises_restricted_and_leaves_nothing_when_the_mode_cannot_be_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # vfat and exFAT keep no modes and refuse the chmod with a plain OSError.
+    def refusing(fd: int, mode: int) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "fchmod", refusing)
+    path = tmp_path / "store.key"
+    with pytest.raises(RestrictedFileError, match="mode could not be set"):
+        write_restricted_file(path, b"KEY-MATERIAL-STAND-IN")
     assert not path.exists()
 
 

@@ -284,9 +284,7 @@ def test_the_key_types_are_not_hashable() -> None:
 
 
 _HOST = custody._HOST_FILE_POLICY
-_CREDENTIAL = custody._PosixPolicy(
-    owners=frozenset({0}), group_read_gids=frozenset({0, 1000}), named_euid_read=True
-)
+_CREDENTIAL = custody._PosixPolicy(owners=frozenset({0}), named_euid_read=True)
 _REG = stat.S_IFREG
 _UNDEFINED_ID = 0xFFFFFFFF
 _R, _RW = 0o4, 0o6
@@ -325,7 +323,9 @@ def _problem(
     acl: bytes | None = None,
     kind: int = _REG,
 ) -> str | None:
-    return custody._posix_file_problem(kind | mode, owner, group, 1000, policy, acl)
+    return custody._posix_file_problem(
+        kind | mode, policy, acl, owner=owner, group=group, euid=1000
+    )
 
 
 def test_the_posix_host_file_check_refuses_any_group_or_other_bit_and_a_foreign_owner() -> None:
@@ -339,10 +339,13 @@ def test_the_posix_host_file_check_refuses_any_group_or_other_bit_and_a_foreign_
     assert "not a regular file" in str(_problem(0o600, 1000, _HOST, kind=stat.S_IFIFO))
 
 
-def test_a_systemd_credential_may_be_read_by_root_s_group_or_the_engine_s_own_only() -> None:
-    assert _problem(0o440, 0, _CREDENTIAL, group=0) is None
-    assert _problem(0o440, 1000, _CREDENTIAL, group=1000) is None
+def test_a_systemd_credential_with_no_list_is_read_by_its_owner_alone() -> None:
+    assert _problem(0o400, 0, _CREDENTIAL, group=0) is None  # the control
+    assert _problem(0o400, 1000, _CREDENTIAL, group=1000) is None
     assert _problem(0o400, 1000, _CREDENTIAL, group=5) is None
+    # No group reads a credential, not even root's or the engine's own: neither systemd form needs it.
+    assert "gid 0 read" in str(_problem(0o440, 0, _CREDENTIAL, group=0))
+    assert "gid 1000 read" in str(_problem(0o440, 1000, _CREDENTIAL, group=1000))
     assert "gid 5 read" in str(_problem(0o440, 0, _CREDENTIAL, group=5))
     assert "0444" in str(_problem(0o444, 0, _CREDENTIAL, group=0))
     assert "0460" in str(_problem(0o460, 0, _CREDENTIAL, group=0))
@@ -355,7 +358,6 @@ def test_the_access_control_list_systemd_writes_for_a_service_user_is_accepted()
     # as 0440. The group bits are the mask, so the file's group (gid 5 here) reads nothing.
     assert _problem(0o440, 0, _CREDENTIAL, group=0, acl=_systemd_acl()) is None
     assert _problem(0o440, 0, _CREDENTIAL, group=5, acl=_systemd_acl()) is None
-    assert _problem(0o440, 0, _CREDENTIAL, group=0, acl=_systemd_acl(group_perms=_R)) is None
 
 
 @pytest.mark.parametrize(
@@ -365,8 +367,9 @@ def test_the_access_control_list_systemd_writes_for_a_service_user_is_accepted()
         (_systemd_acl(_entry(_USER, 0, 2000)), 0, "names uid 2000"),
         (_systemd_acl(_entry(_USER, _RW, 1000)), 0, "own uid more than read"),
         (_systemd_acl(_entry(_USER, _R, 1000), _entry(_GROUP, _R, 0)), 0, "names gid 0"),
-        (_systemd_acl(group_perms=_R), 5, "group gid 5 read"),
-        (_systemd_acl(group_perms=_RW), 0, "more than read"),
+        (_systemd_acl(group_perms=_R), 0, "group gid 0 access"),
+        (_systemd_acl(group_perms=_R), 5, "group gid 5 access"),
+        (_systemd_acl(group_perms=_RW), 0, "group gid 0 access"),
         (
             _acl(_entry(_USER_OBJ, _R), _entry(_GROUP_OBJ, 0), _entry(_OTHER, _R)),
             0,
@@ -405,15 +408,28 @@ def test_an_access_control_list_entry_beyond_the_policy_is_refused(
     assert expected in str(_problem(0o440, 0, _CREDENTIAL, group=group, acl=acl))
 
 
-def test_the_host_file_takes_no_group_read_or_named_entry_from_an_access_control_list() -> None:
+_CARRIES_A_LIST = "carries a POSIX access control list"
+
+
+def test_the_host_file_carries_no_access_control_list_whatever_it_grants() -> None:
+    assert _problem(0o600, 1000, _HOST) is None  # the control: no list
     owner_only = _acl(_entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, 0), _entry(_OTHER, 0))
-    assert _problem(0o600, 1000, _HOST, acl=owner_only) is None
-    # Owner only: even the engine's own uid in a named entry is refused, though it grants nothing.
-    assert "names uid 1000" in str(_problem(0o600, 1000, _HOST, acl=_systemd_acl()))
-    group_read = _acl(_entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, _R), _entry(_OTHER, 0))
-    assert "gid 1000 read" in str(_problem(0o640, 1000, _HOST, acl=group_read))
+    assert _CARRIES_A_LIST in str(_problem(0o600, 1000, _HOST, acl=owner_only))
+    # Even the engine's own uid in a named entry is refused.
+    assert _CARRIES_A_LIST in str(_problem(0o600, 1000, _HOST, acl=_systemd_acl()))
     named = _systemd_acl(_entry(_USER, 0, 2000))
-    assert "uid 2000" in str(_problem(0o600, 1000, _HOST, acl=named))
+    assert _CARRIES_A_LIST in str(_problem(0o600, 1000, _HOST, acl=named))
+
+
+def test_a_host_file_at_0640_with_a_read_mask_and_an_empty_group_entry_is_refused() -> None:
+    # The mask makes the mode read 0640, and with a list the group bits are the mask, so the mode's
+    # group read is not judged; the list's group entry grants nothing. That file is still refused.
+    masked = _acl(
+        _entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, 0), _entry(_MASK, _R), _entry(_OTHER, 0)
+    )
+    assert _CARRIES_A_LIST in str(_problem(0o640, 1000, _HOST, acl=masked))
+    # The same list is one a credential may carry, so the refusal is the host policy's.
+    assert _problem(0o440, 0, _CREDENTIAL, acl=masked) is None
 
 
 @pytest.mark.parametrize(
@@ -543,7 +559,24 @@ def test_a_host_file_whose_access_control_list_names_another_account_is_refused(
     )
     _set_acl_or_skip(path, _ACL_XATTR, acl)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600  # the mode alone would pass
-    with pytest.raises(CustodyError, match=f"names uid {other}") as excinfo:
+    with pytest.raises(CustodyError, match=_CARRIES_A_LIST) as excinfo:
+        custody.read_host_file(path)
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@linux_only
+def test_a_host_file_at_0640_with_a_read_mask_and_an_empty_group_entry_is_refused_for_real(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    assert custody.read_host_file(path) == _blob()  # the control
+    masked = _acl(
+        _entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, 0), _entry(_MASK, _R), _entry(_OTHER, 0)
+    )
+    _set_acl_or_skip(path, _ACL_XATTR, masked)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640  # the group bits are now the mask
+    with pytest.raises(CustodyError, match=_CARRIES_A_LIST) as excinfo:
         custody.read_host_file(path)
     assert not _leaks(str(excinfo.value), _MASTER)
 

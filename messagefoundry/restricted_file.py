@@ -395,9 +395,20 @@ def _create_restricted(path: Path, read_grants: Sequence[str]) -> int:
         if sys.platform == "linux":
             _drop_inherited_acl(path, fd)
         # A default list or a umask can leave the owner without read; set the mode exactly, so a
-        # reader that opens the file as its owner can read what was written.
-        os.fchmod(fd, 0o600)
-        status = os.fstat(fd)
+        # reader that opens the file as its owner can read what was written. A file system that
+        # keeps no modes (vfat, exFAT) refuses the chmod; that is a create that did not restrict.
+        status: os.stat_result | None = None
+        reason = ""
+        try:
+            os.fchmod(fd, 0o600)
+            status = os.fstat(fd)
+        except OSError as exc:
+            reason = exc.strerror or type(exc).__name__
+        if status is None:
+            raise RestrictedFileError(
+                f"{path} could not be created readable by its owner alone: its mode could not be "
+                f"set ({reason})"
+            )
         if stat.S_IMODE(status.st_mode) & 0o077 or status.st_uid != os.geteuid():
             raise RestrictedFileError(
                 f"{path} could not be created readable by its owner alone: it reads back as mode "
