@@ -257,10 +257,27 @@ handles. The launcher was also started through `ShellExecuteExW`, the Windows sh
 opening a file. With neither variable set, each start ran the stand-in, with no stderr. With
 `PYTHONFAULTHANDLER=1`, and again with `PYTHONDEVMODE=1`, each exited 1 without running it.
 `pythonw -m` that inherited its parent's handles, as from a terminal that hands its own on, had a
-stderr and ran under each variable. Not measured, at least: the installed `messagefoundry-tray`
-launcher itself, a real click in Explorer or the Start menu, a `.lnk` shortcut, a start typed
-into an interactive console window, and other `PYTHON*` variables. `docs/TRAY.md` gives the
-operator's remedy.
+stderr and ran under each variable.
+
+The installed launcher was measured on 2026-11-05, on Windows 11 build 26300 with Python 3.14.7,
+by hand rather than by a test. The launcher was the `messagefoundry-tray.exe` that pip wrote into a
+venv's `Scripts` folder for `[project.gui-scripts]`, a GUI-subsystem program. It was started the
+way the test starts its stand-in, with no standard handles and with every other `PYTHON*`
+variable removed. Each start had its own `LOCALAPPDATA`. The measuring process held the tray's
+single-instance mutex, so a tray that ran wrote its start line to `tray.log` and exited 0 before it
+added an icon. `pythonw -m messagefoundry.tray`, started from the same venv the same way, was
+measured beside it.
+
+| Start, no standard handles | `PYTHONFAULTHANDLER=1` | `PYTHONDEVMODE=1` | Neither set |
+|---|---|---|---|
+| `messagefoundry-tray.exe` | exit 1, no `tray.log` | exit 1, no `tray.log` | exit 0, start line in `tray.log` |
+| `pythonw -m messagefoundry.tray` | exit 1, no `tray.log` | exit 1, no `tray.log` | exit 0, start line in `tray.log` |
+
+So no tray code ran under either variable. The same launcher, given a stderr pipe, wrote its start
+line under each variable. Not measured, at least: a real click in Explorer or the Start menu, a
+`.lnk` shortcut, the installed launcher through `ShellExecuteExW`, a start typed into an
+interactive console window, a tray left to run on to its icon, and other `PYTHON*` variables.
+`docs/TRAY.md` gives the operator's remedy.
 
 Shipping a hand start that carries `-E` was rejected. The project cannot add `-E` to the
 `messagefoundry-tray` launcher: pip writes the interpreter line from the interpreter's path alone,
@@ -271,8 +288,7 @@ command, which also turns remote debugging off, uses the bootstrap script in a c
 install it runs from.
 
 The `messagefoundry-tray` command is a launcher the installer writes. It was not run to measure its
-import path, because that starts a real tray; the stand-in measurement above covers only the
-exit. Its console twin from the same install,
+import path; the measurement above covers only the exit. Its console twin from the same install,
 `messagefoundry.exe`, has the same form: a small program with the entry-point script archived
 inside it. Run from a working directory holding a decoy `messagefoundry` package,
 `messagefoundry.exe --version` loaded the real package, while `python -m messagefoundry --version`
