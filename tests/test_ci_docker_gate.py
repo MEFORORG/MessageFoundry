@@ -16,10 +16,11 @@ docker arm in ``ci.yml``'s ``changes`` job. This file pins that arm. The invaria
 5. **It still refuses unrelated paths**, including two shape probes that match only if the regex
    loses its ``\\.py$`` anchor.
 
-THE RUN RATE, measured 2026-11-05 over the 544 commits on engine ``main`` (``4b006afc69``) since
-2026-10-04: the arms that predate #3455 fired on 68, the arm as it stands fires on 265, and the old
-arms plus ``^messagefoundry/`` would fire on 414. These count commits on ``main``, not pull-request
-runs.
+THE RUN RATE, measured 2026-11-05 over the 544 first-parent commits on engine ``main``
+(``4b006afc69``) since 2026-10-04, each read with ``git diff-tree --name-only -r``: the arms that
+predate #3455 fired on 67, the arm as it stands fires on 278, and the old arms plus
+``^messagefoundry/`` would fire on 413. These count squash commits on ``main``, not pull-request
+runs, and a pull request pushed more than once runs the job more than once.
 
 The regex is READ OUT OF ``ci.yml``, never copied here, for the reason
 ``tests/test_ci_tooling_gate.py`` states. Pure text analysis: Python's ``re`` reads this pattern as
@@ -48,14 +49,21 @@ START_PATH_MODULES = frozenset(
     {
         "messagefoundry/__init__.py",
         "messagefoundry/__main__.py",
+        "messagefoundry/serviceenv.py",
+        "messagefoundry/terminal_text.py",
         "messagefoundry/api/__init__.py",
         "messagefoundry/api/app.py",
         "messagefoundry/api/models.py",
         "messagefoundry/api/tls.py",
         "messagefoundry/auth/anchor_path.py",
+        "messagefoundry/auth/passwords.py",
         "messagefoundry/auth/trust_anchors.py",
+        "messagefoundry/config/anchor.py",
+        "messagefoundry/config/retention_classification.py",
         "messagefoundry/config/settings.py",
+        "messagefoundry/config/tls_policy.py",
         "messagefoundry/config/wiring.py",
+        "messagefoundry/transports/egress.py",
         "messagefoundry/logging_setup.py",
         "messagefoundry/pki.py",
         "messagefoundry/remotedebug.py",
@@ -74,7 +82,8 @@ PR_2284_ENGINE_FILES = (
 #: A repo path a step runs: repo-relative, or under a root the steps reach the checkout by.
 #: In-container paths such as /rig/rigadmin.py are not repo paths and are not matched.
 _STEP_PATH = re.compile(
-    r"(?:\$PWD/|\$GITHUB_WORKSPACE/|\$\{GITHUB_WORKSPACE\}/|/repo/|\./|(?<![\w/.$-]))"
+    r"(?:\$PWD/|\$\{PWD\}/|\$\(pwd\)/|\$GITHUB_WORKSPACE/|\$\{GITHUB_WORKSPACE\}/"
+    r"|\$\{\{\s*github\.workspace\s*\}\}/|/repo/|\./|(?<![\w/.$-]))"
     r"((?:harness|scripts|tests)/[\w./-]+\.(?:py|sh|ps1))"
 )
 #: A repo module a step runs with ``python -m``.
@@ -106,13 +115,17 @@ def gate(changed: list[str]) -> bool:
     return any(pattern.search(path) for path in changed)
 
 
-def _module_file(module: str) -> str | None:
-    """The repo path a dotted module name resolves to, package first, or None."""
+def _module_file(module: str, *, run: bool = False) -> str | None:
+    """The repo path a dotted module name resolves to, or None.
+
+    ``run`` is for ``python -m``, which runs a package's ``__main__.py``. An import runs its
+    ``__init__.py`` instead, and ``tests`` has none, so a module there is only ever a ``.py``.
+    """
     base = module.replace(".", "/")
-    for candidate in (f"{base}/__main__.py", f"{base}.py", f"{base}/__init__.py"):
-        if (_ROOT / candidate).is_file():
-            return candidate
-    return None
+    candidates = [f"{base}.py", f"{base}/__init__.py"]
+    if run:
+        candidates.insert(0, f"{base}/__main__.py")
+    return next((c for c in candidates if (_ROOT / c).is_file()), None)
 
 
 def _entrypoint_modules() -> set[str]:
@@ -120,30 +133,40 @@ def _entrypoint_modules() -> set[str]:
     found: set[str] = set()
     for line in _DOCKERFILE.read_text(encoding="utf-8").splitlines():
         if line.startswith("ENTRYPOINT "):
-            argv = json.loads(line.removeprefix("ENTRYPOINT "))
-            module = str(argv[argv.index("-m") + 1])
-            path = _module_file(module)
+            try:
+                argv = json.loads(line.removeprefix("ENTRYPOINT "))
+                module = str(argv[argv.index("-m") + 1])
+            except (ValueError, IndexError):
+                pytest.fail(
+                    f"an ENTRYPOINT is not a one-line exec form running `python -m <module>`, so "
+                    f"this test cannot name the module the gate must admit: {line}"
+                )
+            path = _module_file(module, run=True)
             assert path, f"an ENTRYPOINT runs `-m {module}`, which names no file in the tree"
             found.add(path)
     assert found, "docker/Dockerfile has no exec-form ENTRYPOINT line; this test has drifted"
     return found
 
 
-def _repo_imports(path: str) -> set[str]:
-    """The ``harness``/``scripts``/``tests`` modules a repo script imports, as repo paths."""
+_REPO_ROOTS = frozenset({"harness", "scripts", "tests"})
+
+
+def _repo_imports(source: str) -> set[str]:
+    """The ``harness``/``scripts``/``tests`` modules ``source`` imports, as repo paths.
+
+    ``from pkg import name`` may name a submodule or an attribute, so the submodule is tried first.
+    """
     found: set[str] = set()
-    if not path.endswith(".py"):
-        return found
-    for node in ast.walk(ast.parse((_ROOT / path).read_text(encoding="utf-8"))):
-        if isinstance(node, ast.ImportFrom):
-            names = [node.module or ""]
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            tries = [[f"{node.module}.{alias.name}", node.module] for alias in node.names]
         elif isinstance(node, ast.Import):
-            names = [alias.name for alias in node.names]
+            tries = [[alias.name] for alias in node.names]
         else:
             continue
-        for name in names:
-            if name.split(".")[0] in {"harness", "scripts", "tests"}:
-                resolved = _module_file(name)
+        for names in tries:
+            if names[0].split(".")[0] in _REPO_ROOTS:
+                resolved = next((r for n in names if (r := _module_file(n))), None)
                 if resolved:
                     found.add(resolved)
     return found
@@ -159,8 +182,16 @@ def _scripts_run_by_docker_smoke() -> set[str]:
             if not line.lstrip().startswith("#")
         )
         run.update(_STEP_PATH.findall(executable))
-        run.update(p for m in _STEP_MODULE.findall(executable) if (p := _module_file(m)))
-    return run | {helper for path in run for helper in _repo_imports(path)}
+        run.update(p for m in _STEP_MODULE.findall(executable) if (p := _module_file(m, run=True)))
+    # The import closure, to a fixed point, so a helper's own helper is reached too.
+    todo = list(run)
+    while todo:
+        path = todo.pop()
+        if path.endswith(".py"):
+            new = _repo_imports((_ROOT / path).read_text(encoding="utf-8")) - run
+            run |= new
+            todo.extend(new)
+    return run
 
 
 def test_every_entrypoint_module_trips_the_gate() -> None:
@@ -199,11 +230,29 @@ def test_every_script_the_smoke_steps_run_trips_the_gate() -> None:
         ("bash $GITHUB_WORKSPACE/scripts/ci/probe.sh", "scripts/ci/probe.sh"),
         ('-v "$PWD/harness/load/rigadmin.py:/rig/rigadmin.py:ro"', "harness/load/rigadmin.py"),
         ("python /repo/scripts/ci/make_syslog_ca_crl.py /out", "scripts/ci/make_syslog_ca_crl.py"),
+        ('python3 "${PWD}/scripts/ci/x.py"', "scripts/ci/x.py"),
+        ("python ${{ github.workspace }}/scripts/ci/y.py", "scripts/ci/y.py"),
+        ("python $(pwd)/scripts/ci/z.py", "scripts/ci/z.py"),
     ],
 )
 def test_the_step_path_reader_on_planted_lines(line: str, expected: str) -> None:
     """The shapes a new smoke step may use, so a new script cannot slip past the reader."""
     assert _STEP_PATH.findall(line) == [expected]
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("from tests._phi_gate_provisions import make", {"tests/_phi_gate_provisions.py"}),
+        ("from tests import _phi_gate_provisions", {"tests/_phi_gate_provisions.py"}),
+        ("import harness.load.rigadmin", {"harness/load/rigadmin.py"}),
+        ("from harness.load import rigadmin", {"harness/load/rigadmin.py"}),
+        ("import json\nfrom messagefoundry import pki", set()),
+    ],
+)
+def test_the_import_reader_on_planted_sources(source: str, expected: set[str]) -> None:
+    """A submodule named in ``from pkg import name`` resolves to its own file, not the package."""
+    assert _repo_imports(source) == expected
 
 
 def test_the_step_path_reader_skips_in_container_paths() -> None:
