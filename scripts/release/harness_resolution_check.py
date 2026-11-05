@@ -36,9 +36,10 @@ refused, blaming a correct pin.
 
 THE ONE OTHER BASE DEPENDENCY IT STUBS is ``messagefoundry-toolkit`` (ADR 0201 slice 7: the harness
 imports the toolkit's generators). Every arm offers a toolkit stub at the harness's OWN version with
-no requirements of its own, so the arms still vary the engine alone and measure only its edge. The
-toolkit pin is held exact by ``tests/test_packaging.py``'s specifier check; here a drifted toolkit
-pin shows only as a matched arm that pip refused.
+no requirements of its own, so the arms still vary the engine alone and measure only its edge. So
+this check does not hold the toolkit pin: ``tests/test_packaging.py`` checks the specifier in CI, and
+release.yml's harness wheel smoke checks it on the built wheel. A toolkit pin that drifted past both
+would show here only as a matched arm that pip refused, worded as if the engine pin were at fault.
 
 NOT STDLIB-ONLY, on purpose. It imports ``packaging`` for PEP 440 and PEP 503 normalisation, and
 both places that run it already carry ``packaging``: the test suite's interpreter, and release.yml's

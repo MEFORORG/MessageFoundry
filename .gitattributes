@@ -114,8 +114,8 @@ messagefoundry_toolkit/** text=auto eol=lf
 # compares the two BYTE FOR BYTE. The `messagefoundry_toolkit/**` stanza above pins the toolkit side,
 # generators/_hl7data.py included, which the same test compares with tee/anon/_hl7data.py.
 # Leaving this side unpinned makes that comparison fail on any Windows checkout with
-# `core.autocrlf=true`, because git converts the
-# unpinned copy and not the pinned one -- the files agree in the repository and differ on disk.
+# `core.autocrlf=true`, because git converts the unpinned copy and not the pinned one -- the
+# files agree in the repository and differ on disk.
 # Measured on this PR's own CI: both parity tests failed on windows-2022 and windows-2025 and
 # PASSED on ubuntu-latest, where no conversion happens.
 #

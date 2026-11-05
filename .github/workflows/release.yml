@@ -2038,7 +2038,8 @@ jobs:
           python -m venv /tmp/harnesssmoke
           /tmp/harnesssmoke/bin/pip install --quiet "packaging==$PKG_PIN"
           # --no-deps IS LOAD-BEARING, NOT AN OPTIMISATION. messagefoundry-harness depends on
-          # messagefoundry[harness], so a full install would resolve the ENGINE AND PySide6 FROM PYPI
+          # messagefoundry[harness] and messagefoundry-toolkit, so a full install would resolve the
+          # ENGINE, THE TOOLKIT AND PySide6 FROM PYPI
           # inside a job holding contents: write — and on a first run the engine is not on PyPI
           # yet, since publish-pypi waits on this job (a re-run of this job may follow its upload),
           # so it would also be a live index round-trip on the release path. Install the
@@ -2217,6 +2218,37 @@ jobs:
                   f"messagefoundry[harness]=={dist.version} — this is a LOCKSTEP distribution and its "
                   f"pin drifted from the version it ships at (BACKLOG #1585). Fix the dependencies "
                   f"table in packaging/messagefoundry-harness/pyproject.toml and re-cut the tag."
+              )
+
+          # THE TOOLKIT PIN, THE SAME WAY (ADR 0201 slice 7, AC-7). The harness imports
+          # messagefoundry_toolkit.generators, so it declares the toolkit, lockstep like the engine.
+          # The resolution check below stubs the toolkit at this wheel's own version and so cannot
+          # see this pin drift, and nothing else here reads it: a missing or loose line would
+          # publish a harness that dies on ImportError at its first generator call.
+          toolkit = [
+              req
+              for raw in (dist.metadata.get_all("Requires-Dist") or [])
+              if (req := Requirement(raw)).name.replace("_", "-").lower() == "messagefoundry-toolkit"
+              and not gated_by_an_extra(req)
+          ]
+          toolkit_clauses = list(toolkit[0].specifier) if len(toolkit) == 1 else []
+          toolkit_pin = None
+          if (
+              len(toolkit_clauses) == 1
+              and toolkit_clauses[0].operator == "=="
+              and toolkit[0].marker is None
+              and not toolkit[0].extras
+          ):
+              try:
+                  toolkit_pin = Version(toolkit_clauses[0].version)
+              except InvalidVersion:
+                  toolkit_pin = None  # a wildcard pin is a drift, as for the engine above
+          if toolkit_pin != shipped:
+              raise SystemExit(
+                  f"::error::{DIST} {dist.version} requires {[str(req) for req in toolkit]} of "
+                  f"messagefoundry-toolkit, not exactly messagefoundry-toolkit=={dist.version} (ADR "
+                  f"0201 AC-7). Fix the dependencies table in "
+                  f"packaging/messagefoundry-harness/pyproject.toml and re-cut the tag."
               )
 
           print(

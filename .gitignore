@@ -55,8 +55,7 @@ secrets/
 !/samples/messages/
 !/samples/results_relay/
 # Generated, regenerable test corpus (build with: python -m messagefoundry_toolkit.generators.adt).
-# MUST come
-# after the un-ignores above, or the re-included parent would drag it back in.
+# MUST come after the un-ignores above, or the re-included parent would drag it back in.
 /samples/messages/adt/
 # Workflow agent self-verification temp dirs (an isolated copy of a ported migration module + codesets
 # + fixture for a check/dryrun). Customer-estate-derived — never commit. Delete after a porting batch.

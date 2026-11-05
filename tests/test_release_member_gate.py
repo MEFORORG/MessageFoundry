@@ -526,7 +526,7 @@ def test_an_engine_archive_carrying_toolkit_code_is_refused(member: str) -> None
         "messagefoundry/anonymize.py",  # a near name is not the retired directory
         "messagefoundry/parsing/validate.py",  # the strict validator the schema emitters read
         "messagefoundry/hl7schemas.py",  # a near name is not the retired module
-        "messagefoundry/verify/generators_note.txt",  # a different parent, not the retired run
+        "messagefoundry/verify/generators/x.py",  # the retired leaf under a different parent
     ],
 )
 def test_an_engine_archive_member_that_stays_is_allowed(member: str) -> None:

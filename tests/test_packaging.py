@@ -578,9 +578,15 @@ def _engine_requirement(dependencies: list[str]) -> Requirement | None:
     Returns the REQUIREMENT rather than just its version so the extras check below reads off the same
     parse instead of re-finding it; the two asked the same question twice and could disagree.
     """
+    return _requirement(dependencies, "messagefoundry")
+
+
+def _requirement(dependencies: list[str], name: str) -> Requirement | None:
+    """The first parsed requirement on distribution ``name``, or ``None``. One lookup for the engine
+    and toolkit pin checks, so the two cannot match names differently."""
     for raw in dependencies:
         req = Requirement(raw)
-        if _normalise(req.name) == "messagefoundry":
+        if _normalise(req.name) == name:
             return req
     return None
 
@@ -968,14 +974,7 @@ def _toolkit_pin(dependencies: list[str]) -> str | None:
     ``None`` for every shape ``_engine_pin`` refuses (``_exact_pin`` is the one rule both use),
     and for an extra too, since the toolkit declares none.
     """
-    req = next(
-        (
-            r
-            for raw in dependencies
-            if _normalise((r := Requirement(raw)).name) == "messagefoundry-toolkit"
-        ),
-        None,
-    )
+    req = _requirement(dependencies, "messagefoundry-toolkit")
     return None if req is not None and req.extras else _exact_pin(req)
 
 

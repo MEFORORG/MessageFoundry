@@ -603,6 +603,12 @@ def _generator_imports(source: str) -> list[str]:
         ):
             hits.append(node.module)
         elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module == "messagefoundry_toolkit"
+            and any(a.name == "generators" for a in node.names)
+        ):
+            hits.append("messagefoundry_toolkit.generators")
+        elif (
             isinstance(node, ast.Constant)
             and isinstance(node.value, str)
             and node.value.startswith("messagefoundry_toolkit.generators")
@@ -628,14 +634,15 @@ def test_no_verify_source_imports_the_generators() -> None:
     }
     assert not hits, f"verify still imports the generators: {hits}"
 
-    # Positive control on all three forms. Without it, the clean result above is indistinguishable
+    # Positive control on all four forms. Without it, the clean result above is indistinguishable
     # from a predicate that can never fire.
     control = (
         "import messagefoundry_toolkit.generators.all_types\n"
         "from messagefoundry_toolkit.generators import _core\n"
+        "from messagefoundry_toolkit import generators\n"
         'importlib.import_module("messagefoundry_toolkit.generators.adt")\n'
     )
-    assert len(_generator_imports(control)) == 3, _generator_imports(control)
+    assert len(_generator_imports(control)) == 4, _generator_imports(control)
 
 
 # ---- self smoke: snapshot_on_send thread-through (#241 F3) -------------------------------------

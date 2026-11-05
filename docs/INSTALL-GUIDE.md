@@ -26,10 +26,10 @@ flowchart TB
   classDef ext fill:#eceff1,stroke:#546e7a,color:#1c2429;
 
   CONSOLE["messagefoundry-webconsole<br/>the operator web console, served at /ui<br/>its own version line"]:::opstool
-  TOOLKIT["messagefoundry-toolkit<br/>authoring commands, moving out of the engine in stages<br/>the engine's version"]:::devtool
+  TOOLKIT["messagefoundry-toolkit<br/>authoring and development code moved out of the engine<br/>the engine's version"]:::devtool
   HARNESS["messagefoundry-harness<br/>synthetic send, receive, load and failover testing<br/>the engine's version"]:::devtool
 
-  ENGINE["messagefoundry<br/>the engine, its API and the messagefoundry command<br/>the Windows tray, messagefoundry-tray<br/>the authoring commands not yet moved"]:::core
+  ENGINE["messagefoundry<br/>the engine, its API and the messagefoundry command<br/>the Windows tray, messagefoundry-tray"]:::core
 
   subgraph EXTRAS["Optional extras of the messagefoundry distribution"]
     XSTORE["Store backends<br/>sqlserver, postgres"]:::ext
@@ -42,6 +42,7 @@ flowchart TB
   CONSOLE -->|"declares the engine, and needs a matching release"| ENGINE
   TOOLKIT -->|"declares the engine at its own version"| ENGINE
   HARNESS -->|"declares the engine at its own version, with the harness extra"| ENGINE
+  HARNESS -->|"declares the toolkit at its own version"| TOOLKIT
   ENGINE -.->|"add only what a host needs"| EXTRAS
 ```
 
@@ -58,8 +59,9 @@ verify the engine yourself first, as section 3 says. Do not let another package 
 
 Three facts about versions:
 
-- The toolkit and the harness each declare the engine at exactly their own version. Install all
-  three at one version, and upgrade them together.
+- The toolkit and the harness each declare the engine at exactly their own version, and the
+  harness declares the toolkit the same way, so installing the harness also installs the toolkit and
+  its command. Install all three at one version, and upgrade them together.
 - The web console has its own version line. Its wheel declares a lowest engine version, but the
   pair must also match. The engine checks the pair when it mounts the console and refuses a
   mismatch. Section 7 names the console release to install.
@@ -72,7 +74,8 @@ moves the authoring and development commands out of the engine wheel. They run f
 `messagefoundry --help` and `messagefoundry-toolkit --help` to see which command holds what at your
 version.
 
-Install the toolkit only on a machine where people author configuration:
+Install the toolkit only on a machine where people author configuration, or where the harness
+runs, since the harness brings it:
 
 ```powershell
 pip install "messagefoundry-toolkit==<version>"   # the same version as the engine
@@ -81,8 +84,9 @@ pip install "messagefoundry-toolkit==<version>"   # the same version as the engi
 A production host needs the engine alone. A site that installs the toolkit on a production host has
 chosen to carry the authoring commands there, which is what the split exists to avoid (ASVS 15.2.3).
 The synthetic-HL7 generators, the HL7 schema modules and the de-identification package moved into
-the toolkit too (ADR 0201 slices 6 and 7), so an engine wheel built from this release carries none of
-them. A release built before those slices still ships them in the engine wheel.
+the toolkit too (ADR 0201 slices 6 and 7). Engine releases up to 0.5.2 still carry them, and those
+releases still register the authoring commands on the `messagefoundry` command as well. Run
+`messagefoundry --help` to see which applies to the version you install.
 
 The extras, by group. `pyproject.toml` holds the live list.
 

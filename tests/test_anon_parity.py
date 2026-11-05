@@ -101,9 +101,9 @@ def test_shared_logic_files_are_byte_identical() -> None:
 
 
 def test_vendored_hl7data_matches_generator_source() -> None:
-    engine = (_ROOT / "messagefoundry_toolkit" / "generators" / "_hl7data.py").read_bytes()
+    toolkit = (_ROOT / "messagefoundry_toolkit" / "generators" / "_hl7data.py").read_bytes()
     tee = (_ROOT / "tee" / "anon" / "_hl7data.py").read_bytes()
-    assert engine == tee, (
+    assert toolkit == tee, (
         "tee/anon/_hl7data.py drifted from messagefoundry_toolkit/generators/_hl7data.py"
     )
 
