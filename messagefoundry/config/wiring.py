@@ -6884,12 +6884,15 @@ def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
+def query_credential_hops(
+    registry: Registry, *, env_values: Mapping[str, Any] | None = None
+) -> list[tuple[str, str]]:
     """Every outbound and ``FhirLookup`` whose ``url`` carries a credential-like query parameter, as
     ``(name, parameter names)`` (ASVS 14.2.1). Lookup names are prefixed ``fhir_lookup:``.
 
     The single reader, on the contract of :func:`expiry_relaxed_hops`, so ``messagefoundry check``,
-    ``security_loosenings()`` and ``GET /security/posture`` cannot disagree. Sorted by name. The
+    ``security_loosenings()`` and ``GET /security/posture`` cannot disagree on a literal ``url``;
+    on an ``env()`` one they read the values each has, as below. Sorted by name. The
     second element is the parameter NAMES only, comma-joined, from
     :func:`~messagefoundry.secretscrub.credential_query_params`; a value never leaves this function.
 
@@ -6899,8 +6902,10 @@ def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
     it nowhere else, so it is reported rather than refused, except where
     ``transports.egress.warn_url_query_credentials`` says a build refuses it.
 
-    It reads a literal ``url`` only. An ``env()`` URL is unresolved here and cannot be read; the
-    construction WARNING, ``transports.egress.warn_url_query_credentials``, reads the resolved one.
+    An ``env()`` URL is read as the build resolves it, against ``env_values`` (the live posture
+    route passes the runner's), falling back to its literal ``default=`` when the values, or the
+    caller, have none for its key (vault BACKLOG #3766 item 15). One with neither is not read; the
+    construction WARNING, ``transports.egress.warn_url_query_credentials``, reads the resolved URL.
     Pure."""
     out: list[tuple[str, str]] = []
     for name, settings in (
@@ -6908,6 +6913,8 @@ def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
     ):
         url = settings.get("url")
+        if isinstance(url, EnvRef):
+            url = _resolve_one_env_value(url, env_values or {})
         if isinstance(url, str) and (names := credential_query_params(url)):
             out.append((name, ", ".join(names)))
     return sorted(out)

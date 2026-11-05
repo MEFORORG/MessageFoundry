@@ -2028,8 +2028,9 @@ count is above `0` (vault BACKLOG #2613).
   `security_loosenings()`, and so in `GET /security/posture` on a running engine. All three walk
   outbound connections and `FhirLookup` connections. The WARNING labels a lookup
   `FhirLookup '<name>'`; the `check` line and the posture entry name it with a `fhir_lookup:`
-  prefix. The WARNING reads the resolved URL. The `check` line and the posture entry read a literal
-  `url` only, so a URL supplied by `env()` is in the WARNING alone. A lane the engine has not built
+  prefix. The WARNING reads the resolved URL. The posture entry reads an `env()` URL against the
+  values the graph builds with, and the `check` line, which has none, reads its literal `default=`,
+  so a URL that only the environment supplies, with no default, is in the WARNING alone. A lane the engine has not built
   (for example `auto_start=False`, or DR-parked) logs no WARNING until it is built or checked, and a
   `deployed=False` outbound is never built or build-checked, so no WARNING fires for it; an `env()`
   URL on such a lane appears nowhere meanwhile.
