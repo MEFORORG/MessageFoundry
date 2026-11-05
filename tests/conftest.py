@@ -654,6 +654,20 @@ def _syslog_ca_and_crl_bundle(tmp_path_factory: pytest.TempPathFactory) -> str:
     return make_syslog_ca_and_crl(tmp_path_factory.mktemp("syslog-ca"))
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _the_provisioned_collector_never_reaches_dns() -> Iterator[None]:
+    """Answer the provisioned collector's lookup in this process, so no test asks DNS for it
+    (BACKLOG #2279 item 3). A test that patches ``socket.getaddrinfo`` itself replaces this for its
+    own duration, and monkeypatch's undo puts this back."""
+    import socket
+
+    from tests._phi_gate_provisions import ProvisionedCollectorResolver
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(socket, "getaddrinfo", ProvisionedCollectorResolver(socket.getaddrinfo))
+        yield
+
+
 @pytest.fixture
 def verified_log_forwarding(
     monkeypatch: pytest.MonkeyPatch, _syslog_ca_and_crl_bundle: str
