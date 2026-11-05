@@ -12,9 +12,16 @@ from importlib import metadata
 from pathlib import Path
 
 import pytest
+import yaml
 from packaging.version import Version
 
-from scripts.ci.check_dependency_floors import DEFAULT_EXTRAS, check, declared_floors, main
+from scripts.ci.check_dependency_floors import (
+    DEFAULT_EXTRAS,
+    UndeclaredExtra,
+    check,
+    declared_floors,
+    main,
+)
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -106,11 +113,16 @@ def test_the_named_extras_are_read_and_combine_with_the_runtime_lines(tmp_path: 
     }
 
 
+def test_two_extra_keys_that_canonicalize_alike_are_both_read(tmp_path: Path) -> None:
+    path = _pyproject(tmp_path, dev=["first>=1.0"], Dev=["second>=2.0"])
+    assert declared_floors(path, ["dev"]) == {"first": Version("1.0"), "second": Version("2.0")}
+
+
 def test_an_undeclared_extra_is_refused_rather_than_read_as_empty(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     path = _pyproject(tmp_path, dev=["pytest>=9.0.3"])
-    with pytest.raises(ValueError, match="'dve' is not declared"):
+    with pytest.raises(UndeclaredExtra, match="'dve' is not declared"):
         declared_floors(path, ["dve"])
     assert main(["--pyproject", str(path), "--extra", "dve"]) == 1
     assert "FLOOR NOT MEASURED: extra 'dve' is not declared" in capsys.readouterr().err
@@ -118,33 +130,36 @@ def test_an_undeclared_extra_is_refused_rather_than_read_as_empty(
 
 def test_main_reads_the_dev_floors_unless_told_which_extras(tmp_path: Path) -> None:
     """The workflow passes no ``--extra``, so the default is what makes it read [dev]. The runtime
-    floor is installed exactly, and the control names an empty extra instead and passes, so the
+    floor is installed exactly, and the controls name an empty extra, or none, and pass, so the
     red comes from [dev]."""
     installed = f"packaging=={metadata.version('packaging')}"
     path = _pyproject(tmp_path, installed, dev=["not-a-real-distribution-3177>=1.0"], ok=[])
     assert main(["--pyproject", str(path)]) == 1
     assert main(["--pyproject", str(path), "--extra", "ok"]) == 0
+    # A bare --extra reads the runtime dependencies alone.
+    assert main(["--pyproject", str(path), "--extra"]) == 0
 
 
-def test_the_shipped_pyproject_declares_a_readable_floor_for_every_dev_dependency() -> None:
-    """The control for the default: the real file's [dev] extra is read, and each of its lines
-    yields a floor the check can compare, so the leg reds on a [dev] floor off its mark."""
+def test_the_shipped_pyproject_declares_a_readable_floor_for_every_default_dependency() -> None:
+    """The control for the default: the real file's [dev] extra is read, and every line read, a
+    [dev] line sharing a runtime name included, yields a floor the check can compare."""
     floors = declared_floors(_ROOT / "pyproject.toml", DEFAULT_EXTRAS)
-    runtime = declared_floors(_ROOT / "pyproject.toml")
-    dev_only = floors.keys() - runtime.keys()
-    assert {"pytest", "pytest-asyncio", "pyyaml"} <= dev_only
-    assert all(floors[name] is not None for name in dev_only)
+    assert {"pytest", "pytest-asyncio", "pyyaml"} <= floors.keys()
+    assert [name for name, floor in floors.items() if floor is None] == []
 
 
 def test_the_default_extras_are_the_ones_the_workflow_installs() -> None:
-    """The workflow calls the check with no ``--extra``, so the default must name exactly the
+    """The workflow's check step passes no ``--extra``, so the default must name exactly the
     extras its install step installs: one more reds as not installed, one fewer goes unread."""
-    workflow = (_ROOT / ".github" / "workflows" / "dependency-floors.yml").read_text(
-        encoding="utf-8"
+    workflow = yaml.safe_load(
+        (_ROOT / ".github" / "workflows" / "dependency-floors.yml").read_text(encoding="utf-8")
     )
-    installed = re.findall(r'-e "\.\[([^\]]*)\]"', workflow)
-    assert len(installed) == 1, installed
-    assert {e.strip() for e in installed[0].split(",")} == set(DEFAULT_EXTRAS)
+    runs = [step.get("run", "") for step in workflow["jobs"]["floors"]["steps"]]
+    (install,) = [run for run in runs if "--resolution lowest-direct" in run]
+    (check_step,) = [run for run in runs if "scripts/ci/check_dependency_floors.py" in run]
+    assert "--extra" not in check_step
+    (extras,) = re.findall(r'-e "\.\[([^\]]*)\]"', install)
+    assert {e.strip() for e in extras.split(",")} == set(DEFAULT_EXTRAS)
 
 
 def _installed(versions: dict[str, str | None]) -> Callable[[str], Version | None]:

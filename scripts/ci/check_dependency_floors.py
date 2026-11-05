@@ -49,8 +49,12 @@ _ROOT = Path(__file__).resolve().parents[2]
 _FLOOR_OPERATORS = frozenset({">=", "~=", "=="})
 
 
-#: The extras the workflow installs (``-e ".[dev]"``), read when ``--extra`` names none.
+#: The extras the workflow installs (``-e ".[dev]"``), read when ``--extra`` is not given.
 DEFAULT_EXTRAS = ("dev",)
+
+
+class UndeclaredExtra(ValueError):
+    """An extra was asked for that ``pyproject.toml`` does not declare."""
 
 
 def declared_floors(pyproject: Path, extras: Iterable[str] = ()) -> dict[str, Version | None]:
@@ -61,18 +65,18 @@ def declared_floors(pyproject: Path, extras: Iterable[str] = ()) -> dict[str, Ve
     combines them, whether they are runtime lines, extra lines or one of each: a bare line adds no
     bound, and an exclusion on one line applies to the floor another line declares.
 
-    Raises :class:`ValueError` for an extra ``pyproject.toml`` does not declare, so a misspelt or
-    removed extra cannot pass as one with nothing to check."""
+    Raises :class:`UndeclaredExtra` for an extra ``pyproject.toml`` does not declare, so a misspelt
+    or removed extra cannot pass as one with nothing to check. Two keys that canonicalize alike
+    (``dev`` and ``Dev``) are both read, so neither list's floors go unmeasured."""
     project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
-    declared_extras = {
-        canonicalize_name(extra): lines
-        for extra, lines in project.get("optional-dependencies", {}).items()
-    }
+    declared_extras: dict[str, list[str]] = {}
+    for extra, lines in project.get("optional-dependencies", {}).items():
+        declared_extras.setdefault(canonicalize_name(extra), []).extend(lines)
     groups: list[tuple[str, list[str]]] = [("", project.get("dependencies", []))]
     for extra in extras:
         key = canonicalize_name(extra)
         if key not in declared_extras:
-            raise ValueError(f"extra {extra!r} is not declared in {pyproject}")
+            raise UndeclaredExtra(f"extra {extra!r} is not declared in {pyproject}")
         groups.append((key, declared_extras[key]))
     specifiers: dict[str, SpecifierSet] = {}
     for extra, lines in groups:
@@ -148,9 +152,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--pyproject", type=Path, default=_ROOT / "pyproject.toml")
     parser.add_argument(
         "--extra",
-        action="append",
+        action="extend",
+        nargs="*",
         metavar="NAME",
-        help=f"an extra whose floors to read; repeatable (default: {', '.join(DEFAULT_EXTRAS)})",
+        help=(
+            f"extras whose floors to read; repeatable (default: {', '.join(DEFAULT_EXTRAS)}); "
+            "--extra with no NAME reads the runtime dependencies alone"
+        ),
     )
     parser.add_argument(
         "--raised",
@@ -163,7 +171,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     extras = DEFAULT_EXTRAS if args.extra is None else args.extra
     try:
         floors = declared_floors(args.pyproject, extras)
-    except ValueError as exc:
+    except UndeclaredExtra as exc:
         print(f"FLOOR NOT MEASURED: {exc}", file=sys.stderr)
         return 1
     lines, failures = check(floors, args.raised)
