@@ -515,10 +515,10 @@ def _serve_capturing(
     return handed, captured
 
 
-def test_serve_hands_the_settings_crls_to_the_expiry_monitor(
+def test_serve_hands_the_settings_monitored_files_to_the_expiry_monitor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #299: ``settings_crls`` is the only route an outbound CRL takes to
+    """BACKLOG #299: ``settings_monitored_files`` is the only route an outbound CRL takes to
     ``Engine._monitored_certs``. Without it a stale ``[tls].crl_file`` raised no alert."""
     ca_key = ec.generate_private_key(ec.SECP256R1())
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "crl-ca")])
@@ -538,7 +538,7 @@ def test_serve_hands_the_settings_crls_to_the_expiry_monitor(
     # that one to the monitor too, after [tls].crl_file.
     import os
 
-    assert list(handed["settings_crls"]) == [
+    assert list(handed["settings_monitored_files"]) == [
         MonitoredCert("tls.crl_file", str(crl_path), kind="crl"),
         MonitoredCert(
             "logging.forward_tls_crl_file",

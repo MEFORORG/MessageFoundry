@@ -709,7 +709,9 @@ def test_every_settings_crl_alerts_under_a_distinct_label(tmp_path: Path) -> Non
     assert len(set(labels)) == 5
 
 
-def test_the_engine_hands_the_settings_crls_to_its_expiry_monitor(tmp_path: Path) -> None:
+def test_the_engine_hands_the_settings_monitored_files_to_its_expiry_monitor(
+    tmp_path: Path,
+) -> None:
     crl = tmp_path / "tls_crl.pem"
     _write_crl(crl, next_update=_REF + datetime.timedelta(days=5))
     watched = crls_from_settings(ServiceSettings(tls=TlsSettings(crl_file=str(crl))))
@@ -717,7 +719,7 @@ def test_the_engine_hands_the_settings_crls_to_its_expiry_monitor(tmp_path: Path
     async def _go() -> list[MonitoredCert]:
         eng = await Engine.create(
             tmp_path / "crl.db",
-            settings_crls=watched,
+            settings_monitored_files=watched,
             egress_settings=EgressSettings(deny_by_default=False),
         )
         try:

@@ -11823,7 +11823,7 @@ def create_managed_app(
     api_tls_cert_file: str | None = None,
     api_tls_replacements: Sequence[GeneratedPairReplaced] = (),
     api_tls_client_cert_files: Sequence[str] = (),
-    settings_crls: Sequence[MonitoredCert] = (),
+    settings_monitored_files: Sequence[MonitoredCert] = (),
     api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
     egress_settings: EgressSettings,
@@ -12239,8 +12239,8 @@ def create_managed_app(
             engine_version=__version__,
             api_tls_cert_file=api_tls_cert_file,
             api_tls_client_cert_files=api_tls_client_cert_files,
-            # BACKLOG #299: the settings-level CRL files, mostly outbound, for the same expiry scan.
-            settings_crls=settings_crls,
+            # BACKLOG #299: the settings-level CRL and pin files, for the same expiry scan.
+            settings_monitored_files=settings_monitored_files,
             api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
