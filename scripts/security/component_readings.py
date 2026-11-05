@@ -657,6 +657,15 @@ def _said(value: object) -> bool:
     return bool(str(value or "").strip())
 
 
+def _cell(value: object) -> bool:
+    """Whether a recorded field says something the page can print in one table cell.
+
+    A ``|`` would end the cell early and a line break would end the row, so either one would
+    shift every later cell of that row into the wrong column.
+    """
+    return _said(value) and not any(mark in str(value) for mark in "|\r\n")
+
+
 def _said_list(value: object) -> bool:
     """Whether a recorded field is a list with an entry, where every entry says something."""
     return isinstance(value, list) and bool(value) and all(_said(item) for item in value)
@@ -746,8 +755,10 @@ def survey_problems(
     must be the ones ``adapted_modules`` names. A wheel nobody fetched can record neither, nor a
     second release line of its own. No file may be named twice among a wheel's files read, its
     hits or its adapted modules. Every day is given as ``YYYY-MM-DD``: the search's ``run``, each
-    answer's two dates and a read route's ``date``. The search's ``wheels_searched`` and
-    ``wheel_files_searched`` must be the counts ``files_read`` gives.
+    answer's two dates and a read route's ``date``. No source and data answer is dated before the
+    search's ``run``, and at least one is dated that day. The search's ``wheels_searched`` and
+    ``wheel_files_searched`` must be the counts ``files_read`` gives. A field the page prints in a
+    table cell holds no ``|`` and no line break.
     """
     problems: list[str] = []
     search = survey.get("search")
@@ -756,8 +767,10 @@ def survey_problems(
         _said(search.get(key)) for key in SEARCH_RULES
     ):
         problems.append(f"the survey does not state its search: {SEARCH_LISTS + SEARCH_RULES}")
-    if _iso_day(search.get("run")) is None:
+    run = _iso_day(search.get("run"))
+    if run is None:
         problems.append("the survey's search gives no day it was run, as YYYY-MM-DD")
+    forms_days: list[dt.date] = []
     # The two figures count the wheels, and the wheel files, that the answers name as read. The
     # word search ran over exactly those, so each figure follows from ``files_read``.
     per_wheel = [_wheel_files(wheel) for wheel in survey["wheels"]]
@@ -861,37 +874,61 @@ def survey_problems(
         # An unreadable ``surveyed`` is reported above, and is not reported again here. A compiled
         # answer made again later is meant to go red here: the source and data answers rest on the
         # same ``files_read``, so they are made again with it.
-        elif surveyed is not None and forms_day < surveyed:
-            problems.append(f"{name}: the source and data answers are dated before the first")
+        else:
+            if surveyed is not None and forms_day < surveyed:
+                problems.append(f"{name}: the source and data answers are dated before the first")
+            # The source and data answers are what the search found, so none is made before it.
+            if run is not None and forms_day < run:
+                problems.append(f"{name}: the source and data answers are dated before the search")
+            forms_days.append(forms_day)
         problems += [f"{name}: {problem}" for problem in _own_line_problems(wheel, wheels_named)]
         problems += [f"{name}: {problem}" for problem in _hit_problems(wheel, words, wheels_named)]
         route = wheel.get("route")
         if not _needs_route(wheel, labels):
             if route is not None:
                 problems.append(f"{name}: a route is recorded where the page owes none")
-        elif route not in ROUTES or not _said(wheel.get("route_reason")):
+        elif route not in ROUTES or not _cell(wheel.get("route_reason")):
             problems.append(f"{name}: not designated and not shown to carry no code, with no route")
         elif route == "read" and not all(
-            (_iso_day if field == "date" else _said)(_entries([wheel.get("read")])[0].get(field))
+            (_iso_day if field == "date" else _cell)(_entries([wheel.get("read")])[0].get(field))
             for field in READ_FIELDS
         ):
             problems.append(
                 f"{name}: a read route must record {READ_FIELDS}, the date as YYYY-MM-DD"
             )
+    # ``run`` is the earliest day the search ran for an answer the record still holds. A wheel
+    # searched again later, as after a pin moved, carries the later day in its own
+    # ``forms_surveyed``. So some answer is dated ``run``: once every wheel has been searched
+    # again, ``run`` moves to the earliest of the new days.
+    if run is not None and forms_days and run not in forms_days:
+        problems.append(
+            f"the survey's search ran on {run}, and no source and data answer is dated that day"
+        )
     return problems
 
 
 def _projects_named(projects: object) -> bool:
     """Whether ``projects`` is a list whose every entry is a mapping with a name and a version.
 
-    A ``display``, where one is recorded, is the whole phrase the page prints, so it must be text.
+    A ``display``, where one is recorded, is the whole phrase the page prints in place of the name
+    and the version, so it must be text that holds both. Each of the three fits a table cell.
     """
     return isinstance(projects, list) and all(
         isinstance(p, Mapping)
-        and _said(p.get("name"))
-        and _said(p.get("version"))
-        and ("display" not in p or (isinstance(p["display"], str) and _said(p["display"])))
+        and _cell(p.get("name"))
+        and _cell(p.get("version"))
+        and ("display" not in p or _display_holds(p))
         for p in projects
+    )
+
+
+def _display_holds(project: Mapping[str, Any]) -> bool:
+    """Whether a project's ``display`` is text for one cell that holds its name and its version."""
+    display = project["display"]
+    return (
+        isinstance(display, str)
+        and _cell(display)
+        and all(str(project[key]) in display for key in ("name", "version"))
     )
 
 
@@ -932,7 +969,8 @@ def _hit_problems(wheel: Mapping[str, Any], words: set[str], wheels_named: int) 
     ``HIT_KINDS``, and says what the hit is. Each adapted module names its file, the project the
     file names and the words that say so. The files recorded as adapted modules must be the same
     in both lists, so neither can be edited alone. A wheel that was not fetched records none.
-    A hit's ``lines``, where recorded, are line numbers. No file is named twice in either list.
+    A hit's ``lines``, where recorded, are line numbers, on a hit that names one file. No file is
+    named twice in either list.
     """
     hits, modules = wheel.get("word_hits"), wheel.get("adapted_modules")
     if not isinstance(hits, list) or not isinstance(modules, list):
@@ -949,8 +987,9 @@ def _hit_problems(wheel: Mapping[str, Any], words: set[str], wheels_named: int) 
             and hit.get("kind") in HIT_KINDS
             and _said(hit.get("says"))
             # The line numbers, where recorded, are figures the page does not print. Their shape is
-            # all that can be checked without the wheel.
-            and ("lines" not in hit or _line_numbers(hit["lines"]))
+            # all that can be checked without the wheel. They number the lines of one file, so a
+            # hit that names several files cannot say which file a number belongs to.
+            and ("lines" not in hit or (len(hit["files"]) == 1 and _line_numbers(hit["lines"])))
         ):
             problems.append(f"a word-search hit is not fully recorded: {hit.get('files')!r}")
     # A file named twice would inflate the page's count of files the search hit.
@@ -965,8 +1004,10 @@ def _hit_problems(wheel: Mapping[str, Any], words: set[str], wheels_named: int) 
     twice = _repeated(str(m["file"]) for m in _entries(modules) if _said(m.get("file")))
     if twice:
         problems.append(f"the adapted modules name a file more than once: {twice}")
+    # The file and the project are table cells on the page; the words are not printed.
     if not all(
-        _said(m.get(key)) for m in _entries(modules) for key in ("file", "project", "words")
+        _cell(m.get("file")) and _cell(m.get("project")) and _said(m.get("words"))
+        for m in _entries(modules)
     ):
         problems.append("an adapted module lacks its file, its project or its words")
     as_hits = {
