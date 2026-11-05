@@ -1212,7 +1212,7 @@ def _anchored_graph(cfg: Path, ca: Path) -> None:
         "inbound('ORDERS_IN', Http(port=21580, tls=True, tls_cert_file=CA, "
         "tls_ca_file=env('orders_ca')), router='r')\n"
         "inbound('PACS_IN', DICOM(ae_title='MEFOR', port=21104, tls=True, tls_cert_file=CA, "
-        "tls_ca_file=CA, tls_ca_pin='00' * 32), router='r')\n"
+        "tls_ca_file=CA, tls_ca_pin='00' * 32), router='r', content_type='dicom')\n"
         "inbound('PLAIN_IN', MLLP(port=21576, tls=True, tls_cert_file=CA), router='r')\n"
         "inbound('PARKED_IN', MLLP(port=21577, tls=True, tls_cert_file=CA, tls_ca_file=CA), "
         "router='r', deployed=False)\n"

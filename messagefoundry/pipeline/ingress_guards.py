@@ -501,8 +501,9 @@ def decode_body(raw: str | bytes, ic: InboundConnection) -> str:
 class IngressCodecUnusable(IngressGuardError):
     """A ``decode``-phase refusal caused by the inbound's codec NAME, not by the body: it names no
     text codec, or one that refuses every conversion (BACKLOG #2431). Every body would fail the same
-    way until the configuration changes, so the MLLP listener answers ``AE`` (resend later) where a
-    body invalid in a usable charset gets ``AR``."""
+    way until the configuration changes, so it is a configuration refusal (BACKLOG #5102): the MLLP
+    listener answers ``AE`` (resend later) where a body invalid in a usable charset gets ``AR``, and
+    ``_guard_refusal_kind`` in ``pipeline/wiring_runner.py`` classes it for both listeners."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason, phase="decode")

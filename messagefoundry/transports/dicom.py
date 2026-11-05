@@ -75,7 +75,7 @@ import zlib
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import BytesIO
-from typing import Any, ClassVar, NamedTuple, cast
+from typing import Any, ClassVar, NamedTuple, assert_never, cast
 
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import ConnectorType, Destination, Source
@@ -255,6 +255,24 @@ _STATUS_CANNOT_UNDERSTAND = 0xC000  # final: this object will not be taken as se
 #: status, and 0xC211 when the handler raises.
 _STATUS_REFUSED_OVER_CAP = 0xC010
 _STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist: the backstop in _on_c_store
+
+
+def _refusal_dimse_status(kind: RefusalKind) -> int:
+    """The C-STORE status an engine ingress refusal of ``kind`` is answered with (BACKLOG #2105),
+    in step with ``http_listener._refusal_status`` for every kind but one. A configuration refusal,
+    which ``Http()`` answers ``503``, is the final class here, on purpose (BACKLOG #5102). On the SCP it can arise only on an inbound that declares a text
+    ``content_type``, which the wiring refuses at build, and such an inbound refuses every Part-10
+    object as the body's own fault even after an operator fixes the codec name, so Out of Resources
+    would have a sender re-send the object forever, leaving one ``ERROR`` row per attempt.
+    ``assert_never``, so mypy refuses a new kind left unmapped."""
+    match kind:
+        case RefusalKind.TEMPORARY:
+            return _STATUS_OUT_OF_RESOURCES
+        case RefusalKind.PERMANENT | RefusalKind.OVERSIZE | RefusalKind.CONFIGURATION:
+            return _STATUS_CANNOT_UNDERSTAND
+        case _:
+            assert_never(kind)
+
 
 # A-ASSOCIATE-RJ fields for "busy, retry later" (DICOM PS3.8 section 9.3.4), sent while the engine's
 # intake is paused (BACKLOG #290): rejected-transient, from the service provider's presentation
@@ -2530,9 +2548,11 @@ class DicomScpSource(SourceConnector):
         The handler returns a receipt: the committed message id, or a refusal, when it then recorded
         ``ERROR`` and committed no ingress row. A refusal is a DIMSE failure, never Success (BACKLOG
         #1910), mapped in step with the HTTP listener's answer (BACKLOG #2105). A TEMPORARY refusal
-        may clear on a re-send, so it answers Out of Resources, as the HTTP listener answers ``503``. A
-        permanent or over-size one is Cannot Understand, the status the decode-failure path already
-        answers for an object the engine will not take: the same object would be refused again. A
+        may clear on a re-send, so it answers Out of Resources, as the HTTP listener answers ``503``.
+        A permanent or over-size one is Cannot Understand, the status the decode-failure path
+        already answers for an object the engine will not take: the same object would be refused
+        again. So is a CONFIGURATION refusal, which no operator fix clears on the SCP (BACKLOG #5102,
+        :func:`_refusal_dimse_status`). A
         handler that RAISES, or does not answer in time, has committed nothing for a reason that may
         clear, such as a store that is down, so both answer Out of Resources and the sender re-sends
         (BACKLOG #2103)."""
@@ -2596,9 +2616,7 @@ class DicomScpSource(SourceConnector):
                 receipt.message_id,
                 receipt.refusal.value,
             )
-            if receipt.refusal is RefusalKind.TEMPORARY:
-                return _STATUS_OUT_OF_RESOURCES
-            return _STATUS_CANNOT_UNDERSTAND
+            return _refusal_dimse_status(receipt.refusal)
         logger.info(
             "DICOM C-STORE accepted from %s (SOP class %s, instance %s)",
             peer_ip,

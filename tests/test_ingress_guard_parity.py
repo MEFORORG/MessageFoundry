@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.models import ConnectorType, ContentType, Validation
+from messagefoundry.config.models import ConnectorType, ContentType, Source, Validation
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -36,9 +36,11 @@ from messagefoundry.config.wiring import (
     Send,
 )
 from messagefoundry.parsing.message import RawMessage
+from messagefoundry.parsing.split import split_batch_bytes
 from messagefoundry.pipeline import ingress_guards, wiring_runner
 from messagefoundry.pipeline.dryrun import disposition_for, dry_run, route_message, split_messages
 from messagefoundry.store import MessageStatus, MessageStore
+from messagefoundry.transports.file import FileSource
 
 #: A conformant 2.5.1 ADT^A01 whose PID-5 family name carries a byte that is latin-1 but NOT UTF-8
 #: (U+00DC, "Ü"). Which of the two charsets an inbound declares is exactly what decides whether the
@@ -574,7 +576,7 @@ async def test_a_codec_name_naming_no_text_codec_is_the_same_error_row_on_both_c
     assert rows == [
         {
             "status": MessageStatus.ERROR.value,
-            "error": _as_stored(listener, preview.error, kind="temporary"),
+            "error": _as_stored(listener, preview.error, kind="configuration"),
         }
     ]
 
@@ -601,7 +603,7 @@ async def test_an_env_encoding_is_not_resolved_by_the_decode_even_with_a_value(
     assert rows == [
         {
             "status": MessageStatus.ERROR.value,
-            "error": _as_stored(listener, preview.error, kind="temporary"),
+            "error": _as_stored(listener, preview.error, kind="configuration"),
         }
     ]
 
@@ -623,6 +625,43 @@ async def test_the_mllp_listener_naks_a_codec_name_naming_no_codec(store: Messag
     )
     invalid = await runner_utf8._handle_inbound(reg_utf8.inbound["in"], ADT_LATIN1)
     assert invalid is not None and "MSA|AR|" in invalid
+
+
+@pytest.mark.parametrize(
+    "encoding",
+    ["not-a-real-codec", "undefined"],
+    ids=["no_codec_answers", "refuses_every_conversion"],
+)
+async def test_a_file_source_hands_an_unusable_codec_name_to_the_runner_s_error_row(
+    store: MessageStore, tmp_path: Path, encoding: str
+) -> None:
+    """BACKLOG #5102, closing step 2: a poll source does not hold its input on a configuration
+    fault; docs/CONNECTIONS.md (*An inbound encoding follows one rule on every source*) says what it
+    does instead. The file source's batch split cannot decode the file, so it hands the raw bytes to
+    the runner, whose decode records one ERROR row, and the hand-off returns so the scan consumes
+    the file. The remote-file source's split does the same. Base: "undefined" raised a bare
+    UnicodeError out of both splits, so no row was written and the file was retried every scan."""
+    ic = InboundConnection(
+        "in",
+        ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path), "encoding": encoding}),
+        router="r",
+        content_type=ContentType.HL7V2,
+    )
+    reg = _registry(ic)
+    runner = wiring_runner.RegistryRunner(reg, store, egress=EgressSettings(deny_by_default=False))
+    source = FileSource(
+        Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path), "encoding": encoding})
+    )
+    source._handler = runner._make_handler(reg.inbound["in"])
+
+    assert await source._emit(ADT_UTF8) is True
+
+    cur = await store._db.execute("SELECT status, error FROM messages")
+    rows = [dict(r) for r in await cur.fetchall()]
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
+    assert rows[0]["error"].startswith(f"decode error ({encoding}): ")
+    # The remote-file source splits with this function and hands each part over the same way.
+    assert split_batch_bytes(ADT_UTF8 + ADT_UTF8, encoding) == [ADT_UTF8 + ADT_UTF8]
 
 
 def test_peek_max_bytes_resolves_the_per_connection_cap() -> None:

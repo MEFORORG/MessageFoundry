@@ -3101,10 +3101,11 @@ def Http(
     ``ERROR``/dead-letter + the AlertSink). A pre-ingress refusal (oversize/malformed/allowlist) returns a
     synchronous ``4xx`` + an ADR 0021 ``connection_event``. A body the engine refuses after reading it
     is recorded with status ``ERROR`` and answered, in either mode, ``503`` with ``Retry-After`` for a
-    temporary refusal, ``413`` over a size ceiling, and ``422`` otherwise; the body names that
-    ``ERROR`` row as ``refused_message_id``. Which refusal gets which code is in ADR 0154's amendment of
-    2026-10-30. ``GET``/``HEAD`` are static health probes (no ingress row). This is the behaviour of
-    an inbound **without** ``reply_from``; naming it switches to the synchronous captured-downstream
+    temporary refusal, ``503`` with no ``Retry-After`` for a configuration refusal such as an unusable
+    inbound ``encoding``, ``413`` over a size ceiling, and ``422`` otherwise; the body names that
+    ``ERROR`` row as ``refused_message_id``. Which refusal gets which code is in ADR 0154's
+    amendments of 2026-10-30 and 2026-11-04. ``GET``/``HEAD`` are static health probes (no ingress
+    row). This is the behaviour of an inbound **without** ``reply_from``; naming it switches to the synchronous captured-downstream
     reply described below.
 
     **DoS guards** are HTTP twins of MLLP's: ``max_connections`` (flood), ``receive_timeout`` (slow-loris
@@ -4203,6 +4204,7 @@ def DICOM(
     """A **DICOM DIMSE** endpoint (ADR 0025). **Phase 1 (built): the inbound C-STORE SCP** — pair it
     with ``content_type="dicom"`` on ``inbound(...)`` so a received object is base64-carried (ADR 0028)
     and routed as a ``RawMessage`` a Router/Handler parses on demand via ``messagefoundry.parsing.dicom``.
+    A text ``content_type``, the default ``hl7v2`` included, is refused at load (BACKLOG #5102).
     Like ``X12``, the inbound takes **no** ``host`` (the bind interface is ``[inbound].bind_host``); it
     runs a ``pynetdicom`` AE C-STORE SCP **off the event loop**, commits each object durably to the
     ingress stage **before** returning C-STORE Success (commit-before-SUCCESS), accepts only the
@@ -7889,6 +7891,16 @@ def build_inbound_connection(
         raise WiringError(
             f"inbound connection {name!r}: validation.strict is HL7-specific and can't apply to a "
             f"{content_type.value!r} content_type — validate non-HL7 payloads in the Handler instead"
+        )
+    if spec.type is ConnectorType.DIMSE and not content_type.is_binary:
+        # A text type decodes each received object as text, and a Part-10 object never decodes
+        # cleanly (binary lengths and NUL bytes), so the SCP would refuse every object it receives,
+        # whatever the inbound's codec. Refused here, where check and dry-run see it, rather than
+        # as one ERROR row per object (BACKLOG #5102).
+        raise WiringError(
+            f"inbound connection {name!r}: a DICOM inbound needs a binary content_type, but it "
+            f"declares {content_type.value!r}, which decodes each object as text and so would "
+            'refuse every object received. Declare content_type="dicom".'
         )
     if spec.type in (ConnectorType.LOOPBACK, ConnectorType.PT):
         # An internal inbound (loopback re-ingress / pass-through, ADR 0013) has no socket and no

@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum, auto
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, Protocol, cast
+from typing import Any, Literal, NamedTuple, Protocol, assert_never, cast
 
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.trust_anchors import (
@@ -967,7 +967,7 @@ class _StrictValidateTimedOut(Exception):
         #: The receipt path's class and the MLLP NAK's MSA-1, kept together so the two listeners
         #: cannot split the timeout differently.
         self.refusal_kind = RefusalKind.PERMANENT if started else RefusalKind.TEMPORARY
-        self.nak_code = "AR" if started else "AE"
+        self.nak_code = _nak_code(self.refusal_kind)
         self.ack_text = f"strict-validation timed out after {timeout}s"
         self.reason = self.ack_text if started else f"{self.ack_text} before the validate began"
         super().__init__(self.reason)
@@ -1163,6 +1163,38 @@ def _detach_refusal_kind(exc: Exception) -> RefusalKind:
     if isinstance(exc, _StreamBudgetExceeded):
         return RefusalKind.OVERSIZE if exc.alone else RefusalKind.TEMPORARY
     return RefusalKind.PERMANENT
+
+
+def _guard_refusal_kind(exc: IngressGuardError) -> RefusalKind:
+    """The class of an ingress-guard refusal, which both listeners answer by (BACKLOG #5102).
+
+    The engine ceiling (:class:`IngressTooLarge`) is over-size on every path (BACKLOG #2105). A codec
+    NAME that sets up no decode (:class:`IngressCodecUnusable`) is a configuration refusal: every
+    body fails alike until an operator fixes it, and the same body is accepted after (BACKLOG
+    #2431). Every other guard is about the body and is permanent."""
+    if isinstance(exc, IngressTooLarge):
+        return RefusalKind.OVERSIZE
+    if isinstance(exc, IngressCodecUnusable):
+        return RefusalKind.CONFIGURATION
+    return RefusalKind.PERMANENT
+
+
+def _nak_code(kind: RefusalKind) -> str:
+    """The MLLP NAK's MSA-1 for a refusal of ``kind``, so MLLP and the receipt path cannot split.
+
+    ``AE`` for a refusal a re-send may clear, a temporary one or a configuration fault an operator
+    fixes, and ``AR`` for every final class, over-size included, as the receipt path's ``413`` is
+    final (owner ruling of 2026-11-03, decision log d20261104T032854299-7235a9, stamped in UTC;
+    Manager decision d20261104T003342588-cbb49e). MLLP has no code that says "after an operator
+    acts", so a configuration fault takes the re-send code rather than one a sender drops the body
+    on. ``assert_never``, so mypy refuses a new kind left unmapped."""
+    match kind:
+        case RefusalKind.TEMPORARY | RefusalKind.CONFIGURATION:
+            return "AE"
+        case RefusalKind.PERMANENT | RefusalKind.OVERSIZE:
+            return "AR"
+        case _:
+            assert_never(kind)
 
 
 # OSError errnos a listener bind raises when the (host, port) can't be taken — classified into a clear
@@ -8265,8 +8297,9 @@ class RegistryRunner:
         2026-10-30). What the source answers for each is the source's own logic
         (``HttpSource._serve_one`` for HTTP). A pre-ingress oversize/malformed/allowlist refusal is the
         source's own synchronous ``4xx`` BEFORE this runs. A codec NAME that sets up no decode is a
-        temporary refusal, not a permanent one: the configuration is at fault, not the body, so the
-        same body is accepted once it is fixed (BACKLOG #2431; :meth:`_refuse_guarded`).
+        configuration refusal, not a permanent one: the configuration is at fault, not the body, so
+        the same body is accepted once an operator fixes it (BACKLOG #2431, #5102;
+        :func:`_guard_refusal_kind`).
 
         Shares the SAME store calls, size ceiling, decode handling, and disposition machine as
         :meth:`_handle_inbound`; it differs only in returning a receipt instead of a wire ACK and in not
@@ -8467,20 +8500,11 @@ class RegistryRunner:
         *,
         message_type: str | None,
     ) -> IngressReceipt:
-        """Record an ingress-guard refusal as ``ERROR`` and return it as a receipt refusal.
-
-        The engine ceiling (:class:`IngressTooLarge`) is answered as over-size on every path (BACKLOG
-        #2105). A codec NAME that sets up no decode (:class:`IngressCodecUnusable`) is temporary: the
-        inbound's configuration is at fault, not the body, so every body fails alike until the
-        operator fixes it and the same body is accepted after, the receipt form of the MLLP
-        listener's ``AE`` (BACKLOG #2431). Every other guard is about the body and is permanent."""
-        if isinstance(exc, IngressTooLarge):
-            kind = RefusalKind.OVERSIZE
-        elif isinstance(exc, IngressCodecUnusable):
-            kind = RefusalKind.TEMPORARY
-        else:
-            kind = RefusalKind.PERMANENT
-        return await self._refuse(ic, raw, text, kind, error=exc.reason, message_type=message_type)
+        """Record an ingress-guard refusal as ``ERROR`` and return it as a receipt refusal, of the
+        class :func:`_guard_refusal_kind` gives it, the one the MLLP listener's NAK is read from."""
+        return await self._refuse(
+            ic, raw, text, _guard_refusal_kind(exc), error=exc.reason, message_type=message_type
+        )
 
     def _streaming_over_threshold(self, ic: InboundConnection, text: str) -> bool:
         """Whether ``ic`` is a streaming inbound (``stream_threshold_bytes`` set) and ``text`` is at/above
@@ -8645,9 +8669,14 @@ class RegistryRunner:
                 error=decode_err,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
-            # A codec name that cannot decode anything is the configuration's fault, so AE (resend
-            # once it is fixed); bytes invalid in a usable charset are the message's, so AR.
-            nak_code = "AE" if isinstance(exc, IngressCodecUnusable) else "AR"
+            # The receipt path's class decides MSA-1 (BACKLOG #5102): a codec name that cannot decode
+            # anything is the configuration's fault, so AE (resend once it is fixed); bytes invalid
+            # in a usable charset are the message's, so AR.
+            #
+            # A poll source's answer cannot say "refused", so it consumes its input after this row
+            # rather than hold it for the fix (BACKLOG #5102). What each source does is listed once,
+            # in docs/CONNECTIONS.md, "An inbound encoding follows one rule on every source".
+            nak_code = _nak_code(_guard_refusal_kind(exc))
             ack = (
                 build_ack(raw, code=nak_code, text="decode error", ack_mode=ack_mode)
                 if (hl7v2 and reply)
@@ -8684,8 +8713,11 @@ class RegistryRunner:
                 error=body_err,
                 message_type=None if hl7v2 else ic.content_type.value,
             )
+            # The receipt path's class decides MSA-1, as on the decode arm (BACKLOG #5102): AR today,
+            # since every such body refusal is permanent there.
+            body_code = _nak_code(_guard_refusal_kind(exc))
             ack = (
-                build_ack(raw, code="AR", text=exc.ack_text, ack_mode=ack_mode)
+                build_ack(raw, code=body_code, text=exc.ack_text, ack_mode=ack_mode)
                 if (hl7v2 and reply)
                 else None
             )
@@ -8693,7 +8725,7 @@ class RegistryRunner:
                 await self._capture_ack(
                     mid,
                     ic.name,
-                    ack_code="AR",
+                    ack_code=body_code,
                     ack_phase="decode",
                     ack_body=None,
                     detail=body_err,
@@ -8883,7 +8915,7 @@ class RegistryRunner:
                 # receipt path answers as final, a body alone over the whole budget, an unsupported
                 # backend, a malformed handle, an escaped document (vault BACKLOG #2809) and the
                 # BACKLOG #5099 shapes below alike. MSA-3 names the shape where it is the message's own.
-                nak_code = "AE" if _detach_refusal_kind(exc) is RefusalKind.TEMPORARY else "AR"
+                nak_code = _nak_code(_detach_refusal_kind(exc))
                 if isinstance(exc, EscapedDocumentError):
                     nak_text = "escaped document in OBX-5.5"
                 elif isinstance(exc, NonVerbatimDocumentError):

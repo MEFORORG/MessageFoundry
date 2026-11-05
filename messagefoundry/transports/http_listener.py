@@ -11,10 +11,11 @@ routing/transform/delivery failure happens *after* the ``202`` and is **not** re
 status — it surfaces only as the message's ``ERROR``/dead-letter disposition + the AlertSink, exactly
 as a post-ACK MLLP failure does. A body the pipeline handler refuses at ingress (recorded ``ERROR``,
 no ingress row) is never answered ``202``: a temporary refusal is answered ``503`` with
-``Retry-After``, an over-size one ``413``, and any other ``422``, each naming the ``ERROR`` row as
-``refused_message_id`` (ADR 0154 amendments 2026-09-26 and 2026-10-30). A refusal the inbound's own
-configuration caused, an unusable codec name, is temporary: it clears once the operator fixes the
-name (BACKLOG #2431).
+``Retry-After``, an over-size one ``413``, a permanent one ``422``, and a configuration one ``503``
+with no ``Retry-After``, each naming the ``ERROR`` row as ``refused_message_id`` (ADR 0154
+amendments 2026-09-26, 2026-10-30 and 2026-11-04). A configuration refusal is one the inbound's own
+configuration caused, at least an unusable codec name: it clears only once an operator fixes the
+configuration (BACKLOG #2431, #5102).
 
 **Why this lives in ``transports/`` and not ``api/``.** The one-way dependency rule (CLAUDE.md §2/§4)
 forbids ``transports/`` from importing ``api/``. The engine's FastAPI app stays the admin/RBAC surface;
@@ -257,18 +258,23 @@ _NOT_ACCEPTED = "message was not accepted"
 TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS = 5
 
 
-def _refusal_status(kind: RefusalKind) -> int:
-    """The status a refusal of ``kind`` is answered with (ADR 0154 amendment 2026-10-30). Only a
-    temporary refusal invites a re-send; an over-size body answers the same ``413`` as one over
-    ``max_body_bytes``. A ``match`` with ``assert_never``, so mypy refuses a new kind left unmapped
-    rather than a ``KeyError`` answering ``500`` after the ``ERROR`` row was written."""
+def _refusal_status(kind: RefusalKind) -> tuple[int, dict[str, str] | None]:
+    """The status a refusal of ``kind`` is answered with, and its extra headers (ADR 0154
+    amendments 2026-10-30 and 2026-11-04). Only a temporary refusal invites a re-send soon, with
+    ``Retry-After``; a configuration refusal is the same ``503`` without it, since it clears only
+    when an operator acts (BACKLOG #5102). An over-size body answers the same ``413`` as one over
+    ``max_body_bytes``. One ``match`` with ``assert_never`` decides both, so mypy refuses a new kind
+    left unmapped rather than a ``KeyError`` answering ``500`` after the ``ERROR`` row was written,
+    and no kind gets its header from a second test."""
     match kind:
         case RefusalKind.TEMPORARY:
-            return 503
+            return 503, {"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)}
+        case RefusalKind.CONFIGURATION:
+            return 503, None
         case RefusalKind.OVERSIZE:
-            return 413
+            return 413, None
         case RefusalKind.PERMANENT:
-            return 422
+            return 422, None
         case _:
             assert_never(kind)
 
@@ -1548,23 +1554,21 @@ class HttpSource(SourceConnector):
             # owner ruling of 2026-09-30 answers a temporary refusal 503 with Retry-After and keeps a
             # permanent one at 422. Which refusals are temporary, the one 413 for over-size and the
             # ERROR row's id in the body are Manager decision d20261030T155119571-255c98 (BACKLOG #2105);
-            # at least the unusable codec name (BACKLOG #2431) and a strict-validation timeout that
-            # never began (BACKLOG #5078) joined the temporary class later. Returns False:
+            # a strict-validation timeout that never began (BACKLOG #5078) joined the temporary class
+            # later. A configuration refusal, at least the unusable codec name (BACKLOG #2431), is the
+            # same 503 with no Retry-After, because it clears only when an operator acts (Manager
+            # decision d20261104T003342588-cbb49e, BACKLOG #5102). Returns False:
             # this is a post-record refusal with no connection-event kind of its own, so the outer
             # ``closed`` still fires. The drain gets the receipt-sized budget in both modes: this is a
             # fixed few dozen bytes, never the partner-sized body reply_write_timeout exists for.
-            retry = (
-                {"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)}
-                if receipt.refusal is RefusalKind.TEMPORARY
-                else None
-            )
+            status, headers = _refusal_status(receipt.refusal)
             # ``refused_message_id``, never ``message_id``: where this listener's own answer carries
             # ``message_id``, it names a committed message, so a refusal must not read as one. A
             # proxied reply_from 200 or 502 carries the partner's own bytes, which may hold its own.
             refused = json.dumps({"error": _NOT_ACCEPTED, "refused_message_id": message_id})
             await self._respond(
                 writer,
-                build_response(_refusal_status(receipt.refusal), refused, extra_headers=retry),
+                build_response(status, refused, extra_headers=headers),
                 budget=_CLIENT_SHUTDOWN_GRACE,
             )
             return False

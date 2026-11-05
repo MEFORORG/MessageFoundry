@@ -356,13 +356,40 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > declaration, or keeping the hop on **loopback**. A lab rig on loopback needs none of this, which is
 > what makes the examples copy-runnable there.
 
+### An inbound `encoding` follows one rule on every source
+
+An inbound connection's `encoding` is the charset the engine decodes each received text body with,
+`utf-8` when it is unset or `None`. It must be a literal string naming a usable text codec:
+`messagefoundry check` and `serve` refuse anything else when the config loads, an `env()` reference
+included, in Python config and `connections.toml` alike (BACKLOG #2431). A name that gets past that
+check, on a graph that skipped it, is a **configuration refusal** at run time for every non-empty
+body. An empty body decodes under any name, since Python does not look the codec up for it, and
+meets what any empty body meets. What each source does with a non-empty one, at least:
+
+- **MLLP and TCP listeners** record each body as an `ERROR` row. Where the inbound sends HL7
+  replies, the answer is `AE`; a non-HL7 inbound gets no `AE`. **An `X12()` listener** records the
+  row too, and sends no `AE` either: an `x12` inbound owes no HL7 reply, and one that declares HL7
+  encodes its reply in the inbound's own charset, which fails.
+- **`Http()`** records the row and answers `503` with **no** `Retry-After`.
+- **A DICOM SCP** never decodes: its inbound must declare a binary `content_type` such as `dicom`,
+  and one that declares a text type is refused when the config loads. Should a configuration
+  refusal reach the SCP all the same, it records the row and answers Cannot Understand (`0xC000`),
+  the final class, since a text type refuses every Part-10 object even once the name is fixed.
+- **A `File()` or remote-file source** records the row, which stores its input whole, and consumes
+  the input; it does not hold the file for the fix.
+- **A `DatabasePoll()` or `Timer()` source** fails to build on such a name, so it never starts.
+
+Bytes invalid in a usable charset are the body's own fault and final: `AR`, or `422`. Why:
+the [ADR 0154 amendment of 2026-11-04](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal)
+(BACKLOG #5102). At least the inbound `encoding` rows of the sources above point here.
+
 ### MLLP — `MLLP(...)`
 
 | Setting | Dir | Default | Meaning |
 |---------|-----|---------|---------|
 | `host` | out | — (required) | the downstream peer to dial. **Inbound takes no host** — passing one is a wiring error; the listen interface is the service-level `[inbound].bind_host` (see below). |
 | `port` | both | — (required) | bind/connect port |
-| `encoding` | both | `utf-8` | charset used for MLLP framing |
+| `encoding` | both | `utf-8` | charset used for MLLP framing. **In:** [one rule](#an-inbound-encoding-follows-one-rule-on-every-source) |
 | `max_connections` | in | `256` | cap on concurrent client connections (connection-flood guard). Counts **sockets, not hosts** — see `max_connections_per_host` below for the peer-scoped term. `None`/`0` = unlimited. |
 | `max_connections_per_host` | in | `32` | cap on concurrent connections from **one peer address** (BACKLOG #1725). The connection is accepted, then refused and closed with an `at_capacity` connection event whose reason reads `max_connections_per_host`; nothing was received, so nothing is dropped, and the peer reconnects as soon as one of its own connections ends. An eighth of `max_connections`, so it takes at least eight distinct source addresses to fill a default listener — it raises the floor on a single-address peer and does **not** bound a distributed one. **Set it to `None`/`0` behind a source-NAT load balancer or proxy that does not preserve the client address**: every partner then arrives as one peer and this, not `max_connections`, becomes your effective listener capacity. |
 | `receive_timeout` | in | `60.0` | close a client **idle** this many seconds (slowloris guard). Applied **per read**, so it resets on every byte received: it bounds silence, not a frame — see `max_frame_seconds`. `None`/`0` = no timeout. |
@@ -647,7 +674,7 @@ the bytes.
 | `port` | both | — (required) | bind/connect port |
 | `framing` | both | `"stx_etx"` | framing **preset**: `"stx_etx"` (`0x02`/`0x03`, no trailer) or `"vt_fs"`/`"mllp"` (`0x0B`/`0x1C`/`0x0D`). Pass `framing=None` to use explicit bytes instead. |
 | `start` / `end` / `trailer` | both | — | explicit delimiter **byte ints** (use with `framing=None`; `trailer` optional). Specifying these *and* a preset is a config error. `start` and `end` must differ, and neither may be `0x20` (a space); the connection is refused when it is built. A `0x20` `trailer` is allowed. A `trailer` equal to `start` is also refused when the connection is built. Why: `FrameCodec` in [`messagefoundry/framing.py`](../messagefoundry/framing.py). |
-| `encoding` | both | `utf-8` | charset used to encode/decode the framed payload |
+| `encoding` | both | `utf-8` | charset used to encode/decode the framed payload. **In:** [one rule](#an-inbound-encoding-follows-one-rule-on-every-source) |
 | `max_connections` | in | `256` | cap on concurrent client connections (flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris). `None`/`0` = no timeout. |
 | `max_frame_bytes` | both | `16 MiB` | reject a single frame larger than this before buffering it whole (OOM guard); applies to inbound frames and any framed reply. `None`/`0` = unlimited. |
@@ -721,7 +748,7 @@ when each interchange is wrapped in a fixed sentinel (STX/ETX, VT/FS). The paylo
 |---------|-----|---------|---------|
 | `host` | out | — (required) | the downstream peer to dial. **Inbound takes no host** (wiring error) — listeners bind the service-level `[inbound].bind_host`. |
 | `port` | both | — (required) | bind/connect port |
-| `encoding` | both | `utf-8` | charset used to encode/decode the interchange bytes |
+| `encoding` | both | `utf-8` | charset used to encode/decode the interchange bytes. **In:** [one rule](#an-inbound-encoding-follows-one-rule-on-every-source) |
 | `max_connections` | in | `256` | cap on concurrent client connections (flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | in | `60.0` | close a client idle this many seconds (slowloris). `None`/`0` = no timeout. |
 | `max_interchange_bytes` | both | `16 MiB` | reject a single interchange larger than this before it completes (OOM guard); applies inbound and to any returned interchange. `None`/`0` = unlimited. |
@@ -825,7 +852,7 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | Setting | Default | Meaning |
 |---------|---------|---------|
 | `port` | — (required) | bind port. **Takes no host** — the listen interface is the service-level `[inbound].bind_host` (or a per-connection `bind_address`), exactly as MLLP/TCP/X12. |
-| `encoding` | `utf-8` | charset the POSTed body is decoded with (non-binary content types) |
+| `encoding` | `utf-8` | charset the POSTed body is decoded with (non-binary content types); [one rule](#an-inbound-encoding-follows-one-rule-on-every-source) |
 | `max_connections` | `256` | cap on concurrent clients (connection-flood guard). `None`/`0` = unlimited. |
 | `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
 | `max_connections_per_host` | **off** | cap on concurrent connections from **one peer address**, answered `503` with an `at_capacity` event whose reason reads `max_connections_per_host` (vault BACKLOG #2606); a `tls = true` listener on the stdlib loop closes the socket unanswered instead, as the pre-ingress refusals below say. **Ships off, unlike MLLP/TCP/X12**: this connector answers one request per connection, so behind a reverse proxy every partner arrives from one address and any cap would be the listener's whole capacity. Set one only where the listener sees real client addresses. |
@@ -881,12 +908,15 @@ ingress**, after reading it, is never answered `202`. The message is still recor
 `{"error": "message was not accepted", "refused_message_id": "<id>"}`. The status says whether to re-send:
 
 - **`503`** with `Retry-After` when the refusal is temporary: the engine's own, not the body's.
-  At least three refusals are classed so: the streaming detach's in-flight budget, while other
-  detaches hold it; a strict-validation timeout that fired before any worker thread began the
-  validate, so nothing is known of the body (BACKLOG #5078); and an inbound `encoding` naming no
-  text codec, which refuses every body until an operator fixes the name (BACKLOG #2431), so a
-  sender re-sending every few seconds meanwhile leaves one `ERROR` row per attempt. Re-send the
-  same body later. A body larger than the whole in-flight budget is over-size instead.
+  At least two refusals are classed so: the streaming detach's in-flight budget, while other
+  detaches hold it; and a strict-validation timeout that fired before any worker thread began the
+  validate, so nothing is known of the body (BACKLOG #5078). Re-send the same body later. A body
+  larger than the whole in-flight budget is over-size instead.
+- **`503`** with **no** `Retry-After` for a configuration refusal: the inbound's own configuration
+  refuses every non-empty body until an operator changes it, so the body is not at fault but nothing clears
+  it soon. At least an inbound `encoding` naming no text codec is classed so (BACKLOG #2431, #5102);
+  the [one rule](#an-inbound-encoding-follows-one-rule-on-every-source) says when one can arrive. A
+  sender re-sending meanwhile leaves one `ERROR` row per attempt.
 - **`413`** when the body is over a size ceiling, the same code as a body over `max_body_bytes`. That
   covers at least the engine's ingress ceiling and, for HL7, the parse ceiling a streaming inbound sets
   with `max_message_bytes`. Strict validation keeps its own 16 MiB cap, which does NOT follow
@@ -905,12 +935,14 @@ ingress**, after reading it, is never answered `202`. The message is still recor
 
 The engine's own `Rest()` outbound retries a `503` under its `RetryPolicy` and dead-letters a `413` or
 `422`, so an engine-to-engine hop behaves the same way. Which refusal gets which code, and why, is in
-the [ADR 0154 amendment of 2026-10-30](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after).
+the [ADR 0154 amendment of 2026-10-30](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-10-30-a-temporary-ingress-refusal-is-answered-503-with-retry-after),
+and for a configuration refusal in the
+[amendment of 2026-11-04](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md#amendment-2026-11-04-an-operator-only-intake-fault-is-a-configuration-refusal).
 The owner ruling of 2026-09-26 answered a refused body `422`. The owner ruling of 2026-09-30 set a
 temporary refusal at `503` with `Retry-After` and kept a permanent one at `422`; which refusals are
 temporary, and the one `413` for over-size, are Manager decision d20261030T155119571-255c98. The
-unusable codec name joined the temporary class later, under BACKLOG #2431, and was not part of that
-decision. The
+configuration kind and its `503` with no `Retry-After` are Manager decision
+d20261104T003342588-cbb49e (BACKLOG #5102), recorded as the ADR 0154 amendment of 2026-11-04. The
 `ERROR` row's error text opens with `[refusal kind: <kind>]`, ahead of any refused-body allowance note.
 A **pre-ingress** refusal answers
 synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
@@ -1000,7 +1032,7 @@ def route(msg):
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read/failed files go |
 | `filename` | out | `{MSH-10}.hl7` | output name (supports `{HL7-path}` placeholders). Resolved values are sanitized to a **single safe filename** — path separators/unsafe chars stripped, leading dots removed, trailing dots and spaces stripped, and `.`/`..`/reserved device names fall back — so a message field can never write outside the directory. The final name, `.gz` included, is capped at **200 UTF-8 bytes**; a longer one falls back to `message.hl7` (ADR 0204). **Out:** a deep `directory` lowers the cap to the room left under the platform path limit (logged once when the connection is built), and a directory with no room for the fallback, or a template whose fixed text is over the cap, is refused when the connection is built. |
 | `overwrite` | out | `false` | overwrite vs. uniquify a name collision (collisions are resolved by an **atomic** exclusive create, so concurrent writes never clobber) |
-| `encoding` | both | `utf-8` | file charset (write) |
+| `encoding` | both | `utf-8` | file charset. **In:** [one rule](#an-inbound-encoding-follows-one-rule-on-every-source) |
 | `credential_username` | both | — (unset) | **Windows-only** alternate share identity (ADR 0132, #111): `user`, `DOMAIN\user`, or a `user@domain` UPN. Unset = the engine service-account identity (byte-identical). |
 | `credential_domain` | both | — (unset) | optional AD domain (omit for `DOMAIN\user` / UPN forms). |
 | `credential_password` | both | — (required with a username) | share password — **`env()` only** (an inline literal is refused). Secret; redacted in every settings view, never logged. |
@@ -1542,7 +1574,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read / failed files go |
 | `filename` | out | `{MSH-10}.hl7` | upload name (supports `{HL7-path}` placeholders, sanitized to a **single safe filename** exactly as `File(...)`) |
 | `overwrite` | out | `false` | overwrite vs. uniquify a name collision (never a silent clobber). Left `false`, each upload first **lists** `remote_dir` to find a free name, so the account needs list permission there, and `POST /connections/{name}/test` checks it. A listing that fails writes nothing and is retried; `RemoteFileDestination._unique` states the rule (BACKLOG #1936). Any entry of the same name counts as a collision, a symlink or a directory as well as a file (BACKLOG #2082). On a write-only drop directory, only `true` delivers. It replaces any file of the same name, so pair it with a `filename` that is unique per message. |
-| `encoding` | both | `utf-8` | **Out:** the charset the payload is encoded with before upload. **In:** the source decodes a retrieved HL7 file with it to split a batch file into messages, and the engine decodes each received message with it. A payload that cannot be encoded in it is a permanent `encoding` refusal. On a live send it dead-letters on the first attempt, before anything is sent, and is never retried. That holds under either `internal_error` policy: `stop` does not stop the lane for it, and no alert fires. The error names the charset and a position, never the content. |
+| `encoding` | both | `utf-8` | **Out:** the charset the payload is encoded with before upload. **In:** the source decodes a retrieved HL7 file with it to split a batch file into messages, and the engine decodes each received message with it, by the [one rule](#an-inbound-encoding-follows-one-rule-on-every-source). A payload that cannot be encoded in it is a permanent `encoding` refusal. On a live send it dead-letters on the first attempt, before anything is sent, and is never retried. That holds under either `internal_error` policy: `stop` does not stop the lane for it, and no alert fires. The error names the charset and a position, never the content. |
 
 - **Unencrypted, RSA-2048 or larger (BACKLOG #1352).** An encrypted `private_key`, or any
   `key_password`, is refused at construction: paramiko opens an encrypted key only through MD5
@@ -2638,7 +2670,7 @@ handler returns** — runs `mark_statement` (bound from the row's columns) so th
 | `body_column` | — | unset → the **whole row** as a JSON object `{column: value}` (pair with `content_type=json`); set → that **one column's value verbatim** (e.g. a column holding an HL7 message → `content_type=hl7v2`) |
 | `poll_seconds` | `5.0` | interval between polls, a finite number of seconds above zero; anything else is refused at build, including at least zero, a negative value, NaN, infinity and text that is not a number (BACKLOG #2774) |
 | `poll_max_rows` | `500` | most rows one poll will **hand off** from `poll_statement`'s result set. The rest are left in the table — not read, not marked, not errored — and the next poll selects them again. Still charged at the **fetch**, so a long-unattended table is not materialised whole into memory; a row the source cannot turn into a body does not spend a slot, and the poll asks the driver for the shortfall instead (at most 64 such rows per poll, then it defers the rest). Progress needs `mark_statement` to take a handled row out of the `poll_statement` predicate, which is the shape this connector already requires. See [*Per-tick poll ceilings*](#per-tick-poll-ceilings). `None`/`0` = unlimited. |
-| `encoding` | `utf-8` | charset for the body bytes handed to the pipeline |
+| `encoding` | `utf-8` | charset for the body bytes handed to the pipeline; [one rule](#an-inbound-encoding-follows-one-rule-on-every-source) |
 | `dialect` / `odbc_driver` / `odbc_params` / `odbc_user_key` / `odbc_password_key` | `sqlserver` / … | same as `Database(...)` — `dialect="generic"` polls an OS-installed ODBC driver (PostgreSQL / MySQL); see [*Generic ODBC*](#generic-odbc-postgresql--mysql) |
 | `auth` / `username` / `password` / `port` / `encrypt` / `trust_server_certificate` / `connect_timeout` / `app_name` / `pool_max` | — | identical to the `Database(...)` destination above |
 
@@ -3654,7 +3686,7 @@ scheduled query a Handler fans out. **Source-only** (it generates, never deliver
 | `run_once` | `false` | fire a **single** time, then idle until stop. |
 | `cron_expression` | — | a calendar schedule (ADR 0011 amendment, #160) — a standard **5-field** expression (`minute hour day-of-month month day-of-week`) with `*`, lists, ranges and steps; day-of-week is `0-6`, **Sunday = 0** (`7` also accepted). When *both* day-of-month and day-of-week are restricted, a match on **either** fires (the Vixie OR rule). Unlike the interval heartbeat, cron does **not** fire at t=0 — the first fire is the next scheduled minute. Named months/weekdays are out of scope (numeric only). |
 | `timezone` | — (system-local) | an IANA zone name (e.g. `"America/New_York"`) the cron schedule matches against, DST-aware. **Only** valid together with `cron_expression`. |
-| `encoding` | `utf-8` | charset `body` is encoded with |
+| `encoding` | `utf-8` | charset `body` is encoded with; [one rule](#an-inbound-encoding-follows-one-rule-on-every-source) |
 
 Exactly one of `interval_seconds` / `run_once` / `cron_expression`: the three are **mutually exclusive** and
 declaring none is an error, so a mis-scheduled timer fails at `messagefoundry check` — as does an

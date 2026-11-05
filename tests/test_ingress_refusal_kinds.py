@@ -3,10 +3,11 @@
 """How the Http() listener answers a body refused at ingress, by kind (BACKLOG #2105).
 
 Owner ruling 2026-09-30, recorded as ADR 0154's amendment of 2026-10-30: a TEMPORARY refusal is
-answered ``503`` with ``Retry-After``, an over-size one ``413`` on every over-size path, and any other
-``422``. Each names the ``ERROR`` row as ``refused_message_id``. A strict-validation timeout whose
-validate had begun stays ``422``; one that never began is temporary (BACKLOG #5078, pinned in
-``tests/test_strict_refusal_classes.py``).
+answered ``503`` with ``Retry-After``, an over-size one ``413`` on every over-size path, and a
+permanent one ``422``. A configuration refusal, at least an unusable codec name, is ``503`` with no
+``Retry-After`` (BACKLOG #5102, ADR 0154's amendment of 2026-11-04). Each names the ``ERROR`` row as
+``refused_message_id``. A strict-validation timeout whose validate had begun stays ``422``; one that
+never began is temporary (BACKLOG #5078, pinned in ``tests/test_strict_refusal_classes.py``).
 
 Every case drives the real runner's receipt handler behind a real listener socket, so the answer is
 the one a partner would read. The engine-to-engine pair at the bottom sends from the engine's own REST
@@ -120,8 +121,11 @@ async def _the_one_error_row(store: MessageStore) -> dict[str, Any]:
 def _assert_names_the_row(resp: _Response, row: dict[str, Any]) -> None:
     assert resp.json() == {"error": "message was not accepted", "refused_message_id": row["id"]}
     # BACKLOG #2105: the row itself says which kind of refusal it was, so an operator can tell a
-    # temporary one, which the sender will re-send, from a final one before resending it.
+    # temporary one, which the sender will re-send, from a final one before resending it. A 503
+    # without Retry-After is the configuration kind (BACKLOG #5102).
     kind = {503: "temporary", 413: "oversize", 422: "permanent"}[resp.status]
+    if resp.status == 503 and "retry-after" not in resp.headers:
+        kind = "configuration"
     assert row["error"].startswith(f"[refusal kind: {kind}] "), row["error"]
     # The harness reads only an accepted answer's message_id, so this real refusal reads as none.
     assert message_id_of(resp.body) is None
@@ -355,7 +359,7 @@ async def test_the_guards_are_classed_by_kind(
     guards = {
         "too_large": ingress_guards.IngressTooLarge("r"),
         "decode": ingress_guards.IngressGuardError("r", phase="decode"),
-        # The codec NAME, not the body, is at fault: temporary (BACKLOG #2431).
+        # The codec NAME, not the body, is at fault, and only an operator clears it (BACKLOG #5102).
         "codec": ingress_guards.IngressCodecUnusable("r"),
         "type": ingress_guards.IngressGuardError("r", phase="type"),
         "parse": ingress_guards.IngressGuardError("r", phase="parse"),
@@ -369,11 +373,28 @@ async def test_the_guards_are_classed_by_kind(
     assert kinds == {
         "too_large": RefusalKind.OVERSIZE,
         "decode": RefusalKind.PERMANENT,
-        "codec": RefusalKind.TEMPORARY,
+        "codec": RefusalKind.CONFIGURATION,
         "type": RefusalKind.PERMANENT,
         "parse": RefusalKind.PERMANENT,
         "strict": RefusalKind.PERMANENT,
     }
+
+
+def test_both_listeners_read_one_class_and_one_code_for_every_kind() -> None:
+    # BACKLOG #5102: the MLLP NAK's MSA-1 comes from the class the receipt path answers by, through
+    # one mapping, so the two listeners cannot split. A configuration refusal is AE, as a temporary
+    # one is, since MLLP has no "after an operator acts" code and AR would make a sender drop the
+    # body; every final class is AR, over-size included, as the receipt path's 413 is final.
+    assert {kind: wiring_runner._nak_code(kind) for kind in RefusalKind} == {
+        RefusalKind.TEMPORARY: "AE",
+        RefusalKind.CONFIGURATION: "AE",
+        RefusalKind.PERMANENT: "AR",
+        RefusalKind.OVERSIZE: "AR",
+    }
+    codec = ingress_guards.IngressCodecUnusable("r")
+    assert wiring_runner._guard_refusal_kind(codec) is RefusalKind.CONFIGURATION
+    body = ingress_guards.IngressGuardError("r", phase="decode")
+    assert wiring_runner._guard_refusal_kind(body) is RefusalKind.PERMANENT
 
 
 # --- engine to engine: the REST outbound reads each answer ----------------------------------------
@@ -401,11 +422,14 @@ async def _send_from_rest_to_a_listener_that_refuses(kind: RefusalKind) -> None:
         await listener.stop()
 
 
-async def test_a_503_from_an_engine_hop_is_retried() -> None:
+@pytest.mark.parametrize("kind", [RefusalKind.TEMPORARY, RefusalKind.CONFIGURATION])
+async def test_a_503_from_an_engine_hop_is_retried(kind: RefusalKind) -> None:
     # A temporary refusal at the next engine is a retryable DeliveryError at this one, so the delivery
-    # worker re-pends the row under its RetryPolicy instead of dead-lettering it.
+    # worker re-pends the row under its RetryPolicy instead of dead-lettering it. A configuration
+    # refusal's 503 carries no Retry-After and is retried the same way (BACKLOG #5102): the outbound
+    # never read the header, and its RetryPolicy dead-letters the row if nobody fixes the next engine.
     with pytest.raises(DeliveryError) as raised:
-        await _send_from_rest_to_a_listener_that_refuses(RefusalKind.TEMPORARY)
+        await _send_from_rest_to_a_listener_that_refuses(kind)
     assert not isinstance(raised.value, NegativeAckError)
     assert "HTTP 503" in str(raised.value)
 

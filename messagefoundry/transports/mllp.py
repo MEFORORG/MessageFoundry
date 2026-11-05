@@ -2945,8 +2945,9 @@ class MLLPSource(SourceConnector):
         temporary one, at least a strict-validation timeout that fired before any worker thread
         began the validate and a streaming-detach budget held by concurrent detaches
         (BACKLOG #5078, owner ruling of 2026-11-03, decision log d20261104T032854299-7235a9,
-        stamped in UTC). The strict outcomes are tabled in ``docs/HL7-VALIDATION.md``, *Tier 2*;
-        the detach classes are
+        stamped in UTC), or for a configuration fault an operator must fix, such as an unusable
+        inbound codec name, which does not clear on its own (BACKLOG #5102). The strict outcomes
+        are tabled in ``docs/HL7-VALIDATION.md``, *Tier 2*; the detach classes are
         ``_detach_refusal_kind`` in ``pipeline/wiring_runner.py``. A handler fault is the engine's
         own and says nothing about the body, so it takes the temporary code. The engine's own MLLP
         destination reads the same split: it retries ``AE`` and dead-letters ``AR`` at once. An

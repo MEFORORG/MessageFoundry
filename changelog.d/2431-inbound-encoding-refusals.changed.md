@@ -11,8 +11,8 @@
   Config load refuses a literal `None`. The build check refuses an `env()` value resolving to one,
   at a reload, a connection upsert, and the `build-check` line of `messagefoundry check`, which
   that line skips on a config dir with no service settings. (`BACKLOG #2431`)
-- **An inbound `encoding` naming no text codec is a temporary refusal, not a permanent one.** Such a
-  name refuses every body until it is fixed, and the body is not at fault. The MLLP listener answers
-  `AE`, where a body invalid in a usable charset gets `AR`, and `Http()` answers `503` with
-  `Retry-After`, naming the `ERROR` row as `refused_message_id`, where that body gets `422`. Each
-  refused attempt is still its own `ERROR` row. (`BACKLOG #2431`)
+- **An inbound `encoding` naming no text codec is not a permanent refusal.** Such a name refuses
+  every non-empty body until it is fixed, and the body is not at fault. The MLLP listener answers `AE`, where a
+  body invalid in a usable charset gets `AR`, and `Http()` answers `503`, naming the `ERROR` row as
+  `refused_message_id`, where that body gets `422`. The `BACKLOG #5102` entry says why that `503`
+  carries no `Retry-After`. Each refused attempt is still its own `ERROR` row. (`BACKLOG #2431`)

@@ -29,12 +29,25 @@ class RefusalKind(StrEnum):
     """Why the runner refused a body it read, as the sender needs to know it."""
 
     #: Engine-side, not about the body: the same body may be accepted on a re-send once the cause
-    #: clears. At least three are classed here: the streaming detach's in-flight budget while other
-    #: detaches hold it, which clears on its own; a strict-validation timeout that fired before any
-    #: worker thread began the validate (BACKLOG #5078); and an inbound codec name that sets up no
-    #: decode (BACKLOG #2431), which clears only when the operator fixes it. A strict-validation
-    #: timeout whose validate began is PERMANENT; ADR 0154's amendment of 2026-11-03 says why.
+    #: clears on its own. At least two are classed here: the streaming detach's in-flight budget
+    #: while other detaches hold it, and a strict-validation timeout that fired before any worker
+    #: thread began the validate (BACKLOG #5078). A strict-validation timeout whose validate began
+    #: is PERMANENT; ADR 0154's amendment of 2026-11-03 says why.
     TEMPORARY = "temporary"
+    #: The inbound's own configuration refuses every non-empty body alike, whatever it holds, until
+    #: an operator changes it, so the body is not at fault, yet no re-send clears it on its own
+    #: (BACKLOG #5102). At least an inbound codec name that sets up no decode (BACKLOG #2431). An
+    #: empty body is not this kind: Python decodes empty bytes without looking the codec up, so it
+    #: passes the decode and meets what any empty body meets. A ``text`` inbound commits it and
+    #: ``Http()`` answers ``202``; one whose later guards refuse an empty body, at least ``hl7v2``
+    #: and ``json``, refuses it as PERMANENT. A
+    #: refusal that depends on the body, such as a backend that cannot stream refusing only a body
+    #: over the streaming threshold, is not this kind. Told apart from TEMPORARY so that a source
+    #: whose protocol can say so, at least ``Http()``, does not invite a re-send soon for an
+    #: operator-only fault, and from the final kinds so that the answer does not tell a sender to
+    #: drop a body the engine takes once the fault is fixed. ADR 0154's amendment of 2026-11-04 says
+    #: what each source answers.
+    CONFIGURATION = "configuration"
     #: About the body itself: a re-send of the same bytes is refused the same way.
     PERMANENT = "permanent"
     #: Over a size ceiling. Permanent too, but told apart so every over-size path answers one code.
