@@ -355,7 +355,7 @@ while the script was read as out is stale on this point until someone re-reads i
 it.** That reading is recorded in the 2026-10-02 vault file, under R3. The file is out:
 
 * `scripts/security/scan_forbidden.py` is the CI and pre-commit leak gate. The engine's
-  `messagefoundry/anon/leak.py` loads it by path for the anonymizer's leak check, but no shipped
+  `messagefoundry_toolkit/anon/leak.py` loads it by path for the anonymizer's leak check, but no shipped
   engine code path calls that check. `anon/leak.py` itself, and the hazard of a by-path load, are
   engine code and stay inside the scope through the engine. **The reading covers engine call paths
   only.** The harness's `CaptureSink` takes an optional anonymizer, and its code comment suggests

@@ -83,7 +83,9 @@
   this bullet records the sign-off. The four items below are ratified. The sign-off builds nothing:
   the package is still at `messagefoundry/anon/`, and every path in this ADR describes the tree
   until ADR 0201 slice 6 moves it. That slice re-points the guards and tests that pin the path, in
-  the same change.
+  the same change. **Built by ADR 0201 slice 6:** the package now lives at
+  `messagefoundry_toolkit/anon/`. So `messagefoundry/anon/` and `messagefoundry.anon`, in this
+  bullet and elsewhere in this ADR, name the package's home before the move.
   1. **The home becomes `messagefoundry_toolkit/anon/`**, in the `messagefoundry-toolkit`
      distribution rather than the engine wheel. This replaces the §1 *"engine-owned"* home *"sitting
      beside `parsing/`"*, one of the forks ratified before the build.
