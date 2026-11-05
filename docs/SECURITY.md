@@ -5759,13 +5759,30 @@ when the sign-out ended one. A failed owner lookup on `/ui/logout`, which names 
 the row with no actor, so it does not reach that user's security-events feed. On a session that
 passed its clock checks it also leaves the temporary credential unchecked, as above.
 
-**Open gap: `/ui/logout` audit rows for sign-outs that end no session are unbounded.** A request
-to `/ui/logout` whose session cookie ends no session can still write an `auth.logout` row, with
-`outcome` `nothing_to_revoke`. Nothing in the engine bounds how many such rows a caller who can
-reach the route can append, and nothing prunes `audit_log` (see
-[retention](CONFIGURATION.md#retention)). A bound in the engine is a follow-up, not yet filed.
-Until it exists, treat `/ui/logout` as an unbounded audit-write surface to any caller that can
-reach the console, on the engine's own host or beyond it.
+**`/ui/logout` audit rows for sign-outs that end no session are bounded (BACKLOG #4735).** A
+request to `/ui/logout` whose session cookie ends no session writes an `auth.logout` row with
+`outcome` `nothing_to_revoke`, and the route needs no credential, so the engine bounds those rows.
+Each source writes at most 3 such rows in any 60 seconds, and all sources together at most 120. A
+source is the caller's address, folded as the sign-in limiter folds it, and every caller with no
+address shares one source. So ten addresses flooding the route write 30 rows a minute and leave
+every other caller its rows. A flood spread over more than 40 addresses reaches the 120 ceiling,
+and then no source writes its own row until earlier rows age out of the window. A sign-out past either limit is
+counted, never dropped silently: one `auth.logout` row a minute, with no actor and no client,
+has `outcome` `unrecorded` and `"count": N`, the sign-outs left unwritten since the last such
+row. Its own outcome keeps a reader that counts `nothing_to_revoke` rows from reading it as one
+sign-out. The first sign-out
+past a limit writes that row at once. The count left when a flood stops is written by the next
+sign-out that ends nothing after the minute. With the audit store refusing writes, the ERROR line
+each refused write logs is bounded the same way.
+
+At least these limits stay. The bound and the count are in-process, so each engine shard keeps its
+own, and a restart loses a count not yet written. Nothing prunes `audit_log` (see
+[retention](CONFIGURATION.md#retention)), so the rows still grow, by at most 121 a minute for each
+engine process. The bound gates the row only: the sign-out itself is never refused or delayed. A
+sign-out that ended a session always writes its row, and so does one that names its caller, as
+`POST /auth/logout` does: concurrent `POST /auth/logout` calls on one token each write a row,
+all but one `nothing_to_revoke`, and that is kept on purpose, because each is an authenticated
+request.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
 step-up. So an id shown on a sessions page can go stale. The console's revoke says "Nothing was
@@ -6600,7 +6617,7 @@ the recovery path. Controls 4–6 are covered in their own rows.
 | `POST /ui/account/mfa/verify` | per-actor ceremony budget | |
 | `POST /ui/account/webauthn/verify` | per-actor ceremony budget | the passkey registration finish (BACKLOG #3014); its 429 is a `JSONResponse` carrying `Retry-After: 30` (BACKLOG #3690 item 5), charged after the gate's admin-write floor, and not charged for a session the factor-binding rule refuses, which logs a WARNING instead (BACKLOG #3690 item 6) |
 | `POST /ui/account/password` | *(inherits)* | delegates to the JSON handler, which charges once; the 429 is re-raised intact — deliberately not double-charged |
-| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` and `GET /ui/mfa` belong here because the admin-write floor is non-GET only, and so does `GET /ui/oidc/start` while its interstitial is shown. So do `POST /ui/logout` and `POST /ui/csp-report`, which carry no `require_ui` gate (the sign-out's unbounded `nothing_to_revoke` audit rows are an open gap under [Session inventory](#session-inventory--targeted-revocation-wp-10)), and the passkey-first refusal branch of `POST /ui/reauth` (control 8). The console's WebAuthn **staging** POSTs do **not** — see control 8. The list is at least these |
+| **No limiter of any kind** | — | `POST /auth/logout`, `POST /me/mfa/enroll`, `DELETE /me/sessions[/{id}]`, `POST /ai/chat`. BACKLOG #287 paced three routes that were listed here. They are `DELETE /search/presets/{preset_id}`, `PATCH /logging/level` and `POST /alerts/test-email`, now on `require_paced`. **Two earlier routes left this row and the table did not follow them.** `PATCH /users/{user_id}` is the one already narrated: it lost the write pacing when it was promoted to an action-bound step-up gate, and BACKLOG #1148 made `require_step_up_action` charge the floor again. `DELETE /me/mfa` rides that same gate (`require_step_up_action(STEP_UP_ACTION_MFA_DISABLE)`), so #1148 paced it too and it was left listed here regardless. The `reauth_only` action gate (`require_reauth_only_action`) still charges none. `GET /ui/reauth` and `GET /ui/mfa` belong here because the admin-write floor is non-GET only, and so does `GET /ui/oidc/start` while its interstitial is shown. So do `POST /ui/logout` and `POST /ui/csp-report`, which carry no `require_ui` gate (the sign-out's `nothing_to_revoke` audit rows are bounded, not the request, as [Session inventory](#session-inventory--targeted-revocation-wp-10) states), and the passkey-first refusal branch of `POST /ui/reauth` (control 8). The console's WebAuthn **staging** POSTs do **not** — see control 8. The list is at least these |
 
 The console calls the ceremony gate directly. It used to resolve it through a `getattr` shim that
 fell back to the **sign-in** budget on an engine without the method. The console pins one engine
