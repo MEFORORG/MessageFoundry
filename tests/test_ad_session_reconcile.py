@@ -3787,6 +3787,7 @@ async def test_a_rename_already_applied_by_another_caller_is_not_told_twice(
             new_username="jdoe-married",
             held=held,
             from_plan=True,
+            audit_soft=True,
         )
 
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
@@ -3881,6 +3882,7 @@ async def test_a_sign_in_rename_is_not_skipped_when_a_pass_wrote_an_older_name_f
             new_username="jdoe-remarried",
             held=None,
             from_plan=False,
+            audit_soft=False,
         )
 
         after = await store.get_user(user_id)
@@ -3929,6 +3931,7 @@ async def test_a_stale_plan_is_skipped_not_filed_as_a_conflict_when_another_row_
             new_username="jdoe-married",
             held=held,
             from_plan=True,
+            audit_soft=True,
         )
 
         after = await store.get_user(user_id)
@@ -3963,6 +3966,7 @@ async def test_a_row_deleted_before_the_apply_is_refused_without_a_write_or_a_no
             new_username="jdoe-married",
             held=None,
             from_plan=True,
+            audit_soft=True,
         )
 
         assert writes == [], "the refresh wrote to a row it had just read as gone"
@@ -4051,6 +4055,7 @@ async def test_a_refused_rename_is_audited_under_the_name_the_row_holds(shape: s
             new_username="jdoe-married",
             held=held,
             from_plan=False,
+            audit_soft=False,
         )
 
         [conflict] = [
@@ -4092,6 +4097,7 @@ async def test_a_stale_held_row_is_not_a_conflict_when_this_row_already_has_the_
             new_username="jdoe-married",
             held=stale_held,
             from_plan=True,
+            audit_soft=True,
         )
 
         assert not [
@@ -4328,6 +4334,95 @@ async def test_a_holder_that_fails_its_seal_by_the_re_read_is_refused_with_the_l
         await store.close()
 
 
+@pytest.mark.parametrize("shape", ["write_noop", "write_race"])
+async def test_a_holder_that_fails_its_seal_on_the_write_path_is_refused_with_the_lockout_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, shape: str
+) -> None:
+    """Vault BACKLOG #3069 note T3, on a keyed store. No ``held`` is passed, so the pre-check is
+    skipped and the write finds the new name taken by a row whose record was then changed outside
+    the store. That row still holds the name, so the refusal is the lockout one, with no verified
+    id to name and ``held_by_refused`` on the audit row. RED when the write path reads the holder
+    as absent: the warning then says no row holds the name and a later pass retries it, which is
+    false while that holder fails its seal."""
+    path = tmp_path / "sealed.db"
+    store, _ldap, service, notifier, user_id = await _renamed_service(path)
+    try:
+
+        async def _taken(*a: object, **kw: object) -> bool:
+            await store.create_user(
+                user_id="squatter",
+                username="jdoe-married",
+                auth_provider="ad",
+                password_generated=False,
+                audits=(),
+            )
+            await _raw_for(path)("UPDATE users SET display_name=? WHERE id=?", ("bent", "squatter"))
+            if shape == "write_race":
+                raise sqlite3.IntegrityError("UNIQUE constraint failed: users.username")
+            return False
+
+        store.set_user_username = _taken  # type: ignore[method-assign]
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()
+
+        await service._refresh_cached_username(
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=None,
+            from_plan=True,
+            audit_soft=True,
+        )
+
+        [conflict] = await _rename_audits(store)
+        detail = json.loads(conflict["detail"])
+        assert detail["detected"] == shape
+        assert detail["held_by_user_id"] is None and detail["held_by_refused"] is True
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert [m for m in messages if "refused at its next sign-in" in m], (
+            f"a seal-failed holder on the {shape} path lost the lockout warning"
+        )
+        assert not [m for m in messages if "no row holds the new name" in m]
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+    finally:
+        await store.close()
+
+
+async def test_a_row_that_fails_its_seal_is_not_refused_as_gone(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3069 note T3, the renamed row itself. Its record is changed outside the store
+    after the plan, so the refresh's pre-read refuses it. The row is still there, so the refresh
+    files no ``row_gone`` conflict saying it was removed, writes nothing and tells nobody; the
+    loader has already reported the seal failure. RED when a seal failure reads as a gone row."""
+    path = tmp_path / "sealed.db"
+    store, _ldap, service, notifier, user_id = await _renamed_service(path)
+    try:
+        await _raw_for(path)("UPDATE users SET display_name=? WHERE id=?", ("bent", user_id))
+        caplog.set_level(logging.INFO, logger="messagefoundry.auth.service")
+        caplog.clear()
+
+        await service._refresh_cached_username(
+            user_id=user_id,
+            old_username="jdoe",
+            new_username="jdoe-married",
+            held=None,
+            from_plan=True,
+            audit_soft=True,
+        )
+
+        assert not await _rename_audits(store), "a seal-failed row was filed as a rename refusal"
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+        raw = await store.get_user(user_id)
+        assert raw is not None and raw.username == "jdoe"
+        messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert [m for m in messages if "fails its integrity check" in m and "BACKLOG #3069" in m]
+        assert not [m for m in messages if "removed" in m]
+        assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+    finally:
+        await store.close()
+
+
 async def test_a_store_fault_on_the_holder_re_read_skips_only_that_rename(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -4412,6 +4507,7 @@ async def test_a_store_fault_on_the_holder_re_read_still_raises_off_the_reconcil
                 new_username="jdoe-married",
                 held=replace(row, id="gone-holder", username="jdoe-married"),
                 from_plan=False,
+                audit_soft=False,
             )
         after = await store.get_user(user_id)
         assert after is not None and after.username == "jdoe"
@@ -4436,6 +4532,7 @@ async def test_a_row_gone_refusal_does_not_warn_of_a_lockout(
             new_username="jdoe-married",
             held=None,
             from_plan=False,
+            audit_soft=False,
         )
         [warning] = [r for r in caplog.records if r.name == "messagefoundry.auth.service"]
         assert "removed" in warning.getMessage()
@@ -4475,6 +4572,7 @@ async def test_a_lost_write_with_no_holder_left_does_not_warn_of_a_lockout(
             new_username="jdoe-married",
             held=None,
             from_plan=False,
+            audit_soft=False,
         )
         [warning] = [r for r in caplog.records if r.name == "messagefoundry.auth.service"]
         assert "no row holds the new name" in warning.getMessage()
@@ -4543,6 +4641,7 @@ async def test_two_refreshes_of_one_rename_at_once_write_audit_and_notify_once(
                         new_username="jdoe-married",
                         held=None,
                         from_plan=from_plan,
+                        audit_soft=from_plan,
                     )
                 )
 
@@ -5482,6 +5581,7 @@ async def test_the_login_path_rename_still_fails_on_a_refused_audit_write(
                 new_username="jdoe-new",
                 held=None,
                 from_plan=False,
+                audit_soft=False,
             )
         assert refused == ["jdoe-new"]
         after = await store.get_user(jdoe.id)

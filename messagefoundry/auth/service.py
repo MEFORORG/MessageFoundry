@@ -7594,6 +7594,7 @@ class AuthService:
                     new_username=principal.username,
                     held=by_name,
                     from_plan=False,
+                    audit_soft=False,
                     client=client,
                 )
             # BACKLOG #1139. AN ABSENT DIRECTORY ATTRIBUTE IS NOT AN INSTRUCTION TO ERASE.
@@ -8923,8 +8924,8 @@ class AuthService:
         new_username: str,
         held: UserRecord | None,
         from_plan: bool,
+        audit_soft: bool,
         client: str | None = None,
-        audit_soft: bool = False,
     ) -> None:
         """Copy a directory-reported rename down onto a row's cached ``username`` (BACKLOG #1532).
 
@@ -8932,7 +8933,9 @@ class AuthService:
         is at the skip below, and only there). True for the reconciler: a row that holds neither
         the plan's old name nor its new one is skipped. False for the login, which writes.
 
-        ``audit_soft`` is passed by the reconciler alone (BACKLOG #3018), so its conflict rows go
+        ``audit_soft`` is required too, for the same reason (vault BACKLOG #3069 note T4): a
+        default would let a caller that plans like the reconciler fail like a sign-in. It is True
+        for the reconciler alone (BACKLOG #3018), so its conflict rows go
         through :meth:`_audit_reconciler_row`, and a refused append of the rename's own row, which
         commits with the write (step 7), rolls the rename back and is logged rather than raised.
         The login path leaves it off, so there a refused write still fails the sign-in, as it always
@@ -8979,7 +8982,9 @@ class AuthService:
 
         write_audit = self._audit_reconciler_row if audit_soft else self._audit
 
-        async def _refuse(held_by: str | None, detected: str, holds: str) -> None:
+        async def _refuse(
+            held_by: str | None, detected: str, holds: str, *, holder_refused: bool = False
+        ) -> None:
             # A DIFFERENT ROW ALREADY HOLDS THE NAME. Two accounts cannot share one; refusing the
             # write is the only safe move, and it is audited rather than logged-and-forgotten because
             # an operator has to resolve it. The likely cause is a stale row for a departed operator
@@ -9026,6 +9031,11 @@ class AuthService:
             # never ``old_username``: passing that would bring back the #2291 defect on the login
             # path, an audit row naming an account that no longer exists. The one exception is the
             # ``row_gone`` refusal at the pre-read, where no row was read to hold a name.
+            #
+            # ``holder_refused`` (vault BACKLOG #3069 note T3): a row holds the name but fails its
+            # seal, so its id is not verified and ``held_by`` is None. It still holds the name, so
+            # this is the lockout, not the "no row holds the new name" case, and the audit says
+            # so with ``held_by_refused`` rather than naming an unverified id.
             await write_audit(
                 "auth.ad_username_refresh_conflict",
                 actor=holds,
@@ -9035,6 +9045,7 @@ class AuthService:
                         "held_by_user_id": held_by,
                         "detected": detected,
                         "source": "directory",
+                        **({"held_by_refused": True} if holder_refused else {}),
                     }
                 ),
                 client=client,
@@ -9046,7 +9057,7 @@ class AuthService:
                     scrub_log_argument(holds),
                 )
                 return
-            if held_by is None:
+            if held_by is None and not holder_refused:
                 # The write lost to another writer, but the re-read found no row holding the name
                 # now. Nothing is locked out, and a later sign-in or a pass that probes the account
                 # copies the name down again, so the lockout warning below would be false (BACKLOG
@@ -9067,7 +9078,9 @@ class AuthService:
                 "the stale row is removed; the session it holds now survives only to the absolute "
                 "cap (BACKLOG #1532)",
                 scrub_log_argument(holds),
-                held_by,
+                held_by
+                if held_by is not None
+                else "not verified: its record fails its integrity check",
                 detected,
             )
 
@@ -9090,8 +9103,25 @@ class AuthService:
         # new name, so about once per directory rename, not once per sign-in. Keeping one read site
         # for both callers keeps them on one path, which is the point of this method; the
         # post-write read-back the item also counted went with BACKLOG #2290.
+        async def _own_row_refused() -> bool:
+            # Vault BACKLOG #3069 note T3. The loader answers None for a row that fails its seal as
+            # well as for one that is gone, and only the gone row is ``row_gone``: filing a row that
+            # is still there as removed would be false. The loader has already reported the seal
+            # failure, and the store refuses to write a failing record, so nothing is written, and
+            # nothing more is filed. The next read that finds the record verifying retries it.
+            if not await self._user_id_held(user_id):
+                return False
+            _log.warning(
+                "AD account %s was renamed in the directory, but its record fails its integrity "
+                "check, so the new name was not written (BACKLOG #3069)",
+                user_id,
+            )
+            return True
+
         before = await self._load_user(user_id)
         if before is None:
+            if await _own_row_refused():
+                return
             # Deleted between the plan and the apply. Refused as a write that finds the row gone is
             # refused below, without an UPDATE that can only match nothing. With no row there is
             # no name it holds, so the caller's is the last one known for it. No holder either:
@@ -9162,10 +9192,12 @@ class AuthService:
             # as the caller's read would have been, with the lockout warning, not left to the
             # write-path refusal's "a later pass retries it", which is false while that holder
             # stays seal-failed. Its id is not verified, so the audit names ``held``, the last
-            # verified holder. NOT CLOSED HERE: the reconciler's own ``held`` read, and at least
-            # the two write-path holder reads below, still read a seal-failed holder as None; and
-            # ``refused`` also reads true for a holder deleted or re-keyed between the re-read's
-            # own row and role reads, a narrow window that still files this refusal.
+            # verified holder. The two write-path holder reads below read it the same way (vault
+            # BACKLOG #3069 note T3), with no verified id to name. NOT CLOSED HERE: the reconciler's
+            # own ``held`` read still reads a seal-failed holder as None, so the pre-check is
+            # skipped and the write's guard catches it instead; and ``refused`` also reads true for
+            # a holder deleted or re-keyed between the re-read's own row and role reads, a narrow
+            # window that still files this refusal.
             #
             # On the reconciler's path (``audit_soft``) a store fault on this re-read skips this
             # one rename for this pass rather than raising: a raise would end the pass before the
@@ -9259,9 +9291,15 @@ class AuthService:
             if not _is_integrity_refusal(exc):
                 raise
             # Re-read rather than guess who won: this is an error path, the cost is irrelevant, and an
-            # audit row naming the holder is what makes the collision actionable.
-            winner = await self._load_user_by_username(new_username)
-            await _refuse(winner.id if winner is not None else None, "write_race", before.username)
+            # audit row naming the holder is what makes the collision actionable. A holder that
+            # fails its seal still holds the name (vault BACKLOG #3069 note T3).
+            winner = await self._lookup_by_username(new_username)
+            await _refuse(
+                winner.user.id if winner.user is not None else None,
+                "write_race",
+                before.username,
+                holder_refused=winner.refused,
+            )
             return
         if refused is not None:
             # A sign-in raises the append's own error, as a refused row always failed it. The
@@ -9320,11 +9358,15 @@ class AuthService:
         if not written:
             after = await self._load_user(user_id)
             if after is None:
-                await _refuse(None, "row_gone", before.username)
+                if not await _own_row_refused():
+                    await _refuse(None, "row_gone", before.username)
             elif after.username == before.username:
-                holder = await self._load_user_by_username(new_username)
+                holder = await self._lookup_by_username(new_username)
                 await _refuse(
-                    holder.id if holder is not None else None, "write_noop", before.username
+                    holder.user.id if holder.user is not None else None,
+                    "write_noop",
+                    before.username,
+                    holder_refused=holder.refused,
                 )
             else:
                 _log.info(
