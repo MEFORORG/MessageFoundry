@@ -10641,10 +10641,13 @@ class RegistryRunner:
         refused = None
         if peek_failed:
             # Vault BACKLOG #4796: the refused reply is charged to the loopback's refused-body
-            # allowance, as a listener's refusal is. A handoff that then stores no child (at least a
-            # consumed, depth-capped, missing, erased or corrupt token, or an origin that fails its
-            # row tag), or that raises and is retried, leaves the charge spent, and a replay of that
-            # token charges it again: that errs toward storing less, never more.
+            # allowance, as a listener's refusal is. The charge is never refunded. At least a handoff
+            # that stores no child (a depth-capped token, an origin that fails its row tag, or a
+            # reply erased or deleted after the read above), one that raises and is retried, and one
+            # whose terminal write a server backend fences, re-pending the token, leave it spent, and
+            # each re-run or replay charges again: that errs toward storing less, never more. A
+            # token whose reply is already missing or erased, or whose reference is corrupt, reads
+            # as an empty body above, which fits the head and charges nothing.
             refused = self._refused_body.bound_held(
                 name,
                 body,
