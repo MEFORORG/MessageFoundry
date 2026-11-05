@@ -578,6 +578,19 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     }
   }
 
+  /**
+   * Re-run after a workspace-trust grant (vault BACKLOG #3166, PR 2390 note 1). Untrusted, every run
+   * stops at the exec gate and stores the "workspace not trusted" error, and a grant is not a save,
+   * so without this the error stays until the next save. Masked, like every run no reveal asked for.
+   * Off, or still gated, it runs nothing.
+   */
+  async onTrustGranted(): Promise<void> {
+    if (!this.enabled || isExecGated()) {
+      return;
+    }
+    await this.run(false);
+  }
+
   /** Debounced save hook: re-run only when on, trusted, and the saved file is a config .py module. */
   onSave(doc: vscode.TextDocument): void {
     if (!this.enabled || isExecGated() || doc.languageId !== "python") {

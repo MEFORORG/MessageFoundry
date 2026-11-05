@@ -563,6 +563,26 @@ suite("LiveDebugController trigger paths choose --show-phi (vault BACKLOG #1187)
     }
   });
 
+  test("a trust grant re-runs Live once, masked, and does nothing while Live is off", async () => {
+    const calls: boolean[] = [];
+    const runner: TraceRunner = async (_s, _c, showPhi) => {
+      calls.push(showPhi);
+      return [traceEntry({})];
+    };
+    const controller = new LiveDebugController(runner, () => "/ws");
+    try {
+      await controller.runWith(syntheticSample(), "/ws"); // choose the sample, masked
+      await controller.onTrustGranted(); // Live is off: nothing runs (control)
+      assert.deepStrictEqual(calls, [false]);
+      await controller.toggle(); // Live on, masked
+      await controller.onTrustGranted(); // vault BACKLOG #3166, PR 2390 note 1
+      assert.deepStrictEqual(calls, [false, false, false], "the grant must re-run, never reveal");
+      assert.strictEqual(controller.isShowingValues(), false);
+    } finally {
+      controller.dispose();
+    }
+  });
+
   test("hideValues cancels a reveal still running", async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));

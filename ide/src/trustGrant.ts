@@ -21,6 +21,8 @@ export interface TrustGrantSteps {
   refreshEngineTrust(): unknown;
   /** Re-offer the one-time version-control nudge, silent when untrusted (vault BACKLOG #2791). */
   suggestSourceControl(): unknown;
+  /** Re-run live-debug, whose last run stopped at the exec gate with "workspace not trusted". */
+  rerunLiveDebug(): unknown;
 }
 
 /** The run order. `satisfies` makes a step added to {@link TrustGrantSteps} but not here an error. */
@@ -29,6 +31,7 @@ const ORDER = {
   repaintStatusBar: 1,
   refreshEngineTrust: 2,
   suggestSourceControl: 3,
+  rerunLiveDebug: 4,
 } satisfies Record<keyof TrustGrantSteps, number>;
 
 /**
