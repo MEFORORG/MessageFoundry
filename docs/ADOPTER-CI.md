@@ -330,13 +330,14 @@ What CI **does** guarantee on every PR:
 
 4. **`check` holds no time bound on a strict validation that hangs.** Where a connection turns
    strict validation on, the dry-run validates each fixture inline and compares the time it took to
-   `validation.strict_timeout_s` only after the validator returns
+   the connection's strict-validation timeout only after the validator returns
    ([dryrun.py](../messagefoundry/pipeline/dryrun.py) `_strict_validation_error`), so a validator
-   that never returns would hang `check`, and at least two other surfaces with it: `messagefoundry
-   verify`'s smoke self-check ([verify/smoke.py](../messagefoundry/verify/smoke.py)) and the git
-   pre-commit hook the VS Code extension writes, which execs `messagefoundry check`
-   ([ide/src/sourceControl.ts](../ide/src/sourceControl.ts)). The live listener's validation bound
-   is a separate control, described in [HL7-VALIDATION.md](HL7-VALIDATION.md).
+   that never returns would hang `check`. At least two other surfaces run the same dry-run and would
+   hang with it: `messagefoundry verify`'s smoke self-check, on its one built-in message
+   ([verify/smoke.py](../messagefoundry/verify/smoke.py)), and the git pre-commit hook the VS Code
+   extension writes, which execs `messagefoundry check`
+   ([ide/src/sourceControl.ts](../ide/src/sourceControl.ts)). The live listener handles the same
+   timeout differently; [HL7-VALIDATION.md](HL7-VALIDATION.md) describes how.
 
 ---
 

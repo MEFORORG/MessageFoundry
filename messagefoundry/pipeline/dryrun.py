@@ -963,11 +963,12 @@ def _strict_validation_error(text: str, ic: InboundConnection) -> str | None:
     disabled (``strict_timeout_s <= 0``) nothing times out.
 
     **What inline loses against the listener, by design.** A slow fixture runs its full validate time
-    instead of being abandoned at the timeout, and nothing here bounds that time: the size and segment
-    caps checked before the parse bound how large a message reaches the validate, not how long it
-    runs, so a validate that never returns hangs the dry run and ``messagefoundry check`` with it
-    (``docs/ADOPTER-CI.md`` section 5). And the listener's validates share the default executor's
-    workers with concurrent traffic, so a saturated executor can push a fast validate past its timeout there, answered as temporary when no worker began it before the timeout
+    instead of being abandoned at the timeout, and nothing here bounds that time: the size and
+    segment caps checked before the parse bound how large a message reaches the validate, not how
+    long it runs, so a validate that never returns hangs the dry run and ``messagefoundry check``
+    with it (``docs/ADOPTER-CI.md`` section 5). And the listener's validates share the default
+    executor's workers with concurrent traffic, so a saturated executor can push a fast validate
+    past its timeout there, answered as temporary when no worker began it before the timeout
     fired; the preview validates one message at a time and does not model that. Nor does it model
     the listener's late-result recovery: a validate that began before the deadline and finished
     after it, but before the listener handled the timeout, is used there as if it had not timed out,
