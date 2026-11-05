@@ -11511,6 +11511,8 @@ def _check(args: argparse.Namespace) -> int:
         # BACKLOG #3063 item 2: _resolve_offline_anchor picked the project root's file, which serve
         # with the same flags may not read; run_checks names the difference on each settings line.
         service_config_from_root=args.service_config is None and service_config is not None,
+        # Vault BACKLOG #2355: the settings legs read --env as serve reads its own.
+        env=args.env,
     )
     if args.json:
         _print_json(report.to_json(), compact=True)

@@ -799,6 +799,215 @@ def test_reference_backend_reads_an_environment_only_backend(
     assert "provider_npi" in result.detail and "sqlserver" in result.detail
 
 
+# --- vault BACKLOG #2355, the serve --env half: check --env names the instance as serve --env does --
+# Before this `check --env` reached only the env-file presence check, so a site naming its
+# environment only on `serve --env` got a SKIP from every settings leg, and the retention legs
+# printed a placeholder name. Each test below sets no MEFOR_AI_ENVIRONMENT.
+
+_ENV_FLAG_NOTE = "and check --env names the instance"
+
+
+def _flag_leg(
+    cfg: Path, name: str, env: str | None, *, service_config: Path | None = None
+) -> CheckResult:
+    """``name`` from a run of ``cfg`` with ``check --env`` set to ``env``, confined as :func:`_leg`."""
+    report = run_checks(
+        cfg,
+        run_lint=False,
+        env=env,
+        service_config=service_config,
+        suppress_service_toml_search=True,
+    )
+    return next(r for r in report.results if r.name == name)
+
+
+@pytest.mark.parametrize("name", _SETTINGS_LEGS)
+def test_every_settings_leg_reads_an_instance_named_by_check_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    cfg = _bare_config(tmp_path, monkeypatch)
+    result = _flag_leg(cfg, name, "dev")
+    assert _ENV_ONLY_NOTE in result.detail and _ENV_FLAG_NOTE in result.detail, result.detail
+    assert "graph only" not in result.detail  # static-credentials read the settings half too
+    if name != "static-credentials":  # that leg reads the graph either way, so never skipped
+        assert not result.skipped, f"{name}: {result.detail}"
+    # Control: the same run with no --env is the bare-dir answer.
+    control = _flag_leg(cfg, name, None)
+    assert _ENV_ONLY_NOTE not in control.detail, f"{name}: {control.detail}"
+    if name != "static-credentials":
+        assert control.skipped, f"{name}: {control.detail}"
+
+
+def test_check_env_beats_mefor_ai_environment_and_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # serve applies --env as a CLI override of [ai].environment, above the variable and the file.
+    # A custom name with no production tier is the refusal that shows which name was read.
+    cfg = _bare_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
+    fail = _flag_leg(cfg, "posture", "poc")
+    assert fail.required and not fail.ok and not fail.skipped
+    assert "production_instance" in fail.detail and _ENV_FLAG_NOTE in fail.detail
+    assert _flag_leg(cfg, "posture", None).ok  # control: the variable's own name passes
+
+    toml = tmp_path / "svc.toml"
+    toml.write_text('[ai]\nenvironment = "dev"\n', encoding="utf-8")
+    fail = _flag_leg(cfg, "posture", "poc", service_config=toml)
+    assert not fail.ok and "production_instance" in fail.detail, fail.detail
+    ok = _flag_leg(cfg, "posture", None, service_config=toml)
+    assert ok.ok and "environment 'dev'" in ok.detail, ok.detail
+
+
+def test_build_check_refuses_an_exposed_listener_named_by_check_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _bare_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEFOR_INBOUND_BIND_HOST", "0.0.0.0")
+    result = _flag_leg(cfg, "build-check", "dev")
+    assert result.required and not result.ok and not result.skipped
+    assert "IB_ENV" in result.detail and "without TLS" in result.detail
+    assert _flag_leg(cfg, "build-check", None).skipped  # control
+
+
+def test_hop_ack_refuses_a_terminator_named_by_check_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = _bare_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEFOR_API_TLS_TERMINATED_UPSTREAM", "true")
+    monkeypatch.setenv("MEFOR_API_TRUSTED_PROXIES", "10.0.0.1")
+    result = _flag_leg(cfg, "upstream-hop-ack", "dev")
+    assert result.required and not result.ok and not result.skipped
+    assert "plaintext_upstream_hop_acknowledged" in result.detail
+    assert _flag_leg(cfg, "upstream-hop-ack", None).skipped  # control
+
+
+def test_reference_backend_reads_a_backend_named_by_check_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # As test_reference_backend_reads_an_environment_only_backend, with --env in place of the
+    # variable.
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    monkeypatch.setattr(SqlServerStore, "supports_reference_sets", False)
+    csv = tmp_path / "npi.csv"
+    csv.write_text("key,value\nMED1,9991\n", encoding="utf-8")
+    cfg = _bare_config(
+        tmp_path,
+        monkeypatch,
+        "from messagefoundry import inbound, router, File, Reference, FileRef\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        f"Reference('provider_npi', source=FileRef(path={str(csv)!r}))\n"
+        "@router('r')\n"
+        "def r(m): return []\n",
+    )
+    for key, value in (
+        ("BACKEND", "sqlserver"),
+        ("SERVER", "db.example.invalid"),
+        ("DATABASE", "mefor"),
+        ("USERNAME", "mefor_svc"),
+    ):
+        monkeypatch.setenv(f"MEFOR_STORE_{key}", value)
+    result = _flag_leg(cfg, "reference-backend", "dev")
+    assert result.required and not result.ok and not result.skipped
+    assert "provider_npi" in result.detail and "sqlserver" in result.detail
+    assert _flag_leg(cfg, "reference-backend", None).skipped  # control
+
+
+_PLACEHOLDER = "so the name above is a placeholder"
+
+
+def test_retention_names_the_environment_check_env_gives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The retention legs judged a file naming no environment before, and printed a placeholder
+    # where serve prints the name. With check --env they print the name serve would.
+    cfg = _bare_config(tmp_path, monkeypatch)
+    toml = tmp_path / "svc.toml"
+    toml.write_text("security.delete_message_bodies_after_days = 0\n", encoding="utf-8")
+    named = _flag_leg(cfg, "retention", "prod", service_config=toml)
+    assert not named.ok and not named.skipped
+    assert "('prod')" in named.detail and _PLACEHOLDER not in named.detail, named.detail
+    control = _flag_leg(cfg, "retention", None, service_config=toml)
+    assert not control.ok and _PLACEHOLDER in control.detail, control.detail
+
+
+def test_retention_overrides_names_the_environment_check_env_gives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests._retention_override_graph import override_graph
+
+    _scrub_mefor_env(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    cfg = tmp_path / "cfg"
+    override_graph(cfg, inbound_days=0, outbound_days=None)
+    toml = tmp_path / "svc.toml"
+    toml.write_text("", encoding="utf-8")
+    named = _flag_leg(cfg, "retention-overrides", "prod", service_config=toml)
+    assert not named.ok and not named.skipped
+    assert "IB_FEED" in named.detail and "'prod'" in named.detail, named.detail
+    assert _PLACEHOLDER not in named.detail
+    control = _flag_leg(cfg, "retention-overrides", None, service_config=toml)
+    assert not control.ok and _PLACEHOLDER in control.detail, control.detail
+
+
+def test_the_check_command_passes_env_to_the_settings_legs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The CLI half: `check --env` reaches run_checks. The terminator in the environment is refused
+    # only when the leg reads the environment, so a FAIL shows --env named the instance.
+    cfg = _bare_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEFOR_API_TLS_TERMINATED_UPSTREAM", "true")
+    monkeypatch.setenv("MEFOR_API_TRUSTED_PROXIES", "10.0.0.1")
+    rc, legs = _cli_check(
+        capsys, "--config", str(cfg), "--project-root", str(tmp_path), "--env", "dev"
+    )
+    hop = legs["upstream-hop-ack"]
+    assert rc == 1 and not hop["ok"] and not hop["skipped"], hop["detail"]
+    assert _ENV_FLAG_NOTE in str(hop["detail"])
+    rc, legs = _cli_check(capsys, "--config", str(cfg), "--project-root", str(tmp_path))
+    assert legs["upstream-hop-ack"]["skipped"]  # control: no --env, the bare-dir SKIP
+
+
+# --- vault BACKLOG #2179: check refuses the unlisted destination serve refuses, both sides ----------
+# check built its registry with the egress settings as loaded, while serve flipped deny_by_default on
+# first, so check passed a config serve refused. Engine PR 1976 moved deny into the settings model;
+# this pins the outcome at run_checks, the refusal and the audited opt-out that clears it.
+
+_EGRESS_GRAPH = (
+    "from messagefoundry import inbound, outbound, router, handler, MLLP, Rest, Send\n"
+    "inbound('IB_EG', MLLP(port=2620), router='r')\n"
+    "outbound('OB_HL7', MLLP(host='127.0.0.1', port=2621))\n"
+    "outbound('OB_API', Rest(url='http://127.0.0.1:2622/intake'))\n"
+    "@router('r')\n"
+    "def r(m): return ['h']\n"
+    "@handler('h')\n"
+    "def h(m): return [Send('OB_HL7', m), Send('OB_API', m)]\n"
+)
+#: allowed_mllp set, so serve's no-destination-list gate passes; allowed_http left empty.
+_EGRESS_TOML = '[ai]\nenvironment = "dev"\n[egress]\nallowed_mllp = ["127.0.0.1:2621"]\n'
+
+
+@pytest.mark.parametrize(
+    "security,ok",
+    [("", False), ("[security]\nblock_unlisted_outbound = false\n", True)],
+    ids=["unset-refuses", "opt-out-passes"],
+)
+def test_build_check_refuses_an_unlisted_http_destination_unless_opted_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, security: str, ok: bool
+) -> None:
+    cfg = _bare_config(tmp_path, monkeypatch, _EGRESS_GRAPH)
+    toml = tmp_path / "svc.toml"
+    toml.write_text(security + _EGRESS_TOML, encoding="utf-8")
+    report = run_checks(cfg, run_lint=False, service_config=toml)
+    build = next(r for r in report.results if r.name == "build-check")
+    assert build.required and not build.skipped, build.detail
+    assert build.ok is ok, build.detail
+    if not ok:
+        assert "OB_API" in build.detail and "block_unlisted_outbound" in build.detail
+        assert "OB_HL7" not in build.detail  # the listed MLLP destination is not the refusal
+        assert not report.ok
+
+
 @pytest.mark.parametrize("declared", [True, False], ids=["env-declared", "no-env-name"])
 def test_project_root_names_an_unread_working_directory_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared: bool
