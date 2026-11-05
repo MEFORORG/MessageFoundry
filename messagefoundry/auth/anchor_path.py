@@ -442,6 +442,37 @@ def subst_target(answer: str) -> str | None:
     return answer if answer.startswith("\\??\\") else None
 
 
+#: ``QueryDosDeviceW``'s error for a drive letter with no device behind it.
+_ERROR_FILE_NOT_FOUND = 2
+
+
+def query_drive_target(drive: str) -> str | None:
+    """What ``QueryDosDeviceW`` says the ``drive`` letter stands for, whole (:func:`subst_target`),
+    or ``None`` for a real volume, a network redirector or no device at all. The one reader both
+    walks use, :func:`windows_host_readers` and the generic ODBC path walk, so the two cannot answer
+    one letter differently (vault BACKLOG #5197).
+
+    Any other failed query raises ``OSError``: read as a real volume, a ``subst`` drive it could
+    not read would hide the folders above its target from the walk. Its ``strerror`` names the
+    Win32 error and its code, and no path, so a cause's path-free kind can carry it. Raises
+    ``OSError`` off Windows."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the drive target is read only on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.QueryDosDeviceW.restype = wintypes.DWORD
+    kernel32.QueryDosDeviceW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    buf = ctypes.create_unicode_buffer(1024)
+    if not kernel32.QueryDosDeviceW(drive, buf, len(buf)):
+        error = ctypes.get_last_error()
+        if error == _ERROR_FILE_NOT_FOUND:
+            return None
+        raise ctypes.WinError(error, f"Win32 error {error} ({ctypes.FormatError(error).strip()})")
+    return subst_target(buf.value)
+
+
 def _drive_relative(path: str) -> bool:
     """Whether ``path`` names a drive letter with no separator after it (``C:ca.pem``, ``C:``).
     Windows reads such a path from that drive's own working directory, which a service does not
@@ -561,9 +592,11 @@ def windows_chain(
                     f"the drive {drive} stands for a path this check does not read",
                     "a drive stands for a path this check does not read",
                 )
-            if _drive_relative(target):
-                return chain, WalkCause.plain(_DRIVE_RELATIVE)
+            # The target with the rest of the path, not the target alone: a letter defined onto a
+            # bare drive (``\??\C:``) makes ``S:\ca.pem`` read as ``C:\ca.pem``, which is rooted.
             pending = target + rest
+            if _drive_relative(pending):
+                return chain, WalkCause.plain(_DRIVE_RELATIVE)
             continue
         root = drive + "\\"
         why = volume_cause(root)
@@ -950,8 +983,6 @@ def windows_host_readers() -> WinHost:
     kernel32.GetCurrentProcess.restype = wintypes.HANDLE
     kernel32.GetDriveTypeW.restype = wintypes.UINT
     kernel32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
-    kernel32.QueryDosDeviceW.restype = wintypes.DWORD
-    kernel32.QueryDosDeviceW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
     kernel32.GetVolumeInformationW.restype = wintypes.BOOL
     kernel32.GetVolumeInformationW.argtypes = [
         wintypes.LPCWSTR,
@@ -1221,18 +1252,6 @@ def windows_host_readers() -> WinHost:
             return frozenset(members), read.value >= total.value
         return unresolved(members, "the enumeration did not finish in 64 pages")
 
-    def drive_target(drive: str) -> str | None:
-        """The folder a ``subst`` drive stands for, whole, or ``None`` (:func:`subst_target`). A
-        failed query other than "no such device" raises ``OSError``: read as a real volume, a subst
-        drive it could not read would hide the folders above its target from the walk."""
-        buf = ctypes.create_unicode_buffer(1024)
-        if not kernel32.QueryDosDeviceW(drive, buf, len(buf)):
-            error = ctypes.get_last_error()
-            if error == 2:  # ERROR_FILE_NOT_FOUND: no device at that letter
-                return None
-            raise OSError(f"the drive {drive} could not be read: {win_error(error)}")
-        return subst_target(buf.value)
-
     cache: list[tuple[frozenset[str], bool]] = []
 
     def admin_member(sid: str) -> bool | None:
@@ -1243,7 +1262,7 @@ def windows_host_readers() -> WinHost:
             return True  # a SID found in a partial read is still a member
         return False if complete else None
 
-    return WinHost(read_security, volume_cause, engine_sid(), admin_member, drive_target)
+    return WinHost(read_security, volume_cause, engine_sid(), admin_member, query_drive_target)
 
 
 def _windows_host_verdict(path: str) -> PathVerdict:

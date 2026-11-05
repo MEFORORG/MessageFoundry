@@ -51,6 +51,7 @@ from messagefoundry.auth.trust_anchors import (
     explicit_cause,
     inbound_lane_reads_ca,
     lane_ca_setting,
+    lane_driver_file_settings,
 )
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.db_lookup import activated as db_lookup_activated
@@ -4332,8 +4333,8 @@ class RegistryRunner:
         other inbound, a bound one, an unknown name and one not deployed: :meth:`_start_inbound_unsafe` answers those itself."""
         ic = self.registry.inbound.get(name)
         if ic is not None and not _inbound_lane_reads_ca(ic):
-            # An SFTP poller, FTPS with no CA, or a DatabasePoll with no sslca: nothing to check,
-            # so no old refusal stands.
+            # An SFTP poller, FTPS with no CA, or a DatabasePoll with no driver file keyword:
+            # nothing to check, so no old refusal stands.
             self._anchor_refused.pop(("inbound", name), None)
             return
         if (
@@ -12851,11 +12852,11 @@ _SETTING_KEYS = "tls_ca_pin or tls_ca_file"
 
 
 def _refused_setting_keys(settings: Mapping[str, Any]) -> str:
-    """What a lane's setting refusal names. A generic DATABASE lane whose CA is its ``odbc_params``
-    ``sslca`` (:func:`lane_ca_setting`) names that, since it is the setting the operator set and
-    the lane takes no ``tls_ca_file``. Any other lane names :data:`_SETTING_KEYS` (BACKLOG #2705)."""
-    ca = lane_ca_setting(settings)
-    return _SETTING_KEYS if ca == "tls_ca_file" else ca
+    """What a lane's setting refusal names. A generic DATABASE lane names its ``odbc_params``
+    driver file keywords (:func:`lane_driver_file_settings`), since the check judges each of them
+    and the lane takes no ``tls_ca_file``. Any other lane names :data:`_SETTING_KEYS` (BACKLOG
+    #2705, vault BACKLOG #5197 item 18)."""
+    return lane_driver_file_settings(settings) or _SETTING_KEYS
 
 
 def _lane_setting(direction: str, name: str, key: str) -> str:

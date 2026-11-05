@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import pickle
+import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -388,3 +390,337 @@ def test_review_an_empty_sslca_is_left_to_the_build() -> None:
         "odbc_params": {"SSLMODE": "VERIFY_IDENTITY", "SSLCA": ""},
     }
     assert ta.database_ca_anchor_spec("OB_DB_GEN", settings) is None
+
+
+# === turn 2 of #5197 =============================================================================
+
+_OUT = "OB_DB_GEN"
+_IN = "IB_DB_GEN"
+_GENERIC: dict[str, Any] = {
+    "dialect": "generic",
+    "odbc_driver": "MySQL ODBC 9.1 Unicode Driver",
+    "server": "db.synthetic.test",
+}
+
+
+def _generic(**params: object) -> dict[str, Any]:
+    return {**_GENERIC, "odbc_params": {"SSLMODE": "VERIFY_IDENTITY", **params}}
+
+
+# --- PR 2738 finding 1: a subst drive onto a bare drive ------------------------------------------
+
+
+def test_finding_1_a_subst_drive_onto_a_bare_drive_is_walked(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``DefineDosDevice`` can stand a letter for a bare drive (``\\??\\C:``), so ``S:\\ca.pem`` is
+    ``C:\\ca.pem``. Red: the walk judged the target ``C:`` alone as drive-relative, refused it and
+    warned a cause that was not there."""
+    caplog.set_level(logging.WARNING, logger=database.logger.name)
+    assert _walk(r"S:\ca.pem", substs={"S:": "\\??\\C:"}) is False
+    assert caplog.records == []
+    links = {r"C:\ca.pem": _SHARE + r"\ca.pem"}
+    assert _walk(r"S:\ca.pem", links, substs={"S:": "\\??\\C:"}) is True
+    _chain, cause = windows_chain(
+        r"S:\ca.pem",
+        _no_cwd,
+        _probe(),
+        drive_target=lambda d: "\\??\\C:" if d.upper() == "S:" else None,
+    )
+    assert cause is None
+
+
+def test_finding_1_a_drive_relative_subst_target_is_still_a_cause() -> None:
+    """The control: a target with a drive and no separator before the rest stays a cause."""
+    assert _walk(r"S:\ca.pem", substs={"S:": "\\??\\C:certs"}) is None
+
+
+# --- PR 2738 findings 4, 5 and 9: one QueryDosDeviceW reader -------------------------------------
+
+
+def test_finding_5_both_walks_read_a_subst_drive_through_one_reader() -> None:
+    """Red: database kept its own ``QueryDosDeviceW`` reader, with its own error text."""
+    assert vars(database)["query_drive_target"] is anchor_path.query_drive_target
+    if sys.platform == "win32":
+        assert anchor_path.windows_host_readers().drive_target is anchor_path.query_drive_target
+
+
+def test_finding_4_a_drive_read_cause_keeps_its_code_and_says_it_once() -> None:
+    """The reader's error names the Win32 code in ``strerror``. Red on Windows, with the real
+    reader: database's error was one argument, so the cause read "could not be read: the drive S:
+    could not be read (winerror 6)", and the path-free kind read only "OSError"."""
+
+    def unread(_drive: str) -> str | None:
+        if sys.platform == "win32":
+            return anchor_path.query_drive_target("C:\\")  # error 6, as finding 9 measures
+        raise OSError(None, "Win32 error 6 (The handle is invalid.)")
+
+    _chain, cause = windows_chain(r"S:\ca.pem", _no_cwd, _probe(), drive_target=unread)
+    assert cause is not None
+    assert cause.count("could not be read") == 1
+    assert "Win32 error 6" in cause.kind and "S:" not in cause.kind
+
+
+def test_finding_9_the_drive_reader_raises_for_a_failed_query() -> None:
+    """On Windows the real reader raises for a failed query other than "no such device", and
+    answers ``None`` for a real volume. ``C:\\`` is not a device name, and ``QueryDosDeviceW``
+    answers it with error 6 (measured on Windows 11, 2026-11-05). Red: the reader did not exist
+    outside ``windows_host_readers``, so nothing pinned its raise."""
+    if sys.platform != "win32":
+        with pytest.raises(OSError):
+            anchor_path.query_drive_target("C:")
+        return
+    with pytest.raises(OSError, match="Win32 error 6") as refused:
+        anchor_path.query_drive_target("C:\\")
+    assert refused.value.strerror is not None and "Win32 error 6" in refused.value.strerror
+    assert anchor_path.query_drive_target(os.environ.get("SYSTEMDRIVE", "C:")) is None
+
+
+# --- PR 2738 finding 2: sslkey and sslpassword read by the text sent -----------------------------
+
+
+def test_finding_2_an_sslkey_of_zero_counts_as_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The build sends ``SSLKEY=0``, so the key comes from the file ``0``, which its own check
+    reads, and ``sslcert`` is not read for a key. Red: truthiness read ``0`` as unset."""
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: False)
+    read: list[str] = []
+
+    def reading(path: str, _limit: int) -> bytes:
+        read.append(path)
+        return b"-----BEGIN CERTIFICATE-----\n"
+
+    monkeypatch.setattr(database, "read_if_regular", reading)
+    database._refuse_weak_driver_cert({"sslkey": 0, "sslcert": "client.pem"})
+    assert read == []
+    database._refuse_weak_driver_cert({"sslcert": "client.pem"})  # the control: no sslkey
+    assert read == ["client.pem"]
+
+
+def test_finding_2_an_sslpassword_of_zero_counts_as_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The build sends ``sslpassword=0``, a passphrase the driver unlocks with, so the wrap check
+    is told one was given. Red: truthiness told it none was."""
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: False)
+    monkeypatch.setattr(database, "read_if_regular", lambda _p, _n: b"synthetic key")
+    given: list[bool] = []
+
+    def recording(_data: bytes, **kwargs: Any) -> None:
+        given.append(kwargs["passphrase_given"])
+
+    monkeypatch.setattr(database, "refuse_weak_key_wrap", recording)
+    database._refuse_weak_driver_key({"sslkey": "client.key", "sslpassword": 0})
+    database._refuse_weak_driver_key({"sslkey": "client.key"})  # the control: none given
+    assert given == [True, False]
+
+
+# --- PR 2738 finding 6: one literal check for the build and the lane check ------------------------
+
+
+@pytest.mark.parametrize("value", [True, "C:\\certs\\ca.pem ", "C:\\certs;\\ca.pem"])
+def test_finding_6_the_lane_check_refuses_a_value_with_the_builds_own_text(
+    monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    """The lane check and the build refuse a boolean or a bad literal through one function, so the
+    two refusals cannot drift apart. Red: the lane check copied the boolean check with its own
+    wording."""
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: False)
+    settings = _generic(SSLCA=value)
+    with pytest.raises(ValueError) as built:
+        database._build_odbc_dsn(settings, connection=_OUT)
+    with pytest.raises(ValueError) as checked:
+        ta.database_ca_anchor_spec(_OUT, settings)
+    assert str(checked.value) == str(built.value)
+
+
+# --- closing step 4, ask item 18: the lane check judges every driver file keyword ----------------
+
+
+@pytest.mark.parametrize("keyword", ["SSLCAPATH", "SSLCERT", "SSLKEY"])
+@pytest.mark.parametrize("verdict", [True, None])
+def test_item_18_the_lane_check_refuses_a_driver_path_that_turned_remote(
+    monkeypatch: pytest.MonkeyPatch, keyword: str, verdict: bool | None
+) -> None:
+    """A path the build cleared that later leads off the host, or that the walk can no longer
+    clear, is refused at the lane check, as ``sslca`` is. The refusal names the keyword, never the
+    path. Red: the lane check judged ``sslca`` only, so these got no refusal."""
+    settings = _generic(**{keyword: r"C:\phi-name\client.pem"})
+    assert ta.lane_anchor_spec("outbound", _OUT, settings) is None  # cleared at the build
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: verdict)
+    for direction, name in (("outbound", _OUT), ("inbound", _IN)):
+        with pytest.raises(ValueError, match=f"odbc_params {keyword.lower()} must be a") as refused:
+            ta.lane_anchor_spec(direction, name, settings)
+        assert "phi-name" not in str(refused.value)
+
+
+@pytest.mark.parametrize("keyword", ["SSLCAPATH", "SSLCERT", "SSLKEY"])
+def test_item_18_a_poller_naming_only_another_driver_path_is_lane_checked(keyword: str) -> None:
+    """A ``DatabasePoll`` with no ``sslca`` still goes to the lane check when it names another
+    driver file, and a refused one names that keyword. Red: the gate counted ``sslca`` only."""
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.pipeline import wiring_runner
+
+    settings = _generic(**{keyword: r"C:\certs\client.pem"})
+    assert ta.inbound_lane_reads_ca(ConnectorType.DATABASE, settings)
+    assert wiring_runner._refused_setting_keys(settings) == f"odbc_params {keyword.lower()}"
+    both = _generic(SSLCA=r"C:\certs\ca.pem", **{keyword: r"C:\certs\client.pem"})
+    assert wiring_runner._refused_setting_keys(both) == f"odbc_params sslca or {keyword.lower()}"
+    # The controls: no driver file, and a blank one, count for nothing.
+    assert not ta.inbound_lane_reads_ca(ConnectorType.DATABASE, _generic())
+    assert not ta.inbound_lane_reads_ca(ConnectorType.DATABASE, _generic(**{keyword: ""}))
+
+
+async def test_item_18_the_real_lane_check_refuses_it_as_a_setting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from messagefoundry.store import MessageStore
+
+    store = await MessageStore.open(tmp_path / "audit.db")
+    try:
+        check = ta.make_lane_anchor_check(store, enforcing=True)
+        monkeypatch.setattr(database, "_path_verdict", lambda _p: True)
+        with pytest.raises(ta.AnchorSettingRefused, match="odbc_params sslkey must be a"):
+            await check("outbound", _OUT, _generic(SSLKEY=r"C:\certs\client.key"))
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("value", [True, " client.key", ""])
+def test_item_18_a_value_the_build_refuses_is_not_walked_by_the_lane_check(
+    monkeypatch: pytest.MonkeyPatch, value: object
+) -> None:
+    """A boolean or padded value is refused before any walk, and an empty one is left to the
+    build's refusal, as for ``sslca``."""
+
+    def never(_path: str) -> bool | None:
+        raise AssertionError("a value the build refuses must not be walked")
+
+    monkeypatch.setattr(database, "_path_verdict", never)
+    settings = _generic(SSLKEY=value)
+    if value == "":
+        assert ta.lane_anchor_spec("outbound", _OUT, settings) is None
+        return
+    with pytest.raises(ValueError, match="sslkey"):
+        ta.lane_anchor_spec("outbound", _OUT, settings)
+
+
+# --- closing step 4: the entries of an SSLCAPATH folder ------------------------------------------
+
+
+def _capath(tmp_path: Path, *names: str) -> Path:
+    folder = tmp_path / "phi-capath"
+    folder.mkdir()
+    for name in names:
+        (folder / name).write_bytes(b"synthetic")
+    return folder
+
+
+def _entry_verdicts(
+    monkeypatch: pytest.MonkeyPatch, verdicts: Mapping[str, bool | None]
+) -> list[str]:
+    """Stand ``_path_verdict`` in: an entry named in ``verdicts`` gets its verdict, any other path
+    ``False``. The walk beyond the spelling runs as on Windows. Returns the paths judged."""
+    judged: list[str] = []
+
+    def verdict(path: str) -> bool | None:
+        judged.append(path)
+        return verdicts.get(os.path.basename(path), False)
+
+    monkeypatch.setattr(database, "_WALKS_BEYOND_SPELLING", True)
+    monkeypatch.setattr(database, "_path_verdict", verdict)
+    return judged
+
+
+@pytest.mark.parametrize("verdict", [True, None])
+def test_closing_step_4_an_sslcapath_entry_that_leaves_the_host_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, verdict: bool | None
+) -> None:
+    """A driver opens ``<hash>.0`` in the folder by name, so a link there onto a share leads its CA
+    lookup off the host. The build and the lane check refuse it, naming the keyword and never the
+    path. Red: no entry was judged."""
+    folder = _capath(tmp_path, "0a1b2c3d.0", "readme.txt")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": verdict})
+    settings = _generic(SSLCAPATH=str(folder))
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder whose entries") as built:
+        database._build_odbc_dsn(settings, connection=_OUT)
+    with pytest.raises(ValueError, match="sslcapath must name a folder whose entries") as checked:
+        ta.lane_anchor_spec("outbound", _OUT, settings)
+    for refused in (built, checked):
+        assert "phi-capath" not in str(refused.value)
+
+
+def test_closing_step_4_a_local_sslcapath_folder_passes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The control: every entry judged, none leaves the host, so the build and the lane check pass."""
+    folder = _capath(tmp_path, "0a1b2c3d.0", "0a1b2c3d.1")
+    judged = _entry_verdicts(monkeypatch, {})
+    settings = _generic(SSLCAPATH=str(folder))
+    database._build_odbc_dsn(settings, connection=_OUT)
+    assert ta.lane_anchor_spec("outbound", _OUT, settings) is None
+    assert sorted(os.path.basename(p) for p in judged if p != str(folder)) == [
+        "0a1b2c3d.0",
+        "0a1b2c3d.0",
+        "0a1b2c3d.1",
+        "0a1b2c3d.1",
+    ]
+
+
+def test_closing_step_4_a_folder_past_the_entry_cap_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A folder the check would take too long to judge is refused rather than judged in part."""
+    folder = _capath(tmp_path, "a.0", "b.0", "c.0")
+    _entry_verdicts(monkeypatch, {})
+    monkeypatch.setattr(database, "_MAX_CAPATH_ENTRIES", 2)
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder whose entries"):
+        database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
+
+
+def test_closing_step_4_a_folder_that_cannot_be_listed_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    folder = _capath(tmp_path, "a.0")
+    _entry_verdicts(monkeypatch, {})
+
+    real = os.scandir
+
+    def denied(path: str) -> Any:
+        if os.fspath(path) == str(folder):
+            raise PermissionError(13, "denied", str(folder))
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", denied)
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder whose entries"):
+        database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warned and all("phi-capath" not in m for m in warned)
+
+
+def test_closing_step_4_a_missing_folder_or_a_file_is_left_to_the_driver(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _entry_verdicts(monkeypatch, {})
+    database._build_odbc_dsn(_generic(SSLCAPATH=str(tmp_path / "absent")), connection=_OUT)
+    single = tmp_path / "ca.pem"
+    single.write_bytes(b"synthetic")
+    database._build_odbc_dsn(_generic(SSLCAPATH=str(single)), connection=_OUT)
+
+
+def test_closing_step_4_the_entries_are_not_listed_where_only_the_spelling_is_checked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On POSIX the check reads nothing beyond the spelling (docs/CONNECTIONS.md), so the folder is
+    not listed there."""
+    folder = _capath(tmp_path, "a.0")
+
+    real = os.scandir
+
+    def never(path: str) -> Any:
+        if os.fspath(path) == str(folder):
+            raise AssertionError("the folder must not be listed")
+        return real(path)
+
+    monkeypatch.setattr(database, "_WALKS_BEYOND_SPELLING", False)
+    monkeypatch.setattr(os, "scandir", never)
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: False)
+    database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)

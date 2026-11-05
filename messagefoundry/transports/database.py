@@ -61,13 +61,14 @@ from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
 from functools import partial
+from itertools import islice
 from typing import Any, NamedTuple, TypeGuard
 
 from messagefoundry.auth.anchor_path import (
     SHARE_CAUSE,
     WinProbe,
     _win_probe,
-    subst_target,
+    query_drive_target,
     windows_chain,
 )
 from messagefoundry.auth.trust_anchors import (
@@ -709,6 +710,24 @@ def _odbc_literal(value: object, *, what: str, connection: str | None) -> str:
     return text
 
 
+def odbc_param_text(name: str, value: object, *, connection: str | None) -> str:
+    """The text the generic build sends for the ``odbc_params`` keyword ``name`` (in the form
+    :func:`odbc_keyword_name` gives), or a ValueError naming the keyword and never the value: for
+    ``None``, a boolean, and anything :func:`_odbc_literal` refuses. The one judgement the build and
+    the lane check (``auth.trust_anchors.database_ca_anchor_spec``) both run, so the lane check
+    refuses what the build refuses, in the build's words (vault BACKLOG #5197)."""
+    what = f"odbc_params value for '{name}'"
+    _refuse_none(value, what=what, connection=connection)
+    if isinstance(value, bool):
+        # str() would send True or False, which no driver is known to spell its own way
+        # (psqlODBC reads SSLmode=True as disable). BACKLOG #2705.
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DATABASE {what} must not be a boolean; write the "
+            "driver's own spelling as a string"
+        )
+    return _odbc_literal(value, what=what, connection=connection)
+
+
 # The ``sslmode`` values psqlODBC reads: libpq's six modes, exactly, in lower case (BACKLOG #2705).
 # psqlODBC's source reads an ``SSLmode`` value by its first byte, and only a lower case one names a
 # mode, so ``Require``, ``VERIFY-FULL``, ``REQUIRED``, ``on`` or ``1`` would mean disable to it,
@@ -886,31 +905,6 @@ def _windows_drive_type(root: str) -> int:
     return int(kernel32.GetDriveTypeW(root))
 
 
-def _windows_drive_target(drive: str) -> str | None:
-    """The folder a ``subst`` drive stands for, whole, or ``None`` for a real volume or no device
-    at all, as ``anchor_path.windows_host_readers`` reads it (``anchor_path.subst_target``). Any
-    other failure of the query raises ``OSError``, so the walk does not clear the path: a subst
-    drive it could not read would hide the links behind it."""
-    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
-        raise OSError("the drive target is read only on Windows")
-    import ctypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.QueryDosDeviceW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
-    kernel32.QueryDosDeviceW.restype = ctypes.c_uint
-    buf = ctypes.create_unicode_buffer(1024)
-    if not kernel32.QueryDosDeviceW(drive, buf, len(buf)):
-        error = ctypes.get_last_error()
-        if error == _ERROR_FILE_NOT_FOUND:  # no such device: the drive type then says no volume
-            return None
-        raise OSError(f"the drive {drive} could not be read (winerror {error})")
-    return subst_target(buf.value)
-
-
-#: ``QueryDosDeviceW``'s answer for a drive letter with no device behind it.
-_ERROR_FILE_NOT_FOUND = 2
-
-
 def _windows_path_verdict(
     path: str,
     *,
@@ -965,7 +959,8 @@ def _windows_path_verdict(
         return False
     except OSError as exc:  # a reader the walk does not guard: cwd, or the drive type
         _not_cleared(
-            f"a drive or the working directory could not be read: {type(exc).__name__}", exc
+            f"the working directory or a volume's type could not be read: {type(exc).__name__}",
+            exc,
         )
         return None
     if cause is not None and cause.kind == SHARE_CAUSE:
@@ -1004,7 +999,7 @@ def _path_verdict(text: str) -> bool | None:
             text,
             probe=_win_probe,
             drive_type=_windows_drive_type,
-            drive_target=_windows_drive_target,
+            drive_target=query_drive_target,
             cwd=os.getcwd,
         )
     except (OSError, ValueError) as exc:
@@ -1098,7 +1093,69 @@ def _refuse_remote_paths(
         value = named[name]
         verdicts[name] = file_keyword_verdicts(value)
         _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
+    if "sslcapath" in verdicts and capath_entries_leave_host(
+        named["sslcapath"], verdicts["sslcapath"]
+    ):
+        raise ValueError(
+            f"{hop_name_prefix(connection)}DATABASE odbc_params value for 'sslcapath' "
+            f"{CAPATH_ENTRY_RULE}"
+        )
     return verdicts
+
+
+#: Whether the remote-path check reads anything beyond the spelling: on Windows only
+#: (:func:`_path_verdict`), so an ``sslcapath`` folder is listed there and nowhere else.
+_WALKS_BEYOND_SPELLING = sys.platform == "win32"
+#: How many entries of an ``sslcapath`` folder :func:`capath_entries_leave_host` judges. A folder
+#: holding more is refused rather than judged in part: each entry is a walk, and the build runs on
+#: the event loop. A CA folder holds a few hundred at most (one file and one link per CA).
+_MAX_CAPATH_ENTRIES = 4096
+#: What a refused ``sslcapath`` folder must be, after the setting's name, for the build and the
+#: lane check alike. It names no path.
+CAPATH_ENTRY_RULE = (
+    "must name a folder whose entries are each a plain local path on this host: not a share, a "
+    "network drive, a link to one, or a path the check cannot read"
+)
+
+
+def capath_entries_leave_host(value: object, verdicts: FileVerdicts) -> bool:
+    """Whether an entry of the ``sslcapath`` folder that ``value`` names must be refused (vault
+    BACKLOG #5197, closing step 4). The driver's TLS library opens a ``<hash>.0`` entry there by
+    name at a handshake, so a link there onto a share leads the CA lookup off the host, as the
+    folder itself would. ``verdicts`` are the folder's own (:func:`file_keyword_verdicts`), already
+    judged and not refused.
+
+    Each spelling :func:`driver_file_spellings` gives that is a folder is listed, and every entry
+    in it, not only the hash-named ones, takes :func:`_path_verdict`: ``True`` or ``None`` for any
+    one refuses, as for the trimmed spelling of a file keyword. So does a folder that cannot be
+    listed, or one holding more than :data:`_MAX_CAPATH_ENTRIES`. A spelling that names no folder,
+    or a file, is left to the driver, as a missing file is. Entries are not walked into: the driver
+    reads none below the folder. ``False`` where only the spelling is checked
+    (:data:`_WALKS_BEYOND_SPELLING`), with nothing listed. Like the rest of the check, it judges
+    where an entry leads, not who can write it, and an entry added after the check is not judged
+    (``docs/CONNECTIONS.md``, Generic ODBC)."""
+    if not _WALKS_BEYOND_SPELLING:
+        return False
+    return any(not _capath_folder_clear(p) for p in driver_file_spellings(value, verdicts))
+
+
+def _capath_folder_clear(folder: str) -> bool:
+    """Whether no entry of ``folder`` leads off the host or is a path the walk cannot clear, for
+    :func:`capath_entries_leave_host`. A reason it is not is logged as the walk logs one
+    (:func:`_not_cleared`)."""
+    try:
+        with os.scandir(folder) as listing:
+            names = [entry.name for entry in islice(listing, _MAX_CAPATH_ENTRIES + 1)]
+    except (FileNotFoundError, NotADirectoryError):
+        return True  # no folder at this spelling: left to the driver, as a missing file is
+    except (OSError, ValueError) as exc:
+        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
+        _not_cleared(f"an sslcapath folder could not be listed: {reason}", exc)
+        return False
+    if len(names) > _MAX_CAPATH_ENTRIES:
+        _not_cleared(f"an sslcapath folder holds more than {_MAX_CAPATH_ENTRIES} entries", folder)
+        return False
+    return all(_path_verdict(os.path.join(folder, name)) is False for name in names)
 
 
 def _refuse_weak_driver_key(
@@ -1150,8 +1207,9 @@ def _refuse_weak_driver_cert(
     not read here. That is the rule
     :func:`~messagefoundry.keywrap.refuse_weak_cert_chain_key` follows. It runs when the
     connection is built, not at each connect. docs/CONNECTIONS.md, under the generic dialect, says
-    what it does not cover."""
-    if not str(named.get("sslkey") or "").strip():
+    what it does not cover. ``sslkey`` counts as set by the text the build sends
+    (:func:`_sent_text`), so ``0`` is a key file, not an unset key (vault BACKLOG #5197)."""
+    if not _sent_text(named.get("sslkey")).strip():
         _refuse_weak_driver_wrap(
             named, "sslcert", "certificate file", connection, verdicts=verdicts
         )
@@ -1170,7 +1228,8 @@ def _refuse_weak_driver_wrap(
     passphrase, through :func:`~messagefoundry.keywrap.refuse_weak_key_wrap`. A file the check
     cannot read is refused as :class:`~messagefoundry.keywrap.KeyWrapRefused`, as
     :func:`~messagefoundry.keywrap.refuse_weak_key_file` refuses it. ``leave_irregular`` is
-    :func:`_read_driver_file`'s."""
+    :func:`_read_driver_file`'s. A passphrase counts as given by the text the build sends
+    (:func:`_sent_text`): the driver unlocks with ``sslpassword=0`` (vault BACKLOG #5197)."""
     for setting, data in _driver_file_spellings(
         named,
         keyword,
@@ -1185,7 +1244,7 @@ def _refuse_weak_driver_wrap(
             data,
             setting=setting,
             unlock_setting="odbc_params sslpassword",
-            passphrase_given=bool(named.get("sslpassword")),
+            passphrase_given=bool(_sent_text(named.get("sslpassword"))),
         )
 
 
@@ -1513,18 +1572,8 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
                 "(keywords are case-insensitive); give it once"
             )
         # Before anything reads the value: the remote-path screen reads its str() too.
-        _refuse_none(value, what=f"odbc_params value for '{name}'", connection=connection)
-        if isinstance(value, bool):
-            # str() would send True or False, which no driver is known to spell its own way
-            # (psqlODBC reads SSLmode=True as disable). BACKLOG #2705.
-            raise ValueError(
-                f"{where}DATABASE odbc_params value for '{name}' must not be a boolean; write the "
-                "driver's own spelling as a string"
-            )
+        literal = odbc_param_text(name, value, connection=connection)
         named[name] = value
-        literal = _odbc_literal(
-            value, what=f"odbc_params value for '{name}'", connection=connection
-        )
         if name == "sslmode":
             _refuse_unread_sslmode(literal, family=family, connection=connection)
         parts.append(f"{k}={literal}")
