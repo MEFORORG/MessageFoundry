@@ -331,10 +331,18 @@ def test_supervise_logs_the_audit_line_again_for_the_forwarder(
     relogged = "(Logged again for the off-box forwarder.)"
     assert not lines[0].endswith(relogged), lines
     assert [line.endswith(relogged) for line in lines[1:]] == ([True] if forwarder else []), lines
-    # The off-box copy keeps the first pass's order: the AUDIT line, then the residual and the
-    # acceptance (vault BACKLOG #3795).
+    # In the off-box copy the remote-debugging lines keep the first pass's order: the AUDIT line,
+    # then the residual and the acceptance (vault BACKLOG #3795). Other readings, such as the
+    # unpinned service-environment one, may follow them.
     again = [m for m in _cli_lines(caplog, "") if m.endswith(relogged)]
-    assert (again[0].startswith("AUDIT: ") and len(again) == 3) if forwarder else not again, again
+    if not forwarder:
+        assert not again, again
+        return
+    assert again[0].startswith("AUDIT: "), again
+    assert [m.split(":", 1)[0] for m in again[1:3]] == [
+        "[security] remote_debug_enabled",
+        f"[security] {REMOTE_DEBUG_ACCEPTANCE_KEY}",
+    ], again
 
 
 def _residual_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
