@@ -37,15 +37,29 @@ level, and the engine listener sends none.
 
 The stdlib's own error answers are ``text/plain``, not its default HTML page. The comment on the
 handler's ``error_content_type`` names the paths that were read.
+
+**The sink refuses to start on a Python whose answers it cannot floor** (BACKLOG #1121; owner
+ruling R1 of the vault's ``ASVS-OWNER-RULINGS-2026-10-23-BATCH340``). The project requires Python
+``>=3.14`` and does not pin a patch release, and the stdlib handler changed which answers it writes
+bare between patch releases. So :meth:`HttpSink.start` first runs :func:`self_test`, which serves
+each request in :data:`SELF_TEST_CASES` on a throwaway loopback server built from this module's
+handler, on the running Python, and reads the bytes back. If any final answer lacks a
+:data:`BASELINE_RESPONSE_HEADERS` line, carries one twice, or names no ``frame-ancestors 'none'``
+policy, it logs at ERROR and raises :class:`SinkSelfTestError` before the sink's own port is
+bound. An answer family a later Python adds that the table does not name stays uncovered; R1
+accepts that as a residual.
 """
 
 from __future__ import annotations
 
+import http.client
 import logging
 import socket
 import socketserver
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 
@@ -57,8 +71,12 @@ __all__ = [
     "LOOPBACK",
     "REDACTED",
     "REDACTED_HEADERS",
+    "SELF_TEST_CASES",
     "HttpSink",
+    "SelfTestCase",
+    "SinkSelfTestError",
     "check_status",
+    "self_test",
 ]
 
 _log = logging.getLogger(__name__)
@@ -103,6 +121,203 @@ def check_status(status: int) -> None:
         raise ValueError(f"status must be a final HTTP status (200-599), got {status}")
 
 
+class SinkSelfTestError(RuntimeError):
+    """The sink's answers on this Python lack the baseline headers, so the sink will not start."""
+
+
+@dataclass(frozen=True)
+class SelfTestCase:
+    """One answer family :func:`self_test` drives, and ``tests/test_harness_http_headers.py`` too.
+
+    ``statuses`` are the header blocks the suite expects, interim ones included. The self-test
+    does not refuse on a status: it checks the headers on whatever final answer comes back.
+    """
+
+    name: str
+    request: bytes
+    statuses: tuple[int, ...]
+    #: The status the sink is configured to answer with.
+    sink_status: int = 200
+    #: The request declares a body it never finishes, and the peer keeps its side open: the 408.
+    stalls: bool = False
+
+
+#: The longest request line the stdlib reads: a literal in http/server.py's handle_one_request,
+#: with no name to read it from. A release that raises it reads the 414 case, a two-word line
+#: ended by the half-close, as an HTTP/0.9 GET instead of answering the 414.
+_REQUEST_LINE_LIMIT = 65536
+#: The longest header line: http.client's private _MAXLINE, which parse_headers reads.
+_HEADER_LINE_LIMIT: int = getattr(http.client, "_MAXLINE", 65536)
+#: The most headers parse_headers reads: http.client's private _MAXHEADERS.
+_HEADER_COUNT_LIMIT: int = getattr(http.client, "_MAXHEADERS", 100)
+_GET_LINE = b"GET /x HTTP/1.1\r\n"
+_POST = b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
+
+#: Every answer family the sink writes that the header suite pins: the sink's own answers and
+#: refusals, and the answers the stdlib handler writes before the sink's code runs. Each request
+#: ends where the stdlib stops reading on Python 3.14, because the stdlib closes without draining
+#: and a close with input still unread can reset the connection and discard the answer: after the
+#: request line when it answers from that line alone, after the blank line when it reads headers
+#: first. Which of the HTTP/0.9 cases a given stdlib answers bare depends on the patch level.
+SELF_TEST_CASES: tuple[SelfTestCase, ...] = (
+    SelfTestCase("200", _POST, (200,)),
+    SelfTestCase("configured-400", _POST, (400,), sink_status=400),
+    SelfTestCase("configured-503", _POST, (503,), sink_status=503),
+    SelfTestCase("get", b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n", (200,)),
+    SelfTestCase("head", b"HEAD /x HTTP/1.1\r\nHost: x\r\n\r\n", (200,)),
+    # --- the sink's own refusals ---------------------------------------------------------------
+    SelfTestCase(
+        "413-over-cap",
+        b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999999\r\n\r\n",
+        (413,),
+    ),
+    SelfTestCase("411-no-length", b"POST /x HTTP/1.1\r\nHost: x\r\n\r\n", (411,)),
+    SelfTestCase(
+        "400-transfer-encoding",
+        b"POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n",
+        (400,),
+    ),
+    SelfTestCase(
+        "408-stalled-body",
+        b"POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nonly ten b",
+        (408,),
+        stalls=True,
+    ),
+    # --- answers the stdlib handler writes itself, before the sink's handler runs --------------
+    SelfTestCase("stdlib-400-malformed", b"NOT A REQUEST\r\n", (400,)),
+    SelfTestCase("stdlib-501-method", b"BREW /x HTTP/1.1\r\nHost: x\r\n\r\n", (501,)),
+    SelfTestCase("stdlib-505-version", b"GET /x HTTP/3.0\r\n", (505,)),
+    SelfTestCase("stdlib-414-long-line", b"GET /".ljust(_REQUEST_LINE_LIMIT + 1, b"a"), (414,)),
+    SelfTestCase(
+        "stdlib-431-long-header",
+        _GET_LINE + b"X-Long: ".ljust(_HEADER_LINE_LIMIT + 1, b"a"),
+        (431,),
+    ),
+    # One header past http.client's limit, with no blank line: the stdlib refuses as it reads it.
+    SelfTestCase(
+        "stdlib-431-many-headers",
+        _GET_LINE + b"X-H: v\r\n" * (_HEADER_COUNT_LIMIT + 1),
+        (431,),
+    ),
+    SelfTestCase(
+        "stdlib-100-continue",
+        b"POST /x HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n{}",
+        (100, 200),
+    ),
+    # --- requests some stdlib answers in HTTP/0.9 form, with no header block -------------------
+    SelfTestCase("http-0.9-two-word-request", b"GET /x\r\n", (200,)),
+    SelfTestCase("http-0.9-named-version", b"GET /x HTTP/0.9\r\n\r\n", (200,)),
+    SelfTestCase("http-0.9-stdlib-501", b"BREW /x HTTP/0.9\r\n\r\n", (501,)),
+    SelfTestCase("http-0.9-one-word-line", b"FOO\r\n", (400,)),
+    SelfTestCase("http-0.9-two-word-not-get", b"POST /x\r\n", (400,)),
+)
+
+#: How long the self-test's stalled-body probe waits for the body it was promised. Its bytes are
+#: queued before the probe's handler reads, so a short wait still ends on the missing body.
+_SELF_TEST_STALL_SECONDS = 0.1
+
+
+def _exchange(port: int, request: bytes, *, half_close: bool) -> bytes:
+    """Send raw bytes to a loopback port and read until the server closes. ``half_close`` tells
+    the server no more is coming, so a refusal that discards the rest ends at once."""
+    with socket.create_connection((LOOPBACK, port), READ_TIMEOUT_SECONDS) as conn:
+        conn.sendall(request)
+        if half_close:
+            conn.shutdown(socket.SHUT_WR)
+        chunks = []
+        try:
+            while chunk := conn.recv(65536):
+                chunks.append(chunk)
+        except ConnectionError:
+            # The server closed with unread input still queued. What arrived is the answer; with
+            # nothing arrived, the reset is the finding, and it is raised as itself.
+            if not chunks:
+                raise
+    return b"".join(chunks)
+
+
+def _csp_denies_framing(value: str) -> bool:
+    """Whether one ``Content-Security-Policy`` field names ``frame-ancestors 'none'``. Parsed by
+    directive, not by substring: a substring would match the token inside another directive's
+    value, and directive names are case-insensitive."""
+    for directive in value.split(";"):
+        tokens = directive.split()
+        if tokens and tokens[0].lower() == "frame-ancestors":
+            # Only a policy's first frame-ancestors directive counts; a repeat is ignored.
+            return [source.lower() for source in tokens[1:]] == ["'none'"]
+    return False
+
+
+def _floor_faults(raw: bytes) -> list[str]:
+    """What the final answer in ``raw`` lacks, as sentences; empty when it carries the floor.
+    An interim 1xx is not checked: R3 in the vault's ASVS-OWNER-RULINGS-2026-09-28-BATCH171 puts
+    it outside the verb."""
+    if not raw:
+        return ["nothing was answered"]
+    rest = raw
+    while rest.startswith(b"HTTP/"):
+        head, _, rest = rest.partition(b"\r\n\r\n")
+        status_line, *lines = head.decode("latin-1").split("\r\n")
+        status = (status_line.split(" ", 2) + ["?"])[1]
+        if status.startswith("1"):
+            continue
+        fields: dict[str, list[str]] = {}
+        for line in lines:
+            name, _, value = line.partition(":")
+            fields.setdefault(name.strip().lower(), []).append(value.strip())
+        faults = [
+            f"the {status} lacks {name}: {value!r} once (it carries {fields.get(name.lower(), [])})"
+            for name, value in BASELINE_RESPONSE_HEADERS
+            if fields.get(name.lower()) != [value]
+        ]
+        if not any(map(_csp_denies_framing, fields.get("content-security-policy", []))):
+            faults.append(f"the {status} names no frame-ancestors 'none' policy")
+        return faults
+    return ["the answer has no final status line and header block (HTTP/0.9 form)"]
+
+
+def _probe(case: SelfTestCase) -> list[str]:
+    """Serve ``case`` on a throwaway loopback server built from this module's handler, and return
+    what its answer lacks. The probe's sink is never started, and its record is discarded."""
+    handler = _handler_for(
+        HttpSink(status=case.sink_status, reply_body=b'{"ok":1}'),
+        read_timeout=_SELF_TEST_STALL_SECONDS if case.stalls else None,
+    )
+    # A short poll: every sink start waits for these probes to stop.
+    server, thread = _listen(
+        LOOPBACK, 0, handler, "harness-http-sink-self-test", poll_interval=0.01
+    )
+    try:
+        raw = _exchange(int(server.server_address[1]), case.request, half_close=not case.stalls)
+    except OSError as exc:
+        return [f"the probe could not read an answer: {exc!r}"]
+    finally:
+        _shut(server, thread)
+    return _floor_faults(raw)
+
+
+def self_test() -> None:
+    """Drive every :data:`SELF_TEST_CASES` answer on this Python, and raise
+    :class:`SinkSelfTestError` (after logging it at ERROR) if any lacks the baseline headers."""
+    with ThreadPoolExecutor(
+        len(SELF_TEST_CASES), thread_name_prefix="harness-sink-self-test"
+    ) as pool:
+        results = list(pool.map(_probe, SELF_TEST_CASES))
+    failed = [
+        f"{case.name}: {fault}"
+        for case, faults in zip(SELF_TEST_CASES, results, strict=True)
+        for fault in faults
+    ]
+    if failed:
+        message = (
+            f"the harness HTTP sink will not start: on Python {sys.version.split()[0]}, "
+            f"{len(failed)} answer fault(s) leave the baseline security headers off: "
+            + "; ".join(failed)
+        )
+        _log.error("%s", message)
+        raise SinkSelfTestError(message)
+
+
 class HttpSink(Sink):
     """Records every request a loopback HTTP peer receives and answers ``status``."""
 
@@ -144,24 +359,17 @@ class HttpSink(Sink):
         return self._bound_port or self._requested_port
 
     def start(self) -> None:
-        server = _SinkServer((self.host, self._requested_port), _handler_for(self))
-        self._server = server
-        self._bound_port = int(server.server_address[1])
-        self._thread = threading.Thread(
-            target=server.serve_forever,
-            kwargs={"poll_interval": 0.1},
-            daemon=True,
-            name=f"harness-{self.kind}-sink",
+        # Before the bind, so a sink that would answer without the baseline never listens.
+        self_test()
+        self._server, self._thread = _listen(
+            self.host, self._requested_port, _handler_for(self), f"harness-{self.kind}-sink"
         )
-        self._thread.start()
+        self._bound_port = int(self._server.server_address[1])
 
     def stop(self) -> None:
         if self._server is None:
             return
-        self._server.shutdown()
-        self._server.server_close()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
+        _shut(self._server, self._thread)
         self._server = None
 
     def record_request(self, record: Record) -> None:
@@ -192,12 +400,45 @@ class _SinkServer(ThreadingHTTPServer):
         _log.debug("harness HTTP sink: a request handler failed", exc_info=True)
 
 
-def _handler_for(sink: HttpSink) -> type[BaseHTTPRequestHandler]:
+def _listen(
+    host: str,
+    port: int,
+    handler: type[BaseHTTPRequestHandler],
+    name: str,
+    *,
+    poll_interval: float = 0.1,
+) -> tuple[_SinkServer, threading.Thread]:
+    """Bind ``handler`` on ``(host, port)`` and serve it on a daemon thread. ``poll_interval`` is
+    how often the serving loop checks for a stop, so it bounds how long :func:`_shut` waits."""
+    server = _SinkServer((host, port), handler)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": poll_interval},
+        daemon=True,
+        name=name,
+    )
+    thread.start()
+    return server, thread
+
+
+def _shut(server: ThreadingHTTPServer, thread: threading.Thread | None) -> None:
+    server.shutdown()
+    server.server_close()
+    if thread is not None:
+        thread.join(timeout=5)
+
+
+def _handler_for(
+    sink: HttpSink, *, read_timeout: float | None = None
+) -> type[BaseHTTPRequestHandler]:
+    """The handler class for ``sink``. ``read_timeout`` replaces :data:`READ_TIMEOUT_SECONDS`
+    for one socket read; only the self-test's stalled-body probe sets it."""
+
     class Handler(BaseHTTPRequestHandler):
         # Answer with HTTP/1.1 framing but close each connection: the engine's urllib opener sends
         # one request per connection, and a closed connection can never hold a stop open.
         protocol_version = "HTTP/1.1"
-        timeout = READ_TIMEOUT_SECONDS
+        timeout = READ_TIMEOUT_SECONDS if read_timeout is None else read_timeout
 
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002  (stdlib name)
             return  # silenced: a request line can carry a message-derived path
