@@ -1782,7 +1782,8 @@ class IssuerIndex:
         namesake. A CA whose extensions ``cryptography`` cannot read may or may not be one strict
         verification refuses, or have a key identifier OpenSSL reads, so that case gets the warning
         that every client may be refused, says what it cannot tell, and says to check the CA too.
-        The index does not count a namesake toward the
+        A CA whose issuer name ``cryptography`` cannot read gets the namesake wording, as a CA
+        refused for a reason this does not read does. The index does not count a namesake toward the
         same-DN ambiguity unless it signs itself, so :meth:`unmatched_keys` may give no reason, and
         this is the only start signal. Names are grouped by :func:`_namesake_key`. A warning only:
         it changes no allow, deny or refusal."""
@@ -1792,9 +1793,8 @@ class IssuerIndex:
                 by_name.setdefault(_namesake_key(anchor.cert.subject), []).append(anchor)
         warnings: list[str] = []
         for anchors in by_name.values():
-            others = sorted(
-                (anchor for anchor in anchors if not anchor.ca), key=lambda a: a.position
-            )
+            anchors.sort(key=lambda a: a.position)  # each list, and each warning, in block order
+            others = [anchor for anchor in anchors if not anchor.ca]
             ca_anchors = [anchor for anchor in anchors if anchor.ca]
             if not others or not ca_anchors:
                 continue  # no namesake here, so read no extension for nothing
@@ -1847,29 +1847,43 @@ class IssuerIndex:
 
 def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
     """At least some of the reasons strict verification refuses ``ca`` as a CA, read from its own
-    version and extensions, or ``None`` when ``cryptography`` cannot read them. The reasons read
-    are not complete: an empty list means none of these was found, not that strict verification
-    accepts it.
+    version and extensions, or ``None`` when ``cryptography`` cannot read its extensions or its
+    issuer name. The reasons read are not complete: an empty list means none of these was found,
+    not that strict verification accepts it.
 
     Each was measured on OpenSSL 3.5.7, alone in a CA, to refuse a version-3 and a version-1
     client (BACKLOG #4948); a CA that is not self-signed was measured beside its issuer, as
     strict verification checks its authority key identifier only once it has a chain past it.
-    Whether it is self-signed is read by name, grouped as :func:`_namesake_key` groups names, at
-    least as loosely as OpenSSL, so a root is not called one with an issuer. OpenSSL refuses a CA
+    Whether it is self-signed is read by name: it is when its issuer and subject are one name as
+    :func:`_namesake_key` groups names, which folds white space, or as :func:`_crl_issuer_key`
+    does, which reads a one-byte text type as Latin-1, as OpenSSL reads it. That is still not
+    OpenSSL's reading. At least an issuer that differs from the subject both in white space and
+    in such a value is one name to OpenSSL and reads here as another (measured on OpenSSL 3.5.7),
+    so such a root can be named for an authority key identifier it may omit. OpenSSL refuses a CA
     with no basic constraints as an invalid CA before any other strict check, so then only that
     reason is named. OpenSSL reads a certificate with a key usage without ``keyCertSign`` as no
     CA, so that reason reaches here only where its read and this one differ."""
     if ca.cert.version == x509.Version.v1:
+        try:
+            bare = not len(ca.cert.extensions)
+        except (x509.DuplicateExtension, ValueError, *_UNREAD_EXTENSIONS):
+            bare = False  # an extension that does not read is still there
         return [
             "it is version 1, so it has no extensions: no basic constraints, key usage or subject "
             "key identifier"
+            if bare
+            # Measured on OpenSSL 3.5.7: strict verification refuses it with error 93.
+            else "it is version 1 but carries extensions, which strict verification refuses in a "
+            "certificate before version 3"
         ]
     try:
         extensions = ca.cert.extensions
+        # A self-signed CA may omit its authority key identifier; one with an issuer may not.
+        issued = not _self_issued(ca.cert)
     except (x509.DuplicateExtension, ValueError, *_UNREAD_EXTENSIONS) as exc:
         _log.debug(
-            "certificate block %d: its extensions cannot be read (%s); the namesake warning "
-            "cannot tell whether strict verification refuses it as a CA",
+            "certificate block %d: its extensions or issuer name cannot be read (%s); the namesake "
+            "warning cannot tell whether strict verification refuses it as a CA",
             ca.position,
             type(exc).__name__,
         )
@@ -1893,8 +1907,6 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
             faults.append("its subject key identifier is critical")
     except x509.ExtensionNotFound:
         faults.append("it has no subject key identifier")
-    # A self-signed CA may omit its authority key identifier; one with an issuer may not.
-    issued = _namesake_key(ca.cert.issuer) != _namesake_key(ca.cert.subject)
     try:
         authority = extensions.get_extension_for_class(x509.AuthorityKeyIdentifier)
     except x509.ExtensionNotFound:
@@ -1914,9 +1926,24 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
     return faults
 
 
+def _self_issued(cert: x509.Certificate) -> bool:
+    """Whether ``cert``'s issuer and subject are one name, as :func:`_strict_ca_faults` reads it.
+    Raises ``ValueError`` when ``cryptography`` cannot read the issuer name, or its string types
+    (:func:`_crl_issuer_key`)."""
+    issuer, subject = cert.issuer, cert.subject
+    return _namesake_key(issuer) == _namesake_key(subject) or (
+        _crl_issuer_key(issuer) == _crl_issuer_key(subject)
+    )
+
+
 def _ca_cause_warning(ca: _Anchor, others: list[_Anchor], faults: list[str]) -> str:
     """The one namesake warning for ``ca``, a CA :func:`_strict_ca_faults` found ``faults`` in,
-    naming every certificate in ``others``, each one that is no CA with its subject."""
+    naming every certificate in ``others``, each one that is no CA with its subject.
+
+    Two terms of the remedy were measured with ``openssl verify -x509_strict`` on OpenSSL 3.5.7.
+    With a CRL check, a leaf whose CA signed the CRL under a key usage without ``cRLSign`` is
+    refused (error 35), and without that check it is not. An intermediate whose authority key
+    identifier carries a key identifier other than its issuer's finds no issuer (error 2)."""
     named = _listed(f"{other.position} ({other.subject})" for other in others)
     numbers = _listed(str(other.position) for other in others)
     blocks, is_, cas, has, it = (
@@ -1932,10 +1959,11 @@ def _ca_cause_warning(ca: _Anchor, others: list[_Anchor], faults: list[str]) -> 
         f"every client certificate whose chain runs through block {at}, whether or not {blocks} "
         f"{numbers} {is_} loaded, because it refuses block {at} as a CA for at least {reasons}: "
         f"{'; '.join(faults)}. Re-issue block {at}, with the same subject and key, as a version-3 "
-        "CA with at least critical basic constraints CA:TRUE, key usage keyCertSign, a subject key "
-        "identifier equal to the key identifier its client certificates' authority key "
-        "identifiers carry, and, unless it is self-signed, an authority key identifier carrying a "
-        "key identifier, neither key identifier critical; a client certificate whose authority "
+        "CA with at least critical basic constraints CA:TRUE, key usage keyCertSign, and cRLSign "
+        f"too where the hop checks a CRL that block {at} signs, a subject key identifier equal to "
+        "the key identifier its client certificates' authority key identifiers carry, and, unless "
+        "it is self-signed, an authority key identifier carrying its issuer's subject key "
+        "identifier, neither key identifier critical; a client certificate whose authority "
         f"key identifier names the issuer and serial number of block {at}, or another key "
         f"identifier, must then be re-issued too. Or remove block {at} if it is not needed. While "
         f"block {at} stays loaded, also remove {blocks} {numbers} or re-issue {it} under another "

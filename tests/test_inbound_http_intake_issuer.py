@@ -1063,17 +1063,22 @@ def _tlv_content(element: bytes) -> bytes:
 
 
 def _as_version_1(v3: x509.Certificate, key: ec.EllipticCurvePrivateKey) -> x509.Certificate:
-    """``v3``, built with no extensions, as version 1, signed again by ``key``. ``cryptography``
-    builds only version 3, so the version field is cut from the to-be-signed bytes."""
+    """``v3`` as version 1, signed again by ``key``, with any extensions it was built with kept.
+    ``cryptography`` builds only version 3, so the version field is cut from the to-be-signed
+    bytes."""
     fields = _tlv_content(v3.tbs_certificate_bytes)
     assert fields.startswith(_VERSION_3)
-    tbs = seq(fields.removeprefix(_VERSION_3))
-    signature = key.sign(tbs, ec.ECDSA(hashes.SHA256()))
-    cert = x509.load_der_x509_certificate(
-        seq(tbs, seq(oid("1.2.840.10045.4.3.2")), tlv(0x03, b"\x00" + signature))
-    )
-    assert cert.version == x509.Version.v1 and len(cert.extensions) == 0  # the premise
+    cert = x509.load_der_x509_certificate(_signed_der(fields.removeprefix(_VERSION_3), key))
+    assert cert.version == x509.Version.v1  # the premise
+    assert len(cert.extensions) == len(v3.extensions)
     return cert
+
+
+def _signed_der(tbs_fields: bytes, key: ec.EllipticCurvePrivateKey) -> bytes:
+    """A certificate's DER: ``tbs_fields`` as its to-be-signed fields, signed by ``key``."""
+    tbs = seq(tbs_fields)
+    signature = key.sign(tbs, ec.ECDSA(hashes.SHA256()))
+    return seq(tbs, seq(oid("1.2.840.10045.4.3.2")), tlv(0x03, b"\x00" + signature))
 
 
 def _v1_bundle(tmp_path: Path, signer: _CaPair) -> Path:
@@ -1188,9 +1193,10 @@ async def test_a_namesake_of_a_ca_with_no_key_identifier_names_the_ca_as_the_cau
 #: The remedy the CA-cause namesake warning gives, for a CA in block 1, up to the namesakes.
 _CA_REMEDY = (
     "Re-issue block 1, with the same subject and key, as a version-3 CA with at least critical "
-    "basic constraints CA:TRUE, key usage keyCertSign, a subject key identifier equal to the key "
-    "identifier its client certificates' authority key identifiers carry, and, unless it is "
-    "self-signed, an authority key identifier carrying a key identifier, neither key identifier "
+    "basic constraints CA:TRUE, key usage keyCertSign, and cRLSign too where the hop checks a CRL "
+    "that block 1 signs, a subject key identifier equal to the key identifier its client "
+    "certificates' authority key identifiers carry, and, unless it is self-signed, an authority "
+    "key identifier carrying its issuer's subject key identifier, neither key identifier "
     "critical; a client certificate whose authority key identifier names the issuer and serial "
     "number of block 1, or another key identifier, must then be re-issued too. Or remove block 1 "
     "if it is not needed. While block 1 stays loaded, also remove"
@@ -1200,6 +1206,8 @@ _CA_REMEDY = (
 _CA_FAULTS = {
     "version-1": "it is version 1, so it has no extensions: no basic constraints, key usage or "
     "subject key identifier",
+    "version-1-with-extensions": "it is version 1 but carries extensions, which strict "
+    "verification refuses in a certificate before version 3",
     "no-basic-constraints": "it has no basic constraints",
     "basic-constraints-not-critical": "its basic constraints are not critical",
     "no-key-usage": "it has no key usage",
@@ -1215,14 +1223,21 @@ _CA_FAULTS = {
 }
 
 
-def _strict_ca(*defects: str, akid: bool = True, by: _CaPair | None = None) -> _CaPair:
-    """A CA ``Acme CA``, self-signed or signed by ``by``, with each of ``defects`` named in
-    :data:`_CA_FAULTS`, or with none: critical ``CA:TRUE`` basic constraints, a key usage with
-    ``keyCertSign``, a subject key identifier and, with ``akid``, an authority key identifier,
-    neither critical."""
+def _strict_ca(
+    *defects: str,
+    akid: bool = True,
+    by: _CaPair | None = None,
+    subject: x509.Name | None = None,
+    issuer_name: x509.Name | None = None,
+) -> _CaPair:
+    """A CA ``Acme CA``, or ``subject``, self-signed or signed by ``by``, with each of ``defects``
+    named in :data:`_CA_FAULTS`, or with none: critical ``CA:TRUE`` basic constraints, a key usage
+    with ``keyCertSign``, a subject key identifier and, with ``akid``, an authority key
+    identifier, neither critical. ``issuer_name`` overrides the issuer field the signer writes."""
     key = ec.generate_private_key(ec.SECP256R1())
-    name = _dn((NameOID.COMMON_NAME, "Acme CA"))
+    name = subject or _dn((NameOID.COMMON_NAME, "Acme CA"))
     issuer, signer = (name, key) if by is None else (by[0].subject, by[1])
+    issuer = issuer_name or issuer
     now = datetime.datetime.now(datetime.UTC)
     builder = (
         x509.CertificateBuilder()
@@ -1271,7 +1286,10 @@ def _strict_ca(*defects: str, akid: bool = True, by: _CaPair | None = None) -> _
             x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()),
             critical="authority-key-identifier-critical" in defects,
         )
-    return builder.sign(signer, hashes.SHA256()), key
+    cert = builder.sign(signer, hashes.SHA256())
+    if "version-1-with-extensions" in defects:
+        cert = _as_version_1(cert, signer)
+    return cert, key
 
 
 async def _ca_alone_refuses(
@@ -1383,6 +1401,22 @@ def test_a_ca_cause_warning_is_given_once_per_ca_naming_every_namesake() -> None
     assert "also remove blocks 1, 3 and 4 or re-issue them under another subject" in warning
 
 
+def test_several_cas_with_one_name_are_warned_about_in_block_order() -> None:
+    """Two CAs strict verification refuses, whose names differ only in ASCII case, beside a
+    namesake. One warning is given per CA, in block order. Before this fix, on this branch, they
+    came in the order the exact names were first read, so the CA in block 3 was warned about
+    before the one in block 2 (BACKLOG #4948)."""
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "ACME CA")), root)
+    acme = _strict_ca("no-key-usage")
+    upper = _new_ca(_dn((NameOID.COMMON_NAME, "ACME CA")), key_usage=True, key_ids=False)
+    cadata = (_pem(namesake) + _pem(acme[0]) + _pem(upper[0])).decode("ascii")
+    warnings = IssuerIndex(cadata).namesake_warnings()
+    assert len(warnings) == 2, warnings
+    assert "the subject of the CA certificate in block 2." in warnings[0], warnings
+    assert "the subject of the CA certificate in block 3." in warnings[1], warnings
+
+
 @pytest.mark.parametrize("akid", [True, False], ids=["conforming", "no-authority-key-id"])
 async def test_a_namesake_of_a_ca_strict_verification_admits_still_names_the_namesake(
     tmp_path: Path, akid: bool
@@ -1400,6 +1434,28 @@ async def test_a_namesake_of_a_ca_strict_verification_admits_still_names_the_nam
     assert "as a CA for at least" not in warning, warning
     assert not any(fault in warning for fault in _CA_FAULTS.values()), warning
     assert await _ca_alone_refuses(tmp_path, acme) == (False, False)
+
+
+async def test_a_ca_with_an_issuer_and_an_authority_key_identifier_is_admitted_beside_it(
+    tmp_path: Path,
+) -> None:
+    """Control for the two authority key identifier faults: a CA its root issued, with an
+    authority key identifier carrying the root's key identifier, loaded beside the root. No fault
+    is named, and a strict listener admits a version-3 and a version-1 client of it. So the
+    refusals measured for a CA with no authority key identifier, or one carrying no key
+    identifier, come from that fault and not from the CA having an issuer (BACKLOG #4948)."""
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    acme = _strict_ca(by=root)
+    assert acme[0].issuer == root[0].subject  # the premise: it is not self-signed
+    warning = _ca_namesake_warning(acme, root)
+    assert "that CA issued with no authority key identifier" in warning, warning
+    assert "as a CA for at least" not in warning, warning
+    source = await _started(_source(tmp_path, [acme[0], root[0]], {"CN=Acme CA": [SUBJECT]}))
+    try:
+        assert await _admitted(source, _bundle(tmp_path, acme)) == 202
+        assert await _admitted(source, _v1_bundle(tmp_path, acme)) == 202
+    finally:
+        await source.stop()
 
 
 async def test_a_root_whose_names_differ_only_in_string_type_is_self_signed(
@@ -1435,6 +1491,30 @@ async def test_a_root_whose_names_differ_only_in_string_type_is_self_signed(
     (anchor,) = IssuerIndex(_pem(root).decode("ascii"))._by_subject_name[subject]
     assert anchor.ca and pki._strict_ca_faults(anchor) == []
     assert await _ca_alone_refuses(tmp_path, (root, key)) == (False, False)
+
+
+async def test_a_root_whose_issuer_openssl_reads_as_latin_1_is_self_signed(tmp_path: Path) -> None:
+    """A root with no authority key identifier, its issuer's common name a T61String holding the
+    UTF-8 bytes of a name with one letter outside ASCII, and its subject's the UTF8String those
+    bytes spell when read one byte to a character. OpenSSL reads a T61String that way, as
+    Latin-1, so the two are one name to it and the root is self-signed: measured on OpenSSL 3.5.7,
+    a strict listener trusting it alone admits its clients. ``cryptography`` decodes the bytes as
+    UTF-8, so read by :func:`pki._namesake_key` alone the root had an issuer, and was named for
+    an authority key identifier it may omit (BACKLOG #4948)."""
+    subject = _dn((NameOID.COMMON_NAME, "AcmÃ© CA"))
+    t61 = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Acmé CA", _ASN1Type.T61String)])
+    root, key = _strict_ca(akid=False, subject=subject, issuer_name=t61)
+    assert b"\x14\x08Acm\xc3\xa9 CA" in root.tbs_certificate_bytes  # the premise
+    assert pki._namesake_key(root.issuer) != pki._namesake_key(root.subject)
+    (anchor,) = IssuerIndex(_pem(root).decode("ascii"))._by_subject_name[subject]
+    assert anchor.ca and pki._strict_ca_faults(anchor) == []
+    issuer_key = root.subject.rfc4514_string()
+    source = await _started(_source(tmp_path, [root], {issuer_key: [SUBJECT]}))
+    try:
+        assert await _admitted(source, _bundle(tmp_path, (root, key))) == 202
+        assert await _admitted(source, _v1_bundle(tmp_path, (root, key))) == 202
+    finally:
+        await source.stop()
 
 
 async def test_a_key_usage_without_key_cert_sign_is_no_ca_to_openssl(tmp_path: Path) -> None:
@@ -1537,6 +1617,36 @@ def test_a_namesake_whose_extensions_cannot_be_read_is_warned_about_without_rais
     assert _openssl_loads(cadata) == 2  # the premise: OpenSSL loads it
     (warning,) = IssuerIndex(cadata).namesake_warnings()
     assert "block 2" in warning and "refuse every client certificate of that CA" in warning
+
+
+def test_a_ca_whose_issuer_name_cannot_be_read_is_warned_about_without_raising(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A CA whose issuer name is a T61String holding bytes that are not UTF-8. OpenSSL loads it as
+    a CA, and ``cryptography`` parses it but raises ``ValueError`` reading its issuer. The check
+    for a CA strict verification refuses read that issuer outside any guard, to tell whether the
+    CA is self-signed, so before this fix, on this branch, the namesake warning raised out of the
+    listener's start and refused it. It now falls back to the namesake wording (BACKLOG #4948)."""
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Root ZZ", _ASN1Type.T61String)])
+    v3 = _strict_ca(by=root, issuer_name=issuer)[0]
+    fields = _tlv_content(v3.tbs_certificate_bytes)
+    assert fields.count(b"\x14\x07Root ZZ") == 1
+    der = _signed_der(fields.replace(b"\x14\x07Root ZZ", b"\x14\x07Root \xe9\xe9"), root[1])
+    with pytest.raises(ValueError):  # the premise: cryptography cannot read the issuer
+        _ = x509.load_der_x509_certificate(der).issuer
+    assert pki._openssl_reads_as_ca(der) is True  # and OpenSSL loads it as a CA
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root)
+    cadata = _wrapped(der) + _pem(namesake)
+    (warning,) = IssuerIndex(cadata.decode("ascii")).namesake_warnings()
+    assert warning.startswith("certificate block 2 (CN=Acme CA) is not a CA"), warning
+    assert "that CA issued with no authority key identifier" in warning, warning
+    assert "as a CA for at least" not in warning, warning
+    # The start builds the listener and logs the warning.
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+        _source(tmp_path, [], {"CN=Acme CA": [SUBJECT]}, cadata=cadata)
+    warned = [r.getMessage() for r in caplog.records]
+    assert any("certificate block 2 (CN=Acme CA) is not a CA" in m for m in warned), warned
 
 
 @pytest.mark.parametrize("surface", ["api", "mllp"])
