@@ -5247,9 +5247,9 @@ def audit_seal_next(
 
 #: A genesis record writes a store id (vault BACKLOG #3411) as the lowercase hex of its bytes.
 _AUDIT_STORE_ID_FIELD: Final = "store_id"
-#: Exactly ``2 * STORE_ID_BYTES`` lowercase hex digits. The width is a literal, not interpolated, so
-#: the ReDoS scanner in tests/test_security_static.py reads the pattern; a test pins it to the
-#: constant.
+#: ``2 * STORE_ID_BYTES`` lowercase hex digits, unanchored: use it with ``fullmatch`` only. The width
+#: is a literal, not interpolated, so the ReDoS scanner in tests/test_security_static.py reads the
+#: pattern; a test pins it to the constant.
 _AUDIT_STORE_ID_HEX: Final = re.compile("[0-9a-f]{32}")
 _ABSENT: Final = object()
 
