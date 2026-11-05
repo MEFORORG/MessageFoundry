@@ -232,6 +232,15 @@ MISCONFIGURED_ABORT = "directory_misconfigured"
 PAGING_DEADLINE = "group_search_deadline"
 PAGING_CAP = "group_search_cap"
 
+#: The reason slug of an account whose own probe failed to reach the directory, read
+#: :attr:`ProbeOutcome.UNAVAILABLE` with no paging cause, on ``[auth].ad_reconcile_outage_passes``
+#: of its probes running, each on a pass that reached the directory for another account (BACKLOG
+#: #3100 closing step 2). The whole-directory outage has its own page (:data:`OUTAGE_ABORT`); this
+#: is the bound on one account the directory keeps failing to answer for while it answers others,
+#: which is never struck or revoked while that lasts. It pages once per account as it enters
+#: that state (``AuthService._note_unreached_accounts``).
+UNREACHED_ACCOUNT = "account_unreachable"
+
 #: The outcomes that judge nothing about the account: no strike, no recorded outcome (rule item 4).
 _UNJUDGED = frozenset(
     {
@@ -338,6 +347,12 @@ class ReconcilePlan:
     #: :data:`PAGING_DEADLINE` or :data:`PAGING_CAP`. An account already in that state is not
     #: here, so each pages once per state change. Set on every pass, an outage-shaped one included.
     paging_refused: tuple[tuple[str, str, str], ...] = ()
+    #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3100 closing
+    #: step 2): ``(user_id, username, probes)`` of each account that has just ENTERED the state
+    #: :data:`UNREACHED_ACCOUNT` names, ``probes`` being how many of its probes running read it
+    #: unreachable. An account already in that state is not here, so each pages once per state
+    #: change. Empty on a pass that did not reach the directory.
+    unreached: tuple[tuple[str, str, int], ...] = ()
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709): how many
     #: passes running, this one included, have read the directory unreachable
     #: (:attr:`directory_outage`), in this process. 0 on a pass that reached it. A pass whose

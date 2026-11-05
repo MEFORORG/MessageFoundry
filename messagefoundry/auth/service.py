@@ -3517,6 +3517,13 @@ class AuthService:
         #: account per state change: `_record_paging_refusals` sets it, `_note_paging_refusals`
         #: re-arms it, and the prune drops an account that left.
         self._reconcile_paging_refused: dict[str, str] = {}
+        #: user_id -> how many of that account's probes running read it unreachable on a pass that
+        #: reached the directory (BACKLOG #3100 closing step 2), and the user_ids whose page for
+        #: it is recorded. In memory, like the strikes: a restart counts again and pages a
+        #: standing one once more. `_note_unreached_accounts` keeps the counts and
+        #: `_record_unreached_accounts` the latch.
+        self._reconcile_unreached_runs: dict[str, int] = {}
+        self._reconcile_unreached_paged: dict[str, int] = {}
         #: The undetermined-wave hold's operator message (ADR 0195). Its own latch, because a held
         #: pass is not an aborted one and so clears `_reconcile_alert`. Set on a pass that holds,
         #: cleared on the next pass that judges and does not. A pass with no candidates, or a
@@ -8024,6 +8031,8 @@ class AuthService:
             # code that is not an answer is also reported at WARNING by ldap.py itself, once per
             # operation and code (BACKLOG #3010), in engine text that never quotes the directory's
             # diagnostic message. An undecodable response does not reach here (the arm above).
+            # An account this arm reads on every probe while the directory answers others is
+            # bounded by a page, not a strike (`_note_unreached_accounts`, BACKLOG #3100 step 2).
             _log.debug("directory probe failed for %s: %s", user.username, exc)
             # Vault BACKLOG #3696. A group search past its deadline or its entry cap is still
             # unjudged, so still UNAVAILABLE, but it says which bound refused it, so it pages.
@@ -8135,6 +8144,76 @@ class AuthService:
             ):
                 entered.append((probe.user_id, probe.username, probe.detail))
         return tuple(entered)
+
+    def _note_unreached_accounts(
+        self, plan: reconcile.ReconcilePlan, probes: Iterable[reconcile.Probe]
+    ) -> reconcile.ReconcilePlan:
+        """Count each account's probes running that failed to reach the directory while the pass
+        reached it for others, and say on the plan which accounts enter the lasting state
+        (BACKLOG #3100 closing step 2).
+
+        An ``LdapError`` probe reads :attr:`~reconcile.ProbeOutcome.UNAVAILABLE`, fail-open: no
+        strike and no revocation. On a pass where every probe fails that is a whole-directory
+        outage, which pages once it lasts (:meth:`_note_directory_outage`). An account the
+        directory fails for on every probe while it answers the rest was bounded by nothing
+        before this: no strike and no alert, so its sessions ran to the absolute cap. Once
+        ``[auth].ad_reconcile_outage_passes`` of its probes running read it so, the pass pages for
+        it once, naming the account, as a paging refusal pages (:meth:`_note_paging_refusals`).
+        The same setting, so one knob says how long a failure lasts before it pages.
+
+        Only a pass that reached the directory counts, on the rule :meth:`_note_directory_outage`
+        reads: an outage pages on its own and leaves every count as it stands, and so does a pass
+        that asked nothing or whose every probe failed or faulted. On a pass that counts, an
+        unreachable probe adds one, and any other answer ends the account's run and re-arms its
+        page. A group search refused for its bound is not counted: the user search answered, and
+        it pages on its own (vault BACKLOG #3696). An account the pass did not probe keeps its
+        count. The latch is set only once the account's row is recorded
+        (:meth:`_record_unreached_accounts`), so a pass that raises before then leaves the next
+        pass to page."""
+        if plan.directory_outage or plan.asked == 0 or plan.probe_fault:
+            return plan
+        runs, paged = self._reconcile_unreached_runs, self._reconcile_unreached_paged
+        threshold = self._settings.ad_reconcile_outage_passes
+        entered: list[tuple[str, str, int]] = []
+        for probe in probes:
+            if probe.outcome is reconcile.ProbeOutcome.UNKEYED:
+                continue  # never asked, so it says nothing about the directory
+            if probe.outcome is not reconcile.ProbeOutcome.UNAVAILABLE or probe.detail is not None:
+                runs.pop(probe.user_id, None)
+                paged.pop(probe.user_id, None)
+                continue
+            runs[probe.user_id] = count = runs.get(probe.user_id, 0) + 1
+            if count >= threshold and probe.user_id not in paged:
+                entered.append((probe.user_id, probe.username, count))
+        return replace(plan, unreached=tuple(entered))
+
+    async def _record_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:
+        """Log, audit and latch each account entering the lasting unreachable state (BACKLOG #3100
+        closing step 2; :meth:`_note_unreached_accounts` says when one enters).
+
+        One WARNING and one ``auth.ad_reconcile_unreached`` row per entry, naming the account as
+        ``actor``, so the page the lifespan task raises for it matches a row (ASVS 8.3.2). Through
+        the reconciler's soft write, after the revocations, as a paging refusal's row is."""
+        for user_id, username, probes in plan.unreached:
+            _log.warning(
+                "directory reconcile: %d probes running of %s failed to reach the directory while "
+                "it answered for other accounts, so its sessions are not revoked while this lasts",
+                probes,
+                scrub_log_argument(username),
+            )
+            await self._audit_reconciler_row(
+                "auth.ad_reconcile_unreached",
+                actor=username,
+                detail=_json(
+                    {
+                        "reason": reconcile.UNREACHED_ACCOUNT,
+                        "probes": probes,
+                        "asked": plan.asked,
+                        "aborted": plan.aborted,
+                    }
+                ),
+            )
+            self._reconcile_unreached_paged[user_id] = probes
 
     def _note_directory_outage(self, plan: reconcile.ReconcilePlan) -> reconcile.ReconcilePlan:
         """Count the passes running that read the directory unreachable, and say on the plan
@@ -8305,6 +8384,8 @@ class AuthService:
         reconcile.prune_ledger(self._reconcile_last_probed, users, rank=float)
         reconcile.prune_ledger(self._reconcile_outcomes, users, rank=reconcile.outcome_rank)
         reconcile.prune_ledger(self._reconcile_paging_refused, users, rank=lambda _cause: 0.0)
+        reconcile.prune_ledger(self._reconcile_unreached_runs, users, rank=float)
+        reconcile.prune_ledger(self._reconcile_unreached_paged, users, rank=float)
         if reconcile.ProbeOutcome.UNDETERMINED not in self._reconcile_outcomes.values():
             # u is 0: every held account has left the record, so the hysteresis has nothing to hold.
             self._reconcile_hold_latched = False
@@ -8406,6 +8487,8 @@ class AuthService:
         plan = replace(plan, paging_refused=self._note_paging_refusals(probes, plan.outcomes))
         # BACKLOG #3709. Before any return below, so the outage's skipped row carries the count.
         plan = self._note_directory_outage(plan)
+        # BACKLOG #3100 closing step 2. Before any return below too, so an aborted pass pages.
+        plan = self._note_unreached_accounts(plan, probes)
         if plan.hold:
             self._advance_hold_standing("held")
         # BACKLOG #2136. A trip makes every candidate unconfirmed until a pass that is not aborted
@@ -8457,6 +8540,7 @@ class AuthService:
                 await self._record_reconcile_fault(plan)
             # Vault BACKLOG #3696. On every abort, an outage-shaped one included, as its page is.
             await self._record_paging_refusals(plan)
+            await self._record_unreached_accounts(plan)  # BACKLOG #3100 closing step 2
             if not plan.judged_nothing:
                 # A held pass writes its own row even when the breaker also aborts it (ADR 0195 rule
                 # item 9). A pass that judged nothing (an outage, or one whose every answer went
@@ -8528,6 +8612,7 @@ class AuthService:
         await self._record_reconcile_fault(plan)
         # Vault BACKLOG #3696. After the revocations too, for the same reason.
         await self._record_paging_refusals(plan)
+        await self._record_unreached_accounts(plan)  # BACKLOG #3100 closing step 2
         # ADR 0195. After the revocations, so a held-row audit write that fails cannot stop a
         # genuine disable or demotion in the same pass from being applied. And that failure is
         # logged rather than raised (BACKLOG #2137), so the pass still returns its plan and the

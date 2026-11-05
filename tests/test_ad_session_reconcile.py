@@ -2718,6 +2718,134 @@ async def test_a_threshold_pass_that_raises_pages_on_the_next_pass(
         await store.close()
 
 
+# --- BACKLOG #3100 closing step 2: one account the directory keeps failing for pages ------------
+
+_UNREACHED_PREFIX = "directory-reconciler-unreached:"
+
+
+def _unreached_events(sink: _InverseSink) -> list[tuple[str, str, dict[str, Any]]]:
+    return [e for e in sink.events if e[1].startswith(_UNREACHED_PREFIX)]
+
+
+async def _unreached_rows(store: MessageStore) -> list[tuple[str, int]]:
+    """``(actor, probes)`` of each lasting unreachable account's audit row."""
+    rows = [dict(r) for r in await store.list_audit(action="auth.ad_reconcile_unreached")]
+    return [(str(r["actor"]), json.loads(str(r["detail"]))["probes"]) for r in rows]
+
+
+@pytest.mark.parametrize("threshold", [2, 3])
+async def test_an_account_the_directory_keeps_failing_for_pages_once_naming_it(
+    threshold: int,
+) -> None:
+    """BACKLOG #3100 closing step 2. An ``LdapError`` on one account's probe, while the directory
+    answers the other, reads UNAVAILABLE: no strike, no revocation. Before this nothing bounded
+    it, so the account's sessions ran to the absolute cap and nobody was told. Now
+    ``ad_reconcile_outage_passes`` of its probes running page once, naming the account in the
+    source, with one audit row. The next failing pass pages nothing more; an answer ends the run
+    and re-arms the page. It is still fail-open throughout, and the whole-directory outage page
+    never fires.
+
+    RED when: the arm pages nobody, pages on every pass, or never re-arms."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=threshold)
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        for n in range(1, threshold):
+            plan = await _pass(service, sink)
+            assert not plan.directory_outage and plan.unavailable == 1 and plan.unreached == ()
+            assert service._reconcile_unreached_runs == {alice.id: n}
+        assert _unreached_events(sink) == []  # the N-1 control
+        plan = await _pass(service, sink)
+        assert plan.unreached == ((alice.id, "alice", threshold),)
+        [(kind, source, payload)] = _unreached_events(sink)
+        assert (kind, source) == ("ad_reconcile_aborted", f"{_UNREACHED_PREFIX}alice")
+        assert payload["reason"] == reconcile.UNREACHED_ACCOUNT and payload["probed"] == 2
+        assert f"{threshold} of its directory probes running failed" in payload["detail"]
+        assert "sessions are not revoked" in payload["detail"][:200]
+        assert len(payload["detail"]) <= 200 and "alice" not in payload["detail"]
+        assert await _unreached_rows(store) == [("alice", threshold)]
+
+        assert (await _pass(service, sink)).unreached == ()  # latched: no second page
+        assert len(_unreached_events(sink)) == 1 and len(await _unreached_rows(store)) == 1
+
+        ldap.unreachable = set()  # the account answers once
+        assert (await _pass(service, sink)).unreached == ()
+        assert service._reconcile_unreached_runs == {}
+        ldap.unreachable = {"alice"}
+        for _ in range(threshold):
+            plan = await _pass(service, sink)
+        assert plan.unreached == ((alice.id, "alice", threshold),), "the page did not re-arm"
+        assert len(_unreached_events(sink)) == 2
+        assert _outage_events(sink) == []
+        assert await store.list_sessions(alice.id), "the account's sessions were revoked"
+    finally:
+        await store.close()
+
+
+async def test_an_outage_or_a_fault_only_pass_neither_counts_nor_ends_an_accounts_run() -> None:
+    """BACKLOG #3100 closing step 2. A whole-directory outage pages on its own (#3709), so it
+    neither adds to an account's run nor ends it, and neither does a pass whose every probe
+    failed or faulted, which says nothing about whether the directory was reached. The run picks
+    up where it was on the next pass that reached the directory.
+
+    RED when: an outage or a fault-only pass counts toward an account's run, or resets it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store)  # the default threshold, 3
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        for _ in range(2):
+            await _pass(service, sink)
+        ldap.unreachable = {"alice", "bob"}
+        outage = await _pass(service, sink)
+        assert outage.directory_outage and outage.unreached == ()
+        ldap.unreachable = {"alice"}
+        ldap.broken = {"bob": ValueError("synthetic: unreadable entry")}
+        faulted = await _pass(service, sink)
+        assert faulted.probe_fault and faulted.unreached == ()
+        assert service._reconcile_unreached_runs == {alice.id: 2}
+        ldap.broken = {}
+        third = await _pass(service, sink)
+        assert third.unreached == ((alice.id, "alice", 3),)
+        assert len(_unreached_events(sink)) == 1
+    finally:
+        await store.close()
+
+
+async def test_an_unreached_page_is_latched_only_once_its_row_is_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3100 closing step 2. As a paging refusal's, the page is latched only once its row
+    is recorded, so a pass that raises before then leaves the next pass to page.
+
+    RED when: the latch is set before the pass can raise, so the account never pages."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        await _pass(service, sink)
+        real = service._record_paging_refusals
+
+        async def boom(plan: reconcile.ReconcilePlan) -> None:
+            raise RuntimeError("synthetic: store refused")
+
+        monkeypatch.setattr(service, "_record_paging_refusals", boom)
+        with pytest.raises(RuntimeError):
+            await service.reconcile_directory_sessions()
+        monkeypatch.setattr(service, "_record_paging_refusals", real)
+        plan = await _pass(service, sink)
+        assert [name for _uid, name, _n in plan.unreached] == ["alice"]
+        assert len(_unreached_events(sink)) == 1
+    finally:
+        await store.close()
+
+
 async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id() -> None:
     """ADR 0184 AC-5, held by construction (BACKLOG #1143 slice C).
 

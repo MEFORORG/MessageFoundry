@@ -305,6 +305,7 @@ from messagefoundry.auth.reconcile import (
     PAGING_DEADLINE,
     PROBE_FAULT_ABORT,
     REFERRAL_ABORT,
+    UNREACHED_ACCOUNT,
     ReconcilePlan,
 )
 from messagefoundry.auth.service import (
@@ -11328,6 +11329,15 @@ _PAGING_REFUSAL_TEXT: Final[Mapping[str, str]] = {
     PAGING_DEADLINE: "past [auth].ad_group_search_deadline",
     PAGING_CAP: "past the engine's cap on groups or pages",
 }
+#: The source label prefix of a lasting unreachable account's ``ad_reconcile_aborted`` instance
+#: (BACKLOG #3100 closing step 2), keyed on the account as a paging refusal's is, for the same
+#: reason.
+_UNREACHED_ALERT_SOURCE = "directory-reconciler-unreached"
+#: What it tells the operator. Short, and the consequence first, for the store's 200 characters.
+_UNREACHED_ALERT_TEXT: Final[str] = (
+    "This account's sessions are not revoked: {probes} of its directory probes running failed while "
+    "the directory answered others. Check its entry and the server that holds it."
+)
 
 
 def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSink) -> None:
@@ -11436,6 +11446,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     # After the breaker and the revocations, which do not recur either, and before the referral,
     # the fault and the hold, which page again on the next pass (vault BACKLOG #3696).
     _alert_paging_refusals(plan, sink)
+    _alert_unreached_accounts(plan, sink)  # BACKLOG #3100 closing step 2, the same way
     if plan.referred:
         # BACKLOG #2538. After the breaker and the revocations, matching the service's order.
         sink.ad_reconcile_aborted(
@@ -11501,6 +11512,22 @@ def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
                 "Directory role and scope changes do not reach this account's sessions: its group "
                 f"search was refused, {what}. A disable or deletion still revokes them."
             ),
+        )
+
+
+def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
+    """Page each account that has just entered the lasting unreachable state (BACKLOG #3100
+    closing step 2; ``AuthService._note_unreached_accounts`` says when one enters). Its probe
+    failed to reach the directory on that many passes running that reached it for others, so the
+    reconciler has neither struck nor revoked it. Once per entry, like a paging refusal, and with
+    no inverse: an operator resolves it. An outage pass carries none, because the outage pages
+    on its own. The account name is in the source only, as for a paging refusal."""
+    for _user_id, username, probes in plan.unreached:
+        sink.ad_reconcile_aborted(
+            f"{_UNREACHED_ALERT_SOURCE}:{username}",
+            reason=UNREACHED_ACCOUNT,
+            probed=plan.asked,
+            detail=_UNREACHED_ALERT_TEXT.format(probes=probes),
         )
 
 
