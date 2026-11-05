@@ -236,13 +236,14 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # via `-m 'not tooling'` AND out of every queue entry, where `ci-gate` reads a skipped need
         # as a pass -- the same defect ci.yml already records against `.gitignore` (BACKLOG #327).
         "test_security_txt_rfc9116.py",
-        # LEFT THE MANIFEST (vault BACKLOG #3652). It AST-reads the server-DB store suites
-        # (tests/test_postgres_store.py, tests/test_sqlserver_store.py and the others ci.yml's
-        # server-DB steps run) for their messagefoundry imports, and holds ci.yml's `serverdb` arm
-        # to admit each one. What breaks it is an engine import added to one of those suites, a
-        # test diff that sets `code=true` but NOT `tooling=true`, and the merge_group arm pins
-        # `tooling=false`. Engine PR 2335 was that diff: it merged green, and the push run went red.
-        # Text and AST only, so it is cheap on the engine legs.
+        # LEFT THE MANIFEST (vault BACKLOG #3652). NOT engine source, so this entry widens the
+        # list's stated rule, as test_conftest_name_collision_guard.py does. Its subject is the
+        # server-DB store suites (tests/test_postgres_store.py, tests/test_sqlserver_store.py and
+        # the others ci.yml's server-DB steps run): it AST-reads their messagefoundry imports and
+        # holds ci.yml's `serverdb` arm to admit each one. What breaks it is an engine import added
+        # to one of those suites, a test diff that sets `code=true` but NOT `tooling=true`, and the
+        # merge_group arm pins `tooling=false`. Engine PR 2335 was that diff: it merged green, and
+        # the push run went red.
         "test_serverdb_ci_coverage.py",
         # Engine-subject for the same reason as control_char_check and escape_sequence_check above,
         # and the reason is the one arm that does not use tmp_path: the screen's DEFAULT SCOPE is
