@@ -438,6 +438,81 @@ def test_a_missing_dicom_or_mllp_ca_file_names_the_connection(
     assert "gone.pem" not in message
 
 
+_MLLP = {"tls": True, "host": "lis.internal.example.org"}
+_FTPS = {"host": "ftp.internal.example.org"}
+
+# Each arm that loaded its CA file with its own create_default_context(cafile=...). The verify-off
+# arms pass the clamped escape through the escape_at_warn fixture, the real shape that honours it.
+_ARMS_WITHOUT_A_POLICY = [
+    pytest.param(
+        lambda ca: build_smtp_tls_context(
+            host="smtp.internal.example.org", cell="Email", verify=False, ca_file=ca, name="OB"
+        ),
+        id="smtp-verify-off",
+    ),
+    pytest.param(
+        lambda ca: dicom._client_ssl_context(
+            {"tls": True, "host": "pacs.internal.example.org", "tls_ca_file": ca}, name="OB"
+        ),
+        id="dicom-no-policy",
+    ),
+    pytest.param(
+        lambda ca: mllp._mllp_ssl_context({**_MLLP, "tls_ca_file": ca}, server=False, name="OB"),
+        id="mllp-no-policy",
+    ),
+    pytest.param(
+        lambda ca: mllp._mllp_ssl_context(
+            {**_MLLP, "tls_ca_file": ca, "tls_verify": False},
+            server=False,
+            trust_anchor_policy=TrustAnchorPolicy(),
+            name="OB",
+        ),
+        id="mllp-verify-off",
+    ),
+    pytest.param(
+        lambda ca: _ftps_ssl_context({**_FTPS, "tls_ca_file": ca}, name="OB"),
+        id="ftps-no-policy",
+    ),
+    pytest.param(
+        lambda ca: _ftps_ssl_context(
+            {**_FTPS, "tls_ca_file": ca, "tls_verify": False},
+            trust_anchor_policy=TrustAnchorPolicy(),
+            name="OB",
+        ),
+        id="ftps-verify-off",
+    ),
+]
+
+
+@pytest.mark.usefixtures("escape_at_warn")
+@pytest.mark.parametrize("build", _ARMS_WITHOUT_A_POLICY)
+def test_a_missing_ca_file_on_an_arm_without_a_policy_names_the_setting(
+    build: Callable[[str], object], tmp_path: Path
+) -> None:
+    """Vault BACKLOG #2370 step 2. These arms loaded the CA file with their own
+    ``create_default_context(cafile=...)``, so a missing file was a bare FileNotFoundError naming
+    nothing, while the policy arms beside them named the setting and the connection."""
+    with pytest.raises(CaFileUnreadable) as caught:
+        build(str(tmp_path / "gone.pem"))
+    message = str(caught.value)
+    assert message.startswith("tls_ca_file of connection 'OB' names a CA file that cannot be read")
+    assert "gone.pem" not in message
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
+
+
+@pytest.mark.usefixtures("escape_at_warn")
+@pytest.mark.parametrize("build", _ARMS_WITHOUT_A_POLICY)
+def test_a_readable_ca_file_on_those_arms_is_still_the_only_root(
+    build: Callable[[str], object], tmp_path: Path
+) -> None:
+    """The control for the test above: a CA that loads is still the hop's only root, as
+    ``create_default_context(cafile=...)`` made it. The arms changed their refusal, not their
+    trust."""
+    ctx = build(_ca_pem(tmp_path, "arm-test-ca"))
+    assert isinstance(ctx, ssl.SSLContext)
+    assert _ca_subjects(ctx) == {"arm-test-ca"}
+
+
 def test_a_dicom_suite_refusal_names_the_connection() -> None:
     """BACKLOG #3096 item 3. Built the way the runner builds it, a refused ``tls_ciphers`` says
     which DICOM destination to fix. The control is a direct build with no name, which keeps the

@@ -3016,14 +3016,15 @@ def resolve_trust_anchor(
     *,
     connection_ca_file: str | None,
     host: str,
-    policy: TrustAnchorPolicy,
+    policy: TrustAnchorPolicy | None,
     connection: str | None = None,
     setting: str = "tls_ca_file",
 ) -> TrustAnchor:
     """Resolve the client trust anchor for an outbound hop to ``host`` (#190, ADR 0093 — PURE).
 
     ``connection`` and ``setting`` name where ``connection_ca_file`` came from, for a refusal of
-    an unreadable file (vault BACKLOG #2370). They choose nothing.
+    an unreadable file (vault BACKLOG #2370). They choose nothing. ``policy=None`` is the empty
+    policy: the connection's own CA, else the OS trust store, as ``create_default_context`` loads.
 
     Precedence (load-bearing):
 
@@ -3047,6 +3048,8 @@ def resolve_trust_anchor(
     This only chooses WHICH roots verify the peer and WHETHER a CRL is consulted — it never turns
     verification off — so it composes with the connectors' fail-closed no-CA / ``tls_verify=false`` /
     cleartext-hop refusals rather than weakening them."""
+    if policy is None:
+        policy = TrustAnchorPolicy()
     # Loopback is exempt from BOTH the internal anchor and the CRL; resolved once so the arms below
     # cannot disagree about it.
     crl = None if is_loopback_hop_host(host) else policy.crl_file
@@ -3091,8 +3094,9 @@ def _naming_the_ca_setting(anchor: TrustAnchor) -> Iterator[None]:
     try:
         yield
     except OSError as exc:
-        # No path in the text, as the bare FileNotFoundError this replaces carried none: a connection
-        # test returns this text to the caller and audits it. The setting tells the operator where.
+        # No path in the text, as the bare FileNotFoundError this replaces carried none: a
+        # connection test returns this text to the caller and audits it. The setting tells the
+        # operator where.
         #
         # A [tls].crl_file refusal on the same hop still names its file, and the two shapes are
         # kept by Manager decision (BACKLOG #3096 item 11). This CA setting is per connection. The
@@ -3346,17 +3350,16 @@ def build_smtp_tls_context(
     the connection names no ``ca_file`` of its own. It only chooses WHICH roots verify the peer — it
     never turns verification off.
     """
-    if verify:
-        anchor = resolve_trust_anchor(
-            connection_ca_file=ca_file,
-            host=host,
-            policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
-            connection=name or None,
-            setting=ca_setting,
-        )
-        ctx = build_verifying_client_context(anchor)
-    else:
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
+    # The verify-off arm takes the empty policy: it verifies nothing, so an instance CA or CRL could
+    # only add a way to refuse. It loads ca_file through the anchor for the named refusal (#2370).
+    anchor = resolve_trust_anchor(
+        connection_ca_file=ca_file,
+        host=host,
+        policy=trust_anchor_policy if verify else None,
+        connection=name or None,
+        setting=ca_setting,
+    )
+    ctx = build_verifying_client_context(anchor)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
         ctx.check_hostname = check_hostname

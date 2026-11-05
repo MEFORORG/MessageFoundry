@@ -747,18 +747,16 @@ def _mllp_ssl_context(
             "effect while enforcing, the default, or with no posture)."
         )
     # #190 (ADR 0093): resolve the trust anchor — the connection's own tls_ca_file wins verbatim, else an
-    # internal hop may anchor on the [tls] internal CA. Only the VERIFY path uses it; the tls_verify=false
-    # branch below stays CERT_NONE and is already refused above, so the internal CA never bypasses a refusal.
-    if verify and trust_anchor_policy is not None:
-        anchor = resolve_trust_anchor(
-            connection_ca_file=str(ca) if ca else None,
-            host=str(s.get("host", "127.0.0.1")),
-            policy=trust_anchor_policy,
-            connection=name or None,
-        )
-        ctx = build_verifying_client_context(anchor)
-    else:
-        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
+    # internal hop may anchor on the [tls] internal CA. Only the VERIFY path uses the policy; the
+    # tls_verify=false branch below stays CERT_NONE and is already refused above, so the internal CA
+    # never bypasses a refusal. Every arm loads through the anchor for the named refusal (#2370).
+    anchor = resolve_trust_anchor(
+        connection_ca_file=str(ca) if ca else None,
+        host=str(s.get("host", "127.0.0.1")),
+        policy=trust_anchor_policy if verify else None,
+        connection=name or None,
+    )
+    ctx = build_verifying_client_context(anchor)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     if verify:
         ctx.check_hostname = bool_setting(s, "tls_check_hostname", default=True)

@@ -1668,7 +1668,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # on its accept loop. Same server SSLContext, built by _server_ssl_context above.
             "tls_context:.wrap_socket()",
             "tls_context:ssl.SSLContext",
-            "tls_context:ssl.create_default_context",
             "tls_context:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
             "tls_context:via messagefoundry.keywrap",
@@ -1753,7 +1752,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:.verify_mode = CERT_REQUIRED",
             "tls_context:ssl.SSLContext",
-            "tls_context:ssl.create_default_context",
             "tls_context:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
             "tls_context:via messagefoundry.keywrap",
@@ -1772,7 +1770,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:.check_hostname = False",
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.verify_mode = CERT_NONE",
-            "tls_context:ssl.create_default_context",
             "tls_context:via messagefoundry.config.tls_policy",
             "tls_context:via messagefoundry.keywrap",
         }
