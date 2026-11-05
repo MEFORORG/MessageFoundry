@@ -120,6 +120,15 @@ def test_the_finished_claude_worktrees_step_is_opt_in_and_forwarded() -> None:
     assert "-Apply" in both["argument"]
     assert both["mode"] == "APPLY"
 
+    # The plan says whether the primary's runner declares the switch, read from the file itself;
+    # registration refuses on a false, so this field must not lie.
+    runner = Path(opted["runner"])
+    declares = runner.is_file() and "RemoveFinishedClaudeWorktrees" in runner.read_text(
+        encoding="utf-8"
+    )
+    field = opted["runnerDeclaresRemoveFinishedClaudeWorktrees"]
+    assert field is (declares if runner.is_file() else None)
+
 
 @requires_windows
 def test_it_agrees_with_prune_merged_about_the_primary_checkout() -> None:

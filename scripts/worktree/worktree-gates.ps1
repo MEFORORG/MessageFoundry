@@ -15,7 +15,7 @@
     Defines in the caller's scope: $IDLE_FLOOR_HOURS, $ACTIVITY_MTIME_FILES, Get-ReflogLastEntry,
     Get-WorktreeActivity (occupancy signal 2; prune-merged.ps1's header says what it can and cannot
     see), Test-WorktreeClean, Get-TipHolders, Test-ClaudeManagedPath, Get-FlaggedFileCount,
-    Get-WorkingTreeActivity, Get-WorktreeOnlyCommitCount and Get-ClaimedWorktreeIndex.
+    Get-WorkingTreeActivity, Get-WorktreeOnlyCommitCount, Read-CoordRecord, Get-ClaimedWorktreeIndex and Get-IgnoredCloneCount.
 #>
 
 # The floor under -IdleHours. Signal 2 has been measured at 10.4h on a worktree that was demonstrably
@@ -107,7 +107,8 @@ function Get-WorktreeActivity {
 # the distinction at the exact moment an operator most needs it, because something changed underneath a
 # destructive run.
 # FAILS CLOSED: an unreadable status (a moved-away or half-deleted worktree exits 128 with no output)
-# used to be indistinguishable from "no changes" and pointed straight at destruction.
+# used to be indistinguishable from "no changes" and pointed straight at destruction. So is a folder git
+# could not open: git warns on stderr, skips it and still exits 0, so its contents are unknown.
 # -AllUntracked adds `--untracked-files=all`, so an untracked file inside an untracked directory is
 # counted as a file rather than folded into one directory line. The verdict is the same either way.
 function Test-WorktreeClean {
@@ -120,14 +121,17 @@ function Test-WorktreeClean {
     # reports clean. Measured while writing this: a dirty tree read clean.
     $statusArgs = @('-C', $Path, '--no-optional-locks', 'status', '--porcelain')
     if ($AllUntracked) { $statusArgs += '--untracked-files=all' }
-    $status = @(& git @statusArgs 2>$null)
+    $raw = @(& git @statusArgs 2>&1)
     $statusExit = $LASTEXITCODE
     if ($statusExit -ne 0) {
         return @{ Clean = $false; Reasons = @("git status failed (exit $statusExit) -- cannot establish it is clean") }
     }
+    $status = @($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" })
+    $unopened = @($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] -and "$_" -match 'could not open' })
     $trackedChanges = @($status | Where-Object { $_ -notmatch '^\?\?' })
     $untracked = @($status | Where-Object { $_ -match '^\?\?' })
     $r = @()
+    if ($unopened.Count -gt 0) { $r += "git could not open $($unopened.Count) folder(s), so their contents are unknown" }
     if ($trackedChanges.Count -gt 0) { $r += "dirty: $($trackedChanges.Count) uncommitted tracked change(s)" }
     # Untracked files are the one loss class with no recovery THROUGH GIT: not in the index, not in a
     # stash, not in the reflog. (--force also deletes IGNORED files -- .venv, a dev DB, a generated
@@ -168,14 +172,21 @@ function Get-FlaggedFileCount([string]$Path) {
     return @($lines | Where-Object { $_ -cmatch '^([a-z]|S) ' }).Count
 }
 
-# The newest write to the WORKING TREE's top level: the tree's own folder and each entry directly under
-# it. The idle reading above sees only git metadata, so a session that edits files and runs no git
-# command is invisible to it; a write under the top folder moves at least one of these mtimes in the
-# common cases (a new file, a cache directory rewritten). Not every write: a file edited in place two
-# levels down moves none of them. $null when it cannot be read.
-function Get-WorkingTreeActivity([string]$Path) {
+# The newest write to the WORKING TREE: the tree's own folder, each entry directly under it, and the
+# files inside .pytest_cache and .ruff_cache (a test or lint run rewrites those in place, moving no
+# top-level mtime), up to -CacheCap of them. The idle reading above sees only git metadata, so a session
+# that edits files and runs no git command is invisible to it. Not every write moves one of these: a
+# file edited in place two levels down moves none. $null when it cannot be read.
+function Get-WorkingTreeActivity {
+    param([string]$Path, [int]$CacheCap = 2000)
     try {
         $items = @(Get-Item -LiteralPath $Path -Force -ErrorAction Stop) + @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
+        foreach ($cache in '.pytest_cache', '.ruff_cache') {
+            $dir = Join-Path $Path $cache
+            if (Test-Path -LiteralPath $dir -PathType Container) {
+                $items += @(Get-ChildItem -LiteralPath $dir -Recurse -Force -File -ErrorAction Stop | Select-Object -First $CacheCap)
+            }
+        }
     }
     catch [System.Management.Automation.ItemNotFoundException], [System.IO.IOException], [System.UnauthorizedAccessException] {
         return $null
@@ -185,37 +196,93 @@ function Get-WorkingTreeActivity([string]$Path) {
 
 # Commits that only this worktree's own state holds: its HEAD reflog and its per-worktree refs
 # (refs/worktree, refs/bisect, refs/rewritten). `git worktree remove` deletes both, so a commit no
-# shared ref holds becomes unreachable. Returns that count, or -1 when it cannot be read or there are
-# more than -Cap candidates. An amended or rebased-away commit counts too, which refuses a harmless tree;
-# that is the cheap direction.
+# shared ref holds becomes unreachable. A commit the branch's OWN reflog holds (an amend, a reset, a
+# rebase on that branch) survives the removal, because that reflog lives in the common dir, so it is not
+# counted. Returns the count, or -1 when it cannot be read or there are more than -Cap candidates.
 function Get-WorktreeOnlyCommitCount {
-    param([string]$Path, [string]$Repo, [int]$Cap = 500)
+    param([string]$Path, [string]$Repo, [string]$Branch, [int]$Cap = 500)
     $reflog = @(& git -C $Path reflog show --format=%H HEAD 2>$null)
     if ($LASTEXITCODE -ne 0) { return -1 }
     $own = @(& git -C $Path for-each-ref --format='%(objectname)' refs/worktree refs/bisect refs/rewritten 2>$null)
     if ($LASTEXITCODE -ne 0) { return -1 }
-    $held = @(@($reflog) + @($own) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -match '^[0-9a-f]{40,64}$' } | Select-Object -Unique)
+    $sha = { param($x) @($x | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -match '^[0-9a-f]{40,64}$' } | Select-Object -Unique) }
+    # @() around each, or one SHA unrolls to a bare string, and splatting a string hands git characters.
+    $held = @(& $sha (@($reflog) + @($own)))
     if ($held.Count -eq 0) { return 0 }
     if ($held.Count -gt $Cap) { return -1 }
-    $n = & git -C $Repo rev-list --count @held --not --branches --tags --remotes 2>$null
+    # Fewer exclusions only make this stricter, so a branch reflog that cannot be read, or is longer
+    # than the cap, is used as far as it goes.
+    $kept = @()
+    if ($Branch) { $kept = @(& $sha @(& git -C $Repo reflog show --format=%H "refs/heads/$Branch" 2>$null) | Select-Object -First $Cap) }
+    $n = & git -C $Repo rev-list --count @held --not --branches --tags --remotes @kept 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $n) { return -1 }
     return [int]([string]$n).Trim()
 }
 
-# Which worktrees hold a coordination claim, read from the claims directory coord-root.ps1 names.
-# UNREADABLE IS NOT ABSENT: a claim file that will not parse might name any worktree, so the caller
-# must treat Unreadable as "every tree may be claimed". Needs coord-root.ps1 (Read-CoordText) and
-# occupancy.ps1 (ConvertTo-Norm) loaded by the caller.
-function Get-ClaimedWorktreeIndex([string]$ClaimsDir) {
+# One claim or allocation record file, judged the way remove.ps1 judges it: ONE object per file with a
+# non-blank string `worktree` is the only shape claim.ps1 and alloc.ps1 write, so anything else might
+# hide a tree and is a Problem (cannot tell). Tombstone marks the ownerless record
+# tombstone-retired-backlog-allocator.ps1 writes. A record another PC wrote still counts: the two PCs
+# can share one path layout, so its path may name a tree here. Needs
+# coord-root.ps1 (Read-CoordText) and occupancy.ps1 (ConvertTo-Norm) loaded by the caller.
+function Read-CoordRecord([string]$File) {
+    $out = @{ Record = $null; Holder = ''; Problem = ''; Tombstone = $false }
+    # Deliberately broad: ANY failure to read is the cannot-tell verdict, recorded in Problem rather than
+    # swallowed, and every caller refuses on it.
+    try { $parsed = @(Read-CoordText $File | ConvertFrom-Json -EA Stop) }
+    catch { $out.Problem = "unreadable: $($_.Exception.Message)"; return $out }
+    if ($parsed.Count -ne 1 -or $parsed[0] -isnot [System.Management.Automation.PSCustomObject]) { $out.Problem = 'not one record'; return $out }
+    $rec = $parsed[0]
+    $out.Record = $rec
+    if ($rec.tombstone -is [bool] -and $rec.tombstone -and [string]$rec.worktree -eq '' -and [string]$rec.branch -eq '') {
+        $out.Tombstone = $true; $out.Problem = 'tombstone'; return $out
+    }
+    if ($rec.worktree -isnot [string] -or -not $rec.worktree.Trim()) { $out.Problem = 'no worktree string'; return $out }
+    $out.Holder = ConvertTo-Norm $rec.worktree
+    return $out
+}
+
+# Which worktrees hold a coordination claim, across every claims directory given. UNREADABLE IS NOT
+# ABSENT: a claim file that will not parse or has the wrong shape might name any worktree, and so might
+# a directory that exists and cannot be listed, so the caller must treat Unreadable as "every tree may
+# be claimed". A directory that does not exist holds no claim.
+function Get-ClaimedWorktreeIndex([string[]]$ClaimsDir) {
     $claimed = @{}
     $unreadable = $false
-    if ($ClaimsDir -and (Test-Path -LiteralPath $ClaimsDir)) {
-        foreach ($f in @(Get-ChildItem -LiteralPath $ClaimsDir -Filter *.json -File -EA SilentlyContinue)) {
-            try { $c = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop }
-            catch { $unreadable = $true; continue }
-            $n = ConvertTo-Norm ([string]$c.worktree)
-            if ($n) { $claimed[$n] = $true }
+    foreach ($dir in @($ClaimsDir | Where-Object { $_ })) {
+        if (-not (Test-Path -LiteralPath $dir)) { continue }
+        try { $files = @(Get-ChildItem -LiteralPath $dir -Filter *.json -File -ErrorAction Stop) }
+        catch [System.IO.IOException], [System.UnauthorizedAccessException] { $unreadable = $true; continue }
+        foreach ($f in $files) {
+            $r = Read-CoordRecord $f.FullName
+            if ($r.Tombstone) { continue }
+            if ($r.Problem) { $unreadable = $true; continue }
+            $claimed[$r.Holder] = $true
         }
     }
     return @{ Claimed = $claimed; Unreadable = $unreadable }
+}
+
+# Git clones hidden inside IGNORED directories, where git status never looks and `git worktree remove`
+# deletes without asking: pip's editable clones in .venv/src or venv/src, and packages in node_modules
+# (one @scope level included). Their unpushed commits would go with the tree. Returns the count, or -1
+# when a directory that exists cannot be listed. A clone deeper than that is not looked for.
+function Get-IgnoredCloneCount([string]$Path) {
+    $n = 0
+    try {
+        foreach ($base in '.venv/src', 'venv/src', 'node_modules') {
+            $dir = Join-Path $Path $base
+            if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
+            foreach ($d in @(Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction Stop)) {
+                if (Test-Path -LiteralPath (Join-Path $d.FullName '.git')) { $n++ }
+                elseif ($base -eq 'node_modules' -and $d.Name.StartsWith('@')) {
+                    foreach ($s in @(Get-ChildItem -LiteralPath $d.FullName -Directory -Force -ErrorAction Stop)) {
+                        if (Test-Path -LiteralPath (Join-Path $s.FullName '.git')) { $n++ }
+                    }
+                }
+            }
+        }
+    }
+    catch [System.IO.IOException], [System.UnauthorizedAccessException] { return -1 }
+    return $n
 }

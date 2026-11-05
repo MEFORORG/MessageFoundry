@@ -66,6 +66,8 @@ UNSAFE = (
     "flagged",
     "rewritten",
     "claimed",
+    "cloned",
+    "allocated",
 )
 
 
@@ -164,12 +166,26 @@ def fx(tmp_path: Path) -> Fx:
     _git(flagged, "update-index", "--skip-worktree", "seed.txt")
     (flagged / "seed.txt").write_text("edited under a flag", encoding="utf-8")
 
-    # On a branch, with a commit only the tree's own HEAD reflog still holds.
+    # Back on its branch, with a commit made while detached that only the tree's own HEAD reflog holds.
     rewritten = f.tree("rewritten")
-    (rewritten / "gone.txt").write_text("reset away", encoding="utf-8")
+    _git(rewritten, "checkout", "-q", "--detach")
+    (rewritten / "gone.txt").write_text("detached work", encoding="utf-8")
     _git(rewritten, "add", "--", "gone.txt")
-    _git(rewritten, "commit", "-qm", "reset away")
-    _git(rewritten, "reset", "-q", "--hard", "HEAD~1")
+    _git(rewritten, "commit", "-qm", "detached work")
+    _git(rewritten, "checkout", "-q", "rewritten")
+
+    # An amend on the branch: the old commit is held by the branch's own reflog, which survives the
+    # removal, so it must NOT refuse. Built in a FINISHED tree so the positive control carries it.
+    clean = f.tree("clean")
+    (clean / "amended.txt").write_text("v1", encoding="utf-8")
+    _git(clean, "add", "--", "amended.txt")
+    _git(clean, "commit", "-qm", "v1")
+    _git(clean, "commit", "-q", "--amend", "-m", "v1 amended")
+
+    # A git clone inside an ignored .venv/src, where pip puts an editable install.
+    clone = f.tree("cloned") / ".venv" / "src" / "pkg"
+    clone.mkdir(parents=True)
+    _git(clone, "init", "-q")
 
     for name in (*FINISHED, *UNSAFE):
         if name == "touched":
@@ -182,6 +198,10 @@ def fx(tmp_path: Path) -> Fx:
     (f.coord / "claims").mkdir(parents=True)
     claim = {"key": "row-1", "worktree": str(f.tree("claimed"))}
     (f.coord / "claims" / "row-1.json").write_text(json.dumps(claim), encoding="utf-8")
+    # An ADR number allocated in the tree, whose file is not on origin/main.
+    (f.coord / "alloc" / "adr").mkdir(parents=True)
+    alloc = {"number": "9999", "kind": "adr", "title": "t", "worktree": str(f.tree("allocated"))}
+    (f.coord / "alloc" / "adr" / "9999.json").write_text(json.dumps(alloc), encoding="utf-8")
     # One readable DEAD record outside the repo, so the fence is available and vetoes nothing.
     _session(f, never_live_pid(), f.root, "dead0000-0000")
     return f
@@ -274,12 +294,14 @@ def test_apply_refuses_every_unsafe_tree_and_leaves_it(fx: Fx, sleeper: int) -> 
         "untracked": r"1 untracked file\(s\) present",
         "locked": r"locked: in use by a bench run",
         "active": r"recently active: git metadata",
-        "touched": r"recently active: the working tree's top level",
+        "touched": r"recently active: the working tree was written",
         "flagged": r"1 file\(s\) flagged skip-worktree",
         "rewritten": r"1 commit\(s\) held only by its HEAD reflog",
         "claimed": r"a coordination claim names it",
         "occupied": r"occupied: live0000 LIVE",
-        "stranded": r"no ref holds its tip",
+        "stranded": r"1 commit\(s\) held only by its HEAD reflog",
+        "cloned": r"1 git clone\(s\) inside an ignored",
+        "allocated": r"owns allocation\(s\) not provably on origin/main \(adr #9999\)",
         "gone": r"no longer a registered worktree",
         "repo-sibling": r"outside \.claude/worktrees",
         "clean": r"executing from",
@@ -413,3 +435,39 @@ def test_runner_refuses_apply_with_the_step_inside_claude_code(fx: Fx, tmp_path:
     )
     for name in FINISHED:
         assert fx.tree(name).is_dir()
+
+
+def test_an_unreadable_claim_refuses_every_tree(fx: Fx) -> None:
+    """Cannot-tell is not absent: a claim file of the wrong shape might name any tree."""
+    (fx.coord / "claims" / "bad.json").write_text("[1, 2]", encoding="utf-8")
+    rows = remove(fx, [fx.tree("clean")], apply=True)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert "claim file or directory could not be read" in rows["clean"]["Reason"]
+    assert fx.tree("clean").is_dir()
+
+
+def test_the_helper_refuses_apply_inside_claude_code(fx: Fx) -> None:
+    """Dot-sourcing the helper must not be a way around the runner's refusal."""
+    env = fx.env(claudecode=True)
+    env["T_PRIMARY"] = str(fx.primary)
+    env["T_PATH"] = str(fx.tree("clean"))
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{HELPER}'; Invoke-FinishedWorktreeRemoval -Primary $env:T_PRIMARY "
+            "-Paths @($env:T_PATH) -IdleHours 72 -Apply",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "Refusing Invoke-FinishedWorktreeRemoval -Apply inside Claude Code" in (
+        proc.stderr + proc.stdout
+    )
+    assert fx.tree("clean").is_dir()

@@ -114,6 +114,14 @@ $repoRoot = $occ.PrimaryPath
 # history nobody reads. The task must outlive the checkout that installed it.
 $runner = Join-Path $repoRoot 'scripts/worktree/run-daily-prune.ps1'
 $runnerExists = Test-Path -LiteralPath $runner
+# A switch forwarded to a runner that does not declare it fails parameter binding every night, before the
+# runner writes a log line; Task Scheduler's nonzero result is the only trace. So the primary's copy is
+# asked, by parsing it, whether it declares the switch. $null when there is no runner to ask.
+$runnerDeclaresStep = $null
+if ($runnerExists) {
+    $parsed = [System.Management.Automation.Language.Parser]::ParseFile($runner, [ref]$null, [ref]$null)
+    $runnerDeclaresStep = @($parsed.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) -contains 'RemoveFinishedClaudeWorktrees'
+}
 # NOT a throw here. -Json is a preview, and a preview that refuses to render is useless exactly when you
 # most want to look at it -- from a worktree whose change has not landed on the primary yet. The plan
 # reports the miss as a field; registration below is what refuses.
@@ -149,6 +157,7 @@ $plan = [ordered]@{
     repoRoot   = $repoRoot
     runner     = $runner
     runnerExists = $runnerExists
+    runnerDeclaresRemoveFinishedClaudeWorktrees = $runnerDeclaresStep
     argument   = $taskArgument
     at         = $At
     logDir     = $LogDir
@@ -176,6 +185,10 @@ if ($Uninstall) {
 # Refuse here rather than at resolution time, so -Json above could still render the plan that shows this.
 if (-not $runnerExists) {
     throw "run-daily-prune.ps1 is not in the primary checkout: $runner`nIf it exists in the worktree you are standing in, the change has not landed yet -- merge it before scheduling it. A task pointed at a worktree copy dies with that worktree."
+}
+
+if ($RemoveFinishedClaudeWorktrees -and -not $runnerDeclaresStep) {
+    throw "The primary's run-daily-prune.ps1 does not declare -RemoveFinishedClaudeWorktrees: $runner`nThe change has not landed on the primary checkout yet. Update the primary before scheduling the step, or every nightly run fails parameter binding with no log line."
 }
 
 $action    = New-ScheduledTaskAction -Execute $pwshExe -Argument $taskArgument -WorkingDirectory $repoRoot
