@@ -436,11 +436,11 @@ def test_the_operator_page_names_each_library_secret_a_setting_refuses() -> None
 
 def test_the_hook_environment_is_an_allowlist() -> None:
     """Nothing crosses that nobody named: not a secret, not an ordinary variable, not an
-    interpreter variable. The control is the same parent through the deny-list, which keeps the
-    ordinary variable, so the parent really held it."""
+    interpreter variable. The control is the same parent through the engine shard's builder, which
+    keeps the ordinary variable, so the parent really held it."""
     parent = _parent_environment()
     assert childenv.hook_environment(parent) == {"PATH": "/usr/bin", "TZ": "UTC"}
-    assert childenv.non_engine_environment(parent)[_ORDINARY] == _MARKER
+    assert childenv.engine_environment(parent)[_ORDINARY] == _MARKER
 
 
 def test_a_name_the_operator_passes_reaches_the_hook() -> None:
@@ -494,59 +494,60 @@ async def test_a_listed_name_that_is_not_set_is_logged_by_name(
     assert _MARKER not in caplog.text
 
 
-def test_only_the_dependency_auditor_calls_the_deny_list() -> None:
-    """``non_engine_environment`` lets a secret under any other name cross, so the spawn guard's
-    trust in it is pinned to its one caller. The control plants a second caller."""
-    # Every tree the spawn guard reads, the web console included.
-    sources = _scanned_sources()
-    target = "messagefoundry.childenv.non_engine_environment"
-
-    def refers(source: str) -> bool:
-        # Any reference, called or not, through any import alias: the spawn guard resolves
-        # aliases, so this must too.
-        tree = ast.parse(source)
-        aliases = _aliases(tree)
-        return any(
-            _dotted(node, aliases) == target
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Name | ast.Attribute)
-        )
-
-    def callers(tree: Mapping[str, str]) -> set[str]:
-        return {module for module, source in tree.items() if refers(source)}
-
-    assert callers(sources) == {"security/audit_all_platforms.py"}
-    planted = {
-        **sources,
-        "pipeline/a.py": "from messagefoundry.childenv import non_engine_environment as e\n"
-        "env = e()\n",
-        "pipeline/b.py": "from messagefoundry import childenv\n"
-        "env = childenv.non_engine_environment()\n",
-    }
-    expected = {"security/audit_all_platforms.py", "pipeline/a.py", "pipeline/b.py"}
-    assert callers(planted) == expected
+#: What the dependency auditor's allowlist lets in beyond a Python child's start-up names, as the
+#: runner may set it. Typed here, not read from ``childenv``: a list checked against itself checks
+#: nothing. Upper case only, so one parent serves both platforms.
+_AUDITOR_SETTINGS = {
+    "PIP_INDEX_URL": "https://index.invalid/simple",
+    "PIP_EXTRA_INDEX_URL": "https://mirror.invalid/simple",
+    "PIP_CERT": "/etc/ssl/index-ca.pem",
+    "PIP_CONFIG_FILE": "/etc/pip.conf",
+    "PIP_AUDIT_PROGRESS_SPINNER": "off",
+    "HTTP_PROXY": "http://proxy.invalid:3128",
+    "HTTPS_PROXY": "http://proxy.invalid:3128",
+    "NO_PROXY": "localhost",
+    "ALL_PROXY": "http://proxy.invalid:3128",
+    "SSL_CERT_FILE": "/etc/ssl/ca.pem",
+    "SSL_CERT_DIR": "/etc/ssl/certs",
+    "REQUESTS_CA_BUNDLE": "/etc/ssl/ca.pem",
+    "CURL_CA_BUNDLE": "/etc/ssl/ca.pem",
+    "NETRC": "/home/runner/.netrc",
+    "XDG_CONFIG_HOME": "/home/runner/.config",
+    "XDG_CONFIG_DIRS": "/etc/xdg",
+    "XDG_CACHE_HOME": "/home/runner/.cache",
+}
 
 
-def test_the_non_engine_environment_drops_the_engine_namespace_and_nothing_else() -> None:
-    """The dependency auditor's deny-list (``security/audit_all_platforms.py``)."""
-    parent = _parent_environment()
-    env = childenv.non_engine_environment(parent)
-    dropped = set(parent) - set(env)
-    assert dropped == {
-        n
-        for n in parent
-        if n.startswith(childenv.ENGINE_ENV_PREFIX) or n in _LIBRARY_FALLBACK_SECRETS
-    }
-    assert dropped >= _SECRET_NAMES
-    assert env[_ORDINARY] == _MARKER
+def test_the_auditor_environment_is_an_allowlist() -> None:
+    """The dependency auditor's ``pip`` and ``pip-audit`` keep their index, proxy and certificate
+    settings and a Python child's start-up names, and nothing else: not a secret, not an ordinary
+    variable, not a CI token. The control is the same parent through the engine shard's builder,
+    which keeps the ordinary variable and the token, so the parent really held them."""
+    parent = {**_parent_environment(), **_AUDITOR_SETTINGS, "GH_TOKEN": _MARKER}
+    env = childenv.auditor_environment(parent)
+    assert env == {"PATH": "/usr/bin", "TZ": "UTC", _ALLOWED: _ALLOWED_VALUE, **_AUDITOR_SETTINGS}
+    assert set(env).isdisjoint(_SECRET_NAMES)
+    shard = childenv.engine_environment(parent)
+    assert shard[_ORDINARY] == shard["GH_TOKEN"] == _MARKER
 
 
-def test_the_non_engine_environment_ignores_the_case_of_the_engine_prefix() -> None:
-    """Windows treats a variable's name as case-insensitive, so the lower-case spelling is the same
-    variable there."""
-    assert childenv.non_engine_environment({"mefor_store_password": _MARKER, "Path": "x"}) == {
-        "Path": "x"
-    }
+def test_the_auditor_takes_the_lower_case_proxy_names_as_the_platform_reads_them() -> None:
+    """``urllib`` reads ``https_proxy`` as well as ``HTTPS_PROXY`` on POSIX, where they are two
+    variables. Windows reads them as one, and the builder compares names as it does. pip reads only
+    the upper-case ``PIP_*`` spelling, so a lower-case one stays out off Windows."""
+    parent = {"https_proxy": "http://proxy.invalid:3128", "no_proxy": "localhost", "pip_cert": "x"}
+    env = childenv.auditor_environment(parent)
+    expected = (
+        dict(parent) if sys.platform == "win32" else {k: parent[k] for k in parent if "proxy" in k}
+    )
+    assert env == expected
+
+
+def test_a_name_that_only_starts_like_pips_does_not_reach_the_auditor() -> None:
+    """The namespace is ``PIP_``, with its underscore: another tool's ``PIPENV_*`` or ``PIPX_*``
+    variable is not pip's."""
+    parent = {"PIPENV_PYPI_MIRROR": _MARKER, "PIPX_HOME": _MARKER, "PIP_NO_INPUT": "1"}
+    assert childenv.auditor_environment(parent) == {"PIP_NO_INPUT": "1"}
 
 
 def test_dr_pass_environment_is_refused_at_load(tmp_path: Path) -> None:
@@ -664,7 +665,11 @@ async def test_the_supervisor_starts_a_shard_with_that_environment(
 #: An absolute directory, for an operator's own ``PYTHONPATH`` entry.
 _OPERATOR_PATH = str(Path(__file__).resolve().parent / "operator-libraries")
 
-_BUILDERS_OF_A_PYTHON_CHILD = (childenv.worker_environment, childenv.engine_environment)
+_BUILDERS_OF_A_PYTHON_CHILD = (
+    childenv.worker_environment,
+    childenv.engine_environment,
+    childenv.auditor_environment,
+)
 
 
 @pytest.mark.parametrize(
@@ -1052,7 +1057,7 @@ _BUILDERS = frozenset(
     for name in (
         "worker_environment",
         "hook_environment",
-        "non_engine_environment",
+        "auditor_environment",
         "engine_environment",
         "system_tool_environment",
     )
@@ -1122,8 +1127,8 @@ _MUST_CHOOSE = frozenset(
         # Both openssl runs, the suite list and the OPENSSLDIR read, start in _openssl_lines.
         ("verify/cipher_policy.py", "_windows_enabled_suites", "subprocess.run"),
         ("verify/cipher_policy.py", "_openssl_lines", "subprocess.run"),
-        # The dependency auditor's pip and pip-audit, with non_engine_environment: no MEFOR_*
-        # secret.
+        # The dependency auditor's pip and pip-audit, with auditor_environment: an allowlist, so
+        # no MEFOR_* secret and no CI token.
         ("security/audit_all_platforms.py", "_run", "subprocess.run"),
     }
 )

@@ -388,11 +388,11 @@ and the builders, and a test checks that each module named calls each builder na
   `OPENSSL_ENGINES`. No other
   variable reaches them, and no Python variable, since `openssl` is not Python. Both start
   through one call, so they find the same `openssl` on the same `PATH`.
-- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get everything outside
-  the engine's `MEFOR_*` namespace, less the few secret names the module lists outside it and any
-  empty or relative `PYTHONPATH` entry (`non_engine_environment` over `engine_environment`). So
-  they keep the index, proxy and certificate settings they read from the environment, and any
-  other variable the runner set, a CI token among them, reaches them too.
+- The `pip` and `pip-audit` starts in `security/audit_all_platforms.py` get an allowlist
+  (`auditor_environment`): what a Python child needs to start, as the sandbox worker gets it, less
+  any empty or relative `PYTHONPATH` entry; pip's own `PIP_*` variables; and the proxy,
+  certificate, `NETRC` and XDG folder variables that pip and pip-audit read to reach an index.
+  No other variable reaches them, a CI token or an engine secret among them.
 
 At least these pass on the environment they run with, on purpose: `checks.py`, which adds one
 variable, and the tray's opens, where starting VS Code drops the two variables VS Code's own

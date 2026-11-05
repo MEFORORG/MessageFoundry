@@ -23,14 +23,11 @@ process start whose environment does not come from one of them.
   operator listed in ``[dr].pass_environment``. A variable nobody listed does not cross, so no
   secret is in the hook's own environment by default, whatever name it is kept under. Settings
   load refuses the engine's own names in that setting.
-* :func:`non_engine_environment` is **everything except the engine's own namespace**: the whole
-  ``MEFOR_*`` prefix, and the few names outside it in :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`.
-  It is a deny-list, so **a secret kept under any other name still crosses**: a
-  ``[secrets].provider = "env"`` reference may name any variable, and a library may read one this
-  module does not know. Only for a fixed tool the engine's own code names, run on a build or CI
-  runner rather than by the service, that reads settings the engine cannot list in advance: the
-  dependency auditor's ``pip`` and ``pip-audit``, which read their index, proxy and certificate
-  settings from the environment. ``tests/test_child_process_environment.py`` fails another caller.
+* :func:`auditor_environment` is an **allowlist** too, for the dependency auditor's ``pip`` and
+  ``pip-audit``, run on a build or CI runner rather than by the service: what a Python child needs
+  to start, as for the worker, plus what those two read to reach an index (:data:`_AUDITOR_NAMES`,
+  and pip's own ``PIP_*`` namespace). A variable nobody listed does not cross, so a CI token or a
+  secret kept under any other name stays out of their environment.
 * :func:`engine_environment` is the **whole** environment, for a Python child started through the
   bootstrap that runs the engine's own trusted code: an engine shard, which opens the store and
   builds connections and so needs the secrets, and other such children, the tray's relaunch among
@@ -56,10 +53,10 @@ __all__ = [
     "CHILD_INTERPRETER_FLAGS",
     "ENGINE_ENV_PREFIX",
     "ENGINE_SECRETS_OUTSIDE_THE_PREFIX",
+    "auditor_environment",
     "engine_environment",
     "hook_environment",
     "inherited_interpreter_flags",
-    "non_engine_environment",
     "outside_engine_namespace",
     "python_child_argv",
     "python_module_argv",
@@ -204,6 +201,34 @@ _WINDOWS_SHELL_NAMES: Final = frozenset(
         "PUBLIC",
     }
 )
+
+#: What ``pip`` and ``pip-audit`` read to reach an index, beyond a Python child's start-up names,
+#: for :func:`auditor_environment`: the proxy variables, in both cases since ``urllib`` reads both
+#: on POSIX; the certificate bundle and folder ``requests`` and OpenSSL read; ``NETRC``, where
+#: ``requests`` finds index credentials; and the XDG folders that hold pip's and pip-audit's
+#: configuration and caches on Linux. pip's own settings are :data:`_PIP_PREFIX` names. A variable
+#: a later pip reads is not here until somebody adds it, and the auditor's run then fails, or
+#: reaches the index without it.
+_PROXY_NAMES: Final = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY")
+_AUDITOR_NAMES: Final = frozenset(
+    {
+        *_PROXY_NAMES,
+        *(name.lower() for name in _PROXY_NAMES),
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "NETRC",
+        "XDG_CONFIG_HOME",
+        "XDG_CONFIG_DIRS",
+        "XDG_CACHE_HOME",
+    }
+)
+
+#: pip reads each of its options from an upper-case variable with this prefix (``PIP_INDEX_URL``,
+#: ``PIP_CERT``, ``PIP_CONFIG_FILE``), so the auditor lets the namespace in rather than a list of
+#: today's options. It is pip's: no engine setting or secret is named with it.
+_PIP_PREFIX: Final = "PIP_"
 
 #: Secrets outside the ``MEFOR_*`` prefix that are kept from every child process and refused in
 #: ``pass_environment``. At least these two. asyncpg falls back to ``PGPASSWORD`` when
@@ -454,11 +479,24 @@ def hook_environment(
     return {n: v for n, v in _source(environ).items() if _key(n) in names}
 
 
-def non_engine_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    """Everything in ``environ`` (default :data:`os.environ`) outside the engine's own ``MEFOR_*``
-    namespace, less :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`: the deny-list the module docstring
-    says is only for the dependency auditor. ``PYTHONPATH`` crosses as ``environ`` has it."""
-    return {n: v for n, v in _source(environ).items() if outside_engine_namespace(n)}
+def auditor_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment for the dependency auditor's ``pip`` and ``pip-audit``: an allowlist over
+    ``environ`` (default :data:`os.environ`).
+
+    It holds what :func:`worker_environment` gives a Python child with no extra names, which is the
+    platform's start-up names and the interpreter's own variables with any empty or relative
+    ``PYTHONPATH`` entry dropped. On top of that come :data:`_AUDITOR_NAMES` and every
+    :data:`_PIP_PREFIX` name, so an index, a proxy or a certificate the runner configures still
+    reaches them. Nothing else crosses: no ``MEFOR_*`` variable, no name in
+    :data:`ENGINE_SECRETS_OUTSIDE_THE_PREFIX`, and no CI token. A variable a pip setup needs beyond
+    these, such as a keyring backend's, does not cross either.
+
+    Built through :func:`worker_environment`, so the two cannot drift apart. That builder's
+    "never a secret" rule is for code the engine does not trust; ``pip`` is a tool the auditor
+    names, and a ``PIP_INDEX_URL`` that carries an index credential is meant for it."""
+    source = _source(environ)
+    pip_names = {name for name in source if _key(name).startswith(_PIP_PREFIX)}
+    return worker_environment(source, extra_names=_AUDITOR_NAMES | pip_names)
 
 
 def engine_environment(environ: Mapping[str, str] | None = None) -> dict[str, str]:

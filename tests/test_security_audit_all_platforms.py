@@ -296,21 +296,29 @@ def test_a_failed_install_check_stops_before_the_audit(tmp_path: Path) -> None:
     assert len(ran) == 1
 
 
-#: Exits 3 when the engine secret arrived, 4 when the control variable did not, 0 otherwise.
+#: Exits 3 when the engine secret arrived, 4 or 5 when a setting pip reads did not, 6 when a
+#: variable nobody listed did, 0 otherwise.
 _ENV_PROBE = (
     "import os, sys; "
     "sys.exit(3 if 'MEFOR_TEST_AUDIT_SECRET' in os.environ "
-    "else 4 if os.environ.get('PIP_TEST_AUDIT_SETTING') != 'kept' else 0)"
+    "else 4 if os.environ.get('PIP_TEST_AUDIT_SETTING') != 'kept' "
+    "else 5 if os.environ.get('HTTPS_PROXY') != 'http://proxy.invalid:3128' "
+    "else 6 if 'ORDINARY_RUNNER_VARIABLE' in os.environ else 0)"
 )
 
 
-def test_an_engine_secret_does_not_reach_pip_or_pip_audit(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The real runner hands its children childenv.non_engine_environment, not the whole environment.
+def test_only_what_pip_reads_reaches_pip_or_pip_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real runner hands its children ``childenv.auditor_environment``, an allowlist, not the
+    whole environment (vault BACKLOG #2587).
 
-    The control, a pip-style setting, must still arrive: pip reads its index and proxy from there.
+    An engine secret does not arrive, and neither does a variable nobody listed, which the old
+    deny-list let through. The controls, a pip setting and a proxy, must still arrive: pip reads
+    its index and proxy from there.
     """
     monkeypatch.setenv("MEFOR_TEST_AUDIT_SECRET", "marker-not-a-secret")
     monkeypatch.setenv("PIP_TEST_AUDIT_SETTING", "kept")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("ORDINARY_RUNNER_VARIABLE", "marker-not-a-secret")
     assert _run([sys.executable, "-c", _ENV_PROBE]) == 0
 
 

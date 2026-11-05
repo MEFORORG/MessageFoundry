@@ -77,7 +77,9 @@ UTF-8, UTF-16 or UTF-32 byte-order mark is honoured, as pip honours it.
 
 Both subprocesses start through ``messagefoundry.childenv.python_module_argv``, so with ``-P``
 (the checked-out tree, the current directory, is not on their ``sys.path`` and cannot shadow a
-module the auditor imports) and the engine's other child-interpreter flags.
+module the auditor imports) and the engine's other child-interpreter flags. Their environment is
+``messagefoundry.childenv.auditor_environment``, an allowlist: a variable it does not name, a CI
+token or an engine secret among them, does not reach them.
 
 WHAT IT DOES NOT HANDLE, stated rather than papered over. If a lock ever pins ONE name at two
 versions under two markers (a resolver fork), the copy carries both and pip-audit refuses it with
@@ -98,7 +100,7 @@ import tempfile
 from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 
-from messagefoundry.childenv import engine_environment, non_engine_environment, python_module_argv
+from messagefoundry.childenv import auditor_environment, python_module_argv
 
 
 def is_requirement_line(line: str) -> bool:
@@ -258,12 +260,8 @@ def _skip_private_refusal(private: Collection[str], pip_audit_args: Sequence[str
 
 
 def _run(cmd: list[str]) -> int:
-    # non_engine_environment: everything outside the engine's MEFOR_* namespace and its named
-    # secrets, so pip and pip-audit keep the index, proxy and certificate settings they read from
-    # the environment, and an engine secret set on the same runner does not reach them. Built over
-    # engine_environment, which drops an empty or relative PYTHONPATH entry: that would put the
-    # working directory back on the children's sys.path, which -P keeps off it.
-    env = non_engine_environment(engine_environment())
+    # An allowlist (vault BACKLOG #2587); its docstring says what crosses.
+    env = auditor_environment()
     # The argv is a list and no shell reads it, but it is not all fixed. Written in this module:
     # the module name (pip or pip_audit) and each flag main() writes. From python_module_argv: the
     # interpreter and its child flags, some fixed and some repeated from this process's own flags
