@@ -2446,16 +2446,17 @@ before the change is refused at release with **409** and an `approval.no_longer_
 the approver, whose `reason` says which (`approvals_disabled` or `operation_not_gated`). Nothing
 runs. The request stays pending until an approver rejects it or it expires. The refusal's wording
 tells the approver to reject it and, if the operation is still needed, to run it again, which now
-runs it without a second approver. `GET /approvals` marks such a request `gated: false`, read from
-the same settings test at listing time, and gives it a `release_blocked` reason, below, which the
-console's Approvals page keys on.
+runs it without a second approver. `GET /approvals` marks such a request `release_blocked:
+"not_gated"`, below, read from the same settings test at listing time, which the console's
+Approvals page keys on.
 
 **`GET /approvals` names at least some of the releases the gate refuses whoever approves them
 (vault BACKLOG #3192).** Each pending request carries `release_blocked`, which the release refuses
 on directly, so where it names a reason the two cannot disagree. It names at least a request with
 no requester id, an operation no longer registered, one dual control no longer gates, unreadable
 parameters, parameters naming no requester for an operation whose executor needs one (a purge or a
-reload, `params_no_requester`), and a requester who no longer holds the authority the operation needs, such as a held
+reload, `params_no_requester`), a held reload whose parameters carry no config digest, which its
+release could only refuse whatever the directory holds (`params_no_fingerprint`), and a requester who no longer holds the authority the operation needs, such as a held
 reload or purge whose requester has since been channel-scoped (`requester_not_authorized`, BACKLOG
 #3189). The requester's standing is read when the queue is listed, by the rule the release
 applies, so a change after the listing, or a standing the listing could not read, is met only at
@@ -2465,7 +2466,8 @@ the expiry, the dwell floor, the row's seal and the operation's own refusals are
 page keys on it, and offers a blocked request only Reject, or Withdraw on the requester's own row,
 with a note saying why. A release refused for unreadable parameters writes an
 `approval.params_unreadable` row against the approver, which carries no parameters, and one refused
-as `params_no_requester` writes an `approval.params_no_requester` row against the approver. A
+as `params_no_requester` or `params_no_fingerprint` writes an `approval.params_no_requester` or
+`approval.params_no_fingerprint` row against the approver. A
 release refused on the requester's standing writes `approval.stale_requester`, above. A refusal for
 a request with no requester id, or for an operation no longer registered, still writes no row.
 
@@ -2767,7 +2769,8 @@ in the local audit log for a `dead_letter_replay` or `connection_purge` row writ
 **An audit or store outage that refuses writes answers a mapped status on at least these approval
 paths (vault BACKLOG #2255).** A refusal runs nothing, so a refusal whose own audit row fails still
 answers **409**: that is at least `approval.too_early`, `approval.stale_requester`,
-`approval.no_longer_gated`, `approval.params_unreadable` and `approval.params_no_requester`. A claim, a rejection or a resolution that the store cannot write with
+`approval.no_longer_gated`, `approval.params_unreadable`, `approval.params_no_requester` and
+`approval.params_no_fingerprint`. A claim, a rejection or a resolution that the store cannot write with
 its audit row answers **503**. The request does not move, except where a COMMIT lands despite the
 error, as stated for the claim above.
 

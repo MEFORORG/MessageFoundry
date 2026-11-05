@@ -128,12 +128,39 @@ RESOLVE_OUTCOMES: Mapping[str, str] = {
 DRAIN_TIMEOUT_SECONDS = 3.0
 
 
+def _param_text(params: Mapping[str, Any], key: str) -> str | None:
+    """``params[key]`` when it is a non-empty string, otherwise ``None``."""
+    value = params.get(key)
+    return value if isinstance(value, str) and value else None
+
+
 def named_requester(params: Mapping[str, Any]) -> str | None:
     """The requester's name a hold's params carry, or ``None`` when it is missing or not a non-empty
     string (vault BACKLOG #3217). One test for the executors that need the name and for the queue's
     ``params_no_requester`` prediction, so the two cannot drift."""
-    requester = params.get("requester")
-    return requester if isinstance(requester, str) and requester else None
+    return _param_text(params, "requester")
+
+
+def held_fingerprint(params: Mapping[str, Any]) -> str | None:
+    """The config digest a held reload's params carry, or ``None`` when it is missing or not a
+    non-empty string (vault BACKLOG #3192). A release bound to ``None`` refuses every config, so
+    the reload executor and the queue's ``params_no_fingerprint`` prediction read this one test."""
+    return _param_text(params, "fingerprint")
+
+
+#: The 409 text :meth:`ApprovalGate.approve` answers for each params refusal, which it audits as
+#: ``approval.<reason>``. One arm serves them all, so the audit row cannot differ between them.
+_PARAMS_REFUSALS: dict[ReleaseBlocked, str] = {
+    "params_unreadable": "request parameters are unreadable; reject it instead",
+    "params_no_requester": (
+        "this request's parameters record no requester, so the operation could not name who ran "
+        "it; reject it and request the operation again"
+    ),
+    "params_no_fingerprint": (
+        "this request's parameters record no config digest, so its release could not be bound to "
+        "the config it names; reject it and request the operation again"
+    ),
+}
 
 
 #: The claim owner of an engine that is neither an engine shard nor a cluster node (BACKLOG #1562).
@@ -351,6 +378,10 @@ class _Operation:
     #: The executor refuses params whose ``requester`` is not a non-empty string (vault BACKLOG
     #: #3217), so :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim.
     requires_requester: bool = False
+    #: The executor binds its release to the config digest in params ``fingerprint``, and refuses
+    #: every config when there is none (:func:`held_fingerprint`; vault BACKLOG #3192), so
+    #: :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim too.
+    requires_fingerprint: bool = False
 
 
 class ApprovalError(Exception):
@@ -680,12 +711,14 @@ class ApprovalGate:
         permission: Permission,
         in_scope: ScopeCheck | None = None,
         requires_requester: bool = False,
+        requires_fingerprint: bool = False,
     ) -> None:
         """Register an approvable operation. ``permission`` is REQUIRED, so no operation can become
         approvable without naming the authority its requester must still hold at release.
         ``requires_requester`` declares that ``execute`` refuses params whose ``requester`` is not a
         non-empty string, so the gate refuses such a request before it claims it and the queue
-        marks it ``params_no_requester``."""
+        marks it ``params_no_requester``. ``requires_fingerprint`` declares the same of
+        :func:`held_fingerprint`, marked ``params_no_fingerprint``."""
         self._ops[key] = _Operation(
             key=key,
             label=label,
@@ -693,6 +726,7 @@ class ApprovalGate:
             permission=permission,
             in_scope=in_scope,
             requires_requester=requires_requester,
+            requires_fingerprint=requires_fingerprint,
         )
 
     @property
@@ -1095,7 +1129,6 @@ class ApprovalGate:
             "status": "pending",
             "approver": None,
             "decided_at": None,
-            "gated": self.gates(operation),
             "release_blocked": "seal_failed",
         }
 
@@ -1184,6 +1217,11 @@ class ApprovalGate:
         # #3217): past the claim it was compensated to 'failed' while the queue offered Approve.
         if op.requires_requester and named_requester(params) is None:
             return "params_no_requester"
+        # The same kind of test for a held reload: a release bound to no digest refuses every
+        # config, so it is refused before the claim rather than claimed and compensated. Whether
+        # the directory still matches a digest the hold did capture is met only at release.
+        if op.requires_fingerprint and held_fingerprint(params) is None:
+            return "params_no_fingerprint"
         return None
 
     async def _queue_release_blocked(
@@ -1253,9 +1291,6 @@ class ApprovalGate:
             "status": r.status,
             "approver": r.approver,
             "decided_at": r.decided_at,
-            # The same test approve() refuses on (approval.no_longer_gated), so a page can stop
-            # offering a release the gate would refuse. Read now, like the refusal it predicts.
-            "gated": self.gates(operation),
             "release_blocked": blocked,
         }
 
@@ -1289,8 +1324,8 @@ class ApprovalGate:
 
         **The writes on this path answer a mapped status in a store outage (vault BACKLOG #2255).** A
         refusal's own audit row (at least ``approval.too_early``, ``approval.stale_requester``,
-        ``approval.no_longer_gated``, ``approval.params_unreadable`` and
-        ``approval.params_no_requester``) that fails to write is
+        ``approval.no_longer_gated``, ``approval.params_unreadable``,
+        ``approval.params_no_requester`` and ``approval.params_no_fingerprint``) that fails to write is
         logged and the refusal still answers 409, since it runs nothing. A release whose approver account changed after the request
         writes ``approval.approver_provenance``. That row is soft too, and pages if it fails. It is
         written whether the operation succeeded, failed or was cut off. Many failed writes on this path also page
@@ -1339,15 +1374,17 @@ class ApprovalGate:
             # and the request's own configured shape (who must approve, how old) says nothing
             # about that. Fail closed: refuse, stay pending until it expires or is rejected.
             await self._refuse_ungated(approval_id, row, approver=approver, client=client)
-        if blocked == "params_unreadable":
-            # The queue lists such a row as "unreadable" (BACKLOG #2458). Refuse it as a 409 that
-            # leaves the row pending for a reject, rather than a 500 from a bare parse. Before the
-            # dwell floor, so a row that can never be released writes no too-early row or alert.
-            # Audited like the other refusals (vault BACKLOG #3192), soft for the same reason. The
-            # detail carries no params: they are what could not be read.
+        if blocked in _PARAMS_REFUSALS:
+            # Each is a 409 that leaves the row pending for a reject, as the queue predicts:
+            # unreadable params (BACKLOG #2458) rather than a 500 from a bare parse, and the two the
+            # executor would otherwise refuse only after the claim, compensated to 'failed' (vault
+            # BACKLOG #3217, #3192). Before the dwell floor, so a row that can never be released
+            # writes no too-early row or alert. Audited like the other refusals (vault BACKLOG
+            # #3192), as approval.<reason>, soft for the same reason. The detail carries no params:
+            # for one of them, they are what could not be read.
             await self._record_audit_soft(
                 approval_id,
-                "approval.params_unreadable",
+                f"approval.{blocked}",
                 actor=approver,
                 detail=json.dumps(
                     {"approval_id": approval_id, "operation": operation, "requester": row.requester}
@@ -1355,26 +1392,7 @@ class ApprovalGate:
                 client=client,  # ADR 0150: the approver's address, matching this row's actor
                 context="the release was refused",
             )
-            raise ApprovalError(409, "request parameters are unreadable; reject it instead")
-        if blocked == "params_no_requester":
-            # The executor would refuse it after the claim, compensated to 'failed' (vault BACKLOG
-            # #3217). Refused here instead, so it stays pending for a reject, as the queue
-            # predicts. Audited, and soft, like the unreadable-params refusal above.
-            await self._record_audit_soft(
-                approval_id,
-                "approval.params_no_requester",
-                actor=approver,
-                detail=json.dumps(
-                    {"approval_id": approval_id, "operation": operation, "requester": row.requester}
-                ),
-                client=client,  # ADR 0150: the approver's address, matching this row's actor
-                context="the release was refused",
-            )
-            raise ApprovalError(
-                409,
-                "this request's parameters record no requester, so the operation could not name "
-                "who ran it; reject it and request the operation again",
-            )
+            raise ApprovalError(409, _PARAMS_REFUSALS[blocked])
         op = self._ops.get(operation)
         if blocked is not None or not requester_user_id or op is None or params is None:
             # Unreachable while every reason has its arm above. Fail closed if one is added

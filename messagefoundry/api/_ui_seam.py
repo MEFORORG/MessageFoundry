@@ -502,10 +502,11 @@ from typing import Any
 #: its review repair (at 6d7dcabe1103f08d), then with main: re-derived with ``--write`` on the
 #: merged tree, so the value below covers every entry above.
 #:
-#: Vault BACKLOG #3192 merged with main after BACKLOG #2709 landed there (PR 2341, digest
-#: 344979df3bd2c662 on main). Main moved the seam by that merge alone: the route-gate table and
-#: its review repairs, which this branch had already taken. Re-derived with ``--write`` on the
-#: merged tree; the digest did not move. Main carries that branch at 6d7dcabe1103f08d (PR 2352).
+#: Vault BACKLOG #3192, #3193 and #3236 merged with main after vault BACKLOG #2709 landed there
+#: (PR 2341, digest 344979df3bd2c662 on main). On main, PR 2341 was the only commit to touch this
+#: file since the branch's previous merge of main: the route-gate table and its review repairs,
+#: which the branch had already taken. Re-derived with ``--write`` on the merged tree; the digest
+#: did not move. Main carries that branch at 6d7dcabe1103f08d (PR 2352).
 #:
 #: Vault BACKLOG #3189 and #3031 (at 0b2a8d6524e4acc6) merged with main after PR 2352 landed
 #: there at 6d7dcabe1103f08d. The #3192 review-repair entry above is that branch's own, kept once.
@@ -811,12 +812,19 @@ from typing import Any
 #: ``messagefoundry`` floor instead. An older console on this engine passes the handshake and still
 #: answers a scoped caller's bad flag direction with the unaudited 404.
 #:
+#: Vault BACKLOG #3192 and #3193 N3: ``ReleaseBlocked`` gained ``params_no_fingerprint``, a held
+#: reload whose params carry no config digest, which the gate now refuses before its claim, and
+#: ``PendingApprovalInfo`` lost ``gated``, which ``release_blocked = "not_gated"`` already said.
+#: The Approvals page keys a note on every value and never read ``gated``. An older console on
+#: this engine is refused at mount rather than meeting a value it has no note for. The digest
+#: moved from ``734e7007fb95eb75`` (derived with ``--digest``, then written with ``--write``).
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "734e7007fb95eb75"
+ENGINE_UI_SEAM: str = "1cbeb65e0ed8e86d"
 
 
 @dataclass(frozen=True, slots=True)

@@ -118,6 +118,10 @@ _BLOCKED: dict[ReleaseBlocked, str] = {
         "Its parameters record no requester, so the operation could not name who ran it and it "
         "cannot be approved. {verb} it; if it is still needed, request it again."
     ),
+    "params_no_fingerprint": (
+        "Its parameters record no config digest, so the release could not be bound to the config "
+        "it names, and it cannot be approved. {verb} it; if it is still needed, request it again."
+    ),
     "requester_not_authorized": (
         "The requester no longer holds the authority this operation requires, so it cannot be "
         "approved while that lasts. If their authority is restored, it can be approved then. "

@@ -527,6 +527,7 @@ ReleaseBlocked = Literal[
     "not_gated",
     "params_unreadable",
     "params_no_requester",
+    "params_no_fingerprint",
     "requester_not_authorized",
     "seal_failed",
 ]
@@ -546,19 +547,17 @@ class PendingApprovalInfo(BaseModel):
     user id as the self-approval refusal is (BACKLOG #2460, #1540). The engine refuses that caller's
     approve and resolve whatever this says; it lets a page stop offering them.
 
-    ``gated`` is False when dual control no longer gates this request's operation: ``[approvals].enabled``
-    is off, or the operation has left ``[approvals].operations``. The engine then refuses a
-    ``pending`` request's approve with 409 (``approval.no_longer_gated``) whatever this says; it lets
-    a page offer only the reject. It reads the settings at listing time, and it does not affect the
-    resolve of an ``interrupted`` row.
-
     ``release_blocked`` names why the engine refuses a ``pending`` request's approve whoever the
     approver is, or is ``None`` (vault BACKLOG #3192). Each value is a 409 the gate raises, in the
     order it raises them: ``no_requester_id`` (the row predates requester-id attribution),
-    ``operation_unavailable`` (no such operation is registered), ``not_gated`` (as ``gated`` above),
-    ``params_unreadable``, ``params_no_requester`` (the operation's executor needs the requester's
-    name, as at least a held purge's and reload's do, and these parameters carry none; vault
-    BACKLOG #3217), and
+    ``operation_unavailable`` (no such operation is registered), ``not_gated`` (dual control no
+    longer gates the operation: ``[approvals].enabled`` is off, or the operation has left
+    ``[approvals].operations``, read from the settings at listing time; the approve's 409 writes
+    ``approval.no_longer_gated``), ``params_unreadable``, ``params_no_requester`` (the operation's
+    executor needs the requester's name, as at least a held purge's and reload's do, and these
+    parameters carry none; vault BACKLOG #3217), ``params_no_fingerprint`` (the operation binds
+    its release to a config digest the hold captured, as a held reload does, and these parameters
+    carry none, so the release could only refuse every config; vault BACKLOG #3192), and
     ``requester_not_authorized``, which the gate raises after the dwell floor: the requester no longer holds the authority the operation needs, read when the queue is
     listed (BACKLOG #3189). A held reload or purge whose requester has since been channel-scoped is
     one. The listing writes no ``approval.stale_requester`` row; only an approve refused on it
@@ -567,7 +566,7 @@ class PendingApprovalInfo(BaseModel):
     of that account does. ``None`` does not promise a release. At least the self-approval
     refusal, the expiry, the dwell floor, a change to the requester's standing after the listing, a
     standing the listing could not read, a seal that fails after the listing and the operation's own refusals, such as a
-    held reload with no config digest, are met only at release. It lets a page offer only the reject. It is ``None`` on
+    held reload whose config directory changed since the hold, are met only at release. It lets a page offer only the reject. It is ``None`` on
     an ``interrupted`` row.
 
     ``seal_failed`` (BACKLOG #3639; owner ruling 2026-10-26) marks a ``pending`` row that failed
@@ -588,7 +587,6 @@ class PendingApprovalInfo(BaseModel):
     approver: str | None = None
     decided_at: float | None = None
     caller_is_requester: bool = False
-    gated: bool = True
     release_blocked: ReleaseBlocked | None = None
 
 

@@ -16,6 +16,11 @@ A held purge whose params name no requester was refused by its executor only aft
 registered with ``requires_requester`` is now marked ``params_no_requester`` and refused before the
 claim, audited as ``approval.params_no_requester``.
 
+A held reload whose params carry no config digest is refused by its executor whatever the directory
+holds, since a release bound to no digest matches nothing (vault BACKLOG #3192). An operation
+registered with ``requires_fingerprint`` is marked ``params_no_fingerprint`` and refused before the
+claim, audited as ``approval.params_no_fingerprint``.
+
 The gate runs over a real SQLite store. The odd rows are written through the store directly,
 because no request through ``guard`` can produce them.
 """
@@ -61,7 +66,8 @@ def _gate(store: Any, runs: list[str], sink: _Sink | None = None) -> ApprovalGat
         return {"requeued": 0}
 
     # The replay stands in for an executor that needs the requester's name, as the real purge does
-    # (vault BACKLOG #3217); only the replay is both registered and gated here.
+    # (vault BACKLOG #3217), and the approved digest, as the real reload does (vault BACKLOG
+    # #3192); only the replay is both registered and gated here.
     for key in (_REPLAY, _PURGE):
         # A requester is out of scope for a row whose params say so (BACKLOG #3189), standing in
         # for a held reload or purge whose requester has since been channel-scoped.
@@ -72,11 +78,13 @@ def _gate(store: Any, runs: list[str], sink: _Sink | None = None) -> ApprovalGat
             permission=Permission.MESSAGES_REPLAY,
             in_scope=lambda _identity, p: not p.get("out_of_scope"),
             requires_requester=True,
+            requires_fingerprint=True,
         )
     return gate
 
 
-_NAMED = json.dumps({"requester": "maker"})
+_DIGEST = "a" * 64
+_NAMED = json.dumps({"requester": "maker", "fingerprint": _DIGEST})
 
 
 async def _row(
@@ -118,8 +126,20 @@ async def _rows(store: MessageStore) -> dict[str, ReleaseBlocked | None]:
         await _row(store, params=json.dumps({"requester": ""})): "params_no_requester",
         # Both reasons hold; the params test comes first, in the queue and in approve() alike.
         await _row(store, params=json.dumps({"out_of_scope": True})): "params_no_requester",
+        await _row(store, params=json.dumps({"requester": "maker"})): "params_no_fingerprint",
+        await _row(
+            store, params=json.dumps({"requester": "maker", "fingerprint": ""})
+        ): "params_no_fingerprint",
+        await _row(
+            store, params=json.dumps({"requester": "maker", "fingerprint": 7})
+        ): "params_no_fingerprint",
+        # Both reasons hold again; the digest test comes first, as the requester's name did.
         await _row(
             store, params=json.dumps({"out_of_scope": True, "requester": "maker"})
+        ): "params_no_fingerprint",
+        await _row(
+            store,
+            params=json.dumps({"out_of_scope": True, "requester": "maker", "fingerprint": _DIGEST}),
         ): "requester_not_authorized",
         await _row(store): None,
     }
@@ -152,10 +172,12 @@ async def test_the_prediction_matches_the_refusal(store: MessageStore) -> None:
     [stale] = await store.list_audit(action="approval.stale_requester")
     assert json.loads(str(stale["detail"]))["reason"] == "requester_out_of_scope"
     # Each row predicted params_no_requester was refused on it, the combined row included.
-    unnamed = await store.list_audit(action="approval.params_no_requester")
-    assert sorted(json.loads(str(r["detail"]))["approval_id"] for r in unnamed) == sorted(
-        k for k, v in expected.items() if v == "params_no_requester"
-    )
+    # Each row predicted params_no_fingerprint likewise.
+    for reason in ("params_no_requester", "params_no_fingerprint"):
+        refused = await store.list_audit(action=f"approval.{reason}")
+        assert sorted(json.loads(str(r["detail"]))["approval_id"] for r in refused) == sorted(
+            k for k, v in expected.items() if v == reason
+        ), reason
 
 
 async def test_an_unreadable_params_refusal_writes_its_audit_row(store: MessageStore) -> None:
@@ -201,21 +223,83 @@ async def test_a_no_requester_refusal_writes_its_audit_row(store: MessageStore) 
     assert await store.list_audit(action="approval.release_attempted") == []
 
 
-async def test_a_lost_no_requester_row_still_answers_409_and_pages(store: MessageStore) -> None:
-    approval_id = await _row(store, params="{}")
+@pytest.mark.parametrize(
+    ("params", "action"),
+    [
+        ("{}", "approval.params_no_requester"),
+        (json.dumps({"requester": "maker"}), "approval.params_no_fingerprint"),
+    ],
+    ids=["no-requester", "no-fingerprint"],
+)
+async def test_a_lost_params_refusal_row_still_answers_409_and_pages(
+    store: MessageStore, params: str, action: str
+) -> None:
+    approval_id = await _row(store, params=params)
     sink = _Sink()
-    gate = _gate(_Faulty(store, audit_fails=("approval.params_no_requester",)), [], sink)
+    gate = _gate(_Faulty(store, audit_fails=(action,)), [], sink)
     with pytest.raises(ApprovalError) as caught:
         await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
     assert caught.value.status == 409
-    assert sink.lost == [(f"approval:{approval_id}", "approval.params_no_requester")]
+    assert sink.lost == [(f"approval:{approval_id}", action)]
+
+
+async def test_a_no_fingerprint_refusal_writes_its_audit_row(store: MessageStore) -> None:
+    """Vault BACKLOG #3192: a hold bound to no config digest is refused before the claim, so
+    nothing ran and nothing was claimed, and the refusal is audited against the approver."""
+    approval_id = await _row(store, params=json.dumps({"requester": "maker"}))
+    runs: list[str] = []
+    with pytest.raises(ApprovalError) as caught:
+        await _gate(store, runs).approve(
+            approval_id, approver="checker", approver_user_id=_APPROVER_ID
+        )
+    assert caught.value.status == 409 and runs == []
+    assert "no config digest" in caught.value.detail
+    [row] = await store.list_audit(action="approval.params_no_fingerprint")
+    assert str(row["actor"]) == "checker"
+    detail = json.loads(str(row["detail"]))
+    assert detail == {"approval_id": approval_id, "operation": _REPLAY, "requester": "maker"}
+    assert await store.list_audit(action="approval.release_attempted") == []
+
+
+@pytest.mark.parametrize("resolver", ["none-bound", "resolves-nobody"])
+async def test_a_queue_that_cannot_verify_the_requester_shows_the_block(
+    store: MessageStore, resolver: str
+) -> None:
+    """Vault BACKLOG #3192: with no identity resolver, or one that resolves nobody, approve()
+    refuses every release as ``requester_unverifiable``, and the queue shows that as
+    ``requester_not_authorized`` rather than offering Approve."""
+
+    async def _nobody(_user_id: str) -> Any:
+        return None
+
+    settings = ApprovalsSettings(enabled=True, operations=[_REPLAY], min_dwell_seconds=0.0)
+    gate = ApprovalGate(
+        _StandingStore(store),
+        settings,
+        resolve_identity=None if resolver == "none-bound" else _nobody,
+    )
+    runs: list[str] = []
+
+    async def _execute(_p: Mapping[str, Any]) -> dict[str, Any]:
+        runs.append("ran")
+        return {"requeued": 0}
+
+    gate.register(_REPLAY, "op", _execute, permission=Permission.MESSAGES_REPLAY)
+    approval_id = await _row(store)
+    [entry] = await gate.list_pending()
+    assert entry["release_blocked"] == "requester_not_authorized"
+    with pytest.raises(ApprovalError) as caught:
+        await gate.approve(approval_id, approver="checker", approver_user_id=_APPROVER_ID)
+    assert caught.value.status == 409 and runs == []
+    [stale] = await store.list_audit(action="approval.stale_requester")
+    assert json.loads(str(stale["detail"]))["reason"] == "requester_unverifiable"
 
 
 async def test_an_operation_not_needing_the_requester_releases_without_one(
     store: MessageStore,
 ) -> None:
-    """The negative control: the default, ``requires_requester=False``, leaves params naming no
-    requester releasable, as the real replay is."""
+    """The negative control: the defaults, ``requires_requester=False`` and
+    ``requires_fingerprint=False``, leave params naming neither releasable, as the real replay is."""
     settings = ApprovalsSettings(enabled=True, operations=[_REPLAY], min_dwell_seconds=0.0)
     gate = ApprovalGate(_StandingStore(store), settings, resolve_identity=_resolve)
     runs: list[str] = []

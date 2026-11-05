@@ -215,6 +215,11 @@ this line.**
   503 a later handler change adds is no longer named as the store's refusal. The console now catches
   the engine's `ConfigWriteNotRecorded` and re-raises any other 503. Needs the engine seam that
   carries `api.security.ConfigWriteNotRecorded`. (`BACKLOG #3811`)
+- **The Approvals page offers no Approve on a held reload that names no config digest.** The
+  engine marks it `release_blocked: "params_no_fingerprint"`, and the page offers Reject, or
+  Withdraw on the requester's own row, with a note saying why. Needs the engine seam that carries
+  that value; the same seam drops `PendingApprovalInfo.gated`, which the page never read. (vault
+  `BACKLOG #3192`, `#3193`)
 
 ## [0.5.0] — 2026-10-20 — Early Access
 
