@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import errno
+import inspect
 import ipaddress
 import json
 import logging
@@ -31,6 +32,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from fastapi import HTTPException
 from pydantic import ValidationError
 from starlette.requests import Request
+from uvicorn.main import run as _uvicorn_run
 
 from messagefoundry.__main__ import main
 from messagefoundry.api import create_app
@@ -1303,6 +1305,14 @@ def test_serve_forwarded_allow_ips_empty_when_no_proxy(
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     # Trust nothing by default (override uvicorn's loopback default), so XFF can't spoof the source IP.
     assert captured["forwarded_allow_ips"] == []
+    # Vault BACKLOG #3764 item 6: the premise of tests/test_api_listener_ipv6_only.py. serve names
+    # no loop, so uvicorn.run's own "auto" default runs it on uvloop wherever that imports, and it
+    # binds by host and port, so the loop's create_server makes the socket that file reads.
+    # uvicorn.run is stubbed here, so the default is read off the unpatched function.
+    assert "loop" not in captured
+    assert inspect.signature(_uvicorn_run).parameters["loop"].default == "auto"
+    assert "host" in captured and "port" in captured
+    assert "fd" not in captured and "uds" not in captured
     # WP-L3-07 (ASVS 13.4.6): the `Server: uvicorn` banner is suppressed.
     assert captured["server_header"] is False
     # BACKLOG #3256: the connection drain before the lifespan teardown is bounded.
