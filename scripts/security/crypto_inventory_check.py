@@ -431,7 +431,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # `cryptography` directly — this is the single cert-tooling crypto call site. BACKLOG #1352:
     # .pfx import also decrypts each PKCS#12 EncryptedData part (PBKDF2 + AES-CBC) so keywrap can
     # check the key bags inside before the bundle loads.
-    "messagefoundry/pki.py": frozenset({"cryptography"}),
+    # BACKLOG #4948: IssuerIndex loads the client CA bytes the live context already loaded into a
+    # scratch ssl.SSLContext, to check it indexed exactly the CA certificates OpenSSL took, and a
+    # count of the others OpenSSL's count can match. The
+    # scratch context is discarded: it serves no handshake and changes no hop's trust.
+    "messagefoundry/pki.py": frozenset({"cryptography", "ssl"}),
     # BACKLOG #1748: hashlib = sha256 of a partner-chosen FILE NAME, so `safe_name` can put a short,
     # stable label in a log line where the cleartext name (which can embed an MRN) must never go. The
     # same derived-id, never-a-secret use as transports/file.py's dedup key below, and likewise not a
@@ -1490,6 +1494,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:cryptography.x509.load_pem_x509_crl",
             "key_cert:cryptography.x509.random_serial_number",
             "key_cert:via messagefoundry.keywrap",
+            # BACKLOG #4948: IssuerIndex reads what OpenSSL loads from the client CA bytes, on a
+            # scratch context it then discards. Public certificates only; no trust is granted.
+            "tls_context:.load_verify_locations()",
+            "tls_context:ssl.SSLContext",
             "sign_verify:.sign()[sha256]",
             # Vault BACKLOG #2905: _verify_with asks a CA's public key whether it signed a CRL,
             # so a start can tell a proven bad signature from one it cannot check. Verification
