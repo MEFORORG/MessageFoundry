@@ -47,7 +47,16 @@ async def seal_failed_details(store: Any) -> list[dict[str, object]]:
 
 async def logout_details(store: Any) -> list[dict[str, object]]:
     """Each ``auth.logout`` row's whole ``detail``, newest first."""
+    return [detail for _, _, detail in await logout_entries(store)]
+
+
+async def logout_entries(
+    store: Any, *, limit: int | None = None
+) -> list[tuple[object, object, dict[str, object]]]:
+    """Each ``auth.logout`` row, newest first, as its actor, client address and whole ``detail``.
+    ``limit``, when given, is passed to ``list_audit``."""
+    extra = {} if limit is None else {"limit": limit}
     return [
-        json.loads(str(row["detail"] or "{}"))
-        for row in await store.list_audit(action="auth.logout")
+        (row["actor"], row["client"], json.loads(str(row["detail"] or "{}")))
+        for row in await store.list_audit(action="auth.logout", **extra)
     ]
