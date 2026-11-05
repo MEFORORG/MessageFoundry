@@ -32,7 +32,8 @@
         its worktrees, and a subagent started with `isolation: worktree` is recorded under its
         PARENT's directory, so the occupancy check below would read its tree as empty (BACKLOG
         #1038, Manager decision batch 184). A sibling new.ps1 made beside a linked worktree also
-        sits there; the copy of this script in that worktree still removes it by -Name;
+        sits there; the copy of this script in that worktree still removes it by -Name. A segment
+        ABOVE the primary checkout does not count, so a clone that lives below one is reachable;
       * a target that CONTAINS another registered worktree, since the removal would delete that
         checkout too and leave it registered with no directory;
       * a target git has locked, which is git's own in-use flag;
@@ -41,7 +42,10 @@
         holds. The removal deletes that reflog and those refs, so nothing would reach the commits;
       * a target the session registry records a session in, or any target at all when the registry
         cannot be read (scripts/coord/occupancy.ps1 says why an unreadable fence must refuse). A
-        registry that was read and holds no record at all clears the target. This fence sees only
+        registry that was read and holds no record at all clears the target. The registry is every
+        %USERPROFILE%\.claude* config root, and the caller's CLAUDE_CONFIG_DIR when it names another;
+        a session on any other root is not seen. A record whose process still runs counts unless
+        that process started after the record was written. This fence sees only
         the directory a session was launched in, never where it writes, so on its own it is blind
         to a subagent's tree. The refusals in the next list are the signals that are not;
       * every refusal in the next list, which -Name shares.
@@ -260,10 +264,22 @@ $RepoName = Split-Path $RepoRoot -Leaf
 $transientRefExcludes = @('--exclude=refs/stash', '--exclude=refs/prefetch/*', '--exclude=refs/bisect/*',
     '--exclude=refs/rewritten/*', '--exclude=refs/original/*')
 
-# A path with a .claude/worktrees segment ANYWHERE in it, on a ConvertTo-Norm value. prune-merged.ps1
+# Whether a ConvertTo-Norm path is under a .claude/worktrees segment INSIDE this clone. prune-merged.ps1
 # excludes this population too, for the same reason; its own test needs a trailing slash and is asked
 # only of the primary's siblings, so the two are not the same expression. This one is the wider.
-$managedSegment = '/\.claude/worktrees(/|\z)'
+# A segment that lies ABOVE the primary checkout does not count (vault BACKLOG #2985, item 3): a clone
+# made inside another checkout's .claude/worktrees would otherwise have every one of its trees refused.
+# No harness tree of THIS clone can sit in such a segment. The harness puts one under the checkout the
+# session was launched in, and a checkout of this clone holding the primary would have to be added
+# into a directory that already holds it, which `git worktree add` refuses. Every other segment
+# counts, including one under a directory git does not list, so this fails closed.
+function Test-UnderManagedSegment([string]$Norm) {
+    $primaryNorm = ConvertTo-Norm $PrimaryRoot
+    foreach ($m in [regex]::Matches($Norm, '/\.claude/worktrees(?=/|\z)')) {
+        if (-not $primaryNorm.StartsWith($Norm.Substring(0, $m.Index + $m.Length) + '/')) { return $true }
+    }
+    return $false
+}
 
 $PrimaryRoot = ''
 $registered = @()
@@ -307,7 +323,7 @@ if ($listing) {
             $rest = (Split-Path $w.Path -Leaf).Substring($RepoName.Length + 1)
             if ($namePattern -and $rest -match $namePattern) { $leafName = $rest }
         }
-        $isManaged = $norm -match $managedSegment
+        $isManaged = Test-UnderManagedSegment $norm
         $class = if ($leafName) { 'sibling' } elseif ($isManaged) { 'managed' } else { 'other' }
         $counts[$class]++
         $routes = @()
@@ -373,7 +389,7 @@ if ($byPath) {
     # reads the directory a session was LAUNCHED in. A subagent under `isolation: worktree` is
     # recorded under its parent's directory (measured: 0 occupants for a live subagent's tree), and
     # its tree is one of these. A fence that fails open on a population is worse than no route to it.
-    if ($there -match $managedSegment) {
+    if (Test-UnderManagedSegment $there) {
         Write-Host "REFUSED: '$WorktreePath' is under .claude/worktrees, where the Claude Code harness puts its worktrees." -ForegroundColor Red
         Write-Host ("-Path never removes one: a subagent's tree there is recorded under its parent's directory, " +
             "so the occupancy check would read it as empty.") -ForegroundColor Red
@@ -544,8 +560,8 @@ if ($byPath) {
         }
     }
 
-    # The occupancy fence. The registry is found under $env:USERPROFILE, which is how the tests point
-    # it at a fixture.
+    # The occupancy fence. The registry is found under $env:USERPROFILE, and CLAUDE_CONFIG_DIR below,
+    # which is how the tests point it at a fixture.
     #
     # UNREADABLE REFUSES; READABLE AND EMPTY CLEARS (Manager decision, batch 184, ported from the
     # vault copy). occupancy.ps1 reports Available false in both cases. An unreadable registry,
@@ -560,18 +576,50 @@ if ($byPath) {
     # USERPROFILE through Get-EntriesOrThrow: any error refuses, and a different root count refuses,
     # because the two reads then disagree. NOT Get-ChildItem -ErrorAction Stop, which lists a
     # directory this user may not read as empty and does not throw (vault BACKLOG #2985, item 15).
-    $occ = Get-WorktreeOccupancy -Repo $PrimaryRoot
+    # A `sessions` entry that is not a directory refuses by name: the receipt counts it as a root, and
+    # no session of that root can register there (item 4).
+    #
+    # THE CALLER'S OWN CONFIG ROOT IS READ TOO WHEN IT IS NOT ONE OF THOSE (item 6). CLAUDE_CONFIG_DIR
+    # can name any directory, and the sessions sharing it are then invisible to a listing of
+    # USERPROFILE. So that root joins both reads. A session on some OTHER root outside USERPROFILE is
+    # still not seen: nothing on this machine lists the roots in use.
+    #
+    # A RUNNING PROCESS THAT STARTED BEFORE ITS SESSION REGISTERED IS THAT SESSION (item 9). The
+    # registry's default reads such a record as STALE, which vetoes nothing. A recycled pid belongs to
+    # a process started AFTER the record was written, since one pid is never held by two processes at
+    # once, so only the start-AFTER test can tell reuse. The skew is therefore unbounded here. The
+    # receipt also matches sessions against the worktree list read above, not a second read (item 5).
+    $pinRoot = ''
+    if ($env:CLAUDE_CONFIG_DIR) {
+        if (-not [System.IO.Path]::IsPathFullyQualified($env:CLAUDE_CONFIG_DIR)) {
+            throw "CLAUDE_CONFIG_DIR is the relative path '$env:CLAUDE_CONFIG_DIR', so its session registry cannot be placed. Occupancy unknown. Nothing was removed."
+        }
+        $pin = [System.IO.Path]::GetFullPath($env:CLAUDE_CONFIG_DIR).TrimEnd('\', '/')
+        $underHome = $env:USERPROFILE -and ((Split-Path $pin -Leaf) -like '.claude*') -and
+            ((ConvertTo-Norm (Split-Path $pin -Parent)) -eq (ConvertTo-Norm $env:USERPROFILE))
+        if (-not $underHome -and (Test-PresentOrThrow (Join-Path $pin 'sessions') 'the session registry CLAUDE_CONFIG_DIR names')) {
+            $pinRoot = $pin
+        }
+    }
+    $occArgs = @{ Repo = $PrimaryRoot; Worktrees = $registered; StartSkewMinutes = [int]::MaxValue }
+    if ($pinRoot) { $occArgs.ConfigRoot = @(@(Get-ClaudeConfigRoots) + $pinRoot) }
+    $occ = Get-WorktreeOccupancy @occArgs
     $listedRoots = 0
     $listedRecords = 0
     $listingError = ''
     try {
         if (-not $env:USERPROFILE) { throw 'USERPROFILE is not set' }
         $homes = Get-EntriesOrThrow $env:USERPROFILE 'config roots' '.claude*'
-        foreach ($d in @($homes | Where-Object { $_ -is [System.IO.DirectoryInfo] })) {
-            $kids = Get-EntriesOrThrow $d.FullName 'registry entries'
-            if (-not ($kids | Where-Object { $_ -is [System.IO.DirectoryInfo] -and $_.Name -eq 'sessions' })) { continue }
+        $rootDirs = @($homes | Where-Object { $_ -is [System.IO.DirectoryInfo] } | ForEach-Object { $_.FullName })
+        if ($pinRoot) { $rootDirs += $pinRoot }
+        foreach ($d in $rootDirs) {
+            $registry = Get-EntriesOrThrow $d 'registry entries' 'sessions' | Select-Object -First 1
+            if (-not $registry) { continue }
+            if ($registry -isnot [System.IO.DirectoryInfo]) {
+                throw "'$($registry.FullName)' is not a directory, so no session of that config root can be read"
+            }
             $listedRoots++
-            $listedRecords += @(Get-EntriesOrThrow (Join-Path $d.FullName 'sessions') 'session records' '*.json' -FilesOnly).Count
+            $listedRecords += @(Get-EntriesOrThrow $registry.FullName 'session records' '*.json' -FilesOnly).Count
         }
     }
     # Never empty, so an exception with no message cannot read as a clean listing.
@@ -623,12 +671,15 @@ if ($byPath) {
 # the target, and follows it ONE hop to that repository's common dir. Reading only this clone's
 # own registry would be blind to every claim once the setting is made. The clone's own registry is
 # read AS WELL: a claim taken before the setting was made, or by an older claim.ps1, is there.
-# This repository's shared root, resolved and probed once for both claims/ and alloc/. The target
-# worktree and $GitRoot share one common dir, so either names the same root.
-$script:OwnSharedRoot = $null
-function Get-OwnSharedRoot {
-    if ($null -eq $script:OwnSharedRoot) { $script:OwnSharedRoot = Resolve-CoordSharedRoot -From $GitRoot }
-    return $script:OwnSharedRoot
+# THIS REPOSITORY'S SHARED ROOT, resolved and probed ONCE, here, for both claims/ and alloc/
+# (docs/COORD-SHARED-ROOT.md). The target worktree and $GitRoot share one common dir, so either names
+# the same root. A resolver error leaves both registries unknown, so it refuses on both routes before
+# either is read (vault BACKLOG #2985, item 11). One refusal for both: a later one for the allocation
+# registry alone could never fire, because this one has already stopped the run.
+$ownShared = Resolve-CoordSharedRoot -From $GitRoot
+if ($ownShared.Error) {
+    throw ("The coordination registries of '$GitRoot' could not be resolved ($($ownShared.Error)), so its " +
+        "claims and allocations are unknown. Nothing was removed.")
 }
 
 function Get-TargetClaimsDirs {
@@ -638,13 +689,7 @@ function Get-TargetClaimsDirs {
     if ($code -ne 0 -and $code -ne 1) {
         throw "git could not read mefor.claimsRoot in '$WorktreePath' (exit $code), so claims are unknown. Nothing was removed."
     }
-    # The registry may sit on the shared root (docs/COORD-SHARED-ROOT.md), so coord-root.ps1 names
-    # it. A resolver error is claims-unknown, which refuses like every other cannot-tell here.
-    $own = Get-OwnSharedRoot
-    if ($own.Error) {
-        throw "the claim registry of '$WorktreePath' could not be resolved ($($own.Error)), so claims are unknown. Nothing was removed."
-    }
-    $dirs = @(Join-Path $own.Path 'claims')
+    $dirs = @(Join-Path $ownShared.Path 'claims')
     if ($code -eq 0 -and $setting) {
         # claim.ps1 hands the value to git as it stands, so a relative one resolves against the
         # caller's shell. Nothing here can tell which shell that was.
@@ -1079,15 +1124,10 @@ else {
 # CANNOT-TELL COUNTS AS AT-RISK. An unreadable allocation record might name this worktree, and an
 # unreadable ledger read might hide a heading. Both refuse.
 #
-# BOTH ROUTES FAIL CLOSED on a common dir git cannot name and on an alloc directory that cannot be
-# listed. -Name used to read both as "no records found" (vault BACKLOG #2985, item 11, and #2988).
-# The allocation registry may sit on the shared root (docs/COORD-SHARED-ROOT.md); an error is
-# allocations-unknown, which refuses.
-$allocResolved = Get-OwnSharedRoot
-if ($allocResolved.Error) {
-    throw "the allocation registry of '$GitRoot' could not be resolved ($($allocResolved.Error)), so allocations are unknown. Nothing was removed."
-}
-$allocDirRoot = Join-Path $allocResolved.Path 'alloc'
+# BOTH ROUTES FAIL CLOSED on a shared root that cannot be resolved (refused above, before the claims
+# are read) and on an alloc directory that cannot be listed. -Name used to read both as "no records
+# found" (vault BACKLOG #2985, item 11, and #2988).
+$allocDirRoot = Join-Path $ownShared.Path 'alloc'
 
 function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
     <# $true on origin/main, $false absent, $null CANNOT TELL (which the caller treats as at-risk).

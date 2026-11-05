@@ -253,7 +253,8 @@ Returns a pscustomobject:
     RecordsUnplaceable[int]    records that will not parse, carry no cwd, or name a checkout of this repo
                                that git no longer lists -- any at all => Available false
     UnplaceableFiles  [array]  each one's path and why, so the operator can go and look
-    Worktrees         [array]  every worktree of this .git (Path/Branch/Locked/LockReason/...)
+    Worktrees         [array]  every worktree of this .git (Path/Branch/Locked/LockReason/...), or the
+                               -Worktrees list the caller passed
     PrimaryPath       [string] the trunk checkout (git reports it first)
     Sessions          [array]  one row per record whose cwd falls inside one of those worktrees
 #>
@@ -262,10 +263,13 @@ function Get-WorktreeOccupancy {
     param(
         [string]$Repo,
         [string[]]$ConfigRoot,
-        [int]$StartSkewMinutes = 15
+        [int]$StartSkewMinutes = 15,
+        # The caller's own Get-RepoWorktrees answer, so a caller that already read the list matches
+        # sessions against the same one rather than a second read that can differ from it.
+        [object[]]$Worktrees
     )
 
-    $worktrees = @(Get-RepoWorktrees $Repo)
+    $worktrees = if ($PSBoundParameters.ContainsKey('Worktrees')) { @($Worktrees) } else { @(Get-RepoWorktrees $Repo) }
     if ($worktrees.Count -eq 0) {
         return [pscustomobject]@{
             RepoFound = $false; Available = $false; RegistryRead = $false
