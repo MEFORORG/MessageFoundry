@@ -813,6 +813,12 @@ SITES: dict[str, Site] = {
     "messagefoundry/startupcode.py::_pth_items": Site(
         1, INTERNAL, "`.pth` names from listing a site-packages directory, to inventory them."
     ),
+    "messagefoundry/store/custody.py::read_systemd_credential": Site(
+        1,
+        OPERATOR,
+        "The credential name the caller configures, refused unless it is a plain file name, under "
+        "the directory systemd names in $CREDENTIALS_DIRECTORY.",
+    ),
     "messagefoundry/store/store.py::MessageStore._db_size_bytes": Site(
         1, OPERATOR, _SQLITE_SIDECARS
     ),

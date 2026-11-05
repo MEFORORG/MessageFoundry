@@ -8,8 +8,8 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
   to replace one that exists. Its access list is read back before a single byte is written. A file
   that could not be created that way is never left behind, and there is no fallback to writing the
   file first and tightening it afterwards.
-* :func:`broad_access_problem` answers, before a key file is used, whether a known broad group
-  can read it or change it.
+* :func:`broad_access_problem` answers, before a key file is used, whether a known broad group or
+  an application package can read it or change it.
 
 Beside them, :func:`unlink_generated` removes a key or certificate file the engine wrote, riding out
 the brief Windows hold another process puts on such a file (:func:`ride_out_a_held_file`). It sits
@@ -29,6 +29,9 @@ one. ``CREATE_NEW`` with ``FILE_FLAG_OPEN_REPARSE_POINT`` refuses a name that is
 whether by a file or by a link.
 
 **POSIX.** ``O_CREAT | O_EXCL`` with mode ``0o600``, which also refuses an existing name or link.
+On Linux, a POSIX access control list the new file inherits from a default list on its directory is
+removed before a byte is written, and its absence read back, so the file's mode is its whole access
+(:func:`posix_access_acl`).
 
 All ``ctypes`` work sits behind ``sys.platform`` guards, so the module imports on every platform and
 type-checks on the Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`).
@@ -36,6 +39,7 @@ type-checks on the Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`).
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import sys
@@ -60,6 +64,7 @@ __all__ = [
     "WINERROR_SHARING_VIOLATION",
     "RestrictedFileError",
     "broad_access_problem",
+    "posix_access_acl",
     "replace_generated",
     "ride_out_a_held_file",
     "unlink_generated",
@@ -186,8 +191,21 @@ def _is_broad_group(sid: str) -> bool:
     return sid.startswith("S-1-5-21-") and sid.rsplit("-", 1)[-1] == _DOMAIN_COMPUTERS_RID
 
 
+#: APPLICATION PACKAGE AUTHORITY: every AppContainer package SID and capability SID starts here.
+_PACKAGE_SID_PREFIX = "S-1-15-"
+
+
+def _is_package_sid(sid: str) -> bool:
+    """Whether ``sid`` names an AppContainer package or capability. A package runs under the
+    account that starts it, so a read grant to one would let a confined worker read a key file
+    (vault BACKLOG #3411; the key custody ADR draft, rule 3). Refused as a grant when a file is
+    created, and reported by the check before a key file is used, like a broad group."""
+    return sid.upper().startswith(_PACKAGE_SID_PREFIX)
+
+
 def _windows_access_problem(security: _WinPathSecurity, mask: int = _REACH_MASK) -> str | None:
-    """Why a broad group can read or change the file this access list belongs to, or ``None``.
+    """Why a broad group or an application package can read or change the file this access list
+    belongs to, or ``None``.
 
     A list that could not be read is a problem too, and so is an entry of a kind this check cannot
     interpret: a check that did not finish has not shown the file restricted. Kept free of ctypes
@@ -208,6 +226,8 @@ def _windows_access_problem(security: _WinPathSecurity, mask: int = _REACH_MASK)
             return "its access list holds a conditional entry this check cannot interpret"
         if ace_mask & mask and _is_broad_group(sid):
             return f"{describe_sid(sid)} can read or change it"
+        if ace_mask & mask and _is_package_sid(sid):
+            return f"the application package {sid} can read or change it"
     return None
 
 
@@ -221,6 +241,29 @@ def _posix_access_problem(mode: int) -> str | None:
     return None
 
 
+#: The extended attribute that holds a Linux file's POSIX access control list.
+POSIX_ACL_XATTR = "system.posix_acl_access"
+
+
+def posix_access_acl(fd: int) -> bytes | None:
+    """The raw POSIX access control list of the open file ``fd``, or ``None`` when it has none.
+
+    Linux only, where the list is an extended attribute; raises :class:`RestrictedFileError`
+    elsewhere. No such attribute (``ENODATA``) and a file system that keeps no POSIX list
+    (``ENOTSUP``) both mean no list. Every other error propagates as the ``OSError`` it is, because a
+    list that could not be read is not a list shown absent. **A file system with its own access
+    model, such as an NFSv4 or CIFS mount, also answers ``ENOTSUP``**, so its access list, if it has
+    one, is not read here."""
+    if sys.platform != "linux":
+        raise RestrictedFileError("a POSIX access control list is read on Linux only")
+    try:
+        return os.getxattr(fd, POSIX_ACL_XATTR)
+    except OSError as exc:
+        if exc.errno in {errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP}:
+            return None
+        raise
+
+
 def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
     """Why ``path`` is open beyond the accounts a key file is for, or ``None`` when it is not.
 
@@ -231,8 +274,9 @@ def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
     Windows: an allow entry that lets a known broad group read the file, change it, or take it
     over. The groups are at least Everyone, Authenticated Users and the local Users group; the
     whole list is :func:`_is_broad_group`, and it is a list of known groups, not a proof that only
-    the intended accounts can reach the file. POSIX: a group or other read or write bit. A file
-    whose access cannot be read is reported as a problem, and so is, on Windows, a path that is
+    the intended accounts can reach the file. An application package or capability SID
+    (:func:`_is_package_sid`) is reported the same way. POSIX: a group or other read or write bit.
+    A file whose access cannot be read is reported as a problem, and so is, on Windows, a path that is
     itself a link, because a link carries its own access list and the file behind it was not read.
 
     The answer names accounts and modes only, never the path or the file's contents."""
@@ -348,7 +392,23 @@ def _create_restricted(path: Path, read_grants: Sequence[str]) -> int:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(path, flags, 0o600)
     try:
-        status = os.fstat(fd)
+        if sys.platform == "linux":
+            _drop_inherited_acl(path, fd)
+        # A default list or a umask can leave the owner without read; set the mode exactly, so a
+        # reader that opens the file as its owner can read what was written. A file system that
+        # keeps no modes (vfat, exFAT) refuses the chmod; that is a create that did not restrict.
+        status: os.stat_result | None = None
+        reason = ""
+        try:
+            os.fchmod(fd, 0o600)
+            status = os.fstat(fd)
+        except OSError as exc:
+            reason = exc.strerror or type(exc).__name__
+        if status is None:
+            raise RestrictedFileError(
+                f"{path} could not be created readable by its owner alone: its mode could not be "
+                f"set or read back ({reason})"
+            )
         if stat.S_IMODE(status.st_mode) & 0o077 or status.st_uid != os.geteuid():
             raise RestrictedFileError(
                 f"{path} could not be created readable by its owner alone: it reads back as mode "
@@ -359,6 +419,29 @@ def _create_restricted(path: Path, read_grants: Sequence[str]) -> int:
         path.unlink(missing_ok=True)
         raise
     return fd
+
+
+def _drop_inherited_acl(path: Path, fd: int) -> None:
+    """Remove the access list a new, still empty file inherited from a default list on its
+    directory, and read back that it is gone, so the file's mode is its whole access.
+
+    The ``0o600`` create masks the inherited named entries to nothing, but they stay in the list,
+    where a later ``chmod`` would widen them again and a reader that judges the entries themselves
+    (the key custody reads) refuses them."""
+    if sys.platform != "linux":  # pragma: no cover - guard for the type checker off Linux
+        raise RestrictedFileError("a POSIX access control list is removed on Linux only")
+    reason: str | None = None
+    try:
+        if posix_access_acl(fd) is not None:
+            os.removexattr(fd, POSIX_ACL_XATTR)
+            if posix_access_acl(fd) is not None:
+                reason = "it still carries one after it was removed"
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+    if reason is not None:
+        raise RestrictedFileError(
+            f"{path} could not be created without an inherited POSIX access control list: {reason}"
+        )
 
 
 def _create_restricted_windows(path: Path, read_grants: Sequence[str]) -> int:
@@ -379,6 +462,11 @@ def _create_restricted_windows(path: Path, read_grants: Sequence[str]) -> int:
         )
     read_sids = [_resolve_sid(name) for name in read_grants]
     for name, sid in zip(read_grants, read_sids, strict=True):
+        if _is_package_sid(sid):
+            raise RestrictedFileError(
+                f"{path} was not created: {name!r} is an application package, and a key file is "
+                "granted to the account the engine runs as, never to a package"
+            )
         if _is_broad_group(sid):
             # A grant that would make the file broadly readable is not a restricted create.
             raise RestrictedFileError(
