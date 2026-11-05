@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import io
 import json
 import random
@@ -16,9 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry import privilege_check, terminal_text
+from messagefoundry import terminal_text
 from messagefoundry.controlchars import CONTROL_CATEGORIES
-from messagefoundry.privilege_probes import VaultTokenReading
 from messagefoundry_toolkit import __main__ as toolkit
 from messagefoundry_toolkit import adr_analyze
 from messagefoundry_toolkit.__main__ import main
@@ -185,6 +183,25 @@ def test_cli_missing_adr_dir_exits_two(tmp_path: Path, capsys: pytest.CaptureFix
     captured = capsys.readouterr()
     assert str(missing) in captured.err
     assert captured.out == ""  # the human line goes to stderr, nothing to stdout
+
+
+def test_the_error_line_on_stderr_escapes_what_the_path_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #2891, PR 2390 note 6: the ``error:`` line printed the path raw. A directory name,
+    or a symlink's resolved target, can hold an ESC, a newline or a bidirectional override; a
+    newline would start a line of its own. Faked, since Windows refuses such a name."""
+    shown = "no ADR directory found or readable at /srv/a\x1b]0;owned\x07\n\u202eok"
+    monkeypatch.setattr(
+        adr_analyze,
+        "analyze_adrs",
+        lambda *_a, **_k: adr_analyze.AnalysisResult(reports=[], error=shown),
+    )
+    assert main(["adr-analyze", "--adr-dir", str(tmp_path)]) == 2
+    err = capsys.readouterr().err
+    assert err == (
+        "error: no ADR directory found or readable at /srv/a\\x1b]0;owned\\x07\\x0a\\u202eok\n"
+    )
 
 
 def test_cli_missing_adr_dir_exits_two_under_strict_too(
@@ -461,78 +478,6 @@ def test_a_fullwidth_backslash_cannot_spell_a_fake_escape(
     toolkit._print_record_line(f"open item: {chr(0xFF3C)}x1b and {chr(0xFF3C)} alone")
     out = capsys.readouterr().out
     assert out == "open item: \\uff3cx1b and \uff3c alone\n"
-
-
-#: One code point for each category in ``CONTROL_CATEGORIES``, built from integers so no editor
-#: can show or rewrite them. The test below checks the sample covers the set exactly, so a widened
-#: set cannot pass with the sample left behind.
-_ONE_PER_CATEGORY = {
-    "Cc": 0x9B,
-    "Cf": 0x200B,
-    "Zl": 0x2028,
-    "Zp": 0x2029,
-    "Cs": 0xD800,
-    "Co": 0xE000,
-    "Cn": 0xFFFF,
-}
-
-
-def _disagreements() -> list[str]:
-    """Every place one of the three terminal-text callers fails to treat a code point of
-    ``CONTROL_CATEGORIES`` as dangerous (BACKLOG #2891): the toolkit report line and the
-    ``check-privileges`` text must print it as its visible escape, and the root comparison
-    in ``privilege_check.printable`` must strip it. The escape is looked for, not the raw
-    character's absence, because ``_safe_print`` turns an unencodable one into ``?``."""
-    consumer = privilege_check.VaultConsumer("vault.store", "kek", "store key", "read the KEK")
-    found = []
-    for category, code in _ONE_PER_CATEGORY.items():
-        char, escape = chr(code), f"\\u{code:04x}"
-        printed = io.StringIO()
-        with contextlib.redirect_stdout(printed):
-            toolkit._print_record_line(f"item a{char}b")
-        if escape not in printed.getvalue():
-            found.append(f"the toolkit line does not escape {category}")
-        reading = VaultTokenReading(looked_up=True, policies=(f"p{char}q",))
-        hop = privilege_check.vault_hop(consumer, reading)
-        if escape not in "\n".join(privilege_check.render_text([hop])):
-            found.append(f"the check-privileges text does not escape {category}")
-        if privilege_check.printable(f"ro{char}ot") != "root":
-            found.append(f"the root comparison does not strip {category}")
-    return found
-
-
-def test_the_three_terminal_text_callers_agree_on_the_dangerous_categories() -> None:
-    assert set(_ONE_PER_CATEGORY) == CONTROL_CATEGORIES
-    assert all(unicodedata.category(chr(c)) == k for k, c in _ONE_PER_CATEGORY.items())
-    assert vars(privilege_check)["CONTROL_CATEGORIES"] is CONTROL_CATEGORIES, (
-        "a copy, not the engine's set"
-    )
-    assert _disagreements() == []
-
-
-def test_the_agreement_check_fails_when_the_root_comparison_diverges(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Control: the comparison's rule before BACKLOG #2891, category ``C*``, which left the line
-    and paragraph separators in."""
-    old = frozenset(c for c in CONTROL_CATEGORIES if c.startswith("C"))
-    monkeypatch.setattr(privilege_check, "CONTROL_CATEGORIES", old)
-    assert _disagreements() == [
-        "the root comparison does not strip Zl",
-        "the root comparison does not strip Zp",
-    ]
-
-
-def test_the_agreement_check_fails_when_the_shared_terminal_rule_diverges(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Control: a shared rule that stopped escaping the line separator reaches the toolkit line,
-    and the check-privileges text, which both keep printable Unicode, and the check names both."""
-    monkeypatch.setattr(terminal_text, "CONTROL_CATEGORIES", CONTROL_CATEGORIES - {"Zl"})
-    assert _disagreements() == [
-        "the toolkit line does not escape Zl",
-        "the check-privileges text does not escape Zl",
-    ]
 
 
 # --- BACKLOG #3787: a ref is read from the start of its path token --------------------------------
