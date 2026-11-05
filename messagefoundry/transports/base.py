@@ -1552,8 +1552,8 @@ class SourceConnector(abc.ABC):
     fails or is cancelled, which logs the loss at ERROR, and the process dying during the hold,
     which logs nothing, since the held frames are only in memory.
 
-    One MLLP case is not held: a sender the ``tls_client_subjects`` allowlist refuses (BACKLOG
-    #4907). Its connection closes after the read either way, and a hold would keep a refused peer's
+    The MLLP listener does not hold the frame of a sender the ``tls_client_subjects`` allowlist
+    refuses (BACKLOG #4907). Its connection closes after the read either way, and a hold would keep a refused peer's
     socket open for a whole store outage, so its frame gets one attempt, ``handler_error`` and an
     ERROR line, and the refusal's ``ERROR`` row is not written. Other sources may have gaps of
     their own."""

@@ -114,7 +114,7 @@ waits for no reply, the MLLP, raw-TCP and X12 listeners hold the frame and retry
 record `handler_error` only once the fault outlasts several retries or a stop ends them, so a fault
 after the commit can leave more than one committed row for the frame (BACKLOG #5022). The
 `SourceConnector` docstring in [`transports/base.py`](../messagefoundry/transports/base.py) states
-what each listener does with the frame, and names the one MLLP case that is not retried.
+what each listener does with the frame, and names the MLLP case it does not retry, a refused sender.
 
 What the sender is told depends on the connector and the content type:
 

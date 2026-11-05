@@ -94,17 +94,16 @@ async def _wait_for(predicate: Callable[[], bool], timeout: float = 3.0) -> bool
 
 
 class _FaultFirst:
-    """Raise a store-shaped fault on the first message, then ACK (or return nothing) normally."""
+    """Raise a store-shaped fault on the first message, then ACK normally."""
 
-    def __init__(self, *, reply: bool = True) -> None:
+    def __init__(self) -> None:
         self.calls = 0
-        self.reply = reply
 
     async def __call__(self, raw: bytes) -> str | None:
         self.calls += 1
         if self.calls == 1:
             raise RuntimeError(_FAULT_TEXT)
-        return build_ack(raw, code="AA") if self.reply else None
+        return build_ack(raw, code="AA")
 
 
 async def _boom(raw: bytes) -> str | None:
@@ -409,6 +408,87 @@ async def test_no_reply_a_retry_still_takes_an_in_flight_slot() -> None:
     events = await _drive(source, _ThenEof(frame(_ADT)), _Peer(), fail_then_record)
     assert held == [True, True], "both attempts ran inside a slot"
     assert not slots.locked(), "and the slot was released after the last"
+    assert _kinds_of(events) == ["established", "closed"]
+
+
+class _BlockingRetry:
+    """Faults once, then hangs in every retry, as a store write that never returns."""
+
+    def __init__(self) -> None:
+        self.seen: list[bytes] = []
+        self.blocked = asyncio.Event()
+
+    async def __call__(self, raw: bytes) -> None:
+        self.seen.append(raw)
+        if len(self.seen) == 1:
+            raise RuntimeError(_FAULT_TEXT)
+        self.blocked.set()
+        await asyncio.Event().wait()
+
+
+@pytest.mark.usefixtures("no_retry_pauses")
+async def test_no_reply_a_real_stop_past_its_grace_during_a_blocked_retry_names_the_loss(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # stop() itself, not a hand-set flag: it closes the writer, waits its grace, then cancels the
+    # client task. A retry blocked in the store never sees the flag, so the cancel ends the hold;
+    # it must still log the loss and record handler_error, and must not read as a clean `closed`.
+    monkeypatch.setattr(mllp_mod, "_CLIENT_SHUTDOWN_GRACE", 0.1)
+    source = _no_reply()
+    handler = _BlockingRetry()
+    events: list[Event] = []
+    source.on_connection_event = _sink(events)  # type: ignore[assignment]
+    source._handler = handler
+    with caplog.at_level(logging.ERROR):
+        client = asyncio.create_task(source._on_client(_ThenEof(frame(_ADT)), _Peer()))  # type: ignore[arg-type]
+        await asyncio.wait_for(handler.blocked.wait(), timeout=2.0)
+        await asyncio.wait_for(source.stop(), timeout=5.0)
+    assert client.cancelled()
+    assert _kinds_of(events) == ["established", "handler_error"]
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and errors[0].startswith("MLLP message")
+    assert "may or may not be recorded" in errors[0] and "inside attempt 2" in errors[0]
+
+
+@pytest.mark.usefixtures("no_retry_pauses")
+async def test_no_reply_a_fault_that_never_clears_holds_until_the_task_is_cancelled() -> None:
+    # The control for the zeroed pauses: the hold still yields, so a bound can end it, and the
+    # fault is reported once at the threshold, not again on the cancel.
+    source = _no_reply()
+    seen: list[bytes] = []
+    past_threshold = asyncio.Event()
+
+    async def handler(raw: bytes) -> None:
+        seen.append(raw)
+        if len(seen) > REPORT_AFTER:
+            past_threshold.set()
+        raise RuntimeError(_FAULT_TEXT)
+
+    events: list[Event] = []
+    source.on_connection_event = _sink(events)  # type: ignore[assignment]
+    source._handler = handler
+    client = asyncio.create_task(source._on_client(_ThenEof(frame(_ADT)), _Peer()))  # type: ignore[arg-type]
+    await asyncio.wait_for(past_threshold.wait(), timeout=2.0)
+    client.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(client, timeout=2.0)
+    assert set(seen) == {_ADT.encode()}
+    assert _kinds_of(events) == ["established", "handler_error"]
+
+
+@pytest.mark.usefixtures("no_retry_pauses")
+async def test_no_reply_an_os_error_in_the_handler_is_held_not_a_peer_reset() -> None:
+    # A store write can fail with an OSError. It is a handler fault, held like any other, never the
+    # outer arm's peer_reset, which would close the connection and lose the frame.
+    calls: list[bytes] = []
+
+    async def disk_error_once(raw: bytes) -> None:
+        calls.append(raw)
+        if len(calls) == 1:
+            raise OSError(5, "synthetic I/O error")
+
+    events = await _drive(_no_reply(), _ThenEof(frame(_ADT)), _Peer(), disk_error_once)
+    assert calls == [_ADT.encode()] * 2
     assert _kinds_of(events) == ["established", "closed"]
 
 
