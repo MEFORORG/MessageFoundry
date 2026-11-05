@@ -331,6 +331,10 @@ def test_supervise_logs_the_audit_line_again_for_the_forwarder(
     relogged = "(Logged again for the off-box forwarder.)"
     assert not lines[0].endswith(relogged), lines
     assert [line.endswith(relogged) for line in lines[1:]] == ([True] if forwarder else []), lines
+    # The off-box copy keeps the first pass's order: the AUDIT line, then the residual and the
+    # acceptance (vault BACKLOG #3795).
+    again = [m for m in _cli_lines(caplog, "") if m.endswith(relogged)]
+    assert (again[0].startswith("AUDIT: ") and len(again) == 3) if forwarder else not again, again
 
 
 def _residual_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -348,8 +352,10 @@ def test_supervise_refuses_before_it_reports_the_reading_as_a_residual(
     does not first log the reading as a residual it then refuses on."""
     with caplog.at_level(logging.WARNING, logger=cli.__name__):
         rc, spawned = _supervise(tmp_path, monkeypatch, _ON)
+        # The control in the same capture: a WARNING on this logger is recorded here.
+        logging.getLogger(cli.__name__).warning("[security] remote_debug_ control")
     assert rc == 2 and not spawned and _REFUSAL in capsys.readouterr().err
-    assert _residual_lines(caplog) == []
+    assert _residual_lines(caplog) == ["[security] remote_debug_ control"]
 
 
 @pytest.mark.parametrize(

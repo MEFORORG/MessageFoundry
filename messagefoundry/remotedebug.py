@@ -133,8 +133,9 @@ __all__ = [
 ]
 
 #: The ``[security]`` key of the named acceptance that lifts :func:`remote_debug_refusal` under
-#: ``enforce`` (owner ruling 2026-10-16, vault BACKLOG #2700). The one literal spelling: the
-#: qualified name and the loosening name below derive from it (vault BACKLOG #3795 item 7).
+#: ``enforce`` (owner ruling 2026-10-16, vault BACKLOG #2700). The qualified name and the
+#: loosening name below derive from it (vault BACKLOG #3795 item 7). It must match the
+#: ``SecuritySettings`` field, which code reads as an attribute and so spells as a name.
 REMOTE_DEBUG_ACCEPTANCE_KEY: Final = "allow_remote_debugging"
 
 #: That acceptance by its qualified name, for the refusal and the docs.

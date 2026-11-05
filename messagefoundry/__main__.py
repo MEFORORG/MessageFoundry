@@ -5595,13 +5595,8 @@ def _supervise(args: argparse.Namespace) -> int:
     if forwarder_installed:
         # The readings above were logged before a forwarder existed. Log them once more so the
         # off-box copy has them. With no forwarder installed this writes nothing.
-        for security_line in security_lines:
-            logging.getLogger(__name__).warning(
-                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
-                "forwarder.)",
-                *security_line,
-            )
-        # Vault BACKLOG #2700: the AUDIT line the remote-debugging gate logged above, if any.
+        # Vault BACKLOG #2700: the AUDIT line the remote-debugging gate logged above, if any. First,
+        # because the gate logged it ahead of every line in security_lines (vault BACKLOG #3795).
         if (
             fleet_audit := _remote_debug_audit(
                 settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
@@ -5609,6 +5604,12 @@ def _supervise(args: argparse.Namespace) -> int:
         ) is not None:
             logging.getLogger(__name__).warning(
                 "%s (Logged again for the off-box forwarder.)", fleet_audit
+            )
+        for security_line in security_lines:
+            logging.getLogger(__name__).warning(
+                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
+                "forwarder.)",
+                *security_line,
             )
 
     try:
