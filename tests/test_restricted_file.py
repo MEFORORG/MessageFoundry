@@ -119,6 +119,143 @@ def test_a_created_file_must_read_back_exactly_as_asked() -> None:
     )
 
 
+def test_a_new_file_without_its_creators_access_is_the_drafts_descriptor() -> None:
+    access = restricted_file._expected_access(_CREATOR, [_SERVICE], creator_access=False)
+    assert access == {_SYSTEM: _FULL, _ADMINS: _FULL, _SERVICE: _READ}
+    assert restricted_file._protected_sddl(access) == (
+        f"D:P(A;;FA;;;{_SYSTEM})(A;;FA;;;{_ADMINS})(A;;FR;;;{_SERVICE})"
+    )
+
+
+# --- pure policy: the exact check through a handle ------------------------------------------------
+
+_HandleSecurity = restricted_file._HandleSecurity
+
+
+def _held(*aces: tuple[int, int, int, str], **fields: Any) -> Any:
+    fields.setdefault("owner_sid", _ADMINS)
+    fields.setdefault("protected", True)
+    return _HandleSecurity(aces=aces, **fields)
+
+
+_EXACT_READ = (
+    (_ALLOW, 0, _FULL, _SYSTEM),
+    (_ALLOW, 0, _FULL, _ADMINS),
+    (_ALLOW, 0, _READ, _SERVICE),
+)
+
+
+def _exact(security: Any, *, engine_access: int = _READ) -> str | None:
+    if engine_access == _READ:  # the handoff's list
+        expected = restricted_file._expected_access(_CREATOR, [_SERVICE], creator_access=False)
+    else:  # the host file's list
+        expected = restricted_file._expected_access(_SERVICE, ())
+    return restricted_file._exact_descriptor_problem(security, expected, engine_sid=_SERVICE)
+
+
+def test_the_exact_check_accepts_the_drafts_descriptor_and_each_allowed_owner() -> None:
+    for owner in (_SYSTEM, _ADMINS, _SERVICE):  # the controls for every refusal below
+        assert _exact(_held(*_EXACT_READ, owner_sid=owner)) is None
+    assert _exact(_held(*reversed(_EXACT_READ))) is None  # order does not matter
+    full = ((_ALLOW, 0, _FULL, _SYSTEM), (_ALLOW, 0, _FULL, _ADMINS), (_ALLOW, 0, _FULL, _SERVICE))
+    assert _exact(_held(*full), engine_access=_FULL) is None
+
+
+def test_the_exact_check_refuses_another_owner() -> None:
+    # A handoff another local account wrote with a narrow list: that account owns its file.
+    problem = _exact(_held(*_EXACT_READ, owner_sid=_CREATOR))
+    assert f"owned by {_CREATOR}" in str(problem)
+    assert "owner could not be read" in str(_exact(_held(*_EXACT_READ, owner_sid=None)))
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ((_ALLOW, 0, _READ, _CREATOR), f"grants {_CREATOR} access 0x00120089"),
+        ((_ALLOW, 0, _READ, "S-1-15-2-1"), "the application package S-1-15-2-1"),
+        ((_ALLOW, 0, _READ, _USERS), "Users"),
+        ((_DENY, 0, _FULL, _CREATOR), "type 0x01"),
+        ((0x05, 0, _READ, ""), "type 0x05"),
+    ],
+)
+def test_the_exact_check_refuses_any_extra_entry(
+    extra: tuple[int, int, int, str], expected: str
+) -> None:
+    problem = _exact(_held(*_EXACT_READ, extra))
+    assert expected in str(problem) and "beyond the key file's own" in str(problem)
+
+
+def test_the_exact_check_refuses_a_changed_missing_or_repeated_entry() -> None:
+    widened = (
+        (_ALLOW, 0, _FULL, _SYSTEM),
+        (_ALLOW, 0, _FULL, _ADMINS),
+        (_ALLOW, 0, _FULL, _SERVICE),
+    )
+    assert "access 0x001f01ff" in str(_exact(_held(*widened)))
+    inherit = (*_EXACT_READ[:2], (_ALLOW, 0x10, _READ, _SERVICE))
+    assert "flags 0x10" in str(_exact(_held(*inherit)))
+    assert "lacks or repeats" in str(_exact(_held(*_EXACT_READ[:2])))
+    assert "lacks or repeats" in str(_exact(_held(*_EXACT_READ, _EXACT_READ[2])))
+
+
+def test_the_exact_check_refuses_what_it_could_not_read_or_an_open_list() -> None:
+    assert "could not be read (Win32 error 5" in str(
+        _exact(_HandleSecurity(error="Win32 error 5: Access is denied."))
+    )
+    assert "no access list at all" in str(_exact(_held(dacl_present=False)))
+    assert "does not block inheritance" in str(_exact(_held(*_EXACT_READ, protected=False)))
+
+
+_HandleVolume = restricted_file._HandleVolume
+
+
+def _volume(file_system: str = "NTFS", device_type: int = 0x07, **fields: Any) -> str | None:
+    return restricted_file._volume_problem(
+        _HandleVolume(file_system=file_system, device_type=device_type, **fields)
+    )
+
+
+def test_a_key_file_volume_must_be_a_local_ntfs_or_refs_disk() -> None:
+    assert _volume("NTFS") is None  # the controls: what a local disk answered, measured
+    assert _volume("ReFS") is None
+    # A server or a user-mode file system reports the owner and list; this host keeps neither.
+    assert "network volume" in str(_volume(characteristics=0x10))
+    for device_type in (0x14, 0x12, 0x06, 0x28, 0x35, 0x36):  # network and DFS redirectors
+        assert f"device type {device_type:#04x}" in str(_volume(device_type=device_type))
+    assert "FAT32 volume" in str(_volume("FAT32"))
+    assert "nameless volume" in str(_volume(""))
+    failed = _HandleVolume(error="Win32 error 1")
+    assert "could not be read (Win32 error 1)" in str(restricted_file._volume_problem(failed))
+
+
+def test_the_foreign_file_system_list_cannot_be_changed_at_run_time() -> None:
+    with pytest.raises(TypeError):
+        restricted_file.LINUX_FOREIGN_ACCESS_MODEL_FILE_SYSTEMS[0x6969] = "x"  # type: ignore[index]
+
+
+def test_a_file_that_cannot_be_removed_after_a_failure_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _refuse(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(errno.EACCES, "Access is denied")
+
+    monkeypatch.setattr(Path, "unlink", _refuse)
+    original = RestrictedFileError("the original failure")
+    with pytest.raises(RestrictedFileError, match="left behind") as excinfo:
+        restricted_file._remove_failed(tmp_path / "store.key", original)
+    # The original failure is named, and chained, not replaced by the unlink error.
+    assert "the original failure" in str(excinfo.value)
+    assert excinfo.value.__cause__ is original
+    # A BaseException that is not an Exception keeps its type and gains a note.
+    interrupt = KeyboardInterrupt()
+    restricted_file._remove_failed(tmp_path / "store.key", interrupt)
+    assert "left behind" in " ".join(getattr(interrupt, "__notes__", []))
+
+
+def test_a_file_already_gone_after_a_failure_is_no_second_error(tmp_path: Path) -> None:
+    restricted_file._remove_failed(tmp_path / "absent.key", RestrictedFileError("x"))
+
+
 # --- pure policy: the read check ------------------------------------------------------------------
 
 
@@ -259,6 +396,101 @@ def test_windows_creates_the_file_with_exactly_the_intended_access(
         (_ALLOW, _READ, _SERVICE),
     }
     assert broad_access_problem(path) is None
+
+
+@windows_only
+def test_windows_creates_the_drafts_descriptor_without_the_creators_entry(tmp_path: Path) -> None:
+    # Off-admin, as here, the creator owns the file and is in no entry; it still writes the file
+    # through the handle that made it.
+    path = tmp_path / "handoff.key"
+    write_restricted_file(
+        path, b"KEY-MATERIAL-STAND-IN", read_grants=[f"*{_SERVICE}"], creator_access=False
+    )
+    protected, entries, creator = _windows_access(path)
+    assert protected
+    assert entries == {
+        (_ALLOW, _FULL, _SYSTEM),
+        (_ALLOW, _FULL, _ADMINS),
+        (_ALLOW, _READ, _SERVICE),
+    }
+    assert creator not in {sid for _t, _m, sid in entries}
+    # The default is unchanged: the creator keeps its full-control entry.
+    default = tmp_path / "default.key"
+    write_restricted_file(default, b"k", read_grants=[f"*{_SERVICE}"])
+    assert (_ALLOW, _FULL, creator) in _windows_access(default)[1]
+
+
+def _is_elevated() -> bool:
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
+@windows_only
+def test_windows_creates_the_file_owned_as_asked_or_not_at_all(tmp_path: Path) -> None:
+    path = tmp_path / "handoff.key"
+    grants = [f"*{_SERVICE}"]
+    if not _is_elevated():
+        # A filtered token holds Administrators deny-only, so the create itself is refused.
+        with pytest.raises(RestrictedFileError, match="may not make"):
+            write_restricted_file(
+                path, b"k", read_grants=grants, creator_access=False, owner=_ADMINS
+            )
+        assert not path.exists()
+        return
+    write_restricted_file(path, b"k", read_grants=grants, creator_access=False, owner=_ADMINS)
+    parsed = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(path, owner=True) or "")
+    assert parsed is not None and parsed.owner == _ADMINS
+
+
+@windows_only
+def test_windows_a_file_that_reads_back_owned_by_another_is_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    # Any token may make its own account the owner, so this runs off-admin too.
+    me = _win32_config_source_probes().self_sid
+    assert me is not None
+    control = tmp_path / "control.key"
+    # The control: read back as asked, so kept. Named as a grant is, so the leading `*` resolves.
+    write_restricted_file(control, b"k", owner=f"*{me}")
+    assert control.read_bytes() == b"k"
+    real = restricted_file._read_handle_security
+
+    def _foreign(handle: int) -> Any:
+        read = real(handle)
+        assert read.owner_sid == me  # the real read, through the creating handle, saw the owner
+        return type(read)(owner_sid=_SERVICE)
+
+    monkeypatch.setattr(restricted_file, "_read_handle_security", _foreign)
+    path = tmp_path / "store.key"
+    with pytest.raises(RestrictedFileError, match="reads back owned by"):
+        write_restricted_file(path, b"k", owner=me)
+    assert not path.exists()
+
+
+@windows_only
+def test_windows_the_exact_check_reads_a_real_handle(tmp_path: Path) -> None:
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        return
+    import msvcrt
+
+    path = tmp_path / "store.key"
+    write_restricted_file(path, b"k")  # SYSTEM, Administrators and this account, full control
+    with path.open("rb") as handle:
+        os_handle = msvcrt.get_osfhandle(handle.fileno())
+        assert restricted_file.key_file_handle_problem(os_handle, engine_read_only=False) is None
+        assert "beyond the key file's own" in str(
+            restricted_file.key_file_handle_problem(os_handle, engine_read_only=True)
+        )
+    plain = tmp_path / "plain.bin"
+    plain.write_bytes(b"x")
+    with plain.open("rb") as handle:
+        os_handle = msvcrt.get_osfhandle(handle.fileno())
+        assert restricted_file.key_file_handle_problem(os_handle, engine_read_only=False)
 
 
 @windows_only
@@ -450,6 +682,12 @@ def test_posix_refuses_a_read_grant_it_cannot_honour(tmp_path: Path) -> None:
     with pytest.raises(RestrictedFileError, match="Windows only"):
         write_restricted_file(path, b"k", read_grants=["someone"])
     assert not path.exists()
+    with pytest.raises(RestrictedFileError, match="Windows only"):
+        write_restricted_file(path, b"k", creator_access=False)
+    assert not path.exists()
+    with pytest.raises(RestrictedFileError, match="Windows only"):
+        write_restricted_file(path, b"k", owner=_ADMINS)
+    assert not path.exists()
 
 
 # --- both platforms, for real ---------------------------------------------------------------------
@@ -485,7 +723,7 @@ def test_a_missing_file_is_a_read_problem_not_a_pass(tmp_path: Path) -> None:
 def _refuse_the_create(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make the restricted create fail the way a host that cannot apply the access list would."""
 
-    def _refuse(path: Path, _grants: object) -> int:
+    def _refuse(path: Path, _grants: object, **_k: object) -> int:
         raise RestrictedFileError(f"{path} could not be created restricted: stand-in refusal")
 
     monkeypatch.setattr(restricted_file, "_create_restricted", _refuse)
@@ -495,7 +733,7 @@ def _allow_the_create(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """The control for :func:`_refuse_the_create`: the same seam, succeeding, on any platform."""
     seen: dict[str, Any] = {}
 
-    def _create(path: Path, grants: object) -> int:
+    def _create(path: Path, grants: object, **_k: object) -> int:
         seen["grants"] = list(grants)  # type: ignore[call-overload]
         return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0))
 

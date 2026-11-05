@@ -284,7 +284,7 @@ def test_the_key_types_are_not_hashable() -> None:
 
 
 _HOST = custody._HOST_FILE_POLICY
-_CREDENTIAL = custody._PosixPolicy(owners=frozenset({0}), access_list=True)
+_CREDENTIAL = custody._CREDENTIAL_POLICY  # the production policy, not a copy built here
 _REG = stat.S_IFREG
 _UNDEFINED_ID = 0xFFFFFFFF
 _R, _RW = 0o4, 0o6
@@ -332,11 +332,45 @@ def test_the_posix_host_file_check_refuses_any_group_or_other_bit_and_a_foreign_
     assert _problem(0o600, 1000, _HOST) is None  # the control
     assert "0644" in str(_problem(0o644, 1000, _HOST))
     assert "0610" in str(_problem(0o610, 1000, _HOST))
-    # Owner only (draft rule 3b, mode 0600): group read is refused even for the engine's own group.
+    # Group read is refused even for the engine's own group.
     assert "gid 1000 read" in str(_problem(0o640, 1000, _HOST))
     assert "uid 0" in str(_problem(0o600, 0, _HOST))
     assert "not a regular file" in str(_problem(0o700, 1000, _HOST, kind=stat.S_IFDIR))
     assert "not a regular file" in str(_problem(0o600, 1000, _HOST, kind=stat.S_IFIFO))
+
+
+@pytest.mark.parametrize("mode", [0o400, 0o200, 0o700, 0o000, 0o4600, 0o2600, 0o1600])
+def test_the_posix_host_file_mode_is_exactly_0600(mode: int) -> None:
+    # Draft rule 3b names mode 0600, so the owner's own bits and the setuid, setgid and sticky bits
+    # are judged too. The control is 0600 in the test above.
+    assert "must be exactly 0600" in str(_problem(mode, 1000, _HOST))
+
+
+def test_the_production_credential_policy_fixes_no_mode_and_admits_root() -> None:
+    assert _CREDENTIAL.owners == frozenset({0})
+    assert _CREDENTIAL.access_list is True
+    assert _CREDENTIAL.mode is None
+    # The owner's own bits are not judged for a credential: systemd writes 0400, and 0600 passes.
+    assert _problem(0o600, 0, _CREDENTIAL, group=0) is None
+    assert _problem(0o400, 1000, _CREDENTIAL) is None
+    assert "uid 2000" in str(_problem(0o400, 2000, _CREDENTIAL))
+
+
+def test_the_credential_reader_judges_under_the_production_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[object] = []
+
+    def _read(path: Path, policy: custody._PosixPolicy) -> bytes:
+        seen.append(policy)
+        return _blob().serialize()
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(custody, "_read_posix_checked", _read)
+    environ = {"CREDENTIALS_DIRECTORY": str(tmp_path)}
+    assert custody.read_systemd_credential("store-a", environ=environ) == _blob()
+    assert seen == [custody._CREDENTIAL_POLICY]
+    assert seen[0] is custody._CREDENTIAL_POLICY
 
 
 def test_a_systemd_credential_with_no_list_is_read_by_its_owner_alone() -> None:
@@ -464,8 +498,24 @@ def test_custody_files_are_refused_on_a_posix_host_other_than_linux(
     with pytest.raises(CustodyError, match="Linux and Windows only"):
         custody.write_host_file(tmp_path / "host.blob", _blob())
     assert not (tmp_path / "host.blob").exists()
-    with pytest.raises(CredentialUnavailable, match="Linux only"):
+    # A set directory there is a credential meant and not honoured: refused, so no caller falls
+    # back to a weaker provider, as on Linux for a set directory that does not exist.
+    with pytest.raises(
+        CustodyError, match="is set, but a systemd credential is read on Linux only"
+    ):
         custody.read_systemd_credential("store-a", environ=environ)
+    with pytest.raises(CredentialUnavailable, match="is not set"):  # the control: unset
+        custody.read_systemd_credential("store-a", environ={})
+
+
+@pytest.mark.parametrize("platform", ["darwin", "freebsd14", "win32"])
+def test_a_set_credentials_directory_off_linux_is_refused_not_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    monkeypatch.setattr(sys, "platform", platform)
+    with pytest.raises(CustodyError) as excinfo:
+        custody.read_systemd_credential("store-a", environ={"CREDENTIALS_DIRECTORY": str(tmp_path)})
+    assert not isinstance(excinfo.value, CredentialUnavailable)
 
 
 # --- the POSIX host file, for real ----------------------------------------------------------------
@@ -672,6 +722,101 @@ def test_an_access_control_list_that_cannot_be_read_refuses_the_file(
         custody.read_host_file(path)
 
 
+@linux_only
+def test_the_file_system_type_is_read_through_the_descriptor(tmp_path: Path) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        magic = restricted_file.linux_file_system_type(fd)
+    finally:
+        os.close(fd)
+    # The control for the refusals below: the test's own directory is not on one of them.
+    assert magic not in restricted_file.LINUX_FOREIGN_ACCESS_MODEL_FILE_SYSTEMS
+    assert custody.read_host_file(path) == _blob()
+
+
+@linux_only
+@pytest.mark.parametrize(
+    ("magic", "name"),
+    [(0x6969, "NFS"), (0xFF534D42, "CIFS"), (0x517B, "SMB"), (0x65735546, "FUSE")],
+)
+def test_a_custody_file_on_a_file_system_with_its_own_access_model_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, magic: int, name: str
+) -> None:
+    # Such a file system answers ENOTSUP for the POSIX list, so without this the file would be
+    # judged on its mode and owner alone.
+    host = tmp_path / "host.blob"
+    custody.write_host_file(host, _blob())
+    credential = tmp_path / "store-a"
+    credential.write_bytes(_blob().serialize())
+    os.chmod(credential, 0o400)
+    seen: list[int] = []
+
+    def _fstatfs(fd: int) -> int:
+        seen.append(fd)
+        return magic
+
+    monkeypatch.setattr(restricted_file, "linux_file_system_type", _fstatfs)
+    with pytest.raises(CustodyError, match=f"on a {name} file system") as excinfo:
+        custody.read_host_file(host)
+    assert not _leaks(str(excinfo.value), _MASTER)
+    environ = {"CREDENTIALS_DIRECTORY": str(tmp_path)}
+    with pytest.raises(CustodyError, match=f"on a {name} file system"):
+        custody.read_systemd_credential("store-a", environ=environ)
+    assert len(seen) == 2  # the control: each read asked the descriptor it opened
+
+
+@linux_only
+def test_a_file_system_type_that_cannot_be_read_refuses_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+
+    def _fstatfs(fd: int) -> int:
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(restricted_file, "linux_file_system_type", _fstatfs)
+    with pytest.raises(CustodyError, match="file system could not be read"):
+        custody.read_host_file(path)
+
+
+@linux_only
+def test_a_host_file_at_0400_is_refused_for_real(tmp_path: Path) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    os.chmod(path, 0o400)
+    with pytest.raises(CustodyError, match="must be exactly 0600"):
+        custody.read_host_file(path)
+
+
+@linux_only
+def test_a_c_library_with_no_fstatfs_refuses_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ctypes
+
+    class _NoSymbols:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            pass
+
+        def __getattr__(self, name: str) -> object:
+            raise AttributeError(name)
+
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    monkeypatch.setattr(ctypes, "CDLL", _NoSymbols)
+    with pytest.raises(CustodyError, match="file system could not be read"):
+        custody.read_host_file(path)
+
+
+def test_the_file_system_type_is_read_on_linux_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    with pytest.raises(RestrictedFileError, match="Linux only"):
+        restricted_file.linux_file_system_type(0)
+
+
 def test_systemd_credential_refusals_that_need_no_file() -> None:
     with pytest.raises(CredentialUnavailable, match="is not set"):
         custody.read_systemd_credential("store-a", environ={})
@@ -723,17 +868,179 @@ def _aces(path: Path) -> set[tuple[int, int, str]]:
     return set(security.aces)
 
 
+_SYSTEM, _ADMINS = "S-1-5-18", "S-1-5-32-544"
+#: A per-service account's SID shape (NT SERVICE\<name>); no such service need exist.
+_SERVICE = "S-1-5-80-1-2-3-4-5"
+_FULL, _READ = 0x1F01FF, 0x120089
+
+
+def _engine_sid() -> str:
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    sid = _win32_config_source_probes().self_sid
+    assert sid is not None
+    return sid
+
+
+def _is_elevated() -> bool:
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
+#: The handoff is written owned by Administrators, which only an elevated administrator or SYSTEM may
+#: make a file's owner, so a test that writes one needs that token. The hosted Windows legs run
+#: elevated; off-admin, :func:`test_windows_a_handoff_is_refused_up_front_off_admin` runs instead.
+elevated_only = pytest.mark.skipif(
+    not _is_elevated(),
+    reason="writing a handoff needs an elevated administrator, as provision-admin",
+)
+
+
 @windows_only
-def test_windows_handoff_grants_the_service_and_no_package_sid(
+@pytest.mark.skipif(_is_elevated(), reason="the off-admin arm; an elevated token may write it")
+def test_windows_a_handoff_is_refused_up_front_off_admin(
     tmp_path: Path, dpapi_scopes: list[bool]
 ) -> None:
     path = tmp_path / "handoff.key"
-    custody.write_handoff_file(path, _blob(), service_account="NT AUTHORITY\\LOCAL SERVICE")
+    with pytest.raises(CustodyError, match="must be owned by Administrators") as excinfo:
+        custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    assert not path.exists()
+    assert dpapi_scopes == []  # refused before the blob was protected, let alone written
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@windows_only
+def test_windows_a_token_without_administrators_is_refused_up_front(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dpapi_scopes: list[bool]
+) -> None:
+    # The same refusal on an elevated leg, where the real pre-check would pass.
+    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: False)
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="must be owned by Administrators"):
+        custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    assert not path.exists()
+    assert dpapi_scopes == []
+
+
+@windows_only
+@pytest.mark.skipif(_is_elevated(), reason="the off-admin arm; an elevated token may set the owner")
+def test_windows_a_create_refused_its_owner_is_a_custody_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Past a pre-check that answered wrongly, Windows itself refuses the owner at the create.
+    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: True)
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="may not make") as excinfo:
+        custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    assert isinstance(excinfo.value.__cause__, RestrictedFileError)
+    assert not path.exists()
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@windows_only
+@elevated_only
+def test_windows_handoff_carries_exactly_the_drafts_descriptor(
+    tmp_path: Path, dpapi_scopes: list[bool]
+) -> None:
+    path = tmp_path / "handoff.key"
+    custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
     assert dpapi_scopes == [True]  # machine scope, so the service account can open it
-    sids = {sid for _type, _mask, sid in _aces(path)}
-    assert "S-1-5-19" in sids  # the control: the grant reached the list
-    assert not [sid for sid in sids if sid.upper().startswith("S-1-15-")]
+    # D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;<service>), and no entry for the account that wrote it.
+    assert _aces(path) == {(0, _FULL, _SYSTEM), (0, _FULL, _ADMINS), (0, _READ, _SERVICE)}
+    assert _engine_sid() not in {sid for _type, _mask, sid in _aces(path)}
+
+
+@windows_only
+@elevated_only
+def test_windows_a_handoff_made_for_another_account_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "handoff.key"
+    custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
+    # The list names another account, so the engine's own account is refused.
+    with pytest.raises(CustodyError) as excinfo:
+        custody.read_handoff_file(path)
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@windows_only
+@pytest.mark.parametrize("shared", ["NT AUTHORITY\\LOCAL SERVICE", "*S-1-5-20"])
+def test_windows_a_handoff_for_a_shared_service_account_is_not_written(
+    tmp_path: Path, shared: str
+) -> None:
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="many services share"):
+        custody.write_handoff_file(path, _blob(), service_account=shared)
+    assert not path.exists()
+
+
+@windows_only
+@elevated_only
+def test_windows_an_engine_on_a_shared_service_account_reads_no_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.config import wiring
+
+    path = tmp_path / "handoff.key"
+    custody.write_handoff_file(path, _blob(), service_account=f"*{_engine_sid()}")
+    real = wiring._win32_config_source_probes()
+
+    class _Shared:
+        self_sid = "S-1-5-19"
+        read_path = real.read_path
+
+    monkeypatch.setattr(wiring, "_win32_config_source_probes", _Shared)
+    with pytest.raises(CustodyError, match="many services share"):
+        custody.read_handoff_file(path)
+
+
+@windows_only
+@elevated_only
+def test_windows_a_handoff_made_for_this_account_round_trips(tmp_path: Path) -> None:
+    path = tmp_path / "handoff.key"
+    me = _engine_sid()
+    custody.write_handoff_file(path, _blob(), service_account=f"*{me}")
+    assert _aces(path) == {(0, _FULL, _SYSTEM), (0, _FULL, _ADMINS), (0, _READ, me)}
     assert custody.read_handoff_file(path) == _blob()
+
+
+def _os_handle(fd: int) -> int:
+    """The Windows handle a descriptor owns."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("a handle exists only on Windows")
+    import msvcrt
+
+    return msvcrt.get_osfhandle(fd)
+
+
+@windows_only
+@pytest.mark.skipif(
+    not _is_elevated(), reason="needs an elevated administrator, as provision-admin"
+)
+def test_windows_an_elevated_handoff_is_owned_by_administrators_and_reads(tmp_path: Path) -> None:
+    from messagefoundry.store import store as store_mod
+
+    path = tmp_path / "handoff.key"
+    custody.write_handoff_file(path, _blob(), service_account=f"*{_engine_sid()}")
+    parsed = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(path, owner=True) or "")
+    assert parsed is not None and parsed.owner == _ADMINS
+    assert custody.read_handoff_file(path) == _blob()
+
+
+@windows_only
+def test_windows_a_key_file_with_an_extra_entry_is_refused(tmp_path: Path) -> None:
+    from messagefoundry.store import store as store_mod
+
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())
+    assert custody.read_host_file(path) == _blob()  # the control
+    # Not a broad group and not a package: one named account, which only the exact check refuses.
+    store_mod._grant_read(path, "*S-1-5-20")  # NETWORK SERVICE
+    assert "S-1-5-20" in {sid for _t, _m, sid in _aces(path)}  # the grant landed
+    assert restricted_file.broad_access_problem(path) is None  # the broad check alone passes it
+    with pytest.raises(CustodyError, match="S-1-5-20"):
+        custody.read_host_file(path)
 
 
 @windows_only
@@ -744,6 +1051,7 @@ def test_windows_handoff_grants_the_service_and_no_package_sid(
         "*S-1-15-2-3624051433-2125758914-1423191267-1740899205-1073925389-3782572162-737981194",
     ],
 )
+@elevated_only
 def test_windows_handoff_refuses_a_package_sid(tmp_path: Path, package: str) -> None:
     path = tmp_path / "handoff.key"
     with pytest.raises(RestrictedFileError, match="application package"):
@@ -770,18 +1078,86 @@ def test_windows_a_key_file_widened_to_a_package_after_creation_is_refused(
 
 
 @windows_only
+@elevated_only
 def test_windows_a_blob_of_the_other_scope_is_refused(tmp_path: Path) -> None:
+    from messagefoundry.secrets_dpapi import dpapi_protect
+
+    # Each file's own list names the engine's account differently (read for the handoff, full
+    # control for the host file), so a file renamed to the other's path is refused on its list.
     handoff = tmp_path / "handoff.key"
-    custody.write_handoff_file(handoff, _blob(), service_account="NT AUTHORITY\\LOCAL SERVICE")
-    # A handoff renamed to the host file's path is machine scope, so it is not a host blob.
-    with pytest.raises(CustodyError, match="not a user-scope DPAPI blob"):
+    custody.write_handoff_file(handoff, _blob(), service_account=f"*{_engine_sid()}")
+    with pytest.raises(CustodyError, match="beyond the key file's own"):
         custody.read_host_file(handoff)
     host = tmp_path / "master.key"
     custody.write_host_file(host, _blob())
-    with pytest.raises(CustodyError, match="not a machine-scope DPAPI blob"):
+    with pytest.raises(CustodyError, match="beyond the key file's own"):
         custody.read_handoff_file(host)
+    # Behind the list, the scope is checked too.
+    machine = dpapi_protect(_blob().serialize(), machine_scope=True)
+    with pytest.raises(CustodyError, match="not a user-scope DPAPI blob"):
+        custody.unprotect_host_blob(machine)
+    with pytest.raises(CustodyError, match="not a machine-scope DPAPI blob"):
+        custody._unprotect_in_scope(
+            custody.protect_host_blob(_blob()), machine_scope=True, what="handoff blob"
+        )
     with pytest.raises(CustodyError, match="not a user-scope DPAPI blob"):
         custody.unprotect_host_blob(b"too short")
+
+
+@windows_only
+def test_windows_the_owner_and_list_are_read_through_the_open_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())
+    handles: list[int] = []
+    real_open, real_read = custody._open_windows_held, restricted_file._read_handle_security
+
+    def _open(p: Path) -> int:
+        fd = real_open(p)
+        handles.append(_os_handle(fd))
+        return fd
+
+    def _read(handle: int) -> restricted_file._HandleSecurity:
+        handles.append(handle)
+        return real_read(handle)
+
+    def _by_name(*_a: object, **_k: object) -> str | None:
+        raise AssertionError("a custody read must not judge the file by its name")
+
+    monkeypatch.setattr(custody, "_open_windows_held", _open)
+    monkeypatch.setattr(restricted_file, "_read_handle_security", _read)
+    monkeypatch.setattr(restricted_file, "broad_access_problem", _by_name)
+    assert custody.read_host_file(path) == _blob()
+    assert len(handles) == 2 and handles[0] == handles[1]  # the handle opened is the one judged
+
+
+@windows_only
+def test_windows_a_check_that_cannot_run_is_a_custody_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())
+
+    def _fails(handle: int, *, engine_read_only: bool) -> str | None:
+        raise OSError(5, "Access is denied")
+
+    monkeypatch.setattr(restricted_file, "key_file_handle_problem", _fails)
+    with pytest.raises(CustodyError, match="owner and access list could not be read"):
+        custody.read_host_file(path)
+
+
+@windows_only
+def test_windows_a_custody_file_that_is_a_link_is_refused(tmp_path: Path) -> None:
+    real = tmp_path / "master.key"
+    custody.write_host_file(real, _blob())
+    link = tmp_path / "link.key"
+    try:
+        os.symlink(real, link)
+    except OSError:
+        pytest.skip("this account may not create a symbolic link")
+    with pytest.raises(CustodyError, match="is refused"):
+        custody.read_host_file(link)
 
 
 @windows_only
