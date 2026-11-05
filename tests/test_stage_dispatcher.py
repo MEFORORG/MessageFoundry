@@ -599,6 +599,18 @@ def _verdict(d: StageDispatcher, lane: str | None = None) -> str:
     )
 
 
+def _counters(d: StageDispatcher, i: int = 0) -> str:
+    """One dispatcher's COUNTERS line, shared by the expiry report and the drain-failure message."""
+    return (
+        f"dispatcher[{i}] stage={d._stage.value}"
+        f" empty_claims(total,wake_fanout,idle_poll)={d.empty_claims}"
+        f" claim_lock_timeouts={d.claim_lock_timeouts}"  # BACKLOG #1270 — the route discriminator
+        f" claim_head_skips={d.claim_head_skips}"  # BACKLOG #1270 — the other route's counter
+        f" busy_violations={d.busy_violations} processing_lanes={d.processing_lanes}"
+        f" slots_free={d._slots_free}"
+    )
+
+
 async def _expiry_report(pred: Callable[[], bool] | None = None, lane: str | None = None) -> str:
     """Everything a reader needs to tell the #344 hypotheses apart, without a second CI round-trip."""
     lines = ["_wait_until expired."]
@@ -613,14 +625,7 @@ async def _expiry_report(pred: Callable[[], bool] | None = None, lane: str | Non
             lane if lane is not None else (next(iter(d._states)) if len(d._states) == 1 else None)
         )
         lines.append(f"  {_verdict(d, subject)}")
-        lines.append(
-            f"  dispatcher[{i}] stage={d._stage.value}"
-            f" empty_claims(total,wake_fanout,idle_poll)={d.empty_claims}"
-            f" claim_lock_timeouts={d.claim_lock_timeouts}"  # BACKLOG #1270 — the route discriminator
-            f" claim_head_skips={d.claim_head_skips}"  # BACKLOG #1270 — the other route's counter
-            f" busy_violations={d.busy_violations} processing_lanes={d.processing_lanes}"
-            f" slots_free={d._slots_free}"
-        )
+        lines.append(f"  {_counters(d, i)}")
         # NB distinct loop names: a bare `for lane in ...` here would REBIND the `lane` parameter and
         # give the next dispatcher's verdict a stale subject.
         lines.extend(_lane_report(d, ln) for ln in d._states)
@@ -786,6 +791,23 @@ async def _drain_to_quiescence(
             " dispatcher stranded the lane, not the store"
         )
     return False
+
+
+async def _drain_failure(d: StageDispatcher, store: Any, lanes: list[str], what: str) -> str:
+    """The failure message for a ``_drain_to_quiescence`` that returned False (BACKLOG #2273).
+
+    ``_idle()`` also requires ``processing_lanes == 0``, so the lane phases and the pending rows alone
+    cannot explain every miss: a processing slot held by a lane whose phase reads IDLE fails the drain
+    with both lists empty. The counters line and a report per lane still holding a processing task
+    name that case."""
+    lines = [
+        f"{what} did not reach quiescence; not idle: {_not_idle(d, lanes)}"
+        f"; still pending: {await _pending_lanes(store, lanes)}",
+        f"  {_counters(d)}",
+    ]
+    # Bounded by max_processing_lanes: these are the lanes counted in processing_lanes.
+    lines.extend(_lane_report(d, ln) for ln in d._lane_tasks)
+    return "\n".join(lines)
 
 
 def _first_occurrence_order(
@@ -2894,10 +2916,7 @@ async def test_pause_resume_soak_busy_violations(store: Any) -> None:
         # Resume EVERY lane, then force-drain to quiescence (see _resume_all, _drain_to_quiescence).
         assert await _resume_all(d, lanes), f"lanes still paused: {_pause_state(d, lanes)}"
         drained = await _drain_to_quiescence(d, store, lanes, mc)
-        assert drained, (
-            f"pause/resume soak did not reach quiescence; not idle: {_not_idle(d, lanes)}"
-            f"; still pending: {await _pending_lanes(store, lanes)}"
-        )
+        assert drained, await _drain_failure(d, store, lanes, "pause/resume soak")
 
         assert d.busy_violations == 0
         assert stub.concurrency_violations == 0
@@ -2911,11 +2930,48 @@ async def test_pause_resume_soak_busy_violations(store: Any) -> None:
 
 
 def _counters_line(report: str) -> str:
-    """The expiry report's per-dispatcher COUNTERS line, so an assertion about that line cannot be
-    satisfied by the same number appearing in the prose verdict above it."""
+    """The per-dispatcher COUNTERS line of an expiry report or a drain-failure message, so an
+    assertion about that line cannot be satisfied by the same number appearing in the prose above it."""
     lines = [ln for ln in report.splitlines() if ln.lstrip().startswith("dispatcher[")]
     assert len(lines) == 1, f"expected exactly one dispatcher line, got {len(lines)}: {lines!r}"
     return lines[0]
+
+
+async def test_drain_failure_names_a_slot_held_outside_the_drained_lanes(store: Any) -> None:
+    """A drain that fails on ``processing_lanes`` alone says so (BACKLOG #2273).
+
+    The held lane is gated in PROCESSING but is not among the lanes the drain reads, which is the
+    shape a slot held by an IDLE-reading lane leaves: the lane phases and the pending rows are both
+    empty, and only the counters line and the per-lane report show what held the drain."""
+    mc = ManualClock(1000.0)
+    stub = RecordingStub(store, mc.time)
+    held, drained_lane = "IB_DRAIN_HELD", "IB_DRAIN_FREE"
+    await _seed(store, held, [100.0])
+    await _seed(store, drained_lane, [100.0])
+    gate = asyncio.Event()
+    stub.gate(held, gate)
+    d = _make(store, stub, {held, drained_lane}, max_processing_lanes=4, clock=mc)
+    await d.start()
+    try:
+        # Both heads dispatched (the stub records before it waits on a gate); only the held one stays.
+        assert await _wait_until(lambda: d.processing_lanes == 1 and len(stub.records) == 2)
+        # A short budget is one round of the unchanged drain; it cannot go idle while the gate holds.
+        assert not await _drain_to_quiescence(d, store, [drained_lane], mc, budget=0.01)
+        msg = await _drain_failure(d, store, [drained_lane], "drain probe")
+        # The two lists the old message carried are empty here, so they alone could not explain it.
+        assert msg.startswith(
+            "drain probe did not reach quiescence; not idle: []; still pending: []"
+        )
+        counters = _counters_line(msg).split()
+        assert "processing_lanes=1" in counters, msg
+        assert "slots_free=3" in counters, msg  # 4 slots, one held
+        # Present, not a value: a server store's real locking may move either contention counter.
+        for name in ("claim_head_skips=", "claim_lock_timeouts="):
+            assert any(tok.startswith(name) for tok in counters), msg
+        assert f"{held}: phase=PROCESSING" in msg and "lane_task=ALIVE" in msg, msg
+    finally:
+        gate.set()
+        await d.stop()
 
 
 # --- the harness's own instruments (BACKLOG #1270) ------------------------------------------------
