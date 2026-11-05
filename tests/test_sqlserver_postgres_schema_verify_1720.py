@@ -19,11 +19,14 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import hashlib
 import inspect
 import logging
 import os
+import pathlib
 import pickle
 import re
+import subprocess
 import textwrap
 import types
 from collections.abc import AsyncIterator, Mapping
@@ -173,6 +176,35 @@ def test_every_index_the_postgres_migration_builds_is_one_the_check_reads() -> N
         if name.endswith("_DDL") and value in postgres._MIGRATION_INDEX_DDL
     }
     assert built == declared and len(built) == len(postgres._MIGRATION_INDEX_DDL)
+
+
+def _indexes_on_migration_columns(statements: list[str] | tuple[str, ...]) -> list[str]:
+    """``table.column`` for each column ``_migrate_lease_columns`` adds that an index statement in
+    ``statements`` keys or filters on."""
+    added = _migration_added_columns()
+    hits: list[str] = []
+    for statement in statements:
+        m = re.search(r"\bCREATE\s+(?:UNIQUE\s+)?INDEX\b.*?\bON\s+(\w+)\s*\((.*)", statement, re.S)
+        if m is None:
+            continue
+        table, rest = m.group(1).lower(), m.group(2)
+        hits += sorted(f"{t}.{c}" for t, c in added if t == table and re.search(rf"\b{c}\b", rest))
+    return hits
+
+
+def test_no_postgres_batch_index_needs_a_column_only_the_migration_adds() -> None:
+    """BACKLOG #1720: ``_SCHEMA`` runs before ``_migrate_lease_columns``, so an index there on a
+    column the migration adds fails on an older table with the driver's undefined-column error,
+    before the live-schema check can name the store's differences. That is how
+    ``ux_users_federated_subject`` stopped a v0.3.2 store; it is built in the migration now."""
+    from messagefoundry.store import postgres
+
+    # Positive control: the index this was found in, as it read in _SCHEMA.
+    assert _indexes_on_migration_columns([postgres._FEDERATED_SUBJECT_INDEX_DDL]) == [
+        "users.oidc_issuer",
+        "users.oidc_subject",
+    ]
+    assert _indexes_on_migration_columns(postgres._SCHEMA) == []
 
 
 def test_the_parser_reads_ddl_in_order() -> None:
@@ -861,6 +893,161 @@ async def test_live_sqlserver_open_refuses_a_table_missing_a_column(
         await (await bounded(admin.settings, "open over the short table", opened)).close()
     assert "table 'transit_bound_attestation' is missing column 'audit_hash'" in str(caught.value)
     assert await _sqlserver_marker_rows(admin, db) == 0
+
+
+# --- BACKLOG #1720 step 3: the store v0.3.2 built, opened by this build ---------------------------
+#
+# A v0.3.2 store does not migrate on any backend: its audit_log has no `seq`, which no migration adds
+# because the column is inside every row's MAC (BACKLOG #1198). So the open must refuse it naming
+# that column, roll back, and leave the v0.3.2 marker in place. tests/test_store_schema.py holds the
+# SQLite twin. While the federated-subject index sat in _SCHEMA, the PostgreSQL batch would have
+# stopped before the check, on the driver's undefined-column error for users.oidc_issuer: read from
+# the DDL order, and not run against a server before the move.
+
+_V032_SEQ = "table 'audit_log' is missing column 'seq'"
+
+
+def test_the_v032_server_fixture_hashes_to_its_markers_and_holds_the_old_shape() -> None:
+    """The embedded batches give the markers v0.3.2's ``_schema_hash`` wrote, and the shape they
+    build is the one the open tests below are about. Read without a server."""
+    from tests import _store_v032_shape as v032
+
+    pg = "\n".join(v032.POSTGRES_BATCH) + "\nmigration_rev=1"  # v0.3.2's _MIGRATION_REV
+    assert hashlib.sha256(pg.encode()).hexdigest() == v032.POSTGRES_MARKER
+    ms = "\n".join(v032.SQLSERVER_BATCH)
+    assert hashlib.sha256(ms.encode()).hexdigest() == v032.SQLSERVER_MARKER
+    for shape in (
+        declared_schema((*v032.POSTGRES_BATCH, *v032.POSTGRES_MIGRATION), "postgres"),
+        declared_schema(v032.SQLSERVER_BATCH, "sqlserver"),
+    ):
+        assert "seq" not in shape.columns["audit_log"]
+        assert "oidc_issuer" not in shape.columns["users"]
+        presets = shape.columns["search_presets"]
+        assert "owner" in presets and "owner_user_id" not in presets
+
+
+def _tag_source(path: str) -> str | None:
+    root = pathlib.Path(__file__).resolve().parents[1]
+    try:
+        shown = subprocess.run(
+            ["git", "show", f"v0.3.2:{path}"],
+            cwd=root,
+            capture_output=True,
+            check=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return shown.stdout.decode("utf-8")
+
+
+def test_the_v032_fixture_is_ddl_the_tag_ships() -> None:
+    """Every embedded statement is text from the v0.3.2 tag's store modules: a string constant, or
+    inside one. SQLite stores a CREATE without its ``IF NOT EXISTS``, so that is put back first. The
+    SQL Server claim procedures are rendered by a call, so they are counted, not matched. Skipped
+    where the clone has no tags, as a shallow CI clone does."""
+    from tests import _store_v032_shape as v032
+
+    sqlite = tuple(
+        re.sub(r"^CREATE (UNIQUE )?(TABLE|INDEX) ", r"\g<0>IF NOT EXISTS ", s)
+        for s in v032.SQLITE_DDL
+    )
+    for module, statements, procedures in (
+        ("store.py", sqlite, 0),
+        ("postgres.py", (*v032.POSTGRES_BATCH, *v032.POSTGRES_MIGRATION), 0),
+        ("sqlserver.py", v032.SQLSERVER_BATCH, 2),
+    ):
+        source = _tag_source(f"messagefoundry/store/{module}")
+        if source is None:
+            pytest.skip("this clone has no v0.3.2 tag")
+        constants = [
+            node.value
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ]
+        unmatched = [s for s in statements if not any(s in c for c in constants)]
+        rendered = [s for s in unmatched if "CREATE OR ALTER PROCEDURE" in s]
+        assert len(rendered) == procedures, module
+        assert [s[:80] for s in unmatched if s not in rendered] == [], module
+
+
+@pytest.mark.skipif(not _POSTGRES_ON, reason="set MEFOR_TEST_POSTGRES=1 (+ MEFOR_STORE_* env)")
+async def test_live_postgres_refuses_the_store_v032_built_and_keeps_its_marker() -> None:
+    """In a scratch schema of its own: the v0.3.2 DDL, its marker and two synthetic rows, then an
+    open by this build. It refuses naming the column, and the whole batch rolls back with it: the
+    marker still records v0.3.2, and the preset keeps its username owner in ``owner``."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests import _store_v032_shape as v032
+    from tests._live_scratch import postgres_teardown, scratch_name
+
+    base = load_settings(environ=os.environ).store
+    schema = scratch_name("mefor_b1720v")
+    admin = await PostgresStore.open(base)
+    try:
+        await admin._execute(f"CREATE SCHEMA {schema}")
+        async with admin._timed_acquire(record=False) as conn, conn.transaction():
+            await conn.execute(f"SET LOCAL search_path TO {schema}")
+            for statement in (*v032.POSTGRES_BATCH, *v032.POSTGRES_MIGRATION, *v032.SEED_ROWS):
+                await conn.execute(statement)
+            await conn.execute(
+                "INSERT INTO schema_meta (id, schema_hash, applied_at) VALUES (1, $1, 2.0)",
+                v032.POSTGRES_MARKER,
+            )
+        with pytest.raises(ServerSchemaMismatchError) as caught:
+            # Closed if it opens after all, so the pool does not outlive its schema's teardown.
+            await (await PostgresStore.open(base.model_copy(update={"db_schema": schema}))).close()
+        assert _V032_SEQ in str(caught.value)
+        marker = await admin._fetchone(f"SELECT schema_hash FROM {schema}.schema_meta")
+        assert marker is not None and marker["schema_hash"] == v032.POSTGRES_MARKER
+        columns = await admin._fetchall(
+            "SELECT column_name FROM information_schema.columns"
+            " WHERE table_schema = $1 AND table_name = 'search_presets'",
+            schema,
+        )
+        names = {str(r["column_name"]) for r in columns}
+        assert "owner" in names and "owner_user_id" not in names
+        owners = await admin._fetchall(f"SELECT owner FROM {schema}.search_presets")
+        assert [r["owner"] for r in owners] == ["alice"]
+    finally:
+        await postgres_teardown(admin, database=None, schemas=[schema])
+        await admin.close()
+
+
+@pytest.mark.skipif(not _SQLSERVER_ON, reason="set MEFOR_TEST_SQLSERVER=1 (+ MEFOR_STORE_* env)")
+async def test_live_sqlserver_refuses_the_store_v032_built_and_keeps_its_marker(
+    sqlserver_scratch: tuple[Any, StoreSettings],
+) -> None:
+    """The SQL Server twin, in an empty scratch database: the open refuses naming the column, and
+    the batch rolls back, so the v0.3.2 marker and the preset's ``owner`` column survive."""
+    from messagefoundry.store.sqlserver import SqlServerStore
+    from tests import _store_v032_shape as v032
+    from tests._live_scratch import bounded
+
+    admin, scratch = sqlserver_scratch
+    db = scratch.database
+    assert db is not None
+    marker_row = (
+        "INSERT INTO schema_meta (id, schema_hash, applied_at)"
+        f" VALUES (1, '{v032.SQLSERVER_MARKER}', 2.0)"
+    )
+    for statement in (*v032.SQLSERVER_BATCH, *v032.SEED_ROWS, marker_row):
+        await admin.run_in(db, statement)
+    with pytest.raises(ServerSchemaMismatchError) as caught:
+        opened = SqlServerStore.open(scratch)
+        await (await bounded(admin.settings, "open the store v0.3.2 built", opened)).close()
+    assert _V032_SEQ in str(caught.value)
+    assert (
+        await admin.scalar(f"SELECT schema_hash FROM [{db}].dbo.schema_meta")
+        == v032.SQLSERVER_MARKER
+    )
+    listed = await admin.scalar(
+        f"SELECT STRING_AGG(COLUMN_NAME, N',') FROM [{db}].INFORMATION_SCHEMA.COLUMNS"
+        " WHERE TABLE_NAME = N'search_presets'"
+    )
+    names = set(str(listed).split(","))
+    assert "owner" in names and "owner_user_id" not in names
+    assert await admin.scalar(f"SELECT owner FROM [{db}].dbo.search_presets") == "alice"
 
 
 # --- BACKLOG #5085: column type, nullability and numbering ------------------------------------------
