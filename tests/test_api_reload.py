@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -20,7 +21,7 @@ from messagefoundry.config.environments import load_environment_values
 from messagefoundry.config.fingerprint import config_fingerprint
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.engine import ConfigReloadDenied
+from messagefoundry.pipeline.engine import ConfigReloadDenied, ReloadOutcome, ReloadStepFailure
 from tests import _fs_spy
 from tests._admin_account import create_local_user_chosen
 
@@ -151,6 +152,35 @@ async def test_reload_endpoint_dry_run_validates_without_applying(
     body = r.json()
     assert body["dry_run"] is True and body["inbound"] == 1
     assert body["running"] is False  # the engine had no graph and dry-run swaps nothing
+    assert body["failures"] == [] and body["degraded"] is False
+
+
+async def test_reload_endpoint_dry_run_reports_the_outcomes_failed_steps(
+    engine: Engine, client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dry-run branch answers ``failures`` from the outcome's ``failed_steps``, as the applied
+    branch and a released hold do (vault BACKLOG #3109 item 7).
+
+    RED when: the dry-run branch stops reading the outcome's failures, for example by answering a
+    fixed empty list. A real dry run records no follow-on failure today, so the outcome is wrapped to
+    carry one; the control is the clean dry run above, which answers an empty list.
+    """
+    cfg = tmp_path / "cfg"
+    _write_valid_config(cfg, tmp_path / "in", tmp_path / "out")
+    real = engine.reload_detail
+
+    async def _with_a_failure(*a: Any, **k: Any) -> ReloadOutcome:
+        outcome = await real(*a, **k)
+        return dataclasses.replace(
+            outcome, failures=(ReloadStepFailure("config_fingerprint", "synthetic"),)
+        )
+
+    monkeypatch.setattr(engine, "reload_detail", _with_a_failure)
+    r = await client.post("/config/reload", json={"config_dir": str(cfg), "dry_run": True})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["dry_run"] is True and body["failures"] == ["config_fingerprint"]
+    assert body["degraded"] is False  # a dry run applies nothing, so it is never degraded
 
 
 async def test_reload_endpoint_dry_run_missing_env_value_422(

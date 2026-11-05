@@ -7275,7 +7275,7 @@ def create_app(
             # BACKLOG #1111 -- without this the route answers a degraded apply as clean success.
             if req.dry_run:
                 outcome = await engine.reload_detail(req.config_dir, dry_run=True, propagate=False)
-                failures = [f.step for f in outcome.failures]
+                failures = outcome.failed_steps
             else:
                 outcome, failures = await _reload_and_record(
                     engine, req.config_dir, actor=user.username, client=client_ip(request)
