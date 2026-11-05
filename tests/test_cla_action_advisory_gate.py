@@ -410,7 +410,8 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
 _ABSENT_FROM_BUNDLE = (
     re.compile("sprintf", re.IGNORECASE),  # sprintf-js
     re.compile("ArgumentParser"),  # argparse
-    re.compile("YAMLException|safeLoad"),  # js-yaml
+    re.compile("YAMLException"),  # js-yaml
+    re.compile("safeLoad"),  # js-yaml
     re.compile("Toolkit"),  # actions-toolkit
     re.compile("CHAR_ZERO_WIDTH_NOBREAK_SPACE"),  # braces (and picomatch)
     re.compile("toRegexRange"),  # fill-range
@@ -421,6 +422,7 @@ _ABSENT_FROM_BUNDLE = (
     re.compile("GlobSync"),  # glob
     re.compile("loadPartialConfig"),  # @babel/core
     re.compile("NodePath"),  # @babel/traverse
+    re.compile("wrapRegExp"),  # the helper @babel/helpers emits, GHSA-968p-4wvh-cqc8's code
     re.compile("browserslist", re.IGNORECASE),  # browserslist
     re.compile("compareIdentifiers"),  # semver
     re.compile("MAX_SAFE_COMPONENT_LENGTH"),  # semver
@@ -486,6 +488,16 @@ def test_the_recorded_bundle_reading_still_holds() -> None:
         # browserslist lines start upper-case, so they hold those probes' IGNORECASE too.
         ("export function* loadPartialConfig(", "loadPartialConfig"),
         ("// NodePath is split across many files.", "NodePath"),
+        # babel v7.22.15 packages/babel-helpers/src/helpers/wrapRegExp.js.
+        ("export default function _wrapRegExp() {", "wrapRegExp"),
+        # The 2026-10-07 probes, planted for the first time on 2026-11-05: braces 3.0.2
+        # lib/constants.js, sprintf-js 1.0.3 src/sprintf.js, argparse 1.0.10
+        # lib/argument_parser.js, js-yaml 3.13.1 lib/js-yaml/exception.js and lib/js-yaml.js.
+        ("CHAR_ZERO_WIDTH_NOBREAK_SPACE: '\\uFEFF' /* \\uFEFF */", "CHAR_ZERO_WIDTH_NOBREAK_SPACE"),
+        ("function sprintf() {", "sprintf"),
+        ("* class ArgumentParser", "ArgumentParser"),
+        ("function YAMLException(reason, mark) {", "YAMLException"),
+        ("module.exports.safeLoad            = loader.safeLoad;", "safeLoad"),
         ("var BrowserslistError = require('./error')", "browserslist"),
         ("function compareIdentifiers (a, b) {", "compareIdentifiers"),
         ("var MAX_SAFE_COMPONENT_LENGTH = 16", "MAX_SAFE_COMPONENT_LENGTH"),

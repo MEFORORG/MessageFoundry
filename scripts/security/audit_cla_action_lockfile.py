@@ -12,7 +12,7 @@ WHY A BASELINE. The lockfile is a frozen 2021-era tree that does not audit clean
 means rebuilding the bundle with a Node toolchain this repository does not carry. So the run fails
 only on an advisory NOT in :data:`BASELINE_PATH`. Adding an entry there is the acknowledgement, in a
 reviewed diff, the role ``--ignore-vuln`` plays for ``pip-audit``. The baseline file says its first
-entries were recorded as found, not triaged.
+entries were recorded as found, not triaged, and its header says how to tell which have been since.
 
 THE FALSE CLEAN THIS GUARDS AGAINST. Measured 2026-09-29: ``npm audit --package-lock-only`` with the
 lockfile and NO ``package.json`` exits 0, reports zero vulnerabilities, and counts 6 dependencies.

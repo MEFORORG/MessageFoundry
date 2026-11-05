@@ -386,9 +386,8 @@ check is what shows, on each run, that the audit still sees the known-vulnerable
 that was true until BACKLOG #1578's audit job landed.* The baseline's first entries were recorded as
 found, not triaged for reachability. Some have since been triaged, and the baseline's header says
 how to tell which: a triage comment names each advisory id it covers, and says who triaged it
-and on what reading. Among those still recorded as found are the three lodash advisories, and lodash's code
-is in the bundle.
-The exposure is bounded by where the bundle runs — CI only,
+and on what reading. Among those still recorded as found are the three lodash advisories, on
+code the baseline's header records as in the bundle. The exposure is bounded by where the bundle runs — CI only,
 never in a wheel, sdist or deployment — and `.github/dependabot.yml` records why no automated
 remediation lane exists for it.
 

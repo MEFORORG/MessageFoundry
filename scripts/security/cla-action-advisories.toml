@@ -31,9 +31,11 @@
 # A BUNDLE MEASUREMENT FROM THAT TRIAGE IS KEPT. It bears on the js-yaml entries and on braces
 # GHSA-grv7-fg5c-xmjg. That advisory sits on braces 3.0.2, the node the withdrawn GHSA-vfj7-8cjw-p6xm
 # was also reported against. NONE OF THOSE ENTRIES WAS TRIAGED ON THIS MEASUREMENT ALONE. The
-# 2026-11-05 triage below took it again and triaged those entries. It showed five of these six
-# probes discriminate at their upstream tags. The sixth, toRegexRange, it could not: no fill-range
-# 7.0.1 tag was found, so the braces entry does not rest on it.
+# 2026-11-05 triage below took it again and triaged those entries. It showed sprintf,
+# ArgumentParser, YAMLException, safeLoad and CHAR_ZERO_WIDTH_NOBREAK_SPACE discriminate at their
+# upstream tags. Toolkit's discrimination it takes from the minimatch triage at the end of this
+# file. toRegexRange's it could not show: no fill-range 7.0.1 tag was found, so the braces entry
+# does not rest on it.
 #
 # dist/index.js is not minified, so a package's own identifiers survive in it. Its NAME often does
 # not, because the bundler replaces require paths with module ids. So the probes are identifiers,
@@ -61,7 +63,9 @@
 # given in the batch 608 Manager's chat, and this Builder read it as the Manager relayed it in its
 # brief, not from the owner: a Manager may accept, under class B, an entry proven dev-only, or
 # absent from the bundle by discriminating probes; an entry present in the bundle keeps the
-# owner's per-entry acceptance. This triage found none of its 29 present.
+# owner's per-entry acceptance. This triage found none of its 29 present, and rests none of them on
+# lockfile marks alone. The bundle carries code Babel compiled into other packages' pre-built
+# files (Babel's _interopRequireDefault helper appears 39 times), so each was probed.
 # It follows the deepmerge and minimatch triages at the end of this file, and these words hold for
 # every comment that cites this paragraph:
 #   MARKS. Every lockfile node of the package was read for `dev`, `peer` and `optional`, and every
@@ -72,8 +76,8 @@
 #   PROBES. Identifiers, counted in dist/index.js at engine commit aba973b28. action.yml's main is
 #   that file, the action's only JavaScript file. Each probe a comment offers as evidence returned
 #   0 there, and returned the count the comment gives, at least 1, in the package's own source
-#   at the upstream git tag of its locked version, read over the GitHub API. That is a reading of the tag, not of
-#   the npm tarball. The @actions/core control returned 2. "isMatch" is not a probe.
+#   at the upstream git tag of its locked version, read over the GitHub API. That is a reading of
+#   the tag, not of the npm tarball. The @actions/core control returned 2. "isMatch" is not a probe.
 #   ABSENT means absent under those identifiers, so not reachable on this reading.
 #   LIMIT. Identifier counts do not see code minified or renamed inside another package's pre-built
 #   file, today or after a re-vendor.
@@ -95,10 +99,14 @@
 # src/transform-ast.ts there) for @babel/core; NodePath (61, in
 # packages/babel-traverse/src/path/index.ts at v7.22.17) for @babel/traverse; getDependencies (4)
 # and minVersion (6), in packages/babel-helpers/src/index.ts at v7.22.15, for @babel/helpers.
-# Re-run in the gate test: loadPartialConfig and NodePath. The @babel/helpers names are generic,
-# so they are not. GHSA-4x5r-pxfx-6jf8 is a file read through a sourceMappingURL comment,
-# GHSA-968p-4wvh-cqc8 inefficient RegExp complexity in code Babel generates, and
-# GHSA-67hx-6x53-jw92 code execution while compiling crafted code. Each needs Babel to run.
+# GHSA-4x5r-pxfx-6jf8 is a file read through a sourceMappingURL comment, and GHSA-67hx-6x53-jw92
+# code execution while compiling crafted code. Each needs Babel itself to run. GHSA-968p-4wvh-cqc8
+# is different: it is inefficient RegExp complexity in the _wrapRegExp helper that Babel writes
+# INTO the code it compiles, so it can run with no Babel present, in any pre-built file Babel
+# compiled. So it was probed by that helper too: wrapRegExp and BabelRegExp each returned 0 in the
+# bundle (9 together in packages/babel-helpers/src/helpers/wrapRegExp.js at v7.22.15). Re-run in
+# the gate test: loadPartialConfig, NodePath and wrapRegExp. The other @babel/helpers names are
+# generic, so they are not.
 # PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
 
 [[advisory]]
@@ -137,10 +145,11 @@ package = "@octokit/request-error"
 # the name brace-expansion gives balanced-match, its own dependency); braceExpand, minimatch's call
 # into it, and the rest of that minimatch triage's probes, each 0 again on this reading. Re-run in
 # the gate test: expandTop. All eight advisories are denials of service on a pattern
-# brace-expansion expands, through ReDoS, a hang, unbounded or exponential expansion, or
-# recursion. Each needs brace-expansion code to run. The eight are GHSA-3jxr-9vmj-r5cp,
-# GHSA-f886-m6hf-6m8v, GHSA-mh99-v99m-4gvg, GHSA-rgw5-rvv9-x895 and GHSA-v6h2-p8h4-qcjw below,
-# and GHSA-6j4f-fj2g-mc7p, GHSA-q2hr-2g5m-vwhr and GHSA-qhr7-859c-m2p7 further down.
+# brace-expansion expands, through mechanisms including ReDoS, a hang, quadratic, exponential or
+# unbounded expansion, and recursion. Each needs brace-expansion code to run. The eight are
+# GHSA-3jxr-9vmj-r5cp, GHSA-f886-m6hf-6m8v, GHSA-mh99-v99m-4gvg, GHSA-rgw5-rvv9-x895 and
+# GHSA-v6h2-p8h4-qcjw below, and GHSA-6j4f-fj2g-mc7p, GHSA-q2hr-2g5m-vwhr and GHSA-qhr7-859c-m2p7
+# further down.
 # PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
 
 [[advisory]]
@@ -203,18 +212,21 @@ package = "browserslist"
 # NOT DEV-ONLY; ABSENT FROM THE BUNDLE. npm reports two nodes: cross-spawn 6.0.5, marked neither
 # `dev`, `peer` nor `optional`, and 7.0.3 under jest-changed-files, marked `dev`. 6.0.5's one
 # parent is execa 1.0.0, also unmarked. execa's parents are actions-toolkit 2.2.0, a root runtime
-# dependency, and windows-release 3.2.0. windows-release's parent is os-name 3.1.0, which the
-# universal-user-agent 2.1.0 and 4.0.x copies under @octokit/endpoint, @octokit/request and
-# @octokit/rest need, and @octokit/rest 16.43.2 is a root runtime dependency too. So the lockfile
-# alone does not rule it out. Probes, each 0 in the bundle, with the count at the upstream tag:
-# for cross-spawn v6.0.5, hookChildProcess (2) and verifyENOENT (5) in lib/enoent.js,
+# dependency, and windows-release 3.2.0. windows-release's parent is os-name 3.1.0. The
+# universal-user-agent 4.0.x copies nested under @octokit/endpoint, @octokit/request and
+# @octokit/rest need os-name, and so does the top-level universal-user-agent 2.1.0, which
+# @octokit/graphql 2.1.3 resolves to. @octokit/rest 16.43.2 is a root runtime dependency too. So
+# the lockfile alone does not rule it out. Probes, each 0 in the bundle, with the count at the
+# upstream tag: for cross-spawn v6.0.5, hookChildProcess (2) and verifyENOENT (5) in lib/enoent.js,
 # parseNonShell (2) and resolveCommand (4) in lib/parse.js, and escapeArgument (2) in
 # lib/util/escape.js; for execa v1.0.0, handleArgs (3), npmRunPath (2) and joinCmd (3) in index.js;
 # windowsRelease (2) in windows-release v3.2.0's index.js; osName (2) in os-name v3.1.0's
 # index.js; and Toolkit for actions-toolkit, as the minimatch triage at the end of this file
 # records. Both cross-spawn's and execa's index.js require child_process (1 and 2 hits there), and
-# "child_process" returned 0 in the bundle. Its literal require() calls name assert, crypto,
-# events, fs, http, https, net, os, path, punycode, stream, tls, url, util and zlib. The bundle's
+# "child_process" returned 0 in the bundle. Its 16 literal require() calls name assert, crypto,
+# events, fs, http, https, net, os, path, punycode, stream, tls, url, util (twice) and zlib, and
+# its one eval("require")("encoding"), which the minimatch triage records, names no spawn
+# helper either. The bundle's
 # one getUserAgent definition reads navigator and process and calls no os-name. Re-run in the
 # gate test: hookChildProcess, verifyENOENT, joinCmd, windowsRelease and osName.
 # GHSA-3xgq-45jj-v275 is a ReDoS in cross-spawn, which needs cross-spawn code to run.
@@ -354,9 +366,10 @@ package = "picomatch"
 # marked neither `dev`, `peer` nor `optional`, and 7.3.8 under ts-jest, marked `dev`. Of the
 # packages naming semver, every one but cross-spawn 6.0.5 resolves to a nested copy, under itself
 # or under its parent, and cross-spawn 6.0.5 resolves to the top-level 5.7.1. That puts 5.7.1 on
-# the execa chain the comment above cross-spawn's entry traces to root runtime dependencies. Probes, each 0 in the bundle: semver, case-insensitive (74,
-# in semver.js at tag v5.7.1), SemVer (43), compareIdentifiers (11) and MAX_SAFE_COMPONENT_LENGTH
-# (4), and the chain's probes in the cross-spawn comment. Re-run in the gate test:
+# the execa chain the comment above cross-spawn's entry traces to root runtime dependencies.
+# Probes, each 0 in the bundle: semver, case-insensitive (74, in semver.js at tag v5.7.1), SemVer
+# (43), compareIdentifiers (11) and MAX_SAFE_COMPONENT_LENGTH (4), and the chain's probes in the
+# cross-spawn comment. Re-run in the gate test:
 # compareIdentifiers and MAX_SAFE_COMPONENT_LENGTH, with the chain's. GHSA-c2qf-rxjj-qqgw is a
 # ReDoS in semver, which needs semver code to run.
 # PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
