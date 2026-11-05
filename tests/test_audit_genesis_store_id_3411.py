@@ -10,6 +10,7 @@ three backends from ``tests/audit_chain_cases.py``.
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -20,7 +21,9 @@ from messagefoundry.store.crypto import (
     STORE_ID_BYTES,
 )
 from messagefoundry.store.store import (
+    AUDIT_KEY_EPOCH_ACTION,
     AuditGenesisStoreId,
+    _audit_row_mac_check,
     audit_genesis_detail,
     audit_scheme_refusal,
     parse_audit_epoch,
@@ -58,14 +61,16 @@ def test_a_genesis_record_with_a_store_id_round_trips() -> None:
     assert parse_audit_epoch(detail) is None
 
 
-def test_a_store_id_on_a_record_naming_no_scheme_is_refused() -> None:
+def test_a_store_id_on_a_record_naming_no_scheme_is_refused_as_naming_no_scheme() -> None:
     """No release wrote that shape: the field postdates BACKLOG #3420, and every writer since names
-    the scheme. So a well-formed id there is refused, never read as the unnamed scheme."""
+    the scheme. So a well-formed id there is refused, never read as the unnamed scheme, and the
+    refusal names the missing scheme, the real defect, not the well-formed id."""
     legacy = json.dumps({"genesis": 1, "key_id": _KEY_ID, "store_id": _STORE_ID.hex()})
     record = parse_audit_genesis_record(legacy)
     assert record is not None and record[0] == _KEY_ID
     refusal = audit_scheme_refusal(*record)
-    assert refusal is not None and "malformed store_id" in refusal
+    assert refusal is not None and "names no scheme" in refusal, refusal
+    assert "malformed" not in refusal, refusal
     assert parse_audit_genesis_store_id(legacy) == AuditGenesisStoreId(None, refused=True)
 
 
@@ -86,15 +91,16 @@ def test_the_writer_refuses_a_store_id_of_another_length(length: int) -> None:
 )
 def test_a_malformed_store_id_reads_as_a_genesis_record_and_is_refused(store_id: object) -> None:
     """Refused, never read as no store id and never as no genesis record: either would let a writer
-    of rows change what the chain is. The refusal names the store id, not the scheme, which is
-    well formed here. A record naming no scheme is refused the same way; the well-formed id in
-    :func:`test_a_genesis_record_with_a_store_id_round_trips` is the control."""
+    of rows change what the chain is. Beside a well-formed scheme the refusal names the store id;
+    on a record naming no scheme it names the missing scheme first, whatever the id. The
+    well-formed id in :func:`test_a_genesis_record_with_a_store_id_round_trips` is the control."""
     legacy = json.dumps({"genesis": 1, "key_id": _KEY_ID, "store_id": store_id})
-    for detail in (legacy, genesis_record_with_store_id(_KEY_ID, store_id)):
+    named = genesis_record_with_store_id(_KEY_ID, store_id)
+    for detail, needle in ((legacy, "names no scheme"), (named, "malformed store_id")):
         record = parse_audit_genesis_record(detail)
         assert record is not None and record[0] == _KEY_ID
         refusal = audit_scheme_refusal(*record)
-        assert refusal is not None and "malformed store_id" in refusal, refusal
+        assert refusal is not None and needle in refusal, refusal
         assert parse_audit_genesis_store_id(detail) == AuditGenesisStoreId(None, refused=True)
 
 
@@ -129,9 +135,11 @@ def test_a_store_id_does_not_rescue_a_record_missing_its_own_fields() -> None:
     assert parse_audit_genesis_record(json.dumps({"store_id": _STORE_ID.hex()})) is None
 
 
-def test_a_range_record_carrying_a_store_id_is_refused() -> None:
-    """The label is a genesis field only: on a range record it is a field beyond the record, refused
-    as such (ADR 0193 item 3). The control is the same record without it, which is held."""
+def test_a_range_record_carrying_a_store_id_is_not_yet_admitted() -> None:
+    """Not yet, not never: until the key-custody restore slice lands, a store id on a range record
+    is a field beyond the record, refused as such (ADR 0193 item 3, amended 2026-11-04). That
+    draft's rule 4 restore appends a range row naming the new store id, and that slice changes this
+    test. The control is the same record without it, which is held."""
     closes = {"key_id": "a", "from_seq": 1, "to_seq": 1, "rows": 1, "digest": "", "prev_hash": ""}
     held = {"mac": AUDIT_SCHEME_IN_HEAP.mac, "kdf": AUDIT_SCHEME_IN_HEAP.kdf}
     record = {"key_id": _KEY_ID, "closes": closes, "handover": "t", **held}
@@ -139,3 +147,57 @@ def test_a_range_record_carrying_a_store_id_is_refused() -> None:
     assert epoch is not None and audit_scheme_refusal(epoch.key_id, epoch.scheme) is None
     epoch = parse_audit_epoch(json.dumps({**record, "store_id": _STORE_ID.hex()}))
     assert epoch is not None and audit_scheme_refusal(epoch.key_id, epoch.scheme) is not None
+
+
+# --- the Transit attestation gap names a class, never a record's text --------------------------------
+
+#: A value anyone who can write the audit log could put in a record.
+_MARKER = "RECORD-SUPPLIED-TEXT"
+_CLOSES = {"key_id": "a", "from_seq": 1, "to_seq": 1, "rows": 1, "digest": "", "prev_hash": ""}
+_HELD = {"mac": AUDIT_SCHEME_IN_HEAP.mac, "kdf": AUDIT_SCHEME_IN_HEAP.kdf}
+_UNKNOWN = {"mac": _MARKER + "-mac", "kdf": _MARKER + "-kdf"}
+_KEY = _MARKER + "-key"
+_SCHEME = "names an audit scheme this release does not hold"
+
+
+@pytest.mark.parametrize(
+    ("opening_seq", "record", "phrase"),
+    [
+        (1, {"genesis": 1, "key_id": _KEY, **_UNKNOWN}, _SCHEME),
+        (1, {"genesis": 1, "key_id": _KEY, **_UNKNOWN, "store_id": _MARKER}, _SCHEME),
+        (
+            1,
+            {"genesis": 1, "key_id": _KEY, **_HELD, "store_id": _MARKER},
+            "opens with a record that carries a malformed store_id",
+        ),
+        (
+            1,
+            {"genesis": 1, "key_id": _KEY, "store_id": _MARKER},
+            "opens with a record that carries a store_id but names no scheme",
+        ),
+        (2, {"key_id": _KEY, "closes": _CLOSES, "handover": _MARKER, **_UNKNOWN}, _SCHEME),
+    ],
+)
+async def test_the_one_row_check_names_the_refusal_class_in_fixed_words(
+    opening_seq: int, record: dict[str, Any], phrase: str
+) -> None:
+    """The Transit attestation gap and the one-row evidence read report a refused range in fixed
+    words from a fixed set. The refusal's own words quote ``mac``, ``kdf`` and ``key_id``, which
+    anyone who can write the audit log chooses, so none of the record's text reaches the message."""
+    detail = json.dumps(record)
+
+    async def fetch(sql: str, params: tuple[object, ...]) -> dict[str, Any] | None:
+        if sql.startswith("SELECT row_hash"):
+            return {"row_hash": "0" * 64}
+        return {"seq": opening_seq, "action": AUDIT_KEY_EPOCH_ACTION, "detail": detail}
+
+    found = await _audit_row_mac_check({}, 3, fetch, mac_keys={}, mac_fn=None)
+    assert found == f"audit row 3's key range {phrase}"
+    assert isinstance(found, str) and _MARKER not in found
+    # The control: where the refusal itself quotes the record, the check above would see a leak.
+    if phrase == _SCHEME:
+        epoch = parse_audit_epoch(detail)
+        parsed = (
+            parse_audit_genesis_record(detail) if epoch is None else (epoch.key_id, epoch.scheme)
+        )
+        assert parsed is not None and _MARKER in (audit_scheme_refusal(*parsed) or "")

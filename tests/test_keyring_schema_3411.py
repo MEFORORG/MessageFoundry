@@ -3,12 +3,16 @@
 """Vault BACKLOG #3411, key custody slice S3: the keyring table.
 
 Schema only: nothing writes the keyring yet. These tests pin that the table exists on all three
-backends with one set of columns, the ones the key-custody draft's rule 6 names for a row, and that
-each live-schema check expects it.
+backends with one set of columns and one primary key, and that each live-schema check expects it.
+The key-custody draft's rule 6 names key id, purpose, class, state, period and the sealed key;
+``wrapped_by`` and the three times are the table's own. The primary key is the key id, the purpose
+and the wrapping key's id, because the draft has several rows wrapping one key: the recovery wrap
+and the master handover row both wrap a master key.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -18,11 +22,14 @@ from messagefoundry.store import MessageStore
 from messagefoundry.store.schema_verify import SchemaMismatchError
 from messagefoundry.store.server_schema_verify import (
     ColumnShape,
+    _pk_columns,
     live_shape,
     server_schema_differences,
 )
 from tests._server_schema_rows import mssql_declared, pg_declared
 
+#: The keyring's primary key, the same on every backend.
+_KEYRING_KEY = frozenset({"key_id", "purpose", "wrapped_by"})
 #: The keyring's columns, the same on every backend.
 _KEYRING_COLUMNS = frozenset(
     {
@@ -57,27 +64,74 @@ async def test_a_sqlite_store_has_the_keyring_and_its_schema_check_passes(tmp_pa
         conn.close()
     assert set(columns) == _KEYRING_COLUMNS
     assert columns["key_id"] == ("TEXT", True, True)  # NOT NULL, as on both server backends
+    assert {name for name, (_, _, pk) in columns.items() if pk} == _KEYRING_KEY
     nullable = {name for name, (_, notnull, pk) in columns.items() if not notnull and not pk}
     assert nullable == {"period_from", "period_to", "proved_at"}
     store = await MessageStore.open(db)  # and a reopen passes the same check
     await store.close()
 
 
+_INSERT = (
+    "INSERT INTO keyring (key_id, purpose, state, wrapped_by, created_at, state_at)"
+    " VALUES (?, ?, 's', ?, 0, 0)"
+)
+
+
 async def test_a_sqlite_keyring_refuses_a_null_key_id(tmp_path: Path) -> None:
     """SQLite lets a non-integer primary key hold NULL unless the column says NOT NULL; both server
-    backends refuse one, so this backend must too."""
+    backends refuse one, so this backend must too. The control is the same row with a key id."""
     db = tmp_path / "null.db"
     store = await MessageStore.open(db)
     await store.close()
     conn = sqlite3.connect(db)
     try:
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO keyring (key_id, purpose, state, wrapped_by, created_at, state_at)"
-                " VALUES (NULL, 'p', 's', 'w', 0, 0)"
-            )
+        conn.execute(_INSERT, ("k", "p", "w"))
+        with pytest.raises(sqlite3.IntegrityError, match="keyring.key_id"):
+            conn.execute(_INSERT, (None, "p", "w"))
     finally:
         conn.close()
+
+
+async def test_a_sqlite_keyring_holds_several_wraps_of_one_key_and_refuses_a_duplicate(
+    tmp_path: Path,
+) -> None:
+    """The draft wraps one key in several rows: the recovery wrap and the master handover row both
+    wrap a master key, and each host wrap names its own wrapping key. Each coexists; the same wrap
+    twice is refused."""
+    db = tmp_path / "wraps.db"
+    store = await MessageStore.open(db)
+    await store.close()
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(_INSERT, ("master", "recovery-wrap", "recovery"))
+        conn.execute(_INSERT, ("master", "master-handover", "old-master"))
+        conn.execute(_INSERT, ("master", "host-wrap", "host-a"))
+        conn.execute(_INSERT, ("master", "host-wrap", "host-b"))
+        assert conn.execute("SELECT count(*) FROM keyring").fetchone() == (4,)
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+            conn.execute(_INSERT, ("master", "recovery-wrap", "recovery"))
+    finally:
+        conn.close()
+
+
+async def test_a_sqlite_keyring_keyed_on_the_key_id_alone_is_refused(tmp_path: Path) -> None:
+    """A keyring keyed on ``key_id`` alone, as an earlier build of this slice made it, could not
+    hold the wraps above, so the live-schema check refuses it."""
+    db = tmp_path / "narrow.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "CREATE TABLE keyring (key_id TEXT NOT NULL PRIMARY KEY, purpose TEXT NOT NULL,"
+            " key_class TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, period_from REAL,"
+            " period_to REAL, wrapped_by TEXT NOT NULL, wrapped TEXT NOT NULL DEFAULT '',"
+            " created_at REAL NOT NULL, state_at REAL NOT NULL, proved_at REAL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(SchemaMismatchError) as info:
+        await MessageStore.open(db)
+    assert "table 'keyring' is missing the constraint index" in str(info.value)
 
 
 async def test_a_sqlite_keyring_missing_a_column_is_refused(tmp_path: Path) -> None:
@@ -86,10 +140,11 @@ async def test_a_sqlite_keyring_missing_a_column_is_refused(tmp_path: Path) -> N
     conn = sqlite3.connect(db)
     try:
         conn.execute(
-            "CREATE TABLE keyring (key_id TEXT NOT NULL PRIMARY KEY, purpose TEXT NOT NULL,"
+            "CREATE TABLE keyring (key_id TEXT NOT NULL, purpose TEXT NOT NULL,"
             " key_class TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, period_from REAL,"
             " period_to REAL, wrapped_by TEXT NOT NULL, wrapped TEXT NOT NULL DEFAULT '',"
-            " created_at REAL NOT NULL, state_at REAL NOT NULL)"
+            " created_at REAL NOT NULL, state_at REAL NOT NULL,"
+            " PRIMARY KEY (key_id, purpose, wrapped_by))"
         )
         conn.commit()
     finally:
@@ -113,6 +168,17 @@ def test_each_server_batch_declares_the_keyring_with_the_same_columns() -> None:
     for declared in (pg, ms):
         nullable = {c for c, s in declared.column_shapes["keyring"].items() if s.nullable}
         assert nullable == {"period_from", "period_to", "proved_at"}
+
+
+def test_each_server_batch_keys_the_keyring_as_sqlite_does() -> None:
+    """The server checks compare no primary key, so the batch text is read here: each declares the
+    keyring's key once, on the same three columns as SQLite."""
+    from messagefoundry.store import postgres, sqlserver
+
+    for batch in (postgres._SCHEMA, sqlserver._SCHEMA):
+        ddl = [s for s in batch if re.search(r"CREATE TABLE (IF NOT EXISTS )?keyring\b", s)]
+        assert len(ddl) == 1 and len(re.findall(r"PRIMARY\s+KEY", ddl[0])) == 1
+        assert _pk_columns(ddl[0]) == _KEYRING_KEY
 
 
 @pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
