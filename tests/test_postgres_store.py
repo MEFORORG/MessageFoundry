@@ -1424,7 +1424,7 @@ async def test_rotation_racing_a_sweep_is_swept(store) -> None:
         )
 
     await _assert_rotation_racing_a_sweep_is_swept(
-        store, holder_of=_backend_pid, is_blocking=_is_blocking, rotation_takes_account_row=False
+        store, holder_of=_backend_pid, is_blocking=_is_blocking
     )
 
 

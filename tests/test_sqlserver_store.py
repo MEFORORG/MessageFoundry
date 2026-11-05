@@ -1185,7 +1185,10 @@ async def test_rotation_racing_a_sweep_is_swept(store) -> None:
     ``rotate_session`` takes the account's ``users`` row before its session row, so the rotation
     and the sweep take one lock order. The shared body is the one the Postgres suite runs, plus
     the second order, which only this store's rotation has. Probes as the lock-order test above."""
-    from tests._federated_unbind_store_contract import _assert_rotation_racing_a_sweep_is_swept
+    from tests._federated_unbind_store_contract import (
+        _assert_rotation_racing_a_sweep_is_swept,
+        _assert_rotation_waits_for_a_bind,
+    )
 
     async def _session_id(cur: Any) -> object:
         await cur.execute("SELECT @@SPID")
@@ -1199,8 +1202,9 @@ async def test_rotation_racing_a_sweep_is_swept(store) -> None:
         return bool(row and row["n"])
 
     await _assert_rotation_racing_a_sweep_is_swept(
-        store, holder_of=_session_id, is_blocking=_is_blocking, rotation_takes_account_row=True
+        store, holder_of=_session_id, is_blocking=_is_blocking
     )
+    await _assert_rotation_waits_for_a_bind(store, holder_of=_session_id, is_blocking=_is_blocking)
 
 
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:

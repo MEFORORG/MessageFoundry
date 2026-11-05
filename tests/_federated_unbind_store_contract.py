@@ -386,59 +386,18 @@ async def _assert_bind_and_user_delete_take_one_lock_order(
     )
     await store.create_session(token_hash="bd-live", user_id=account, expires_at=_EXPIRES, now=1.0)
 
-    real_write = store._write_user
-    holding = asyncio.Event()
-    release = asyncio.Event()
-    holder: list[object] = []
-
-    async def _paused_write(handle: Any, user_id: str, change: Any) -> Any:
-        written = await real_write(handle, user_id, change)
-        if not holder and user_id == account:  # the bind's write, the first to this account
-            holder.append(await holder_of(handle))
-            holding.set()
-            await release.wait()
-        return written
-
-    store._write_user = _paused_write
-    tasks: list[asyncio.Task[Any]] = []
-    try:
-        bind = asyncio.create_task(
-            store.set_user_federated_subject(account, ISSUER, "S-1-bind-delete", now=2.0)
-        )
-        held = asyncio.create_task(holding.wait())
-        tasks += [bind, held]
-        await asyncio.wait({bind, held}, timeout=_STEP_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
-        if bind.done():
-            bind.result()  # a bind that failed before its pause raises its own error here
-        assert holding.is_set(), "the bind never reached its user write"
-
-        delete = asyncio.create_task(store.delete_user(account))
-        tasks.append(delete)
-        queued = False
-        for _ in range(_PROBE_POLLS):
-            if delete.done():
-                break
-            if await is_blocking(holder[0]):
-                queued = True
-                break
-            await asyncio.sleep(_PROBE_INTERVAL)
-        # The race actually exercised: without this the test would pass on a delete that never met
-        # the bind, which proves nothing about the order.
-        if delete.done():
-            delete.result()  # a delete that failed fast raises its own error here
-            raise AssertionError("delete_user finished while the bind held the account's row")
-        assert queued, "delete_user never queued behind the bind, so the interleaving did not run"
-
-        release.set()
-        swept = await asyncio.wait_for(bind, timeout=_STEP_TIMEOUT)
-        await asyncio.wait_for(delete, timeout=_STEP_TIMEOUT)
-    finally:
-        release.set()
-        del store._write_user  # the instance attribute only; the class method is untouched
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+    swept, _ = await _hold_then_race(
+        store,
+        attr="_write_user",
+        key=account,
+        first=(
+            "the bind",
+            lambda: store.set_user_federated_subject(account, ISSUER, "S-1-bind-delete", now=2.0),
+        ),
+        second=("delete_user", lambda: store.delete_user(account)),
+        holder_of=holder_of,
+        is_blocking=is_blocking,
+    )
 
     # Neither was ended by the server: the bind swept the one live session, and the delete then
     # removed the account and every session row, the revoked one included.
@@ -447,25 +406,82 @@ async def _assert_bind_and_user_delete_take_one_lock_order(
     assert await store.get_session("bd-live") is None
 
 
-async def _probe_queued(
-    waiter: asyncio.Task[Any], holder: object, is_blocking: Callable[[object], Awaitable[bool]]
-) -> bool:
-    """Poll until a lock request waits on ``holder``; ``False`` if ``waiter`` finishes first or the
-    polls run out."""
-    for _ in range(_PROBE_POLLS):
-        if waiter.done():
-            return False
-        if await is_blocking(holder):
-            return True
-        await asyncio.sleep(_PROBE_INTERVAL)
-    return False
+#: A labelled store call: the label names it in a failure message.
+_Step = tuple[str, Callable[[], Coroutine[Any, Any, Any]]]
 
 
-async def _settle(tasks: list[asyncio.Task[Any]]) -> None:
-    for task in tasks:
-        if not task.done():
-            task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+async def _hold_then_race(
+    store: Any,
+    *,
+    attr: str,
+    key: str,
+    first: _Step,
+    second: _Step,
+    holder_of: Callable[[Any], Awaitable[object]],
+    is_blocking: Callable[[object], Awaitable[bool]],
+) -> tuple[Any, Any]:
+    """Run ``first`` until its call to ``store.<attr>`` for ``key`` has landed, and hold it there
+    with its locks; start ``second``; require that ``second`` really waits on ``first``'s server
+    session; then release ``first`` and return both results, ``first``'s first.
+
+    ``attr`` names a write helper called ``(handle, key, change)``: ``_write_user`` or
+    ``_write_session``. Only the first call for ``key`` pauses. The race is hooked, not timed:
+    without the probe a pass could come from a ``second`` that never met ``first``, which proves
+    nothing about the order.
+    """
+    (first_name, start_first), (second_name, start_second) = first, second
+    real_write = getattr(store, attr)
+    holding = asyncio.Event()
+    release = asyncio.Event()
+    holder: list[object] = []
+
+    async def _paused_write(handle: Any, written_key: str, change: Any) -> Any:
+        written = await real_write(handle, written_key, change)
+        if not holder and written_key == key:
+            holder.append(await holder_of(handle))
+            holding.set()
+            await release.wait()
+        return written
+
+    setattr(store, attr, _paused_write)
+    tasks: list[asyncio.Task[Any]] = []
+    try:
+        running = asyncio.create_task(start_first())
+        held = asyncio.create_task(holding.wait())
+        tasks += [running, held]
+        await asyncio.wait(
+            {running, held}, timeout=_STEP_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
+        )
+        if running.done():
+            running.result()  # a call that failed before its pause raises its own error here
+        assert holding.is_set(), f"{first_name} never reached {attr}"
+
+        waiting = asyncio.create_task(start_second())
+        tasks.append(waiting)
+        queued = False
+        for _ in range(_PROBE_POLLS):
+            if waiting.done():
+                break
+            if await is_blocking(holder[0]):
+                queued = True
+                break
+            await asyncio.sleep(_PROBE_INTERVAL)
+        if waiting.done():
+            waiting.result()  # a call that failed fast raises its own error here
+            raise AssertionError(f"{second_name} finished while {first_name} held its row")
+        assert queued, f"{second_name} never queued behind {first_name}, so the race did not run"
+
+        release.set()
+        first_result = await asyncio.wait_for(running, timeout=_STEP_TIMEOUT)
+        second_result = await asyncio.wait_for(waiting, timeout=_STEP_TIMEOUT)
+    finally:
+        release.set()
+        delattr(store, attr)  # the instance attribute only; the class method is untouched
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return first_result, second_result
 
 
 async def _sweep_by_bind(store: Any, account: str) -> int:
@@ -510,7 +526,6 @@ async def _assert_rotation_racing_a_sweep_is_swept(
     *,
     holder_of: Callable[[Any], Awaitable[object]],
     is_blocking: Callable[[object], Awaitable[bool]],
-    rotation_takes_account_row: bool,
 ) -> None:
     """A session rotated while a whole-account sweep runs is swept too (BACKLOG #4974, #2738).
 
@@ -525,74 +540,42 @@ async def _assert_rotation_racing_a_sweep_is_swept(
     replayed. By the reading in ``rotate_session``, SQL Server without the account row first would
     count 0 and leave the new hash live; that was not run.
 
-    ``rotation_takes_account_row`` adds the other order, on the store whose rotation takes the
-    account row: a bind paused while it holds that row, and a rotation started then, must wait for
-    the bind, then find the session ended and re-key nothing.
-
-    ``holder_of`` and ``is_blocking`` are the lock-order test's: no timing decides either case.
+    ``holder_of`` and ``is_blocking`` are the lock-order test's: no timing decides the race.
     """
-    real_write_session = store._write_session
     for name, sweep, bound in _SWEEPS:
-        account = f"fed-rotate-{name}"
-        old, new = f"rs-z-{name}-old", f"rs-a-{name}-new"
-        await _new_account(store, account, bound=bound)
-        await store.create_session(token_hash=old, user_id=account, expires_at=_EXPIRES, now=2.0)
+        await _assert_one_sweep_takes_a_rotated_session(
+            store, name, sweep, bound=bound, holder_of=holder_of, is_blocking=is_blocking
+        )
 
-        holding = asyncio.Event()
-        release = asyncio.Event()
-        holder: list[object] = []
 
-        async def _paused_write(
-            handle: Any,
-            token_hash: str,
-            change: Any,
-            _old: str = old,
-            _holding: asyncio.Event = holding,
-            _release: asyncio.Event = release,
-            _holder: list[object] = holder,
-        ) -> Any:
-            written = await real_write_session(handle, token_hash, change)
-            if not _holder and token_hash == _old:  # the rotation's re-key, still uncommitted
-                _holder.append(await holder_of(handle))
-                _holding.set()
-                await _release.wait()
-            return written
+async def _assert_one_sweep_takes_a_rotated_session(
+    store: Any,
+    name: str,
+    sweep: Callable[[Any, str], Coroutine[Any, Any, int]],
+    *,
+    bound: bool,
+    holder_of: Callable[[Any], Awaitable[object]],
+    is_blocking: Callable[[object], Awaitable[bool]],
+) -> None:
+    account = f"fed-rotate-{name}"
+    old, new = f"rs-z-{name}-old", f"rs-a-{name}-new"
+    await _new_account(store, account, bound=bound)
+    await store.create_session(token_hash=old, user_id=account, expires_at=_EXPIRES, now=2.0)
 
-        store._write_session = _paused_write
-        tasks: list[asyncio.Task[Any]] = []
-        try:
-            rotation = asyncio.create_task(store.rotate_session(old, new_token_hash=new, now=2.5))
-            held = asyncio.create_task(holding.wait())
-            tasks += [rotation, held]
-            await asyncio.wait(
-                {rotation, held}, timeout=_STEP_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
-            )
-            if rotation.done():
-                rotation.result()  # a rotation that failed before its pause raises its own error
-            assert holding.is_set(), f"{name}: the rotation never reached its re-key"
+    rotated, swept = await _hold_then_race(
+        store,
+        attr="_write_session",
+        key=old,
+        first=(f"{name}: the rotation", lambda: store.rotate_session(old, new_token_hash=new)),
+        second=(f"{name}: the sweep", lambda: sweep(store, account)),
+        holder_of=holder_of,
+        is_blocking=is_blocking,
+    )
 
-            sweeping = asyncio.create_task(sweep(store, account))
-            tasks.append(sweeping)
-            queued = await _probe_queued(sweeping, holder[0], is_blocking)
-            if sweeping.done():
-                sweeping.result()  # a sweep that failed fast raises its own error here
-                raise AssertionError(f"{name}: the sweep finished while the rotation held its row")
-            assert queued, f"{name}: the sweep never queued behind the rotation"
-
-            release.set()
-            assert await asyncio.wait_for(rotation, timeout=_STEP_TIMEOUT) is True
-            swept = await asyncio.wait_for(sweeping, timeout=_STEP_TIMEOUT)
-        finally:
-            release.set()
-            del store._write_session  # the instance attribute only; the class method is untouched
-            await _settle(tasks)
-
-        assert swept == 1, f"{name}: the sweep counted {swept}, not the rotated session"
-        assert await store.get_session(old) is None, f"{name}: the old hash still has a row"
-        assert not await _live(store, new), f"{name}: the rotated session outlived the sweep"
-
-    if rotation_takes_account_row:
-        await _assert_rotation_waits_for_a_bind(store, holder_of=holder_of, is_blocking=is_blocking)
+    assert rotated is True, f"{name}: the rotation did not land"
+    assert swept == 1, f"{name}: the sweep counted {swept}, not the rotated session"
+    assert await store.get_session(old) is None, f"{name}: the old hash still has a row"
+    assert not await _live(store, new), f"{name}: the rotated session outlived the sweep"
 
 
 async def _assert_rotation_waits_for_a_bind(
@@ -601,52 +584,23 @@ async def _assert_rotation_waits_for_a_bind(
     holder_of: Callable[[Any], Awaitable[object]],
     is_blocking: Callable[[object], Awaitable[bool]],
 ) -> None:
-    """The other order (BACKLOG #4974): a bind holds the account row, and a rotation of one of its
-    sessions waits for it, then re-keys nothing, because the bind ended the session."""
+    """The other order (BACKLOG #4974), on the store whose rotation takes the account row: a bind
+    holds that row, and a rotation of one of its sessions waits for it, then re-keys nothing,
+    because the bind ended the session."""
     account = "fed-rotate-after-bind"
     old, new = "rb-z-old", "rb-a-new"
     await _new_account(store, account, bound=False)
     await store.create_session(token_hash=old, user_id=account, expires_at=_EXPIRES, now=2.0)
 
-    real_write = store._write_user
-    holding = asyncio.Event()
-    release = asyncio.Event()
-    holder: list[object] = []
-
-    async def _paused_write(handle: Any, user_id: str, change: Any) -> Any:
-        written = await real_write(handle, user_id, change)
-        if not holder and user_id == account:  # the bind's write, the first to this account
-            holder.append(await holder_of(handle))
-            holding.set()
-            await release.wait()
-        return written
-
-    store._write_user = _paused_write
-    tasks: list[asyncio.Task[Any]] = []
-    try:
-        bind = asyncio.create_task(_sweep_by_bind(store, account))
-        held = asyncio.create_task(holding.wait())
-        tasks += [bind, held]
-        await asyncio.wait({bind, held}, timeout=_STEP_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
-        if bind.done():
-            bind.result()  # a bind that failed before its pause raises its own error here
-        assert holding.is_set(), "the bind never reached its user write"
-
-        rotation = asyncio.create_task(store.rotate_session(old, new_token_hash=new, now=2.5))
-        tasks.append(rotation)
-        queued = await _probe_queued(rotation, holder[0], is_blocking)
-        if rotation.done():
-            rotation.result()
-            raise AssertionError("the rotation finished while the bind held the account's row")
-        assert queued, "the rotation never queued behind the bind"
-
-        release.set()
-        swept = await asyncio.wait_for(bind, timeout=_STEP_TIMEOUT)
-        rotated = await asyncio.wait_for(rotation, timeout=_STEP_TIMEOUT)
-    finally:
-        release.set()
-        del store._write_user  # the instance attribute only; the class method is untouched
-        await _settle(tasks)
+    swept, rotated = await _hold_then_race(
+        store,
+        attr="_write_user",
+        key=account,
+        first=("the bind", lambda: _sweep_by_bind(store, account)),
+        second=("the rotation", lambda: store.rotate_session(old, new_token_hash=new)),
+        holder_of=holder_of,
+        is_blocking=is_blocking,
+    )
 
     assert swept == 1, swept
     assert rotated is False, "the rotation re-keyed a session the bind had ended"
