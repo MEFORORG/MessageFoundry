@@ -2117,8 +2117,9 @@ def test_the_harness_smoke_checks_the_lockstep_pin_on_the_built_artifact(
             ["messagefoundry-toolkit==" + _SMOKE_VERSION, "messagefoundry-toolkit==0.0.1"],
             "two toolkit requirements",
         ),
+        (["messagefoundry-toolkit[dev]==" + _SMOKE_VERSION], "an extra on the toolkit pin"),
     ],
-    ids=["absent", "wrong-version", "range", "wildcard", "platform-marker", "two-lines"],
+    ids=["absent", "wrong-version", "range", "wildcard", "platform-marker", "two-lines", "extra"],
 )
 def test_the_harness_smoke_checks_the_toolkit_pin_on_the_built_artifact(
     toolkit_requires: list[str], why: str, venv_template: Path, tmp_path: Path
@@ -2144,7 +2145,35 @@ def test_the_harness_smoke_checks_the_toolkit_pin_on_the_built_artifact(
     )
 
 
-# --- an extra's requirement is not the lockstep pin (BACKLOG #1585)---------------------------------
+def test_the_harness_smoke_does_not_count_a_toolkit_line_an_extra_gates(
+    venv_template: Path, tmp_path: Path
+) -> None:
+    """The control for the toolkit arms above: a second toolkit line that only an extra the wheel
+    declares installs is not the base pin, exactly as for the engine, so a correct pin beside it
+    passes and the success line names the toolkit pin it read."""
+    script, dist, pkg, exe, purelib = _prepared(_HARNESS_DIST, venv_template, tmp_path)
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _SMOKE_VERSION,
+        package_files=_good_package(pkg, _SMOKE_VERSION),
+        toolkit_requires=[
+            "messagefoundry-toolkit==" + _SMOKE_VERSION,
+            'messagefoundry-toolkit; extra == "dev"',
+        ],
+        provides_extra=["dev"],
+    )
+
+    rc, stdout, out = _run_smoke(exe, script, tmp_path)
+    assert rc == 0, f"the harness smoke counted an extra-gated toolkit line as the pin.\n{out}"
+    assert stdout.strip() == _SMOKE_VERSION, out
+    assert "messagefoundry-toolkit==" + _SMOKE_VERSION in out, (
+        f"the harness smoke's success line does not name the toolkit pin it accepted.\n{out}"
+    )
+
+
+# --- an extra's requirement is not the lockstep pin (BACKLOG #1585) ---------------------------------
 
 #: What ``dev = ["messagefoundry[dev]"]`` becomes in wheel metadata. Not hypothetical: that exact
 #: table is already in packaging/messagefoundry-webconsole/pyproject.toml, so the harness is one

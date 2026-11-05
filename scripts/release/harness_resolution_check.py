@@ -38,8 +38,9 @@ THE ONE OTHER BASE DEPENDENCY IT STUBS is ``messagefoundry-toolkit`` (ADR 0201 s
 imports the toolkit's generators). Every arm offers a toolkit stub at the harness's OWN version with
 no requirements of its own, so the arms still vary the engine alone and measure only its edge. So
 this check does not hold the toolkit pin: ``tests/test_packaging.py`` checks the specifier in CI, and
-release.yml's harness wheel smoke checks it on the built wheel. A toolkit pin that drifted past both
-would show here only as a matched arm that pip refused, worded as if the engine pin were at fault.
+release.yml's harness wheel smoke checks it on the built wheel. A toolkit requirement that does not
+admit the harness's own version is reported here by name, before the arms run, so the matched arm
+never blames the engine pin for it.
 
 NOT STDLIB-ONLY, on purpose. It imports ``packaging`` for PEP 440 and PEP 503 normalisation, and
 both places that run it already carry ``packaging``: the test suite's interpreter, and release.yml's
@@ -237,6 +238,20 @@ def check(harness: Path, arms: Collection[str] = ARMS) -> list[str]:
             f"{harness.name} declares base dependencies besides {list(STUBBED)}: {others}. This "
             f"check stubs only those and runs with --no-index, so every arm would read as refused. "
             f"Extend scripts/release/harness_resolution_check.py to stub them (BACKLOG #1585)."
+        ]
+    # Every arm offers the toolkit at the harness's own version, so a toolkit requirement that does
+    # not admit it would refuse the matched arm and read as an engine-pin fault. Name it instead.
+    toolkit_drift = [
+        str(req)
+        for raw in requires
+        if canonicalize_name((req := Requirement(raw)).name) == TOOLKIT
+        and (req.marker is None or req.marker.evaluate({"extra": ""}))
+        and not req.specifier.contains(shipped, prereleases=True)
+    ]
+    if toolkit_drift:
+        return [
+            f"{harness.name} {shipped} requires {toolkit_drift}, which does not admit "
+            f"{TOOLKIT} {shipped}, the version it ships with (ADR 0201 AC-7)."
         ]
     # The arms aim at the harness's OWN version, not at whatever its pin says: lockstep means the
     # engine at that version and no other. Aiming at the pin would let a pin that drifted from the

@@ -2254,7 +2254,8 @@ jobs:
           print(
               f"harness wheel installed from {origin}: {len(recorded)} {PKG}/ members, "
               f"entry point {PKG}.__main__:main resolves, requires "
-              f"messagefoundry[harness]{engine[0].specifier}, version {dist.version}",
+              f"messagefoundry[harness]{engine[0].specifier} and "
+              f"messagefoundry-toolkit{toolkit[0].specifier}, version {dist.version}",
               file=sys.stderr,
           )
           print(dist.version)

@@ -811,6 +811,30 @@ def test_the_install_resolution_check_names_an_unstubbed_dependency(tmp_path: Pa
     assert len(failures) == 1 and "httpx" in failures[0] and "besides" in failures[0], failures
 
 
+def test_the_install_resolution_check_names_a_drifted_toolkit_pin(tmp_path: Path) -> None:
+    """Every arm stubs the toolkit at the harness's own version (ADR 0201 slice 7), so a toolkit
+    pin that drifted would refuse the matched arm and blame the engine. It is named instead, before
+    any arm runs, and a correct toolkit pin beside the engine is not refused for it."""
+    (tmp_path / "drifted").mkdir()
+    drifted = _synthetic_harness_wheel(
+        tmp_path / "drifted",
+        "0.3.2",
+        ["messagefoundry[harness]==0.3.2", "messagefoundry-toolkit==0.3.1"],
+    )
+    failures = _resolution_module().check(drifted)
+    assert len(failures) == 1 and "messagefoundry-toolkit==0.3.1" in failures[0], failures
+    assert "AC-7" in failures[0] and "arm" not in failures[0], failures
+
+    (tmp_path / "clean").mkdir()
+    clean = _synthetic_harness_wheel(
+        tmp_path / "clean",
+        "0.3.2",
+        ["messagefoundry[harness]==0.3.2", "messagefoundry-toolkit==0.3.2"],
+    )
+    _require_pip()
+    assert _resolution_module().check(clean, arms={"matched"}) == []
+
+
 def test_the_install_resolution_check_counts_a_dependency_marked_for_another_platform() -> None:
     """A base dependency gated to Windows is still a base dependency on the ubuntu runner.
 
@@ -915,13 +939,16 @@ def test_the_harness_names_the_engine_once_in_the_table_the_release_counts() -> 
     _extra_gates). Counting them here would forbid a table the sibling console already ships.
     """
     deps = tomllib.loads(_HARNESS_PYPROJECT.read_text(encoding="utf-8"))["project"]["dependencies"]
-    named = [raw for raw in deps if _normalise(Requirement(raw).name) == "messagefoundry"]
-    assert len(named) == 1, (
-        f"the harness base dependency table names the engine {len(named)} times: {named}. The "
-        f"release smoke counts them on the built wheel and accepts only one, so this fails at the "
-        f"tag rather than here. Keep one line in "
-        f"{_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()}."
-    )
+    # The toolkit too (ADR 0201 slice 7): the smoke counts its lines the same way, and
+    # ``_toolkit_pin`` reads only the first.
+    for name, what in (("messagefoundry", "the engine"), ("messagefoundry-toolkit", "the toolkit")):
+        named = [raw for raw in deps if _normalise(Requirement(raw).name) == name]
+        assert len(named) == 1, (
+            f"the harness base dependency table names {what} {len(named)} times: {named}. The "
+            f"release smoke counts them on the built wheel and accepts only one, so this fails at "
+            f"the tag rather than here. Keep one line in "
+            f"{_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()}."
+        )
 
 
 # --- the toolkit pins the engine it ships with (ADR 0201 AC-7, BACKLOG #1192) ---------------------
