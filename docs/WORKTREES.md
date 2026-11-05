@@ -311,8 +311,11 @@ script header is the source of record for what is parked and what refuses (docs/
 a session's or a subagent's worktree. The occupancy check reads the directory a session was
 *launched* in. A subagent started with `isolation: worktree` is recorded under its **parent's**
 directory, so its tree would read as empty. A deletion route whose check fails open on a
-population is worse than no route to it, so there is none. (BACKLOG #1038, Manager decision
-batch 184.) Removing one of those trees stays the user's decision.
+population is worse than no route to it, so a session has none. (BACKLOG #1038, Manager decision
+batch 184.) Removing one of those trees stays the user's decision. The user's one standing route is
+the opt-in nightly step, `run-daily-prune.ps1 -RemoveFinishedClaudeWorktrees` (owner request
+2026-11-05), which refuses `-Apply` inside Claude Code; *Run it nightly* below says what it checks
+and what it cannot see.
 
 One layout overlaps. `new.ps1` run from a linked worktree makes its sibling **beside that
 worktree**, and for a harness-made worktree that is also under `.claude/worktrees`. `-Path`
@@ -695,23 +698,38 @@ each one immediately before acting. At least these re-checks run, and any one fa
 
 - it is not the primary, not the worktree the run executes from, and contains neither;
 - it is still registered, and `git worktree list --porcelain` reports it neither locked nor prunable;
+- no file is flagged skip-worktree or assume-unchanged, whose edits `git status` cannot see;
 - `git status --porcelain --untracked-files=all` is empty, so ignored files such as `.venv` do not count;
-- its git metadata is idle beyond the `-IdleHours` that `prune-merged.ps1` used, and that window is not
-  under the 12 h floor;
-- a detached tree's tip is still held by some ref;
-- last, so the gap before the removal is short: the liveness fence, read fresh, is available and finds no
-  live session in it or nested in it, and it contains no other registered worktree.
+- its git metadata and its working tree's top level are both idle beyond the `-IdleHours` that
+  `prune-merged.ps1` used, and that window is a number not under the 12 h floor;
+- a detached tree's tip is still held by some ref, and no commit is held only by its own HEAD reflog or
+  per-worktree refs, which the removal deletes;
+- no coordination claim names it, and every claim file could be read;
+- last, so the gap before the removal is short: the liveness fence, read fresh, is available, finds no
+  registered session launched in it or nested in it, and finds no other registered worktree inside it.
 
-Each gate is the one `prune-merged.ps1` decides with, shared through
+Each gate is the one `prune-merged.ps1` decides with where it has one, shared through
 [`worktree-gates.ps1`](../scripts/worktree/worktree-gates.ps1) and `scripts/coord/occupancy.ps1`
-rather than copied. The coordination-claim check is not re-run: the list holds no claimed tree.
+rather than copied.
+
+**The fence alone fails open on this population, and the step does not rest on it.** The fence reads
+the directory a session was launched in, and a subagent under `isolation: worktree` is recorded under
+its parent's (*What `-Path` does not reach* above). What covers a live subagent is the rest: the
+harness locks a live agent's worktree (observed 2026-11-05 with the reason `claude agent <id> (pid
+<n>)`), and work there moves the git metadata or the top-level mtimes within `-IdleHours`. A session
+that holds no lock, runs no git command, and writes nothing at the tree's top level for that long is
+not seen. Ignored files other than `.venv` go with the tree, and an allocation the tree owns
+(`alloc.ps1`) is not checked.
 
 The removal is a plain `git -C <primary> worktree remove <path>` with **no `--force`**, so git's own
-refusal on a locked or dirty tree stays a last fence. The branch survives it. Each path is logged as
-`REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `FAILED` or `ORPHANED` with its reason, then
-a summary line with the counts and the drive's free space. A refusal is data and leaves the exit code
-alone; a failed removal raises it to `1`, an orphan to `3`, and a list that could not be read skips
-the step and raises it to `2`. Tests:
+refusal on a locked or dirty tree stays a last fence. The branch survives it. Each path is logged as it
+is decided, as `REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `DECLINED` (every re-check
+passed and git still refused), `FAILED` or `ORPHANED`, with its reason, then a summary line with the
+counts and the drive's free space. A refusal or a decline is data and leaves the exit code alone; a
+failure raises it to `1`, and an orphan raises it to `3` and goes into `prune-merged.ps1`'s orphan
+ledger, so later runs keep reporting it. A list that could not be read skips the step, raising the
+code to `2` on a dry run and to `1` under `-Apply`, since the prune before it may have removed
+siblings. With `-Apply` the runner refuses to run inside Claude Code. Tests:
 [`tests/test_worktree_finished_claude_removal.py`](../tests/test_worktree_finished_claude_removal.py).
 
 ## A scheduled hygiene report that deletes nothing — `hygiene-report.ps1`

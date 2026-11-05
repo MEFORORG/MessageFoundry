@@ -13,8 +13,10 @@
     the absence of a veto, not a permission. When the fence cannot look at all, nothing is pruned.
 
     Enumerates the <repo>-<name> sibling worktrees and removes each one that is ALL of the following.
-    It never touches a tree under .claude/worktrees, including one `new.ps1 -Nested` made; no script
-    tears that tree down, and remove.ps1 -Path refuses it too. Which mechanism makes which layout is stated once, in the
+    It never touches a tree under .claude/worktrees, including one `new.ps1 -Nested` made, and
+    remove.ps1 -Path refuses it too. The one script that removes such a tree is the opt-in nightly
+    step, run-daily-prune.ps1 -RemoveFinishedClaudeWorktrees (owner request 2026-11-05), acting on this
+    script's REPORT-ONLY list after its own re-checks. Which mechanism makes which layout is stated once, in the
     "WHICH MECHANISM MADE THIS WORKTREE" block of scripts/hooks/worktree_gate.ps1 (BACKLOG #1038).
 
       (a) merged     -- no commits beyond origin/main, OR a merged PR whose head is this exact tip, OR
@@ -1334,20 +1336,13 @@ if ($claimsError) {
 # UNREADABLE IS NOT ABSENT, same rule as Remove-ClaimsHeldBy: a claim file we cannot parse might name
 # this worktree, so it withholds. Fails closed.
 if ($reportOnly.Count -gt 0) {
-    $claimed = @{}
     # Unresolved is not empty: withhold every suggestion, the same as an unreadable claim.
-    $claimUnreadable = [bool]$claimsError
-    if ($claimsDir -and (Test-Path -LiteralPath $claimsDir)) {
-        foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue)) {
-            try { $c = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop }
-            catch { $claimUnreadable = $true; continue }
-            $n = ConvertTo-Norm ([string]$c.worktree)
-            if ($n) { $claimed[$n] = $true }
-        }
-    }
+    # worktree-gates.ps1's reader, shared with the nightly removal's re-check.
+    $index = Get-ClaimedWorktreeIndex $claimsDir
+    $claimUnreadable = [bool]$claimsError -or $index.Unreadable
     $kept = @()
     foreach ($r in $reportOnly) {
-        if ($claimUnreadable -or $claimed.ContainsKey((ConvertTo-Norm $r.Path))) { $reportHeld++; continue }
+        if ($claimUnreadable -or $index.Claimed.ContainsKey((ConvertTo-Norm $r.Path))) { $reportHeld++; continue }
         $kept += $r
     }
     $reportOnly = @($kept)
@@ -1774,7 +1769,7 @@ if ($Json) {
         # `reportOnlyHeld` is a COUNT of what was withheld, not a list: naming the withheld trees
         # would re-create the suggestion the withholding exists to avoid.
         #
-        # `whyFinished` names every gate the row passed, so a consumer acting on the row --
+        # `whyFinished` names the gates the row passed, so a consumer acting on the row --
         # run-daily-prune.ps1 -RemoveFinishedClaudeWorktrees -- logs WHY the tree looked finished
         # rather than a bare path. `claudeManaged` is the path-shape fact that consumer is scoped to.
         # Neither field is a permission: the consumer re-checks the gates itself before it acts, and
@@ -1787,7 +1782,7 @@ if ($Json) {
                     idleHours     = $_.IdleH
                     safety        = $_.Landed
                     claudeManaged = (Test-ClaudeManagedPath $_.Path)
-                    whyFinished   = "no live session in it or nested in it; contains no other worktree; clean, with no tracked change and no untracked file; git metadata idle $($_.IdleH) h, beyond the $IdleHours h window; holds no coordination claim; $($_.Landed)"
+                    whyFinished   = "no registered session launched in it or in a tree nested in it (the fence reads launch directories only); contains no other worktree; clean, with no tracked change and no untracked file; git metadata idle $($_.IdleH) h, beyond the $IdleHours h window; holds no coordination claim; $($_.Landed)"
                 }
             })
         # $null when -ReapVenvs was not asked for; an object with `ran: false` when it WAS asked for

@@ -55,7 +55,18 @@ pytestmark = [
 
 # Trees the fixture builds under <primary>/.claude/worktrees.
 FINISHED = ("clean", "venv")
-UNSAFE = ("dirty", "untracked", "locked", "active", "occupied", "stranded")
+UNSAFE = (
+    "dirty",
+    "untracked",
+    "locked",
+    "active",
+    "touched",
+    "occupied",
+    "stranded",
+    "flagged",
+    "rewritten",
+    "claimed",
+)
 
 
 class Fx:
@@ -69,11 +80,14 @@ class Fx:
     def tree(self, name: str) -> Path:
         return self.primary / ".claude" / "worktrees" / name
 
-    def env(self) -> dict[str, str]:
+    def env(self, *, claudecode: bool = False) -> dict[str, str]:
         env = dict(os.environ)
         env["USERPROFILE"] = str(self.home)
         env["MEFOR_COORD_ROOT"] = str(self.coord)
-        env.pop("CLAUDECODE", None)
+        if claudecode:
+            env["CLAUDECODE"] = "1"
+        else:
+            env.pop("CLAUDECODE", None)
         return env
 
     def registered(self) -> set[str]:
@@ -99,6 +113,14 @@ def _session(fx: Fx, pid: int, cwd: Path, sid: str) -> None:
         "entrypoint": "claude-desktop",
     }
     (fx.sessions / f"{pid}.json").write_text(json.dumps(rec), encoding="utf-8")
+
+
+def _age(primary: Path, tree: Path, hours: float) -> None:
+    """Age the git metadata AND the working tree's top level, the two idle readings."""
+    _backdate(primary, tree, hours)
+    when = time.time() - hours * 3600
+    for entry in (tree, *tree.iterdir()):
+        os.utime(entry, (when, when))
 
 
 @pytest.fixture
@@ -137,12 +159,29 @@ def fx(tmp_path: Path) -> Fx:
     _git(stranded, "commit", "-qm", "lone")
     _git(f.primary, "branch", "-q", "-D", "stranded")
 
+    # An edit git status cannot see: the file is flagged skip-worktree first.
+    flagged = f.tree("flagged")
+    _git(flagged, "update-index", "--skip-worktree", "seed.txt")
+    (flagged / "seed.txt").write_text("edited under a flag", encoding="utf-8")
+
+    # On a branch, with a commit only the tree's own HEAD reflog still holds.
+    rewritten = f.tree("rewritten")
+    (rewritten / "gone.txt").write_text("reset away", encoding="utf-8")
+    _git(rewritten, "add", "--", "gone.txt")
+    _git(rewritten, "commit", "-qm", "reset away")
+    _git(rewritten, "reset", "-q", "--hard", "HEAD~1")
+
     for name in (*FINISHED, *UNSAFE):
-        if name != "active":
+        if name == "touched":
+            # Git metadata idle, but the working tree written just now.
             _backdate(f.primary, f.tree(name), 200)
+        elif name != "active":
+            _age(f.primary, f.tree(name), 200)
 
     f.sessions.mkdir(parents=True)
-    f.coord.mkdir()
+    (f.coord / "claims").mkdir(parents=True)
+    claim = {"key": "row-1", "worktree": str(f.tree("claimed"))}
+    (f.coord / "claims" / "row-1.json").write_text(json.dumps(claim), encoding="utf-8")
     # One readable DEAD record outside the repo, so the fence is available and vetoes nothing.
     _session(f, never_live_pid(), f.root, "dead0000-0000")
     return f
@@ -168,7 +207,7 @@ def remove(
     paths: list[Path],
     *,
     apply: bool,
-    idle_hours: float = 72,
+    idle_hours: str = "72",
     protect: list[Path] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Call Invoke-FinishedWorktreeRemoval directly, keyed by tree name.
@@ -234,7 +273,11 @@ def test_apply_refuses_every_unsafe_tree_and_leaves_it(fx: Fx, sleeper: int) -> 
         "dirty": r"dirty: 1 uncommitted tracked change",
         "untracked": r"1 untracked file\(s\) present",
         "locked": r"locked: in use by a bench run",
-        "active": r"recently active",
+        "active": r"recently active: git metadata",
+        "touched": r"recently active: the working tree's top level",
+        "flagged": r"1 file\(s\) flagged skip-worktree",
+        "rewritten": r"1 commit\(s\) held only by its HEAD reflog",
+        "claimed": r"a coordination claim names it",
         "occupied": r"occupied: live0000 LIVE",
         "stranded": r"no ref holds its tip",
         "gone": r"no longer a registered worktree",
@@ -250,16 +293,18 @@ def test_apply_refuses_every_unsafe_tree_and_leaves_it(fx: Fx, sleeper: int) -> 
             assert fx.is_registered(p)
 
 
-def test_a_window_under_the_floor_refuses_everything(fx: Fx) -> None:
-    rows = remove(fx, [fx.tree("clean")], apply=True, idle_hours=6)
-    assert rows["clean"]["Outcome"] == "REFUSED"
+@pytest.mark.parametrize("idle", ["6", "0", "([double]::NaN)", "([double]::PositiveInfinity)"])
+def test_a_window_under_the_floor_or_not_a_number_refuses_everything(fx: Fx, idle: str) -> None:
+    """NaN compares false both ways, so a `-lt` guard alone would wave it through."""
+    rows = remove(fx, [fx.tree("clean")], apply=True, idle_hours=idle)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
     assert "floor" in rows["clean"]["Reason"]
     assert fx.tree("clean").is_dir()
 
 
 def test_no_removal_command_carries_force(fx: Fx) -> None:
     # The command is built before any re-check, so a floor refusal (no git reads) still carries it.
-    rows = remove(fx, [fx.tree(n) for n in (*FINISHED, *UNSAFE)], apply=False, idle_hours=6)
+    rows = remove(fx, [fx.tree(n) for n in (*FINISHED, *UNSAFE)], apply=False, idle_hours="6")
     for r in rows.values():
         assert "worktree remove" in r["Command"]
         assert not re.search(r"\s(--force|-f)\b", r["Command"]), r
@@ -279,8 +324,10 @@ def test_no_removal_command_carries_force(fx: Fx) -> None:
             )
 
 
-def run_runner(fx: Fx, log_dir: Path, *args: str) -> tuple[int, str]:
-    proc = subprocess.run(
+def run_runner(
+    fx: Fx, log_dir: Path, *args: str, claudecode: bool = False
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         [
             "pwsh",
             "-NoProfile",
@@ -296,9 +343,13 @@ def run_runner(fx: Fx, log_dir: Path, *args: str) -> tuple[int, str]:
         capture_output=True,
         text=True,
         timeout=300,
-        env=fx.env(),
+        env=fx.env(claudecode=claudecode),
         check=False,
     )
+
+
+def run_logged(fx: Fx, log_dir: Path, *args: str, claudecode: bool = False) -> tuple[int, str]:
+    proc = run_runner(fx, log_dir, *args, claudecode=claudecode)
     logs = sorted(log_dir.glob("prune-*.log"))
     assert logs, f"no log written (exit {proc.returncode}): {proc.stderr}"
     return proc.returncode, logs[-1].read_text(encoding="utf-8")
@@ -313,7 +364,7 @@ def _outcome(log: str, outcome: str, tree: Path) -> bool:
 
 
 def test_runner_without_the_switch_does_not_touch_claude_worktrees(fx: Fx, tmp_path: Path) -> None:
-    _, log = run_runner(fx, tmp_path / "logs-off", "-Apply")
+    _, log = run_logged(fx, tmp_path / "logs-off", "-Apply")
     assert "finished .claude/worktrees" not in log
     for name in FINISHED:
         assert fx.tree(name).is_dir()
@@ -323,7 +374,10 @@ def test_runner_dry_run_lists_from_a_fresh_prune_merged_run_and_removes_nothing(
     fx: Fx, tmp_path: Path, sleeper: int
 ) -> None:
     _session(fx, sleeper, fx.tree("occupied"), "live0000-0000")
-    code, log = run_runner(fx, tmp_path / "logs-dry", "-RemoveFinishedClaudeWorktrees")
+    # Under CLAUDECODE on purpose: the dry run must stay usable in-session; only -Apply is refused.
+    code, log = run_logged(
+        fx, tmp_path / "logs-dry", "-RemoveFinishedClaudeWorktrees", claudecode=True
+    )
     assert "--- finished .claude/worktrees: mode=DRYRUN ---" in log
     for name in FINISHED:
         assert _outcome(log, "WOULD-REMOVE", fx.tree(name)), log
@@ -339,10 +393,23 @@ def test_runner_apply_removes_the_finished_trees_and_logs_each(
     fx: Fx, tmp_path: Path, sleeper: int
 ) -> None:
     _session(fx, sleeper, fx.tree("occupied"), "live0000-0000")
-    _, log = run_runner(fx, tmp_path / "logs-apply", "-Apply", "-RemoveFinishedClaudeWorktrees")
+    _, log = run_logged(fx, tmp_path / "logs-apply", "-Apply", "-RemoveFinishedClaudeWorktrees")
     for name in FINISHED:
         assert _outcome(log, "REMOVED", fx.tree(name)), log
         assert not fx.tree(name).exists()
     for name in UNSAFE:
         assert fx.tree(name).is_dir(), f"{name} was removed: {log}"
     assert re.search(r"mode=APPLY listed=\d+ removed=2 wouldRemove=0 ", log), log
+
+
+def test_runner_refuses_apply_with_the_step_inside_claude_code(fx: Fx, tmp_path: Path) -> None:
+    """The other arm of the dry-run test above: same switch, -Apply added, CLAUDECODE set."""
+    proc = run_runner(
+        fx, tmp_path / "logs-cc", "-Apply", "-RemoveFinishedClaudeWorktrees", claudecode=True
+    )
+    assert proc.returncode != 0
+    assert "Refusing -Apply -RemoveFinishedClaudeWorktrees inside Claude Code" in (
+        proc.stderr + proc.stdout
+    )
+    for name in FINISHED:
+        assert fx.tree(name).is_dir()

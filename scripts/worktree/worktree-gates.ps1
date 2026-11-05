@@ -14,7 +14,8 @@
 
     Defines in the caller's scope: $IDLE_FLOOR_HOURS, $ACTIVITY_MTIME_FILES, Get-ReflogLastEntry,
     Get-WorktreeActivity (occupancy signal 2; prune-merged.ps1's header says what it can and cannot
-    see), Test-WorktreeClean, Get-TipHolders and Test-ClaudeManagedPath.
+    see), Test-WorktreeClean, Get-TipHolders, Test-ClaudeManagedPath, Get-FlaggedFileCount,
+    Get-WorkingTreeActivity, Get-WorktreeOnlyCommitCount and Get-ClaimedWorktreeIndex.
 #>
 
 # The floor under -IdleHours. Signal 2 has been measured at 10.4h on a worktree that was demonstrably
@@ -156,4 +157,65 @@ function Get-TipHolders {
 # currently owns the tree and survives the containing worktree being deregistered.
 function Test-ClaudeManagedPath([string]$Path) {
     return (($Path -replace '\\', '/') -match '(?i)/\.claude/worktrees/')
+}
+
+# Files flagged skip-worktree (`S`) or assume-unchanged (a lowercase tag) in `git ls-files -v`. git
+# status does not show an edit to either, and neither does git's own check in `worktree remove`, so an
+# edit there would go with the tree unseen. Returns the count, or -1 when it cannot be read.
+function Get-FlaggedFileCount([string]$Path) {
+    $lines = @(& git -C $Path ls-files -v 2>$null)
+    if ($LASTEXITCODE -ne 0) { return -1 }
+    return @($lines | Where-Object { $_ -cmatch '^([a-z]|S) ' }).Count
+}
+
+# The newest write to the WORKING TREE's top level: the tree's own folder and each entry directly under
+# it. The idle reading above sees only git metadata, so a session that edits files and runs no git
+# command is invisible to it; a write under the top folder moves at least one of these mtimes in the
+# common cases (a new file, a cache directory rewritten). Not every write: a file edited in place two
+# levels down moves none of them. $null when it cannot be read.
+function Get-WorkingTreeActivity([string]$Path) {
+    try {
+        $items = @(Get-Item -LiteralPath $Path -Force -ErrorAction Stop) + @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
+    }
+    catch [System.Management.Automation.ItemNotFoundException], [System.IO.IOException], [System.UnauthorizedAccessException] {
+        return $null
+    }
+    return ($items | Measure-Object -Property LastWriteTime -Maximum).Maximum
+}
+
+# Commits that only this worktree's own state holds: its HEAD reflog and its per-worktree refs
+# (refs/worktree, refs/bisect, refs/rewritten). `git worktree remove` deletes both, so a commit no
+# shared ref holds becomes unreachable. Returns that count, or -1 when it cannot be read or there are
+# more than -Cap candidates. An amended or rebased-away commit counts too, which refuses a harmless tree;
+# that is the cheap direction.
+function Get-WorktreeOnlyCommitCount {
+    param([string]$Path, [string]$Repo, [int]$Cap = 500)
+    $reflog = @(& git -C $Path reflog show --format=%H HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0) { return -1 }
+    $own = @(& git -C $Path for-each-ref --format='%(objectname)' refs/worktree refs/bisect refs/rewritten 2>$null)
+    if ($LASTEXITCODE -ne 0) { return -1 }
+    $held = @(@($reflog) + @($own) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -match '^[0-9a-f]{40,64}$' } | Select-Object -Unique)
+    if ($held.Count -eq 0) { return 0 }
+    if ($held.Count -gt $Cap) { return -1 }
+    $n = & git -C $Repo rev-list --count @held --not --branches --tags --remotes 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $n) { return -1 }
+    return [int]([string]$n).Trim()
+}
+
+# Which worktrees hold a coordination claim, read from the claims directory coord-root.ps1 names.
+# UNREADABLE IS NOT ABSENT: a claim file that will not parse might name any worktree, so the caller
+# must treat Unreadable as "every tree may be claimed". Needs coord-root.ps1 (Read-CoordText) and
+# occupancy.ps1 (ConvertTo-Norm) loaded by the caller.
+function Get-ClaimedWorktreeIndex([string]$ClaimsDir) {
+    $claimed = @{}
+    $unreadable = $false
+    if ($ClaimsDir -and (Test-Path -LiteralPath $ClaimsDir)) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $ClaimsDir -Filter *.json -File -EA SilentlyContinue)) {
+            try { $c = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop }
+            catch { $unreadable = $true; continue }
+            $n = ConvertTo-Norm ([string]$c.worktree)
+            if ($n) { $claimed[$n] = $true }
+        }
+    }
+    return @{ Claimed = $claimed; Unreadable = $unreadable }
 }

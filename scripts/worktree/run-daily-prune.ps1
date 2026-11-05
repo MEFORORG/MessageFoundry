@@ -28,7 +28,8 @@
     re-checks each one immediately before acting and removes it with a plain `git worktree remove`, never
     with --force. That file's header lists the re-checks. Each removed or refused path is logged with its
     reason, then a summary line with the counts and the drive's free space. A refusal is data, not a
-    failure, and leaves the exit code alone. Without -Apply the step only logs WOULD-REMOVE.
+    failure, and leaves the exit code alone. Without -Apply the step only logs WOULD-REMOVE. With
+    -Apply it refuses to run inside Claude Code, the same refusal install-daily-prune.ps1 carries.
 
 .PARAMETER RepoRoot
     The primary checkout to prune. Defaults to the value the shared liveness fence calls the primary --
@@ -62,6 +63,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# The same refusal install-daily-prune.ps1 carries, for the one combination that removes Claude-managed
+# trees: a session that can run this from a checkout it can edit could remove other sessions'
+# .claude/worktrees trees with no reviewer, and worktree_gate.ps1 deliberately gives sessions no route
+# to that population. The dry run stays usable in-session.
+if ($env:CLAUDECODE -eq '1' -and $Apply -and $RemoveFinishedClaudeWorktrees) {
+    throw "Refusing -Apply -RemoveFinishedClaudeWorktrees inside Claude Code: it removes Claude-managed worktrees. Run it from a plain terminal, or from the scheduled task install-daily-prune.ps1 registers. (Without -Apply it only reports, and is allowed.)"
+}
+
 # prune-merged.ps1 reports its verdict through the exit code, so a non-zero exit is DATA here, not a
 # failure to be turned into a throw. Same reason that script sets this; the reason survives the call.
 $PSNativeCommandUseErrorActionPreference = $false
@@ -127,10 +137,11 @@ if ($RemoveFinishedClaudeWorktrees) {
     catch { "  could not parse the listing run's JSON (exit $listExit): $($_.Exception.Message)" | Add-Content -LiteralPath $log }
 
     if ($null -eq $listing -or $null -eq $listing.fence -or $null -eq $listing.fence.idleHours) {
-        # Not a refusal of one tree but of the whole step: nothing could be established, so nothing was
-        # attempted -- which is exactly what prune-merged.ps1's exit 2 means.
-        "=== finished .claude/worktrees: SKIPPED, the finished list could not be read; nothing was attempted ===" | Add-Content -LiteralPath $log
-        $code = [math]::Max($code, 2)
+        # Not a refusal of one tree but of the whole step. 2 promises nothing was removed, which holds
+        # only on a dry run: under -Apply the prune above may already have removed siblings, so the
+        # refusal is reported as 1, the same rule prune-merged.ps1 applies to its own refusals.
+        "=== finished .claude/worktrees: SKIPPED, the finished list could not be read; no .claude/worktrees tree was attempted ===" | Add-Content -LiteralPath $log
+        $code = [math]::Max($code, $(if ($Apply) { 1 } else { 2 }))
     }
     else {
         $finished = @($listing.reportOnly | Where-Object { $_.claudeManaged -eq $true })
@@ -148,15 +159,17 @@ if ($RemoveFinishedClaudeWorktrees) {
         $why = @{}
         foreach ($f in $finished) { $why[$f.path] = $f }
 
+        # Logged per row as the helper emits it, not after it returns: a run killed part way (the task's
+        # one-hour limit, say) still leaves the record of every tree it already removed.
         $rows = @(Invoke-FinishedWorktreeRemoval -Primary $RepoRoot -Paths @($finished | ForEach-Object { $_.path }) `
-                -IdleHours ([double]$listing.fence.idleHours) -Protect $protect -Apply:$Apply)
-        $out = foreach ($r in $rows) {
-            $f = $why[$r.Path]
-            $detail = if ($r.Outcome -in 'REMOVED', 'WOULD-REMOVE') { "$($r.Reason) [$($f.branch)]; listed because: $($f.whyFinished)" } else { $r.Reason }
-            "  {0,-12} {1} -- {2}" -f $r.Outcome, $r.Path, $detail
-            if ($r.Outcome -eq 'WOULD-REMOVE') { "               would run: $($r.Command)" }
-        }
-        if ($out) { $out | Add-Content -LiteralPath $log }
+                -IdleHours ([double]$listing.fence.idleHours) -Protect $protect -Apply:$Apply | ForEach-Object {
+                $f = $why[$_.Path]
+                $detail = if ($_.Outcome -in 'REMOVED', 'WOULD-REMOVE') { "$($_.Reason) [$($f.branch)]; listed because: $($f.whyFinished)" } else { $_.Reason }
+                $lines = @("  {0,-12} {1} -- {2}" -f $_.Outcome, $_.Path, $detail)
+                if ($_.Outcome -eq 'WOULD-REMOVE') { $lines += "               would run: $($_.Command)" }
+                $lines | Add-Content -LiteralPath $log
+                $_
+            })
 
         $byOutcome = @{}
         foreach ($r in $rows) { $byOutcome[$r.Outcome] = 1 + [int]$byOutcome[$r.Outcome] }
@@ -169,10 +182,11 @@ if ($RemoveFinishedClaudeWorktrees) {
         catch [System.ArgumentException], [System.IO.IOException], [System.UnauthorizedAccessException] {
             $free = "free space unreadable: $($_.Exception.Message)"
         }
-        "=== finished .claude/worktrees: mode=$mode listed=$($finished.Count) removed=$(& $n 'REMOVED') wouldRemove=$(& $n 'WOULD-REMOVE') refused=$(& $n 'REFUSED') failed=$(& $n 'FAILED') orphaned=$(& $n 'ORPHANED'); $free ===" |
+        "=== finished .claude/worktrees: mode=$mode listed=$($finished.Count) removed=$(& $n 'REMOVED') wouldRemove=$(& $n 'WOULD-REMOVE') refused=$(& $n 'REFUSED') declined=$(& $n 'DECLINED') failed=$(& $n 'FAILED') orphaned=$(& $n 'ORPHANED'); $free ===" |
             Add-Content -LiteralPath $log
 
-        # Refusals leave the code alone. A removal git reported and did not deliver is a failure, and a
+        # Refusals leave the code alone, and so does git declining a tree every re-check passed: nothing
+        # changed, and the DECLINED line is there to be read. A removal that failed is a failure, and a
         # deregistered tree still on disk is an orphan -- the same severity order prune-merged.ps1 uses.
         if ((& $n 'FAILED') -gt 0) { $code = [math]::Max($code, 1) }
         if ((& $n 'ORPHANED') -gt 0) { $code = [math]::Max($code, 3) }
