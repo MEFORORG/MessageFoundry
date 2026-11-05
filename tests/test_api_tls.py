@@ -2758,9 +2758,11 @@ def _signed(
     by: _CaPair | None,
     *,
     key_usage: bool = False,
+    key_ids: bool = True,
 ) -> x509.Certificate:
     """A cert for ``subject`` signed by ``by`` (self-signed CA when ``None``). Key identifiers are
-    set so OpenSSL picks the issuer by key, not only by name, as real CAs do.
+    set so OpenSSL picks the issuer by key, not only by name, as real CAs do, unless ``key_ids`` is
+    false.
 
     ``key_usage`` adds a ``keyUsage`` extension, which a verifier under ``VERIFY_X509_STRICT``
     requires on a CA, as the inbound HTTP listener is (``tests/test_inbound_http_intake_issuer.py``).
@@ -2775,11 +2777,13 @@ def _signed(
         .not_valid_before(_NOW - datetime.timedelta(minutes=5))
         .not_valid_after(_NOW + datetime.timedelta(days=1))
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
-        .add_extension(
+    )
+    if key_ids:
+        builder = builder.add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
+        ).add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), critical=False
         )
-    )
     if key_usage:
         builder = builder.add_extension(
             x509.KeyUsage(
@@ -2798,9 +2802,11 @@ def _signed(
     return builder.sign(signer, hashes.SHA256())
 
 
-def _new_ca(dn: x509.Name, by: _CaPair | None = None, *, key_usage: bool = False) -> _CaPair:
+def _new_ca(
+    dn: x509.Name, by: _CaPair | None = None, *, key_usage: bool = False, key_ids: bool = True
+) -> _CaPair:
     key = ec.generate_private_key(ec.SECP256R1())
-    return _signed(dn, key, by, key_usage=key_usage), key
+    return _signed(dn, key, by, key_usage=key_usage, key_ids=key_ids), key
 
 
 def _pem(cert: x509.Certificate) -> bytes:

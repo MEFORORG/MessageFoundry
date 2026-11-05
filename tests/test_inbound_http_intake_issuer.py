@@ -38,6 +38,7 @@ from messagefoundry.pki import IssuerIndex
 from messagefoundry.transports.http_listener import HttpSource, _client_issuer_index
 from messagefoundry.transports.mllp import _sender_issuer_lookup
 from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
+from tests._approved_key_wrap import seq, tlv
 from tests.test_api_tls import (
     _CaPair,
     _client_bundle,
@@ -387,13 +388,16 @@ def test_an_unparsable_certificate_in_the_trust_store_refuses_the_build(
     assert not caplog.records
 
 
+#: A certificate's DER version field, for version 3.
+_VERSION_3 = b"\xa0\x03\x02\x01\x02"
+
+
 def _v4(cert: x509.Certificate) -> bytes:
     """``cert``'s DER with its version field set to 4, which OpenSSL loads and ``cryptography``
     refuses with ``InvalidVersion``, which is not a ``ValueError``."""
     der = _der(cert)
-    v3 = b"\xa0\x03\x02\x01\x02"
-    assert der.count(v3) == 1
-    return der.replace(v3, b"\xa0\x03\x02\x01\x03")
+    assert der.count(_VERSION_3) == 1
+    return der.replace(_VERSION_3, b"\xa0\x03\x02\x01\x03")
 
 
 def _odd_twin(cert: x509.Certificate, shape: str) -> bytes:
@@ -1047,13 +1051,134 @@ async def test_a_namesake_that_is_no_ca_is_warned_about_at_start(
         await source.stop()
 
 
+def _tlv_content(element: bytes) -> bytes:
+    """The content of the DER element ``element`` opens with."""
+    if element[1] < 0x80:
+        return element[2 : 2 + element[1]]
+    width = element[1] & 0x7F
+    size = int.from_bytes(element[2 : 2 + width], "big")
+    return element[2 + width : 2 + width + size]
+
+
+def _v1_bundle(tmp_path: Path, signer: _CaPair) -> Path:
+    """:func:`_bundle`'s client certificate as version 1, so with no extensions and no authority
+    key identifier, with its key. ``cryptography`` builds only version 3, so its version field is
+    cut from the to-be-signed bytes and they are signed again."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.UTC)
+    v3 = (
+        x509.CertificateBuilder()
+        .subject_name(_dn((NameOID.COMMON_NAME, "partner.example")))
+        .issuer_name(signer[0].subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .sign(signer[1], hashes.SHA256())
+    )
+    fields = _tlv_content(v3.tbs_certificate_bytes)
+    assert fields.startswith(_VERSION_3)
+    tbs = seq(fields.removeprefix(_VERSION_3))
+    ecdsa_sha256 = bytes.fromhex("300a06082a8648ce3d040302")
+    signature = signer[1].sign(tbs, ec.ECDSA(hashes.SHA256()))
+    der = seq(tbs, ecdsa_sha256, tlv(0x03, b"\x00" + signature))
+    leaf = x509.load_der_x509_certificate(der)
+    assert leaf.version == x509.Version.v1 and len(leaf.extensions) == 0  # the premise
+    leaf.verify_directly_issued_by(signer[0])
+    bundle = tmp_path / f"client-v1-{len(list(tmp_path.iterdir()))}.pem"
+    bundle.write_bytes(
+        ssl.DER_cert_to_PEM_cert(der).encode("ascii")
+        + key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return bundle
+
+
+async def test_a_namesake_with_another_key_identifier_is_warned_to_refuse_a_version_1_client(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A loaded certificate that is no CA, with a key identifier that differs from the CA's, with
+    the CA's subject. OpenSSL rules it out for a client certificate whose authority key identifier
+    names the CA's key, but not for one with none. A version-1 client certificate has none, and the
+    listener's strict verification accepts it (the control below). In the shipped code the warning
+    said such a namesake could be taken only for a certificate strict verification refuses anyway,
+    which would have told an operator a harmful namesake was harmless (BACKLOG #4948).
+
+    Measured on Windows, OpenSSL 3.5.7: listed after the CA, the namesake refused the version-1
+    client at the handshake, and listed first it did not; the version-3 client was admitted in both
+    orders. The order OpenSSL tries equal names in differs by platform, as the case above records,
+    so both orders are started, each must warn, and at least one must refuse the version-1 client.
+    The warning changes no outcome."""
+    acme = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root)
+    subjects = {"CN=Acme CA": [SUBJECT]}
+    v1_client, v3_client = _v1_bundle(tmp_path, acme), _bundle(tmp_path, acme)
+    refused = []
+    for order, (ca_at, other_at) in (("ca-first", (1, 2)), ("namesake-first", (2, 1))):
+        trusted = [acme[0], namesake] if ca_at == 1 else [namesake, acme[0]]
+        (tmp_path / order).mkdir()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+            source = await _started(_source(tmp_path / order, trusted, subjects))
+        try:
+            warned = [r.getMessage() for r in caplog.records]
+            assert any(
+                f"tls_ca_file certificate block {other_at} (CN=Acme CA) is not a CA" in m
+                and f"the CA certificate in block {ca_at}" in m
+                and "that CA issued with no authority key identifier" in m
+                and "Strict verification accepts such a certificate when it is version 1" in m
+                and "every client certificate" not in m
+                for m in warned
+            ), (order, warned)
+            refused.append(await _handshake_refused(source, v1_client))
+            # A client certificate naming the CA's key is not refused this way, in either order.
+            assert await _admitted(source, v3_client) == 202
+        finally:
+            await source.stop()
+    assert any(refused), refused
+    # Control: with the CA alone, strict verification admits the version-1 client.
+    (tmp_path / "alone").mkdir()
+    source = await _started(_source(tmp_path / "alone", [acme[0]], subjects))
+    try:
+        assert await _admitted(source, v1_client) == 202
+    finally:
+        await source.stop()
+
+
+def test_a_namesake_of_a_ca_with_no_key_identifier_is_warned_to_refuse_every_client() -> None:
+    """A CA with no subject key identifier, and a namesake that is no CA with one. Nothing here
+    shows which of the CA's client certificates carry an authority key identifier that rules the
+    namesake out, so the warning says every client of the CA may be refused, and why. In the
+    shipped code this case took the differing-key-identifier warning, which named only clients
+    with no authority key identifier (BACKLOG #4948)."""
+    (acme, _) = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), key_usage=True, key_ids=False)
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root)
+    with pytest.raises(x509.ExtensionNotFound):  # the premise: the CA has no key identifier
+        acme.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+    (warning,) = IssuerIndex((_pem(acme) + _pem(namesake)).decode("ascii")).namesake_warnings()
+    assert "refuse every client certificate of that CA" in warning, warning
+    assert "Block 1 has no key identifier this check can read" in warning, warning
+    assert "rules block 2 out" in warning, warning
+    # Control: a namesake with no key identifier gets the same warning without the reason, as that
+    # namesake is never ruled out by one.
+    bare = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root, skid=False)
+    (warning,) = IssuerIndex((_pem(acme) + _pem(bare)).decode("ascii")).namesake_warnings()
+    assert "refuse every client certificate of that CA" in warning, warning
+    assert "no key identifier this check can read" not in warning, warning
+
+
 @pytest.mark.parametrize(
     ("cn", "skid", "refused"),
     [
         pytest.param("ACME CA", False, "every client certificate of that CA", id="case"),
         pytest.param(" Acme  CA", False, "every client certificate of that CA", id="spacing"),
         pytest.param(
-            "Acme CA", True, "only as the issuer of a client certificate with no", id="key-id"
+            "Acme CA", True, "that CA issued with no authority key identifier", id="key-id"
         ),
     ],
 )
@@ -1061,8 +1186,8 @@ def test_a_namesake_warning_matches_names_as_openssl_does_and_says_whom_it_refus
     cn: str, skid: bool, refused: str
 ) -> None:
     """Names are grouped at least as loosely as OpenSSL matches an issuer by name, ASCII case and
-    white space folded. A namesake with a key identifier of its own can be taken only as the
-    issuer of a client certificate with no authority key identifier, so the warning says so
+    white space folded. A namesake with a key identifier of its own may still be taken as the
+    issuer of a client certificate with no authority key identifier, so the warning names those
     (BACKLOG #4948)."""
     acme = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, cn)), acme, skid=skid)
