@@ -13,8 +13,14 @@ import json
 
 import pytest
 
-from messagefoundry.store.crypto import AUDIT_SCHEME_IN_HEAP, NO_STORE_ID, STORE_ID_BYTES
+from messagefoundry.store.crypto import (
+    AUDIT_KEYLESS_MAC,
+    AUDIT_SCHEME_IN_HEAP,
+    NO_STORE_ID,
+    STORE_ID_BYTES,
+)
 from messagefoundry.store.store import (
+    AuditGenesisStoreId,
     audit_genesis_detail,
     audit_scheme_refusal,
     parse_audit_epoch,
@@ -37,7 +43,9 @@ def test_a_genesis_record_in_todays_shape_records_no_store_id() -> None:
     # NO_STORE_ID, what every other store-id API takes before one is minted, records none too.
     assert audit_genesis_detail(_KEY_ID, NO_STORE_ID) == detail
     assert parse_audit_genesis_record(detail) == (_KEY_ID, AUDIT_SCHEME_IN_HEAP)
-    assert parse_audit_genesis_store_id(detail) is None
+    assert parse_audit_genesis_store_id(detail) == AuditGenesisStoreId(None, refused=False)
+    # Not a genesis record at all is a third answer, apart from both.
+    assert parse_audit_genesis_store_id(json.dumps({"key_id": _KEY_ID})) is None
 
 
 def test_a_genesis_record_with_a_store_id_round_trips() -> None:
@@ -45,7 +53,7 @@ def test_a_genesis_record_with_a_store_id_round_trips() -> None:
     assert json.loads(detail)["store_id"] == _STORE_ID.hex()
     assert parse_audit_genesis_record(detail) == (_KEY_ID, AUDIT_SCHEME_IN_HEAP)
     assert parse_audit_genesis(detail) == _KEY_ID
-    assert parse_audit_genesis_store_id(detail) == _STORE_ID
+    assert parse_audit_genesis_store_id(detail) == AuditGenesisStoreId(_STORE_ID, refused=False)
     # A store id does not make a genesis record a range record, nor a range record a genesis one.
     assert parse_audit_epoch(detail) is None
 
@@ -58,8 +66,7 @@ def test_a_store_id_on_a_record_naming_no_scheme_is_refused() -> None:
     assert record is not None and record[0] == _KEY_ID
     refusal = audit_scheme_refusal(*record)
     assert refusal is not None and "malformed store_id" in refusal
-    with pytest.raises(ValueError, match="store_id is malformed"):
-        parse_audit_genesis_store_id(legacy)
+    assert parse_audit_genesis_store_id(legacy) == AuditGenesisStoreId(None, refused=True)
 
 
 @pytest.mark.parametrize("length", [1, STORE_ID_BYTES - 1, STORE_ID_BYTES + 1])
@@ -88,19 +95,31 @@ def test_a_malformed_store_id_reads_as_a_genesis_record_and_is_refused(store_id:
         assert record is not None and record[0] == _KEY_ID
         refusal = audit_scheme_refusal(*record)
         assert refusal is not None and "malformed store_id" in refusal, refusal
-        with pytest.raises(ValueError, match="store_id is malformed"):
-            parse_audit_genesis_store_id(detail)
+        assert parse_audit_genesis_store_id(detail) == AuditGenesisStoreId(None, refused=True)
 
 
 def test_a_store_id_refusal_cannot_be_named_by_a_record() -> None:
-    """The store-id refusal is matched by identity: a record naming an empty scheme pair is refused
+    """The store-id refusal is a class of its own: a record naming an empty scheme pair is refused
     as a scheme, and does not borrow the store-id message."""
     detail = json.dumps({"genesis": 1, "key_id": _KEY_ID, "mac": "", "kdf": ""})
     record = parse_audit_genesis_record(detail)
     assert record is not None
     refusal = audit_scheme_refusal(*record)
     assert refusal is not None and "store_id" not in refusal
-    assert parse_audit_genesis_store_id(detail) is None
+    assert parse_audit_genesis_store_id(detail) == AuditGenesisStoreId(None, refused=True)
+
+
+@pytest.mark.parametrize("store_id", ["ab" * STORE_ID_BYTES, "AB" * STORE_ID_BYTES])
+def test_a_refused_scheme_speaks_before_the_store_id(store_id: str) -> None:
+    """A record naming the keyless mode is reported as that, whatever its store id: a malformed
+    label must not hide it, and a well-formed one on a refused record is never handed out."""
+    keyless = {"mac": AUDIT_KEYLESS_MAC, "kdf": "x"}
+    detail = json.dumps({"genesis": 1, "key_id": _KEY_ID, **keyless, "store_id": store_id})
+    record = parse_audit_genesis_record(detail)
+    assert record is not None
+    refusal = audit_scheme_refusal(*record)
+    assert refusal is not None and "keyless store mode" in refusal, refusal
+    assert parse_audit_genesis_store_id(detail) == AuditGenesisStoreId(None, refused=True)
 
 
 def test_a_store_id_does_not_rescue_a_record_missing_its_own_fields() -> None:

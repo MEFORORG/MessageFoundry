@@ -47,6 +47,7 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
+    AuditGenesisStoreId,
     audit_genesis_detail,
     audit_handover_tag,
     audit_range_closing,
@@ -819,7 +820,8 @@ async def a_genesis_row_may_record_a_store_id_and_a_malformed_one_is_refused(
     finally:
         await store.close()
     today = (await _chain(b))[0]["detail"]
-    assert "store_id" not in json.loads(today) and parse_audit_genesis_store_id(today) is None
+    assert "store_id" not in json.loads(today)
+    assert parse_audit_genesis_store_id(today) == AuditGenesisStoreId(None, refused=False)
     store_id = bytes(range(STORE_ID_BYTES))
     mac = _mac_key(key)
     key_id = audit_key_id(mac)
@@ -828,11 +830,14 @@ async def a_genesis_row_may_record_a_store_id_and_a_malformed_one_is_refused(
     rows = await _write_chain(
         b, [(AUDIT_KEY_EPOCH_ACTION, audit_genesis_detail(key_id, store_id), mac), act]
     )
-    assert parse_audit_genesis_store_id(rows[0]["detail"]) == store_id, b.name
+    label = parse_audit_genesis_store_id(rows[0]["detail"])
+    assert label == AuditGenesisStoreId(store_id, refused=False), b.name
     store = await b.open_keyed(key, ())
     try:
         ok, message = await store.verify_audit_chain()
         assert ok and store._audit_ranges_trusted, f"{b.name}: {message}"
+        # The one-row MAC check reads the genesis record too, and accepts the label.
+        assert await store.newest_keyed_audit_row("act", actor="u", after_seq=0), b.name
     finally:
         await store.close()
     unnamed = json.dumps({"genesis": 1, "key_id": key_id, "store_id": store_id.hex()})
@@ -845,6 +850,7 @@ async def a_genesis_row_may_record_a_store_id_and_a_malformed_one_is_refused(
             ok, message = await store.verify_audit_chain()
             assert not ok and "malformed store_id" in (message or ""), f"{b.name}: {message}"
             assert store._audit_ranges_trusted is False, b.name
+            assert await store.newest_keyed_audit_row("act", actor="u", after_seq=0) is None
         finally:
             await store.close()
         keyless = await b.open_keyless()

@@ -354,8 +354,9 @@ release would have done to a first deployment's rows.
    range parser ignored an extra field. AMENDED 2026-11-04 (vault BACKLOG #3411): a genesis record,
    and only a genesis record, may also carry `store_id`, the lowercase hex of the 16-byte store id,
    as a label beside a named scheme. The row MAC covers it and no key is derived from it. A malformed
-   one, or one on a record that names no scheme, is refused as a field beyond the pair is, and the
-   refusal names the store id.
+   one, or one on a record that names no scheme, is refused as a field beyond the pair is. The
+   refusal names the store id, unless the scheme the record names is refused too: that refusal is
+   reported instead, so a malformed label cannot hide a record naming the keyless mode.
 4. **No record may name the keyless store mode.** Its `mac` is `sha256` (`AUDIT_KEYLESS_MAC`), and a
    record naming it is refused whatever its `kdf` says, by a handle with or without a key. So a row
    cannot declare its chain keyless. A record naming an unknown scheme or the keyless mode still

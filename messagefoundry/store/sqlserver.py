@@ -2300,8 +2300,9 @@ _SCHEMA: list[str] = [
         attested_at FLOAT NOT NULL, audit_seq BIGINT NOT NULL,
         audit_hash NVARCHAR(64) NOT NULL)""",
     # The keyring (vault BACKLOG #3411) -- see the SQLite `_SCHEMA`. BIN2 so ids and the
-    # code-constant names compare byte for byte. `wrapped` is MAX so this batch fixes no width for a
-    # sealed key before S4 settles its encoding.
+    # code-constant names compare case- and accent-exactly. It does NOT fix trailing spaces: see the
+    # `state` table's comment, so a writer must refuse them. `wrapped` is MAX so this batch fixes no
+    # width for a sealed key before S4 settles its encoding.
     """IF OBJECT_ID('keyring','U') IS NULL CREATE TABLE keyring (
         key_id NVARCHAR(128) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY,
         purpose NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
