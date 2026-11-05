@@ -745,6 +745,7 @@ def test_release_publish_uses_trusted_publishing_no_token() -> None:
     other step, or add a `TWINE_PASSWORD` anywhere. Red here."""
     rel = _release()
     uploads = [step for _, step in _pypi_uploads()]
+    assert uploads, "no PyPI upload step found in release.yml; the detector matched nothing"
     # Trusted Publishing selected, and PEP 740 attestations on, at every upload step.
     wrong = [w for s in uploads for w in _wrong_inputs(s, ("user", "password", "attestations"))]
     assert not wrong, (
@@ -4099,6 +4100,7 @@ def test_every_pypi_upload_runs_one_digest_pinned_image() -> None:
     """
     sites = _publish_sites()
     assert len(sites) == _PYPI_UPLOAD_SITES, sites
+    assert sites, "no publish site found under .github/; the walk matched nothing"
     unpinned = [site for site in sites if not _is_pinned_publish(site[1])]
     assert not unpinned, f"PyPI uploads not on the digest-pinned image: {unpinned}"
     assert len({uses for _, uses in sites}) == 1, f"the upload sites name different images: {sites}"
@@ -4117,9 +4119,11 @@ def test_every_pypi_upload_passes_each_input_the_composite_defaulted() -> None:
     Mutation: drop `repository-url` from one step, point it at another index, or set
     `attestations: false` or `verbose: false`. Red here.
     """
+    uploads = _pypi_uploads()
+    assert uploads, "no PyPI upload step found in release.yml; the detector matched nothing"
     problems = [
         f"{key}: {w}"
-        for key, step in _pypi_uploads()
+        for key, step in uploads
         for w in _wrong_inputs(step, tuple(_PUBLISH_FIXED_INPUTS))
     ]
     assert not problems, "\n".join(problems)
