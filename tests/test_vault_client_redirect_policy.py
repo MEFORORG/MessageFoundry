@@ -3,7 +3,7 @@
 """Every `[vault]` client refuses redirects (BACKLOG #1042, ASVS 15.3.2 / 1.3.6).
 
 Every other shipped HTTP egress routes through a no-redirect opener (`transports/rest.py`'s
-`_NO_REDIRECT_OPENER`, and `auth/oidc_http.py`'s local twin for the IdP hop). The three `[vault]`
+`_shared_no_redirect_opener()`, and `auth/oidc_http.py`'s local twin for the IdP hop). The three `[vault]`
 clients were the exception: they built an `hvac.Client` with no redirect policy, and hvac's default
 is `allow_redirects=True` -- so on a first deployment an on-path 3xx (absent TLS integrity) or a
 spoofed Vault could relocate a request carrying `X-Vault-Token` off-path.

@@ -34,7 +34,7 @@ from messagefoundry.transports.ai_broker import (
     ai_broker_from_settings,
     endpoint_host_allowed,
 )
-from messagefoundry.transports.rest import _NO_REDIRECT_OPENER
+from messagefoundry.transports.rest import _shared_no_redirect_opener
 from tests._admin_account import create_local_user_chosen
 from tests._malformed_reply import MALFORMED_REPLIES, RaisingOpener, RefusedAndMalformed
 
@@ -162,7 +162,7 @@ def test_broker_requires_endpoint_and_key() -> None:
 def test_broker_uses_no_redirect_opener_and_no_api_import() -> None:
     broker = ai_broker_from_settings(_managed_ai())
     # Reuses rest.py's shared hardened, TLS-verifying, no-redirect opener (never a bespoke one).
-    assert broker._opener is _NO_REDIRECT_OPENER
+    assert broker._opener is _shared_no_redirect_opener()
     # One-way deps (CLAUDE.md §4): the broker MUST NOT import api/. Check actual import STATEMENTS (a
     # docstring may legitimately name the api route it serves), not any textual mention.
     src = Path(ai_broker_mod.__file__).read_text(encoding="utf-8")

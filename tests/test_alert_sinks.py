@@ -17,6 +17,7 @@ from messagefoundry.pipeline.alert_sinks import (
     EmailTransport,
     NotifierAlertSink,
     WebhookTransport,
+    _shared_no_redirect_opener,
     notifier_from_settings,
 )
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
@@ -258,7 +259,7 @@ def test_webhook_transport_posts_json(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # The transport now sends via the shared no-redirect opener (WP-7a, ASVS 15.3.2), not
     # urllib.request.urlopen, so patch the opener's open().
-    monkeypatch.setattr("messagefoundry.pipeline.alert_sinks._NO_REDIRECT_OPENER.open", fake_open)
+    monkeypatch.setattr(_shared_no_redirect_opener(), "open", fake_open)
     t = WebhookTransport("https://hooks.example/x", timeout=5.0, posture=_NOT_ENFORCING)
     asyncio.run(t.send({"type": "queue_buildup", "connection": "OB_X", "depth": 3}))
     assert captured["url"] == "https://hooks.example/x"

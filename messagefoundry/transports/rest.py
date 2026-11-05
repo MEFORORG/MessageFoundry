@@ -38,6 +38,7 @@ import http.client
 import logging
 import re
 import ssl
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -423,7 +424,7 @@ def _no_redirect_opener(
 ) -> urllib.request.OpenerDirector:
     """A PER-CONNECTION verifying, no-redirect opener carrying ``extra_handlers`` (a forward-proxy
     ``ProxyHandler``, a reactive ``ProxyDigestAuthHandler``, …) — used in place of the shared
-    :data:`_NO_REDIRECT_OPENER` whenever a connection needs a handler the shared one lacks, so the shared
+    :func:`_shared_no_redirect_opener` whenever a connection needs a handler the shared one lacks, so the shared
     opener is **never** mutated (ADR 0126). Passing a ``ProxyHandler`` here also suppresses urllib's
     default env-reading ProxyHandler (``build_opener`` skips a default whose class a supplied handler
     already covers), so there is never a competing double-proxy. So ``ProxyHandler({})`` builds an
@@ -450,7 +451,26 @@ def _no_redirect_opener(
 # identical to the previous `build_opener(_NoRedirectHandler)`: build_opener would have added an
 # HTTPSHandler of its own, and this supplies the same class built the same way. build_strict_opener
 # then swaps both HTTP handlers for strict subclasses on the same context (BACKLOG #2052).
-_NO_REDIRECT_OPENER = _no_redirect_opener()
+_shared_opener: urllib.request.OpenerDirector | None = None
+_shared_opener_lock = threading.Lock()
+
+
+def _shared_no_redirect_opener() -> urllib.request.OpenerDirector:
+    """The shared verifying, no-redirect opener, built on first use and the same object after.
+
+    Built on first use, not at import (BACKLOG #2484): an OpenSSL build that refuses the engine's
+    TLS 1.3 or signature-scheme list raises ``EngineTlsListRefused`` from the build, and at import that
+    surfaced as a failed import of every module that names this opener, not as a configuration
+    refusal. A build that raises caches nothing, so the next caller is refused the same way.
+
+    Callers compare an opener to this one by identity to learn whether it is shared and so must never
+    be mutated, which is why the build is under a lock: two threads racing the first call must not
+    each get an opener of their own."""
+    global _shared_opener
+    with _shared_opener_lock:
+        if _shared_opener is None:
+            _shared_opener = _no_redirect_opener()
+        return _shared_opener
 
 
 def _insecure_opener(
@@ -1585,7 +1605,7 @@ def refuse_unrevoked_verified_hop(
     carries a CRL would then be refused and told to configure the CRL it has (vault BACKLOG #2188).
     Pass ``None`` on purpose, in at least these cases:
 
-    - A caller whose hop rides the shared import-time opener, which can carry no CRL. Passing that
+    - A caller whose hop rides the shared opener, which can carry no CRL. Passing that
       opener gives the same answer.
     - A hop re-addressed to an ECH sidecar (ADR 0139). ``None`` is required there: the engine dials
       the loopback sidecar and the sidecar verifies the real peer, so no context the engine holds
@@ -1793,7 +1813,7 @@ def enforce_signature_header_limits(signer: object | None, *, connector: str) ->
 #
 # A per-connection forward proxy for the whole stdlib HTTP family (REST/SOAP/FHIR/fhir_lookup/DICOMweb +
 # the OAuth2/SMART token endpoints). Built into a per-connection ``ProxyHandler`` threaded through EVERY
-# opener path (the shared _NO_REDIRECT_OPENER is NEVER mutated), plus the pre-emptive tunnel-header Basic
+# opener path (the shared opener is NEVER mutated), plus the pre-emptive tunnel-header Basic
 # credential the reactive stdlib handlers cannot supply for an https destination. Off by default →
 # byte-identical.
 
@@ -2803,7 +2823,7 @@ class RestDestination(DestinationConnector):
                 # shared opener stays.
                 self._opener = _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
             else:
-                self._opener = _NO_REDIRECT_OPENER
+                self._opener = _shared_no_redirect_opener()
         else:
             # verify_tls=false makes the https hop MITM-able — an insecure hop decided by the instance
             # posture (#200): an enforcing hop REFUSES, a non-enforcing one refuses unless the clamped
@@ -2825,7 +2845,7 @@ class RestDestination(DestinationConnector):
             )
             self._opener = _insecure_opener(*proxy_handlers)
         # #65: HTTP Digest (RFC 7616) — fold the challenge-answering handler into a PER-CONNECTION opener
-        # (never mutate the shared _NO_REDIRECT_OPENER). urllib answers the 401 + retries within
+        # (never mutate the shared opener). urllib answers the 401 + retries within
         # opener.open(). None (default) → byte-identical. Mutually exclusive with a bearer provider.
         from messagefoundry.transports.http_auth import digest_handler_from_settings
 
@@ -2836,7 +2856,7 @@ class RestDestination(DestinationConnector):
                     "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
                     "(mutually exclusive — configure exactly one)"
                 )
-            if self._opener is _NO_REDIRECT_OPENER:
+            if self._opener is _shared_no_redirect_opener():
                 # Rebuild a per-connection verifying opener so add_handler never touches the shared one.
                 # Through _no_redirect_opener, not a bare build_opener: the bare form lets urllib
                 # fill in an HTTPSHandler whose context the engine never names, so the forward-secrecy

@@ -590,7 +590,7 @@ def test_no_redirect_handler_refuses_redirect_and_is_wired_into_default_opener()
     assert result is None  # refuses to build a follow-up request → no redirect
 
     # And the refusal is wired into the shared verifying opener, so every REST delivery inherits it.
-    handlers = rest._NO_REDIRECT_OPENER.handlers  # type: ignore[attr-defined]  # typeshed omits it
+    handlers = rest._shared_no_redirect_opener().handlers  # type: ignore[attr-defined]  # typeshed omits it
     assert any(isinstance(h, rest._NoRedirectHandler) for h in handlers)
 
 

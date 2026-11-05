@@ -995,10 +995,6 @@ IMPORT_ONLY: dict[str, str] = {
         "active_hop_posture): a TLS posture decision with no crypto-shaped call in it; and names "
         "store.crypto's CipherError only to classify a decrypt failure, calling no cipher"
     ),
-    "messagefoundry/transports/ai_broker.py": (
-        "names HopPosture only to annotate the factory's unread posture parameter; builds no "
-        "context"
-    ),
     "messagefoundry/transports/base.py": (
         "hands a caller's ssl context to asyncio.open_connection and tells an SSLError from an "
         "OSError; builds and decides nothing (its INVENTORY row says why that is the right shape)"
@@ -1643,6 +1639,17 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "mac:hmac.new[sha256]",
             # BACKLOG #2592: session_seal_ok checks a session row's seal (RowSealer.verify).
             "sign_verify:.verify()",
+        }
+    ),
+    # Vault BACKLOG #2484: the broker dials through rest.py's shared verifying opener, which it now
+    # obtains by calling rest._shared_no_redirect_opener() rather than reading a module constant, so
+    # the operation arm sees the hop. Before this it was IMPORT_ONLY; the opener is rest.py's, built
+    # through tls_policy, and the broker builds no context of its own.
+    "messagefoundry/transports/ai_broker.py": frozenset(
+        {
+            "key_cert:via messagefoundry.transports.rest",
+            "sign_verify:via messagefoundry.transports.rest",
+            "tls_context:via messagefoundry.transports.rest",
         }
     ),
     # BACKLOG #1352 / #1171: the generic dialect checks a driver client key's wrap (libpq sslkey)

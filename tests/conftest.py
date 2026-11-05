@@ -625,6 +625,23 @@ def _remote_debug_start_gate_stood_down() -> Iterator[Callable[..., bool]]:
         yield real
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _shared_openers_built_before_any_test() -> None:
+    """Build both shared no-redirect openers once, from the runner's own environment.
+
+    They are built on first use (BACKLOG #2484), and the build reads the proxy environment into a
+    default ``ProxyHandler``. Left to first use, the first test that dials through one would fix its
+    proxy for every later test in the process, so a test that sets ``HTTP_PROXY`` could leak it
+    into whichever tests ran after it. Building them here keeps what import used to give: openers
+    that read the environment the runner started with. A test that needs a fresh one sets the
+    module's ``_shared_opener`` itself."""
+    from messagefoundry.pipeline import alert_sinks
+    from messagefoundry.transports import rest
+
+    rest._shared_no_redirect_opener()
+    alert_sinks._shared_no_redirect_opener()
+
+
 @pytest.fixture
 def remote_debug_start_gate(
     monkeypatch: pytest.MonkeyPatch, _remote_debug_start_gate_stood_down: Callable[..., bool]

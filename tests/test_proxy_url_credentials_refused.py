@@ -463,7 +463,8 @@ _FAMILIES: dict[str, Callable[[], urllib.request.OpenerDirector]] = {
 def test_an_environment_proxy_with_credentials_is_refused_on_every_opener_family(
     recorded: None, monkeypatch: pytest.MonkeyPatch, family: str, target: str
 ) -> None:
-    """Building the opener must not raise: the shared ones are built at import. The request does."""
+    """Building the opener must not raise: the shared ones are built before any request. The request
+    does."""
     monkeypatch.setenv("HTTP_PROXY", _CREDENTIALED)
     monkeypatch.setenv("HTTPS_PROXY", _CREDENTIALED)
     opener = _FAMILIES[family]()

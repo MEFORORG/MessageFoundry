@@ -10,7 +10,7 @@ builder the runner uses, so they prove the authoring surface reaches the opener.
 Two halves, pulling in opposite directions:
 
 * named, the CA is the hop's ONLY trust anchor, and it beats a pinned instance ``[tls]`` anchor;
-* unnamed, the hop is built exactly as before -- the shared ``_NO_REDIRECT_OPENER``, by identity.
+* unnamed, the hop is built exactly as before -- the shared ``_shared_no_redirect_opener()``, by identity.
 
 This does not move ASVS 12.3.4. Every default is still permissive; the key is opt-in.
 """
@@ -205,7 +205,7 @@ def test_a_named_ca_is_the_destination_hops_only_anchor(
     ca = _ca_pem(tmp_path, f"mefor-{factory.lower()}-ca")
     policy = _pinned(tmp_path) if with_policy else None
     opener = _destination_opener(_DESTINATION_FACTORIES[factory](tls_ca_file=ca), policy)
-    assert opener is not rest._NO_REDIRECT_OPENER
+    assert opener is not rest._shared_no_redirect_opener()
     # The connection's own CA, and not the instance one, even when the instance is pinned.
     assert _opener_subjects(opener) == {f"mefor-{factory.lower()}-ca"}
     ctx = rest.opener_tls_context(opener, connector="test")
@@ -223,7 +223,7 @@ def test_a_named_ca_is_the_lookup_hops_only_anchor(tmp_path: Path) -> None:
         trust_anchor_policy=_pinned(tmp_path),
         egress=EgressSettings(deny_by_default=False),
     )
-    assert ex._opener["L"] is not rest._NO_REDIRECT_OPENER
+    assert ex._opener["L"] is not rest._shared_no_redirect_opener()
     assert _opener_subjects(ex._opener["L"]) == {"mefor-lookup-ca"}
 
 
@@ -598,7 +598,7 @@ def test_without_a_ca_the_destination_keeps_the_shared_opener(factory: str) -> N
     """THE negative control. A factory-built spec that names no CA, and now carries an explicit
     ``tls_ca_file: None``, must still be handed the shared opener object -- not an equivalent one."""
     opener = _destination_opener(_DESTINATION_FACTORIES[factory](), TrustAnchorPolicy())
-    assert opener is rest._NO_REDIRECT_OPENER
+    assert opener is rest._shared_no_redirect_opener()
 
 
 def test_without_a_ca_the_lookup_keeps_the_shared_opener() -> None:
@@ -608,7 +608,7 @@ def test_without_a_ca_the_lookup_keeps_the_shared_opener() -> None:
         trust_anchor_policy=TrustAnchorPolicy(),
         egress=EgressSettings(deny_by_default=False),
     )
-    assert ex._opener["L"] is rest._NO_REDIRECT_OPENER
+    assert ex._opener["L"] is rest._shared_no_redirect_opener()
 
 
 def test_without_a_ca_ftps_builds_what_an_absent_key_builds(tmp_path: Path) -> None:

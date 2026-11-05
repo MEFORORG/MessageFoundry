@@ -94,7 +94,6 @@ from messagefoundry.transports.bounded_read import (
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture.
 from messagefoundry.transports.rest import (
-    _NO_REDIRECT_OPENER,
     AUTH_CHALLENGE_REFUSED,
     HttpAuthError,
     InsecureHopGuard,
@@ -104,6 +103,7 @@ from messagefoundry.transports.rest import (
     _no_redirect_opener,
     _NoRedirectHandler,
     _redact_url,
+    _shared_no_redirect_opener,
     assert_probe_hop,
     auth_challenge_refused,
     capture_response_headers,
@@ -548,7 +548,7 @@ class SoapDestination(DestinationConnector):
                 # A narrowed trust anchor needs its own opener for the same reason.
                 self._opener = _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
             else:
-                self._opener = _NO_REDIRECT_OPENER
+                self._opener = _shared_no_redirect_opener()
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
             guard = refuse_verify_off(
@@ -596,7 +596,7 @@ class SoapDestination(DestinationConnector):
                     "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
                     "(mutually exclusive — configure exactly one)"
                 )
-            if self._opener is _NO_REDIRECT_OPENER:
+            if self._opener is _shared_no_redirect_opener():
                 # _no_redirect_opener, not a bare build_opener: the bare form lets urllib fill in an
                 # HTTPSHandler whose context the engine never names, so the forward-secrecy assertion
                 # cannot reach this hop (ASVS 12.1.2).

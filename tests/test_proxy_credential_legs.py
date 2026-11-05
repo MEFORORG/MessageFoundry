@@ -714,7 +714,7 @@ def test_a_rest_send_with_a_static_proxy_header_and_no_proxy_for_its_scheme_is_r
     recorded: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``proxy_url = "default"`` reads the environment when the connection is built; the shared
-    opener read it at import. ``HTTP_PROXY`` gives that connection no proxy for ``https``, so the
+    opener read it when it was first built. ``HTTP_PROXY`` gives that connection no proxy for ``https``, so the
     send goes direct, and the static header is refused before the dial (vault BACKLOG #3417).
     Measured 2026-10-30: with ``bounded_read._refuse_proxy_credentials_on_this_leg`` replaced by a
     no-op, the dial was reached with the header on the request and this test failed. Control: with
@@ -758,12 +758,12 @@ def test_a_rest_send_its_own_bypass_list_sends_direct_is_refused(
     recorded: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A ``proxy_no_proxy`` match, where ``for_host`` drops the proxy and the connection sends on
-    the shared opener. That opener is built again here, because the one built at import read
+    the shared opener. That opener is built again here, because the one already built read
     whatever the environment held then. The static header is refused before the dial (vault
     BACKLOG #3417). Measured 2026-10-30: with ``bounded_read._refuse_proxy_credentials_on_this_leg``
     replaced by a no-op, the dial was reached with the header on the request and this test failed.
     Control: with no header the same send reaches the dial."""
-    monkeypatch.setattr(rest, "_NO_REDIRECT_OPENER", rest._no_redirect_opener())
+    monkeypatch.setattr(rest, "_shared_opener", rest._no_redirect_opener())
     settings: dict[str, Any] = {
         "proxy_url": f"http://{_MARKER}",
         "proxy_no_proxy": "partner.example.test",
@@ -1037,7 +1037,7 @@ def test_a_rest_send_over_a_verifying_proxy_leg_is_refused(
 ) -> None:
     """The same destination with TLS verification left on, leg 2 of vault BACKLOG #4909.
     ``proxy_url = "default"`` gives it a per-connection opener that reads ``HTTP_PROXY`` when it
-    is built; the shared opener read the environment at import. Before #4909 the proxy got one
+    is built; the shared opener read the environment when it was first built. Before #4909 the proxy got one
     connection, TLS first. Now the send is refused and nothing is dialled. The control is the same
     destination behind a credential-free proxy, which gets one connection, TLS first."""
     with _WireProxy() as proxy:

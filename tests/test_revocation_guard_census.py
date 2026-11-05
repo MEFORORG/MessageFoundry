@@ -11,7 +11,7 @@ in review, whether it is guarded or exempt and why.
 
 **What counts as a site.** A function in ``messagefoundry/`` that calls a name in :data:`_BUILDERS`,
 passes one of the engine's own builders as a value (to ``run_in_executor``, say), or reads
-``_NO_REDIRECT_OPENER``, by bare name or through a module. Those names are at least the ways the engine hands out a verifying
+``_shared_no_redirect_opener``, by bare name or through a module. Those names are at least the ways the engine hands out a verifying
 client context today, not all of them (SDS-3.6): a context reached by another name is outside this
 census, which is why :func:`test_every_builder_name_is_still_defined` keeps the list from rotting
 under a rename. A function whose own name is in :data:`_BUILDERS` is not a site. It hands its context
@@ -109,9 +109,9 @@ _BUILDERS = frozenset(
     }
 )
 
-#: The shared import-time opener, defined in each of :data:`_SHARED_OPENER_MODULES`. Reading it is
+#: The getter of the shared opener, defined in each of :data:`_SHARED_OPENER_MODULES`. Calling it is
 #: how a hop dials through a verifying context without calling a builder.
-_SHARED_OPENER = "_NO_REDIRECT_OPENER"
+_SHARED_OPENER = "_shared_no_redirect_opener"
 _SHARED_OPENER_MODULES = ("transports/rest.py", "pipeline/alert_sinks.py")
 
 #: The stdlib and truststore names. Matched only as a call: a bare ``SSLContext`` also names a type.
@@ -247,9 +247,13 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     ),
     "messagefoundry/pipeline/alert_sinks.py::_build_no_redirect_opener": Guarded(
         by="messagefoundry/pipeline/alert_sinks.py::WebhookTransport.__init__",
-        note="the webhook's shared opener, built at import. Each WebhookTransport runs "
+        note="the webhook's shared opener. Each WebhookTransport runs "
         "_refuse_webhook_revocation for an https URL, with its [alerts] attestation pair as the "
         "only lever (BACKLOG #2193)",
+    ),
+    "messagefoundry/pipeline/alert_sinks.py::WebhookTransport.__init__": Guarded(
+        note="builds the shared opener so a refused engine TLS list refuses the start (BACKLOG "
+        "#2484), and runs _refuse_webhook_revocation for an https URL"
     ),
     "messagefoundry/pipeline/alert_sinks.py::WebhookTransport._post": Guarded(
         by="messagefoundry/pipeline/alert_sinks.py::WebhookTransport.__init__",
@@ -287,9 +291,9 @@ _CENSUS: dict[str, Guarded | Exempt] = {
         "a verify-OFF context, so no verified certificate exists whose revocation matters. The "
         "verify-off gate (#200, refuse_verify_off) owns that hop"
     ),
-    "messagefoundry/transports/rest.py::<module>": Exempt(
-        "builds the shared import-time _NO_REDIRECT_OPENER. Each function that dials through it "
-        "reads that name and is its own entry here"
+    "messagefoundry/transports/rest.py::_shared_no_redirect_opener": Exempt(
+        "builds the shared opener on first use. Each function that dials through it calls this "
+        "getter and is its own entry here"
     ),
     "messagefoundry/transports/http_listener.py::HttpSource.__init__": Exempt(_LISTENER),
     "messagefoundry/transports/mllp.py::MLLPSource.__init__": Exempt(_LISTENER),
@@ -310,7 +314,7 @@ _CENSUS: dict[str, Guarded | Exempt] = {
 class _Scan:
     sites: frozenset[str]
     guard_calls: frozenset[str]
-    #: modules that assign the shared opener at module level.
+    #: modules that define the shared opener's getter at module level.
     opener_modules: frozenset[str]
     #: bare function or class name -> the guard names its body calls, for every def in the package.
     defs: dict[str, frozenset[str]]
@@ -354,6 +358,8 @@ class _Visitor(ast.NodeVisitor):
         return any(scope in _BUILDERS for scope in self._scope)
 
     def _enter(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> None:
+        if not self._scope and node.name == _SHARED_OPENER:
+            self._opener_modules.add(self._rel)
         self._scope.append(node.name)
         self._defs.setdefault(node.name, set())
         self.generic_visit(node)
@@ -371,18 +377,11 @@ class _Visitor(ast.NodeVisitor):
             self._sites.add(self._key())
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        # The same, read through a module: ``rest._NO_REDIRECT_OPENER`` or
+        # The same, read through a module: ``rest._shared_no_redirect_opener`` or
         # ``tls_policy.build_verifying_client_context`` passed as a value.
         is_engine_name = node.attr == _SHARED_OPENER or node.attr in _BUILDERS - _STDLIB_BUILDERS
         if is_engine_name and isinstance(node.ctx, ast.Load) and not self._in_builder():
             self._sites.add(self._key())
-        self.generic_visit(node)
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        if not self._scope and any(
-            isinstance(t, ast.Name) and t.id == _SHARED_OPENER for t in node.targets
-        ):
-            self._opener_modules.add(self._rel)
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
@@ -526,10 +525,10 @@ def test_every_builder_name_is_still_defined() -> None:
     assert len(engine_builders) >= 12, f"only {len(engine_builders)} engine builder names, floor 12"
     missing = sorted(name for name in engine_builders if name not in scan.defs)
     assert not missing, f"builder name(s) no longer defined in messagefoundry/: {missing}"
-    # The shared opener is a module-level assignment, not a def.
+    # The shared opener's getter is a module-level def, which the loop above does not check.
     expected = {f"messagefoundry/{rel}" for rel in _SHARED_OPENER_MODULES}
     assert scan.opener_modules == expected, (
-        f"{_SHARED_OPENER} is assigned at module level in {sorted(scan.opener_modules)}, "
+        f"{_SHARED_OPENER} is defined at module level in {sorted(scan.opener_modules)}, "
         f"expected {sorted(expected)}"
     )
 

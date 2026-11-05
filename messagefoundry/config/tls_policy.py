@@ -1583,11 +1583,7 @@ def _narrow_tls13_and_sigalgs(ctx: ssl.SSLContext) -> None:
     :class:`RuntimeError`, such as a ``NotImplementedError``. Before #2484 only the ldap3 and hvac
     seam caught it. Converting here, in the two wrappers, reaches every seam that calls one. The
     narrowers' own message names the list; this adds the linked OpenSSL, because the fault is that
-    build's.
-
-    It does not reach a context built at IMPORT. At least ``rest._NO_REDIRECT_OPENER`` and
-    ``alert_sinks._NO_REDIRECT_OPENER`` are, so on such a build the import itself fails before any
-    seam can report a refusal."""
+    build's."""
     try:
         narrow_tls13_suites(ctx)
         narrow_signature_algorithms(ctx)
@@ -2998,8 +2994,8 @@ class TrustAnchor:
         rather than spelling out the test, so the five HTTP-family call sites cannot drift apart.
 
         **A CRL counts (BACKLOG #299), and it has to.** Those five call sites reuse a shared,
-        module-level opener whenever the anchor does not narrow. That opener is built once at import,
-        before any config is loaded, so a CRL could never reach it — a hop that answered "nothing to
+        module-level opener whenever the anchor does not narrow. That opener is built with no anchor,
+        so a CRL could never reach it — a hop that answered "nothing to
         narrow" here would silently keep the unrevoked shared opener while its guard was told
         revocation was checked. Widening this predicate is what routes such a hop onto its own
         opener, with its own context, carrying its own CRL."""

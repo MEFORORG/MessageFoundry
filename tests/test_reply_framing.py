@@ -1370,10 +1370,10 @@ def test_every_engine_opener_reads_replies_strictly() -> None:
     from messagefoundry.transports import rest
 
     for opener in (
-        rest._NO_REDIRECT_OPENER,
+        rest._shared_no_redirect_opener(),
         rest._insecure_opener(),
         rest._expiry_relaxed_opener("example.test"),
-        alert_sinks._NO_REDIRECT_OPENER,
+        alert_sinks._shared_no_redirect_opener(),
         build_idp_opener(None),
     ):
         _assert_strict(opener)

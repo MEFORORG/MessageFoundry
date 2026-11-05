@@ -66,7 +66,6 @@ from messagefoundry.transports.dicom import recover_dicom_object_bytes
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture (NOT a
 # wrapper around RestDestination; ADR 0025 §2, exactly as fhir.py / soap.py do).
 from messagefoundry.transports.rest import (
-    _NO_REDIRECT_OPENER,
     _RETRYABLE_4XX,
     AUTH_CHALLENGE_REFUSED,
     HttpAuthError,
@@ -75,6 +74,7 @@ from messagefoundry.transports.rest import (
     _insecure_opener,
     _no_redirect_opener,
     _redact_url,
+    _shared_no_redirect_opener,
     assert_probe_hop,
     auth_challenge_refused,
     egress_route_from_settings,
@@ -282,7 +282,7 @@ class DicomWebDestination(DestinationConnector):
             self._opener: urllib.request.OpenerDirector = (
                 _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
                 if proxy_handlers or anchor.narrows
-                else _NO_REDIRECT_OPENER
+                else _shared_no_redirect_opener()
             )
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the DICOMweb-server cert but
             # does no OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI

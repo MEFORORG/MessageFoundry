@@ -102,7 +102,6 @@ from messagefoundry.transports.bounded_read import (
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture
 # (NOT a wrapper around RestDestination; ADR 0022 §2, exactly as soap.py does).
 from messagefoundry.transports.rest import (
-    _NO_REDIRECT_OPENER,
     _RETRYABLE_4XX,
     AUTH_CHALLENGE_REFUSED,
     MAX_OUTBOUND_HEADER_VALUE_LEN,
@@ -113,6 +112,7 @@ from messagefoundry.transports.rest import (
     _insecure_opener,
     _no_redirect_opener,
     _redact_url,
+    _shared_no_redirect_opener,
     assert_probe_hop,
     auth_challenge_refused,
     capture_response_headers,
@@ -1215,7 +1215,7 @@ class FhirDestination(DestinationConnector):
                 # A narrowed trust anchor needs its own opener for the same reason.
                 self._opener = _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
             else:
-                self._opener = _NO_REDIRECT_OPENER
+                self._opener = _shared_no_redirect_opener()
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
             guard = refuse_verify_off(
@@ -1248,7 +1248,7 @@ class FhirDestination(DestinationConnector):
                     "a connection cannot use BOTH a bearer-token provider and HTTP Digest auth "
                     "(mutually exclusive — configure exactly one)"
                 )
-            if self._opener is _NO_REDIRECT_OPENER:
+            if self._opener is _shared_no_redirect_opener():
                 # _no_redirect_opener, not a bare build_opener: the bare form lets urllib fill in an
                 # HTTPSHandler whose context the engine never names, so the forward-secrecy assertion
                 # cannot reach this hop (ASVS 12.1.2).
@@ -1995,7 +1995,7 @@ class FhirLookupExecutor:
                 self._opener[cname] = (
                     _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)
                     if proxy_handlers or lookup_anchor.narrows
-                    else _NO_REDIRECT_OPENER
+                    else _shared_no_redirect_opener()
                 )
                 # BACKLOG #2193 (ADR 0173): the read hop verifies the FHIR server's certificate, but
                 # stdlib ssl checks no OCSP or CRL, so a revoked certificate would still be accepted on

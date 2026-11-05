@@ -42,7 +42,7 @@ from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV, HopPos
 from messagefoundry.pipeline import Engine
 from messagefoundry.transports import ai_broker as ai_broker_mod
 from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError, ai_broker_from_settings
-from messagefoundry.transports.rest import _NO_REDIRECT_OPENER, opener_tls_context
+from messagefoundry.transports.rest import _shared_no_redirect_opener, opener_tls_context
 from tests.test_revocation_guard_remaining_hops import _guard_log
 
 _ENDPOINT = "https://ai.internal/v1/messages"
@@ -197,7 +197,7 @@ def test_the_decision_reads_the_context_the_broker_dials_with(
 
     monkeypatch.setattr(tls_policy, "context_checks_revocation", checks)
     broker = _broker(posture=_ENFORCING)
-    expected = opener_tls_context(_NO_REDIRECT_OPENER, connector="AI endpoint")
+    expected = opener_tls_context(_shared_no_redirect_opener(), connector="AI endpoint")
     assert seen == [expected]
     # The context judged is the one this broker dials through.
     assert seen[0] is opener_tls_context(broker._opener, connector="AI endpoint")

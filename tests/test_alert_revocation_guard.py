@@ -12,7 +12,7 @@ revoked but unexpired certificate was accepted with no refusal and no record. Th
   pair. A hop with no login takes no guard, a decline recorded in ADR 0173. The security notifier
   rides the same hop and takes the same guard.
 * **(d) the https webhook**, with the ``[alerts].webhook_tls_revocation_attested`` pair as its only
-  lever, on the pattern of ADR 0173 section 12: its opener is built at import and no CRL reaches it.
+  lever, on the pattern of ADR 0173 section 12: its opener is shared and no CRL reaches it.
 
 The arms follow ``tests/test_revocation_guard_remaining_hops.py``: refused under an enforcing posture
 with no lever (the control), admitted with a CRL read off the hop's OWN context, and still refused
@@ -366,7 +366,7 @@ def test_an_off_box_https_webhook_is_refused_when_it_checks_no_revocation() -> N
         WebhookTransport(WEBHOOK, posture=ENFORCING)
     text = str(exc.value)
     assert _WEBHOOK_CELL in text
-    # The attestation is the only lever: no CRL reaches the import-time opener.
+    # The attestation is the only lever: no CRL reaches the shared opener.
     assert "[alerts].webhook_tls_revocation_attested" in text
     assert "Configure [tls].crl_file" not in text
     # The path token, the webhook's credential, never reaches the refusal.
@@ -483,7 +483,7 @@ def test_the_build_and_the_send_apply_one_allowlist_test(
     monkeypatch.setattr(alert_sinks, "_refuse_webhook_revocation", lambda *a, **k: None)
     monkeypatch.setattr(alert_sinks, "_refuse_alert_smtp_revocation", lambda *a, **k: None)
     monkeypatch.setattr(alert_sinks, "checked_envelope", stub)
-    monkeypatch.setattr(alert_sinks._NO_REDIRECT_OPENER, "open", stub)
+    monkeypatch.setattr(alert_sinks._shared_no_redirect_opener(), "open", stub)
 
     def builds(build: Callable[[], object]) -> bool:
         try:

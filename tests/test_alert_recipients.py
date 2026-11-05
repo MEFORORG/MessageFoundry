@@ -27,6 +27,7 @@ from messagefoundry.pipeline.alert_sinks import (
     EmailTransport,
     NotifierAlertSink,
     WebhookTransport,
+    _shared_no_redirect_opener,
     notifier_from_settings,
     send_plain_email,
 )
@@ -130,7 +131,7 @@ async def test_recipients_never_reach_the_webhook_payload(
         captured["body"] = req.data
         return _Resp()
 
-    monkeypatch.setattr("messagefoundry.pipeline.alert_sinks._NO_REDIRECT_OPENER.open", fake_open)
+    monkeypatch.setattr(_shared_no_redirect_opener(), "open", fake_open)
     web = WebhookTransport("https://hooks.example/x", posture=_NOT_ENFORCING)
     rule = AlertRule(event_type="connection_stopped", recipients=["oncall@secret.example"])
     sink = NotifierAlertSink([web], rules=[rule])

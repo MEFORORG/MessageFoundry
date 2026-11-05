@@ -34,6 +34,8 @@ import ast
 import datetime
 import re
 import ssl
+import subprocess
+import sys
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -599,10 +601,10 @@ def test_every_hop_offers_the_approved_list_in_order(hop: str, pki: _Pki) -> Non
 
 
 def test_the_shared_module_level_openers_are_narrowed_too() -> None:
-    """The two openers built once at import and shared by every connection that needs no extra
+    """The two openers built once and shared by every connection that needs no extra
     handler. The per-hop tests build FRESH ones so they can add a trust root without touching shared
     state; this reads the shared objects themselves."""
-    for opener in (rest._NO_REDIRECT_OPENER, alert_sinks._NO_REDIRECT_OPENER):
+    for opener in (rest._shared_no_redirect_opener(), alert_sinks._shared_no_redirect_opener()):
         assert _tls12(_https_context(opener)) == list(APPROVED_TLS12_SUITES)
 
 
@@ -865,6 +867,59 @@ def test_only_the_narrowers_own_refusal_is_relabelled(monkeypatch: pytest.Monkey
     monkeypatch.setattr(tls_policy, "narrow_tls13_suites", broken)
     with pytest.raises(NotImplementedError):
         narrow_to_approved_suites(ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT))
+
+
+#: Run in a fresh interpreter, because the defect is at import and this process imported both
+#: modules long ago. The narrower refuses before either module is imported, as a refusing OpenSSL
+#: build would from the start.
+_IMPORT_UNDER_A_REFUSING_NARROWER = """
+from messagefoundry import tls_sigalgs
+from messagefoundry.config import tls_policy
+
+
+def refuse(ctx):
+    raise tls_sigalgs.NarrowerRefused("stub: this OpenSSL refused the engine's TLS 1.3 suites")
+
+
+tls_policy.narrow_tls13_suites = refuse
+from messagefoundry.pipeline import alert_sinks
+from messagefoundry.transports import rest
+
+uses = {
+    "rest": rest._shared_no_redirect_opener,
+    "alert_sinks": alert_sinks._shared_no_redirect_opener,
+    "webhook build": lambda: alert_sinks.WebhookTransport(
+        "https://hooks.example.test/x", posture=tls_policy.HopPosture(enforcing=False)
+    ),
+}
+for name, use in uses.items():
+    for _ in range(2):  # a refused build caches nothing, so the second use is refused too
+        try:
+            use()
+        except tls_policy.EngineTlsListRefused as exc:
+            print("refused", name, tls_policy.ssl.OPENSSL_VERSION in str(exc))
+        else:
+            raise SystemExit(name + " built an opener the narrower refused")
+"""
+
+
+def test_a_refused_engine_list_is_a_refusal_at_first_use_not_an_import_failure() -> None:
+    """BACKLOG #2484 step 3. Both shared no-redirect openers were built at import, so on an OpenSSL
+    that refuses the engine's list, importing ``transports.rest`` or ``pipeline.alert_sinks`` raised.
+    They are built on first use now: both modules import, each getter raises the named
+    configuration refusal, and so does building a webhook sink, so the start is refused rather
+    than each POST. Measured red on the parent commit: the import raised ``EngineTlsListRefused``
+    and the child exited 1."""
+    result = subprocess.run(
+        [sys.executable, "-c", _IMPORT_UNDER_A_REFUSING_NARROWER],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"refused {name} True" for name in ("rest", "alert_sinks", "webhook build") for _ in (1, 2)
+    ], result.stdout
 
 
 class _RefusesTls12(ssl.SSLContext):

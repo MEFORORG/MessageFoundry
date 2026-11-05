@@ -70,12 +70,12 @@ from messagefoundry.transports.bounded_read import (
 # Reuse rest.py's hardened opener + URL redaction (no new HTTP plumbing) — exactly as fhir.py/soap.py
 # do. rest.py imports this module's provider LAZILY (inside __init__) so there is no import cycle.
 from messagefoundry.transports.rest import (
-    _NO_REDIRECT_OPENER,
     ECH_HOP_WAYS_ACROSS,
     HttpAuthError,
     ProxyConfig,
     _no_redirect_opener,
     _redact_url,
+    _shared_no_redirect_opener,
     auth_challenge_refused,
     ech_readdressed_request,
     enforce_outbound_length_limits,
@@ -343,7 +343,7 @@ class _TokenEndpointProvider(abc.ABC):
                 trust_anchor=trust_anchor,
             )
             if token_proxy is not None or trust_anchor.narrows
-            else _NO_REDIRECT_OPENER
+            else _shared_no_redirect_opener()
         )
         # #1498, #2112 (ADR 0173 §4.3): the revocation twin of the cleartext refusal, and the same
         # one-statement call its HTTP-family siblings make. The token hop VERIFIES the authorization

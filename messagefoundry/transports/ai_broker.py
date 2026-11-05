@@ -15,7 +15,7 @@ the vetted network call.
   ``[ai].allowed_endpoints`` list — an un-listed host (**or an EMPTY list**) is REFUSED. Combined with
   rest.py's hardened **no-redirect** opener, a crafted or redirected endpoint cannot exfiltrate the prompt
   to an unintended host.
-* **No new dependency.** The POST reuses rest.py's TLS-verifying, no-redirect ``_NO_REDIRECT_OPENER`` +
+* **No new dependency.** The POST reuses rest.py's TLS-verifying, no-redirect shared opener +
   ``_redact_url`` (stdlib :mod:`urllib`) — exactly as smart.py does. A vendor SDK would be a separate
   DEP-1 vet, so it is intentionally avoided.
 * **Off the event loop.** :meth:`AiBroker.chat` blocks (a provider POST); the API route awaits
@@ -67,8 +67,8 @@ from messagefoundry.transports.bounded_read import EgressReplyError, read_bounde
 # Reuse rest.py's hardened, TLS-verifying, no-redirect opener + URL redaction (no new HTTP plumbing) —
 # exactly as smart.py / fhir.py / soap.py do. No import cycle: rest.py never imports this module.
 from messagefoundry.transports.rest import (
-    _NO_REDIRECT_OPENER,
     _redact_url,
+    _shared_no_redirect_opener,
     find_outbound_length_violation,
     opener_tls_context,
     refuse_url_credentials,
@@ -182,7 +182,7 @@ def _refuse_an_unrevoked_ai_hop(
       through, never off a setting. It is ``True`` only when that context checks a CRL
       (``context_checks_revocation``) and does not skip time validity
       (``skips_validity_period``), which would accept a CRL past its ``nextUpdate`` (vault
-      BACKLOG #5086). Today that is rest.py's shared import-time opener, which loads no CRL and
+      BACKLOG #5086). Today that is rest.py's shared opener, which loads no CRL and
       does not skip time validity, so it is ``False``, and no CRL lever is built for this hop.
     * An attestation with no reason or a blank one, and a reason holding a control character or a
       lone surrogate, are refused here as at settings load, so a broker built directly cannot
@@ -359,7 +359,7 @@ class AiBroker:
             )
         # The opener is chosen before the guard and handed to it, so the guard judges the context
         # this broker really dials with, whichever opener that later becomes.
-        opener: urllib.request.OpenerDirector = _NO_REDIRECT_OPENER
+        opener: urllib.request.OpenerDirector = _shared_no_redirect_opener()
         # Last, so an endpoint refused for any reason above never logs a revocation crossing, and
         # the operator is never sent to attest a hop that is refused anyway (BACKLOG #2193 (e)).
         _refuse_an_unrevoked_ai_hop(

@@ -221,7 +221,7 @@ def test_without_the_patch_the_same_context_is_silent() -> None:
 
 def test_rest_shared_verifying_opener_asserts(every_suite_looks_weak: None) -> None:
     """``_no_redirect_opener`` — the default REST / FHIR / DICOMweb / fhir_lookup egress path, and the
-    construction the module-level ``_NO_REDIRECT_OPENER`` is itself built from."""
+    construction ``_shared_no_redirect_opener()`` is itself built from."""
 
     with pytest.raises(ValueError, match="HTTP-family destination"):
         rest._no_redirect_opener()
@@ -272,7 +272,7 @@ def test_the_rest_opener_handshake_is_unchanged_by_the_assertion() -> None:
     asserts urllib's own context instead of replacing it; this pins that, on the one half of the
     difference that is readable back (ALPN is write-only).
     """
-    engine = _opener_context(rest._NO_REDIRECT_OPENER)
+    engine = _opener_context(rest._shared_no_redirect_opener())
     stock = _opener_context(urllib.request.build_opener(rest._NoRedirectHandler))
     assert engine is not None and stock is not None
     assert engine.post_handshake_auth == stock.post_handshake_auth, (

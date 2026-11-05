@@ -4836,7 +4836,7 @@ def alert_revocation_attestations(
     """Each ``[alerts]`` revocation attestation that is set: its switch name, the hop it covers,
     what that hop's own handshake can check, and its reason (BACKLOG #2193). The ``[alerts]``
     sibling of :func:`vault_revocation_attestations`, read by :func:`security_loosenings`. A CRL
-    reaches the SMTP hop's context; none can reach the webhook's import-time opener."""
+    reaches the SMTP hop's context; none can reach the webhook's shared opener."""
     pairs = (
         (
             "alerts.email_tls_revocation_attested",
@@ -5891,7 +5891,7 @@ class AlertsSettings(_Section):
     # the webhook host's certificate is covered outside the engine. The POST carries the webhook's
     # path token over https the engine verifies and checks no CRL or OCSP on, so an off-box https
     # webhook on an enforcing instance is refused at build unless this is true, with its mandatory
-    # reason. It is the only way across: the webhook rides one opener built at import, which no CRL
+    # reason. It is the only way across: the webhook rides one shared opener, which no CRL
     # can reach. A loosening, named in security_loosenings(). It never lifts the cleartext refusal.
     webhook_tls_revocation_attested: bool = False
     webhook_tls_revocation_attested_reason: str | None = None

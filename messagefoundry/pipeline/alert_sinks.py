@@ -28,6 +28,7 @@ import json
 import logging
 import smtplib
 import string
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -70,7 +71,7 @@ from messagefoundry.pipeline.alerts import (
 from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
 from messagefoundry.transports.base import NegativeAckError
 
-# Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
+# Not lazy, unlike the two transports imports below: _NoRedirectHandler subclasses one at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so these
 # add no import cost.
 from messagefoundry.transports.bounded_read import NoRedirectHandler, build_strict_opener
@@ -339,8 +340,8 @@ def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
     approved AEAD default every engine-built hop takes (BACKLOG #300). And ``build_strict_opener``
     reads each reply with the strict response class, keeping the same TLS context (BACKLOG #2052).
 
-    A named function, not an inline module-level expression, so a test can call the exact construction
-    the shared opener is built from instead of reloading this module.
+    A named function apart from :func:`_shared_no_redirect_opener`, so a test can call the exact
+    construction the shared opener is built from and get a fresh one.
 
     Built through the ``tls_policy`` factory so this module still never names ``ssl`` itself, matching
     the plain-data TLS settings :class:`EmailTransport` carries for the same reason."""
@@ -350,12 +351,28 @@ def _build_no_redirect_opener() -> urllib.request.OpenerDirector:
     )
 
 
-# The shared opener, reused for every webhook POST.
-_NO_REDIRECT_OPENER = _build_no_redirect_opener()
+_shared_opener: urllib.request.OpenerDirector | None = None
+_shared_opener_lock = threading.Lock()
+
+
+def _shared_no_redirect_opener() -> urllib.request.OpenerDirector:
+    """The shared opener, reused for every webhook POST: built on first use, the same object after.
+
+    Built on first use, not at import (BACKLOG #2484): an OpenSSL build that refuses the engine's
+    TLS 1.3 or signature-scheme list raises ``EngineTlsListRefused`` from the build, and at import that
+    surfaced as a failed import of this module, not as a refusal of the webhook. A build that raises
+    caches nothing, so the next POST is refused the same way. The lock keeps two threads racing the
+    first POST to one opener, as the REST twin does."""
+    global _shared_opener
+    with _shared_opener_lock:
+        if _shared_opener is None:
+            _shared_opener = _build_no_redirect_opener()
+        return _shared_opener
+
 
 #: The webhook hop's OWN way across its revocation refusal (BACKLOG #2193). The connection-shaped
 #: default names ``[tls].crl_file`` and a connection's attestation, and neither reaches this hop: it
-#: dials through :data:`_NO_REDIRECT_OPENER`, built at import before any config loads, so no CRL can
+#: dials through :func:`_shared_no_redirect_opener`, built with no trust anchor, so no CRL can
 #: reach its context, and it is not a connection. So the attestation pair is the only lever, as on
 #: the Vault hops (ADR 0173 section 12).
 _WEBHOOK_WAYS_ACROSS = (
@@ -476,7 +493,7 @@ def _refuse_webhook_revocation(
     https the engine verifies. Stdlib ssl checks no OCSP or CRL there, so a revoked but unexpired
     certificate would be accepted with no refusal and no record.
 
-    ``context=None``: the hop dials through :data:`_NO_REDIRECT_OPENER`, built at import, and no
+    ``context=None``: the hop dials through :func:`_shared_no_redirect_opener`, and no
     CRL reaches it, so the owner ruling of 2026-10-27 gave it an attestation pair on the pattern of
     ADR 0173 section 12, and no CRL lever. ``posture`` is PASSED, because the sink is built in the
     API lifespan outside every ``active_hop_posture`` scope. ``None`` reads the ambient posture, and
@@ -651,6 +668,9 @@ class WebhookTransport:
         # the URL is operator config and the sole header is a fixed ``Content-Type``, so nothing is
         # added between here and the wire.
         enforce_outbound_length_limits(url, {"Content-Type": "application/json"})
+        # BACKLOG #2484: build the shared opener here, so an OpenSSL that refuses the engine's list
+        # refuses the start, as at #5088 above, rather than failing every POST.
+        _shared_no_redirect_opener()
         # BACKLOG #2193 slice (d): last, so a URL another check refuses never logs a crossing.
         _refuse_webhook_revocation(
             url,
@@ -703,7 +723,7 @@ class WebhookTransport:
         from messagefoundry.transports.bounded_read import drain_2xx_reply
 
         # The no-redirect opener (not urllib.request.urlopen) so a 3xx can't divert the POST (15.3.2).
-        with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as resp:
+        with _shared_no_redirect_opener().open(req, timeout=self.timeout) as resp:
             # Drain (bounded) so the connection can be reused/closed cleanly. The body is discarded,
             # so completeness is not checked: the POST has already been accepted by this point, and
             # failing the drain on a short reply would report an alert as undelivered when the host

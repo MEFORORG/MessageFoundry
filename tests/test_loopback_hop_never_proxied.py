@@ -346,7 +346,7 @@ def test_a_loopback_destination_gets_no_proxy_handler_and_no_proxy_credential(
     settings = {"proxy_url": "http://127.0.0.1:3128", "proxy_user": "pu", "proxy_password": "pw"}
     with caplog.at_level(logging.INFO, logger=rest.__name__):
         dest = _rest("http://127.0.0.1:18080/x", **settings)
-    assert dest._opener is rest._NO_REDIRECT_OPENER
+    assert dest._opener is rest._shared_no_redirect_opener()
     assert "Proxy-Authorization" not in dest._headers
     assert [r.getMessage() for r in _skip_records(caplog)] == [
         "connection 'OB_REST'; the configured web proxy is not used for a loopback target, "
@@ -356,7 +356,7 @@ def test_a_loopback_destination_gets_no_proxy_handler_and_no_proxy_credential(
     caplog.clear()
     with caplog.at_level(logging.INFO, logger=rest.__name__):
         control = _rest("https://partner.invalid/x", **settings)
-    assert control._opener is not rest._NO_REDIRECT_OPENER
+    assert control._opener is not rest._shared_no_redirect_opener()
     assert control._headers["Proxy-Authorization"].startswith("Basic ")
     assert not _skip_records(caplog)
 
@@ -475,11 +475,11 @@ def test_a_bypass_entry_matching_a_trailing_dot_opens_no_on_box_carve_out(
     config = rest.proxy_config_from_settings(settings, dest_scheme="https", connection="OB_REST")
     assert config is not None
     assert config.for_host("https://localhost./x") is None
-    # The connection sends on the shared opener, rebuilt here because the one built at import read
+    # The connection sends on the shared opener, rebuilt here because the one already built read
     # whatever the environment held then.
-    monkeypatch.setattr(rest, "_NO_REDIRECT_OPENER", rest._no_redirect_opener())
+    monkeypatch.setattr(rest, "_shared_opener", rest._no_redirect_opener())
     dest = _rest("https://localhost./x", **settings)
-    assert dest._opener is rest._NO_REDIRECT_OPENER
+    assert dest._opener is rest._shared_no_redirect_opener()
     assert _dialled(dest._opener, "https://localhost./x") == _PROXY_HOST
     with active_hop_posture(HopPosture(enforcing=True)):
         with pytest.raises(InsecureHopRefused, match="HTTP cleartext egress"):
