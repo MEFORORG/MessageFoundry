@@ -901,10 +901,9 @@ def _crl_issuer_key(name: x509.Name) -> CrlIssuerKey:
     ``NameAttribute._type``. If a release drops it, every CRL is refused. A start and a reload
     name that cause. The expiry monitor's check of a CA file says only that it cannot judge the
     CRL. The namesake warning's self-signed read (:func:`_self_issued`) can no longer compare
-    names, so a CA beside a namesake whose authority key identifier carries no key identifier,
-    or that has none, and in which no other fault is found, gets the warning that the engine
-    cannot compare them. Comparing the exact text instead would reopen
-    the T61String gap with no sign.
+    names: a CA with a namesake, in which no other fault is found and whose own authority key
+    identifier is missing or carries no key identifier, gets the warning that the engine cannot
+    compare them. Comparing the exact text instead would reopen the T61String gap with no sign.
 
     **Latin-1 here covers UTF-8 bytes only.** A one-byte text type whose bytes are not valid
     UTF-8 already fails ``cryptography``'s parse, so the file is refused. A certificate's issuer,
@@ -1792,9 +1791,10 @@ class IssuerIndex:
         faults go unread; with no other fault found, its warning, in whichever wording the
         namesake's key identifier gives, says the issuer name cannot be read, that strict
         verification refuses every client through the CA if it is not self-signed, and to check
-        the CA too (:data:`_UNREAD_TEXT`). Where an engine defect stops the names being compared, it says that instead. The index does not count a namesake toward the
-        same-DN ambiguity unless it signs itself, so :meth:`unmatched_keys` may give no reason, and
-        this is the only start signal. Names are grouped by :func:`_namesake_key`. A warning only:
+        the CA too (:data:`_UNREAD_TEXT`). Where an engine defect stops the names being compared,
+        it says that instead. The index does not count a namesake toward the same-DN ambiguity
+        unless it signs itself, so :meth:`unmatched_keys` may give no reason, and this is the only
+        start signal. Names are grouped by :func:`_namesake_key`. A warning only:
         it changes no allow, deny or refusal."""
         by_name: dict[_NameKey, list[_Anchor]] = {}
         # In block order, so each group's lists and warnings are too, and the groups follow the

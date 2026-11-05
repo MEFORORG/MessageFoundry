@@ -1922,7 +1922,8 @@ async def test_what_a_ca_whose_issuer_cannot_be_read_does_to_its_clients_is_meas
     tmp_path: Path, arm: str, client_refused: bool
 ) -> None:
     """A CA whose issuer name ``cryptography`` cannot read, a T61String holding bytes that are not
-    UTF-8, beside a namesake with a key identifier of its own, behind a real strict listener.
+    UTF-8, its warning read beside a namesake with a key identifier of its own, and its clients
+    measured behind a real strict listener without the namesake, so each refusal is the CA's.
     Measured on OpenSSL 3.5.7, which reads those bytes as Latin-1:
 
     * with no authority key identifier and an issuer OpenSSL reads as another name, loaded or
@@ -1957,14 +1958,17 @@ async def test_what_a_ca_whose_issuer_cannot_be_read_does_to_its_clients_is_meas
     with pytest.raises(ValueError):  # the premise: cryptography cannot read the issuer
         _ = ca.issuer
     namesake = _issued_no_ca(subject, root)
-    loaded = _wrapped(der) + _pem(namesake)
+    trusted = _wrapped(der)
     if arm in ("no-akid-issuer-loaded", "akid-issuer-loaded"):
-        loaded += _pem(root[0])
+        trusted += _pem(root[0])
+    loaded = trusted + _pem(namesake)
     (warning,) = IssuerIndex(loaded.decode("ascii")).namesake_warnings()
     assert "that CA issued with no authority key identifier" in warning, warning
     assert (_CANNOT_TELL_ISSUER in warning) is (not arm.startswith("akid")), warning
+    # Measured without the namesake, which may refuse a version-1 client itself, so a refusal
+    # here is the CA's.
     source = await _started(
-        _source(tmp_path, [], {subject.rfc4514_string(): [SUBJECT]}, cadata=loaded)
+        _source(tmp_path, [], {subject.rfc4514_string(): [SUBJECT]}, cadata=trusted)
     )
     try:
         if client_refused:
@@ -1972,6 +1976,7 @@ async def test_what_a_ca_whose_issuer_cannot_be_read_does_to_its_clients_is_meas
             assert await _handshake_refused(source, _v1_bundle(tmp_path, (ca, key)))
         else:
             assert await _admitted(source, _bundle(tmp_path, (ca, key))) == 202
+            assert await _admitted(source, _v1_bundle(tmp_path, (ca, key))) == 202
     finally:
         await source.stop()
 
