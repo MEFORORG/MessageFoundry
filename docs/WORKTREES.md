@@ -668,6 +668,52 @@ same invocation wherever one is possible (a refusal test refuses the whole run b
 a session arrives, the fence dies, the metadata is touched — before answering, which reproduces the
 race deterministically with no threads and no sleeps.
 
+### Run it nightly with `install-daily-prune.ps1`
+
+[`install-daily-prune.ps1`](../scripts/worktree/install-daily-prune.ps1) registers a daily Windows
+scheduled task, as you and never as SYSTEM, that runs
+[`run-daily-prune.ps1`](../scripts/worktree/run-daily-prune.ps1) from the **primary** checkout. The
+runner calls `prune-merged.ps1`, appends what it printed to a dated log under
+`%LOCALAPPDATA%\MessageFoundry\worktree-prune`, and passes its exit code back. The task **dry-runs
+unless registered with `-Apply`**, and the installer refuses to run inside Claude Code (`-Json`, which
+registers nothing, excepted). Run it from a plain terminal:
+
+```powershell
+pwsh -File scripts\worktree\install-daily-prune.ps1 -Json                                   # the plan; registers nothing
+pwsh -File scripts\worktree\install-daily-prune.ps1 -At 03:00                               # dry-run task
+pwsh -File scripts\worktree\install-daily-prune.ps1 -At 03:00 -Apply -RemoveFinishedClaudeWorktrees
+```
+
+**`-RemoveFinishedClaudeWorktrees` is the one opt-in that reaches `.claude/worktrees`** (owner request,
+2026-11-05). `prune-merged.ps1` still removes nothing there; it lists the trees that look finished under
+`REPORT-ONLY`, and its `-Json` carries them as `reportOnly` rows with `path`, `branch`, `idleHours`,
+`claudeManaged` and `whyFinished`. With the switch, the runner runs `prune-merged.ps1 -Json` a second
+time, after the prune, and takes that fresh list, never an earlier table. It keeps the rows under a
+`.claude/worktrees/` segment and hands them to
+[`finished-worktree-removal.ps1`](../scripts/worktree/finished-worktree-removal.ps1), which re-checks
+each one immediately before acting. At least these re-checks run, and any one failing refuses that tree:
+
+- it is not the primary, not the worktree the run executes from, and contains neither;
+- it is still registered, and `git worktree list --porcelain` reports it neither locked nor prunable;
+- `git status --porcelain --untracked-files=all` is empty, so ignored files such as `.venv` do not count;
+- its git metadata is idle beyond the `-IdleHours` that `prune-merged.ps1` used, and that window is not
+  under the 12 h floor;
+- a detached tree's tip is still held by some ref;
+- last, so the gap before the removal is short: the liveness fence, read fresh, is available and finds no
+  live session in it or nested in it, and it contains no other registered worktree.
+
+Each gate is the one `prune-merged.ps1` decides with, shared through
+[`worktree-gates.ps1`](../scripts/worktree/worktree-gates.ps1) and `scripts/coord/occupancy.ps1`
+rather than copied. The coordination-claim check is not re-run: the list holds no claimed tree.
+
+The removal is a plain `git -C <primary> worktree remove <path>` with **no `--force`**, so git's own
+refusal on a locked or dirty tree stays a last fence. The branch survives it. Each path is logged as
+`REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `FAILED` or `ORPHANED` with its reason, then
+a summary line with the counts and the drive's free space. A refusal is data and leaves the exit code
+alone; a failed removal raises it to `1`, an orphan to `3`, and a list that could not be read skips
+the step and raises it to `2`. Tests:
+[`tests/test_worktree_finished_claude_removal.py`](../tests/test_worktree_finished_claude_removal.py).
+
 ## A scheduled hygiene report that deletes nothing — `hygiene-report.ps1`
 
 [`hygiene-report.ps1`](../scripts/worktree/hygiene-report.ps1) writes a report on the state of every

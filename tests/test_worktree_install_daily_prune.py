@@ -102,6 +102,26 @@ def test_dry_run_is_the_default_and_apply_is_opt_in() -> None:
 
 
 @requires_windows
+def test_the_finished_claude_worktrees_step_is_opt_in_and_forwarded() -> None:
+    """Both directions, and it must not imply -Apply: without it the runner only reports."""
+    default = plan()
+    opted = plan("-RemoveFinishedClaudeWorktrees")
+    both = plan("-Apply", "-RemoveFinishedClaudeWorktrees")
+
+    assert "-RemoveFinishedClaudeWorktrees" not in default["argument"]
+    assert default["removeFinishedClaudeWorktrees"] is False
+
+    assert "-RemoveFinishedClaudeWorktrees" in opted["argument"]
+    assert opted["removeFinishedClaudeWorktrees"] is True
+    assert "-Apply" not in opted["argument"], "the opt-in step must not arm removal by itself"
+    assert opted["mode"] == "DRYRUN"
+
+    assert "-RemoveFinishedClaudeWorktrees" in both["argument"]
+    assert "-Apply" in both["argument"]
+    assert both["mode"] == "APPLY"
+
+
+@requires_windows
 def test_it_agrees_with_prune_merged_about_the_primary_checkout() -> None:
     """The installer's primary must be the one prune-merged.ps1 would accept, not merely a valid repo."""
     p = plan()

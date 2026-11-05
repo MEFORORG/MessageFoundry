@@ -20,11 +20,17 @@
     This was briefly a base64 -EncodedCommand built from a here-string; run-daily-prune.ps1's header
     records why that was wrong.
 
-    SCOPE IS THE SIBLING WORKTREES ONLY. prune-merged.ps1 excludes anything under a `.claude/worktrees/`
-    path segment by design -- that is the population EnterWorktree relocates LIVE sessions into, and
-    claude-code issue 92342 (open) is exactly that the harness's own cleanup does not fire for adopted
-    worktrees. This installer does not widen that scope and must not be made to. Those 73 worktrees need
-    their own occupancy fence, which is a different piece of work.
+    BY DEFAULT THE SCOPE IS THE SIBLING WORKTREES ONLY. prune-merged.ps1 excludes anything under a
+    `.claude/worktrees/` path segment by design -- that is the population EnterWorktree relocates LIVE
+    sessions into, and claude-code issue 92342 (open) is exactly that the harness's own cleanup does not
+    fire for adopted worktrees. prune-merged.ps1 still never removes one.
+
+    -RemoveFinishedClaudeWorktrees IS THE ONE OPT-IN WIDENING (owner request, 2026-11-05). It forwards
+    the same switch to the registered task, so run-daily-prune.ps1 also takes the trees under
+    .claude/worktrees that a fresh prune-merged.ps1 run lists as looking finished, re-checks each one
+    immediately before acting, and removes it with a plain `git worktree remove`, never --force.
+    finished-worktree-removal.ps1's header lists the re-checks. It follows -Apply like everything else:
+    without -Apply the task only logs what it WOULD remove.
 
     THE TASK RUNS AS YOU, INTERACTIVELY, NOT AS SYSTEM. prune-merged.ps1's liveness fence reads each
     Claude config root's sessions/<pid>.json to decide what is occupied. As SYSTEM those roots are a
@@ -35,6 +41,9 @@
 .PARAMETER Apply
     Register the task to actually remove worktrees. Omit this -- the default -- and the task dry-runs and
     logs. Re-run the installer with -Apply once the logs look right; registration is idempotent.
+
+.PARAMETER RemoveFinishedClaudeWorktrees
+    Also register the opt-in .claude/worktrees step described above. Dry run unless -Apply is given too.
 
 .PARAMETER At
     Daily start time, 24h "HH:mm". Default 03:30, chosen to be outside any plausible working session --
@@ -48,6 +57,8 @@
 .EXAMPLE
     pwsh -File scripts\worktree\install-daily-prune.ps1              # dry-run task, 03:30 daily
     pwsh -File scripts\worktree\install-daily-prune.ps1 -Apply       # promote it to actually remove
+    pwsh -File scripts\worktree\install-daily-prune.ps1 -Apply -RemoveFinishedClaudeWorktrees -At 03:00
+                                                                     # and remove finished .claude/worktrees
     pwsh -File scripts\worktree\install-daily-prune.ps1 -Json        # show the plan, register nothing
     pwsh -File scripts\worktree\install-daily-prune.ps1 -Uninstall   # remove the task
 #>
@@ -55,6 +66,8 @@
 param(
     # Register the task WITH -Apply. Default is a logging dry run; see the header.
     [switch]$Apply,
+    # Also remove finished .claude/worktrees trees (opt-in; reports only without -Apply). See the header.
+    [switch]$RemoveFinishedClaudeWorktrees,
     # Daily start time, "HH:mm".
     [string]$At = '03:30',
     # Hours of inactivity before a worktree stops being treated as occupied. Passed straight through.
@@ -126,11 +139,13 @@ $userId    = "$env:USERDOMAIN\$env:USERNAME"
 # to prune, somewhere nobody is looking.
 $taskArgument = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$runner`" -LogDir `"$LogDir`" -Label `"$TaskName`""
 if ($Apply) { $taskArgument += ' -Apply' }
+if ($RemoveFinishedClaudeWorktrees) { $taskArgument += ' -RemoveFinishedClaudeWorktrees' }
 if ($PSBoundParameters.ContainsKey('IdleHours')) { $taskArgument += " -IdleHours $IdleHours" }
 
 $plan = [ordered]@{
     taskName   = $TaskName
     mode       = $mode
+    removeFinishedClaudeWorktrees = [bool]$RemoveFinishedClaudeWorktrees
     repoRoot   = $repoRoot
     runner     = $runner
     runnerExists = $runnerExists
@@ -173,7 +188,7 @@ $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimi
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 
-Write-Host "Registered '$TaskName': daily at $At, mode $mode."
+Write-Host "Registered '$TaskName': daily at $At, mode $mode, finished .claude/worktrees step $(if ($RemoveFinishedClaudeWorktrees) { 'ON' } else { 'off' })."
 Write-Host "  repo: $repoRoot"
 Write-Host "  runs: $runner"
 Write-Host "  logs: $LogDir"

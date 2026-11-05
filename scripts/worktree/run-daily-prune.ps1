@@ -16,16 +16,30 @@
     a single missing backtick silently freezes a value at install time. Ten lines of untestable logic in
     the one component whose job is deciding whether deletions happened is a bad trade at any size.
 
-    IT DOES NOT DECIDE ANYTHING. Every safety judgement stays in prune-merged.ps1: what is merged, what is
-    occupied, what is locked, what gets removed. This script starts that one, records what it said, and
-    passes its exit code back unchanged.
+    IT DOES NOT DECIDE ANYTHING ABOUT THE SIBLINGS. Every safety judgement on them stays in
+    prune-merged.ps1: what is merged, what is occupied, what is locked, what gets removed. This script
+    starts that one, records what it said, and passes its exit code back.
+
+    -RemoveFinishedClaudeWorktrees ADDS ONE OPT-IN STEP, and it is the only thing here that can touch
+    .claude/worktrees. prune-merged.ps1 still removes nothing there; it lists the trees there that look
+    finished, under REPORT-ONLY. After the prune run, this step runs prune-merged.ps1 AGAIN with -Json,
+    in the same invocation, and takes that fresh list -- never a table from an earlier run. It keeps the
+    rows under a `.claude/worktrees/` path segment and hands them to finished-worktree-removal.ps1, which
+    re-checks each one immediately before acting and removes it with a plain `git worktree remove`, never
+    with --force. That file's header lists the re-checks. Each removed or refused path is logged with its
+    reason, then a summary line with the counts and the drive's free space. A refusal is data, not a
+    failure, and leaves the exit code alone. Without -Apply the step only logs WOULD-REMOVE.
 
 .PARAMETER RepoRoot
     The primary checkout to prune. Defaults to the value the shared liveness fence calls the primary --
     the SAME source prune-merged.ps1 checks its own -RepoRoot against -- so the two can never disagree.
 
 .PARAMETER Apply
-    Forwarded to prune-merged.ps1. Omitted, the run is a dry run that removes nothing.
+    Forwarded to prune-merged.ps1. Omitted, the run is a dry run that removes nothing. It also arms the
+    -RemoveFinishedClaudeWorktrees step; without it, that step only reports.
+
+.PARAMETER RemoveFinishedClaudeWorktrees
+    Opt in to the .claude/worktrees step described above. Off by default.
 
 .PARAMETER KeepLogs
     How many dated logs to keep. Older ones are deleted after each run.
@@ -33,11 +47,14 @@
 .EXAMPLE
     pwsh -File scripts\worktree\run-daily-prune.ps1 -LogDir C:\logs            # dry run, logged
     pwsh -File scripts\worktree\run-daily-prune.ps1 -LogDir C:\logs -Apply     # actually prune
+    pwsh -File scripts\worktree\run-daily-prune.ps1 -LogDir C:\logs -RemoveFinishedClaudeWorktrees          # also list what it would remove
+    pwsh -File scripts\worktree\run-daily-prune.ps1 -LogDir C:\logs -Apply -RemoveFinishedClaudeWorktrees   # and remove it
 #>
 [CmdletBinding()]
 param(
     [string]$RepoRoot,
     [switch]$Apply,
+    [switch]$RemoveFinishedClaudeWorktrees,
     [double]$IdleHours,
     [Parameter(Mandatory)][string]$LogDir,
     [string]$Label = 'MEFOR-Worktree-Prune',
@@ -92,6 +109,75 @@ $log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
 & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $prune @pruneArgs *>&1 |
     Add-Content -LiteralPath $log
 $code = $LASTEXITCODE
+
+if ($RemoveFinishedClaudeWorktrees) {
+    . (Join-Path $PSScriptRoot 'finished-worktree-removal.ps1')
+    "--- finished .claude/worktrees: mode=$mode ---" | Add-Content -LiteralPath $log
+
+    # A FRESH list, from a second prune-merged.ps1 run in this invocation, after the prune above. Always
+    # a dry run (-Json without -Apply) and -SkipGh: the report-only set does not read merge signals.
+    $listArgs = @('-RepoRoot', $RepoRoot, '-Json', '-SkipGh')
+    if ($PSBoundParameters.ContainsKey('IdleHours')) { $listArgs += @('-IdleHours', $IdleHours) }
+    $raw = @(& (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $prune @listArgs 2>&1)
+    $listExit = $LASTEXITCODE
+    $stderrLines = @($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "  stderr: $_" })
+    if ($stderrLines.Count -gt 0) { $stderrLines | Add-Content -LiteralPath $log }
+    $listing = $null
+    try { $listing = (@($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n") | ConvertFrom-Json -ErrorAction Stop }
+    catch { "  could not parse the listing run's JSON (exit $listExit): $($_.Exception.Message)" | Add-Content -LiteralPath $log }
+
+    if ($null -eq $listing -or $null -eq $listing.fence -or $null -eq $listing.fence.idleHours) {
+        # Not a refusal of one tree but of the whole step: nothing could be established, so nothing was
+        # attempted -- which is exactly what prune-merged.ps1's exit 2 means.
+        "=== finished .claude/worktrees: SKIPPED, the finished list could not be read; nothing was attempted ===" | Add-Content -LiteralPath $log
+        $code = [math]::Max($code, 2)
+    }
+    else {
+        $finished = @($listing.reportOnly | Where-Object { $_.claudeManaged -eq $true })
+        $outside = @($listing.reportOnly).Count - $finished.Count
+        "  listed finished: $($finished.Count) under .claude/worktrees; $outside elsewhere, left alone; $($listing.counts.reportOnlyHeld) withheld by prune-merged.ps1 (listing exit $listExit)" |
+            Add-Content -LiteralPath $log
+
+        # Never the worktree this run executes from, nor the one the shell stands in. The scheduled task
+        # runs from the primary, which is refused anyway; a hand run from a worktree must not remove it.
+        $protect = @($PSScriptRoot, (Get-Location).Path) | ForEach-Object {
+            $top = & git -C $_ rev-parse --show-toplevel 2>$null
+            if ($LASTEXITCODE -eq 0 -and $top) { ([string]$top).Trim() }
+        }
+        # The helper returns each input path unchanged, so the raw path is the key.
+        $why = @{}
+        foreach ($f in $finished) { $why[$f.path] = $f }
+
+        $rows = @(Invoke-FinishedWorktreeRemoval -Primary $RepoRoot -Paths @($finished | ForEach-Object { $_.path }) `
+                -IdleHours ([double]$listing.fence.idleHours) -Protect $protect -Apply:$Apply)
+        $out = foreach ($r in $rows) {
+            $f = $why[$r.Path]
+            $detail = if ($r.Outcome -in 'REMOVED', 'WOULD-REMOVE') { "$($r.Reason) [$($f.branch)]; listed because: $($f.whyFinished)" } else { $r.Reason }
+            "  {0,-12} {1} -- {2}" -f $r.Outcome, $r.Path, $detail
+            if ($r.Outcome -eq 'WOULD-REMOVE') { "               would run: $($r.Command)" }
+        }
+        if ($out) { $out | Add-Content -LiteralPath $log }
+
+        $byOutcome = @{}
+        foreach ($r in $rows) { $byOutcome[$r.Outcome] = 1 + [int]$byOutcome[$r.Outcome] }
+        $n = { param($o) [int]$byOutcome[$o] }
+        $free = 'unknown'
+        try {
+            $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($RepoRoot))
+            $free = "{0:N1} GB free on {1}" -f ($drive.AvailableFreeSpace / 1GB), $drive.Name
+        }
+        catch [System.ArgumentException], [System.IO.IOException], [System.UnauthorizedAccessException] {
+            $free = "free space unreadable: $($_.Exception.Message)"
+        }
+        "=== finished .claude/worktrees: mode=$mode listed=$($finished.Count) removed=$(& $n 'REMOVED') wouldRemove=$(& $n 'WOULD-REMOVE') refused=$(& $n 'REFUSED') failed=$(& $n 'FAILED') orphaned=$(& $n 'ORPHANED'); $free ===" |
+            Add-Content -LiteralPath $log
+
+        # Refusals leave the code alone. A removal git reported and did not deliver is a failure, and a
+        # deregistered tree still on disk is an orphan -- the same severity order prune-merged.ps1 uses.
+        if ((& $n 'FAILED') -gt 0) { $code = [math]::Max($code, 1) }
+        if ((& $n 'ORPHANED') -gt 0) { $code = [math]::Max($code, 3) }
+    }
+}
 
 $meaning = if ($EXIT_MEANING.ContainsKey($code)) { $EXIT_MEANING[$code] } else { "UNKNOWN exit code $code" }
 "=== exit $code ($meaning) ===" | Add-Content -LiteralPath $log
