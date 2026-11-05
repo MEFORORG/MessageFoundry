@@ -982,6 +982,12 @@ DIRECTORY_ROLES_DEMOTED = "directory_roles_demoted"
 #: re-saving the map (BACKLOG #3082). Audited as :data:`DIRECTORY_ROLES_DEMOTED` is.
 DIRECTORY_ROLE_MAP_UNSEALED = "directory_role_map_unsealed"
 
+#: The outcome :meth:`AuthService._directory_roles_lost` gives, on every leg that calls it, an
+#: account whose stored channel scope its current groups would narrow (vault BACKLOG #3081 item
+#: 4); that method's docstring states the rule. Audited as :data:`DIRECTORY_ROLES_DEMOTED` is, and
+#: its fix is the same, a new sign-in, which writes the scope the groups grant now.
+DIRECTORY_SCOPE_NARROWED = "directory_scope_narrowed"
+
 
 class DirectoryRefusal(Enum):
     """Which fix clears a second-factor, enrolment or password re-bind leg's directory refusal,
@@ -1000,10 +1006,10 @@ class DirectoryRefusal(Enum):
 
 
 def _directory_refusal(outcome: str) -> DirectoryRefusal:
-    """The fix a ``_directory_step_up_refusal`` outcome needs: a lost role is a demotion, and every
-    other outcome, an outage or a role map that failed its seal included, is an account the
-    directory did not confirm."""
-    if outcome == DIRECTORY_ROLES_DEMOTED:
+    """The fix a ``_directory_step_up_refusal`` outcome needs: a lost role or a narrowed channel
+    scope is a demotion, which a new sign-in clears, and every other outcome, an outage or a role
+    map that failed its seal included, is an account the directory did not confirm."""
+    if outcome in (DIRECTORY_ROLES_DEMOTED, DIRECTORY_SCOPE_NARROWED):
         return DirectoryRefusal.DEMOTED
     return DirectoryRefusal.UNCONFIRMED
 
@@ -1085,6 +1091,12 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
         DIRECTORY_ROLES_DEMOTED: (
             "Your directory groups no longer grant the roles this session holds. Sign out, then"
             " sign in again to take the roles your groups grant now."
+        ),
+        # The same fix as a lost role: a new sign-in writes the scope the groups grant now (vault
+        # BACKLOG #3081 item 4).
+        DIRECTORY_SCOPE_NARROWED: (
+            "Your directory groups no longer grant the channels this session holds. Sign out, then"
+            " sign in again to take the channels your groups grant now."
         ),
         # Not a demotion: a new sign-in reads the same failing map, so it is never told to sign
         # out (BACKLOG #3082).
@@ -6775,7 +6787,7 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return await refuse("session_gone", lost=True)
-        refusal = await self._directory_roles_lost(fresh.role_ids, principal.groups)
+        refusal = await self._directory_roles_lost(fresh, principal.groups)
         if refusal is not None:
             return await refuse(refusal)
         purpose = flow.step_up_purpose
@@ -12302,7 +12314,7 @@ class AuthService:
             ):
                 refusal = DIRECTORY_IDENTITY_CONFLICT
             else:
-                refusal = await self._directory_roles_lost(current.role_ids, groups)
+                refusal = await self._directory_roles_lost(current, groups)
             if refusal is not None:
                 return _Reproof(ok=False, user=current, reason=refusal, directory_unconfirmed=True)
         if not clear:
@@ -14518,7 +14530,8 @@ class AuthService:
         row. The Windows SSO sign-in and the password step-up refuse the same row the same way.
         This leg used to ask an id-less row with no binding by its name.
 
-        **A present account that lost a role in the directory is refused too (BACKLOG #2240),** by
+        **A present account that lost a role in the directory is refused too (BACKLOG #2240), and so
+        is one whose channel scope its groups would narrow (vault BACKLOG #3081 item 4),** by
         :meth:`_directory_roles_lost`, whose docstring states the rule.
         """
         answer = await self._directory_presence(user)
@@ -14530,16 +14543,17 @@ class AuthService:
         fresh = await self._load_user(user.id)
         if fresh is None:
             return ACCOUNT_REFUSED
-        return await self._directory_roles_lost(fresh.role_ids, answer.groups)
+        return await self._directory_roles_lost(fresh, answer.groups)
 
-    async def _directory_roles_lost(
-        self, role_ids: Iterable[str], groups: Iterable[str]
-    ) -> str | None:
-        """Why a stored role in ``role_ids`` is not among the roles ``groups`` map to, or ``None``
-        when every one is: the demotion test the directory step-up and enrolment legs refuse on
-        (BACKLOG #2240, #2154, #3061, #3081), shared by every leg that refuses on it (BACKLOG #3081
-        item 6). This docstring is where the rule and its reasons live; a caller cites it rather
-        than restating it. An account with no roles has none to lose.
+    async def _directory_roles_lost(self, user: VerifiedUser, groups: Iterable[str]) -> str | None:
+        """Why the stored authority of directory account ``user`` exceeds what ``groups`` grant,
+        or ``None`` when it does not: the demotion test the directory step-up and enrolment legs
+        refuse on (BACKLOG #2240, #2154, #3061, #3081), shared by every leg that refuses on it
+        (BACKLOG #3081 item 6). This docstring is where the rule and its reasons live; a caller
+        cites it rather than restating it. ``user`` is the row the caller read after its directory
+        answer, through the loader, so what is judged is what the account's seal covers. An
+        account with no roles has none to lose, and the role map is not read for it (vault
+        BACKLOG #3081 item 7).
 
         Every stored role must be among the roles the account's current groups map to, the same
         pair the reconciler diffs. Without the test, an operator demoted in the directory since
@@ -14556,20 +14570,48 @@ class AuthService:
 
         Only a LOST role counts: an added role leaves the account holding fewer roles than the
         directory grants, not more. Roles are compared by id, not by permission, so a move from one
-        role to another counts even when the new role grants more. Channel scope is not compared.
-        At least three role decisions ask a different question and do not call this: sign-in and
-        the reconciler ask whether the roles CHANGED at all, because they re-sync or revoke, and
+        role to another counts even when the new role grants more. At least three role decisions
+        ask a different question and do not call this: sign-in and the reconciler ask whether the
+        roles CHANGED at all, because they re-sync or revoke, and
         :meth:`identity_for_cert_user_id` keeps the stored roles still mapped, because it narrows
-        rather than refuses."""
-        held = set(role_ids)
-        if not held:
+        rather than refuses.
+
+        **A narrowed channel scope refuses too (vault BACKLOG #3081 item 4),** as
+        :data:`DIRECTORY_SCOPE_NARROWED`, after the role test passes. The question is the
+        reconciler's scope re-diff (ADR 0198): would
+        :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope` take a channel away from
+        the stored scope? The reconciler revokes for exactly that, so without this test an account
+        whose directory groups lost a scope-mapped group would step up with the channels it no
+        longer holds until the next pass. An Administrator is not asked, because the role already
+        reaches every channel; the role it holds has passed the role test above, so the directory
+        grants it. A stored scope that grants nothing cannot narrow, so the scope map is not read
+        for it. A scope map that fails its seal maps no channel, as at sign-in and in the
+        reconciler, so a directory-set scope reads as withdrawn and refuses, while a scope an
+        administrator set is kept, as that rule keeps it. A new sign-in clears the refusal: it
+        writes the scope the groups grant now."""
+        held = set(user.role_ids)
+        if held:
+            role_map = await self._sealed_ad_map(AD_ROLE_MAP)
+            if role_map is None:
+                return DIRECTORY_ROLE_MAP_UNSEALED
+            if not held <= role_map.values_for(groups):
+                return DIRECTORY_ROLES_DEMOTED
+        # Compared with the empty set, not by truth: a wildcard grant reads as None, every channel,
+        # and can narrow.
+        if (
+            Role.ADMINISTRATOR.value in held
+            or channel_scope.scope_channels(user.channel_scope) == frozenset()
+        ):
             return None
-        role_map = await self._sealed_ad_map(AD_ROLE_MAP)
-        if role_map is None:
-            return DIRECTORY_ROLE_MAP_UNSEALED
-        if not held <= role_map.values_for(groups):
-            return DIRECTORY_ROLES_DEMOTED
-        return None
+        decision = channel_scope.decide_ad_channel_scope(
+            channel_scope.ScopeInput(
+                stored_scope=user.channel_scope,
+                stored_source=user.channel_scope_source,
+                mapped=await self._ad_channels_for_groups(groups),
+                administrator=False,
+            )
+        )
+        return DIRECTORY_SCOPE_NARROWED if decision.narrows else None
 
     async def _directory_presence(self, user: UserRecord) -> reconcile.Probe | str:
         """Ask the directory whether AD row ``user`` is a present, enabled account. Returns the

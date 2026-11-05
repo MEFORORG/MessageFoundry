@@ -3401,8 +3401,14 @@ more. A lookup whose groups map to no role refuses every directory account that 
 refusal writes no roles; the next reconciliation pass, when it runs, or the next sign-in re-syncs
 them. It is audited as `directory_roles_demoted`: as the `outcome` beside
 `reason=directory_unconfirmed` on the code, passkey and enrolment legs, which otherwise behave as
-the refusals above, and as the `auth.reauth` row's `reason` on the IdP and re-bind legs. Channel
-scope is not compared on any of these legs. When the AD group-to-role map fails its seal, no role
+the refusals above, and as the `auth.reauth` row's `reason` on the IdP and re-bind legs. Once the
+roles pass, each of these legs also refuses an account whose channel scope the groups would narrow,
+as `directory_scope_narrowed`, audited the same way (vault BACKLOG #3081 item 4). The question is
+the reconciliation pass's scope re-diff, which revokes for exactly that. An Administrator is not
+asked, and neither is a stored scope that grants nothing. A scope map that fails its seal maps no
+channel, as at sign-in, so a directory-set scope refuses and a scope an administrator set does not.
+Its fix is a demotion's: a new sign-in writes the scope the groups grant now. When the AD
+group-to-role map fails its seal, no role
 can be judged, so each of these legs refuses an account that holds a role with
 `directory_role_map_unsealed` instead, whether or not a role was lost, and an account with no role
 passes. That is not a demotion: nothing changed in the directory, a new sign-in reads the same
