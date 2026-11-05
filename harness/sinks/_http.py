@@ -12,8 +12,9 @@ the sink answered, the ``peer``, and every request header as ``header:<lower-cas
 values of at least the headers in :data:`REDACTED_HEADERS` are recorded as ``<redacted>``. That
 is not every place a credential can travel: a SOAP ``ws_security`` password or a ``body_secrets``
 value is in the BODY, and ``dynamic_headers`` can put one under any name, so point a sink only at
-an outbound carrying test credentials. Nothing is logged: the stdlib server's per-request line is
-silenced, and a handler error is logged at DEBUG without the request.
+an outbound carrying test credentials. No request is logged: the stdlib server's per-request line
+is silenced, and a handler error is logged at DEBUG without the request. The one other log line
+is the self-test's refusal, below, at ERROR; it names cases and headers, never a request.
 
 ``status`` picks the answer, and can be changed between runs: a 2xx is a delivery, a 5xx drives
 the outbound's retry and then dead-letter path, a 4xx its permanent-rejection path. The sink reads
@@ -44,16 +45,18 @@ ruling R1 of the vault's ``ASVS-OWNER-RULINGS-2026-10-23-BATCH340``). The projec
 bare between patch releases. So :meth:`HttpSink.start` first runs :func:`self_test`, which serves
 each request in :data:`SELF_TEST_CASES` on a throwaway loopback server built from this module's
 handler, on the running Python, and reads the bytes back. If any final answer lacks a
-:data:`BASELINE_RESPONSE_HEADERS` line, carries one twice, or names no ``frame-ancestors 'none'``
-policy, it logs at ERROR and raises :class:`SinkSelfTestError` before the sink's own port is
-bound. An answer family a later Python adds that the table does not name stays uncovered; R1
-accepts that as a residual.
+:data:`BASELINE_RESPONSE_HEADERS` line, carries one twice, names no ``frame-ancestors 'none'``
+policy, or carries a ``Server`` or HSTS line, or if an answer cannot be read at all, it logs at
+ERROR and raises :class:`SinkSelfTestError` before the sink's own port is bound. An answer
+family a later Python adds that the table does not name stays uncovered; R1 accepts that as a
+residual.
 """
 
 from __future__ import annotations
 
 import http.client
 import logging
+import re
 import socket
 import socketserver
 import sys
@@ -121,8 +124,11 @@ def check_status(status: int) -> None:
         raise ValueError(f"status must be a final HTTP status (200-599), got {status}")
 
 
-class SinkSelfTestError(RuntimeError):
-    """The sink's answers on this Python lack the baseline headers, so the sink will not start."""
+class SinkSelfTestError(OSError):
+    """The sink's answers on this Python lack the baseline headers, so the sink will not start.
+
+    An ``OSError``, as a port that will not bind is: a setup failure, not a verdict on the engine,
+    so the harness CLI's ``--scenario`` reports it as SETUP (exit 2), not FAIL."""
 
 
 @dataclass(frozen=True)
@@ -212,15 +218,25 @@ SELF_TEST_CASES: tuple[SelfTestCase, ...] = (
     SelfTestCase("http-0.9-two-word-not-get", b"POST /x\r\n", (400,)),
 )
 
-#: How long the self-test's stalled-body probe waits for the body it was promised. Its bytes are
-#: queued before the probe's handler reads, so a short wait still ends on the missing body.
+#: How long the self-test's stalled-body probe waits for the body it was promised. It is set on
+#: the connection just before the body read, so the request line and headers still get
+#: :data:`_SELF_TEST_READ_SECONDS`: a late send cannot turn the 408 into no answer at all.
 _SELF_TEST_STALL_SECONDS = 0.1
+#: Every other read and write a probe makes, at both ends. A constant of its own, not
+#: :data:`READ_TIMEOUT_SECONDS`, which a caller may shorten to test the real sink.
+_SELF_TEST_READ_SECONDS = 5.0
+
+#: CSP splits on ASCII whitespace only; ``str.split()`` would also split on U+00A0 and the like,
+#: which a browser reads as part of a token.
+_CSP_WHITESPACE = re.compile(r"[\t\n\f\r ]+")
+#: HTTP optional whitespace around a field value.
+_OWS = " \t"
 
 
 def _exchange(port: int, request: bytes, *, half_close: bool) -> bytes:
     """Send raw bytes to a loopback port and read until the server closes. ``half_close`` tells
     the server no more is coming, so a refusal that discards the rest ends at once."""
-    with socket.create_connection((LOOPBACK, port), READ_TIMEOUT_SECONDS) as conn:
+    with socket.create_connection((LOOPBACK, port), _SELF_TEST_READ_SECONDS) as conn:
         conn.sendall(request)
         if half_close:
             conn.shutdown(socket.SHUT_WR)
@@ -241,7 +257,7 @@ def _csp_denies_framing(value: str) -> bool:
     directive, not by substring: a substring would match the token inside another directive's
     value, and directive names are case-insensitive."""
     for directive in value.split(";"):
-        tokens = directive.split()
+        tokens = [token for token in _CSP_WHITESPACE.split(directive) if token]
         if tokens and tokens[0].lower() == "frame-ancestors":
             # Only a policy's first frame-ancestors directive counts; a repeat is ignored.
             return [source.lower() for source in tokens[1:]] == ["'none'"]
@@ -249,11 +265,11 @@ def _csp_denies_framing(value: str) -> bool:
 
 
 def _floor_faults(raw: bytes) -> list[str]:
-    """What the final answer in ``raw`` lacks, as sentences; empty when it carries the floor.
-    An interim 1xx is not checked: R3 in the vault's ASVS-OWNER-RULINGS-2026-09-28-BATCH171 puts
-    it outside the verb."""
+    """What is wrong with the final answer in ``raw``, as sentences; empty when it carries the
+    floor. An interim 1xx is not checked: R3 in the vault's ASVS-OWNER-RULINGS-2026-09-28-BATCH171
+    puts it outside the verb."""
     if not raw:
-        return ["nothing was answered"]
+        return ["nothing was answered, so its headers could not be read"]
     rest = raw
     while rest.startswith(b"HTTP/"):
         head, _, rest = rest.partition(b"\r\n\r\n")
@@ -264,7 +280,7 @@ def _floor_faults(raw: bytes) -> list[str]:
         fields: dict[str, list[str]] = {}
         for line in lines:
             name, _, value = line.partition(":")
-            fields.setdefault(name.strip().lower(), []).append(value.strip())
+            fields.setdefault(name.strip(_OWS).lower(), []).append(value.strip(_OWS))
         faults = [
             f"the {status} lacks {name}: {value!r} once (it carries {fields.get(name.lower(), [])})"
             for name, value in BASELINE_RESPONSE_HEADERS
@@ -272,16 +288,24 @@ def _floor_faults(raw: bytes) -> list[str]:
         ]
         if not any(map(_csp_denies_framing, fields.get("content-security-policy", []))):
             faults.append(f"the {status} names no frame-ancestors 'none' policy")
+        # What the header suite refuses too: the stdlib's Server line names the Python patch
+        # level, and HSTS has no place on a cleartext loopback answer.
+        faults.extend(
+            f"the {status} carries {name}"
+            for name in ("server", "strict-transport-security")
+            if name in fields
+        )
         return faults
     return ["the answer has no final status line and header block (HTTP/0.9 form)"]
 
 
 def _probe(case: SelfTestCase) -> list[str]:
     """Serve ``case`` on a throwaway loopback server built from this module's handler, and return
-    what its answer lacks. The probe's sink is never started, and its record is discarded."""
+    what is wrong with its answer. The probe's sink is never started; its record is discarded."""
     handler = _handler_for(
         HttpSink(status=case.sink_status, reply_body=b'{"ok":1}'),
-        read_timeout=_SELF_TEST_STALL_SECONDS if case.stalls else None,
+        read_timeout=_SELF_TEST_READ_SECONDS,
+        body_timeout=_SELF_TEST_STALL_SECONDS if case.stalls else None,
     )
     # A short poll: every sink start waits for these probes to stop.
     server, thread = _listen(
@@ -290,7 +314,7 @@ def _probe(case: SelfTestCase) -> list[str]:
     try:
         raw = _exchange(int(server.server_address[1]), case.request, half_close=not case.stalls)
     except OSError as exc:
-        return [f"the probe could not read an answer: {exc!r}"]
+        return [f"the probe could not read an answer, so its headers are unknown: {exc!r}"]
     finally:
         _shut(server, thread)
     return _floor_faults(raw)
@@ -311,8 +335,8 @@ def self_test() -> None:
     if failed:
         message = (
             f"the harness HTTP sink will not start: on Python {sys.version.split()[0]}, "
-            f"{len(failed)} answer fault(s) leave the baseline security headers off: "
-            + "; ".join(failed)
+            f"{len(failed)} answer fault(s) mean it cannot show every answer carries the "
+            "baseline security headers: " + "; ".join(failed)
         )
         _log.error("%s", message)
         raise SinkSelfTestError(message)
@@ -417,7 +441,11 @@ def _listen(
         daemon=True,
         name=name,
     )
-    thread.start()
+    try:
+        thread.start()
+    except BaseException:
+        server.server_close()  # bound and listening, and nothing else would ever close it
+        raise
     return server, thread
 
 
@@ -429,10 +457,11 @@ def _shut(server: ThreadingHTTPServer, thread: threading.Thread | None) -> None:
 
 
 def _handler_for(
-    sink: HttpSink, *, read_timeout: float | None = None
+    sink: HttpSink, *, read_timeout: float | None = None, body_timeout: float | None = None
 ) -> type[BaseHTTPRequestHandler]:
-    """The handler class for ``sink``. ``read_timeout`` replaces :data:`READ_TIMEOUT_SECONDS`
-    for one socket read; only the self-test's stalled-body probe sets it."""
+    """The handler class for ``sink``. ``read_timeout`` replaces :data:`READ_TIMEOUT_SECONDS` as
+    the timeout on every read and write of a connection. ``body_timeout``, when set, replaces it
+    from the body read on. Only the self-test's probes set either."""
 
     class Handler(BaseHTTPRequestHandler):
         # Answer with HTTP/1.1 framing but close each connection: the engine's urllib opener sends
@@ -544,6 +573,8 @@ def _handler_for(
             if length > DEFAULT_MAX_MESSAGE_BYTES:
                 return 413, b"", "over the per-message cap; not read", min(length, _DRAIN_LIMIT)
             try:
+                if body_timeout is not None:
+                    self.connection.settimeout(body_timeout)
                 body = self.rfile.read(length)
             except OSError:  # TimeoutError included: the peer stalled mid-body
                 return 408, b"", "the declared body did not arrive", 0

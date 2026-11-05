@@ -30,6 +30,7 @@ import logging
 import platform
 import socket
 import threading
+import time
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -119,8 +120,9 @@ def _is_bare(raw: bytes) -> bool:
 
 
 #: The answer families, from the sink's own table: the self-test the sink runs before every start
-#: drives the same list on the running Python (BACKLOG #1121). This suite drives it with its own
-#: socket code and its own parser, so the two instruments can disagree.
+#: drives the same list on the running Python (BACKLOG #1121). This suite reads the answers with
+#: its own parser and its own assertions, so the two header verdicts are reached separately. The
+#: socket loop that fetches the bytes is the same in both, so a fault there is shared.
 _CASES: list[Any] = [
     pytest.param(case.sink_status, case.request, list(case.statuses), id=case.name)
     for case in http_sink.SELF_TEST_CASES
@@ -378,9 +380,10 @@ def test_the_body_and_the_record_are_unchanged() -> None:
 # --- the self-test the sink runs before it starts (BACKLOG #1121, owner ruling R1) ----------------
 
 
-def test_the_case_table_names_every_answer_family() -> None:
+def test_the_case_table_pins_the_answer_families_driven_today() -> None:
     """The self-test drives exactly this table, so a case dropped from it would leave that answer
-    family unchecked on a new Python. This pin is where a drop turns red."""
+    family unchecked on a new Python. This pin is where a drop turns red. It is not a claim that
+    the table is complete: a family a later stdlib adds is not in it until someone adds it."""
     assert [case.name for case in http_sink.SELF_TEST_CASES] == [
         "200",
         "configured-400",
@@ -443,6 +446,9 @@ def _refusal(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) 
     assert names and set(names) == {"harness-http-sink-self-test"}, names
     assert sink._server is None and sink.port == 0
     assert [record.getMessage() for record in caplog.records] == [str(refused.value)]
+    # A setup failure, as a port that will not bind is: the harness CLI reports an OSError as
+    # SETUP (exit 2), not as a FAIL verdict on the engine.
+    assert isinstance(refused.value, OSError)
     return str(refused.value)
 
 
@@ -469,18 +475,39 @@ def test_a_sink_that_strips_a_baseline_header_refuses_to_start(
         assert "names no frame-ancestors 'none' policy" in message
 
 
-@pytest.mark.parametrize("override", ["end_headers", "request_version"])
+@pytest.mark.parametrize("override", ["end_headers", "request_version", "send_header"])
 def test_a_sink_missing_an_override_refuses_to_start(
     override: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Without end_headers no answer carries the baseline. Without request_version the stdlib's
     HTTP/0.9-form answers have nowhere to carry it: at least the cases every CPython read so far
-    answers bare (``_BARE_ON_EVERY_PYTHON_READ``) are refused."""
+    answers bare (``_BARE_ON_EVERY_PYTHON_READ``) are refused. Without the send_header filter the
+    stdlib's Server line, naming the Python patch level, reaches every answer."""
     _change_handler(monkeypatch, lambda handler: delattr(handler, override))
     message = _refusal(monkeypatch, caplog)
     if override == "request_version":
         for case_id in _BARE_ON_EVERY_PYTHON_READ:
             assert f"{case_id}: the answer has no final status line" in message, message
+    if override == "send_header":
+        assert "200: the 200 carries server" in message, message
+        assert "lacks " not in message, message
+
+
+def test_a_late_send_still_gets_the_stalled_probe_its_408(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stalled-body probe's short wait covers the body read only. A request that reaches the
+    probe's handler later than that wait still gets its 408, rather than no answer, which would
+    refuse the start for a reason that has nothing to do with headers."""
+    (stalled,) = [case for case in http_sink.SELF_TEST_CASES if case.stalls]
+    late = http_sink._SELF_TEST_STALL_SECONDS * 3
+
+    def _late_exchange(port: int, request: bytes, *, half_close: bool) -> bytes:
+        with socket.create_connection(("127.0.0.1", port), 5.0) as conn:
+            time.sleep(late)
+            conn.sendall(request)
+            return b"".join(iter(lambda: conn.recv(65536), b""))
+
+    monkeypatch.setattr(http_sink, "_exchange", _late_exchange)
+    assert http_sink._probe(stalled) == []
 
 
 def test_a_baseline_whose_policy_allows_framing_refuses_to_start(
@@ -508,6 +535,9 @@ def test_a_baseline_whose_policy_allows_framing_refuses_to_start(
         ("frame-ancestors 'self'; frame-ancestors 'none'", False),
         ("default-src 'none'", False),
         ("report-uri /frame-ancestors 'none'", False),
+        # A no-break space is not CSP whitespace: a browser reads one unknown directive here.
+        ("frame-ancestors\xa0'none'", False),
+        ("frame-ancestors\t'none'", True),
         ("", False),
     ],
 )
