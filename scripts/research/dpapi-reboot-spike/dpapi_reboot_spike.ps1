@@ -159,9 +159,8 @@
   bound to it both ways: the service cannot open the administrator's blob, nor the administrator
   the service's (-2146893813 is 0x8009000B, NTE_BAD_KEY_STATE). It survives a restart. The virtual
   account's profile is under C:\Windows\ServiceProfiles and stayed loaded for those 300 s, so on
-  this build no profile reload without a reboot was observed; the reboot (A4) is the first profile
-  reload this can observe. The reboot arms are the owner command above, -Mode Host, recorded in
-  the next block.
+  this build no profile reload without a reboot was observed. The reboot arms are the owner
+  command above, -Mode Host, recorded in the next block.
 
   RESULTS, THE REBOOT ARMS (-Mode Host). The owner ran the owner command above on MEFORHV01 on
   2026-11-05 (UTC), the code at commit 47039223ae5ccd12072b7b0ae07770e9341a19da, on REVTEST01
@@ -186,11 +185,9 @@
   the reboot for both. A3 reads INCONCLUSIVE: the profile was not seen unloaded before its
   start. The administrator's crosscheck was refused with the key-state code, -2146893813.
   What is left open, at least. These lines do not name the guest's OS. The pre-reboot runs on
-  the same checkpoint name read Windows Server 2022, build 20348; by that reading this answers
-  the question on Server 2022, not on Server 2025. A3, a profile unload without a reboot, stays
-  unmeasured. A reboot reloads the profile, so A4 and A5 ran after a profile reload by that
-  reasoning, not by a reading: no step reads the profile at A4 or A5. Nothing here shows the
-  blob opening after an unload alone.
+  the same checkpoint name read Windows Server 2022, build 20348. A3, a profile unload without a
+  reboot, stays unmeasured. Nothing here shows the blob opening after an unload alone. The run is
+  a single Host run. Whether the reboot minted a new DPAPI master key is not read here.
 #>
 [CmdletBinding()]
 param(
