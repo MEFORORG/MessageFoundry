@@ -14171,6 +14171,18 @@ class AuthService:
         )
         return True
 
+    def _mfa_floor_holds(self, session: SessionRecord, now: float) -> bool:
+        """Whether the login-to-MFA floor still holds ``session`` at ``now``: the floor is on, the
+        session's factor is not yet stamped, and less than ``[auth].mfa_verify_min_elapsed_seconds``
+        has passed since its mint, which is the sign-in (BACKLOG #2301).
+
+        The one statement of that rule, read by :meth:`_second_factor_too_early` and
+        :meth:`_enrolment_too_early` alike (BACKLOG #3194), so the verify legs and the enrolment
+        legs cannot drift apart on it. An enrolment adds its own test on top: whether the account
+        owes a factor at all."""
+        floor = self._settings.mfa_verify_min_elapsed_seconds
+        return floor > 0 and session.mfa_verified_at is None and now - session.created_at < floor
+
     async def _second_factor_too_early(
         self,
         session: SessionRecord,
@@ -14197,11 +14209,9 @@ class AuthService:
         ENROLLED factor, and through :meth:`_enrolment_too_early` by the two enrolment legs,
         :meth:`confirm_mfa_enrollment` and :meth:`finish_webauthn_registration`, which can also
         satisfy a pending session (BACKLOG #2389). A new leg that can satisfy a pending session
-        calls one of the two."""
-        floor = self._settings.mfa_verify_min_elapsed_seconds
-        if floor <= 0 or session.mfa_verified_at is not None:
-            return False
-        if now - session.created_at >= floor:
+        calls one of the two. ``tests/test_second_step_time_floors.py`` reads this module's syntax
+        tree and fails on a function that stamps a session's factor without calling either first."""
+        if not self._mfa_floor_holds(session, now):
             return False
         # An enrolment leg names its phase, as its own wrong-code row does, so an investigator can
         # tell someone binding a NEW authenticator from someone proving an enrolled one.
@@ -14239,13 +14249,12 @@ class AuthService:
         ``[auth].require_action_step_up``, the route in front of ``POST /me/mfa/confirm`` has
         already spent its single-use password step-up, exactly as it has for a wrong code, so a
         refusal there costs the person one password re-proof."""
-        floor = self._settings.mfa_verify_min_elapsed_seconds
-        if floor <= 0:
+        # The floor's own off switch, read first only to spare the session read; the rule itself
+        # is :meth:`_mfa_floor_holds`, which the verify legs read too (BACKLOG #3194).
+        if self._settings.mfa_verify_min_elapsed_seconds <= 0:
             return False
         session = await self._load_session(hash_token(token))
-        if session is None or session.mfa_verified_at is not None:
-            return False
-        if now - session.created_at >= floor:
+        if session is None or not self._mfa_floor_holds(session, now):
             return False
         if not await self._unverified_session_owes_factor(user):
             return False
