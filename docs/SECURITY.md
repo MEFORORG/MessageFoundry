@@ -5304,10 +5304,13 @@ who holds no audit key cannot silence the alert with a forged row. That method n
 residuals, at least a holder of the active audit key and a writer who lowers the watermark close
 to a genuine revocation of the same account. On a keyless audit chain no repeat is quiet.
 Any other revocation that ends nothing and changes no role, such as a scope, role, undetermined or
-unkeyed one, is quiet too. Two reconcilers that both read the old roles, or both read before either
-writes its row, both report. If the first reconciler's pass ended before it alerted, the second's
-quiet revocation means that account pages nobody. A quiet revocation whose own row is refused
-alerts instead, with no notice.
+unkeyed one, is quiet too. Two reconcilers that both read the audit chain before either writes its
+row both report. Two that both read the old roles do not, because the role write is a
+compare-and-set on the roles it writes (vault BACKLOG #3085): only the first counts the change, and
+the second, ending no session, is quiet. The second still reports when it ends a session the first
+had not yet ended; `AuthService._apply_reconcile_revocation` names that residual. If the first
+reconciler's pass ended before it alerted, the second's quiet revocation means that account pages
+nobody. A quiet revocation whose own row is refused alerts instead, with no notice.
 
 A pass that fails part-way keeps the audit rows for what it already revoked, but raises no alert for
 them. A refused audit write does not end the pass (BACKLOG #3018). That holds for the store errors

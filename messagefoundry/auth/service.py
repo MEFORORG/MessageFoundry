@@ -9880,7 +9880,14 @@ class AuthService:
         So a disabled or absent account's revocation reports even when it ended nothing, as when
         the user signed out mid-pass, unless :meth:`_already_revoked_elsewhere` finds a verified
         row showing another pass already revoked it (owner ruling B258-R7). That method states the
-        rule."""
+        rule.
+
+        A role change counts only when THIS call's write made it: the write is a compare-and-set
+        (vault BACKLOG #3085), so of two reconcilers that both read the old roles only the first
+        counts it, and the second, ending no session, is quiet. **Residual, at least:** the second
+        can still end a session the first had not yet ended, when its whole apply runs between the
+        first's role write and the first's own session revocation. Both then report, the first
+        for the roles and the second for the session."""
         user = await self._load_user(revocation.user_id)
         if revocation.reason == reconcile.SCOPE_CHANGED and (
             user is None or user.channel_scope != revocation.scope_from
@@ -9898,33 +9905,42 @@ class AuthService:
         # No role write for an account that is gone or fails its seal (BACKLOG #2592): the store would
         # refuse it, and ending the sessions below needs no write to the account. None either when
         # the stored roles already match, as they do once another reconciler wrote them (BACKLOG
-        # #3085). Read before the write, so two reconcilers that both read the old roles before
-        # either wrote both count it as a change, and both report.
+        # #3085). That read is a cheap skip, not the decision: two reconcilers can both read the
+        # old roles before either writes. The write is a compare-and-set on the roles it carries,
+        # so only the first of them writes and counts a change; the second finds the roles already
+        # written and counts none, as if it had read them so (vault BACKLOG #3085).
         roles_changed = False
         if (
             revocation.role_ids is not None
             and user is not None
             and set(user.role_ids) != set(revocation.role_ids)
         ):
-            roles_changed = True
-            await self._store.set_user_roles(
+            replaced = await self._store.set_user_roles_unless_held(
                 revocation.user_id, list(revocation.role_ids), assigned_by="ad-reconcile"
             )
-            # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a demotion of
-            # the last enabled Administrator is applied, never refused. It alerts and audits
-            # instead, right after the write, so no later step's failure can skip it. The ruling
-            # accepts the cost, noted with vault BACKLOG #2711.
-            # `user` was read through its seal at the top of this method, not taken from the plan,
-            # whose roles can be a pass old: the report judges what THIS write took away.
-            await self._report_directory_admin_loss(
-                user, before=user.role_ids, after=revocation.role_ids, via="ad-reconcile"
-            )
-            # Vault BACKLOG #3141. The gain side, from the same sealed read and at the same point,
-            # so a later step's failure cannot lose the page. The next sign-in finds the role
-            # already written and gains nothing, so this pass is the only chance to raise it.
-            self._report_directory_admin_grant(
-                user, before=user.role_ids, after=revocation.role_ids
-            )
+            if replaced is None:
+                # Another writer, most likely a second reconciler, wrote these roles after the read
+                # above, or the row went. That writer owns the change and its report.
+                _log.info(
+                    "directory reconcile: the roles of %s were already written by another writer, "
+                    "so this revocation changed no role (BACKLOG #3085)",
+                    scrub_log_argument(revocation.username),
+                )
+            else:
+                roles_changed = True
+                # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a
+                # demotion of the last enabled Administrator is applied, never refused. It alerts
+                # and audits instead, right after the write, so no later step's failure can skip
+                # it. The ruling accepts the cost, noted with vault BACKLOG #2711.
+                # ``replaced`` is what the write itself read, through the seal, not the plan's
+                # roles, which can be a pass old: the report judges what THIS write took away.
+                await self._report_directory_admin_loss(
+                    user, before=replaced, after=revocation.role_ids, via="ad-reconcile"
+                )
+                # Vault BACKLOG #3141. The gain side, from the same read and at the same point, so
+                # a later step's failure cannot lose the page. The next sign-in finds the role
+                # already written and gains nothing, so this pass is the only chance to raise it.
+                self._report_directory_admin_grant(user, before=replaced, after=revocation.role_ids)
         revoked = (await self._store.revoke_user_sessions(revocation.user_id)).count
         # Owner ruling 2026-10-17 narrows "audit always": a disabled or absent account whose
         # revocation ended nothing still reports, unless a verified row shows another pass revoked

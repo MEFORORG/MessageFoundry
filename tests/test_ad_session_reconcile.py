@@ -6029,6 +6029,65 @@ async def test_a_role_revocation_another_reconciler_applied_first_is_quiet() -> 
         await store.close()
 
 
+async def test_two_reconcilers_that_both_read_the_old_roles_report_the_change_once() -> None:
+    """Vault BACKLOG #3085, the role-half race. Two applies of one role revocation both read the
+    old roles before either writes. Only the first write counts the change: one apply reports and
+    tells the user, the other is quiet, and both still write their row ("audit always").
+
+    **The barrier is what makes this the race.** Without it ``asyncio.gather`` can run one apply
+    to its write before the other reads, and the second would read the new roles and skip, which
+    passed before the compare-and-set too. Neither apply may go past its first read of the account
+    until both have made it. The sessions are ended first, so neither apply's session count can
+    decide its report: only the role write can."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        await store.revoke_user_sessions(user.id)
+        target = () if await store.get_user_role_ids(user.id) else (Role.OPERATOR.value,)
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=target
+        )
+        barrier = asyncio.Barrier(2)
+        reads = 0
+        load_user = service._load_user
+
+        async def _read_then_wait(user_id: str) -> VerifiedUser | None:
+            nonlocal reads
+            row = await load_user(user_id)
+            reads += 1
+            if reads <= 2:
+                await barrier.wait()
+            return row
+
+        service._load_user = _read_then_wait  # type: ignore[method-assign]
+        writes: list[tuple[str, ...] | None] = []
+        write = store.set_user_roles_unless_held
+
+        async def _count_write(*a: Any, **kw: Any) -> tuple[str, ...] | None:
+            replaced = await write(*a, **kw)
+            writes.append(replaced)
+            return replaced
+
+        store.set_user_roles_unless_held = _count_write  # type: ignore[method-assign]
+        watermark = await service._audit_watermark()
+        async with asyncio.timeout(10):
+            outcomes = await asyncio.gather(
+                service._apply_reconcile_revocation(revocation, watermark=watermark),
+                service._apply_reconcile_revocation(revocation, watermark=watermark),
+            )
+
+        assert len(writes) == 2, "both applies must reach the write, or this is not the race"
+        assert sorted(outcomes) == ["quiet", "reported"], outcomes
+        assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
+        assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0, 0]
+        assert sorted(await store.get_user_role_ids(user.id)) == sorted(target)
+    finally:
+        await store.close()
+
+
 async def test_a_role_change_that_ends_no_session_still_reports() -> None:
     """The control on the quiet case: a revocation that ends no session but does change the roles
     still alerts and still tells the user, because something did happen to the account."""
