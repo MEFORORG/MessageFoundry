@@ -193,7 +193,8 @@ _PACKAGE_SID_PREFIX = "S-1-15-"
 def _is_package_sid(sid: str) -> bool:
     """Whether ``sid`` names an AppContainer package or capability. A package runs under the
     account that starts it, so a read grant to one would let a confined worker read a key file
-    (vault BACKLOG #3411; the key custody ADR draft, rule 3). Refused on the create side only."""
+    (vault BACKLOG #3411; the key custody ADR draft, rule 3). Refused as a grant when a file is
+    created, and reported by the check before a key file is used, like a broad group."""
     return sid.upper().startswith(_PACKAGE_SID_PREFIX)
 
 
@@ -219,6 +220,8 @@ def _windows_access_problem(security: _WinPathSecurity, mask: int = _REACH_MASK)
             return "its access list holds a conditional entry this check cannot interpret"
         if ace_mask & mask and _is_broad_group(sid):
             return f"{describe_sid(sid)} can read or change it"
+        if ace_mask & mask and _is_package_sid(sid):
+            return f"the application package {sid} can read or change it"
     return None
 
 
@@ -242,8 +245,9 @@ def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
     Windows: an allow entry that lets a known broad group read the file, change it, or take it
     over. The groups are at least Everyone, Authenticated Users and the local Users group; the
     whole list is :func:`_is_broad_group`, and it is a list of known groups, not a proof that only
-    the intended accounts can reach the file. POSIX: a group or other read or write bit. A file
-    whose access cannot be read is reported as a problem, and so is, on Windows, a path that is
+    the intended accounts can reach the file. An application package or capability SID
+    (:func:`_is_package_sid`) is reported the same way. POSIX: a group or other read or write bit.
+    A file whose access cannot be read is reported as a problem, and so is, on Windows, a path that is
     itself a link, because a link carries its own access list and the file behind it was not read.
 
     The answer names accounts and modes only, never the path or the file's contents."""

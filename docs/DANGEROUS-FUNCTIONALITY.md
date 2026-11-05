@@ -57,7 +57,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
 | 4 | Starting processes | 13 modules | Varies, see below |
-| 5 | Calling native libraries | 21 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 22 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -459,7 +459,7 @@ reach one:
 
 ## 5. Native library calls
 
-21 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+22 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
@@ -476,6 +476,11 @@ pure-Python equivalent:
   the call that creates it and an existing file or link is refused. It asks `advapi32` to build
   that list and to resolve an account name to its SID. POSIX needs no `ctypes` for this; it
   creates the file with `O_CREAT | O_EXCL` and mode `0o600`
+- Key custody file reads: `store/custody.py`, which on Windows opens a host or handoff key file with
+  `kernel32`'s `CreateFileW`, `FILE_FLAG_OPEN_REPARSE_POINT` and a share mode that admits only other
+  readers, so a link is opened as itself and the name cannot be replaced while its access list is
+  read (vault BACKLOG #3411). POSIX needs no `ctypes` for this; it opens the file with `O_NOFOLLOW`
+  and reads its mode and owner from the open descriptor
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
@@ -677,9 +682,9 @@ The scan leaves some parsing out on purpose, and it has limits:
 
 | Why it is left out | Modules |
 |---|---|
-| It reads rows or files the engine wrote itself: its store, the key custody host blob and recovery wrap, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/custody.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
+| It reads rows or files the engine wrote itself: its store, the key custody host blob and the recovery wrap kept in its store (no command reads a wrap from an archive yet), audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/custody.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py`, `api/protocol_floor_selftest.py` |
-| It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
+| It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file, the trust anchor files it chooses to trust, a systemd credential and a recovery key a person types | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py`, `store/custody.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
 | It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py` |
 | It reads a URL an operator configures, never a received body: an outbound's or a `FhirLookup`'s `url` setting, the value its `env()` reference resolves to, and, for the settings views, any URL-named setting such as `proxy_url` and an `env()` default. It splits the query string with `urllib.parse` to name the parameters that look like credentials. At least the ASVS 14.2.1 warning and loosening entry, the `verify_tls = false` credential refusal (vault BACKLOG #3230) and the off-box cleartext credential refusal (vault BACKLOG #3533) use those names. For the settings views it also splits the whole URL by hand, with one regular expression, at every `?`, `&`, `#` and `;`, and percent-decodes each segment's name; a URL it finds a credential name in is withheld whole. It runs at least when a `Rest`, `Soap`, `FHIR`, `DICOMweb` or `FhirLookup` connection is built, in `messagefoundry check`, on `GET /security/posture` on a running engine and on each settings view (`GET /metadata`, `graph --json`). The warning, the reports and the views put no bound on the URL's length, because the operator wrote it. Some refusals read it only after `enforce_outbound_length_limits` has refused one over `MAX_OUTBOUND_URL_LEN`, and some before, at least a `FhirLookup`'s off-box cleartext refusal. It returns parameter names, never values, and returns nothing rather than raising on a URL it cannot parse. | `secretscrub.py` |

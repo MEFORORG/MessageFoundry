@@ -86,6 +86,15 @@ def test_recovery_key_text_round_trips_and_is_grouped() -> None:
     loose = " ".join(groups).lower()
     assert RecoveryKey.parse(loose) == key
     assert RecoveryKey.parse(text.replace("0", "O").replace("1", "I")) == key
+    # A word processor's en dash between groups is a separator too.
+    assert RecoveryKey.parse(text.replace("-", "–")) == key
+
+
+def test_a_non_ascii_letter_is_not_read_as_a_digit() -> None:
+    text = RecoveryKey(_RECOVERY).text()
+    # U+0131, dotless i, upper-cases to an ASCII I; it is refused rather than read as a 1.
+    with pytest.raises(CustodyError, match="character 1 of the entry"):
+        RecoveryKey.parse("ı" + text[1:])
 
 
 def test_every_single_character_mistype_is_refused_by_the_checksum() -> None:
@@ -94,9 +103,12 @@ def test_every_single_character_mistype_is_refused_by_the_checksum() -> None:
     refused = 0
     for position, ch in enumerate(text):
         swap = alphabet[(alphabet.index(ch) + 7) % len(alphabet)]
+        entry = text[:position] + swap + text[position + 1 :]
         with pytest.raises(CustodyError, match="checksum does not match") as excinfo:
-            RecoveryKey.parse(text[:position] + swap + text[position + 1 :])
-        assert text not in str(excinfo.value)
+            RecoveryKey.parse(entry)
+        message = str(excinfo.value)
+        assert entry not in message and text not in message
+        assert not any(entry[i : i + 4] in message for i in range(0, 56, 4))
         refused += 1
     assert refused == 56  # the control: every position was tried
 
@@ -106,13 +118,40 @@ def test_a_recovery_key_of_the_wrong_length_or_alphabet_is_refused_without_echo(
     compact = text.replace("-", "")
     with pytest.raises(CustodyError, match="this entry has 55") as short:
         RecoveryKey.parse(compact[:-1])
-    with pytest.raises(CustodyError, match="character 3 of the recovery key") as bad:
-        RecoveryKey.parse(compact[:2] + "U" + compact[3:])
+    # The position counts the dashes the person sees: the third character of the second group.
+    bad_entry = text[:7] + "U" + text[8:]
+    with pytest.raises(CustodyError, match="character 8 of the entry") as bad:
+        RecoveryKey.parse(bad_entry)
     for excinfo in (short, bad):
         message = str(excinfo.value)
         # No run of the entry survives into the message: not the whole key, not one group of it.
-        assert compact[:-1] not in message
-        assert not any(group in message for group in text.split("-"))
+        assert compact[:-1] not in message and bad_entry not in message
+        assert not any(group in message for group in bad_entry.split("-"))
+
+
+def test_a_refusal_leaves_no_key_material_in_the_raising_frame() -> None:
+    # A renderer that prints frame locals (BACKLOG #3471's concern) walks the traceback's frames.
+    text = RecoveryKey(_RECOVERY).text()
+    mistyped = ("1" if text[0] != "1" else "2") + text[1:]
+    bad_blob = _blob().serialize()[:-1]
+    for call in (lambda: RecoveryKey.parse(mistyped), lambda: HostBlob.parse(bad_blob)):
+        with pytest.raises(CustodyError) as excinfo:
+            call()
+        seen = 0
+        tb = excinfo.value.__traceback__
+        while tb is not None:
+            frame = tb.tb_frame
+            if frame.f_code.co_filename == custody.__file__:
+                seen += 1
+                rendered = repr(dict(frame.f_locals))
+                assert mistyped not in rendered and text[5:9] not in rendered
+                assert not _leaks(rendered, _MASTER)
+            tb = tb.tb_next
+        assert seen == 1  # the control: the raising frame in custody.py was examined
+
+
+def test_a_host_blob_given_as_a_bytearray_parses() -> None:
+    assert HostBlob.parse(bytearray(_blob().serialize())) == _blob()
 
 
 # --- the host blob --------------------------------------------------------------------------------
@@ -224,18 +263,30 @@ def test_the_key_types_are_not_hashable() -> None:
 
 
 def test_the_posix_host_file_check_refuses_any_group_or_other_bit_and_a_foreign_owner() -> None:
-    check = custody._posix_file_problem
     regular = stat.S_IFREG
-    assert check(regular | 0o600, 1000, 1000, forbidden=0o077, owner_only=True) is None  # control
-    assert "0644" in str(check(regular | 0o644, 1000, 1000, forbidden=0o077, owner_only=True))
-    assert "0610" in str(check(regular | 0o610, 1000, 1000, forbidden=0o077, owner_only=True))
-    assert "uid 0" in str(check(regular | 0o600, 0, 1000, forbidden=0o077, owner_only=True))
-    assert "not a regular file" in str(
-        check(stat.S_IFDIR | 0o700, 1000, 1000, forbidden=0o077, owner_only=True)
-    )
-    # A systemd credential: the owner and group are systemd's, and only the other bits refuse.
-    assert check(regular | 0o440, 0, 1000, forbidden=0o007, owner_only=False) is None
-    assert "0444" in str(check(regular | 0o444, 0, 1000, forbidden=0o007, owner_only=False))
+    none: frozenset[int] = frozenset()
+
+    def host(mode: int, owner: int) -> str | None:
+        return custody._posix_file_problem(mode, owner, 1000, forbidden=0o077, owners=none)
+
+    def credential(mode: int, owner: int) -> str | None:
+        return custody._posix_file_problem(
+            mode, owner, 1000, forbidden=0o027, owners=frozenset({0})
+        )
+
+    assert host(regular | 0o600, 1000) is None  # the control
+    assert "0644" in str(host(regular | 0o644, 1000))
+    assert "0610" in str(host(regular | 0o610, 1000))
+    assert "uid 0" in str(host(regular | 0o600, 0))
+    assert "not a regular file" in str(host(stat.S_IFDIR | 0o700, 1000))
+    assert "not a regular file" in str(host(stat.S_IFIFO | 0o600, 1000))
+    # A systemd credential: owned by root or the engine, readable by its group, never writable by
+    # it, and nothing for other accounts.
+    assert credential(regular | 0o440, 0) is None
+    assert credential(regular | 0o400, 1000) is None
+    assert "0444" in str(credential(regular | 0o444, 0))
+    assert "0460" in str(credential(regular | 0o460, 0))
+    assert "uid 2000" in str(credential(regular | 0o400, 2000))
 
 
 # --- the POSIX host file, for real ----------------------------------------------------------------
@@ -267,8 +318,16 @@ def test_posix_host_file_that_is_a_link_is_refused(tmp_path: Path) -> None:
     custody.write_host_file(real, _blob())
     link = tmp_path / "link.blob"
     link.symlink_to(real)
-    with pytest.raises(CustodyError, match="could not be opened"):
+    with pytest.raises(CustodyError, match="could not be read"):
         custody.read_host_file(link)
+
+
+@posix_only
+def test_posix_host_file_that_is_a_fifo_is_refused_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "host.blob"
+    os.mkfifo(fifo, 0o600)
+    with pytest.raises(CustodyError, match="not a regular file"):
+        custody.read_host_file(fifo)
 
 
 @posix_only
@@ -363,6 +422,47 @@ def test_windows_handoff_refuses_a_package_sid(tmp_path: Path, package: str) -> 
     with pytest.raises(RestrictedFileError, match="application package"):
         custody.write_handoff_file(path, _blob(), service_account=package)
     assert not path.exists()
+
+
+_PACKAGE = "S-1-15-2-3624051433-2125758914-1423191267-1740899205-1073925389-3782572162-737981194"
+
+
+@windows_only
+def test_windows_a_key_file_widened_to_a_package_after_creation_is_refused(
+    tmp_path: Path,
+) -> None:
+    from messagefoundry.store import store as store_mod
+
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())
+    assert custody.read_host_file(path) == _blob()  # the control
+    store_mod._grant_read(path, f"*{_PACKAGE}")
+    assert _PACKAGE in {sid for _t, _m, sid in _aces(path)}  # the grant landed
+    with pytest.raises(CustodyError, match="application package"):
+        custody.read_host_file(path)
+
+
+@windows_only
+def test_windows_a_blob_of_the_other_scope_is_refused(tmp_path: Path) -> None:
+    handoff = tmp_path / "handoff.key"
+    custody.write_handoff_file(handoff, _blob(), service_account="NT AUTHORITY\\LOCAL SERVICE")
+    # A handoff renamed to the host file's path is machine scope, so it is not a host blob.
+    with pytest.raises(CustodyError, match="not a user-scope DPAPI blob"):
+        custody.read_host_file(handoff)
+    host = tmp_path / "master.key"
+    custody.write_host_file(host, _blob())
+    with pytest.raises(CustodyError, match="not a machine-scope DPAPI blob"):
+        custody.read_handoff_file(host)
+    with pytest.raises(CustodyError, match="not a user-scope DPAPI blob"):
+        custody.unprotect_host_blob(b"too short")
+
+
+@windows_only
+def test_windows_a_missing_custody_file_is_file_not_found(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        custody.read_host_file(tmp_path / "absent.key")
+    with pytest.raises(FileNotFoundError):
+        custody.read_handoff_file(tmp_path / "absent.key")
 
 
 def test_the_handoff_is_windows_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
