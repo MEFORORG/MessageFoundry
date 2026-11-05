@@ -468,16 +468,16 @@ class _PosixPolicy:
     whatever it grants; with it, :func:`_posix_acl_entries_problem` judges the list entry by entry
     and refuses any named entry but read for the engine's own uid. :func:`_posix_file_problem`
     checks at least the file type, the owner, the mode's group and other permission bits (its group
-    read bit only when there is no list) and the list. It does not check the owner's own bits or
-    the setuid, setgid and sticky bits, and it cannot see an access model a file system keeps
+    read bit only when there is no list) and the list. What it does not check includes at least the
+    owner's own bits and the setuid, setgid and sticky bits, and it cannot see an access model a file system keeps
     outside the POSIX list (:func:`~messagefoundry.restricted_file.posix_access_acl`)."""
 
     owners: frozenset[int]
     access_list: bool
 
 
-#: The host file (draft rule 3b): owned by the engine's account, mode ``0600``, and no access
-#: control list at all, which :func:`write_host_file` makes sure it writes.
+#: The host file (draft rule 3b): owned by the engine's account, no access for group or other in
+#: its mode, and no access control list at all, which :func:`write_host_file` makes sure it writes.
 _HOST_FILE_POLICY = _PosixPolicy(owners=frozenset(), access_list=False)
 
 #: Group write or execute, and any access for other accounts. Group read is judged apart, because
@@ -550,7 +550,7 @@ def _posix_file_problem(
     """Why a custody file of this ``mode``, ``owner``, ``group`` and access control list must not
     be used, or ``None``. ``acl`` is the raw ``system.posix_acl_access`` value, ``None`` for none.
 
-    A file the policy allows no list carries none, whatever the list grants. With a list, the
+    A file whose policy allows no list is refused if it carries one, whatever the list grants. With a list, the
     mode's group bits are its mask rather than the group's access, so whether the group may reach
     the file is judged from the list's group entry. Kept free of I/O so the decision is testable on
     every platform."""
@@ -845,7 +845,8 @@ def read_systemd_credential(name: str, *, environ: Mapping[str, str] | None = No
     name that is not a plain file name, a directory that is not an absolute path, a file that is a
     link, and content that is not a host blob. It raises the same for a file that is owned by an
     account other than root or the engine's own, and for at least these grants: any access for the
-    file's group, in its mode or in its list's group entry, any access for other accounts, and any
+    file's group in its list's group entry or, with no access control list, in its mode's group
+    bits, any access for other accounts, and any
     named user or group entry in its POSIX access control list but read for the engine's own uid.
     A file system with its own access model, such as an NFSv4 or CIFS mount, shows no POSIX list,
     so what that model grants is not checked

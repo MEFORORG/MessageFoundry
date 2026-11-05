@@ -544,7 +544,7 @@ def _set_acl_or_skip(path: Path, name: str, acl: bytes) -> None:
 
 
 @linux_only
-def test_a_host_file_whose_access_control_list_names_another_account_is_refused(
+def test_a_host_file_carrying_any_access_control_list_is_refused(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "host.blob"
