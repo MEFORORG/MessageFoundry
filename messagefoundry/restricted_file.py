@@ -66,12 +66,18 @@ if TYPE_CHECKING:
     from messagefoundry.config.wiring import _WinPathSecurity
 
 __all__ = [
-    "LINUX_FOREIGN_ACCESS_MODEL_FILE_SYSTEMS",
+    "LINUX_CREDENTIAL_FILE_SYSTEMS",
+    "LINUX_HOST_FILE_SYSTEMS",
     "WINERROR_ACCESS_DENIED",
     "WINERROR_SHARING_VIOLATION",
     "RestrictedFileError",
     "broad_access_problem",
+    "custody_account_problem",
+    "delete_through_handle",
     "key_file_handle_problem",
+    "custody_engine_problem",
+    "linux_file_system_problem",
+    "linux_file_system_refusal",
     "linux_file_system_type",
     "posix_access_acl",
     "replace_generated",
@@ -90,25 +96,37 @@ class RestrictedFileError(OSError):
 
 # --- the access list a new file carries (Windows) -------------------------------------------------
 
-#: FILE_ALL_ACCESS and FILE_GENERIC_READ, as the SDDL rights ``FA`` and ``FR`` store them in an ACE.
+#: FILE_ALL_ACCESS and FILE_GENERIC_READ, as the SDDL rights ``FA`` and ``FR`` store them in an ACE,
+#: and FILE_GENERIC_READ with DELETE (``FRSD``): the handoff's grant, so the service that reads it
+#: can delete it through the handle it read it with (the key custody draft, rule 3 step 2).
 _FULL_ACCESS = 0x001F01FF
 _READ_ACCESS = 0x00120089
-_SDDL_RIGHT: Mapping[int, str] = {_FULL_ACCESS: "FA", _READ_ACCESS: "FR"}
+_DELETE = 0x00010000
+_READ_DELETE_ACCESS = _READ_ACCESS | _DELETE
+_SDDL_RIGHT: Mapping[int, str] = {
+    _FULL_ACCESS: "FA",
+    _READ_ACCESS: "FR",
+    _READ_DELETE_ACCESS: "FRSD",
+}
 
 
 def _expected_access(
-    creator_sid: str, read_sids: Sequence[str], *, creator_access: bool = True
+    creator_sid: str,
+    read_sids: Sequence[str],
+    *,
+    creator_access: bool = True,
+    read_delete: bool = False,
 ) -> dict[str, int]:
     """The whole access list of a new file, as SID to access mask, in the order it is written.
 
     Full control for SYSTEM, Administrators and the creating account (not the creating account when
-    ``creator_access`` is off); read for each account in ``read_sids``. An account already holding
-    full control keeps it and gets no second entry."""
+    ``creator_access`` is off); read for each account in ``read_sids``, and with ``read_delete``
+    read and delete. An account already holding full control keeps it and gets no second entry."""
     access = {SYSTEM_SID: _FULL_ACCESS, ADMINISTRATORS_SID: _FULL_ACCESS}
     if creator_access:
         access.setdefault(creator_sid, _FULL_ACCESS)
     for sid in read_sids:
-        access.setdefault(sid, _READ_ACCESS)
+        access.setdefault(sid, _READ_DELETE_ACCESS if read_delete else _READ_ACCESS)
     return access
 
 
@@ -117,24 +135,39 @@ def _protected_sddl(access: Mapping[str, int]) -> str:
     return "D:P" + "".join(f"(A;;{_SDDL_RIGHT[mask]};;;{sid})" for sid, mask in access.items())
 
 
-def _created_mismatch(
-    security: _WinPathSecurity, protected: bool | None, expected: Mapping[str, int]
-) -> str | None:
-    """Why a just-created file does NOT carry exactly ``expected``, or ``None`` when it does.
+#: Accounts a key custody file is never kept for: SYSTEM, LOCAL SERVICE and NETWORK SERVICE. Every
+#: service that runs as LOCAL SERVICE or NETWORK SERVICE holds that account, and SYSTEM is the
+#: operating system's own, so a key bound to one is open to all of them. SYSTEM also already holds
+#: full control in every custody list, so a grant to it would collapse into that entry and the
+#: list would name no engine account at all. Refused unconditionally: as the handoff's grantee and
+#: as the account the engine runs as, for the handoff and the host file alike.
+_CUSTODY_REFUSED_SIDS = frozenset({SYSTEM_SID, *_SHARED_SERVICE_SIDS})
 
-    ``protected`` is whether the list blocks inheritance, or ``None`` when that could not be read.
-    Kept free of ctypes so the decision is testable on every platform."""
-    if security.status != 0:
-        return f"its access list could not be read back (Win32 error {security.status})"
-    if not security.dacl_present or security.aces is None:
-        return "its access list could not be read back"
-    if protected is not True:
-        return "its access list does not block inheritance from the directory"
-    found = sorted(security.aces)
-    wanted = sorted((ACCESS_ALLOWED_ACE_TYPE, mask, sid) for sid, mask in expected.items())
-    if found != wanted:
-        return "its access list is not the one that was asked for"
+
+def custody_account_problem(sid: str | None) -> str | None:
+    """Why a key custody file must not be kept for the account ``sid``, or ``None``.
+
+    ``None`` for ``sid`` (an account that could not be read) is a problem too. Kept free of ctypes so
+    the decision is testable on every platform."""
+    if sid is None:
+        return (
+            "the account could not be read, so it cannot be shown to be one the engine alone "
+            "runs as"
+        )
+    if sid in _CUSTODY_REFUSED_SIDS:
+        return (
+            f"{describe_sid(sid)} is an account many services share or the operating system's "
+            "own, and a key custody file is kept for an account the engine alone runs as (a "
+            "virtual service account, S-1-5-80-...)"
+        )
     return None
+
+
+def custody_engine_problem(engine_sid: str | None) -> str | None:
+    """Why the engine, running as ``engine_sid``, may keep no key custody file, or ``None``: the
+    one refusal both the custody writers and :func:`key_file_handle_problem` give."""
+    problem = custody_account_problem(engine_sid)
+    return None if problem is None else f"the engine's own account is refused: {problem}"
 
 
 # --- the read check, before a key file is used ----------------------------------------------------
@@ -277,32 +310,51 @@ def posix_access_acl(fd: int) -> bytes | None:
         raise
 
 
-#: Linux file systems that keep an access model of their own beside, or instead of, the POSIX list,
-#: by their ``statfs`` magic (``linux/magic.h``). Each answers ``ENOTSUP`` for the POSIX list, so
-#: :func:`posix_access_acl` reads it as absent while the file system may still grant more than the
-#: mode shows, or a network or cluster file system whose server, or whose other hosts' root, decides
-#: access too. **At least these, and never a complete list**: a file system not named here is not
-#: thereby shown local, so this is a refusal list, not an allow list.
-LINUX_FOREIGN_ACCESS_MODEL_FILE_SYSTEMS: Mapping[int, str] = MappingProxyType(
+#: Linux file systems a key custody HOST file may be kept on, by their ``statfs`` magic
+#: (``linux/magic.h``; ZFS's from OpenZFS): local disk file systems whose access this host's own
+#: kernel keeps, through the mode and, where one is set, the POSIX list. **An allowlist, so it fails
+#: closed:** a file system not named here is refused whatever it is, so a network, cluster, FUSE or
+#: overlay file system, or one stacked over such a file system, is refused without being named.
+#: ecryptfs is left out on purpose: it is local, but it may be stacked over NFS, and its own magic
+#: does not say what lies beneath it. ext2, ext3 and ext4 share one magic.
+LINUX_HOST_FILE_SYSTEMS: Mapping[int, str] = MappingProxyType(
     {
-        0x6969: "NFS",
-        0x517B: "SMB",
-        0xFF534D42: "CIFS",
-        0xFE534D42: "SMB2",
-        0x65735546: "FUSE",
-        0x01021997: "9P",
-        0x5346414F: "AFS",
-        0x6B414653: "kAFS",
-        0x786F4256: "vboxsf",
-        0x73757245: "Coda",
-        0x564C: "NCP",
-        0x47504653: "GPFS",
-        0x0BD00BD0: "Lustre",
-        0x00C36400: "CephFS",
-        0x7461636F: "OCFS2",
-        0x01161970: "GFS2",
+        0xEF53: "ext2/3/4",
+        0x58465342: "xfs",
+        0x9123683E: "btrfs",
+        0x2FC12FC1: "zfs",
+        0xF2F52010: "f2fs",
+        0xCA451A4E: "bcachefs",
     }
 )
+
+#: Linux file systems a systemd credential may be read from: the in-memory file systems systemd
+#: mounts a unit's credentials directory on. An allowlist, as :data:`LINUX_HOST_FILE_SYSTEMS` is.
+LINUX_CREDENTIAL_FILE_SYSTEMS: Mapping[int, str] = MappingProxyType(
+    {0x858458F6: "ramfs", 0x01021994: "tmpfs"}
+)
+
+
+def linux_file_system_problem(magic: int, allowed: Mapping[int, str], what: str) -> str | None:
+    """Why a ``what`` must not be kept on a file system of ``statfs`` magic ``magic``, or ``None``
+    when ``allowed`` names it. The refusal names the magic in hex. Kept free of I/O so the decision
+    is testable on every platform."""
+    if magic in allowed:
+        return None
+    names = list(allowed.values())
+    listed = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} or {names[-1]}"
+    return f"it is on a file system of type {magic:#010x}, and a {what} is kept on {listed} only"
+
+
+def linux_file_system_refusal(fd: int, allowed: Mapping[int, str], what: str) -> str | None:
+    """Why the open file ``fd`` must not be used as a ``what``: its file system could not be read,
+    or ``allowed`` does not name it (:func:`linux_file_system_problem`). ``None`` when it may. Read
+    through the descriptor. Linux only, as :func:`linux_file_system_type` is."""
+    try:
+        magic = linux_file_system_type(fd)
+    except OSError as exc:
+        return f"its file system could not be read ({exc.strerror or type(exc).__name__})"
+    return linux_file_system_problem(magic, allowed, what)
 
 
 def linux_file_system_type(fd: int) -> int:
@@ -310,10 +362,10 @@ def linux_file_system_type(fd: int) -> int:
 
     Read through the descriptor, so it is the file system of the file that was opened, not of
     whatever a name points to now. Linux only; raises :class:`RestrictedFileError` elsewhere, and
-    ``OSError`` when the call fails or the C library offers no ``fstatfs``."""
+    ``OSError`` when the call fails or the C library offers no ``fstatfs``, chained from the error
+    that said so."""
     if sys.platform != "linux":
         raise RestrictedFileError("a file system type is read on Linux only")
-    fstatfs = None
     try:
         import ctypes
 
@@ -322,10 +374,8 @@ def linux_file_system_type(fd: int) -> int:
         # system with EOVERFLOW. Both structs open with f_type.
         libc = ctypes.CDLL(None, use_errno=True)
         fstatfs = getattr(libc, "fstatfs64", None) or libc.fstatfs
-    except (ImportError, AttributeError):  # no ctypes, or a build that exports no C library
-        pass
-    if fstatfs is None:  # raised outside the handler, so it chains nothing
-        raise OSError(errno.ENOSYS, "this process's C library offers no fstatfs")
+    except (ImportError, AttributeError) as exc:  # no ctypes, or a C library with no fstatfs
+        raise OSError(errno.ENOSYS, "this process's C library offers no fstatfs") from exc
     fstatfs.argtypes = [ctypes.c_int, ctypes.c_void_p]
     fstatfs.restype = ctypes.c_int
     # struct statfs opens with f_type: an unsigned int on s390x, and a native long (__fsword_t) on
@@ -645,13 +695,15 @@ def key_file_handle_problem(handle: int, *, engine_read_only: bool) -> str | Non
     parent directory re-pointed after the open does not change what is judged. The file must be on
     a local NTFS or ReFS volume (:func:`_volume_problem`), owned by SYSTEM, Administrators or the
     account this process runs as, and its protected list must be exactly SYSTEM and Administrators
-    with full control and that account with read (``engine_read_only``, the list
-    :func:`write_restricted_file` writes with ``creator_access`` off and a read grant to that
-    account) or with full control (the list it writes for its own creator, with no read grant). Any
-    other entry, a deny entry included, is refused. An account that holds a privilege to set any
-    owner, such as the restore privilege Administrators and Backup Operators hold, can still make a
-    file that passes. Raises :class:`RestrictedFileError` off Windows, and ``OSError`` or a ctypes
-    error when a call cannot be made at all."""
+    with full control and that account with read and delete (``engine_read_only``, the handoff's
+    list: what :func:`write_restricted_file` writes with ``creator_access`` off, ``read_delete`` on
+    and a read grant to that account) or with full control (the host file's list: what it writes
+    for its own creator, with no read grant). Any other entry, a deny entry included, is refused.
+    An engine that runs as SYSTEM, LOCAL SERVICE or NETWORK SERVICE is refused for either list
+    (:func:`custody_account_problem`). An account that holds a privilege to set any owner, such as
+    the restore privilege Administrators and Backup Operators hold, can still make a file that
+    passes. Raises :class:`RestrictedFileError` off Windows, and ``OSError`` or a ctypes error when
+    a call cannot be made at all."""
     if sys.platform != "win32":
         raise RestrictedFileError("a key file's handle is checked on Windows only")
     from messagefoundry.config.wiring import _win32_config_source_probes
@@ -660,21 +712,48 @@ def key_file_handle_problem(handle: int, *, engine_read_only: bool) -> str | Non
     if volume is not None:
         return volume
     engine_sid = _win32_config_source_probes().self_sid
-    if engine_sid is None:
-        return "this process's own account could not be read, so the file's owner cannot be judged"
-    if engine_read_only and engine_sid in _SHARED_SERVICE_SIDS:
-        # Every service that runs as LOCAL SERVICE or NETWORK SERVICE holds this account, so a
-        # handoff made for it, or owned by it, is open to all of them.
-        return (
-            f"the engine runs as {describe_sid(engine_sid)}, an account many services share, and "
-            "a handoff is made for an account the engine alone runs as"
-        )
+    refused = custody_engine_problem(engine_sid)
+    if refused is not None or engine_sid is None:
+        return refused
     # The two lists write_restricted_file makes: the handoff's and the host file's.
     if engine_read_only:
-        expected = _expected_access(engine_sid, [engine_sid], creator_access=False)
+        expected = _expected_access(
+            engine_sid, [engine_sid], creator_access=False, read_delete=True
+        )
     else:
         expected = _expected_access(engine_sid, ())
     return _exact_descriptor_problem(_read_handle_security(handle), expected, engine_sid=engine_sid)
+
+
+#: FILE_INFO_BY_HANDLE_CLASS FileDispositionInfo.
+_FILE_DISPOSITION_INFO = 4
+
+
+def delete_through_handle(handle: int) -> None:
+    """Windows: delete the file open as ``handle``, through that handle, so what is deleted is the
+    file the handle reached and never whatever its name reaches now.
+
+    ``SetFileInformationByHandle`` with ``FileDispositionInfo``: the name goes when the last handle
+    to the file closes, so a caller that holds the only handle closes it next. The handle must hold
+    DELETE. Raises ``OSError`` when Windows refuses, and :class:`RestrictedFileError` off Windows."""
+    if sys.platform != "win32":
+        raise RestrictedFileError("a file is deleted through its handle on Windows only")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    delete = ctypes.c_ubyte(1)  # FILE_DISPOSITION_INFO.DeleteFile
+    if not kernel32.SetFileInformationByHandle(
+        handle, _FILE_DISPOSITION_INFO, ctypes.byref(delete), ctypes.sizeof(delete)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 # --- removing a file the engine wrote -------------------------------------------------------------
@@ -789,6 +868,8 @@ def write_restricted_file(
     read_grants: Sequence[str] = (),
     creator_access: bool = True,
     owner: str | None = None,
+    read_delete: bool = False,
+    local_volume_only: bool = False,
 ) -> None:
     """Create ``path`` restricted, confirm its access, then write ``data`` to it.
 
@@ -810,6 +891,23 @@ def write_restricted_file(
     to delete it from the directory, or Administrators' full control, so an elevated administrator
     is the caller this is for.
 
+    ``read_delete`` (Windows only) gives each read grant DELETE beside read (SDDL ``FRSD``), so the
+    account it names can delete the file through the handle it reads it with: the key custody
+    handoff, which the service deletes once it has converted it (draft rule 3 step 2).
+
+    ``local_volume_only`` refuses, while the new file is still empty, a file on a volume whose
+    access this host does not keep: on Windows anything but a local NTFS or ReFS disk
+    (:func:`_volume_problem`, read through the creating handle), and on Linux a file system
+    :data:`LINUX_HOST_FILE_SYSTEMS` does not name (``fstatfs`` on the creating descriptor). The
+    empty file is then removed, so no byte reaches a network, cluster or user-mode file system. Any
+    other POSIX host refuses it before a file is made. The key custody writers pass it; it is off
+    by default, so the other key files are written as before.
+
+    On Windows the new file's owner and access list are read back through the creating handle and
+    judged by the same exact check a key custody read makes (:func:`_exact_descriptor_problem`):
+    owned by SYSTEM, Administrators or the creating account (or by ``owner``, when given), a
+    protected list, and exactly the entries asked for, with no inheritance flag.
+
     Raises ``FileExistsError`` when ``path`` already exists, as a file or as a link, and leaves
     what is there untouched. Raises :class:`RestrictedFileError` when the file cannot be created
     restricted or does not read back as asked, and ``OSError`` when the write itself fails. After
@@ -818,7 +916,14 @@ def write_restricted_file(
     # The exclusive create sits OUTSIDE the cleanup guard on purpose: a name that is taken raises
     # FileExistsError HERE, and that file belongs to someone. Unlinking it would be the overwrite
     # the exclusive create exists to prevent.
-    fd = _create_restricted(path, read_grants, creator_access=creator_access, owner=owner)
+    fd = _create_restricted(
+        path,
+        read_grants,
+        creator_access=creator_access,
+        owner=owner,
+        read_delete=read_delete,
+        local_volume_only=local_volume_only,
+    )
     try:
         try:
             handle = os.fdopen(fd, "wb")
@@ -861,25 +966,48 @@ def _remove_failed(path: Path, failure: BaseException) -> None:
 
 
 def _create_restricted(
-    path: Path, read_grants: Sequence[str], *, creator_access: bool, owner: str | None
+    path: Path,
+    read_grants: Sequence[str],
+    *,
+    creator_access: bool,
+    owner: str | None,
+    read_delete: bool = False,
+    local_volume_only: bool = False,
 ) -> int:
     """Exclusively create ``path`` restricted and return a write-only descriptor for it.
 
-    The access is confirmed here, while the file is still empty, so no byte is ever written to a
-    file whose access was not what was asked for. A file that fails that check is removed."""
+    The access, and with ``local_volume_only`` the volume, are confirmed here, while the file is
+    still empty, so no byte is ever written to a file whose access was not what was asked for. A
+    file that fails either check is removed."""
     if sys.platform == "win32":
         return _create_restricted_windows(
-            path, read_grants, creator_access=creator_access, owner=owner
+            path,
+            read_grants,
+            creator_access=creator_access,
+            owner=owner,
+            read_delete=read_delete,
+            local_volume_only=local_volume_only,
         )
-    if read_grants:
+    if read_grants or read_delete:
         raise RestrictedFileError("a read grant for another account is supported on Windows only")
     if not creator_access:
         raise RestrictedFileError("a file without its creator's access is made on Windows only")
     if owner is not None:
         raise RestrictedFileError("a file owned by another account is made on Windows only")
+    if local_volume_only and sys.platform != "linux":
+        raise RestrictedFileError(
+            "a file system is checked before a key file is written on Linux and Windows only"
+        )
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(path, flags, 0o600)
     try:
+        if local_volume_only:
+            # Before the inherited list is asked for, so a refused file system is not asked.
+            refused = linux_file_system_refusal(
+                fd, LINUX_HOST_FILE_SYSTEMS, "key custody host file"
+            )
+            if refused is not None:
+                raise RestrictedFileError(f"{path} was not written: {refused}")
         if sys.platform == "linux":
             _drop_inherited_acl(path, fd)
         # A default list or a umask can leave the owner without read; set the mode exactly, so a
@@ -933,7 +1061,13 @@ def _drop_inherited_acl(path: Path, fd: int) -> None:
 
 
 def _create_restricted_windows(
-    path: Path, read_grants: Sequence[str], *, creator_access: bool, owner: str | None
+    path: Path,
+    read_grants: Sequence[str],
+    *,
+    creator_access: bool,
+    owner: str | None,
+    read_delete: bool,
+    local_volume_only: bool,
 ) -> int:
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise RestrictedFileError("the Windows create runs only on Windows")
@@ -942,7 +1076,6 @@ def _create_restricted_windows(
     from ctypes import wintypes
 
     from messagefoundry.config.wiring import _win32_config_source_probes
-    from messagefoundry.store.store import _parse_sddl_dacl, _read_dacl_sddl
 
     probes = _win32_config_source_probes()
     if probes.self_sid is None:
@@ -967,7 +1100,9 @@ def _create_restricted_windows(
                 "hold, and a key file cannot be granted to it. Name the one account the engine "
                 "runs as"
             )
-    expected = _expected_access(probes.self_sid, read_sids, creator_access=creator_access)
+    expected = _expected_access(
+        probes.self_sid, read_sids, creator_access=creator_access, read_delete=read_delete
+    )
 
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -1010,8 +1145,8 @@ def _create_restricted_windows(
     flags_and_attributes = 0x00000080 | 0x00200000
     invalid_handle = wintypes.HANDLE(-1).value
 
-    # With an owner, the handle also takes READ_CONTROL, so that owner is read back through it.
-    desired_access = generic_write | (_READ_CONTROL if owner_sid is not None else 0)
+    # READ_CONTROL too, so the new file's owner and list are read back through this handle.
+    desired_access = generic_write | _READ_CONTROL
     sddl_text = ("" if owner_sid is None else f"O:{owner_sid}") + _protected_sddl(expected)
     descriptor = ctypes.c_void_p()
     if not convert(sddl_text, 1, ctypes.byref(descriptor), None):
@@ -1046,15 +1181,14 @@ def _create_restricted_windows(
         kernel32.LocalFree(descriptor)
 
     try:
-        sddl = _read_dacl_sddl(path)
-        parsed = _parse_sddl_dacl(sddl) if sddl is not None else None
-        mismatch = _created_mismatch(
-            probes.read_path(path), None if parsed is None else parsed.protected, expected
-        )
-        if mismatch is not None:
-            raise RestrictedFileError(f"{path} could not be created restricted: {mismatch}")
+        if local_volume_only:
+            volume = _volume_problem(_read_handle_volume(handle))
+            if volume is not None:
+                raise RestrictedFileError(f"{path} was not written: {volume}")
+        # Read through the creating handle, never by name, and judged by the check a key custody
+        # read makes, so the create and the read hold one standard.
+        security = _read_handle_security(handle)
         if owner_sid is not None:
-            security = _read_handle_security(handle)
             if security.error is not None or security.owner_sid is None:
                 raise _OwnerRefused(
                     f"{path} could not be created owned by {describe_sid(owner_sid)}: its owner "
@@ -1065,6 +1199,11 @@ def _create_restricted_windows(
                     f"{path} could not be created owned by {describe_sid(owner_sid)}: it reads back "
                     f"owned by {_who(security.owner_sid)}"
                 )
+        mismatch = _exact_descriptor_problem(
+            security, expected, engine_sid=owner_sid or probes.self_sid
+        )
+        if mismatch is not None:
+            raise RestrictedFileError(f"{path} could not be created restricted: {mismatch}")
         return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
     except BaseException as failure:
         kernel32.CloseHandle(handle)
