@@ -25,15 +25,27 @@ the smoke inside the pytest-timeout budget.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import json
 import os
+import secrets
 import socket
+import ssl
 import tempfile
+import time
+from collections.abc import Sequence
 from pathlib import Path
 
+import httpx
 import pytest
 
-from harness.load.multishard import MultiShardReport, run_multishard
+from harness.load import rigadmin
+from harness.load.enginepoll import rig_client
+from harness.load.failover import EngineNode
+from harness.load.multishard import FleetProbe, MultiShardReport, run_multishard
+from messagefoundry.api.message_scope import CONNECTION_DENIED_DETAIL
+from messagefoundry.apiclient import EngineClient
 
 pytestmark = pytest.mark.timeout(
     120
@@ -80,7 +92,9 @@ def _free_window(
     raise RuntimeError(f"no free {span}-port window found in [{lo}, {hi})")
 
 
-async def _run_once(engine_index_base: int = 0) -> MultiShardReport:
+async def _run_once(
+    engine_index_base: int = 0, probe: FleetProbe | None = None
+) -> MultiShardReport:
     # N=2, C=2 conns/engine, stride 100: engine k's inbound block is [inbound_base+100*k .. +1], its
     # sink port is sink_base+100*k, its API is api_base+k. Reserve ONE wide verified-free window and
     # carve the three (non-overlapping) blocks out of it at fixed offsets (the engines bind FIXED ports,
@@ -106,6 +120,7 @@ async def _run_once(engine_index_base: int = 0) -> MultiShardReport:
             cluster_enabled=False,
             db_path=db_path,
             drain_timeout_s=_DRAIN_TIMEOUT_S,
+            probe=probe,
         )
         assert Path(db_path).exists(), "the shared SQLite store file was never created"
     return report
@@ -191,3 +206,114 @@ async def test_multishard_engine_index_base_offsets_lane_tags() -> None:
         assert e.inbound_rows == _COUNT_PER_ENGINE, e
         assert e.foreign_rows == 0, e
         assert e.reads > 0, e
+
+
+# --- BACKLOG #3031 step 2: a scoped operator asking the wrong engine shard ---------------------------
+#
+# Each engine of this rig loads only its own E{k}-tagged inbounds and serves its own API port, over ONE
+# shared store, so accounts, sessions, scopes and the audit trail are shared while each graph is not.
+# That is the shape of an engine-shard deployment that finding 2 of #3031 is about. A multi-shard
+# `serve --shard` config itself needs a server-DB store (ADR 0063), which this CI leg has none of.
+
+_OPERATOR = "ms-scoped-operator"
+_E0_OWN = "IB_E0_CS_00000"  # held by engine shard E0, in the operator's scope
+_E0_OUT_OF_SCOPE = "IB_E0_CS_00001"  # held by engine shard E0, outside the operator's scope
+_E1_OWN = "IB_E1_CS_00000"  # held by engine shard E1 only, in the operator's scope
+
+
+def _api(node: EngineNode) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=node.url,
+        verify=ssl.create_default_context(cafile=node.cacert),
+        trust_env=False,  # loopback only, never through a proxy the runner's environment names
+        timeout=10.0,
+    )
+
+
+def _scoped_operator_token(e0: EngineNode) -> str:
+    """Create a channel-scoped Operator through engine shard E0's own API with the shipped client, as
+    an administrator would, and return a session for it. The store is shared, so E1 honours it too."""
+    with rig_client(e0.url, cacert=e0.cacert) as admin:
+        created = admin.create_user(
+            _OPERATOR, email="ms-scoped-operator@example.invalid", roles=["operator"]
+        )
+        # The administrator-write floor (admin_write_min_interval_seconds, 0.15 s by default)
+        # answers a second write this soon with 429.
+        time.sleep(0.25)
+        admin.set_channel_scope(created.id, [_E0_OWN, _E1_OWN])
+    chosen = secrets.token_hex(24)  # rigadmin's draw, which the password policy cannot refuse
+    with EngineClient(e0.url, cacert=e0.cacert) as operator:
+        assert operator.login(_OPERATOR, created.temp_password).must_change_password
+        operator.change_password(created.temp_password, chosen)
+        signed_in = operator.login(_OPERATOR, chosen)
+    assert not signed_in.must_change_password
+    return signed_in.token
+
+
+class _WrongEngineShardProbe:
+    """Ask each engine shard about each name, as the scoped operator and as the unscoped rig
+    Administrator, then read the denial rows back. It records what it saw; the test asserts on it."""
+
+    def __init__(self) -> None:
+        self.answers: dict[tuple[str, str, str], tuple[int, object]] = {}
+        self.denials: list[dict[str, object]] = []
+
+    async def __call__(self, nodes: Sequence[EngineNode]) -> None:
+        e0, e1 = nodes
+        operator = await asyncio.to_thread(_scoped_operator_token, e0)
+        admin = await asyncio.to_thread(rigadmin.session_token, e1.url, cacert=e1.cacert)
+        asks = [
+            ("operator", operator, e0, _E0_OWN),
+            ("operator", operator, e1, _E1_OWN),
+            ("operator", operator, e0, _E1_OWN),  # the case: in scope, held by the OTHER shard
+            ("operator", operator, e0, _E0_OUT_OF_SCOPE),
+            ("admin", admin, e0, _E1_OWN),
+        ]
+        async with _api(e0) as c0, _api(e1) as c1:
+            clients = {e0.node_id: c0, e1.node_id: c1}
+            for who, token, node, name in asks:
+                reply = await clients[node.node_id].get(
+                    f"/connections/{name}/metadata", headers={"Authorization": f"Bearer {token}"}
+                )
+                detail = reply.json().get("detail") if reply.status_code >= 400 else None
+                self.answers[(who, node.node_id, name)] = (reply.status_code, detail)
+            # Read the trail from engine shard E1, which wrote none of these rows: the store is shared.
+            reply = await c1.get(
+                "/audit",
+                params={"action": "auth.channel_denied", "actor": _OPERATOR},
+                headers={"Authorization": f"Bearer {admin}"},
+            )
+        assert reply.status_code == 200, f"GET /audit: HTTP {reply.status_code} {reply.text}"
+        self.denials = reply.json()["entries"]
+
+
+async def test_a_scoped_operator_asking_the_wrong_engine_shard_gets_the_403_and_a_denial_row() -> (
+    None
+):
+    # BACKLOG #3031 step 2: finding 2 RUN, not only read. docs/SECURITY.md cites this test for the case.
+    probe = _WrongEngineShardProbe()
+    report = await _run_once(probe=probe)
+    assert {e.name_tag for e in report.records[0].per_engine} == {"E0", "E1"}
+    a = probe.answers
+
+    # Controls: each engine shard answers for its own in-scope inbound.
+    assert a[("operator", "ms-e0", _E0_OWN)] == (200, None)
+    assert a[("operator", "ms-e1", _E1_OWN)] == (200, None)
+
+    # The case. Engine shard E0 does not hold IB_E1_CS_00000, which the operator may reach on E1, and
+    # answers the one channel refusal: the same status and body an out-of-scope inbound E0 holds gets.
+    assert a[("operator", "ms-e0", _E1_OWN)] == (403, CONNECTION_DENIED_DETAIL)
+    assert a[("operator", "ms-e0", _E0_OUT_OF_SCOPE)] == (403, CONNECTION_DENIED_DETAIL)
+    # An unscoped caller asking the same wrong engine shard gets 404, as every caller did before #2640.
+    assert a[("admin", "ms-e0", _E1_OWN)][0] == 404
+
+    # One auth.channel_denied row per refusal. The row names the channel and nothing that says which
+    # engine shard answered, so the in-scope miss reads like any other denial until the reader looks
+    # the name up in the whole config.
+    assert len(probe.denials) == 2, probe.denials
+    rows = {row["channel_id"]: row for row in probe.denials}
+    assert set(rows) == {_E1_OWN, _E0_OUT_OF_SCOPE}, probe.denials
+    wrong_shard = rows[_E1_OWN]
+    assert wrong_shard["actor"] == _OPERATOR
+    assert json.loads(str(wrong_shard["detail"])) == {"channel": _E1_OWN}
+    assert wrong_shard["client"] == rows[_E0_OUT_OF_SCOPE]["client"]

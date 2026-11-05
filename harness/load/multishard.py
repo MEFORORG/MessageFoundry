@@ -38,7 +38,7 @@ import asyncio
 import contextlib
 import os
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -86,6 +86,10 @@ _SEED = "messagefoundry-multishard"
 # One trivial ADT type — the connscale graph routes every message identically (the wall is the store,
 # not message-type spread).
 _MIX = TypeMix({"ADT^A01": 1.0})
+
+#: A check a caller runs against the live fleet: every engine is up, signed in and reporting its own
+#: inbound lanes, and no traffic has been offered yet. It is handed the nodes in engine order.
+FleetProbe = Callable[[Sequence[EngineNode]], Awaitable[None]]
 
 
 # --- the aggregate record ----------------------------------------------------
@@ -318,6 +322,7 @@ async def run_multishard(
     db_path: str | None = None,
     install_executor_shim: bool = False,
     drain_timeout_s: float = _DRAIN_TIMEOUT_S,
+    probe: FleetProbe | None = None,
 ) -> MultiShardReport:
     """Run the N-engine store-contention sweep and return a :class:`MultiShardReport`.
 
@@ -326,6 +331,11 @@ async def run_multishard(
     genuinely share one store; on a server backend the shared connection comes from ``MEFOR_STORE_*``.
     ``drain_timeout_s`` bounds the post-hold drain + settled reconcile (a short value keeps the CI smoke
     inside its per-test budget; the bench uses the long default).
+
+    ``probe``, when given, runs once per step against the live fleet (:data:`FleetProbe`), before
+    the hold. It is how a test asks one engine about a connection another engine owns, with the
+    orchestrator's own start-up and teardown around it. Whatever it raises ends the run, and the
+    engines are still stopped.
 
     ``engine_index_base`` offsets the per-engine lane index — engine ``k`` is tagged
     ``E{k + engine_index_base}`` (name prefix, node id, attribution) — so a SECOND concurrent
@@ -357,6 +367,7 @@ async def run_multishard(
             db_path=db_path,
             install_executor_shim=install_executor_shim,
             drain_timeout_s=drain_timeout_s,
+            probe=probe,
         )
         records.append(record)
     return MultiShardReport(
@@ -386,6 +397,7 @@ async def _run_one_step(
     db_path: str | None,
     install_executor_shim: bool,
     drain_timeout_s: float,
+    probe: FleetProbe | None,
 ) -> MultiShardRecord:
     if engines < 1:
         raise ConnScaleError(f"engine count must be >= 1, got {engines}")
@@ -491,6 +503,8 @@ async def _run_one_step(
         # engine only, so the single-engine `_await_inbound_rows` would undercount here — sum each
         # engine's /connections directly.
         await _await_inbound_rows_all(nodes, count_per_engine, timeout=_PORTS_READY_TIMEOUT)
+        if probe is not None:
+            await probe(nodes)
 
         # Ramp every engine's connections open, then HOLD all N concurrently.
         for driver in drivers:
