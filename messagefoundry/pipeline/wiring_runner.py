@@ -12077,9 +12077,10 @@ class _RedactedFault(Exception):
 
 class UserCodeCalledSysExit(_RedactedFault):
     """A Router or a Handler raised ``SystemExit``, ``sys.exit()`` called at run time (vault BACKLOG
-    #3134). Converted at least where the engine runs that code in-process, so the message takes the
-    internal-error policy as for any other raise. Not under ``[sandbox].mode`` subprocess or
-    isolated, where the child's handler arm catches only ``Exception``.
+    #3134). Converted where the engine runs that code in-process, so the message takes the
+    internal-error policy as for any other raise. Under ``[sandbox].mode`` subprocess or isolated
+    the worker's ``_run_one`` converts it with this class and reports its text as a plain handler
+    error, so the worker survives and the parent raises ``SandboxError`` carrying the same words.
 
     **Why this differs from the config-code rule in ``config/wiring.py``**, whose comments say never
     to catch ``BaseException`` because ``SystemExit`` must keep propagating. That rule is about code

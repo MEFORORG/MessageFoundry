@@ -22,9 +22,9 @@ direction, in either process.
    re-establishes the run-scoped context providers for the phase (substituting the boot-carried code
    sets, which the per-dispatch frame deliberately does not repeat), runs the function, and
    **describes** the result back as ``ok`` — or ``fail`` with ``kind`` ``denied`` (forbidden import, a
-   live ``db_lookup``/``fhir_lookup`` at ``mode=subprocess``), ``error`` (a plain handler raise, an
-   undescribable result, or at ``mode=isolated`` a lookup error, the lookup having been asked of the
-   parent through :class:`_Broker` while the Handler ran) or
+   live ``db_lookup``/``fhir_lookup`` at ``mode=subprocess``), ``error`` (a plain handler raise, a
+   ``sys.exit()`` in user code, an undescribable result, or at ``mode=isolated`` a lookup error,
+   the lookup having been asked of the parent through :class:`_Broker` while the Handler ran) or
    ``memory`` (a ``MemoryError``, after which the worker exits so the parent starts a fresh one).
    The reply echoes the request's ``id``, ``phase`` and ``name`` so the parent can prove the frame
    answers the call it made.
@@ -343,6 +343,7 @@ def _run_one(
     from messagefoundry.config.run_context import run_contexts
     from messagefoundry.config.wiring import handler_result_items
     from messagefoundry.pipeline._sandbox_codec import SandboxError
+    from messagefoundry.pipeline.wiring_runner import UserCodeCalledSysExit
 
     phase = req.phase
     name = req.name
@@ -427,6 +428,13 @@ def _run_one(
         return False, None, "denied", str(exc)
     except MemoryError:
         raise  # not a plain handler error: main() answers it and recycles the worker
+    except SystemExit as exc:
+        # Caught deliberately: sys.exit() in user code is a content fault, reported in mode=off's words
+        # (vault BACKLOG #3134; UserCodeCalledSysExit says why config code differs). Uncaught, it ended
+        # the worker, so the message read as a crash and the next paid a respawn. No shutdown of this
+        # worker raises here: the parent closes the pipe (EOF in main()) or kills it. KeyboardInterrupt
+        # and every other BaseException are not converted, as at mode=off.
+        return False, None, "error", _error_text(UserCodeCalledSysExit.from_exit(exc))
     except Exception as exc:  # noqa: BLE001 — a handler raise is content, reported not crashed
         return False, None, "error", _error_text(exc)
     return True, result, "", ""
@@ -506,6 +514,11 @@ def main() -> int:
         import messagefoundry.config.db_lookup  # noqa: F401
         import messagefoundry.config.fhir_lookup  # noqa: F401
         import messagefoundry.config.run_context  # noqa: F401
+
+        # _run_one's sys.exit() arm reads UserCodeCalledSysExit from here. The package __init__ has
+        # already imported it, and that import pulls in modules the guard forbids, so name it here
+        # rather than leave the arm resting on the package's side effect (vault BACKLOG #3134).
+        import messagefoundry.pipeline.wiring_runner  # noqa: F401
 
         memory_cap = _apply_resource_caps(boot.mem_mb)
         _install_import_guard(boot.forbidden)
