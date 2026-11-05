@@ -129,7 +129,8 @@
   It prints the DPAPI-REBOOT lines at the end and leaves them, the transcript and the raw reports
   in the out folder it names.
 
-  RESULTS. The code that ran is commit 47039223ae5ccd12072b7b0ae07770e9341a19da, the commit the
+  RESULTS, THE PRE-REBOOT RUNS (-Mode Payload; the reboot arms are the next block). The code
+  that ran is commit 47039223ae5ccd12072b7b0ae07770e9341a19da, the commit the
   owner command pins, with every guest step under Windows PowerShell 5.1 as Host mode runs it.
   -Mode Payload, run from MEFORDEV01 through hvtest (Invoke-HvTest.ps1 and HvTestCommand.ps1 at
   vault origin/main 7697441b2) on REVTEST01 at post-move-mefor-lab-2026-10-17, results stamp
@@ -159,8 +160,37 @@
   the service's (-2146893813 is 0x8009000B, NTE_BAD_KEY_STATE). It survives a restart. The virtual
   account's profile is under C:\Windows\ServiceProfiles and stayed loaded for those 300 s, so on
   this build no profile reload without a reboot was observed; the reboot (A4) is the first profile
-  reload this can observe. The reboot arm is the owner command above, -Mode Host, and no session
-  has run it.
+  reload this can observe. The reboot arms are the owner command above, -Mode Host, recorded in
+  the next block.
+
+  RESULTS, THE REBOOT ARMS (-Mode Host). The owner ran the owner command above on MEFORHV01 on
+  2026-11-05, about 00:52 to 01:04 UTC, the code at commit
+  47039223ae5ccd12072b7b0ae07770e9341a19da, on REVTEST01 at post-move-mefor-lab-2026-10-17. The
+  lines it printed, as the owner pasted them, unedited but for one host path, removed where
+  marked:
+    ----- guest step Uninstall  -----
+    service=deleted
+    folder=removed C:\mefor-dpapi-reboot
+    profile=kept, still loaded: C:\Windows\ServiceProfiles\MeforDpapiReboot
+    REVTEST01 turned off and reverted to post-move-mefor-lab-2026-10-17; output in [host user TEMP path removed]\dpapi-reboot-3803a8c615704cc8a8ea8804fc58cb8d\out
+    DPAPI-REBOOT crosscheck, the administrator opens the service's user-scope blob: admin_open=FAIL win32=-2146893813 by REVTEST01\Administrator exit=0
+    DPAPI-REBOOT boots: A1 boot_id=5 uptime_ms=17484 boot_utc=2026-11-05T00:52:45.9484512Z; A2 boot_id=5 uptime_ms=19781 boot_utc=2026-11-05T00:52:45.9603104Z; A3 boot_id=5 uptime_ms=324718 boot_utc=2026-11-05T00:52:45.9366329Z; A4 boot_id=6 uptime_ms=3234 boot_utc=2026-11-05T00:58:31.4499221Z; A5 boot_id=6 uptime_ms=300921 boot_utc=2026-11-05T00:58:31.4605134Z
+    DPAPI-REBOOT A1 first start, protect and unprotect in user scope: YES (user_unprotect OK match; controls HELD: foreign FAIL win32=-2146893813, tampered FAIL win32=13, machine OK match)
+    DPAPI-REBOOT A2 after a service restart: YES (user_unprotect OK match; controls HELD: foreign FAIL win32=-2146893813, tampered FAIL win32=13, machine OK match)
+    DPAPI-REBOOT A3 after the profile was unloaded: INCONCLUSIVE (the profile was not seen unloaded before the start; user_unprotect OK match; controls HELD: foreign FAIL win32=-2146893813, tampered FAIL win32=13, machine OK match)
+    DPAPI-REBOOT A4 after a reboot, the SCM start at boot: YES (user_unprotect OK match; controls HELD: foreign FAIL win32=-2146893813, tampered FAIL win32=13, machine OK match)
+    DPAPI-REBOOT A5 after a reboot, a demand start: YES (user_unprotect OK match; controls HELD: foreign FAIL win32=-2146893813, tampered FAIL win32=13, machine OK match)
+    DPAPI-REBOOT VERDICT: SURVIVES
+  Notes, not raw lines. The verdict is SURVIVES. A4 and A5 each read YES with every control
+  held. Each carries boot_id=6 against A1 to A3's 5, an uptime_ms lower than A3's, and a
+  boot_utc about 6 minutes after theirs (00:58:31Z against 00:52:45Z), so the boots line shows
+  the reboot for both. A3 reads INCONCLUSIVE because the profile stayed loaded. The
+  administrator's crosscheck was refused with the key-state code, -2146893813.
+  What is left open. These lines do not name the guest's OS. The pre-reboot runs on the same
+  checkpoint read Windows Server 2022, build 20348, so this answers the question on Server 2022,
+  not on Server 2025. A3, a profile unload without a reboot, stays unmeasured. Each reboot
+  reloads the profile, so A4 and A5 opened the blob after a profile reload, but not after an
+  unload alone.
 #>
 [CmdletBinding()]
 param(
