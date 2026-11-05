@@ -301,7 +301,7 @@ def _wiring_problems(facts: dict[str, Any]) -> list[str]:
         if needle not in setter["text"]:
             problems.append(f"the call does not pass {needle}: {setter['text']}")
     accounts = calls("Set-ServiceAccount")
-    if not accounts or setter["start"] < max(c["start"] for c in accounts):
+    if not accounts or setter["start"] < max(c["outerIfEnd"] for c in accounts):
         problems.append("the token is set before the run-as account it depends on")
     choices = calls("Get-ServiceSidTypeChoice")
     if len(choices) != 1 or "-Skip:$SkipRestrictedServiceSid" not in choices[0]["text"]:

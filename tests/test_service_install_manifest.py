@@ -1074,32 +1074,13 @@ def _preflight_facts(tmp_path: Path, script: Path | None = None) -> dict:
   })
   $cmds = @(foreach ($c in $ast.FindAll({ $args[0] -is
       [System.Management.Automation.Language.CommandAst] }, $true)) {
-    # One walk up. It records whether the call is in a function, and each part of an if statement
-    # it sits in, keyed by that if's offset: "b<n>" for clause n's body, the else being clause
-    # Clauses.Count, and "c<n>" for clause n's condition. A part below a loop, a switch, a trap or a
-    # scriptblock literal is dropped, since that code can run more than once in one run.
+    # One walk up: whether the call is in a function, and where the outermost if statement around
+    # it ends, or the call itself when no if statement is around it.
     $inFunction = $false
-    $branches = @{}
-    $child = $c
-    $q = $c.Parent
-    while ($q) {
+    $outerIfEnd = $c.Extent.EndOffset
+    for ($q = $c.Parent; $q; $q = $q.Parent) {
       if ($q -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $inFunction = $true }
-      if (($q -is [System.Management.Automation.Language.LoopStatementAst]) -or
-          ($q -is [System.Management.Automation.Language.SwitchStatementAst]) -or
-          ($q -is [System.Management.Automation.Language.TrapStatementAst]) -or
-          ($q -is [System.Management.Automation.Language.ScriptBlockExpressionAst])) {
-        $branches = @{}
-      }
-      if ($q -is [System.Management.Automation.Language.IfStatementAst]) {
-        $at = "$($q.Extent.StartOffset)"
-        for ($i = 0; $i -lt $q.Clauses.Count; $i++) {
-          if ([object]::ReferenceEquals($q.Clauses[$i].Item1, $child)) { $branches[$at] = "c$i" }
-          if ([object]::ReferenceEquals($q.Clauses[$i].Item2, $child)) { $branches[$at] = "b$i" }
-        }
-        if ([object]::ReferenceEquals($q.ElseClause, $child)) { $branches[$at] = "b$($q.Clauses.Count)" }
-      }
-      $child = $q
-      $q = $q.Parent
+      if ($q -is [System.Management.Automation.Language.IfStatementAst]) { $outerIfEnd = $q.Extent.EndOffset }
     }
     [pscustomobject]@{
       name       = $c.GetCommandName()
@@ -1107,7 +1088,7 @@ def _preflight_facts(tmp_path: Path, script: Path | None = None) -> dict:
       line       = $c.Extent.StartLineNumber
       text       = $c.Extent.Text
       inFunction = $inFunction
-      branches   = $branches
+      outerIfEnd = $outerIfEnd
     }
   })
   [pscustomobject]@{ assignments = @($assigns); commands = @($cmds) } |
@@ -1828,59 +1809,35 @@ def test_all_three_acl_sites_are_still_wired(tmp_path: Path) -> None:
 # for icacls only once the service exists, and the service is registered before that call. The
 # installer's own comment says the SID needs ObjectName too; that part is not what this guard rests on.
 #
-# ORDER BY SOURCE OFFSET. That is execution order only while every one of these calls sits outside
-# any function, whose body runs when it is called rather than where it is written, so the guard
-# checks that as well. It does not cover every way a call can run elsewhere than it is written; at
-# least a stored scriptblock, a trap body, Invoke-Expression and a computed command name escape it.
+# THE RULE. Take the outermost if statement around each Set-ServiceAccount call, or the call itself
+# where no if statement is around it. Every Set-SecureDataDirAcl, Set-SecureConfigAcl and
+# Set-ConfigReadAcl call must start after the end of the last of those, and none of these calls may
+# sit inside a function, whose body runs when it is called rather than where it is written. There must
+# be at least one Set-ServiceAccount call and at least one call of each ACL function. Names match
+# without regard to case, as PowerShell resolves them.
 #
-# PER CONTROL-FLOW PATH, BY IF-STATEMENT PART. The installer sets the account in three places, in
-# different clauses of one if/else: the password and password-less calls in the named-account branch,
-# and a third in the LocalSystem branch. A run that takes one clause of an if statement takes no
-# other, and evaluates no condition of a later clause. So a Set-ServiceAccount in such a part is off
-# the ACL call's path, and does not count for or against it. Two checks, then:
-#   * every Set-ServiceAccount on an ACL call's path comes before it, and at least one is there;
-#   * every Set-ServiceAccount has a later call of each ACL function on ITS path, so a lockdown
-#     moved into one branch, which leaves the others with none, fails.
-# So the guard passes a lockdown after the whole if/else, and copies inside the branches each after
-# that branch's own call, and fails a lockdown in one branch only. A part below a loop, a switch, a
-# trap or a scriptblock literal is not read as exclusive, because that code can run more than once.
-# It reads no other control flow, which then counts as on every path: at least a try or catch, a
-# switch's own clauses, `&&`, `||`, the ternary, and -and or -or. "At least one before it" is also
-# not "one on every path to it": an if with no else around the account call still passes.
-# Whether each run-as branch sets the account is NOT checked here.
-# test_objectname_is_written_on_every_run_as_branch counts three calls, and
-# test_the_localsystem_optout_writes_objectname_rather_than_leaving_it places one in the opt-out
-# branch; neither places one in each named-account branch.
+# The rule pins the installer's real shape: it sets the account in three places, all inside one run-as
+# if/else, and locks down once, after that whole if/else. So a lockdown placed inside a run-as branch
+# reads red BY DESIGN, even after that branch's own Set-ServiceAccount, and so does a lockdown inside
+# an unrelated if statement written before the run-as if. An ACL call nested in a Set-ServiceAccount
+# argument sits inside that call, and reads red too.
+#
+# It does NOT check, at least:
+#   * a loop around both the run-as if and an ACL call, where an earlier pass runs the ACL call
+#     before a later pass sets the account;
+#   * an exit, return or throw between the run-as if and the lockdown, which leaves the account set
+#     and nothing locked;
+#   * whether each run-as branch actually sets the account. Only the count of three calls in
+#     test_objectname_is_written_on_every_run_as_branch pins that, and it places none in a branch;
+#   * a call that runs elsewhere than it is written: a stored scriptblock, a trap body,
+#     Invoke-Expression, a computed command name.
 
 _RUN_AS_ASSIGNMENT = "$RunAsObjectName = if ("
-
-
-def _parts_exclusive(x: str, y: str) -> bool:
-    """Whether no run reaches both of two parts of one if statement: "b<n>", clause n's body, or
-    "c<n>", clause n's condition. A body excludes every other body, and the condition of every
-    clause after its own, which is then never evaluated."""
-    (kx, nx), (ky, ny) = (x[0], int(x[1:])), (y[0], int(y[1:]))
-    if kx == ky == "b":
-        return nx != ny
-    if kx == "b" and ky == "c":
-        return nx < ny
-    if kx == "c" and ky == "b":
-        return ny < nx
-    return False
-
-
-def _exclusive(a: dict, b: dict) -> bool:
-    """Whether ``a`` and ``b`` sit in exclusive parts of one if statement, so no run reaches both."""
-    return any(
-        _parts_exclusive(part, b["branches"][at])
-        for at, part in a["branches"].items()
-        if at in b["branches"]
-    )
+_RUNS_BEFORE = "runs before the run-as account is set"
 
 
 def _acl_order_problems(facts: dict) -> list[str]:
-    """Why an ACL call in install-service.ps1 could run before the run-as account is set, or a path
-    that sets the account could run no ACL call after it."""
+    """Why an ACL call in install-service.ps1 could run before the run-as account is set."""
     accounts = _objectname_calls(facts)
     if not accounts:
         return ["no Set-ServiceAccount call sets the run-as account the ACLs name"]
@@ -1889,58 +1846,22 @@ def _acl_order_problems(facts: dict) -> list[str]:
         for c in facts["commands"]
         if c["inFunction"] and any(_named(c, n) for n in (*_ACL_CALLS, "Set-ServiceAccount"))
     ]
+    last = max(accounts, key=lambda a: a["outerIfEnd"])
     for fn in _ACL_CALLS:
         calls = [c for c in facts["commands"] if _named(c, fn)]
         if not calls:
             problems.append(f"{fn} is not called")
-        for c in calls:
-            on_path = [a for a in accounts if not _exclusive(a, c)]
-            later = [a["line"] for a in on_path if a["start"] > c["start"]]
-            if later:
-                problems.append(
-                    f"{fn} at line {c['line']} runs before the run-as account is set,"
-                    f" by the Set-ServiceAccount at line {min(later)}"
-                )
-            elif not on_path:
-                problems.append(
-                    f"{fn} at line {c['line']} runs before the run-as account is set:"
-                    " no Set-ServiceAccount is on its path"
-                )
         problems += [
-            f"no {fn} call follows the Set-ServiceAccount at line {a['line']} on its path"
-            for a in accounts
-            if calls and not any(c["start"] > a["start"] and not _exclusive(a, c) for c in calls)
+            f"{fn} at line {c['line']} {_RUNS_BEFORE}: it does not start after the"
+            f" Set-ServiceAccount at line {last['line']} and every if statement around it"
+            for c in calls
+            if c["start"] < last["outerIfEnd"]
         ]
     return problems
 
 
 def test_the_acls_are_written_after_the_run_as_account_is_set(tmp_path: Path) -> None:
     assert _acl_order_problems(_preflight_facts(tmp_path)) == []
-
-
-@pytest.mark.parametrize(
-    ("a", "b", "exclusive"),
-    [
-        ({"10": "b0"}, {"10": "b1"}, True),
-        ({"10": "b0"}, {"10": "b0"}, False),
-        # A run that takes clause 0's body never evaluates clause 1's condition.
-        ({"10": "b0"}, {"10": "c1"}, True),
-        ({"10": "c1"}, {"10": "b0"}, True),
-        # Clause 1's condition is evaluated on the way to clause 1's body and the else.
-        ({"10": "b1"}, {"10": "c1"}, False),
-        ({"10": "c1"}, {"10": "b2"}, False),
-        ({"10": "c0"}, {"10": "c1"}, False),
-        # Parts of two different if statements, or none, exclude nothing.
-        ({"10": "b0"}, {"20": "b1"}, False),
-        ({}, {"10": "b0"}, False),
-        ({"10": "b0", "30": "b0"}, {"10": "b0", "30": "b1"}, True),
-    ],
-)
-def test_the_order_guard_reads_if_statement_parts_as_a_run_does(
-    a: dict[str, str], b: dict[str, str], exclusive: bool
-) -> None:
-    assert _exclusive({"branches": a}, {"branches": b}) is exclusive
-    assert _exclusive({"branches": b}, {"branches": a}) is exclusive
 
 
 def _rewrite(*edits: tuple[str, str]) -> Callable[[str], str]:
@@ -1955,9 +1876,11 @@ def _rewrite(*edits: tuple[str, str]) -> Callable[[str], str]:
     return mutate
 
 
-def _hoist(call: str) -> Callable[[str], str]:
-    """Move ``call`` from where it stands to just above the run-as block."""
-    return _rewrite((call, ""), (_RUN_AS_ASSIGNMENT, f"{call}\n{_RUN_AS_ASSIGNMENT}"))
+def _hoist(call: str, wrap: str = "{call}") -> Callable[[str], str]:
+    """Move ``call`` from where it stands to just above the run-as block, written as ``wrap``
+    (with ``{call}`` in it)."""
+    above = f"{wrap.format(call=call)}\n{_RUN_AS_ASSIGNMENT}"
+    return _rewrite((call, ""), (_RUN_AS_ASSIGNMENT, above))
 
 
 def _replace(call: str, template: str) -> Callable[[str], str]:
@@ -1970,140 +1893,105 @@ def _account_set_last(source: str) -> str:
     return source + "\nSet-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName\n"
 
 
-def _early_lowercase_call(source: str) -> str:
-    """A second lockdown, spelled in lower case, above the run-as block. PowerShell runs it."""
-    assert source.count(_RUN_AS_ASSIGNMENT) == 1, "CONTROL FAILED: the run-as block moved"
-    early = "set-securedatadiracl -Path $DataDir -Account $ServiceAccount"
-    return source.replace(_RUN_AS_ASSIGNMENT, f"{early}\n{_RUN_AS_ASSIGNMENT}")
-
-
-_RUNS_BEFORE = "runs before the run-as account is set"
 _LOCKDOWN = "Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount"
-# Anchors in the run-as if/else, each in the script once.
+_CONFIG_LOCK = "Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount"
+_CONFIG_READ = "Set-ConfigReadAcl -Path $Config -Account $ServiceAccount"
+# The three run-as calls, each anchored so that it is in the script once.
+_ACCOUNT_CALL = "Set-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName"
+_PASSWORD_CALL = f"{_ACCOUNT_CALL} -Password $ServiceAccountPassword"
+_NO_PASSWORD_CALL = f"        {_ACCOUNT_CALL}\n    }}\n"
+_LOCALSYSTEM_CALL = f"\n    {_ACCOUNT_CALL}\n"
 _NAMED_BRANCH_END = '    Write-Host "  Account: $RunAsObjectName" -ForegroundColor Green\n'
-_NAMED_BRANCH_START = "    Set-ServiceLogonRight -Account $ServiceAccount\n"
-_PASSWORD_CALL_END = "-Password $ServiceAccountPassword\n"
-_LOCALSYSTEM_CALL = "\n    Set-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName\n"
-_LOCALSYSTEM_ELSE = "} else {\n    # $ServiceAccount is empty only when"
 
 
 def _after(anchor: str, line: str) -> tuple[str, str]:
     return anchor, f"{anchor}{line}\n"
 
 
-def _no_account_set(source: str) -> str:
-    """Every Set-ServiceAccount call commented out."""
-    call = "Set-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName"
-    assert source.count(call) == 3, "CONTROL FAILED: the three run-as calls moved"
-    return source.replace(call, f"# {call}")
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        pytest.param(
-            _rewrite(
-                (_LOCKDOWN, f"# {_LOCKDOWN} moved into each run-as branch"),
-                _after(_NAMED_BRANCH_END, f"    {_LOCKDOWN}"),
-                _after(_LOCALSYSTEM_CALL, f"    {_LOCKDOWN}"),
-            ),
-            id="lockdown-in-each-branch-after-its-account",
-        ),
-        pytest.param(
-            _rewrite(_after(_PASSWORD_CALL_END, f"        {_LOCKDOWN}")),
-            id="lockdown-after-the-password-call",
-        ),
-    ],
-)
-def test_the_acl_order_guard_passes_a_lockdown_inside_a_branch_after_its_account(
-    tmp_path: Path, mutate: Callable[[str], str]
-) -> None:
-    """A lockdown inside a run-as branch, after that branch's own Set-ServiceAccount, is in order,
-    though a call in another branch sits later in the source. The arms below must still fail."""
-    assert _SCRIPT is not None
-    mutated = tmp_path / "install-service.ps1"
-    mutated.write_text(mutate(_SCRIPT.read_text(encoding="utf-8")), encoding="utf-8")
-    assert _acl_order_problems(_preflight_facts(tmp_path, script=mutated)) == []
+def _commented(call: str) -> tuple[str, str]:
+    return call, call.replace(_ACCOUNT_CALL, f"# {_ACCOUNT_CALL}")
 
 
 @pytest.mark.parametrize(
     ("mutate", "expect"),
     [
         pytest.param(
-            _hoist("Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount"),
-            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
-            id="data-dir-lockdown-hoisted",
+            _hoist(_LOCKDOWN), ("Set-SecureDataDirAcl at line", _RUNS_BEFORE), id="lockdown-hoisted"
         ),
         pytest.param(
-            _hoist("Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount"),
+            _hoist(_CONFIG_LOCK),
             ("Set-SecureConfigAcl at line", _RUNS_BEFORE),
             id="config-lock-hoisted",
         ),
         pytest.param(
-            _hoist("Set-ConfigReadAcl -Path $Config -Account $ServiceAccount"),
+            _hoist(_CONFIG_READ),
             ("Set-ConfigReadAcl at line", _RUNS_BEFORE),
             id="config-read-hoisted",
         ),
+        # $null, not a comment: the read call shares its line with the closing brace of its if.
         pytest.param(
-            _replace("Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount", "# {call}"),
+            _replace(_LOCKDOWN, "$null"),
             ("Set-SecureDataDirAcl is not called",),
-            id="data-dir-lockdown-deleted",
+            id="lockdown-deleted",
         ),
         pytest.param(
-            _replace(
-                "Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount",
-                "function Invoke-Lockdown {{ {call} }}",
-            ),
+            _replace(_CONFIG_LOCK, "$null"),
+            ("Set-SecureConfigAcl is not called",),
+            id="config-lock-deleted",
+        ),
+        pytest.param(
+            _replace(_CONFIG_READ, "$null"),
+            ("Set-ConfigReadAcl is not called",),
+            id="config-read-deleted",
+        ),
+        pytest.param(
+            _replace(_LOCKDOWN, "function Invoke-Lockdown {{ {call} }}"),
             ("Set-SecureDataDirAcl at line", "is inside a function"),
-            id="data-dir-lockdown-in-a-function",
+            id="lockdown-in-a-function",
         ),
-        pytest.param(_account_set_last, (_RUNS_BEFORE,), id="account-set-last"),
+        # Red BY DESIGN: after its own branch's account, yet inside the run-as if/else.
         pytest.param(
-            _early_lowercase_call,
+            _rewrite((_LOCKDOWN, "$null"), _after(_NAMED_BRANCH_END, f"    {_LOCKDOWN}")),
             ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
-            id="early-call-in-lower-case",
-        ),
-        pytest.param(
-            _rewrite(_after(_NAMED_BRANCH_START, f"    {_LOCKDOWN}")),
-            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE, "by the Set-ServiceAccount at line"),
-            id="lockdown-in-a-branch-before-its-account",
+            id="lockdown-moved-into-a-run-as-branch",
         ),
         pytest.param(
             _rewrite(
-                (
-                    _LOCALSYSTEM_ELSE,
-                    "} elseif ($AllowLocalSystem -and $SkipGmsaPreflight) {\n"
-                    f"    {_LOCKDOWN}\n{_LOCALSYSTEM_ELSE}",
-                )
-            ),
-            ("Set-SecureDataDirAcl at line", "no Set-ServiceAccount is on its path"),
-            id="lockdown-in-a-branch-that-sets-no-account",
-        ),
-        pytest.param(
-            _rewrite(
-                (_LOCKDOWN, f"# {_LOCKDOWN} moved into the named-account branch only"),
+                (_LOCKDOWN, "$null"),
                 _after(_NAMED_BRANCH_END, f"    {_LOCKDOWN}"),
+                _after(_LOCALSYSTEM_CALL, f"    {_LOCKDOWN}"),
             ),
-            ("no Set-SecureDataDirAcl call follows the Set-ServiceAccount at line",),
-            id="lockdown-in-one-branch-only",
+            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
+            id="lockdown-moved-into-each-run-as-branch",
+        ),
+        pytest.param(
+            _hoist(_LOCKDOWN, "if ($LockConfigDir) {{ {call} }}"),
+            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
+            id="lockdown-in-an-unrelated-if-before-the-run-as-if",
         ),
         pytest.param(
             _rewrite(
+                (_LOCKDOWN, "$null"),
                 (
-                    _LOCKDOWN,
-                    "foreach ($step in 'acl', 'account') { if ($step -eq 'acl') { "
-                    f"{_LOCKDOWN} }} else {{ Set-ServiceAccount -ServiceName $ServiceName "
-                    "-Account $RunAsObjectName } }",
-                )
+                    _LOCALSYSTEM_CALL,
+                    f"\n    Set-ServiceAccount -ServiceName $ServiceName -Account ({_LOCKDOWN})\n",
+                ),
             ),
-            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE, "by the Set-ServiceAccount at line"),
-            id="lockdown-and-account-in-one-loop",
+            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
+            id="lockdown-in-a-run-as-argument",
         ),
         pytest.param(
-            _no_account_set,
+            _rewrite(*map(_commented, (_PASSWORD_CALL, _NO_PASSWORD_CALL, _LOCALSYSTEM_CALL))),
             ("no Set-ServiceAccount call sets the run-as account the ACLs name",),
             id="no-set-serviceaccount",
         ),
+        # A second lockdown, spelled in lower case, above the run-as block. PowerShell runs it.
+        pytest.param(
+            _rewrite((_RUN_AS_ASSIGNMENT, f"{_LOCKDOWN.lower()}\n{_RUN_AS_ASSIGNMENT}")),
+            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
+            id="early-call-in-lower-case",
+        ),
+        pytest.param(_account_set_last, (_RUNS_BEFORE,), id="account-set-last"),
     ],
 )
 def test_the_acl_order_guard_fails_when_the_order_is_broken(
