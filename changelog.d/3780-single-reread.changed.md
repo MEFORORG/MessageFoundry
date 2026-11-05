@@ -1,5 +1,6 @@
-- **A directory account's TOTP or recovery-code attempt re-reads its session, account and lock once
-  after the directory lookup, not twice.** `verify_mfa` no longer re-reads right after the lookup;
-  the re-read inside the account's queue, which already ran before any code is checked, is now that
-  read. It also rejoins the queue under the account's new name when a directory rename landed after
-  the queue was keyed, which the dropped read used to cover for the lookup. (`BACKLOG #3780`)
+- **A directory account's TOTP or recovery-code attempt reads its session, account and lock once
+  between the directory lookup and the code check, not twice.** `verify_mfa` no longer re-reads
+  right after the lookup. The re-read inside the account's queue, which already ran before any code
+  is checked, is now that read. The re-reads after the code check are unchanged. The dropped read
+  also supplied the queue's key, so the in-queue read now rejoins the queue once under the
+  account's new name when a directory rename landed after the queue was keyed. (`BACKLOG #3780`)

@@ -342,7 +342,8 @@ async def test_a_directory_accounts_sign_in_lock_alone_does_not_refuse_the_secon
 ) -> None:
     """ADR 0197: ``verify_mfa`` is refused by the SECOND-STEP lock only, on the directory branch too.
     A sign-in lock is the one a caller who knows only the username can set, and this session has
-    already passed the step it guards. Covers both lock checks, before and after the lookup."""
+    already passed the step it guards. Covers both lock checks, before the lookup and inside the
+    account's queue (BACKLOG #3780 item 2)."""
     e = await _enrolled_directory_session(store, monkeypatch)
     # Wall clock, not the pinned TOTP clock: the service reads the lock against time.time().
     await store.record_login_failure(e.user_id, failed_attempts=5, locked_until=time.time() + 900.0)
@@ -522,15 +523,18 @@ async def test_a_directory_attempt_reads_its_holder_once_between_the_lookup_and_
 ) -> None:
     """BACKLOG #3780 item 2. ``verify_mfa`` read the session, the account and its lock right after
     the lookup and again inside the account's queue, with only the queue's acquisition between.
-    The in-queue read is now the one re-read after the lookup. RED when: a second read comes back.
-    The control is that the attempt still succeeds, so the count is of a leg that ran."""
+    The in-queue read is now the one re-read after the lookup. RED when: a second read of the
+    session, or a second lock check, comes back between the lookup and the code check. The control
+    is that the attempt still succeeds, so the count is of a leg that ran."""
     e = await _enrolled_directory_session(store, monkeypatch)
     real_probe = e.service._probe_principal
     real_load = e.service._load_session
+    real_lock_refused = e.service._mfa_lock_refused
     real_verify = e.service._verify_second_factor
     looked_up = False
     reads_after_lookup = 0
-    reads_before_code: list[int] = []
+    lock_checks_after_lookup = 0
+    reads_before_code: list[tuple[int, int]] = []
 
     async def _probe(user: Any) -> reconcile.Probe:
         nonlocal looked_up
@@ -544,19 +548,26 @@ async def test_a_directory_attempt_reads_its_holder_once_between_the_lookup_and_
             reads_after_lookup += 1
         return await real_load(token_hash)
 
+    async def _lock_refused(*args: Any, **kwargs: Any) -> bool:
+        nonlocal lock_checks_after_lookup
+        if looked_up:
+            lock_checks_after_lookup += 1
+        return await real_lock_refused(*args, **kwargs)
+
     async def _verify(*args: Any, **kwargs: Any) -> bool:
-        reads_before_code.append(reads_after_lookup)
+        reads_before_code.append((reads_after_lookup, lock_checks_after_lookup))
         return await real_verify(*args, **kwargs)
 
     monkeypatch.setattr(e.service, "_probe_principal", _probe)
     monkeypatch.setattr(e.service, "_load_session", _load)
+    monkeypatch.setattr(e.service, "_mfa_lock_refused", _lock_refused)
     monkeypatch.setattr(e.service, "_verify_second_factor", _verify)
 
     verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
 
     assert verified.ok is True
     assert looked_up
-    assert reads_before_code == [1]
+    assert reads_before_code == [(1, 1)]
 
 
 @pytest.mark.parametrize("change", ["revoke", "disable", "lock"])
@@ -656,6 +667,40 @@ async def test_a_rename_rejoins_the_queue_under_the_new_name_before_the_code(
     assert e.service._credential_locks == {}
     rows = await store.list_audit(action="auth.mfa_verified")
     assert [r["actor"] for r in rows] == ["jdoe-renamed"]
+
+
+async def test_a_second_rename_carries_on_in_the_queue_held(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3780 item 2. The rejoin runs once, so a name that keeps moving cannot keep an
+    attempt cycling through queues. RED when: the rejoin is unbounded (the attempt queues a third
+    time) or a second rename refuses the attempt. A second rename carries on in the queue then held,
+    as one during the code check does; the success is still filed under the name written last."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_lock = e.service._account_credential_lock
+    names = ["jdoe", "jdoe-renamed", "jdoe-third"]
+    queued_as: list[str] = []
+
+    @asynccontextmanager
+    async def _queue(username: str) -> AsyncIterator[None]:
+        queued_as.append(username)
+        if len(queued_as) < len(names):
+            step = len(queued_as)
+            assert await store.set_user_username(
+                e.user_id, names[step], expected_username=names[step - 1], audits=()
+            )
+        async with real_lock(username):
+            yield
+
+    monkeypatch.setattr(e.service, "_account_credential_lock", _queue)
+
+    verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert verified.ok is True
+    assert queued_as == ["jdoe", "jdoe-renamed"]
+    assert e.service._credential_locks == {}
+    rows = await store.list_audit(action="auth.mfa_verified")
+    assert [r["actor"] for r in rows] == ["jdoe-third"]
 
 
 @pytest.mark.parametrize(

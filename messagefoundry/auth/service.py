@@ -13865,9 +13865,8 @@ class AuthService:
         trip, and one slow lookup held in the queue would stall every attempt queued on that
         account. It only adds a refusal and counts nothing, so running it concurrently cannot let a
         burst past the lock: the check that bounds the burst is the one inside the queue. That
-        in-queue read is also the one re-read after the lookup (BACKLOG #3780 item 2), so it
-        rejoins the queue under the account's new name when a rename landed after the queue was
-        keyed.
+        in-queue read is also the one re-read after the lookup; the comment above the lookup's
+        call states the rule (BACKLOG #3780 item 2).
 
         The TOTP code is judged at the moment the request ARRIVED, not when it leaves the queue
         (``arrived``). Otherwise a caller who knows only the username could queue padded failures
@@ -13926,10 +13925,14 @@ class AuthService:
         # or recovery code and charges nothing to the lockout: the caller did not guess wrong, the
         # directory could not vouch for the account. This only ADDS a refusal; a confirmed
         # directory account meets the same lock and lockout feed. A local account is not asked.
-        # BACKLOG #3780 item 2: no re-read follows the lookup here, because the in-queue re-read
-        # below is that read. Only the queue's acquisition awaits between the two, and nothing is
-        # spent before the in-queue read, so it refuses everything the lookup let land: a
-        # revocation, a disable, a lock, and a rename (it rejoins the queue under the new name).
+        # BACKLOG #3780 item 2, THE ONE STATEMENT OF THIS RULE: no re-read follows the lookup here,
+        # because the in-queue re-read below is that read. Only the queue's acquisition awaits
+        # between the two, and nothing is spent before the in-queue read, so it still refuses,
+        # before any code is checked, a revocation, a disable or a lock the lookup let land. It
+        # refuses them after the in-queue ``totp_enabled`` and lapse checks rather than before
+        # them, as it already did for a local account. The dropped read also supplied the queue's
+        # key, so a rename during the lookup was queued under the new name; the in-queue read now
+        # rejoins the queue under the new name instead, once (see below).
         vouched = await self._directory_vouches_for_factor(
             token, user, event="auth.mfa_failed", client=client, report_lock=True, reread=False
         )
@@ -13937,7 +13940,7 @@ class AuthService:
             return vouched
         async with AsyncExitStack() as queue:
             queued_as = user.username
-            while True:
+            for may_rejoin in (True, False):
                 await queue.enter_async_context(self._account_credential_lock(queued_as))
                 # Read the session, the account and its lock again. The queue may have been a wait,
                 # and for a directory account the lookup came before it, so what was read before
@@ -13958,15 +13961,20 @@ class AuthService:
                         phase=None,
                     )
                     return Elevation(session_lost=True)
-                if _credential_lock_key(loaded.username) == _credential_lock_key(queued_as):
+                if not may_rejoin or (
+                    _credential_lock_key(loaded.username) == _credential_lock_key(queued_as)
+                ):
+                    user = loaded
                     break
                 # A directory rename landed after the queue was keyed, so the queue held is one
                 # that attempts reading the new name do not join, and a burst split across the two
-                # would overshoot the lockout (BACKLOG #1943). Leave it and queue under the name
-                # the row holds now; the reads above run again after that wait.
+                # can get one code check past the lockout (BACKLOG #1943). Leave it and queue under
+                # the name the row holds now; the reads above run again after that wait. ONCE: a
+                # second rename carries on in the queue then held, as a rename during the code
+                # check below does. Both windows stay open while the queue is keyed by name; the
+                # read this replaces, which ran before the queue, covered neither.
                 await queue.pop_all().aclose()
                 queued_as = loaded.username
-            user = loaded
             if not user.totp_enabled:
                 return Elevation()
             if await self._mfa_lapsed(token, user, client=client, factor_checked=False):
@@ -14376,10 +14384,11 @@ class AuthService:
         to carry on with: ``user`` itself for a local account, which is never asked and costs no
         read, or the row read afresh after a confirmed lookup.
 
-        ``reread=False`` skips that re-read and returns ``user`` itself after a confirmed lookup.
-        Only for a caller whose own read of the session, the account and its lock follows the
-        lookup with nothing spent in between: :meth:`verify_mfa`, whose in-queue re-read is that
-        read, so a directory attempt re-reads once rather than twice (BACKLOG #3780 item 2).
+        **Except under ``reread=False``,** which skips that re-read and returns ``user`` itself, as
+        read BEFORE the lookup: nothing below about the re-read then holds, and the caller must
+        not use the returned row as fresh. Only :meth:`verify_mfa` passes it, whose own in-queue
+        read follows the lookup before anything is spent; the comment at its call says why
+        (BACKLOG #3780 item 2).
 
         The one copy of a block :meth:`verify_mfa` (BACKLOG #2023) and
         :meth:`finish_webauthn_assertion` (BACKLOG #2239) each used to spell out (BACKLOG #3068).
@@ -14439,9 +14448,8 @@ class AuthService:
 
         For a check that must land just before a factor is written, after awaits in which a
         revocation, a disable or a lock could have landed (BACKLOG #3068).
-        :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup for every caller but
-        :meth:`verify_mfa`, which re-reads inside its queue instead (BACKLOG #3780 item 2), both
-        second-factor legs run it again right before ``mark_session_mfa_verified``, and
+        :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, unless told not to
+        (``reread``), both second-factor legs run it again right before ``mark_session_mfa_verified``, and
         :meth:`verify_mfa` runs it on a matched code whose spend failed, before it decides the
         charge. A session
         revoked or gone, or an account disabled or gone, returns ``session_lost``: the token no longer
