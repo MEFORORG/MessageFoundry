@@ -175,8 +175,8 @@ def _attach_issuer_index(ctx: ssl.SSLContext, cadata: str, cert_map: Mapping[str
     every certificate under it with nothing in the log, so each one is warned about here (#2237),
     as is a loaded certificate that is no CA with a loaded CA's subject
     (:meth:`~messagefoundry.pki.IssuerIndex.namesake_warnings`). Raises ``ValueError``, refusing
-    the start, when the index cannot hold exactly what the context loaded
-    (:class:`~messagefoundry.pki.IssuerIndex`, BACKLOG #4948)."""
+    the start, when :class:`~messagefoundry.pki.IssuerIndex` refuses the file; what it compares
+    with the context is stated there (BACKLOG #4948)."""
     from messagefoundry.api.tls_client_cert import ISSUER_INDEX_ATTR
     from messagefoundry.pki import IssuerIndex
 

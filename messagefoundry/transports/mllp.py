@@ -2143,8 +2143,8 @@ def _sender_issuer_lookup(
     refuse every sender under it with nothing in the log, so each is warned about here, as the
     inbound HTTP listener does for ``intake_client_subjects``, as is a loaded certificate that is no
     CA with a loaded CA's subject (:meth:`~messagefoundry.pki.IssuerIndex.namesake_warnings`).
-    Raises ``ValueError``, refusing the start, when the index cannot hold exactly what the TLS
-    library loaded (:class:`~messagefoundry.pki.IssuerIndex`)."""
+    Raises ``ValueError``, refusing the start, when :class:`~messagefoundry.pki.IssuerIndex`
+    refuses the file; what it compares with the TLS library is stated there."""
     # Lazy: pki pulls in cryptography, which a listener without the allowlist never needs.
     from messagefoundry.pki import IssuerIndex
 

@@ -729,8 +729,8 @@ def _client_issuer_index(
     every certificate under it with nothing in the log, so each one is warned about here, as the API
     does for ``[api].tls_client_cert_identities``, as is a loaded certificate that is no CA with a
     loaded CA's subject (:meth:`~messagefoundry.pki.IssuerIndex.namesake_warnings`). Raises
-    ``ValueError``, refusing the start, when the index cannot hold exactly what the TLS library
-    loaded (:class:`~messagefoundry.pki.IssuerIndex`)."""
+    ``ValueError``, refusing the start, when :class:`~messagefoundry.pki.IssuerIndex` refuses the
+    file; what it compares with the TLS library is stated there."""
     if cadata is None:
         return None
     # Lazy: pki pulls in cryptography, which a listener without mtls_subject never needs.
