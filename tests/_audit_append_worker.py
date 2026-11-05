@@ -7,10 +7,11 @@ Run as a SEPARATE OS PROCESS, which is the whole point. ``SqlServerStore._audit_
 against the unpatched code. Two of these processes hold two unrelated locks over one chain, which
 is what ``serve --shard`` does.
 
-Argv: ``<tag> <count> <ready-file> <go-file>``. The process opens a store, touches the ready file,
-waits for the go file, appends ``count`` audit rows, and exits 0. The two-file barrier exists
-because store open is far slower than one append: without it a fast worker can finish its whole
-run before its peer connects, and the appends never overlap at all.
+Argv: ``<tag> <count> <go-file>``. The process opens a store, prints ``READY``, waits for the go
+file, appends ``count`` audit rows, and exits 0: the child contract of ``tests/_process_rig.py``
+(vault BACKLOG #3193 N5). The barrier exists because store open is far slower than one append:
+without it a fast worker can finish its whole run before its peer connects, and the appends never
+overlap at all.
 
 Not collected by pytest: the leading underscore keeps it out of the ``test_*.py`` pattern.
 """
@@ -37,7 +38,7 @@ def _wait_for(path: Path) -> None:
         time.sleep(_BARRIER_POLL_SECONDS)
 
 
-async def _append(tag: str, count: int, ready: Path, go: Path) -> None:
+async def _append(tag: str, count: int, go: Path) -> None:
     # Imported inside the coroutine so an import failure still reaches the parent as a non-zero exit
     # with a readable traceback on stderr, rather than as a silent barrier timeout.
     from messagefoundry.config.settings import load_settings
@@ -50,7 +51,7 @@ async def _append(tag: str, count: int, ready: Path, go: Path) -> None:
         load_settings(environ=os.environ).store, posture=HopPosture(enforcing=False)
     )
     try:
-        ready.write_text(str(os.getpid()), encoding="utf-8")
+        print("READY", flush=True)
         _wait_for(go)
         for i in range(count):
             await store.record_audit(
@@ -63,8 +64,8 @@ async def _append(tag: str, count: int, ready: Path, go: Path) -> None:
 
 
 def main(argv: list[str]) -> int:
-    tag, count, ready, go = argv[0], int(argv[1]), Path(argv[2]), Path(argv[3])
-    asyncio.run(_append(tag, count, ready, go))
+    tag, count, go = argv[0], int(argv[1]), Path(argv[2])
+    asyncio.run(_append(tag, count, go))
     return 0
 
 
