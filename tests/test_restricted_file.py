@@ -82,48 +82,55 @@ def test_an_account_already_holding_full_control_gets_no_second_entry() -> None:
     }
 
 
-def test_a_created_file_must_read_back_exactly_as_asked() -> None:
-    expected = restricted_file._expected_access(_CREATOR, [_SERVICE])
-    exact = _security(
-        (_ALLOW, _FULL, _SYSTEM),
-        (_ALLOW, _FULL, _ADMINS),
-        (_ALLOW, _FULL, _CREATOR),
-        (_ALLOW, _READ, _SERVICE),
-    )
-    assert restricted_file._created_mismatch(exact, True, expected) is None  # the control
-
-    one_more = _security(*(exact.aces or ()), (_ALLOW, _READ, _USERS))
-    assert "not the one that was asked for" in str(
-        restricted_file._created_mismatch(one_more, True, expected)
-    )
-    widened = _security(
-        (_ALLOW, _FULL, _SYSTEM),
-        (_ALLOW, _FULL, _ADMINS),
-        (_ALLOW, _FULL, _CREATOR),
-        (_ALLOW, _FULL, _SERVICE),
-    )
-    assert restricted_file._created_mismatch(widened, True, expected) is not None
-    assert "does not block inheritance" in str(
-        restricted_file._created_mismatch(exact, False, expected)
-    )
-    # A read-back that did not finish is a mismatch, never a pass.
-    assert restricted_file._created_mismatch(exact, None, expected) is not None
-    assert restricted_file._created_mismatch(_WinPathSecurity(status=5), True, expected) is not None
-    assert (
-        restricted_file._created_mismatch(_WinPathSecurity(dacl_present=False), True, expected)
-        is not None
-    )
-    assert (
-        restricted_file._created_mismatch(_WinPathSecurity(owner_sid=_CREATOR), True, expected)
-        is not None
-    )
-
-
 def test_a_new_file_without_its_creators_access_is_the_drafts_descriptor() -> None:
     access = restricted_file._expected_access(_CREATOR, [_SERVICE], creator_access=False)
     assert access == {_SYSTEM: _FULL, _ADMINS: _FULL, _SERVICE: _READ}
     assert restricted_file._protected_sddl(access) == (
         f"D:P(A;;FA;;;{_SYSTEM})(A;;FA;;;{_ADMINS})(A;;FR;;;{_SERVICE})"
+    )
+
+
+_READ_DELETE = 0x00130089
+
+
+def test_the_handoffs_grant_is_read_and_delete() -> None:
+    # Vault BACKLOG #3411: the service deletes the handoff through the handle it read it with.
+    access = restricted_file._expected_access(
+        _CREATOR, [_SERVICE], creator_access=False, read_delete=True
+    )
+    assert access == {_SYSTEM: _FULL, _ADMINS: _FULL, _SERVICE: _READ_DELETE}
+    assert restricted_file._protected_sddl(access) == (
+        f"D:P(A;;FA;;;{_SYSTEM})(A;;FA;;;{_ADMINS})(A;;FRSD;;;{_SERVICE})"
+    )
+    # The control: without it, read alone.
+    assert restricted_file._expected_access(_CREATOR, [_SERVICE])[_SERVICE] == _READ
+
+
+@pytest.mark.parametrize("sid", [_SYSTEM, "S-1-5-19", "S-1-5-20", None])
+def test_a_key_custody_file_is_never_kept_for_a_shared_account(sid: str | None) -> None:
+    # SYSTEM is named outright: a grant to it would collapse into SYSTEM's own full-control entry.
+    assert restricted_file.custody_account_problem(sid) is not None
+    assert restricted_file.custody_account_problem(_SERVICE) is None  # the control
+    assert restricted_file.custody_account_problem(_CREATOR) is None
+
+
+def test_the_create_and_the_read_judge_one_exact_standard() -> None:
+    # The create reads back through the creating handle and calls the read side's own check,
+    # which judges each entry's flags too.
+    expected = restricted_file._expected_access(_CREATOR, [_SERVICE])
+    exact = (
+        (_ALLOW, 0, _FULL, _SYSTEM),
+        (_ALLOW, 0, _FULL, _ADMINS),
+        (_ALLOW, 0, _FULL, _CREATOR),
+        (_ALLOW, 0, _READ, _SERVICE),
+    )
+    held = restricted_file._HandleSecurity(owner_sid=_CREATOR, protected=True, aces=exact)
+    assert restricted_file._exact_descriptor_problem(held, expected, engine_sid=_CREATOR) is None
+    flagged = restricted_file._HandleSecurity(
+        owner_sid=_CREATOR, protected=True, aces=(*exact[:3], (_ALLOW, 0x10, _READ, _SERVICE))
+    )
+    assert "flags 0x10" in str(
+        restricted_file._exact_descriptor_problem(flagged, expected, engine_sid=_CREATOR)
     )
 
 
@@ -228,9 +235,157 @@ def test_a_key_file_volume_must_be_a_local_ntfs_or_refs_disk() -> None:
     assert "could not be read (Win32 error 1)" in str(restricted_file._volume_problem(failed))
 
 
-def test_the_foreign_file_system_list_cannot_be_changed_at_run_time() -> None:
+def test_the_file_system_allowlists_cannot_be_changed_at_run_time() -> None:
     with pytest.raises(TypeError):
-        restricted_file.LINUX_FOREIGN_ACCESS_MODEL_FILE_SYSTEMS[0x6969] = "x"  # type: ignore[index]
+        restricted_file.LINUX_HOST_FILE_SYSTEMS[0x6969] = "x"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        restricted_file.LINUX_CREDENTIAL_FILE_SYSTEMS[0x6969] = "x"  # type: ignore[index]
+
+
+_EXT4, _XFS, _BTRFS, _ZFS, _F2FS, _BCACHEFS = (
+    0xEF53,
+    0x58465342,
+    0x9123683E,
+    0x2FC12FC1,
+    0xF2F52010,
+    0xCA451A4E,
+)
+_RAMFS, _TMPFS = 0x858458F6, 0x01021994
+
+
+def test_the_file_system_allowlists_name_exactly_the_local_kinds() -> None:
+    assert set(restricted_file.LINUX_HOST_FILE_SYSTEMS) == {
+        _EXT4,
+        _XFS,
+        _BTRFS,
+        _ZFS,
+        _F2FS,
+        _BCACHEFS,
+    }
+    assert set(restricted_file.LINUX_CREDENTIAL_FILE_SYSTEMS) == {_RAMFS, _TMPFS}
+
+
+@pytest.mark.parametrize(
+    "magic",
+    [
+        0x6969,  # NFS
+        0xFF534D42,  # CIFS
+        0xFE534D42,  # SMB2
+        0x65735546,  # FUSE
+        0x794C7630,  # overlayfs
+        0xF15F,  # ecryptfs, which may be stacked over NFS
+        # On no deny list slice B1.5 had, and refused here without being named.
+        0x20030528,  # OrangeFS
+        0x19830326,  # BeeGFS
+        _TMPFS,  # in memory: a host file would not outlive a reboot
+        0,
+    ],
+)
+def test_a_host_file_system_the_allowlist_does_not_name_is_refused_by_its_magic(
+    magic: int,
+) -> None:
+    allowed = restricted_file.LINUX_HOST_FILE_SYSTEMS
+    problem = restricted_file.linux_file_system_problem(magic, allowed, "host file")
+    assert f"type {magic:#010x}" in str(problem)
+    assert "xfs" in str(problem) and "bcachefs only" in str(problem)
+    for local in allowed:  # the controls
+        assert restricted_file.linux_file_system_problem(local, allowed, "host file") is None
+
+
+def test_an_empty_allowlist_refuses_every_file_system() -> None:
+    from types import MappingProxyType
+
+    assert "no file system holds" in str(
+        restricted_file.linux_file_system_problem(_EXT4, MappingProxyType({}), "host file")
+    )
+
+
+@pytest.mark.parametrize(
+    ("sid", "kind", "allowed"),
+    [
+        (_CREATOR, 1, True),  # a user account
+        (_SERVICE, 5, True),  # a virtual service account, as Windows reports one
+        (_SERVICE, None, True),  # the same, for a service not yet installed
+        (_ADMINS, 4, False),  # an alias
+        ("S-1-5-32-551", 4, False),  # Backup Operators
+        ("S-1-5-21-1-2-3-512", 2, False),  # a domain group
+        ("S-1-5-21-1-2-3-512", None, False),  # one whose domain did not answer
+        ("S-1-5-80-0", 5, False),  # ALL SERVICES
+        ("S-1-1-0", 5, False),  # Everyone
+        ("S-1-15-2-1", 5, False),  # ALL APPLICATION PACKAGES
+        (_SYSTEM, 5, False),
+        ("S-1-5-19", 5, False),
+        ("S-1-5-80-1-2-3-4-5-6", 5, False),  # not the shape of one service's own SID
+        ("S-1-5-21-1-2-3-1105", 9, True),  # a computer account, as a gMSA may answer
+    ],
+)
+def test_a_handoff_is_granted_to_one_account_only(
+    sid: str, kind: int | None, allowed: bool
+) -> None:
+    asked: list[str] = []
+
+    def _kind_of(asked_sid: str) -> int | None:
+        asked.append(asked_sid)
+        return kind
+
+    problem = restricted_file.handoff_grantee_problem(sid, _kind_of)
+    assert (problem is None) is allowed, problem
+    # Windows is asked only past the checks that need no lookup: the shared accounts, a package
+    # and one service's own SID are judged on the SID alone.
+    no_lookup = sid in {_SYSTEM, "S-1-5-19", "S-1-15-2-1", _SERVICE}
+    assert asked == ([] if no_lookup else [sid])
+
+
+@windows_only
+def test_windows_an_account_kind_is_read_from_windows() -> None:
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    me = _win32_config_source_probes().self_sid
+    assert me is not None
+    assert restricted_file._lookup_sid_kind(me) == 1  # a user account
+    assert restricted_file._lookup_sid_kind(_ADMINS) == 4  # an alias
+    assert restricted_file._lookup_sid_kind("S-1-5-21-1-2-3-512") is None  # mapped to nothing
+
+
+def test_a_credential_is_read_from_an_in_memory_file_system_only() -> None:
+    allowed = restricted_file.LINUX_CREDENTIAL_FILE_SYSTEMS
+    assert restricted_file.linux_file_system_problem(_TMPFS, allowed, "credential") is None
+    assert restricted_file.linux_file_system_problem(_RAMFS, allowed, "credential") is None
+    assert "ramfs or tmpfs only" in str(
+        restricted_file.linux_file_system_problem(_EXT4, allowed, "credential")
+    )
+
+
+def test_a_c_library_without_fstatfs_is_an_error_chained_from_its_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+
+    class _NoSymbols:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            pass
+
+        def __getattr__(self, name: str) -> object:
+            raise AttributeError(name)
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(ctypes, "CDLL", _NoSymbols)
+    with pytest.raises(OSError, match="offers no fstatfs") as excinfo:
+        restricted_file.linux_file_system_type(0)
+    assert excinfo.value.errno == errno.ENOSYS
+    assert isinstance(excinfo.value.__cause__, AttributeError)  # not dropped
+
+
+def test_a_volume_check_off_linux_and_windows_is_refused_before_a_file_is_made(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    path = tmp_path / "host.blob"
+    with pytest.raises(RestrictedFileError, match="Linux and Windows only"):
+        restricted_file._create_restricted(
+            path, (), creator_access=True, owner=None, local_volume_only=True
+        )
+    assert not path.exists()
 
 
 def test_a_file_that_cannot_be_removed_after_a_failure_says_so(
@@ -566,15 +721,162 @@ def test_windows_removes_a_file_whose_access_does_not_read_back(
     path = tmp_path / "store.key"
     seen: dict[str, bool] = {}
 
-    def _disagree(*_a: object) -> str:
+    def _disagree(*_a: object, **_k: object) -> str:
         seen["existed"] = path.exists()
         return "stand-in mismatch"
 
-    monkeypatch.setattr(restricted_file, "_created_mismatch", _disagree)
+    monkeypatch.setattr(restricted_file, "_exact_descriptor_problem", _disagree)
     with pytest.raises(RestrictedFileError, match="stand-in mismatch"):
         write_restricted_file(path, b"KEY-MATERIAL-STAND-IN")
     assert seen == {"existed": True}
     assert list(tmp_path.iterdir()) == []
+
+
+@windows_only
+def test_windows_the_create_reads_back_through_its_own_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _by_name(*_a: object, **_k: object) -> str | None:
+        raise AssertionError("the create must not read the new file back by its name")
+
+    handles: list[int] = []
+    real = restricted_file._read_handle_security
+
+    def _spy(handle: int) -> Any:
+        handles.append(handle)
+        return real(handle)
+
+    monkeypatch.setattr(store_mod, "_read_dacl_sddl", _by_name)
+    monkeypatch.setattr(restricted_file, "_read_handle_security", _spy)
+    path = tmp_path / "store.key"
+    write_restricted_file(path, b"k")
+    assert path.read_bytes() == b"k"
+    assert len(handles) == 1  # the creating handle, read once
+
+
+@windows_only
+def test_windows_a_created_entry_with_an_inheritance_flag_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The read side's standard: the earlier create-side check compared entries without their flags.
+    real = restricted_file._read_handle_security
+
+    def _flagged(handle: int) -> Any:
+        read = real(handle)
+        ace_type, _flags, mask, sid = read.aces[-1]
+        return type(read)(
+            owner_sid=read.owner_sid,
+            protected=read.protected,
+            aces=(*read.aces[:-1], (ace_type, 0x10, mask, sid)),
+        )
+
+    monkeypatch.setattr(restricted_file, "_read_handle_security", _flagged)
+    path = tmp_path / "store.key"
+    with pytest.raises(RestrictedFileError, match="flags 0x10"):
+        write_restricted_file(path, b"KEY-MATERIAL-STAND-IN")
+    assert list(tmp_path.iterdir()) == []
+
+
+@windows_only
+def test_windows_creates_a_read_and_delete_grant(tmp_path: Path) -> None:
+    path = tmp_path / "handoff.key"
+    write_restricted_file(
+        path, b"k", read_grants=[f"*{_SERVICE}"], creator_access=False, read_delete=True
+    )
+    assert _windows_access(path)[1] == {
+        (_ALLOW, _FULL, _SYSTEM),
+        (_ALLOW, _FULL, _ADMINS),
+        (_ALLOW, _READ_DELETE, _SERVICE),
+    }
+
+
+@windows_only
+@pytest.mark.parametrize(
+    ("volume", "expected"),
+    [
+        (restricted_file._HandleVolume(file_system="FAT32", device_type=0x07), "FAT32 volume"),
+        (
+            restricted_file._HandleVolume(
+                file_system="NTFS", device_type=0x07, characteristics=0x10
+            ),
+            "network volume",
+        ),
+        (restricted_file._HandleVolume(file_system="NTFS", device_type=0x14), "device type 0x14"),
+    ],
+)
+def test_windows_a_key_custody_file_off_a_local_disk_is_refused_before_a_byte_is_written(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    volume: Any,
+    expected: str,
+) -> None:
+    control = tmp_path / "control.key"
+    write_restricted_file(control, b"k", local_volume_only=True)  # the control: a real local disk
+    assert control.read_bytes() == b"k"
+    seen: list[int] = []
+
+    def _read(handle: int) -> Any:
+        seen.append(handle)
+        return volume
+
+    monkeypatch.setattr(restricted_file, "_read_handle_volume", _read)
+    path = tmp_path / "store.key"
+    with pytest.raises(RestrictedFileError, match=expected):
+        write_restricted_file(path, b"KEY-MATERIAL-STAND-IN", local_volume_only=True)
+    assert not path.exists() and len(seen) == 1
+    # Off by default: the other key writers, the TLS key's included, are not checked.
+    write_restricted_file(tmp_path / "tls.key", b"k")
+    assert len(seen) == 1
+
+
+@windows_only
+def test_windows_a_file_is_deleted_through_its_handle(tmp_path: Path) -> None:
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        return
+    import msvcrt
+
+    path = tmp_path / "handoff.key"
+    write_restricted_file(path, b"k")
+    # The control: a handle without DELETE is refused.
+    with path.open("rb") as handle, pytest.raises(PermissionError):
+        restricted_file.delete_through_handle(msvcrt.get_osfhandle(handle.fileno()))
+    assert path.exists()
+    from messagefoundry.store.custody import _open_windows_held
+
+    fd = _open_windows_held(path, delete=True)
+    try:
+        restricted_file.delete_through_handle(msvcrt.get_osfhandle(fd))
+    finally:
+        os.close(fd)
+    assert not path.exists()
+
+
+@windows_only
+def test_windows_a_read_only_file_is_deleted_through_its_handle(tmp_path: Path) -> None:
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        return
+    import msvcrt
+
+    from messagefoundry.store.custody import _open_windows_held
+
+    path = tmp_path / "handoff.key"
+    write_restricted_file(path, b"k")
+    os.chmod(path, stat.S_IREAD)  # FILE_ATTRIBUTE_READONLY, as a copy or a restore may leave it
+    assert os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY
+    fd = _open_windows_held(path, delete=True)
+    try:
+        restricted_file.delete_through_handle(msvcrt.get_osfhandle(fd))
+    finally:
+        os.close(fd)
+    assert not path.exists()
+
+
+def test_a_file_is_deleted_through_its_handle_on_windows_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    with pytest.raises(RestrictedFileError, match="Windows only"):
+        restricted_file.delete_through_handle(0)
 
 
 @windows_only
@@ -688,6 +990,40 @@ def test_posix_refuses_a_read_grant_it_cannot_honour(tmp_path: Path) -> None:
     with pytest.raises(RestrictedFileError, match="Windows only"):
         write_restricted_file(path, b"k", owner=_ADMINS)
     assert not path.exists()
+    with pytest.raises(RestrictedFileError, match="Windows only"):
+        write_restricted_file(path, b"k", read_delete=True)
+    assert not path.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the file system is checked on Linux only")
+@pytest.mark.parametrize("magic", [0x6969, 0x794C7630, _TMPFS])
+def test_linux_a_key_custody_file_off_a_local_disk_is_refused_before_a_byte_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, magic: int
+) -> None:
+    fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        here = restricted_file.linux_file_system_type(fd)
+    finally:
+        os.close(fd)
+    if here not in restricted_file.LINUX_HOST_FILE_SYSTEMS:  # a /tmp on tmpfs, at least
+        pytest.skip(f"the temporary directory is on file system type {here:#010x}")
+    control = tmp_path / "control.key"
+    write_restricted_file(control, b"k", local_volume_only=True)  # the control: the real disk
+    assert control.read_bytes() == b"k"
+    sizes: list[int] = []
+
+    def _fstatfs(fd: int) -> int:
+        sizes.append(os.fstat(fd).st_size)  # what the file held when its file system was judged
+        return magic
+
+    monkeypatch.setattr(restricted_file, "linux_file_system_type", _fstatfs)
+    path = tmp_path / "store.key"
+    with pytest.raises(RestrictedFileError, match=f"type {magic:#010x}"):
+        write_restricted_file(path, b"KEY-MATERIAL-STAND-IN", local_volume_only=True)
+    assert sizes == [0] and not path.exists()
+    # Off by default: the other key writers, the TLS key's included, are not checked.
+    write_restricted_file(tmp_path / "tls.key", b"k")
+    assert sizes == [0]
 
 
 # --- both platforms, for real ---------------------------------------------------------------------
