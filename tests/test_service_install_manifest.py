@@ -1504,14 +1504,24 @@ def _run_dacl_step(
     tmp_path: Path, *, account: str, data: list[str], logs: list[str]
 ) -> subprocess.CompletedProcess[str]:
     """Run the step's script with icacls and Test-Path stood in, under ``SMOKE_ACCOUNT=account``.
-    A function shadows the executable of the same name, so no real icacls runs. Wrapped as the
-    runner wraps a powershell step, as _run_smoke_stop says: 'stop' first, $LASTEXITCODE last."""
-    if shutil.which("pwsh") is None:
-        pytest.skip("SKIP (nothing run): pwsh not on PATH")
+
+    A function shadows the executable of the same name, so no real icacls runs, and the other
+    spellings that could change a real DACL are stand-ins that throw. Wrapped as the runner wraps
+    a powershell step, as _run_smoke_stop says: 'stop' first, $LASTEXITCODE last. The step is
+    ``shell: powershell``, so Windows PowerShell 5.1 runs it where it is on PATH; pwsh elsewhere.
+    """
+    shell = shutil.which("powershell") or shutil.which("pwsh")
+    if shell is None:
+        pytest.skip("SKIP (nothing run): neither powershell nor pwsh on PATH")
     acls = {_DATA: _icacls(_DATA, data), _LOGS: _icacls(_LOGS, logs)}
     table = "; ".join(f"{_psq(k)} = {_psq(v)}" for k, v in acls.items())
     stand_ins = f"""$ErrorActionPreference = 'stop'
 $global:Acls = @{{ {table} }}
+foreach ($changes in 'icacls.exe', 'Set-Acl', 'takeown', 'takeown.exe') {{
+  Set-Item -Path "function:global:$changes" -Value {{
+    throw "the step ran $($MyInvocation.MyCommand.Name), which this harness does not stand in for"
+  }}
+}}
 function Test-Path {{
   param($Path, $LiteralPath)
   if ($LiteralPath) {{ return Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath }}
@@ -1527,7 +1537,7 @@ function icacls {{ param($Path) if ($args.Count) {{ throw "the step changed a DA
         encoding="utf-8",
     )
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", f". {_psq(str(f))}"],
+        [shell, "-NoProfile", "-NonInteractive", "-Command", f". {_psq(str(f))}"],
         capture_output=True,
         text=True,
         timeout=180,
@@ -1545,36 +1555,66 @@ def test_the_smoke_dacl_step_passes_a_lockdown_that_kept_the_run_as_grant(tmp_pa
     data directory, inherited onto logs."""
     r = _run_dacl_step(tmp_path, account="virtual", data=_GRANTED, logs=_inherited(_GRANTED))
     assert r.returncode == 0, r.stderr + r.stdout
-    assert f"{_VIRTUAL} holds (OI)(CI)(M) on both" in r.stdout, r.stdout
+    assert f"{_VIRTUAL} holds its (OI)(CI)(M) entry on both" in r.stdout, r.stdout
+
+
+_DENY = f"{_VIRTUAL}:(OI)(CI)(DENY)(W)"
 
 
 @pytest.mark.parametrize(
-    ("logs_entry", "why"),
+    ("broken", "data", "logs"),
     [
-        (None, "the entry is gone, and only the path still says MessageFoundry"),
-        (f"{_VIRTUAL}:(I)(OI)(CI)(RX)", "read only"),
-        (f"{_VIRTUAL}:(I)(M)", "not inherited by what the service creates"),
-        (r"NT SERVICE\MessageFoundryX:(I)(OI)(CI)(M)", "another service's account"),
+        # The entry is gone from logs, and only the path still says MessageFoundry.
+        (_LOGS, _GRANTED, _inherited(_LOCKED)),
+        (_LOGS, _GRANTED, [*_inherited(_LOCKED), f"{_VIRTUAL}:(I)(OI)(CI)(RX)"]),
+        # Not inherited by what the service creates beneath logs.
+        (_LOGS, _GRANTED, [*_inherited(_LOCKED), f"{_VIRTUAL}:(I)(M)"]),
+        (_LOGS, _GRANTED, [*_inherited(_LOCKED), r"NT SERVICE\MessageFoundryX:(I)(OI)(CI)(M)"]),
+        # Explicit on logs: logs no longer inherits the data directory's lockdown.
+        (_LOGS, _GRANTED, _GRANTED),
+        (_LOGS, _GRANTED, [*_inherited(_GRANTED), _DENY.replace(":(", ":(I)(", 1)]),
+        (_DATA, _LOCKED, _inherited(_GRANTED)),
+        # Inherited on the data directory: the lockdown's /inheritance:r did not take there.
+        (_DATA, _inherited(_GRANTED), _inherited(_GRANTED)),
+        (_DATA, [*_GRANTED, _DENY], _inherited(_GRANTED)),
+    ],
+    ids=[
+        "logs-gone",
+        "logs-read-only",
+        "logs-not-inherited-onward",
+        "logs-other-account",
+        "logs-explicit",
+        "logs-deny",
+        "data-gone",
+        "data-inherited",
+        "data-deny",
     ],
 )
-def test_the_smoke_dacl_step_fails_when_the_run_as_grant_is_not_modify(
-    tmp_path: Path, logs_entry: str | None, why: str
+def test_the_smoke_dacl_step_fails_when_the_run_as_grant_is_wrong(
+    tmp_path: Path, broken: str, data: list[str], logs: list[str]
 ) -> None:
-    """Each wrong entry on logs is refused, and named by directory. The data directory keeps the
-    right one, so the failure is the logs line alone."""
-    logs = _inherited(_LOCKED) + ([logs_entry] if logs_entry else [])
-    r = _run_dacl_step(tmp_path, account="virtual", data=_GRANTED, logs=logs)
-    assert r.returncode != 0, f"passed with {why}:\n{r.stdout}"
+    """Each wrong entry is refused and named by its directory. The other directory keeps the right
+    one, so the failure is that directory's line alone."""
+    r = _run_dacl_step(tmp_path, account="virtual", data=data, logs=logs)
+    assert r.returncode != 0, r.stdout
     out = r.stdout + r.stderr
-    assert f"NO RUN-AS GRANT: {_LOGS} does not grant {_VIRTUAL}" in out, out
-    assert f"NO RUN-AS GRANT: {_DATA} does not" not in out, out
+    fine = _DATA if broken == _LOGS else _LOGS
+    assert f"NO RUN-AS GRANT: {broken} " in out, out
+    assert f"NO RUN-AS GRANT: {fine} " not in out, out
 
 
-def test_the_smoke_dacl_step_asserts_no_named_grant_for_localsystem(tmp_path: Path) -> None:
-    """The installer writes no named grant for LocalSystem, which writes through SYSTEM's entry."""
+def test_the_smoke_dacl_step_requires_systems_entry_on_the_localsystem_leg(tmp_path: Path) -> None:
+    """The installer writes no named grant for LocalSystem, which writes through SYSTEM's entry, so
+    that is the entry this leg requires. A SYSTEM entry that cannot write is refused."""
     r = _run_dacl_step(tmp_path, account="localsystem", data=_LOCKED, logs=_inherited(_LOCKED))
     assert r.returncode == 0, r.stderr + r.stdout
-    assert "LocalSystem writes through the SYSTEM entry" in r.stdout, r.stdout
+    assert r"NT AUTHORITY\SYSTEM holds its (OI)(CI)(F) entry on both" in r.stdout, r.stdout
+    read_only = [r"NT AUTHORITY\SYSTEM:(OI)(CI)(RX)", r"BUILTIN\Administrators:(OI)(CI)(F)"]
+    weak = _run_dacl_step(
+        tmp_path, account="localsystem", data=read_only, logs=_inherited(read_only)
+    )
+    assert weak.returncode != 0, weak.stdout
+    assert f"NO RUN-AS GRANT: {_DATA} shows no" in weak.stdout + weak.stderr
 
 
 def test_the_smoke_dacl_step_names_the_local_user_on_that_leg(tmp_path: Path) -> None:
@@ -1585,7 +1625,7 @@ def test_the_smoke_dacl_step_names_the_local_user_on_that_leg(tmp_path: Path) ->
     assert ok.returncode == 0, ok.stderr + ok.stdout
     wrong = _run_dacl_step(tmp_path, account="localuser", data=_GRANTED, logs=_inherited(_GRANTED))
     assert wrong.returncode != 0, wrong.stdout
-    assert r"does not grant RIG-01\mefor-svc" in wrong.stdout + wrong.stderr
+    assert r"shows no 'RIG-01\mefor-svc:(OI)(CI)(M)' entry" in wrong.stdout + wrong.stderr
 
 
 def test_the_smoke_dacl_step_still_refuses_a_broad_principal(tmp_path: Path) -> None:
@@ -1616,7 +1656,12 @@ _ACL_CALLS = ["Set-SecureDataDirAcl", "Set-SecureConfigAcl", "Set-ConfigReadAcl"
 def _objectname_calls(facts: dict) -> list[dict]:
     """The calls that set the run-as account. Set-ServiceAccount, through the SCM, since NSSM 2.24
     refuses `set ObjectName` for a virtual account (BACKLOG #2364)."""
-    return [c for c in facts["commands"] if c["name"] == "Set-ServiceAccount"]
+    return [c for c in facts["commands"] if _named(c, "Set-ServiceAccount")]
+
+
+def _named(call: dict, name: str) -> bool:
+    """PowerShell resolves a command name without regard to case, so a guard must too."""
+    return str(call["name"] or "").lower() == name.lower()
 
 
 def test_objectname_is_written_on_every_run_as_branch(tmp_path: Path) -> None:
@@ -1744,14 +1789,16 @@ def test_all_three_acl_sites_are_still_wired(tmp_path: Path) -> None:
 
 
 # --- the ACLs are written AFTER the run-as account is set (BACKLOG #1699, S4 ordering, #224) ---------
-# The grants name NT SERVICE\<ServiceName>, whose SID resolves for icacls only once the service is
-# registered under that account. The row says "after ObjectName"; the account is now set by
-# Set-ServiceAccount through the SCM (BACKLOG #2364), so that is the call the order is pinned to.
-# #1553 writing the account on every branch does not make the order moot: the SID still has to resolve.
+# The grants are written for $ServiceAccount, and they are right only while the service runs as that
+# account (BACKLOG #1553), so they follow the call that makes it run as that account. The row says
+# "after ObjectName"; the account is now set by Set-ServiceAccount through the SCM (BACKLOG #2364), so
+# that is the call the order is pinned to. The virtual account NT SERVICE\<ServiceName> also resolves
+# for icacls only once the service exists, and the service is registered before that call. The
+# installer's own comment says the SID needs ObjectName too; that part is not what this guard rests on.
 #
 # ORDER BY SOURCE OFFSET. That is execution order only while every one of these calls sits outside
 # any function, whose body runs when it is called rather than where it is written, so the guard
-# checks that as well. A deferred scriptblock assigned to a variable would escape it; none is used.
+# checks that as well. A scriptblock stored in a variable and invoked later would still escape it.
 
 _RUN_AS_ASSIGNMENT = "$RunAsObjectName = if ("
 
@@ -1765,10 +1812,10 @@ def _acl_order_problems(facts: dict) -> list[str]:
     problems = [
         f"{c['name']} at line {c['line']} is inside a function, so its offset is not its run order"
         for c in facts["commands"]
-        if c["inFunction"] and c["name"] in (*_ACL_CALLS, "Set-ServiceAccount")
+        if c["inFunction"] and any(_named(c, n) for n in (*_ACL_CALLS, "Set-ServiceAccount"))
     ]
     for fn in _ACL_CALLS:
-        calls = [c for c in facts["commands"] if c["name"] == fn]
+        calls = [c for c in facts["commands"] if _named(c, fn)]
         if not calls:
             problems.append(f"{fn} is not called")
         problems += [
@@ -1810,27 +1857,37 @@ def _account_set_last(source: str) -> str:
     return source + "\nSet-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName\n"
 
 
+def _early_lowercase_call(source: str) -> str:
+    """A second lockdown, spelled in lower case, above the run-as block. PowerShell runs it."""
+    assert source.count(_RUN_AS_ASSIGNMENT) == 1, "CONTROL FAILED: the run-as block moved"
+    early = "set-securedatadiracl -Path $DataDir -Account $ServiceAccount"
+    return source.replace(_RUN_AS_ASSIGNMENT, f"{early}\n{_RUN_AS_ASSIGNMENT}")
+
+
+_RUNS_BEFORE = "runs before the run-as account is set"
+
+
 @pytest.mark.parametrize(
     ("mutate", "expect"),
     [
         pytest.param(
             _hoist("Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount"),
-            "Set-SecureDataDirAcl at line",
+            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
             id="data-dir-lockdown-hoisted",
         ),
         pytest.param(
             _hoist("Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount"),
-            "Set-SecureConfigAcl at line",
+            ("Set-SecureConfigAcl at line", _RUNS_BEFORE),
             id="config-lock-hoisted",
         ),
         pytest.param(
             _hoist("Set-ConfigReadAcl -Path $Config -Account $ServiceAccount"),
-            "Set-ConfigReadAcl at line",
+            ("Set-ConfigReadAcl at line", _RUNS_BEFORE),
             id="config-read-hoisted",
         ),
         pytest.param(
             _replace("Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount", "# {call}"),
-            "Set-SecureDataDirAcl is not called",
+            ("Set-SecureDataDirAcl is not called",),
             id="data-dir-lockdown-deleted",
         ),
         pytest.param(
@@ -1838,22 +1895,28 @@ def _account_set_last(source: str) -> str:
                 "Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount",
                 "function Invoke-Lockdown {{ {call} }}",
             ),
-            "is inside a function",
+            ("Set-SecureDataDirAcl at line", "is inside a function"),
             id="data-dir-lockdown-in-a-function",
         ),
-        pytest.param(_account_set_last, "runs before the run-as account", id="account-set-last"),
+        pytest.param(_account_set_last, (_RUNS_BEFORE,), id="account-set-last"),
+        pytest.param(
+            _early_lowercase_call,
+            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
+            id="early-call-in-lower-case",
+        ),
     ],
 )
 def test_the_acl_order_guard_fails_when_the_order_is_broken(
-    tmp_path: Path, mutate: Callable[[str], str], expect: str
+    tmp_path: Path, mutate: Callable[[str], str], expect: tuple[str, ...]
 ) -> None:
     """THE CONTROL. Each mutation breaks the order, or the call, in a copy of the script, and the
-    guard must then name it. A guard that cannot fail would pass on a script that locks nothing."""
+    guard must then name it, in one problem carrying every part of ``expect``. A guard that cannot
+    fail would pass on a script that locks nothing."""
     assert _SCRIPT is not None
     mutated = tmp_path / "install-service.ps1"
     mutated.write_text(mutate(_SCRIPT.read_text(encoding="utf-8")), encoding="utf-8")
     problems = _acl_order_problems(_preflight_facts(tmp_path, script=mutated))
-    assert any(expect in p for p in problems), problems
+    assert any(all(part in p for part in expect) for p in problems), problems
 
 
 # --- the uninstaller's inventory of what it leaves (BACKLOG #1704) --------------------------------
