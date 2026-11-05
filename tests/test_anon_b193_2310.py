@@ -20,7 +20,7 @@ from types import ModuleType
 
 import pytest
 
-from messagefoundry.anon import rules as engine_rules
+from messagefoundry_toolkit.anon import rules as engine_rules
 from tee.anon import rules as tee_rules
 
 _BOTH = pytest.mark.parametrize("rules", [engine_rules, tee_rules], ids=["engine", "tee"])

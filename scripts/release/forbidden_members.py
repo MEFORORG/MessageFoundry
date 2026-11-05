@@ -125,6 +125,11 @@ RETIRED_ENGINE_PATHS: tuple[tuple[str, ...], ...] = (
     ("messagefoundry", "lens.py"),
     ("messagefoundry", "lens_schema.py"),
     ("messagefoundry", "corepoint_import.py"),
+    # Slice 6: the de-identification package (ADR 0030), now messagefoundry_toolkit/anon/. The run
+    # names the directory, so it refuses every member under it, whatever the file, and the last
+    # component matches by stem, so a one-file module (anon.py, anon.pyc, an extension module)
+    # that would restore the import name messagefoundry.anon is refused too.
+    ("messagefoundry", "anon"),
 )
 
 
@@ -254,6 +259,25 @@ def development_content(member: str) -> str | None:
     return None
 
 
+def _stem(part: str) -> str:
+    """A path component up to its first dot: ``anon.cpython-314.pyc`` is ``anon``."""
+    return part.split(".", 1)[0]
+
+
+def _has_retired_run(parts: list[str], retired: tuple[str, ...]) -> bool:
+    """Whether ``parts`` holds ``retired`` as a consecutive run, its last component matched by
+    stem. A retired module comes back as a sourceless ``.pyc`` or an extension module just as
+    well as a ``.py``, and a retired package as a one-file module, so the last component is
+    compared by what Python imports it as, not by its whole name."""
+    *parents, last = retired
+    width = len(retired)
+    for i in range(len(parts) - width + 1):
+        window = parts[i : i + width]
+        if window[:-1] == parents and _stem(window[-1]) == _stem(last):
+            return True
+    return False
+
+
 def split_violation(member: str, dist: str) -> str | None:
     """Why ``member`` breaks the engine and toolkit split for distribution ``dist``, or ``None``.
 
@@ -273,8 +297,7 @@ def split_violation(member: str, dist: str) -> str | None:
         if any(part.split(".", 1)[0] == TOOLKIT_PACKAGE for part in parts):
             return f"a path named for {TOOLKIT_PACKAGE!r} belongs to the toolkit distribution"
         for retired in RETIRED_ENGINE_PATHS:
-            width = len(retired)
-            if any(tuple(parts[i : i + width]) == retired for i in range(len(parts) - width + 1)):
+            if _has_retired_run(parts, retired):
                 return f"{'/'.join(retired)} moved to the toolkit distribution (ADR 0201)"
     elif dist == TOOLKIT_DISTRIBUTION:
         if parts[0] == ENGINE_DISTRIBUTION:

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Anonymizer (de-identification) for test datasets — engine side (ADR 0030, BACKLOG #36).
+"""Anonymizer (de-identification) for test datasets — toolkit side (ADR 0030, BACKLOG #36).
 
 Turns a real, messy HL7 v2 message into a **structurally-faithful, de-identified** copy to commit,
 share, and replay as a fixture — the first built slice of the de-identification capability CLAUDE.md

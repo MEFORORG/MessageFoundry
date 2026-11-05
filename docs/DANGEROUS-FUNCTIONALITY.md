@@ -147,11 +147,11 @@ these: `auth/ldap.py` probes two `pyspnego` modules to learn whether Kerberos is
 `__init__.py` resolves its lazy exports from a fixed table.
 
 `anon/leak.py` loads one file by path: the publish guard's scanner. It looks in one place only,
-`scripts/security/scan_forbidden.py` under the folder that holds the `messagefoundry` package. It
-builds that path from its own location and searches no other folder. In a source checkout the
+`scripts/security/scan_forbidden.py` under the folder that holds the `messagefoundry_toolkit`
+package, where `anon/` lives since ADR 0201 slice 6. It builds that path from its own location and searches no other folder. In a source checkout the
 folder is the repository root, so the file is the repository's own scanner. From an installed wheel
 the folder is the one that holds the installed package files, normally `site-packages`. The wheel
-ships no such file, so the leak check refuses to run there. So the leak check needs a source
+ships no such file, and neither does the toolkit wheel, so the leak check refuses to run there. So the leak check needs a source
 checkout, which an editable install (`pip install -e .`) also gives, or a scanner file that
 someone placed beside the installed package. A file at that path in a folder above the install is
 never read. Whoever can write the folder that holds the package can already change
@@ -701,12 +701,12 @@ The scan leaves some parsing out on purpose, and it has limits:
 | What it parses | Modules |
 |---|---|
 | MLLP and TCP frames, before any other code sees the bytes | `framing.py`, `mllpcodec.py` |
-| HL7 v2, in the engine's own tolerant parser (ADR 0054). It reads every inbound HL7 body, and the de-identification tools read captured traffic through it. | `parsing/_builtin_hl7.py`, `parsing/peek.py`, `anon/hl7.py` |
+| HL7 v2, in the engine's own tolerant parser (ADR 0054). It reads every inbound HL7 body, and the de-identification tools read captured traffic through it. | `parsing/_builtin_hl7.py`, `parsing/peek.py`, `messagefoundry_toolkit/anon/hl7.py` |
 | HL7 batch files, split into messages | `parsing/split.py` |
 | The first bytes of a payload, to check its declared content type | `parsing/sniff.py` |
 | An inbound text body, decoded with its connection's declared character set and checked for NUL bytes and size, before the HL7 peek or a Router sees it. A binary body is only size-checked and base64-carried. | `pipeline/ingress_guards.py` |
 | Base64 binary carriage (ADR 0028). Also the base64 documents a sender embeds in HL7 OBX-5, which intake detaches, retention strips and delivery puts back. | `parsing/binary.py` |
-| The separators of a captured HL7 message, before de-identification | `anon/surrogates.py` |
+| The separators of a captured HL7 message, before de-identification | `messagefoundry_toolkit/anon/surrogates.py` |
 | The reply from a network time server | `logging_setup.py` |
 | Decision records, for `messagefoundry-toolkit adr-analyze`. It reads each `[0-9]*.md` file at the top of the `--adr-dir` folder, `docs/adr` by default. Regular expressions pick out each record's status, acceptance criteria and open items. For each `tests/`, `fixtures/`, `samples/` or `harness/` path a criterion names, it checks whether that path exists under `--repo-root`. A linked path that climbs out of that root with `..`, or has a part named for a DOS device such as `NUL` or `nul.py`, is reported and not checked, on every platform. A symbolic link inside that root is still followed. Nothing bounds a record's size, so a record is only as trusted as its author. | `messagefoundry_toolkit/adr_analyze.py` |
 
@@ -751,7 +751,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | Input | Where it comes from | Files |
 |---|---|---|
 | Replies from an engine address | Whatever answers at the engine URL setting. The file's own comment says that is not necessarily the engine, and a plain `http` URL gets no TLS. The Python clients' replies sit in the first table above for that reason too. Unlike `apiclient/client.py`, this client puts no size cap on a reply before it parses it, and a POST has no timeout. | `engineClient.ts` |
-| An HL7 sample, and what a dry run made of it | The sample file you pick, which [`CONNECTIONS.md`](CONNECTIONS.md) lists as an upload feature, and the output a dry run built from it. The Test Bench diff splits them into segments and fields by hand, and the Steps view pulls the segment names out of the sample. A saved test case's recorded output is diffed the same way. `hl7diff.ts` does the same job as `anon/surrogates.py` in the engine's hand-read table. | `hl7diff.ts`, `hl7scope.ts` |
+| An HL7 sample, and what a dry run made of it | The sample file you pick, which [`CONNECTIONS.md`](CONNECTIONS.md) lists as an upload feature, and the output a dry run built from it. The Test Bench diff splits them into segments and fields by hand, and the Steps view pulls the segment names out of the sample. A saved test case's recorded output is diffed the same way. `hl7diff.ts` does the same job as `messagefoundry_toolkit/anon/surrogates.py` in the hand-read table above. | `hl7diff.ts`, `hl7scope.ts` |
 
 **Extension parse sites left out, and why.**
 

@@ -1948,7 +1948,7 @@ the posture, level unchanged, audited as `logging_level_change_denied` with the 
 allows is audited as `logging_level_change` (old and new level, actor). A `/config/reload` does not
 re-level the log or change the posture, so it cannot bring `DEBUG` back. `DEBUG` exists only on an
 instance that is non-production from start-up: reproduce a problem on a separate non-production
-instance fed synthetic or de-identified messages (the `messagefoundry/anon/` framework), never a copy
+instance fed synthetic or de-identified messages (the `messagefoundry_toolkit/anon/` framework), never a copy
 of the production feed, and do not relabel a production instance to get verbose logs. Either shortcut
 would put PHI in a log by another door.
 
@@ -2341,8 +2341,8 @@ inventory; read the reasoning there.
 **`[BUILT]`** (HL7 v2 first; ADR 0030, PR #440)
 
 The de-identification framework is **built** and **centralized** — do **not** inline ad-hoc de-id
-logic; route it through the framework. It lives in [`messagefoundry/anon/`](../messagefoundry/anon/)
-and is vendored to `tee/anon/` for the standalone tee relay. The rule, keying and surrogate files
+logic; route it through the framework. It lives in [`messagefoundry_toolkit/anon/`](../messagefoundry_toolkit/anon/),
+in the `messagefoundry-toolkit` distribution rather than the engine wheel (ADR 0201 slice 6), and is vendored to `tee/anon/` for the standalone tee relay. The rule, keying and surrogate files
 are byte-identical there; the other files are parallel copies, and `tests/test_anon_parity.py`
 checks that the two give the same output on a golden and an adversarial corpus. It exists to build **test datasets from real traffic**. It adds
 no new dependency.
@@ -2357,7 +2357,7 @@ Properties of the anonymizer:
   genuinely random salts drawn from a narrow alphabet, such as decimal digits. That is an accepted
   cost. If one is refused, replace it with a salt from that tool, not another draw from the same
   alphabet. The rates and the stated bound are in the docstring of `_estimated_entropy_bits` in
-  [`keying.py`](../messagefoundry/anon/keying.py) (vault BACKLOG #3359).
+  [`keying.py`](../messagefoundry_toolkit/anon/keying.py) (vault BACKLOG #3359).
 - **Width/shape-preserving surrogates** — a surrogate keeps the original's width/shape so the
   scrubbed dataset stays structurally realistic.
 - **Field-anchored site-code scrub** — the site-code scrub is anchored to the field, not matched by
@@ -2365,7 +2365,7 @@ Properties of the anonymizer:
   `python -m tee anonymize-captures` prints a warning saying so (vault BACKLOG #3516).
 - **Fail-closed contract.** A message with **no parseable MSH / malformed** is **REFUSED** (raises
   `AnonError`) — it never emits an un-scrubbed body. So is a message holding a line no rule can
-  reach. Plain `anonymize` and `anonymize_checked` both refuse it, on the engine and on the tee.
+  reach. Plain `anonymize` and `anonymize_checked` both refuse it, in the toolkit and on the tee.
 
 Surfaces: the **`python -m tee anonymize-captures`** subcommand and the test-harness
 `CaptureSink`/corpus hooks. [`scripts/security/scan_forbidden.py`](../scripts/security/scan_forbidden.py)
@@ -2390,7 +2390,7 @@ both are described below:
 | A line no rule can reach (`AnonError`, raised by the anonymizer before the leak-check runs). Its first field is not a segment id (a lowercase second `msh` line included). Or it has no field separator and is not a segment id that the message's HL7 version defines or that a rule rewriting a field of that segment names. A wrapped `LEE` or `ZOE` is such a line, and with no readable version in MSH-12 the version defines no id. Or it is an `MSH`, `BHS` or `FHS` line with fewer than three split fields, the header included. Or it is an `MSH` line ahead of the header. | Every line but a header of three or more split fields whose first field is `MSH`, in capitals or not. The header is the one line the separators are read from. It is the first line that starts `MSH`, in capitals or not, and holds at least four encoding characters |
 | The denylist tables did not load, and the caller passed `require_live_denylist=True` | The token source |
 
-The rows describe both anonymizers, the engine's `messagefoundry/anon/` and the tee's
+The rows describe both anonymizers, the toolkit's `messagefoundry_toolkit/anon/` and the tee's
 `tee/anon/`. The inputs on which the two are known to differ are listed in one place, the list
 that starts **The two anonymizers still differ on some inputs**, below. It names at least those
 known; it does not prove there are no others.

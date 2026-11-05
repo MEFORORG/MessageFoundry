@@ -671,7 +671,9 @@ first lists missed, so each slice's builder runs the whole suite rather than tru
      `tests/test_anon_core.py`, `tests/test_anon_integration.py`, the slice 6 docs in section 6,
      `scripts/release/forbidden_members.py` (one more retired path).
 
-   On its own.
+   On its own. Done: the package lives at `messagefoundry_toolkit/anon/`, and the engine wheel and
+   sdist refuse a member under `messagefoundry/anon/`. The anon import searches in
+   `tests/test_dependency_boundaries.py` re-point to the new name in the same change.
 7. **Move `generators/`, `hl7schema.py` and `hl7structures.py`.** Files:
    - moved: those three into `messagefoundry_toolkit/`;
    - edit: `messagefoundry_toolkit/anon/_pools.py` and the moved handlers (re-pointed imports), the

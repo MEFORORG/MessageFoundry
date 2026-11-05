@@ -182,7 +182,7 @@ _CARRIES_KEY: dict[str, frozenset[str]] = {
     # Secret keys the engine holds or feeds.
     "messagefoundry/auth/totp.py": frozenset({_TOTP}),
     "messagefoundry/auth/service.py": frozenset({_TOTP}),
-    "messagefoundry/anon/keying.py": frozenset({_ANON_SALT}),
+    "messagefoundry_toolkit/anon/keying.py": frozenset({_ANON_SALT}),
     "tee/anon/keying.py": frozenset({_ANON_SALT}),
     "tee/__main__.py": frozenset({_ANON_SALT}),
     # BACKLOG #1174: the per-process key that seals the state and reference caches.

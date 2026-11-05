@@ -481,6 +481,17 @@ _TOOLKIT_WHEEL = "messagefoundry_toolkit-0.4.0-py3-none-any.whl"
         "messagefoundry-0.4.0/messagefoundry/lens.py",
         "messagefoundry-0.4.0/messagefoundry/lens_schema.py",
         "messagefoundry-0.4.0/messagefoundry/corepoint_import.py",
+        # The slice 6 retired directory: every member under it, wheel form and sdist form.
+        "messagefoundry/anon/__init__.py",
+        "messagefoundry/anon/leak.py",
+        "messagefoundry-0.4.0/messagefoundry/anon/keying.py",
+        "messagefoundry/anon.py",  # a one-file module restoring the import name
+        "messagefoundry-0.4.0/messagefoundry/anon.py",
+        # The last component matches by stem: a sourceless .pyc or an extension module restores
+        # the retired import name as well as a .py does.
+        "messagefoundry/anon.pyc",
+        "messagefoundry/anon.cp314-win_amd64.pyd",
+        "messagefoundry/adr_analyze.pyc",
         "messagefoundry_toolkit/__init__.py",  # the toolkit package inside the engine
         "messagefoundry-0.4.0/messagefoundry_toolkit/__main__.py",
         "messagefoundry_toolkit.py",  # the import name as a top-level module
@@ -499,6 +510,8 @@ def test_an_engine_archive_carrying_toolkit_code_is_refused(member: str) -> None
         "messagefoundry-0.4.0/messagefoundry/config/impact.py",  # stays in the engine (ADR 0201)
         "messagefoundry/tools/adr_analyze.py",  # not the retired run: a different parent
         "adr_analyze.py",  # a run of one is not the two-component retired path
+        "messagefoundry/redaction.py",  # the engine's own redactor, not the moved anon/ package
+        "messagefoundry/anonymize.py",  # a near name is not the retired directory
     ],
 )
 def test_an_engine_archive_member_that_stays_is_allowed(member: str) -> None:

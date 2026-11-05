@@ -289,7 +289,7 @@ _TOPLEVEL_TRIGGERS = CRYPTO_MODULES | CRYPTO_LIBRARY_MODULES
 INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0030: keyed BLAKE2b derives the deterministic, salt-keyed seed that picks a surrogate, so
     # the anonymizer's pseudonymization is consistent-within-a-dataset yet one-way (re-id-resistant).
-    "messagefoundry/anon/keying.py": frozenset({"hashlib"}),
+    "messagefoundry_toolkit/anon/keying.py": frozenset({"hashlib"}),
     "messagefoundry/api/tls.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # BACKLOG #1352 / #1171: every private-key TLS load goes through keywrap.load_checked_cert_chain,
     # which checks the key's passphrase wrap and then calls load_cert_chain; ssl for that one call.
@@ -809,9 +809,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # The standalone tee CLI builds the ssl context (create_default_context, or a cafile via --cacert;
     # CERT_NONE only under the explicit --insecure escape) for the tee's https engine-API pulls.
     "tee/__main__.py": frozenset({"ssl"}),
-    # ADR 0030: the byte-identical vendored twin of messagefoundry/anon/keying.py — keyed BLAKE2b
-    # (hashlib) derives the deterministic, per-dataset, one-way pseudonymization seed. Kept in lockstep
-    # with the engine copy by the parity test.
+    # ADR 0030: the byte-identical vendored twin of messagefoundry_toolkit/anon/keying.py -- keyed
+    # BLAKE2b (hashlib) derives the deterministic, per-dataset, one-way pseudonymization seed. Kept in
+    # lockstep with the toolkit copy by the parity test.
     "tee/anon/keying.py": frozenset({"hashlib"}),
     # #14: the tee's stdlib MEFOR engine-API client accepts an optional ssl.SSLContext for authenticated
     # GETs against an https engine (the tee stays stdlib-only; no mTLS / rich-retry client).
@@ -1094,7 +1094,7 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.store.postgres",
         }
     ),
-    "messagefoundry/anon/keying.py": frozenset({"hash:hashlib.blake2b"}),
+    "messagefoundry_toolkit/anon/keying.py": frozenset({"hash:hashlib.blake2b"}),
     # The reload preflight also reaches anchor_cadata's cadata= trial load (BACKLOG #2025), but
     # through asyncio.to_thread, a reference this scanner does not follow as a call.
     # BACKLOG #1167 (ASVS 11.2.4): the config-provenance drift compare, via fingerprint_matches.
