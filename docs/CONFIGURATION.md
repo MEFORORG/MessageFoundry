@@ -2616,16 +2616,31 @@ secret. Each file in that directory holds one setting and is named exactly as it
   `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` is refused. Keep the key in a DPAPI-protected key file,
   [`[store].encryption_key_file`](#store).
 - A trailing line break is dropped; any other character, a space included, is part of the value.
-- The files are plain, protected by their access list alone. Nothing creates the directory for you
-  yet. A variable a library reads for itself, such as `PGPASSWORD`, is not read from here. The
-  engine reads no `VAULT_TOKEN` at all (BACKLOG #2851).
+- The files are plain, protected by their access list alone. A variable a library reads for
+  itself, such as `PGPASSWORD`, is not read from here. The engine reads no `VAULT_TOKEN` at all
+  (BACKLOG #2851).
 
-On Windows, create the directory with inheritance off, granting SYSTEM and Administrators full
-control and the service account read, and nothing else, except as the Vault Agent route below
-says. Make each grant inheritable by files (`(OI)` in `icacls` terms): a file an administrator
-creates in the directory then gets the service account's read, where a grant that is not
-inheritable leaves the new file unreadable to the engine. On POSIX, make it mode `0700` and each
-file `0600`, owned by the engine's account.
+**Where the directory is.** The engine reads the path `MEFOR_SECRETS_DIRECTORY` names and has no
+default; where to put it is the platform's choice (ADR 0214, slice C).
+
+- **A Windows service.** `install-service.ps1` creates `<DataDir>\secrets` (or the path
+  `-SecretsDir` names) restricted as the next paragraph says, and names it to the service as
+  `MEFOR_SECRETS_DIRECTORY` ([SERVICE.md](SERVICE.md)). To make it by hand instead: inheritance
+  off, SYSTEM and Administrators full control and the service account read, and nothing else,
+  except as the Vault Agent route below says. Make each grant inheritable by files (`(OI)` in
+  `icacls` terms): a file an administrator creates in the directory then gets the service account's
+  read, where a grant that is not inheritable leaves the new file unreadable to the engine.
+- **POSIX.** Make it mode `0700` and each file `0600`, owned by the engine's account.
+- **A container.** Mount a host directory read-only, as `docker/compose.yaml` shows for
+  `/run/mefor/secrets`, and own it as the TLS directory there is owned: uid 10001, the directory
+  `0700` and each file `0600`. The engine refuses a directory or file whose mode has a group or
+  other read or write bit, and a bind mount keeps the host's modes, so a mode the runtime sets on
+  a path it creates for you passes only when it has no such bit.
+- **systemd credentials.** A unit can point the variable at its credentials directory with
+  `Environment=MEFOR_SECRETS_DIRECTORY=%d` and one `LoadCredential=` per setting, the credential
+  named as the variable. That is not measured here; Linux is not a supported v1 deployment target
+  ([SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md)). Check the directory's and files' modes
+  against the rule above before you rely on it.
 
 **A Vault token in this directory** (BACKLOG #2851). The Vault clients never read
 `~/.vault-token`, and no setting names a token file: the token is the file named

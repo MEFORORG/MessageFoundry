@@ -1226,7 +1226,7 @@ _BROAD = {
     "S-1-5-32-546": "Guests",
 }
 
-_ACL_FNS = ["Set-SecureDataDirAcl", "Get-BroadAclResidue"]
+_ACL_FNS = ["Set-SecureDataDirAcl", "Get-WellKnownBroadSids", "Get-BroadAclResidue"]
 
 _windows_only = pytest.mark.skipif(
     not sys.platform.startswith("win"), reason="icacls / Windows DACLs"
@@ -2255,3 +2255,135 @@ def test_the_notice_names_localdumps_separately_from_the_exclusion_list(tmp_path
     assert "ExcludedApplications" in plain, (
         f"the exclusion-list surface stopped being named:\n{plain}"
     )
+
+
+# --------------------------------------------- the secrets directory (vault BACKLOG #2595 slice C)
+
+
+def test_the_environment_merge_replaces_only_the_secrets_directory(tmp_path: Path) -> None:
+    """`nssm set AppEnvironmentExtra` replaces the whole list, so the installer merges instead: a
+    rerun keeps every entry an operator set and leaves exactly one MEFOR_SECRETS_DIRECTORY, whatever
+    case the old entry was spelled in. The control: the old value is in the input."""
+    assert _SCRIPT is not None
+    body = r"""
+  $old = @('MEFOR_LOG_LEVEL=INFO', 'mefor_secrets_directory=C:\old', 'MEFOR_X=a=b')
+  $merged = Get-MergedEnvironmentList -Existing $old -Name 'MEFOR_SECRETS_DIRECTORY' -Value 'C:\new'
+  $fresh = Get-MergedEnvironmentList -Existing $null -Name 'MEFOR_SECRETS_DIRECTORY' -Value 'C:\new'
+  [pscustomobject]@{ old = $old; merged = @($merged); fresh = @($fresh) } | ConvertTo-Json -Compress
+"""
+    got = json.loads(
+        _ok(_extract(_SCRIPT, ["Get-MergedEnvironmentList"], body), tmp_path)
+        .strip()
+        .splitlines()[-1]
+    )
+    assert r"mefor_secrets_directory=C:\old" in got["old"]  # the control
+    assert got["merged"] == [
+        "MEFOR_LOG_LEVEL=INFO",
+        "MEFOR_X=a=b",
+        r"MEFOR_SECRETS_DIRECTORY=C:\new",
+    ]
+    assert got["fresh"] == [r"MEFOR_SECRETS_DIRECTORY=C:\new"]
+
+
+@_windows_only
+def test_the_secrets_directory_lockdown_passes_the_engines_own_check(tmp_path: Path) -> None:
+    """Set-SecretsDirAcl on a directory that inherits Users read and the account's Modify, the shape
+    a fresh <DataDir>/secrets would have under an unlocked parent. Measured with the engine's own
+    check, broad_access_problem(directory=True): it refuses the directory before and accepts it
+    after. The account keeps read and loses the inherited Modify. Unelevated, the owner change is
+    refused and says so; that warning is the only one expected."""
+    from messagefoundry.restricted_file import broad_access_problem
+
+    assert _SCRIPT is not None
+    parent = tmp_path / f"sd-{uuid.uuid4().hex[:8]}"
+    secrets = parent / "secrets"
+    secrets.mkdir(parents=True)
+    # Two phases, so the engine's check reads the directory in the state the lockdown starts from.
+    pre = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  & icacls {_psq(str(parent))} /grant '*S-1-5-32-545:(OI)(CI)RX' "${{me}}:(OI)(CI)M" | Out-Null
+"""
+    _ok(_extract(_SCRIPT, [], pre), tmp_path)
+    before = broad_access_problem(secrets, directory=True)
+    assert before is not None, (
+        "CONTROL FAILED: the engine accepted the directory before the lockdown"
+    )
+    lock = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $mySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $dir = {_psq(str(secrets))}
+  $warnings = @()
+  $emitted = & {{ Set-SecretsDirAcl -Path $dir -Account $me }} 3>&1
+  foreach ($o in @($emitted)) {{
+    if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
+  }}
+  $acl = Get-Acl $dir
+  $mine = @($acl.Access | Where-Object {{
+    try {{ $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $mySid }}
+    catch {{ $false }} }})
+  [pscustomobject]@{{
+    warnings = @($warnings)
+    inherited = @($acl.Access | Where-Object {{ $_.IsInherited }}).Count
+    protected = $acl.AreAccessRulesProtected
+    mine = @($mine | ForEach-Object {{ "$($_.FileSystemRights)" }})
+    text = (& icacls $dir | Out-String)
+  }} | ConvertTo-Json -Depth 4 -Compress
+"""
+    try:
+        got = json.loads(
+            _ok(
+                _extract(
+                    _SCRIPT,
+                    ["Set-SecretsDirAcl", "Get-WellKnownBroadSids", "Get-BroadAclResidue"],
+                    lock,
+                ),
+                tmp_path,
+            )
+            .strip()
+            .splitlines()[-1]
+        )
+        after = broad_access_problem(secrets, directory=True)
+    finally:
+        restore = rf"""
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  & icacls {_psq(str(secrets))} /inheritance:e /grant "${{me}}:(OI)(CI)F" | Out-Null
+"""
+        _run(_extract(_SCRIPT, [], restore), tmp_path)
+    assert after is None, f"the engine still refuses the locked directory: {after}\n{got['text']}"
+    assert got["protected"] and got["inherited"] == 0, got["text"]
+    assert got["mine"], f"the service account lost its read:\n{got['text']}"
+    assert all("Modify" not in r and "Write" not in r for r in got["mine"]), (
+        f"the account kept the Modify it inherited:\n{got['text']}"
+    )
+    unexpected = [w for w in got["warnings"] if "owner" not in w]
+    assert unexpected == [], f"a clean lockdown must report no residue; got {unexpected}"
+
+
+def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -> None:
+    """CALL-SITE guard: the functions above prove nothing if the script stops calling them. The
+    directory is restricted after the data directory, whose inheritable grants would reach it, and
+    is named to the service through the merging writer, never `nssm set AppEnvironmentExtra`."""
+    facts = _preflight_facts(tmp_path)
+    data = _sole_call(facts, "Set-SecureDataDirAcl")
+    lock = _sole_call(facts, "Set-SecretsDirAcl")
+    assert "-Path $SecretsDir" in lock["text"], lock["text"]
+    assert lock["start"] > data["start"], "the secrets directory is restricted before the data dir"
+    named = _sole_call(facts, "Set-ServiceEnvironmentValue")
+    assert "MEFOR_SECRETS_DIRECTORY" in named["text"] and "$SecretsDir" in named["text"]
+    assert "AppEnvironmentExtra" not in " ".join(
+        c["text"] for c in facts["commands"] if c["name"] == "Invoke-Nssm"
+    ), "an `nssm set AppEnvironmentExtra` would replace the operator's whole list"
+    # The lockdown replaces the directory's list, so -SecretsDir may not be or hold the data
+    # directory, the store's, the config's, NSSM's or the engine's. Refused before anything acts.
+    text = _script_text()
+    guard = text.index("is, or holds")
+    assert text.index("$SecretsDir = Resolve-AbsolutePath $SecretsDir") < guard
+    assert guard < text.index("$NssmPath = Resolve-Nssm"), "the guard must run before anything acts"
+    for other in (
+        "$DataDir",
+        "(Split-Path -Parent $DbPath)",
+        "$Config",
+        "$NssmDir",
+        "$AppDirectory",
+    ):
+        assert other in text[text.rindex("foreach", 0, guard) : guard], other

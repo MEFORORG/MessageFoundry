@@ -74,6 +74,9 @@ param(
     [string]$ProjectRoot,
     [string]$DbPath,
     [string]$DataDir = "C:\ProgramData\MessageFoundry",
+    # The secrets directory (vault BACKLOG #2595 slice C, ADR 0214). Created restricted, and named to
+    # the service as MEFOR_SECRETS_DIRECTORY in its NSSM environment. Default: <DataDir>\secrets.
+    [string]$SecretsDir,
     [string]$ListenHost = "127.0.0.1",
     [int]$Port = 8765,
     # Least-privilege service account (DEPLOY-1). Override the default run-as with a specific account -
@@ -683,6 +686,24 @@ function Save-PinnedNssm {
 }
 
 
+function Get-WellKnownBroadSids {
+    <#
+      The well-known broad principals the data-directory and secrets-directory lockdowns remove, as
+      icacls '*SID' arguments. At least these, not all of them: Set-SecureDataDirAcl says why the
+      read-back that follows each removal is what catches the rest.
+    #>
+    return @(
+        "*S-1-1-0",       # Everyone
+        "*S-1-5-32-545",  # BUILTIN\Users
+        "*S-1-5-11",      # Authenticated Users
+        "*S-1-5-4",       # INTERACTIVE
+        "*S-1-3-0",       # CREATOR OWNER
+        "*S-1-3-4",       # OWNER RIGHTS
+        "*S-1-5-32-546",  # Guests
+        "*S-1-5-7"        # ANONYMOUS LOGON
+    )
+}
+
 function Set-SecureDataDirAcl {
     <#
       Lock the data/log directory down to SYSTEM + Administrators (+ the service account). NSSM
@@ -736,16 +757,7 @@ function Set-SecureDataDirAcl {
     # icacls exiting 0, propagated to the logs directory beneath it, and only the read-back saw it.
     # Removing the ACE does not lock the owner out: with no S-1-3-4 ACE constraining them, Windows
     # falls back to the owner's implicit READ_CONTROL + WRITE_DAC.
-    $broad = @(
-        "*S-1-1-0",       # Everyone
-        "*S-1-5-32-545",  # BUILTIN\Users
-        "*S-1-5-11",      # Authenticated Users
-        "*S-1-5-4",       # INTERACTIVE
-        "*S-1-3-0",       # CREATOR OWNER
-        "*S-1-3-4",       # OWNER RIGHTS
-        "*S-1-5-32-546",  # Guests
-        "*S-1-5-7"        # ANONYMOUS LOGON
-    )
+    $broad = Get-WellKnownBroadSids
     & icacls $Path /remove:g @broad | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Warning ("Could not remove broad-principal ACEs from '$Path' (icacls exit " +
@@ -820,6 +832,92 @@ function Get-BroadAclResidue {
         if (($allowed -notcontains $sid) -and ($allowed -notcontains $name)) { $found += $name }
     }
     return ($found | Select-Object -Unique)
+}
+
+function Set-SecretsDirAcl {
+    <#
+      Restrict the secrets directory (vault BACKLOG #2595 slice C, ADR 0214): inheritance off, SYSTEM
+      and Administrators full control, the service account read, each inherited by the files in it,
+      and Administrators as the owner: an individual owner keeps WRITE_DAC whatever the list says
+      (Set-AdminOnlyAcl says when New-Item leaves one). The engine refuses the directory, and every setting in it, when
+      a known broad group can read or change it, so a directory left open fails the service's start
+      rather than leaking. Read access only: the engine reads the files and never writes them.
+
+      THE ACCOUNT'S GRANT IS ADDED, NEVER REPLACED. An existing directory may give a dedicated engine
+      account more than read, for the Vault Agent sink route docs/CONFIGURATION.md describes, and a
+      rerun must not take that away. Inheritance comes off, so the Modify the account inherits from
+      the data directory goes, and a fresh directory gives it read alone. Any other explicit entry an
+      operator added stays, and the read-back names it. Best-effort, like Set-SecureDataDirAcl: it
+      warns and never aborts.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [string]$Account)
+    & icacls $Path /inheritance:r /grant:r "*S-1-5-18:(OI)F" "*S-1-5-32-544:(OI)F" | Out-Null
+    $failed = $LASTEXITCODE -ne 0
+    if (-not $failed -and $Account) {
+        & icacls $Path /grant "${Account}:(OI)RX" | Out-Null
+        $failed = $LASTEXITCODE -ne 0
+    }
+    if (-not $failed) {
+        # The same well-known broad set Set-SecureDataDirAcl removes, for the reasons it gives.
+        $broad = Get-WellKnownBroadSids
+        & icacls $Path /remove:g @broad | Out-Null
+        $failed = $LASTEXITCODE -ne 0
+    }
+    if ($failed) {
+        Write-Warning ("Could not restrict the secrets directory '$Path' (icacls exit $LASTEXITCODE). " +
+            "The engine refuses a secrets directory a broad group can read or change. Restrict it " +
+            "as docs/CONFIGURATION.md 'The secrets directory' shows.")
+        return
+    }
+    $residue = Get-BroadAclResidue -Path $Path -Account $Account
+    if ($residue) {
+        Write-Warning ("The secrets directory '$Path' also grants access to: $($residue -join ', '). " +
+            "Each can read the service's secrets; remove any grant you did not intend.")
+    }
+    # Last and on its own, so a host that refuses the owner change still had the list read back.
+    & icacls $Path /setowner "*S-1-5-32-544" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning ("Could not make Administrators the owner of the secrets directory '$Path' " +
+            "(icacls exit $LASTEXITCODE). Run 'icacls ""$Path"" /setowner ""*S-1-5-32-544""' elevated.")
+    }
+}
+
+function Get-MergedEnvironmentList {
+    <#
+      $Existing, an NSSM environment list of NAME=value entries, with every entry for $Name replaced
+      by one NAME=$Value at the end. Windows variable names ignore case, so the match does too. Every
+      other entry is kept, in order: this installer adds one variable and owns no other.
+    #>
+    param([AllowNull()][string[]]$Existing, [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Value)
+    $prefix = "$Name="
+    $kept = @($Existing | Where-Object { $_ -and -not $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })
+    return [string[]](@($kept) + "$prefix$Value")
+}
+
+function Set-ServiceEnvironmentValue {
+    <#
+      Set one variable in the service's NSSM environment (AppEnvironmentExtra under its Parameters
+      key), keeping the others. `nssm set ... AppEnvironmentExtra` replaces the whole list, which on
+      a rerun would drop what an operator set there. The value is read back. Returns the value it
+      replaced, or $null when there was none or it was the same. Throws when the read-back differs.
+
+      Only a path goes through here: the Parameters key is readable by local users, which is why the
+      secrets this directory holds must not be in it (vault BACKLOG #2595).
+    #>
+    param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Value)
+    $keyPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters"
+    $existing = (Get-Item -LiteralPath $keyPath -ErrorAction Stop).GetValue('AppEnvironmentExtra', $null)
+    $previous = @($existing | Where-Object { $_ -and $_.StartsWith("$Name=", [StringComparison]::OrdinalIgnoreCase) }) |
+        Select-Object -Last 1
+    $merged = Get-MergedEnvironmentList -Existing $existing -Name $Name -Value $Value
+    Set-ItemProperty -LiteralPath $keyPath -Name 'AppEnvironmentExtra' -Value $merged -Type MultiString -ErrorAction Stop
+    $stored = @((Get-Item -LiteralPath $keyPath -ErrorAction Stop).GetValue('AppEnvironmentExtra', $null))
+    if ($stored -cnotcontains "$Name=$Value") {
+        throw "The service's environment does not hold $Name=$Value after it was written."
+    }
+    if ($previous -and $previous -cne "$Name=$Value") { return $previous.Substring($Name.Length + 1) }
+    return $null
 }
 
 function Set-ConfigReadAcl {
@@ -1897,6 +1995,8 @@ if (-not $ServiceConfig) {
 # Derived from the ALREADY-absolute $DataDir, so the default is absolute without a second pass.
 if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }
 else { $DbPath = Resolve-AbsolutePath $DbPath }
+if (-not $SecretsDir) { $SecretsDir = Join-Path $DataDir "secrets" }
+else { $SecretsDir = Resolve-AbsolutePath $SecretsDir }
 
 $NssmDir = Resolve-AbsolutePath $NssmDir
 # NSSM is resolved before a build (vault BACKLOG #2626), so an -NssmDir at or inside the root would
@@ -1921,7 +2021,15 @@ if ($ServiceConfig) { $AppParams += " --service-config $(Format-QuotedPath $Serv
 if ($ProjectRoot) { $AppParams += " --project-root $(Format-QuotedPath $ProjectRoot)" }
 # The paths stored outside the arguments: the log paths sit under -DataDir, and the SCM expands the
 # image path, which names nssm.exe in -NssmDir. An empty $PythonExe is refused further down.
-foreach ($stored in @($PythonExe, $AppDirectory, $DataDir, $NssmDir)) { Assert-NoNssmExpansion $stored }
+foreach ($stored in @($PythonExe, $AppDirectory, $DataDir, $NssmDir, $SecretsDir)) { Assert-NoNssmExpansion $stored }
+# The secrets directory's lockdown replaces its access list, and the engine refuses a file in it
+# named for no setting, so it must not be, or hold, a directory the service uses for anything else.
+$SecretsKey = $SecretsDir.TrimEnd('\') + '\'
+foreach ($other in @($DataDir, (Split-Path -Parent $DbPath), $Config, $NssmDir, $AppDirectory)) {
+    if ($other -and ($other.TrimEnd('\') + '\').StartsWith($SecretsKey, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "-SecretsDir '$SecretsDir' is, or holds, '$other'. Point it at a folder of its own, such as the default <DataDir>\secrets."
+    }
+}
 
 # Before the lock check below, which would report a missing -Config only as a folder it cannot read.
 if (-not (Test-Path -LiteralPath $Config -PathType Container)) { throw "Config directory not found at: $Config" }
@@ -2341,6 +2449,25 @@ if ($ServiceExisted) {
 Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount
 # The owner too, not only the DACL: the engine's store rule reads it (ADR 0183 Wave 0b).
 Set-DataDirOwner -Path $DataDir
+# The secrets directory (vault BACKLOG #2595 slice C, ADR 0214): the protected channel for every
+# secret but the store key, which stays in its DPAPI key file. Made here, after the account resolves,
+# and restricted after the data directory, whose inheritable grants would otherwise reach it. Empty:
+# an administrator adds one file per setting. The service is told where it is through its
+# environment, which holds only the path.
+New-Item -ItemType Directory -Force -Path $SecretsDir | Out-Null
+Set-SecretsDirAcl -Path $SecretsDir -Account $ServiceAccount
+try {
+    $replacedSecretsDir = Set-ServiceEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_SECRETS_DIRECTORY" -Value $SecretsDir
+    if ($replacedSecretsDir) {
+        Write-Warning ("The service's MEFOR_SECRETS_DIRECTORY named '$replacedSecretsDir' and now names " +
+            "'$SecretsDir'. Move any file from the old directory, or pass -SecretsDir to keep it.")
+    }
+    Write-Host "  Secrets: '$SecretsDir', named to the service as MEFOR_SECRETS_DIRECTORY (docs/SERVICE.md)."
+} catch {
+    Write-Warning ("Could not name the secrets directory in the service's environment " +
+        "($($_.Exception.Message)). Add MEFOR_SECRETS_DIRECTORY=$SecretsDir to its AppEnvironmentExtra " +
+        "by hand, keeping the entries already there.")
+}
 # The lockdown above removes Users and Authenticated Users, so a named account writes the data
 # directory through its own grant. That grant is read back on the two directories the service must
 # write (vault BACKLOG #2702). LocalSystem has no named grant: it writes through the SYSTEM entry.

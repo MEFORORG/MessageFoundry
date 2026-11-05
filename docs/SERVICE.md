@@ -621,12 +621,19 @@ environment.
   settings other than the store key, among them the database password, and every `MEFOR_VALUE_*`
   value can each come from a file instead of the service's NSSM list. A variable an operator names
   as a `[secrets].provider = "env"` reference, and one a library reads for itself, are not read
-  from it. Point `MEFOR_SECRETS_DIRECTORY` at a directory only
-  SYSTEM, Administrators and the service account can reach, with one file per setting, named as
-  its variable. A path in the NSSM list is not a secret. The engine refuses a directory or file a
-  broad group can read or change. The files are plain, protected by their access list alone, and
-  nothing creates the directory yet, so you create it. Which settings it supplies, and the rules,
-  are stated once, in
+  from it. **The installer creates it**: `<DataDir>\secrets` unless `-SecretsDir` names another
+  path, with inheritance off, SYSTEM and Administrators full control and the service account read,
+  and it adds `MEFOR_SECRETS_DIRECTORY=<that path>` to the service's NSSM list, keeping the entries
+  already there. A path in the NSSM list is not a secret. The directory starts empty: as an
+  administrator, add one file per setting, named as its variable, and restart the service. A file
+  you create there inherits the directory's grants. The engine refuses a directory or file a broad
+  group can read or change, and the installer warns when a grant beyond those three is left on it.
+  A rerun turns inheritance off again and adds the account's read. It keeps every other explicit
+  grant there except the well-known broad groups, which it removes, so a grant you rely on must be
+  explicit, not inherited. With `-SecretsDir`, restrict the folders above that path yourself: the
+  engine does not read them. `uninstall-service.ps1` leaves the directory, as it leaves the rest of
+  the data directory. The files are plain, protected by their access list alone. Which settings it
+  supplies, and the rules, are stated once, in
   [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). This is the
   first part of the protected channel vault BACKLOG #2595 asks for, not the whole of it: a secret
   left in the NSSM list is still named, not refused.

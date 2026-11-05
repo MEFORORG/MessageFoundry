@@ -691,13 +691,15 @@ def test_a_refusal_reports_whether_the_service_was_disabled(tmp_path: Path) -> N
 
 def test_a_path_nssm_expands_is_refused_with_percent_before_anything_acts() -> None:
     """nssm expands %NAME% at start in the interpreter path, the working directory and the log
-    paths under -DataDir, as it does in the arguments, and the SCM expands the image path."""
+    paths under -DataDir, as it does in the arguments, and the SCM expands the image path. The
+    secrets directory's path goes into the service's environment, so it is held to the same rule."""
     text = _text()
     check = text.index(
-        "foreach ($stored in @($PythonExe, $AppDirectory, $DataDir, $NssmDir)) "
+        "foreach ($stored in @($PythonExe, $AppDirectory, $DataDir, $NssmDir, $SecretsDir)) "
         "{ Assert-NoNssmExpansion $stored }"
     )
     assert text.index("$NssmDir = Resolve-AbsolutePath $NssmDir") < check
+    assert text.index("$SecretsDir = Resolve-AbsolutePath $SecretsDir") < check
     assert text.index("$PythonExe = Get-EngineInterpreter") < check
     assert check < text.index("$NssmPath = Resolve-Nssm")
 

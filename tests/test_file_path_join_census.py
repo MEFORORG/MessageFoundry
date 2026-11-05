@@ -1019,7 +1019,7 @@ SCRIPT_SITES: dict[str, Site] = {
         7, OPERATOR, "Fixed names under the repo root, the helper source and the install directory."
     ),
     "scripts/service/install-service.ps1": Site(
-        38,
+        39,
         OPERATOR,
         "Fixed names under paths the operator passes or the script derives (repo root, install "
         "root and its site-packages, dist-info, wheelhouse and buildtemp folders, the engine "

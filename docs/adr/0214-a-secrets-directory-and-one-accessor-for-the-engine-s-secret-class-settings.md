@@ -145,8 +145,9 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 
 ## To resolve on acceptance
 
-- [ ] Whether the directory's location becomes a fixed path under the data directory once the
-      installer creates it (slice C), or stays operator-named.
+- [x] Whether the directory's location becomes a fixed path under the data directory once the
+      installer creates it (slice C), or stays operator-named. **Operator-named** (2026-11-05,
+      slice C): see the amendment below.
 - [ ] Whether a Windows file is also DPAPI-wrapped, after the user-scope DPAPI spike.
 
 ## Amendments
@@ -156,3 +157,17 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   refused as an unknown name. Question 12 of the maintainer-internal decisions index answered yes
   (Manager decision 2026-10-01, under the owner's driver rule). ADR 0019 carries the matching
   amendment.
+- **2026-11-05, slice C built: the location stays operator-named.** The engine keeps reading only
+  the path `MEFOR_SECRETS_DIRECTORY` names, with no default. `install-service.ps1` creates
+  `<DataDir>\secrets`, or the path `-SecretsDir` names, restricted to SYSTEM and Administrators
+  (full control) and the service account (read), and adds the variable to the service's NSSM
+  environment, merging it into the entries already there. The Linux and container locations are
+  documented, not built: a read-only bind mount in `docker/compose.yaml`, commented out, and a
+  systemd credentials directory, which is not measured. **Why not a fixed path:** the engine is
+  not told the data directory (it is given `--db`), so a fixed path would need a new engine rule
+  that every platform then has to meet, where a container mounts its secrets wherever its runtime
+  puts them. An operator-named path needs no engine change, the variable holds a path and not a
+  secret, and each platform's installer or manifest supplies the one value that fits it. **What it
+  costs:** the variable is one more entry in the service's registry key, so a local user can read
+  where the directory is, though not what it holds; and an engine started without the variable
+  reads every secret from the environment, as before slice A.
