@@ -1069,14 +1069,13 @@ def driver_file_spellings(value: object, verdicts: FileVerdicts | None = None) -
 def _refuse_remote_path(
     value: object, verdicts: FileVerdicts, *, name: str, connection: str | None
 ) -> None:
-    """Raise ``ValueError`` when :func:`names_another_host` is ``True`` for ``value`` and its
-    ``verdicts`` (BACKLOG #2705); otherwise return. The message names the keyword, not the value.
-    ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
-    if names_another_host(value, verdicts):
+    """Raise ``ValueError`` when ``value`` breaks a rule :func:`driver_file_rule` names for the
+    file keyword ``name`` and its ``verdicts`` (BACKLOG #2705); otherwise return. The message names
+    the keyword, not the value. ``docs/CONNECTIONS.md``, Generic ODBC, states the check's limits."""
+    rule = driver_file_rule(name, value, verdicts)
+    if rule is not None:
         raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' must be a plain "
-            "local path on this host: not a share, a network drive, a link to one, or a path it "
-            "cannot read"
+            f"{hop_name_prefix(connection)}DATABASE odbc_params value for '{name}' {rule}"
         )
 
 
@@ -1084,23 +1083,42 @@ def _refuse_remote_paths(
     named: Mapping[str, Any], *, connection: str | None
 ) -> dict[str, FileVerdicts]:
     """Compute the verdicts of each file keyword in ``named``, in sorted keyword order, and raise
-    ``ValueError`` (:func:`_refuse_remote_path`) at the first that :func:`names_another_host`
-    refuses, in every ``sslmode``. Otherwise return the verdicts for the checks that read the
-    files: one entry per file keyword ``named`` holds, set or not. ``docs/CONNECTIONS.md``, Generic
-    ODBC, states the check's limits."""
+    ``ValueError`` (:func:`_refuse_remote_path`) at the first that breaks a rule, in every
+    ``sslmode``. Otherwise return the verdicts for the checks that read the files: one entry per
+    file keyword ``named`` holds, set or not. ``docs/CONNECTIONS.md``, Generic ODBC, states the
+    check's limits."""
     verdicts: dict[str, FileVerdicts] = {}
     for name in sorted(_ODBC_PATH_KEYS & named.keys()):
         value = named[name]
         verdicts[name] = file_keyword_verdicts(value)
         _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
-    if "sslcapath" in verdicts and capath_entries_leave_host(
-        named["sslcapath"], verdicts["sslcapath"]
-    ):
-        raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE odbc_params value for 'sslcapath' "
-            f"{CAPATH_ENTRY_RULE}"
-        )
     return verdicts
+
+
+#: What a refused driver file value must be, after the setting's name, for the build and the lane
+#: check alike (:func:`driver_file_rule`). Neither names a path.
+REMOTE_PATH_RULE = (
+    "must be a plain local path on this host: not a share, a network drive, a link to one, or a "
+    "path the check cannot read"
+)
+CAPATH_ENTRY_RULE = (
+    "must name a folder whose entries are each a plain local path on this host: not a share, a "
+    "network drive, a link to one, or a path the check cannot read"
+)
+
+
+def driver_file_rule(keyword: str, value: object, verdicts: FileVerdicts) -> str | None:
+    """The rule a driver file keyword's ``value`` breaks, given its ``verdicts``, or ``None``:
+    :data:`REMOTE_PATH_RULE` when :func:`names_another_host` refuses it, and
+    :data:`CAPATH_ENTRY_RULE` when an entry of an ``sslcapath`` folder must be refused
+    (:func:`capath_entries_leave_host`). The one judgement the build and the lane check
+    (``auth.trust_anchors.database_ca_anchor_spec``) both run, so the two refuse alike (vault
+    BACKLOG #5197)."""
+    if names_another_host(value, verdicts):
+        return REMOTE_PATH_RULE
+    if keyword == "sslcapath" and capath_entries_leave_host(value, verdicts):
+        return CAPATH_ENTRY_RULE
+    return None
 
 
 #: Whether the remote-path check reads anything beyond the spelling: on Windows only
@@ -1110,12 +1128,6 @@ _WALKS_BEYOND_SPELLING = sys.platform == "win32"
 #: holding more is refused rather than judged in part: each entry is a walk, and the build runs on
 #: the event loop. A CA folder holds a few hundred at most (one file and one link per CA).
 _MAX_CAPATH_ENTRIES = 4096
-#: What a refused ``sslcapath`` folder must be, after the setting's name, for the build and the
-#: lane check alike. It names no path.
-CAPATH_ENTRY_RULE = (
-    "must name a folder whose entries are each a plain local path on this host: not a share, a "
-    "network drive, a link to one, or a path the check cannot read"
-)
 
 
 def capath_entries_leave_host(value: object, verdicts: FileVerdicts) -> bool:

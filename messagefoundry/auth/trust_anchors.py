@@ -197,8 +197,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     check writes a ``changed`` row. A CA the driver never reads under ``sslmode=disable`` is not
     checked (:func:`unread_ca_reason`), and neither is a missing file or a directory, which the
     build leaves to the driver. A value the build's remote-path check refuses is refused here as a
-    setting, in every ``sslmode`` (BACKLOG #2705); ``docs/CONNECTIONS.md``, Generic ODBC, states
-    that check's limits.
+    setting, in every ``sslmode`` (BACKLOG #2705), for ``sslcapath``, ``sslcert`` and ``sslkey``
+    too, and for each entry of an ``sslcapath`` folder (vault BACKLOG #5197 item 18), though none
+    of those is an anchor; ``docs/CONNECTIONS.md``, Generic ODBC, states that check's limits.
     A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
     that holds for every anchor here since vault BACKLOG #3090. Unread is not unopened on Windows:
     the stat that judges the path opens it there, so a named pipe's server sees a connect first
@@ -210,7 +211,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     reading the file at each new connect until the lane is rebuilt, and the refused reload is the
     only signal. Any check-then-load leaves a swap window, as for ``sslkey``. There is no pin:
     ``odbc_params`` has no pin setting. An ``sslcapath`` CA directory, which a driver also reads
-    to choose whom to trust, is not an anchor at all: no ACL, path or audit check covers it. Nor
+    to choose whom to trust, is not an anchor at all: no ACL, path or audit check covers it, only
+    the remote-path check of its entries. Nor
     is the lane check skipped for a TLS-off keyword other than ``sslmode``, such as ``Encrypt``.
 """
 
@@ -1696,10 +1698,11 @@ def _odbc_tls_disabled(settings: Mapping[str, Any]) -> bool:
 
 
 def inbound_lane_reads_ca(conn_type: object, settings: Mapping[str, Any]) -> bool:
-    """Whether an inbound of ``conn_type`` dials out with a CA its lane check reads: an ``Ftp``
-    poller naming a ``tls_ca_file``, or a ``DatabasePoll`` naming an ``odbc_params`` ``sslca``
-    (vault BACKLOG #3090, step 7). ``settings`` may be unresolved; the check resolves them. The one
-    list of such inbounds, for :func:`registry_anchor_specs` and the runner.
+    """Whether an inbound of ``conn_type`` dials out with a CA or driver file its lane check reads:
+    an ``Ftp`` poller naming a ``tls_ca_file``, or a ``DatabasePoll`` naming an ``odbc_params``
+    ``sslca`` (vault BACKLOG #3090, step 7), ``sslcapath``, ``sslcert`` or ``sslkey`` (vault BACKLOG
+    #5197 item 18). ``settings`` may be unresolved; the check resolves them. The one list of such
+    inbounds, for :func:`registry_anchor_specs` and the runner.
 
     A ``dialect`` that is not yet text, such as an ``env()`` value, may resolve to ``generic``, so
     its ``sslca`` counts here and the check decides once it resolves; otherwise such a poller would
@@ -1709,15 +1712,11 @@ def inbound_lane_reads_ca(conn_type: object, settings: Mapping[str, Any]) -> boo
     return conn_type is ConnectorType.DATABASE and bool(_lane_driver_files(settings))
 
 
-#: The generic ODBC file keywords the lane check judges again, in the build's order
-#: (``database._ODBC_PATH_KEYS``, sorted). Only ``sslca`` is also an anchor the check reads.
-_LANE_DRIVER_FILES = ("sslca", "sslcapath", "sslcert", "sslkey")
-
-
 def _lane_driver_files(settings: Mapping[str, Any]) -> tuple[str, ...]:
-    """The keywords of :data:`_LANE_DRIVER_FILES` a DATABASE connection's ``odbc_params`` set to a
-    non-empty value, which its lane check judges again (vault BACKLOG #5197 item 18). A value of
-    spaces counts, and :func:`database_ca_anchor_spec` refuses it, as the build does. So does a
+    """The generic ODBC file keywords (``database._ODBC_PATH_KEYS``, in the build's sorted order) a
+    DATABASE connection's ``odbc_params`` set to a non-empty value, which its lane check judges
+    again (vault BACKLOG #5197 item 18). Only ``sslca`` is also an anchor the check reads. A value
+    of spaces counts, and :func:`database_ca_anchor_spec` refuses it, as the build does. So does a
     value that is not text, such as ``0``, judged by the ``str()`` the build sends, not by its
     truthiness (item 15). A ``dialect`` that is not yet text may resolve to ``generic``, so it is
     read as one."""
@@ -1725,11 +1724,11 @@ def _lane_driver_files(settings: Mapping[str, Any]) -> tuple[str, ...]:
         return ()
     if not isinstance(settings.get("dialect", "sqlserver"), str):
         settings = {**settings, "dialect": "generic"}  # only for an unresolved dialect
-    from messagefoundry.transports.database import _sent_text
+    from messagefoundry.transports.database import _ODBC_PATH_KEYS, _sent_text
 
     return tuple(
         keyword
-        for keyword in _LANE_DRIVER_FILES
+        for keyword in sorted(_ODBC_PATH_KEYS)
         if _sent_text(_generic_odbc_param(settings, keyword))
     )
 
@@ -1798,35 +1797,28 @@ def database_ca_anchor_spec(
     if not files:
         return None
     from messagefoundry.transports.database import (
-        CAPATH_ENTRY_RULE,
-        capath_entries_leave_host,
+        driver_file_rule,
         driver_file_spellings,
         file_keyword_verdicts,
-        names_another_host,
         odbc_param_text,
     )
 
-    judged: dict[str, Mapping[str, bool | None]] = {}
+    ca: tuple[object, Mapping[str, bool | None]] | None = None
     for keyword in files:
         value = _generic_odbc_param(settings, keyword)
-        # The build refuses a boolean before it reads the text, so ``True`` is never a file a
-        # driver is handed, and the lane check must not walk or stat the relative path "True".
+        # The build's own literal check, in its words, before anything walks or stats the value.
         odbc_param_text(keyword, value, connection=name)
-        judged[keyword] = verdicts = file_keyword_verdicts(value)
-        if names_another_host(value, verdicts):
-            raise ValueError(
-                f"{kind} '{name}' odbc_params {keyword} must be a plain local path on this host: "
-                "not a share, a network drive, a link to one, or a path the check cannot read"
-            )
-        if keyword == "sslcapath" and capath_entries_leave_host(value, verdicts):
-            raise ValueError(f"{kind} '{name}' odbc_params sslcapath {CAPATH_ENTRY_RULE}")
-    if "sslca" not in judged or unread_ca_reason(settings) is not None:
-        # No sslca, or an empty one, which names no file: the build refuses that naming the
+        verdicts = file_keyword_verdicts(value)
+        rule = driver_file_rule(keyword, value, verdicts)
+        if rule is not None:
+            raise ValueError(f"{kind} '{name}' odbc_params {keyword} {rule}")
+        if keyword == "sslca":
+            ca = (value, verdicts)
+    if ca is None or unread_ca_reason(settings) is not None:
+        # No sslca, or an empty one, which names no file and the build refuses naming the
         # keyword, where a refusal here would be reported against tls_ca_file.
         return None
-    value = _generic_odbc_param(settings, "sslca")
-    verdicts = judged["sslca"]
-    spellings = driver_file_spellings(value, verdicts)
+    spellings = driver_file_spellings(*ca)
     path = next((p for p in spellings if os.path.exists(p) and not os.path.isdir(p)), None)
     if path is None:
         return None
@@ -2680,9 +2672,9 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
 
     It raises :class:`TrustAnchorError` for a refused or unreadable file, and
     :class:`AnchorSettingRefused`, a ``ValueError``, for a ``tls_ca_pin`` that is blank, unread or
-    does not parse, a CA path the OS will not take, or a generic DATABASE ``sslca`` value
-    :func:`~messagefoundry.transports.database.names_another_host` refuses (BACKLOG #2705), in
-    every ``sslmode``. Each names the connection. A lane with no
+    does not parse, a CA path the OS will not take, or a generic DATABASE driver file value
+    (:func:`database_ca_anchor_spec`) the build's remote-path check refuses (BACKLOG #2705, vault
+    BACKLOG #5197 item 18), in every ``sslmode``. Each names the connection. A lane with no
     CA it reads is a no-op: no store call, no audit row. A store that refuses the audit read or
     write raises :class:`AnchorStoreUnavailable`, which is not a refusal and is not remembered
     below, so the next check reads the file again (BACKLOG #3091).

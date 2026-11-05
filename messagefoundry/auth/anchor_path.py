@@ -30,6 +30,7 @@ ctypes.
 
 from __future__ import annotations
 
+import functools
 import logging
 import ntpath
 import os
@@ -38,6 +39,7 @@ import stat
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from typing import Any, cast
 
 log = logging.getLogger(__name__)
 
@@ -446,6 +448,22 @@ def subst_target(answer: str) -> str | None:
 _ERROR_FILE_NOT_FOUND = 2
 
 
+@functools.cache
+def _query_dos_device() -> Callable[[str, Any, int], int]:
+    """``QueryDosDeviceW`` from a private ``kernel32`` handle, typed once, since a walk asks it for
+    every drive it meets and an ``sslcapath`` folder walks each entry. Private, so the argument
+    types set here never reach another module's ``ctypes.windll``. Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("QueryDosDeviceW exists only on Windows")
+    import ctypes
+    from ctypes import wintypes
+
+    query = ctypes.WinDLL("kernel32", use_last_error=True).QueryDosDeviceW
+    query.restype = wintypes.DWORD
+    query.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    return cast("Callable[[str, Any, int], int]", query)
+
+
 def query_drive_target(drive: str) -> str | None:
     """What ``QueryDosDeviceW`` says the ``drive`` letter stands for, whole (:func:`subst_target`),
     or ``None`` for a real volume, a network redirector or no device at all. The one reader both
@@ -459,13 +477,9 @@ def query_drive_target(drive: str) -> str | None:
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the drive target is read only on Windows")
     import ctypes
-    from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.QueryDosDeviceW.restype = wintypes.DWORD
-    kernel32.QueryDosDeviceW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
     buf = ctypes.create_unicode_buffer(1024)
-    if not kernel32.QueryDosDeviceW(drive, buf, len(buf)):
+    if not _query_dos_device()(drive, buf, len(buf)):
         error = ctypes.get_last_error()
         if error == _ERROR_FILE_NOT_FOUND:
             return None
@@ -535,9 +549,9 @@ def windows_chain(
 
     At least these end the walk with a cause, since Windows would open another object than the text
     names (vault BACKLOG #5197): a drive-relative spelling (:func:`_drive_relative`), in the path, a
-    link target or a ``subst`` target; a name ending in a space or a dot, which Win32 strips; and a
-    link target rooted with no drive (:data:`_ROOTED_LINK`); a device prefix written with forward
-    slashes (``//?/S:/x``); and a stream name after a link. A path that reaches a share ends with
+    link target or a ``subst`` target joined to the rest of the path; a name ending in a space or a
+    dot, which Win32 strips; and a link target rooted with no drive (:data:`_ROOTED_LINK`); a
+    device prefix written with forward slashes (``//?/S:/x``); and a stream name after a link. A path that reaches a share ends with
     :data:`SHARE_CAUSE`."""
     full = _strip_win_prefix(path)
     if full is None:
