@@ -29,6 +29,7 @@ from messagefoundry.api.security import (
     enforce_phi_read_hop,
     get_auth,
     mark_route_gate,
+    mark_ws_gate_admitted,
     record_repeated_credential,
 )
 from messagefoundry.auth import Identity, Permission
@@ -1918,6 +1919,8 @@ async def authorize_ui_ws(
                 identity, permission, websocket.url.path, client=client_ip(websocket)
             )
             return None, None
+    # Vault BACKLOG #2955: the engine refuses to accept an in-body socket no gate marked admitted.
+    mark_ws_gate_admitted(websocket)
     return identity, token
 
 

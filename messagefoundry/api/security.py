@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
 
@@ -35,6 +35,7 @@ from fastapi.routing import APIRoute, RouteContext, iter_route_contexts
 from pydantic import BaseModel
 from starlette.requests import HTTPConnection
 from starlette.routing import BaseRoute
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry.api.auth_models import STEP_UP_VIA_HEADER, STEP_UP_VIA_IDP, CredentialReply
 from messagefoundry.api.tls_client_cert import (
@@ -937,6 +938,98 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
     if websocket:
         raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
     raise HTTPException(status.HTTP_403_FORBIDDEN, UNDECLARED_ROUTE_DETAIL)
+
+
+# --- An in-body WebSocket is accepted only after a gate admitted it (vault BACKLOG #2955) -----------
+# ``authorizes_in_body`` says a WebSocket endpoint runs its own gate before ``accept()``, and the
+# route walk reads that gate as a call in the body. A call is not proof the body acts on it: a body
+# that ignored a refusal, or never reached its gate, would still accept. So every WebSocket gate
+# records on the handshake's scope that it admitted the caller, and :class:`WebSocketAcceptGate`
+# refuses ``websocket.accept`` on any socket whose scope carries no such record, unless the route
+# declares its authorization some other way: a gate dependency, which ran and admitted the caller
+# before the body did, or a ``public_route`` mark. An undeclared socket never gets this far, because
+# :func:`refuse_undeclared_route` refuses it first.
+#
+# The record is a flag, not an identity: it says a gate admitted the caller, not which permission the
+# route needed. The route walk still reads which permissions the body asks for.
+
+#: The scope key a WebSocket gate sets when it admits the caller. Its value is ``True``.
+_WS_GATE_ADMITTED_KEY = "mefor.ws_gate_admitted"
+#: The route attribute that holds when :class:`WebSocketAcceptGate` last logged a refusal there.
+_ACCEPT_REFUSAL_LOGGED_ATTR = "_mefor_accept_refusal_logged_at"
+
+
+def mark_ws_gate_admitted(websocket: HTTPConnection) -> None:
+    """Record on ``websocket``'s scope that a gate admitted its caller. Only a gate calls this.
+
+    A test double with no scope is left unmarked, which leaves its accept refused: the safe side."""
+    scope = getattr(websocket, "scope", None)
+    if isinstance(scope, MutableMapping):
+        scope[_WS_GATE_ADMITTED_KEY] = True
+
+
+def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
+    """Whether :class:`WebSocketAcceptGate` lets this WebSocket scope's ``accept`` through."""
+    if scope.get(_WS_GATE_ADMITTED_KEY) is True:
+        return True
+    route = scope.get("route")
+    if route is None:
+        return False
+    if route_has_gate(route):
+        return True
+    declared = route_declaration_of(getattr(route, "endpoint", None))
+    return declared is not None and declared.public
+
+
+def _log_refused_accept(route: object) -> None:
+    """Log a refused accept at ERROR, at most once per :data:`REFUSAL_LOG_INTERVAL_SECONDS` a route.
+
+    The line names the route's path template, never the request's path."""
+    now = time.monotonic()
+    last = getattr(route, _ACCEPT_REFUSAL_LOGGED_ATTR, None)
+    if isinstance(last, float) and now - last < REFUSAL_LOG_INTERVAL_SECONDS:
+        return
+    log.error(
+        "refused accept on WebSocket route %s: no gate admitted the caller before accept()",
+        getattr(route, "path", None) or UNKNOWN_ROUTE_KEY,
+    )
+    if route is not None:
+        setattr(route, _ACCEPT_REFUSAL_LOGGED_ATTR, now)
+
+
+class WebSocketAcceptGate:
+    """Refuse ``websocket.accept`` on a WebSocket no gate admitted, as the note above defines it.
+
+    Pure ASGI, wrapping ``send`` only. The refusal is a policy-violation close sent in place of the
+    accept, so the handshake fails exactly as a gate's own pre-accept refusal does; the header floor
+    outside turns it into a 403 where the server allows one. The handler then gets a
+    :class:`WebSocketException`, which Starlette answers with a close this wrapper drops, because
+    the socket is already closed. Every later message but a close raises the same exception."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "websocket":
+            await self.app(scope, receive, send)
+            return
+        refused = False
+
+        async def guarded_send(message: Message) -> None:
+            nonlocal refused
+            kind = message.get("type")
+            if refused:
+                if kind == "websocket.close":
+                    return
+                raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
+            if kind == "websocket.accept" and not ws_accept_allowed(scope):
+                refused = True
+                _log_refused_accept(scope.get("route"))
+                await send({"type": "websocket.close", "code": status.WS_1008_POLICY_VIOLATION})
+                raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
+            await send(message)
+
+        await self.app(scope, receive, guarded_send)
 
 
 def _gate(dependency: _Gate, authenticate: _Step) -> _Gate:
@@ -1987,8 +2080,18 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     """Authorize a WebSocket upgrade: validate the ``Origin`` (4.4.2), then the bearer token from the
     Authorization header and the listed permissions.
 
-    Returns the :class:`Identity` on success, or ``None`` if auth fails (caller should close).
+    Returns the :class:`Identity` on success, or ``None`` if auth fails (caller should close). On
+    success it also marks the handshake admitted, which :class:`WebSocketAcceptGate` requires before
+    an in-body socket may be accepted.
     """
+    identity = await _authorize_ws(websocket, *permissions)
+    if identity is not None:
+        mark_ws_gate_admitted(websocket)
+    return identity
+
+
+async def _authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identity | None:
+    """:func:`authorize_ws` without the admitted mark."""
     if not _ws_origin_allowed(websocket):
         return None  # cross-site / disallowed browser Origin — reject before accept()
     auth: AuthService | None = getattr(websocket.app.state, "auth", None)

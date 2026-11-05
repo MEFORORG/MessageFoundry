@@ -25,6 +25,7 @@ from _webui_support import (
 from starlette.datastructures import Headers
 
 from messagefoundry.api import create_app
+from messagefoundry.api.security import ws_accept_allowed
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
@@ -92,6 +93,9 @@ async def test_ws_cookie_auth_same_origin_ok(engine: Engine) -> None:
     ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
     identity, tok = await authorize_ui_ws(ws, Permission.MONITORING_READ)  # type: ignore[arg-type]
     assert identity is not None and tok == token
+    # Vault BACKLOG #2955: the cookie gate marks the handshake admitted, which the engine's accept
+    # gate requires before it lets an in-body socket be accepted.
+    assert ws_accept_allowed(ws.scope)
 
 
 async def test_ws_cookie_auth_rejects_cross_origin(engine: Engine) -> None:
@@ -123,6 +127,8 @@ async def test_ws_cookie_auth_requires_cookie_and_origin(engine: Engine) -> None
     # A bad/expired cookie value → rejected.
     bad = _FakeWS(origin="http://t", host="t", cookie="not-a-real-token", app=app)
     assert (await authorize_ui_ws(bad, Permission.MONITORING_READ))[0] is None  # type: ignore[arg-type]
+    # A refused handshake is never marked admitted (vault BACKLOG #2955).
+    assert not any(ws_accept_allowed(w.scope) for w in (no_cookie, no_origin, bad))
 
 
 async def test_ws_cookie_auth_permission_denial_is_audited(engine: Engine) -> None:
@@ -157,6 +163,7 @@ async def test_ws_cookie_auth_permission_denial_is_audited(engine: Engine) -> No
     ws = _FakeWS(origin="http://t", host="t", cookie=token, app=app, peer=_WS_PEER)
     identity, tok = await authorize_ui_ws(ws, Permission.CONFIG_DEPLOY)  # type: ignore[arg-type]
     assert identity is None and tok is None  # behaviour unchanged: the caller still falls through
+    assert not ws_accept_allowed(ws.scope)  # a wrong-permission caller is not marked admitted
 
     rows = await _denials()
     assert len(rows) == 1, "the refused handshake left no denial row"

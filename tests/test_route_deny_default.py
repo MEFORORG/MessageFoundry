@@ -39,6 +39,7 @@ import messagefoundry.api.security as security_module
 from messagefoundry.api.app import create_app, create_managed_app
 from messagefoundry.api.security import (
     UNDECLARED_ROUTE_DETAIL,
+    authorize_ws,
     authorizes_in_body,
     public_route,
     require,
@@ -474,6 +475,8 @@ def test_a_websocket_that_declares_nothing_is_refused_and_one_that_declares_is_s
     @app.websocket("/zz/ws-declared")
     @authorizes_in_body("a synthetic socket")
     async def ws_declared(websocket: WebSocket) -> None:
+        # The gate must run and admit the caller, or the accept gate refuses the accept (#2955).
+        assert await authorize_ws(websocket, Permission.MONITORING_READ) is not None
         await websocket.accept()
         await websocket.close()
 
