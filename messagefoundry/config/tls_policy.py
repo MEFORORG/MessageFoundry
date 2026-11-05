@@ -2545,7 +2545,7 @@ def phi_read_hop_disposition(
 # instance (BACKLOG #299).
 #
 # COMPOSES with #200 (ADR 0092): #200 refuses the CLEARTEXT / verify-off hop, so revocation only matters
-# on a VERIFYING hop — the two gates key on disjoint conditions and never double-refuse the same hop.
+# on a VERIFYING hop.
 
 
 def revocation_hop_disposition(

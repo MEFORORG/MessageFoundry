@@ -157,11 +157,13 @@ def _build(
     *,
     crl: str | None = None,
     revocation_attested: bool = False,
+    hop_attested: bool = False,
     url: str | None = None,
     extra: _Settings = _NONE,
 ) -> object:
     """Build one destination the way the loader does. ``crl`` is the instance ``[tls].crl_file``,
-    and ``extra`` is laid over the settings the connection factory produced."""
+    and ``extra`` is laid over the settings the connection factory produced. ``hop_attested`` sets
+    ``tls_hop_attested``, which lets an attested ``verify_tls=false`` hop past the verify-off gate."""
     ctype, factory, default_url = _CELLS[cell]
     return build_destination(
         Destination(
@@ -169,6 +171,8 @@ def _build(
             type=ctype,
             settings={**factory(url=url or default_url).settings, **extra},
             trust_anchor_policy=TrustAnchorPolicy(crl_file=crl),
+            tls_hop_attested=hop_attested,
+            tls_hop_attested_reason="partner cert pinned out of band" if hop_attested else None,
             tls_revocation_attested=revocation_attested,
             tls_revocation_attested_reason="revocation-checking PKI at the partner edge"
             if revocation_attested
@@ -184,10 +188,12 @@ def _checks_a_crl(dest: object) -> bool:
     return context_checks_revocation(opener_tls_context(opener, connector="probe"))
 
 
-def _refused(cell: str, *, crl: str | None = None, extra: _Settings = _NONE) -> str:
+def _refused(
+    cell: str, *, crl: str | None = None, hop_attested: bool = False, extra: _Settings = _NONE
+) -> str:
     """Build under the enforcing posture, expect the revocation refusal, and return its text."""
     with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation") as exc:
-        _build(cell, crl=crl, extra=extra)
+        _build(cell, crl=crl, hop_attested=hop_attested, extra=extra)
     return str(exc.value)
 
 
@@ -339,6 +345,29 @@ def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[st
     assert "tls_revocation_attested=true" in default
     # The destination wording the lookup's own description must not change (BACKLOG #2987).
     assert "delivers over verified https" in default
+
+
+# verify_tls=false with the verify-off hop attested, so that gate lets the hop build and only the
+# revocation guard is left to decide.
+_VERIFY_OFF: _Settings = {"verify_tls": False}
+_ECH_VERIFY_OFF: _Settings = {**_VERIFY_OFF, **_ECH}
+
+
+def test_rest_with_an_ech_sidecar_and_verify_off_is_still_refused() -> None:
+    """Vault BACKLOG #2977 item 8. With ECH the engine dials the loopback sidecar through a
+    verifying opener, whatever ``verify_tls`` says, and the sidecar makes the TLS connection to the
+    peer. So ``verify_tls=false`` turns off no verification on the wire, and must not turn off the
+    revocation guard either. Before the fix it did: an attested verify-off hop built with no
+    revocation attestation, while the same hop with ``verify_tls`` on was refused."""
+    assert ECH_HOP_WAYS_ACROSS in _refused("REST", hop_attested=True, extra=_ECH_VERIFY_OFF)
+    # CONTROL 1: the revocation attestation crosses it, so the refusal above is the revocation guard
+    # and not the verify-off gate or a bad setting.
+    with active_hop_posture(PROD_PHI):
+        _build("REST", revocation_attested=True, hop_attested=True, extra=_ECH_VERIFY_OFF)
+    # CONTROL 2: without the sidecar the verify-off hop has no verification for a revocation check to
+    # add to, so the revocation guard stays off and the attested hop builds, unchanged.
+    with active_hop_posture(PROD_PHI):
+        _build("REST", hop_attested=True, extra=_VERIFY_OFF)
 
 
 def test_opener_is_a_required_keyword() -> None:

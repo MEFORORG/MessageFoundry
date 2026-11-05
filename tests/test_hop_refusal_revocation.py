@@ -22,8 +22,7 @@ relaxation went with BACKLOG #1279 -- every instance carries patient data -- and
 arm, which no engine call site ever set True, with BACKLOG #3514 item 5 (pinned below).
 
 The revocation refusal COMPOSES with #200: #200 refuses the CLEARTEXT / verify-off hop, so revocation
-fires ONLY on a VERIFYING hop — the two gates key on disjoint conditions and never double-refuse one
-hop.
+fires ONLY on a VERIFYING hop.
 """
 
 from __future__ import annotations

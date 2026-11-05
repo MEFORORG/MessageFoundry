@@ -1570,9 +1570,8 @@ def refuse_unrevoked_verified_hop(
     attested (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED``
     env, folded in by :meth:`RevocationHopGuard.capture`); a non-prod PHI hop WARNs; loopback / synthetic /
     attested hops are byte-identical. Only meaningful for ``https`` — an ``http`` url has no TLS (its
-    cleartext body is refused by :func:`refuse_cleartext_egress`) and ``verify_tls=false`` is not a
-    verifying hop (refused by :func:`refuse_verify_off`), so the revocation gate and the #200 cleartext /
-    verify-off gates key on disjoint conditions and never double-refuse one hop.
+    cleartext body is refused by :func:`refuse_cleartext_egress`) and ``verify_tls=false`` on a direct
+    hop is not a verifying hop (refused by :func:`refuse_verify_off`).
 
     ``opener`` (BACKLOG #1498) is the opener this hop will really dial through, when the caller has
     already built one. Its https context is then read and handed to the guard, so a ``[tls].crl_file``
@@ -2856,12 +2855,16 @@ class RestDestination(DestinationConnector):
             # loopback rule alone already dials every accepted sidecar direct, so this adds no
             # routing. It makes "no proxy on this hop" hold by construction as well as by rule.
             self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
-        if verify:
+        if verify or self._ech_sidecar is not None:
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the peer cert but does no
             # OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI verified
-            # hop unless revocation is attested or this hop's own opener checks a CRL. Composes with
-            # #200: it keys on the verify-ON https path, disjoint from the cleartext / verify-off gates
-            # above, so no hop is ever double-refused.
+            # hop unless revocation is attested or this hop's own opener checks a CRL. On a direct hop
+            # it keys on the verify-ON https path, disjoint from the verify-off gate above.
+            #
+            # An ECH hop is judged here whatever verify_tls says (vault BACKLOG #2977 item 8): the
+            # sidecar opener above replaced the insecure one, and the sidecar makes the peer's TLS
+            # connection, so verify_tls=false turns off no verification and must not lift this guard.
+            # The SMART and OAuth2 token hop through the same sidecar already runs it unconditionally.
             #
             # Last in __init__, below every statement that builds or replaces `self._opener`, and no
             # opener with an ECH sidecar or tls_allow_expired: see refuse_unrevoked_verified_hop.
