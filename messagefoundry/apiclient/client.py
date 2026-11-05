@@ -141,11 +141,13 @@ _HTTP_PENDING_APPROVAL = 202
 #: How long the reply to a request that can wait in the engine's per-account queue may take, in
 #: seconds (vault BACKLOG #2950): the sign-in, and the elevations that rotate the token, which
 #: queue on that account too: ``reauth``, ``verify_mfa`` and ``confirm_mfa`` (each rotation runs
-#: under the account's re-proof lock, and ``verify_mfa`` also under its credential lock). Matches
+#: under the account's re-proof lock, and ``verify_mfa`` also under its credential lock), and
+#: ``change_password``, whose current-password proof runs under the re-proof lock. Matches
 #: the IDE's ``SIGN_IN_TIMEOUT_MS`` (``ide/src/signInSession.ts``). The queue has no bound
 #: (``keyed_lock.hold_keyed_lock`` takes no timeout), so no value covers every wait: this makes a
-#: lost reply rarer than the 5 s default did, and does not rule one out. It raises the read phase
-#: only (:meth:`EngineClient._sign_in_timeout`); every other request keeps the client's timeout.
+#: lost reply rarer than the 5 s default did, and does not rule one out. It is a floor on the read
+#: phase only (:meth:`EngineClient._sign_in_timeout`); every other request keeps the client's
+#: timeout.
 SIGN_IN_TIMEOUT_SECONDS = 30.0
 
 
@@ -1123,11 +1125,13 @@ class EngineClient:
         return response
 
     def _sign_in_timeout(self) -> httpx.Timeout:
-        """This client's timeout with only the READ phase raised to :data:`SIGN_IN_TIMEOUT_SECONDS`
-        (vault BACKLOG #2950). The engine's per-account queue is waited out after the request is
-        sent, so connect, write and pool keep the client's own bound: a caller on a GUI thread
-        still learns of an unreachable engine as fast as before."""
-        return httpx.Timeout(self._timeout, read=SIGN_IN_TIMEOUT_SECONDS)
+        """This client's timeout with only the READ phase raised to at least
+        :data:`SIGN_IN_TIMEOUT_SECONDS` (vault BACKLOG #2950). The engine's per-account queue is
+        waited out after the request is sent, so connect, write and pool keep the client's own
+        bound: a caller on a GUI thread still learns of an unreachable engine as fast as before. A
+        client built with a longer timeout keeps it for the read too, since a shorter read would
+        make the lost reply more likely for exactly the caller that asked to wait (#3751 item 4)."""
+        return httpx.Timeout(self._timeout, read=max(self._timeout, SIGN_IN_TIMEOUT_SECONDS))
 
     def _adopt_rotated(self, response: httpx.Response) -> None:
         """Adopt the re-keyed session token an elevation route hands back (ASVS 7.2.4).
@@ -1736,10 +1740,10 @@ class EngineClient:
           ``login`` raises :class:`ApiError` and every later call on the held token is refused
           with a 401 until the caller signs in again. A timeout is the likely way in: a sign-in
           waiting in the engine's per-account queue can outlast the client, while the engine goes
-          on to finish it. This request therefore waits :data:`SIGN_IN_TIMEOUT_SECONDS` (30 s) for
-          its reply rather than the client's 5 s default (vault BACKLOG #2950). That makes a lost
-          reply rarer, not impossible: the queue has no bound, so a long enough queue still
-          outlasts it. Before, the old token stayed live in that case. The new session nobody holds stays valid
+          on to finish it. This request therefore waits at least :data:`SIGN_IN_TIMEOUT_SECONDS`
+          (30 s) for its reply rather than the client's 5 s default (vault BACKLOG #2950). That
+          makes a lost reply rarer, not impossible: the queue has no bound, so a long enough queue
+          still outlasts it. Before, the old token stayed live in that case. The new session nobody holds stays valid
           until it idles out or expires, as it did before. This is the accepted price of ending the
           old session ahead of the cap. It is not harmless.
 
@@ -1814,10 +1818,13 @@ class EngineClient:
             self.clear_auth()
 
     def change_password(self, current_password: str, new_password: str) -> None:
+        # Vault BACKLOG #2950 step 5: the current-password proof queues behind the account's
+        # re-proof lock, so it gets the sign-in's timeout (see SIGN_IN_TIMEOUT_SECONDS).
         self._request(
             "POST",
             "/me/password",
             json={"current_password": current_password, "new_password": new_password},
+            timeout=self._sign_in_timeout(),
         )
         self.clear_auth()  # the server revokes sessions on change; sign in again
 

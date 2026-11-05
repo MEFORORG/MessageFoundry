@@ -6,10 +6,11 @@
 ``EngineClient.login`` names the token it replaces, and the engine ends that session inside the
 sign-in (BACKLOG #2281). A sign-in waiting in the engine's per-account queue could outlast the
 client's 5 s default, and a lost reply then leaves the client holding a token the engine ended.
-``login``, ``reauth``, ``verify_mfa`` and ``confirm_mfa`` now wait ``SIGN_IN_TIMEOUT_SECONDS``
-for their reply, which matches the IDE's ``SIGN_IN_TIMEOUT_MS``; their other phases, and every
-other request, keep the client's own timeout. The queue has no bound, so this makes the lost reply
-rarer, not impossible.
+``login``, ``reauth``, ``verify_mfa``, ``confirm_mfa`` and ``change_password`` now wait at least
+``SIGN_IN_TIMEOUT_SECONDS`` for their reply, which matches the IDE's ``SIGN_IN_TIMEOUT_MS``, or
+the client's own timeout when that is longer; their other phases, and every other request, keep
+the client's own timeout. The queue has no bound, so this makes the lost reply rarer, not
+impossible.
 
 The transport is an ``httpx.MockTransport``: what is pinned is the timeout each request carries,
 read from ``request.extensions["timeout"]``, not what an engine does with it.
@@ -50,15 +51,18 @@ def _reply(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json=body)
 
 
-def _recording_client() -> tuple[EngineClient, dict[str, dict[str, float | None]]]:
-    """An ``EngineClient`` over a mock transport, and the timeout each path's request carried."""
+def _recording_client(
+    timeout: float | None = None,
+) -> tuple[EngineClient, dict[str, dict[str, float | None]]]:
+    """An ``EngineClient`` over a mock transport, and the timeout each path's request carried.
+    ``timeout`` is the client's own, or its default when None."""
     seen: dict[str, dict[str, float | None]] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen[request.url.path] = dict(request.extensions["timeout"])
         return _reply(request)
 
-    client = EngineClient(_BASE)
+    client = EngineClient(_BASE) if timeout is None else EngineClient(_BASE, timeout=timeout)
     default = client._http.timeout
     client._http.close()
     # The client's own timeout, as _open_transport sets it, so the default is the one under test.
@@ -73,22 +77,30 @@ def _every_phase(seconds: float) -> dict[str, float | None]:
 
 
 #: The requests that wait in the engine's per-account queue.
-_QUEUED = ("/auth/login", "/me/reauth", "/auth/mfa-verify", "/me/mfa/confirm")
+_QUEUED = ("/auth/login", "/me/reauth", "/auth/mfa-verify", "/me/mfa/confirm", "/me/password")
 
 
-def test_the_sign_in_and_the_queued_elevations_wait_longer_for_their_reply() -> None:
-    """RED when: ``/auth/login``, ``/me/reauth``, ``/auth/mfa-verify`` or ``/me/mfa/confirm``
-    waits only the client's 5 s default for its reply (vault BACKLOG #2950), when anything but
-    the read phase is raised, or when ``/auth/me`` loses that default."""
-    client, seen = _recording_client()
+def _send_every_queued_call_then_a_control(client: EngineClient) -> None:
+    """Each queued call once, then ``/auth/me``, the request that must keep the client's own
+    timeout. ``change_password`` signs the client out, so it runs after the control."""
     try:
         client.login("jdoe", "a-strong-test-passphrase")
         client.reauth("a-strong-test-passphrase")
         client.verify_mfa("123456")
         assert client.confirm_mfa("123456").recovery_codes == ("code-one",)
         client.me()
+        client.change_password("a-strong-test-passphrase", "another-strong-test-passphrase")
     finally:
         client.close()
+
+
+def test_the_sign_in_and_the_queued_elevations_wait_longer_for_their_reply() -> None:
+    """RED when: ``/auth/login``, ``/me/reauth``, ``/auth/mfa-verify``, ``/me/mfa/confirm`` or
+    ``/me/password`` waits only the client's 5 s default for its reply (vault BACKLOG #2950,
+    ``/me/password`` by its step 5), when anything but the read phase is raised, or when
+    ``/auth/me`` loses that default."""
+    client, seen = _recording_client()
+    _send_every_queued_call_then_a_control(client)
     # Only the read phase waits out the queue; connect, write and pool keep the client's bound,
     # so an unreachable engine is still reported as fast as before.
     longer = {**_every_phase(5.0), "read": SIGN_IN_TIMEOUT_SECONDS}
@@ -96,6 +108,19 @@ def test_the_sign_in_and_the_queued_elevations_wait_longer_for_their_reply() -> 
         assert seen[path] == longer, path
     # The control: any other request keeps the client's default.
     assert seen["/auth/me"] == _every_phase(5.0)
+
+
+def test_a_client_built_with_a_longer_timeout_keeps_it_on_the_queued_calls() -> None:
+    """RED when: a client built with a timeout above ``SIGN_IN_TIMEOUT_SECONDS`` gets a SHORTER
+    read on a queued call than on any other request (vault BACKLOG #2950 step 5, #3751 item 4).
+    The sign-in timeout is a floor on the read phase, never a ceiling: a caller that asked to wait
+    longer would otherwise lose the reply sooner, the case the timeout exists to make rarer."""
+    own = SIGN_IN_TIMEOUT_SECONDS * 2
+    client, seen = _recording_client(timeout=own)
+    _send_every_queued_call_then_a_control(client)
+    for path in _QUEUED:
+        assert seen[path] == _every_phase(own), path
+    assert seen["/auth/me"] == _every_phase(own)
 
 
 def test_the_timeout_matches_the_ides_sign_in_timeout() -> None:
