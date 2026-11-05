@@ -25,6 +25,7 @@ reporting presence.
 
 from __future__ import annotations
 
+import http.client
 import http.server
 import logging
 import platform
@@ -47,24 +48,9 @@ _Block = tuple[int, list[tuple[str, str]]]
 _EXPECTED = [(name.lower(), value) for name, value in _BASELINE_RESPONSE_HEADERS]
 
 
-def _exchange(port: int, request: bytes, *, half_close: bool) -> bytes:
-    """Send raw bytes and read until the sink closes the connection. ``half_close`` tells the sink
-    no more is coming, so a refusal that discards the rest of the request ends at once and not on
-    the read timeout."""
-    with socket.create_connection(("127.0.0.1", port), 5.0) as conn:
-        conn.sendall(request)
-        if half_close:
-            conn.shutdown(socket.SHUT_WR)
-        chunks = []
-        try:
-            while chunk := conn.recv(65536):
-                chunks.append(chunk)
-        except ConnectionError:
-            # The sink closed with unread input still queued. What arrived is the answer; with
-            # nothing arrived, the reset is the finding, and it is raised as itself.
-            if not chunks:
-                raise
-    return b"".join(chunks)
+#: The sink's own socket loop: send raw bytes, half-close when asked, read until the sink closes.
+#: Bound here at import, so a test that replaces the sink module's copy does not reach this one.
+_exchange = http_sink._exchange
 
 
 def _answer(monkeypatch: pytest.MonkeyPatch, request: bytes, status: int = 200) -> bytes:
@@ -122,7 +108,8 @@ def _is_bare(raw: bytes) -> bool:
 #: The answer families, from the sink's own table: the self-test the sink runs before every start
 #: drives the same list on the running Python (BACKLOG #1121). This suite reads the answers with
 #: its own parser and its own assertions, so the two header verdicts are reached separately. The
-#: socket loop that fetches the bytes is the same in both, so a fault there is shared.
+#: socket loop that fetches the bytes is the sink's ``_exchange`` in both, so a fault there is
+#: shared.
 _CASES: list[Any] = [
     pytest.param(case.sink_status, case.request, list(case.statuses), id=case.name)
     for case in http_sink.SELF_TEST_CASES
@@ -445,7 +432,10 @@ def _refusal(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) 
         sink.start()
     assert names and set(names) == {"harness-http-sink-self-test"}, names
     assert sink._server is None and sink.port == 0
-    assert [record.getMessage() for record in caplog.records] == [str(refused.value)]
+    ours = [record for record in caplog.records if record.name == http_sink.__name__]
+    assert [(record.levelno, record.getMessage()) for record in ours] == [
+        (logging.ERROR, str(refused.value))
+    ]
     # A setup failure, as a port that will not bind is: the harness CLI reports an OSError as
     # SETUP (exit 2), not as a FAIL verdict on the engine.
     assert isinstance(refused.value, OSError)
@@ -485,12 +475,28 @@ def test_a_sink_missing_an_override_refuses_to_start(
     stdlib's Server line, naming the Python patch level, reaches every answer."""
     _change_handler(monkeypatch, lambda handler: delattr(handler, override))
     message = _refusal(monkeypatch, caplog)
+    if override == "end_headers":
+        for case in http_sink.SELF_TEST_CASES:
+            assert f"{case.name}: the {case.statuses[-1]} lacks " in message, case.name
     if override == "request_version":
         for case_id in _BARE_ON_EVERY_PYTHON_READ:
             assert f"{case_id}: the answer has no final status line" in message, message
     if override == "send_header":
         assert "200: the 200 carries server" in message, message
         assert "lacks " not in message, message
+
+
+def test_a_case_answered_with_another_status_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A Python whose stdlib reads more headers than the many-headers case sends answers it 200,
+    with the baseline: the 431 path was never driven, so the self-test cannot vouch for it."""
+    monkeypatch.setattr(http.client, "_MAXHEADERS", 10_000)
+    message = _refusal(monkeypatch, caplog)
+    assert message.endswith(
+        "stdlib-431-many-headers: the answer is a 200, not the 431 this case drives, so that "
+        "answer family was not exercised"
+    ), message
 
 
 def test_a_late_send_still_gets_the_stalled_probe_its_408(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -538,6 +544,10 @@ def test_a_baseline_whose_policy_allows_framing_refuses_to_start(
         # A no-break space is not CSP whitespace: a browser reads one unknown directive here.
         ("frame-ancestors\xa0'none'", False),
         ("frame-ancestors\t'none'", True),
+        # A field may carry several policies, comma-separated; each is enforced on its own.
+        ("frame-ancestors 'none', script-src 'self'", True),
+        ("script-src 'self', frame-ancestors 'none'", True),
+        ("frame-ancestors 'self', script-src 'self'", False),
         ("", False),
     ],
 )

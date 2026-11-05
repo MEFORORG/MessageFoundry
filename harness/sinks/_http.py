@@ -45,11 +45,11 @@ ruling R1 of the vault's ``ASVS-OWNER-RULINGS-2026-10-23-BATCH340``). The projec
 bare between patch releases. So :meth:`HttpSink.start` first runs :func:`self_test`, which serves
 each request in :data:`SELF_TEST_CASES` on a throwaway loopback server built from this module's
 handler, on the running Python, and reads the bytes back. If any final answer lacks a
-:data:`BASELINE_RESPONSE_HEADERS` line, carries one twice, names no ``frame-ancestors 'none'``
-policy, or carries a ``Server`` or HSTS line, or if an answer cannot be read at all, it logs at
-ERROR and raises :class:`SinkSelfTestError` before the sink's own port is bound. An answer
-family a later Python adds that the table does not name stays uncovered; R1 accepts that as a
-residual.
+:data:`BASELINE_RESPONSE_HEADERS` line, carries one twice, or names no ``frame-ancestors 'none'``
+policy, if any block carries a ``Server`` or HSTS line, if a case is answered with a status other
+than the one it drives (so its family was not exercised), or if an answer cannot be read at all,
+it logs at ERROR and raises :class:`SinkSelfTestError` before the sink's own port is bound. An
+answer family a later Python adds, that the table does not name, is not driven.
 """
 
 from __future__ import annotations
@@ -136,7 +136,8 @@ class SelfTestCase:
     """One answer family :func:`self_test` drives, and ``tests/test_harness_http_headers.py`` too.
 
     ``statuses`` are the header blocks the suite expects, interim ones included. The self-test
-    does not refuse on a status: it checks the headers on whatever final answer comes back.
+    refuses a final answer whose status is not the last of them: a Python that answers the case
+    some other way has not driven the family the case names, so its headers there are unknown.
     """
 
     name: str
@@ -249,54 +250,70 @@ def _exchange(port: int, request: bytes, *, half_close: bool) -> bytes:
             # nothing arrived, the reset is the finding, and it is raised as itself.
             if not chunks:
                 raise
+            _log.debug(
+                "harness HTTP sink: a loopback exchange was reset after %d bytes",
+                sum(map(len, chunks)),
+                exc_info=True,
+            )
     return b"".join(chunks)
 
 
 def _csp_denies_framing(value: str) -> bool:
-    """Whether one ``Content-Security-Policy`` field names ``frame-ancestors 'none'``. Parsed by
-    directive, not by substring: a substring would match the token inside another directive's
-    value, and directive names are case-insensitive."""
-    for directive in value.split(";"):
-        tokens = [token for token in _CSP_WHITESPACE.split(directive) if token]
-        if tokens and tokens[0].lower() == "frame-ancestors":
-            # Only a policy's first frame-ancestors directive counts; a repeat is ignored.
-            return [source.lower() for source in tokens[1:]] == ["'none'"]
+    """Whether one ``Content-Security-Policy`` field holds a policy naming ``frame-ancestors
+    'none'``. A field may carry several policies, comma-separated, each enforced on its own.
+    Parsed by directive, not by substring: a substring would match the token inside another
+    directive's value, and directive names are case-insensitive."""
+    for policy in value.split(","):
+        for directive in policy.split(";"):
+            tokens = [token for token in _CSP_WHITESPACE.split(directive) if token]
+            if tokens and tokens[0].lower() == "frame-ancestors":
+                # Only a policy's first frame-ancestors directive counts; a repeat is ignored.
+                if [source.lower() for source in tokens[1:]] == ["'none'"]:
+                    return True
+                break
     return False
 
 
-def _floor_faults(raw: bytes) -> list[str]:
-    """What is wrong with the final answer in ``raw``, as sentences; empty when it carries the
-    floor. An interim 1xx is not checked: R3 in the vault's ASVS-OWNER-RULINGS-2026-09-28-BATCH171
-    puts it outside the verb."""
+def _floor_faults(raw: bytes, final_status: int) -> list[str]:
+    """What is wrong with the answer in ``raw``, as sentences; empty when its final answer is
+    ``final_status`` and carries the floor. An interim 1xx is checked only for the Server and
+    HSTS lines the header suite refuses everywhere: R3 in the vault's
+    ASVS-OWNER-RULINGS-2026-09-28-BATCH171 puts an interim answer outside the baseline's verb."""
     if not raw:
         return ["nothing was answered, so its headers could not be read"]
+    faults: list[str] = []
     rest = raw
     while rest.startswith(b"HTTP/"):
         head, _, rest = rest.partition(b"\r\n\r\n")
         status_line, *lines = head.decode("latin-1").split("\r\n")
         status = (status_line.split(" ", 2) + ["?"])[1]
-        if status.startswith("1"):
-            continue
         fields: dict[str, list[str]] = {}
         for line in lines:
             name, _, value = line.partition(":")
             fields.setdefault(name.strip(_OWS).lower(), []).append(value.strip(_OWS))
-        faults = [
-            f"the {status} lacks {name}: {value!r} once (it carries {fields.get(name.lower(), [])})"
-            for name, value in BASELINE_RESPONSE_HEADERS
-            if fields.get(name.lower()) != [value]
-        ]
-        if not any(map(_csp_denies_framing, fields.get("content-security-policy", []))):
-            faults.append(f"the {status} names no frame-ancestors 'none' policy")
-        # What the header suite refuses too: the stdlib's Server line names the Python patch
-        # level, and HSTS has no place on a cleartext loopback answer.
+        # The stdlib's Server line names the Python patch level, and HSTS has no place on a
+        # cleartext loopback answer.
         faults.extend(
             f"the {status} carries {name}"
             for name in ("server", "strict-transport-security")
             if name in fields
         )
+        if status.startswith("1"):
+            continue
+        if status != str(final_status):
+            faults.append(
+                f"the answer is a {status}, not the {final_status} this case drives, so that "
+                "answer family was not exercised"
+            )
+        faults.extend(
+            f"the {status} lacks {name}: {value!r} once (it carries {fields.get(name.lower(), [])})"
+            for name, value in BASELINE_RESPONSE_HEADERS
+            if fields.get(name.lower()) != [value]
+        )
+        if not any(map(_csp_denies_framing, fields.get("content-security-policy", []))):
+            faults.append(f"the {status} names no frame-ancestors 'none' policy")
         return faults
-    return ["the answer has no final status line and header block (HTTP/0.9 form)"]
+    return [*faults, "the answer has no final status line and header block (HTTP/0.9 form)"]
 
 
 def _probe(case: SelfTestCase) -> list[str]:
@@ -307,17 +324,20 @@ def _probe(case: SelfTestCase) -> list[str]:
         read_timeout=_SELF_TEST_READ_SECONDS,
         body_timeout=_SELF_TEST_STALL_SECONDS if case.stalls else None,
     )
-    # A short poll: every sink start waits for these probes to stop.
-    server, thread = _listen(
-        LOOPBACK, 0, handler, "harness-http-sink-self-test", poll_interval=0.01
-    )
+    try:
+        # A short poll: every sink start waits for these probes to stop.
+        server, thread = _listen(
+            LOOPBACK, 0, handler, "harness-http-sink-self-test", poll_interval=0.01
+        )
+    except (OSError, RuntimeError) as exc:  # RuntimeError: a thread that cannot start
+        return [f"the probe could not be served, so its headers are unknown: {exc!r}"]
     try:
         raw = _exchange(int(server.server_address[1]), case.request, half_close=not case.stalls)
     except OSError as exc:
         return [f"the probe could not read an answer, so its headers are unknown: {exc!r}"]
     finally:
         _shut(server, thread)
-    return _floor_faults(raw)
+    return _floor_faults(raw, case.statuses[-1])
 
 
 def self_test() -> None:
