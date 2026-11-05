@@ -34,6 +34,10 @@ from cryptography.x509.oid import NameOID
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
+    _CONNECTION_WAYS_ACROSS,
+    _EXPIRY_RELAXED_NO_CHECK,
+    _NO_REVOCATION_CHECK,
+    EXPIRY_RELAXED_WAYS_ACROSS,
     TLS_REVOCATION_ATTESTED_ENV,
     CaFileUnreadable,
     HopPosture,
@@ -58,6 +62,7 @@ PROD_PHI = HopPosture(enforcing=True)
 REMOTE = "10.0.0.5"  # a non-loopback host; nothing here dials it
 LOOPBACK = "127.0.0.1"
 SIDECAR = f"http://{LOOPBACK}:8123"
+_PROXY_HOST = "10.0.0.9"  # a non-loopback forward proxy; nothing here dials it
 
 _CELLS: dict[str, tuple[ConnectorType, Callable[..., ConnectionSpec], str]] = {
     "REST": (ConnectorType.REST, Rest, f"https://{REMOTE}/x"),
@@ -137,6 +142,7 @@ def pki(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     directory = tmp_path_factory.mktemp("crl2188")
     pem = serialization.Encoding.PEM
     files = {
+        "ca": ca.public_bytes(pem),
         "crl": crl.public_bytes(pem),
         "ca_and_crl": ca.public_bytes(pem) + crl.public_bytes(pem),
         "client_cert": client.public_bytes(pem),
@@ -174,7 +180,8 @@ def _build(
             if revocation_attested
             else None,
         ),
-        egress=EgressSettings(deny_by_default=False),
+        # The proxy is listed so the forward-proxy arms build; no other arm sets a proxy.
+        egress=EgressSettings(deny_by_default=False, allowed_proxy=[_PROXY_HOST]),
     )
 
 
@@ -208,7 +215,9 @@ def test_the_expiry_relaxed_arm_is_still_refused_with_a_crl(cell: str, pki: dict
     """``tls_allow_expired`` builds an opener that skips validity-period checks, a CRL's own
     included (measured below). Its CRL is not evidence the guard accepts, so the arm stays refused,
     as it was before #2188."""
-    assert _LABEL[cell] in _refused(cell, crl=pki["crl"], extra=_EXPIRED)
+    text = _refused(cell, crl=pki["crl"], extra=_EXPIRED)
+    assert _LABEL[cell] in text
+    _assert_expiry_relaxed_remedy(text)
     # CONTROL 1: the plain verifying arm with the same CRL builds, so the refusal above is the
     # expiry-relaxed arm and not a CRL that failed to load.
     with active_hop_posture(PROD_PHI):
@@ -229,10 +238,40 @@ def test_soap_mutual_tls_with_expiry_relaxed_is_still_refused_with_a_crl(
         "client_key_file": pki["client_key"],
         **_EXPIRED,
     }
-    _refused("SOAP", crl=pki["crl"], extra=mtls)
+    _assert_expiry_relaxed_remedy(_refused("SOAP", crl=pki["crl"], extra=mtls))
     with active_hop_posture(PROD_PHI):
         dest = _build("SOAP", crl=pki["crl"], revocation_attested=True, extra=mtls)
     assert _checks_a_crl(dest) is True
+
+
+def _assert_expiry_relaxed_remedy(text: str) -> None:
+    """Vault BACKLOG #2977 item 2. The refusal on a ``tls_allow_expired`` hop offered
+    ``[tls].crl_file``, which cannot admit it, and did not name that setting as the cause. It now
+    names it and offers only levers that can cross, in the expiry-relaxed record's own words."""
+    assert EXPIRY_RELAXED_WAYS_ACROSS in text
+    assert _CONNECTION_WAYS_ACROSS not in text
+    assert _EXPIRY_RELAXED_NO_CHECK in text
+    assert _NO_REVOCATION_CHECK not in text
+
+
+@pytest.mark.parametrize("cell", _EXPIRY_CELLS)
+def test_the_expiry_relaxed_refusal_with_no_crl_names_the_same_remedy(cell: str) -> None:
+    _assert_expiry_relaxed_remedy(_refused(cell, extra=_EXPIRED))
+    # CONTROL: the plain verifying arm keeps the connection-shaped default, which does cross it.
+    default = _refused(cell)
+    assert _CONNECTION_WAYS_ACROSS in default
+    assert EXPIRY_RELAXED_WAYS_ACROSS not in default
+
+
+def test_rest_with_an_ech_sidecar_and_expiry_relaxed_keeps_the_ech_remedy(
+    pki: dict[str, str],
+) -> None:
+    """On an ECH hop the sidecar dials the partner, so the engine's relaxed opener is never used and
+    the ECH remedy stands rather than the expiry-relaxed one."""
+    text = _refused("REST", crl=pki["crl"], extra={**_ECH, **_EXPIRED})
+    assert ECH_HOP_WAYS_ACROSS in text
+    assert EXPIRY_RELAXED_WAYS_ACROSS not in text
+    assert "[tls].crl_file" not in text
 
 
 def test_a_lapsed_crl_passes_a_context_that_skips_validity_checks(tmp_path: Path) -> None:
@@ -394,6 +433,40 @@ def test_the_guard_is_handed_the_opener_the_destination_keeps(
     dest = _build(cell, crl=pki["crl"] if with_crl else None, extra=extra)
     assert len(seen) == 1
     assert seen[0] is dest._opener  # type: ignore[attr-defined]
+
+
+#: Opener shapes the arms above do not build (vault BACKLOG #2977 item 12): a forward proxy, a
+#: per-connection CA file, and SOAP mutual TLS. Each names the settings it lays over, resolved
+#: against the ``pki`` fixture by :func:`_shape_settings`, since a parametrize id cannot hold a path.
+_PROXY = f"http://{_PROXY_HOST}:3128"
+_SHAPE_ARMS = [
+    (cell, shape) for cell in ("REST", "SOAP", "FHIR", "DICOMWEB") for shape in ("proxy", "ca_file")
+] + [("SOAP", "mtls")]
+
+
+def _shape_settings(shape: str, pki: dict[str, str]) -> _Settings:
+    if shape == "proxy":
+        return {"proxy_url": _PROXY}
+    if shape == "ca_file":
+        return {"tls_ca_file": pki["ca"]}
+    return {"client_cert_file": pki["client_cert"], "client_key_file": pki["client_key"]}
+
+
+@pytest.mark.parametrize(("cell", "shape"), _SHAPE_ARMS)
+@pytest.mark.parametrize("with_crl", [True, False])
+def test_the_guard_is_handed_the_opener_of_each_opener_shape(
+    cell: str,
+    shape: str,
+    with_crl: bool,
+    pki: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _record_guard_openers(cell, monkeypatch)
+    dest = _build(cell, crl=pki["crl"] if with_crl else None, extra=_shape_settings(shape, pki))
+    assert len(seen) == 1
+    assert seen[0] is dest._opener  # type: ignore[attr-defined]
+    # CONTROL: the shape built its own opener, so the identity above is not the shared one.
+    assert dest._opener is not rest._NO_REDIRECT_OPENER  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize("cell", _EXPIRY_CELLS)

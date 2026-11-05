@@ -612,13 +612,15 @@ class SoapDestination(DestinationConnector):
         # Below every statement that builds or replaces `self._opener`, and no opener with
         # tls_allow_expired: see refuse_unrevoked_verified_hop.
         if verify:
+            allow_expired = bool(s.get("tls_allow_expired", False))
             refuse_unrevoked_verified_hop(
                 scheme,
                 self.url,
                 connector="SOAP destination",
                 revocation_attested=config.tls_revocation_attested,
                 revocation_attested_reason=config.tls_revocation_attested_reason,
-                opener=None if bool(s.get("tls_allow_expired", False)) else self._opener,
+                opener=None if allow_expired else self._opener,
+                expiry_relaxed=allow_expired,
                 connection=config.name,
             )
 

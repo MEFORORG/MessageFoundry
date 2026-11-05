@@ -69,7 +69,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.logging_setup import SyslogForward, _build_tls_context
 from messagefoundry.pipeline.engine import Engine
-from messagefoundry.store.postgres import _build_ssl
+from messagefoundry.store.postgres import _STORE_WAYS_ACROSS, _build_ssl
 from messagefoundry.store.store import MessageStore
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.dicom import _client_ssl_context as _dicom_client_ssl_context
@@ -623,9 +623,14 @@ def test_the_store_refusal_names_a_lever_that_exists_for_it() -> None:
     their trust store for no reason."""
     with pytest.raises(InsecureHopRefused) as exc:
         _build_ssl(_pg(), posture=PROD_PHI)
-    assert "[store].ssl_crl_file" in str(exc.value)
-    assert "[store].ssl_root_cert" not in str(exc.value)
-    assert "tls_revocation_attested" not in str(exc.value)
+    text = str(exc.value)
+    assert "[store].ssl_crl_file" in text
+    assert "[store].ssl_root_cert" not in text
+    assert "tls_revocation_attested" not in text
+    # Vault BACKLOG #2977 item 9: no call site can declare a revocation-checking proxy, so the
+    # store's text no longer offers one. Loopback, the lever it names, is the loopback arm.
+    assert _STORE_WAYS_ACROSS in text
+    assert "proxy" not in text
 
 
 def test_the_store_crl_closes_its_own_gate_on_the_default_path(bare_crl: str) -> None:

@@ -957,9 +957,9 @@ def skips_validity_period(ctx: ssl.SSLContext) -> bool:
     BACKLOG #5086). At least the MLLP destination and the DICOM SCU also ask it of the context they
     dial with and, on True, pass ``expiry_relaxed=True`` with that context (vault BACKLOG #2978 and
     #5089, ADR 0173 §13). FTPS (vault BACKLOG #2193) reaches the same answer from the
-    ``tls_allow_expired`` setting and passes the same flag. The REST family (vault BACKLOG #2188)
-    reads the setting too and hands the guard no context, and does not name
-    :data:`EXPIRY_RELAXED_WAYS_ACROSS`."""
+    ``tls_allow_expired`` setting and passes the same flag. The REST, SOAP and FHIR destinations
+    (vault BACKLOG #2188) read the setting too, hand the guard no context, and pass the same flag
+    (vault BACKLOG #2977 item 2)."""
     return bool(ctx.verify_flags & _X509_V_FLAG_NO_CHECK_TIME)
 
 
@@ -2882,8 +2882,8 @@ class RevocationHopGuard:
         # validity, which it leaves False whether the caller passed `expiry_relaxed` or only handed
         # over such a context, keeps this line (vault BACKLOG #5086). At least FTPS
         # (_guard_ftps_revocation), MLLP and the DICOM SCU pass `expiry_relaxed=True` on a
-        # tls_allow_expired hop, and the REST, SOAP and FHIR destinations pass no context there
-        # (ADR 0173 §4.3 and §13). Those hops cross on the attestation and keep the line for that
+        # tls_allow_expired hop, and the REST, SOAP and FHIR destinations pass it with no context
+        # there (ADR 0173 §4.3 and §13). Those hops cross on the attestation and keep the line for that
         # reason.
         # blanket_attested is not here: under an enforcing posture it can no longer produce an ALLOW
         # (BACKLOG #299), and under a non-enforcing one `posture.enforcing` already excludes the line.
@@ -3234,8 +3234,8 @@ def requests_verify_from_anchor(anchor: TrustAnchor, *, cell: str) -> str | None
     if anchor.crl_file is not None:
         raise ValueError(
             f"{cell}: [tls].crl_file cannot be expressed to a requests-based client, which takes one "
-            f"bundle path and no revocation flag. Terminate this hop at a revocation-checking proxy or "
-            f"leave the CRL unset rather than have it silently ignored here."
+            f"bundle path and no revocation flag. Leave the CRL unset rather than have it silently "
+            f"ignored here."
         )
     if anchor.cafile is None:
         return None
