@@ -52,17 +52,17 @@ def _reply(request: httpx.Request) -> httpx.Response:
 
 
 def _recording_client(
-    timeout: float | None = None,
+    timeout: float = 5.0,
 ) -> tuple[EngineClient, dict[str, dict[str, float | None]]]:
-    """An ``EngineClient`` over a mock transport, and the timeout each path's request carried.
-    ``timeout`` is the client's own, or its default when None."""
+    """An ``EngineClient`` built with ``timeout`` over a mock transport, and the timeout each
+    path's request carried. The 5.0 default is ``EngineClient``'s own."""
     seen: dict[str, dict[str, float | None]] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen[request.url.path] = dict(request.extensions["timeout"])
         return _reply(request)
 
-    client = EngineClient(_BASE) if timeout is None else EngineClient(_BASE, timeout=timeout)
+    client = EngineClient(_BASE, timeout=timeout)
     default = client._http.timeout
     client._http.close()
     # The client's own timeout, as _open_transport sets it, so the default is the one under test.
@@ -118,9 +118,8 @@ def test_a_client_built_with_a_longer_timeout_keeps_it_on_the_queued_calls() -> 
     own = SIGN_IN_TIMEOUT_SECONDS * 2
     client, seen = _recording_client(timeout=own)
     _send_every_queued_call_then_a_control(client)
-    for path in _QUEUED:
+    for path in (*_QUEUED, "/auth/me"):
         assert seen[path] == _every_phase(own), path
-    assert seen["/auth/me"] == _every_phase(own)
 
 
 def test_the_timeout_matches_the_ides_sign_in_timeout() -> None:
