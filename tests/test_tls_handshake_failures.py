@@ -39,6 +39,7 @@ from messagefoundry.transports import mllp as mllp_module
 from messagefoundry.transports.http_listener import HttpSource
 from messagefoundry.transports.mllp import MLLPDestination
 from messagefoundry.transports.receipt import receipt_handler
+from tests._log_absence import assert_capture_sees
 from tests.test_mllp_tls import ADT, _ack, _cert, _close_raw, _Events, _tls_source, _until
 
 _PLAINTEXT = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -509,6 +510,7 @@ async def test_a_counter_whose_listener_is_gone_reports_nothing_and_never_raises
     with caplog.at_level(logging.DEBUG, logger="messagefoundry.tls_handshake_failures"):
         _fail_in_memory(ctx)
     assert failures.count == 2  # counted, then the report went nowhere
+    assert_capture_sees(caplog, "messagefoundry.tls_handshake_failures")
     assert not [r for r in caplog.records if "recording a failed" in r.getMessage()]
 
 

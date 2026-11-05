@@ -18,6 +18,8 @@ from typing import Any
 
 import pytest
 
+from tests._log_absence import assert_capture_sees
+
 pytest.importorskip("webauthn")
 
 from webauthn.helpers import base64url_to_bytes, bytes_to_base64url  # noqa: E402
@@ -415,6 +417,7 @@ async def test_a_stored_key_registration_would_refuse_fails_sign_in_audited(
         ):
             refused = await _finish_assertion(service, token, signer)
         assert refused == Elevation(), "the caller must see the same refusal as a bad signature"
+        assert_capture_sees(caplog, _WEBAUTHN_LOG)
         assert not [r for r in caplog.records if r.name == _WEBAUTHN_LOG]
         warned = _stored_key_warnings(caplog)
         assert len(warned) == 1 and "'test key'" in warned[0], warned

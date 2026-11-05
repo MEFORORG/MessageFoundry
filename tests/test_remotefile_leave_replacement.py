@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.transports.remotefile import _FtpClient, _Listed, _SftpClient
+from tests._log_absence import assert_capture_sees
 from tests.test_remotefile_transport import (
     _FakeClient,
     _FakeLedger,
@@ -130,6 +131,7 @@ async def test_a_skip_on_a_key_with_an_mtime_is_not_reported(
     caplog.clear()
     await src._poll_once()
     assert src._handler.bodies == [_V1]
+    assert_capture_sees(caplog, _LOGGER)
     assert not [r for r in caplog.records if "skipped as already ingested" in r.getMessage()]
 
 
