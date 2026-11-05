@@ -38,6 +38,7 @@ from tests.test_worktree_remove_path import (
     build_rig,
     pytestmark,  # noqa: F401  (the same Windows-and-pwsh skip)
     settle_worktrees,
+    start_live_process,
 )
 
 #: Each route is driven against a SIBLING, which both can reach: ``-Name`` by its directory name,
@@ -337,11 +338,7 @@ def test_name_does_not_clear_a_sibling_a_live_session_in_a_parent_tree_is_workin
     (sibling / "scratch-notes.txt").write_text("untracked work in progress\n", encoding="utf-8")
     claim = _claim(rig, "9288", sibling)
 
-    # The base interpreter, for the reason the -Path twin of this test gives.
-    interpreter = getattr(sys, "_base_executable", None) or sys.executable
-    session = subprocess.Popen(
-        [interpreter, "-c", "import time; time.sleep(300)"], cwd=str(rig.root)
-    )
+    session = start_live_process(rig.root)
     try:
         (rig.home / ".claude" / "sessions" / f"{session.pid}.json").write_text(
             json.dumps(
@@ -671,6 +668,30 @@ def test_an_allocation_directory_that_cannot_be_listed_refuses(rig: Rig, route: 
     assert wt.exists()
 
     proc = rig.run(*_target(route, wt))
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+@pytest.mark.parametrize("route", ROUTES)
+@pytest.mark.parametrize("root", ["relative\\coord", "MISSING"], ids=["relative", "missing"])
+def test_a_shared_root_that_cannot_be_resolved_refuses_both_registries(
+    rig: Rig, route: str, root: str
+) -> None:
+    """Vault BACKLOG #2985, item 11: the shared-root error branch had no test. The claims and the
+    allocation registry both sit under that root, so one refusal covers both, before either is read.
+    A relative MEFOR_COORD_ROOT and an absolute one that does not exist are two resolver errors."""
+    wt = _sibling(rig, "rootless")
+    value = str(rig.root / "no-such-coord-root") if root == "MISSING" else root
+
+    proc = rig.run(*_target(route, wt), "-Force", extra={"MEFOR_COORD_ROOT": value})
+    assert proc.returncode != 0, _out(proc)
+    # pwsh wraps a long error at the console width, behind a "| " margin, so the words are rejoined.
+    said = " ".join(_out(proc).replace("|", " ").split())
+    assert "could not be resolved" in said and "claims and allocations are unknown" in said, said
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: the same call with the root resolving to the clone's own registry.
+    proc = rig.run(*_target(route, wt), extra={"MEFOR_COORD_ROOT": ""})
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()
 

@@ -25,7 +25,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -40,8 +39,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 # Every GIT_* variable goes: run from inside a git hook, GIT_DIR or GIT_WORK_TREE would point these
-# children at the REAL repository instead of the throwaway one.
-_ENV = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+# children at the REAL repository instead of the throwaway one. CLAUDE_CONFIG_DIR goes too: the
+# occupancy fence reads the config root it names, which would be this machine's real registry.
+_ENV = {
+    k: v
+    for k, v in os.environ.items()
+    if not k.upper().startswith("GIT_") and k.upper() != "CLAUDE_CONFIG_DIR"
+}
 
 # What the fixture repository ignores. `__pycache__` is written WITHOUT a trailing slash so it also
 # matches a FILE of that name, which is one of the two cases the exception must not swallow.
@@ -224,6 +228,22 @@ def _out(proc: subprocess.CompletedProcess[str]) -> str:
     return proc.stdout + proc.stderr
 
 
+def start_live_process(cwd: Path) -> subprocess.Popen[bytes]:
+    """A real running process for a session record to name, started from ``cwd``.
+
+    pwsh, which this module already requires, and NOT sys.executable: in a Windows virtual
+    environment that is a launcher stub that starts the real interpreter as a child, so killing it
+    would leave the child sleeping. This used to reach the base interpreter through
+    ``sys._base_executable``, a private attribute (vault BACKLOG #2985, item 18). The caller kills it.
+    """
+    return subprocess.Popen(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"],
+        cwd=str(cwd),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def build_rig(root: Path) -> Rig:
     """A primary with one seed commit, an origin/main at it, and a readable session registry."""
     r = Rig(root)
@@ -364,13 +384,8 @@ def test_a_live_session_recorded_in_a_parent_tree_does_not_clear_a_sibling_it_is
     _commit(sibling, "built.txt")
     claim = _claim(rig, "9191", sibling)
 
-    # THE BASE INTERPRETER, NOT sys.executable. In a Windows virtual environment sys.executable is a
-    # launcher stub that starts the real interpreter as a child, and kill() below would end the stub
-    # and leave that child sleeping. Its cwd is the fixture root, so nothing here holds a checkout.
-    interpreter = getattr(sys, "_base_executable", None) or sys.executable
-    session = subprocess.Popen(
-        [interpreter, "-c", "import time; time.sleep(300)"], cwd=str(rig.root)
-    )
+    # Its cwd is the fixture root, so nothing here holds a checkout.
+    session = start_live_process(rig.root)
     try:
         sessions = rig.home / ".claude" / "sessions"
         (sessions / f"{session.pid}.json").write_text(
@@ -536,6 +551,35 @@ def test_a_tree_under_claude_worktrees_is_not_reached_and_name_still_removes_the
     assert foo.exists()
 
 
+def test_a_clone_below_a_claude_worktrees_segment_still_reaches_its_own_trees(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #2985, item 3. The segment was matched anywhere in the path, so a clone that
+    lives inside another checkout's ``.claude/worktrees`` had every tree refused, and ``-List`` called
+    them all managed. A segment ABOVE the primary does not count now; the clone's own one still does.
+    Red before the fix: the sibling was refused as under .claude/worktrees."""
+    host = tmp_path / ".claude" / "worktrees" / "host"
+    host.mkdir(parents=True)
+    rig = build_rig(host)
+    sibling = rig.add(rig.primary.parent / "Repo-sib")
+    harness = rig.add(rig.primary / ".claude" / "worktrees" / "agent")
+
+    listing = rig.run("-List")
+    assert listing.returncode == 0, _out(listing)
+    assert "sibling 1, managed 1, other 0" in listing.stdout, listing.stdout
+
+    # The clone's own .claude/worktrees still refuses, -Force included.
+    proc = rig.run("-Path", str(harness), "-Force")
+    assert proc.returncode != 0, _out(proc)
+    assert "under .claude/worktrees" in _out(proc), _out(proc)
+    assert harness.exists() and rig.is_registered(harness)
+
+    proc = rig.run("-Path", str(sibling))
+    assert proc.returncode == 0, _out(proc)
+    assert not sibling.exists()
+    assert harness.exists()
+
+
 def test_a_target_holding_another_registered_worktree_is_refused(rig: Rig) -> None:
     outer = rig.add(rig.scratch("outer"))
     inner = rig.add(outer / "inner")
@@ -679,6 +723,90 @@ def test_a_readable_registry_with_no_records_clears_the_target(rig: Rig) -> None
 
     proc = rig.run("-Path", str(wt), home=empty)
 
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_live_process_that_started_before_its_session_registered_occupies_the_target(
+    rig: Rig,
+) -> None:
+    """Vault BACKLOG #2985, item 9. The registry's default reads a record as STALE, which vetoes
+    nothing, when its running process started more than 15 minutes before the session registered.
+    A recycled pid belongs to a process started AFTER the record, so that process is the session
+    itself. Red before the fix: the tree went. Staged with a registration an hour after the process."""
+    wt = rig.add(rig.scratch("long-lived"))
+    session = start_live_process(rig.root)
+    try:
+        late = rig.root / "late-home"
+        sessions = late / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / f"{session.pid}.json").write_text(
+            json.dumps(
+                {
+                    "cwd": str(wt),
+                    "pid": session.pid,
+                    "sessionId": "registered-late",
+                    "startedAt": int((time.time() + 3600) * 1000),
+                }
+            ),
+            encoding="utf-8",
+        )
+        proc = rig.run("-Path", str(wt), home=late)
+        assert proc.returncode != 0, _out(proc)
+        assert "Target is occupied" in _out(proc) and "LIVE" in _out(proc), _out(proc)
+        assert wt.exists() and rig.is_registered(wt)
+    finally:
+        session.kill()
+        session.wait(timeout=30)
+
+    # Control: the process is gone, so the same record is DEAD and the same call removes the tree.
+    proc = rig.run("-Path", str(wt), home=late)
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_session_on_the_callers_config_root_outside_userprofile_occupies_the_target(
+    rig: Rig,
+) -> None:
+    """Vault BACKLOG #2985, item 6. The fence listed only ``%USERPROFILE%\\.claude*``, so a session on
+    a root CLAUDE_CONFIG_DIR names elsewhere was invisible. The caller's own root is read too now.
+    Red before the fix: the tree went."""
+    wt = rig.add(rig.scratch("pinned-root"))
+    pinned = rig.root / "config-elsewhere"
+    (pinned / "sessions").mkdir(parents=True)
+    # No pid fences as UNREADABLE, which vetoes: a session recorded in the target.
+    (pinned / "sessions" / "7.json").write_text(
+        json.dumps({"cwd": str(wt), "sessionId": "on-a-pinned-root"}), encoding="utf-8"
+    )
+
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(pinned)})
+    assert proc.returncode != 0, _out(proc)
+    assert "Target is occupied" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    # Control: a CLAUDE_CONFIG_DIR that IS one of the USERPROFILE roots is read once, not twice, so the
+    # two listings agree and the clearing registry there removes the tree.
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(rig.home / ".claude")})
+    assert proc.returncode == 0, _out(proc)
+    assert not wt.exists()
+
+
+def test_a_file_where_a_session_registry_belongs_refuses_by_name(rig: Rig) -> None:
+    """Vault BACKLOG #2985, item 4. The receipt counts a root whose ``sessions`` is a file, the second
+    listing did not, and the run refused on a bare count mismatch. It still refuses, since no session
+    of that root can register there, and now says why."""
+    wt = rig.add(rig.scratch("stray-file"))
+    stray = rig.home / ".claude-account-9"
+    stray.mkdir()
+    (stray / "sessions").write_text("not a directory\n", encoding="utf-8")
+
+    proc = rig.run("-Path", str(wt))
+    assert proc.returncode != 0, _out(proc)
+    assert "is not a directory" in _out(proc) and "Occupancy unknown" in _out(proc), _out(proc)
+    assert wt.exists() and rig.is_registered(wt)
+
+    (stray / "sessions").unlink()
+    proc = rig.run("-Path", str(wt))
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()
 

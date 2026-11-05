@@ -52,7 +52,12 @@ _COMMAND_LINE = re.compile(r"^\s{4,}(?:pwsh|git)\s")
 
 _FAMILIES = ("sibling", "other", "managed")
 
-_ENV = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+# CLAUDE_CONFIG_DIR goes with GIT_*: remove.ps1's occupancy fence would read the real registry it names.
+_ENV = {
+    k: v
+    for k, v in os.environ.items()
+    if not k.upper().startswith("GIT_") and k.upper() != "CLAUDE_CONFIG_DIR"
+}
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:
