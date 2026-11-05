@@ -858,6 +858,8 @@ class QueueStore(StoreLifecycle, Protocol):
         summary: str | None,
         peek_failed: bool = False,
         peek_error: str | None = None,
+        refused_raw: str | None = None,
+        refused_metadata: Mapping[str, Any] | None = None,
         now: float | None = None,
     ) -> bool:
         """Consume one INFLIGHT ``Stage.RESPONSE`` work-row and produce the re-ingressed message+ingress
@@ -865,8 +867,14 @@ class QueueStore(StoreLifecycle, Protocol):
         work-row is the exactly-once commit, so a committed run is an idempotent no-op (``False``). The
         re-ingress worker peeks the loopback body and passes the derived metadata in. ``peek_error`` is
         the ERROR reason a ``peek_failed`` child records; ``None`` keeps the HL7-peek wording (BACKLOG
-        #1914 passes the oversize reason). It must carry no byte of the body. Returns ``True`` if this
-        call performed the handoff."""
+        #1914 passes the oversize reason). It must carry no byte of the body.
+
+        ``refused_raw`` and ``refused_metadata`` are what the refused-body allowance decided to store
+        for a ``peek_failed`` child (vault BACKLOG #4796): its ``raw`` in place of the whole reply,
+        and keys merged into its engine-internal metadata. ``None`` stores the whole reply and adds
+        nothing, as before. Both are ignored unless ``peek_failed``. Neither moves the child's
+        content-addressed id, which still hashes the whole reply. Returns ``True`` if this call
+        performed the handoff."""
         ...
 
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:

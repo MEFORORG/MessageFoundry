@@ -237,7 +237,7 @@ from messagefoundry.store.cell_tag import CellTagError, CellTagSink, dead_letter
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.sealed_cache import point_in_time
-from messagefoundry.store.store import ConnectionEventWrite, OwnedLanes
+from messagefoundry.store.store import REINGRESS_PEEK_FAILED, ConnectionEventWrite, OwnedLanes
 from messagefoundry.store.transit_attestation import utf16_units
 from messagefoundry.transports import (
     DeliveryError,
@@ -10715,7 +10715,8 @@ class RegistryRunner:
             return _ItemOutcome.STOPPED, None
         # Peek the reply body for the loopback's content_type (in pipeline/, not the store), then
         # hand off in one atomic transaction. response_body_for_work_row reads the same immutable
-        # artifact ingress_handoff re-reads for the message raw, so peek and raw always agree.
+        # artifact ingress_handoff re-reads for the message raw, so peek and raw always agree. A
+        # refused (peek_failed) child is the exception: it stores this read's bounded view instead.
         try:
             body = await self.store.response_body_for_work_row(item.id) or ""
         except CipherError as exc:
@@ -10742,6 +10743,23 @@ class RegistryRunner:
             control_id, message_type, summary, peek_failed = _peek_for_loopback(ic, body)
         else:
             control_id, message_type, summary, peek_failed = None, ic.content_type.value, None, True
+        refused = None
+        if peek_failed:
+            # Vault BACKLOG #4796: the refused reply is charged to the loopback's refused-body
+            # allowance, as a listener's refusal is. The charge is never refunded. At least a handoff
+            # that stores no child (a depth-capped token, an origin that fails its row tag, or a
+            # reply erased or deleted after the read above), one that raises and is retried, and one
+            # whose terminal write a server backend fences, re-pending the token, leave it spent, and
+            # each re-run or replay charges again: that errs toward storing less, never more. A
+            # token whose reply is already missing or erased, or whose reference is corrupt, reads
+            # as an empty body above, which fits the head and charges nothing.
+            refused = self._refused_body.bound_held(
+                name,
+                body,
+                ic.content_type.value,
+                oversize or REINGRESS_PEEK_FAILED,
+                cipher=self.store.cipher(),
+            )
         produced = await self.store.ingress_handoff(
             response_row_id=item.id,
             loopback_channel_id=name,
@@ -10750,7 +10768,9 @@ class RegistryRunner:
             message_type=message_type,
             summary=summary,
             peek_failed=peek_failed,
-            peek_error=oversize,
+            peek_error=None if refused is None else refused.error,
+            refused_raw=None if refused is None else refused.raw,
+            refused_metadata=None if refused is None else refused.fields,
         )
         if produced:
             # Wake the loopback's router worker to route the freshly-ingressed answer (a no-op
