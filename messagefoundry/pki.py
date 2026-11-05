@@ -1766,25 +1766,40 @@ class IssuerIndex:
         out for a leaf of that CA with no authority key identifier, and strict verification
         accepts such a leaf when it is version 1, which has no extensions: measured on OpenSSL
         3.5.7, a real listener refused one in at least one listing order. So a namesake with a
-        differing key identifier still warns, naming those leaves. A CA with no key identifier this
-        reads cannot show which of its leaves rule the namesake out, so that case gets the warning
-        that every client of the CA may be refused, and says why. The index does not count a
-        namesake toward the same-DN ambiguity unless it signs itself, so :meth:`unmatched_keys` may
-        give no reason, and this is the only start signal. Names are grouped by
-        :func:`_namesake_key`. A warning only: it changes no allow, deny or refusal."""
+        differing key identifier still warns, naming those leaves.
+
+        A CA with no subject key identifier at all is a different fault. Every context that builds
+        this index verifies strictly (``harden_verify_flags``), and strict verification refuses a
+        client of such a CA whether or not a namesake is loaded: measured on OpenSSL 3.5.7, with
+        the CA alone, for a version-3 client naming its key and for a version-1 client. So that
+        warning names the CA as the cause. A CA whose key identifier ``cryptography`` cannot read
+        may still have one OpenSSL reads, so this cannot tell which of its clients rule the
+        namesake out; that case gets the warning that every client may be refused, and says so.
+        The index does not count a namesake toward the same-DN ambiguity unless it signs itself, so
+        :meth:`unmatched_keys` may give no reason, and this is the only start signal. Names are
+        grouped by :func:`_namesake_key`. A warning only: it changes no allow, deny or refusal."""
         by_name: dict[_NameKey, list[_Anchor]] = {}
         for anchors in self._by_subject_name.values():
             for anchor in anchors:
                 by_name.setdefault(_namesake_key(anchor.cert.subject), []).append(anchor)
         warnings: list[str] = []
         for anchors in by_name.values():
+            others = [anchor for anchor in anchors if not anchor.ca]
+            if not others:
+                continue  # read no CA's key identifier for nothing
             cas = [(anchor, _key_identifier(anchor)) for anchor in anchors if anchor.ca]
-            if not cas:
-                continue
-            for other in (anchor for anchor in anchors if not anchor.ca):
-                key_id = _key_identifier(other)
-                for ca, ca_key_id in cas:
-                    if key_id is not None and ca_key_id is not None and key_id != ca_key_id:
+            for other in others:
+                key_id, _ = _key_identifier(other)
+                for ca, (ca_key_id, ca_read) in cas:
+                    if ca_key_id is None and ca_read:
+                        effect = (
+                            "refuses every client certificate of that CA under strict "
+                            f"verification, whether or not block {other.position} is loaded, "
+                            f"because block {ca.position} has no subject key identifier. Re-issue "
+                            f"block {ca.position} with one, and remove block {other.position} or "
+                            "re-issue it under another subject"
+                        )
+                    elif key_id is not None and ca_key_id is not None and key_id != ca_key_id:
                         effect = (
                             f"may take block {other.position}, whose key identifier differs from "
                             "the CA's, as the issuer of a client certificate that CA issued with no "
@@ -1795,8 +1810,8 @@ class IssuerIndex:
                         )
                     else:
                         why = (
-                            f" Block {ca.position} has no key identifier this check can read, so "
-                            "it cannot tell which of that CA's client certificates carry an "
+                            f" The key identifier of block {ca.position} cannot be read here, so "
+                            "this check cannot tell which client certificates of that CA carry an "
                             f"authority key identifier that rules block {other.position} out."
                             if ca_key_id is None and key_id is not None
                             else ""
@@ -1832,24 +1847,24 @@ def _namesake_attribute(
     return oid, is_bytes, " ".join(value.split()) if isinstance(value, str) else value
 
 
-def _key_identifier(anchor: _Anchor) -> bytes | None:
+def _key_identifier(anchor: _Anchor) -> tuple[bytes | None, bool]:
     """``anchor``'s subject key identifier, or ``None`` when it has none or its extensions cannot
-    be read. ``None``, on the namesake or on the CA, gives the wider warning, so an unreadable one
-    can only overstate it."""
+    be read, and whether they were read. An unreadable one on the namesake or the CA gives the
+    wider warning, so it can only overstate it."""
     try:
         return anchor.cert.extensions.get_extension_for_class(
             x509.SubjectKeyIdentifier
-        ).value.digest
+        ).value.digest, True
     except x509.ExtensionNotFound:
-        return None
+        return None, True
     except (x509.DuplicateExtension, ValueError, *_UNREAD_EXTENSIONS) as exc:
         _log.debug(
             "certificate block %d: its key identifier cannot be read (%s); the namesake warning "
-            "assumes it has none",
+            "assumes it may have none",
             anchor.position,
             type(exc).__name__,
         )
-        return None
+        return None, False
 
 
 def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:

@@ -38,7 +38,7 @@ from messagefoundry.pki import IssuerIndex
 from messagefoundry.transports.http_listener import HttpSource, _client_issuer_index
 from messagefoundry.transports.mllp import _sender_issuer_lookup
 from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
-from tests._approved_key_wrap import seq, tlv
+from tests._approved_key_wrap import oid, seq, tlv
 from tests.test_api_tls import (
     _CaPair,
     _client_bundle,
@@ -1079,9 +1079,8 @@ def _v1_bundle(tmp_path: Path, signer: _CaPair) -> Path:
     fields = _tlv_content(v3.tbs_certificate_bytes)
     assert fields.startswith(_VERSION_3)
     tbs = seq(fields.removeprefix(_VERSION_3))
-    ecdsa_sha256 = bytes.fromhex("300a06082a8648ce3d040302")
     signature = signer[1].sign(tbs, ec.ECDSA(hashes.SHA256()))
-    der = seq(tbs, ecdsa_sha256, tlv(0x03, b"\x00" + signature))
+    der = seq(tbs, seq(oid("1.2.840.10045.4.3.2")), tlv(0x03, b"\x00" + signature))
     leaf = x509.load_der_x509_certificate(der)
     assert leaf.version == x509.Version.v1 and len(leaf.extensions) == 0  # the premise
     leaf.verify_directly_issued_by(signer[0])
@@ -1149,27 +1148,54 @@ async def test_a_namesake_with_another_key_identifier_is_warned_to_refuse_a_vers
         await source.stop()
 
 
-def test_a_namesake_of_a_ca_with_no_key_identifier_is_warned_to_refuse_every_client() -> None:
-    """A CA with no subject key identifier, and a namesake that is no CA with one. Nothing here
-    shows which of the CA's client certificates carry an authority key identifier that rules the
-    namesake out, so the warning says every client of the CA may be refused, and why. In the
-    shipped code this case took the differing-key-identifier warning, which named only clients
-    with no authority key identifier (BACKLOG #4948)."""
-    (acme, _) = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), key_usage=True, key_ids=False)
+@pytest.mark.parametrize("namesake_skid", [True, False], ids=["namesake-key-id", "bare-namesake"])
+async def test_a_namesake_of_a_ca_with_no_key_identifier_names_the_ca_as_the_cause(
+    tmp_path: Path, namesake_skid: bool
+) -> None:
+    """A CA with no subject key identifier, beside a namesake that is no CA. The listener verifies
+    strictly, and strict verification refuses every client of such a CA with the CA ALONE,
+    measured here for a version-3 client naming its key and a version-1 client. So the warning
+    says every client of the CA is refused, and names the CA as the cause rather than the
+    namesake. In the shipped code a namesake with a key identifier took the
+    differing-key-identifier warning, which named only clients with no authority key identifier
+    and blamed the namesake (BACKLOG #4948)."""
+    acme = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), key_usage=True, key_ids=False)
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
-    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root)
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root, skid=namesake_skid)
     with pytest.raises(x509.ExtensionNotFound):  # the premise: the CA has no key identifier
-        acme.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
-    (warning,) = IssuerIndex((_pem(acme) + _pem(namesake)).decode("ascii")).namesake_warnings()
+        acme[0].extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+    cadata = (_pem(acme[0]) + _pem(namesake)).decode("ascii")
+    (warning,) = IssuerIndex(cadata).namesake_warnings()
+    assert "refuses every client certificate of that CA under strict verification" in warning
+    assert "whether or not block 2 is loaded" in warning, warning
+    assert "because block 1 has no subject key identifier" in warning, warning
+    # The cause, measured: with the CA alone, the strict listener refuses both kinds of client.
+    source = await _started(_source(tmp_path, [acme[0]], {"CN=Acme CA": [SUBJECT]}))
+    try:
+        assert await _handshake_refused(source, _bundle(tmp_path, acme))
+        assert await _handshake_refused(source, _v1_bundle(tmp_path, acme))
+    finally:
+        await source.stop()
+
+
+def test_a_namesake_of_a_ca_whose_key_identifier_cannot_be_read_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CA whose extensions ``cryptography`` cannot read may still have a key identifier OpenSSL
+    reads, so the check cannot tell which of its clients rule a namesake with one out. The warning
+    then says every client may be refused, and why (BACKLOG #4948). The unreadable read is stood
+    in for, as a CA OpenSSL loads whose extensions ``cryptography`` refuses is not built here."""
+    acme = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), acme)
+    real = pki._key_identifier
+    monkeypatch.setattr(
+        pki, "_key_identifier", lambda anchor: (None, False) if anchor.ca else real(anchor)
+    )
+    (warning,) = IssuerIndex((_pem(acme[0]) + _pem(namesake)).decode("ascii")).namesake_warnings()
     assert "refuse every client certificate of that CA" in warning, warning
-    assert "Block 1 has no key identifier this check can read" in warning, warning
+    assert "key identifier of block 1 cannot be read here" in warning, warning
     assert "rules block 2 out" in warning, warning
-    # Control: a namesake with no key identifier gets the same warning without the reason, as that
-    # namesake is never ruled out by one.
-    bare = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root, skid=False)
-    (warning,) = IssuerIndex((_pem(acme) + _pem(bare)).decode("ascii")).namesake_warnings()
-    assert "refuse every client certificate of that CA" in warning, warning
-    assert "no key identifier this check can read" not in warning, warning
+    assert "has no subject key identifier" not in warning, warning
 
 
 @pytest.mark.parametrize(
