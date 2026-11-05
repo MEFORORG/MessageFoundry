@@ -1097,6 +1097,7 @@ def _v1_bundle(tmp_path: Path, signer: _CaPair) -> Path:
         .sign(signer[1], hashes.SHA256())
     )
     leaf = _as_version_1(v3, signer[1])
+    assert len(leaf.extensions) == 0  # the premise: no authority key identifier
     der = _der(leaf)
     leaf.verify_directly_issued_by(signer[0])
     bundle = tmp_path / f"client-v1-{len(list(tmp_path.iterdir()))}.pem"
@@ -1235,9 +1236,10 @@ def _strict_ca(
     with ``keyCertSign``, a subject key identifier and, with ``akid``, an authority key
     identifier, neither critical. ``issuer_name`` overrides the issuer field the signer writes."""
     key = ec.generate_private_key(ec.SECP256R1())
-    name = subject or _dn((NameOID.COMMON_NAME, "Acme CA"))
+    name = _dn((NameOID.COMMON_NAME, "Acme CA")) if subject is None else subject
     issuer, signer = (name, key) if by is None else (by[0].subject, by[1])
-    issuer = issuer_name or issuer
+    if issuer_name is not None:
+        issuer = issuer_name
     now = datetime.datetime.now(datetime.UTC)
     builder = (
         x509.CertificateBuilder()
@@ -1249,7 +1251,9 @@ def _strict_ca(
         .not_valid_after(now + datetime.timedelta(days=1))
     )
     if "version-1" in defects:
-        return _as_version_1(builder.sign(signer, hashes.SHA256()), signer), key
+        v1 = _as_version_1(builder.sign(signer, hashes.SHA256()), signer)
+        assert len(v1.extensions) == 0  # the premise
+        return v1, key
     if "no-basic-constraints" not in defects:
         builder = builder.add_extension(
             x509.BasicConstraints(ca=True, path_length=None),
@@ -1500,9 +1504,14 @@ async def test_a_root_whose_issuer_openssl_reads_as_latin_1_is_self_signed(tmp_p
     Latin-1, so the two are one name to it and the root is self-signed: measured on OpenSSL 3.5.7,
     a strict listener trusting it alone admits its clients. ``cryptography`` decodes the bytes as
     UTF-8, so read by :func:`pki._namesake_key` alone the root had an issuer, and was named for
-    an authority key identifier it may omit (BACKLOG #4948)."""
-    subject = _dn((NameOID.COMMON_NAME, "AcmÃ© CA"))
-    t61 = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Acmé CA", _ASN1Type.T61String)])
+    an authority key identifier it may omit (BACKLOG #4948). A control root whose issuer is
+    another name is refused by the same listener, as no issuer of it is loaded, so admission
+    tells the two readings apart."""
+    spelled = b"Acm\xc3\xa9 CA"
+    subject = _dn((NameOID.COMMON_NAME, spelled.decode("latin-1")))
+    t61 = x509.Name(
+        [x509.NameAttribute(NameOID.COMMON_NAME, spelled.decode("utf-8"), _ASN1Type.T61String)]
+    )
     root, key = _strict_ca(akid=False, subject=subject, issuer_name=t61)
     assert b"\x14\x08Acm\xc3\xa9 CA" in root.tbs_certificate_bytes  # the premise
     assert pki._namesake_key(root.issuer) != pki._namesake_key(root.subject)
@@ -1513,6 +1522,14 @@ async def test_a_root_whose_issuer_openssl_reads_as_latin_1_is_self_signed(tmp_p
     try:
         assert await _admitted(source, _bundle(tmp_path, (root, key))) == 202
         assert await _admitted(source, _v1_bundle(tmp_path, (root, key))) == 202
+    finally:
+        await source.stop()
+    # Control: the same shape with an issuer OpenSSL reads as another name is refused.
+    other = _strict_ca(akid=False, subject=subject, issuer_name=_dn((NameOID.COMMON_NAME, "Z")))
+    (tmp_path / "control").mkdir()
+    source = await _started(_source(tmp_path / "control", [other[0]], {issuer_key: [SUBJECT]}))
+    try:
+        assert await _handshake_refused(source, _bundle(tmp_path, other))
     finally:
         await source.stop()
 
@@ -1619,17 +1636,27 @@ def test_a_namesake_whose_extensions_cannot_be_read_is_warned_about_without_rais
     assert "block 2" in warning and "refuse every client certificate of that CA" in warning
 
 
+@pytest.mark.parametrize(
+    ("defects", "fault"),
+    [
+        pytest.param((), None, id="conforming"),
+        pytest.param(("no-key-usage",), "no-key-usage", id="fault-read-without-the-issuer"),
+        pytest.param(("no-authority-key-identifier",), None, id="fault-needing-the-issuer"),
+    ],
+)
 def test_a_ca_whose_issuer_name_cannot_be_read_is_warned_about_without_raising(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, defects: tuple[str, ...], fault: str | None
 ) -> None:
     """A CA whose issuer name is a T61String holding bytes that are not UTF-8. OpenSSL loads it as
     a CA, and ``cryptography`` parses it but raises ``ValueError`` reading its issuer. The check
     for a CA strict verification refuses read that issuer outside any guard, to tell whether the
     CA is self-signed, so before this fix, on this branch, the namesake warning raised out of the
-    listener's start and refused it. It now falls back to the namesake wording (BACKLOG #4948)."""
+    listener's start and refused it. Only the authority key identifier faults need the issuer, so
+    a fault read without it is still named, and with none the warning falls back to the namesake
+    wording (BACKLOG #4948)."""
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Root ZZ", _ASN1Type.T61String)])
-    v3 = _strict_ca(by=root, issuer_name=issuer)[0]
+    v3 = _strict_ca(*defects, by=root, issuer_name=issuer)[0]
     fields = _tlv_content(v3.tbs_certificate_bytes)
     assert fields.count(b"\x14\x07Root ZZ") == 1
     der = _signed_der(fields.replace(b"\x14\x07Root ZZ", b"\x14\x07Root \xe9\xe9"), root[1])
@@ -1640,8 +1667,11 @@ def test_a_ca_whose_issuer_name_cannot_be_read_is_warned_about_without_raising(
     cadata = _wrapped(der) + _pem(namesake)
     (warning,) = IssuerIndex(cadata.decode("ascii")).namesake_warnings()
     assert warning.startswith("certificate block 2 (CN=Acme CA) is not a CA"), warning
-    assert "that CA issued with no authority key identifier" in warning, warning
-    assert "as a CA for at least" not in warning, warning
+    if fault is None:
+        assert "that CA issued with no authority key identifier" in warning, warning
+        assert "as a CA for at least" not in warning, warning
+    else:
+        assert f"as a CA for at least this reason: {_CA_FAULTS[fault]}." in warning, warning
     # The start builds the listener and logs the warning.
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
         _source(tmp_path, [], {"CN=Acme CA": [SUBJECT]}, cadata=cadata)
