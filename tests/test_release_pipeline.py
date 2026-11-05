@@ -57,7 +57,7 @@ from _bash_resolver import bash_candidates, explain_returncode, require_bash
 
 from tests._force_include import hatch_build
 from tests._verify_softeners import verification_softeners
-from tests._workflow_contexts import needs_of
+from tests._workflow_contexts import WORKFLOWS, jobs_of, load_workflow, needs_of
 
 _REPO = Path(__file__).resolve().parents[1]
 PYPROJECT = _REPO / "pyproject.toml"
@@ -213,8 +213,9 @@ def test_release_load_bearing_canaries_present() -> None:
             "messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json, "
             "messagefoundry-sbom-windows.cdx.json"
         ),
-        # PyPI publish via the pinned pypa action, tag-gated, reading the clean staging dir
-        "PyPI publish action pinned": "uses: pypa/gh-action-pypi-publish@",
+        # PyPI publish via the pypa action's image pinned by digest (BACKLOG #5046), tag-gated,
+        # reading the clean staging dir. Section (14b) pins the full spelling at every site.
+        "PyPI publish image pinned by digest": f"uses: {_PUBLISH_IMAGE}@sha256:",
         "PyPI publish reads dist-pub": "packages-dir: dist-pub/",
         # id-token scope for OIDC (Sigstore + Trusted Publishing + provenance)
         "id-token OIDC scope": "id-token: write",
@@ -478,9 +479,9 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
 #: artifact", never as "a dispatch writes nothing public".
 _EXPECTED_MUTATING_STEPS = 10
 
-#: Actions that publish a release artifact, matched as a `uses:` prefix.
+#: Actions that publish a release artifact, matched as a `uses:` prefix. The PyPI publish is not
+#: here: `_is_publish_action` finds it by any spelling, so neither the image nor the action escapes.
 _PUBLISHING_ACTIONS = (
-    "pypa/gh-action-pypi-publish@",
     "softprops/action-gh-release@",
     "actions/create-release@",
 )
@@ -516,6 +517,64 @@ def _is_publish_action(uses: str) -> bool:
     return "gh-action-pypi-publish" in uses.lower()
 
 
+#: The one spelling a PyPI upload step may use (BACKLOG #5046): the action's image, by DIGEST. The
+#: action's own `pypa/gh-action-pypi-publish@<commit>` form runs that image by a ghcr TAG, which
+#: can be repointed; release.yml's header has the reading.
+_PUBLISH_IMAGE = "docker://ghcr.io/pypa/gh-action-pypi-publish"
+_PINNED_PUBLISH = re.compile(re.escape(_PUBLISH_IMAGE) + r"@sha256:[0-9a-f]{64}")
+
+
+def _is_pinned_publish(uses: str) -> bool:
+    """True only for the publish image named by a full `sha256:` digest, nothing before or after."""
+    return _PINNED_PUBLISH.fullmatch(uses) is not None
+
+
+#: The upload steps: toolkit, engine and harness in `publish-pypi`, the console's in its own job.
+_PYPI_UPLOAD_SITES = 4
+
+#: Every input of an upload step but `packages-dir`, at the one value each may take (BACKLOG #5046):
+#: the composite's defaults at v1.14.3, except `skip-existing`, which this file has always set true
+#: (the toolkit step's comment says why) where the composite defaults it false. Why each must be passed,
+#: and what a missing or other value does, is in release.yml's header. Section (5) exempts the
+#: `user` and `password` lines from its token ban.
+_PUBLISH_FIXED_INPUTS: dict[str, object] = {
+    "repository-url": "https://upload.pypi.org/legacy/",
+    "user": "__token__",
+    "password": "",
+    "attestations": True,
+    "skip-existing": True,
+    "verify-metadata": True,
+    "verbose": True,
+    "print-hash": True,
+}
+#: The inputs a publish step sets, all of them and no others.
+_PUBLISH_INPUTS = {"packages-dir", *_PUBLISH_FIXED_INPUTS}
+
+
+def _pypi_uploads() -> list[tuple[str, dict]]:
+    """``(job, step)`` for every PyPI upload step in release.yml, found by any spelling."""
+    found = [
+        (key, step)
+        for key, job in _jobs().items()
+        for step in job["steps"]
+        if _is_publish_action(str(step.get("uses") or ""))
+    ]
+    assert len(found) == _PYPI_UPLOAD_SITES, [(k, s.get("name")) for k, s in found]
+    return found
+
+
+def _wrong_inputs(step: dict, names: Sequence[str]) -> list[str]:
+    """Each of ``names`` that ``step`` does not set to its `_PUBLISH_FIXED_INPUTS` value. The type
+    is compared too: YAML reads `1` as an int equal to True, and `"true"` as a string."""
+    given = step.get("with") or {}
+    wrong = []
+    for name in names:
+        got, want = given.get(name), _PUBLISH_FIXED_INPUTS[name]
+        if (type(got), got) != (type(want), want):
+            wrong.append(f"{step.get('name')!r} sets {name}={got!r}, not {want!r}")
+    return wrong
+
+
 def _mutating_steps(job: dict) -> list[tuple[str, str]]:
     """``(step name, EFFECTIVE if-expression)`` for every step in ``job`` that publishes or attests.
 
@@ -549,7 +608,7 @@ def _mutating_steps(job: dict) -> list[tuple[str, str]]:
         step = raw_step or {}
         name = step.get("name") or step.get("uses") or "<unnamed step>"
         uses = str(step.get("uses") or "")
-        mutates = uses.startswith(_MUTATING_ACTIONS)
+        mutates = uses.startswith(_MUTATING_ACTIONS) or _is_publish_action(uses)
         body = _executed_shell(str(step.get("run") or ""))
         releases = _PUBLISHING_COMMANDS.search(body) is not None
         if mutates or releases:
@@ -672,11 +731,37 @@ def test_the_attestation_step_keeps_its_visibility_test() -> None:
 # --- (5) Trusted Publishing (OIDC) — never a token ---------------------------------------------------
 
 
+#: The two lines every upload step must carry since BACKLOG #5046, because the image reads both under
+#: `set -u`. Together they are how the image selects Trusted Publishing: the token user name with an
+#: EMPTY password. They are exempt from the ban below only verbatim, and only once per upload step.
+_TRUSTED_PUBLISHING_SELECTOR = (
+    f"user: {_PUBLISH_FIXED_INPUTS['user']}",
+    f'password: "{_PUBLISH_FIXED_INPUTS["password"]}"',
+)
+
+
 def test_release_publish_uses_trusted_publishing_no_token() -> None:
+    """Mutation: give an upload step a non-empty `password`, put a `user:` line of any value on any
+    other step, or add a `TWINE_PASSWORD` anywhere. Red here."""
     rel = _release()
-    # No API-token / password path may exist anywhere in the release workflow: publishing is OIDC-only.
+    uploads = [step for _, step in _pypi_uploads()]
+    assert uploads, "no PyPI upload step found in release.yml; the detector matched nothing"
+    # Trusted Publishing selected, and PEP 740 attestations on, at every upload step.
+    wrong = [w for s in uploads for w in _wrong_inputs(s, ("user", "password", "attestations"))]
+    assert not wrong, (
+        f"upload steps that do not select Trusted Publishing with attestations: {wrong}"
+    )
+    # Each selector line is removed only where it sits verbatim, as its own line, and must occur
+    # exactly once per upload step, so no other occurrence of either word survives unexamined.
+    for line in _TRUSTED_PUBLISHING_SELECTOR:
+        hits = re.findall(rf"^[ ]+{re.escape(line)}$", rel, flags=re.MULTILINE)
+        assert len(hits) == len(uploads), f"{line!r} occurs {len(hits)} times, not {len(uploads)}"
+        rel = re.sub(rf"^[ ]+{re.escape(line)}$", "", rel, flags=re.MULTILINE)
+    # No API-token / password path may exist anywhere else in the release workflow: publishing is
+    # OIDC-only.
     for forbidden in (
         "password:",
+        "user:",
         "TWINE_PASSWORD",
         "__token__",
         "PYPI_API_TOKEN",
@@ -687,9 +772,10 @@ def test_release_publish_uses_trusted_publishing_no_token() -> None:
             f"release.yml reintroduced a token-based publish path ({forbidden!r}) — publishing must stay "
             f"Trusted Publishing (OIDC), no token"
         )
-    # The pinned pypa action + PEP 740 attestations, backed by the job's id-token scope.
-    assert "uses: pypa/gh-action-pypi-publish@" in rel, "the Trusted-Publishing action is gone"
-    assert "attestations: true" in rel, "PEP 740 attestations disabled on the PyPI publish"
+    # The digest-pinned pypa image, backed by the job's id-token scope.
+    assert all(_is_pinned_publish(str(s["uses"])) for s in uploads), (
+        "the Trusted-Publishing image is gone"
+    )
     assert "id-token: write" in rel, "the release job dropped the id-token OIDC scope"
 
 
@@ -922,17 +1008,22 @@ def test_the_console_publish_uses_trusted_publishing_and_is_tag_gated() -> None:
     jobs = _jobs()
     publish = jobs["publish-pypi-webconsole"]
     assert needs_of(publish) == ["release-webconsole"], needs_of(publish)
-    assert any(
-        str(s.get("uses") or "").startswith("pypa/gh-action-pypi-publish@")
-        for s in publish["steps"]
-    ), "the console must publish via the pinned action"
+    assert any(_is_pinned_publish(str(s.get("uses") or "")) for s in publish["steps"]), (
+        "the console must publish via the digest-pinned image"
+    )
     assert publish.get("permissions") == {"id-token": "write"}, (
         "Trusted Publishing needs the OIDC identity, and the publish job needs nothing else"
     )
     assert "id-token" not in (jobs["release-webconsole"].get("permissions") or {}), (
         "the console build job holds the OIDC identity again; only its publish job may"
     )
-    assert not re.search(r"password|PYPI_.*TOKEN|api-token", str(publish)), (
+    # The empty `password` input is the Trusted Publishing selector, not a token (section (5) pins
+    # its value), so it is taken out before the search, and only when it is empty.
+    scrubbed = copy.deepcopy(publish)
+    for step in scrubbed["steps"]:
+        if not _wrong_inputs(step, ("password",)):
+            del step["with"]["password"]
+    assert not re.search(r"password|PYPI_.*TOKEN|api-token", str(scrubbed)), (
         "the console publish must not use an API token — Trusted Publishing only"
     )
     guard = str(publish.get("if") or "")
@@ -3844,9 +3935,13 @@ def test_a_draft_publisher_refuses_while_the_variable_is_set_and_the_upload_did_
 # dispatch at all.
 
 _ENVIRONMENT = "pypi"
-_PUBLISH_ACTION = "pypa/gh-action-pypi-publish@"
 _VERIFY_PREFIX = "The downloaded files are the ones the build job gated"
-_PUBLISH_JOB_ACTIONS = ("actions/download-artifact@", _PUBLISH_ACTION)
+_DOWNLOAD_ACTION = "actions/download-artifact@"
+
+
+def _publish_job_may_call(uses: str) -> bool:
+    """A publish job's allowlist: the artifact download, and the publish image by digest only."""
+    return uses.startswith(_DOWNLOAD_ACTION) or _is_pinned_publish(uses)
 
 
 def _environment(job: dict) -> str | None:
@@ -3880,9 +3975,10 @@ def test_every_pypi_publish_runs_in_a_publish_only_job_that_names_the_environmen
         for step in job["steps"]:
             uses = str(step.get("uses") or "")
             # An allowlist, not a checkout ban: any other action is code running with the identity.
-            if uses and not uses.startswith(_PUBLISH_JOB_ACTIONS):
+            if uses and not _publish_job_may_call(uses):
                 problems.append(
-                    f"{key} calls {uses}; a publish job may call only {_PUBLISH_JOB_ACTIONS}"
+                    f"{key} calls {uses}; a publish job may call only {_DOWNLOAD_ACTION} and "
+                    f"{_PINNED_PUBLISH.pattern}"
                 )
             if "run" in step and not str(step.get("name", "")).startswith(_VERIFY_PREFIX):
                 problems.append(f"{key} runs a command: {step.get('name')!r}")
@@ -3891,16 +3987,31 @@ def test_every_pypi_publish_runs_in_a_publish_only_job_that_names_the_environmen
                 problems.append(f"{key}: {step.get('name')!r} carries continue-on-error")
             if any(f in str(step.get("if") or "") for f in _STATUS_FUNCTIONS):
                 problems.append(f"{key}: {step.get('name')!r} runs after a failed step")
-            if _is_publish_action(uses) and set(step.get("with") or {}) - _PUBLISH_INPUTS:
-                problems.append(f"{key}: {step.get('name')!r} sets inputs beyond {_PUBLISH_INPUTS}")
+            if _is_publish_action(uses):
+                if set(step.get("with") or {}) != _PUBLISH_INPUTS:
+                    problems.append(
+                        f"{key}: {step.get('name')!r} sets inputs {sorted(step.get('with') or {})}, "
+                        f"not exactly {sorted(_PUBLISH_INPUTS)}"
+                    )
+                # A step `env:` reaches the image as well, past the fixed inputs, and the image's
+                # entry script reads at least `DEBUG`, which turns on a shell trace. The workflow
+                # `env:` and a `$GITHUB_ENV` write reach it the same way; both are refused below.
+                if "env" in step:
+                    problems.append(f"{key}: {step.get('name')!r} sets a step `env:`")
+            if any(f in str(step.get("run") or "") for f in ("GITHUB_ENV", "GITHUB_PATH")):
+                problems.append(
+                    f"{key}: {step.get('name')!r} writes the environment of later steps"
+                )
         for key_word in ("env", "defaults", "continue-on-error"):
             if key_word in job:
                 problems.append(f"{key} sets job-level `{key_word}:`")
+    if "env" in load_workflow(RELEASE_YML.name):
+        problems.append(
+            "release.yml sets a workflow-level `env:`, which reaches every publish step"
+        )
     assert not problems, "\n".join(problems)
 
 
-#: Inputs a publish step may set. `repository-url` above all is out: it sends the OIDC token there.
-_PUBLISH_INPUTS = {"packages-dir", "skip-existing", "attestations"}
 _STATUS_FUNCTIONS = ("always()", "cancelled()", "failure()")
 
 
@@ -3932,6 +4043,89 @@ def test_only_the_publish_jobs_can_reach_pypi() -> None:
             shell = _executed_shell(str(step.get("run") or "")).replace("\\\n", " ")
             if _PYPI_UPLOAD_COMMANDS.search(shell):
                 problems.append(f"{key} uploads to PyPI from a shell: {step.get('name')!r}")
+    assert not problems, "\n".join(problems)
+
+
+# --- (14b) every PyPI upload runs the publish image by digest, with every input set (BACKLOG #5046) ---
+
+#: An upload line and its comment, which names the upstream commit (and its release) whose
+#: action.yml and twine-upload.sh the inputs were checked against. `- ` admits `uses:` as a step's
+#: first key. Group 1 is the whole line from `uses:` on, so the sites can be compared.
+_PINNED_PUBLISH_LINE = re.compile(
+    rf"^[ ]+(?:- )?(uses: {_PINNED_PUBLISH.pattern} # commit [0-9a-f]{{40}} \(v\d+\.\d+\.\d+\), "
+    r"its commit tag's image;.*)$",
+    flags=re.MULTILINE,
+)
+
+
+def _publish_sites() -> list[tuple[str, str]]:
+    """``(where, uses)`` for each step under .github/ that `_is_publish_action` matches, by at least
+    these routes: each workflow's job steps, and each local action's composite steps and docker
+    `runs.image`, which a workflow could call to reach the image by tag through a path no `uses:`
+    check here reads as a publish. A local action's Dockerfile `FROM` and a remote reusable
+    workflow are not read."""
+    import yaml
+
+    github = _REPO / ".github"
+    sites: list[tuple[str, str]] = []
+    for path in sorted([*WORKFLOWS.glob("*.y*ml"), *(github / "actions").rglob("action.y*ml")]):
+        text = path.read_text(encoding="utf-8")
+        # Only a file whose text names the action can hold a step `_is_publish_action` matches, so
+        # the others are not parsed.
+        if "gh-action-pypi-publish" not in text.lower():
+            continue
+        if path.parent == WORKFLOWS:
+            groups = {key: job.get("steps") for key, job in jobs_of(path.name).items()}
+        else:
+            runs = yaml.safe_load(text).get("runs") or {}
+            # A docker-type local action names its image in `runs.image`, the shape of the
+            # trampoline upstream's create-docker-action.py writes; read it as one more step.
+            groups = {"runs": [*(runs.get("steps") or []), {"uses": runs.get("image")}]}
+        for key, steps in groups.items():
+            for step in steps or []:
+                uses = str((step or {}).get("uses") or "")
+                if _is_publish_action(uses):
+                    sites.append((f"{path.relative_to(github).as_posix()}:{key}", uses))
+    return sites
+
+
+def test_every_pypi_upload_runs_one_digest_pinned_image() -> None:
+    """The action form runs its image by a repointable ghcr tag, so every upload `_publish_sites`
+    finds names the image by `sha256:` digest, all by the same one, each with one and the same
+    comment naming the commit the digest was read from.
+
+    Mutation: put one site back on `pypa/gh-action-pypi-publish@<commit>`, name the image by a tag,
+    shorten a digest, give one site a different digest, or drop or change one site's comment. Red
+    here. That the comment's commit is the digest's own is not checked: no test here reaches ghcr.
+    """
+    sites = _publish_sites()
+    assert len(sites) == _PYPI_UPLOAD_SITES, sites
+    assert sites, "no publish site found under .github/; the walk matched nothing"
+    unpinned = [site for site in sites if not _is_pinned_publish(site[1])]
+    assert not unpinned, f"PyPI uploads not on the digest-pinned image: {unpinned}"
+    assert len({uses for _, uses in sites}) == 1, f"the upload sites name different images: {sites}"
+    commented = _PINNED_PUBLISH_LINE.findall(_release())
+    assert len(commented) == _PYPI_UPLOAD_SITES, (
+        f"{len(commented)} upload lines carry the commit comment, not {_PYPI_UPLOAD_SITES}"
+    )
+    assert len(set(commented)) == 1, f"the upload lines differ: {sorted(set(commented))}"
+
+
+def test_every_pypi_upload_passes_each_input_the_composite_defaulted() -> None:
+    """The image route skips the composite action.yml, so its defaults no longer apply; release.yml's
+    header says what each missing or other value does. Each value is pinned here, and section (14)
+    refuses any other input.
+
+    Mutation: drop `repository-url` from one step, point it at another index, or set
+    `attestations: false` or `verbose: false`. Red here.
+    """
+    uploads = _pypi_uploads()
+    assert uploads, "no PyPI upload step found in release.yml; the detector matched nothing"
+    problems = [
+        f"{key}: {w}"
+        for key, step in uploads
+        for w in _wrong_inputs(step, tuple(_PUBLISH_FIXED_INPUTS))
+    ]
     assert not problems, "\n".join(problems)
 
 
@@ -4073,9 +4267,7 @@ def test_each_publish_job_checks_the_digests_its_producer_recorded() -> None:
         verify = [
             i for i, s in enumerate(steps) if str(s.get("name", "")).startswith(_VERIFY_PREFIX)
         ]
-        publishes = [
-            i for i, s in enumerate(steps) if str(s.get("uses") or "").startswith(_PUBLISH_ACTION)
-        ]
+        publishes = [i for i, s in enumerate(steps) if _is_publish_action(str(s.get("uses") or ""))]
         assert len(verify) == 1 and verify[0] < min(publishes), (key, verify, publishes)
         bodies.add(steps[verify[0]]["run"])
         # One `needs.<producer>.outputs.pypi-digests` per line, and nothing else, because the check
