@@ -45,6 +45,7 @@ from messagefoundry.exception_origin import (
     ExceptionChainTooLong,
     exception_chain,
     raised_by_the_engine,
+    raised_through,
 )
 from messagefoundry.privilege_check import vault_admin_paths
 from messagefoundry.transports.bounded_read import TruncatedResponseError
@@ -205,15 +206,18 @@ def _why(exc: BaseException) -> str:
 
 
 def _ad_why(exc: BaseException) -> str:
-    """:func:`_why` for the AD bind probe, which keeps an ``InsecureHopRefused``'s text whole.
+    """:func:`_why` for the AD bind probe, which keeps the LDAPS revocation guard's refusal whole.
 
-    On that probe one comes from building the LDAPS bind: the revocation guard of BACKLOG #2193,
-    whose text names the hop, the domain controller's host and the setting that clears it, and
-    reads no password. ``provision-admin`` and ``serve`` print the same refusal whole. The Vault
-    probe does not take this rule (BACKLOG #3471)."""
+    That guard (BACKLOG #2193) is an ``InsecureHopRefused`` whose text names the hop, the domain
+    controller's host and the setting that clears it, and reads no password. ``provision-admin``
+    and ``serve`` print the same refusal whole. Only one the guard raised keeps its text: its
+    traceback passes through ``auth.ldap._refuse_ad_revocation``. Any other ``InsecureHopRefused``
+    on this probe, at least one from resolving a Vault-held bind password, takes :func:`_why`'s
+    rule, as on the Vault probe (BACKLOG #3471, #4883)."""
+    from messagefoundry.auth.ldap import _refuse_ad_revocation
     from messagefoundry.config.tls_policy import InsecureHopRefused
 
-    if isinstance(exc, InsecureHopRefused):
+    if isinstance(exc, InsecureHopRefused) and raised_through(exc, _refuse_ad_revocation.__code__):
         return strip_control_chars(str(exc))
     return _why(exc)
 

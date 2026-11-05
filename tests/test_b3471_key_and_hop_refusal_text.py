@@ -17,6 +17,11 @@ Item 2: a hop refusal keeps its text only when it is exactly the Vault hop's mar
 ``VaultHopRefused``: in ``provision-admin``'s secret-provider arm, in both Vault client builds and
 in the Vault probe's ``_why``.
 
+BACKLOG #4882, the routes engine PR 2662 left open: a codec error on any link of a build error,
+whatever the error's class, leaves no byte in the refusal; and the store open and
+``provision-admin`` print such a refusal with no byte. BACKLOG #4883, its ``_ad_why`` item: the AD
+probe keeps only the LDAPS revocation guard's own refusal whole.
+
 All key bytes, hosts and tokens here are synthetic. Severity is conditional (CLAUDE.md section 0).
 """
 
@@ -26,6 +31,7 @@ import re
 import traceback
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -120,6 +126,15 @@ def _decode_error() -> UnicodeDecodeError:
     raise AssertionError("the synthetic key bytes decoded as ASCII")
 
 
+def _with_provider(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """Every store key resolution raises ``error``."""
+    monkeypatch.setattr(
+        store_base,
+        "resolve_key_provider",
+        lambda settings, posture=None: _CodecErrorProvider(error),
+    )
+
+
 @pytest.mark.parametrize(
     "error",
     [_decode_error(), ValueError("wrapped", _decode_error())],
@@ -129,11 +144,7 @@ def test_build_store_cipher_renders_a_codec_error_without_its_bytes(
     error: Exception, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Any key source, not only DPAPI: the build renders the codec error and does not chain it."""
-    monkeypatch.setattr(
-        store_base,
-        "resolve_key_provider",
-        lambda settings, posture=None: _CodecErrorProvider(error),
-    )
+    _with_provider(monkeypatch, error)
     with pytest.raises(StoreCipherConfigError) as caught:
         build_store_cipher(StoreSettings())
     _assert_no_key_byte(_whole(caught.value))
@@ -143,11 +154,7 @@ def test_build_store_cipher_renders_a_codec_error_without_its_bytes(
 def test_any_other_build_error_keeps_its_text_and_chain(monkeypatch: pytest.MonkeyPatch) -> None:
     """The control: a ValueError that holds no codec error is kept as before."""
     error = ValueError("[store].synthetic_setting is not valid")
-    monkeypatch.setattr(
-        store_base,
-        "resolve_key_provider",
-        lambda settings, posture=None: _CodecErrorProvider(error),
-    )
+    _with_provider(monkeypatch, error)
     with pytest.raises(StoreCipherConfigError) as caught:
         build_store_cipher(StoreSettings())
     assert str(caught.value) == str(error)
@@ -398,5 +405,181 @@ def test_the_vault_probe_keeps_only_the_marked_refusal_text() -> None:
 
     assert _why(VaultHopRefused("Vault test hop: fixed text")) == "Vault test hop: fixed text"
     assert _why(_host_echoing()) == "InsecureHopRefused"
-    # The AD probe keeps the LDAPS guard's text, as provision-admin and serve print it.
-    assert _ad_why(_host_echoing()) == str(_host_echoing())
+    # BACKLOG #4883: the AD probe keeps only the LDAPS guard's own refusal whole, so a hop refusal
+    # it did not raise reads by its type, as on the Vault probe.
+    assert _ad_why(_host_echoing()) == "InsecureHopRefused"
+
+
+# --- BACKLOG #4883, the `_ad_why` item: only the LDAPS guard's refusal keeps its text -----------
+
+
+def test_the_ad_probe_keeps_the_ldaps_guard_refusal_whole(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The control: the guard's own refusal, raised inside ``_refuse_ad_revocation``."""
+    from messagefoundry.auth import ldap
+    from messagefoundry.config.settings import AuthSettings
+    from messagefoundry.privilege_probes import _ad_why
+
+    monkeypatch.setattr(ldap.RevocationHopGuard, "capture", _raising(_host_echoing()))
+    tls: Any = SimpleNamespace(handshake_context=lambda: None)
+    with pytest.raises(InsecureHopRefused) as caught:
+        ldap._refuse_ad_revocation(
+            AuthSettings(ad_server="ldaps://dc.synthetic.test:636"), tls, None
+        )
+    assert _ad_why(caught.value) == str(_host_echoing())
+
+
+def test_a_hop_refusal_from_the_bind_password_resolution_keeps_no_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hop refusal the AD probe meets past the guard, here from resolving a Vault-held bind
+    password, is named by its type, so the Vault host it names is not printed."""
+    from messagefoundry.auth import ldap
+    from messagefoundry.privilege_probes import read_ldap_bind
+    from tests.test_vault_ldap_privilege_probes import _ad_service_settings
+
+    monkeypatch.setattr(ldap, "resolve_connector_secret", _raising(_host_echoing()))
+    reading = read_ldap_bind(_ad_service_settings(), None)
+    assert reading.bound is False
+    assert reading.problem is not None and "InsecureHopRefused" in reading.problem, reading
+    assert _HOST not in reading.problem, reading.problem
+
+
+# --- BACKLOG #4882: build_store_cipher routes PR 2662 left open ---------------------------------
+
+
+def _built_from[E: Exception](error: UnicodeDecodeError, kind: type[E]) -> E:
+    """A ``kind`` whose text quotes ``error``, raised from it."""
+    try:
+        raise kind(f"synthetic key source refused: {error}") from error
+    except kind as exc:
+        return exc
+
+
+def _context_beside_cause(error: UnicodeDecodeError) -> ValueError:
+    """A ValueError whose text quotes ``error``, which is its context; its cause is plain."""
+    try:
+        try:
+            raise error
+        except UnicodeDecodeError as inner:
+            raise ValueError(f"synthetic: {inner}") from ValueError("synthetic plain cause")
+    except ValueError as exc:
+        return exc
+
+
+def _group_holding(error: UnicodeDecodeError) -> ValueError:
+    """A ValueError whose context is a group with the codec error as a member."""
+    try:
+        try:
+            raise ExceptionGroup("synthetic", [error])
+        except ExceptionGroup:
+            raise ValueError("synthetic: the key source failed")  # noqa: B904 -- the context is the point
+    except ValueError as exc:
+        return exc
+
+
+#: The refusal's words for an error whose chain, not its own text, holds the codec error.
+_CHAINED = "whose chain holds a codec error"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _built_from(_decode_error(), ValueError),
+        _context_beside_cause(_decode_error()),
+        _group_holding(_decode_error()),
+    ],
+    ids=["text-built-from-a-chained-codec-error", "context-beside-a-cause", "group-member"],
+)
+def test_a_value_error_with_a_codec_error_on_any_link_prints_no_byte(
+    error: ValueError, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each held the byte in its own text or on a link the old walk did not read, and kept it."""
+    assert any(spelling in _whole(error) for spelling in _BYTE_SPELLINGS), "the fixture holds none"
+    _with_provider(monkeypatch, error)
+    with pytest.raises(StoreCipherConfigError) as caught:
+        build_store_cipher(StoreSettings())
+    _assert_no_key_byte(_whole(caught.value))
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert f"ValueError {_CHAINED}" in str(caught.value), str(caught.value)
+
+
+@pytest.mark.parametrize("kind", [RuntimeError, KeyProviderError, DpapiError])
+def test_a_runtime_error_that_chains_a_codec_error_prints_no_byte(
+    kind: type[RuntimeError], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It passed through untouched; it is raised as KeyProviderError, which every store open's
+    caller already reports as a key that could not be resolved."""
+    _with_provider(monkeypatch, _built_from(_decode_error(), kind))
+    with pytest.raises(KeyProviderError) as caught:
+        build_store_cipher(StoreSettings())
+    _assert_no_key_byte(_whole(caught.value))
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert f"{kind.__name__} {_CHAINED}" in str(caught.value), str(caught.value)
+
+
+def test_a_runtime_error_with_no_codec_error_passes_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control: the same object, untouched."""
+    own = KeyProviderError("synthetic: the provider's own refusal")
+    _with_provider(monkeypatch, own)
+    with pytest.raises(KeyProviderError) as caught:
+        build_store_cipher(StoreSettings())
+    assert caught.value is own
+
+
+def test_the_postgres_tls_wrap_reads_a_context_beside_a_cause() -> None:
+    """``_carries_a_codec_error`` is also the PostgreSQL TLS wrap's test (BACKLOG #2532)."""
+    assert store_base._carries_a_codec_error(_context_beside_cause(_decode_error()))
+    assert not store_base._carries_a_codec_error(ValueError("synthetic plain"))
+
+
+@pytest.mark.parametrize("command", _KEY_REFUSING_COMMANDS)
+def test_the_store_open_refusal_prints_no_byte_of_a_chained_codec_error(
+    command: str,
+    shell: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``_open_store_or_refuse``, the route PR 2662 named as ``_open_store_or_refuse_the_key``:
+    exit 2, and no byte, for a key source whose own text quotes the codec error."""
+    db = shell / "keyed.db"
+    key = generate_key()
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    _with_provider(monkeypatch, _built_from(_decode_error(), KeyProviderError))
+    rc = main(_argv(command, db, shell))
+    captured = capsys.readouterr()
+    _assert_no_key_byte(captured.out + captured.err)
+    assert rc == 2, (captured.out, captured.err)
+    assert _CHAINED in captured.out + captured.err
+
+
+def test_provision_admin_prints_no_byte_of_a_chained_codec_error(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``provision-admin``'s key arm, at its pre-check of an absent SQLite store: exit 2."""
+    from tests.test_keyless_chain_every_command import _PASSWORD
+    from tests.test_provision_first_administrator import _tty
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    _with_provider(monkeypatch, _built_from(_decode_error(), KeyProviderError))
+    _tty(monkeypatch, _PASSWORD, _PASSWORD)
+    db = shell / "absent.db"
+    rc = main(
+        [
+            "provision-admin",
+            "--username",
+            "site-admin",
+            "--email",
+            "ops@example.invalid",
+            "--db",
+            str(db),
+            "--json",
+        ]
+    )
+    captured = capsys.readouterr()
+    _assert_no_key_byte(captured.out + captured.err)
+    assert rc == 2, (captured.out, captured.err)
+    assert _CHAINED in captured.out, captured.out
+    assert not db.exists()

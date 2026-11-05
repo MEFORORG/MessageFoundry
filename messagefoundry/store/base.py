@@ -39,7 +39,8 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.config.tls_policy import HopPosture
-from messagefoundry.redaction import codec_safe_str, prints_a_codec_error
+from messagefoundry.exception_origin import ExceptionChainTooLong, exception_chain
+from messagefoundry.redaction import codec_safe_line, codec_safe_str, prints_a_codec_error
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT,
@@ -58,7 +59,7 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.document_strip import StripResult
-from messagefoundry.store.keyprovider import resolve_key_provider
+from messagefoundry.store.keyprovider import KeyProviderError, resolve_key_provider
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.privilege import (
     StorePrivilegeReport,
@@ -3426,34 +3427,66 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     (vault BACKLOG #2983). ``None`` counts as enforcing there, so a caller with no posture gets
     the strict answer.
 
-    **A codec error is not chained (BACKLOG #3471).** Its own text names a byte of what it decoded,
-    and its ``.object`` holds all of it, so a key source that yields bytes that are not text would
-    put key material in the refusal and in any traceback of it. A ``ValueError`` from the build
-    that is one, holds one, or has one on the links :func:`_carries_a_codec_error` follows, is
-    rendered with :func:`~messagefoundry.redaction.codec_safe_str` and raised outside the handler.
-    Every other ``ValueError`` keeps its text and its chain. An error of another class, such as a
-    ``KeyProviderError`` or ``DpapiError``, passes through untouched."""
+    **A codec error is not chained (BACKLOG #3471, #4882).** Its own text names a byte of what it
+    decoded, and its ``.object`` holds all of it, so a key source that yields bytes that are not
+    text would put key material in the refusal and in any traceback of it. An error from the build
+    of any class that is one, holds one, or has one anywhere :func:`_codec_error_on` looks, is
+    raised outside the handler with no chain:
+
+    - one that is or holds a codec error, with its
+      :func:`~messagefoundry.redaction.codec_safe_str` rendering;
+    - one that only has one on its chain, with a fixed text naming its class and the codec error's
+      :func:`~messagefoundry.redaction.codec_safe_line`, never its own text, since that may have
+      been built from the codec error's and quote the byte.
+
+    Such a ``ValueError`` is raised as :class:`StoreCipherConfigError`, and an error of any other
+    class as ``KeyProviderError``, which every caller of a store open already reports as a key
+    that could not be resolved. Every other ``ValueError`` keeps its text and its chain, and an
+    error of another class with no codec error on it, such as a ``KeyProviderError`` or
+    ``DpapiError``, passes through untouched."""
     try:
         return _build_store_cipher(settings, posture)
-    except ValueError as exc:
-        if not _carries_a_codec_error(exc):
-            raise StoreCipherConfigError(str(exc)) from exc
-        refusal = codec_safe_str(exc)
-    raise StoreCipherConfigError(refusal)
+    except Exception as exc:
+        codec = _codec_error_on(exc)
+        if codec is None:
+            if isinstance(exc, ValueError):
+                raise StoreCipherConfigError(str(exc)) from exc
+            raise
+        kind = StoreCipherConfigError if isinstance(exc, ValueError) else KeyProviderError
+        if codec is exc:
+            refusal = codec_safe_str(exc)
+        else:
+            refusal = (
+                f"the store cipher could not be built: a {type(exc).__name__} whose chain holds a "
+                f"codec error or cannot be read whole, its own text not shown "
+                f"({codec_safe_line(codec)})"
+            )
+    raise kind(refusal)
+
+
+def _codec_error_on(exc: BaseException) -> BaseException | None:
+    """An error that is a codec error or prints one (BACKLOG #3471, #4882), ``exc`` itself first,
+    else one :func:`~messagefoundry.exception_origin.exception_chain` reaches from it, or ``None``.
+    That walk reads every link's ``__cause__`` and ``__context__`` both, since a context beside a
+    cause can still be printed or quoted, and each member of an exception group. A chain too long
+    to read whole answers with that refusal, so it is never judged clean."""
+    try:
+        return next(
+            (
+                e
+                for e in exception_chain(exc)
+                if isinstance(e, UnicodeError) or prints_a_codec_error(e)
+            ),
+            None,
+        )
+    except ExceptionChainTooLong:
+        return ExceptionChainTooLong("the error's chain is too long to read")
 
 
 def _carries_a_codec_error(exc: BaseException) -> bool:
-    """Whether ``exc``, or an error on its chain, is a codec error or prints one (BACKLOG #3471).
-    Each link is followed by its ``__cause__``, else its ``__context__``, as a traceback prints it;
-    a ``__context__`` beside a ``__cause__`` is not read."""
-    seen: set[int] = set()
-    link: BaseException | None = exc
-    while link is not None and id(link) not in seen:
-        seen.add(id(link))
-        if isinstance(link, UnicodeError) or prints_a_codec_error(link):
-            return True
-        link = link.__cause__ or link.__context__
-    return False
+    """Whether ``exc``, or an error :func:`_codec_error_on` reaches from it, is a codec error or
+    prints one (BACKLOG #3471, #4882)."""
+    return _codec_error_on(exc) is not None
 
 
 class StoreCipherConfigError(ValueError):
