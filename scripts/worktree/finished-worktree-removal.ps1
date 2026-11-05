@@ -40,6 +40,8 @@
       * no file in it is flagged skip-worktree or assume-unchanged, whose edits git status cannot see;
       * `git status --porcelain --untracked-files=all`, run with LC_ALL=C so its warning text is
         untranslated, exits 0, prints nothing, and warns of no folder it could not open;
+      * its private git metadata, and its working tree (the top level, plus the files in .pytest_cache
+        and .ruff_cache), are both idle beyond -IdleHours;
       * no rebase, am, cherry-pick, merge, revert or bisect is in progress in its own git dir;
       * it holds no IGNORED entry but a regenerable cache (worktree-gates.ps1's
         $REGENERABLE_IGNORED_PATTERN, remove.ps1 -Path's list: .venv at the root; node_modules,
@@ -47,8 +49,6 @@
         a .env, a *.db store or a build output refuses the tree rather than going with it;
       * no git checkout (an entry named .git, file or directory) is nested anywhere in it, ignored
         directories included; the whole working tree is walked, and a folder that cannot be listed refuses;
-      * its private git metadata, and its working tree (the top level, plus the files in .pytest_cache
-        and .ruff_cache), are both idle beyond -IdleHours;
       * no commit is held only by its own HEAD reflog or per-worktree refs, which the removal deletes (a
         commit the branch's own reflog holds survives, so it does not count; a detached tip is covered);
       * it owns no allocation (alloc.ps1) whose item is not provably on origin/main, matched by the path
@@ -169,14 +169,6 @@ function Get-FinishedWorktreeRefusal {
     if ($flagged -ne 0) { return $(if ($flagged -lt 0) { 'its flagged files could not be read' } else { "$flagged file(s) flagged skip-worktree or assume-unchanged, whose edits git status cannot see" }) }
     $clean = Test-WorktreeClean -Path $Path -AllUntracked
     if (-not $clean.Clean) { return "not clean: $($clean.Reasons -join '; ')" }
-    $ops = Get-InProgressOperation $Path
-    if ($null -eq $ops) { return 'its git dir could not be read for an operation in progress' }
-    if ($ops.Count -gt 0) { return "an operation is in progress in its git dir ($($ops -join ', ')), whose state the removal deletes" }
-    $ignored = Get-UnsafeIgnoredEntries $Path
-    if ($null -eq $ignored) { return 'its ignored files could not be listed' }
-    if ($ignored.Count -gt 0) { return "$($ignored.Count) ignored entr(ies) that are not a regenerable cache, which the removal would delete (first: $($ignored[0]))" }
-    $clones = Get-NestedRepoCount $Path
-    if ($clones -ne 0) { return $(if ($clones -lt 0) { 'its working tree could not be listed in full, so a nested git checkout may be there' } else { "$clones git checkout(s) nested inside it, which git status does not read into" }) }
 
     $cut = (Get-Date).AddHours(-1 * $IdleHours)
     $act = Get-WorktreeActivity -Path $Path
@@ -185,6 +177,16 @@ function Get-FinishedWorktreeRefusal {
     $wact = Get-WorkingTreeActivity -Path $Path
     if ($null -eq $wact) { return 'its working-tree activity could not be read' }
     if ($wact -gt $cut) { return "recently active: the working tree was written $([math]::Round(((Get-Date) - $wact).TotalHours, 1)) h ago, inside the $IdleHours h window" }
+
+    # After the idle readings, which are cheap: these cost a second git status and a whole-tree walk.
+    $ops = Get-InProgressOperation $Path
+    if ($null -eq $ops) { return 'its git dir could not be read for an operation in progress' }
+    if ($ops.Count -gt 0) { return "an operation is in progress in its git dir ($($ops -join ', ')), whose state the removal deletes" }
+    $ignored = Get-UnsafeIgnoredEntries $Path
+    if ($null -eq $ignored) { return 'its ignored files could not be listed' }
+    if ($ignored.Count -gt 0) { return "$($ignored.Count) ignored entr(ies) that are not a regenerable cache, which the removal would delete (first: $($ignored[0]))" }
+    $clones = Get-NestedRepoCount $Path
+    if ($clones -ne 0) { return $(if ($clones -lt 0) { 'its working tree could not be listed in full, so a nested git checkout may be there' } else { "$clones git checkout(s) nested inside it, which git status does not read into" }) }
 
     # Covers a detached tip too: `reflog show HEAD` prints the current HEAD even when the log is empty.
     $branch = if ($wt.Detached) { '' } else { [string]$wt.Branch }
@@ -307,7 +309,7 @@ function Invoke-FinishedWorktreeRemoval {
             # Once a verdict on the end state is in (ORPHANED, say), a later throw must not relabel it:
             # an orphan re-read as REFUSED would drop the exit code 3 that makes a human look.
             if ($row.Outcome -eq 'ATTEMPTING') { $row.Outcome = 'FAILED'; $row.Reason = "the removal was attempted and then a read threw: $($_.Exception.Message)" }
-            elseif ($row.Outcome -in 'REFUSED', 'WOULD-REMOVE') { $row.Outcome = 'REFUSED'; $row.Reason = "a check could not complete: $($_.Exception.Message)" }
+            elseif ($row.Outcome -eq 'REFUSED') { $row.Reason = "a check could not complete: $($_.Exception.Message)" }
             else { $row.Reason = "$($row.Reason); then an error: $($_.Exception.Message)" }
         }
         $row

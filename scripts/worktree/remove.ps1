@@ -436,10 +436,6 @@ $ownTop = "$(& git -C $WorktreePath rev-parse --path-format=absolute --show-topl
 if ($LASTEXITCODE -ne 0) { $ownTop = '' }
 $targetNorms = @(@($WorktreePath, $ownTop) | Where-Object { $_ } | ForEach-Object { ConvertTo-Norm $_ } | Sort-Object -Unique)
 
-# Test-PresentOrThrow and Get-EntriesOrThrow, the two readers every refusal below lists through, live
-# in worktree-gates.ps1 (dot-sourced above): Test-Path reads access-denied as absent, and Get-ChildItem
-# lists an unlistable directory as empty, so neither may stand in for them here.
-
 # A DETACHED HEAD WHOSE COMMIT NO REF HOLDS is lost with the worktree: removal deletes the HEAD reflog
 # too, so nothing reaches it afterwards. -Force does not override it -- -Force means
 # "discard changes", nothing else. The shape is the vault remove.ps1's (vault PR 2125). Refs are read
@@ -951,10 +947,10 @@ if ($byPath) {
     # .venv is tolerated at the ROOT only (vault BACKLOG #1017, owner point (i)): one deeper down is
     # not the tree's own environment. node_modules and the four caches at any depth, because this
     # repository's own ide/node_modules is one (new.ps1 -Ide). The clones inside both are checked above.
-    # The pattern lives in worktree-gates.ps1, so the nightly .claude/worktrees removal tolerates
-    # exactly this list and no other.
-    $exemptIgnored = $REGENERABLE_IGNORED_PATTERN
-    $pending = @($statusLines | Where-Object { $_ -and $_ -cnotmatch $exemptIgnored })
+    # The pattern and Test-PlainDirectory live in worktree-gates.ps1, shared with the nightly
+    # .claude/worktrees removal. That route reads status in --ignored=matching mode, so a cache inside
+    # an otherwise unignored folder (ide/node_modules/) is tolerated there and refuses here as `!! ide/`.
+    $pending = @($statusLines | Where-Object { $_ -and $_ -cnotmatch $REGENERABLE_IGNORED_PATTERN })
     # A TOLERATED NAME IS NOT ENOUGH: THE DIRECTORY MUST BE A REAL ONE, INSIDE THE TREE. A junction or
     # symlink named `node_modules` points at a directory somewhere else, so it is not this tree's
     # cache to throw away. A tolerated directory that is a reparse point, or that cannot be read,
@@ -964,16 +960,10 @@ if ($byPath) {
     # drop the registration, exit 0 and leave the directory behind, which this guard prevents for a
     # top-level junction. A junction INSIDE a tolerated directory still ends that way; the script
     # then reports the leftover and exits 1, after the removal.
-    foreach ($line in @($statusLines | Where-Object { $_ -cmatch $exemptIgnored })) {
-        $rel = $line.Substring(3).TrimEnd('/')
-        $isRealDirectory = $false
-        try {
-            $item = Get-Item -LiteralPath (Join-Path $WorktreePath $rel) -Force -ErrorAction Stop
-            $isRealDirectory = $item.PSIsContainer -and
-                -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+    foreach ($line in @($statusLines | Where-Object { $_ -cmatch $REGENERABLE_IGNORED_PATTERN })) {
+        if (-not (Test-PlainDirectory $WorktreePath $line.Substring(3).TrimEnd('/'))) {
+            $pending += "$line  (a link, or unreadable: not a plain directory)"
         }
-        catch { $isRealDirectory = $false }
-        if (-not $isRealDirectory) { $pending += "$line  (a link, or unreadable: not a plain directory)" }
     }
     # git status does not look at a file flagged skip-worktree (S) or assume-unchanged (lower case), so
     # an edit to one is invisible above. Count every flagged file as pending: nothing here can tell an

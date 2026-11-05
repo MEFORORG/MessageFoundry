@@ -17,7 +17,7 @@
     for them), Get-ReflogLastEntry, Get-WorktreeActivity (occupancy signal 2; prune-merged.ps1's header
     says what it can and cannot see), Test-WorktreeClean, Get-TipHolders, Test-ClaudeManagedPath,
     Get-FlaggedFileCount, Get-WorkingTreeActivity, Get-WorktreeOnlyCommitCount, Read-CoordRecord,
-    Get-ClaimedWorktreeIndex, Get-NestedRepoCount, Get-InProgressOperation and Get-UnsafeIgnoredEntries.
+    Get-ClaimedWorktreeIndex, Get-NestedRepoCount, Get-InProgressOperation, Get-UnsafeIgnoredEntries and Test-PlainDirectory.
 #>
 
 # The floor under -IdleHours. Signal 2 has been measured at 10.4h on a worktree that was demonstrably
@@ -345,18 +345,11 @@ function Get-ClaimedWorktreeIndex([string[]]$ClaimsDir) {
 # (measured 2026-11-05). A link is not descended, because git does not delete through one
 # (remove.ps1 records the measurement). Returns the count, or -1 when any directory cannot be listed.
 function Get-NestedRepoCount([string]$Path) {
-    $root = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
-    $n = 0
-    try {
-        foreach ($e in @(Get-EntriesOrThrow $Path 'working-tree entries' -Recurse)) {
-            if ($e.Name -ne '.git') { continue }
-            # The tree's own .git file sits directly under the root; every other one is a nested checkout.
-            if ([System.IO.Path]::GetDirectoryName($e.FullName).TrimEnd('\', '/') -ieq $root) { continue }
-            $n++
-        }
-    }
+    # The tree's own .git sits directly under the root; every other one is a nested checkout. The
+    # filter applies after the recursion decision, so every directory is still walked.
+    $own = Join-Path ([System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')) '.git'
+    try { return @(Get-EntriesOrThrow $Path 'working-tree entries' '.git' -Recurse | Where-Object { $_.FullName -ine $own }).Count }
     catch { return -1 }
-    return $n
 }
 
 # An operation git has started in the tree's own git dir and not finished: a rebase, am, cherry-pick,
@@ -368,7 +361,7 @@ function Get-InProgressOperation([string]$Path) {
     if ($LASTEXITCODE -ne 0 -or -not $gitdir) { return $null }
     $present = @()
     try {
-        foreach ($m in 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'MERGE_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'sequencer') {
+        foreach ($m in 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'MERGE_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'BISECT_START', 'sequencer') {
             if (Test-PresentOrThrow (Join-Path $gitdir $m) "the $m marker") { $present += $m }
         }
     }
@@ -389,13 +382,15 @@ function Get-UnsafeIgnoredEntries([string]$Path) {
     $unsafe = @()
     foreach ($line in @($lines | Where-Object { "$_".StartsWith('!! ') })) {
         if ($line -cnotmatch $REGENERABLE_IGNORED_PATTERN) { $unsafe += $line; continue }
-        $isRealDirectory = $false
-        try {
-            $item = Get-Item -LiteralPath (Join-Path $Path $line.Substring(3).TrimEnd('/')) -Force -ErrorAction Stop
-            $isRealDirectory = $item.PSIsContainer -and -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
-        }
-        catch { $isRealDirectory = $false }
-        if (-not $isRealDirectory) { $unsafe += "$line (a link, or unreadable: not a plain directory)" }
+        if (-not (Test-PlainDirectory $Path $line.Substring(3).TrimEnd('/'))) { $unsafe += "$line (a link, or unreadable: not a plain directory)" }
     }
     return , $unsafe
+}
+
+# A tolerated cache name is not enough: the entry must be a real directory inside the tree, not a link
+# to one somewhere else. Unreadable is not plain. Shared with remove.ps1 -Path.
+function Test-PlainDirectory([string]$Root, [string]$Rel) {
+    try { $item = Get-Item -LiteralPath (Join-Path $Root $Rel) -Force -ErrorAction Stop }
+    catch { return $false }
+    return $item.PSIsContainer -and -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
 }

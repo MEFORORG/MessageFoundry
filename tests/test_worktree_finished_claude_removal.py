@@ -573,16 +573,15 @@ def test_git_declining_a_tree_every_check_passed_is_declined_not_refused(fx: Fx)
     assert fx.is_registered(fx.tree("clean"))
 
 
-def _orphan_shim() -> str:
-    # The real removal, then the directory put back: deregistered, still on disk.
-    return _GIT_SHIM.format(
-        body="& git.exe @args; $c = $LASTEXITCODE; "
-        "$null = New-Item -ItemType Directory -Path $args[4]; $global:LASTEXITCODE = $c"
-    )
+#: The real removal, then the directory put back: deregistered, still on disk.
+_ORPHAN_SHIM = _GIT_SHIM.format(
+    body="& git.exe @args; $c = $LASTEXITCODE; "
+    "$null = New-Item -ItemType Directory -Path $args[4]; $global:LASTEXITCODE = $c"
+)
 
 
 def test_a_tree_left_on_disk_after_deregistering_is_orphaned_and_ledgered(fx: Fx) -> None:
-    rows = remove(fx, [fx.tree("clean")], apply=True, prelude=_orphan_shim())
+    rows = remove(fx, [fx.tree("clean")], apply=True, prelude=_ORPHAN_SHIM)
     assert rows["clean"]["Outcome"] == "ORPHANED", rows["clean"]
     assert not fx.is_registered(fx.tree("clean"))
     common = Path(
@@ -594,7 +593,7 @@ def test_a_tree_left_on_disk_after_deregistering_is_orphaned_and_ledgered(fx: Fx
 
 def test_an_error_after_the_orphaned_verdict_keeps_it(fx: Fx) -> None:
     """Red before the fix: the throw relabelled the row REFUSED, and the runner's exit 3 was lost."""
-    prelude = _orphan_shim() + "; function Add-OrphanLedgerEntry { throw 'ledger boom' }"
+    prelude = _ORPHAN_SHIM + "; function Add-OrphanLedgerEntry { throw 'ledger boom' }"
     rows = remove(fx, [fx.tree("clean")], apply=True, prelude=prelude)
     assert rows["clean"]["Outcome"] == "ORPHANED", rows["clean"]
     assert "ledger boom" in rows["clean"]["Reason"]
