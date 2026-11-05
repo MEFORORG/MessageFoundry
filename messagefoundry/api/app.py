@@ -10332,8 +10332,10 @@ def create_app(
         code.
 
         **Which refusals get their own audit row.** Only the ones this body reaches. ``require_step_up``
-        already records the permission / step-up / MFA 403s as ``auth.permission_denied`` and the body
-        never runs on those, so a second denied row there would double-count. The ``409`` needs none
+        already records its own refusals, the permission 403 as ``auth.permission_denied``, the MFA
+        403 as ``auth.mfa_denied`` and the step-up 403 and the pacing 429 as ``auth.gate_refused``
+        (BACKLOG #1197), and the body never runs on those, so a second denied row there would
+        double-count. The ``409`` needs none
         either — the ``cluster_stepdown`` row written from the coordinator's return already reads
         ``was_leader: false, lease_released: false``, which IS the refusal. That leaves the
         not-clustered ``400``, the no-sibling ``412`` and the three ``503``s, which nothing else would

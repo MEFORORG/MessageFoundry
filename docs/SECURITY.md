@@ -4684,6 +4684,14 @@ flowchart TB
 - A permitted request writes an `auth.permission_granted` row. Two cases differ. A route gated
   only by a PHI-view permission records the read in its own row. A route that names no permission
   writes no grant row.
+- A gate that adds checks of its own, at least `require_paced`, `require_phi_read` and the four
+  step-up gates, writes that row only once those checks pass (BACKLOG #1197). When a pacing limit,
+  the new-address question or a step-up refuses the request instead, it writes
+  `auth.gate_refused`, naming the same permission and a `reason` of `throttled` or `step_up`. It
+  writes that row only where it would have written the grant row, so a gate that writes no grant
+  row writes no refusal row either. A refused second factor writes `auth.mfa_denied`, as the base
+  gate's does. A refusal a route body makes after its gate has passed, such as a step-up proof the
+  route spends itself, still follows a grant row.
 - Routes that act on a Connection also check the identity's connection scope. That scope starts
   empty for every role except Administrator.
 - Sensitive routes add a step-up re-check on top of this flow. See
@@ -6718,7 +6726,7 @@ Every authentication and authorization event is written to the durable `audit_lo
 user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.directory_login_locked` / `auth.logout` /
 `auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
-`auth.permission_denied` / `auth.channel_denied` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /
+`auth.permission_denied` / `auth.channel_denied` / `auth.gate_refused` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /
 `auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
 `user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
 and `auth.ad_scope_resynced`. Most reads narrowed to the caller's channel scope write no row
