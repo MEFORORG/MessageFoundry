@@ -463,20 +463,22 @@ class _PosixPolicy:
     """Who beside the engine's own account may own a POSIX custody file, and whether it may carry
     a POSIX access control list.
 
-    ``owners`` is the uids that may own the file beside the engine's own. ``named_euid_read`` is
-    whether the file may carry an access control list at all; :func:`_posix_acl_entries_problem`
-    then judges that list, and refuses any named entry but read for the engine's own uid. What
-    :func:`_posix_file_problem` checks is the file type, the owner, a group write or execute bit and
-    any other bit in the mode, the group read bit when there is no list, and each entry of a list.
-    The owner's own permission bits are not checked."""
+    ``owners`` is the uids that may own the file beside the engine's own. ``access_list`` is
+    whether the file may carry an access control list at all: without it, any list is refused
+    whatever it grants; with it, :func:`_posix_acl_entries_problem` judges the list entry by entry
+    and refuses any named entry but read for the engine's own uid. :func:`_posix_file_problem`
+    checks at least the file type, the owner, the mode's group and other permission bits (its group
+    read bit only when there is no list) and the list. It does not check the owner's own bits or
+    the setuid, setgid and sticky bits, and it cannot see an access model a file system keeps
+    outside the POSIX list (:func:`~messagefoundry.restricted_file.posix_access_acl`)."""
 
     owners: frozenset[int]
-    named_euid_read: bool
+    access_list: bool
 
 
 #: The host file (draft rule 3b): owned by the engine's account, mode ``0600``, and no access
 #: control list at all, which :func:`write_host_file` makes sure it writes.
-_HOST_FILE_POLICY = _PosixPolicy(owners=frozenset(), named_euid_read=False)
+_HOST_FILE_POLICY = _PosixPolicy(owners=frozenset(), access_list=False)
 
 #: Group write or execute, and any access for other accounts. Group read is judged apart, because
 #: with an access control list the group bits are its mask rather than the group's access.
@@ -563,7 +565,7 @@ def _posix_file_problem(
         return f"it is owned by uid {owner}, not by the account the engine runs as (uid {euid})"
     if acl is None:
         return None
-    if not policy.named_euid_read:
+    if not policy.access_list:
         return "it carries a POSIX access control list, and this file must carry none"
     return _posix_acl_entries_problem(acl, group, euid)
 
@@ -842,12 +844,12 @@ def read_systemd_credential(name: str, *, environ: Mapping[str, str] | None = No
     host is not Linux, since systemd credentials are Linux-only. Raises :class:`CustodyError` for a
     name that is not a plain file name, a directory that is not an absolute path, a file that is a
     link, and content that is not a host blob. It raises the same for a file that is owned by an
-    account other than root or the engine's own, or that grants any account but its owner access,
-    with one exception: read for the engine's own uid in a named entry of its POSIX access control
-    list.
-
-    So any access for the file's group, in its mode or in its list's group entry, any access for
-    other accounts, and any other named user or group entry are refused. systemd writes the
+    account other than root or the engine's own, and for at least these grants: any access for the
+    file's group, in its mode or in its list's group entry, any access for other accounts, and any
+    named user or group entry in its POSIX access control list but read for the engine's own uid.
+    A file system with its own access model, such as an NFSv4 or CIFS mount, shows no POSIX list,
+    so what that model grants is not checked
+    (:func:`~messagefoundry.restricted_file.posix_access_acl`). systemd writes the
     credential owned by root at mode ``0400`` and grants a non-root service user read through a
     named entry, which shows the mode as ``0440`` because the group bits are then the list's mask;
     where the file system takes no access control list it gives the file to the service user and
@@ -871,7 +873,7 @@ def read_systemd_credential(name: str, *, environ: Mapping[str, str] | None = No
     with contextlib.suppress(FileNotFoundError):
         data = _read_posix_checked(
             Path(directory) / name,
-            _PosixPolicy(owners=frozenset({0}), named_euid_read=True),
+            _PosixPolicy(owners=frozenset({0}), access_list=True),
         )
     # Raised outside the suppressed error, so the refusal carries no chained exception.
     if data is None:

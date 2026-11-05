@@ -407,7 +407,7 @@ def _create_restricted(path: Path, read_grants: Sequence[str]) -> int:
         if status is None:
             raise RestrictedFileError(
                 f"{path} could not be created readable by its owner alone: its mode could not be "
-                f"set ({reason})"
+                f"set or read back ({reason})"
             )
         if stat.S_IMODE(status.st_mode) & 0o077 or status.st_uid != os.geteuid():
             raise RestrictedFileError(

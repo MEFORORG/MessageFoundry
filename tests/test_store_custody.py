@@ -284,7 +284,7 @@ def test_the_key_types_are_not_hashable() -> None:
 
 
 _HOST = custody._HOST_FILE_POLICY
-_CREDENTIAL = custody._PosixPolicy(owners=frozenset({0}), named_euid_read=True)
+_CREDENTIAL = custody._PosixPolicy(owners=frozenset({0}), access_list=True)
 _REG = stat.S_IFREG
 _UNDEFINED_ID = 0xFFFFFFFF
 _R, _RW = 0o4, 0o6

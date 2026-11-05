@@ -484,8 +484,8 @@ pure-Python equivalent:
   access list is still read by name, so a link in a parent directory re-pointed in between is not
   caught. Nothing calls these reads yet. Linux needs no `ctypes` for this; it opens the file with
   `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list from the open
-  descriptor. Any other POSIX host is refused before the file is opened, because this engine
-  reads the list on Linux only
+  descriptor. Any other POSIX host opens none of these files, because this engine reads the list
+  on Linux only: a host file is refused, and a systemd credential is reported unavailable
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
