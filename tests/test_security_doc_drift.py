@@ -2923,9 +2923,12 @@ def test_data_plane_mtls_listeners_are_derived_from_the_transports() -> None:
     assert "CERT_REQUIRED" in joined and "tls_ca_file" in joined, (
         "the mTLS data-plane row must name the verify mode and the setting that turns it on"
     )
-    assert "never reaches the accept path" in joined, (
-        "the row must state that the refusal happens at the TLS handshake, before the accept path — "
-        "which is why there is no connection event for it"
+    # BACKLOG #2479: the row used to say an HTTP connection on uvloop "never reaches the accept
+    # path". The MLLP and HTTP listeners now admit every TLS socket before its handshake on every
+    # loop, so what the row must still state is why the refusal writes no session event.
+    assert "the only connection event is a throttled `tls_handshake_failed`" in joined, (
+        "the row must state that a refusal at the TLS handshake opens no session, which is why "
+        "its only connection event is the throttled handshake failure"
     )
 
 
