@@ -1445,14 +1445,37 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
         self.assertIn("watch.py", why, "the notice never names the usage watch hook that stayed")
         self.assertIn("workflow", why, "the notice never says the Workflow gate still binds")
 
+    #: The one date the notice may carry: the day the owner said the seat was gone. Any other date
+    #: in it is a retirement date the tree does not record.
+    STATEMENT_DATE = "2026-11-05"
+
+    @classmethod
+    def _invented_dates(cls, notice: str) -> list[str]:
+        return [d for d in re.findall(r"\b20\d\d-\d\d-\d\d\b", notice) if d != cls.STATEMENT_DATE]
+
     def test_the_notice_invents_no_date_or_successor(self):
         why = seats()["retired"]["steward"].lower()
         self.assertIn("not recorded", why, "the notice no longer says the date is unrecorded")
-        self.assertNotRegex(why, r"retired 20\d\d-", "the notice states a retirement date")
+        self.assertEqual([], self._invented_dates(why), "the notice states a retirement date")
         self.assertIn("no successor", why, "the notice no longer denies a recorded successor")
 
-    def test_the_agreement_no_longer_carries_a_steward_row(self):
-        self.assertNotIn("| **Steward** |", read(AGREEMENT))
+    def test_the_date_scan_would_fire_on_an_invented_date(self):
+        """Positive control. Without it the date assertion above passes against any wording."""
+        self.assertEqual(
+            ["2026-08-01"], self._invented_dates("retired on 2026-08-01 by owner decision.")
+        )
+
+    def test_the_agreement_retires_the_steward_rather_than_going_quiet(self):
+        text = read(AGREEMENT)
+        self.assertIsNone(
+            re.search(r"^\|\s*\*\*Steward\*\*\s*\|", text, re.M), "CLAUDE.md keeps a Steward row"
+        )
+        self.assertIn(
+            "The STEWARD is retired too",
+            " ".join(text.split()),
+            "CLAUDE.md no longer states the retirement, so a document routing work to a Steward "
+            "has nothing contradicting it",
+        )
 
 
 if __name__ == "__main__":

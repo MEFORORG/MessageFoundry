@@ -32,7 +32,7 @@ request*, holds the steps.
 
 **No work-in-progress limit** (owner ruling 2026-10-26). Brief at full speed: at least the open
 PR count, the merge queue and the merge rate never limit briefing, and no item count caps a wave
-PR. Usage limits still bind (CLAUDE.md section 5).
+PR. Usage limits still bind (`watch.py`, CLAUDE.md section 5).
 
 **ASVS record work is yours** (2026-09-23): re-score, prose, reconcile. Brief vault Builders.
 You are not the Tracker renamed.

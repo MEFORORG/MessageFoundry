@@ -561,7 +561,13 @@ it reads against `CLAUDE.md` at `aba973b282` rather than at `ddf350e1d0`.
 **The owner said on 2026-11-05, in a Manager session: *"There is no steward... that seat was
 retired months ago."*** When it went, and under which ruling, is not recorded in this repository:
 neither this page, the git history of `CLAUDE.md` and `docs/roles/`, nor `seats.json` holds a date.
-No successor seat is recorded either, so none is named here. The roster row section 5 carried until then, verbatim:
+No successor seat is recorded either, so none is named here. **The tree does not bear out the
+"months" by itself, and this page does not settle it:** the Manager card change of 2026-10-26
+(`a63e960ef2`) still cited korus `STEWARD.md` for usage limits, ADR 0211's amendment of 2026-11-03
+records an owner ruling of 2026-11-02 about the Steward's `watch.py`, and korus PR 260 edited
+`roles/STEWARD.md` on 2026-11-02. Read that as a mechanism that ran on under the seat's name, or as
+a retirement nobody wrote down; which one is the owner's to say. The roster row section 5 carried
+until then, verbatim:
 
     | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
 
@@ -571,7 +577,8 @@ korus `roles/STEWARD.md` and `roles/COMMON.md` define them."*
 **The seat went; the usage controls did not.** Any seat still reads usage itself with `get_usage`.
 The user-scope usage watch hook, `watch.py`, still prints the weekly ladder at SessionStart and
 UserPromptSubmit, and by the owner's ruling of 2026-10-31 the weekly window carries the stop, so its
-HOLD NEW WORK state still means start no new work. The 90 percent gate on a new Workflow still binds.
+HOLD NEW WORK state still means start no new work. The Lander is exempt from the ladder's three states, as
+ADR 0211 records from korus `STEWARD.md` 3e. The 90 percent gate on a new Workflow still binds.
 `scripts/hooks/usage-headroom-inject.ps1` still reads a `status.json` it calls the Steward's, as a
 labelled fallback; a retired seat can leave a mechanism running, and that one is left as it is.
 `docs/roles/seats.json` resolves `steward` to a retirement notice and `docs/roles/steward.card.md`

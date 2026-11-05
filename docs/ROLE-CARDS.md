@@ -338,8 +338,10 @@ improvement as live seats, and it says of itself that it is a partial list. Sect
 settles this directly: a document naming a retired seat is stale, and section 5 wins.
 
 **korus `roles/README.md` names the seven seats retired on 2026-09-01 in prose, and its live table
-is current.** That table runs six seats: the five here plus a **Special** seat the owner added on
-2026-09-16 as an addition, not a replacement. Section 5 still settles the roster for this
+was current when this section was written.** That table then ran six seats, among them a
+**Special** seat the owner added on 2026-09-16 as an addition, not a replacement. At korus
+`origin/main` on 2026-11-05 it still listed the Steward, which this repository retired that day;
+korus records that retirement in its own change, not here. Section 5 still settles the roster for this
 repository: it is the **naming** of a retired seat that goes stale, not the whole document that
 names one on purpose, so the cards follow section 5's roster.
 
@@ -356,7 +358,7 @@ also added `roles/README.md`; korus itself was initialised 35 minutes earlier). 
 separate, later owner ruling that they are READ at `origin/main` -- conflating the two dates the
 move two days late, which this document and a test docstring both did.
 
-**Every live seat has a korus playbook, and all six cards cite one.** Measured at korus
+**Every live seat had a korus playbook, and all six cards then cited one.** Measured at korus
 `origin/main`, tip `efd7b42`, 2026-09-19: `roles/SPECIAL.md` 248 lines, `roles/WATCHDOG.md` 398,
 `roles/MANAGER.md` 459, `roles/BUILDER.md` 1,077, `roles/LANDER.md` 1,500, `roles/STEWARD.md`
 1,545. Control, run the same way so it can fail on its own: `roles/NOTASEAT.md` returns 404.
@@ -562,7 +564,7 @@ Test-driven: the tests were written first and watched fail before any of the cod
 | A sixth role card | For the seat the owner retired the same day (`12063c91e`), deliberately unnamed here per owner instruction 2026-09-16. |
 | `docs/roles/builder.card.md` | Role card |
 | `docs/roles/regulator.card.md` | Role card. Its playbook is korus `roles/REGULATOR.md`, which existed on 2026-09-02 and which the card cites. |
-| `docs/roles/steward.card.md` | Role card |
+| `docs/roles/steward.card.md` | Role card. Removed on 2026-11-05, when the owner said the Steward seat had been retired. |
 | `docs/roles/lander.card.md` | Role card |
 | `scripts/hooks/role-card-inject.ps1` | The SessionStart hook |
 | `tests/test_role_cards.py` | The suite |
