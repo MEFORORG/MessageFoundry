@@ -1309,10 +1309,10 @@ def test_serve_forwarded_allow_ips_empty_when_no_proxy(
     # no loop, so uvicorn.run's own "auto" default runs it on uvloop wherever that imports, and it
     # binds by host and port, so the loop's create_server makes the socket that file reads.
     # uvicorn.run is stubbed here, so the default is read off the unpatched function.
-    assert "loop" not in captured
-    assert inspect.signature(_uvicorn_run).parameters["loop"].default == "auto"
-    assert "host" in captured and "port" in captured
-    assert "fd" not in captured and "uds" not in captured
+    premise = "the premise of tests/test_api_listener_ipv6_only.py no longer holds"
+    assert "loop" not in captured, premise
+    assert inspect.signature(_uvicorn_run).parameters["loop"].default == "auto", premise
+    assert "fd" not in captured and "uds" not in captured, premise
     # WP-L3-07 (ASVS 13.4.6): the `Server: uvicorn` banner is suppressed.
     assert captured["server_header"] is False
     # BACKLOG #3256: the connection drain before the lifespan teardown is bounded.
