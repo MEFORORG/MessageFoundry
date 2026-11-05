@@ -6843,11 +6843,12 @@ _SDDL_SID_ALIASES: Mapping[str, str] = MappingProxyType({"SY": "S-1-5-18", "BA":
 _STORE_DIR_TRUSTED_SIDS = ("S-1-5-18", "S-1-5-32-544")
 #: One per-service virtual account, NT SERVICE\<name>: S-1-5-80 plus exactly five sub-authorities.
 #: NT SERVICE\ALL SERVICES is S-1-5-80-0 and does NOT match, because it admits every service.
-_SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+")
+_SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+", re.ASCII)
 #: A machine- or domain-relative account SID: S-1-5-21, the three sub-authorities naming the machine
 #: or the domain, then the RID. A local user, a domain user and a gMSA all have this shape; so do
 #: their groups, which is why the shape alone admits nothing (see :func:`_account_type_refusal`).
-#: ASCII digits only: ``\d`` alone also matches other scripts' digits, which ``int`` accepts.
+#: ASCII digits only, here and in :data:`_SERVICE_SID`: ``\d`` alone also matches other scripts'
+#: digits, which ``int`` accepts.
 _ACCOUNT_SID = re.compile(r"S-1-5-21-\d+-\d+-\d+-(\d+)", re.ASCII)
 #: The lowest RID Windows hands an account or group it creates. Below it sit the built-in ones: at
 #: least Administrator (500), Guest (501), krbtgt (502), DefaultAccount (503) and the well-known
@@ -6963,10 +6964,10 @@ def _hardening_refusal(directory: _SddlDacl) -> str | None:
     # rewritten -- and warned about -- on every start.
     if named != set(_STORE_DIR_TRUSTED_SIDS):
         return "it does not grant both SYSTEM and Administrators"
-    # ONE run-as principal, of either kind: two service accounts, two users, or a service account
-    # beside a user are all refused, as the installer grants exactly one.
+    # At most ONE run-as principal, of either kind: two service accounts, two users, or a service
+    # account beside a user are all refused. The installer grants one, or none for LocalSystem.
     if len(run_as) > 1:
-        return "it grants more than one service or user account"
+        return f"it grants more than one service or user account ({', '.join(sorted(run_as))})"
     if directory.owner is None or (
         directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in run_as
     ):
@@ -7017,13 +7018,22 @@ def _account_type_refusal(sid: str) -> str | None:
     return None
 
 
-def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...]:
-    """The principals the trio is granted in a HARDENED ``directory``: SYSTEM, Administrators, then
-    its run-as account if it names one. Only for a directory :func:`_hardening_refusal` has passed;
-    taking that answer from the caller keeps the account lookup to one per check. The answer names
-    only principals the directory allows, never who happens to be opening."""
+def _hardening_verdict(directory: _SddlDacl) -> tuple[tuple[str, ...] | None, str | None]:
+    """``(grants, None)`` when ``directory`` is HARDENED, else ``(None, refusal)``: one check, so the
+    account lookup :func:`_hardening_refusal` may make runs once, and the grants are never built for
+    a directory that was not checked. The grants are SYSTEM, Administrators, then the run-as account
+    if the directory names one: only principals the directory allows, never who happens to be
+    opening."""
+    refusal = _hardening_refusal(directory)
+    if refusal is not None:
+        return None, refusal
     run_as = (sid for _t, _f, _r, sid in directory.aces if sid not in _STORE_DIR_TRUSTED_SIDS)
-    return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(run_as))
+    return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(run_as)), None
+
+
+def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
+    """The grants of :func:`_hardening_verdict`, or ``None`` when ``directory`` is not hardened."""
+    return _hardening_verdict(directory)[0]
 
 
 def _sddl_flag_set(flags: str) -> set[str]:
@@ -7203,7 +7213,7 @@ def _reaches_through_a_link(path: Path) -> bool:
 
 
 def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
-    """The trio grants for a store in ``directory`` (see :func:`_hardening_refusal`), or ``None``
+    """The trio grants for a store in ``directory`` (see :func:`_hardening_verdict`), or ``None``
     for the owner-only rewrite: off Windows, through a link, or when the DACL cannot be read or
     parsed."""
     if not _is_windows() or _reaches_through_a_link(directory):
@@ -7214,7 +7224,7 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
     parsed = _parse_sddl_dacl(sddl)
     if parsed is None:
         return None
-    reason = _hardening_refusal(parsed)
+    grants, reason = _hardening_verdict(parsed)
     if reason is not None:
         # A locked-down directory (inheritance off) that still fails the test is the case an operator
         # needs to hear about: the fallback brings back the Wave 0 lockout, whose only other symptom
@@ -7225,15 +7235,14 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
         if parsed.protected and not any(sid == "OW" for _t, _f, _r, sid in parsed.aces):
             log.warning(
                 "%s is locked down but %s, so the store there is restricted owner-only; the service "
-                "account and an operator's provision-admin cannot then both open it (ADR 0163 note "
-                "of 2026-09-24)",
+                "account and an operator's provision-admin cannot then both open it (ADR 0163 notes "
+                "of 2026-09-24 and 2026-11-05)",
                 directory,
                 reason,
             )
         else:
             log.debug("%s is not a hardened store directory: %s", directory, reason)
-        return None
-    return _hardened_trio_grants(parsed)
+    return grants
 
 
 def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = None) -> bool:

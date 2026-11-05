@@ -65,9 +65,7 @@ _INSTALLER_DIR = _installer_dir_for(_TI)
 
 def _grants(sddl: str) -> tuple[str, ...] | None:
     dacl = store_mod._parse_sddl_dacl(sddl)
-    if dacl is None or store_mod._hardening_refusal(dacl) is not None:
-        return None
-    return store_mod._hardened_trio_grants(dacl)
+    return None if dacl is None else store_mod._hardened_trio_grants(dacl)
 
 
 def test_the_installers_data_directory_is_hardened() -> None:
@@ -285,7 +283,9 @@ def test_a_second_run_as_principal_is_refused(
     sddl = f"O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA){aces}"
     dacl = store_mod._parse_sddl_dacl(sddl)
     assert dacl is not None
-    assert store_mod._hardening_refusal(dacl) == "it grants more than one service or user account"
+    assert store_mod._hardening_refusal(dacl) == (
+        f"it grants more than one service or user account ({', '.join(sorted(extra))})"
+    )
     assert lookup.asked == [], label
 
 
@@ -335,6 +335,27 @@ def test_a_resolved_named_run_as_directory_is_shared_quietly(
     assert lookup.asked == [_GMSA]
 
 
+@pytest.mark.parametrize(("label", "kind"), [("a group", 2), ("an unresolvable account", None)])
+def test_a_refused_named_run_as_is_warned_about_by_name_and_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    label: str,
+    kind: int | None,
+) -> None:
+    # A group with an assigned RID, the SID type refusal, through _store_dir_grants: the fallback
+    # must be NAMED, with the account and why, and point at the rule that refused it.
+    monkeypatch.setattr(store_mod, "_is_windows", lambda: True)
+    monkeypatch.setattr(store_mod, "_reaches_through_a_link", lambda _p: False)
+    monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _p, **_kw: _installer_dir_for(_GMSA))
+    _install_lookup(monkeypatch, _Lookup({_GMSA: kind}))
+    with caplog.at_level("WARNING", logger=store_mod.log.name):
+        assert store_mod._store_dir_grants(tmp_path) is None, label
+    [message] = [r.getMessage() for r in caplog.records]
+    assert _GMSA in message and "2026-11-05" in message, message
+    assert ("SID type 2" in message) if kind == 2 else ("could not resolve" in message), message
+
+
 def test_a_refused_locked_directory_is_logged_and_an_ordinary_one_is_not(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -361,7 +382,7 @@ def test_a_refused_locked_directory_is_logged_and_an_ordinary_one_is_not(
         # A gMSA run-as is admitted once it resolves to a user account (the test after this one);
         # one this host cannot resolve is still refused, and loudly.
         ("an unresolvable gMSA run-as", f"O:BA{installer}(A;OICI;0x1301bf;;;{_GMSA})"),
-        ("a group run-as", f"O:BA{installer}(A;OICI;0x1301bf;;;S-1-5-21-9-9-9-513)"),
+        ("a built-in group run-as", f"O:BA{installer}(A;OICI;0x1301bf;;;S-1-5-21-9-9-9-513)"),
         ("a NetworkService run-as", f"O:BA{installer}(A;OICI;0x1301bf;;;NS)"),
         ("CREATOR OWNER left over", f"O:{user}{installer}(A;OICIIO;GA;;;CO){service}"),
     ):
@@ -751,20 +772,20 @@ def test_the_dacl_reader_agrees_with_icacls(tmp_path: Path) -> None:
 def test_the_real_lookup_resolves_this_user_and_refuses_what_it_cannot() -> None:
     # LookupAccountSidW itself, on SIDs every Windows host can and cannot resolve. The decisions
     # above inject it; this is the one place the real call is checked.
-    me = _my_sid()
-    assert store_mod._lookup_sid_type(me) == store_mod._SID_TYPE_USER, me
     assert store_mod._lookup_sid_type("S-1-5-32-545") == 4, "BUILTIN\\Users is an alias"
+    assert store_mod._lookup_sid_type("S-1-5-18") == 5, "SYSTEM is a well-known SID"
     assert store_mod._lookup_sid_type(_LOCAL_USER) is None, "no machine or domain has this SID"
     assert store_mod._lookup_sid_type("not a sid") is None
     # Through the decision, with the real lookup: an unresolvable account is refused.
     assert _grants(_installer_dir_for(_LOCAL_USER)) is None
-    rid = int(me.rsplit("-", 1)[1])
-    if rid >= store_mod._FIRST_ASSIGNED_RID:
-        assert _grants(_installer_dir_for(me)) == (_SY, _BA, me)
-    else:
-        # The hosted runners run as the built-in Administrator (RID 500, CI run 36039014999): a user
-        # account the rule still refuses by its RID.
+    me = _my_sid()
+    if store_mod._account_shape_refusal(me) is not None:
+        # The hosted runners run as the built-in Administrator (RID 500, CI run 36039014999); an
+        # Entra ID account's SID is S-1-12-1-...: users the rule refuses by their shape.
         assert _grants(_installer_dir_for(me)) is None
+        pytest.skip(f"this user's SID {me} is not one the rule may admit")
+    assert store_mod._lookup_sid_type(me) == store_mod._SID_TYPE_USER, me
+    assert _grants(_installer_dir_for(me)) == (_SY, _BA, me)
 
 
 @_windows_only
@@ -773,8 +794,8 @@ def test_a_real_directory_granting_this_user_as_run_as_is_hardened(tmp_path: Pat
     # directory it made, and the rule admits the run-as as owner, so the installer's shape with this
     # user in the service's place is hardened through the real reader and the real lookup.
     me = _my_sid()
-    if int(me.rsplit("-", 1)[1]) < store_mod._FIRST_ASSIGNED_RID:
-        pytest.skip(f"this user's RID is below {store_mod._FIRST_ASSIGNED_RID}, so it is refused")
+    if store_mod._account_shape_refusal(me) is not None:
+        pytest.skip(f"this user's SID {me} is not one the rule may admit")
     data = tmp_path / "data"
     data.mkdir()
     try:

@@ -315,8 +315,8 @@ installing that way would have had the service and the provisioning operator loc
 first deployment.
 
 **Decision (owner ruling 2026-11-05, in the batch 608 Manager's chat).** The hardened directory may
-grant exactly one principal beyond SYSTEM and Administrators. It is a per-service virtual account as
-before, or a SID that `LookupAccountSidW` resolves to `SidTypeUser` and whose RID is 1000 or more. It
+grant at most one principal beyond SYSTEM and Administrators (none for a LocalSystem install, as
+before). It is a per-service virtual account as before, or a SID that `LookupAccountSidW` resolves to `SidTypeUser` and whose RID is 1000 or more. It
 gets the same Modify right (`0x1301bf`) and `OICI` inheritance the virtual account gets, and may own
 the directory, as the virtual account may. In `messagefoundry/store/store.py`,
 `_account_shape_refusal` requires a machine- or domain-relative SID (`S-1-5-21-` plus three
@@ -325,7 +325,7 @@ lookup to answer `SidTypeUser`. A failed lookup and every other type are refused
 with an assigned RID has a user's shape, and admitting one would widen the store to every member.
 A RID under 1000 is refused before any lookup, so the built-in Administrator (500) and Guest (501)
 are refused although they are user accounts. The lookup runs last, after every cheaper refusal, and
-once per open.
+once per check (`_hardening_verdict`).
 
 **What did not change.** The rule is still an allow-list. A deny entry, a wrong right or inheritance,
 a second principal of either kind, an owner outside the set, inheritance left on, a link in the path,
@@ -333,17 +333,25 @@ and the OWNER RIGHTS temp-directory exemption all stand exactly as the 2026-09-2
 The trio still names only principals the directory allows.
 
 **What it widens.** One principal kind: a resolved user account that the directory already grants
-Modify in the installer's shape. That account is the service's own identity, and the directory
-already grants it Modify, so the trio grants it no right the directory did not.
+Modify in the installer's shape, so the trio grants it no right the directory did not. **The code
+does not check that this account is the one the service runs as.** It admits whichever resolved user
+the directory grants. On an installed directory that is the `-ServiceAccount` the installer granted.
+Anyone who could grant another user there already holds WRITE_DAC over the directory: an
+Administrator, SYSTEM or the directory's owner, each of whom the trio already admits. Tying the
+admitted SID to the service's configured account was not chosen.
 
 **Left open, at least.** What a gMSA resolves to is unmeasured: no hosted runner has a domain. A
 gMSA is a computer-class object in Active Directory, so it is expected to resolve as `SidTypeUser`;
 if it resolves as anything else, it is refused and the WARNING names the type. A domain account
-resolves through a domain controller or the LSA lookup cache, so a start where neither answers gets
-the owner-only rewrite, which also drops the operator's entry from a trio written on an earlier
-start. A computer account (`DOMAIN\HOST$`) is expected to resolve the same way, and would then be
-admitted if a directory granted it Modify in the installer's shape; unmeasured too. The local-user smoke leg is still not in the
-`windows-service-smoke` matrix (BACKLOG #3760 closing step 2, which waits on #3938).
+resolves through a domain controller or the LSA lookup cache, with no timeout of its own, so a slow
+controller delays the open. A start where neither answers gets the owner-only rewrite: the `-wal` and
+`-shm` that start creates, and a new store, are then the opener's alone until a later start resolves
+the account. An existing store file keeps its explicit entries, because that rewrite replaces only
+the principal it names (measured, above). A computer account (`DOMAIN\HOST$`) is expected to resolve
+the same way, and would then be admitted if a directory granted it Modify in the installer's shape;
+unmeasured too. No run has started the service as a named account. The local-user smoke leg is
+still not in the `windows-service-smoke` matrix (BACKLOG #3760 closing step 2, which waits on
+#3938).
 
 ## How this was reached
 

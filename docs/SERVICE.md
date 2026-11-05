@@ -459,25 +459,39 @@ process and of the engine's processes runs as SYSTEM, carries no restricting SID
 `SeChangeNotifyPrivilege`. Its first run is in the merge queue.
 
 **No leg runs a named account yet, a local user or a gMSA.** A local-user leg is wired in `ci.yml`
-and left out of the matrix. A gMSA also needs an Active Directory domain that the runner has
-joined, and no hosted runner has one.
+and left out of the matrix. Listing it now would still fail: the installer's read-back of the
+account it registered would refuse the `HOST\user` spelling the leg passes (BACKLOG #3938). A
+gMSA leg would also need an Active Directory domain that the runner has joined, and no hosted
+runner has one.
 
 **A SQLite store in the data directory admits one named account.** The store shares its files
 between the service and the operator only when the data directory grants SYSTEM, Administrators
-and exactly one run-as account, in the shape the installer writes. That account is either a
-per-service virtual account, `NT SERVICE\<name>`, or one account that Windows resolves to a user
-account with a RID of 1000 or more. A local user or a gMSA named with `-ServiceAccount` is such an
-account. The engine resolves it with `LookupAccountSid` each time it opens the store. It refuses
+and at most one run-as account, in the shape the installer writes. A `-AllowLocalSystem` install
+grants none. The run-as account is either a per-service virtual account, `NT SERVICE\<name>`, or
+one account that Windows resolves to a user account with a RID of 1000 or more. A local user or a
+gMSA named with `-ServiceAccount` is such an account. The engine does not check that this account
+is the one the service runs as. It admits whichever user the directory grants, so grant the data
+directory to the service account only, as the installer does.
+
+The engine resolves the account with `LookupAccountSid` each time it opens the store. It refuses
 the directory when the lookup fails, when the account resolves to anything but a user, such as a
 group, or when the directory names a second account. A refused directory gets the owner-only
-store, and the engine logs a WARNING naming the account and the reason. Then the service and the
-operator who provisions the first Administrator would lock each other out of the store.
+store, and the engine logs a WARNING naming the reason. Then the service and the operator who
+provisions the first Administrator would lock each other out of the store.
 
-Two cases are unmeasured. No run has shown what a gMSA resolves to. A gMSA is a kind of computer
-account in Active Directory, so it is expected to resolve as a user. If it resolves as anything
-else, the WARNING names that type. And a gMSA resolves through a domain controller, or through
-the local lookup cache when no controller answers. A start where neither answers gets the
-owner-only store. The rule and its reasons are in ADR 0163, *Note (2026-11-05)*.
+At least these are unmeasured:
+
+- **A named account end to end.** No run has installed and started the service as a local user or
+  a gMSA.
+- **What a gMSA resolves to.** A gMSA is a kind of computer account in Active Directory, so it is
+  expected to resolve as a user. If it resolves as anything else, the WARNING names that type.
+- **A start with no domain controller.** A gMSA resolves through a domain controller, or through
+  the local lookup cache when no controller answers. The lookup has no timeout of its own, so a
+  slow controller delays the open. A start where neither answers gets the owner-only store: the
+  `-wal` and `-shm` files that start creates, and a new store, are then the service's alone until
+  a later start resolves the account.
+
+The rule and its reasons are in ADR 0163, *Note (2026-11-05)*.
 
 **`-SkipRestrictedServiceSid` opts out** for the default account. Use it only when the engine must
 write somewhere you cannot grant to `NT SERVICE\<ServiceName>`. The engine can then write wherever
