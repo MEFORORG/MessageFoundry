@@ -413,6 +413,35 @@ def _write_out(
     return _anonymize_to(tmp_path, monkeypatch, out)
 
 
+def _out_help(command: str) -> str:
+    parser = _build_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    out = next(a for a in sub.choices[command]._actions if "--out" in a.option_strings)
+    return " ".join((out.help or "").split())
+
+
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+def test_out_help_states_what_the_writer_does_to_the_file(command: str) -> None:
+    # Vault BACKLOG #3166 step 4: the accepted behaviour changes are met only when the tee's own
+    # text states them, not the ledger alone.
+    text = _out_help(command)
+    for consequence in (
+        "LF on every OS, Windows included",
+        "owner-only (0600)",
+        "a read-only (0444) FILE is overwritten",
+        "a hard link at FILE is broken",
+        "a symbolic link at FILE is replaced",
+        "On Windows an existing FILE is written in place and keeps its access list",
+    ):
+        assert consequence in text, f"{command} --out help lacks {consequence!r}: {text}"
+
+
+def test_compare_out_help_states_that_an_existing_file_is_replaced() -> None:
+    text = _out_help("compare")
+    assert "owner-only (0600)" in text
+    assert "an existing FILE is replaced" in text
+
+
 @pytest.mark.parametrize("command", _OUT_COMMANDS)
 def test_out_goes_through_the_owner_only_writer(
     command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

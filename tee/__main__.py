@@ -142,6 +142,16 @@ def _parse_age(spec: str) -> float:
     return day.timestamp()
 
 
+# What ``export --out`` and ``anonymize-captures --out`` do to the file, stated where an operator
+# reads it (vault BACKLOG #3166 step 4). :func:`_write_owner_only` is the source of record.
+_OUT_IN_PLACE_ON_WINDOWS = (
+    "Lines end in LF on every OS, Windows included. On POSIX the file is created owner-only (0600), "
+    "and an existing FILE is replaced rather than written into: a read-only (0444) FILE is "
+    "overwritten, a hard link at FILE is broken, and a symbolic link at FILE is replaced, not "
+    "followed. On Windows an existing FILE is written in place and keeps its access list."
+)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tee", description="Standalone MLLP tee relay (backlog #14)"
@@ -233,7 +243,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=None, metavar="N", help="cap to the most recent N rows"
     )
     export.add_argument(
-        "--out", metavar="FILE", default=None, help="write to FILE instead of stdout"
+        "--out",
+        metavar="FILE",
+        default=None,
+        help=f"write to FILE instead of stdout. {_OUT_IN_PLACE_ON_WINDOWS}",
     )
 
     purge = sub.add_parser("purge", help="delete logged rows (and captured bodies) from the DB")
@@ -286,7 +299,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out",
         metavar="FILE",
         default=None,
-        help="write the JSON report to FILE instead of stdout",
+        help=(
+            "write the JSON report to FILE instead of stdout. On POSIX the file is created "
+            "owner-only (0600). On every OS an existing FILE is replaced rather than written into, "
+            "so on Windows the report takes its folder's access list"
+        ),
     )
     compare.add_argument(
         "--show-diffs",
@@ -312,7 +329,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     anon.add_argument("--db", required=True, metavar="PATH", help="tee SQLite DB (captured bodies)")
     anon.add_argument(
-        "--out", required=True, metavar="FILE", help="output JSONL of de-identified messages"
+        "--out",
+        required=True,
+        metavar="FILE",
+        help=f"output JSONL of de-identified messages. {_OUT_IN_PLACE_ON_WINDOWS}",
     )
     anon.add_argument(
         "--direction",

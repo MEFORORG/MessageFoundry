@@ -137,6 +137,28 @@ captured message bodies** (so it's safe to hand to a reviewer or an AI session).
 python -m tee export --db ./tee.db --naks-only --since 24h --out ./tee-review.json
 ```
 
+### What `--out` does to the file
+
+`export --out`, `anonymize-captures --out` and `compare --out` share one writer,
+`_write_owner_only` in `tee/__main__.py`, which is the source of record. At least these
+consequences follow from it:
+
+* **On POSIX the file is created owner-only (`0600`)**, whatever the umask.
+* **On POSIX an existing file is replaced, not written into.** A read-only (`0444`) file is
+  overwritten, a hard link at the path is broken (the other name keeps the old contents), and a
+  symbolic link at the path is replaced rather than followed. A named stream such as `/dev/stdout`
+  is written through. These hold for all three commands.
+* **`export` and `anonymize-captures` write LF line endings on every OS**, Windows included, so a
+  Windows `export` file no longer ends its lines in CRLF.
+* **On Windows, `export` and `anonymize-captures` write an existing file in place**, so it keeps its
+  access list and owner. A file this account may not write, or one marked read-only, is an error
+  and exit 1; it is never replaced. A new file takes its folder's access list.
+* **`compare` replaces an existing file on Windows too**, so the report takes its folder's access
+  list, whatever list the old file had. It writes the platform's line endings.
+
+The POSIX replace and the LF line endings were accepted as behaviour changes by a Lander decision
+under the owner's driver rule (vault BACKLOG #3166), not by a standalone owner ruling.
+
 ### Purge
 
 `python -m tee purge` clears the log DB and reclaims disk (`VACUUM`). With no `--before` it purges
