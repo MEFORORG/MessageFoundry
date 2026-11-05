@@ -1121,6 +1121,62 @@ def verify_refused_body_digest(cipher: Cipher, wire: bytes, record: object) -> b
     return _mac_matches(_bytes_mac(_derive_refused_body_digest_key(audit_key), wire), digest)
 
 
+# HKDF info label for the key a dual-control reload hold binds the environment value file under
+# (vault BACKLOG #2596). Its own label, so this MAC never verifies as a body digest.
+_CONFIG_VALUE_FILE_INFO = b"mefor/config-value-file/v1"
+#: The two HKDF-SHA256 steps the value-file binding key takes from the DEK, as its record names them.
+CONFIG_VALUE_FILE_KDF = (
+    AUDIT_SCHEME_IN_HEAP.kdf + ",hkdf-sha256:" + _CONFIG_VALUE_FILE_INFO.decode("ascii")
+)
+
+
+def _derive_config_value_file_key(audit_key: bytes) -> bytes:
+    """The value-file binding key derived from one audit-chain key, under its own label."""
+    return _derive_from_audit_key(audit_key, _CONFIG_VALUE_FILE_INFO)
+
+
+def config_value_file_mac(cipher: Cipher, material: bytes) -> dict[str, str] | None:
+    """A keyed digest of the environment value file a held reload binds (vault BACKLOG #2596).
+
+    ``material`` is :func:`~messagefoundry.config.fingerprint.value_file_material`. The value file
+    can hold credentials, and the hold's params are shown to every approver and stored in plain
+    JSON, so a plain hash would let a reader test a guess of a low-entropy value offline. This is
+    HMAC-SHA256 under a key HKDF-SHA256 derives from the in-heap audit-chain key under
+    ``mefor/config-value-file/v1``, so only a holder of the store key can test one. Every engine
+    shard and cluster node opens the one store with the same key, so each computes the same
+    record. Returns ``{"alg", "kdf", "key_id", "digest"}``, or ``None`` when there is no in-heap
+    key: a keyless store, or a Vault Transit cipher whose audit key never enters the engine. The
+    caller then binds nothing, never a plain hash."""
+    audit_key = cipher.audit_mac_key()
+    if audit_key is None:
+        return None
+    return {
+        "alg": BODY_DIGEST_ALG,
+        "kdf": CONFIG_VALUE_FILE_KDF,
+        "key_id": audit_key_id(audit_key),
+        "digest": _bytes_mac(_derive_config_value_file_key(audit_key), material).finalize().hex(),
+    }
+
+
+def verify_config_value_file_mac(cipher: Cipher, material: bytes, record: object) -> bool | None:
+    """Whether ``material`` is what a :func:`config_value_file_mac` ``record`` was taken of,
+    compared in constant time (vault BACKLOG #2596). ``None`` when it cannot be checked: ``record``
+    is not such a dict, names another scheme, holds no HMAC-SHA256 output in hex, or names an audit
+    key not in the cipher's keyring, as after a rotation drops the retired key, and always on a
+    cipher with no in-heap key. A caller refuses on anything but ``True``."""
+    if not isinstance(record, dict):
+        return None
+    if (record.get("alg"), record.get("kdf")) != (BODY_DIGEST_ALG, CONFIG_VALUE_FILE_KDF):
+        return None
+    key_id, digest = record.get("key_id"), record.get("digest")
+    if not isinstance(key_id, str) or not isinstance(digest, str):
+        return None
+    audit_key = cipher.audit_mac_keyring().get(key_id)
+    if audit_key is None:
+        return None
+    return _mac_matches(_bytes_mac(_derive_config_value_file_key(audit_key), material), digest)
+
+
 def new_store_salt() -> bytes:
     """Mint a random store salt (ADR 0196). A store calls this once, when it is created or restored."""
     return os.urandom(STORE_SALT_BYTES)
