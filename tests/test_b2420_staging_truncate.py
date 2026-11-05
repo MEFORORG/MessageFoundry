@@ -15,9 +15,12 @@ Every test uses synthetic bytes only."""
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -604,3 +607,162 @@ def test_a_file_that_vanishes_only_after_its_open_is_still_reported(tmp_path, mo
     monkeypatch.setattr(os, "ftruncate", gone)
     assert dr_backup._empty_files_in_place(staging) == ["extracted_store.db"]
     assert (staging / "extracted_store.db").read_bytes() == b"synthetic plaintext"
+
+
+# --- the name screened is the name truncated, and a listed name that is gone is reported ---------
+#
+# Two defects of this item's class, rolled in 2026-11-04 from engine PR 2744's open findings 1 and 2.
+
+_PLAINTEXT = b"synthetic plaintext"
+_REWRITTEN = "(a name Windows opens as another object, not {})"
+_GONE = "(moved or removed before it was emptied, not truncated)"
+
+
+def _verbatim(root: Path, *names: str) -> str:
+    """``root/names...`` behind the verbatim prefix, which has Win32 open each name exactly as
+    written, so a test can make and read the names an ordinary open would rewrite."""
+    return "\\\\?\\" + os.path.abspath(root) + "".join("\\" + name for name in names)
+
+
+def _plant(root: Path, *names: str) -> None:
+    with open(_verbatim(root, *names), "wb") as handle:
+        handle.write(_PLAINTEXT)
+
+
+def _size(root: Path, *names: str) -> int:
+    return os.stat(_verbatim(root, *names)).st_size
+
+
+@pytest.fixture
+def win_tmp(tmp_path: Path) -> Iterator[Path]:
+    """``tmp_path``, removed through the verbatim prefix afterwards: an ordinary removal cannot reach
+    a name such as ``NUL`` or ``a.tar.``."""
+    yield tmp_path
+    shutil.rmtree(_verbatim(tmp_path), ignore_errors=True)
+
+
+_windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="Win32 path rewriting is Windows-only"
+)
+
+
+@_windows_only
+@pytest.mark.parametrize("name", ["extracted_store.db.", "extracted_store.db ", "NUL"])
+def test_a_name_windows_rewrites_is_reported_and_not_truncated_as_another_file(
+    win_tmp: Path, name: str
+) -> None:
+    """Win32 drops a trailing dot or space, and opens a device name as the device, before it opens a
+    path. Red before the fix: `extracted_store.db.` was checked and truncated as
+    `extracted_store.db`, so the listed file kept its plaintext; with no such sibling the open found
+    nothing and read as nothing to empty. Either way the report called the directory clean."""
+    staging = win_tmp / "mefor-verify-planted"
+    staging.mkdir()
+    _plant(staging, name)
+    sibling = name.rstrip(". ")
+    if sibling != name:
+        (staging / sibling).write_bytes(b"synthetic sibling")
+    unproven = dr_backup._empty_files_in_place(staging)
+    assert unproven == [f"{name} {_REWRITTEN.format('truncated')}"]
+    assert _size(staging, name) == len(_PLAINTEXT)
+    if sibling != name:
+        # The control: the sibling is a listed file of its own, and is emptied as itself.
+        assert (staging / sibling).read_bytes() == b""
+
+
+@_windows_only
+def test_a_directory_name_windows_rewrites_is_not_walked_as_another_directory(
+    win_tmp: Path,
+) -> None:
+    """`sub.` opens as `sub`. Red before the fix: the walk held and listed `sub` in its place, so
+    `sub.`'s file was never reached, and nothing reported it."""
+    staging = win_tmp / "mefor-verify-planted"
+    staging.mkdir()
+    os.mkdir(_verbatim(staging, "sub."))
+    _plant(staging, "sub.", "inner.tar")
+    (staging / "sub").mkdir()
+    (staging / "sub" / "own.tar").write_bytes(_PLAINTEXT)
+    unproven = dr_backup._empty_files_in_place(staging)
+    assert unproven == [f"sub./ {_REWRITTEN.format('walked')}"]
+    assert _size(staging, "sub.", "inner.tar") == len(_PLAINTEXT)
+    assert (staging / "sub" / "own.tar").read_bytes() == b""
+
+
+@_windows_only
+def test_a_staging_root_whose_name_windows_rewrites_is_not_walked(win_tmp: Path) -> None:
+    """A sweep can hand the fail-safe a planted `mefor-backup-x.`, which opens as `mefor-backup-x`."""
+    os.mkdir(_verbatim(win_tmp, "mefor-backup-x."))
+    other = win_tmp / "mefor-backup-x"
+    other.mkdir()
+    (other / "archive.tar").write_bytes(_PLAINTEXT)
+    unproven = dr_backup._empty_files_in_place(win_tmp / "mefor-backup-x.")
+    assert unproven == [f"mefor-backup-x./ {_REWRITTEN.format('walked')}"]
+    assert (other / "archive.tar").read_bytes() == _PLAINTEXT
+
+
+@_windows_only
+def test_the_final_path_compare_refuses_a_rewritten_name_the_screen_missed(
+    win_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backstop for the name screen: with the screen told to pass every name, the file opened
+    for `a.tar.` and the directory held for `sub.` have final paths other than the names listed, so
+    neither is emptied as the listed name."""
+    staging = win_tmp / "mefor-verify-planted"
+    staging.mkdir()
+    _plant(staging, "a.tar.")
+    (staging / "a.tar").write_bytes(b"synthetic sibling")
+    os.mkdir(_verbatim(staging, "sub."))
+    _plant(staging, "sub.", "inner.tar")
+    (staging / "sub").mkdir()
+    monkeypatch.setattr(dr_backup, "_win_opens_another", lambda path: False)
+    unproven = dr_backup._empty_files_in_place(staging)
+    assert sorted(unproven) == [
+        "a.tar. (changed while being emptied, not truncated)",
+        "sub./ (changed while being emptied, not walked)",
+    ]
+    assert _size(staging, "a.tar.") == len(_PLAINTEXT)
+    assert _size(staging, "sub.", "inner.tar") == len(_PLAINTEXT)
+
+
+def test_a_file_renamed_after_the_listing_is_reported_not_read_as_nothing_to_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Renamed between the listing and the screen. Red before the fix: the screen's "not found" read
+    as nothing to empty, so the teardown called the directory clean while `moved.tar` still held
+    its plaintext under a name the walk had not listed. Both platforms."""
+    staging = tmp_path / "mefor-verify-planted"
+    staging.mkdir()
+    (staging / "a.tar").write_bytes(_PLAINTEXT)
+    seam = "_win_held_walk" if sys.platform == "win32" else "_walk"
+    real_walk = getattr(dr_backup, seam)
+
+    def rename_after_listing(*args: Any, **kwargs: Any) -> Iterator[Any]:
+        for step in real_walk(*args, **kwargs):
+            if "a.tar" in step[2]:
+                os.rename(staging / "a.tar", staging / "moved.tar")
+            yield step
+
+    monkeypatch.setattr(dr_backup, seam, rename_after_listing)
+    assert dr_backup._empty_files_in_place(staging) == [f"a.tar {_GONE}"]
+    assert (staging / "moved.tar").read_bytes() == _PLAINTEXT
+
+
+def test_a_file_renamed_after_its_screen_is_reported_not_read_as_nothing_to_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Renamed between the screen and the first open: the open's "not found" is reported too."""
+    staging = tmp_path / "mefor-verify-planted"
+    staging.mkdir()
+    (staging / "a.tar").write_bytes(_PLAINTEXT)
+    (staging / "own.tar").write_bytes(_PLAINTEXT)
+    real_open = dr_backup._open_unfollowed
+
+    def rename_then_open(entry: Path, dir_fd: int | None, inside: str | None) -> int:
+        if entry.name == "a.tar":
+            os.rename(staging / "a.tar", staging / "moved.tar")
+        return real_open(entry, dir_fd, inside)
+
+    monkeypatch.setattr(dr_backup, "_open_unfollowed", rename_then_open)
+    assert dr_backup._empty_files_in_place(staging) == [f"a.tar {_GONE}"]
+    assert (staging / "moved.tar").read_bytes() == _PLAINTEXT
+    # The control: the other file of the same directory is still emptied.
+    assert (staging / "own.tar").read_bytes() == b""

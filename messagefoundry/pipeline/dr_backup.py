@@ -1977,7 +1977,11 @@ def _empty_files_in_place(staging: Path) -> list[str]:
       ``O_NOFOLLOW``; each file is opened with ``O_NOFOLLOW`` relative to its directory's descriptor.
     - Windows: :func:`_win_held_walk` holds each directory, and the ones above it, while it is checked,
       listed and emptied. Each file is opened as itself and checked (:func:`_open_unfollowed`), and
-      its final path must lie under ``staging``'s.
+      its final path must be its directory's joined with the name listed. A name Windows would open
+      as another object (:func:`_win_opens_another`) is reported and never opened.
+
+    A listed file that is gone from its name before it is opened is reported, never read as nothing to
+    empty: a rename leaves its bytes under another name.
 
     What this leaves open is listed once, in docs/PHI.md section 2's ``mefor-backup-*`` /
     ``mefor-verify-*`` staging row."""
@@ -1993,13 +1997,21 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 
     walked = False
     if sys.platform == "win32":
-        for dirpath, dirnames, filenames, inside in _win_held_walk(staging, unproven, _report):
+        for dirpath, dirnames, filenames, here in _win_held_walk(staging, unproven, _report):
             walked = True
-            # Never descend through a link or a junction, which `os.walk` follows even with
-            # `followlinks=False`.
-            dirnames[:] = [d for d in dirnames if not _is_dir_link(os.path.join(dirpath, d))]
+            kept: list[str] = []
+            for d in dirnames:
+                # Screened first: a name Windows rewrites would have the link test below, and the
+                # walk, reach another directory.
+                if _win_opens_another(Path(dirpath) / d):
+                    unproven.append(f"{d}/ {_REWRITTEN_REASON.format('walked')}")
+                # Never descend through a link or a junction, which `os.walk` follows even with
+                # `followlinks=False`.
+                elif not _is_dir_link(os.path.join(dirpath, d)):
+                    kept.append(d)
+            dirnames[:] = kept
             for name in filenames:
-                _report(_truncate_unfollowed(Path(dirpath) / name, None, inside))
+                _report(_truncate_unfollowed(Path(dirpath) / name, None, here))
     else:
         for dirpath, _dirnames, filenames, dirfd in _walk(staging, onerror=_unlisted):
             walked = True
@@ -2014,6 +2026,24 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 #: What the fail-safe reports for something it reached through a link. Not named: it lives outside
 #: the staging directory, wherever the link pointed, and its name may be anyone's.
 _OUTSIDE_REASON = "an entry outside the directory (reached through a link, not truncated)"
+#: What the Windows fail-safe reports, after the name, for a name :func:`_win_opens_another` flags.
+_REWRITTEN_REASON = "(a name Windows opens as another object, not {})"
+
+
+def _win_opens_another(path: Path) -> bool:
+    """Windows: whether an open of ``path`` by name would reach an object other than the one listed
+    as ``path.name`` (BACKLOG #2420).
+
+    Win32 rewrites a path before it opens it. At least it drops a trailing dot or space from a name,
+    so ``a.tar.`` opens ``a.tar`` or nothing, and it opens a reserved device name as the device. Of
+    ``NUL``, ``AUX``, ``COM1``, ``CONIN$`` and ``con.txt``, Windows 11 build 26300 rewrote only
+    ``NUL`` (measured), and the set differs by build, so this asks the OS's own rewrite
+    (``os.path.abspath``, which is ``GetFullPathNameW``) rather than keep a list. A name it changes
+    is never opened, only reported: the open would reach some other object, and the listed file
+    would keep its bytes while the report called it empty. The final-path compare on the opened
+    handle backs this up (:func:`_open_unfollowed`)."""
+    plain = os.path.join(os.path.abspath(path.parent), path.name)
+    return os.path.abspath(plain) != plain
 
 
 class _HardLinked(OSError):
@@ -2030,10 +2060,18 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     """Truncate ``entry`` if it is a regular file with one link, checked on the handle that truncates
     it. ``None`` when it was emptied or holds nothing to empty, else what to report.
 
-    ``dir_fd`` is its directory's descriptor on POSIX; ``inside`` is the staging directory's final
-    path on Windows, as :func:`_win_held_walk` yields it. The ``lstat`` first only skips a link or a
-    hard link without opening it; the check that decides is the one on the open handle."""
+    ``dir_fd`` is its directory's descriptor on POSIX; ``inside`` is the final path of the directory
+    listed on Windows, with a trailing separator, as :func:`_win_held_walk` yields it. The ``lstat``
+    first only skips a link or a hard link without opening it; the check that decides is the one on
+    the open handle.
+
+    A name that is gone at the ``lstat`` or the open is reported, not read as nothing to empty: it
+    was listed, so it was renamed or removed since, and a rename leaves the file full under a name
+    this walk may never list (BACKLOG #2420)."""
     name = entry.name
+    gone = f"{name} (moved or removed before it was emptied, not truncated)"
+    if sys.platform == "win32" and _win_opens_another(entry):
+        return f"{name} {_REWRITTEN_REASON.format('truncated')}"
     try:
         if dir_fd is not None:
             st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -2045,7 +2083,7 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
         else:
             st = os.lstat(entry)
     except FileNotFoundError:
-        return None
+        return gone
     except OSError:
         return name
     # A directory here is one the walk took for a file because reading its type raised, so nothing
@@ -2066,7 +2104,7 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     try:
         fd = _open_unfollowed(entry, dir_fd, inside)
     except FileNotFoundError:
-        return None
+        return gone
     except OSError as exc:
         return _not_truncated(name, exc)
     try:
@@ -2108,13 +2146,16 @@ def _open_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> int
     Windows opens ``entry`` through ``transports/file.py``'s :func:`_win_open_file`, the file
     connector's own open: as itself, refusing a link or junction there (``_Unconfined``), and
     refusing a reopen that reaches another file (``_Replaced``). Before a filter is let serve the
-    file, the file opened as itself must have a final path under ``inside`` (``_Outside``) and pass
-    :func:`_vet_for_truncate`, so a file reached outside the directory, through a directory turned
-    into a junction in place, is never served by its filter (BACKLOG #4992).
+    file, the file opened as itself must have a final path under ``inside``, the directory listed
+    (``_Outside``), and equal to ``inside`` joined with the name listed (``_Replaced``), and pass
+    :func:`_vet_for_truncate`. So a file reached outside the directory, through a directory turned
+    into a junction in place, is never served by its filter (BACKLOG #4992), and a name Windows
+    rewrote on the way to the open is never truncated as another file (BACKLOG #2420), the exact
+    compare ``transports/file.py``'s ``_open_confined`` makes.
 
     A name that is gone once the file was opened as itself, as when it is renamed away before the
-    reopen, raises ``_Replaced``, not ``FileNotFoundError``: the caller reads that as nothing to
-    empty, and the file still holds its bytes under another name."""
+    reopen, raises ``_Replaced``, not ``FileNotFoundError``, so the caller reports it as changed
+    rather than as gone before its open."""
     if sys.platform == "win32":
         # GENERIC_READ | GENERIC_WRITE, what `open(..., "r+b")` asked for before.
         access = 0x80000000 | 0x40000000
@@ -2122,8 +2163,12 @@ def _open_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> int
 
         def vet(fd: int) -> None:
             opened.append(True)
-            if inside is not None and not _win_final_path(_os_handle(fd)).startswith(inside):
-                raise _Outside("outside the directory")
+            if inside is not None:
+                final = _win_final_path(_os_handle(fd))
+                if not final.startswith(inside):
+                    raise _Outside("outside the directory")
+                if final != inside + os.path.normcase(entry.name):
+                    raise _Replaced("not the name listed")
             _vet_for_truncate(fd)
 
         try:
@@ -2209,8 +2254,10 @@ def _win_held_walk(
     staging: Path, unproven: list[str], report: Callable[[str | None], None]
 ) -> Iterator[tuple[str, list[str], list[str], str]]:
     """Windows: walk ``staging`` top down, as ``os.walk`` does, yielding ``(dirpath, dirnames,
-    filenames, inside)`` for each directory, where ``inside`` is ``staging``'s final path with a
-    trailing separator, for a prefix test. A caller that prunes ``dirnames`` in place prunes the walk.
+    filenames, here)`` for each directory, where ``here`` is that directory's final path with a
+    trailing separator, for the compare :func:`_open_unfollowed` makes. Below ``staging`` it must
+    equal ``staging``'s final path joined with the names walked (BACKLOG #2420). A caller that prunes
+    ``dirnames`` in place prunes the walk.
 
     Each directory is HELD by :func:`_win_hold_dirs`, with every directory between it and
     ``staging``, and ``staging`` itself: opened as themselves, refused if one names another path, and
@@ -2224,7 +2271,8 @@ def _win_held_walk(
     A directory that cannot be opened or listed is added to ``unproven`` by its own name, never
     ``staging``'s, and its error is logged as itself (:func:`_win_unlisted`). One that is a link, a
     junction or no directory, or whose final path lies outside ``staging``, is passed to ``report``
-    as :data:`_OUTSIDE_REASON`, without a name. Neither is descended into."""
+    as :data:`_OUTSIDE_REASON`, without a name; one inside it at another path than the one walked is
+    reported by its name. None of them is descended into."""
     held_root = _win_hold_root(staging, unproven)
     if held_root is None:
         return
@@ -2233,9 +2281,10 @@ def _win_held_walk(
         stack = [staging]
         while stack:
             where = stack.pop()
-            held = _win_hold_below(staging, where, inside, unproven, report)
-            if held is None:
+            below = _win_hold_below(staging, where, inside, unproven, report)
+            if below is None:
                 continue
+            held, here = below
             try:
                 try:
                     with os.scandir(where) as listing:
@@ -2250,7 +2299,7 @@ def _win_held_walk(
                     (dirnames if entry.is_dir(follow_symlinks=False) else filenames).append(
                         entry.name
                     )
-                yield os.fspath(where), dirnames, filenames, inside
+                yield os.fspath(where), dirnames, filenames, here
                 stack.extend(where / name for name in reversed(dirnames))
             finally:
                 _win_release(held)
@@ -2260,7 +2309,12 @@ def _win_held_walk(
 
 def _win_hold_root(staging: Path, unproven: list[str]) -> tuple[list[int], str] | None:
     """Hold ``staging`` itself and return its handle with its final path, or ``None`` once what
-    stopped it is reported. A link or a junction there is never walked."""
+    stopped it is reported. A link or a junction there is never walked, nor a name Windows would
+    open as another directory (:func:`_win_opens_another`), as a sweep's planted ``mefor-backup-x.``
+    would open ``mefor-backup-x``."""
+    if _win_opens_another(staging):
+        unproven.append(f"{staging.name}/ {_REWRITTEN_REASON.format('walked')}")
+        return None
     try:
         root = _win_hold_dirs(staging.parent, (staging.name,))
     except _Unconfined:
@@ -2288,11 +2342,13 @@ def _win_hold_below(
     inside: str,
     unproven: list[str],
     report: Callable[[str | None], None],
-) -> list[int] | None:
-    """Hold every directory from below ``staging`` down to ``where`` and return their handles, or
-    ``None`` once what refused it is reported. ``staging`` itself is held by the caller."""
+) -> tuple[list[int], str] | None:
+    """Hold every directory from below ``staging`` down to ``where`` and return their handles with
+    ``where``'s final path, ending in a separator, or ``None`` once what refused it is reported.
+    ``staging`` itself is held by the caller, and ``inside`` is its final path."""
+    parts = where.relative_to(staging).parts
     try:
-        held = _win_hold_dirs(staging, where.relative_to(staging).parts)
+        held = _win_hold_dirs(staging, parts)
     except _Unconfined:
         report(_OUTSIDE_REASON)
         return None
@@ -2300,18 +2356,25 @@ def _win_hold_below(
         _win_unlisted(unproven, where, exc)
         return None
     if not held:  # `staging` itself, checked by _win_hold_root
-        return held
+        return held, inside
     try:
-        outside = not (_win_final_path(held[-1]).rstrip("\\") + "\\").startswith(inside)
+        here = _win_final_path(held[-1]).rstrip("\\") + "\\"
     except OSError as exc:
         _win_release(held)
         _win_unlisted(unproven, where, exc, final_path=True)
         return None
-    if outside:
+    if not here.startswith(inside):
         _win_release(held)
         report(_OUTSIDE_REASON)
         return None
-    return held
+    if here != inside + os.path.normcase(os.sep.join(parts)) + "\\":
+        # Inside, but not at the path walked: a rewritten name the screen missed, or a directory
+        # turned into a junction to another one inside (BACKLOG #2420). Nothing in it is emptied
+        # under names that may be another directory's; this line reports it instead.
+        _win_release(held)
+        unproven.append(f"{where.name}/ (changed while being emptied, not walked)")
+        return None
+    return held, here
 
 
 def _discard_verify_staging(staging: Path) -> str | None:
