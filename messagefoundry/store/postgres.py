@@ -980,14 +980,8 @@ _SCHEMA: list[str] = [
         cred_digest          TEXT NOT NULL DEFAULT '',
         authz_seal           TEXT NOT NULL DEFAULT ''
     )""",
-    # BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself --
-    # its read and its write are separate awaits, so two concurrent FIRST logins for one subject can
-    # both observe "no holder" and both bind. Same shape as ux_webauthn_label (ADR 0068 4).
-    # PARTIAL so unfederated rows coexist; Postgres treats NULLs as distinct, so the WHERE states
-    # intent here and is REQUIRED on SQL Server, where NULLs compare equal.
-    """CREATE UNIQUE INDEX IF NOT EXISTS ux_users_federated_subject
-        ON users(oidc_issuer, oidc_subject)
-        WHERE oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL""",
+    # ux_users_federated_subject (BACKLOG #1256) is built in _migrate_lease_columns, after the ADD
+    # of the two columns it keys on; _FEDERATED_SUBJECT_INDEX_DDL says why.
     """CREATE TABLE IF NOT EXISTS roles (
         id           TEXT PRIMARY KEY,
         display_name TEXT NOT NULL,
@@ -1288,7 +1282,9 @@ _SCHEMA.append(
 # 8 (BACKLOG #1720): the same function's catalog reads are scoped to current_schema(), and the open
 # now checks the live schema before it writes the marker. _SCHEMA is unchanged, so this bump is the
 # only thing that sends a store marked by an earlier build through both once.
-_MIGRATION_REV = 8
+# 9 (BACKLOG #1720): the same function builds ux_users_federated_subject, moved out of _SCHEMA. The
+# _SCHEMA edit moves the hash too; the bump is what the contract above ties the body to.
+_MIGRATION_REV = 9
 
 # BACKLOG #1726: for the tracking view's newest-first page and its received_at filter. SQLite's plan
 # is pinned by a test; this backend's plan has not been measured. Built in _migrate_lease_columns with
@@ -1315,6 +1311,19 @@ _FIFO_OUT_SEQ_INDEX_DDL = (
 # name dropped here is not expected (BACKLOG #5062).
 _FIFO_IN_DROP_DDL = "DROP INDEX IF EXISTS ix_queue_fifo_in"
 _FIFO_OUT_DROP_DDL = "DROP INDEX IF EXISTS ix_queue_fifo_out"
+# BACKLOG #1256: the atomicity the CHECK-THEN-ACT guard in auth/service.py cannot give itself -- its
+# read and its write are separate awaits, so two concurrent FIRST logins for one subject can both
+# observe "no holder" and both bind. Same shape as ux_webauthn_label (ADR 0068 4). PARTIAL so
+# unfederated rows coexist; Postgres treats NULLs as distinct, so the WHERE states intent here and is
+# REQUIRED on SQL Server, where NULLs compare equal. Built after the migration ADDs its two columns
+# (BACKLOG #1720): in _SCHEMA it ran first, and on a users table that predates them, a 0.3.2 one, the
+# build failed with the driver's undefined-column error before the live-schema check could name the
+# store's real differences. SQLite builds it in its _migrate for the same reason.
+_FEDERATED_SUBJECT_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_users_federated_subject"
+    " ON users(oidc_issuer, oidc_subject)"
+    " WHERE oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL"
+)
 #: What the live-schema check expects: the batch, then every index the migration builds or drops, in
 #: the order it runs them. The migration's columns are in the batch's CREATE TABLE statements
 #: already, so it adds none here; a test holds each ADD's type and nullability to that CREATE TABLE.
@@ -1326,6 +1335,7 @@ _MIGRATION_INDEX_DDL: Final = (
     _FIFO_IN_DROP_DDL,
     _FIFO_OUT_DROP_DDL,
     _RECEIVED_INDEX_DDL,
+    _FEDERATED_SUBJECT_INDEX_DDL,
 )
 
 # The live shape, read on the schema transaction's own connection after the batch (BACKLOG #1720).
@@ -2560,6 +2570,7 @@ class PostgresStore:
         ):
             if column not in users_cols:
                 await conn.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
+        await conn.execute(_FEDERATED_SUBJECT_INDEX_DDL)
         # Claimed-ness (BACKLOG #1245): whether the holder has ever set their own credential. It was
         # added for the first-run account's auto-retirement, and ADR 0183 Amendment A retired that
         # account and its one reader. The column stays, because its writers stay and the fact it
