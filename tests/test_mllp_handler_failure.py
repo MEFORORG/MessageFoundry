@@ -197,6 +197,7 @@ class _Recording:
         return None
 
 
+@pytest.mark.usefixtures("no_retry_pauses")
 async def test_an_ackless_inbound_keeps_the_socket_and_holds_the_frame() -> None:
     # AckMode.NONE: the sender expects no reply and never resends. Dropping the socket would also
     # discard the frames already sent behind the faulted one, so the listener keeps it, and it
@@ -223,6 +224,7 @@ async def test_an_ackless_inbound_keeps_the_socket_and_holds_the_frame() -> None
     assert "handler_error" not in kinds and "framing_error" not in kinds, kinds
 
 
+@pytest.mark.usefixtures("no_retry_pauses")
 async def test_a_non_hl7_inbound_gets_no_hl7_reply() -> None:
     # The runner injects the content type; it never answers a non-HL7 body in HL7, so neither
     # does the listener, even for a body that happens to start with MSH. It holds the frame instead.
@@ -243,7 +245,8 @@ async def test_a_non_hl7_inbound_gets_no_hl7_reply() -> None:
     finally:
         await asyncio.wait_for(source.stop(), timeout=5.0)
     assert handler.recorded == [_ADT.encode(), _ADT2.encode()]
-    assert "framing_error" not in cap.kinds(), cap.kinds()
+    kinds = cap.kinds()
+    assert "handler_error" not in kinds and "framing_error" not in kinds, kinds
 
 
 # --- BACKLOG #5022, step 2: the no-reply arm holds the frame, as the raw-TCP and X12 listeners do.
