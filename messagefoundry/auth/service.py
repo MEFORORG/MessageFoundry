@@ -1211,8 +1211,9 @@ class Elevation:
       as that ``auth.temp_password_expired`` row records; or (``confirm_mfa_enrollment`` only,
       BACKLOG #2224) the proof was good but turning TOTP on matched no row, so the confirm ended
       the session it had just rotated, as its ``auth.mfa_enroll_refused`` row records. That row's
-      ``session_ended`` is false when the store refused the revoke (vault BACKLOG #3113): the
-      rotated session then still exists, but its token was never handed back. Or (the TOTP and
+      ``session_ended`` is false when the store refused the revoke and the second attempt the
+      confirm then makes (vault BACKLOG #3113, #3025): only then does the rotated session still
+      exist, stamped MFA-verified, and its token was never handed back. Or (the TOTP and
       passkey legs, BACKLOG #3068) the session or its account went while the leg waited on the
       directory lookup, the account queue or the proof check, with the proof checked or not. Fails
       CLOSED: no token is handed back. Held apart from a wrong proof so a route answers 401 rather
@@ -13612,7 +13613,8 @@ class AuthService:
         staged secret, a second confirm enabled first (BACKLOG #2224), or a second begin staged a
         secret this confirm never verified (BACKLOG #3025). That confirm ends the session it rotated,
         hands back no codes, and audits ``auth.mfa_enroll_refused``, whose ``session_ended`` says
-        whether the store took the revoke (vault BACKLOG #3113).
+        whether the store took the revoke, which a refusal makes it try once more (vault BACKLOG
+        #3113, #3025).
 
         This is one of the two legs that turn an MFA-pending session into an MFA-satisfied one for a
         FIRST enrolment, so it rotates for the same reason ``verify_mfa`` does: without it a pre-MFA
@@ -13756,19 +13758,28 @@ class AuthService:
             # ``session_lost`` (vault BACKLOG #3113). That covers aiosqlite's closed connection
             # too, which it raises as a bare ``ValueError`` before sqlite3 is reached. A defect
             # the helper re-raises still propagates, and the ``finally`` writes the refusal row
-            # first, so no exception the revoke raises can skip it. ``session_ended`` records
-            # what the revoke did. The token is not handed back either way, so the caller still
-            # cannot use the session; a session the revoke left live expires on its own timers.
-            # The row's own write is soft too, so a store fault there is logged at ERROR rather
-            # than replacing the answer, or a defect already propagating. Known limit: a
-            # cancellation can land after the store committed the revoke, and the row then says
-            # ``session_ended: false`` for a session that did end.
+            # first, so no exception the revoke raises can skip it. A refused revoke is tried once
+            # more, through ``supersede_session``, a second statement (BACKLOG #3025): left live,
+            # the rotated session stays stamped MFA-verified on a factor that is not enabled.
+            # ``session_ended`` records whether either attempt landed. Only when the store refuses
+            # both does the session stay live, unreachable, since its token is never handed back,
+            # until its own timers end it. The row's own write is soft too, so a store fault
+            # there is logged at ERROR rather than replacing the answer, or a defect already
+            # propagating. Known limit: a cancellation can land after the store committed the
+            # revoke, and the row then says ``session_ended: false`` for a session that did end.
             rotated = hash_token(elevation.token)
             refused = audit_write_errors()
             session_ended = False
             try:
                 session_ended = await write_audit_soft(
                     lambda: self._store.revoke_session(rotated),
+                    log=_log,
+                    message="a refused TOTP enrolment for %s had its revoke refused; trying again",
+                    args=lambda: (scrub_log_argument(identity.username),),
+                    errors=refused,
+                    defects=AUDIT_WRITE_DEFECTS,
+                ) or await write_audit_soft(
+                    lambda: self._store.supersede_session(rotated, now=time.time()),
                     log=_log,
                     message="a refused TOTP enrolment for %s could not end the session it rotated",
                     args=lambda: (scrub_log_argument(identity.username),),

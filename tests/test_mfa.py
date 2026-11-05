@@ -2636,11 +2636,19 @@ async def test_a_second_confirm_that_enabled_first_keeps_the_winners_codes(
     ],
     ids=["store-refusal", "closed-connection"],
 )
+@pytest.mark.parametrize("retry_refused", [False, True], ids=["retry-lands", "retry-refused"])
 async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fault: Exception
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fault: Exception,
+    retry_refused: bool,
 ) -> None:
     """RED when: a store refusal of the revoke skips the ``auth.mfa_enroll_refused`` row (vault
-    BACKLOG #3113 item 2), or the row claims the session ended when it did not (item 7)."""
+    BACKLOG #3113 item 2), the row claims the session ended when it did not (item 7), or a
+    refused revoke leaves the rotated session live, stamped MFA-verified on a factor that is not
+    enabled, although the second attempt, through ``supersede_session``, would land (BACKLOG
+    #3025, closing step 2's third clause). With that attempt refused too, the session is left
+    live and the row says so."""
     store = await _store()
     try:
         service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
@@ -2667,8 +2675,15 @@ async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row
         async def refused_revoke(token_hash: str, *, now: float | None = None) -> None:
             raise fault
 
+        async def refused_supersede(
+            token_hash: str, *, now: float, lineage_since: float | None = None
+        ) -> None:
+            raise fault
+
         monkeypatch.setattr(store, "enable_totp", reset_then_enable)
         monkeypatch.setattr(store, "revoke_session", refused_revoke)
+        if retry_refused:
+            monkeypatch.setattr(store, "supersede_session", refused_supersede)
         with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
             refused = await service.confirm_mfa_enrollment(
                 identity, fresh_totp(enroll.secret), token=token
@@ -2676,15 +2691,21 @@ async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row
         # Fails closed all the same: no token and no codes come back.
         assert refused.ok is False and refused.session_lost is True
         assert refused.token is None and refused.recovery_codes == ()
+        live = await store.list_sessions(identity.user_id)
+        assert (live != []) is retry_refused, (
+            "a refused revoke left the rotated session live, stamped MFA-verified"
+        )
         rows = await store.list_audit(
             actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
         )
         assert len(rows) == 1, "the refusal row was skipped when the revoke raised"
         detail = json.loads(str(rows[0]["detail"]))
-        assert detail == {"reason": "secret_cleared", "session_ended": False}
-        assert any(
-            "could not end the session it rotated" in r.getMessage() for r in caplog.records
-        ), "the refused revoke was swallowed without a log line"
+        assert detail == {"reason": "secret_cleared", "session_ended": not retry_refused}
+        logged = [r.getMessage() for r in caplog.records]
+        assert any("had its revoke refused" in m for m in logged), (
+            "the refused revoke was swallowed without a log line"
+        )
+        assert any("could not end the session it rotated" in m for m in logged) is retry_refused
     finally:
         await store.close()
 
