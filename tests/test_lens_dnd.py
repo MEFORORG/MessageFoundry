@@ -12,7 +12,7 @@ import re
 
 import pytest
 
-from messagefoundry.lens import LensRewriteError, parse_source, rewrite_source
+from messagefoundry_toolkit.lens import LensRewriteError, parse_source, rewrite_source
 
 
 def _lines(s: str) -> list[str]:

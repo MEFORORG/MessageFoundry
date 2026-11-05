@@ -23,7 +23,7 @@ from types import ModuleType
 
 import pytest
 
-from messagefoundry import lens
+from messagefoundry_toolkit import lens
 
 _ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _ROOT / "scripts" / "quality" / "lens_coverage.py"

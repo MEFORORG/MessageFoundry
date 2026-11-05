@@ -40,14 +40,6 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.lens import (
-    CONTRACT_V2,
-    REFUSAL_COLUMN_LIMIT,
-    LensRewriteError,
-    _argument_dump,
-    parse_source,
-    rewrite_source,
-)
 from messagefoundry.parsing import _builtin_hl7
 from messagefoundry.parsing import split as split_mod
 from messagefoundry.parsing.message import Message, reencode_with_separators
@@ -63,6 +55,14 @@ from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.mllp import MLLPDestination
 from messagefoundry.transports.receipt import RefusalKind
+from messagefoundry_toolkit.lens import (
+    CONTRACT_V2,
+    REFUSAL_COLUMN_LIMIT,
+    LensRewriteError,
+    _argument_dump,
+    parse_source,
+    rewrite_source,
+)
 from tests.test_remotefile_transport import (
     _FakeClient,
     _FakeLedger,

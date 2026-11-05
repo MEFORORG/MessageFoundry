@@ -30,8 +30,8 @@ from typing import Any
 
 import pytest
 
-from messagefoundry import lens
-from messagefoundry.lens import (
+from messagefoundry_toolkit import lens
+from messagefoundry_toolkit.lens import (
     CONTRACT_V1,
     CONTRACT_V2,
     MODE_DYNAMIC,
@@ -859,7 +859,7 @@ def test_the_early_cli_refusals_carry_the_generic_code(
     never meets a payload without one."""
     import json
 
-    from messagefoundry.__main__ import main
+    from messagefoundry_toolkit.__main__ import main
 
     module = tmp_path / "h.py"
     module.write_bytes(_one_row(_STATIC).encode("utf-8"))
@@ -875,7 +875,7 @@ def test_non_utf8_stdin_is_refused_with_a_code_and_no_source_echo(
     import io
     import json
 
-    from messagefoundry.__main__ import main
+    from messagefoundry_toolkit.__main__ import main
 
     class _Stdin:
         buffer = io.BytesIO(b"x = 1\n# SECRETPAYLOAD \xff\n")
@@ -895,7 +895,7 @@ def test_a_non_utf8_edit_spec_on_stdin_is_refused_with_a_code(
     import io
     import json
 
-    from messagefoundry.__main__ import main
+    from messagefoundry_toolkit.__main__ import main
 
     class _Stdin:
         buffer = io.BytesIO(b'{"line_start": 6, "line_end": 6, "params": {"value": "\xff"}}')
@@ -917,7 +917,7 @@ def test_an_exception_no_arm_names_still_carries_the_generic_code(
     TypeError the rewriter does not name) leaves the IDE a code to branch on."""
     import json
 
-    from messagefoundry.__main__ import main
+    from messagefoundry_toolkit.__main__ import main
 
     module = tmp_path / "h.py"
     module.write_bytes(_one_row(_STATIC).encode("utf-8"))
@@ -949,7 +949,7 @@ def test_lens_rewrite_emits_the_code_beside_the_error(
     exactly the exception's message, so a consumer reading only it sees no change."""
     import json
 
-    from messagefoundry.__main__ import main
+    from messagefoundry_toolkit.__main__ import main
 
     module = tmp_path / "h.py"
     module.write_bytes(_one_row(line).encode("utf-8"))
@@ -969,7 +969,7 @@ def test_an_unreadable_module_carries_the_generic_code(
 ) -> None:
     import json
 
-    from messagefoundry.__main__ import main
+    from messagefoundry_toolkit.__main__ import main
 
     missing = tmp_path / "absent.py"
     rc = main(["lens", "rewrite", str(missing), "--edit", '{"line_start": 1, "line_end": 1}'])

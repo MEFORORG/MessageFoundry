@@ -23,9 +23,12 @@ from typing import TypeGuard
 import pytest
 
 from messagefoundry import redaction
-from tests._ast_sites import callee_name, parse_source
+from tests._ast_sites import callee_name, package_sources, parse_source
 
-_ENGINE = Path(__file__).resolve().parents[1] / "messagefoundry"
+_REPO = Path(__file__).resolve().parents[1]
+#: ``package_sources()`` names the packages read. Their text is engine-authored, the toolkit's too
+#: since ADR 0201 slice 4 moved authoring commands there.
+_SOURCES = package_sources()
 _LOG_METHODS = frozenset({"debug", "info", "warning", "warn", "error", "exception", "critical"})
 
 #: Parameter and field names that carry a label a transport or guard later interpolates into a message.
@@ -102,10 +105,10 @@ def _local_positions(tree: ast.Module) -> _Positions:
 def _engine_positions() -> dict[str, _Positions]:
     """Each engine module's module-level functions and classes with their label positions, by dotted
     name (a package's ``__init__`` under the package). Parsed directly, not through the shared
-    ``parse_source`` cache, which holds 16 trees and would only be churned by 290 modules."""
+    ``parse_source`` cache, which holds 16 trees and would only be churned by hundreds of modules."""
     out: dict[str, _Positions] = {}
-    for path in sorted(_ENGINE.rglob("*.py")):
-        parts = path.relative_to(_ENGINE.parent).with_suffix("").parts
+    for path in _SOURCES:
+        parts = path.relative_to(_REPO).with_suffix("").parts
         module = ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
         tree = ast.parse(path.read_text(encoding="utf-8").removeprefix("\ufeff"))
         out[module] = {s.name: _hits(s) for s in tree.body if isinstance(s, (ast.ClassDef, *_DEFS))}
@@ -310,12 +313,13 @@ def test_the_pattern_is_the_shipped_one() -> None:
     )
 
 
-_SOURCES = sorted(_ENGINE.rglob("*.py"))
+def _rel(path: Path) -> str:
+    return path.relative_to(_REPO).as_posix()
 
 
 def test_the_scan_has_a_population() -> None:
-    # A moved `_ENGINE` path would parametrize nothing and pass. A floor well under the real counts
-    # still catches an empty or wrong root.
+    # A moved root would parametrize nothing and pass. A floor well under the real counts still
+    # catches an empty or wrong root; package_sources() refuses a package that contributes nothing.
     assert len(_SOURCES) > 200
     literals = sum(
         len(_message_literals(parse_source(p.read_text(encoding="utf-8")))) for p in _SOURCES
@@ -323,7 +327,7 @@ def test_the_scan_has_a_population() -> None:
     assert literals > 2000
 
 
-@pytest.mark.parametrize("path", _SOURCES, ids=lambda p: p.relative_to(_ENGINE).as_posix())
+@pytest.mark.parametrize("path", _SOURCES, ids=_rel)
 def test_engine_message_text_holds_no_name_run(path: Path) -> None:
     hits = _runs(path.read_text(encoding="utf-8"))
     assert not hits, (
@@ -360,7 +364,7 @@ def test_the_comma_scan_fires_on_both_arms() -> None:
     ]
 
 
-@pytest.mark.parametrize("path", _SOURCES, ids=lambda p: p.relative_to(_ENGINE).as_posix())
+@pytest.mark.parametrize("path", _SOURCES, ids=_rel)
 def test_engine_message_text_holds_no_comma_name_run(path: Path) -> None:
     hits = _comma_runs(path.read_text(encoding="utf-8"))
     assert not hits, (
@@ -415,12 +419,21 @@ _TIME_RENDERERS = frozenset({"log_timestamp", "_crl_time"})
 #: bare ``YYYY-MM-DD`` was redacted before vault BACKLOG #2784 as well, and an eight-digit form is
 #: read by the same pass, so :func:`messagefoundry.redaction.log_timestamp` does not help a date.
 _DATE_ONLY = {
-    ("timezone.py", "born.isoformat()"): "a patient's date of birth, which must be redacted",
-    ("timezone.py", "ref.isoformat()"): "the reference date beside that date of birth",
-    ("pipeline/secret_rotation.py", "eff_last.isoformat()"): "a key rotation date, redacted before",
+    (
+        "messagefoundry/timezone.py",
+        "born.isoformat()",
+    ): "a patient's date of birth, which must be redacted",
+    (
+        "messagefoundry/timezone.py",
+        "ref.isoformat()",
+    ): "the reference date beside that date of birth",
+    (
+        "messagefoundry/pipeline/secret_rotation.py",
+        "eff_last.isoformat()",
+    ): "a key rotation date, redacted before",
     # `messagefoundry certs` prints to stdout, which no redaction pass reads, so ISO stays there.
-    ("__main__.py", "parsed.next_update_iso"): "CLI stdout, never redacted",
-    ("__main__.py", "facts.not_after_iso"): "CLI stdout, never redacted",
+    ("messagefoundry/__main__.py", "parsed.next_update_iso"): "CLI stdout, never redacted",
+    ("messagefoundry/__main__.py", "facts.not_after_iso"): "CLI stdout, never redacted",
 }
 
 
@@ -435,9 +448,9 @@ def test_the_isoformat_scan_fires_on_its_control() -> None:
     assert [line for line, _ in _isoformat_calls(planted)] == [1, 2]
 
 
-@pytest.mark.parametrize("path", _SOURCES, ids=lambda p: p.relative_to(_ENGINE).as_posix())
+@pytest.mark.parametrize("path", _SOURCES, ids=_rel)
 def test_engine_text_renders_no_isoformat(path: Path) -> None:
-    name = path.relative_to(_ENGINE).as_posix()
+    name = _rel(path)
     source = path.read_text(encoding="utf-8")
     assert source, f"{name} read empty, so the scan below would see nothing"
     hits = [hit for hit in _isoformat_calls(source) if (name, hit[1]) not in _DATE_ONLY]
@@ -452,7 +465,7 @@ def test_engine_text_renders_no_isoformat(path: Path) -> None:
 
 def test_the_date_only_exemptions_are_still_needed() -> None:
     for name, expression in _DATE_ONLY:
-        found = _isoformat_calls((_ENGINE / name).read_text(encoding="utf-8"))
+        found = _isoformat_calls((_REPO / name).read_text(encoding="utf-8"))
         assert expression in {text for _, text in found}, (name, expression)
 
 

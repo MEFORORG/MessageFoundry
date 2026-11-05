@@ -82,10 +82,10 @@ from typing import Any
 
 import pytest
 
-from messagefoundry import corepoint_import as head
 from messagefoundry.config.snapshot import read_config_snapshot
 from messagefoundry.config.wiring import Registry, _loading
 from messagefoundry.parsing.message import Message
+from messagefoundry_toolkit import corepoint_import as head
 
 # --- the step 1 importer --------------------------------------------------------------------------
 

@@ -1017,8 +1017,11 @@ def _helper_only(directory: Path) -> Path:
 
 def test_load_config_refuses_a_config_that_declares_no_connections(tmp_path: Path) -> None:
     _helper_only(tmp_path)
-    with pytest.raises(WiringError, match=_EMPTY_MARKER):
+    with pytest.raises(WiringError, match=_EMPTY_MARKER) as exc:
         load_config(tmp_path)
+    # The scaffold is a toolkit command (ADR 0201 slice 4), so the hint names the command that has
+    # it. `messagefoundry init` would be refused by the engine as not one of its commands.
+    assert "'messagefoundry-toolkit init'" in str(exc.value)
 
 
 def test_load_config_allow_empty_opt_out_loads_the_same_directory(tmp_path: Path) -> None:

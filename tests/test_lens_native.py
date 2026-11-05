@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.lens import LensRewriteError, parse_source, rewrite_source
+from messagefoundry_toolkit.lens import LensRewriteError, parse_source, rewrite_source
 
 
 def _handler_def_ranges(source: str) -> dict[str, tuple[int, int]]:

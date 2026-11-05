@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.lens import parse_source
+from messagefoundry_toolkit.lens import parse_source
 
 
 def _handler_def_ranges(source: str) -> dict[str, tuple[int, int]]:

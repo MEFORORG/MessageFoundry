@@ -89,7 +89,7 @@ import pytest
 # * ``_SOURCE_ROOTS`` — messagefoundry/ + messagefoundry_webconsole/ + messagefoundry_toolkit/ +
 #   harness/ + tee/, the first-party Python the ReDoS and single-parser clauses walk. The toolkit
 #   joined before any code moved into it (ADR 0201 section 4): code that leaves messagefoundry/ must
-#   not leave these clauses, and ``corepoint_import`` parses untrusted Corepoint XML once it moves.
+#   not leave these clauses, and ``corepoint_import`` parses untrusted Corepoint XML there since slice 4.
 #   ``tee/`` belongs here on the same footing as the rest: it parses untrusted HL7 off the wire (``tee/mllp.py``'s segment split over
 #   decoded MLLP frames, ``tee/anon/*`` over message fields), which is exactly the class these clauses
 #   score. Measured before adding: zero nested-quantifier offenders, zero unscannable patterns, no
@@ -1016,7 +1016,7 @@ _XML_PARSER_ALLOWLIST = {
         "the vendored defusedxml copy (messagefoundry/_vendor/defusedxml) ElementTree.fromstring with "
         "forbid_dtd/forbid_entities/forbid_external in RawMessage.xml(); the xml.etree import beside it is TYPE_CHECKING-only (Element, for hints)"
     ),
-    "messagefoundry/corepoint_import.py": (
+    "messagefoundry_toolkit/corepoint_import.py": (
         "the vendored defusedxml copy's ElementTree.fromstring with forbid_dtd/forbid_entities/"
         "forbid_external, isolated "
         "in _hardened_fromstring() so tests/test_xml_parser_consistency.py drives THAT surface "

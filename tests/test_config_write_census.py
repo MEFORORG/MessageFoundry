@@ -75,6 +75,10 @@ LIBRARY: frozenset[str] = frozenset(
 #: with the new digest, which moves the baseline then. A start that loads it first raises
 #: ``config_changed``, and that alert is the record of an edit no engine made. The service settings
 #: file is outside the config digest, so its two writers have no baseline to move.
+#: The two command-line modules: the engine's, and the toolkit's, which took the authoring
+#: subcommands in ADR 0201 slice 4. Each subcommand of either runs in its own process.
+_CLI_MODULES = frozenset({"messagefoundry/__main__.py", "messagefoundry_toolkit/__main__.py"})
+
 CENSUS: dict[tuple[str, str], str] = {
     ("messagefoundry/__main__.py", "_connection"): (
         "the `connection` CLI upserts or removes a connections.toml entry, in its own process"
@@ -83,11 +87,11 @@ CENSUS: dict[tuple[str, str], str] = {
         "the `codeset` CLI writes, renames or removes a codesets/ table, and a rename rewrites the "
         "config modules that name it"
     ),
-    ("messagefoundry/__main__.py", "_impact"): (
+    ("messagefoundry_toolkit/__main__.py", "_impact"): (
         "the `impact` CLI's rename rewrites string literals in config modules"
     ),
-    ("messagefoundry/__main__.py", "_init"): "`init` scaffolds a new config directory",
-    ("messagefoundry/__main__.py", "_import"): (
+    ("messagefoundry_toolkit/__main__.py", "_init"): "`init` scaffolds a new config directory",
+    ("messagefoundry_toolkit/__main__.py", "_import"): (
         "`import` writes config modules generated from a Corepoint export"
     ),
     ("messagefoundry/__main__.py", "_restore"): (
@@ -147,10 +151,10 @@ def test_every_config_write_call_site_is_in_the_census() -> None:
 
 
 def test_only_the_cli_writes_config() -> None:
-    """Only the CLI module's subcommands run in their own process, so the engine writes no config
+    """Only the CLI modules' subcommands run in their own process, so the engine writes no config
     file at all."""
     for path, site in CENSUS:
-        assert path == "messagefoundry/__main__.py", (path, site)
+        assert path in _CLI_MODULES, (path, site)
 
 
 def test_the_guard_refuses_an_unlisted_writer() -> None:
@@ -233,7 +237,7 @@ def _write_targets(call: ast.Call) -> list[ast.expr]:
 def _direct_config_writes(trees: Mapping[str, ast.Module]) -> list[str]:
     hits: list[str] = []
     for path, tree in sorted(trees.items()):
-        if path in LIBRARY or path == "messagefoundry/__main__.py":
+        if path in LIBRARY or path in _CLI_MODULES:
             continue
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):

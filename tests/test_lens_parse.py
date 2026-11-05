@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.lens import LensParseError, parse_module, parse_source
+from messagefoundry_toolkit.lens import LensParseError, parse_module, parse_source
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SAMPLES = REPO_ROOT / "samples" / "config"
@@ -470,7 +470,7 @@ def test_generated_handler_round_trips_through_lens(tmp_path: Path) -> None:
     refusal: every mapped vocabulary call classifies into an ``action``/``lookup`` row, the return into
     a ``send`` row, and an unmapped-action TODO marker degrades in place to a ``code`` row (ADR 0086
     AC-4; the correctness gate that closes the import ↔ lens loop)."""
-    from messagefoundry.corepoint_import import import_corepoint
+    from messagefoundry_toolkit.corepoint_import import import_corepoint
 
     fixture = REPO_ROOT / "tests" / "fixtures" / "corepoint" / "acme_adt.json"
     import_corepoint(fixture, tmp_path)

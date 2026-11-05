@@ -99,6 +99,7 @@ __all__ = [
     "find_funcs",
     "named_func",
     "outermost_def_sites",
+    "package_sources",
     "package_trees",
     "parse_source",
     "source_calls",
@@ -251,13 +252,27 @@ def outermost_def_sites(tree: ast.Module, test: Callable[[ast.AST], bool]) -> se
 
 
 @functools.cache
+def package_sources() -> tuple[Path, ...]:
+    """Every module path of the packages that run in the engine process or ship beside it, sorted
+    within each package, for a scan that reads the text itself. Each package must contribute a
+    file, so a moved or renamed package fails here rather than leaving a scan, or
+    :func:`package_trees`, with nothing of it to read."""
+    paths: list[Path] = []
+    for package in _ENGINE_PACKAGES:
+        found = sorted((_REPO / package).rglob("*.py"))
+        if not found:
+            raise AssertionError(f"{package}/ contributed no module to package_sources()")
+        paths.extend(found)
+    return tuple(paths)
+
+
+@functools.cache
 def package_trees() -> dict[str, ast.Module]:
-    """Every module of the packages that run in the engine process or ship beside it, by path
-    relative to the repository, parsed once for the whole run: a full pass costs seconds."""
+    """Every module of :func:`package_sources`, by path relative to the repository, parsed once
+    for the whole run: a full pass costs seconds."""
     return {
         path.relative_to(_REPO).as_posix(): ast.parse(path.read_text(encoding="utf-8"))
-        for package in _ENGINE_PACKAGES
-        for path in (_REPO / package).rglob("*.py")
+        for path in package_sources()
     }
 
 

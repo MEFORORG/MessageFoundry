@@ -108,18 +108,28 @@ export function runDirHasEngine(opts: { serviceTomlExists: boolean; dbFiles: str
  * the resolved interpreter cannot import messagefoundry (a fresh clone with no venv / uninstalled deps).
  * Pure over `{ hasPyproject, platform }`:
  *   - a workspace WITH a `pyproject.toml` is the source checkout ⇒ an editable install (`-e .`);
- *   - a workspace without one is a config repo ⇒ install the published package.
+ *   - a workspace without one is a config repo ⇒ install the published engine AND toolkit, since the
+ *     extension's Steps view and Generate Samples run the toolkit (ADR 0201 slice 4). A scaffolded
+ *     repo's `requirements.txt` and `requirements-dev.txt` pin both, so they are installed as written;
+ *     the repo's own install step would otherwise move the engine off a toolkit installed beside it,
+ *     and the toolkit refuses to run beside another engine version. Without both files, the two are
+ *     installed unpinned, and the toolkit's exact engine pin makes pip resolve them to one version.
  * The venv is created with a base `python` (venv is stdlib, so any Python 3 can), then the venv's own
  * interpreter does the install. Returned as strings (not argv) because the shell TYPES them into a real
  * terminal the user watches — the venv interpreter path is platform-specific and shell-runnable as-is.
  */
 export function buildBootstrapPlan(opts: {
   hasPyproject: boolean;
+  hasPinFiles?: boolean;
   platform: NodeJS.Platform;
 }): { steps: string[]; venvPython: string } {
   const venvPython =
     opts.platform === "win32" ? ".\\.venv\\Scripts\\python.exe" : "./.venv/bin/python";
-  const target = opts.hasPyproject ? "-e ." : "messagefoundry";
+  const target = opts.hasPyproject
+    ? "-e ."
+    : opts.hasPinFiles
+      ? "-r requirements.txt -r requirements-dev.txt"
+      : "messagefoundry messagefoundry-toolkit";
   return {
     steps: [`python -m venv .venv`, `${venvPython} -m pip install ${target}`],
     venvPython,

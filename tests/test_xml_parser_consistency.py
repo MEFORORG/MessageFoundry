@@ -176,7 +176,7 @@ def _corepoint_parse(document: str) -> object:
     structural reason that has nothing to do with XML hardening: a check that cannot fail. Calling the
     parse surface itself means a loosened flag reds the build.
     """
-    from messagefoundry.corepoint_import import _hardened_fromstring
+    from messagefoundry_toolkit.corepoint_import import _hardened_fromstring
 
     return _hardened_fromstring(document)
 

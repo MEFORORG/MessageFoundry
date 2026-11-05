@@ -35,8 +35,9 @@ refusals, that makes three actions built on one predicate:
     attacker a real file. A header value has no such property -- removing CR/LF cannot redirect a
     request anywhere -- and ``rest.py`` already REJECTS a header NAME failing its RFC 7230 token
     check. Name-rejected, value-stripped, which is principled. **"Only" is stale:** at least
-    ``corepoint_import.py`` and ``uploads.py`` strip too. The upload filename is display-only and
-    never locates a file, so the #1238 ruling does not reach it either.
+    the toolkit's ``corepoint_import.py`` and the engine's ``uploads.py`` strip too. The upload
+    filename is display-only and never locates a file, so the #1238 ruling does not reach it
+    either.
   * ESCAPE -- every log line, :func:`scrub_control_chars`. Neither refuses nor deletes: it renders
     the code point as a readable backslash escape, so one record cannot become two. Its alphabet is
     WIDER than the other two arms' (vault BACKLOG #2815); :func:`_escapes_in_a_log_line` states it.

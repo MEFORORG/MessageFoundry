@@ -66,10 +66,25 @@ Three facts about versions:
 - Every distribution needs Python 3.14 or later.
 
 [ADR 0201](adr/0201-a-messagefoundry-toolkit-distribution-carries-the-authoring-and-development-tooling-out-of-the-engine-wheel.md)
-moves the authoring and development commands out of the engine wheel in stages. Until the last
-stage, most of them are still engine commands, such as `messagefoundry init` in section 4. Run
+moves the authoring and development commands out of the engine wheel. They run from the separate
+`messagefoundry-toolkit` command, such as `messagefoundry-toolkit init` in section 4, and the engine's
+`messagefoundry` command refuses them with a line naming that command. Run
 `messagefoundry --help` and `messagefoundry-toolkit --help` to see which command holds what at your
 version.
+
+Install the toolkit only on a machine where people author configuration:
+
+```powershell
+pip install "messagefoundry-toolkit==<version>"   # the same version as the engine
+```
+
+A production host needs the engine alone. A site that installs the toolkit on a production host has
+chosen to carry the authoring commands there, which is what the split exists to avoid (ASVS 15.2.3).
+The split is not finished: the synthetic-HL7 generators, the HL7 schema modules and the
+de-identification package still ship in the engine wheel until later ADR 0201 slices move them, so
+an engine-only host still carries that code. The `messagefoundry` command has no subcommand that runs
+it, but at least one module still runs on its own: `python -m messagefoundry.generators.adt` writes
+synthetic ADT messages from the engine wheel alone (`messagefoundry/generators/adt.py`).
 
 The extras, by group. `pyproject.toml` holds the live list.
 
@@ -256,11 +271,13 @@ refs above must match the tag you are installing (e.g. `refs/tags/v0.5.0-rc1`), 
 
 ## 4. Step 2 — Create your config repo with the scaffolder
 
-The engine ships an `init` command that lays down a complete, **`check`-green-from-the-first-commit**
-config repo skeleton:
+The toolkit ships an `init` command that lays down a complete, **`check`-green-from-the-first-commit**
+config repo skeleton. Install the toolkit first, at the engine's version, on the authoring machine
+(*Which package to install for which job*, above):
 
 ```powershell
-messagefoundry init ./my-config-repo
+pip install "messagefoundry-toolkit==<version>"
+messagefoundry-toolkit init ./my-config-repo
 cd my-config-repo
 ```
 
@@ -274,6 +291,7 @@ my-config-repo/
 ├─ messages/sets/example_adt.hl7   # a synthetic fixture (NO real PHI) that gates `check`
 ├─ messagefoundry.toml             # THIS instance's settings (environment + posture + store + API + egress)
 ├─ requirements.txt                # pins the engine:  messagefoundry==0.5.2
+├─ requirements-dev.txt            # pins the toolkit at the same version, for authoring machines only
 ├─ .github/workflows/check.yml     # CI: install the pinned engine + run `messagefoundry check` on every PR
 ├─ .vscode/settings.json           # points the VS Code extension at config/ + messages/
 ├─ .gitignore  .gitattributes      # excludes stores, secrets, captures, venvs, caches
@@ -496,7 +514,7 @@ There is simply no developer workflow that routes through engine source — by c
 ---
 
 ### Bottom line
-Install the pinned engine into a venv; run `messagefoundry init` to scaffold a private config repo; push
+Install the pinned engine into a venv; run `messagefoundry-toolkit init` to scaffold a private config repo; push
 it to your private git host with branch protection + the included CI check; deploy as many instances as
 you need from that one repo, each with its own environment name, posture, and secrets. Your developers
 get a clean, reviewable, code-first authoring experience, and the engine stays a fixed, auditable

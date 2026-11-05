@@ -32,7 +32,7 @@ content in a public post.
 
 Please include: affected component (e.g. MLLP/file transport, store, API/auth, console),
 a description and impact, and reproduction steps or a proof of concept. Do **not** include
-real PHI — use synthetic HL7 (the `messagefoundry generate` corpus is ideal).
+real PHI — use synthetic HL7 (the `messagefoundry-toolkit generate` corpus is ideal).
 
 We aim to acknowledge within a few business days and credit reporters who wish to be named once a
 fix is released.

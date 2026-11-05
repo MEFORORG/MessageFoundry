@@ -9,7 +9,7 @@
 
 - CI runs against **your config repo**, not the engine. The engine is a read-only, version-pinned
   wheel; your Connections/Routers/Handlers/fixtures are the thing under test.
-- `messagefoundry init` scaffolds a ready-made workflow at `.github/workflows/check.yml` with three
+- `messagefoundry-toolkit init` scaffolds a ready-made workflow at `.github/workflows/check.yml` with three
   jobs: **`verify-engine`** (supply-chain provenance of the pinned engine), **`check`** (the
   config-quality gate, `messagefoundry check`), and **`audit-pin`** (reds your CI when the pinned
   engine or its dependencies have a known published vulnerability).
@@ -123,7 +123,7 @@ What each stage would do for a site:
    The engine audits every reload and every dry run. Where the site turns on dual control for
    reloads, the engine holds the swap until a second user approves.
 
-The engine's built-in environment names are `dev`, `staging` and `prod`. `messagefoundry init`
+The engine's built-in environment names are `dev`, `staging` and `prod`. `messagefoundry-toolkit init`
 writes `environments/dev.toml` and `environments/prod.toml`. A site that runs a staging instance
 would add `environments/staging.toml` with the same keys. With several named targets
 set, the promote command asks which one to use. With none set, it uses the one engine URL in its
@@ -142,7 +142,7 @@ engine. The three-tier ownership model is:
 | **Config repo** | your analysts | `config/` (Connection/Router/Handler `.py`), `codesets/`, `environments/<env>.toml`, fixtures | one org-owned, separately-versioned repo |
 | **Per-instance settings** | your ops | `messagefoundry.toml` + `MEFOR_*` env + secrets | per deployed instance, **never** in the config repo |
 
-`messagefoundry init` ([scaffold.py](../messagefoundry/scaffold.py)) lays this repo down, **including
+`messagefoundry-toolkit init` ([scaffold.py](../messagefoundry_toolkit/scaffold.py)) lays this repo down, **including
 the CI workflow** at `.github/workflows/check.yml`. So CI is yours, scoped to your config, and the
 scaffolded workflow runs on **every pull request and every push to `main`**.
 
@@ -156,8 +156,8 @@ The exact same gate is shared by three call sites, so a green CI means a green d
 
 ## 2. The scaffolded workflow has three jobs
 
-See [`.github/workflows/check.yml`](../messagefoundry/scaffold.py) (templated in
-[scaffold.py](../messagefoundry/scaffold.py)).
+See [`.github/workflows/check.yml`](../messagefoundry_toolkit/scaffold.py) (templated in
+[scaffold.py](../messagefoundry_toolkit/scaffold.py)).
 
 ### Job 1 — `verify-engine`: supply-chain integrity of the interface dependency
 
@@ -312,7 +312,7 @@ What CI **does** guarantee on every PR:
    **silently skipped** and the gate passes on `validate` alone
    ([checks.py](../messagefoundry/checks.py) `_check_dryrun`; see also
    [EARLY-ADOPTER-GUIDE.md §8](EARLY-ADOPTER-GUIDE.md)). Building and maintaining a synthetic corpus
-   (`messagefoundry generate`) is **your** job — it's the difference between "config compiles" and
+   (`messagefoundry-toolkit generate`) is **your** job — it's the difference between "config compiles" and
    "config behaves." *(An explicitly-given messages path that doesn't exist **fails** the gate
    rather than skipping — that guards against a typo'd/renamed fixtures dir.)*
 
@@ -332,7 +332,7 @@ What CI **does** guarantee on every PR:
 
 ## 6. Recommended adopter practice
 
-- **Build a synthetic corpus first:** `messagefoundry generate --type ADT --count 50 --out messages/sets`.
+- **Build a synthetic corpus first:** `messagefoundry-toolkit generate --type ADT --count 50 --out messages/sets`.
 - **Pin fixtures per feed** under `messages/sets/<inbound_name>/` so each feed is asserted in
   isolation.
 - **Treat the gate as a merge requirement** (branch protection on `main`): no config merges unless
@@ -353,5 +353,5 @@ What CI **does** guarantee on every PR:
 - [EARLY-ADOPTER-GUIDE.md](EARLY-ADOPTER-GUIDE.md) (§8 validation toolchain, §9 capacity testing)
 - [INSTALL-GUIDE.md](INSTALL-GUIDE.md) (manual verify-before-install recipe)
 - Engine source: [`messagefoundry/checks.py`](../messagefoundry/checks.py),
-  [`messagefoundry/scaffold.py`](../messagefoundry/scaffold.py),
+  [`messagefoundry_toolkit/scaffold.py`](../messagefoundry_toolkit/scaffold.py),
   [`messagefoundry/pipeline/dryrun.py`](../messagefoundry/pipeline/dryrun.py)

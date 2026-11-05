@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""CLI introspection subcommands (validate/graph/dryrun/hl7schema) emit JSON for the IDE."""
+"""CLI introspection subcommands (validate/graph/dryrun) emit JSON for the IDE.
+
+The process-wide properties of the engine's command (the last-resort hooks, the dispatch floor, the
+stderr log sink) are probed through ``ai-policy``: a production command that runs offline, takes no
+argument, has a ``--json`` mode and writes nothing. Before ADR 0201 slice 4 the probe was
+``hl7schema``, which is a toolkit command now; a property of the engine's command needs an engine
+command to measure it on."""
 
 from __future__ import annotations
 
@@ -484,7 +490,10 @@ def test_dryrun_missing_messages_path(capsys: pytest.CaptureFixture[str]) -> Non
 
 
 def test_hl7schema_emits_segments(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["hl7schema", "--json"]) == 0
+    # A toolkit command since ADR 0201 slice 4, so it runs on the toolkit's command.
+    from messagefoundry_toolkit.__main__ import main as toolkit_main
+
+    assert toolkit_main(["hl7schema", "--json"]) == 0
     schema = _out_json(capsys)
     assert schema["version"] == "2.5.1"
     assert "PID" in schema["segments"]
@@ -3799,7 +3808,7 @@ def test_audit_verify_exits_2_on_a_file_that_is_not_a_database(tmp_path: Path) -
 
 
 def test_a_non_serve_subcommand_installs_both_last_resort_hooks(
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Both hooks, because `install_thread_excepthook` had the identical serve-only gap: a non-main
     thread's escaping exception goes to `threading.excepthook` and nowhere else, so installing the
@@ -3818,8 +3827,10 @@ def test_a_non_serve_subcommand_installs_both_last_resort_hooks(
     try:
         sys.excepthook, threading.excepthook = sys.__excepthook__, threading.__excepthook__
 
-        assert main(["hl7schema", "--json"]) == 0
-        capsys.readouterr()  # the schema payload is not what this test is about
+        # Away from the checkout, so no stray ./messagefoundry.toml decides the probe's exit.
+        monkeypatch.chdir(tmp_path)
+        assert main(["ai-policy", "--json"]) == 0
+        capsys.readouterr()  # the policy payload is not what this test is about
 
         assert sys.excepthook is last_resort._excepthook, (
             "a non-serve subcommand ran with the stock sys.excepthook: an uncaught exception would "
@@ -3854,13 +3865,13 @@ def test_an_uncaught_exception_in_a_non_serve_subcommand_prints_no_traceback(
     import subprocess
     import sys
 
-    argv = ["hl7schema", "--json"] if as_json else ["hl7schema"]
+    argv = ["ai-policy", "--json"] if as_json else ["ai-policy"]
     driver = tmp_path / "raise_in_a_subcommand.py"
     driver.write_text(
         "import messagefoundry.__main__ as m\n"
         "def _boom(args):\n"
         "    raise RuntimeError('synthetic failure PID|1||123456^^^MRN||DOE^JANE')\n"
-        "m._DISPATCH['hl7schema'] = _boom\n"
+        "m._DISPATCH['ai-policy'] = _boom\n"
         f"raise SystemExit(m.main({argv!r}))\n",
         encoding="utf-8",
     )
@@ -3908,9 +3919,9 @@ def test_the_dispatch_floor_catches_exception_but_not_base_exception(
     def _raise(_args: object) -> int:
         raise raised
 
-    monkeypatch.setitem(cli._DISPATCH, "hl7schema", _raise)
+    monkeypatch.setitem(cli._DISPATCH, "ai-policy", _raise)
     with pytest.raises(expected):
-        main(["hl7schema", "--json"])
+        main(["ai-policy", "--json"])
     assert capsys.readouterr().out == ""
 
 
@@ -3921,8 +3932,12 @@ def test_lens_rewrite_counts_as_a_json_command_for_an_uncaught_exception(
     it there). Its subparser sets `json=True` so `main`'s dispatch floor (BACKLOG #1863) emits a
     JSON error for it too, rather than the text-mode empty stdout.
 
-    RED when: the `set_defaults(json=True)` on the rewrite subparser is dropped."""
-    from messagefoundry import lens
+    RED when: the `set_defaults(json=True)` on the rewrite subparser is dropped.
+
+    `lens rewrite` is a toolkit command since ADR 0201 slice 4, so the floor measured is the shared
+    `run_cli` one under the toolkit's command, with the toolkit's floor code."""
+    from messagefoundry_toolkit import lens
+    from messagefoundry_toolkit.__main__ import main
 
     def _boom(*_args: object, **_kwargs: object) -> str:
         raise RuntimeError("synthetic rewrite failure")
@@ -4495,8 +4510,8 @@ def test_a_real_cli_process_starts_with_no_root_handler_and_redacts(tmp_path: Pa
         "    print('handlers-at-dispatch', len(logging.getLogger().handlers), flush=True)\n"
         + _CHILD_PROBE
         + "    return 0\n"
-        "m._DISPATCH['hl7schema'] = _probe\n"
-        "raise SystemExit(m.main(['hl7schema']))\n",
+        "m._DISPATCH['ai-policy'] = _probe\n"
+        "raise SystemExit(m.main(['ai-policy']))\n",
         returncode=0,
         handlers_line="handlers-at-dispatch 1",
     )

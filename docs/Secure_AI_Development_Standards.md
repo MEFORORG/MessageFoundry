@@ -122,7 +122,7 @@ Every control below traces to one of five named failure modes the consensus lite
 - **P2 PHI-critical / security-control** — code that **protects** PHI or is itself a compliance control (at-rest crypto, auth/RBAC, audit log, bind guard, redaction); a failure is a direct HIPAA / ASVS-L3 exposure.
 - **P3 Real-PHI runtime** — the built/deployed system carries **real patient data** in production (every MEFOR adopter deployment).
 
-> **Hard rule (restated as a floor).** `phi_touch` describes the **production code path**, **never real PHI on a dev box**. PO.5 means dev/test is **ALWAYS synthetic** — `python -m messagefoundry generate`. "PHI-touch" never licenses real PHI in a prompt, fixture, transcript, or memory file at *any* tier.
+> **Hard rule (restated as a floor).** `phi_touch` describes the **production code path**, **never real PHI on a dev box**. PO.5 means dev/test is **ALWAYS synthetic** — `python -m messagefoundry_toolkit generate`. "PHI-touch" never licenses real PHI in a prompt, fixture, transcript, or memory file at *any* tier.
 
 ### 4.2 THE MATRIX
 

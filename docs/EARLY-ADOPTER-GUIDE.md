@@ -240,7 +240,7 @@ accepts an attestation from any workflow in the repository, on any ref. The `--s
 says `0.5.0rc1`, while its tag says `v0.5.0-rc1`.
 
 For a **reproducible pinned** deploy, generate a hash-locked requirements file scoped to the extras you
-actually run and install it with `--require-hashes`. The scaffolded config repo (`messagefoundry init`,
+actually run and install it with `--require-hashes`. The scaffolded config repo (`messagefoundry-toolkit init`,
 below) already pins the engine in its `requirements.txt` — extend that into a full hash-lock for your
 host.
 
@@ -262,7 +262,7 @@ The table names the extras an operator reaches for first. The full list, includi
 > forgot `pip install 'messagefoundry[postgres]'`, you get a raw `ImportError` at startup instead of a
 > clear message. Install the extra with the backend.
 
-### Start your own config repo (`messagefoundry init`)
+### Start your own config repo (`messagefoundry-toolkit init`)
 
 §4.1 installed the **engine**. Now scaffold the other half a deploying organization owns — your **own**
 separately-versioned **config repo** ([ADR 0017](adr/0017-consumer-deployment-model.md)) — which holds
@@ -271,19 +271,24 @@ to run MessageFoundry:** the `samples/` directory used in older quickstarts ship
 checkout, **not in the installed wheel**, so a wheel install runs against *your* `config/`, not
 `samples/`.
 
+`init` is an authoring command, so it runs from the separate toolkit, installed at the engine's own
+version on the machine where you author configuration and not on a production host:
+
 ```powershell
-messagefoundry init ./my-config-repo
+pip install "messagefoundry-toolkit==<version>"
+messagefoundry-toolkit init ./my-config-repo
 ```
 
 It writes a runnable starter feed (`config/`), `environments/<env>.toml` value stubs, a synthetic
 fixture, an instance `messagefoundry.toml` (active environment + posture), a `requirements.txt` pinning
-this engine version, a CI `check` workflow, and `.vscode` settings — so `messagefoundry check --config
+this engine version, a `requirements-dev.txt` pinning the toolkit at the same version for authoring
+machines, a CI `check` workflow, and `.vscode` settings — so `messagefoundry check --config
 config --messages messages/sets` is green from the first commit. See the generated `README.md` for the
 day-to-day workflow.
 
 ### 4.3 Run it (foreground, to learn the ropes)
 
-From your config repo (the one `messagefoundry init` created), run the engine against its `config/`
+From your config repo (the one `messagefoundry-toolkit init` created), run the engine against its `config/`
 directory:
 
 ```powershell
@@ -417,7 +422,7 @@ There are two distinct configuration surfaces:
 1. **The message graph (Python modules)** in your `--config` directory. The minimum first flow is
    one module: an `inbound()` with a transport spec and a `router=` binding, a `@router` that returns
    handler name(s), and a `@handler` that returns `Send(...)` to a declared `outbound()`. The scaffolded
-   repo (`messagefoundry init`, §4) gives you a working `config/IB_EXAMPLE_ADT.py` to start from (or,
+   repo (`messagefoundry-toolkit init`, §4) gives you a working `config/IB_EXAMPLE_ADT.py` to start from (or,
    from a source checkout, copy `samples/config/IB_ACME_ADT.py`). The loader globs `*.py` (non-recursive;
    skips `_*`-prefixed helper files), then merges an optional `connections.toml`.
 2. **Service/operational settings** in `messagefoundry.toml` (+ `MEFOR_*` env + CLI). Keep **all
@@ -598,7 +603,7 @@ Prove correctness **before** any network traffic. None of this should ever run a
 `generate`/`dryrun` can emit full message bodies; never redirect their output to a committed file or
 CI log.
 
-1. **Build a synthetic corpus:** `messagefoundry generate --type ADT --count 50 --out <fixtures>`
+1. **Build a synthetic corpus:** `messagefoundry-toolkit generate --type ADT --count 50 --out <fixtures>`
    (conformant HL7 v2.5.1, validated against hl7apy; 13 message types, 57 ADT triggers; PHI-free).
 2. **Gate the config in CI / a pre-commit hook:**
    `messagefoundry check --config <dir> --messages <fixtures>`.
@@ -774,7 +779,7 @@ are met.
 
 **Goal:** prove wiring, dispositions, and recovery on a throwaway box, with **synthetic data only**.
 
-**Setup:** SQLite, loopback, auth on, a synthetic corpus from `messagefoundry generate`.
+**Setup:** SQLite, loopback, auth on, a synthetic corpus from `messagefoundry-toolkit generate`.
 
 **Exit criteria (→ Stage 1):**
 - [ ] `messagefoundry check --config <dir> --messages <fixtures>` exits 0 (validate **and** dryrun green).
@@ -1043,7 +1048,7 @@ throughput — only the leader processes.
   `messagefoundry` package), the only supported version before 1.0 (`docs/SUPPORT-POLICY.md`). Include the engine version, config shape, and relevant **non-PHI** log excerpts.
 - **Never attach real PHI** to anything you share, including a log excerpt or a reproduction.
   Redact hostnames, IP addresses and partner names. Reproduce with a synthetic corpus from
-  `messagefoundry generate`.
+  `messagefoundry-toolkit generate`.
 
 ---
 

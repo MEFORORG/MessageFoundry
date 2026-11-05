@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.lens import (
+from messagefoundry_toolkit.lens import (
     CONTRACT_V2,
     LensRewriteError,
     parse_source,

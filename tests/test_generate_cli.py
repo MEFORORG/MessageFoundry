@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.__main__ import main
 from messagefoundry.parsing import Peek
+from messagefoundry_toolkit.__main__ import main
 
 
 def _out_json(capsys: pytest.CaptureFixture[str]) -> object:

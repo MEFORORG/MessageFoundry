@@ -33,18 +33,21 @@ off the engine's entry point must change those guides in the same change.
 
 WHICH COMMAND REGISTERS WHICH ROWS (ADR 0201). Two parsers register rows: the engine's
 ``messagefoundry`` command, and the separate ``messagefoundry-toolkit`` command from the
-distribution of that name. A row's key is the same string on either command. ADR 0201 moves the
-toolkit rows one slice at a time, from slice 2 on; until the last one moves, some toolkit rows are
-still registered on the engine's command and still packed in its wheel. The engine refuses a top-level
-toolkit row it no longer registers, with a line naming the toolkit command. Which rows have moved is
-read off the two parsers, never kept here.
+distribution of that name. A row's key is the same string on either command. Since ADR 0201 slice 4
+the engine's command registers exactly the production rows and the toolkit's command exactly the
+toolkit rows. The engine refuses a top-level toolkit row with a line naming the toolkit command.
 
 ``tests/test_cli_surface.py`` builds both real parsers and fails when a subcommand has no row, when a
 row names no subcommand, when a group breaks the rule above, when the toolkit rows stop matching the
-ruling, when the two parsers share a row, or when the toolkit parser registers a production row.
+ruling, when the two parsers share a row, when the toolkit parser registers a production row, or when
+either command registers a row outside its own tier. The engine's release smoke asserts the same
+production set on the built wheel, installed without the toolkit (``.github/workflows/release.yml``).
 
-SO THIS TABLE IS NOT YET THE CONTROL THAT KEEPS DEVELOPMENT CODE OFF A PRODUCTION BOX. Until the last
-toolkit row leaves the engine, which is ADR 0201 slice 4, do not cite it as one.
+WHAT THIS TABLE DOES NOT COVER. It governs the command surface, ASVS 15.2.3's clause (b). Clause (a),
+what the engine wheel includes, is the physical move of each module into the toolkit package, which
+ADR 0201 slices 6 and 7 finish for ``anon/``, ``generators/``, ``hl7schema.py`` and
+``hl7structures.py``. Until those land, do not cite this table as keeping that code off a production
+box.
 
 The module imports nothing from the engine and builds no parser, so a wheel build can read it cheaply.
 """

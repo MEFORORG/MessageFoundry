@@ -109,11 +109,13 @@ inert.
 
 **Some tools write Python into a config directory, and the loader then runs it.** At least these:
 
-- `messagefoundry import corepoint`, in `corepoint_import.py`, turns a Corepoint export into one
-  module per channel in the `--out` folder. It reads the export with `defusedxml`, and checks that
-  each generated module compiles before writing it. `compile` here only parses the source; nothing
-  runs until the engine loads that folder.
-- `messagefoundry init` scaffolds a new config repository with a starter feed.
+- `messagefoundry-toolkit import corepoint`, in the toolkit's `corepoint_import.py`, turns a
+  Corepoint export into one module per channel in the `--out` folder. It reads the export with
+  `defusedxml`, and checks that each generated module compiles before writing it. `compile` here
+  only parses the source; nothing runs until the engine loads that folder.
+- `messagefoundry-toolkit init` scaffolds a new config repository with a starter feed.
+  Both are toolkit commands, from the separate `messagefoundry-toolkit` distribution (ADR 0201), so
+  a host that installs the engine alone carries neither.
 - `messagefoundry restore --config-to` writes a backup's config files into a folder, so a restore
   is only as trusted as the backup it reads. Section 7 says what holds that read.
 - The VS Code extension's new-route command writes a new module into your config directory.
@@ -619,8 +621,9 @@ the first table. The rule places at least these modules:
 - `transports/loopback.py` and `transports/passthrough.py`, second. They hand their bodies to the
   engine's intake.
 - `__main__.py`, second. It hands at least dry-run fixtures to `pipeline/dryrun.py` and
-  `pipeline/dryrun_trace.py`, a Corepoint export to `corepoint_import.py`, and a backup to
-  `pipeline/dr_backup.py`.
+  `pipeline/dryrun_trace.py`, and a backup to `pipeline/dr_backup.py`. The toolkit's
+  `messagefoundry_toolkit/__main__.py` hands a Corepoint export to
+  `messagefoundry_toolkit/corepoint_import.py` the same way.
 - `auth/service.py`, second. It hands an identity provider's token to `auth/oidc/`, and a passkey
   response to `auth/webauthn.py`. The first table's identity provider and passkey rows cover them.
 
@@ -670,7 +673,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | A TLS client's certificate | The certificate a TLS client presents, read again to find its issuer. The same module also decodes an operator's PKCS #12 file and certificate revocation lists. | `pki.py` |
 | A partner's certificate | The recipient certificate a Direct outbound encrypts to. An operator names the file, but the partner issued what is in it. The module decodes it first, then checks it against the operator's trust anchor. It also reads the operator's own signing key. | `transports/direct.py` |
 | Web console requests | The form bodies a browser posts, and the Content Security Policy reports it sends | `messagefoundry_webconsole/routes/_common.py`, `messagefoundry_webconsole/routes/connection_writes.py`, `messagefoundry_webconsole/routes/core.py`, `messagefoundry_webconsole/routes/monitoring_writes.py`, `messagefoundry_webconsole/routes/oidc.py` |
-| A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `corepoint_import.py` |
+| A file from another system | A Corepoint export, read with `defusedxml` (section 2) | `messagefoundry_toolkit/corepoint_import.py` |
 | A backup | The manifest and encrypted blocks `messagefoundry restore` reads. The archive list below says what bounds them. | `pipeline/dr_backup.py`, `store/backup_codec.py` |
 
 **Parse sites left out, and why.**
