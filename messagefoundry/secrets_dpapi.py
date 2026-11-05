@@ -110,10 +110,10 @@ def dpapi_unprotect(blob: bytes) -> bytes:
     )
     if not ok:
         raise DpapiError(
-            f"CryptUnprotectData failed (Win32 error {ctypes.get_last_error()}); the key file must be "
-            "unprotected on the same machine that protected it — and, if it was protected with --user "
-            "scope, by the same Windows user (machine scope, the default, lets any account on the host "
-            "decrypt it)"
+            f"CryptUnprotectData failed (Win32 error {ctypes.get_last_error()}); a DPAPI blob opens "
+            "only on the machine that protected it, and a user-scope blob (protect-key --user, or "
+            "a key custody host blob) only for the Windows account that protected it; machine scope "
+            "lets any account on that host open it"
         )
     try:
         return ctypes.string_at(out_blob.pbData, out_blob.cbData)

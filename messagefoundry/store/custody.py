@@ -38,6 +38,7 @@ so the master key stays in memory as long as its object lives; that is the same 
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import os
@@ -188,6 +189,11 @@ def _decode_recovery_text(entry: str) -> tuple[bytes | None, str]:
                 f"character {position} of the entry is not one a recovery key uses (the count "
                 "includes every character typed, dashes and spaces too)"
             )
+        if count == _TEXT_CHARS:  # stop at once, rather than grow the number for a long paste
+            return None, (
+                f"a recovery key has {_TEXT_CHARS} characters, not counting dashes and spaces; "
+                "this entry has more"
+            )
         number = (number << 5) | digit
         count += 1
     if count != _TEXT_CHARS:
@@ -274,6 +280,8 @@ class HostBlob:
     earlier_store_ids: tuple[StoreId, ...] = ()
 
     def __post_init__(self) -> None:
+        # Held as a tuple whatever was passed, so the ids checked below cannot change afterwards.
+        object.__setattr__(self, "earlier_store_ids", tuple(self.earlier_store_ids))
         ids = [self.store_id.value, *(s.value for s in self.earlier_store_ids)]
         if len(set(ids)) != len(ids):
             raise CustodyError(
@@ -380,13 +388,17 @@ def unwrap_master_key(wrapped: bytes, recovery_key: RecoveryKey, store_id: Store
         raise CustodyError(f"a recovery wrap is {_WRAP_BYTES} bytes, not {len(wrapped)}")
     nonce = wrapped[len(_WRAP_HEADER) : len(_WRAP_HEADER) + _NONCE_BYTES]
     sealed = wrapped[len(_WRAP_HEADER) + _NONCE_BYTES :]
+    key: bytes | None
     try:
         key = _wrap_cipher(recovery_key).decrypt(nonce, sealed, _WRAP_HEADER + store_id.value)
     except InvalidTag:
+        key = None
+    # Raised outside the handler, so the refusal carries no chained exception.
+    if key is None:
         raise CustodyError(
             "the recovery key does not open this recovery wrap for this store id: either the key "
             "is not the one issued for this store, or the wrap belongs to another store"
-        ) from None
+        )
     return MasterKey(key)
 
 
@@ -460,51 +472,85 @@ def _posix_file_problem(
     return None
 
 
+def _os_reason(exc: OSError) -> str:
+    return exc.strerror or type(exc).__name__
+
+
 def _read_capped(handle: BinaryIO, path: Path) -> bytes:
-    data = handle.read(_MAX_FILE_BYTES + 1)
+    """Read a custody file's bytes, refusing one larger than any custody file. Each refusal is
+    raised outside any handler, and the oversized bytes are dropped first, so neither a chained
+    exception nor this frame's locals carry them."""
+    reason: str | None = None
+    data = b""
+    try:
+        data = handle.read(_MAX_FILE_BYTES + 1)
+    except OSError as exc:
+        reason = _os_reason(exc)
+    if reason is not None:
+        raise CustodyError(f"{path} could not be read: {reason}")
     if len(data) > _MAX_FILE_BYTES:
+        del data
         raise CustodyError(f"{path} is larger than any custody file, so it is not one")
     return data
 
 
-def _unreadable(path: Path, exc: OSError) -> CustodyError:
-    return CustodyError(f"{path} could not be read: {exc.strerror or type(exc).__name__}")
+def _posix_acl_problem(fd: int) -> str | None:
+    """Why the open file's POSIX access control list may grant more than its mode shows, or
+    ``None``. With an ACL the group bits are only its mask, so a named user or group entry can
+    reach the file whatever those bits say. A file system with no extended attributes has no ACL."""
+    listxattr = getattr(os, "listxattr", None)
+    if listxattr is None:
+        return None
+    try:
+        names = listxattr(fd)
+    except OSError:
+        return None
+    if "system.posix_acl_access" in names:
+        return "it carries a POSIX access control list, which can grant accounts its mode does not show"
+    return None
 
 
 def _read_posix_checked(path: Path, *, forbidden: int, owners: frozenset[int]) -> bytes:
     """Read a custody file on POSIX, checking the file it opened rather than the name.
 
     ``O_NOFOLLOW`` refuses a link, ``O_NONBLOCK`` keeps a FIFO from stalling the open until the
-    regular-file check refuses it, and the mode and owner are read from the open descriptor, so the
-    file checked is the file read. ``FileNotFoundError`` propagates as it is; every other failure
-    is a :class:`CustodyError`."""
+    regular-file check refuses it, and the mode, owner and access control list are read from the
+    open descriptor, so the file checked is the file read. ``FileNotFoundError`` propagates as it
+    is; every other failure is a :class:`CustodyError`, raised outside any handler."""
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
         raise CustodyError("the POSIX custody file check runs on POSIX only")
+    fd = -1
+    reason: str | None = None
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     except FileNotFoundError:
         raise
     except OSError as exc:
-        raise _unreadable(path, exc) from None
-    with os.fdopen(fd, "rb") as handle:
-        status = os.fstat(handle.fileno())
+        reason = _os_reason(exc)
+    if reason is not None:
+        raise CustodyError(f"{path} could not be read: {reason}")
+    try:
+        handle = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)  # nothing owns the descriptor yet
+        raise
+    with handle:
+        status = os.fstat(fd)
         problem = _posix_file_problem(
             status.st_mode, status.st_uid, os.geteuid(), forbidden=forbidden, owners=owners
-        )
+        ) or _posix_acl_problem(fd)
         if problem is not None:
             raise CustodyError(f"{path} is refused: {problem}")
-        try:
-            return _read_capped(handle, path)
-        except OSError as exc:
-            raise _unreadable(path, exc) from None
+        return _read_capped(handle, path)
 
 
 def _open_windows_held(path: Path) -> int:
     """Open ``path`` for reading as itself, never following a link, and return a descriptor.
 
-    The share mode allows other readers only, so while the descriptor is open the name cannot be
-    renamed, replaced or deleted: the access list read by name afterwards is this file's. A brief
-    hold by another process is ridden out. Raises ``FileNotFoundError`` when there is no file."""
+    The share mode admits other readers only, so while the descriptor is open the file at the final
+    name cannot be renamed, replaced or deleted. A brief hold by another process is ridden out.
+    Anything but a disk file (a pipe, a device) is refused. Raises ``FileNotFoundError`` when there
+    is no file, and :class:`CustodyError` for every other failure."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise CustodyError("the Windows custody file open runs on Windows only")
     import ctypes
@@ -525,7 +571,11 @@ def _open_windows_held(path: Path) -> int:
         wintypes.HANDLE,
     ]
     create.restype = wintypes.HANDLE
-    generic_read, file_share_read, open_existing = 0x80000000, 0x00000001, 3
+    kernel32.GetFileType.argtypes = [wintypes.HANDLE]
+    kernel32.GetFileType.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    generic_read, file_share_read, open_existing, file_type_disk = 0x80000000, 0x1, 3, 0x1
     # FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT: a link is opened as itself, and the
     # access check that follows refuses it.
     flags = 0x00000080 | 0x00200000
@@ -538,35 +588,48 @@ def _open_windows_held(path: Path) -> int:
             raise ctypes.WinError(ctypes.get_last_error())
         opened.append(handle)
 
-    ride_out_a_held_file(_open, frozenset({WINERROR_SHARING_VIOLATION}))
+    reason: str | None = None
     try:
-        return msvcrt.open_osfhandle(opened[0], os.O_RDONLY | os.O_BINARY)
+        ride_out_a_held_file(_open, frozenset({WINERROR_SHARING_VIOLATION}))
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        reason = _os_reason(exc)
+    if reason is not None:
+        raise CustodyError(f"{path} could not be read: {reason}")
+    handle = opened[0]
+    try:
+        if kernel32.GetFileType(handle) != file_type_disk:
+            raise CustodyError(f"{path} is refused: it is not a file on disk")
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
     except BaseException:
-        kernel32.CloseHandle(wintypes.HANDLE(opened[0]))
+        kernel32.CloseHandle(handle)
         raise
 
 
 def _read_windows_checked(path: Path) -> bytes:
-    """Read a custody file on Windows, refusing one a known broad group or an application package
-    can read or change, or a link. The file stays open while its access list is read, so the file
-    checked is the file read. ``FileNotFoundError`` propagates as it is; every other failure is a
+    """Read a custody file on Windows, refusing a link, anything but a disk file, and a file a known
+    broad group or an application package can read or change.
+
+    The file stays open, unshared for writing, renaming and deleting, while its access list is read.
+    **That list is still read by name**, so at least a link or junction in a PARENT directory that is
+    re-pointed between the open and that read is not caught: the list read may then belong to
+    another file. Reading the list from the open handle closes that, and the slice that wires these
+    reads must do so. ``FileNotFoundError`` propagates as it is; every other failure is a
     :class:`CustodyError`."""
     from messagefoundry.restricted_file import broad_access_problem
 
+    fd = _open_windows_held(path)
     try:
-        fd = _open_windows_held(path)
-    except (FileNotFoundError, CustodyError):
+        handle = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)  # nothing owns the descriptor yet
         raise
-    except OSError as exc:
-        raise _unreadable(path, exc) from None
-    with os.fdopen(fd, "rb") as handle:
+    with handle:
         problem = broad_access_problem(path)
         if problem is not None:
             raise CustodyError(f"{path} is refused: {problem}")
-        try:
-            return _read_capped(handle, path)
-        except OSError as exc:
-            raise _unreadable(path, exc) from None
+        return _read_capped(handle, path)
 
 
 def write_host_file(path: Path, blob: HostBlob) -> None:
@@ -593,8 +656,10 @@ def read_host_file(path: Path) -> HostBlob:
     ``FileNotFoundError`` when there is no file, and :class:`CustodyError` (or a DPAPI error on
     Windows) for every other refusal.
 
-    Not checked on Windows yet: the file's owner, and an access list that names an account outside
-    the known broad groups. The POSIX arm checks the owner."""
+    Not checked on Windows yet, at least: the file's owner, an access list that names an account
+    outside the known broad groups, the containing directory's access, and a parent link swapped
+    between the open and the access-list read (:func:`_read_windows_checked`). The POSIX arm checks
+    the owner."""
     if sys.platform == "win32":
         return unprotect_host_blob(_read_windows_checked(path))
     return HostBlob.parse(_read_posix_checked(path, forbidden=0o077, owners=frozenset()))
@@ -637,9 +702,11 @@ def read_handoff_file(path: Path) -> HostBlob:
     a blob that is not a host blob, and the DPAPI errors of
     :func:`~messagefoundry.secrets_dpapi.dpapi_unprotect`. Windows only, as the write is.
 
-    Not checked yet, as :func:`read_host_file` says: the owner, and an access list naming an account
-    outside the known broad groups. Since machine scope opens for every account, that list is the
-    only control on the handoff, so the slice that converts it at first start must close this."""
+    Not checked yet, at least what :func:`read_host_file` lists for Windows. Since machine scope
+    opens for every account, any local account that can create a file at this path can make a
+    handoff around a key it chose, and the access list is the only control. **So nothing may convert
+    a handoff read here until those checks exist**; the slice that converts it at first start must
+    add them first."""
     from messagefoundry.secrets_dpapi import DpapiUnavailable
 
     if sys.platform != "win32":
@@ -676,11 +743,14 @@ def read_systemd_credential(name: str, *, environ: Mapping[str, str] | None = No
         raise CredentialUnavailable("a systemd credential is offered on Linux only")
     if not os.path.isabs(directory):
         raise CustodyError(f"${_CREDENTIALS_DIRECTORY} must be an absolute path")
-    try:
-        return HostBlob.parse(
-            _read_posix_checked(Path(directory) / name, forbidden=0o027, owners=frozenset({0}))
-        )
-    except FileNotFoundError:
-        raise CredentialUnavailable(
-            f"${_CREDENTIALS_DIRECTORY} holds no credential named {name!r}"
-        ) from None
+    if not os.path.isdir(directory):
+        # Set but missing is a broken credential setup, not an absent credential: refuse, so a
+        # caller does not fall back to a weaker provider.
+        raise CustodyError(f"${_CREDENTIALS_DIRECTORY} names no directory")
+    data: bytes | None = None
+    with contextlib.suppress(FileNotFoundError):
+        data = _read_posix_checked(Path(directory) / name, forbidden=0o027, owners=frozenset({0}))
+    # Raised outside the suppressed error, so the refusal carries no chained exception.
+    if data is None:
+        raise CredentialUnavailable(f"${_CREDENTIALS_DIRECTORY} holds no credential named {name!r}")
+    return HostBlob.parse(data)

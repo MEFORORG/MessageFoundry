@@ -8,8 +8,8 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
   to replace one that exists. Its access list is read back before a single byte is written. A file
   that could not be created that way is never left behind, and there is no fallback to writing the
   file first and tightening it afterwards.
-* :func:`broad_access_problem` answers, before a key file is used, whether a known broad group
-  can read it or change it.
+* :func:`broad_access_problem` answers, before a key file is used, whether a known broad group or
+  an application package can read it or change it.
 
 Beside them, :func:`unlink_generated` removes a key or certificate file the engine wrote, riding out
 the brief Windows hold another process puts on such a file (:func:`ride_out_a_held_file`). It sits
@@ -199,7 +199,8 @@ def _is_package_sid(sid: str) -> bool:
 
 
 def _windows_access_problem(security: _WinPathSecurity, mask: int = _REACH_MASK) -> str | None:
-    """Why a broad group can read or change the file this access list belongs to, or ``None``.
+    """Why a broad group or an application package can read or change the file this access list
+    belongs to, or ``None``.
 
     A list that could not be read is a problem too, and so is an entry of a kind this check cannot
     interpret: a check that did not finish has not shown the file restricted. Kept free of ctypes

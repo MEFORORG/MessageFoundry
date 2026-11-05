@@ -150,6 +150,21 @@ def test_a_refusal_leaves_no_key_material_in_the_raising_frame() -> None:
         assert seen == 1  # the control: the raising frame in custody.py was examined
 
 
+def test_a_long_paste_is_refused_at_the_first_extra_character() -> None:
+    text = RecoveryKey(_RECOVERY).text()
+    with pytest.raises(CustodyError, match="this entry has more"):
+        RecoveryKey.parse(text + "0" * 2_000_000)
+
+
+def test_earlier_store_ids_are_held_as_a_tuple() -> None:
+    ids = [StoreId(b"\x21" * 16)]
+    blob = HostBlob(MasterKey(_MASTER), StoreId(b"\x11" * 16), ids)  # type: ignore[arg-type]
+    ids.append(StoreId(b"\x11" * 16))  # a later change to the list does not reach the blob
+    assert blob.earlier_store_ids == (StoreId(b"\x21" * 16),)
+    generated = HostBlob(MasterKey(_MASTER), StoreId(b"\x11" * 16), (s for s in ids[:1]))  # type: ignore[arg-type]
+    assert generated.earlier_store_ids == (StoreId(b"\x21" * 16),)
+
+
 def test_a_host_blob_given_as_a_bytearray_parses() -> None:
     assert HostBlob.parse(bytearray(_blob().serialize())) == _blob()
 
@@ -211,7 +226,8 @@ def test_a_wrong_recovery_key_is_refused() -> None:
     wrapped = wrap_master_key(MasterKey(_MASTER), RecoveryKey(_RECOVERY), store_id)
     with pytest.raises(CustodyError, match="does not open this recovery wrap") as excinfo:
         unwrap_master_key(wrapped, RecoveryKey.mint(), store_id)
-    assert excinfo.value.__cause__ is None and excinfo.value.__suppress_context__
+    # Raised outside the handler: no chained exception at all, not one merely hidden.
+    assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
     assert not _leaks(str(excinfo.value), _MASTER, _RECOVERY)
 
 
@@ -345,6 +361,16 @@ def test_systemd_credential_is_read_from_the_named_file(tmp_path: Path) -> None:
         custody.read_systemd_credential("store-a", environ={"CREDENTIALS_DIRECTORY": "relative"})
 
 
+@posix_only
+def test_a_credentials_directory_that_does_not_exist_is_refused_not_unavailable(
+    tmp_path: Path,
+) -> None:
+    environ = {"CREDENTIALS_DIRECTORY": str(tmp_path / "missing")}
+    with pytest.raises(CustodyError, match="names no directory") as excinfo:
+        custody.read_systemd_credential("store-a", environ=environ)
+    assert not isinstance(excinfo.value, CredentialUnavailable)
+
+
 def test_systemd_credential_refusals_that_need_no_file() -> None:
     with pytest.raises(CredentialUnavailable, match="is not set"):
         custody.read_systemd_credential("store-a", environ={})
@@ -455,6 +481,30 @@ def test_windows_a_blob_of_the_other_scope_is_refused(tmp_path: Path) -> None:
         custody.read_handoff_file(host)
     with pytest.raises(CustodyError, match="not a user-scope DPAPI blob"):
         custody.unprotect_host_blob(b"too short")
+
+
+@windows_only
+def test_windows_the_held_file_cannot_be_replaced_or_deleted(tmp_path: Path) -> None:
+    path = tmp_path / "master.key"
+    custody.write_host_file(path, _blob())
+    other = tmp_path / "other.key"
+    other.write_bytes(b"planted")
+    fd = custody._open_windows_held(path)
+    try:
+        with pytest.raises(PermissionError):
+            os.replace(other, path)
+        with pytest.raises(PermissionError):
+            os.unlink(path)
+    finally:
+        os.close(fd)
+    os.replace(other, path)  # the control: once released, the name can be replaced
+
+
+@windows_only
+def test_windows_a_device_is_refused() -> None:
+    # A device that exists and is not a disk file: the null device.
+    with pytest.raises(CustodyError, match="not a file on disk"):
+        custody._open_windows_held(Path("NUL"))
 
 
 @windows_only

@@ -478,9 +478,11 @@ pure-Python equivalent:
   creates the file with `O_CREAT | O_EXCL` and mode `0o600`
 - Key custody file reads: `store/custody.py`, which on Windows opens a host or handoff key file with
   `kernel32`'s `CreateFileW`, `FILE_FLAG_OPEN_REPARSE_POINT` and a share mode that admits only other
-  readers, so a link is opened as itself and the name cannot be replaced while its access list is
-  read (vault BACKLOG #3411). POSIX needs no `ctypes` for this; it opens the file with `O_NOFOLLOW`
-  and reads its mode and owner from the open descriptor
+  readers, so a link is opened as itself and the file at that name cannot be replaced while its
+  access list is read, and `GetFileType` refuses anything but a disk file (vault BACKLOG #3411). The
+  access list is still read by name, so a link in a parent directory re-pointed in between is not
+  caught. Nothing calls these reads yet. POSIX needs no `ctypes` for this; it opens the file with
+  `O_NOFOLLOW` and reads its mode and owner from the open descriptor
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
