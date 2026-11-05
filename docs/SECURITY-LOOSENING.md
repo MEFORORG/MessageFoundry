@@ -1924,10 +1924,13 @@ count is above `0` (vault BACKLOG #2613).
 - **It is never silent:** a WARNING at every construction naming the connection, never an id, a
   `fhir-update-path-form` line in `messagefoundry check` naming every connection that sets it, and
   an `update_url_form` entry in `security_loosenings()`, which `GET /security/posture` shows with
-  the same connection names (vault BACKLOG #2571). The last two read one list. That list holds a
-  connection whose `update_url_form` is written as the literal `"path"`. A value supplied
-  through `env()` is not resolved when the list is built, so such a connection is not named by
-  either.
+  the same connection names (vault BACKLOG #2571). The last two read one list. A value supplied
+  through `env()` is named too. The posture route resolves it against the values the running graph
+  was built with, and names the connection only if it resolves to `"path"`. `check` does not resolve
+  it, so it names every such connection, marked possibly. A value neither can resolve is named and
+  marked possibly, never left off. A connection whose writes resolve to something other than an
+  update is not named, because the build refuses the path form there. Nor is a `deployed=False`
+  connection whose `update_url_form` is an `env()` value, because it is never built.
 - **What it cannot do, and where it is NOT reported:** it is **advisory only**, on the precedent of
   `tls_allow_expired`, the other per-connection interoperability relaxation. No posture gate keys on it,
   and `[security].enforcement = enforce` does not refuse it. It is not in the

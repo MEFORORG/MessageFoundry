@@ -18,6 +18,16 @@ All notable changes to MessageFoundry are documented here. The format follows
   its path leads to another host, or cannot finish reading the path; see the Generic ODBC section of
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
 
+### Fixed
+- **A FHIR connection that takes `update_url_form` from `env()` is now named as a loosening.**
+  `GET /security/posture` resolves the value against the running graph's values and names the
+  connection if it resolves to `"path"`. `messagefoundry check` does not resolve it, so it names
+  such a connection marked possibly, and so does the posture route for a value it cannot resolve.
+  `FHIR()` now also reads an `env()` `interaction` or `conditional` through its default when it
+  checks the path form and the Bundle entry lists, and leaves a value with no default to the build,
+  so it no longer refuses a connection the build accepts. See
+  [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md). (`BACKLOG #2571`)
+
 ## [0.5.2] — 2026-10-20 — Early Access
 
 This engine pairs with web console 0.5.0, which is published after it under its own

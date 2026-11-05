@@ -2084,10 +2084,19 @@ def _posture_loosenings(
     )
     attested_hops = hops(attested_secure_hops)
     revocation_hops = hops(revocation_attested_hops)
-    # Vault BACKLOG #2571. This reader returns plain names already.
-    path_form_hops = [] if registry is None else keep(path_form_fhir_updates(registry))
-    # Resolved against the same values as the DATABASE hops above. A name the values cannot
-    # resolve keeps the reader's marker, because the entry keeps names only.
+    # Vault BACKLOG #2571. Both readers below resolve env() against the same values as the
+    # DATABASE hops above. A name the values cannot resolve keeps the reader's marker, because the
+    # entry keeps names only and its text states that each named connection takes the loosening.
+    path_form_hops = (
+        []
+        if registry is None
+        else [
+            f"{name} ({note})" if note else name
+            for name, note in path_form_fhir_updates(registry, env_values=db_env_values)
+            # Narrowed on the bare name, before any marker is added.
+            if visible is None or visible(name)
+        ]
+    )
     ech_hops = (
         []
         if registry is None

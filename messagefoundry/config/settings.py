@@ -10248,7 +10248,7 @@ def security_loosenings(
     which walks outbound and ``FhirLookup``; ``unverified_generic_db_hops``, which walks inbound as well as
     outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
     ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``;
-    ``path_form_fhir_updates``, which walks outbound and already returns plain names;
+    ``path_form_fhir_updates``, which walks the ``FHIR()`` outbounds;
     ``ech_cleartext_sidecar_hops``, which walks the ``REST`` outbounds). A caller that
     genuinely has no graph — ``messagefoundry security show``, which reads a
     settings file and never loads the connection config — passes empty sequences and SAYS SO in its
@@ -10904,7 +10904,9 @@ def security_loosenings(
                 f"({named}) — each update puts the message's resource id in the request URL, "
                 "so the receiving server's access log, and any proxy log on the path, holds "
                 "it; an id can be a medical record number or another identifier. The shipped "
-                "transaction form keeps the id out of the URL",
+                "transaction form keeps the id out of the URL. A name marked possibly has an "
+                "update_url_form env() value this reading could not resolve, and the above holds "
+                "of it only if that resolves to path",
             )
         )
     # ADR 0139: the engine-to-sidecar hop of an ECH connection. docs/SECURITY-LOOSENING.md,

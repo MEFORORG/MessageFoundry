@@ -32,7 +32,7 @@ from _fhir_fixtures import (
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
-from messagefoundry.config.wiring import FHIR, WiringError
+from messagefoundry.config.wiring import FHIR, WiringError, env
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
@@ -1898,6 +1898,65 @@ def test_path_form_is_refused_where_it_would_do_nothing(over: dict[str, str]) ->
         )
 
 
+@pytest.mark.parametrize(
+    "over",
+    [
+        # The form known only at build, beside a create: the build checks it.
+        {"update_url_form": env("form"), "interaction": "create"},
+        # The interaction known only at build, beside a literal path form. This was refused.
+        {"update_url_form": "path", "interaction": env("kind")},
+        {"update_url_form": "path", "conditional": env("cond")},
+        # An interaction known only at build, beside entry lists. This was refused too.
+        {"interaction": env("kind"), "allowed_entry_methods": ["POST"]},
+        # Defaults that make a coherent connection.
+        {
+            "update_url_form": env("form", default="path"),
+            "interaction": env("kind", default="update"),
+        },
+    ],
+    ids=["env-form", "env-interaction", "env-conditional", "env-interaction-lists", "defaults"],
+)
+def test_the_factory_leaves_an_env_value_it_cannot_read_to_the_build(
+    over: dict[str, object],
+) -> None:
+    """Vault BACKLOG #2571, #5330: an ``env()`` with no default is known only at build, where
+    ``FhirDestination`` checks it, so the factory does not refuse it on a guess."""
+    FHIR(url=BASE, **over)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("over", "match"),
+    [
+        ({"interaction": "create"}, "update_url_form='path' applies only"),
+        ({"conditional": "if-none-exist", "conditional_query": "a=b"}, "applies only"),
+    ],
+    ids=["create", "if-none-exist"],
+)
+def test_the_factory_reads_an_env_value_through_its_default(
+    over: dict[str, object], match: str
+) -> None:
+    """An ``env()`` default is what an unset key resolves to, so the factory checks it now, as it
+    checks a literal: a path form that would not apply is refused, whether the form or the write
+    kind comes from a default. A transaction default beside the same settings is the control."""
+    with pytest.raises(ValueError, match=match):
+        FHIR(url=BASE, update_url_form=env("form", default="path"), **over)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=match):
+        FHIR(
+            url=BASE,
+            update_url_form="path",
+            **{k: env(k, default=v) for k, v in over.items()},  # type: ignore[arg-type]
+        )
+    FHIR(url=BASE, update_url_form=env("form", default="transaction"), **over)  # type: ignore[arg-type]
+
+
+def test_the_factory_reads_an_env_interaction_default_against_the_entry_lists() -> None:
+    """The Bundle entry lists are checked against an ``env()`` interaction's default, as against a
+    literal, and the transaction default beside them is the control."""
+    with pytest.raises(ValueError, match="allowed_entry_methods applies only"):
+        FHIR(url=BASE, interaction=env("kind", default="create"), allowed_entry_methods=["POST"])
+    FHIR(url=BASE, interaction=env("kind", default="transaction"), allowed_entry_methods=["POST"])
+
+
 def test_unknown_update_url_form_is_refused() -> None:
     with pytest.raises(ValueError, match="update_url_form must be one of"):
         _dest(interaction="update", update_url_form="query")
@@ -1919,11 +1978,29 @@ def test_check_names_every_path_form_connection(tmp_path: Any) -> None:
         f'outbound("OB_EPIC", FHIR(url="{BASE}", interaction="update", update_url_form="path"))\n'
         f'outbound("OB_DEFAULT", FHIR(url="{BASE}", interaction="update"))\n',
     )
-    assert path_form_fhir_updates(load_config(cfg)) == ["OB_EPIC"]
+    assert path_form_fhir_updates(load_config(cfg)) == [("OB_EPIC", "")]
     [r] = [r for r in run_checks(cfg, run_lint=False).results if r.name == "fhir-update-path-form"]
     assert r.ok and not r.required and not r.skipped
     assert "OB_EPIC" in r.detail and "OB_DEFAULT" not in r.detail
     assert "owner ruling R3" in r.detail
+
+
+def test_check_names_an_env_path_form_connection_as_possibly(tmp_path: Any) -> None:
+    """Vault BACKLOG #2571: ``check`` resolves no ``env()``, so it names a connection whose form
+    comes from one, marked possibly. The env() form beside a create, which the build refuses with
+    the path form, is the control."""
+    from messagefoundry.checks import run_checks
+
+    cfg = _write_feed(
+        tmp_path,
+        "from messagefoundry import env\n"
+        f'outbound("OB_ENV", FHIR(url="{BASE}", interaction="update", '
+        'update_url_form=env("epic_form")))\n'
+        f'outbound("OB_CREATE", FHIR(url="{BASE}", update_url_form=env("epic_form")))\n',
+    )
+    [r] = [r for r in run_checks(cfg, run_lint=False).results if r.name == "fhir-update-path-form"]
+    assert "OB_ENV (possibly: update_url_form is an env() value" in r.detail
+    assert "OB_CREATE" not in r.detail
 
 
 def test_check_says_none_when_no_connection_takes_the_path_form(tmp_path: Any) -> None:

@@ -2751,7 +2751,7 @@ def test_the_fhir_path_form_update_is_actually_wired() -> None:
     transaction-form connection beside it is the control that must not be named."""
     from messagefoundry.config.wiring import path_form_fhir_updates
 
-    hops = tuple(path_form_fhir_updates(_fhir_update_registry()))
+    hops = tuple(name for name, _ in path_form_fhir_updates(_fhir_update_registry()))
     assert hops == ("OB_PATH",)
     risk = dict(_pairs(path_form_hops=hops))["update_url_form"]
     assert "OB_PATH" in risk and "OB_TXN" not in risk
@@ -2780,6 +2780,143 @@ async def test_posture_route_does_not_name_a_transaction_form_update(engine: Eng
     body = await _posture_body(engine)
     assert "update_url_form" not in [e["switch"] for e in body["loosenings"]]  # type: ignore[index,union-attr]
     assert body["loosenings_scope"] is None
+
+
+def _fhir_env_form_registry(**over: object) -> Any:
+    """One update ``OB_ENV`` whose ``update_url_form`` is ``env("epic_form")``, with ``over`` merged
+    into the factory's keywords, and a ``deployed`` keyword taken out for the registry."""
+    from messagefoundry.config.wiring import FHIR, Registry, build_outbound_connection, env
+
+    deployed = bool(over.pop("deployed", True))
+    keywords: dict[str, Any] = {
+        "interaction": "update",
+        "update_url_form": env("epic_form"),
+        **over,
+    }
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_ENV", FHIR(url="https://fhir.example.org/fhir", **keywords), deployed=deployed
+        )
+    )
+    return reg
+
+
+@pytest.mark.parametrize(
+    ("over", "listed"),
+    [
+        # An env() form on an update: possibly the path form, so named with the marker.
+        ({}, "possibly"),
+        # ...on an if-match, which the path form applies to as well.
+        ({"interaction": "create", "conditional": "if-match"}, "possibly"),
+        # A default is not what this reading resolves without values: the key may be set.
+        ({"update_url_form": ("epic_form", "transaction")}, "possibly"),
+        # A create rules the path form out whatever the form resolves to: the build refuses it.
+        ({"interaction": "create"}, None),
+        # A literal path form beside an env() interaction cannot be ruled out, so it is named plain.
+        ({"update_url_form": "path", "interaction": "kind"}, ""),
+        # A not-deployed connection with an env() form is never built, so it is skipped...
+        ({"deployed": False}, None),
+        # ...and a not-deployed literal path form is still read, as before.
+        ({"update_url_form": "path", "deployed": False}, ""),
+        # The control: a literal transaction form is never named.
+        ({"update_url_form": "transaction"}, None),
+    ],
+    ids=[
+        "env-update",
+        "env-if-match",
+        "env-with-default",
+        "env-create",
+        "env-interaction",
+        "dark-env",
+        "dark-literal",
+        "literal-transaction",
+    ],
+)
+def test_the_path_form_reader_names_an_env_form(
+    over: dict[str, object], listed: str | None
+) -> None:
+    """Vault BACKLOG #2571: each arm of the reader with no env values, as ``messagefoundry check``
+    reads it. ``listed`` is ``None`` when the connection is left off, ``""`` when it is named
+    plain, and ``"possibly"`` when it is named with the marker. A string value stands for
+    ``env(<it>)`` and a pair for ``env(<key>, default=<value>)``, except a literal form."""
+    from messagefoundry.config.wiring import (
+        UNRESOLVED_UPDATE_URL_FORM,
+        env,
+        path_form_fhir_updates,
+    )
+
+    literal = {"path", "transaction", "create", "update", "if-match"}
+
+    def ref(value: object) -> object:
+        if isinstance(value, tuple):
+            return env(value[0], default=value[1])
+        return env(value) if isinstance(value, str) and value not in literal else value
+
+    found = dict(
+        path_form_fhir_updates(_fhir_env_form_registry(**{k: ref(v) for k, v in over.items()}))
+    )
+    expected = {None: None, "": "", "possibly": UNRESOLVED_UPDATE_URL_FORM}[listed]
+    assert found.get("OB_ENV") == expected
+
+
+@pytest.mark.parametrize(
+    ("values", "over", "listed"),
+    [
+        ({"epic_form": "path"}, {}, True),
+        # The control: the same connection resolving to the transaction form is not named.
+        ({"epic_form": "transaction"}, {}, False),
+        # The interaction resolves to a create, which the build refuses with the path form.
+        ({"epic_form": "path", "kind": "create"}, {"interaction": "kind"}, False),
+        ({"epic_form": "path", "kind": "update"}, {"interaction": "kind"}, True),
+    ],
+    ids=["resolves-path", "resolves-transaction", "resolves-create", "resolves-update"],
+)
+def test_the_path_form_reader_resolves_an_env_form_with_the_values(
+    values: dict[str, str], over: dict[str, str], listed: bool
+) -> None:
+    """With the instance's values the reader reads an ``env()`` as the build does: a form that
+    resolves to path is named plain, and one the build would not send in the path form is not."""
+    from messagefoundry.config.wiring import env, path_form_fhir_updates
+
+    reg = _fhir_env_form_registry(**{k: env(v) for k, v in over.items()})
+    found = dict(path_form_fhir_updates(reg, env_values=values))
+    assert found == ({"OB_ENV": ""} if listed else {})
+
+
+@pytest.mark.parametrize(
+    ("values", "risk"),
+    [
+        ({"epic_form": "path"}, "OB_ENV) — each update"),
+        ({}, "OB_ENV (possibly: update_url_form is an env() value"),
+        ({"epic_form": "transaction"}, None),
+    ],
+    ids=["resolves-path", "unresolved", "resolves-transaction"],
+)
+async def test_posture_route_names_an_env_path_form_update(
+    tmp_path: Path, values: dict[str, str], risk: str | None
+) -> None:
+    """Vault BACKLOG #2571: ``GET /security/posture`` resolves an ``env()`` form against the
+    values the graph was built with. One that resolves to path is named plain, one with no value is
+    named with the marker, and one that resolves to the transaction form, the control, names
+    nothing."""
+    eng = await Engine.create(
+        tmp_path / "posture.db",
+        poll_interval=0.02,
+        egress_settings=EgressSettings(deny_by_default=False),
+        env_values=values,
+    )
+    try:
+        eng.add_registry(_fhir_env_form_registry())
+        body = await _posture_body(eng)
+    finally:
+        await eng.stop()
+    entries = {e["switch"]: e["risk"] for e in body["loosenings"]}  # type: ignore[index,union-attr]
+    if risk is None:
+        assert "update_url_form" not in entries
+    else:
+        assert risk in entries["update_url_form"]
+        assert "A name marked possibly" in entries["update_url_form"]
 
 
 def _ech_sidecar_registry(*, named: bool = True) -> Any:
