@@ -3473,6 +3473,39 @@ def test_serve_warns_when_a_credential_reminder_is_silenced(
         assert switch in out, switch
 
 
+@pytest.mark.parametrize("interface_on", [True, False], ids=["interface-on", "interface-off"])
+def test_serve_names_remote_debugging_in_its_loosening_warning_only_while_it_is_on(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    interface_on: bool,
+) -> None:
+    # Vault BACKLOG #3795: tests/conftest.py pins this reading off for every in-process start, so
+    # this is the start that carries it on through the acceptance into the loosening WARNING.
+    from messagefoundry import __main__ as cli
+    from messagefoundry.remotedebug import RemoteDebugPosture
+
+    reading = RemoteDebugPosture(interpreter_enabled=interface_on, guard_installed=interface_on)
+    monkeypatch.setattr(cli, "remote_debug_posture", lambda: reading)
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_remote_debugging = true\n"
+        + _SECURE_RETENTION
+        + _CERT_REMINDER_OFF
+        + _ROTATION_REMINDER_OFF
+        + _SECURE_ALERTS,
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The control: the WARNING is written either way, for the silenced reminders.
+    assert "posture loosened from the secure defaults" in out
+    # The entry, "name (risk)"; the acceptance's own risk text names it bare.
+    i = out.find("remote_debug_enabled (")
+    assert (i >= 0) is interface_on, out[max(0, i - 600) : i + 300]
+
+
 def test_serve_reminder_recipient_gate_honours_the_audited_waiver(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

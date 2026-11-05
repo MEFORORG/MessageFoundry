@@ -620,7 +620,9 @@ def _remote_debug_posture_pinned_off() -> Iterator[None]:
     Autouse for that reason, like the config-source read above: it is a fact about the test
     runner, not about any scenario. The reading is pinned, not the gate, so the real gate still
     runs in every in-process start, and one that refuses or raises with the interface off fails
-    them. A subprocess start is not covered."""
+    them. A test that needs the process's own reading takes :func:`remote_debug_start_gate`. Not
+    covered: a subprocess start, and the API's own reading (``messagefoundry.api.app``), which
+    :func:`remote_debugging_off` pins where a test asks."""
     from messagefoundry import __main__ as cli
 
     with pytest.MonkeyPatch.context() as patch:
