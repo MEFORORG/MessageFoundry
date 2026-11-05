@@ -278,8 +278,9 @@ async def _assert_webauthn_store_contract(store: Any) -> None:
     )
 
     # Sign-count CAS (the consume_totp_step precedent), answered by the one locked write (BACKLOG
-    # #3774): "moved" iff stored == expected; "mismatch" when the passkey exists with another count
-    # (the clone signal), which writes nothing; "gone" when there is no such passkey. 0->0 (synced
+    # #3774): "moved" iff stored == expected; "mismatch" when the passkey exists with another count,
+    # which writes nothing; "gone" when there is no such passkey. The service treats both misses as
+    # a clone signal (ADR 0068 decision 4, amendment of 2026-10-17). 0->0 (synced
     # passkey) succeeds repeatedly and stays 0; last_used_at is stamped.
     assert await store.update_webauthn_sign_count("h1", expected=5, new=6, used_at=60.0) == "moved"
     assert (

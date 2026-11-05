@@ -15280,13 +15280,16 @@ class AuthService:
         A successful assertion DOES clear the failure counter (BACKLOG #1638). That is the other
         direction and the divergence does not cover it — see the call site.
 
-        **A directory account must be confirmed by the directory first** (BACKLOG #2239), through
-        the same :meth:`_directory_vouches_for_factor` :meth:`verify_mfa` calls. A refusal returns
-        ``directory_refusal`` and spends neither the challenge nor the sign count. The lookup
-        runs only once a ceremony is staged for the session, so a post with nothing staged gets the
-        plain ``expired`` refusal and costs no lookup (BACKLOG #3068). The session, the account and
-        the lock are read once more right before the factor is written. A store fault in the
-        passkey re-read after that refuses, audited with ``reason=store_error`` (BACKLOG #3775)."""
+        **A directory account must be confirmed by the directory before its factor is marked**
+        (BACKLOG #2239), through the same :meth:`_directory_vouches_for_factor` :meth:`verify_mfa`
+        calls. It is asked only once the assertion has verified against a staged ceremony, so a
+        caller that has proved nothing causes no lookup and never reads the directory's answer
+        (BACKLOG #3068). A refusal returns ``directory_refusal``: the challenge is spent, the sign
+        count does not move, and nothing is charged. After the sign-count write the passkey set is
+        read, then the session, the account and the lock, so the last read before the factor write
+        is the holder re-read, with no other await between it and the write (BACKLOG #3068). A store
+        fault in the passkey re-read refuses, audited with ``reason=store_error`` (BACKLOG
+        #3775)."""
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
@@ -15306,33 +15309,9 @@ class AuthService:
             session, user, now, event="auth.webauthn_failed", client=client
         ):
             return Elevation()
+        # BACKLOG #3068: popped before anything else is asked, so a post with nothing staged for
+        # this session, which includes every account holding no passkey, gets the plain refusal.
         challenge_key = (hash_token(token), "assert")
-        # BACKLOG #3068: the directory lookup below costs a network round trip and its answer is
-        # a fact about the account, so a caller that has staged no ceremony, which includes every
-        # account holding no passkey, must not reach it. PEEKED, never popped: a refusal below must
-        # leave a staged ceremony in flight. The miss is answered as the pop below answers it.
-        staged = self._webauthn_challenges.peek(challenge_key)
-        if staged is None or staged.user_id != user.id:
-            if staged is not None:
-                # Another account's entry under this token is dead, so it is ended here as the pop
-                # below and the registration leg end one.
-                self._webauthn_challenges.pop(challenge_key)
-            return await self._assertion_refused(user, client, "expired")
-        # BACKLOG #2239: a good assertion below marks the factor met, so a DIRECTORY account must
-        # still be in the directory first, as verify_mfa asks (#2023). Without this an account
-        # disabled in the directory would clear the MFA gate with its passkey until the reconciler
-        # revoked it. Asked before the challenge is popped and before the sign count moves, so a
-        # refusal leaves the ceremony in flight and charges nothing; assertion failures feed no
-        # lockout here anyway (ADR 0068). A local account is not asked.
-        current = await self._directory_vouches_for_factor(
-            token, user, event="auth.webauthn_failed", client=client, report_lock=False
-        )
-        if isinstance(current, Elevation):
-            return current
-        user = current
-        now = time.time()
-        # Popped, not reused from the peek: the ceremony may have expired, or been replaced,
-        # during the lookup.
         pending = self._webauthn_challenges.pop(challenge_key)
         if pending is None or pending.user_id != user.id:
             return await self._assertion_refused(user, client, "expired")
@@ -15366,6 +15345,20 @@ class AuthService:
         )
         if new_count is None:
             return Elevation()
+        # BACKLOG #2239: a good assertion below marks the factor met, so a DIRECTORY account must
+        # still be in the directory first, as verify_mfa asks (#2023). Without this an account
+        # disabled in the directory would clear the MFA gate with its passkey until the reconciler
+        # revoked it. BACKLOG #3068: asked only now, once the assertion has verified, so a caller
+        # that has proved nothing costs no lookup and is not told what the directory said. Before
+        # the sign count moves, so a refusal leaves it; the challenge is already spent, and
+        # assertion failures feed no lockout (ADR 0068). A local account is not asked.
+        current = await self._directory_vouches_for_factor(
+            token, user, event="auth.webauthn_failed", client=client, report_lock=False
+        )
+        if isinstance(current, Elevation):
+            return current
+        user = current
+        now = time.time()
         answer = await self._store.update_webauthn_sign_count(
             cred.credential_id_hash, expected=cred.sign_count, new=new_count, used_at=now
         )
@@ -15375,46 +15368,42 @@ class AuthService:
             # window from a counter mismatch (BACKLOG #3774). Written before any other read, so no
             # refusal or store error below can drop it.
             await self._clone_suspected(user, cred, client, answer=answer)
-        # BACKLOG #3068: the passkey read and the sign-count write awaited since the session, the
-        # account and its lock were last read, so a revocation, a disable or a lock that landed in
-        # between must stop the factor write, as on verify_mfa. Asked whatever the write answered,
-        # so each refusal is audited with its own reason.
-        fresh = await self._factor_holder_current(
-            token,
-            actor=user.username,
-            event="auth.webauthn_failed",
-            client=client,
-            report_lock=False,
-        )
-        if isinstance(fresh, Elevation):
-            return fresh
-        user = fresh
         # The code leg's TOTP-off check, for a passkey: a self-service delete takes no queue, so the
-        # passkey that signed may be gone. Asked after the holder re-read, as the last read before
-        # the factor write. It decides the refusal only: the clone row, if owed, is written above.
-        try:
-            standing = await self._passkey_held(user, cred)
-        except AUDIT_WRITE_DEFECTS:
-            # SQLite's bad statement or bind is a defect, not a store refusal. On PostgreSQL and
-            # SQL Server a bad statement is a driver DatabaseError, so it is refused below.
-            raise
-        except _session_write_errors():
-            # BACKLOG #3775: after the sign-count write, a store fault here refuses with an audit
-            # row rather than raising past the ceremony with none. Soft, so a store that refuses
-            # that row too still gets the refusal back: the refusal is the fail-closed control,
-            # and the row only records it.
-            _log.exception("finish_webauthn_assertion: the passkey re-read raised")
-            await write_audit_soft(
-                lambda: self._assertion_refused(user, client, "store_error"),
-                log=_log,
-                message="the auth.webauthn_failed store_error audit row could not be written",
-                errors=audit_write_errors(),
-                defects=AUDIT_WRITE_DEFECTS,
-            )
+        # passkey that signed may be gone. Asked BEFORE the holder re-read below (BACKLOG #3068), so
+        # its awaits cannot sit between that re-read and the factor write. Asked whatever the write
+        # answered, so a set that fails its seal is reported even when a holder refusal follows.
+        standing = await self._passkey_standing(user, cred, client)
+        if standing is None:
             return Elevation()
+        # BACKLOG #3068: the passkey reads and the sign-count write awaited since the session, the
+        # account and its lock were last read, so a revocation, a disable or a lock that landed in
+        # between must stop the factor write, as on verify_mfa. This is the LAST read before the
+        # write: nothing below awaits until the write, but the lapse check, which awaits only when
+        # it ends the session. On a sealed store the account row's digest covers its passkeys, so a
+        # row whose digest moved since the passkey read means the set changed: the set is asked
+        # again, then the holder, until a holder read finds the digest the set was judged against.
+        # A keyless store keeps no digest, so a passkey deleted during the last re-read is not seen
+        # there, as a delete landing just after the write would not be.
+        while True:
+            fresh = await self._factor_holder_current(
+                token,
+                actor=user.username,
+                event="auth.webauthn_failed",
+                client=client,
+                report_lock=False,
+            )
+            if isinstance(fresh, Elevation):
+                return fresh
+            settled = fresh.cred_digest == user.cred_digest
+            user = fresh
+            if settled or standing != "held":
+                break
+            standing = await self._passkey_standing(user, cred, client)
+            if standing is None:
+                return Elevation()
         if standing == "account_gone":
-            # Deleted after the holder re-read: the token no longer authenticates, so the answer
-            # is the lost session the re-read would have given, not a factor question.
+            # Gone during the passkey read: the token no longer authenticates, so the answer is the
+            # lost session the holder re-read gives, not a factor question.
             return await self._assertion_refused(user, client, "session_lost", session_lost=True)
         if standing == "unverified":
             return await self._assertion_refused(user, client, "factor_unverified")
@@ -15452,6 +15441,32 @@ class AuthService:
             # vault BACKLOG #2145, as in verify_mfa.
             await self._mark_login_address_known(user.id, client)
         return elevation
+
+    async def _passkey_standing(
+        self, user: VerifiedUser, cred: WebAuthnCredential, client: str | None
+    ) -> _PasskeyHeld | None:
+        """:meth:`_passkey_held`, as :meth:`finish_webauthn_assertion` asks it after the sign-count
+        write, or ``None`` when a store fault refused the read and the refusal is audited."""
+        try:
+            return await self._passkey_held(user, cred)
+        except AUDIT_WRITE_DEFECTS:
+            # SQLite's bad statement or bind is a defect, not a store refusal. On PostgreSQL and
+            # SQL Server a bad statement is a driver DatabaseError, so it is refused below.
+            raise
+        except _session_write_errors():
+            # BACKLOG #3775: after the sign-count write, a store fault here refuses with an audit
+            # row rather than raising past the ceremony with none. Soft, so a store that refuses
+            # that row too still gets the refusal back: the refusal is the fail-closed control,
+            # and the row only records it.
+            _log.exception("finish_webauthn_assertion: the passkey re-read raised")
+            await write_audit_soft(
+                lambda: self._assertion_refused(user, client, "store_error"),
+                log=_log,
+                message="the auth.webauthn_failed store_error audit row could not be written",
+                errors=audit_write_errors(),
+                defects=AUDIT_WRITE_DEFECTS,
+            )
+            return None
 
     async def _passkey_still_held(self, user_id: str, cred: WebAuthnCredential) -> bool:
         """Whether the account still holds ``cred`` after a conditional delete wrote nothing, which
@@ -15508,9 +15523,9 @@ class AuthService:
         self, user: UserRecord, client: str | None, reason: str, *, session_lost: bool = False
     ) -> Elevation:
         """A refusal :meth:`finish_webauthn_assertion` gives, audited ``auth.webauthn_failed`` with
-        ``reason``. One spelling for the expired ceremony, so the peek before the directory lookup
-        and the pop after it cannot be told apart, and for the passkey that signed, or its account,
-        gone or unverifiable before the factor write (BACKLOG #3068)."""
+        ``reason``. One spelling for each refusal: the expired ceremony, a malformed or unknown
+        credential, and the passkey that signed, or its account, gone or unverifiable before the
+        factor write (BACKLOG #3068)."""
         await self._audit(
             "auth.webauthn_failed",
             actor=user.username,
