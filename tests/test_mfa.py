@@ -2628,15 +2628,16 @@ async def test_a_second_confirm_that_enabled_first_keeps_the_winners_codes(
 
 
 @pytest.mark.parametrize(
-    "fault",
+    ("fault", "retry_refused"),
     [
-        RuntimeError("the store refused the revoke"),
-        # aiosqlite's own refusal of a closed connection, raised before sqlite3 is reached.
-        ValueError("Connection closed"),
+        (RuntimeError("the store refused the revoke"), False),
+        (RuntimeError("the store refused the revoke"), True),
+        # aiosqlite's own refusal of a closed connection, raised before sqlite3 is reached. A
+        # closed connection refuses the retry too, so it has no retry-lands case.
+        (ValueError("Connection closed"), True),
     ],
-    ids=["store-refusal", "closed-connection"],
+    ids=["store-refusal-retry-lands", "store-refusal-retry-refused", "closed-connection"],
 )
-@pytest.mark.parametrize("retry_refused", [False, True], ids=["retry-lands", "retry-refused"])
 async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -2646,9 +2647,8 @@ async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row
     """RED when: a store refusal of the revoke skips the ``auth.mfa_enroll_refused`` row (vault
     BACKLOG #3113 item 2), the row claims the session ended when it did not (item 7), or a
     refused revoke leaves the rotated session live, stamped MFA-verified on a factor that is not
-    enabled, although the second attempt, through ``supersede_session``, would land (BACKLOG
-    #3025, closing step 2's third clause). With that attempt refused too, the session is left
-    live and the row says so."""
+    enabled, although a second attempt would land (BACKLOG #3025, closing step 2's third clause).
+    With the second attempt refused too, the session is left live and the row says so."""
     store = await _store()
     try:
         service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
@@ -2672,18 +2672,17 @@ async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row
                 now=now,
             )
 
-        async def refused_revoke(token_hash: str, *, now: float | None = None) -> None:
-            raise fault
+        real_revoke = store.revoke_session
+        revokes: list[str] = []
 
-        async def refused_supersede(
-            token_hash: str, *, now: float, lineage_since: float | None = None
-        ) -> None:
-            raise fault
+        async def refused_revoke(token_hash: str, *, now: float | None = None) -> None:
+            revokes.append(token_hash)
+            if len(revokes) == 1 or retry_refused:
+                raise fault
+            await real_revoke(token_hash, now=now)
 
         monkeypatch.setattr(store, "enable_totp", reset_then_enable)
         monkeypatch.setattr(store, "revoke_session", refused_revoke)
-        if retry_refused:
-            monkeypatch.setattr(store, "supersede_session", refused_supersede)
         with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
             refused = await service.confirm_mfa_enrollment(
                 identity, fresh_totp(enroll.secret), token=token
@@ -2691,10 +2690,14 @@ async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row
         # Fails closed all the same: no token and no codes come back.
         assert refused.ok is False and refused.session_lost is True
         assert refused.token is None and refused.recovery_codes == ()
+        assert len(revokes) == 2 and revokes[0] == revokes[1], "the revoke was not tried again"
         live = await store.list_sessions(identity.user_id)
-        assert (live != []) is retry_refused, (
-            "a refused revoke left the rotated session live, stamped MFA-verified"
-        )
+        if retry_refused:
+            # Only the rotated session is left, and it is the one still stamped MFA-verified.
+            assert [s.token_hash for s in live] == revokes[:1]
+            assert live[0].mfa_verified_at is not None
+        else:
+            assert live == [], "a refused revoke left the rotated session live, MFA-verified"
         rows = await store.list_audit(
             actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
         )
@@ -2710,12 +2713,14 @@ async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row
         await store.close()
 
 
+@pytest.mark.parametrize("retry_lands", [False, True], ids=["retry-defect", "retry-lands"])
 async def test_a_refused_enable_whose_revoke_hits_a_defect_still_writes_its_refusal_row(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, retry_lands: bool
 ) -> None:
     """RED when: a defect the revoke raises, which the soft write re-raises rather than logs, skips
-    the ``auth.mfa_enroll_refused`` row (vault BACKLOG #3113 item 2, round two). The defect still
-    propagates, so a bug is not passed over as a store refusal."""
+    the ``auth.mfa_enroll_refused`` row (vault BACKLOG #3113 item 2, round two), or skips the
+    second attempt at the revoke (BACKLOG #3025). The defect still propagates, so a bug is not
+    passed over as a store refusal."""
     store = await _store()
     try:
         service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
@@ -2739,20 +2744,28 @@ async def test_a_refused_enable_whose_revoke_hits_a_defect_still_writes_its_refu
                 now=now,
             )
 
+        real_revoke = store.revoke_session
+        revokes: list[str] = []
+
         async def broken_revoke(token_hash: str, *, now: float | None = None) -> None:
-            raise NotImplementedError("a backend without the revoke")
+            revokes.append(token_hash)
+            if len(revokes) == 1 or not retry_lands:
+                raise NotImplementedError("a backend without the revoke")
+            await real_revoke(token_hash, now=now)
 
         monkeypatch.setattr(store, "enable_totp", reset_then_enable)
         monkeypatch.setattr(store, "revoke_session", broken_revoke)
         with pytest.raises(NotImplementedError):
             await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
+        assert len(revokes) == 2, "a defect in the first revoke skipped the second"
+        assert (await store.list_sessions(identity.user_id) == []) is retry_lands
         rows = await store.list_audit(
             actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
         )
         assert len(rows) == 1, "the refusal row was skipped when the revoke raised a defect"
         assert json.loads(str(rows[0]["detail"])) == {
             "reason": "secret_cleared",
-            "session_ended": False,
+            "session_ended": retry_lands,
         }
     finally:
         await store.close()
