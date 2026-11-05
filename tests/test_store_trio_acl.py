@@ -43,10 +43,21 @@ _windows_only = pytest.mark.skipif(
 _TI = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
 _OTHER_SERVICE = "S-1-5-80-1-2-3-4-5"
 _SY, _BA = "S-1-5-18", "S-1-5-32-544"
+#: A local user and a gMSA as -ServiceAccount names them: machine- and domain-relative SIDs, RID
+#: 1000 or more. Synthetic; neither exists on any host.
+_LOCAL_USER = "S-1-5-21-111-222-333-1001"
+_GMSA = "S-1-5-21-9-9-9-4455"
 
-#: The data directory install-service.ps1 writes: owned by Administrators, protected, SYSTEM and
-#: Administrators full control, the run-as virtual account Modify, inherited by files and folders.
-_INSTALLER_DIR = f"O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{_TI})"
+
+def _installer_dir_for(run_as: str, *, owner: str = "BA") -> str:
+    """The data directory install-service.ps1 writes for ``run_as``: owned by ``owner``, protected,
+    SYSTEM and Administrators full control, the run-as account Modify, inherited by files and
+    folders."""
+    return f"O:{owner}D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{run_as})"
+
+
+#: The default install's data directory: the run-as is the per-service virtual account.
+_INSTALLER_DIR = _installer_dir_for(_TI)
 
 
 # --- the decisions, on every platform -------------------------------------------------------------
@@ -54,7 +65,9 @@ _INSTALLER_DIR = f"O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{
 
 def _grants(sddl: str) -> tuple[str, ...] | None:
     dacl = store_mod._parse_sddl_dacl(sddl)
-    return None if dacl is None else store_mod._hardened_trio_grants(dacl)
+    if dacl is None or store_mod._hardening_refusal(dacl) is not None:
+        return None
+    return store_mod._hardened_trio_grants(dacl)
 
 
 def test_the_installers_data_directory_is_hardened() -> None:
@@ -146,6 +159,182 @@ def test_a_directory_with_a_deny_entry_is_not_hardened() -> None:
     assert _grants(_INSTALLER_DIR + "(D;OICI;FA;;;BG)") is None
 
 
+# --- one named run-as user account (BACKLOG #3760, #2234; owner ruling 2026-11-05) ---------------
+
+
+class _Lookup:
+    """A stand-in for ``LookupAccountSidW``: answers from ``types`` (a missing SID is a failed
+    lookup) and records every SID it was asked about."""
+
+    def __init__(
+        self, types: dict[str, int | None] | None = None, *, default: int | None = None
+    ) -> None:
+        self.types = types or {}
+        self.default = default
+        self.asked: list[str] = []
+
+    def __call__(self, sid: str) -> int | None:
+        self.asked.append(sid)
+        return self.types.get(sid, self.default)
+
+
+def _install_lookup(monkeypatch: pytest.MonkeyPatch, lookup: _Lookup) -> _Lookup:
+    monkeypatch.setattr(store_mod, "_lookup_sid_type", lookup)
+    return lookup
+
+
+@pytest.mark.parametrize("run_as", [_LOCAL_USER, _GMSA], ids=["a local user", "a gMSA"])
+@pytest.mark.parametrize("owner", ["BA", "SY", "run-as"])
+def test_a_named_run_as_that_resolves_to_a_user_account_is_hardened(
+    monkeypatch: pytest.MonkeyPatch, run_as: str, owner: str
+) -> None:
+    # The -ServiceAccount install: the installer's own shape with a named account in place of the
+    # virtual one. RED before the ruling: refused, so the store fell back owner-only and the service
+    # and the provisioning operator locked each other out. The run-as may own the directory, as a
+    # service account may.
+    lookup = _install_lookup(monkeypatch, _Lookup({run_as: store_mod._SID_TYPE_USER}))
+    sddl = _installer_dir_for(run_as, owner=run_as if owner == "run-as" else owner)
+    assert _grants(sddl) == (_SY, _BA, run_as)
+    assert lookup.asked == [run_as], "the one candidate is resolved, exactly once"
+
+
+@pytest.mark.parametrize(
+    ("label", "kind"),
+    [
+        ("the lookup fails", None),
+        ("a domain group (SidTypeGroup)", 2),
+        ("a local group (SidTypeAlias)", 4),
+        ("a well-known group (SidTypeWellKnownGroup)", 5),
+        ("a deleted account (SidTypeDeletedAccount)", 6),
+        ("an unknown type (SidTypeUnknown)", 8),
+        ("a computer (SidTypeComputer)", 9),
+    ],
+)
+def test_a_named_run_as_that_is_not_a_resolved_user_account_is_refused(
+    monkeypatch: pytest.MonkeyPatch, label: str, kind: int | None
+) -> None:
+    # A group with an assigned RID has exactly a user's shape. Granted Modify by hand, it would widen
+    # the store to every member, so only SidTypeUser is admitted and everything else falls back.
+    lookup = _install_lookup(monkeypatch, _Lookup({_GMSA: kind}))
+    dacl = store_mod._parse_sddl_dacl(_installer_dir_for(_GMSA))
+    assert dacl is not None
+    reason = store_mod._hardening_refusal(dacl)
+    assert reason is not None and _GMSA in reason, label
+    assert ("could not resolve" in reason) if kind is None else (f"SID type {kind}" in reason)
+    assert lookup.asked == [_GMSA], label
+
+
+@pytest.mark.parametrize(
+    "sid",
+    [
+        "S-1-5-21-111-222-333-500",  # the built-in Administrator
+        "S-1-5-21-111-222-333-501",  # Guest
+        "S-1-5-21-111-222-333-502",  # krbtgt
+        "S-1-5-21-111-222-333-503",  # DefaultAccount
+        "S-1-5-21-111-222-333-513",  # Domain Users
+        "S-1-5-21-111-222-333-999",  # the last RID below the first assigned one
+    ],
+)
+def test_a_built_in_rid_is_refused_without_a_lookup(
+    monkeypatch: pytest.MonkeyPatch, sid: str
+) -> None:
+    # Even where the host would call it a user (500, 501 are SidTypeUser), a RID below 1000 is a
+    # built-in account or group, refused on its shape before anything leaves the process.
+    lookup = _install_lookup(monkeypatch, _Lookup(default=store_mod._SID_TYPE_USER))
+    assert _grants(_installer_dir_for(sid)) is None, sid
+    assert lookup.asked == [], sid
+
+
+@pytest.mark.parametrize(
+    "sid",
+    [
+        "S-1-5-21-111-222-1001",  # one domain sub-authority short
+        "S-1-5-21-111-222-333-444-1001",  # one too many
+        "S-1-12-1-111-222-333-1001",  # an Entra ID account: not a machine or domain RID
+        "S-1-5-21-111-222-333-١٠٠١",  # 1001 in Arabic-Indic digits
+        "S-1-5-32-545",  # BUILTIN\Users, by SID
+        "S-1-5-80-0",  # NT SERVICE\ALL SERVICES
+        "NS",  # NetworkService, by alias
+        "LA",  # the built-in Administrator, by alias
+        "DU",  # Domain Users, by alias
+    ],
+)
+def test_a_sid_of_no_account_shape_is_refused_without_a_lookup(
+    monkeypatch: pytest.MonkeyPatch, sid: str
+) -> None:
+    lookup = _install_lookup(monkeypatch, _Lookup(default=store_mod._SID_TYPE_USER))
+    assert _grants(_installer_dir_for(sid)) is None, sid
+    assert lookup.asked == [], sid
+
+
+@pytest.mark.parametrize(
+    ("label", "extra"),
+    [
+        ("two users", (_LOCAL_USER, _GMSA)),
+        ("a user beside the service account", (_TI, _LOCAL_USER)),
+        ("the service account beside a user", (_LOCAL_USER, _TI)),
+    ],
+)
+def test_a_second_run_as_principal_is_refused(
+    monkeypatch: pytest.MonkeyPatch, label: str, extra: tuple[str, str]
+) -> None:
+    # The ruling admits exactly ONE principal beyond SYSTEM and Administrators, of either kind. The
+    # refusal comes before the lookup, so a directory refused anyway never reaches a domain controller.
+    lookup = _install_lookup(monkeypatch, _Lookup(default=store_mod._SID_TYPE_USER))
+    aces = "".join(f"(A;OICI;0x1301bf;;;{sid})" for sid in extra)
+    sddl = f"O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA){aces}"
+    dacl = store_mod._parse_sddl_dacl(sddl)
+    assert dacl is not None
+    assert store_mod._hardening_refusal(dacl) == "it grants more than one service or user account"
+    assert lookup.asked == [], label
+
+
+@pytest.mark.parametrize(
+    ("label", "sddl"),
+    [
+        ("inheritance still on", _installer_dir_for(_LOCAL_USER).replace("D:PAI", "D:AI")),
+        (
+            "a deny entry for the user",
+            _installer_dir_for(_LOCAL_USER) + f"(D;OICI;FA;;;{_LOCAL_USER})",
+        ),
+        ("a deny entry for Guests", _installer_dir_for(_LOCAL_USER) + "(D;OICI;FA;;;BG)"),
+        (
+            "the user holding full control",
+            _installer_dir_for(_LOCAL_USER).replace("0x1301bf", "FA"),
+        ),
+        ("the user read-only", _installer_dir_for(_LOCAL_USER).replace("0x1301bf", "FR")),
+        ("the user container-only", _installer_dir_for(_LOCAL_USER).replace(";OICI;0x", ";CI;0x")),
+        ("Administrators left out", f"O:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;{_LOCAL_USER})"),
+        ("owned by another user", _installer_dir_for(_LOCAL_USER, owner=_GMSA)),
+        ("owned by the RID-500 user", _installer_dir_for(_LOCAL_USER, owner="LA")),
+        ("no owner read", _installer_dir_for(_LOCAL_USER).removeprefix("O:BA")),
+        ("OWNER RIGHTS beside the user", _installer_dir_for(_LOCAL_USER) + "(A;OICI;FA;;;OW)"),
+    ],
+)
+def test_every_existing_refusal_holds_for_a_resolved_user(
+    monkeypatch: pytest.MonkeyPatch, label: str, sddl: str
+) -> None:
+    # The widening is of WHO the one run-as may be, nothing else: every shape the virtual account is
+    # refused in is refused for a user the host resolves too.
+    _install_lookup(monkeypatch, _Lookup(default=store_mod._SID_TYPE_USER))
+    assert _grants(sddl) is None, label
+
+
+def test_a_resolved_named_run_as_directory_is_shared_quietly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Through _store_dir_grants, as open and restore call it: the grants, no warning, and the lookup
+    # made once, not again when the grants are built.
+    monkeypatch.setattr(store_mod, "_is_windows", lambda: True)
+    monkeypatch.setattr(store_mod, "_reaches_through_a_link", lambda _p: False)
+    monkeypatch.setattr(store_mod, "_read_dacl_sddl", lambda _p, **_kw: _installer_dir_for(_GMSA))
+    lookup = _install_lookup(monkeypatch, _Lookup({_GMSA: store_mod._SID_TYPE_USER}))
+    with caplog.at_level("WARNING", logger=store_mod.log.name):
+        assert store_mod._store_dir_grants(tmp_path) == (_SY, _BA, _GMSA)
+    assert not caplog.records, [r.getMessage() for r in caplog.records]
+    assert lookup.asked == [_GMSA]
+
+
 def test_a_refused_locked_directory_is_logged_and_an_ordinary_one_is_not(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -154,6 +343,8 @@ def test_a_refused_locked_directory_is_logged_and_an_ordinary_one_is_not(
     # An ordinary inheriting directory (a checkout, a temp directory) must stay quiet.
     monkeypatch.setattr(store_mod, "_is_windows", lambda: True)
     monkeypatch.setattr(store_mod, "_reaches_through_a_link", lambda _p: False)
+    # Pinned, so the named-account rows read the same on every platform: no SID resolves.
+    monkeypatch.setattr(store_mod, "_lookup_sid_type", lambda _sid: None)
     installer = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
     service = f"(A;OICI;0x1301bf;;;{_TI})"
     user = "S-1-5-21-1-2-3-1001"
@@ -167,7 +358,10 @@ def test_a_refused_locked_directory_is_logged_and_an_ordinary_one_is_not(
         ("a wrong inheritance", f"O:BA{installer}(A;CI;0x1301bf;;;{_TI})"),
         ("a deny for the service", f"O:BA{installer}{service}(D;OICI;FA;;;{_TI})"),
         ("a deny for Guests", f"O:BA{installer}{service}(D;OICI;FA;;;BG)"),
-        ("a gMSA run-as", f"O:BA{installer}(A;OICI;0x1301bf;;;S-1-5-21-9-9-9-4455)"),
+        # A gMSA run-as is admitted once it resolves to a user account (the test after this one);
+        # one this host cannot resolve is still refused, and loudly.
+        ("an unresolvable gMSA run-as", f"O:BA{installer}(A;OICI;0x1301bf;;;{_GMSA})"),
+        ("a group run-as", f"O:BA{installer}(A;OICI;0x1301bf;;;S-1-5-21-9-9-9-513)"),
         ("a NetworkService run-as", f"O:BA{installer}(A;OICI;0x1301bf;;;NS)"),
         ("CREATOR OWNER left over", f"O:{user}{installer}(A;OICIIO;GA;;;CO){service}"),
     ):
@@ -551,6 +745,45 @@ def test_the_dacl_reader_agrees_with_icacls(tmp_path: Path) -> None:
     ours = store_mod._parse_sddl_dacl(store_mod._read_dacl_sddl(db) or "")
     theirs = store_mod._parse_sddl_dacl(_sddl_of(db, tmp_path))
     assert ours is not None and ours == theirs, (ours, theirs)
+
+
+@_windows_only
+def test_the_real_lookup_resolves_this_user_and_refuses_what_it_cannot() -> None:
+    # LookupAccountSidW itself, on SIDs every Windows host can and cannot resolve. The decisions
+    # above inject it; this is the one place the real call is checked.
+    me = _my_sid()
+    assert store_mod._lookup_sid_type(me) == store_mod._SID_TYPE_USER, me
+    assert store_mod._lookup_sid_type("S-1-5-32-545") == 4, "BUILTIN\\Users is an alias"
+    assert store_mod._lookup_sid_type(_LOCAL_USER) is None, "no machine or domain has this SID"
+    assert store_mod._lookup_sid_type("not a sid") is None
+    # Through the decision, with the real lookup: an unresolvable account is refused.
+    assert _grants(_installer_dir_for(_LOCAL_USER)) is None
+    rid = int(me.rsplit("-", 1)[1])
+    if rid >= store_mod._FIRST_ASSIGNED_RID:
+        assert _grants(_installer_dir_for(me)) == (_SY, _BA, me)
+    else:
+        # The hosted runners run as the built-in Administrator (RID 500, CI run 36039014999): a user
+        # account the rule still refuses by its RID.
+        assert _grants(_installer_dir_for(me)) is None
+
+
+@_windows_only
+def test_a_real_directory_granting_this_user_as_run_as_is_hardened(tmp_path: Path) -> None:
+    # End to end without elevation: this user stands in for a -ServiceAccount run-as. It owns the
+    # directory it made, and the rule admits the run-as as owner, so the installer's shape with this
+    # user in the service's place is hardened through the real reader and the real lookup.
+    me = _my_sid()
+    if int(me.rsplit("-", 1)[1]) < store_mod._FIRST_ASSIGNED_RID:
+        pytest.skip(f"this user's RID is below {store_mod._FIRST_ASSIGNED_RID}, so it is refused")
+    data = tmp_path / "data"
+    data.mkdir()
+    try:
+        _build_dir_dacl(data, "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", f"*{me}:(OI)(CI)M")
+        dacl = _read_back(data)
+        assert dacl.owner in (me, _SY, _BA), f"fixture: {dacl}"
+        assert store_mod._store_dir_grants(data) == (_SY, _BA, me), dacl
+    finally:
+        _release(data, me)
 
 
 def _elevated() -> bool:
