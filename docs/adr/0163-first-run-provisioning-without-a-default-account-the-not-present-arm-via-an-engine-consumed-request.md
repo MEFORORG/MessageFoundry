@@ -277,7 +277,9 @@ Because the trio's DACL is protected, a later edit to the directory does not rea
 Wave 0 lockout returns for it:
 
 - a run-as account other than a per-service virtual account or LocalSystem: a gMSA, a dedicated user,
-  LocalService or NetworkService;
+  LocalService or NetworkService. **AMENDED 2026-11-05:** a gMSA and a dedicated user are now admitted
+  when they resolve to a user account, per the *Note (2026-11-05)* below; LocalService and
+  NetworkService are still refused;
 - a data directory owned by anyone else. `install-service.ps1` now sets it to Administrators
   (`Set-DataDirOwner`), because the default-owner policy can leave the creating user as owner: under
   "Object creator", and for the hosted runners' built-in Administrator (RID 500), measured owning the
@@ -301,6 +303,47 @@ leaves any explicit entry for another principal in place, because `icacls /inher
 replaces only the principals it names (measured while building this); that predates this change.
 POSIX is unchanged (`chmod 0600`). Consequences 3 and 4 are not touched here: the key half was answered
 by BACKLOG #1905.
+
+## Note (2026-11-05): one named run-as user account (BACKLOG #3760, #2234)
+
+**The gap.** The 2026-09-24 rule admitted a per-service virtual account and nothing else, so an
+install with `-ServiceAccount` naming a local user or a gMSA left a data directory the store refused.
+`install-service.ps1` writes the same shape for that account as for the virtual one
+(`Set-SecureDataDirAcl` grants it `(OI)(CI)M`, and `Set-DataDirOwner` makes Administrators the
+owner). The store then fell back to the owner-only rewrite, and the Wave 0 lockout returned: a site
+installing that way would have had the service and the provisioning operator lock each other out on
+first deployment.
+
+**Decision (owner ruling 2026-11-05, in the batch 608 Manager's chat).** The hardened directory may
+grant exactly one principal beyond SYSTEM and Administrators. It is a per-service virtual account as
+before, or a SID that `LookupAccountSidW` resolves to `SidTypeUser` and whose RID is 1000 or more. It
+gets the same Modify right (`0x1301bf`) and `OICI` inheritance the virtual account gets, and may own
+the directory, as the virtual account may. In `messagefoundry/store/store.py`,
+`_account_shape_refusal` requires a machine- or domain-relative SID (`S-1-5-21-` plus three
+sub-authorities and the RID) with a RID of 1000 or more, and `_account_type_refusal` requires the
+lookup to answer `SidTypeUser`. A failed lookup and every other type are refused: a group or alias
+with an assigned RID has a user's shape, and admitting one would widen the store to every member.
+A RID under 1000 is refused before any lookup, so the built-in Administrator (500) and Guest (501)
+are refused although they are user accounts. The lookup runs last, after every cheaper refusal, and
+once per open.
+
+**What did not change.** The rule is still an allow-list. A deny entry, a wrong right or inheritance,
+a second principal of either kind, an owner outside the set, inheritance left on, a link in the path,
+and the OWNER RIGHTS temp-directory exemption all stand exactly as the 2026-09-24 note states them.
+The trio still names only principals the directory allows.
+
+**What it widens.** One principal kind: a resolved user account that the directory already grants
+Modify in the installer's shape. That account is the service's own identity, and the directory
+already grants it Modify, so the trio grants it no right the directory did not.
+
+**Left open, at least.** What a gMSA resolves to is unmeasured: no hosted runner has a domain. A
+gMSA is a computer-class object in Active Directory, so it is expected to resolve as `SidTypeUser`;
+if it resolves as anything else, it is refused and the WARNING names the type. A domain account
+resolves through a domain controller or the LSA lookup cache, so a start where neither answers gets
+the owner-only rewrite, which also drops the operator's entry from a trio written on an earlier
+start. A computer account (`DOMAIN\HOST$`) is expected to resolve the same way, and would then be
+admitted if a directory granted it Modify in the installer's shape; unmeasured too. The local-user smoke leg is still not in the
+`windows-service-smoke` matrix (BACKLOG #3760 closing step 2, which waits on #3938).
 
 ## How this was reached
 
