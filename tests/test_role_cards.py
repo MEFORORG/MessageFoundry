@@ -1444,14 +1444,37 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
         why = seats()["retired"]["steward"].lower()
         self.assertIn("watch.py", why, "the notice never names the usage watch hook that stayed")
         self.assertIn("workflow", why, "the notice never says the Workflow gate still binds")
+        self.assertIn(
+            "did not go with it", why, "the notice no longer says the usage controls stayed"
+        )
+        self.assertIn("still bind", why, "the notice no longer says the usage controls bind")
 
     #: The one date the notice may carry: the day the owner said the seat was gone. Any other date
-    #: in it is a retirement date the tree does not record.
+    #: in it, ISO or a month name, is a retirement date the tree does not record. AT LEAST these two
+    #: forms: a date in some other spelling still passes.
     STATEMENT_DATE = "2026-11-05"
+    _MONTH = re.compile(
+        r"\b(?:january|february|march|april|may|june|july|august|september|october|november"
+        r"|december)\b",
+        re.I,
+    )
 
     @classmethod
     def _invented_dates(cls, notice: str) -> list[str]:
-        return [d for d in re.findall(r"\b20\d\d-\d\d-\d\d\b", notice) if d != cls.STATEMENT_DATE]
+        iso = [d for d in re.findall(r"\b20\d\d-\d\d?-\d\d?\b", notice) if d != cls.STATEMENT_DATE]
+        return iso + cls._MONTH.findall(notice)
+
+    #: The row the agreement must no longer carry, matched as a table row.
+    _ROW = re.compile(r"^\|\s*\*\*Steward\*\*\s*\|", re.M)
+
+    def test_no_card_sends_a_session_to_the_steward(self):
+        """A card outranks the agreement in a session's context, so the cards must agree too."""
+        offenders = [
+            p.name
+            for p in card_paths()
+            if re.search(r"STEWARD\.md|steward hold|steward's hold", read(p), re.I)
+        ]
+        self.assertEqual([], offenders, f"these cards still point at the Steward: {offenders}")
 
     def test_the_notice_invents_no_date_or_successor(self):
         why = seats()["retired"]["steward"].lower()
@@ -1459,17 +1482,19 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
         self.assertEqual([], self._invented_dates(why), "the notice states a retirement date")
         self.assertIn("no successor", why, "the notice no longer denies a recorded successor")
 
-    def test_the_date_scan_would_fire_on_an_invented_date(self):
-        """Positive control. Without it the date assertion above passes against any wording."""
+    def test_the_scans_would_fire_on_the_wording_they_forbid(self):
+        """Positive controls. Without them each scan above passes against any wording."""
         self.assertEqual(
             ["2026-08-01"], self._invented_dates("retired on 2026-08-01 by owner decision.")
         )
+        self.assertEqual(["August"], self._invented_dates("retired in August 2026."))
+        self.assertEqual([], self._invented_dates("the owner's statement of 2026-11-05"))
+        removed = "| **Steward** | cron, zero model calls | Reading usage. | Warn a session. |"
+        self.assertIsNotNone(self._ROW.search(removed), "the row pattern misses the removed row")
 
     def test_the_agreement_retires_the_steward_rather_than_going_quiet(self):
         text = read(AGREEMENT)
-        self.assertIsNone(
-            re.search(r"^\|\s*\*\*Steward\*\*\s*\|", text, re.M), "CLAUDE.md keeps a Steward row"
-        )
+        self.assertIsNone(self._ROW.search(text), "CLAUDE.md keeps a Steward row")
         self.assertIn(
             "The STEWARD is retired too",
             " ".join(text.split()),

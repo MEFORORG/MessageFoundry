@@ -19,6 +19,7 @@ is defined here and nowhere else, so other pages point at this line rather than 
 | Builder | One brief, then exits | Works, commits, pushes its branch, reports, and stops. The Manager opens the PR (since 2026-09-18). That is you, most of the time. |
 | Watchdog | As needed | Watches the Lander and keeps it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. It never drains, never takes the claim, and never says whose a red is. Added 2026-09-19. |
 | Lander | Standing authority | Enqueues and merges. Both, since the Console's retirement. |
+| Special | As the owner needs it | Work the owner assigns directly, outside the other seats. It stands by until an instruction arrives, and that instruction is its whole scope. Added 2026-09-16. |
 
 **A MANAGER AND THE LANDER MAY SPAWN A SESSION; every other seat needs permission first (owner
 ruling 2026-09-16).** The owner still starts each Manager in the ordinary case, and a Manager's
@@ -574,13 +575,17 @@ until then, verbatim:
 The Manager row also read *"Usage limits still bind, at least a Steward hold and the Workflow gate;
 korus `roles/STEWARD.md` and `roles/COMMON.md` define them."*
 
-**The seat went; the usage controls did not.** Any seat still reads usage itself with `get_usage`.
-The user-scope usage watch hook, `watch.py`, still prints the weekly ladder at SessionStart and
-UserPromptSubmit, and by the owner's ruling of 2026-10-31 the weekly window carries the stop, so its
-HOLD NEW WORK state still means start no new work. The Lander is exempt from the ladder's three states, as
-ADR 0211 records from korus `STEWARD.md` 3e. The 90 percent gate on a new Workflow still binds.
+**The seat went; the usage controls did not.** A local session can still read usage itself with
+`get_usage`. On a config root whose user-scope `settings.json` wires it, the usage watch hook,
+`watch.py`, still prints the weekly ladder at SessionStart and UserPromptSubmit; a cloud session and
+an unwired root see no ladder, and that does not mean none is in force. By the owner's ruling of
+2026-10-31 the weekly window carries the stop, so the ladder's HOLD NEW WORK state still means start
+no new work. The Lander is exempt from the ladder's three states, as ADR 0211 records from korus
+`STEWARD.md` 3e. The 90 percent gate on a new Workflow still binds.
 `scripts/hooks/usage-headroom-inject.ps1` still reads a `status.json` it calls the Steward's, as a
-labelled fallback; a retired seat can leave a mechanism running, and that one is left as it is.
+labelled fallback. Read on 2026-11-05, that file sits beside `watch.py`, which writes it, and no
+scheduled task named for the Steward was found. A retired seat can leave a mechanism running, and
+that one is left as it is.
 `docs/roles/seats.json` resolves `steward` to a retirement notice and `docs/roles/steward.card.md`
 is removed, so `/seat steward` prints the notice rather than a card.
 
@@ -839,7 +844,7 @@ From the notes under the section 5 roster. `CLAUDE.md` keeps the roster row, a s
 ruling, and pointers to korus `roles/SPECIAL.md` and `docs/roles/special.card.md`.
 
 **THE SPECIAL SEAT IS THE OWNER'S, AND IT HAS NO STANDING DUTIES (owner decision 2026-09-16).** It
-exists for work that falls outside the other five, so its instruction is the whole of its scope and
+exists for work that falls outside the other standing seats, so its instruction is the whole of its scope and
 it has none until the owner gives it one. It does not take a BACKLOG item, a brief, or a red. It is
 an ADDITION -- nothing retired to make room for it -- and it is not a spawn-authorised seat, so the
 ruling below binds it.

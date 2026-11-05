@@ -314,7 +314,7 @@ section 5 of `CLAUDE.md`. The **Steward** left it when the owner said on 2026-11
 had been retired months earlier; the date is not recorded, and `seats.json` resolves the name to a
 retirement notice. The **Special** seat joined 2026-09-16 by owner decision, for work
 outside the other standing seats; it is an addition, and nothing retired to make room for it. A
-different sixth seat existed until 2026-09-05, when the owner retired it along with the `reviewed` label and
+different seat existed until 2026-09-05, when the owner retired it along with the `reviewed` label and
 the review gate; it is deliberately unnamed. The **Console** held the Manager's place until 2026-09-10,
 when the owner retired it; the Manager is its replacement and **not a rename of it**, so a Console
 rule does not carry across (BACKLOG #1529).
@@ -575,8 +575,8 @@ from #970 as `1584742b2` on 2026-09-08. So no single commit matches this table, 
 heading names the branch commit rather than the merge.
 
 `seats.json` has since gained a fourth map, `elsewhere`, and its roster key was renamed from `seats`
-to `live`. The shipped card set today is `builder`, `lander`, `manager`, `special` and `watchdog`.
-`steward.card.md` was removed when the owner said on 2026-11-05 that the Steward was retired.
+to `live`. The shipped card set today is `builder`, `lander`, `manager`, `special` and `watchdog`,
+`steward.card.md` having been removed when the owner said on 2026-11-05 that the Steward was retired.
 
 **That last sentence read "`manager`, `builder`, `regulator`, `steward`, `lander`" until 2026-09-20,
 and it was wrong at both ends.** It named a card that does not exist and omitted two that do.
