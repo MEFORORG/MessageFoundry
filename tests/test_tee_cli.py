@@ -286,11 +286,14 @@ def test_compare_out_replaces_an_existing_readable_file(
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
 
 
+@_POSIX_MODES
 def test_compare_out_replaces_a_link_rather_than_following_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A link at the output name would otherwise send the report to whatever file it points at.
-    # On Windows too: compare's os.replace on main swapped the link itself (vault BACKLOG #3166).
+    # On Windows compare now writes through a link, as export and anonymize-captures do, so a
+    # hardened target keeps its list (PR 2390 note 7, vault BACKLOG #3166); the Windows symlink
+    # test below covers it.
     db = _seed_compare(tmp_path, monkeypatch)
     target = tmp_path / "elsewhere.json"
     target.write_text("untouched\n", encoding="utf-8")
@@ -299,8 +302,7 @@ def test_compare_out_replaces_a_link_rather_than_following_it(
     assert _compare_to(db, out) == 0
     assert target.read_text(encoding="utf-8") == "untouched\n"
     assert not out.is_symlink()
-    if sys.platform != "win32":
-        assert stat.S_IMODE(out.stat().st_mode) == 0o600
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
 
 
 @_POSIX_MODES
@@ -396,9 +398,9 @@ def test_export_out_is_created_owner_only(tmp_path: Path) -> None:
 
 
 _OUT_COMMANDS = ["anonymize-captures", "export", "compare"]
-# The commands whose existing --out is written in place on Windows, as write_text did on main.
-# compare replaced its file on main and still does (vault BACKLOG #3166).
-_IN_PLACE_COMMANDS = ["anonymize-captures", "export"]
+# The commands that write LF on every OS. compare keeps the platform's, CRLF on Windows, as on main
+# (vault BACKLOG #3166). They are also the two that run inside asyncio.run.
+_LF_COMMANDS = ["anonymize-captures", "export"]
 _WHAT = {"anonymize-captures": "dataset", "export": "export", "compare": "report"}
 
 
@@ -413,6 +415,17 @@ def _write_out(
     return _anonymize_to(tmp_path, monkeypatch, out)
 
 
+def _line_end(command: str) -> bytes:
+    return b"\n" if command in _LF_COMMANDS else os.linesep.encode()
+
+
+def _assert_line_ends(command: str, data: bytes) -> None:
+    """``data`` ends in ``command``'s line ending, and every line uses it."""
+    newline = _line_end(command)
+    assert data.endswith(b"}" + newline)  # control: the file really has a line ending
+    assert data.count(b"\r\n") == (data.count(b"\n") if newline == b"\r\n" else 0)
+
+
 def _out_help(command: str) -> str:
     parser = _build_parser()
     sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
@@ -420,13 +433,13 @@ def _out_help(command: str) -> str:
     return " ".join((out.help or "").split())
 
 
-@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
 def test_out_help_states_what_the_writer_does_to_the_file(command: str) -> None:
     # Vault BACKLOG #3166 step 4: the accepted behaviour changes are met only when the tee's own
     # text states them, not the ledger alone.
     text = _out_help(command)
+    assert ("LF on every OS, Windows included" in text) == (command in _LF_COMMANDS), text
     for consequence in (
-        "LF on every OS, Windows included",
         "owner-only (0600)",
         "a read-only (0444) FILE is overwritten",
         "a hard link at FILE is broken",
@@ -434,12 +447,6 @@ def test_out_help_states_what_the_writer_does_to_the_file(command: str) -> None:
         "On Windows an existing FILE is written in place and keeps its access list",
     ):
         assert consequence in text, f"{command} --out help lacks {consequence!r}: {text}"
-
-
-def test_compare_out_help_states_that_an_existing_file_is_replaced() -> None:
-    text = _out_help("compare")
-    assert "owner-only (0600)" in text
-    assert "an existing FILE is replaced" in text
 
 
 @pytest.mark.parametrize("command", _OUT_COMMANDS)
@@ -450,20 +457,20 @@ def test_out_goes_through_the_owner_only_writer(
     # fails if a command goes back to write_text.
     import tee.__main__ as tee_main
 
-    calls: list[tuple[str, bool]] = []
+    calls: list[tuple[str, str | None]] = []
     real = tee_main._write_owner_only
 
-    def spy(path: str, text: str, *, in_place_on_windows: bool) -> None:
-        calls.append((path, in_place_on_windows))
-        real(path, text, in_place_on_windows=in_place_on_windows)
+    def spy(path: str, text: str, *, newline: str | None) -> None:
+        calls.append((path, newline))
+        real(path, text, newline=newline)
 
     monkeypatch.setattr(tee_main, "_write_owner_only", spy)
     out = tmp_path / "out.json"
     assert _write_out(command, tmp_path, monkeypatch, out) == 0
-    assert calls == [(str(out), command in _IN_PLACE_COMMANDS)]
+    assert calls == [(str(out), "\n" if command in _LF_COMMANDS else None)]
 
 
-@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+@pytest.mark.parametrize("command", _LF_COMMANDS)
 def test_out_is_written_off_the_event_loop(
     command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -474,13 +481,13 @@ def test_out_is_written_off_the_event_loop(
     on_loop: list[bool] = []
     real = tee_main._write_owner_only
 
-    def spy(path: str, text: str, *, in_place_on_windows: bool) -> None:
+    def spy(path: str, text: str, *, newline: str | None) -> None:
         try:
             asyncio.get_running_loop()
             on_loop.append(True)
         except RuntimeError:
             on_loop.append(False)
-        real(path, text, in_place_on_windows=in_place_on_windows)
+        real(path, text, newline=newline)
 
     monkeypatch.setattr(tee_main, "_write_owner_only", spy)
     assert _write_out(command, tmp_path, monkeypatch, tmp_path / "out.json") == 0
@@ -489,19 +496,15 @@ def test_out_is_written_off_the_event_loop(
 
 @pytest.mark.parametrize("command", _OUT_COMMANDS)
 def test_out_newline(command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # The dataset is JSONL, read back line by line by the harness corpus, so the in-place commands
-    # write LF everywhere. compare keeps main's text-layer default, CRLF on Windows (vault BACKLOG
-    # #3166). The CRLF count discriminates on win32 for all three commands.
-    newline = b"\n" if command in _IN_PLACE_COMMANDS else os.linesep.encode()
+    # The dataset is JSONL, read back line by line by the harness corpus, so export and
+    # anonymize-captures write LF everywhere. compare keeps main's text-layer default, CRLF on
+    # Windows (vault BACKLOG #3166). The CRLF count discriminates on win32 for all three commands.
     out = tmp_path / "out.json"
     assert _write_out(command, tmp_path, monkeypatch, out) == 0
-    data = out.read_bytes()
-    assert data.endswith(b"}" + newline)  # control: the file really has a line ending
-    crlf = data.count(b"\r\n")
-    assert crlf == (data.count(b"\n") if newline == b"\r\n" else 0)
+    _assert_line_ends(command, out.read_bytes())
 
 
-@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
 def test_out_that_cannot_be_written_is_an_error_line(
     command: str,
     tmp_path: Path,
@@ -617,13 +620,14 @@ def _opens_for_writing(path: Path) -> bool:
 
 
 @_WINDOWS_ACLS
-@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
 @pytest.mark.parametrize("trailing_separator", [False, True], ids=["plain", "trailing-separator"])
 def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
     command: str, trailing_separator: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A file renamed over the target would take the folder's inherited access list, so an export
-    # or dataset an operator had hardened would lose that hardening in a looser folder.
+    # A file renamed over the target would take the folder's inherited access list, so an export,
+    # dataset or report an operator had hardened would lose that hardening in a looser folder.
+    # compare replaced it until PR 2390 note 7 (vault BACKLOG #3166).
     scratch = tmp_path / "acl"
     out = tmp_path / "out.json"
     # Longer than any output, so a write that skipped the truncate would leave stale bytes behind.
@@ -640,8 +644,25 @@ def test_out_keeps_the_access_list_of_a_hardened_target_on_windows(
     assert _sddl_of(out, scratch) == hardened
     data = out.read_bytes()
     assert b"stale" not in data
-    assert data.endswith(b"}\n")
-    assert b"\r\n" not in data
+    _assert_line_ends(command, data)
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@_WINDOWS_ACLS
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
+def test_out_that_a_reader_holds_open_is_written_on_windows(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # PR 2390 note 10: a replace needs to delete the old file, which a reader's handle without
+    # delete sharing refuses, so compare failed with WinError 5 naming its .tmp file. Python's
+    # open shares read and write, so the in-place write goes through and the reader sees it.
+    out = tmp_path / "out.json"
+    out.write_text("stale\n", encoding="utf-8")
+    with out.open("rb") as reader:
+        assert _write_out(command, tmp_path, monkeypatch, out) == 0
+        data = reader.read()
+    assert b"stale" not in data
+    _assert_line_ends(command, data)
     assert not list(tmp_path.glob("*.tmp"))
 
 
@@ -658,7 +679,7 @@ def test_out_replaces_a_second_hard_link_on_posix(tmp_path: Path) -> None:
 
 
 @_WINDOWS_ACLS
-@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
 def test_out_through_a_second_hard_link_keeps_the_hardened_access_list_on_windows(
     command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -676,8 +697,7 @@ def test_out_through_a_second_hard_link_keeps_the_hardened_access_list_on_window
     data = out.read_bytes()
     assert other.read_bytes() == data
     assert b"stale" not in data
-    assert data.endswith(b"}\n")
-    assert b"\r\n" not in data
+    _assert_line_ends(command, data)
 
 
 def _symlink_or_skip(link: Path, target: Path) -> None:
@@ -688,7 +708,7 @@ def _symlink_or_skip(link: Path, target: Path) -> None:
 
 
 @_WINDOWS_ACLS
-@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
 def test_out_through_a_symlink_keeps_the_hardened_target_on_windows(
     command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -705,12 +725,11 @@ def test_out_through_a_symlink_keeps_the_hardened_target_on_windows(
     assert _sddl_of(target, scratch) == hardened
     data = target.read_bytes()
     assert b"stale" not in data
-    assert data.endswith(b"}\n")
-    assert b"\r\n" not in data
+    _assert_line_ends(command, data)
 
 
 @_WINDOWS_ACLS
-@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+@pytest.mark.parametrize("command", _OUT_COMMANDS)
 @pytest.mark.parametrize("name", ["plain", "second-hard-link", "trailing-separator"])
 def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
     command: str,
@@ -740,9 +759,9 @@ def test_out_refuses_a_target_hardened_against_this_account_writing_on_windows(
     assert not list(tmp_path.glob("*.tmp"))
 
 
-@pytest.mark.parametrize("in_place_on_windows", [True, False])
+@pytest.mark.parametrize("newline", ["\n", None], ids=["lf", "platform"])
 def test_out_creates_a_missing_target_through_mkstemp(
-    in_place_on_windows: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    newline: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # On every platform, Windows included, a name that is not there is made by mkstemp and renamed
     # into place, never opened in place.
@@ -758,11 +777,10 @@ def test_out_creates_a_missing_target_through_mkstemp(
 
     out = tmp_path / "out.json"
     monkeypatch.setattr(tempfile, "mkstemp", spy)
-    tee_main._write_owner_only(str(out), "new\n", in_place_on_windows=in_place_on_windows)
+    tee_main._write_owner_only(str(out), "new\n", newline=newline)
     monkeypatch.undo()
     assert len(calls) == 1
-    newline = b"\n" if in_place_on_windows else os.linesep.encode()
-    assert out.read_bytes() == b"new" + newline
+    assert out.read_bytes() == b"new" + (b"\n" if newline else os.linesep.encode())
     assert not list(tmp_path.glob("*.tmp"))
 
 
@@ -783,7 +801,7 @@ def test_out_that_appears_after_the_check_is_written_in_place_on_windows(
     # Control: a file renamed into this folder would get a different list, so a replace fails this.
     assert hardened != _sddl_of(sibling, scratch)
     monkeypatch.setattr(os.path, "lexists", lambda path: False)
-    tee_main._write_owner_only(str(out), "new\n", in_place_on_windows=True)
+    tee_main._write_owner_only(str(out), "new\n", newline="\n")
     monkeypatch.undo()
     assert _sddl_of(out, scratch) == hardened
     assert out.read_bytes() == b"new\n"
@@ -801,28 +819,3 @@ def test_out_through_a_dangling_symlink_creates_its_target_on_windows(tmp_path: 
     assert _export_to(tmp_path, out) == 0
     assert out.is_symlink()
     assert target.read_bytes().endswith(b"}\n")
-
-
-@_WINDOWS_ACLS
-@pytest.mark.parametrize("grant", ["F", "R"])
-def test_compare_out_replaces_a_hardened_target_on_windows(
-    grant: Literal["F", "R"], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # compare replaced an existing --out on main, so the report takes the folder's access list
-    # rather than the old file's, even one that denied this account writing. It still does
-    # (vault BACKLOG #3166).
-    scratch = tmp_path / "acl"
-    out = tmp_path / "out.json"
-    out.write_text("stale\n", encoding="utf-8")
-    hardened = _harden(out, grant, scratch)
-    sibling = tmp_path / "fresh.json"
-    sibling.write_text("x\n", encoding="utf-8")
-    folders = _sddl_of(sibling, scratch)
-    # Control: the hardening really differs from what a new file in this folder gets.
-    assert hardened != folders
-    assert _write_out("compare", tmp_path, monkeypatch, out) == 0
-    assert _sddl_of(out, scratch) == folders
-    data = out.read_bytes()
-    assert b"stale" not in data
-    assert json.loads(data)["summary"]["matched"] == 1
-    assert not list(tmp_path.glob("*.tmp"))

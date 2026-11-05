@@ -150,11 +150,12 @@ consequences follow from it:
   is written through. These hold for all three commands.
 * **`export` and `anonymize-captures` write LF line endings on every OS**, Windows included, so a
   Windows `export` file no longer ends its lines in CRLF.
-* **On Windows, `export` and `anonymize-captures` write an existing file in place**, so it keeps its
-  access list and owner. A file this account may not write, or one marked read-only, is an error
-  and exit 1; it is never replaced. A new file takes its folder's access list.
-* **`compare` replaces an existing file on Windows too**, so the report takes its folder's access
-  list, whatever list the old file had. It writes the platform's line endings.
+* **On Windows an existing file is written in place**, by all three commands, so it keeps its
+  access list and owner, and a link's target is the file written. A file this account may not
+  write, or one marked read-only, is an error and exit 1; it is never replaced. A new file takes
+  its folder's access list. `compare` replaced an existing file on Windows until vault BACKLOG
+  #3166, so for its report this is new.
+* **`compare` writes the platform's line endings**, CRLF on Windows.
 
 The POSIX replace and the LF line endings were accepted as behaviour changes by a Lander decision
 under the owner's driver rule (vault BACKLOG #3166), not by a standalone owner ruling.
