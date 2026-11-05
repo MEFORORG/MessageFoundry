@@ -476,9 +476,11 @@ pure-Python equivalent:
 - Key file creation: `restricted_file.py`, which on Windows calls `kernel32`'s `CreateFileW` with
   the file's access list attached and `CREATE_NEW`, so a file that holds a key is restricted in
   the call that creates it and an existing file or link is refused. It asks `advapi32` to build
-  that list and to resolve an account name to its SID. POSIX needs no `ctypes` for this; it
-  creates the file with `O_CREAT | O_EXCL` and mode `0o600`, and on Linux removes a POSIX access
-  control list the file inherits from its directory before writing to it
+  that list and to resolve an account name to its SID. Creating the file on POSIX needs no
+  `ctypes`; it creates the file with `O_CREAT | O_EXCL` and mode `0o600`, and on Linux removes a
+  POSIX access control list the file inherits from its directory before writing to it. The module
+  still loads the C library through `ctypes` on Linux for one read: `linux_file_system_type` calls
+  `fstatfs` on an open descriptor, for the key custody file reads below
 - Key custody file reads: `store/custody.py`, which on Windows opens a host or handoff key file with
   `kernel32`'s `CreateFileW`, `FILE_FLAG_OPEN_REPARSE_POINT` and a share mode that admits only other
   readers, so a link is opened as itself and the file at that name cannot be replaced while it is
@@ -530,8 +532,9 @@ pure-Python equivalent:
 
 **What holds them.** Every library whose code runs is loaded by a name fixed in the code, never by a
 path from configuration. On Windows that is a system library such as `kernel32` or `advapi32`. The
-one non-Windows load is in `store/crypto.py`, which reaches the C library already loaded into the
-process to call `mlock`. One load takes a computed path: `tray/branding.py` opens the tray's own
+non-Windows loads include at least `store/crypto.py`, which reaches the C library already loaded
+into the process to call `mlock`, and `restricted_file.linux_file_system_type`, which reaches the
+same library on Linux to call `fstatfs`. One load takes a computed path: `tray/branding.py` opens the tray's own
 launcher with `LoadLibraryExW`, but as a data file, to read its version resource, so none of that
 file's code runs. Most sites declare argument and return types before the call, so a wrong-width
 argument fails at the boundary rather than corrupting the stack. Not all do: at least `service.py`,
