@@ -392,10 +392,10 @@ def worker_environment(
     interpreter's own variables, and ``extra_names``. Code in the child that reads any other
     variable finds it unset, which is a difference from running in the engine process.
 
-    ``extra_names`` is what the caller adds: an engine switch the child's own code reads to make a
-    decision its parent already made, and the names an operator listed in
-    ``[sandbox].pass_environment``. Never a secret: whatever is named here is in the environment of
-    the code this builder exists to keep secrets from. Settings load refuses the engine's own.
+    ``extra_names`` is what the caller adds: for the sandbox worker, the names an operator listed in
+    ``[sandbox].pass_environment``. Never a secret there: whatever is named here is in the
+    environment of the code this builder exists to keep secrets from. Settings load refuses the
+    engine's own.
 
     ``defaults`` are values for names the result does not already hold, so a value the operator
     passed through ``extra_names`` wins. They are set here, not on the returned dict, because

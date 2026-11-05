@@ -205,11 +205,12 @@ def test_the_worker_does_not_search_the_working_directory_and_loads_the_parents_
     assert seen["REMOTE_DEBUG"] == "False"
 
 
-def test_the_sandbox_hands_its_worker_one_engine_switch_and_no_other_engine_variable(
+def test_the_sandbox_hands_its_worker_no_engine_variable(
     graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The worker runs ``load_config`` itself, so the parent's answer on the config-source gate has
-    to reach it, or it would refuse a directory its parent loaded. Read off the real spawn call."""
+    """Not even the config-source escape and the dial that unlocks it: the parent decides the
+    config-source gate when it reads the snapshot, and the worker loads what the boot frame carries
+    (vault BACKLOG #2596, #2587). Read off the real spawn call, with both set in the parent."""
     _registry, config_dir = graph
     captured: dict[str, Any] = {}
 
@@ -224,14 +225,21 @@ def test_the_sandbox_hands_its_worker_one_engine_switch_and_no_other_engine_vari
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     for name in (settings.INSECURE_CONFIG_SOURCE_ESCAPE_ENV, settings.INSECURE_TLS_ESCAPE_ENV):
         monkeypatch.setenv(name, "1")
+    monkeypatch.setenv(settings.SECURITY_ENFORCEMENT_ENV, "warn")
     for name in _SECRET_NAMES:
         monkeypatch.setenv(name, _MARKER)
+    # The control: a name the operator passes does cross, so the env read is the worker's.
+    monkeypatch.setenv(_ORDINARY, _MARKER)
+    policy = sandbox_mod.SandboxPolicy(
+        mode=sandbox_mod.SandboxMode.SUBPROCESS, wall_seconds=15.0, pass_environment=(_ORDINARY,)
+    )
 
     with pytest.raises(_Stop):
-        _session(config_dir, inbound="IB_ENV")._spawn()
+        _session(config_dir, inbound="IB_ENV", policy=policy)._spawn()
 
-    engine_names = {n for n in captured["env"] if n.startswith(childenv.ENGINE_ENV_PREFIX)}
-    assert engine_names == {settings.INSECURE_CONFIG_SOURCE_ESCAPE_ENV}
+    engine_names = {n for n in captured["env"] if n.upper().startswith(childenv.ENGINE_ENV_PREFIX)}
+    assert engine_names == set()
+    assert captured["env"][_ORDINARY] == _MARKER
     # One thread arena at most on Linux, so threads cannot spend [sandbox].mem_mb (vault BACKLOG
     # #3133). Elsewhere the cap is not RLIMIT_DATA, so the worker's allocator is left alone.
     expected = "2" if sys.platform.startswith("linux") else None

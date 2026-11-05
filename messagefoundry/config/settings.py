@@ -522,14 +522,14 @@ def insecure_config_source_escape_permitted(environ: Mapping[str, str] | None = 
     ``[security].enforcement = warn`` (:func:`weakened_tls_escape_permitted`).
 
     **Why the dial is read from the environment and not from loaded settings.** The check runs inside
-    ``load_config``, in every process that executes config: ``serve``, a reload, the sandbox worker's
-    boot load, and offline commands. At least ``check`` and ``dryrun`` load config before they read
-    any settings, and the worker never reads a settings file. A posture handed down by each caller
-    would be missed by the caller nobody remembered (the lesson of vault BACKLOG #2354). The escape is
-    an environment variable, so the dial that unlocks it is read from the same place, the same way in
-    every one of those processes. The sandbox worker's environment is an allowlist, so
-    ``pipeline/sandbox.py`` carries both into it by name: the escape, and every spelling of the dial
-    that :func:`security_enforcement_env_names` finds. The worker then reads what the engine read.
+    ``load_config``, in every process that reads a config directory: ``serve``, a reload, a sandbox
+    session that reads its own directory, and offline commands. At least ``check`` and ``dryrun``
+    load config before they read any settings. A posture handed down by each caller would be missed
+    by the caller nobody remembered (the lesson of vault BACKLOG #2354). The escape is an environment
+    variable, so the dial that unlocks it is read from the same place, the same way in every one of
+    those processes. The sandbox worker is not one of them: it loads the snapshot its parent read
+    and checked, sent in the boot frame (vault BACKLOG #2596), so neither variable is in its
+    environment (vault BACKLOG #2587).
 
     **Where "never under enforce" holds.** For a process whose settings come from
     :func:`load_settings` over this same environment, which is ``serve``, ``supervise`` and every CLI
@@ -561,8 +561,7 @@ def security_enforcement_env_names(environ: Mapping[str, str] | None = None) -> 
 
     ``_env_overrides`` lowercases what follows the prefix, so ``MEFOR_SECURITY_enforcement`` is the
     same setting as :data:`SECURITY_ENFORCEMENT_ENV`, and on a case-sensitive platform both can be
-    set. The sandbox hands exactly these names to its worker, beside the escape, so the worker's
-    config-source check reads what the engine's read."""
+    set. The escape's clamp reads every one of them."""
     env = os.environ if environ is None else environ
     key = SECURITY_ENFORCEMENT_ENV[len(_ENV_PREFIX) :].lower()
     return tuple(

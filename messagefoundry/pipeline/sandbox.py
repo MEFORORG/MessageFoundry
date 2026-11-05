@@ -115,12 +115,7 @@ from messagefoundry.config.db_lookup import is_available as db_lookup_available
 from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
 from messagefoundry.config.fhir_lookup import is_available as fhir_lookup_available
 from messagefoundry.config.run_context import RunContext
-from messagefoundry.config.settings import (
-    INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
-    EgressSettings,
-    SandboxSettings,
-    security_enforcement_env_names,
-)
+from messagefoundry.config.settings import EgressSettings, SandboxSettings
 from messagefoundry.config.snapshot import ConfigSnapshot
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _sandbox_codec as codec
@@ -765,14 +760,12 @@ class SandboxSession:
         self._responses = queue.Queue()
         self._generation += 1
         # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
-        # environment (vault BACKLOG #2587). Two engine variables cross, and they are one
-        # decision: the config-source escape and the enforcement dial that unlocks it (vault
-        # BACKLOG #2599). They crossed because the child ran ``load_config`` on the directory
-        # itself, and with only the escape it would refuse a directory its parent loaded at
-        # ``warn``. Since vault BACKLOG #2596 the child loads the snapshot it is sent and runs no
-        # trust check of its own, so no code in it reads either; dropping them is a separate
-        # change. The dial is a posture switch, not a secret. The operator's
-        # ``[sandbox].pass_environment`` names cross with them.
+        # environment (vault BACKLOG #2587). No engine variable crosses. The config-source escape
+        # and the enforcement dial that unlocks it (vault BACKLOG #2599) used to, because the child
+        # ran ``load_config`` on the directory itself. Since vault BACKLOG #2596 the parent makes
+        # that decision when it reads the snapshot, the boot frame carries the bytes it vetted, and
+        # the child runs no trust check of its own, so nothing in it reads either. The operator's
+        # ``[sandbox].pass_environment`` names cross.
         # At most one glibc malloc arena besides the main one, where the worker's memory cap is
         # RLIMIT_DATA. An arena keeps its peak writable size counted in VmData after its threads
         # exit, so with one per thread, the threads a Handler starts would spend [sandbox].mem_mb
@@ -784,14 +777,7 @@ class SandboxSession:
             if self.policy.mem_mb is not None and sys.platform.startswith("linux")
             else {}
         )
-        env = worker_environment(
-            extra_names=(
-                INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
-                *security_enforcement_env_names(),
-                *self.policy.pass_environment,
-            ),
-            defaults=arena,
-        )
+        env = worker_environment(extra_names=self.policy.pass_environment, defaults=arena)
         # Fixed argv (this interpreter + our own worker module), no shell, no
         # untrusted input in the command line — so B603 does not apply. ``start_new_session`` puts the
         # worker in its own POSIX process group so ``_kill`` can ``killpg`` its whole tree; it is a

@@ -1082,8 +1082,9 @@ def _worker_session(config_dir: Path) -> SandboxSession:
 
 @pytest.mark.usefixtures("escape_under_enforce")
 def test_the_sandbox_worker_boot_load_honours_the_clamp(tmp_path: Path) -> None:
-    """The worker loads config in its own process at boot. With the escape set under ``enforce`` it
-    refuses a writable source, and the parent sees the refusal instead of a running worker."""
+    """A session given no snapshot reads its directory, with the trust check, before it starts a
+    worker. With the escape set under ``enforce`` that read refuses a writable source, and the
+    caller sees the refusal instead of a running worker."""
     _write_cfg(tmp_path)
     _grant_others_write(tmp_path)
     session = _worker_session(tmp_path)
@@ -1097,10 +1098,10 @@ def test_the_sandbox_worker_boot_load_honours_the_clamp(tmp_path: Path) -> None:
 
 @pytest.mark.usefixtures("escape_honoured")
 def test_the_sandbox_worker_decides_as_the_engine_did_at_warn(tmp_path: Path) -> None:
-    """The worker's environment is an allowlist. The escape crosses it, and so must the dial that
-    unlocks it, or the worker would refuse a directory the engine loaded at ``warn``. Through the
-    real spawn: with both set, the worker boots over a really-writable directory. The test above is
-    the other arm, and it would pass whether or not the dial crossed."""
+    """The parent reads the directory, with the clamp, and the worker loads those bytes, so a
+    worker boots over a really-writable directory the parent accepted at ``warn`` with neither
+    variable in its own environment (vault BACKLOG #2587). Through the real spawn. The test above
+    is the other arm."""
     _write_cfg(tmp_path)
     _grant_others_write(tmp_path)
     session = _worker_session(tmp_path)
@@ -1124,12 +1125,14 @@ def test_the_engine_refuses_the_same_directory_with_the_escape_alone(tmp_path: P
 
 
 @pytest.mark.parametrize("spelling", ["MEFOR_SECURITY_ENFORCEMENT", "MEFOR_SECURITY_enforcement"])
-def test_every_spelling_of_the_dial_reaches_the_worker_environment(
+def test_no_spelling_of_the_dial_reaches_the_worker_environment(
     spelling: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The engine's check reads every spelling of the dial the settings loader would. The worker's
-    environment carries each one that is set, read off the real spawn call, and nothing else of
-    the engine's but the escape."""
+    """The parent decides the config-source gate when it reads the snapshot the boot frame carries,
+    and the worker runs no trust check of its own (vault BACKLOG #2596). So neither the escape nor
+    any spelling of the dial is in the worker's environment (vault BACKLOG #2587), read off the
+    real spawn call. ``test_the_sandbox_worker_decides_as_the_engine_did_at_warn`` is the control
+    that a worker still boots over a directory the parent accepted at ``warn``."""
     captured: dict[str, dict[str, str]] = {}
 
     class _Stop(Exception):
@@ -1148,8 +1151,7 @@ def test_every_spelling_of_the_dial_reaches_the_worker_environment(
         _worker_session(tmp_path)._spawn()
     crossed = {name: value for name, value in captured["env"].items() if name.startswith("MEFOR_")}
     # Windows holds one variable under an upper-cased name, whichever spelling set it.
-    as_stored = spelling.upper() if sys.platform == "win32" else spelling
-    assert crossed == {INSECURE_CONFIG_SOURCE_ESCAPE_ENV: "1", as_stored: "warn"}
+    assert crossed == {}
 
 
 def test_the_loosening_page_lists_the_escape() -> None:
