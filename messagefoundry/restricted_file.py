@@ -248,10 +248,12 @@ POSIX_ACL_XATTR = "system.posix_acl_access"
 def posix_access_acl(fd: int) -> bytes | None:
     """The raw POSIX access control list of the open file ``fd``, or ``None`` when it has none.
 
-    Linux only, because only Linux exposes the list as an extended attribute; raises
-    :class:`RestrictedFileError` elsewhere. No such attribute (``ENODATA``) and a file system that
-    keeps no extended attributes (``ENOTSUP``) both mean no list. Every other error propagates as
-    the ``OSError`` it is, because a list that could not be read is not a list shown absent."""
+    Linux only, where the list is an extended attribute; raises :class:`RestrictedFileError`
+    elsewhere. No such attribute (``ENODATA``) and a file system that keeps no POSIX list
+    (``ENOTSUP``) both mean no list. Every other error propagates as the ``OSError`` it is, because a
+    list that could not be read is not a list shown absent. **A file system with its own access
+    model, such as an NFSv4 or CIFS mount, also answers ``ENOTSUP``**, so its access list, if it has
+    one, is not read here."""
     if sys.platform != "linux":
         raise RestrictedFileError("a POSIX access control list is read on Linux only")
     try:
@@ -392,6 +394,9 @@ def _create_restricted(path: Path, read_grants: Sequence[str]) -> int:
     try:
         if sys.platform == "linux":
             _drop_inherited_acl(path, fd)
+        # A default list or a umask can leave the owner without read; set the mode exactly, so a
+        # reader that opens the file as its owner can read what was written.
+        os.fchmod(fd, 0o600)
         status = os.fstat(fd)
         if stat.S_IMODE(status.st_mode) & 0o077 or status.st_uid != os.geteuid():
             raise RestrictedFileError(

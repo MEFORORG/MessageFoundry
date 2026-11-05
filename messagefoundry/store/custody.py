@@ -22,7 +22,8 @@ What is here:
 * **The host provider.** Windows: the host blob under user-scope DPAPI, made by the service account
   itself (:func:`protect_host_blob`). Linux: the host blob in a file only its owner can read (rule
   3b), and a reader for a systemd credential (:func:`read_systemd_credential`). Both read the file's
-  POSIX access control list, which only Linux exposes, so another POSIX host is refused.
+  POSIX access control list, which this engine reads on Linux only, so another POSIX host is
+  refused.
 * **The handoff blob** (:func:`write_handoff_file`): machine-scope DPAPI, in a file created
   restricted with read for the service account and for no package SID. It carries the key from the
   administrator who mints it to the service's first start, which re-wraps it in its own user scope.
@@ -502,19 +503,31 @@ def _posix_acl_entries_problem(
 
     The owner's entry and the mask are not judged here: the owner is checked by uid, and the mask
     only narrows the entries it covers. Every other entry is judged by its own permissions, not as
-    the mask narrows them, so an entry is refused for what it would grant once the mask widens."""
+    the mask narrows them, so an entry is refused for what it would grant once the mask widens. A
+    list without exactly one owner, group and other entry, or with named entries and no single mask,
+    is not one Linux writes, and is refused rather than read as granting nothing."""
     if (
         len(acl) < _ACL_HEADER.size
         or (len(acl) - _ACL_HEADER.size) % _ACL_ENTRY.size
         or _ACL_HEADER.unpack_from(acl)[0] != _ACL_VERSION
     ):
         return "its access control list is not in a form this engine reads"
-    for tag, perms, ident in _ACL_ENTRY.iter_unpack(acl[_ACL_HEADER.size :]):
+    entries = list(_ACL_ENTRY.iter_unpack(acl[_ACL_HEADER.size :]))
+    tags = [tag for tag, _perms, _ident in entries]
+    masks = tags.count(_ACL_MASK)
+    named = _ACL_USER in tags or _ACL_GROUP in tags
+    if (
+        any(tags.count(tag) != 1 for tag in (_ACL_USER_OBJ, _ACL_GROUP_OBJ, _ACL_OTHER))
+        or masks > 1
+        or (named and masks != 1)
+    ):
+        return "its access control list is not in a form this engine reads"
+    for tag, perms, ident in entries:
         if tag in (_ACL_USER_OBJ, _ACL_MASK):
             continue
         if tag == _ACL_USER:
             if ident != euid or not policy.named_euid_read:
-                return f"its access control list grants uid {ident} access"
+                return f"its access control list names uid {ident}"
             if perms & ~_ACL_READ:
                 return "its access control list grants the engine's own uid more than read"
         elif tag == _ACL_GROUP_OBJ:
@@ -523,7 +536,7 @@ def _posix_acl_entries_problem(
             if perms and group not in policy.group_read_gids:
                 return f"its access control list lets its group gid {group} read it"
         elif tag == _ACL_GROUP:
-            return f"its access control list grants gid {ident} access"
+            return f"its access control list names gid {ident}"
         elif tag == _ACL_OTHER and perms:
             return "its access control list grants every other account access"
         elif tag != _ACL_OTHER:
@@ -582,13 +595,13 @@ def _read_posix_checked(path: Path, policy: _PosixPolicy) -> bytes:
     ``O_NOFOLLOW`` refuses a link, ``O_NONBLOCK`` keeps a FIFO from stalling the open until the
     regular-file check refuses it, and the mode, owner, group and access control list are read from
     the open descriptor, so the file checked is the file read. Any other POSIX host is refused before
-    the file is opened: only Linux exposes the access control list, and a list that cannot be read
-    is not a list shown absent. ``FileNotFoundError`` propagates as it is; every other failure is a
+    the file is opened: this engine reads the access control list on Linux only, and a list that
+    is not read is not a list shown absent. ``FileNotFoundError`` propagates as it is; every other failure is a
     :class:`CustodyError`, raised outside any handler."""
     if sys.platform != "linux":
         raise CustodyError(
             f"{path} is refused: a custody file is read on Linux and Windows only, because only "
-            "there can its access control list be read"
+            "there does this engine read its access control list"
         )
     from messagefoundry.restricted_file import posix_access_acl
 
@@ -723,9 +736,10 @@ def write_host_file(path: Path, blob: HostBlob) -> None:
     ``0600`` owned by the calling account and carrying no POSIX access control list, one it inherits
     from its directory's default list included (draft rules 3b and 5), so :func:`read_host_file`
     accepts what this writes. Any other platform is refused before a file is made, because
-    :func:`read_host_file` refuses every file there. Raises ``FileExistsError`` when ``path``
-    exists, and what :func:`~messagefoundry.restricted_file.write_restricted_file` raises otherwise;
-    after any failure but ``FileExistsError`` there is no file at ``path``."""
+    :func:`read_host_file` refuses every file there. Raises :class:`CustodyError` on such a
+    platform, ``FileExistsError`` when ``path`` exists, and what
+    :func:`~messagefoundry.restricted_file.write_restricted_file` raises otherwise; after any failure
+    but ``FileExistsError`` there is no file at ``path``."""
     from messagefoundry.restricted_file import write_restricted_file
 
     if sys.platform not in {"win32", "linux"}:
@@ -740,10 +754,11 @@ def read_host_file(path: Path) -> HostBlob:
     Windows: a link, or a file a known broad group or an application package can read or change,
     is refused before it is read (:func:`~messagefoundry.restricted_file.broad_access_problem`), and
     so is a blob that is not user-scope DPAPI. Linux: the owner alone may reach the file (draft rule
-    3b, mode ``0600``), so a link, a file whose mode grants any group or other access, one the
-    engine's own account does not own, and one whose POSIX access control list names another
-    account or gives its group or other accounts any access are refused. Any other POSIX host is
-    refused, because the file's access control list cannot be read there. Raises
+    3b, mode ``0600``), so at least these are refused: a link, anything but a regular file, a file
+    whose mode grants any group or other access, one the engine's own account does not own, and one
+    whose POSIX access control list names any user or group (the engine's own uid included), gives
+    its group or other accounts any access, or cannot be read or parsed. Any other POSIX host is
+    refused, because this engine reads the file's access control list on Linux only. Raises
     ``FileNotFoundError`` when there is no file, and :class:`CustodyError` (or a DPAPI error on
     Windows) for every other refusal.
 
@@ -830,8 +845,9 @@ def read_systemd_credential(name: str, *, environ: Mapping[str, str] | None = No
     user or group entry are refused. systemd writes the credential owned by root at mode ``0400``
     and grants a non-root service user read through a named entry, which shows the mode as
     ``0440`` because the group bits are then the list's mask; where the file system takes no access
-    control list it gives the file to the service user and group instead. The draft does not rule
-    on group read; root's group or the engine's own is the narrowest that admits both forms."""
+    control list it gives the file to the service user and group instead. Neither form grants the
+    file's group read, so refusing all group read would admit both too. The draft does not rule on
+    group read, and read for root's group or the engine's own is the allowance chosen here."""
     if not name or name in {".", ".."} or any(c in name for c in "/\\\x00"):
         raise CustodyError("a credential name is a plain file name, with no directory part")
     directory = (os.environ if environ is None else environ).get(_CREDENTIALS_DIRECTORY)

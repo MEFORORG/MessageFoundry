@@ -361,14 +361,39 @@ def test_the_access_control_list_systemd_writes_for_a_service_user_is_accepted()
 @pytest.mark.parametrize(
     ("acl", "group", "expected"),
     [
-        (_systemd_acl(_entry(_USER, _R, 2000)), 0, "grants uid 2000 access"),
-        (_systemd_acl(_entry(_USER, 0, 2000)), 0, "grants uid 2000 access"),
+        (_systemd_acl(_entry(_USER, _R, 2000)), 0, "names uid 2000"),
+        (_systemd_acl(_entry(_USER, 0, 2000)), 0, "names uid 2000"),
         (_systemd_acl(_entry(_USER, _RW, 1000)), 0, "own uid more than read"),
-        (_systemd_acl(_entry(_USER, _R, 1000), _entry(_GROUP, _R, 0)), 0, "grants gid 0 access"),
+        (_systemd_acl(_entry(_USER, _R, 1000), _entry(_GROUP, _R, 0)), 0, "names gid 0"),
         (_systemd_acl(group_perms=_R), 5, "group gid 5 read"),
         (_systemd_acl(group_perms=_RW), 0, "more than read"),
-        (_acl(_entry(_USER_OBJ, _R), _entry(_OTHER, _R)), 0, "every other account"),
-        (_acl(_entry(0x40, _R)), 0, "of a kind this engine does not read"),
+        (
+            _acl(_entry(_USER_OBJ, _R), _entry(_GROUP_OBJ, 0), _entry(_OTHER, _R)),
+            0,
+            "every other account",
+        ),
+        (
+            _acl(_entry(_USER_OBJ, _R), _entry(_GROUP_OBJ, 0), _entry(_OTHER, 0), _entry(0x40, _R)),
+            0,
+            "of a kind this engine does not read",
+        ),
+        # Not a list Linux writes: no group or other entry, a second owner entry, named entries
+        # with no mask, two masks, or the header alone. Each is refused, not read as granting nothing.
+        (_acl(_entry(_USER_OBJ, _RW), _entry(_OTHER, 0)), 0, "not in a form"),
+        (_acl(_entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, 0)), 0, "not in a form"),
+        (_systemd_acl() + _entry(_USER_OBJ, _R), 0, "not in a form"),
+        (
+            _acl(
+                _entry(_USER_OBJ, _R),
+                _entry(_USER, _R, 1000),
+                _entry(_GROUP_OBJ, 0),
+                _entry(_OTHER, 0),
+            ),
+            0,
+            "not in a form",
+        ),
+        (_systemd_acl() + _entry(_MASK, _R), 0, "not in a form"),
+        (_acl(), 0, "not in a form"),
         (_systemd_acl()[:-1], 0, "not in a form"),
         (struct.pack("<I", 1) + _systemd_acl()[4:], 0, "not in a form"),
         (b"", 0, "not in a form"),
@@ -384,7 +409,7 @@ def test_the_host_file_takes_no_group_read_or_named_entry_from_an_access_control
     owner_only = _acl(_entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, 0), _entry(_OTHER, 0))
     assert _problem(0o600, 1000, _HOST, acl=owner_only) is None
     # Owner only: even the engine's own uid in a named entry is refused, though it grants nothing.
-    assert "grants uid 1000 access" in str(_problem(0o600, 1000, _HOST, acl=_systemd_acl()))
+    assert "names uid 1000" in str(_problem(0o600, 1000, _HOST, acl=_systemd_acl()))
     group_read = _acl(_entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, _R), _entry(_OTHER, 0))
     assert "gid 1000 read" in str(_problem(0o640, 1000, _HOST, acl=group_read))
     named = _systemd_acl(_entry(_USER, 0, 2000))
@@ -518,7 +543,7 @@ def test_a_host_file_whose_access_control_list_names_another_account_is_refused(
     )
     _set_acl_or_skip(path, _ACL_XATTR, acl)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600  # the mode alone would pass
-    with pytest.raises(CustodyError, match=f"grants uid {other} access") as excinfo:
+    with pytest.raises(CustodyError, match=f"names uid {other}") as excinfo:
         custody.read_host_file(path)
     assert not _leaks(str(excinfo.value), _MASTER)
 
@@ -534,7 +559,7 @@ def test_a_credential_with_the_access_control_list_systemd_writes_is_read(tmp_pa
     environ = {"CREDENTIALS_DIRECTORY": str(tmp_path)}
     assert custody.read_systemd_credential("store-a", environ=environ) == _blob()
     os.setxattr(path, _ACL_XATTR, _systemd_acl(_entry(_USER, _R, euid + 1)))
-    with pytest.raises(CustodyError, match=f"grants uid {euid + 1} access"):
+    with pytest.raises(CustodyError, match=f"names uid {euid + 1}"):
         custody.read_systemd_credential("store-a", environ=environ)
 
 
@@ -574,6 +599,29 @@ def test_an_inherited_access_control_list_that_cannot_be_removed_leaves_no_file(
     with pytest.raises(RestrictedFileError, match="inherited POSIX access control list"):
         custody.write_host_file(path, _blob())
     assert not path.exists()
+
+
+@linux_only
+def test_an_inherited_access_control_list_still_there_after_removal_leaves_no_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(restricted_file, "posix_access_acl", lambda fd: b"inherited")
+    monkeypatch.setattr(os, "removexattr", lambda fd, name: None)
+    path = tmp_path / "host.blob"
+    with pytest.raises(RestrictedFileError, match="still carries one after it was removed"):
+        custody.write_host_file(path, _blob())
+    assert not path.exists()
+
+
+@linux_only
+def test_a_host_file_is_written_at_0600_whatever_the_umask(tmp_path: Path) -> None:
+    previous = os.umask(0o677)
+    try:
+        custody.write_host_file(tmp_path / "host.blob", _blob())
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE((tmp_path / "host.blob").stat().st_mode) == 0o600
+    assert custody.read_host_file(tmp_path / "host.blob") == _blob()
 
 
 @linux_only
