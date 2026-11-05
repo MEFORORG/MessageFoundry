@@ -14976,6 +14976,13 @@ class SqlServerStore:
                     if await self._write_user(cur, user_id, change) is None:
                         await conn.rollback()
                         return AdminGrant.ACCOUNT_CHANGED
+                    # BACKLOG #3078 F2, as on SQLite. After the write, which holds the account row
+                    # under UPDLOCK as every passkey write does, so a passkey committed before it is
+                    # seen here and a later one waits for this commit.
+                    await cur.execute(_MSSQL_WEBAUTHN_ANY_FOR_USER, (user_id,))
+                    if await cur.fetchall():
+                        await conn.rollback()
+                        return AdminGrant.ACCOUNT_CHANGED
                     await self._commit(conn)
             except Exception:
                 # BACKLOG #1940, as in remove_unless_last_admin.

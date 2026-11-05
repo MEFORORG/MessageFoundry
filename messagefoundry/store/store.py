@@ -403,8 +403,18 @@ async def _writer_guard(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIt
 
 
 @asynccontextmanager
-async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIterator[None]:
+async def _writer_txn(
+    db: aiosqlite.Connection, lock: asyncio.Lock, *, immediate: bool = False
+) -> AsyncIterator[None]:
     """Run the block inside ONE writer transaction, holding ``lock``, unwinding on **BaseException**.
+
+    ``immediate`` opens it with ``BEGIN IMMEDIATE``, which takes SQLite's write lock at the
+    ``BEGIN``, waiting out another process's writer under ``busy_timeout``, so nothing another
+    process commits can land between the block's first read and its write. The deferred default
+    takes it at the first write, and a writer in another process that committed after the block's
+    read then fails that write with ``SQLITE_BUSY_SNAPSHOT`` rather than wait (BACKLOG #3078 F5).
+    The ``asyncio`` lock already serializes this process, so only a block that must decide on a
+    read across processes needs it: the first-administrator grant.
 
     **Every writer that opens an EXPLICIT transaction goes through here** — ``execute("BEGIN")``
     appears nowhere else on ``self._db``, and ``tests/test_writer_txn_is_the_only_begin.py`` keeps it
@@ -432,7 +442,10 @@ async def _writer_txn(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIter
     ``rollback()`` itself first or it leaves the transaction open for the next writer."""
     async with lock:
         try:
-            await db.execute("BEGIN")
+            if immediate:
+                await db.execute("BEGIN IMMEDIATE")
+            else:
+                await db.execute("BEGIN")
             yield
         except BaseException as exc:
             await _unwind_and_raise(db, exc, role="writer")
@@ -1893,17 +1906,17 @@ class AdminGrant(StrEnum):
     #: written. ``provision_first_administrator`` counts only one that signs in with a local
     #: password (vault BACKLOG #2711 step 1).
     ADMIN_EXISTS = "admin_exists"
-    #: The account no longer holds the credentials the caller wrote, holds a role already, or is
-    #: disabled or gone, so nothing was written.
+    #: The account no longer holds the credentials the caller wrote, holds a role or a passkey
+    #: already, or is disabled or gone, so nothing was written.
     ACCOUNT_CHANGED = "account_changed"
 
 
 #: How many times the SQLite store runs the first-administrator grant's transaction when SQLite
-#: answers busy (BACKLOG #3078). ``provision-admin`` is a process of its own, and the writer's
-#: deferred ``BEGIN`` means a writer in another process that committed after this one's read makes
-#: the write fail with ``SQLITE_BUSY_SNAPSHOT`` rather than wait. The re-run re-reads, so the
-#: committed write decides. Bounded, and a busy that outlasts it is raised, never read as a refusal:
-#: an unrelated engine write can be what was busy.
+#: answers busy (BACKLOG #3078). ``provision-admin`` is a process of its own. Its ``BEGIN IMMEDIATE``
+#: (F5) waits out another process's writer for ``busy_timeout`` before answering busy, so a re-run
+#: follows a writer that held the lock past that wait, such as a long engine transaction. The re-run
+#: re-reads, so the committed write decides. Bounded, and a busy that outlasts it is raised, never
+#: read as a refusal: an unrelated engine write can be what was busy.
 _ADMIN_GRANT_BUSY_ATTEMPTS: Final = 5
 _ADMIN_GRANT_BUSY_BACKOFF_SECONDS: Final = 0.05
 
@@ -17593,8 +17606,13 @@ class MessageStore:
     ) -> AdminGrant:
         """The first-administrator guard and its grant in one transaction (BACKLOG #3078); see
         ``AuthStore``. The writer lock serializes it in this process. Another process is serialized
-        by SQLite's single writer: a write that lost to one committed after this read fails busy,
-        and the transaction runs again so the re-read decides (:data:`_ADMIN_GRANT_BUSY_ATTEMPTS`)."""
+        by ``BEGIN IMMEDIATE`` (BACKLOG #3078 F5): the transaction takes SQLite's write lock before
+        its read, waiting out another writer under ``busy_timeout``, so no other process commits
+        between the read and the write. A busy that outlasts that wait is run again so the re-read
+        decides (:data:`_ADMIN_GRANT_BUSY_ATTEMPTS`). Before, the deferred ``BEGIN`` let an engine
+        write in another process land after the read, and then this write failed busy at once, so a
+        busy ``serve`` could exhaust the re-runs. The account write that follows the guard read
+        also checks that no passkey is on the row (F2), as the server backends do."""
         now = time.time() if now is None else now
         change = first_admin_grant(
             admin_role_id,
@@ -17605,7 +17623,7 @@ class MessageStore:
         )
         for attempt in range(1, _ADMIN_GRANT_BUSY_ATTEMPTS + 1):
             try:
-                async with _writer_txn(self._db, self._lock):
+                async with _writer_txn(self._db, self._lock, immediate=True):
                     cur = await self._db.execute(_SQL_ADMIN_GUARD_HOLDERS, (user_id, admin_role_id))
                     holders = [(str(r[0]), bool(r[1])) for r in await cur.fetchall()]
                     _, others = await admin_guard_counts(
@@ -17619,6 +17637,13 @@ class MessageStore:
                         await self._db.rollback()
                         return AdminGrant.ADMIN_EXISTS
                     if await self._write_user(user_id, change) is None:
+                        await self._db.rollback()
+                        return AdminGrant.ACCOUNT_CHANGED
+                    # BACKLOG #3078 F2: a passkey on the row is an earlier holder's, enrolled in the
+                    # repair window, since this command enrols none. Read after the write, on this
+                    # transaction's connection, so it sees every passkey committed before it.
+                    passkey = await self._db.execute(_WEBAUTHN_ANY_FOR_USER, (user_id,))
+                    if await passkey.fetchone() is not None:
                         await self._db.rollback()
                         return AdminGrant.ACCOUNT_CHANGED
                     await self._commit()

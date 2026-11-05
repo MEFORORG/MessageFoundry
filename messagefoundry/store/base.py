@@ -2812,16 +2812,20 @@ class AuthStore(Protocol):
         ``expected_password_hash``, and no TOTP secret when ``expected_totp_secret_cell`` is
         ``None`` or TOTP on with that staged cell when it is not. When those no longer hold it
         writes nothing and returns :attr:`AdminGrant.ACCOUNT_CHANGED`; a missing account, and a
-        compare on the seal lost to a concurrent write, answer the same.
+        compare on the seal lost to a concurrent write, answer the same. So does an account holding
+        any passkey (BACKLOG #3078 F2): ``provision-admin`` enrols none and clears an earlier
+        holder's first, so one present at the grant was enrolled by that holder in the repair
+        window, and the role is not written beside it.
 
         **It is serialized against every other call of this and of :meth:`remove_unless_last_admin`
         on the same database**, under the same lock, not only in this process. So two provisioning
         runs with different usernames, each of which saw no administrator ``counts_as_admin``
         passes, cannot both be granted:
         the one whose grant commits second reads the first and is refused. SQLite has no such lock
-        across processes and relies on its single writer instead; its implementation re-runs the
-        transaction a bounded number of times when the write fails busy, and raises past that bound
-        rather than answering a refusal."""
+        across processes and relies on its single writer instead, taken at the transaction's start
+        with ``BEGIN IMMEDIATE``; its implementation re-runs the transaction a bounded number of
+        times when that still answers busy, and raises past that bound rather than answering a
+        refusal."""
         ...
 
     async def set_user_channel_scope(

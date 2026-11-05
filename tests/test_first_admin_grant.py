@@ -22,6 +22,7 @@ in for two ``provision-admin`` processes, because SQLite answers their collision
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sqlite3
 import time
@@ -47,6 +48,7 @@ from tests._first_admin_grant_store_contract import (
     assert_concurrent_grants_leave_one,
     assert_first_admin_grant_contract,
     assert_grant_counts_only_a_local_administrator_that_signs_in,
+    assert_grant_refuses_a_row_holding_a_passkey,
     enabled_admins,
     grant,
     provisioned_row,
@@ -81,6 +83,10 @@ async def test_the_grant_counts_only_a_local_administrator_that_signs_in_on_sqli
 
 async def test_two_concurrent_grants_leave_one_administrator(store: MessageStore) -> None:
     await assert_concurrent_grants_leave_one(store)
+
+
+async def test_the_grant_refuses_a_row_holding_a_passkey_on_sqlite(store: MessageStore) -> None:
+    await assert_grant_refuses_a_row_holding_a_passkey(store)
 
 
 def _busy() -> sqlite3.OperationalError:
@@ -286,67 +292,61 @@ async def test_two_runs_with_different_usernames_make_one_administrator(
         await _close_pair(stores)
 
 
-async def test_a_grant_that_loses_to_another_process_is_refused_through_sqlite_busy(
+async def test_a_grant_in_another_process_waits_for_the_open_one_rather_than_racing_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Two stores on one file, as two ``provision-admin`` processes. The second run's grant reads
-    before the first commits and writes after, so SQLite fails its write with
-    ``SQLITE_BUSY_SNAPSHOT``. The re-run reads the committed Administrator and refuses."""
+    """BACKLOG #3078 F5. Two stores on one file stand in for two ``provision-admin`` processes. Run
+    B's grant is held inside its transaction, after its guard read, for up to half a second, and
+    run A's grant starts meanwhile. ``BEGIN IMMEDIATE`` holds SQLite's write lock from B's
+    ``BEGIN``, so A cannot read until B commits: B is granted, and A reads B's Administrator and is
+    refused. The deferred ``BEGIN`` it replaced let A read and commit inside B's hold, and B's write
+    then failed busy at once, which is how a busy ``serve`` could exhaust the re-runs.
+
+    RED when: the grant's ``_writer_txn`` opens with a deferred ``BEGIN``; A then reads while B is
+    open and is the one granted."""
     stores = await _open_pair(tmp_path, True)
     try:
-        monkeypatch.setattr(store_module, "_ADMIN_GRANT_BUSY_BACKOFF_SECONDS", 0.0)
-        services = [AuthService(s, AuthSettings()) for s in stores]
-        for service in services:
-            await service.initialize()
-        both_read = _hold_both_after_the_read(services, monkeypatch)
+        await seed_roles(stores[0])
+        await provisioned_row(stores[0], "a", totp=False)
+        await provisioned_row(stores[0], "b", totp=False)
+        real_counts = store_module.admin_guard_counts
+        real_commit = stores[1]._commit
         b_read = asyncio.Event()
-        a_granted = asyncio.Event()
-        in_grant = False
-        held_once = False
-        busy_seen = 0
-        real_write = stores[1]._write_user
-        real_grant_b = stores[1].grant_first_admin_unless_admin_exists
-        real_grant_a = stores[0].grant_first_admin_unless_admin_exists
+        a_read = asyncio.Event()
+        b_open = False
+        a_read_while_b_open = False
 
-        async def write_b(user_id: str, change: Any) -> Any:
-            nonlocal held_once, busy_seen
-            if in_grant and not held_once:
-                held_once = True
+        async def counts(holders: Any, sealer: Any, reader: Any, *a: Any, **k: Any) -> Any:
+            nonlocal b_open, a_read_while_b_open
+            found = await real_counts(holders, sealer, reader, *a, **k)
+            owner = getattr(reader, "__self__", None)
+            if owner is stores[0]:
+                a_read_while_b_open = a_read_while_b_open or b_open
+                a_read.set()
+            elif owner is stores[1] and not b_read.is_set():
+                b_open = True
                 b_read.set()
-                await asyncio.wait_for(a_granted.wait(), timeout=10)
-            try:
-                return await real_write(user_id, change)
-            except sqlite3.OperationalError as exc:
-                busy_seen += store_module._is_sqlite_busy(exc)
-                raise
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(a_read.wait(), timeout=0.5)
+            return found
 
-        async def grant_b(*a: Any, **k: Any) -> AdminGrant:
-            nonlocal in_grant
-            in_grant = True
-            return await real_grant_b(*a, **k)
+        async def commit_b() -> None:
+            nonlocal b_open
+            b_open = False  # before the COMMIT: A cannot read before it lands, only after
+            await real_commit()
 
-        async def grant_a(*a: Any, **k: Any) -> AdminGrant:
-            await asyncio.wait_for(b_read.wait(), timeout=10)
-            try:
-                return await real_grant_a(*a, **k)
-            finally:
-                a_granted.set()
+        async def run_a() -> AdminGrant:
+            await b_read.wait()
+            return await grant(stores[0], "a", None)
 
-        monkeypatch.setattr(stores[1], "_write_user", write_b)
-        monkeypatch.setattr(stores[1], "grant_first_admin_unless_admin_exists", grant_b)
-        monkeypatch.setattr(stores[0], "grant_first_admin_unless_admin_exists", grant_a)
-        outcomes: tuple[Any, ...] = await asyncio.gather(
-            _provision(services[0], "site-admin-one"),
-            _provision(services[1], "site-admin-two"),
-            return_exceptions=True,
-        )
-        assert both_read.is_set(), "both runs must have read before either granted"
-        first, second = outcomes
-        assert not isinstance(first, BaseException), first
-        assert isinstance(second, FirstAdministratorRefused), second
-        assert busy_seen >= 1, "the losing write must have met SQLite's busy answer"
-        assert await enabled_admins(stores[0]) == {first.user_id}
-        assert len(await _provisioned_rows(stores[0])) == 1
+        monkeypatch.setattr(store_module, "admin_guard_counts", counts)
+        monkeypatch.setattr(stores[1], "_commit", commit_b)
+        outcomes = await asyncio.gather(grant(stores[1], "b", None), run_a())
+        assert b_read.is_set() and a_read.is_set(), "both grants must have read"
+        assert not a_read_while_b_open, "A read inside B's open transaction"
+        assert list(outcomes) == [AdminGrant.GRANTED, AdminGrant.ADMIN_EXISTS], outcomes
+        monkeypatch.undo()
+        assert await enabled_admins(stores[0]) == {"b"}
     finally:
         await _close_pair(stores)
 
