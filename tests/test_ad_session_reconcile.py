@@ -72,6 +72,7 @@ from messagefoundry.store.store import (
     VerifiedUser,
     audit_row_hash,
 )
+from tests import test_ad_user_account_control as uac
 from tests._admin_account import create_local_user_chosen
 from tests.test_ad_user_account_control import _InverseSink
 from tests.test_approval_requester_recheck import _Sink
@@ -2844,6 +2845,116 @@ async def test_an_unreached_page_is_latched_only_once_its_row_is_written(
         assert len(_unreached_events(sink)) == 1
     finally:
         await store.close()
+
+
+# --- ADR 0195, "What a restart does to the hold", direction 1 (BACKLOG #3057, #3689) -------------
+#
+# The latch and the outcome record are process memory, so a fresh process on the same store holds
+# what the ADR note says it holds, and no more. Each test first shows the process that saw the wave
+# keeping it held, so the revocations after the restart are the restart's doing.
+
+
+def _unreachable_for(monkeypatch: pytest.MonkeyPatch, service: AuthService, name: str) -> None:
+    """``name``'s probe raises :class:`LdapError` on ``service``, so it reads UNAVAILABLE, while
+    every other account is still answered by the real authenticator."""
+    auth = service._ldap
+    assert auth is not None
+    real = auth.probe_principal
+
+    def probe(username: str, *, object_id: str | None = None) -> DirectoryProbe:
+        if username == name:
+            raise LdapError("synthetic: LDAP socket closed")
+        return real(username, object_id=object_id)
+
+    monkeypatch.setattr(auth, "probe_principal", probe)
+
+
+async def test_a_restart_at_one_strike_revokes_a_held_wave_one_account_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3057 closing step 3, and #3689 closing step 3's strike-1 test. ADR 0195,
+    *What a restart does to the hold*, direction 1: at ``ad_session_recheck_strikes = 1`` with an
+    ``ad_session_recheck_max_users`` below the signed-in count, a fresh process could revoke an
+    earlier run's held wave one account at a time.
+
+    Four accounts and a budget of two, so the id order fixes the samples. The two undetermined
+    accounts sort first and third. The readable ones sign in only after the wave is seen, so the
+    process that saw it probes the two together and latches. The control: that process holds them
+    through two full rotations and revokes nothing. A fresh process on the same store, with the
+    same settings and the same directory, samples each undetermined account beside a readable one,
+    holds neither, and revokes one per pass.
+
+    RED when: a held account is revoked before the restart, or the restart keeps the hold, which
+    would contradict the ADR note and owe it an edit."""
+    names = ["n1", "n2", "n3", "n4"]
+    settings: dict[str, Any] = {"ad_session_recheck_strikes": 1, "ad_session_recheck_max_users": 2}
+    async with uac._signed_in_estate(monkeypatch, names, **settings) as estate:
+        directory, service, store, tokens = estate
+        listed = sorted((u.id, u.username) for u in await store.list_users())
+        order = [name for _id, name in listed if name in names]
+        held, readable = [order[0], order[2]], [order[1], order[3]]
+        held_ids = {await uac._id(store, n) for n in held}
+        directory.uac.update(dict.fromkeys(held, uac.ABSENT))
+        await uac._expire(store, readable)
+
+        first = await uac._pass(service)
+        assert first.hold and first.latched and set(first.held) == held_ids
+        await uac._sign_in(service, readable)
+        for n in range(4):  # two full rotations of the budget
+            plan = await uac._pass(service)
+            assert plan.hold and plan.revocations == (), f"pass {n + 2} of the process that held"
+        assert await uac._alive(service, {n: tokens[n] for n in held}) == set(held)
+
+        fresh = uac._fresh_process(store, **settings)
+        await fresh.initialize()
+        revoked: list[list[tuple[str, str]]] = []
+        for _ in range(2):
+            plan = await uac._pass(fresh)
+            assert not plan.hold and not plan.latched
+            revoked.append([(r.username, r.reason) for r in plan.revocations])
+        assert revoked == [
+            [(held[0], "directory_undetermined")],
+            [(held[1], "directory_undetermined")],
+        ]
+        assert await uac._alive(fresh, {n: tokens[n] for n in held}) == set()
+
+
+async def test_a_restart_at_default_settings_revokes_a_held_account_beside_an_unreachable_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vault BACKLOG #3689 closing step 3's second test. ADR 0195, *What a restart does to the
+    hold*, direction 1 at default settings: the empty outcome record loses rule item 4's
+    protection, so on a pass where one held account's probe is UNAVAILABLE a fresh process counts
+    only the other, and strikes and revokes a held account that is not the last.
+
+    The control: the process that held the wave keeps both held while one of them is unreachable,
+    because its record still reads that one undetermined. The fresh process, on the same store
+    and directory, revokes the reachable one at the default two strikes and leaves the unreachable
+    one, which is never judged, signed in.
+
+    RED when: the process that held revokes either account, or the fresh one revokes none, which
+    would contradict the ADR note and owe it an edit."""
+    names = ["u1", "u2", "ok1"]
+    async with uac._signed_in_estate(monkeypatch, names) as estate:
+        directory, service, store, tokens = estate
+        directory.uac.update({"u1": uac.ABSENT, "u2": uac.ABSENT})
+        assert (await uac._pass(service)).hold
+        _unreachable_for(monkeypatch, service, "u1")
+        for n in range(3):
+            plan = await uac._pass(service)
+            assert plan.hold and plan.undetermined == 2 and plan.unavailable == 1, f"pass {n + 2}"
+            assert plan.revocations == ()
+
+        fresh = uac._fresh_process(store)
+        await fresh.initialize()
+        _unreachable_for(monkeypatch, fresh, "u1")
+        struck = await uac._pass(fresh)
+        assert not struck.hold and struck.undetermined == 1 and struck.revocations == ()
+        revoked = await uac._pass(fresh)
+        assert [(r.username, r.reason) for r in revoked.revocations] == [
+            ("u2", "directory_undetermined")
+        ]
+        assert await uac._alive(fresh, tokens) == {"u1", "ok1"}
 
 
 async def test_ac5_a_federated_binding_only_lands_on_a_row_the_probe_keys_by_id() -> None:
