@@ -517,6 +517,147 @@ async def test_a_lock_set_during_the_lookup_is_honoured(
     assert session is not None and session.reauth_at is None
 
 
+async def test_a_directory_attempt_reads_its_holder_once_between_the_lookup_and_the_code(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3780 item 2. ``verify_mfa`` read the session, the account and its lock right after
+    the lookup and again inside the account's queue, with only the queue's acquisition between.
+    The in-queue read is now the one re-read after the lookup. RED when: a second read comes back.
+    The control is that the attempt still succeeds, so the count is of a leg that ran."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_probe = e.service._probe_principal
+    real_load = e.service._load_session
+    real_verify = e.service._verify_second_factor
+    looked_up = False
+    reads_after_lookup = 0
+    reads_before_code: list[int] = []
+
+    async def _probe(user: Any) -> reconcile.Probe:
+        nonlocal looked_up
+        probe = await real_probe(user)
+        looked_up = True
+        return probe
+
+    async def _load(token_hash: str) -> Any:
+        nonlocal reads_after_lookup
+        if looked_up:
+            reads_after_lookup += 1
+        return await real_load(token_hash)
+
+    async def _verify(*args: Any, **kwargs: Any) -> bool:
+        reads_before_code.append(reads_after_lookup)
+        return await real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(e.service, "_probe_principal", _probe)
+    monkeypatch.setattr(e.service, "_load_session", _load)
+    monkeypatch.setattr(e.service, "_verify_second_factor", _verify)
+
+    verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert verified.ok is True
+    assert looked_up
+    assert reads_before_code == [1]
+
+
+@pytest.mark.parametrize("change", ["revoke", "disable", "lock"])
+async def test_what_lands_during_the_lookup_is_refused_before_the_code_is_checked(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """BACKLOG #3780 item 2. With one re-read after the lookup, that read must still come before
+    the code is checked, so a revocation, a disable or a lock that lands during the lookup spends
+    no TOTP step and charges nothing. RED when: the in-queue re-read is removed, since the read
+    after the code check would then refuse only once the step is spent."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_probe = e.service._probe_principal
+    checks = 0
+    real_verify = e.service._verify_second_factor
+
+    async def _probe_while_something_lands(user: Any) -> reconcile.Probe:
+        probe = await real_probe(user)
+        if change == "revoke":
+            await store.revoke_session(hash_token(e.token))
+        elif change == "disable":
+            await store.set_user_disabled(e.user_id, disabled=True)
+        else:
+            await _lock_second_step(store, e.user_id)
+        return probe
+
+    async def _counted(*args: Any, **kwargs: Any) -> bool:
+        nonlocal checks
+        checks += 1
+        return await real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(e.service, "_probe_principal", _probe_while_something_lands)
+    monkeypatch.setattr(e.service, "_verify_second_factor", _counted)
+
+    refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert refused.ok is False
+    assert refused.session_lost is (change != "lock")
+    assert refused.locked is (change == "lock")
+    assert checks == 0, "the code was checked, so its TOTP step was spent"
+    reason = "locked" if change == "lock" else "session_lost"
+    assert {"reason": reason} in await _audited_mfa_failures(store)
+    user = await store.get_user(e.user_id)
+    # The lock case's one failure is the lock itself; the code adds none.
+    assert user is not None and user.second_step_failed_attempts == (1 if change == "lock" else 0)
+
+
+@pytest.mark.parametrize("when", ["during-lookup", "while-queued"])
+async def test_a_rename_rejoins_the_queue_under_the_new_name_before_the_code(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, when: str
+) -> None:
+    """BACKLOG #3780 item 2. The queue is keyed by the account's name (BACKLOG #1943), and a
+    directory rename needs no queue to land. The read after the lookup used to supply that key,
+    so a rename during the lookup was queued under the new name. The in-queue re-read now does it:
+    a name that keys a different queue from the one held sends the attempt to the new one before
+    the code is checked. RED when: the code is checked while holding the old name's queue, which
+    attempts reading the new name do not join, so a burst split across a rename would overshoot
+    the lockout."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_probe = e.service._probe_principal
+    real_lock = e.service._account_credential_lock
+    real_verify = e.service._verify_second_factor
+    queued_as: list[str] = []
+    held_at_check: list[set[str]] = []
+
+    async def _rename() -> None:
+        assert await store.set_user_username(
+            e.user_id, "jdoe-renamed", expected_username="jdoe", audits=()
+        )
+
+    async def _probe(user: Any) -> reconcile.Probe:
+        probe = await real_probe(user)
+        if when == "during-lookup":
+            await _rename()
+        return probe
+
+    @asynccontextmanager
+    async def _queue(username: str) -> AsyncIterator[None]:
+        queued_as.append(username)
+        if when == "while-queued" and len(queued_as) == 1:
+            await _rename()
+        async with real_lock(username):
+            yield
+
+    async def _verify(*args: Any, **kwargs: Any) -> bool:
+        held_at_check.append(set(e.service._credential_locks))
+        return await real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(e.service, "_probe_principal", _probe)
+    monkeypatch.setattr(e.service, "_account_credential_lock", _queue)
+    monkeypatch.setattr(e.service, "_verify_second_factor", _verify)
+
+    verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert verified.ok is True
+    assert queued_as[-1] == "jdoe-renamed"
+    assert held_at_check == [{service_module._credential_lock_key("jdoe-renamed")}]
+    assert e.service._credential_locks == {}
+    rows = await store.list_audit(action="auth.mfa_verified")
+    assert [r["actor"] for r in rows] == ["jdoe-renamed"]
+
+
 @pytest.mark.parametrize(
     "change",
     [
