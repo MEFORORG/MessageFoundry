@@ -1682,7 +1682,6 @@ class IssuerIndex:
         # Subjects whose keys include a self-signed certificate OpenSSL reads as no CA, so
         # unmatched_keys does not call it a CA.
         self._pinned_subjects: set[str] = set()
-        self._label = label
         read: list[tuple[x509.Certificate, str, bytes, bytes, int]] = []
         blocks = _pem_certificate_blocks(cadata.encode("ascii", "replace"))
         for position, block in enumerate(blocks, start=1):
@@ -1757,33 +1756,62 @@ class IssuerIndex:
 
     def namesake_warnings(self) -> list[str]:
         """One warning for each loaded certificate OpenSSL reads as no CA that has the subject of a
-        loaded CA, naming both, for the caller to log at start (BACKLOG #4948).
+        loaded CA, naming both blocks, for the caller to log at start with the file it read
+        (BACKLOG #4948).
 
-        OpenSSL finds a leaf's issuer among the loaded certificates by name. Unless the namesake's
-        key identifier rules it out, it may take the namesake, then refuse the chain because it is
-        no CA, so every client certificate under that CA fails the handshake. The index does not
-        count such a namesake toward the same-DN ambiguity unless it signs itself, so
-        :meth:`unmatched_keys` may give no reason, and this is the only start signal. Names are
-        compared with ASCII case folded, as OpenSSL folds it. It warns whatever the key
-        identifiers say, as a client certificate with no authority key identifier rules nothing
-        out. A warning only: it changes no allow, deny or refusal."""
+        OpenSSL finds a leaf's issuer among the loaded certificates by name. It may take the
+        namesake, then refuse the chain because it is no CA. A key identifier on the namesake that
+        differs from the CA's rules it out only for a leaf whose authority key identifier names
+        the CA's key, so the warning says which clients it can refuse: every one, or those with no
+        authority key identifier. The index does not count such a namesake toward the same-DN
+        ambiguity unless it signs itself, so :meth:`unmatched_keys` may give no reason, and this
+        is the only start signal. Names are grouped by :func:`_namesake_key`, at least as loosely
+        as OpenSSL matches them. A warning only: it changes no allow, deny or refusal."""
         by_name: dict[_NameKey, list[_Anchor]] = {}
         for anchors in self._by_subject_name.values():
             for anchor in anchors:
-                by_name.setdefault(_issuer_name_key(anchor.cert.subject), []).append(anchor)
+                by_name.setdefault(_namesake_key(anchor.cert.subject), []).append(anchor)
         warnings: list[str] = []
         for anchors in by_name.values():
             cas = [anchor for anchor in anchors if anchor.ca]
             for other in (anchor for anchor in anchors if not anchor.ca):
-                warnings.extend(
-                    f"{self._label}: certificate block {other.position} ({other.subject}) is not a "
-                    f"CA but has the subject of the CA certificate in block {ca.position}. The TLS "
-                    f"library may take block {other.position} as the issuer of a client "
-                    "certificate that CA issued, and then refuse every client certificate of that "
-                    "CA. Remove it, or re-issue it under another subject"
-                    for ca in cas
-                )
+                key_id = _key_identifier(other.cert)
+                for ca in cas:
+                    refused = (
+                        "every client certificate of that CA"
+                        if key_id is None or key_id == _key_identifier(ca.cert)
+                        else "each one that carries no authority key identifier"
+                    )
+                    warnings.append(
+                        f"certificate block {other.position} ({other.subject}) is not a CA but has "
+                        f"the subject of the CA certificate in block {ca.position}. The TLS library "
+                        f"may take block {other.position} as the issuer of a client certificate "
+                        f"that CA issued, and then refuse {refused}. Remove it, or re-issue it "
+                        "under another subject"
+                    )
         return warnings
+
+
+def _namesake_key(name: x509.Name) -> _NameKey:
+    """``name`` as :meth:`IssuerIndex.namesake_warnings` groups it: :func:`_issuer_name_key`'s
+    form, with white space around a value dropped and each run of it inside read as one space, as
+    OpenSSL reads it. Looser than OpenSSL here costs only a warning, so it is never tightened."""
+    return tuple(tuple(sorted(map(_namesake_attribute, rdn))) for rdn in name.rdns)
+
+
+def _namesake_attribute(
+    attribute: x509.NameAttribute[str | bytes],
+) -> tuple[str, bool, str | bytes]:
+    oid, is_bytes, value = _attribute_key(attribute)
+    return oid, is_bytes, " ".join(value.split()) if isinstance(value, str) else value
+
+
+def _key_identifier(cert: x509.Certificate) -> bytes | None:
+    """``cert``'s subject key identifier, or ``None`` when it has none or it cannot be read."""
+    try:
+        return cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value.digest
+    except (x509.ExtensionNotFound, ValueError, *_UNREAD_EXTENSIONS):
+        return None
 
 
 def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:

@@ -732,8 +732,8 @@ def _client_issuer_index(
             name,
             issuer,
         )
-    for warning in index.namesake_warnings():  # names this listener and its file
-        logger.warning("%s", warning)
+    for warning in index.namesake_warnings():
+        logger.warning("HTTP source %s: tls_ca_file %s", name, warning)
     return index
 
 

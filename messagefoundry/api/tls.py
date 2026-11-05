@@ -181,7 +181,7 @@ def _attach_issuer_index(ctx: ssl.SSLContext, cadata: str, cert_map: Mapping[str
     for key, reason in index.unmatched_keys(cert_map).items():
         log.warning("[api].tls_client_cert_identities issuer %r %s", key, reason)
     for warning in index.namesake_warnings():
-        log.warning("%s", warning)
+        log.warning("[api].tls_client_ca_file %s", warning)
 
 
 #: Filenames for the first-run generated pair, written beside the store database (BACKLOG #1276).

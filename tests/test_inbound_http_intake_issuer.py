@@ -967,9 +967,12 @@ async def test_a_certificate_that_is_no_ca_sharing_a_cas_subject_is_no_twin(
 
 
 async def _handshake_refused(source: HttpSource, bundle: Path) -> bool:
-    """Whether the listener ends the TLS handshake of a client presenting ``bundle``, so no HTTP
-    status is ever answered. Under TLS 1.3 the client finishes first, so the refusal can reach it
-    as an alert, a reset or an empty read."""
+    """Whether the listener ends the TLS handshake of a client presenting ``bundle``.
+
+    Under TLS 1.3 the client finishes first, so the refusal reaches it as an alert, a reset or an
+    empty read. A client the listener admitted sends nothing here, so the listener waits for a
+    request and the read times out: that is ``False``. This listener closes with no bytes only
+    when it refuses at the handshake or at accept, and a refusal at accept answers a status."""
     try:
         reader, writer = await asyncio.open_connection(
             "127.0.0.1", source.sockport, ssl=_client_context(bundle)
@@ -977,44 +980,57 @@ async def _handshake_refused(source: HttpSource, bundle: Path) -> bool:
     except (ssl.SSLError, ConnectionError):
         return True
     try:
-        data = await asyncio.wait_for(reader.read(-1), 10.0)
+        data = await asyncio.wait_for(reader.read(-1), 3.0)
     except (ssl.SSLError, ConnectionError):
         return True
+    except TimeoutError:
+        return False
     finally:
         writer.close()
+    assert not data.startswith(b"HTTP/1.1 "), data[:40]  # a status means it got past the handshake
     return data == b""
 
 
 async def test_a_namesake_that_is_no_ca_is_warned_about_at_start(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A loaded certificate that is no CA, with no key identifier, listed after the CA whose
-    subject it has. OpenSSL may take it as the issuer of a client certificate that CA issued, and
-    then refuses the chain, so every client of that CA fails the handshake. The index does not
-    count it as a twin (fix 3 of BACKLOG #4948), so the key maps nothing wrong and no reason for
-    it is given; the start warns instead, naming both certificates. In the shipped code a
-    namesake counted as a twin, so the start warned about the key, for the wrong reason; at
-    d18a761e the start was silent. The warning changes no outcome."""
+    """A loaded certificate that is no CA, with no key identifier, with the subject of a loaded CA.
+    OpenSSL may take it as the issuer of a client certificate that CA issued, and then refuses the
+    chain, so every client of that CA fails the handshake. The index does not count it as a twin
+    (fix 3 of BACKLOG #4948), so the key maps nothing wrong and no reason for it is given; the
+    start warns instead, naming both certificates. In the shipped code such a namesake counted as
+    a twin, so the start warned about the key, for the wrong reason; once fix 3 stopped counting
+    it, the start was silent. The warning changes no outcome.
+
+    Which of two certificates with one name OpenSSL tries first follows its sort of equal names,
+    which differs by platform: on Windows, OpenSSL 3.5.7, it took the one listed later. So both
+    orders are started, each must warn, and at least one must refuse the CA's client."""
     acme = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root, skid=False)
     subjects = {"CN=Acme CA": [SUBJECT]}
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
-        source = await _started(_source(tmp_path, [acme[0], namesake], subjects))
-    try:
-        warned = [r.getMessage() for r in caplog.records]
-        assert any(
-            "certificate block 2 (CN=Acme CA) is not a CA" in m
-            and "the CA certificate in block 1" in m
-            and "refuse every client certificate" in m
-            for m in warned
-        ), warned
-        assert source._issuer_index is not None
-        assert source._issuer_index.unmatched_keys(subjects) == {}  # still no twin
-        # The failure warned of, measured: a client the CA issued fails the handshake.
-        assert await _handshake_refused(source, _bundle(tmp_path, acme))
-    finally:
-        await source.stop()
+    refused = []
+    for order, (ca_at, other_at) in (("ca-first", (1, 2)), ("namesake-first", (2, 1))):
+        trusted = [acme[0], namesake] if ca_at == 1 else [namesake, acme[0]]
+        (tmp_path / order).mkdir()
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+            source = await _started(_source(tmp_path / order, trusted, subjects))
+        try:
+            warned = [r.getMessage() for r in caplog.records]
+            assert any(
+                f"tls_ca_file certificate block {other_at} (CN=Acme CA) is not a CA" in m
+                and f"the CA certificate in block {ca_at}" in m
+                and "refuse every client certificate of that CA" in m
+                for m in warned
+            ), (order, warned)
+            assert source._issuer_index is not None
+            assert source._issuer_index.unmatched_keys(subjects) == {}  # still no twin
+            refused.append(await _handshake_refused(source, _bundle(tmp_path, acme)))
+        finally:
+            await source.stop()
+    # The failure warned of, measured: in at least one order the CA's client fails the handshake.
+    assert any(refused), refused
     # Control: with the CA alone, nothing is warned and the same CA's client is admitted.
     caplog.clear()
     (tmp_path / "alone").mkdir()
@@ -1025,6 +1041,30 @@ async def test_a_namesake_that_is_no_ca_is_warned_about_at_start(
         assert await _admitted(source, _bundle(tmp_path, acme)) == 202
     finally:
         await source.stop()
+
+
+@pytest.mark.parametrize(
+    ("cn", "skid", "refused"),
+    [
+        pytest.param("ACME CA", False, "every client certificate of that CA", id="case"),
+        pytest.param(" Acme  CA", False, "every client certificate of that CA", id="spacing"),
+        pytest.param("Acme CA", True, "each one that carries no authority key", id="key-id"),
+    ],
+)
+def test_a_namesake_warning_matches_names_as_openssl_does_and_says_whom_it_refuses(
+    cn: str, skid: bool, refused: str
+) -> None:
+    """Names are grouped at least as loosely as OpenSSL matches an issuer by name, ASCII case and
+    white space folded. A namesake with a key identifier of its own can be taken only as the
+    issuer of a client certificate with no authority key identifier, so the warning says so
+    (BACKLOG #4948)."""
+    acme = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, cn)), acme, skid=skid)
+    (warning,) = IssuerIndex((_pem(acme[0]) + _pem(namesake)).decode("ascii")).namesake_warnings()
+    assert "block 2" in warning and "block 1" in warning and refused in warning, warning
+    # Control: another name is no namesake.
+    other = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA 2")), acme, skid=skid)
+    assert IssuerIndex((_pem(acme[0]) + _pem(other)).decode("ascii")).namesake_warnings() == []
 
 
 @pytest.mark.parametrize("surface", ["api", "mllp"])
@@ -1046,10 +1086,12 @@ def test_the_api_and_mllp_starts_warn_about_a_namesake_that_is_no_ca(
                 _sender_issuer_lookup("IB_PARTNER", cadata, subjects)
         return [r.getMessage() for r in caplog.records]
 
-    file = "[api].tls_client_ca_file" if surface == "api" else "tls_ca_file"
+    file = (
+        "[api].tls_client_ca_file" if surface == "api" else "MLLP listener IB_PARTNER: tls_ca_file"
+    )
     warned = build((_pem(acme[0]) + _pem(namesake)).decode("ascii"))
     assert any(
-        f"{file}: certificate block 2 (CN=Acme CA) is not a CA" in m and "block 1" in m
+        m.startswith(f"{file} certificate block 2 (CN=Acme CA) is not a CA") and "block 1" in m
         for m in warned
     ), warned
     assert build(_pem(acme[0]).decode("ascii")) == []  # control
