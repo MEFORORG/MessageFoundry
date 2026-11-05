@@ -417,9 +417,10 @@ def test_the_ad_probe_keeps_the_ldaps_guard_refusal_whole(monkeypatch: pytest.Mo
     """The control: the guard's own refusal, raised inside ``_refuse_ad_revocation``."""
     from messagefoundry.auth import ldap
     from messagefoundry.config.settings import AuthSettings
+    from messagefoundry.config.tls_policy import RevocationHopGuard
     from messagefoundry.privilege_probes import _ad_why
 
-    monkeypatch.setattr(ldap.RevocationHopGuard, "capture", _raising(_host_echoing()))
+    monkeypatch.setattr(RevocationHopGuard, "capture", _raising(_host_echoing()))
     tls: Any = SimpleNamespace(handshake_context=lambda: None)
     with pytest.raises(InsecureHopRefused) as caught:
         ldap._refuse_ad_revocation(
