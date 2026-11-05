@@ -285,7 +285,8 @@ Wave 0 lockout returns for it:
   "Object creator", and for the hosted runners' built-in Administrator (RID 500), measured owning the
   objects it creates (CI run 36039014999). A directory made some other way can still be refused, and
   the engine logs a WARNING naming the reason when it refuses a directory whose inheritance is off --
-  including one set up for a gMSA, a dedicated user, LocalService or NetworkService, and one carrying
+  including one set up for LocalService or NetworkService (and, before the 2026-11-05 note, a gMSA
+  or a dedicated user), and one carrying
   leftover entries such as CREATOR OWNER. The one deliberate exception is a directory carrying an
   OWNER RIGHTS entry: CPython 3.13+ `mkdtemp` writes every temp directory PROTECTED with SYSTEM,
   Administrators and OWNER RIGHTS (measured), and warning there fired on every engine start in a temp
@@ -316,9 +317,11 @@ first deployment.
 
 **Decision (owner ruling 2026-11-05, in the batch 608 Manager's chat).** The hardened directory may
 grant at most one principal beyond SYSTEM and Administrators (none for a LocalSystem install, as
-before). It is a per-service virtual account as before, or a SID that `LookupAccountSidW` resolves to `SidTypeUser` and whose RID is 1000 or more. It
-gets the same Modify right (`0x1301bf`) and `OICI` inheritance the virtual account gets, and may own
-the directory, as the virtual account may. In `messagefoundry/store/store.py`,
+before). It is a per-service virtual account as before, or a SID that `LookupAccountSidW` resolves
+to `SidTypeUser` and whose RID is 1000 or more. It gets the same Modify right (`0x1301bf`) and `OICI`
+inheritance the virtual account gets. Unlike the virtual account it may NOT own the directory: any
+standard user can own a directory she made and grant herself that shape, while the installer always
+makes Administrators the owner. In `messagefoundry/store/store.py`,
 `_account_shape_refusal` requires a machine- or domain-relative SID (`S-1-5-21-` plus three
 sub-authorities and the RID) with a RID of 1000 or more, and `_account_type_refusal` requires the
 lookup to answer `SidTypeUser`. A failed lookup and every other type are refused: a group or alias
@@ -328,17 +331,21 @@ are refused although they are user accounts. The lookup runs last, after every c
 once per check (`_hardening_verdict`).
 
 **What did not change.** The rule is still an allow-list. A deny entry, a wrong right or inheritance,
-a second principal of either kind, an owner outside the set, inheritance left on, a link in the path,
+a second principal of either kind, an owner outside SYSTEM, Administrators and a virtual run-as,
+inheritance left on, a link in the path,
 and the OWNER RIGHTS temp-directory exemption all stand exactly as the 2026-09-24 note states them.
 The trio still names only principals the directory allows.
 
 **What it widens.** One principal kind: a resolved user account that the directory already grants
 Modify in the installer's shape, so the trio grants it no right the directory did not. **The code
 does not check that this account is the one the service runs as.** It admits whichever resolved user
-the directory grants. On an installed directory that is the `-ServiceAccount` the installer granted.
-Anyone who could grant another user there already holds WRITE_DAC over the directory: an
-Administrator, SYSTEM or the directory's owner, each of whom the trio already admits. Tying the
-admitted SID to the service's configured account was not chosen.
+the directory grants. On a `-ServiceAccount` install that is the account the installer granted. On
+any other directory it is whichever user someone granted, and only SYSTEM or an Administrator can,
+because the owner must be one of them. So an Administrator who grants a user Modify on a hardened
+data directory now also grants that user Modify on the store. That includes a `-AllowLocalSystem`
+install, whose directory names no run-as: before this note such a grant left the store owner-only,
+and now it shares the store with that user. Tying the admitted SID to the service's configured
+account was not chosen.
 
 **Left open, at least.** What a gMSA resolves to is unmeasured: no hosted runner has a domain. A
 gMSA is a computer-class object in Active Directory, so it is expected to resolve as `SidTypeUser`;

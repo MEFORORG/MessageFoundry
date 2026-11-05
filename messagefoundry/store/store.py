@@ -6927,10 +6927,18 @@ def _hardening_refusal(directory: _SddlDacl) -> str | None:
     then Set-DataDirOwner): inheritance blocked; every ACE an allow with the installer's own
     inheritance (``OICI``) and rights -- full control (``FA``) for SYSTEM and Administrators, both
     present, and Modify (``0x1301bf``) for at most ONE run-as account -- and nothing else; no deny
-    ACE, because the trio's DACL does not carry denies over; and an owner of SYSTEM, Administrators
-    or that run-as account, because an owner keeps WRITE_DAC over the directory. The run-as account
-    is a per-service virtual account, or one user account this host resolves with a RID of 1000 or
-    more (:func:`_account_shape_refusal`, :func:`_account_type_refusal`).
+    ACE, because the trio's DACL does not carry denies over; and an owner of SYSTEM or
+    Administrators, or of the run-as account when it is a per-service virtual account, because an
+    owner keeps WRITE_DAC over the directory. The run-as account is a per-service virtual account,
+    or one user account this host resolves with a RID of 1000 or more (:func:`_account_shape_refusal`,
+    :func:`_account_type_refusal`). A user never qualifies as the OWNER: any standard user can own a
+    directory she made and grant herself the installer's shape, while install-service.ps1 always
+    makes Administrators the owner (Set-DataDirOwner), and no standard user can own a directory as
+    a virtual account.
+
+    NOT pure: for a user run-as it calls ``LookupAccountSidW``, which may block on a domain
+    controller and logs nothing itself. Call it once per decision (:func:`_hardening_verdict`), and
+    never on an event loop.
 
     The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
     written with FA/Modify: a directory granting Administrators read, or a service container-only,
@@ -6968,16 +6976,15 @@ def _hardening_refusal(directory: _SddlDacl) -> str | None:
     # account beside a user are all refused. The installer grants one, or none for LocalSystem.
     if len(run_as) > 1:
         return f"it grants more than one service or user account ({', '.join(sorted(run_as))})"
+    services = {sid for sid in run_as if _SERVICE_SID.fullmatch(sid)}
     if directory.owner is None or (
-        directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in run_as
+        directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in services
     ):
         return f"it is owned by {directory.owner}, which keeps WRITE_DAC over it"
     # Last, because it is the one check that can leave the host: a gMSA's SID resolves through a
     # domain controller. Every cheaper refusal has had its chance first.
-    for sid in run_as:  # at most one, by the check above
-        if not _SERVICE_SID.fullmatch(sid):
-            return _account_type_refusal(sid)
-    return None
+    user = next(iter(run_as - services), None)  # at most one, by the check above
+    return None if user is None else _account_type_refusal(user)
 
 
 def _account_shape_refusal(sid: str) -> str | None:
@@ -7010,9 +7017,12 @@ def _account_type_refusal(sid: str) -> str | None:
     when ``LookupAccountSidW`` resolves it to SidTypeUser. Refused when the lookup fails, and when it
     returns any other type: a group or alias with an assigned RID has the same shape as a user, and
     granting one Modify must not widen the store to every member."""
-    kind = _lookup_sid_type(sid)
+    kind, status = _lookup_sid_type(sid)
     if kind is None:
-        return f"it grants {sid}, which this host could not resolve to an account"
+        return (
+            f"it grants {sid}, which this host could not resolve to an account (Win32 status "
+            f"{status})"
+        )
     if kind != _SID_TYPE_USER:
         return f"it grants {sid}, which resolves to SID type {kind}, not a user account"
     return None
@@ -7029,11 +7039,6 @@ def _hardening_verdict(directory: _SddlDacl) -> tuple[tuple[str, ...] | None, st
         return None, refusal
     run_as = (sid for _t, _f, _r, sid in directory.aces if sid not in _STORE_DIR_TRUSTED_SIDS)
     return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(run_as)), None
-
-
-def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
-    """The grants of :func:`_hardening_verdict`, or ``None`` when ``directory`` is not hardened."""
-    return _hardening_verdict(directory)[0]
 
 
 def _sddl_flag_set(flags: str) -> set[str]:
@@ -7122,15 +7127,17 @@ def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:
         kernel32.LocalFree(descriptor)
 
 
-def _lookup_sid_type(sid: str) -> int | None:
-    """The SID_NAME_USE ``LookupAccountSidW`` reports for ``sid`` on this host, or ``None`` when the
-    lookup fails or this is not Windows. A seam for tests, so the decision runs anywhere.
+def _lookup_sid_type(sid: str) -> tuple[int | None, int]:
+    """``(SID_NAME_USE, 0)`` for what ``LookupAccountSidW`` reports for ``sid`` on this host, or
+    ``(None, Win32 status)`` when the lookup fails, and ``(None, 0)`` off Windows. A seam for tests,
+    so the decision runs anywhere.
 
     A domain account's SID resolves through a domain controller, or through the LSA's lookup cache
-    when none answers; a SID neither knows fails with ERROR_NONE_MAPPED (1332). A failure is logged
-    with its Win32 status, because the caller then refuses the directory."""
+    when none answers; a SID neither knows fails with ERROR_NONE_MAPPED (1332), while an unreachable
+    controller fails otherwise (1722, say). Nothing is logged here: the status goes into the
+    refusal, which the caller logs once, beside the directory it refused."""
     if sys.platform != "win32":
-        return None
+        return None, 0
     import ctypes
     from ctypes import wintypes
 
@@ -7154,8 +7161,7 @@ def _lookup_sid_type(sid: str) -> int | None:
     kernel32.LocalFree.restype = ctypes.c_void_p
     psid = ctypes.c_void_p()
     if not convert(sid, ctypes.byref(psid)):
-        log.warning("could not read %s as a SID (Win32 status %s)", sid, ctypes.get_last_error())
-        return None
+        return None, ctypes.get_last_error()
     try:
         name_len, domain_len = wintypes.DWORD(256), wintypes.DWORD(256)
         status = 0
@@ -7174,12 +7180,11 @@ def _lookup_sid_type(sid: str) -> int | None:
                 ctypes.byref(domain_len),
                 ctypes.byref(use),
             ):
-                return use.value
+                return use.value, 0
             status = ctypes.get_last_error()
             if status != 122:
                 break
-        log.warning("could not resolve %s to an account (Win32 status %s)", sid, status)
-        return None
+        return None, status
     finally:
         kernel32.LocalFree(psid)
 
