@@ -18,7 +18,6 @@ is defined here and nowhere else, so other pages point at this line rather than 
 | Manager | Long-lived, several at once | The seat the owner talks to. Reads the record and writes a brief citing an item, dispatches subagent workers, then polls. It decides when to cut a PR and what goes in it, usually one PR per wave of workers (owner ruling 2026-09-23). The record is two ledgers, and NEITHER IS IN THIS REPOSITORY any more: the item ledger moved to the maintainer-internal repo (BACKLOG #1250), and the `wshallwshall/claude-multisession` issues track KORUS itself. Nothing pushes to it. |
 | Builder | One brief, then exits | Works, commits, pushes its branch, reports, and stops. The Manager opens the PR (since 2026-09-18). That is you, most of the time. |
 | Watchdog | As needed | Watches the Lander and keeps it draining. Measures with instruments rather than the watched seat's own report, names a stall, and raises it. It never drains, never takes the claim, and never says whose a red is. Added 2026-09-19. |
-| Steward | A cron, no model calls | Reads account usage and names the account with headroom. It cannot interrupt a running session. |
 | Lander | Standing authority | Enqueues and merges. Both, since the Console's retirement. |
 
 **A MANAGER AND THE LANDER MAY SPAWN A SESSION; every other seat needs permission first (owner
@@ -65,7 +64,8 @@ Seven seats were retired by owner decision on 2026-09-01: Dispatcher, Liaison, P
 Manager, Process Improvement and ASVS Tracker. **An eighth went on 2026-09-05**, with the
 `reviewed` label and `review-gate.yml`; it is deliberately unnamed, here and everywhere else in this
 repository, by owner instruction 2026-09-16. **The CONSOLE went on 2026-09-10, and the Manager above
-replaces it.** If a document names one, that document is stale.
+replaces it.** **The STEWARD is retired too**, by the owner's statement of 2026-11-05; its notice is
+under *Retired CLAUDE.md notices*. If a document names one, that document is stale.
 *Count note, 2026-10-07:* the blocks under *Retired CLAUDE.md notices* call the Console the eighth,
 because that file never counted the unnamed seat; the note at the head of that section says the same.
 
@@ -552,6 +552,30 @@ evidence, measures whether reds are being cleared at all, and never says whose o
 to a Watchdog gets a reading and no verdict, and a session waiting for that verdict waits forever.
 `docs/roles/seats.json` resolves `regulator` to a retirement notice saying this, for the same reason
 the Console's does.
+
+### The Steward, retired before 2026-11-05
+
+Not a block moved out of `CLAUDE.md` on 2026-10-07: this one was written when the row came out, so
+it reads against `CLAUDE.md` at `aba973b282` rather than at `ddf350e1d0`.
+
+**The owner said on 2026-11-05, in a Manager session: *"There is no steward... that seat was
+retired months ago."*** When it went, and under which ruling, is not recorded in this repository:
+neither this page, the git history of `CLAUDE.md` and `docs/roles/`, nor `seats.json` holds a date.
+No successor seat is recorded either, so none is named here. The roster row section 5 carried until then, verbatim:
+
+    | **Steward** | cron, zero model calls | Reading usage and naming the account with headroom. | Warn a running session. Nothing can interrupt one. |
+
+The Manager row also read *"Usage limits still bind, at least a Steward hold and the Workflow gate;
+korus `roles/STEWARD.md` and `roles/COMMON.md` define them."*
+
+**The seat went; the usage controls did not.** Any seat still reads usage itself with `get_usage`.
+The user-scope usage watch hook, `watch.py`, still prints the weekly ladder at SessionStart and
+UserPromptSubmit, and by the owner's ruling of 2026-10-31 the weekly window carries the stop, so its
+HOLD NEW WORK state still means start no new work. The 90 percent gate on a new Workflow still binds.
+`scripts/hooks/usage-headroom-inject.ps1` still reads a `status.json` it calls the Steward's, as a
+labelled fallback; a retired seat can leave a mechanism running, and that one is left as it is.
+`docs/roles/seats.json` resolves `steward` to a retirement notice and `docs/roles/steward.card.md`
+is removed, so `/seat steward` prints the notice rather than a card.
 
 ### Seat declaration crosses accounts, measured 2026-09-12
 
