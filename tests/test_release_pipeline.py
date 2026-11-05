@@ -533,7 +533,8 @@ def _is_pinned_publish(uses: str) -> bool:
 _PYPI_UPLOAD_SITES = 4
 
 #: Every input of an upload step but `packages-dir`, at the one value each may take (BACKLOG #5046):
-#: the composite's defaults at v1.14.3, plus the three this file always set. Why each must be passed,
+#: the composite's defaults at v1.14.3, except `skip-existing`, which this file has always set true
+#: (the toolkit step's comment says why) where the composite defaults it false. Why each must be passed,
 #: and what a missing or other value does, is in release.yml's header. Section (5) exempts the
 #: `user` and `password` lines from its token ban.
 _PUBLISH_FIXED_INPUTS: dict[str, object] = {
@@ -740,8 +741,8 @@ _TRUSTED_PUBLISHING_SELECTOR = (
 
 
 def test_release_publish_uses_trusted_publishing_no_token() -> None:
-    """Mutation: give an upload step a non-empty `password`, a second `user:` line, or a
-    `TWINE_PASSWORD` anywhere. Red here."""
+    """Mutation: give an upload step a non-empty `password`, put a `user:` line of any value on any
+    other step, or add a `TWINE_PASSWORD` anywhere. Red here."""
     rel = _release()
     uploads = [step for _, step in _pypi_uploads()]
     # Trusted Publishing selected, and PEP 740 attestations on, at every upload step.
@@ -759,6 +760,7 @@ def test_release_publish_uses_trusted_publishing_no_token() -> None:
     # OIDC-only.
     for forbidden in (
         "password:",
+        "user:",
         "TWINE_PASSWORD",
         "__token__",
         "PYPI_API_TOKEN",
@@ -4056,9 +4058,11 @@ _PINNED_PUBLISH_LINE = re.compile(
 
 
 def _publish_sites() -> list[tuple[str, str]]:
-    """``(where, uses)`` for every step under .github/ that `_is_publish_action` matches: each
-    workflow's jobs, and each local action's composite steps, which a workflow could call to reach
-    the action form by a path no `uses:` check here would read as a publish."""
+    """``(where, uses)`` for each step under .github/ that `_is_publish_action` matches, by at least
+    these routes: each workflow's job steps, and each local action's composite steps and docker
+    `runs.image`, which a workflow could call to reach the image by tag through a path no `uses:`
+    check here reads as a publish. A local action's Dockerfile `FROM` and a remote reusable
+    workflow are not read."""
     import yaml
 
     github = _REPO / ".github"
@@ -4072,7 +4076,10 @@ def _publish_sites() -> list[tuple[str, str]]:
         if path.parent == WORKFLOWS:
             groups = {key: job.get("steps") for key, job in jobs_of(path.name).items()}
         else:
-            groups = {"runs": (yaml.safe_load(text).get("runs") or {}).get("steps")}
+            runs = yaml.safe_load(text).get("runs") or {}
+            # A docker-type local action names its image in `runs.image`, the shape of the
+            # trampoline upstream's create-docker-action.py writes; read it as one more step.
+            groups = {"runs": [*(runs.get("steps") or []), {"uses": runs.get("image")}]}
         for key, steps in groups.items():
             for step in steps or []:
                 uses = str((step or {}).get("uses") or "")
@@ -4082,8 +4089,8 @@ def _publish_sites() -> list[tuple[str, str]]:
 
 
 def test_every_pypi_upload_runs_one_digest_pinned_image() -> None:
-    """The action form runs its image by a repointable ghcr tag, so every upload anywhere under
-    .github/ names the image by `sha256:` digest, all by the same one, each with one and the same
+    """The action form runs its image by a repointable ghcr tag, so every upload `_publish_sites`
+    finds names the image by `sha256:` digest, all by the same one, each with one and the same
     comment naming the commit the digest was read from.
 
     Mutation: put one site back on `pypa/gh-action-pypi-publish@<commit>`, name the image by a tag,

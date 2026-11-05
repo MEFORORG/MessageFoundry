@@ -108,7 +108,9 @@
 # That is the image the action itself would have run. Upstream's `:v1.14.3` tag names a different
 # build of the same commit, with a different digest, so do not check the pin against that tag.
 # Calling the image skips the composite, which also supplied the image's input defaults, so each
-# upload step passes every input the composite passed, at the composite's own default value. The
+# upload step passes every input the composite passed, at the composite's own default value, except
+# `skip-existing`, which stays true where the composite defaults it false (the toolkit step says
+# why: a re-run must not die on "File already exists"). The
 # image's entry script runs under `set -u` and reads at least the user name, password and verbose
 # inputs directly, so leaving one out fails the step; its token exchange reads the repository URL
 # with no default, so leaving that out fails it too. A repository URL other than PyPI's would send
