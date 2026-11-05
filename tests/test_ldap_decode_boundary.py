@@ -644,7 +644,7 @@ def test_an_engine_fault_propagates_whatever_its_value(fault: Exception) -> None
     with pytest.raises(type(fault)) as raised:
         ldap_module._search(double, "user search")
     assert raised.value is fault
-    with pytest.raises(type(fault)) as raised, ldap_module._ldap3_call("user bind", close=True):
+    with pytest.raises(type(fault)) as raised, ldap_module._ldap3_call("user bind"):
         _raise(fault)()
     assert raised.value is fault
 

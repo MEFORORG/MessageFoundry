@@ -2,13 +2,15 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #3017: what ``auth/ldap.py`` answers when the directory fails, and what it leaves open.
 
-Five properties are pinned, each with the test that failed before the change:
+Six properties are pinned, each with the test that failed before the change:
 
 * a second connect that fails answers an absent account and a present one alike, and a plain wrong
   user name on a healthy directory still reads as a failed sign-in, through a real ldap3 stack;
 * an ldap3 error's text, which can list every address the engine tried, never reaches the
   ``LdapError`` or the ``auth.login_error`` row;
 * ``authenticate`` and ``probe_principal`` unbind the service account's connection on every path;
+* a failed service-account bind closes its socket on every error, even one raised after the
+  socket opened, such as on a password SASLprep refuses (L4);
 * a service-account bind refused with a referral is refused as a referral, and any other refusal
   names its result code, through a real ldap3 stack;
 * a sign-in or step-up leg answers a directory error for any fault the authenticator raises, with
@@ -300,31 +302,109 @@ def test_any_other_service_bind_refusal_names_its_result_code() -> None:
         authenticator.probe_principal("alice")
     assert not isinstance(err.value, LdapReferralError)
     assert str(err.value).startswith(
-        "AD ended the service-account bind with result code 49 (invalidCredentials)"
+        "AD ended the service-account bind with result code 49 (invalidCredentials), which "
+        "refused the bind;"
     )
+    # L3: a refused bind is the directory's answer, so it is not called one it did not give.
+    assert "not an answer" not in str(err.value)
     assert "check [auth].ad_bind_dn and its password" in str(err.value)
     assert dc.searches == []
 
 
-def test_a_refusal_whose_connection_cannot_be_found_names_the_type_only(
+def test_a_refused_service_bind_with_no_result_code_still_refuses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Raised from anywhere but ldap3's ``_do_auto_bind``, no connection is read, and the text
-    claims no result code and carries none of ldap3's."""
-    _install_fakes(monkeypatch)
-    _faulting(monkeypatch, at="open", fault=ldap3.core.exceptions.LDAPBindError("synthetic"))
+    """A bind answered ``False`` with no result to read claims no result code, still refuses, and
+    closes the socket (BACKLOG #3017 L4)."""
+    rec = _install_fakes(monkeypatch)
+    base = ldap3.Connection
+
+    class Unreadable(base):  # type: ignore[misc, valid-type]
+        def bind(self) -> bool:
+            if self._bind_dn != _SERVICE_DN:
+                return bool(super().bind())
+            self.result = None
+            return False
+
+    monkeypatch.setattr(ldap3, "Connection", Unreadable)
     with pytest.raises(LdapError) as err:
         LdapAuthenticator(_ad_settings()).probe_principal("alice")
     assert not isinstance(err.value, LdapReferralError)
-    assert str(err.value) == "AD refused the service-account bind; ldap3 raised LDAPBindError"
+    assert str(err.value) == "AD refused the service-account bind, with no result code to name"
+    assert rec.closes == [_SERVICE_DN]
 
 
-def test_the_ldap3_names_the_auto_bind_reading_relies_on_exist() -> None:
-    """``_auto_binding_connection`` finds the refused connection by these names. A rename in ldap3
-    would make every refusal read as an unreadable one, so pin them."""
-    module, method = ldap_module._AUTO_BIND_FRAME
-    assert ldap3.Connection.__module__ == module
-    assert "raise LDAPBindError" in inspect.getsource(getattr(ldap3.Connection, method))
+# --- L4: a service bind that fails after its socket opens leaves no socket open -----------------
+
+
+def test_a_service_bind_that_raises_after_the_socket_opens_closes_it() -> None:
+    """BACKLOG #3017 L4, through a real ldap3 stack. A password SASLprep (RFC 4013) refuses raises
+    after the socket opens and before the bind request is sent. Under ``auto_bind`` the engine never
+    held that connection, so its socket stayed open while anything referenced it; here the
+    traceback ``pytest.raises`` keeps holds it, and the domain controller still sees the close."""
+    built: list[Any] = []
+    real = ldap3.Connection
+
+    class Kept(real):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            built.append(self)
+            super().__init__(*args, **kwargs)
+
+    with (
+        pytest.MonkeyPatch.context() as mp,
+        _scripted_dc(lambda _raw: []) as (dc, authenticator),
+    ):
+        mp.setattr(ldap3, "Connection", Kept)
+        authenticator._bind_password = "synthetic\x07pw-3017"  # a control character
+        with pytest.raises(LdapError) as err:
+            authenticator.probe_principal("alice")
+        assert dc.ended.wait(timeout=5), "the domain controller never saw the socket close"
+        assert dc.opened == 1 and dc.searches == []
+    assert str(err.value).startswith("AD directory call failed: ldap3 raised LDAP")
+    assert "synthetic" not in str(err.value)
+    [conn] = built
+    assert conn.closed and conn.socket is None
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        pytest.param(ldap3.core.exceptions.LDAPSocketReceiveError("synthetic"), id="ldap3-error"),
+        pytest.param(OSError("synthetic"), id="socket-fault"),
+        pytest.param(KeyError("synthetic"), id="engine-defect"),
+    ],
+)
+def test_every_failed_service_bind_closes_its_socket(
+    monkeypatch: pytest.MonkeyPatch, fault: Exception
+) -> None:
+    """Whatever the service account's bind raises, the socket is closed without sending, and the
+    error the caller sees is unchanged by the close (BACKLOG #3017 L4)."""
+    rec = _install_fakes(monkeypatch)
+    _faulting(monkeypatch, at="open", fault=fault)
+    with pytest.raises((LdapError, KeyError)) as err:
+        LdapAuthenticator(_ad_settings()).probe_principal("alice")
+    if isinstance(fault, KeyError):
+        assert err.value is fault, "an engine defect must stay itself"
+    else:
+        assert err.value.__cause__ is fault
+    assert rec.closes == [_SERVICE_DN]
+    assert rec.unbinds == [], "a connection that never bound is closed, not unbound"
+
+
+def test_the_service_connection_is_built_without_auto_bind() -> None:
+    """``auto_bind`` binds inside ldap3's constructor, where the engine holds no connection to close
+    on a failure (BACKLOG #3017 L4, L5). The service connection is built unbound and bound by
+    ``_service_conn`` itself."""
+    tree = ast.parse(inspect.getsource(ldap_module))
+    built = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "Connection"
+    ]
+    assert len(built) >= 3, "the service, user and decoy connections; the census lost them"
+    assert not [n.lineno for n in built if any(k.arg == "auto_bind" for k in n.keywords)]
 
 
 # --- (e) the sign-in and step-up legs answer a directory error for any fault ---------------------

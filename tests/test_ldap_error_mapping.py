@@ -37,7 +37,7 @@ import pytest
 from messagefoundry.auth.ldap import LdapAuthenticator, LdapError
 from messagefoundry.auth.service import AuthService
 from messagefoundry.store.store import MessageStore
-from tests.test_ldap_timeouts import _ad_settings, _install_fakes, _shape_search
+from tests.test_ldap_timeouts import _SERVICE_DN, _ad_settings, _install_fakes, _shape_search
 
 #: Stands for directory data a socket fault's message might carry. It must never reach the text.
 _LEAK = "CN=synthetic-leak,OU=Users,DC=example,DC=com"
@@ -67,7 +67,7 @@ _LDAP3_ERRORS = [
 def _faulting(monkeypatch: pytest.MonkeyPatch, *, at: str, fault: BaseException) -> None:
     """Make one ldap3 operation raise ``fault``, over the doubles already installed.
 
-    ``at`` is ``"open"`` (the service account's ``auto_bind`` connection), ``"search"``,
+    ``at`` is ``"open"`` (the service account's bind, which opens its socket), ``"search"``,
     ``"user build"`` (constructing alice's bind connection), ``"user bind"``, ``"decoy bind"``
     (the #1140 equalizing bind) or ``"unbind"``. A bare fault at
     ``open`` or a bind is the shape real ldap3 raises: with one candidate address, ``open()``
@@ -78,8 +78,6 @@ def _faulting(monkeypatch: pytest.MonkeyPatch, *, at: str, fault: BaseException)
     class Faulting(base):  # type: ignore[misc, valid-type]
         def __init__(self, server: Any = None, **kwargs: Any) -> None:
             super().__init__(server, **kwargs)
-            if at == "open" and kwargs.get("auto_bind"):
-                raise fault
             if at == "user build" and str(kwargs.get("user", "")).startswith("CN=alice"):
                 raise fault
 
@@ -89,8 +87,14 @@ def _faulting(monkeypatch: pytest.MonkeyPatch, *, at: str, fault: BaseException)
             return bool(super().search(**kwargs))
 
         def bind(self) -> bool:
-            decoy = str(self._bind_dn or "").startswith("CN=mf-nonexistent")
-            if at == ("decoy bind" if decoy else "user bind"):
+            dn = str(self._bind_dn or "")
+            if dn == _SERVICE_DN:
+                kind = "open"
+            elif dn.startswith("CN=mf-nonexistent"):
+                kind = "decoy bind"
+            else:
+                kind = "user bind"
+            if at == kind:
                 raise fault
             return bool(super().bind())
 
