@@ -1768,20 +1768,22 @@ class IssuerIndex:
         3.5.7, a real listener refused one in at least one listing order. So a namesake with a
         differing key identifier still warns, naming those leaves.
 
-        A CA with no subject key identifier at all is a different fault. At least the contexts the
-        API and the HTTP and MLLP listeners build this index beside verify strictly
+        A CA that strict verification refuses as a CA is a different fault. At least the contexts
+        the API and the HTTP and MLLP listeners build this index beside verify strictly
         (``harden_verify_flags``, a no-op only where the runtime lacks the flag), and strict
-        verification refuses a client verified through such a CA whether or not a namesake is
-        loaded: measured on OpenSSL 3.5.7, with the CA alone, for a version-3 client naming its key
-        and for a version-1 client. So that warning names the CA as the cause, under strict
-        verification. A version-1 CA has no extensions, so it lands here too, and strict
-        verification refuses it for its missing basic constraints as well, so the remedy names a
-        version-3 CA. A CA whose key identifier ``cryptography`` cannot read may or may not have one
-        OpenSSL reads, so that case gets the warning that every client may be refused, and says
-        what it cannot tell. The index does not count a namesake toward the same-DN ambiguity unless
-        it signs itself, so :meth:`unmatched_keys` may give no reason, and this is the only start
-        signal. Names are grouped by :func:`_namesake_key`. A warning only: it changes no allow,
-        deny or refusal."""
+        verification refuses every client verified through such a CA whether or not a namesake is
+        loaded. :func:`_strict_ca_faults` reads at least some of the reasons from the CA's own
+        extensions, each measured on OpenSSL 3.5.7 with the CA alone, for a version-3 client naming
+        its key and for a version-1 client: a version-1 CA, and a version-3 CA with no basic
+        constraints, basic constraints that are not critical, no key usage, or no subject key
+        identifier. When it finds any, the warning names the CA and those reasons as the cause,
+        whatever key identifier the namesake has, once per CA, naming every namesake. A CA whose
+        extensions ``cryptography`` cannot read may or may not be one strict verification refuses,
+        or have a key identifier OpenSSL reads, so that case gets the warning that every client may
+        be refused, and says what it cannot tell. The index does not count a namesake toward the
+        same-DN ambiguity unless it signs itself, so :meth:`unmatched_keys` may give no reason, and
+        this is the only start signal. Names are grouped by :func:`_namesake_key`. A warning only:
+        it changes no allow, deny or refusal."""
         by_name: dict[_NameKey, list[_Anchor]] = {}
         for anchors in self._by_subject_name.values():
             for anchor in anchors:
@@ -1791,22 +1793,15 @@ class IssuerIndex:
             others = [anchor for anchor in anchors if not anchor.ca]
             ca_anchors = [anchor for anchor in anchors if anchor.ca]
             if not others or not ca_anchors:
-                continue  # no namesake here, so read no key identifier for nothing
-            cas = [(ca, _key_identifier(ca)) for ca in ca_anchors]
-            for other in others:
-                key_id, _ = _key_identifier(other)
-                for ca, (ca_key_id, ca_read) in cas:
-                    if ca_key_id is None and ca_read:
-                        effect = (
-                            "refuses, under strict verification, every client certificate whose "
-                            f"chain runs through block {ca.position}, whether or not block "
-                            f"{other.position} is loaded, because block {ca.position} has no "
-                            "subject key identifier. Re-issue or remove block "
-                            f"{ca.position}, as a version-3 CA with basic constraints, key usage "
-                            f"and a subject key identifier, and remove block {other.position} or "
-                            "re-issue it under another subject"
-                        )
-                    elif key_id is not None and ca_key_id is not None and key_id != ca_key_id:
+                continue  # no namesake here, so read no extension for nothing
+            other_ids = [(other, _key_identifier(other)[0]) for other in others]
+            for ca in ca_anchors:
+                if faults := _strict_ca_faults(ca):
+                    warnings.append(_ca_cause_warning(ca, others, faults))
+                    continue
+                ca_key_id, ca_read = _key_identifier(ca)
+                for other, key_id in other_ids:
+                    if key_id is not None and ca_key_id is not None and key_id != ca_key_id:
                         effect = (
                             f"may take block {other.position}, whose key identifier differs from "
                             "the CA's, as the issuer of a client certificate that CA issued with no "
@@ -1817,7 +1812,7 @@ class IssuerIndex:
                         )
                     else:
                         why = ""
-                        if ca_key_id is None:  # unreadable: one with none took the branch above
+                        if not ca_read:
                             rules_out = (
                                 ", or which client certificates of that CA carry an authority key "
                                 f"identifier that rules block {other.position} out"
@@ -1825,9 +1820,10 @@ class IssuerIndex:
                                 else ""
                             )
                             why = (
-                                f" The key identifier of block {ca.position} cannot be read here, "
-                                f"so this check cannot tell whether block {ca.position} itself is "
-                                f"the cause, as a CA with none would be{rules_out}."
+                                f" The extensions of block {ca.position} cannot be read here, so "
+                                f"this check cannot tell whether block {ca.position} itself is the "
+                                "cause, as a CA strict verification refuses would be"
+                                f"{rules_out}."
                             )
                         effect = (
                             f"may take block {other.position} as the issuer of a client "
@@ -1840,6 +1836,84 @@ class IssuerIndex:
                         f"{effect}"
                     )
         return warnings
+
+
+def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
+    """At least some of the reasons strict verification refuses ``ca`` as a CA, read from its own
+    version and extensions, or ``None`` when ``cryptography`` cannot read them. The reasons read
+    are not complete: an empty list means none of these was found, not that strict verification
+    accepts it.
+
+    Each was measured on OpenSSL 3.5.7, with the CA alone, to refuse a version-3 and a version-1
+    client (BACKLOG #4948). OpenSSL reads a certificate with ``CA:FALSE``, or a key usage without
+    ``keyCertSign``, as no CA, so those reach here only where its read and this one differ."""
+    if ca.cert.version == x509.Version.v1:
+        return [
+            "it is version 1, so it has no extensions: no basic constraints, key usage or subject "
+            "key identifier"
+        ]
+    try:
+        extensions = ca.cert.extensions
+    except (x509.DuplicateExtension, ValueError, *_UNREAD_EXTENSIONS) as exc:
+        _log.debug(
+            "certificate block %d: its extensions cannot be read (%s); the namesake warning "
+            "cannot tell whether strict verification refuses it as a CA",
+            ca.position,
+            type(exc).__name__,
+        )
+        return None
+    faults: list[str] = []
+    try:
+        constraints = extensions.get_extension_for_class(x509.BasicConstraints)
+    except x509.ExtensionNotFound:
+        faults.append("it has no basic constraints")
+    else:
+        if not constraints.value.ca:
+            faults.append("its basic constraints are not CA:TRUE")
+        elif not constraints.critical:
+            faults.append("its basic constraints are not critical")
+    try:
+        usage = extensions.get_extension_for_class(x509.KeyUsage).value
+    except x509.ExtensionNotFound:
+        faults.append("it has no key usage")
+    else:
+        if not usage.key_cert_sign:
+            faults.append("its key usage does not include keyCertSign")
+    try:
+        extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+    except x509.ExtensionNotFound:
+        faults.append("it has no subject key identifier")
+    return faults
+
+
+def _ca_cause_warning(ca: _Anchor, others: list[_Anchor], faults: list[str]) -> str:
+    """The one namesake warning for ``ca``, a CA :func:`_strict_ca_faults` found ``faults`` in,
+    naming every certificate in ``others``, each one that is no CA with its subject."""
+    named = _listed(f"{other.position} ({other.subject})" for other in others)
+    numbers = _listed(str(other.position) for other in others)
+    blocks, is_, cas, has, it = (
+        ("block", "is", "a CA", "has", "it")
+        if len(others) == 1
+        else ("blocks", "are", "CAs", "have", "them")
+    )
+    reasons = "this reason" if len(faults) == 1 else "these reasons"
+    at = ca.position  # keeps each line of the message whole
+    return (
+        f"certificate {blocks} {named} {is_} not {cas} but {has} the subject "
+        f"of the CA certificate in block {at}. The TLS library refuses, under strict verification, "
+        f"every client certificate whose chain runs through block {at}, whether or not {blocks} "
+        f"{numbers} {is_} loaded, because strict verification refuses block {at} as a CA for at "
+        f"least {reasons}: {'; '.join(faults)}. Re-issue block {at} as a version-3 CA with at least "
+        "critical basic constraints CA:TRUE, key usage keyCertSign and a subject key identifier, "
+        f"or remove it if it is not needed; and remove {blocks} {numbers} or re-issue {it} under "
+        "another subject"
+    )
+
+
+def _listed(items: Iterable[str]) -> str:
+    """``items`` as an English list: ``a``, ``a and b``, ``a, b and c``."""
+    *head, last = items
+    return f"{', '.join(head)} and {last}" if head else last
 
 
 def _namesake_key(name: x509.Name) -> _NameKey:
