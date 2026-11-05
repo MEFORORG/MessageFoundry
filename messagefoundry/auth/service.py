@@ -3529,7 +3529,7 @@ class AuthService:
         #: standing one once more. `_note_unreached_accounts` keeps the counts and
         #: `_record_unreached_accounts` the latch.
         self._reconcile_unreached_runs: dict[str, int] = {}
-        self._reconcile_unreached_paged: dict[str, int] = {}
+        self._reconcile_unreached_paged: set[str] = set()
         #: The undetermined-wave hold's operator message (ADR 0195). Its own latch, because a held
         #: pass is not an aborted one and so clears `_reconcile_alert`. Set on a pass that holds,
         #: cleared on the next pass that judges and does not. A pass with no candidates, or a
@@ -8176,7 +8176,7 @@ class AuthService:
         count. The latch is set only once the account's row is recorded
         (:meth:`_record_unreached_accounts`), so a pass that raises before then leaves the next
         pass to page."""
-        if plan.directory_outage or plan.asked == 0 or plan.probe_fault:
+        if not plan.reached_directory:
             return plan
         runs, paged = self._reconcile_unreached_runs, self._reconcile_unreached_paged
         threshold = self._settings.ad_reconcile_outage_passes
@@ -8186,7 +8186,7 @@ class AuthService:
                 continue  # never asked, so it says nothing about the directory
             if probe.outcome is not reconcile.ProbeOutcome.UNAVAILABLE or probe.detail is not None:
                 runs.pop(probe.user_id, None)
-                paged.pop(probe.user_id, None)
+                paged.discard(probe.user_id)
                 continue
             runs[probe.user_id] = count = runs.get(probe.user_id, 0) + 1
             if count >= threshold and probe.user_id not in paged:
@@ -8219,7 +8219,7 @@ class AuthService:
                     }
                 ),
             )
-            self._reconcile_unreached_paged[user_id] = probes
+            self._reconcile_unreached_paged.add(user_id)
 
     def _note_directory_outage(self, plan: reconcile.ReconcilePlan) -> reconcile.ReconcilePlan:
         """Count the passes running that read the directory unreachable, and say on the plan
@@ -8252,7 +8252,7 @@ class AuthService:
                 and self._reconcile_outage_passes >= self._settings.ad_reconcile_outage_passes
             )
             return replace(plan, outage_passes=self._reconcile_outage_passes, outage_page=page)
-        if plan.asked == 0 or plan.probe_fault:
+        if not plan.reached_directory:
             # Nothing was asked, or every probe asked failed or faulted: a fault the engine could
             # not read says nothing about whether the directory was reached, so it neither ends
             # nor extends the run.
@@ -8394,7 +8394,7 @@ class AuthService:
         reconcile.prune_ledger(self._reconcile_outcomes, users, rank=reconcile.outcome_rank)
         reconcile.prune_ledger(self._reconcile_paging_refused, users, rank=lambda _cause: 0.0)
         reconcile.prune_ledger(self._reconcile_unreached_runs, users, rank=float)
-        reconcile.prune_ledger(self._reconcile_unreached_paged, users, rank=float)
+        self._reconcile_unreached_paged.intersection_update(users)
         if reconcile.ProbeOutcome.UNDETERMINED not in self._reconcile_outcomes.values():
             # u is 0: every held account has left the record, so the hysteresis has nothing to hold.
             self._reconcile_hold_latched = False

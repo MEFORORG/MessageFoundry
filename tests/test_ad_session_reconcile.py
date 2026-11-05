@@ -2823,24 +2823,27 @@ async def test_an_unreached_page_is_latched_only_once_its_row_is_written(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #3100 closing step 2. As a paging refusal's, the page is latched only once its row
-    is recorded, so a pass that raises before then leaves the next pass to page.
+    is recorded, so a pass whose own row write raises leaves the next pass to page.
 
-    RED when: the latch is set before the pass can raise, so the account never pages."""
+    RED when: the latch is set before the row is written, so the account never pages."""
     store = await MessageStore.open(":memory:")
     try:
         service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
         sink = _InverseSink()
         ldap.unreachable = {"alice"}
         await _pass(service, sink)
-        real = service._record_paging_refusals
+        real = service._audit_reconciler_row
 
-        async def boom(plan: reconcile.ReconcilePlan) -> None:
-            raise RuntimeError("synthetic: store refused")
+        async def boom(action: str, **kwargs: Any) -> None:
+            if action == "auth.ad_reconcile_unreached":
+                raise RuntimeError("synthetic: a defect in the row write")
+            await real(action, **kwargs)
 
-        monkeypatch.setattr(service, "_record_paging_refusals", boom)
+        monkeypatch.setattr(service, "_audit_reconciler_row", boom)
         with pytest.raises(RuntimeError):
             await service.reconcile_directory_sessions()
-        monkeypatch.setattr(service, "_record_paging_refusals", real)
+        assert service._reconcile_unreached_paged == set()
+        monkeypatch.setattr(service, "_audit_reconciler_row", real)
         plan = await _pass(service, sink)
         assert [name for _uid, name, _n in plan.unreached] == ["alice"]
         assert len(_unreached_events(sink)) == 1

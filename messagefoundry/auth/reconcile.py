@@ -418,6 +418,15 @@ class ReconcilePlan:
         )
 
     @property
+    def reached_directory(self) -> bool:
+        """True when the pass shows the directory was reached: it asked something, not every probe
+        failed (:attr:`directory_outage`), and not every probe failed or faulted
+        (:attr:`probe_fault`), since a fault says nothing about reach. A pass of referrals or
+        configuration refusals only reached it. The outage run and each account's unreached run
+        read this one predicate (BACKLOG #3709, #3100), so the two cannot disagree."""
+        return self.asked > 0 and not self.directory_outage and not self.probe_fault
+
+    @property
     def judged(self) -> int:
         """The mass-revoke breaker's denominator: every probe of the pass. The breaker's decision and
         the ceiling an operator is told both use this, so a change to the rule lands here once.
