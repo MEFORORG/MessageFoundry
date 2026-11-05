@@ -38,6 +38,11 @@ linux_only = pytest.mark.skipif(
 )
 
 
+#: Taken at import, so a test that stands in for fstatfs cannot change what this fixture reads:
+#: fixtures a test names with ``usefixtures`` are set up before this one.
+_REAL_FILE_SYSTEM_TYPE = restricted_file.linux_file_system_type
+
+
 @pytest.fixture
 def tmp_path(tmp_path: Path) -> Path:
     """pytest's own, but on Linux only where a host file may be kept: a ``/tmp`` on tmpfs, the
@@ -46,7 +51,7 @@ def tmp_path(tmp_path: Path) -> Path:
     if sys.platform == "linux":
         fd = os.open(tmp_path, os.O_RDONLY)
         try:
-            magic = restricted_file.linux_file_system_type(fd)
+            magic = _REAL_FILE_SYSTEM_TYPE(fd)
         finally:
             os.close(fd)
         if magic not in restricted_file.LINUX_HOST_FILE_SYSTEMS:
@@ -1083,6 +1088,20 @@ def test_windows_a_handoff_for_a_shared_account_is_not_written(
     assert dpapi_scopes == []  # refused before the blob was protected
 
 
+@windows_only
+def test_windows_a_grantee_that_cannot_be_looked_up_is_a_custody_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _fails(sid: str) -> int | None:
+        raise RestrictedFileError(f"the account {sid} could not be looked up (Win32 error 1789)")
+
+    monkeypatch.setattr(restricted_file, "_lookup_sid_kind", _fails)
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="could not be looked up"):
+        custody.write_handoff_file(path, _blob(), service_account="*S-1-5-21-1-2-3-1001")
+    assert not path.exists()
+
+
 def _engine_as(monkeypatch: pytest.MonkeyPatch, sid: str) -> None:
     """Make the engine's own account read as ``sid``; every other probe is the real one."""
     import dataclasses
@@ -1400,6 +1419,9 @@ def test_windows_a_handoff_the_delete_refuses_is_a_custody_refusal(
     converted: list[HostBlob] = []
     with pytest.raises(custody.HandoffLeftBehind, match="could not be deleted") as excinfo:
         custody.consume_handoff_file(path, converted.append)
+    # Not a CustodyError: a caller refusing a start on one must not take this, after the
+    # conversion, for a refusal before it.
+    assert not isinstance(excinfo.value, CustodyError)
     assert converted == [_blob()] and path.exists()
     assert not _leaks(str(excinfo.value), _MASTER)
     assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None

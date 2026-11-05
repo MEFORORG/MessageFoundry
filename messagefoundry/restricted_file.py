@@ -164,8 +164,9 @@ def custody_account_problem(sid: str | None) -> str | None:
     return None
 
 
-#: SID_NAME_USE SidTypeUser: one account.
-_SID_TYPE_USER = 1
+#: SID_NAME_USE SidTypeUser and SidTypeComputer: one account each (a group managed service
+#: account, at least, may answer either).
+_ONE_ACCOUNT_KINDS = frozenset({1, 9})
 _SID_TYPE_NAMES: Mapping[int, str] = MappingProxyType(
     {
         2: "a group",
@@ -175,37 +176,36 @@ _SID_TYPE_NAMES: Mapping[int, str] = MappingProxyType(
         6: "a deleted account",
         7: "an invalid account",
         8: "an unknown account",
-        9: "a computer",
         10: "a label",
         11: "a logon session",
     }
 )
 
 
-def _is_service_sid(sid: str) -> bool:
-    """Whether ``sid`` has the shape of one service's own SID, ``S-1-5-80-`` and five more
-    sub-authorities: what Windows derives from a service's name for its virtual account. ALL
-    SERVICES (``S-1-5-80-0``), the one group under that authority, has one."""
-    parts = sid.upper().split("-")
-    return len(parts) == 9 and parts[:4] == ["S", "1", "5", "80"]
+def handoff_grantee_problem(sid: str, kind_of: Callable[[str], int | None]) -> str | None:
+    """Why the account ``sid`` must not be granted a handoff, or ``None`` when it may.
+    ``kind_of`` answers a SID's SID_NAME_USE, ``None`` when Windows maps it to no account
+    (:func:`_lookup_sid_kind`); it is asked only once the checks that need no lookup have passed.
 
+    The grantee must be ONE account. SYSTEM, LOCAL SERVICE and NETWORK SERVICE are refused first
+    (:func:`custody_account_problem`), then an application package. One service's own SID
+    (``store.store._SERVICE_SID``, S-1-5-80 and five sub-authorities) passes without a lookup:
+    Windows reports it as a well-known group, or maps it to nothing before the service is
+    installed. Anything else must be a user account or a computer account, as at least a group
+    managed service account may answer; a group, an alias, a domain or any other kind is refused,
+    and so is a SID Windows maps to nothing, since that may be a domain group whose controller did
+    not answer. Kept free of ctypes so the decision is testable on every platform."""
+    from messagefoundry.store.store import _SERVICE_SID
 
-def handoff_grantee_problem(sid: str, kind: int | None) -> str | None:
-    """Why the account ``sid``, of SID_NAME_USE ``kind`` (``None`` when Windows maps it to no
-    account), must not be granted a handoff, or ``None`` when it may.
-
-    The grantee must be ONE account: a user account, or one service's own SID, which Windows
-    reports as a well-known group, or maps to nothing before the service is installed. A group, an
-    alias, a domain or any other kind is refused, and so is any other SID Windows maps to nothing,
-    since an unmapped SID may be a domain group whose controller did not answer. SYSTEM, LOCAL
-    SERVICE and NETWORK SERVICE are refused first (:func:`custody_account_problem`). Kept free of
-    ctypes so the decision is testable on every platform."""
     shared = custody_account_problem(sid)
     if shared is not None:
         return shared
     if _is_package_sid(sid):
         return f"the application package {sid} is not the account the service runs as"
-    if kind == _SID_TYPE_USER or _is_service_sid(sid):
+    if _SERVICE_SID.fullmatch(sid):
+        return None
+    kind = kind_of(sid)
+    if kind in _ONE_ACCOUNT_KINDS:
         return None
     what = "no account" if kind is None else _SID_TYPE_NAMES.get(kind, f"an account of kind {kind}")
     return (
@@ -245,10 +245,20 @@ def _lookup_sid_kind(sid: str) -> int | None:
     if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(pointer)):
         raise RestrictedFileError(f"the account {sid} could not be read as a SID")
     try:
-        name = ctypes.create_unicode_buffer(256)
-        domain = ctypes.create_unicode_buffer(256)
-        name_size, domain_size = wintypes.DWORD(256), wintypes.DWORD(256)
+        name_size, domain_size = wintypes.DWORD(0), wintypes.DWORD(0)
         use = ctypes.c_int(0)
+        # Sizing probe: fails by design and fills the two lengths, or says the SID maps to nothing.
+        advapi32.LookupAccountSidW(
+            None,
+            pointer,
+            None,
+            ctypes.byref(name_size),
+            None,
+            ctypes.byref(domain_size),
+            ctypes.byref(use),
+        )
+        name = ctypes.create_unicode_buffer(max(name_size.value, 1))
+        domain = ctypes.create_unicode_buffer(max(domain_size.value, 1))
         if advapi32.LookupAccountSidW(
             None,
             pointer,
@@ -837,6 +847,9 @@ def key_file_handle_problem(handle: int, *, engine_read_only: bool) -> str | Non
 _FILE_DISPOSITION_INFO = 4
 _FILE_DISPOSITION_INFO_EX = 21
 _DISPOSITION_DELETE_POSIX = 0x1 | 0x2
+#: FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: a read-only attribute that a copy or a restore
+#: left on the file does not stop the delete, which the deleting account could not clear.
+_DISPOSITION_IGNORE_READONLY = 0x10
 _WIN_UNSUPPORTED = frozenset({1, 50, 87})
 
 
@@ -844,11 +857,13 @@ def delete_through_handle(handle: int) -> None:
     """Windows: delete the file open as ``handle``, through that handle, so what is deleted is the
     file the handle reached and never whatever its name reaches now.
 
-    ``SetFileInformationByHandle``, POSIX semantics first (``FileDispositionInfoEx``), so the name
-    goes at once even while another handle holds the file open. Where the volume has no such
-    delete, the classic ``FileDispositionInfo``, which removes the name only when the last handle
-    to the file closes. The handle must hold DELETE. Raises ``OSError`` when Windows refuses, and
-    :class:`RestrictedFileError` off Windows."""
+    ``SetFileInformationByHandle``, POSIX semantics first (``FileDispositionInfoEx``, ignoring a
+    read-only attribute, then without that flag on a build that predates it), so the name goes
+    when THIS handle closes, even while another handle holds the file open. Where the volume has
+    no such delete, the classic ``FileDispositionInfo``, which removes the name only when the last
+    handle to the file closes and refuses a read-only file. Either way the name is still there
+    until the handle closes. The handle must hold DELETE. Raises ``OSError`` when Windows refuses,
+    and :class:`RestrictedFileError` off Windows."""
     if sys.platform != "win32":
         raise RestrictedFileError("a file is deleted through its handle on Windows only")
     import ctypes
@@ -862,14 +877,18 @@ def delete_through_handle(handle: int) -> None:
         wintypes.DWORD,
     ]
     kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
-    flags = ctypes.c_uint32(_DISPOSITION_DELETE_POSIX)  # FILE_DISPOSITION_INFO_EX.Flags
-    if kernel32.SetFileInformationByHandle(
-        handle, _FILE_DISPOSITION_INFO_EX, ctypes.byref(flags), ctypes.sizeof(flags)
+    for value in (
+        _DISPOSITION_DELETE_POSIX | _DISPOSITION_IGNORE_READONLY,
+        _DISPOSITION_DELETE_POSIX,
     ):
-        return
-    error = ctypes.get_last_error()
-    if error not in _WIN_UNSUPPORTED:
-        raise ctypes.WinError(error)
+        flags = ctypes.c_uint32(value)  # FILE_DISPOSITION_INFO_EX.Flags
+        if kernel32.SetFileInformationByHandle(
+            handle, _FILE_DISPOSITION_INFO_EX, ctypes.byref(flags), ctypes.sizeof(flags)
+        ):
+            return
+        error = ctypes.get_last_error()
+        if error not in _WIN_UNSUPPORTED:
+            raise ctypes.WinError(error)
     delete = ctypes.c_ubyte(1)  # FILE_DISPOSITION_INFO.DeleteFile
     if not kernel32.SetFileInformationByHandle(
         handle, _FILE_DISPOSITION_INFO, ctypes.byref(delete), ctypes.sizeof(delete)

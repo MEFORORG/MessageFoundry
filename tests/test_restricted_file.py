@@ -316,13 +316,24 @@ def test_an_empty_allowlist_refuses_every_file_system() -> None:
         (_SYSTEM, 5, False),
         ("S-1-5-19", 5, False),
         ("S-1-5-80-1-2-3-4-5-6", 5, False),  # not the shape of one service's own SID
+        ("S-1-5-21-1-2-3-1105", 9, True),  # a computer account, as a gMSA may answer
     ],
 )
 def test_a_handoff_is_granted_to_one_account_only(
     sid: str, kind: int | None, allowed: bool
 ) -> None:
-    problem = restricted_file.handoff_grantee_problem(sid, kind)
+    asked: list[str] = []
+
+    def _kind_of(asked_sid: str) -> int | None:
+        asked.append(asked_sid)
+        return kind
+
+    problem = restricted_file.handoff_grantee_problem(sid, _kind_of)
     assert (problem is None) is allowed, problem
+    # Windows is asked only past the checks that need no lookup: the shared accounts, a package
+    # and one service's own SID are judged on the SID alone.
+    no_lookup = sid in {_SYSTEM, "S-1-5-19", "S-1-15-2-1", _SERVICE}
+    assert asked == ([] if no_lookup else [sid])
 
 
 @windows_only
@@ -832,6 +843,26 @@ def test_windows_a_file_is_deleted_through_its_handle(tmp_path: Path) -> None:
     assert path.exists()
     from messagefoundry.store.custody import _open_windows_held
 
+    fd = _open_windows_held(path, delete=True)
+    try:
+        restricted_file.delete_through_handle(msvcrt.get_osfhandle(fd))
+    finally:
+        os.close(fd)
+    assert not path.exists()
+
+
+@windows_only
+def test_windows_a_read_only_file_is_deleted_through_its_handle(tmp_path: Path) -> None:
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        return
+    import msvcrt
+
+    from messagefoundry.store.custody import _open_windows_held
+
+    path = tmp_path / "handoff.key"
+    write_restricted_file(path, b"k")
+    os.chmod(path, stat.S_IREAD)  # FILE_ATTRIBUTE_READONLY, as a copy or a restore may leave it
+    assert os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY
     fd = _open_windows_held(path, delete=True)
     try:
         restricted_file.delete_through_handle(msvcrt.get_osfhandle(fd))

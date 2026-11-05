@@ -106,11 +106,12 @@ class CredentialUnavailable(CustodyError):
     engine cannot honour included."""
 
 
-class HandoffLeftBehind(CustodyError):
+class HandoffLeftBehind(Exception):
     """The handoff was converted, and ``convert`` returned, but the handoff file is still there: its
-    delete was refused, or its name outlived the delete. Told apart from every other refusal of
-    :func:`consume_handoff_file`, which all come before the conversion ran, because the host file
-    this conversion wrote now exists."""
+    delete was refused, or its name outlived the delete. Deliberately NOT a :class:`CustodyError`,
+    so a caller that refuses a start on a custody refusal cannot take this for one: every
+    :class:`CustodyError` of :func:`consume_handoff_file` comes before the conversion ran, and this
+    comes after, once the host file it wrote exists."""
 
 
 # --- the three minted values ----------------------------------------------------------------------
@@ -954,18 +955,20 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
         raise DpapiUnavailable("the handoff blob is Windows-only; a POSIX host needs no handoff")
     from messagefoundry.auth.anchor_path import ADMINISTRATORS_SID
     from messagefoundry.restricted_file import (
+        RestrictedFileError,
         _administrators_enabled,
         _lookup_sid_kind,
         _OwnerRefused,
         _resolve_sid,
-        custody_account_problem,
         handoff_grantee_problem,
     )
 
     service_sid = _resolve_sid(service_account)
-    refused = custody_account_problem(service_sid) or handoff_grantee_problem(
-        service_sid, _lookup_sid_kind(service_sid)
-    )
+    refused: str | None = None
+    try:
+        refused = handoff_grantee_problem(service_sid, _lookup_sid_kind)
+    except RestrictedFileError as exc:
+        refused = str(exc)
     if refused is not None:
         raise CustodyError(f"the handoff was not written for {service_account!r}: {refused}")
     if not _administrators_enabled():
@@ -1027,8 +1030,8 @@ def consume_handoff_file(path: Path, convert: Callable[[HostBlob], None]) -> Hos
     and the error propagates, so a start that cannot convert refuses and never runs from the
     handoff (step 3). When Windows refuses the delete, or the name is still there once the handle
     closes (a volume with no POSIX-semantics delete, while another handle holds the file),
-    :class:`HandoffLeftBehind` says so, after ``convert`` has run; the handoff must then be deleted
-    by hand. Otherwise raises as :func:`read_handoff_file` does. Windows only."""
+    :class:`HandoffLeftBehind` says so, after ``convert`` has run. Otherwise raises as
+    :func:`read_handoff_file` does. Windows only."""
     from messagefoundry.restricted_file import delete_through_handle
     from messagefoundry.secrets_dpapi import DpapiUnavailable
 
@@ -1049,8 +1052,13 @@ def consume_handoff_file(path: Path, convert: Callable[[HostBlob], None]) -> Hos
             return blob
         except OSError:
             pass  # a name still pending its delete answers access denied: it is still there
-        reason = "was deleted through the handle that read it, but its name is still there"
-    raise HandoffLeftBehind(f"{path} was converted, but {reason}; delete it by hand")
+        reason = (
+            "was deleted through the handle that read it, and its name is still there: another "
+            "handle may still hold it, and the name goes when that closes"
+        )
+    raise HandoffLeftBehind(
+        f"{path} was converted, but {reason}; check that it is gone, and delete it if it is not"
+    )
 
 
 # --- the systemd credential (POSIX, draft rule 3b) ------------------------------------------------

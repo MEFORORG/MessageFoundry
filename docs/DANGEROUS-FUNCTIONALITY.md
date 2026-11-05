@@ -481,8 +481,8 @@ pure-Python equivalent:
   never by name, and judged by the same exact check the key custody reads below make. A handoff
   file is made owned by Administrators in that same call, after `advapi32`'s
   `CheckTokenMembership` says this process holds that group enabled, and only for one account, which
-  `advapi32`'s `LookupAccountSidW` must report as a user account unless the SID has the shape of one
-  service's own SID (`handoff_grantee_problem`). For a key custody file the
+  `advapi32`'s `LookupAccountSidW` must report as a user or computer account unless the SID has
+  the shape of one service's own SID (`handoff_grantee_problem`). For a key custody file the
   volume is read through the creating handle too, with `kernel32`'s
   `GetVolumeInformationByHandleW` and `ntdll`'s `NtQueryVolumeInformationFile`, and a file on
   anything but a local NTFS or ReFS disk is removed while still empty. Creating the file on POSIX
