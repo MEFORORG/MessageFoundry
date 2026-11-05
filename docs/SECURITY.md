@@ -5388,7 +5388,10 @@ the right one*:
   latches until a clean pass. A whole-directory outage audits `auth.ad_reconcile_skipped` instead, and
   one such pass raises no alert. A run of `ad_reconcile_outage_passes` of them (3 by default) pages
   once, and the first pass that reaches the directory resolves it (BACKLOG #3709;
-  [CONFIGURATION.md](CONFIGURATION.md) has the row). Both thresholds
+  [CONFIGURATION.md](CONFIGURATION.md) has the row). A partial outage, where some probes go
+  unanswered and the rest are judged, pages after a run as long under its own source,
+  `directory-reconciler-partial-outage`, and audits `auth.ad_reconcile_partial_outage`; the
+  same row says how the two runs meet. Both thresholds
   must be exceeded — the floor alone would sign out a five-person site, the proportion alone would fire
   on a genuine 3-of-3 offboarding — so it trips only on a change that is simultaneously large and broad.
 
@@ -5440,7 +5443,8 @@ estate is still reconciled. A pass with any fault logs one ERROR naming no accou
 fails, at least one a fault, the pass judges no account it asked about and revokes nothing, like an
 outage, but it still pages, and it still strikes an id-less row (BACKLOG #3170). A pass where every
 probe fails and none faults is a plain outage, and pages nobody until a run of them lasts
-`ad_reconcile_outage_passes` passes (BACKLOG #3709). A
+`ad_reconcile_outage_passes` passes (BACKLOG #3709). A pass where some probes fail and others
+are answered pages as a partial outage after a run as long. A
 connection, timeout or name-lookup error that escapes the directory layer is still read as
 unreachable. So is at least an operating-system error saying the network or host is unreachable,
 down or reset. Another network-class error can still read as a probe fault and page.
