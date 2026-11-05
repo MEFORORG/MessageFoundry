@@ -1416,10 +1416,10 @@ def test_several_cas_with_one_name_are_warned_about_in_block_order() -> None:
     acme = _strict_ca("no-key-usage")
     upper = _new_ca(_dn((NameOID.COMMON_NAME, "ACME CA")), key_usage=True, key_ids=False)
     cadata = (_pem(namesake) + _pem(acme[0]) + _pem(upper[0])).decode("ascii")
-    warnings = IssuerIndex(cadata).namesake_warnings()
-    assert len(warnings) == 2, warnings
-    assert "the subject of the CA certificate in block 2." in warnings[0], warnings
-    assert "the subject of the CA certificate in block 3." in warnings[1], warnings
+    found = IssuerIndex(cadata).namesake_warnings()
+    assert len(found) == 2, found
+    assert "the subject of the CA certificate in block 2." in found[0], found
+    assert "the subject of the CA certificate in block 3." in found[1], found
 
 
 @pytest.mark.parametrize("akid", [True, False], ids=["conforming", "no-authority-key-id"])
@@ -1506,12 +1506,11 @@ async def test_a_root_whose_issuer_openssl_reads_as_latin_1_is_self_signed(tmp_p
     a strict listener trusting it alone admits its clients. ``cryptography`` decodes the bytes as
     UTF-8, so read by :func:`pki._namesake_key` alone the root had an issuer, and was named for
     an authority key identifier it may omit (BACKLOG #4948). A control root whose issuer is
-    another name is refused by the same listener, as no issuer of it is loaded, so admission
-    tells the two readings apart."""
-    spelled = b"Acm\xc3\xa9 CA"
-    subject = _dn((NameOID.COMMON_NAME, spelled.decode("latin-1")))
+    another name is refused by a listener of the same shape, as no issuer of it is loaded, so
+    admission tells the two readings apart."""
+    subject = _dn((NameOID.COMMON_NAME, _SPELLED.decode("latin-1")))
     t61 = x509.Name(
-        [x509.NameAttribute(NameOID.COMMON_NAME, spelled.decode("utf-8"), _ASN1Type.T61String)]
+        [x509.NameAttribute(NameOID.COMMON_NAME, _SPELLED.decode("utf-8"), _ASN1Type.T61String)]
     )
     root, key = _strict_ca(akid=False, subject=subject, issuer_name=t61)
     assert b"\x14\x08Acm\xc3\xa9 CA" in root.tbs_certificate_bytes  # the premise
@@ -1533,6 +1532,75 @@ async def test_a_root_whose_issuer_openssl_reads_as_latin_1_is_self_signed(tmp_p
         assert await _handshake_refused(source, _bundle(tmp_path, other))
     finally:
         await source.stop()
+
+
+def _name(*attributes: tuple[x509.ObjectIdentifier, str, _ASN1Type | None]) -> x509.Name:
+    """A name of one attribute per RDN, each in the string type given, or the default."""
+    return x509.Name(
+        [
+            x509.NameAttribute(oid, value) if kind is None else x509.NameAttribute(oid, value, kind)
+            for oid, value, kind in attributes
+        ]
+    )
+
+
+_SPELLED = b"Acm\xc3\xa9 CA"  # UTF-8 bytes of a name with one letter outside ASCII
+_CN = NameOID.COMMON_NAME
+_T61 = _ASN1Type.T61String
+
+
+@pytest.mark.parametrize(
+    ("subject", "issuer"),
+    [
+        pytest.param(
+            _name((_CN, _SPELLED.decode("latin-1"), None)),
+            _name((_CN, _SPELLED.decode("utf-8"), _T61)),
+            id="t61-read-as-latin-1",
+        ),
+        pytest.param(
+            _name((_CN, _SPELLED.decode("utf-8"), None)),
+            _name((_CN, _SPELLED.decode("utf-8"), _T61)),
+            id="t61-read-as-utf-8",
+        ),
+        pytest.param(
+            _name((_CN, _SPELLED.decode("latin-1"), None)),
+            _name((_CN, " " + _SPELLED.decode("utf-8").replace(" ", "  "), _T61)),
+            id="latin-1-and-white-space",
+        ),
+        pytest.param(
+            _name((_CN, "Acme CA", None)), _name((_CN, " ACME \t ca ", None)), id="ascii-folds"
+        ),
+        pytest.param(
+            _name((_CN, "Acme CA", None)), _name((_CN, "Acme CA", None)), id="no-break-space"
+        ),
+        pytest.param(
+            _name((_CN, "Acme CA", None), (NameOID.SERIAL_NUMBER, "123", None)),
+            _name((_CN, "Acme CA", None), (NameOID.SERIAL_NUMBER, "123", _ASN1Type.NumericString)),
+            id="numeric-string",
+        ),
+    ],
+)
+async def test_whether_a_root_is_self_signed_is_read_as_openssl_reads_it(
+    tmp_path: Path, subject: x509.Name, issuer: x509.Name
+) -> None:
+    """Whether a root with no authority key identifier is self-signed, as the CA-cause check reads
+    it, against OpenSSL's own answer, measured, not written down: a strict listener trusting the
+    root alone admits its client only when OpenSSL reads its issuer and subject as one name, and
+    otherwise looks for an issuer it does not hold and refuses (error 2 under ``openssl verify``).
+    Before this fix, on this branch, the check read a T61String as UTF-8 where OpenSSL reads
+    Latin-1, folded white space outside ASCII, and ignored a NumericString's type, so a root with
+    an issuer could read as self-signed and its missing authority key identifier go unnamed; and
+    a name differing in white space and a Latin-1 value at once read as another (BACKLOG
+    #4948)."""
+    root, key = _strict_ca(akid=False, subject=subject, issuer_name=issuer)
+    source = await _started(_source(tmp_path, [root], {subject.rfc4514_string(): [SUBJECT]}))
+    try:
+        refused = await _handshake_refused(source, _bundle(tmp_path, (root, key)))
+    finally:
+        await source.stop()
+    (anchor,) = IssuerIndex(_pem(root).decode("ascii"))._by_subject_name[subject]
+    named = [_CA_FAULTS["no-authority-key-identifier"]] if refused else []
+    assert pki._strict_ca_faults(anchor) == named, refused
 
 
 async def test_a_key_usage_without_key_cert_sign_is_no_ca_to_openssl(tmp_path: Path) -> None:
@@ -1646,7 +1714,7 @@ def test_a_namesake_whose_extensions_cannot_be_read_is_warned_about_without_rais
             "no-key-usage",
             id="fault-read-without-the-issuer",
         ),
-        pytest.param(("no-authority-key-identifier",), None, id="fault-needing-the-issuer"),
+        pytest.param(("no-authority-key-identifier",), "", id="fault-needing-the-issuer"),
     ],
 )
 def test_a_ca_whose_issuer_name_cannot_be_read_is_warned_about_without_raising(
@@ -1657,8 +1725,12 @@ def test_a_ca_whose_issuer_name_cannot_be_read_is_warned_about_without_raising(
     for a CA strict verification refuses read that issuer outside any guard, to tell whether the
     CA is self-signed, so before this fix, on this branch, the namesake warning raised out of the
     listener's start and refused it. Only the authority key identifier faults need the issuer, so
-    a fault read without it is still named, and with none the warning falls back to the namesake
-    wording (BACKLOG #4948)."""
+    a fault read without it is still named. A CA with an authority key identifier needs no issuer
+    read, and gets the namesake wording (``fault`` None). One whose authority key identifier
+    fault needed the issuer (``fault`` empty) gets the warning that every client may be refused,
+    that the check cannot tell whether the CA is the cause, and to check it too: the narrower
+    namesake wording, given there before, told an operator to remove the namesake when strict
+    verification may refuse every client through the CA (BACKLOG #4948)."""
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Root ZZ", _ASN1Type.T61String)])
     v3 = _strict_ca(*defects, by=root, issuer_name=issuer)[0]
@@ -1675,6 +1747,12 @@ def test_a_ca_whose_issuer_name_cannot_be_read_is_warned_about_without_raising(
     if fault is None:
         assert "that CA issued with no authority key identifier" in warning, warning
         assert "as a CA for at least" not in warning, warning
+    elif not fault:
+        assert "refuse every client certificate of that CA" in warning, warning
+        assert "The issuer name of block 1 cannot be read here" in warning, warning
+        assert "whether block 1 itself is the cause" in warning, warning
+        assert "Check block 1 too. Remove block 2" in warning, warning
+        assert "rules block 2 out" not in warning, warning
     else:
         assert f"as a CA for at least this reason: {_CA_FAULTS[fault]}." in warning, warning
     # The start builds the listener and logs the warning.
@@ -1703,7 +1781,57 @@ def test_an_issuer_name_that_warns_does_not_raise_where_warnings_are_errors() ->
         (anchor,) = IssuerIndex(ssl.DER_cert_to_PEM_cert(der))._by_subject_name[
             _dn((NameOID.COMMON_NAME, "Acme CA"))
         ]
-        assert pki._strict_ca_faults(anchor) is None
+        assert pki._strict_ca_faults(anchor) == "issuer name"
+
+
+def test_an_engine_defect_reading_string_types_is_logged_as_one(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If ``cryptography`` stops exposing an attribute's string type, the self-signed read cannot
+    compare names. That is an engine defect, not a fault in the file, so it is logged as a warning
+    with its own text, rather than at debug level as an issuer name that cannot be read, which
+    is how it was caught before this fix, on this branch (BACKLOG #4948). The check never
+    raises, and the fault needing the read is not named."""
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    acme = _strict_ca("no-authority-key-identifier", by=root)
+    (anchor,) = IssuerIndex(_pem(acme[0]).decode("ascii"))._by_subject_name[acme[0].subject]
+    assert pki._strict_ca_faults(anchor) == [_CA_FAULTS["no-authority-key-identifier"]]  # control
+
+    def defect(attribute: object) -> object:
+        raise ValueError("stand-in engine defect")
+
+    monkeypatch.setattr(pki, "_crl_attribute_key", defect)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pki"):
+        assert pki._strict_ca_faults(anchor) == "issuer name"
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("stand-in engine defect" in m for m in warned), warned
+
+
+def test_extensions_that_warn_do_not_raise_out_of_the_namesake_warning() -> None:
+    """A CA whose authority key identifier names its issuer by a directory name holding a
+    three-letter country, beside a namesake. Where warnings are errors, reading the CA's
+    extensions raises ``UserWarning``, which escaped :meth:`IssuerIndex.namesake_warnings`
+    before this fix (BACKLOG #4948). The warning now says the CA's extensions cannot be read and
+    to check it too, as for any other extensions that do not read."""
+    with pytest.warns(UserWarning):
+        root = _ca(
+            x509.Name(
+                [
+                    x509.NameAttribute(NameOID.COUNTRY_NAME, "USA", _validate=False),
+                    x509.NameAttribute(NameOID.COMMON_NAME, "Root CA"),
+                ]
+            )
+        )
+        acme = _strict_ca("authority-key-identifier-without-key-id", by=root)
+    other_root = _ca(_dn((NameOID.COMMON_NAME, "Other Root")))
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), other_root)
+    index = IssuerIndex((_pem(acme[0]) + _pem(namesake)).decode("ascii"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        (warning,) = index.namesake_warnings()
+    assert warning.startswith("certificate block 2 (CN=Acme CA) is not a CA"), warning
+    assert "The extensions of block 1 cannot be read here" in warning, warning
+    assert "Check block 1 too." in warning, warning
 
 
 @pytest.mark.parametrize("surface", ["api", "mllp"])

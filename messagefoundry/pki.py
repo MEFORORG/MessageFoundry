@@ -904,7 +904,7 @@ def _crl_issuer_key(name: x509.Name) -> CrlIssuerKey:
 
     **Latin-1 here covers UTF-8 bytes only.** A one-byte text type whose bytes are not valid
     UTF-8 already fails ``cryptography``'s parse, so the file is refused. A certificate's issuer,
-    which :func:`_self_issued` reads, is parsed only when it is read, so there the read raises
+    which :func:`_strict_ca_faults` reads, is parsed only when it is read, so there the read raises
     and the caller handles it: the certificate itself loads."""
     return tuple(tuple(sorted(map(_crl_attribute_key, rdn))) for rdn in name.rdns)
 
@@ -1785,8 +1785,8 @@ class IssuerIndex:
         verification refuses, or have a key identifier OpenSSL reads, so that case gets the warning
         that every client may be refused, says what it cannot tell, and says to check the CA too.
         For a CA whose issuer name ``cryptography`` cannot read, only the authority key identifier
-        faults go unread; with no other fault found, it gets the namesake wording, as a CA refused
-        for a reason this does not read does. The index does not count a namesake toward the
+        faults go unread; with no other fault found, it gets that same warning, saying the issuer
+        name cannot be read. The index does not count a namesake toward the
         same-DN ambiguity unless it signs itself, so :meth:`unmatched_keys` may give no reason, and
         this is the only start signal. Names are grouped by :func:`_namesake_key`. A warning only:
         it changes no allow, deny or refusal."""
@@ -1806,10 +1806,17 @@ class IssuerIndex:
                 continue  # no namesake here, so read no extension for nothing
             other_ids: list[tuple[_Anchor, bytes | None]] | None = None  # read only if needed
             for ca in ca_anchors:
-                if faults := _strict_ca_faults(ca):
+                faults = _strict_ca_faults(ca)
+                if isinstance(faults, str):
+                    # What did not read is not read again, and the narrow wording never applies.
+                    unread: str | None = faults
+                    ca_key_id, ca_read = None, faults != "extensions"
+                elif faults:
                     warnings.append(_ca_cause_warning(ca, others, faults))
                     continue
-                ca_key_id, ca_read = _key_identifier(ca)
+                else:
+                    unread = None
+                    ca_key_id, ca_read = _key_identifier(ca)
                 if other_ids is None:
                     other_ids = [(other, _key_identifier(other)[0]) for other in others]
                 for other, key_id in other_ids:
@@ -1824,17 +1831,18 @@ class IssuerIndex:
                         )
                     else:
                         why = ""
-                        if not ca_read:
+                        if unread or not ca_read:
+                            # Only unread extensions hide which clients rule the namesake out.
                             rules_out = (
                                 ", or which client certificates of that CA carry an authority key "
                                 f"identifier that rules block {other.position} out"
-                                if key_id is not None
+                                if key_id is not None and not ca_read
                                 else ""
                             )
                             why = (
-                                f" The extensions of block {ca.position} cannot be read here, so "
-                                f"this check cannot tell whether block {ca.position} itself is the "
-                                "cause, as a CA strict verification refuses would be"
+                                f" The {unread or 'extensions'} of block {ca.position} cannot be "
+                                f"read here, so this check cannot tell whether block {ca.position} "
+                                "itself is the cause, as a CA strict verification refuses would be"
                                 f"{rules_out}. Check block {ca.position} too."
                             )
                         effect = (
@@ -1851,34 +1859,34 @@ class IssuerIndex:
         return warnings
 
 
-def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
+#: What reading a certificate's extensions raises, at least, when ``cryptography`` cannot read
+#: them. A ``UserWarning``, such as for a three-letter country in a directory name, is raised only
+#: where warnings are errors.
+_UNREAD_CA_EXTENSIONS = (x509.DuplicateExtension, ValueError, UserWarning, *_UNREAD_EXTENSIONS)
+
+
+def _strict_ca_faults(ca: _Anchor) -> list[str] | Literal["extensions", "issuer name"]:
     """At least some of the reasons strict verification refuses ``ca`` as a CA, read from its own
-    version and extensions, or ``None`` when it finds none and ``cryptography`` cannot read what
-    it needs: a version-3 CA's extensions, or the issuer name where the authority key identifier
-    faults need it. A version-1 CA whose extensions do not read still carries extensions, so it
-    gets that fault. The reasons read are not complete: an empty list means none of these was
-    found, not that strict verification accepts it.
+    version and extensions. When it finds none and ``cryptography`` cannot read what it needs, it
+    says what: a version-3 CA's ``"extensions"``, or its ``"issuer name"`` where an authority key
+    identifier fault needs it. A version-1 CA whose extensions do not read still carries
+    extensions, so it gets that fault. The reasons read are not complete: an empty list means
+    none of these was found, not that strict verification accepts it.
 
     Each was measured on OpenSSL 3.5.7, alone in a CA, to refuse a version-3 and a version-1
     client (BACKLOG #4948); a CA that is not self-signed was measured beside its issuer, as
     strict verification checks its authority key identifier only once it has a chain past it.
-    Whether it is self-signed is read by name: it is when its issuer and subject are one name as
-    :func:`_namesake_key` groups names, which folds white space, or as :func:`_crl_issuer_key`
-    does, which reads a one-byte text type as Latin-1, as OpenSSL reads it. That is still not
-    OpenSSL's reading, in at least two ways. An issuer that differs from the subject both in
-    white space and in such a value is one name to OpenSSL and reads here as another (measured on
-    OpenSSL 3.5.7), so such a root can be named for an authority key identifier it may omit. And
-    :func:`_namesake_key` is looser than OpenSSL in places: it folds white space outside ASCII,
-    such as U+00A0, which OpenSSL 3.5.7 was measured not to, and, as :func:`_issuer_name_key`
-    records, it ignores the string type of a value that is not text. So a CA with an issuer can
-    read as self-signed and that fault go unnamed. OpenSSL refuses a CA with no basic
-    constraints as an invalid CA before any other strict check, so then only that reason is
-    named. OpenSSL reads a certificate with a key usage without ``keyCertSign`` as no CA, so that
-    reason reaches here only where its read and this one differ."""
+    Whether it is self-signed is read by name, by :func:`_self_issued`, which models OpenSSL's
+    comparison. Each way it models was measured against OpenSSL 3.5.7 for at least one pair of
+    names, but it is a model and not OpenSSL's comparison, so it may still differ in ways not
+    measured. OpenSSL refuses a CA with no basic constraints as an invalid CA before any other
+    strict check, so then only that reason is named. OpenSSL reads a certificate with a key usage
+    without ``keyCertSign`` as no CA, so that reason reaches here only where its read and this
+    one differ."""
     if ca.cert.version == x509.Version.v1:
         try:
             bare = not len(ca.cert.extensions)
-        except (x509.DuplicateExtension, ValueError, *_UNREAD_EXTENSIONS) as exc:
+        except _UNREAD_CA_EXTENSIONS as exc:
             _log.debug(
                 "certificate block %d: its extensions cannot be read (%s); a version-1 CA "
                 "carrying them is refused either way",
@@ -1896,14 +1904,14 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
         ]
     try:
         extensions = ca.cert.extensions
-    except (x509.DuplicateExtension, ValueError, *_UNREAD_EXTENSIONS) as exc:
+    except _UNREAD_CA_EXTENSIONS as exc:
         _log.debug(
             "certificate block %d: its extensions cannot be read (%s); the namesake warning "
             "cannot tell whether strict verification refuses it as a CA",
             ca.position,
             type(exc).__name__,
         )
-        return None
+        return "extensions"
     try:
         constraints = extensions.get_extension_for_class(x509.BasicConstraints)
     except x509.ExtensionNotFound:
@@ -1936,9 +1944,7 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
     # A self-signed CA may omit its authority key identifier; one with an issuer may not. Only
     # this reads the issuer name, so one that does not read loses only this fault.
     try:
-        issued = not _self_issued(ca.cert)
-    # A UserWarning is raised only where warnings are errors, for an attribute out of its range,
-    # such as a three-letter country.
+        issuer = ca.cert.issuer
     except (ValueError, UserWarning) as exc:
         _log.debug(
             "certificate block %d: its issuer name cannot be read (%s); the namesake warning "
@@ -1946,7 +1952,17 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
             ca.position,
             type(exc).__name__,
         )
-        return faults or None
+        return faults or "issuer name"
+    try:
+        issued = not _self_issued(issuer, ca.cert.subject)
+    except ValueError as exc:  # _crl_attribute_key: an engine defect, not a fault in the file
+        _log.warning(
+            "certificate block %d: %s; the namesake warning cannot tell whether it may omit its "
+            "authority key identifier",
+            ca.position,
+            exc,
+        )
+        return faults or "issuer name"
     if issued:
         faults.append(
             f"it is not self-signed and {lacks}, which strict verification requires once its "
@@ -1955,13 +1971,31 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
     return faults
 
 
-def _self_issued(cert: x509.Certificate) -> bool:
-    """Whether ``cert``'s issuer and subject are one name, as :func:`_strict_ca_faults` reads it.
-    Raises ``ValueError`` when ``cryptography`` cannot read the issuer name, or its string types
-    (:func:`_crl_issuer_key`), and ``UserWarning`` where warnings are errors."""
-    issuer, subject = cert.issuer, cert.subject
-    return _namesake_key(issuer) == _namesake_key(subject) or (
-        _crl_issuer_key(issuer) == _crl_issuer_key(subject)
+#: ASCII white space other than the space, each to a space, as OpenSSL's ``ossl_isspace`` reads
+#: white space in a name: ASCII only.
+_ASCII_SPACE = str.maketrans("\t\n\v\f\r", "     ")
+
+
+def _self_issued(issuer: x509.Name, subject: x509.Name) -> bool:
+    """Whether ``issuer`` and ``subject`` are one name, modelling OpenSSL's comparison:
+    :func:`_crl_issuer_key`'s form (ASCII case folded, a one-byte text type read as Latin-1, the
+    string type dropped for text types and kept for any other), with ASCII white space dropped
+    around each text value and each run of it inside read as one space. Raises ``ValueError``
+    where :func:`_crl_issuer_key` does."""
+    return _openssl_name_key(issuer) == _openssl_name_key(subject)
+
+
+def _openssl_name_key(name: x509.Name) -> CrlIssuerKey:
+    return tuple(
+        tuple(
+            sorted(
+                (oid, tag, " ".join(filter(None, value.translate(_ASCII_SPACE).split(" "))))
+                if tag == 0 and isinstance(value, str)
+                else (oid, tag, value)
+                for oid, tag, value in rdn
+            )
+        )
+        for rdn in _crl_issuer_key(name)
     )
 
 
