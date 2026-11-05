@@ -2001,13 +2001,14 @@ def _empty_files_in_place(staging: Path) -> list[str]:
             walked = True
             kept: list[str] = []
             for d in dirnames:
+                child = Path(dirpath) / d
                 # Screened first: a name Windows rewrites would have the link test below, and the
                 # walk, reach another directory.
-                if _win_opens_another(Path(dirpath) / d):
-                    unproven.append(f"{d}/ {_REWRITTEN_REASON.format('walked')}")
+                if _win_opens_another(child):
+                    unproven.append(f"{d}/ {_REWRITTEN_DIR}")
                 # Never descend through a link or a junction, which `os.walk` follows even with
                 # `followlinks=False`.
-                elif not _is_dir_link(os.path.join(dirpath, d)):
+                elif not _is_dir_link(os.fspath(child)):
                     kept.append(d)
             dirnames[:] = kept
             for name in filenames:
@@ -2026,8 +2027,12 @@ def _empty_files_in_place(staging: Path) -> list[str]:
 #: What the fail-safe reports for something it reached through a link. Not named: it lives outside
 #: the staging directory, wherever the link pointed, and its name may be anyone's.
 _OUTSIDE_REASON = "an entry outside the directory (reached through a link, not truncated)"
-#: What the Windows fail-safe reports, after the name, for a name :func:`_win_opens_another` flags.
-_REWRITTEN_REASON = "(a name Windows opens as another object, not {})"
+#: What the Windows fail-safe reports, after the name, for a file or a directory whose name
+#: :func:`_win_opens_another` flags.
+_REWRITTEN_FILE = "(a name Windows opens as another object, not truncated)"
+_REWRITTEN_DIR = "(a name Windows opens as another object, not walked)"
+#: What the fail-safe reports, after the name, for a listed file gone from its name before its open.
+_GONE_REASON = "(moved or removed before it was emptied, not truncated)"
 
 
 def _win_opens_another(path: Path) -> bool:
@@ -2052,26 +2057,24 @@ class _HardLinked(OSError):
 
 
 class _Outside(OSError):
-    """Windows: the file opened as itself has a final path outside the staging directory, so it is
+    """Windows: the file opened as itself has a final path outside the directory listed, so it is
     not truncated and is reported as :data:`_OUTSIDE_REASON`. Never carries a name."""
 
 
-def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> str | None:
+def _truncate_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> str | None:
     """Truncate ``entry`` if it is a regular file with one link, checked on the handle that truncates
     it. ``None`` when it was emptied or holds nothing to empty, else what to report.
 
-    ``dir_fd`` is its directory's descriptor on POSIX; ``inside`` is the final path of the directory
-    listed on Windows, with a trailing separator, as :func:`_win_held_walk` yields it. The ``lstat``
-    first only skips a link or a hard link without opening it; the check that decides is the one on
-    the open handle.
+    ``dir_fd`` is its directory's descriptor on POSIX; ``here`` is that directory's final path on
+    Windows, as :func:`_win_held_walk` yields it. The ``lstat`` first only skips a link or a hard
+    link without opening it; the check that decides is the one on the open handle.
 
     A name that is gone at the ``lstat`` or the open is reported, not read as nothing to empty: it
     was listed, so it was renamed or removed since, and a rename leaves the file full under a name
     this walk may never list (BACKLOG #2420)."""
     name = entry.name
-    gone = f"{name} (moved or removed before it was emptied, not truncated)"
     if sys.platform == "win32" and _win_opens_another(entry):
-        return f"{name} {_REWRITTEN_REASON.format('truncated')}"
+        return f"{name} {_REWRITTEN_FILE}"
     try:
         if dir_fd is not None:
             st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -2083,7 +2086,7 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
         else:
             st = os.lstat(entry)
     except FileNotFoundError:
-        return gone
+        return f"{name} {_GONE_REASON}"
     except OSError:
         return name
     # A directory here is one the walk took for a file because reading its type raised, so nothing
@@ -2102,9 +2105,9 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) ->
     if st.st_nlink > 1:
         return f"{name} (hard-linked, not truncated)"
     try:
-        fd = _open_unfollowed(entry, dir_fd, inside)
+        fd = _open_unfollowed(entry, dir_fd, here)
     except FileNotFoundError:
-        return gone
+        return f"{name} {_GONE_REASON}"
     except OSError as exc:
         return _not_truncated(name, exc)
     try:
@@ -2133,9 +2136,9 @@ def _not_truncated(name: str, exc: OSError) -> str:
     return name
 
 
-def _open_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> int:
+def _open_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> int:
     """Open ``entry`` for writing without following a link at its last component, and return a
-    descriptor. A test seam. ``dir_fd`` and ``inside`` are as :func:`_truncate_unfollowed` takes
+    descriptor. A test seam. ``dir_fd`` and ``here`` are as :func:`_truncate_unfollowed` takes
     them.
 
     POSIX opens ``entry.name`` relative to ``dir_fd`` (``entry`` itself without one) with
@@ -2146,8 +2149,8 @@ def _open_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> int
     Windows opens ``entry`` through ``transports/file.py``'s :func:`_win_open_file`, the file
     connector's own open: as itself, refusing a link or junction there (``_Unconfined``), and
     refusing a reopen that reaches another file (``_Replaced``). Before a filter is let serve the
-    file, the file opened as itself must have a final path under ``inside``, the directory listed
-    (``_Outside``), and equal to ``inside`` joined with the name listed (``_Replaced``), and pass
+    file, the file opened as itself must have a final path under ``here``, the directory listed
+    (``_Outside``), and equal to ``here`` joined with the name listed (``_Replaced``), and pass
     :func:`_vet_for_truncate`. So a file reached outside the directory, through a directory turned
     into a junction in place, is never served by its filter (BACKLOG #4992), and a name Windows
     rewrote on the way to the open is never truncated as another file (BACKLOG #2420), the exact
@@ -2163,11 +2166,11 @@ def _open_unfollowed(entry: Path, dir_fd: int | None, inside: str | None) -> int
 
         def vet(fd: int) -> None:
             opened.append(True)
-            if inside is not None:
+            if here is not None:
                 final = _win_final_path(_os_handle(fd))
-                if not final.startswith(inside):
+                if not final.startswith(here):
                     raise _Outside("outside the directory")
-                if final != inside + os.path.normcase(entry.name):
+                if final != here + os.path.normcase(entry.name):
                     raise _Replaced("not the name listed")
             _vet_for_truncate(fd)
 
@@ -2313,7 +2316,7 @@ def _win_hold_root(staging: Path, unproven: list[str]) -> tuple[list[int], str] 
     open as another directory (:func:`_win_opens_another`), as a sweep's planted ``mefor-backup-x.``
     would open ``mefor-backup-x``."""
     if _win_opens_another(staging):
-        unproven.append(f"{staging.name}/ {_REWRITTEN_REASON.format('walked')}")
+        unproven.append(f"{staging.name}/ {_REWRITTEN_DIR}")
         return None
     try:
         root = _win_hold_dirs(staging.parent, (staging.name,))

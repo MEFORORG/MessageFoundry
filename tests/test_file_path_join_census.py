@@ -715,6 +715,18 @@ SITES: dict[str, Site] = {
         "directory is held; the child is then opened as itself and refused if it names another "
         "path (BACKLOG #4992).",
     ),
+    "messagefoundry/pipeline/dr_backup.py::_win_hold_below": Site(
+        1,
+        REVIEWED,
+        "The names walked below a held staging directory, joined only to compare against the held "
+        "directory's final path; never opened (BACKLOG #2420).",
+    ),
+    "messagefoundry/pipeline/dr_backup.py::_win_opens_another": Site(
+        1,
+        REVIEWED,
+        "A listed name joined to its directory only to ask whether Win32 would rewrite it; never "
+        "opened (BACKLOG #2420).",
+    ),
     "messagefoundry/pipeline/dr_backup.py::_fd_walk": Site(
         1,
         REVIEWED,

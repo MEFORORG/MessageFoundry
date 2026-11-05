@@ -614,8 +614,7 @@ def test_a_file_that_vanishes_only_after_its_open_is_still_reported(tmp_path, mo
 # Two defects of this item's class, rolled in 2026-11-04 from engine PR 2744's open findings 1 and 2.
 
 _PLAINTEXT = b"synthetic plaintext"
-_REWRITTEN = "(a name Windows opens as another object, not {})"
-_GONE = "(moved or removed before it was emptied, not truncated)"
+_GONE = dr_backup._GONE_REASON
 
 
 def _verbatim(root: Path, *names: str) -> str:
@@ -662,7 +661,7 @@ def test_a_name_windows_rewrites_is_reported_and_not_truncated_as_another_file(
     if sibling != name:
         (staging / sibling).write_bytes(b"synthetic sibling")
     unproven = dr_backup._empty_files_in_place(staging)
-    assert unproven == [f"{name} {_REWRITTEN.format('truncated')}"]
+    assert unproven == [f"{name} {dr_backup._REWRITTEN_FILE}"]
     assert _size(staging, name) == len(_PLAINTEXT)
     if sibling != name:
         # The control: the sibling is a listed file of its own, and is emptied as itself.
@@ -682,7 +681,7 @@ def test_a_directory_name_windows_rewrites_is_not_walked_as_another_directory(
     (staging / "sub").mkdir()
     (staging / "sub" / "own.tar").write_bytes(_PLAINTEXT)
     unproven = dr_backup._empty_files_in_place(staging)
-    assert unproven == [f"sub./ {_REWRITTEN.format('walked')}"]
+    assert unproven == [f"sub./ {dr_backup._REWRITTEN_DIR}"]
     assert _size(staging, "sub.", "inner.tar") == len(_PLAINTEXT)
     assert (staging / "sub" / "own.tar").read_bytes() == b""
 
@@ -695,7 +694,7 @@ def test_a_staging_root_whose_name_windows_rewrites_is_not_walked(win_tmp: Path)
     other.mkdir()
     (other / "archive.tar").write_bytes(_PLAINTEXT)
     unproven = dr_backup._empty_files_in_place(win_tmp / "mefor-backup-x.")
-    assert unproven == [f"mefor-backup-x./ {_REWRITTEN.format('walked')}"]
+    assert unproven == [f"mefor-backup-x./ {dr_backup._REWRITTEN_DIR}"]
     assert (other / "archive.tar").read_bytes() == _PLAINTEXT
 
 
