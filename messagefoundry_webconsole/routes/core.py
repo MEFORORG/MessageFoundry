@@ -1413,7 +1413,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if prior is None or not identity.can_access_channel(prior.to_destination):
             return HTMLResponse(pages.message_resend_unknown(message_id), status_code=404)
         return HTMLResponse(
-            pages.message_resend_done(message_id, prior.to_destination, "", duplicate=duplicate)
+            pages.message_resend_done(message_id, prior.to_destination, duplicate=duplicate)
         )
 
     # NEITHER OUTCOME GOES TO THE MESSAGE DETAIL PAGE. That page is `require_ui(MESSAGES_VIEW_RAW)`,

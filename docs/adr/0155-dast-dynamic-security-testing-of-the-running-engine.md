@@ -353,7 +353,10 @@ reach passes exempt is a row they never measure (vault BACKLOG #3241).
 **What changed.** When a privileged reach probe gets a 403 that names an action in
 `X-Step-Up-Action`, the sweep re-proves the scan password for that action through `POST /me/reauth`,
 carries the re-keyed token forward, and sends the probe once more. That is what the IDE and the
-harness do. A second refusal is scored like any other row. A refused re-proof is exit 2. The BFLA
+harness do. A second refusal is scored like any other row. A refused re-proof is exit 2 (changed
+2026-11-05, vault BACKLOG #3241 added item 3: the sweep now lists the row as a refused re-proof,
+scores it as unreached, and goes on, and the receipt check makes any refused re-proof an error, so
+the run exits 1 or, where the lost rows breach a floor, 2). The BFLA
 passes never re-prove, because a low-privilege caller must be refused before any step-up is asked.
 The receipt counts the re-proofs and lists their rows by method and path template. It never records
 the action, which is a header value.

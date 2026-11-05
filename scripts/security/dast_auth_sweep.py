@@ -252,6 +252,7 @@ async def _reach_probe(
     *,
     target: DastTarget,
     reproved: list[str],
+    reproof_refused: list[str],
 ) -> tuple[int, str]:
     """One privileged probe that passes an action-bound step-up wall: ``(status, live token)``.
 
@@ -261,14 +262,24 @@ async def _reach_probe(
     re-proves for the named action ONCE, as the IDE and the harness do, and sends the probe again.
     A second refusal is scored like any other, so a wall that a re-proof cannot pass still reds.
 
+    A re-proof the engine refuses no longer ends the sweep (vault BACKLOG #3241, added item 3). The
+    row goes into ``reproof_refused``, keeps its first 403, and is scored as unreached like any
+    other refused row, so the run still fails, and every other row is still measured. The token is
+    unchanged: a refused re-proof re-keys nothing.
+
     The re-proof re-keys the session, so the caller must carry the returned token forward. Only
-    the method and path template go into ``reproved``, never the action: it is a header value.
+    the method and path template go into ``reproved`` and ``reproof_refused``, never the action: it
+    is a header value.
     """
     response = await client.request(row.method, url, headers={"Authorization": f"Bearer {token}"})
     action = response.headers.get(STEP_UP_ACTION_HEADER)
     if response.status_code != 403 or not action:
         return response.status_code, token
-    token = await target.reprove(token, action)
+    try:
+        token = await target.reprove(token, action)
+    except DastTargetUnusable:
+        reproof_refused.append(f"{row.method} {row.path}")
+        return response.status_code, token
     reproved.append(f"{row.method} {row.path}")
     response = await client.request(row.method, url, headers={"Authorization": f"Bearer {token}"})
     return response.status_code, token
@@ -285,12 +296,14 @@ async def _write_pass(
     max_rebuilds: int,
     rebuilt: list[str],
     reproved: list[str] | None = None,
+    reproof_refused: list[str] | None = None,
 ) -> tuple[list[tuple[route_gates.RouteRow, int]], str]:
     """Probe ``rows`` with ``username``'s session, keeping that session alive across side effects.
     Returns the results and the session's token as the pass left it.
 
     With ``reproved`` given, each probe passes an action-bound step-up wall through
-    :func:`_reach_probe`, which records the row there. The privileged reach pass passes it; the
+    :func:`_reach_probe`, which records the row there, or in ``reproof_refused`` when the engine
+    refuses the re-proof. The privileged reach pass passes it; the
     BFLA pass does not, because a low-privilege caller must be refused before any step-up is asked.
 
     THE PROBLEM THIS SOLVES, measured rather than imagined: ``POST /auth/logout`` answers a valid
@@ -317,7 +330,13 @@ async def _write_pass(
             status = await _probe(client, row.method, url, token)
         else:
             status, token = await _reach_probe(
-                client, row, url, token, target=target, reproved=reproved
+                client,
+                row,
+                url,
+                token,
+                target=target,
+                reproved=reproved,
+                reproof_refused=reproof_refused if reproof_refused is not None else [],
             )
         results.append((row, status))
 
@@ -366,6 +385,7 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
         write_outcomes = {"refused": 0, "stopped-at-validation": 0, "executed": 0}
         rebuilt: list[str] = []
         reproved: list[str] = []
+        reproof_refused: list[str] = []
         max_rebuilds = int(policy.get("max_write_session_rebuilds", 0))
         # The administrator's session as the reach passes leave it: a re-proof re-keys it.
         admin_token = target.admin_token
@@ -399,7 +419,13 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
             for row in get_rows:
                 url = route_gates.concrete_path(row.path, placeholder)
                 status, admin_token = await _reach_probe(
-                    client, row, url, admin_token, target=target, reproved=reproved
+                    client,
+                    row,
+                    url,
+                    admin_token,
+                    target=target,
+                    reproved=reproved,
+                    reproof_refused=reproof_refused,
                 )
                 if is_reached(status):
                     reached += 1
@@ -465,6 +491,7 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
                 max_rebuilds=max_rebuilds,
                 rebuilt=rebuilt,
                 reproved=reproved,
+                reproof_refused=reproof_refused,
             )
             for row, status in write_reach_results:
                 write_outcomes[write_probe_outcome(status)] += 1
@@ -521,6 +548,10 @@ async def run_sweep(policy: dict[str, Any], *, canary: str | None = None) -> dic
             # template only; the action the gate named is a header value and stays out.
             "step_up_reproofs": len(reproved),
             "step_up_reproof_rows": list(reproved),
+            # Rows whose re-proof the engine refused (vault BACKLOG #3241, added item 3). Each is
+            # also scored as unreached above, so the run fails; the sweep no longer stops there.
+            "step_up_reproof_refusals": len(reproof_refused),
+            "step_up_reproof_refused_rows": list(reproof_refused),
             "findings": findings,
             "canary": canary,
         }
@@ -689,6 +720,16 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
             "kept dying cannot be credited."
         )
 
+    # Vault BACKLOG #3241, added item 3: a refused re-proof no longer ends the sweep, so it is an
+    # error here, whether or not its row is also allowlisted. The scan password re-proved nothing for
+    # that row, so the step-up wall in front of it was measured, not the route behind it.
+    refused_reproofs = receipt.get("step_up_reproof_refused_rows") or []
+    if refused_reproofs:
+        errors.append(
+            f"the engine refused the action-bound re-proof for {len(refused_reproofs)} row(s): "
+            f"{refused_reproofs}. Each was measured at its step-up wall, not behind it."
+        )
+
     max_unexplained = int(policy.get("max_unexplained_unreached", 0))
     unexplained = int(receipt.get("unreached_unexplained", 0))
     if unexplained > max_unexplained:
@@ -835,7 +876,9 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
         f"re-minted -- {receipt.get('write_session_rebuild_rows') or 'none'}",
         f"step-up re-proofs -- {receipt.get('step_up_reproofs', 0)} row(s) refused the "
         "administrator with an action-bound step-up, were re-proved for that action and probed "
-        f"again -- {receipt.get('step_up_reproof_rows') or 'none'}",
+        f"again -- {receipt.get('step_up_reproof_rows') or 'none'}; "
+        f"{receipt.get('step_up_reproof_refusals', 0)} re-proof(s) refused -- "
+        f"{receipt.get('step_up_reproof_refused_rows') or 'none'}",
         f"floors -- {floor_text} unexplained<="
         f"{policy.get('max_unexplained_unreached', 0)} "
         f"{'ok' if int(receipt.get('unreached_unexplained', 0)) <= int(policy.get('max_unexplained_unreached', 0)) else 'FAIL'}"

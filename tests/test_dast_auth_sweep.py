@@ -776,13 +776,68 @@ def test_without_a_re_proof_the_action_bound_rows_are_findings(
     )
 
 
-async def test_a_refused_re_proof_is_a_could_not_measure() -> None:
-    """A re-proof the engine refuses raises ``DastTargetUnusable``, which ``main()`` turns into
-    exit 2. Driven on the real endpoint with a token that authenticates nothing."""
+async def test_a_refused_re_proof_raises_from_the_target() -> None:
+    """A re-proof the engine refuses raises ``DastTargetUnusable`` out of the target's
+    ``reprove``. Driven on the real endpoint with a token that authenticates nothing. The sweep
+    catches it per row; the next test pins what it does then."""
     async with dast_target() as target:
         with pytest.raises(DastTargetUnusable) as caught:
             await target.reprove("dast-not-a-real-token", "config_reload")
     assert "measured nothing" in str(caught.value), caught.value
+
+
+def test_a_refused_re_proof_is_a_finding_and_the_sweep_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3241, added item 3. One refused re-proof used to end the whole sweep with
+    exit 2, so every row after it went unmeasured. Now the sweep goes on: the refused rows are
+    listed and scored, every other action-bound row is still re-proved, and the run still fails.
+    RED when: a refused re-proof aborts the run, its rows are not listed, or the run exits 0."""
+    import scripts.security.dast_auth_sweep as sweep
+
+    real = dast_target
+    # A row the clean run re-proves: POST /config/reload with no body stops at validation first.
+    refused_action = "connection_purge"
+
+    @asynccontextmanager
+    async def _target(**kwargs: Any) -> AsyncIterator[Any]:
+        async with real(**kwargs) as target:
+            real_reprove = target.reprove
+
+            async def _refuse_one_action(token: str, action: str) -> str:
+                if action == refused_action:
+                    raise DastTargetUnusable("synthetic: the engine refused this re-proof")
+                return await real_reprove(token, action)
+
+            yield replace(target, reprove=_refuse_one_action)
+
+    monkeypatch.setattr(sweep, "dast_target", _target)
+    receipt_path = tmp_path / "receipt.json"
+    code = main(["--policy", str(_POLICY), "--receipt", str(receipt_path)])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    assert code == 1, f"a refused re-proof should be a finding, exit 1, not {code}"
+    expected = {"POST /connections/{name}/purge"}
+    assert _action_bound_rows()[("POST", "/connections/{name}/purge")] == refused_action
+    assert set(receipt["step_up_reproof_refused_rows"]) == expected, receipt
+    assert receipt["step_up_reproof_refusals"] == len(expected)
+    # The rows after the refusal were still measured: the other bound rows were re-proved.
+    assert receipt["step_up_reproofs"] > 0
+    assert not set(receipt["step_up_reproof_rows"]) & expected
+    assert refused_action not in json.dumps(receipt)  # the action is a header value
+
+
+def test_a_receipt_with_a_refused_re_proof_does_not_pass(
+    clean_run: tuple[int, dict[str, Any]],
+) -> None:
+    """The receipt-side half: a refused re-proof is an error on its own, so a row that is also
+    allowlisted, or otherwise scored as reached, cannot hide it. The clean receipt is the control."""
+    clean_code, clean = clean_run
+    assert clean_code == 0 and clean["step_up_reproof_refused_rows"] == []
+    code, errors = evaluate(
+        {**clean, "step_up_reproof_refused_rows": ["POST /config/reload"]}, _policy()
+    )
+    assert code == 1 and any("refused the action-bound re-proof" in e for e in errors), errors
 
 
 # =====================================================================================================
