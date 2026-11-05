@@ -477,8 +477,8 @@ SITES: dict[str, Site] = {
     "messagefoundry/_child_bootstrap.py::_load_this_build": Site(
         1, INTERNAL, "A fixed name in the engine's own package directory."
     ),
-    "messagefoundry/anon/leak.py::_scanner": Site(1, INTERNAL, _PKG_LITERAL),
-    "messagefoundry/anon/surrogates.py::_resolve_token_text": Site(
+    "messagefoundry_toolkit/anon/leak.py::_scanner": Site(1, INTERNAL, _PKG_LITERAL),
+    "messagefoundry_toolkit/anon/surrogates.py::_resolve_token_text": Site(
         1, INTERNAL, "One fixed path under the folder that holds the package."
     ),
     "messagefoundry/api/tls.py::_generated_pair": Site(

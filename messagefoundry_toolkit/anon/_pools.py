@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Surrogate value pools — the **engine seam** (ADR 0030 §1/§3).
 
-:mod:`messagefoundry.anon.surrogates` draws fabricated names/streets/cities/clinicians from these
+:mod:`messagefoundry_toolkit.anon.surrogates` draws fabricated names/streets/cities/clinicians from these
 pools. On the engine side they are re-exported straight from the generator's already-pure,
 dependency-free data tables (:mod:`messagefoundry.generators._hl7data`) so there is **one** source
 of synthetic data — surrogates and the synthetic ADT generator stay consistent and there is nothing

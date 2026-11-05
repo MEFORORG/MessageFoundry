@@ -108,8 +108,17 @@ def _imported_modules(path: Path, root: Path, *, with_names: bool = False) -> se
     return _modules_imported_by(tree, _package_of(path, root), with_names=with_names)
 
 
-def _modules_imported_by(tree: ast.AST, package: str, *, with_names: bool = False) -> set[str]:
-    """`_imported_modules` over a tree already parsed, for a file in the dotted ``package``."""
+def _modules_imported_by(
+    tree: ast.AST,
+    package: str,
+    *,
+    with_names: bool = False,
+    name_parents: frozenset[str] = frozenset({_ROOT_PACKAGE}),
+) -> set[str]:
+    """`_imported_modules` over a tree already parsed, for a file in the dotted ``package``.
+
+    A `from <parent> import name` also yields ``<parent>.name`` for each parent in
+    ``name_parents``, since a package can be imported as a name of its parent."""
     mods: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -122,7 +131,7 @@ def _modules_imported_by(tree: ast.AST, package: str, *, with_names: bool = Fals
             else:
                 module = _resolve_relative(package, node.level, node.module)
             mods.add(module)
-            if with_names or module == _ROOT_PACKAGE:
+            if with_names or module in name_parents:
                 mods.update(f"{module}.{a.name}" for a in node.names if a.name != "*")
     return mods
 
@@ -1584,10 +1593,11 @@ def test_the_toolkit_search_sees_a_planted_name(tmp_path: Path, plant: str) -> N
 
 # --- No walked source file imports the anon package, or looks like it does (follows PR 2024) ----
 #
-# No file in the source trees this test walks imports `messagefoundry.anon` today, outside the
-# package itself. Those trees are at least `messagefoundry/`, `harness/` and `scripts/`. The tee
-# carries its own copy of the package, and the harness capture sink is handed a plain str-to-str
-# `anonymizer`. `tests/` and `tee/` are not walked, and tests import the package freely.
+# No file in the source trees this test walks imports `messagefoundry_toolkit.anon` today, outside
+# the package itself. Those trees are at least `messagefoundry/`, `messagefoundry_toolkit/`,
+# `harness/` and `scripts/`. The tee carries its own copy of the package, and the harness capture
+# sink is handed a plain str-to-str `anonymizer`. `tests/` and `tee/` are not walked, and tests
+# import the package freely.
 #
 # TWO SEARCHES HOLD THAT STATE, because each sees what the other misses.
 #
@@ -1599,10 +1609,10 @@ def test_the_toolkit_search_sees_a_planted_name(tmp_path: Path, plant: str) -> N
 #
 # The second parses each file and reads its imports. It sees at least these shapes the pattern
 # does not spell: a relative import such as `from ..anon import Keyer`, `import os,
-# messagefoundry.anon`, a `from messagefoundry import (` wrapped over several lines, and two spaces
-# after `from`. It also reads a call spelled `import_module(...)` or `x.import_module(...)` with a
-# literal name. A relative name there needs a literal `package` or `__package__`. And it reads a
-# call spelled `__import__(...)` or `x.__import__(...)` with a literal name. A literal `level` above
+# messagefoundry_toolkit.anon`, a `from messagefoundry_toolkit import (` wrapped over several
+# lines, and two spaces after `from`. It also reads a call spelled `import_module(...)` or
+# `x.import_module(...)` with a literal name. A relative name there needs a literal `package` or
+# `__package__`. And it reads a call spelled `__import__(...)` or `x.__import__(...)` with a literal name. A literal `level` above
 # zero makes that name relative to the file's own package. A literal list, tuple or set `fromlist`
 # adds its names. A relative import that climbs past its top package is resolved the same way in
 # every form: clamped at the top and reported, though it would fail at run time. The parse cannot
@@ -1620,15 +1630,16 @@ def test_the_toolkit_search_sees_a_planted_name(tmp_path: Path, plant: str) -> N
 # so. An owner ruling says which side gives way, and `_REAL_ANON_IMPORT_ADVICE` cites it in every
 # failure message that may be a real import.
 #
-# THE PACKAGE'S OWN FILES. The claim is about files outside `messagefoundry/anon/`, and the package
-# imports its own modules, so the parse reports nothing there. It counts those imports instead, as
-# its positive control on the real tree. The text search does report there. The verifier reads the
+# THE PACKAGE'S OWN FILES. The claim is about files outside `messagefoundry_toolkit/anon/`, and the
+# package imports its own modules, so the parse reports nothing there. It counts those imports
+# instead, as its positive control on the real tree. The text search does report there. The verifier reads the
 # package's files with the same pattern and skips nothing, so a hit there reads the claim FALSE as
 # surely as one anywhere else. It gets its own message.
 #
-# IF THE PACKAGE MOVES. ADR 0201 section 5 moves it to `messagefoundry_toolkit/anon/` (BACKLOG
-# #1192). After that, nothing can import `messagefoundry.anon`, and both searches would pass on
-# nothing. So the real-tree tests fail first when the package directory is gone.
+# IF THE PACKAGE MOVES. ADR 0201 section 5 moved it from `messagefoundry/anon/` to
+# `messagefoundry_toolkit/anon/` (BACKLOG #1192, slice 6), and these searches moved with it. A
+# search for the old name would pass on nothing, since nothing can import it. So the real-tree
+# tests fail first when the package directory is gone, and a later move re-points them again.
 #
 # Both searches read the files the source walk in `scripts/asvs/scorecard.py` reads, through that
 # module's own per-file view, and keep no copy of its walk. The view is raw text under `harness/`
@@ -1636,15 +1647,16 @@ def test_the_toolkit_search_sees_a_planted_name(tmp_path: Path, plant: str) -> N
 # would miss the same two lines in a docstring under `messagefoundry/`.
 
 _ANON_IMPORT = re.compile(
-    r"(from|import) messagefoundry\.anon\b|from messagefoundry import [^\n]*\banon\b"
+    r"(from|import) messagefoundry_toolkit\.anon\b|from messagefoundry_toolkit import [^\n]*\banon\b"
 )
 
-#: The dotted package both searches are about, and the directory it lives in.
-_ANON_MODULE = "messagefoundry.anon"
+#: The dotted package both searches are about, its parent package, and the directory it lives in.
+_ANON_MODULE = "messagefoundry_toolkit.anon"
+_ANON_PARENT = _ANON_MODULE.rpartition(".")[0]
 _ANON_PACKAGE_DIR = PurePosixPath(*_ANON_MODULE.split("."))
 
 #: Every import shape the parse is named to see spells ``anon`` as a whole word, whether as
-#: ``messagefoundry.anon``, ``..anon`` or ``import anon``. So a file outside the package without
+#: ``messagefoundry_toolkit.anon``, ``..anon`` or ``import anon``. So a file outside the package without
 #: it is not parsed. The section comment above says what that lets through.
 _ANON_WORD = re.compile(r"\banon\b")
 
@@ -1652,22 +1664,23 @@ _ANON_WORD = re.compile(r"\banon\b")
 #: walks a tree, so a pattern edited until it matches nothing fails there, in every test that reads
 #: the search, before a clean tree can pass it.
 _ANON_IMPORT_SHAPES = (
-    "from messagefoundry.anon import Keyer, anonymize_checked",
-    "        from messagefoundry.anon.leak import CoverageTally",
-    "import messagefoundry.anon",
-    "from messagefoundry import parsing, anon",
-    "# a caller does: from messagefoundry.anon import Keyer",
+    "from messagefoundry_toolkit.anon import Keyer, anonymize_checked",
+    "        from messagefoundry_toolkit.anon.leak import CoverageTally",
+    "import messagefoundry_toolkit.anon",
+    "from messagefoundry_toolkit import lens, anon",
+    "# a caller does: from messagefoundry_toolkit.anon import Keyer",
 )
 
 #: One file per form the parse reads outside the package, by its path and text. Like the shapes
 #: above, `_guarded_anon_search` checks each before it walks a tree.
 _ANON_PARSE_SHAPES: Mapping[str, str] = MappingProxyType(
     {
-        "harness/joined.py": "import os, messagefoundry.anon\n",
-        "messagefoundry/sub/rel.py": "from ..anon import Keyer\n",
-        "harness/call.py": 'importlib.import_module("messagefoundry.anon")\n',
-        "messagefoundry/pkg.py": 'import_module(".anon", __package__)\n',
-        "harness/dunder.py": '__import__("messagefoundry", fromlist=["anon"])\n',
+        "harness/joined.py": "import os, messagefoundry_toolkit.anon\n",
+        "messagefoundry_toolkit/sub/rel.py": "from ..anon import Keyer\n",
+        "harness/call.py": 'importlib.import_module("messagefoundry_toolkit.anon")\n',
+        "messagefoundry_toolkit/pkg.py": 'import_module(".anon", __package__)\n',
+        "harness/dunder.py": '__import__("messagefoundry_toolkit", fromlist=["anon"])\n',
+        "harness/wrapped.py": "from messagefoundry_toolkit import (\n    anon,\n)\n",
     }
 )
 
@@ -1676,32 +1689,30 @@ _ANON_DOCSTRING_PLANT = (
     "class CaptureSink:\n"
     '    """For example::\n'
     "\n"
-    "        from messagefoundry.anon import Keyer, anonymize_checked\n"
-    "        from messagefoundry.anon.leak import CoverageTally\n"
+    "        from messagefoundry_toolkit.anon import Keyer, anonymize_checked\n"
+    "        from messagefoundry_toolkit.anon.leak import CoverageTally\n"
     '    """\n'
 )
 
 #: The fewest `.py` files the real walk must read under each root before a clean verdict means
 #: anything. About half the census taken at 60647bb242 (messagefoundry 334, harness 147, scripts
-#: 79, messagefoundry_webconsole 37), for the reason `_MIN_FILES_WALKED` gives. One floor per root,
-#: because one total floor still passes with a whole root gone: losing all of `harness/` left 436
-#: files over a total floor of 290. `_guarded_anon_search` holds them, so no test reads the search
-#: without them.
+#: 79, messagefoundry_webconsole 37), and at slice 6 of ADR 0201 for messagefoundry_toolkit (14),
+#: for the reason `_MIN_FILES_WALKED` gives. One floor per root, because one total floor still
+#: passes with a whole root gone: losing all of `harness/` left 436 files over a total floor of
+#: 290. `_guarded_anon_search` holds them, so no test reads the search without them.
 _MIN_ANON_SEARCH_FILES: Mapping[str, int] = MappingProxyType(
-    {"messagefoundry": 160, "harness": 70, "scripts": 40, "messagefoundry_webconsole": 18}
+    {
+        "messagefoundry": 160,
+        "harness": 70,
+        "scripts": 40,
+        "messagefoundry_webconsole": 18,
+        "messagefoundry_toolkit": 7,
+    }
 )
 
 #: Each root the walk reads that has no floor, and why. `_guarded_anon_search` refuses a root the
 #: walk reads with neither, so a root the verifier starts to walk gets a decision here.
-_UNFLOORED_ANON_ROOTS: Mapping[str, str] = MappingProxyType(
-    {
-        "messagefoundry_toolkit": (
-            "it held 3 `.py` files at 60647bb242, under `_MIN_FLOOR`, the least a floor here may "
-            "be. ADR 0201 section 5 moves the anon package there, and the package-gone check "
-            "fires first on that move; floor this root when these tests are re-pointed."
-        ),
-    }
-)
+_UNFLOORED_ANON_ROOTS: Mapping[str, str] = MappingProxyType({})
 
 #: Shared by every failure that may be a real import, and so put first in each.
 _REAL_ANON_IMPORT_ADVICE = (
@@ -1709,7 +1720,8 @@ _REAL_ANON_IMPORT_ADVICE = (
     "imports the package, and its correction says none does. The record's absence claim says no "
     "file outside the package imports it. "
     "The owner ruled that the import gives way to the claim (owner ruling 2026-10-12, BACKLOG "
-    "#3006 part 3). An author who needs the package waits for its move, BACKLOG #1192. Do not "
+    "#3006 part 3). The package has moved to messagefoundry_toolkit/anon/ (BACKLOG #1192), "
+    "and the claim moved with it. Do not "
     "hide the import from these searches by rewording it or building its name at run time."
 )
 
@@ -1774,7 +1786,10 @@ def _parsed_anon_imports(rel: PurePosixPath, source: str) -> list[str]:
         raise AssertionError(f"{rel} does not parse, so the anon search cannot read it") from exc
     # The file's `__package__`, for a module and for an `__init__.py` alike.
     own_package = ".".join(rel.parent.parts)
-    named = _modules_imported_by(tree, own_package)
+    # `from messagefoundry_toolkit import anon` names the package as an imported NAME of its parent.
+    named = _modules_imported_by(
+        tree, own_package, name_parents=frozenset({_ROOT_PACKAGE, _ANON_PARENT})
+    )
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -1907,9 +1922,10 @@ def _guarded_anon_search(
     if not (root / _ANON_PACKAGE_DIR / "__init__.py").is_file():
         raise AssertionError(
             f"{_ANON_PACKAGE_DIR}/ is gone, so no file can import {_ANON_MODULE} and the anon "
-            f"searches would pass on nothing. ADR 0201 section 5 moves the package to "
-            f"messagefoundry_toolkit/anon/ (BACKLOG #1192). Re-point or retire these tests "
-            f"together with the record's absence claim on that row; do not just delete this check."
+            f"searches would pass on nothing. ADR 0201 section 5 moved the package here from "
+            f"messagefoundry/anon/ (BACKLOG #1192). If it moves again, re-point or retire these "
+            f"tests together with the record's absence claim on that row; do not just delete "
+            f"this check."
         )
     search = _anon_search(root)
     for top, floor in floors.items():
@@ -1954,8 +1970,8 @@ def _real_anon_search() -> _AnonSearch:
 def test_the_anon_guard_refuses_each_tree_it_exists_to_refuse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    floors = {"harness": _MIN_FLOOR, "messagefoundry": _MIN_FLOOR}
-    for top, files in (("harness", _MIN_FLOOR), ("messagefoundry", _MIN_FLOOR - 1)):
+    floors = {"harness": _MIN_FLOOR, "messagefoundry_toolkit": _MIN_FLOOR}
+    for top, files in (("harness", _MIN_FLOOR), ("messagefoundry_toolkit", _MIN_FLOOR - 1)):
         (tmp_path / top).mkdir()
         for i in range(files):
             (tmp_path / top / f"m{i}.py").write_text("import json\n", encoding="utf-8")
@@ -2006,30 +2022,33 @@ def test_the_anon_searches_see_every_planted_shape(tmp_path: Path) -> None:
         "harness/reconcile/capture.py": _ANON_DOCSTRING_PLANT,
         "messagefoundry/x.py": _ANON_DOCSTRING_PLANT,
         "scripts/tool.py": _ANON_DOCSTRING_PLANT,
-        "scripts/live.py": "from messagefoundry.anon import Keyer\n",
+        "scripts/live.py": "from messagefoundry_toolkit.anon import Keyer\n",
         "harness/clean.py": "import json\n",
-        "harness/joined.py": "import os, messagefoundry.anon\n",
-        "harness/bom.py": "\ufeffimport os, messagefoundry.anon\n",
-        "harness/spaced.py": "from  messagefoundry.anon import Keyer\n",
-        "harness/call_rel.py": 'import_module(".anon", package="messagefoundry")\n',
-        "harness/call_kw.py": 'importlib.import_module(name="messagefoundry.anon")\n',
-        "harness/call_from.py": '__import__("messagefoundry", fromlist=["anon"])\n',
-        "harness/call_far.py": 'import_module("...anon", package="messagefoundry")\n',
-        "messagefoundry/far.py": "from ...anon import Keyer\n",
-        "messagefoundry/pkg.py": 'import_module(".anon", __package__)\n',
-        "messagefoundry/lvl.py": '__import__("anon", globals(), None, ["Keyer"], 1)\n',
-        "harness/call_set.py": '__import__("messagefoundry", None, None, {"anon"})\n',
-        "harness/call_bad.py": '__import__("messagefoundry", fromlist={["anon"]})\n',
+        "harness/joined.py": "import os, messagefoundry_toolkit.anon\n",
+        "harness/bom.py": "\ufeffimport os, messagefoundry_toolkit.anon\n",
+        "harness/spaced.py": "from  messagefoundry_toolkit.anon import Keyer\n",
+        "harness/call_rel.py": 'import_module(".anon", package="messagefoundry_toolkit")\n',
+        "harness/call_kw.py": 'importlib.import_module(name="messagefoundry_toolkit.anon")\n',
+        "harness/call_from.py": '__import__("messagefoundry_toolkit", fromlist=["anon"])\n',
+        "harness/call_far.py": 'import_module("...anon", package="messagefoundry_toolkit")\n',
+        "messagefoundry_toolkit/far.py": "from ...anon import Keyer\n",
+        "messagefoundry_toolkit/pkg.py": 'import_module(".anon", __package__)\n',
+        "messagefoundry_toolkit/lvl.py": '__import__("anon", globals(), None, ["Keyer"], 1)\n',
+        "harness/call_set.py": '__import__("messagefoundry_toolkit", None, None, {"anon"})\n',
+        "harness/call_bad.py": '__import__("messagefoundry_toolkit", fromlist={["anon"]})\n',
         # The `# anon` comment makes the parse read this file, so its near names reach the check.
         "harness/near.py": (
-            "# anon\nfrom messagefoundry import anonymize\nimport messagefoundry.anonymous\n"
+            "# anon\nfrom messagefoundry_toolkit import anonymize\n"
+            "import messagefoundry_toolkit.anonymous\n"
         ),
-        "harness/built.py": 'import_module("messagefoundry." + "anon")\n',
-        "messagefoundry/sub/rel.py": "from ..anon import Keyer\n",
-        "messagefoundry/call.py": 'importlib.import_module("messagefoundry.anon.leak")\n',
-        "scripts/wrapped.py": "from messagefoundry import (\n    parsing,\n    anon,\n)\n",
-        "messagefoundry/anon/__init__.py": (
-            '"""Use it as::\n\n    from messagefoundry.anon import Keyer\n"""\n'
+        "harness/built.py": 'import_module("messagefoundry_toolkit." + "anon")\n',
+        "messagefoundry_toolkit/sub/rel.py": "from ..anon import Keyer\n",
+        "messagefoundry/call.py": 'importlib.import_module("messagefoundry_toolkit.anon.leak")\n',
+        # The package's old name is a near name now: nothing can import it, and it is not hunted.
+        "messagefoundry/old.py": "from messagefoundry.anon import Keyer  # anon\n",
+        "scripts/wrapped.py": "from messagefoundry_toolkit import (\n    lens,\n    anon,\n)\n",
+        "messagefoundry_toolkit/anon/__init__.py": (
+            '"""Use it as::\n\n    from messagefoundry_toolkit.anon import Keyer\n"""\n'
             "from .keying import Keyer\n"
         ),
     }
@@ -2046,27 +2065,27 @@ def test_the_anon_searches_see_every_planted_shape(tmp_path: Path) -> None:
             "messagefoundry/x.py:5",
             "scripts/live.py:1",
         ),
-        ("messagefoundry/anon/__init__.py:3",),
+        ("messagefoundry_toolkit/anon/__init__.py:3",),
         (
-            "harness/bom.py: messagefoundry.anon",
-            "harness/call_far.py: messagefoundry.anon",
-            "harness/call_from.py: messagefoundry.anon",
-            "harness/call_kw.py: messagefoundry.anon",
-            "harness/call_rel.py: messagefoundry.anon",
-            "harness/call_set.py: messagefoundry.anon",
-            "harness/joined.py: messagefoundry.anon",
-            "harness/spaced.py: messagefoundry.anon",
-            "messagefoundry/call.py: messagefoundry.anon.leak",
-            "messagefoundry/far.py: messagefoundry.anon",
-            "messagefoundry/lvl.py: messagefoundry.anon",
-            "messagefoundry/lvl.py: messagefoundry.anon.Keyer",
-            "messagefoundry/pkg.py: messagefoundry.anon",
-            "messagefoundry/sub/rel.py: messagefoundry.anon",
-            "scripts/live.py: messagefoundry.anon",
-            "scripts/wrapped.py: messagefoundry.anon",
+            "harness/bom.py: messagefoundry_toolkit.anon",
+            "harness/call_far.py: messagefoundry_toolkit.anon",
+            "harness/call_from.py: messagefoundry_toolkit.anon",
+            "harness/call_kw.py: messagefoundry_toolkit.anon",
+            "harness/call_rel.py: messagefoundry_toolkit.anon",
+            "harness/call_set.py: messagefoundry_toolkit.anon",
+            "harness/joined.py: messagefoundry_toolkit.anon",
+            "harness/spaced.py: messagefoundry_toolkit.anon",
+            "messagefoundry/call.py: messagefoundry_toolkit.anon.leak",
+            "messagefoundry_toolkit/far.py: messagefoundry_toolkit.anon",
+            "messagefoundry_toolkit/lvl.py: messagefoundry_toolkit.anon",
+            "messagefoundry_toolkit/lvl.py: messagefoundry_toolkit.anon.Keyer",
+            "messagefoundry_toolkit/pkg.py: messagefoundry_toolkit.anon",
+            "messagefoundry_toolkit/sub/rel.py: messagefoundry_toolkit.anon",
+            "scripts/live.py: messagefoundry_toolkit.anon",
+            "scripts/wrapped.py: messagefoundry_toolkit.anon",
         ),
         1,
-        {"harness": 13, "messagefoundry": 7, "scripts": 3},
+        {"harness": 13, "messagefoundry": 3, "messagefoundry_toolkit": 5, "scripts": 3},
     )
 
 
@@ -2081,7 +2100,7 @@ def test_no_walked_source_file_looks_like_it_imports_the_anon_package() -> None:
         f"{len(search.outside)} place(s) in the walked source trees look like an import of "
         f"{_ANON_MODULE}: {list(search.outside)}. {_REAL_ANON_IMPORT_ADVICE} If a hit is docstring "
         f"or comment text, name the package in a sentence instead (`Keyer` is in the "
-        f"`messagefoundry.anon` package), and start the example at its first call. This search "
+        f"`messagefoundry_toolkit.anon` package), and start the example at its first call. This search "
         f"reads source text, so text shaped like an import counts as one."
     )
     assert not search.inside, (

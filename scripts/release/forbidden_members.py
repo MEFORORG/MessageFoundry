@@ -125,6 +125,9 @@ RETIRED_ENGINE_PATHS: tuple[tuple[str, ...], ...] = (
     ("messagefoundry", "lens.py"),
     ("messagefoundry", "lens_schema.py"),
     ("messagefoundry", "corepoint_import.py"),
+    # Slice 6: the de-identification package (ADR 0030), now messagefoundry_toolkit/anon/. The run
+    # names the directory, so it refuses every member under it, whatever the file.
+    ("messagefoundry", "anon"),
 )
 
 

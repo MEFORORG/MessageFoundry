@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Surrogate value pools — the **tee seam** (ADR 0030 §1).
 
-Mirror of ``messagefoundry/anon/_pools.py`` for the standalone tee, which cannot import
+Mirror of ``messagefoundry_toolkit/anon/_pools.py`` for the standalone tee, which cannot import
 ``messagefoundry``: it re-exports the same pool names from the **vendored** copy of the generator's
 data tables (``tee/anon/_hl7data.py``, held byte-identical to the engine's by the parity test). The
 shared ``surrogates.py`` only ever reaches pools through ``from . import _pools``, so the surrogate

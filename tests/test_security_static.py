@@ -671,7 +671,7 @@ _UNSCANNABLE_RE_PATTERNS = {
     # necessarily makes the expression unresolvable to this static scanner. The shape is bounded and
     # non-catastrophic by inspection: an alternation of digit literals followed by a fixed ``\d{4}`` —
     # no nested quantifier, no overlapping alternation.
-    "messagefoundry/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
+    "messagefoundry_toolkit/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
     "tee/anon/surrogates.py": ("f'(?:{alt})\\\\d{{4}}'",),
     # BACKLOG #1678 -- the orphan sweep's temp-file shape. Unresolvable BY CONSTRUCTION, and that is
     # the point: the matcher is spliced from the SAME constants the atomic write MINTS the name from
@@ -1851,8 +1851,11 @@ def test_crypto_roots_carry_no_unrecorded_call_site() -> None:
         "crypto call site(s) in the walked roots that no inventory covers — document them in "
         f"scripts/security/crypto_inventory_check.py (or here, for non-package roots): {undocumented}"
     )
+    # The toolkit receives code that moves out of messagefoundry/ (ADR 0201), and the gate's own
+    # INVENTORY governs it as it does the engine, so neither needs a row here.
+    package_roots = ("messagefoundry/", "messagefoundry_toolkit/")
     outside = {
-        path: mods for path, mods in discovered.items() if not path.startswith("messagefoundry/")
+        path: mods for path, mods in discovered.items() if not path.startswith(package_roots)
     }
     assert outside == _CRYPTO_SITES_OUTSIDE_THE_PACKAGE
 

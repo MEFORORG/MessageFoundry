@@ -19,8 +19,8 @@ from types import ModuleType
 
 import pytest
 
-from messagefoundry.anon import leak as engine_leak
-from messagefoundry.anon import surrogates as engine_surrogates
+from messagefoundry_toolkit.anon import leak as engine_leak
+from messagefoundry_toolkit.anon import surrogates as engine_surrogates
 from tee.anon import leak as tee_leak
 from tee.anon import surrogates as tee_surrogates
 

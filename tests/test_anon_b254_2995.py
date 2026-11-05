@@ -22,7 +22,7 @@ from types import ModuleType
 
 import pytest
 
-from messagefoundry.anon import surrogates as engine_surrogates
+from messagefoundry_toolkit.anon import surrogates as engine_surrogates
 from tee.anon import surrogates as tee_surrogates
 
 # The depth table is the scanner loader's own, so the two loaders are held to one set of places.

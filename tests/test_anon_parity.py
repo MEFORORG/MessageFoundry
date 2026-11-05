@@ -11,14 +11,14 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.anon import DEFAULT_RULES
-from messagefoundry.anon import anonymize as engine_anonymize
-from messagefoundry.anon import leak as engine_leak
 from messagefoundry.generators import (
     _core,
     _hl7data,
     all_types,  # noqa: F401  (registers message types)
 )
+from messagefoundry_toolkit.anon import DEFAULT_RULES
+from messagefoundry_toolkit.anon import anonymize as engine_anonymize
+from messagefoundry_toolkit.anon import leak as engine_leak
 from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import leak as tee_leak
@@ -93,9 +93,11 @@ def _load_scan_forbidden() -> object:
 
 def test_shared_logic_files_are_byte_identical() -> None:
     for name in _BYTE_IDENTICAL:
-        engine = (_ROOT / "messagefoundry" / "anon" / name).read_bytes()
+        engine = (_ROOT / "messagefoundry_toolkit" / "anon" / name).read_bytes()
         tee = (_ROOT / "tee" / "anon" / name).read_bytes()
-        assert engine == tee, f"{name} drifted — re-copy messagefoundry/anon/{name} to tee/anon/"
+        assert engine == tee, (
+            f"{name} drifted — re-copy messagefoundry_toolkit/anon/{name} to tee/anon/"
+        )
 
 
 def test_vendored_hl7data_matches_generator_source() -> None:
@@ -258,7 +260,7 @@ def test_anon_files_do_not_self_trip_the_publish_guard() -> None:
     # in a new (non-exempt) anon file would block the commit while pytest stayed green. Guard it here.
     sf = _load_scan_forbidden()
     files = [
-        *(_ROOT / "messagefoundry" / "anon").glob("*.py"),
+        *(_ROOT / "messagefoundry_toolkit" / "anon").glob("*.py"),
         *(_ROOT / "tee" / "anon").glob("*.py"),
     ]
     offenders = [hit for f in files for hit in sf.scan_file(f)]  # type: ignore[attr-defined]

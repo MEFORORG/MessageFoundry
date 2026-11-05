@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Anonymizer for the standalone tee (ADR 0030, BACKLOG #36) — vendored twin of ``messagefoundry.anon``.
+"""Anonymizer for the standalone tee (ADR 0030, BACKLOG #36) — vendored twin of ``messagefoundry_toolkit.anon``.
 
 Turns captured real HL7 v2 into a structurally-faithful, de-identified dataset, with **no**
 ``messagefoundry`` import (the tee sits on the Epic/Corepoint boundary and stays standalone — it

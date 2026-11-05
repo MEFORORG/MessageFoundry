@@ -4,7 +4,7 @@
 
 The token tables (customer/partner names + estate-vendor tokens) are the owner-managed
 ``scripts/security/scan_forbidden.py`` set; this file **loads them from that guard by path at import**
-(the same way ``messagefoundry/anon/leak.py`` does) rather than vendoring a copy — so **no literal or
+(the same way ``messagefoundry_toolkit/anon/leak.py`` does) rather than vendoring a copy — so **no literal or
 fragmented customer/vendor token appears in this tracked, published file**, and there is nothing to
 drift (``test_anon_parity`` still pins the two equal). Loading by path keeps the tee ``messagefoundry``-free.
 
@@ -741,7 +741,7 @@ def leak_report(
 ) -> LeakReport:
     """The full :class:`LeakReport` for ``text`` using the tee's vendored token authority.
 
-    Behaviourally parallel to the engine's :func:`messagefoundry.anon.leak.leak_report`: the token
+    Behaviourally parallel to the engine's :func:`messagefoundry_toolkit.anon.leak.leak_report`: the token
     hits come from the tee's local :func:`scan_text` (and the field-anchored site-code check) rather
     than the engine's ``_scanner()`` delegate, but the structural walk, coverage report, and
     token-floor signal are the byte-identical shared logic above. Structural detection engages **only
