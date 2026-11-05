@@ -303,6 +303,7 @@ from messagefoundry.auth.reconcile import (
     OUTAGE_ABORT,
     PAGING_CAP,
     PAGING_DEADLINE,
+    PARTIAL_OUTAGE_REASON,
     PROBE_FAULT_ABORT,
     REFERRAL_ABORT,
     ReconcilePlan,
@@ -11321,6 +11322,16 @@ _OUTAGE_ALERT_TEXT: Final[str] = (
     "No directory probe succeeded in {passes} reconcile passes running, so the reconciler revoked "
     "nothing. Check the directory, the path to it, and any group-search paging alert."
 )
+#: The source label of a lasting PARTIAL outage's own ``ad_reconcile_aborted`` instance (BACKLOG
+#: #3709 step 1, #4772 item 6), apart from the whole outage's, so acknowledging one directory
+#: controller's outage does not silence a later outage of the whole directory.
+_PARTIAL_OUTAGE_ALERT_SOURCE = "directory-reconciler-partial-outage"
+#: What the lasting partial outage tells the operator, under the same 200-character bound. It
+#: names the accounts' consequence, which differs from the whole outage's: the rest were judged.
+_PARTIAL_OUTAGE_ALERT_TEXT: Final[str] = (
+    "Some directory probes went unanswered in {passes} reconcile passes running ({unreached} of "
+    "{asked} on the last); those accounts were not reconciled. Check each domain controller."
+)
 #: What each paging refusal cause tells the operator. Short, and the consequence first, because
 #: the store keeps only the first 200 characters of an instance's reason; the account is in the
 #: source.
@@ -11345,6 +11356,11 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     pages once, as ``ad_reconcile_aborted`` with reason ``directory_unavailable`` under its own
     source label (:data:`_OUTAGE_ALERT_SOURCE`), and the first pass that reaches the directory
     resolves it (BACKLOG #3709; ``AuthService._note_directory_outage`` says when each is set).
+    A run as long of passes that left some probes unanswered, a pass that reached the directory
+    in part paging it, pages once as ``ad_reconcile_aborted`` with reason
+    ``directory_partly_unavailable`` under its own source (:data:`_PARTIAL_OUTAGE_ALERT_SOURCE`),
+    matching its ``auth.ad_reconcile_partial_outage`` row, and the first pass whose every probe
+    was answered resolves it (``AuthService._note_partial_outage``).
 
     A referral (BACKLOG #2538) is NOT an outage: it recurs until a search base is fixed. Any pass
     with a referred probe is ``auth.ad_reconcile_referred`` and becomes one ``ad_reconcile_aborted``
@@ -11397,7 +11413,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     also gets its inverse, which pages nobody and resolves the open instance (BACKLOG #2136):
     ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
     ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance, and
-    under the outage's source for the outage's (BACKLOG #3709). The
+    under the outage's source for the outage's (BACKLOG #3709), and under the partial outage's
+    for its own. The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
     ``plan.hold_clear``, ``plan.referral_clear``, ``plan.outage_clear``; see
     ``AuthService._mark_reconcile_clears`` and ``AuthService._note_directory_outage``), so
@@ -11436,6 +11453,16 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     # After the breaker and the revocations, which do not recur either, and before the referral,
     # the fault and the hold, which page again on the next pass (vault BACKLOG #3696).
     _alert_paging_refusals(plan, sink)
+    if plan.partial_outage_page:
+        # BACKLOG #3709 step 1. Once per run, so with the other pages that do not recur.
+        sink.ad_reconcile_aborted(
+            _PARTIAL_OUTAGE_ALERT_SOURCE,
+            reason=PARTIAL_OUTAGE_REASON,
+            probed=plan.asked,
+            detail=_PARTIAL_OUTAGE_ALERT_TEXT.format(
+                passes=plan.partial_outage_passes, unreached=plan.unreached, asked=plan.asked
+            ),
+        )
     if plan.referred:
         # BACKLOG #2538. After the breaker and the revocations, matching the service's order.
         sink.ad_reconcile_aborted(
@@ -11479,6 +11506,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_breaker_cleared(_REFERRAL_ALERT_SOURCE)
     if plan.outage_clear:
         sink.ad_reconcile_breaker_cleared(_OUTAGE_ALERT_SOURCE)
+    if plan.partial_outage_clear:
+        sink.ad_reconcile_breaker_cleared(_PARTIAL_OUTAGE_ALERT_SOURCE)
 
 
 def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
@@ -11534,6 +11563,7 @@ _RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, tuple[str, str]]] = {
     "hold_clear": ("directory-reconciler", "ad_reconcile_held"),
     "referral_clear": (_REFERRAL_ALERT_SOURCE, "ad_reconcile_aborted"),
     "outage_clear": (_OUTAGE_ALERT_SOURCE, "ad_reconcile_aborted"),
+    "partial_outage_clear": (_PARTIAL_OUTAGE_ALERT_SOURCE, "ad_reconcile_aborted"),
 }
 
 

@@ -208,6 +208,11 @@ HOLD_REASON = "user_account_control_undetermined"
 #: lasting outage's alert (BACKLOG #3709).
 OUTAGE_ABORT = "directory_unavailable"
 
+#: The reason slug of a lasting PARTIAL outage's alert and audit row (BACKLOG #3709 step 1, #4772
+#: item 6): passes that reached the directory for some probes and not for others. Never an
+#: ``aborted`` slug, since such a pass judged every probe that was answered.
+PARTIAL_OUTAGE_REASON = "directory_partly_unavailable"
+
 #: The ``aborted`` slug of a pass whose every answer went unjudged, at least one a referral (BACKLOG
 #: #2538); the others may be failures, configuration refusals or faults (BACKLOG #3010, #3100),
 #: which are then recorded under their own alerts as well. Also the reason slug of the referral's
@@ -231,6 +236,8 @@ MISCONFIGURED_ABORT = "directory_misconfigured"
 #: enabled account's roles and scope are not re-read while it lasts. Also the alert's ``reason``.
 PAGING_DEADLINE = "group_search_deadline"
 PAGING_CAP = "group_search_cap"
+#: Both, for telling such a probe from one the directory did not answer (BACKLOG #3709 step 1).
+_PAGING_CAUSES = frozenset({PAGING_DEADLINE, PAGING_CAP})
 
 #: The outcomes that judge nothing about the account: no strike, no recorded outcome (rule item 4).
 _UNJUDGED = frozenset(
@@ -292,6 +299,9 @@ class ReconcilePlan:
     #: refusal's (vault BACKLOG #3696), which concerns one account and reports the pass's count.
     asked: int = 0
     unavailable: int = 0
+    #: The UNAVAILABLE probes the directory did not answer: all but those refused for the engine's
+    #: own paging bound (BACKLOG #3709 step 1), which the directory answered.
+    unreached: int = 0
     #: ``user_id`` of every probe the directory answered with a referral (BACKLOG #2538). Any one
     #: alerts, and none of them stops the rest of the pass being judged.
     referred: tuple[str, ...] = ()
@@ -351,6 +361,19 @@ class ReconcilePlan:
     #: Whether this pass reached the directory after a run that paged, in this process (BACKLOG
     #: #3709). Read like the other ``*_clear`` flags: the caller resolves the outage's instance on it.
     outage_clear: bool = False
+    #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709 step 1,
+    #: #4772 item 6): how many passes running, this one included, left at least one probe without
+    #: an answer from the directory, a whole outage included. A probe refused for the engine's own
+    #: paging bound is not counted: the directory answered it, and it pages on its own. 0 on a pass
+    #: whose every probe was answered. ``AuthService._note_partial_outage`` keeps it.
+    partial_outage_passes: int = 0
+    #: Whether the lifespan task pages for a lasting PARTIAL outage on this pass: the pass reached
+    #: the directory for some probes and not for others, the run above has reached
+    #: ``[auth].ad_reconcile_outage_passes``, and no partial page is recorded for it yet.
+    partial_outage_page: bool = False
+    #: Whether every probe this pass asked was answered after a partial-outage run that paged, in
+    #: this process. The caller resolves the partial outage's instance on it.
+    partial_outage_clear: bool = False
 
     @property
     def directory_outage(self) -> bool:
@@ -531,6 +554,9 @@ def plan_pass(
     """
     probes = list(probes)
     unavailable = [p for p in probes if p.outcome is ProbeOutcome.UNAVAILABLE]
+    # BACKLOG #3709 step 1. The ones the directory did not answer: a paging-bound refusal was
+    # answered, and pages on its own (vault BACKLOG #3696).
+    unreached = sum(1 for p in unavailable if p.detail not in _PAGING_CAUSES)
     referred = [p for p in probes if p.outcome is ProbeOutcome.REFERRED]
     faulted = [p for p in probes if p.outcome is ProbeOutcome.FAULT]
     misconfigured = [p for p in probes if p.outcome is ProbeOutcome.MISCONFIGURED]
@@ -558,6 +584,7 @@ def plan_pass(
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
+            unreached=unreached,
             referred=tuple(p.user_id for p in referred),
             faulted=tuple(p.user_id for p in faulted),
             misconfigured=tuple(p.user_id for p in misconfigured),
@@ -576,6 +603,7 @@ def plan_pass(
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
+            unreached=unreached,
             aborted=OUTAGE_ABORT,
             latched=latched,
         )
@@ -668,6 +696,7 @@ def plan_pass(
         probed=len(probes),
         asked=asked,
         unavailable=len(unavailable),
+        unreached=unreached,
         referred=tuple(p.user_id for p in referred),
         faulted=tuple(p.user_id for p in faulted),
         misconfigured=tuple(p.user_id for p in misconfigured),
