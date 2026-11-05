@@ -660,18 +660,26 @@ async def test_a_stopped_check_on_a_restart_leaves_a_running_poller_down(
 ) -> None:
     """What the restart's line says, on a lane that was serving. The stop half runs before the
     check, so a store fault there takes the poller down, and the answer has to say so. Red under:
-    ``restart_inbound`` checking first, which makes the line false, so it would have to change."""
+    ``restart_inbound`` checking first, which makes the line false, so it would have to change.
+
+    The CA is replaced before the restart, so the check judges it again and reaches the store: a
+    repeat of the start's pass would come from memory and make no store call (vault BACKLOG
+    #3188)."""
+    from tests.test_alert_smtp_tls import _self_signed_ca_pem
+
     faulty: Any = _FaultyAuditStore(None)
     engine = Engine(
         store,
         lane_anchor_check=ta.make_lane_anchor_check(faulty, enforcing=True),
         egress_settings=EgressSettings(deny_by_default=False),
     )
-    engine.add_registry(_poller_graph(_real_ca(tmp_path), None))
+    ca = _real_ca(tmp_path)
+    engine.add_registry(_poller_graph(ca, None))
     await engine.start()
     try:
         rr = engine.registry_runner
         assert rr is not None and rr.inbound_running(_IB)
+        ca.write_bytes(_self_signed_ca_pem())
         faulty.fail = "list_audit"
         r = await _control(engine, "restart")
         assert r.status_code == 503, r.text

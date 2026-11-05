@@ -45,6 +45,7 @@ from messagefoundry.auth.trust_anchors import (
     AnchorSettingRefused,
     AnchorStoreUnavailable,
     LaneAnchorCheck,
+    RetainsLanes,
     TrustAnchorError,
     anchor_store_refusal,
     connection_anchor_failure,
@@ -4419,6 +4420,18 @@ class RegistryRunner:
             and name not in self._destinations
         )
 
+    def _forget_removed_anchor_lanes(self) -> None:
+        """Drop the refusal marks, and the lane check's memory, of every lane the graph no
+        longer declares (vault BACKLOG #3188). A reload calls it once its swap has committed, so a
+        removed or renamed lane leaves nothing behind. A lane the graph still declares keeps both,
+        as a rolled-back reload keeps them."""
+        lanes: set[tuple[Direction, str]] = {("inbound", n) for n in self.registry.inbound}
+        lanes |= {("outbound", n) for n in self.registry.outbound}
+        for lane in [k for k in self._anchor_refused if k not in lanes]:
+            del self._anchor_refused[lane]
+        if isinstance(self._lane_anchor_check, RetainsLanes):
+            self._lane_anchor_check.retain_lanes(lanes)
+
     def _reload_anchor_lanes(
         self, old: Registry, new: Registry, old_inbound_names: Sequence[str]
     ) -> list[tuple[Direction, str, Mapping[str, Any]]]:
@@ -7910,6 +7923,7 @@ class RegistryRunner:
                     self._park_outbounds_while_passive()
             if not self._running:
                 self.registry = new_registry
+                self._forget_removed_anchor_lanes()
                 return
 
             old = self.registry
@@ -8127,6 +8141,7 @@ class RegistryRunner:
             # refusal mark. Not before: a rolled-back reload leaves the old marks as they were.
             for lane in anchors_passed:
                 self._anchor_refused.pop(lane, None)
+            self._forget_removed_anchor_lanes()
             # 3a. The swap committed, so the calendars follow it: every task is replaced from the new
             # graph, so an added schedule starts, an edited one changes and a removed one stops
             # (BACKLOG #2069). After the rollback point on purpose,

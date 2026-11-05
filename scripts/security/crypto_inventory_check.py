@@ -1102,7 +1102,6 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/api/app.py": frozenset(
         {
             "hash:via messagefoundry.config.wiring",  # vault BACKLOG #2724: load_config's digest
-            "compare:via messagefoundry.auth.trust_anchors",  # BACKLOG #1167: the pin compare
             "compare:via messagefoundry.config.fingerprint",
             "hash:via messagefoundry.auth.trust_anchors",
             "tls_context:via messagefoundry.config.tls_policy",
