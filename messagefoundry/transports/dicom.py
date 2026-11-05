@@ -259,8 +259,8 @@ _STATUS_NOT_AUTHORIZED = 0x0124  # peer IP not in the allowlist: the backstop in
 
 def _refusal_dimse_status(kind: RefusalKind) -> int:
     """The C-STORE status an engine ingress refusal of ``kind`` is answered with (BACKLOG #2105),
-    in step with ``http_listener._refusal_status``. A configuration refusal is the final class here
-    (BACKLOG #5102). On the SCP it can arise only on an inbound that declares a text
+    in step with ``http_listener._refusal_status`` for every kind but one. A configuration refusal,
+    which ``Http()`` answers ``503``, is the final class here, on purpose (BACKLOG #5102). On the SCP it can arise only on an inbound that declares a text
     ``content_type``, which the wiring refuses at build, and such an inbound refuses every Part-10
     object as the body's own fault even after an operator fixes the codec name, so Out of Resources
     would have a sender re-send the object forever, leaving one ``ERROR`` row per attempt.
