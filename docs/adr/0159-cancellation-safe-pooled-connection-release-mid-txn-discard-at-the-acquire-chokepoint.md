@@ -637,6 +637,28 @@ the next reader does not re-derive the wrong precedent from the same comment.
   locks, open until the server ends it. Pinned offline by
   `tests/test_backlog5010_database_gate_discard.py`.
 
+  **NOTE 2026-11-05 (BACKLOG #2394, the last slice): the first two bullets of *What it leaves
+  open* above are superseded, and a cancelled statement on a connection with no gate no longer
+  returns it.** The gate now tracks a call from the moment aioodbc submits it. A call whose
+  awaiting future was cancelled before it took the gate's lock never runs, as an executor already
+  skips one it cancels before a worker takes it, so no close races it. A call that had entered runs
+  to its end, and a cursor it makes (`Connection.cursor`, `Connection.execute`) is closed by the
+  gate as it returns, before any job or connection close handed to it. A DATABASE borrow cancelled
+  during `conn.cursor()` hands its rollback to that call, so its connection goes back only once the
+  call has returned. A cancelled DATABASE borrow on a connection with no gate drops its handle and
+  closes nothing: the pool gets it back closed, and pyodbc frees the cursor, then the connection,
+  once nothing uses them, since a pyodbc cursor holds its connection. That handle is freed on
+  whichever thread drops it last, the event loop's included, and its session ends only then. The
+  SQL Server store's claim holder now leaves through the one-shot exits the open-time probes use:
+  a cancelled open or a cancelled claim hands its connection and cursor to the gate with no await,
+  and an ordinary discard waits on a close a second cancellation cannot cut short. **Still open, at
+  least:** a cancellation that lands after a `cursor()` call returned on its thread but before the
+  loop delivered the result leaves that cursor for the collector; and the store's pooled
+  quarantine, its `_cursor` helper and the one-shot exits still close an ungated connection beside a
+  running call. Under the `aioodbc==0.5.0` pin (BACKLOG #5005) no real connection is ungated.
+  Pinned offline by `tests/test_backlog2394_cancel_exits.py` and
+  `tests/test_backlog2394_database_gate.py`.
+
 ## Acceptance Criteria
 
 - **AC-1** A cancellation delivered at any body await inside a pooled write leaves the connection
