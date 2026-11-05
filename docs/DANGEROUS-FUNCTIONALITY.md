@@ -742,7 +742,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | Input | Where it comes from | Files |
 |---|---|---|
 | Replies from an engine address | Whatever answers at the engine URL setting. The file's own comment says that is not necessarily the engine, and a plain `http` URL gets no TLS. The Python clients' replies sit in the first table above for that reason too. Unlike `apiclient/client.py`, this client puts no size cap on a reply before it parses it, and a POST has no timeout. | `engineClient.ts` |
-| An HL7 sample, and what a dry run made of it | The sample file you pick, which [`CONNECTIONS.md`](CONNECTIONS.md) lists as an upload feature, and the output a dry run built from it. The Test Bench diff splits them into segments and fields by hand, and the Steps view pulls the segment names out of the sample. A saved test case's recorded output is diffed the same way. `hl7diff.ts` does the same job as `anon/surrogates.py` in the engine's hand-read table. | `hl7diff.ts`, `hl7scope.ts` |
+| An HL7 sample, and what a dry run made of it | The sample file you pick, which [`CONNECTIONS.md`](CONNECTIONS.md) lists as an upload feature, and the output a dry run built from it. The Test Bench diff splits them into segments and fields by hand, and the Steps view pulls the segment names out of the sample. A saved test case's recorded output is diffed the same way. `hl7diff.ts` does the same job as `messagefoundry_toolkit/anon/surrogates.py` in the hand-read table above. | `hl7diff.ts`, `hl7scope.ts` |
 
 **Extension parse sites left out, and why.**
 

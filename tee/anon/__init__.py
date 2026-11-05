@@ -6,9 +6,9 @@ Turns captured real HL7 v2 into a structurally-faithful, de-identified dataset, 
 ``messagefoundry`` import (the tee sits on the Epic/Corepoint boundary and stays standalone — it
 vendors the shared logic, mirroring ``tee/hl7_fields.py``/``tee/mllp.py``). The shared files
 (``keying``/``rules``/``surrogates`` + the vendored ``_hl7data``) are held byte-identical to the
-engine's by the parity test; the adapter/leak seams are behaviourally parallel (golden-corpus test).
+toolkit's (and, for ``_hl7data``, the engine generator's) by the parity test; the adapter/leak seams are behaviourally parallel (golden-corpus test).
 
-Public surface (same shape as the engine's):
+Public surface (same shape as the toolkit's):
 
 * :func:`anonymize` — de-identify one HL7 message. Raises :class:`AnonError` for a message with
   no parseable MSH, or with a line no rule can reach (a malformed segment id).
@@ -18,7 +18,7 @@ Public surface (same shape as the engine's):
   retarget of a default field left (BACKLOG #3493). A name, an undashed number or a date in an
   unmapped field passes; only the coverage report records it.
 * :func:`leak_check` / :func:`leak_report` — token hits + structural PHI-shape detection over the
-  unmapped fields + the unmapped-field coverage report (vendored twin of the engine's; BACKLOG #331).
+  unmapped fields + the unmapped-field coverage report (vendored twin of the toolkit's; BACKLOG #331).
 """
 
 from __future__ import annotations

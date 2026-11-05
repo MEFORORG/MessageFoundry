@@ -80,7 +80,10 @@ class CaptureSink:
     The example below uses four names. ``Keyer``, ``load_rules`` and ``anonymize_checked`` are in
     the ``messagefoundry_toolkit.anon`` package. ``CoverageTally`` is in that package's ``leak``
     module. That package ships in the ``messagefoundry-toolkit`` distribution, which the harness
-    does not depend on, so install the toolkit beside the harness to run the example.
+    does not depend on. Its leak check loads ``scripts/security/scan_forbidden.py`` from the
+    folder that holds the package, so run the example from a source checkout of the repository
+    (an editable install is one); from an installed wheel the check refuses, and the sink drops
+    every message.
 
     For example::
 

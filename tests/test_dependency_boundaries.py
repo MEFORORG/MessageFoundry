@@ -1659,8 +1659,8 @@ _ANON_NAME_PARENTS = frozenset({_ROOT_PACKAGE, _ANON_PARENT})
 _ANON_PACKAGE_DIR = PurePosixPath(*_ANON_MODULE.split("."))
 
 #: Every import shape the parse is named to see spells ``anon`` as a whole word, whether as
-#: ``messagefoundry_toolkit.anon``, ``..anon`` or ``import anon``. So a file outside the package without
-#: it is not parsed. The section comment above says what that lets through.
+#: ``messagefoundry_toolkit.anon``, ``..anon`` or ``import anon``. So a file outside the package
+#: without it is not parsed. The section comment above says what that lets through.
 _ANON_WORD = re.compile(r"\banon\b")
 
 #: One line per shape the pattern exists to catch. `_guarded_anon_search` searches these before it
@@ -1700,7 +1700,8 @@ _ANON_DOCSTRING_PLANT = (
 #: The fewest `.py` files the real walk must read under each root before a clean verdict means
 #: anything. About half the census taken at 60647bb242 (messagefoundry 334, harness 147, scripts
 #: 79, messagefoundry_webconsole 37), and at slice 6 of ADR 0201 for messagefoundry_toolkit (14),
-#: for the reason `_MIN_FILES_WALKED` gives. One floor per root, because one total floor still
+#: for the reason `_MIN_FILES_WALKED` gives. The toolkit's floor sits above the anon package's
+#: own 7 files, so the package alone cannot meet it: the claim is about the files outside it. One floor per root, because one total floor still
 #: passes with a whole root gone: losing all of `harness/` left 436 files over a total floor of
 #: 290. `_guarded_anon_search` holds them, so no test reads the search without them.
 _MIN_ANON_SEARCH_FILES: Mapping[str, int] = MappingProxyType(
@@ -1709,7 +1710,7 @@ _MIN_ANON_SEARCH_FILES: Mapping[str, int] = MappingProxyType(
         "harness": 70,
         "scripts": 40,
         "messagefoundry_webconsole": 18,
-        "messagefoundry_toolkit": 7,
+        "messagefoundry_toolkit": 10,
     }
 )
 
@@ -1724,7 +1725,7 @@ _REAL_ANON_IMPORT_ADVICE = (
     "file outside the package imports it. "
     "The owner ruled that the import gives way to the claim (owner ruling 2026-10-12, BACKLOG "
     "#3006 part 3). The package moved to messagefoundry_toolkit/anon/ (BACKLOG #1192), and "
-    "the record's absence claim follows it there. Do not "
+    "the record's absence claim is to be re-pointed to follow it. Do not "
     "hide the import from these searches by rewording it or building its name at run time."
 )
 
@@ -2101,8 +2102,8 @@ def test_no_walked_source_file_looks_like_it_imports_the_anon_package() -> None:
         f"{len(search.outside)} place(s) in the walked source trees look like an import of "
         f"{_ANON_MODULE}: {list(search.outside)}. {_REAL_ANON_IMPORT_ADVICE} If a hit is docstring "
         f"or comment text, name the package in a sentence instead (`Keyer` is in the "
-        f"`messagefoundry_toolkit.anon` package), and start the example at its first call. This search "
-        f"reads source text, so text shaped like an import counts as one."
+        f"`messagefoundry_toolkit.anon` package), and start the example at its first call. This "
+        f"search reads source text, so text shaped like an import counts as one."
     )
     assert not search.inside, (
         f"{len(search.inside)} place(s) in {_ANON_PACKAGE_DIR}/ read as an import of the package "

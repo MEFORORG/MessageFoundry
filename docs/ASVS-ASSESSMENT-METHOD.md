@@ -360,7 +360,9 @@ it.** That reading is recorded in the 2026-10-02 vault file, under R3. The file 
   the hazard of a by-path load, were engine code and stayed inside the scope through the engine.
   Slice 6 moved them into the `messagefoundry-toolkit` distribution, which the **Included** list
   in section 2 does not name. Whether they are still in scope is OPEN, and it is the owner's to
-  settle. **The reading covers engine call paths only.** The harness's `CaptureSink` takes an optional anonymizer, and its code comment suggests
+  settle. Until the owner rules, the by-path load of this file is UNASSESSED: this reading kept
+  the file out on the ground that the load stayed in scope through engine code, and that ground
+  went with the move. **The reading covers engine call paths only.** The harness's `CaptureSink` takes an optional anonymizer, and its code comment suggests
   wiring `anonymize_checked` there, which would reach the same load from the harness. The vault file
   names that wiring as a reason to revisit this reading; until someone does, treat it as open.
 

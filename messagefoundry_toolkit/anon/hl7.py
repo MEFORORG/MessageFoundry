@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Engine-side HL7 anonymization adapter (ADR 0030 §1/§3) — the **non-parity seam**.
+"""Toolkit-side HL7 anonymization adapter (ADR 0030 §1/§3) — the **non-parity seam**.
 
 Drives the rule map over a message using the engine's battle-tested mutable model
 (:class:`messagefoundry.parsing.message.Message`). The standalone ``tee/anon/hl7.py`` does the *same
