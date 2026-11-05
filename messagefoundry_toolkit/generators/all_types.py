@@ -9,7 +9,7 @@ module registers itself on import; list new types here as they're built.
 from __future__ import annotations
 
 # Each import runs the module's _core.register(...) side effect.
-from messagefoundry.generators import (
+from messagefoundry_toolkit.generators import (
     adt,  # noqa: F401
     bar,  # noqa: F401
     dft,  # noqa: F401

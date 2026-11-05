@@ -506,8 +506,9 @@ def test_relative_imports_are_resolved_not_skipped(tmp_path: Path) -> None:
 # `messagefoundry.mllpcodec`; this walk keeps them out.
 #
 # THE RULE IS NARROWER THAN "ONLY PARSING", ON PURPOSE. It forbids the four runtime packages and
-# nothing else, so `apiclient`, `generators`, `mllpcodec`, `timezone`, `pki` and the web console's
-# seam pass. The seam deserves a sentence because the item asked for it on this list: the web console
+# nothing else, so `apiclient`, `mllpcodec`, `timezone`, `pki` and the web console's seam pass,
+# and so does the toolkit: the harness imports `messagefoundry_toolkit.generators`, its private
+# `_core` included, and no rule here bounds a client's toolkit imports. The seam deserves a sentence because the item asked for it on this list: the web console
 # imports `messagefoundry.api._ui_seam` and `messagefoundry.auth` by design (ADR 0065, BACKLOG #1220),
 # and neither is under the four packages below, so it needs no entry. An entry that matches nothing
 # is exactly what `test_the_client_allow_list_is_exactly_what_the_tree_uses` refuses.

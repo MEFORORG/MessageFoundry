@@ -8,8 +8,8 @@ insurance (IN1) for realistic billing accounts.
 
 from __future__ import annotations
 
-from messagefoundry.generators import _core
-from messagefoundry.generators._core import MessageSpec
+from messagefoundry_toolkit.generators import _core
+from messagefoundry_toolkit.generators._core import MessageSpec
 
 _core.register(
     MessageSpec(

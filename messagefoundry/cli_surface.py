@@ -45,9 +45,9 @@ production set on the built wheel, installed without the toolkit (``.github/work
 
 WHAT THIS TABLE DOES NOT COVER. It governs the command surface, ASVS 15.2.3's clause (b). Clause (a),
 what the engine wheel includes, is the physical move of each module into the toolkit package, which
-ADR 0201 slice 6 finished for ``anon/`` and slice 7 finishes for ``generators/``, ``hl7schema.py``
-and ``hl7structures.py``. Until slice 7 lands, do not cite this table as keeping that code off a production
-box.
+ADR 0201 slice 6 finished for ``anon/`` and slice 7 for ``generators/``, ``hl7schema.py`` and
+``hl7structures.py``. Even so, do not cite this table as keeping that code off a production box: it
+is clause (b) only, and ADR 0201 section 8 reads clause (a) on a released engine wheel.
 
 The module imports nothing from the engine and builds no parser, so a wheel build can read it cheaply.
 """

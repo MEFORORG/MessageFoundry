@@ -1480,6 +1480,9 @@ _SMOKE_VERSION = "7.7.7"
 #: The toolkit distribution (ADR 0201), built and smoked inside the engine's `release` job.
 _TOOLKIT_DIST = "messagefoundry-toolkit"
 
+#: The harness distribution, which declares the toolkit beside the engine (ADR 0201 slice 7).
+_HARNESS_DIST = "messagefoundry-harness"
+
 
 @functools.cache
 def _wheel_smoke_steps() -> dict[str, dict]:
@@ -1694,8 +1697,13 @@ def _write_install(
     recorded_files: dict[str, str] | None = None,
     requires: list[str] | None = None,
     provides_extra: list[str] | None = None,
+    toolkit_requires: list[str] | None = None,
 ) -> None:
     """Materialise an installed distribution in ``purelib``, the way a wheel install leaves one.
+
+    ``toolkit_requires`` is the harness's toolkit lines, appended after ``requires`` for the harness
+    only; the default is its correct lockstep pin (ADR 0201 slice 7), so a test about the engine pin
+    keeps a correct toolkit pin beside it.
 
     ``package_files`` maps a path under ``<pkg>/`` to its text; ``None`` ships no package tree at all.
     ``recorded_files`` is written to disk as well and becomes the ONLY package content RECORD claims,
@@ -1739,7 +1747,11 @@ def _write_install(
         if dist == _TOOLKIT_DIST
         else f"messagefoundry[harness]=={version}"
     )
-    declared = [default] if requires is None else requires
+    declared = [default] if requires is None else list(requires)
+    if dist == _HARNESS_DIST:
+        declared += (
+            [f"messagefoundry-toolkit=={version}"] if toolkit_requires is None else toolkit_requires
+        )
     info.joinpath("METADATA").write_text(
         "".join(
             [
@@ -2087,6 +2099,77 @@ def test_the_harness_smoke_checks_the_lockstep_pin_on_the_built_artifact(
     )
     assert "1585" in out, (
         f"the harness smoke rejected {why} without naming the row that explains it.\n{out}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("toolkit_requires", "why"),
+    [
+        ([], "no requirement on the toolkit at all"),
+        (["messagefoundry-toolkit==0.0.1"], "a toolkit pin at the wrong version"),
+        (["messagefoundry-toolkit>=" + _SMOKE_VERSION], "a toolkit range instead of a pin"),
+        (["messagefoundry-toolkit==7.7.*"], "a wildcard toolkit pin"),
+        (
+            ["messagefoundry-toolkit==" + _SMOKE_VERSION + '; sys_platform == "linux"'],
+            "an exact toolkit pin gated by a platform marker",
+        ),
+        (
+            ["messagefoundry-toolkit==" + _SMOKE_VERSION, "messagefoundry-toolkit==0.0.1"],
+            "two toolkit requirements",
+        ),
+        (["messagefoundry-toolkit[dev]==" + _SMOKE_VERSION], "an extra on the toolkit pin"),
+    ],
+    ids=["absent", "wrong-version", "range", "wildcard", "platform-marker", "two-lines", "extra"],
+)
+def test_the_harness_smoke_checks_the_toolkit_pin_on_the_built_artifact(
+    toolkit_requires: list[str], why: str, venv_template: Path, tmp_path: Path
+) -> None:
+    """ADR 0201 slice 7, AC-7: the harness pins the toolkit the way it pins the engine, and the
+    built wheel is where a tag cut from an ungated commit is last checkable. The engine pin beside
+    it is correct, so the refusal can only be the toolkit's. The resolution check cannot see this
+    drift, because it stubs the toolkit at the harness's own version."""
+    script, dist, pkg, exe, purelib = _prepared(_HARNESS_DIST, venv_template, tmp_path)
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _SMOKE_VERSION,
+        package_files=_good_package(pkg, _SMOKE_VERSION),
+        toolkit_requires=toolkit_requires,
+    )
+
+    rc, _stdout, out = _run_smoke(exe, script, tmp_path)
+    assert rc != 0, f"the harness smoke published a wheel with {why}.\n{out}"
+    assert "messagefoundry-toolkit" in out and "AC-7" in out, (
+        f"the harness smoke rejected {why} without naming the toolkit pin and AC-7.\n{out}"
+    )
+
+
+def test_the_harness_smoke_does_not_count_a_toolkit_line_an_extra_gates(
+    venv_template: Path, tmp_path: Path
+) -> None:
+    """The control for the toolkit arms above: a second toolkit line that only an extra the wheel
+    declares installs is not the base pin, exactly as for the engine, so a correct pin beside it
+    passes and the success line names the toolkit pin it read."""
+    script, dist, pkg, exe, purelib = _prepared(_HARNESS_DIST, venv_template, tmp_path)
+    _write_install(
+        purelib,
+        dist,
+        pkg,
+        _SMOKE_VERSION,
+        package_files=_good_package(pkg, _SMOKE_VERSION),
+        toolkit_requires=[
+            "messagefoundry-toolkit==" + _SMOKE_VERSION,
+            'messagefoundry-toolkit; extra == "dev"',
+        ],
+        provides_extra=["dev"],
+    )
+
+    rc, stdout, out = _run_smoke(exe, script, tmp_path)
+    assert rc == 0, f"the harness smoke counted an extra-gated toolkit line as the pin.\n{out}"
+    assert stdout.strip() == _SMOKE_VERSION, out
+    assert "messagefoundry-toolkit==" + _SMOKE_VERSION in out, (
+        f"the harness smoke's success line does not name the toolkit pin it accepted.\n{out}"
     )
 
 

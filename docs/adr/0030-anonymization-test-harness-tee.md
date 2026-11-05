@@ -6,9 +6,9 @@
   [`parsing/message.py`](../../messagefoundry/parsing/message.py) (`Message.set`/`encode`, MSH-derived
   `_encoding_chars`, repetition handling) and [`parsing/peek.py`](../../messagefoundry/parsing/peek.py)
   (tolerant python-hl7 peek); the surrogate pools + datatype encoders in
-  [`generators/_hl7data.py`](../../messagefoundry/generators/_hl7data.py) (`FAMILY_NAMES`, `STREETS`,
+  [`generators/_hl7data.py`](../../messagefoundry_toolkit/generators/_hl7data.py) (`FAMILY_NAMES`, `STREETS`,
   `cx()`/`xpn()`/`xad()`/`xcn()`, NANP-reserved fictional phones); the seeded-determinism pattern in
-  [`generators/_core.py`](../../messagefoundry/generators/_core.py) (`random.Random(f"{seed}|…")`); the
+  [`generators/_core.py`](../../messagefoundry_toolkit/generators/_core.py) (`random.Random(f"{seed}|…")`); the
   vendored standalone HL7 reader [`tee/hl7_fields.py`](../../tee/hl7_fields.py); the tee capture/export
   path ([`tee/store.py`](../../tee/store.py) `RelayStore.captures`, [`tee/__main__.py`](../../tee/__main__.py));
   the harness capture sink ([`harness/reconcile/capture.py`](../../harness/reconcile/capture.py)) and
@@ -135,7 +135,7 @@
 
 The highest-value test inputs MessageFoundry can have are **real-world HL7 shapes** — messy, non-
 conformant, vendor-quirky messages from an actual feed. Those are precisely the inputs we **cannot
-commit**: they carry PHI. The synthetic generators ([`generators/`](../../messagefoundry/generators/),
+commit**: they carry PHI. The synthetic generators ([`generators/`](../../messagefoundry_toolkit/generators/),
 mirroring Synthea) produce conformant messages but not the off-spec shapes that break parsers. BACKLOG
 #36 asks for an **anonymizer** that converts captured real messages into **structurally-faithful, PHI-free**
 fixtures safe to commit/share/replay — consumed by both the standalone **tee** relay

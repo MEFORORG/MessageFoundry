@@ -414,7 +414,7 @@ Written in EARS form. Every requirement is for the analyst build unless it says 
   the selected step, with changed values marked. It SHALL open no other panel (gap 4).
 - **FR-33.** WHERE a message type has no generator, Test SHALL be unavailable for it, and the analyst
   build SHALL say why: Test runs only on a generated message, and none exists for that type.
-  `messagefoundry/generators/` covers a fixed set of types; any other type falls here.
+  `messagefoundry_toolkit/generators/` covers a fixed set of types; any other type falls here.
 - Test errors SHALL read as a plain summary, with the details behind a toggle (section 9).
 
 ### 7.6 Submit for review

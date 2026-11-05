@@ -153,7 +153,7 @@ def test_forbidden_members_are_refused(member: str) -> None:
     "member",
     [
         # Named LIKE a forbidden file but not one. A rule that fired here would red real releases.
-        "messagefoundry/generators/README.md",
+        "messagefoundry_toolkit/generators/README.md",
         "messagefoundry/CLAUDE.md.txt",
         "messagefoundry/NOT-CLAUDE.md",
         "messagefoundry/claudemd",
@@ -265,7 +265,7 @@ def test_development_content_is_refused(member: str) -> None:
         "messagefoundry/contest.py",
         "messagefoundry/testament.py",
         "messagefoundry/test_data.json",
-        "messagefoundry/generators/README.md",
+        "messagefoundry_toolkit/generators/README.md",
         "messagefoundry_webconsole/static/csp-probe.js",
         "messagefoundry/testing_notes/x.py",
     ],
@@ -492,6 +492,18 @@ _TOOLKIT_WHEEL = "messagefoundry_toolkit-0.4.0-py3-none-any.whl"
         "messagefoundry/anon.pyc",
         "messagefoundry/anon.cp314-win_amd64.pyd",
         "messagefoundry/adr_analyze.pyc",
+        # The slice 7 retired paths: every member under generators/, and the two schema emitters,
+        # wheel form and sdist form.
+        "messagefoundry/generators/__init__.py",
+        "messagefoundry/generators/_hl7data.py",
+        "messagefoundry/generators/README.md",
+        "messagefoundry-0.4.0/messagefoundry/generators/adt.py",
+        "messagefoundry/generators.py",  # a one-file module restoring the import name
+        "messagefoundry/hl7schema.py",
+        "messagefoundry/hl7structures.py",
+        "messagefoundry-0.4.0/messagefoundry/hl7schema.py",
+        "messagefoundry-0.4.0/messagefoundry/hl7structures.py",
+        "messagefoundry/hl7structures.cpython-314.pyc",
         "messagefoundry_toolkit/__init__.py",  # the toolkit package inside the engine
         "messagefoundry-0.4.0/messagefoundry_toolkit/__main__.py",
         "messagefoundry_toolkit.py",  # the import name as a top-level module
@@ -512,6 +524,9 @@ def test_an_engine_archive_carrying_toolkit_code_is_refused(member: str) -> None
         "adr_analyze.py",  # a run of one is not the two-component retired path
         "messagefoundry/redaction.py",  # the engine's own redactor, not the moved anon/ package
         "messagefoundry/anonymize.py",  # a near name is not the retired directory
+        "messagefoundry/parsing/validate.py",  # the strict validator the schema emitters read
+        "messagefoundry/hl7schemas.py",  # a near name is not the retired module
+        "messagefoundry/verify/generators/x.py",  # the retired leaf under a different parent
     ],
 )
 def test_an_engine_archive_member_that_stays_is_allowed(member: str) -> None:

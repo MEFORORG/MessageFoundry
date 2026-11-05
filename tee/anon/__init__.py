@@ -6,7 +6,7 @@ Turns captured real HL7 v2 into a structurally-faithful, de-identified dataset, 
 ``messagefoundry`` import (the tee sits on the Epic/Corepoint boundary and stays standalone — it
 vendors the shared logic, mirroring ``tee/hl7_fields.py``/``tee/mllp.py``). The shared files
 (``keying``/``rules``/``surrogates`` + the vendored ``_hl7data``) are held byte-identical to the
-toolkit's (and, for ``_hl7data``, the engine generator's) by the parity test; the adapter/leak seams are behaviourally parallel (golden-corpus test).
+toolkit's (and, for ``_hl7data``, the toolkit generator's) by the parity test; the adapter/leak seams are behaviourally parallel (golden-corpus test).
 
 Public surface (same shape as the toolkit's):
 

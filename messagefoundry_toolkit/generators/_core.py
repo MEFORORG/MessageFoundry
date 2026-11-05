@@ -24,11 +24,11 @@ from typing import Any
 
 from hl7apy import v2_5_1 as _ref
 
-from messagefoundry.generators import _hl7data as d
 from messagefoundry.parsing import validate
 
 # The strict validator's own choice test, so generation and validation agree on what a choice is.
 from messagefoundry.parsing.validate import is_choice_group
+from messagefoundry_toolkit.generators import _hl7data as d
 
 _MESSAGES = _ref.MESSAGES
 _SEGMENTS = _ref.SEGMENTS
