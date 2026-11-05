@@ -552,9 +552,10 @@ async def _no_reply(_raw: bytes) -> str | None:
 async def test_the_http_listener_records_a_failed_handshake(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runner: str
 ) -> None:
-    """On the stdlib loop the listener runs its own handshakes since BACKLOG #2479, and counts a
-    failure with its peer. ``loop`` forces the path uvloop takes, where the context's hook counts
-    it and does not read the peer."""
+    """The listener counts a failure with its peer on every loop since BACKLOG #2479: it runs
+    the handshake itself on the stdlib loop, and hands an admitted socket to
+    ``connect_accepted_socket`` through its own accept loop on every other. ``loop`` forces the
+    path uvloop takes, where before the accept loop the context's hook counted it, with no peer."""
     if runner == "loop":
         monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
     source, cert = _http_tls_source(tmp_path)
@@ -574,8 +575,8 @@ async def test_the_http_listener_records_a_failed_handshake(
         failed = [e for e in events.seen if e[0] == "tls_handshake_failed"]
         assert len(failed) == 1
         (_kind, peer, reason) = failed[0]
-        # The listener's own handshake knows its peer; the loop's hook does not read it.
-        assert peer == ("127.0.0.1" if runner == "listener" else None)
+        # The listener admitted the socket before its handshake on both paths, so knows its peer.
+        assert peer == "127.0.0.1"
         assert reason is not None and reason.startswith("1 failed handshake(s)")
         assert "GET" not in reason  # a cause, never the peer's bytes
         assert source.tls_handshake_failures == 1
@@ -597,8 +598,8 @@ async def test_the_http_listener_window_shortens_through_the_shared_seam(
 ) -> None:
     """Vault BACKLOG #3785 item 4: HTTP had no window seam, because its counter took the window
     as a default bound at import. Patched in one place, every listener's window is read from it.
-    Run on the loop-run path, through the context hook it was written for (BACKLOG #2479 moved the
-    stdlib loop's default onto the listener's own handshake)."""
+    Run on the accept-loop path; it was written for the context hook, which the HTTP listener no
+    longer arms on any loop (BACKLOG #2479)."""
     monkeypatch.setattr(tls_handshake_failures, "EVENT_SECONDS", 0.3)
     monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
     source, _cert_path = _http_tls_source(tmp_path)

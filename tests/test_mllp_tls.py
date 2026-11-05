@@ -803,8 +803,8 @@ def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
     """uvloop's Loop is an AbstractEventLoop and not a BaseEventLoop, so this is what sends it to the
     listener's own accept loop; see `_upgrades_tls_itself` for why. A BaseEventLoop subclass goes
     there too: its transports are not the ones the upgrade was read against (vault BACKLOG #4552).
-    The HTTP listener, which has no accept loop of its own, has its own predicate and keeps the
-    upgrade on such a subclass."""
+    The HTTP listener runs the same accept loop since BACKLOG #2479, so its predicate matches the
+    same way."""
 
     class _OtherLoop(asyncio.AbstractEventLoop):
         pass
@@ -819,8 +819,7 @@ def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
         for predicate in (mllp_module._upgrades_tls_itself, http_module._upgrades_tls_itself):
             assert predicate(stdlib) is True
             assert predicate(selector) is True
-        assert mllp_module._upgrades_tls_itself(subclassed) is False
-        assert http_module._upgrades_tls_itself(subclassed) is True
+            assert predicate(subclassed) is False
     finally:
         stdlib.close()
         selector.close()

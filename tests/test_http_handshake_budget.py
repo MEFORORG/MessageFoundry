@@ -2,10 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The HTTP listener bounds how many slots one address may hold in a TLS handshake (vault BACKLOG #4888).
 
-On a loop that upgrades TLS itself (``_upgrades_tls_itself``, the stdlib loops) a socket is admitted
-before its handshake, so it holds a ``max_connections`` slot until the handshake ends, up to the 10 s
-handshake bound. ``max_connections_per_host`` ships off on ``Http()`` (vault BACKLOG #2606), so before
-this row one address that never finished a handshake, at least an mTLS peer with no client
+A TLS socket is admitted before its handshake on every loop (BACKLOG #2479): upgraded with
+``start_tls`` on the stdlib loops (``_upgrades_tls_itself``), and through the listener's own accept
+loop on every other, so it holds a ``max_connections`` slot until the handshake ends, up to the 10 s
+handshake bound. The tests below that open sockets run both ways (``tls_path``).
+``max_connections_per_host`` ships off on ``Http()`` (vault BACKLOG #2606), so before this row one address that never finished a handshake, at least an mTLS peer with no client
 certificate, could have held every one of the 256 slots. ``max_handshakes_per_host`` bounds only the
 handshake: a socket leaves the count the moment its handshake ends, so a completed connection never
 counts against it, and the per-host cap stays off for established traffic behind an L4 load
@@ -32,7 +33,8 @@ from messagefoundry.transports import mllp as mllp_module
 from messagefoundry.transports.admission import ListenerAdmission
 from messagefoundry.transports.http_listener import DEFAULT_MAX_HANDSHAKES_PER_HOST, HttpSource
 from messagefoundry.transports.receipt import receipt_handler
-from tests.test_http_listener_tls_admission import _https_post, _Intake
+from tests.test_http_listener_tls_admission import _Intake, _on_path
+from tests.test_http_listener_tls_admission import tls_path as tls_path  # a fixture, used by name
 from tests.test_listener_admission import _PeerWriter
 from tests.test_mllp_tls import _close_raw, _closed_by_listener, _Events, _until
 from tests.test_tls_handshake_failures import _http_tls_source as _tls_source
@@ -47,7 +49,7 @@ async def _silent_socket(port: int) -> tuple[asyncio.StreamReader, asyncio.Strea
 
 
 async def test_one_address_holds_at_most_the_budget_in_its_handshake(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls_path: str
 ) -> None:
     """The row's case: per-host cap off (the shipped default), so before #4888 a third silent
     socket was admitted like the first two and only ``max_connections`` bounded the address."""
@@ -59,7 +61,7 @@ async def test_one_address_holds_at_most_the_budget_in_its_handshake(
     await source.start(receipt_handler(_Intake()))
     opened: list[asyncio.StreamWriter] = []
     try:
-        assert source._upgrade_tls is True
+        _on_path(source, tls_path)
         for _ in range(2):
             opened.append((await _silent_socket(source.sockport))[1])
         await _until(lambda: source._admission.active == 2, "two silent sockets were not admitted")
@@ -89,7 +91,7 @@ async def test_one_address_holds_at_most_the_budget_in_its_handshake(
 
 
 async def test_a_completed_handshake_does_not_count_against_the_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tls_path: str
 ) -> None:
     """The budget counts the handshake, not the connection, which is what keeps it apart from a
     per-host cap of 1: a peer past its handshake is still open here, and a silent socket from the
@@ -101,6 +103,7 @@ async def test_a_completed_handshake_does_not_count_against_the_budget(
     await source.start(receipt_handler(_Intake()))
     opened: list[asyncio.StreamWriter] = []
     try:
+        _on_path(source, tls_path)
         _r, done = await asyncio.wait_for(
             asyncio.open_connection(
                 HOST, source.sockport, ssl=_pinned_client(cert), server_hostname=HOST
@@ -124,48 +127,18 @@ async def test_a_completed_handshake_does_not_count_against_the_budget(
         await asyncio.wait_for(source.stop(), timeout=10.0)
 
 
-async def test_the_budget_is_inert_where_the_loop_runs_the_handshake(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """On a loop that does not upgrade TLS itself (uvloop's path, forced here), a socket in its
-    handshake takes no slot and is not counted. Two silent sockets from one address with a budget
-    of 1 leave a real client from that address served. This pins behaviour, not wiring: on this path
-    `_on_client` runs only after the loop's handshake, so no wiring change could make the budget
-    count these sockets."""
-    monkeypatch.setattr(http_module, "_upgrades_tls_itself", lambda _loop: False)
-    monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
-    source, cert = _tls_source(tmp_path, max_handshakes_per_host=1)
-    events = _Events()
-    source.on_connection_event = events
-    intake = _Intake()
-    await source.start(receipt_handler(intake))
-    opened: list[asyncio.StreamWriter] = []
-    try:
-        assert source._upgrade_tls is False
-        for _ in range(2):
-            opened.append((await _silent_socket(source.sockport))[1])
-        assert await _https_post(source.sockport, cert) == 202
-        assert "at_capacity" not in events.kinds()
-        assert source._admission.handshaking == {}
-    finally:
-        for writer in opened:
-            await _close_raw(writer)
-        await asyncio.wait_for(source.stop(), timeout=10.0)
-    assert intake.received == [b"hi"]
-
-
 class _SubclassedLoop(asyncio.SelectorEventLoop):
-    """A subclass of a stdlib loop, which the MLLP listener treats as an unknown loop (vault
-    BACKLOG #4552) and the HTTP listener does not."""
+    """A subclass of a stdlib loop, which both listeners treat as an unknown loop (vault BACKLOG
+    #4552), so a real loop on which neither upgrades TLS itself, with nothing forced."""
 
 
 def test_the_budget_still_applies_on_a_subclass_of_a_stdlib_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The HTTP listener has no accept loop of its own, so if a BaseEventLoop subclass took it off
-    its own upgrade, its caps would apply only after the loop's handshake and this budget never.
-    It keeps the upgrade there, as before vault BACKLOG #4552. The control: the same loop is one the MLLP
-    listener's exact match refuses, so the HTTP listener passes the looser test on purpose."""
+    """Before BACKLOG #2479's accept loop, the HTTP listener kept the ``start_tls`` upgrade on a
+    BaseEventLoop subclass, because the loop's handshake was its only other path, and there this
+    budget never applied. Now a subclass gets the accept loop, as on the MLLP listener, and the
+    budget applies there: a second silent socket from one address is refused at a budget of 1."""
     monkeypatch.setattr(http_module, "_TLS_HANDSHAKE_TIMEOUT", 60.0)
 
     async def scenario() -> None:
@@ -178,7 +151,7 @@ def test_the_budget_still_applies_on_a_subclass_of_a_stdlib_loop(
         await source.start(receipt_handler(_Intake()))
         opened: list[asyncio.StreamWriter] = []
         try:
-            assert source._upgrade_tls is True
+            _on_path(source, "accept_loop")
             opened.append((await _silent_socket(source.sockport))[1])
             await _until(lambda: source._admission.handshaking == {HOST: 1}, "not in handshake")
             r2, w2 = await _silent_socket(source.sockport)
