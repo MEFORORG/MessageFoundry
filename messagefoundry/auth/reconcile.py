@@ -424,7 +424,9 @@ class ReconcilePlan:
 
         Held probes stay in (ADR 0195 amendment 2026-10-11, BACKLOG #2138, a seat decision under
         owner delegation 2026-10-08, not an owner ruling), and so do referred ones (BACKLOG #2538).
-        The amendment says why, and what the dilution costs."""
+        The amendment says why, and what the dilution costs. So does every other unjudged probe,
+        at least a faulted, a misconfigured and an unavailable one (BACKLOG #3100, #3010): the
+        denominator is every candidate the pass took, whatever it read."""
         return self.probed
 
 

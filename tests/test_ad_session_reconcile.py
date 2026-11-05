@@ -1068,9 +1068,9 @@ async def test_a_referring_user_search_base_judges_nothing_and_pages_every_pass(
         assert "ad_user_search_base" in alert[:200] and "ad_group_search_base" in alert[:200]
         assert "revoked nothing" in alert and "circuit breaker" not in alert
         # BACKLOG #3100 items 4 and 6. The detail says what a referral costs: a disabled account
-        # behind the base is not revoked while it lasts. That sentence falls past the 200
-        # characters the alert instance keeps; the notifier's detail carries it. No account named.
-        assert "never revoked while it is referred" in alert
+        # behind the base is not revoked while it lasts. Inside the 200 characters the alert
+        # instance keeps, beside the settings (BACKLOG #3100 P5). No account named.
+        assert "never revoked while it is referred" in alert[:200]
         assert "jdoe" not in alert and "asmith" not in alert
         audit = await store.list_audit()
         referred = _referred_rows(audit)
@@ -1530,6 +1530,7 @@ async def test_when_every_probe_raises_the_operator_sees_a_probe_fault_not_an_ou
         assert "session_absolute_hours" in alert
         # The store keeps 200 characters of the alert's reason: the pointer must fit in them.
         assert "names the account" in alert[:200]
+        assert "never revoked while its probe faults" in alert[:200]  # and so must the cost (P5)
         audit = await store.list_audit()
         expected = {
             "reason": "probe_fault",

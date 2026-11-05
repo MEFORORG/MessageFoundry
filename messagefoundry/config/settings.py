@@ -5556,8 +5556,10 @@ _ALERT_EVENT_TYPES = frozenset(
         # inline config reload's lost config_reload_attempted row, keyed `config_reload:inline`.
         "audit_write_failed",
         # ADR 0079 mechanism 2: the directory reconciler's two audited outcomes, each routable apart:
-        # a pass left accounts unrevoked (the breaker tripped, or probes were referred, BACKLOG
-        # #2538), and one principal's sessions were revoked.
+        # a pass left accounts unrevoked, and one principal's sessions were revoked. The first is
+        # raised for at least a breaker trip, a referral (BACKLOG #2538), a configuration refusal
+        # (#3010), a probe fault (#3100), a paging refusal (vault #3696), a lasting outage (#3709)
+        # and an account the directory keeps failing for (#3100), each under its own source.
         "ad_reconcile_aborted",
         "ad_session_revoked",
         # ADR 0195: the reconciler held accounts whose userAccountControl it could not read.

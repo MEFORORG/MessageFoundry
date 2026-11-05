@@ -634,26 +634,29 @@ _BreakerStanding = Literal["fresh", "tripped", "forfeit"]
 _ReferralStanding = Literal["fresh", "referred", "forfeit"]
 #: The three standings above, as `AuthService._reconcile_episodes` keys them (BACKLOG #3083).
 _EpisodeKind = Literal["breaker", "referral", "hold"]
-#: What a forfeited standing logs when a new condition of its kind opens (BACKLOG #3083). Why a
-#: restarted process does not resolve an instance it finds open: `AuthService._mark_reconcile_clears`.
+#: Why no other process can be relied on to resolve the instance either, said once for the three
+#: lines below (BACKLOG #3083 C6, C7). Why a restarted process does not resolve an instance it
+#: finds open, and which engines resolve none: `AuthService._mark_reconcile_clears`.
+_FORFEIT_NOBODY_ELSE: Final[str] = (
+    ", because a restarted process does not resolve one it finds open, and a [cluster] node or "
+    "an engine of more than one engine shard resolves none itself"
+)
+#: What a forfeited standing logs when a new condition of its kind opens (BACKLOG #3083).
 _FORFEITED_EPISODE_WARNINGS: Final[dict[_EpisodeKind, str]] = {
     "breaker": (
         "directory reconcile: the breaker tripped after this process gave up resolving "
         "ad_reconcile_aborted, so it will not resolve this trip's alert itself; once the "
-        "directory reads clean, resolve any open instance by hand, because a restarted process "
-        "does not resolve one it finds open"
+        "directory reads clean, resolve any open instance by hand" + _FORFEIT_NOBODY_ELSE
     ),
     "referral": (
         "directory reconcile: an LDAP referral opened after this process gave up resolving the "
         "referral's ad_reconcile_aborted instance, so it will not resolve this one itself; once "
-        "the search bases are fixed, resolve any open instance by hand, because a restarted "
-        "process does not resolve one it finds open"
+        "the search bases are fixed, resolve any open instance by hand" + _FORFEIT_NOBODY_ELSE
     ),
     "hold": (
         "directory reconcile: the undetermined userAccountControl hold engaged after this process "
         "gave up resolving ad_reconcile_held, so it will not resolve this hold itself; once the "
-        "attribute reads clean, resolve any open instance by hand, because a restarted process "
-        "does not resolve one it finds open"
+        "attribute reads clean, resolve any open instance by hand" + _FORFEIT_NOBODY_ELSE
     ),
 }
 
@@ -3448,8 +3451,11 @@ class AuthService:
         # preflight never ran); a reason string = browser SSO degraded until restart.
         self._kerberos_unavailable_reason: str | None = None
         # Directory session reconciliation (ADR 0079 mechanism 2). Process-local, like the rate
-        # limiters and the action step-up grants above — a restart resets the strike counts, which
-        # costs at most one extra interval of exposure and is biased toward NOT revoking.
+        # limiters and the action step-up grants above. Within one process two strikes cost at
+        # most one extra interval of exposure. A restart resets the strike counts, which is
+        # biased toward NOT revoking: each restart starts the count again, so an engine that
+        # restarts more often than strikes times interval never revokes through this, and it
+        # also loses the hold's latch (ADR 0195, "What a restart does to the hold"; BACKLOG #3689).
         #: user_id -> consecutive passes the principal failed to resolve.
         self._reconcile_strikes: dict[str, int] = {}
         #: user_id -> monotonic clock of its last probe; orders the per-pass bind budget.
@@ -8306,7 +8312,10 @@ class AuthService:
         * a probe that could not reach the directory contributes nothing (fail-open);
         * a probe the directory referred contributes nothing either, and the pass alerts, while
           every other account is still judged (BACKLOG #2538). So does a probe the directory
-          refused for its configuration, such as a deleted search base (BACKLOG #3010);
+          refused for its configuration, such as a deleted search base (BACKLOG #3010), and a
+          probe that raised something the engine could not read, a probe fault (BACKLOG #3100);
+        * an account whose probe keeps failing to reach the directory while it answers others
+          pages once that lasts (BACKLOG #3100), and so does a whole-directory outage (#3709);
         * a principal must come back absent, disabled, undetermined or unkeyed
           ``ad_session_recheck_strikes`` passes running;
         * a PRESENT principal whose directory groups would change its roles, or withdraw or narrow
@@ -9639,14 +9648,15 @@ class AuthService:
             else "Accounts that answered without a referral were judged as usual."
         )
         others = self._unjudged_others(plan, others, faults=True, refusals=True)
+        # The cost inside the first 200 characters too, beside the settings (BACKLOG #3100 P5).
         self._reconcile_referral_alert = (
-            "LDAP referral: check [auth].ad_user_search_base, [auth].ad_group_search_base for "
-            "nested groups, and [auth].ad_bind_dn; one names another domain of the forest. "
-            f"{len(plan.referred)} of {plan.asked} signed-in directory account(s) probed were "
-            f"referred and left unjudged. {others} A referred account is never revoked while it "
-            "is referred, because the engine does not follow referrals. Use a base in the bound "
-            "domain controller's own domain, or a global catalog. The ERROR log line for each such "
-            "pass names the first referred search and its hosts."
+            "LDAP referral: check [auth].ad_user_search_base, [auth].ad_group_search_base and "
+            "[auth].ad_bind_dn; one names another domain. A referred account is never revoked "
+            f"while it is referred. {len(plan.referred)} of {plan.asked} signed-in directory "
+            f"account(s) probed were referred and left unjudged. {others} The engine does not "
+            "follow referrals, so use a base in the bound domain controller's own domain, or a "
+            "global catalog. The ERROR log line for each such pass names the first referred "
+            "search and its hosts."
         )
         # The refusal's text goes to the log only: it names the search and the referred hosts and
         # nothing else (BACKLOG #2530), which is what an operator needs to fix the base. One line
@@ -9707,10 +9717,10 @@ class AuthService:
         # of an alert instance's reason, as `_record_reconcile_referral` says.
         self._reconcile_fault_alert = (
             "directory probe fault: the engine log's WARNING for each faulting probe names the "
-            f"account and the exception type. {len(plan.faulted)} of {plan.asked} signed-in "
-            "directory account(s) asked raised an error the engine could not read, and were left "
-            f"unjudged. {others} A faulted account is never revoked while its probe faults, so its "
-            "sessions run to [auth].session_absolute_hours."
+            "account and the exception type. A faulted account is never revoked while its probe "
+            f"faults. {len(plan.faulted)} of {plan.asked} signed-in directory account(s) asked "
+            f"raised an error the engine could not read, and were left unjudged. {others} So a "
+            "faulted account's sessions run to [auth].session_absolute_hours."
         )
         _log.error("directory reconcile: %s", self._reconcile_fault_alert)
         await self._audit_reconciler_row(
