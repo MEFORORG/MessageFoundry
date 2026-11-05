@@ -168,9 +168,11 @@ def _attach_issuer_index(ctx: ssl.SSLContext, cadata: str, cert_map: Mapping[str
     Built from the SAME ``cadata`` the context just loaded, once, rather than per connection. The shim
     reads it back off the context (:data:`~messagefoundry.api.tls_client_cert.ISSUER_INDEX_ATTR`). A
     key that names no loaded CA, or names two with one subject (typical mid-rollover), would deny
-    every certificate under it with nothing in the log, so each one is warned about here (#2237).
-    Raises ``ValueError``, refusing the start, when the index cannot hold exactly what the context
-    loaded (:class:`~messagefoundry.pki.IssuerIndex`, BACKLOG #4948)."""
+    every certificate under it with nothing in the log, so each one is warned about here (#2237),
+    as is a loaded certificate that is no CA with a loaded CA's subject
+    (:meth:`~messagefoundry.pki.IssuerIndex.namesake_warnings`). Raises ``ValueError``, refusing
+    the start, when the index cannot hold exactly what the context loaded
+    (:class:`~messagefoundry.pki.IssuerIndex`, BACKLOG #4948)."""
     from messagefoundry.api.tls_client_cert import ISSUER_INDEX_ATTR
     from messagefoundry.pki import IssuerIndex
 
@@ -178,6 +180,8 @@ def _attach_issuer_index(ctx: ssl.SSLContext, cadata: str, cert_map: Mapping[str
     setattr(ctx, ISSUER_INDEX_ATTR, index)
     for key, reason in index.unmatched_keys(cert_map).items():
         log.warning("[api].tls_client_cert_identities issuer %r %s", key, reason)
+    for warning in index.namesake_warnings():
+        log.warning("%s", warning)
 
 
 #: Filenames for the first-run generated pair, written beside the store database (BACKLOG #1276).

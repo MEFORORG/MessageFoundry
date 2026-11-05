@@ -1642,6 +1642,9 @@ class _Anchor:
     #: Whether OpenSSL reads it as a CA. One it does not can sign nothing in a chain OpenSSL
     #: verifies, so it names only itself, as a pinned client certificate (BACKLOG #4948).
     ca: bool
+    #: Its certificate block's number in the file, counted as the parse refusal counts it, so a
+    #: warning can name it.
+    position: int
 
 
 class IssuerIndex:
@@ -1679,7 +1682,8 @@ class IssuerIndex:
         # Subjects whose keys include a self-signed certificate OpenSSL reads as no CA, so
         # unmatched_keys does not call it a CA.
         self._pinned_subjects: set[str] = set()
-        read: list[tuple[x509.Certificate, str, bytes, bytes]] = []
+        self._label = label
+        read: list[tuple[x509.Certificate, str, bytes, bytes, int]] = []
         blocks = _pem_certificate_blocks(cadata.encode("ascii", "replace"))
         for position, block in enumerate(blocks, start=1):
             try:
@@ -1697,10 +1701,10 @@ class IssuerIndex:
                 ) from exc
             copies[der] += 1
             if copies[der] == 1:
-                read.append((cert, subject, der, key))
+                read.append((cert, subject, der, key, position))
         cas = _refuse_unless_openssl_loads(cadata, copies, label=label)
-        for cert, subject, der, key in read:
-            anchor = _Anchor(cert, subject, der, ca=der in cas)
+        for cert, subject, der, key, position in read:
+            anchor = _Anchor(cert, subject, der, ca=der in cas, position=position)
             self._by_subject_name.setdefault(cert.subject, []).append(anchor)
             # One OpenSSL reads as no CA signs nothing it verifies, so issuer_of names it only as
             # itself, when it signs itself. One that does not is named for no leaf, and is no
@@ -1750,6 +1754,36 @@ class IssuerIndex:
                     "so they cannot be told apart and no certificate maps under it"
                 )
         return problems
+
+    def namesake_warnings(self) -> list[str]:
+        """One warning for each loaded certificate OpenSSL reads as no CA that has the subject of a
+        loaded CA, naming both, for the caller to log at start (BACKLOG #4948).
+
+        OpenSSL finds a leaf's issuer among the loaded certificates by name. Unless the namesake's
+        key identifier rules it out, it may take the namesake, then refuse the chain because it is
+        no CA, so every client certificate under that CA fails the handshake. The index does not
+        count such a namesake toward the same-DN ambiguity unless it signs itself, so
+        :meth:`unmatched_keys` may give no reason, and this is the only start signal. Names are
+        compared with ASCII case folded, as OpenSSL folds it. It warns whatever the key
+        identifiers say, as a client certificate with no authority key identifier rules nothing
+        out. A warning only: it changes no allow, deny or refusal."""
+        by_name: dict[_NameKey, list[_Anchor]] = {}
+        for anchors in self._by_subject_name.values():
+            for anchor in anchors:
+                by_name.setdefault(_issuer_name_key(anchor.cert.subject), []).append(anchor)
+        warnings: list[str] = []
+        for anchors in by_name.values():
+            cas = [anchor for anchor in anchors if anchor.ca]
+            for other in (anchor for anchor in anchors if not anchor.ca):
+                warnings.extend(
+                    f"{self._label}: certificate block {other.position} ({other.subject}) is not a "
+                    f"CA but has the subject of the CA certificate in block {ca.position}. The TLS "
+                    f"library may take block {other.position} as the issuer of a client "
+                    "certificate that CA issued, and then refuse every client certificate of that "
+                    "CA. Remove it, or re-issue it under another subject"
+                    for ca in cas
+                )
+        return warnings
 
 
 def _directly_issued(leaf: x509.Certificate, issuer: x509.Certificate) -> bool:

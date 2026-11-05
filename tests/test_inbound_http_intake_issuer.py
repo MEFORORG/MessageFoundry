@@ -31,10 +31,12 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from messagefoundry import pki
+from messagefoundry.api.tls import _attach_issuer_index
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import Http, WiringError, env
 from messagefoundry.pki import IssuerIndex
 from messagefoundry.transports.http_listener import HttpSource, _client_issuer_index
+from messagefoundry.transports.mllp import _sender_issuer_lookup
 from messagefoundry.transports.receipt import IngressReceipt, receipt_handler
 from tests.test_api_tls import (
     _CaPair,
@@ -100,6 +102,16 @@ async def _started(source: HttpSource) -> HttpSource:
     return source
 
 
+def _client_context(bundle: Path) -> ssl.SSLContext:
+    """A client context presenting ``bundle`` that verifies nothing: the LISTENER side is the
+    verifier under test."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_cert_chain(bundle)
+    return ctx
+
+
 async def _status(source: HttpSource, bundle: Path, *, send: bool) -> int:
     """The HTTP status the listener answers a client presenting ``bundle``.
 
@@ -107,11 +119,9 @@ async def _status(source: HttpSource, bundle: Path, *, send: bool) -> int:
     nothing (``send=False``) and only reads: writing into a socket the listener is closing can reset
     it and lose the status. If such a client were admitted instead, the listener would wait for a
     request and the read would time out, failing the case. ``send=True`` posts a body first."""
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE  # the LISTENER side is the verifier under test
-    ctx.load_cert_chain(bundle)
-    reader, writer = await asyncio.open_connection("127.0.0.1", source.sockport, ssl=ctx)
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", source.sockport, ssl=_client_context(bundle)
+    )
     try:
         if send:
             writer.write(b"POST /ingest HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}")
@@ -820,13 +830,14 @@ def test_a_certificate_openssl_reads_as_no_ca_names_only_itself() -> None:
     assert index.issuer_of(_der(other)) == ""
 
 
-def _issued_no_ca(dn: x509.Name, by: _CaPair) -> x509.Certificate:
+def _issued_no_ca(dn: x509.Name, by: _CaPair, *, skid: bool = True) -> x509.Certificate:
     """A certificate for ``dn`` that ``by`` signed, marked ``CA:FALSE``. It signs nothing OpenSSL
-    verifies, and it does not sign itself, so the index never names it as itself. Its key
-    identifier is set, as a real certificate's is, so OpenSSL does not try it as a leaf's issuer."""
+    verifies, and it does not sign itself, so the index never names it as itself. With ``skid``,
+    its key identifier is set, as a real certificate's is, so OpenSSL does not try it as the issuer
+    of a leaf whose authority key identifier names another key."""
     key = ec.generate_private_key(ec.SECP256R1())
     now = datetime.datetime.now(datetime.UTC)
-    return (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(dn)
         .issuer_name(by[0].subject)
@@ -835,9 +846,12 @@ def _issued_no_ca(dn: x509.Name, by: _CaPair) -> x509.Certificate:
         .not_valid_before(now - datetime.timedelta(minutes=5))
         .not_valid_after(now + datetime.timedelta(days=1))
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
-        .sign(by[1], hashes.SHA256())
     )
+    if skid:
+        builder = builder.add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
+        )
+    return builder.sign(by[1], hashes.SHA256())
 
 
 @pytest.mark.parametrize("other", ["ca", "pinned"])
@@ -950,6 +964,95 @@ async def test_a_certificate_that_is_no_ca_sharing_a_cas_subject_is_no_twin(
     assert "pinned" in index.unmatched_keys(["CN=Acme CA"])["CN=Acme CA"]
     # Control: with the CA alone, the same leaf is named.
     assert IssuerIndex(_pem(acme[0]).decode("ascii")).issuer_of(leaf) == "CN=Acme CA"
+
+
+async def _handshake_refused(source: HttpSource, bundle: Path) -> bool:
+    """Whether the listener ends the TLS handshake of a client presenting ``bundle``, so no HTTP
+    status is ever answered. Under TLS 1.3 the client finishes first, so the refusal can reach it
+    as an alert, a reset or an empty read."""
+    try:
+        reader, writer = await asyncio.open_connection(
+            "127.0.0.1", source.sockport, ssl=_client_context(bundle)
+        )
+    except (ssl.SSLError, ConnectionError):
+        return True
+    try:
+        data = await asyncio.wait_for(reader.read(-1), 10.0)
+    except (ssl.SSLError, ConnectionError):
+        return True
+    finally:
+        writer.close()
+    return data == b""
+
+
+async def test_a_namesake_that_is_no_ca_is_warned_about_at_start(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A loaded certificate that is no CA, with no key identifier, listed after the CA whose
+    subject it has. OpenSSL may take it as the issuer of a client certificate that CA issued, and
+    then refuses the chain, so every client of that CA fails the handshake. The index does not
+    count it as a twin (fix 3 of BACKLOG #4948), so the key maps nothing wrong and no reason for
+    it is given; the start warns instead, naming both certificates. In the shipped code a
+    namesake counted as a twin, so the start warned about the key, for the wrong reason; at
+    d18a761e the start was silent. The warning changes no outcome."""
+    acme = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root, skid=False)
+    subjects = {"CN=Acme CA": [SUBJECT]}
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+        source = await _started(_source(tmp_path, [acme[0], namesake], subjects))
+    try:
+        warned = [r.getMessage() for r in caplog.records]
+        assert any(
+            "certificate block 2 (CN=Acme CA) is not a CA" in m
+            and "the CA certificate in block 1" in m
+            and "refuse every client certificate" in m
+            for m in warned
+        ), warned
+        assert source._issuer_index is not None
+        assert source._issuer_index.unmatched_keys(subjects) == {}  # still no twin
+        # The failure warned of, measured: a client the CA issued fails the handshake.
+        assert await _handshake_refused(source, _bundle(tmp_path, acme))
+    finally:
+        await source.stop()
+    # Control: with the CA alone, nothing is warned and the same CA's client is admitted.
+    caplog.clear()
+    (tmp_path / "alone").mkdir()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
+        source = await _started(_source(tmp_path / "alone", [acme[0]], subjects))
+    try:
+        assert not caplog.records, [r.getMessage() for r in caplog.records]
+        assert await _admitted(source, _bundle(tmp_path, acme)) == 202
+    finally:
+        await source.stop()
+
+
+@pytest.mark.parametrize("surface", ["api", "mllp"])
+def test_the_api_and_mllp_starts_warn_about_a_namesake_that_is_no_ca(
+    caplog: pytest.LogCaptureFixture, surface: str
+) -> None:
+    """The API's and the MLLP listener's index builds log the same namesake warning as the HTTP
+    listener's, naming their own file, and nothing for the CA alone (BACKLOG #4948)."""
+    acme = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), acme, skid=False)
+    subjects = {"CN=Acme CA": [SUBJECT]}
+
+    def build(cadata: str) -> list[str]:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            if surface == "api":
+                _attach_issuer_index(ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER), cadata, subjects)
+            else:
+                _sender_issuer_lookup("IB_PARTNER", cadata, subjects)
+        return [r.getMessage() for r in caplog.records]
+
+    file = "[api].tls_client_ca_file" if surface == "api" else "tls_ca_file"
+    warned = build((_pem(acme[0]) + _pem(namesake)).decode("ascii"))
+    assert any(
+        f"{file}: certificate block 2 (CN=Acme CA) is not a CA" in m and "block 1" in m
+        for m in warned
+    ), warned
+    assert build(_pem(acme[0]).decode("ascii")) == []  # control
 
 
 @pytest.mark.parametrize(

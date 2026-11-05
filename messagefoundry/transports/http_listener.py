@@ -712,9 +712,10 @@ def _client_issuer_index(
     ``cadata`` is the text the SSL context loaded, or ``None`` when it loaded none. A key
     naming no loaded CA, or naming two loaded CAs with one subject and different keys, would deny
     every certificate under it with nothing in the log, so each one is warned about here, as the API
-    does for ``[api].tls_client_cert_identities``. Raises ``ValueError``, refusing the start,
-    when the index cannot hold exactly what the TLS library loaded
-    (:class:`~messagefoundry.pki.IssuerIndex`)."""
+    does for ``[api].tls_client_cert_identities``, as is a loaded certificate that is no CA with a
+    loaded CA's subject (:meth:`~messagefoundry.pki.IssuerIndex.namesake_warnings`). Raises
+    ``ValueError``, refusing the start, when the index cannot hold exactly what the TLS library
+    loaded (:class:`~messagefoundry.pki.IssuerIndex`)."""
     if cadata is None:
         return None
     # Lazy: pki pulls in cryptography, which a listener without mtls_subject never needs.
@@ -731,6 +732,8 @@ def _client_issuer_index(
             name,
             issuer,
         )
+    for warning in index.namesake_warnings():  # names this listener and its file
+        logger.warning("%s", warning)
     return index
 
 
