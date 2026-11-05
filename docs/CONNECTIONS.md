@@ -2016,7 +2016,8 @@ where the connection is declared, code-first or in `connections.toml`, so the co
 load and `messagefoundry check`'s required `validate` fails, with or without a
 `messagefoundry.toml`. Every other case is refused when the connection is built: that fails a
 dry run, a reload and the required `build-check` where it runs (it skips with no
-`messagefoundry.toml` and no `MEFOR_AI_ENVIRONMENT`), and in the live build at `serve` start it
+`messagefoundry.toml` and no `check --env` or `MEFOR_AI_ENVIRONMENT`), and in the live build at
+`serve` start it
 fails that connection. The `[egress].allowed_db` check refuses the same name, whatever its entry for
 the host says. An `env()` `dialect` or `odbc_driver` is resolved when the connection is built,
 and refused unless the driver resolves to a name above. `messagefoundry check` reads the graph
@@ -2080,7 +2081,7 @@ each runs:
 
 - For `Database`, `DatabasePoll` and `DatabaseLookup`, both run when the engine starts or
   reloads. They also run in `messagefoundry check` where its build leg runs, with a
-  `messagefoundry.toml` or `MEFOR_AI_ENVIRONMENT`.
+  `messagefoundry.toml`, `check --env` or `MEFOR_AI_ENVIRONMENT`.
 - For a `DatabaseRef`, both run at each sync, and the first sync runs at start. The build also
   runs at a reload, a dry run included, and in that `messagefoundry check` leg, once its `env()`
   values resolve. So each case below still fails there. The egress check runs only at sync.

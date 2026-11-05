@@ -294,13 +294,15 @@ host that file names. A bind host given only as `serve --host` is not in that fi
 check judges the file's host. The shipped service installer always passes `--host`, so on that path
 the check and `serve` can disagree on the bind host. With
 no file and no `--service-config`, it reads the environment instead. That needs
-`MEFOR_AI_ENVIRONMENT` to name the instance, and the line says so. At least these cases keep the
+`check --env` or `MEFOR_AI_ENVIRONMENT` to name the instance, and the line says which.
+`check --env` names the environment as `serve --env` does, above the file and the variable.
+At least these cases keep the
 skip. A `--service-config` naming a missing file is one, because `serve` refuses that file.
 Another is `--project-root` with no `--service-config`, no file under the root or the config
 directory, and a `messagefoundry.toml` in a working directory that is not the root. The line
-names that file. A third is no file and no `MEFOR_AI_ENVIRONMENT`. So a terminator set through
-`MEFOR_API_*` variables alone, for example on a site that names its environment only with
-`serve --env`, still reaches `serve` and not the check.
+names that file. A third is no file, no `check --env` and no `MEFOR_AI_ENVIRONMENT`. So a
+terminator set through `MEFOR_API_*` variables alone, on a site that names its environment only
+with `serve --env`, reaches the check only when `check` is given the same `--env`.
 
 **What else a proxy in front owes.** `serve` checks these after the refusals above, whether the hop
 is plaintext or TLS, and `--allow-insecure-bind` covers none of them.
