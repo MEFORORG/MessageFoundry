@@ -901,9 +901,9 @@ def _crl_issuer_key(name: x509.Name) -> CrlIssuerKey:
     ``NameAttribute._type``. If a release drops it, every CRL is refused. A start and a reload
     name that cause. The expiry monitor's check of a CA file says only that it cannot judge the
     CRL. The namesake warning's self-signed read (:func:`_self_issued`) can no longer compare
-    names, so a CA whose authority key identifier carries no key identifier, or that has none,
-    beside a namesake gets the
-    warning that the engine cannot compare them. Comparing the exact text instead would reopen
+    names, so a CA beside a namesake whose authority key identifier carries no key identifier,
+    or that has none, and in which no other fault is found, gets the warning that the engine
+    cannot compare them. Comparing the exact text instead would reopen
     the T61String gap with no sign.
 
     **Latin-1 here covers UTF-8 bytes only.** A one-byte text type whose bytes are not valid
@@ -1829,8 +1829,8 @@ class IssuerIndex:
                         rules_out = (
                             ", or which client certificates of that CA carry an authority key "
                             f"identifier that rules block {other.position} out"
-                            if key_id is not None and unread == "extensions"
-                            else ""
+                            if key_id is not None
+                            else ""  # only the extensions text has a place for it
                         )
                         why = " " + _UNREAD_TEXT[unread].format(n=ca.position, rules_out=rules_out)
                     if key_id is not None and ca_key_id is not None and key_id != ca_key_id:
@@ -1870,8 +1870,9 @@ _UNREAD_CA_EXTENSIONS = (x509.DuplicateExtension, ValueError, UserWarning, *_UNR
 _Unread = Literal["extensions", "issuer name", "name comparison"]
 _NOT_SELF_SIGNED = (
     ", so this check cannot tell whether block {n} is self-signed. If it is not, strict "
-    "verification refuses every client certificate whose chain runs through block {n}, as it has "
-    "no authority key identifier carrying a key identifier. Check block {n} too."
+    "verification refuses every client certificate whose chain runs through block {n}, with its "
+    "issuer loaded or not: without it no chain is found, and with it block {n} needs an "
+    "authority key identifier carrying a key identifier, which it lacks. Check block {n} too."
 )
 _UNREAD_TEXT: dict[_Unread, str] = {
     "extensions": "The extensions of block {n} cannot be read here, so this check cannot tell "
@@ -1962,8 +1963,8 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | _Unread:
         lacks = "its authority key identifier carries no key identifier"
     # A self-signed CA may omit its authority key identifier; one with an issuer may not. Only
     # this reads the issuer name, so one that does not read loses only this fault.
-    # The subject parsed when the index was built, so only the issuer can fail here, unless
-    # warnings became errors after the build.
+    # The subject was parsed when the index was built, and cryptography keeps it, so only the
+    # issuer can fail here.
     try:
         issuer, subject = ca.cert.issuer, ca.cert.subject
     except (ValueError, UserWarning) as exc:
@@ -1977,8 +1978,8 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | _Unread:
     try:
         issued = not _self_issued(issuer, subject)
     # _crl_attribute_key: an engine defect, not a fault in the file. The namesake warning, which
-    # the caller logs with its file, says so. Only the type is logged: an exception's text can
-    # carry a certificate field.
+    # the caller logs with its file, says so. Only the type is logged, as the sibling handlers
+    # do: this catches any ValueError, and another one's text could carry a certificate field.
     except ValueError as exc:
         _log.debug(
             "certificate block %d: the engine cannot compare its issuer name with its subject "
