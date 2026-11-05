@@ -43,12 +43,12 @@
       * its private git metadata, and its working tree (the top level, plus the files in .pytest_cache
         and .ruff_cache), are both idle beyond -IdleHours;
       * no rebase, am, cherry-pick, merge, revert or bisect is in progress in its own git dir;
-      * it holds no IGNORED entry but a regenerable cache (worktree-gates.ps1's
-        $REGENERABLE_IGNORED_PATTERN, remove.ps1 -Path's list: .venv at the root; node_modules,
-        __pycache__, .pytest_cache, .mypy_cache and .ruff_cache at any depth), each a plain directory, so
-        a .env, a *.db store or a build output refuses the tree rather than going with it;
-      * no git checkout (an entry named .git, file or directory) is nested anywhere in it, ignored
-        directories included; the whole working tree is walked, and a folder that cannot be listed refuses;
+      * every IGNORED entry git lists is a regenerable cache directory, by the list remove.ps1 -Path
+        tolerates ($REGENERABLE_IGNORED_PATTERN in worktree-gates.ps1, which names them), and a plain
+        directory, so a .env, a *.db store or a build output beside them refuses the tree;
+      * a walk of the whole working tree, ignored directories included, finds no nested git checkout (an
+        entry named .git), no link of any kind, and inside a cache directory no file named like data
+        ($CACHE_DATA_NAME_PATTERN); a folder it cannot list refuses;
       * no commit is held only by its own HEAD reflog or per-worktree refs, which the removal deletes (a
         commit the branch's own reflog holds survives, so it does not count; a detached tip is covered);
       * it owns no allocation (alloc.ps1) whose item is not provably on origin/main, matched by the path
@@ -61,9 +61,10 @@
         registered worktree inside it.
     Every gate is the shared copy in worktree-gates.ps1 or occupancy.ps1 where one exists. The claim and
     allocation readers list through Test-PresentOrThrow and Get-EntriesOrThrow, the readers remove.ps1
-    uses (both now in worktree-gates.ps1), so an unreachable coordination root refuses rather than
-    reading as empty; the record parsing follows remove.ps1's rules, cannot-tell refusing, without
-    sharing its code.
+    uses (both now in worktree-gates.ps1), and a registry directory reads as absent only while the
+    folder holding it is there, so a coordination root that is unreachable, or drops mid-run, refuses
+    rather than reading as empty; the record parsing follows remove.ps1's rules, cannot-tell refusing,
+    without sharing its code.
 
     WHAT THESE DO NOT SEE, said rather than implied. The fence reads the directory a session was
     LAUNCHED in, and a subagent under `isolation: worktree` is recorded under its parent's directory, so
@@ -74,9 +75,12 @@
     runs no git command and writes none of those for that long is not seen, and its tree can be removed
     under it. Its committed work survives through refs (the branch is never deleted, and a commit only
     the tree's own reflog holds refuses the tree); what it had not committed was already refused by the
-    clean check. THE IGNORED CACHES ARE DELETED WITH THE TREE, the .venv included; every other ignored
-    entry refuses the tree. A tree a killed run left half-deleted reads REFUSED (prunable or not clean)
-    on later nights rather than raising the code.
+    clean check. THE IGNORED CACHES ARE DELETED WITH THE TREE, the .venv included, and what is inside
+    one is not read beyond the walk's denylist: a data file there under any other name goes with it.
+    A PROCESS OUTSIDE CLAUDE that holds files in the tree (a python.exe from its .venv, an engine started
+    there) is not looked for: git deletes what it can, fails on the held file, and the row ends ORPHANED
+    for a human. A tree a killed run left half-deleted reads REFUSED (prunable or not clean) on later
+    nights rather than raising the code.
     -Apply refuses inside Claude Code, here and in run-daily-prune.ps1.
     THE REMOVAL IS `git -C <primary> worktree remove <path>`, WITH NO --force, EVER. There is no switch
     to add one. git's own refusal on a locked or dirty tree is then a last fence this step keeps.
@@ -101,7 +105,7 @@ function Get-AllocationRefusal {
     param([string]$Primary, [string[]]$Norms, [string]$AllocDir)
     # Through the throwing readers, so an unreachable registry refuses rather than reading as empty.
     try {
-        if (-not (Test-PresentOrThrow $AllocDir 'the allocation directory')) { return '' }
+        if (-not (Test-RegistryPresentOrThrow $AllocDir 'the allocation directory')) { return '' }
         $files = @(Get-EntriesOrThrow $AllocDir 'allocations' '*.json' -Recurse -FilesOnly)
     }
     catch { return "the allocation registry could not be read, so an allocation may name it: $($_.Exception.Message)" }
@@ -185,8 +189,8 @@ function Get-FinishedWorktreeRefusal {
     $ignored = Get-UnsafeIgnoredEntries $Path
     if ($null -eq $ignored) { return 'its ignored files could not be listed' }
     if ($ignored.Count -gt 0) { return "$($ignored.Count) ignored entr(ies) that are not a regenerable cache, which the removal would delete (first: $($ignored[0]))" }
-    $clones = Get-NestedRepoCount $Path
-    if ($clones -ne 0) { return $(if ($clones -lt 0) { 'its working tree could not be listed in full, so a nested git checkout may be there' } else { "$clones git checkout(s) nested inside it, which git status does not read into" }) }
+    try { $hazard = Get-NestedHazard $Path } catch { return $_.Exception.Message }
+    if ($hazard) { return "it holds $hazard, which git status does not read into" }
 
     # Covers a detached tip too: `reflog show HEAD` prints the current HEAD even when the log is empty.
     $branch = if ($wt.Detached) { '' } else { [string]$wt.Branch }
@@ -202,7 +206,7 @@ function Get-FinishedWorktreeRefusal {
     if ($alloc) { return $alloc }
     $dirs = Get-TreeClaimsDirs -Path $Path -OwnClaimsDir $OwnClaimsDir
     if ($dirs.Error) { return "claims are unknown: $($dirs.Error)" }
-    $claims = Get-ClaimedWorktreeIndex $dirs.Dirs
+    $claims = Get-ClaimedWorktreeIndex $dirs.Dirs -RequireParent
     if ($claims.Unreadable) { return 'a claim file or directory could not be read, so any tree may be claimed' }
     if (@($norms | Where-Object { $claims.Claimed.ContainsKey($_) }).Count -gt 0) { return 'a coordination claim names it' }
 

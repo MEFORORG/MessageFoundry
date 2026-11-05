@@ -949,7 +949,8 @@ if ($byPath) {
     # repository's own ide/node_modules is one (new.ps1 -Ide). The clones inside both are checked above.
     # The pattern and Test-PlainDirectory live in worktree-gates.ps1, shared with the nightly
     # .claude/worktrees removal. That route reads status in --ignored=matching mode, so a cache inside
-    # an otherwise unignored folder (ide/node_modules/) is tolerated there and refuses here as `!! ide/`.
+    # an untracked folder whose whole content is ignored is listed by name there and tolerated, where
+    # this traditional-mode read lists the folder itself and refuses it.
     $pending = @($statusLines | Where-Object { $_ -and $_ -cnotmatch $REGENERABLE_IGNORED_PATTERN })
     # A TOLERATED NAME IS NOT ENOUGH: THE DIRECTORY MUST BE A REAL ONE, INSIDE THE TREE. A junction or
     # symlink named `node_modules` points at a directory somewhere else, so it is not this tree's
@@ -1047,9 +1048,12 @@ function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
     `git show` on a missing path prints nothing and can exit 0 through a pipe, so EXISTENCE is
     probed with ls-tree and only then read -- the trap the fleet hit twice reading role playbooks. #>
     if ($Kind -eq 'adr') {
+        # A number that is not all digits names no ADR file, so it is cannot-tell; escaped anyway, so
+        # the record's text is never read as a pattern (the nightly removal's reader does the same).
+        if ($Number -notmatch '\A\d+\z') { return $null }
         $listed = & git -C $GitRoot ls-tree -r --name-only 'origin/main' 'docs/adr/' 2>$null
         if ($LASTEXITCODE -ne 0) { return $null }
-        $pad = $Number.PadLeft(4, '0')
+        $pad = [regex]::Escape($Number.PadLeft(4, '0'))
         foreach ($n in @($listed)) { if ($n -match "/$pad-") { return $true } }
         return $false
     }

@@ -325,8 +325,8 @@ def test_apply_refuses_every_unsafe_tree_and_leaves_it(fx: Fx, sleeper: int) -> 
         "claimed": r"a coordination claim names it",
         "occupied": r"occupied: live0000 LIVE",
         "stranded": r"1 commit\(s\) held only by its HEAD reflog",
-        "cloned": r"1 git checkout\(s\) nested inside it",
-        "deepclone": r"1 git checkout\(s\) nested inside it",
+        "cloned": r"a nested git checkout at \.venv/src/pkg/\.git",
+        "deepclone": r"a nested git checkout at ide/node_modules/pkg/vendor/lib/\.git",
         # The ignored-entry check runs first and lists .claude/ itself; the nested walk would also refuse.
         "hiddenclone": r"ignored entr\(ies\) that are not a regenerable cache.*!! \.claude/",
         "dotenv": r"1 ignored entr\(ies\) that are not a regenerable cache.*!! \.env",
@@ -504,12 +504,21 @@ def test_the_helper_refuses_apply_inside_claude_code(fx: Fx) -> None:
 
 @pytest.mark.parametrize(
     "marker",
-    ["rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "MERGE_HEAD", "REVERT_HEAD", "BISECT_LOG"],
+    [
+        "rebase-merge",
+        "rebase-apply",
+        "CHERRY_PICK_HEAD",
+        "MERGE_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "BISECT_START",
+        "sequencer",
+    ],
 )
 def test_an_operation_in_progress_refuses(fx: Fx, marker: str) -> None:
     """Its state lives in the tree's own git dir, which the removal deletes."""
     gitdir = Path(_git(fx.tree("clean"), "rev-parse", "--absolute-git-dir").strip())
-    if marker.startswith("rebase-"):
+    if marker.startswith("rebase-") or marker == "sequencer":
         (gitdir / marker).mkdir()
     else:
         (gitdir / marker).write_text("0" * 40 + "\n", encoding="utf-8")
@@ -597,3 +606,74 @@ def test_an_error_after_the_orphaned_verdict_keeps_it(fx: Fx) -> None:
     rows = remove(fx, [fx.tree("clean")], apply=True, prelude=prelude)
     assert rows["clean"]["Outcome"] == "ORPHANED", rows["clean"]
     assert "ledger boom" in rows["clean"]["Reason"]
+
+
+def test_a_link_inside_a_tolerated_cache_refuses(fx: Fx) -> None:
+    """git does not delete through a link, so the removal would end ORPHANED (npm link makes these)."""
+    elsewhere = fx.root / "elsewhere"
+    elsewhere.mkdir()
+    modules = fx.tree("clean") / "ide" / "node_modules"
+    modules.mkdir(parents=True)
+    subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "New-Item -ItemType Junction -Path $env:T_LINK -Target $env:T_TARGET | Out-Null",
+        ],
+        check=True,
+        capture_output=True,
+        timeout=60,
+        env={**os.environ, "T_LINK": str(modules / "linked"), "T_TARGET": str(elsewhere)},
+    )
+    _age(fx.primary, fx.tree("clean"), 200)
+    rows = remove(fx, [fx.tree("clean")], apply=True)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert "a link at ide/node_modules/linked" in rows["clean"]["Reason"]
+    assert fx.tree("clean").is_dir()
+
+
+@pytest.mark.parametrize("name", [".env", "store.db", "store.db-wal", ".env.local", "x.sqlite3"])
+def test_a_data_file_inside_a_tolerated_cache_refuses(fx: Fx, name: str) -> None:
+    """git lists the cache folder as one ignored line and never reads into it."""
+    modules = fx.tree("clean") / "ide" / "node_modules"
+    modules.mkdir(parents=True)
+    (modules / name).write_text("x\n", encoding="utf-8")
+    _age(fx.primary, fx.tree("clean"), 200)
+    rows = remove(fx, [fx.tree("clean")], apply=True)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert (
+        f"a data file inside a cache directory at ide/node_modules/{name}"
+        in rows["clean"]["Reason"]
+    )
+    assert fx.tree("clean").is_dir()
+
+
+def test_a_registry_whose_holding_folder_is_gone_reads_as_unreadable(fx: Fx) -> None:
+    """Red before the fix: an unreachable share raises the same ItemNotFoundException as a missing
+    folder, so a root that dropped after the run's one probe read as "no claims, no allocations"."""
+    env = fx.env()
+    env["T_GONE"] = str(fx.root / "gone-root")
+    env["T_HERE"] = str(fx.coord)
+    command = (
+        f". '{HELPER}'; "
+        "$a = (Get-ClaimedWorktreeIndex @(Join-Path $env:T_GONE 'claims') -RequireParent).Unreadable; "
+        "$b = (Get-ClaimedWorktreeIndex @(Join-Path $env:T_HERE 'no-claims-yet') -RequireParent).Unreadable; "
+        "$c = Get-AllocationRefusal -Primary . -Norms @('x') -AllocDir (Join-Path $env:T_GONE 'alloc'); "
+        "ConvertTo-Json -InputObject @{ gone = $a; here = $b; alloc = $c }"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["gone"] is True, out
+    # The control: a registry not made yet, under a folder that is there, holds no claim.
+    assert out["here"] is False, out
+    assert "allocation registry could not be read" in out["alloc"], out

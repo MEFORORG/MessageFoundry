@@ -17,7 +17,8 @@
     for them), Get-ReflogLastEntry, Get-WorktreeActivity (occupancy signal 2; prune-merged.ps1's header
     says what it can and cannot see), Test-WorktreeClean, Get-TipHolders, Test-ClaudeManagedPath,
     Get-FlaggedFileCount, Get-WorkingTreeActivity, Get-WorktreeOnlyCommitCount, Read-CoordRecord,
-    Get-ClaimedWorktreeIndex, Get-NestedRepoCount, Get-InProgressOperation, Get-UnsafeIgnoredEntries and Test-PlainDirectory.
+    Get-ClaimedWorktreeIndex, Test-RegistryPresentOrThrow, $CACHE_DATA_NAME_PATTERN, Get-NestedHazard,
+    Get-InProgressOperation, Get-UnsafeIgnoredEntries and Test-PlainDirectory.
 #>
 
 # The floor under -IdleHours. Signal 2 has been measured at 10.4h on a worktree that was demonstrably
@@ -311,18 +312,33 @@ function Read-CoordRecord([string]$File) {
     return $out
 }
 
+# A coordination registry directory (claims/, alloc/) that may legitimately not exist yet. ABSENT ONLY
+# WHEN ITS PARENT IS THERE: on an unreachable share, Get-Item on the directory raises the same
+# ItemNotFoundException as on a missing one (measured on a UNC host that does not answer), so a root
+# that drops after the run's one probe would otherwise read as "no records". $true present, $false
+# absent under a present parent, and a throw for anything else.
+function Test-RegistryPresentOrThrow([string]$Dir, [string]$What) {
+    if (Test-PresentOrThrow $Dir $What) { return $true }
+    $parent = [System.IO.Path]::GetDirectoryName($Dir.TrimEnd('\', '/'))
+    if ($parent -and (Test-PresentOrThrow $parent "the folder that holds $What")) { return $false }
+    throw "Neither $What ('$Dir') nor the folder that holds it can be found, so the coordination root may be unreachable. Nothing was removed."
+}
+
 # Which worktrees hold a coordination claim, across every claims directory given. UNREADABLE IS NOT
 # ABSENT: a claim file that will not parse or has the wrong shape might name any worktree, and so might
 # a directory that exists and cannot be listed, so the caller must treat Unreadable as "every tree may
-# be claimed". A directory that does not exist holds no claim.
-function Get-ClaimedWorktreeIndex([string[]]$ClaimsDir) {
+# be claimed". A directory that does not exist holds no claim; with -RequireParent, only when the folder
+# holding it does (Test-RegistryPresentOrThrow). prune-merged.ps1 omits it, because its default
+# coordination directory may not exist yet; the nightly removal, whose root was probed, passes it.
+function Get-ClaimedWorktreeIndex([string[]]$ClaimsDir, [switch]$RequireParent) {
     $claimed = @{}
     $unreadable = $false
     foreach ($dir in @($ClaimsDir | Where-Object { $_ })) {
         # Through the throwing readers: Test-Path reads an unreachable directory as absent, and
         # Get-ChildItem lists an unlistable one as empty, so either would read as "no claims".
         try {
-            if (-not (Test-PresentOrThrow $dir 'the claims directory')) { continue }
+            $present = if ($RequireParent) { Test-RegistryPresentOrThrow $dir 'the claims directory' } else { Test-PresentOrThrow $dir 'the claims directory' }
+            if (-not $present) { continue }
             $files = @(Get-EntriesOrThrow $dir 'claims' '*.json' -FilesOnly)
         }
         catch { $unreadable = $true; continue }
@@ -336,20 +352,48 @@ function Get-ClaimedWorktreeIndex([string[]]$ClaimsDir) {
     return @{ Claimed = $claimed; Unreadable = $unreadable }
 }
 
-# Git checkouts nested anywhere in the working tree: an entry named `.git`, file or directory, at any
-# depth below the tree's own. git status never reads into an IGNORED directory, and an ignored
-# directory holding nothing but nested repositories is not even listed (measured, remove.ps1), so
-# pip's editable clones in .venv/src, a package in node_modules, or a checkout under an ignored
-# .claude/ would all go with the tree, unpushed commits and all. So the whole tree is walked rather
-# than the directories git lists: about 20,000 entries in a tenth of a second on a tree with a .venv
-# (measured 2026-11-05). A link is not descended, because git does not delete through one
-# (remove.ps1 records the measurement). Returns the count, or -1 when any directory cannot be listed.
-function Get-NestedRepoCount([string]$Path) {
-    # The tree's own .git sits directly under the root; every other one is a nested checkout. The
-    # filter applies after the recursion decision, so every directory is still walked.
-    $own = Join-Path ([System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')) '.git'
-    try { return @(Get-EntriesOrThrow $Path 'working-tree entries' '.git' -Recurse | Where-Object { $_.FullName -ine $own }).Count }
-    catch { return -1 }
+#: Data a tolerated cache directory should never hold. git status does not read inside an ignored
+#: directory, so a file of one of these names in a .venv or node_modules would go with it unseen. A
+#: denylist, so it catches only these names; it does not make a cache directory safe to delete.
+$CACHE_DATA_NAME_PATTERN = '(?i)\A(?:\.env(?:\..*)?|.*\.(?:db|db-wal|db-shm|db-journal|sqlite|sqlite3))\z'
+
+# The first thing in the working tree that git status cannot see and the removal must not take, walked
+# from the tree's own root: a nested git checkout (an entry named `.git`, file or directory, at any depth
+# below the tree's own), a link of any kind (git does not delete through one, so the removal ends
+# deregistered with the directory left behind, ORPHANED; remove.ps1 records the measurement), or, inside
+# a tolerated cache directory, a file named like data ($CACHE_DATA_NAME_PATTERN). git status never reads
+# into an IGNORED directory, and one holding nothing but nested repositories is not even listed
+# (measured, remove.ps1), so the whole tree is walked rather than the directories git lists: about
+# 20,000 entries in a tenth of a second on a tree with a .venv (measured 2026-11-05). The walk stops at
+# the first hit and never descends a link or a nested .git. Returns '' or what it found, and THROWS when
+# any directory cannot be listed, so the caller refuses.
+function Get-NestedHazard([string]$Path) {
+    $opts = [System.IO.EnumerationOptions]::new()
+    $opts.IgnoreInaccessible = $false
+    $opts.AttributesToSkip = [System.IO.FileAttributes]0
+    $root = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $own = Join-Path $root '.git'
+    $cacheNames = @('node_modules', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache')
+    $pending = [System.Collections.Generic.Stack[object]]::new()
+    $pending.Push(@($root, $false))
+    try {
+        while ($pending.Count -gt 0) {
+            $here, $inCache = $pending.Pop()
+            foreach ($e in [System.IO.DirectoryInfo]::new($here).EnumerateFileSystemInfos('*', $opts)) {
+                if ($e.FullName -ieq $own) { continue }
+                $rel = [System.IO.Path]::GetRelativePath($root, $e.FullName).Replace('\', '/')
+                if ($e.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return "a link at $rel" }
+                if ($e.Name -ieq '.git') { return "a nested git checkout at $rel" }
+                if ($e -is [System.IO.DirectoryInfo]) {
+                    $cache = $inCache -or ($e.Name -cin $cacheNames) -or ($here -ieq $root -and $e.Name -ceq '.venv')
+                    $pending.Push(@($e.FullName, $cache))
+                }
+                elseif ($inCache -and $e.Name -match $CACHE_DATA_NAME_PATTERN) { return "a data file inside a cache directory at $rel" }
+            }
+        }
+    }
+    catch { throw "Could not list the working tree of '$Path' in full ($($_.Exception.Message)), so a nested checkout or link may be there." }
+    return ''
 }
 
 # An operation git has started in the tree's own git dir and not finished: a rebase, am, cherry-pick,

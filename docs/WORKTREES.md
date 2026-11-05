@@ -705,8 +705,9 @@ harness locks a live agent's worktree (observed 2026-11-05 with the reason `clau
 <n>)`), and work there moves the git metadata or the watched working-tree mtimes within `-IdleHours`.
 **The residual: a session that holds no lock, runs no git command, and writes none of those for that
 long is not seen**, and its tree can be removed under it. Its committed work survives through refs,
-since the branch is never deleted. The ignored caches (the `.venv`, `node_modules` and the tool
-caches) go with the tree; any other ignored entry, such as a `.env` or a `*.db` store, refuses it.
+since the branch is never deleted. The ignored cache directories go with the tree, and what is inside
+one is read only for a few data-like names; an ignored entry git lists outside them, such as a `.env`
+or a `*.db` store, refuses it. The header says what else the step does not see.
 The removal is a plain `git -C <primary> worktree remove <path>` with **no `--force`**, so git's own
 refusal on a locked or dirty tree stays a last fence. The branch survives it. Each path is logged as it
 is decided, as `REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `DECLINED` (every re-check
