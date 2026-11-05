@@ -3842,13 +3842,17 @@ def Rest(
     )
 
 
-def _fhir_takes_update(interaction: object, conditional: object) -> bool:
-    """Whether a ``FHIR()`` connection's writes are updates by id, so the path form applies to it.
+def _path_form_ruled_out(interaction: object, conditional: object) -> bool:
+    """Whether a ``FHIR()`` connection's writes are known not to be updates, so the build refuses
+    the path form there. ``False`` while either value is :data:`_UNRESOLVED`: it cannot be ruled out.
 
-    The rule ``FhirDestination`` applies to its resolved settings, with its reads of the two keys:
-    conditional first, as it dispatches, so ``if-match`` is an update whatever the interaction."""
-    cond = str(conditional) if conditional else None
-    return cond == "if-match" or (cond is None and str(interaction) == "update")
+    The rule is the build's own ``transports.fhir.takes_update``, imported lazily for the one-way
+    rule, so the factory, :func:`path_form_fhir_updates` and the build cannot disagree."""
+    from messagefoundry.transports.fhir import takes_update
+
+    if interaction is _UNRESOLVED or conditional is _UNRESOLVED:
+        return False
+    return not takes_update(interaction, conditional)
 
 
 def FHIR(
@@ -3936,12 +3940,7 @@ def FHIR(
         return value
 
     form, kind, cond = at_load(update_url_form), at_load(interaction), at_load(conditional)
-    if (
-        form == "path"
-        and kind is not _UNRESOLVED
-        and cond is not _UNRESOLVED
-        and not _fhir_takes_update(kind, cond)
-    ):
+    if form == "path" and _path_form_ruled_out(kind, cond):
         # Refused here as well as in FhirDestination, so the loaded graph cannot hold a path-form
         # connection that would never build (#2550).
         raise ValueError(
@@ -6984,11 +6983,7 @@ def path_form_fhir_updates(
             continue
         kind = _db_setting(settings, "interaction", "create", values)
         cond = _db_setting(settings, "conditional", None, values)
-        if (
-            kind is not _UNRESOLVED
-            and cond is not _UNRESOLVED
-            and not _fhir_takes_update(kind, cond)
-        ):
+        if _path_form_ruled_out(kind, cond):
             continue  # the build refuses the path form here, so no update is ever sent in it
         out.append((oc.name, UNRESOLVED_UPDATE_URL_FORM if form is _UNRESOLVED else ""))
     return sorted(out)

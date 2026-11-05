@@ -58,6 +58,7 @@ from messagefoundry.config.settings import (
     security_loosenings,
     uvicorn_trusted_hosts,
 )
+from messagefoundry.config.wiring import env
 from messagefoundry.pipeline import Engine
 
 
@@ -2782,12 +2783,11 @@ async def test_posture_route_does_not_name_a_transaction_form_update(engine: Eng
     assert body["loosenings_scope"] is None
 
 
-def _fhir_env_form_registry(**over: object) -> Any:
+def _fhir_env_form_registry(*, deployed: bool = True, **over: object) -> Any:
     """One update ``OB_ENV`` whose ``update_url_form`` is ``env("epic_form")``, with ``over`` merged
-    into the factory's keywords, and a ``deployed`` keyword taken out for the registry."""
+    into the factory's keywords."""
     from messagefoundry.config.wiring import FHIR, Registry, build_outbound_connection, env
 
-    deployed = bool(over.pop("deployed", True))
     keywords: dict[str, Any] = {
         "interaction": "update",
         "update_url_form": env("epic_form"),
@@ -2802,25 +2802,28 @@ def _fhir_env_form_registry(**over: object) -> Any:
     return reg
 
 
+_POSSIBLY = "possibly: update_url_form is an env() value this reading could not resolve"
+
+
 @pytest.mark.parametrize(
-    ("over", "listed"),
+    ("over", "deployed", "note"),
     [
         # An env() form on an update: possibly the path form, so named with the marker.
-        ({}, "possibly"),
+        ({}, True, _POSSIBLY),
         # ...on an if-match, which the path form applies to as well.
-        ({"interaction": "create", "conditional": "if-match"}, "possibly"),
+        ({"interaction": "create", "conditional": "if-match"}, True, _POSSIBLY),
         # A default is not what this reading resolves without values: the key may be set.
-        ({"update_url_form": ("epic_form", "transaction")}, "possibly"),
+        ({"update_url_form": env("epic_form", default="transaction")}, True, _POSSIBLY),
         # A create rules the path form out whatever the form resolves to: the build refuses it.
-        ({"interaction": "create"}, None),
+        ({"interaction": "create"}, True, None),
         # A literal path form beside an env() interaction cannot be ruled out, so it is named plain.
-        ({"update_url_form": "path", "interaction": "kind"}, ""),
+        ({"update_url_form": "path", "interaction": env("kind")}, True, ""),
         # A not-deployed connection with an env() form is never built, so it is skipped...
-        ({"deployed": False}, None),
+        ({}, False, None),
         # ...and a not-deployed literal path form is still read, as before.
-        ({"update_url_form": "path", "deployed": False}, ""),
+        ({"update_url_form": "path"}, False, ""),
         # The control: a literal transaction form is never named.
-        ({"update_url_form": "transaction"}, None),
+        ({"update_url_form": "transaction"}, True, None),
     ],
     ids=[
         "env-update",
@@ -2834,30 +2837,16 @@ def _fhir_env_form_registry(**over: object) -> Any:
     ],
 )
 def test_the_path_form_reader_names_an_env_form(
-    over: dict[str, object], listed: str | None
+    over: dict[str, object], deployed: bool, note: str | None
 ) -> None:
     """Vault BACKLOG #2571: each arm of the reader with no env values, as ``messagefoundry check``
-    reads it. ``listed`` is ``None`` when the connection is left off, ``""`` when it is named
-    plain, and ``"possibly"`` when it is named with the marker. A string value stands for
-    ``env(<it>)`` and a pair for ``env(<key>, default=<value>)``, except a literal form."""
-    from messagefoundry.config.wiring import (
-        UNRESOLVED_UPDATE_URL_FORM,
-        env,
-        path_form_fhir_updates,
-    )
+    reads it. ``note`` is ``None`` when the connection is left off, ``""`` when it is named plain,
+    and the marker when it is named possibly."""
+    from messagefoundry.config.wiring import UNRESOLVED_UPDATE_URL_FORM, path_form_fhir_updates
 
-    literal = {"path", "transaction", "create", "update", "if-match"}
-
-    def ref(value: object) -> object:
-        if isinstance(value, tuple):
-            return env(value[0], default=value[1])
-        return env(value) if isinstance(value, str) and value not in literal else value
-
-    found = dict(
-        path_form_fhir_updates(_fhir_env_form_registry(**{k: ref(v) for k, v in over.items()}))
-    )
-    expected = {None: None, "": "", "possibly": UNRESOLVED_UPDATE_URL_FORM}[listed]
-    assert found.get("OB_ENV") == expected
+    assert _POSSIBLY == UNRESOLVED_UPDATE_URL_FORM
+    found = dict(path_form_fhir_updates(_fhir_env_form_registry(deployed=deployed, **over)))
+    assert found.get("OB_ENV") == note
 
 
 @pytest.mark.parametrize(

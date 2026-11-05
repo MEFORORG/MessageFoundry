@@ -269,6 +269,16 @@ def _allow_list(
     return frozenset(value)
 
 
+def takes_update(interaction: object, conditional: object) -> bool:
+    """Whether a connection's writes are updates by id, so ``update_url_form="path"`` applies.
+
+    Conditional first, as :class:`FhirDestination` dispatches: ``if-match`` is an update whatever the
+    interaction says. Pure. The ``FHIR()`` factory and ``path_form_fhir_updates`` call it too, so the
+    three cannot disagree on which connections the path form applies to (vault BACKLOG #2571)."""
+    cond = str(conditional) if conditional else None
+    return cond == "if-match" or (cond is None and str(interaction) == "update")
+
+
 def entry_screen_settings(interaction: str, methods: object, types: object) -> _EntryScreen | None:
     """Check the Bundle entry allow-lists a connection declares, and return its screen, or ``None``
     for an interaction that sends no Bundle of the Handler's (vault BACKLOG #2804).
@@ -1066,11 +1076,8 @@ class FhirDestination(DestinationConnector):
         self._entry_screen = entry_screen_settings(
             self.interaction, s.get("allowed_entry_methods"), s.get("allowed_entry_types")
         )
-        # Whether this connection's writes are updates by id. Conditional first, as _resolve_request
-        # dispatches: if-match is an update whatever the interaction says.
-        self._is_update = self.conditional == "if-match" or (
-            self.conditional is None and self.interaction == "update"
-        )
+        # Whether this connection's writes are updates by id, as _resolve_request dispatches.
+        self._is_update = takes_update(self.interaction, self.conditional)
         self.update_url_form: str = str(s.get("update_url_form") or "transaction")
         if self.update_url_form not in _UPDATE_URL_FORMS:
             raise ValueError(

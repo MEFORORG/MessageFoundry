@@ -1925,22 +1925,17 @@ def test_the_factory_leaves_an_env_value_it_cannot_read_to_the_build(
 
 
 @pytest.mark.parametrize(
-    ("over", "match"),
-    [
-        ({"interaction": "create"}, "update_url_form='path' applies only"),
-        ({"conditional": "if-none-exist", "conditional_query": "a=b"}, "applies only"),
-    ],
+    "over",
+    [{"interaction": "create"}, {"conditional": "if-none-exist", "conditional_query": "a=b"}],
     ids=["create", "if-none-exist"],
 )
-def test_the_factory_reads_an_env_value_through_its_default(
-    over: dict[str, object], match: str
-) -> None:
+def test_the_factory_reads_an_env_value_through_its_default(over: dict[str, object]) -> None:
     """An ``env()`` default is what an unset key resolves to, so the factory checks it now, as it
     checks a literal: a path form that would not apply is refused, whether the form or the write
     kind comes from a default. A transaction default beside the same settings is the control."""
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(ValueError, match="update_url_form=.path. applies only"):
         FHIR(url=BASE, update_url_form=env("form", default="path"), **over)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(ValueError, match="update_url_form=.path. applies only"):
         FHIR(
             url=BASE,
             update_url_form="path",
