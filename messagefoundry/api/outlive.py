@@ -40,9 +40,8 @@ import weakref
 from collections.abc import Coroutine
 from typing import Any
 
-from messagefoundry.api.approvals import _outlive_caller
+from messagefoundry.api.approvals import _outlive_caller, log_orphaned
 from messagefoundry.pipeline.dr import _HOOK_REAP_SECONDS
-from messagefoundry.redaction import safe_exc
 
 __all__ = [
     "CANCEL_GRACE_SECONDS",
@@ -91,22 +90,6 @@ def cancel_grace_left() -> float | None:
     return None if ends is None else ends - asyncio.get_running_loop().time()
 
 
-def _log_orphan_outcome(task: asyncio.Future[Any], label: str) -> None:
-    """Log how an operation ended after its caller had gone, since nobody else will read it.
-
-    Reading the error here also marks it retrieved, so asyncio does not report it a second time."""
-    if task.cancelled():
-        log.warning("%s: cancelled after its caller had gone", label)
-        return
-    error = task.exception()
-    if error is None:
-        log.warning(
-            "%s: finished after its caller had gone; its audit row records the outcome", label
-        )
-    else:
-        log.warning("%s: failed after its caller had gone: %s", label, safe_exc(error))
-
-
 class OutlivingOperations:
     """Runs operations that a cancelled caller must not cut short, and holds them until they end.
 
@@ -144,7 +127,21 @@ class OutlivingOperations:
                         "the operation continues and records its own outcome",
                         label,
                     )
-                task.add_done_callback(lambda t: _log_orphan_outcome(t, label))
+                # Logged once, all at WARNING, and a failure as its safe_exc text: the operation's
+                # own outcome row is the record (vault BACKLOG #3193 N4 folded this logger).
+                task.add_done_callback(
+                    lambda t: log_orphaned(
+                        t,
+                        label,
+                        cancelled="cancelled after its caller had gone",
+                        finished="finished after its caller had gone; its audit row records the "
+                        "outcome",
+                        failed="failed after its caller had gone",
+                        level=logging.WARNING,
+                        redact=True,
+                        logger=log,
+                    )
+                )
             raise
 
     def _forget(self, task: asyncio.Future[Any]) -> None:

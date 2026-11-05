@@ -73,7 +73,7 @@ from messagefoundry.pipeline.alerts import (
     LoggingAlertSink,
     authority_seal_alert,
 )
-from messagefoundry.redaction import json_loads_or_refusal
+from messagefoundry.redaction import json_loads_or_refusal, safe_exc
 from messagefoundry.store.base import Store
 from messagefoundry.store.row_seal import (
     APPROVAL_KIND,
@@ -294,14 +294,45 @@ def _encodable_result(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
-    """Log a shielded write whose caller was cancelled, since nothing else will read its error.
+def log_orphaned(
+    task: asyncio.Future[Any],
+    subject: str,
+    *,
+    cancelled: str,
+    finished: str | None = None,
+    failed: str | None = None,
+    level: int = logging.ERROR,
+    redact: bool = False,
+    logger: logging.Logger = log,
+) -> None:
+    """Log once how ``task`` ended after its caller was cancelled, since nothing else will read it
+    (vault BACKLOG #3193 N4: the gate's three orphan loggers and :mod:`~messagefoundry.api.outlive`'s
+    were near-copies of this). Reading the error here also marks it retrieved, so asyncio does not
+    report it again.
 
-    Reading the error here also marks it retrieved, so asyncio does not report it again."""
+    Each message is logged after ``subject`` and a colon. ``cancelled`` and ``failed`` are logged
+    at ``level``, ``finished`` at WARNING with ``{result}`` replaced by the task's result. A
+    ``None`` logs nothing for that ending: a ``failed`` of ``None`` is for a task that logged its own
+    failure. A failure carries its traceback, or with ``redact`` only its
+    :func:`~messagefoundry.redaction.safe_exc` text, for an error whose message may hold content."""
     if task.cancelled():
-        log.error("approval %s: a shielded outcome write was cancelled", approval_id)
+        logger.log(level, "%s: %s", subject, cancelled)
         return
     error = task.exception()
+    if error is None:
+        if finished is not None:
+            logger.warning("%s: %s", subject, finished.format(result=task.result()))
+    elif failed is not None:
+        if redact:
+            logger.log(level, "%s: %s: %s", subject, failed, safe_exc(error))
+        else:
+            logger.log(level, "%s: %s", subject, failed, exc_info=error)
+
+
+def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
+    """:func:`log_orphaned` for a shielded outcome write, the default of
+    :meth:`ApprovalGate._shielded`."""
+    error = None if task.cancelled() else task.exception()
     if isinstance(error, ApprovalError) and error.status in (409, 503):
         # A refusal the gate raises on purpose. A 409, such as a resolve that lost the race to
         # another operator, is no fault: the row's status says what won. The only 503 a
@@ -314,45 +345,13 @@ def _log_orphaned_write(task: asyncio.Future[Any], approval_id: str) -> None:
             error.status,
             error.detail,
         )
-    elif error is not None:
-        log.error(
-            "approval %s: a shielded outcome write failed after its caller was cancelled",
-            approval_id,
-            exc_info=error,
-        )
-
-
-def _log_orphaned_request(task: asyncio.Future[Any], approval_id: str) -> None:
-    """Log a request write whose caller was cancelled (vault BACKLOG #3193).
-
-    :meth:`ApprovalGate._file_request` logs and pages its own failures, so a failure is only read
-    here, which marks it retrieved. What only this callback can say is that the request was held
-    after the caller stopped waiting, so this call got no 202. For a repeat the held request is
-    the older one it joined, whose own 202 may have reached the requester."""
-    if task.cancelled():
-        log.error("approval %s: a request write was cancelled", approval_id)
         return
-    if task.exception() is None:
-        log.warning(
-            "approval %s: a request was filed or joined after its caller was cancelled, so that "
-            "call got no 202. A repeat by the same requester joins this request",
-            task.result(),
-        )
-
-
-def _log_orphaned_repeat(task: asyncio.Future[Any], approval_id: str) -> None:
-    """Log a rejoin's ``approval.request_repeated`` write whose caller was cancelled (BACKLOG #3740
-    item 9). :meth:`ApprovalGate._record_repeat` logs and pages its own failure, so a failure is
-    only read here, which marks it retrieved."""
-    if task.cancelled():
-        log.error("approval %s: a repeat's audit write was cancelled", approval_id)
-        return
-    if task.exception() is None:
-        log.warning(
-            "approval %s: a repeat's audit row was written after its caller was cancelled, so "
-            "that call got no 202",
-            approval_id,
-        )
+    log_orphaned(
+        task,
+        f"approval {approval_id}",
+        cancelled="a shielded outcome write was cancelled",
+        failed="a shielded outcome write failed after its caller was cancelled",
+    )
 
 
 async def _outlive_caller[T](task: asyncio.Future[T]) -> T:
@@ -811,7 +810,17 @@ class ApprovalGate:
                 client=client,
             ),
             approval_id,
-            orphaned=_log_orphaned_request,
+            # Vault BACKLOG #3193: _file_request logs and pages its own failures, so a failure is
+            # only read. What only this can say is that the request was held after the caller
+            # stopped waiting, so this call got no 202. For a repeat the held request is the
+            # older one it joined, whose own 202 may have reached the requester.
+            orphaned=lambda task, aid: log_orphaned(
+                task,
+                f"approval {aid}",
+                cancelled="a request write was cancelled",
+                finished="a request was filed or joined after its caller was cancelled, so that "
+                "call got no 202. It is held as {result}; a repeat by the same requester joins it",
+            ),
         )
 
     async def _file_request(
@@ -1052,7 +1061,15 @@ class ApprovalGate:
         await self._shielded(
             self._record_repeat(held, operation, requester, client),
             held,
-            orphaned=_log_orphaned_repeat,
+            # BACKLOG #3740 item 9: _record_repeat logs and pages its own failure, so a failure is
+            # only read.
+            orphaned=lambda task, aid: log_orphaned(
+                task,
+                f"approval {aid}",
+                cancelled="a repeat's audit write was cancelled",
+                finished="a repeat's audit row was written after its caller was cancelled, so that "
+                "call got no 202",
+            ),
         )
         log.info(
             "approval %s: a repeat %s request by %s rejoined it; nothing new is held",
