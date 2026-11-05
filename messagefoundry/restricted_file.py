@@ -11,6 +11,9 @@ Two entry points, and both fail closed (vault BACKLOG #2601):
 * :func:`broad_access_problem` answers, before a key file is used, whether a known broad group or
   an application package can read it or change it.
 
+:func:`key_file_handle_problem` is the stricter Windows read check the key custody reads use: the
+owner and the exact list, read through the open handle.
+
 Beside them, :func:`unlink_generated` removes a key or certificate file the engine wrote, riding out
 the brief Windows hold another process puts on such a file (:func:`ride_out_a_held_file`). It sits
 here so the `cert` commands, which write through this module, need not import the API TLS module.
@@ -22,8 +25,8 @@ file that already exists and only logs when it cannot. A file that holds a key m
 as its only protection.
 
 **Windows.** The access list is attached in the ``CreateFileW`` call itself, as a protected list
-(no inheritance from the directory) naming SYSTEM, Administrators, the creating account, and each
-account granted read. That is the set ``scripts/service/install-service.ps1`` leaves on the data
+(no inheritance from the directory) naming SYSTEM, Administrators, the creating account unless the
+caller turns that off, and each account granted read. That is the set ``scripts/service/install-service.ps1`` leaves on the data
 directory. SYSTEM and Administrators already reach every file on the host, so naming them adds no
 one. ``CREATE_NEW`` with ``FILE_FLAG_OPEN_REPARSE_POINT`` refuses a name that is already taken,
 whether by a file or by a link.
@@ -45,6 +48,7 @@ import stat
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -60,10 +64,13 @@ if TYPE_CHECKING:
     from messagefoundry.config.wiring import _WinPathSecurity
 
 __all__ = [
+    "LINUX_FOREIGN_ACCESS_MODEL_FILE_SYSTEMS",
     "WINERROR_ACCESS_DENIED",
     "WINERROR_SHARING_VIOLATION",
     "RestrictedFileError",
     "broad_access_problem",
+    "key_file_handle_problem",
+    "linux_file_system_type",
     "posix_access_acl",
     "replace_generated",
     "ride_out_a_held_file",
@@ -87,13 +94,15 @@ _READ_ACCESS = 0x00120089
 _SDDL_RIGHT: Mapping[int, str] = {_FULL_ACCESS: "FA", _READ_ACCESS: "FR"}
 
 
-def _expected_access(creator_sid: str, read_sids: Sequence[str]) -> dict[str, int]:
+def _expected_access(creator_sid: str | None, read_sids: Sequence[str]) -> dict[str, int]:
     """The whole access list of a new file, as SID to access mask, in the order it is written.
 
-    Full control for SYSTEM, Administrators and the creating account; read for each account in
-    ``read_sids``. An account already holding full control keeps it and gets no second entry."""
+    Full control for SYSTEM, Administrators and the creating account (none when ``creator_sid`` is
+    ``None``); read for each account in ``read_sids``. An account already holding full control keeps
+    it and gets no second entry."""
     access = {SYSTEM_SID: _FULL_ACCESS, ADMINISTRATORS_SID: _FULL_ACCESS}
-    access.setdefault(creator_sid, _FULL_ACCESS)
+    if creator_sid is not None:
+        access.setdefault(creator_sid, _FULL_ACCESS)
     for sid in read_sids:
         access.setdefault(sid, _READ_ACCESS)
     return access
@@ -264,6 +273,45 @@ def posix_access_acl(fd: int) -> bytes | None:
         raise
 
 
+#: Linux file systems that keep an access model of their own beside, or instead of, the POSIX list,
+#: by their ``statfs`` magic (``linux/magic.h``). Each answers ``ENOTSUP`` for the POSIX list, so
+#: :func:`posix_access_acl` reads it as absent while the file system may still grant more than the
+#: mode shows. **At least these, and never a complete list.**
+LINUX_FOREIGN_ACCESS_MODEL_FILE_SYSTEMS: Mapping[int, str] = {
+    0x6969: "NFS",
+    0x517B: "SMB",
+    0xFF534D42: "CIFS",
+    0xFE534D42: "SMB2",
+    0x65735546: "FUSE",
+    0x01021997: "9P",
+    0x5346414F: "AFS",
+    0x6B414653: "kAFS",
+}
+
+
+def linux_file_system_type(fd: int) -> int:
+    """The ``statfs`` magic of the file system that holds the open file ``fd`` (``fstatfs``).
+
+    Read through the descriptor, so it is the file system of the file that was opened, not of
+    whatever a name points to now. Linux only; raises :class:`RestrictedFileError` elsewhere, and
+    ``OSError`` when the call fails."""
+    if sys.platform != "linux":
+        raise RestrictedFileError("a file system type is read on Linux only")
+    import ctypes
+
+    # The process's own symbols, which hold the C library's; no library search, so no subprocess.
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.fstatfs.argtypes = [ctypes.c_int, ctypes.c_void_p]
+    libc.fstatfs.restype = ctypes.c_int
+    # struct statfs opens with f_type, a native long (__fsword_t) on the 64-bit and 32-bit ABIs the
+    # engine runs on. The rest of the struct is under 128 bytes everywhere; the buffer is larger.
+    buffer = ctypes.create_string_buffer(256)
+    if libc.fstatfs(fd, buffer) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    return ctypes.c_ulong.from_buffer(buffer).value & 0xFFFFFFFF
+
+
 def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
     """Why ``path`` is open beyond the accounts a key file is for, or ``None`` when it is not.
 
@@ -295,6 +343,205 @@ def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
             _DIRECTORY_REACH_MASK if directory else _REACH_MASK,
         )
     return _posix_access_problem(status.st_mode)
+
+
+# --- the exact check, through an open handle (Windows) --------------------------------------------
+
+#: Who may own a key file: SYSTEM, Administrators (the owner of a file an elevated administrator
+#: creates) and the account the engine runs as. An owner keeps READ_CONTROL and WRITE_DAC whatever
+#: the access list says, so a file any other account owns could be re-granted by that account.
+_KEY_FILE_OWNERS = frozenset({SYSTEM_SID, ADMINISTRATORS_SID})
+_SE_DACL_PROTECTED = 0x1000
+_ACCESS_DENIED_ACE_TYPE = 0x01
+
+
+@dataclass(frozen=True, slots=True)
+class _HandleSecurity:
+    """The owner and access list ``GetSecurityInfo`` read from one open handle, before any policy.
+
+    ``aces`` holds ``(type, flags, mask, sid)`` per entry, with ``sid`` empty for an entry type
+    whose account the reader does not parse. ``error`` is set when the read did not finish."""
+
+    error: str | None = None
+    owner_sid: str | None = None
+    dacl_present: bool = True
+    protected: bool = False
+    aces: tuple[tuple[int, int, int, str], ...] = ()
+
+
+def _who(sid: str) -> str:
+    return f"the application package {sid}" if _is_package_sid(sid) else describe_sid(sid)
+
+
+def _exact_descriptor_problem(
+    security: _HandleSecurity, engine_sid: str, *, engine_access: int
+) -> str | None:
+    """Why the file ``security`` was read from is not owned and listed exactly as a key file is,
+    or ``None`` when it is.
+
+    Exactly means: owned by SYSTEM, Administrators or ``engine_sid``; a protected list; and the
+    list :func:`_expected_access` gives for no creator and a read grant to ``engine_sid``, with
+    ``engine_access`` in place of read for that account, entry for entry: no extra entry of any
+    kind, a deny included, no missing one and no inheritance flag. Kept free of ctypes so the
+    decision is testable on every platform."""
+    if security.error is not None:
+        return f"its owner and access list could not be read ({security.error})"
+    owner = security.owner_sid
+    if owner is None:
+        return "its owner could not be read"
+    if owner not in _KEY_FILE_OWNERS | {engine_sid}:
+        return (
+            f"it is owned by {_who(owner)}, not by SYSTEM, Administrators or the account the "
+            "engine runs as"
+        )
+    if not security.dacl_present:
+        return "it has no access list at all, so every account on the host can read or change it"
+    if not security.protected:
+        return "its access list does not block inheritance from the directory"
+    expected = _expected_access(None, ())
+    expected.setdefault(engine_sid, engine_access)
+    wanted = sorted((ACCESS_ALLOWED_ACE_TYPE, 0, mask, sid) for sid, mask in expected.items())
+    for ace_type, flags, mask, sid in security.aces:
+        if (ace_type, flags, mask, sid) in wanted:
+            continue
+        if ace_type != ACCESS_ALLOWED_ACE_TYPE or flags:
+            who = f" for {_who(sid)}" if sid else ""
+            return (
+                f"its access list holds an entry of type {ace_type:#04x} with flags {flags:#04x}"
+                f"{who}, beyond the key file's own"
+            )
+        return f"its access list grants {_who(sid)} access {mask:#010x}, beyond the key file's own"
+    if sorted(security.aces) != wanted:
+        return "its access list lacks or repeats an entry the key file's own list names"
+    return None
+
+
+def _read_handle_security(handle: int) -> _HandleSecurity:
+    """Read the owner and access list of the object open as ``handle`` with ``GetSecurityInfo``, so
+    what is read belongs to the open file and not to whatever its name reaches now. The handle needs
+    READ_CONTROL, which a read handle holds. Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise RestrictedFileError("a handle's access list is read on Windows only")
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    pvoid_p = ctypes.POINTER(ctypes.c_void_p)
+    advapi32.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+        pvoid_p,
+    ]
+    advapi32.GetSecurityInfo.restype = wintypes.DWORD
+    advapi32.GetSecurityDescriptorControl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
+    advapi32.GetAce.argtypes = [ctypes.c_void_p, wintypes.DWORD, pvoid_p]
+    advapi32.GetAce.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    def sid_text(address: int | None) -> str | None:
+        if not address:
+            return None
+        text = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(address, ctypes.byref(text)):
+            return None
+        try:
+            return text.value
+        finally:
+            kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+
+    owner = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetSecurityInfo(
+        handle,
+        1,  # SE_FILE_OBJECT
+        0x00000001 | 0x00000004,  # OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
+        ctypes.byref(owner),
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0:
+        return _HandleSecurity(error=f"Win32 error {status}: {ctypes.FormatError(status).strip()}")
+    try:
+        # The owner and list pointers point INTO the descriptor, so all is copied out before it is
+        # freed.
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        if not advapi32.GetSecurityDescriptorControl(
+            descriptor, ctypes.byref(control), ctypes.byref(revision)
+        ):
+            return _HandleSecurity(error=f"Win32 error {ctypes.get_last_error()}")
+        owner_sid = sid_text(owner.value)
+        if not dacl.value:
+            return _HandleSecurity(owner_sid=owner_sid, dacl_present=False)
+        # ACL header: revision, sbz1 (bytes), size, count, sbz2 (words). The count is at offset 4.
+        count = ctypes.cast(dacl.value + 4, ctypes.POINTER(wintypes.WORD))[0]
+        aces: list[tuple[int, int, int, str]] = []
+        for index in range(count):
+            ace = ctypes.c_void_p()
+            if not advapi32.GetAce(dacl.value, index, ctypes.byref(ace)) or not ace.value:
+                return _HandleSecurity(error=f"entry {index} of its access list could not be read")
+            base = ace.value
+            ace_type = ctypes.cast(base, ctypes.POINTER(ctypes.c_ubyte))[0]
+            ace_flags = ctypes.cast(base + 1, ctypes.POINTER(ctypes.c_ubyte))[0]
+            ace_mask = ctypes.cast(base + 4, ctypes.POINTER(wintypes.DWORD))[0]
+            sid = ""
+            if ace_type in (ACCESS_ALLOWED_ACE_TYPE, _ACCESS_DENIED_ACE_TYPE):
+                # Both carry the account's SID right after the 4-byte header and the mask.
+                parsed = sid_text(base + 8)
+                if parsed is None:
+                    return _HandleSecurity(error=f"the account in entry {index} could not be read")
+                sid = parsed
+            aces.append((int(ace_type), int(ace_flags), int(ace_mask), sid))
+        return _HandleSecurity(
+            owner_sid=owner_sid,
+            protected=bool(control.value & _SE_DACL_PROTECTED),
+            aces=tuple(aces),
+        )
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def key_file_handle_problem(handle: int, *, engine_read_only: bool) -> str | None:
+    """Windows: why the key file open as ``handle`` is not owned and listed exactly as one, or
+    ``None`` when it is.
+
+    The owner and access list are read through the handle, never by name, so a link in a parent
+    directory re-pointed after the open does not change what is judged. The file must be owned by
+    SYSTEM, Administrators or the account this process runs as, and its protected list must be
+    exactly SYSTEM and Administrators with full control and that account with read
+    (``engine_read_only``, the list :func:`write_restricted_file` writes with ``creator_access``
+    off and a read grant to that account) or with full control (the list it writes for its own
+    creator, with no read grant). Any other entry, a deny entry included, is refused. Raises
+    :class:`RestrictedFileError` off Windows."""
+    if sys.platform != "win32":
+        raise RestrictedFileError("a key file's handle is checked on Windows only")
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    engine_sid = _win32_config_source_probes().self_sid
+    if engine_sid is None:
+        return "this process's own account could not be read, so the file's owner cannot be judged"
+    return _exact_descriptor_problem(
+        _read_handle_security(handle),
+        engine_sid,
+        engine_access=_READ_ACCESS if engine_read_only else _FULL_ACCESS,
+    )
 
 
 # --- removing a file the engine wrote -------------------------------------------------------------
@@ -349,20 +596,31 @@ def replace_generated(staged: Path, live: Path) -> None:
 # --- creating the file ----------------------------------------------------------------------------
 
 
-def write_restricted_file(path: Path, data: bytes, *, read_grants: Sequence[str] = ()) -> None:
+def write_restricted_file(
+    path: Path, data: bytes, *, read_grants: Sequence[str] = (), creator_access: bool = True
+) -> None:
     """Create ``path`` restricted, confirm its access, then write ``data`` to it.
 
     ``read_grants`` (Windows only) names further accounts to grant read: an account name such as
     ``NT SERVICE\\MessageFoundry``, or a SID, with or without a leading ``*``.
 
+    ``creator_access`` (Windows only to turn off) gives the creating account full control. With it
+    off the list is SYSTEM and Administrators with full control and each read grant with read, and
+    nothing for the creating account: the key custody draft's descriptor (rule 5) when the one read
+    grant is the service. The creator still writes the file through the handle that creates it, and
+    as its owner it can read the list back. Removing the file after a failure then takes the right
+    to delete it from the directory, or Administrators' full control, so an elevated administrator
+    is the caller this is for.
+
     Raises ``FileExistsError`` when ``path`` already exists, as a file or as a link, and leaves
     what is there untouched. Raises :class:`RestrictedFileError` when the file cannot be created
     restricted or does not read back as asked, and ``OSError`` when the write itself fails. After
-    any failure but ``FileExistsError`` there is no file at ``path``."""
+    any failure but ``FileExistsError`` there is no file at ``path``, given the delete right above
+    when ``creator_access`` is off."""
     # The exclusive create sits OUTSIDE the cleanup guard on purpose: a name that is taken raises
     # FileExistsError HERE, and that file belongs to someone. Unlinking it would be the overwrite
     # the exclusive create exists to prevent.
-    fd = _create_restricted(path, read_grants)
+    fd = _create_restricted(path, read_grants, creator_access=creator_access)
     try:
         try:
             handle = os.fdopen(fd, "wb")
@@ -380,15 +638,17 @@ def write_restricted_file(path: Path, data: bytes, *, read_grants: Sequence[str]
         raise
 
 
-def _create_restricted(path: Path, read_grants: Sequence[str]) -> int:
+def _create_restricted(path: Path, read_grants: Sequence[str], *, creator_access: bool) -> int:
     """Exclusively create ``path`` restricted and return a write-only descriptor for it.
 
     The access is confirmed here, while the file is still empty, so no byte is ever written to a
     file whose access was not what was asked for. A file that fails that check is removed."""
     if sys.platform == "win32":
-        return _create_restricted_windows(path, read_grants)
+        return _create_restricted_windows(path, read_grants, creator_access=creator_access)
     if read_grants:
         raise RestrictedFileError("a read grant for another account is supported on Windows only")
+    if not creator_access:
+        raise RestrictedFileError("a file without its creator's access is made on Windows only")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(path, flags, 0o600)
     try:
@@ -444,7 +704,9 @@ def _drop_inherited_acl(path: Path, fd: int) -> None:
         )
 
 
-def _create_restricted_windows(path: Path, read_grants: Sequence[str]) -> int:
+def _create_restricted_windows(
+    path: Path, read_grants: Sequence[str], *, creator_access: bool
+) -> int:
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise RestrictedFileError("the Windows create runs only on Windows")
     import ctypes
@@ -474,7 +736,7 @@ def _create_restricted_windows(path: Path, read_grants: Sequence[str]) -> int:
                 "hold, and a key file cannot be granted to it. Name the one account the engine "
                 "runs as"
             )
-    expected = _expected_access(probes.self_sid, read_sids)
+    expected = _expected_access(probes.self_sid if creator_access else None, read_sids)
 
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)

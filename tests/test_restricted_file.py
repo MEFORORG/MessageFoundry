@@ -119,6 +119,91 @@ def test_a_created_file_must_read_back_exactly_as_asked() -> None:
     )
 
 
+def test_a_new_file_without_its_creators_access_is_the_drafts_descriptor() -> None:
+    access = restricted_file._expected_access(None, [_SERVICE])
+    assert access == {_SYSTEM: _FULL, _ADMINS: _FULL, _SERVICE: _READ}
+    assert restricted_file._protected_sddl(access) == (
+        f"D:P(A;;FA;;;{_SYSTEM})(A;;FA;;;{_ADMINS})(A;;FR;;;{_SERVICE})"
+    )
+
+
+# --- pure policy: the exact check through a handle ------------------------------------------------
+
+_HandleSecurity = restricted_file._HandleSecurity
+
+
+def _held(*aces: tuple[int, int, int, str], **fields: Any) -> Any:
+    fields.setdefault("owner_sid", _ADMINS)
+    fields.setdefault("protected", True)
+    return _HandleSecurity(aces=aces, **fields)
+
+
+_EXACT_READ = (
+    (_ALLOW, 0, _FULL, _SYSTEM),
+    (_ALLOW, 0, _FULL, _ADMINS),
+    (_ALLOW, 0, _READ, _SERVICE),
+)
+
+
+def _exact(security: Any, *, engine_access: int = _READ) -> str | None:
+    return restricted_file._exact_descriptor_problem(
+        security, _SERVICE, engine_access=engine_access
+    )
+
+
+def test_the_exact_check_accepts_the_drafts_descriptor_and_each_allowed_owner() -> None:
+    for owner in (_SYSTEM, _ADMINS, _SERVICE):  # the controls for every refusal below
+        assert _exact(_held(*_EXACT_READ, owner_sid=owner)) is None
+    assert _exact(_held(*reversed(_EXACT_READ))) is None  # order does not matter
+    full = ((_ALLOW, 0, _FULL, _SYSTEM), (_ALLOW, 0, _FULL, _ADMINS), (_ALLOW, 0, _FULL, _SERVICE))
+    assert _exact(_held(*full), engine_access=_FULL) is None
+
+
+def test_the_exact_check_refuses_another_owner() -> None:
+    # A handoff another local account wrote with a narrow list: that account owns its file.
+    problem = _exact(_held(*_EXACT_READ, owner_sid=_CREATOR))
+    assert f"owned by {_CREATOR}" in str(problem)
+    assert "owner could not be read" in str(_exact(_held(*_EXACT_READ, owner_sid=None)))
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ((_ALLOW, 0, _READ, _CREATOR), f"grants {_CREATOR} access 0x00120089"),
+        ((_ALLOW, 0, _READ, "S-1-15-2-1"), "the application package S-1-15-2-1"),
+        ((_ALLOW, 0, _READ, _USERS), "Users"),
+        ((_DENY, 0, _FULL, _CREATOR), "type 0x01"),
+        ((0x05, 0, _READ, ""), "type 0x05"),
+    ],
+)
+def test_the_exact_check_refuses_any_extra_entry(
+    extra: tuple[int, int, int, str], expected: str
+) -> None:
+    problem = _exact(_held(*_EXACT_READ, extra))
+    assert expected in str(problem) and "beyond the key file's own" in str(problem)
+
+
+def test_the_exact_check_refuses_a_changed_missing_or_repeated_entry() -> None:
+    widened = (
+        (_ALLOW, 0, _FULL, _SYSTEM),
+        (_ALLOW, 0, _FULL, _ADMINS),
+        (_ALLOW, 0, _FULL, _SERVICE),
+    )
+    assert "access 0x001f01ff" in str(_exact(_held(*widened)))
+    inherit = (*_EXACT_READ[:2], (_ALLOW, 0x10, _READ, _SERVICE))
+    assert "flags 0x10" in str(_exact(_held(*inherit)))
+    assert "lacks or repeats" in str(_exact(_held(*_EXACT_READ[:2])))
+    assert "lacks or repeats" in str(_exact(_held(*_EXACT_READ, _EXACT_READ[2])))
+
+
+def test_the_exact_check_refuses_what_it_could_not_read_or_an_open_list() -> None:
+    assert "could not be read (Win32 error 5" in str(
+        _exact(_HandleSecurity(error="Win32 error 5: Access is denied."))
+    )
+    assert "no access list at all" in str(_exact(_held(dacl_present=False)))
+    assert "does not block inheritance" in str(_exact(_held(*_EXACT_READ, protected=False)))
+
+
 # --- pure policy: the read check ------------------------------------------------------------------
 
 
@@ -259,6 +344,49 @@ def test_windows_creates_the_file_with_exactly_the_intended_access(
         (_ALLOW, _READ, _SERVICE),
     }
     assert broad_access_problem(path) is None
+
+
+@windows_only
+def test_windows_creates_the_drafts_descriptor_without_the_creators_entry(tmp_path: Path) -> None:
+    # Off-admin, as here, the creator owns the file and is in no entry; it still writes the file
+    # through the handle that made it.
+    path = tmp_path / "handoff.key"
+    write_restricted_file(
+        path, b"KEY-MATERIAL-STAND-IN", read_grants=[f"*{_SERVICE}"], creator_access=False
+    )
+    protected, entries, creator = _windows_access(path)
+    assert protected
+    assert entries == {
+        (_ALLOW, _FULL, _SYSTEM),
+        (_ALLOW, _FULL, _ADMINS),
+        (_ALLOW, _READ, _SERVICE),
+    }
+    assert creator not in {sid for _t, _m, sid in entries}
+    # The default is unchanged: the creator keeps its full-control entry.
+    default = tmp_path / "default.key"
+    write_restricted_file(default, b"k", read_grants=[f"*{_SERVICE}"])
+    assert (_ALLOW, _FULL, creator) in _windows_access(default)[1]
+
+
+@windows_only
+def test_windows_the_exact_check_reads_a_real_handle(tmp_path: Path) -> None:
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        return
+    import msvcrt
+
+    path = tmp_path / "store.key"
+    write_restricted_file(path, b"k")  # SYSTEM, Administrators and this account, full control
+    with path.open("rb") as handle:
+        os_handle = msvcrt.get_osfhandle(handle.fileno())
+        assert restricted_file.key_file_handle_problem(os_handle, engine_read_only=False) is None
+        assert "beyond the key file's own" in str(
+            restricted_file.key_file_handle_problem(os_handle, engine_read_only=True)
+        )
+    plain = tmp_path / "plain.bin"
+    plain.write_bytes(b"x")
+    with plain.open("rb") as handle:
+        os_handle = msvcrt.get_osfhandle(handle.fileno())
+        assert restricted_file.key_file_handle_problem(os_handle, engine_read_only=False)
 
 
 @windows_only
@@ -450,6 +578,9 @@ def test_posix_refuses_a_read_grant_it_cannot_honour(tmp_path: Path) -> None:
     with pytest.raises(RestrictedFileError, match="Windows only"):
         write_restricted_file(path, b"k", read_grants=["someone"])
     assert not path.exists()
+    with pytest.raises(RestrictedFileError, match="Windows only"):
+        write_restricted_file(path, b"k", creator_access=False)
+    assert not path.exists()
 
 
 # --- both platforms, for real ---------------------------------------------------------------------
@@ -485,7 +616,7 @@ def test_a_missing_file_is_a_read_problem_not_a_pass(tmp_path: Path) -> None:
 def _refuse_the_create(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make the restricted create fail the way a host that cannot apply the access list would."""
 
-    def _refuse(path: Path, _grants: object) -> int:
+    def _refuse(path: Path, _grants: object, **_k: object) -> int:
         raise RestrictedFileError(f"{path} could not be created restricted: stand-in refusal")
 
     monkeypatch.setattr(restricted_file, "_create_restricted", _refuse)
@@ -495,7 +626,7 @@ def _allow_the_create(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """The control for :func:`_refuse_the_create`: the same seam, succeeding, on any platform."""
     seen: dict[str, Any] = {}
 
-    def _create(path: Path, grants: object) -> int:
+    def _create(path: Path, grants: object, **_k: object) -> int:
         seen["grants"] = list(grants)  # type: ignore[call-overload]
         return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0))
 
