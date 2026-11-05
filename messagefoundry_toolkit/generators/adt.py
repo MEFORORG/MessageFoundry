@@ -16,8 +16,8 @@ hl7apy cannot validate whole, so each patient block is validated independently a
 
 Usage::
 
-    python -m messagefoundry.generators.adt                 # all triggers, 50 each
-    python messagefoundry/generators/adt.py --triggers A01,A04 --count 5
+    python -m messagefoundry_toolkit.generators.adt                 # all triggers, 50 each
+    python messagefoundry_toolkit/generators/adt.py --triggers A01,A04 --count 5
 """
 
 from __future__ import annotations
@@ -27,19 +27,20 @@ import random
 import sys
 from pathlib import Path
 
-from messagefoundry.generators import _core
-from messagefoundry.generators import _hl7data as d
-from messagefoundry.generators._core import Ctx, MessageSpec, next_seq, seg
-from messagefoundry.hl7structures import TRIGGER_TO_STRUCTURE
 from messagefoundry.parsing import HL7PeekError, Peek, normalize, validate
+from messagefoundry_toolkit.generators import _core
+from messagefoundry_toolkit.generators import _hl7data as d
+from messagefoundry_toolkit.generators._core import Ctx, MessageSpec, next_seq, seg
+from messagefoundry_toolkit.hl7structures import TRIGGER_TO_STRUCTURE
 
 DEFAULT_SEED = _core.DEFAULT_SEED
 DEFAULT_OUT = "samples/messages/adt"
 
 # Trigger event -> 2.5.1 message structure (HL7 Chapter 3): the single source now lives in
-# messagefoundry.hl7structures (also consumed by the ADR 0104 §2.3 field picker) and is imported above, so
-# there is one map, never two (CLAUDE.md — never duplicate). Every value is one of hl7apy's 25 ADT
-# structures; shared triggers (e.g. A04->ADT_A01) carry the structure in MSH-9.3.
+# messagefoundry_toolkit.hl7structures (also consumed by the ADR 0104 §2.3 field picker) and is
+# imported above, so there is one map, never two (CLAUDE.md — never duplicate). Every value is
+# one of hl7apy's 25 ADT structures; shared triggers (e.g. A04->ADT_A01) carry the structure in
+# MSH-9.3.
 
 ALL_TRIGGERS: list[str] = sorted(TRIGGER_TO_STRUCTURE)
 

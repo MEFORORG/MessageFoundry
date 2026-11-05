@@ -652,7 +652,7 @@ SITES: dict[str, Site] = {
         "can reach the join (vault BACKLOG #2595).",
         "messagefoundry/engine_secrets.py::open_secrets_directory",
     ),
-    "messagefoundry/generators/_core.py::write_corpus": Site(
+    "messagefoundry_toolkit/generators/_core.py::write_corpus": Site(
         2,
         OPERATOR,
         "A trigger checked against the registry before the join, and a numbered file name, under "

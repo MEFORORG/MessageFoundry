@@ -7,7 +7,7 @@ Real-world ORU lab/radiology results and MDM transcriptions carry a scanned PDF 
 
     OBX|1|ED|DOC^Report^L||^application^pdf^Base64^JVBERi0xLjQK...||||||F
 
-The reference-driven generators (:mod:`messagefoundry.generators._core`) only emit numeric/text OBX
+The reference-driven generators (:mod:`messagefoundry_toolkit.generators._core`) only emit numeric/text OBX
 values, so this module adds the document-carrying ORU/MDM variants plus a deterministic synthetic PDF
 blob — the fixtures the base64 round-trip tests need (plan SYNTHETIC-TEST-PLAN §1.0.b).
 
@@ -21,11 +21,11 @@ from __future__ import annotations
 import base64
 import random
 
-from messagefoundry.generators import (
+from messagefoundry.parsing.message import Message
+from messagefoundry_toolkit.generators import (
     all_types,  # noqa: F401  (registers ORU/MDM/... specs on import)
 )
-from messagefoundry.generators._core import DEFAULT_SEED, generate_message
-from messagefoundry.parsing.message import Message
+from messagefoundry_toolkit.generators._core import DEFAULT_SEED, generate_message
 
 __all__ = ["synthetic_pdf", "oru_with_pdf", "mdm_with_pdf"]
 

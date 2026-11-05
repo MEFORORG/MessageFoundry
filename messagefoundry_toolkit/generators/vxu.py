@@ -7,8 +7,8 @@ RXA/RXR live in the shared core (also used by RAS), so this is just the spec.
 
 from __future__ import annotations
 
-from messagefoundry.generators import _core
-from messagefoundry.generators._core import MessageSpec
+from messagefoundry_toolkit.generators import _core
+from messagefoundry_toolkit.generators._core import MessageSpec
 
 _core.register(
     MessageSpec(

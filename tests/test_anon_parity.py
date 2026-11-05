@@ -11,14 +11,14 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.generators import (
+from messagefoundry_toolkit.anon import DEFAULT_RULES
+from messagefoundry_toolkit.anon import anonymize as engine_anonymize
+from messagefoundry_toolkit.anon import leak as engine_leak
+from messagefoundry_toolkit.generators import (
     _core,
     _hl7data,
     all_types,  # noqa: F401  (registers message types)
 )
-from messagefoundry_toolkit.anon import DEFAULT_RULES
-from messagefoundry_toolkit.anon import anonymize as engine_anonymize
-from messagefoundry_toolkit.anon import leak as engine_leak
 from tee.anon import DEFAULT_RULES as TEE_DEFAULT_RULES
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import leak as tee_leak
@@ -101,9 +101,11 @@ def test_shared_logic_files_are_byte_identical() -> None:
 
 
 def test_vendored_hl7data_matches_generator_source() -> None:
-    engine = (_ROOT / "messagefoundry" / "generators" / "_hl7data.py").read_bytes()
+    engine = (_ROOT / "messagefoundry_toolkit" / "generators" / "_hl7data.py").read_bytes()
     tee = (_ROOT / "tee" / "anon" / "_hl7data.py").read_bytes()
-    assert engine == tee, "tee/anon/_hl7data.py drifted from messagefoundry/generators/_hl7data.py"
+    assert engine == tee, (
+        "tee/anon/_hl7data.py drifted from messagefoundry_toolkit/generators/_hl7data.py"
+    )
 
 
 def test_leak_token_table_matches_publish_guard() -> None:

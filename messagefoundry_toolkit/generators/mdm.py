@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import random
 
-from messagefoundry.generators import _core
-from messagefoundry.generators import _hl7data as d
-from messagefoundry.generators._core import Ctx, MessageSpec, next_seq, seg
+from messagefoundry_toolkit.generators import _core
+from messagefoundry_toolkit.generators import _hl7data as d
+from messagefoundry_toolkit.generators._core import Ctx, MessageSpec, next_seq, seg
 
 
 def _build_txa(rng: random.Random, ctx: Ctx) -> str:

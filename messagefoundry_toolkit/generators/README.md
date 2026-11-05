@@ -12,10 +12,10 @@ gated through the engine's strict validator (`messagefoundry.parsing.validate`) 
 
 ```powershell
 # all triggers, 50 each -> samples/messages/adt/<TRIGGER>/0001.hl7 …
-python -m messagefoundry.generators.adt
+python -m messagefoundry_toolkit.generators.adt
 
 # a subset, fewer each, custom output
-python -m messagefoundry.generators.adt --triggers A01,A04 --count 5 --out out/adt
+python -m messagefoundry_toolkit.generators.adt --triggers A01,A04 --count 5 --out out/adt
 ```
 
 The output corpus (`samples/messages/adt/`) is **git-ignored and regenerable** — it isn't

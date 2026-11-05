@@ -497,7 +497,7 @@ def test_synthetic_message_strict_validates() -> None:
     """The inlined literal (#1192) is still a conformant 2.5.1 ADT^A01.
 
     Nothing regenerates the message any more, so something has to keep it honest. This pins
-    CONFORMANCE rather than byte-equality with ``messagefoundry.generators``, deliberately: an
+    CONFORMANCE rather than byte-equality with ``messagefoundry_toolkit.generators``, deliberately: an
     equality test would go red the day the generators leave the engine distribution -- the end state
     this inlining exists to unblock -- and would churn on any unrelated generator edit while proving
     nothing extra, since a generator change does not make the existing literal non-conformant.
@@ -543,20 +543,20 @@ from messagefoundry.verify import checks, federation, model, report, runner, smo
 
 smoke.synthetic_message()
 
-found = sorted(m for m in sys.modules if m.startswith("messagefoundry.generators"))
+found = sorted(m for m in sys.modules if m.startswith("messagefoundry_toolkit.generators"))
 print("AFTER_VERIFY=" + ",".join(found))
 
 # Positive control. Without it an empty line above is indistinguishable from a probe that cannot
 # see a generators import at all.
-import messagefoundry.generators.all_types  # noqa: F401
+import messagefoundry_toolkit.generators.all_types  # noqa: F401
 
-found = sorted(m for m in sys.modules if m.startswith("messagefoundry.generators"))
+found = sorted(m for m in sys.modules if m.startswith("messagefoundry_toolkit.generators"))
 print("AFTER_CONTROL=" + ",".join(found))
 """
 
 
 def test_verify_does_not_import_the_generators() -> None:
-    """``messagefoundry.verify`` must not pull ``messagefoundry.generators`` into its runtime.
+    """``messagefoundry.verify`` must not pull ``messagefoundry_toolkit.generators`` into its runtime.
 
     This is the guarantee the inlining buys. Without this test the import edge could come back on
     any later edit and nothing would report it.
@@ -576,14 +576,14 @@ def test_verify_does_not_import_the_generators() -> None:
     assert lines["AFTER_VERIFY"] == "", (
         f"messagefoundry.verify imported the generators: {lines['AFTER_VERIFY']}"
     )
-    assert "messagefoundry.generators.all_types" in lines["AFTER_CONTROL"], (
+    assert "messagefoundry_toolkit.generators.all_types" in lines["AFTER_CONTROL"], (
         "positive control failed -- the probe cannot detect a generators import at all, so its "
         "clean answer above means nothing"
     )
 
 
 def _generator_imports(source: str) -> list[str]:
-    """Every way ``source`` could reach ``messagefoundry.generators``, by symbol not by text.
+    """Every way ``source`` could reach ``messagefoundry_toolkit.generators``, by symbol not by text.
 
     A plain substring scan cannot do this job: the prose in ``smoke.py`` names the package to
     explain why it is absent, and a scan would read that as the defect it documents. Walk the AST
@@ -593,17 +593,19 @@ def _generator_imports(source: str) -> list[str]:
     hits: list[str] = []
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
-            hits += [a.name for a in node.names if a.name.startswith("messagefoundry.generators")]
+            hits += [
+                a.name for a in node.names if a.name.startswith("messagefoundry_toolkit.generators")
+            ]
         elif (
             isinstance(node, ast.ImportFrom)
             and node.module is not None
-            and node.module.startswith("messagefoundry.generators")
+            and node.module.startswith("messagefoundry_toolkit.generators")
         ):
             hits.append(node.module)
         elif (
             isinstance(node, ast.Constant)
             and isinstance(node.value, str)
-            and node.value.startswith("messagefoundry.generators")
+            and node.value.startswith("messagefoundry_toolkit.generators")
         ):
             hits.append(node.value)
     return hits
@@ -612,7 +614,7 @@ def _generator_imports(source: str) -> list[str]:
 def test_no_verify_source_imports_the_generators() -> None:
     """Source-level companion to the import probe.
 
-    The probe only sees imports that actually execute; a lazy ``from messagefoundry.generators
+    The probe only sees imports that actually execute; a lazy ``from messagefoundry_toolkit.generators
     import ...`` inside an un-taken branch, or a dotted path handed to ``importlib``, would slip
     past it.
     """
@@ -629,9 +631,9 @@ def test_no_verify_source_imports_the_generators() -> None:
     # Positive control on all three forms. Without it, the clean result above is indistinguishable
     # from a predicate that can never fire.
     control = (
-        "import messagefoundry.generators.all_types\n"
-        "from messagefoundry.generators import _core\n"
-        'importlib.import_module("messagefoundry.generators.adt")\n'
+        "import messagefoundry_toolkit.generators.all_types\n"
+        "from messagefoundry_toolkit.generators import _core\n"
+        'importlib.import_module("messagefoundry_toolkit.generators.adt")\n'
     )
     assert len(_generator_imports(control)) == 3, _generator_imports(control)
 

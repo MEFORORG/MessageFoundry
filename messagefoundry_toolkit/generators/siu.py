@@ -13,9 +13,9 @@ import random
 
 from hl7apy import v2_5_1 as _ref
 
-from messagefoundry.generators import _core
-from messagefoundry.generators import _hl7data as d
-from messagefoundry.generators._core import Ctx, MessageSpec, next_seq, seg
+from messagefoundry_toolkit.generators import _core
+from messagefoundry_toolkit.generators import _hl7data as d
+from messagefoundry_toolkit.generators._core import Ctx, MessageSpec, next_seq, seg
 
 # Every SIU structure: trigger "S12" -> "SIU_S12".
 TRIGGER_TO_STRUCTURE: dict[str, str] = {

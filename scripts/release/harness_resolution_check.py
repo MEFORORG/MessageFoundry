@@ -34,6 +34,12 @@ the harness-to-engine edge only. A harness that declares any OTHER base dependen
 its own message, because ``--no-index`` could not resolve it and every arm would then read as
 refused, blaming a correct pin.
 
+THE ONE OTHER BASE DEPENDENCY IT STUBS is ``messagefoundry-toolkit`` (ADR 0201 slice 7: the harness
+imports the toolkit's generators). Every arm offers a toolkit stub at the harness's OWN version with
+no requirements of its own, so the arms still vary the engine alone and measure only its edge. The
+toolkit pin is held exact by ``tests/test_packaging.py``'s specifier check; here a drifted toolkit
+pin shows only as a matched arm that pip refused.
+
 NOT STDLIB-ONLY, on purpose. It imports ``packaging`` for PEP 440 and PEP 503 normalisation, and
 both places that run it already carry ``packaging``: the test suite's interpreter, and release.yml's
 ``/tmp/harnesssmoke`` venv, which installs it pinned from the lock before this runs.
@@ -58,6 +64,8 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 ENGINE = "messagefoundry"
+#: The lockstep sibling every arm stubs at the harness's own version (ADR 0201 slice 7).
+TOOLKIT = "messagefoundry-toolkit"
 ARMS = ("older", "newer", "matched")
 
 #: The platforms a base requirement's marker is evaluated on. The harness installs on all three, so
@@ -96,7 +104,7 @@ def _metadata(wheel: Path) -> tuple[Version, list[str]]:
 
 
 def _other_base_requirements(requires: Iterable[str]) -> list[str]:
-    """Base (non-extra) requirements on anything other than the engine.
+    """Base (non-extra) requirements on anything other than the engine and the toolkit.
 
     A marker is evaluated on EACH platform in ``_PLATFORMS``, not only the one running this check,
     so a Windows-only dependency is still counted on the ubuntu runner. Other marker variables,
@@ -105,7 +113,7 @@ def _other_base_requirements(requires: Iterable[str]) -> list[str]:
     others = []
     for raw in requires:
         req = Requirement(raw)
-        if canonicalize_name(req.name) == ENGINE:
+        if canonicalize_name(req.name) in (ENGINE, TOOLKIT):
             continue
         marker = req.marker
         if marker is not None and not any(
@@ -156,10 +164,14 @@ def stub_wheel(
     return path
 
 
-def _resolves(harness: Path, engine_version: str, index: Path) -> tuple[bool, str]:
-    """Does pip resolve ``harness`` when the only engine it can see is ``engine_version``?"""
+def _resolves(
+    harness: Path, engine_version: str, toolkit_version: str, index: Path
+) -> tuple[bool, str]:
+    """Does pip resolve ``harness`` when the only engine it can see is ``engine_version``, beside a
+    toolkit at ``toolkit_version``?"""
     index.mkdir()
     stub_wheel(index, ENGINE, engine_version, provides_extra=["harness"])
+    stub_wheel(index, TOOLKIT, toolkit_version)
     argv = [
         sys.executable,
         "-I",
@@ -219,8 +231,9 @@ def check(harness: Path, arms: Collection[str] = ARMS) -> list[str]:
     others = _other_base_requirements(requires)
     if others:
         return [
-            f"{harness.name} declares base dependencies besides {ENGINE}: {others}. This check "
-            f"stubs only the engine and runs with --no-index, so every arm would read as refused. "
+            f"{harness.name} declares base dependencies besides {ENGINE} and {TOOLKIT}: "
+            f"{others}. This check stubs only those two and runs with --no-index, so every arm "
+            f"would read as refused. "
             f"Extend scripts/release/harness_resolution_check.py to stub them (BACKLOG #1585)."
         ]
     # The arms aim at the harness's OWN version, not at whatever its pin says: lockstep means the
@@ -239,7 +252,7 @@ def check(harness: Path, arms: Collection[str] = ARMS) -> list[str]:
                 )
                 continue
             engine_version, want = runnable[arm]
-            got, out = _resolves(harness, engine_version, Path(tmp) / f"index-{arm}")
+            got, out = _resolves(harness, engine_version, str(shipped), Path(tmp) / f"index-{arm}")
             print(
                 f"{arm}: engine {engine_version} -> {'resolves' if got else 'refused'}",
                 file=sys.stderr,

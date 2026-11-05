@@ -130,6 +130,12 @@ RETIRED_ENGINE_PATHS: tuple[tuple[str, ...], ...] = (
     # component matches by stem, so a one-file module (anon.py, anon.pyc, an extension module)
     # that would restore the import name messagefoundry.anon is refused too.
     ("messagefoundry", "anon"),
+    # Slice 7: the synthetic HL7 generators and the two schema emitters, now
+    # messagefoundry_toolkit/generators/, hl7schema.py and hl7structures.py. The generators run
+    # names the directory, so it refuses every member under it, as the anon run does.
+    ("messagefoundry", "generators"),
+    ("messagefoundry", "hl7schema.py"),
+    ("messagefoundry", "hl7structures.py"),
 )
 
 

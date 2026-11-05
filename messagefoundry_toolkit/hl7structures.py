@@ -185,7 +185,7 @@ def verified_paths() -> dict[str, dict[str, list[int] | list[str]]]:
     path proven once is proven for every structure. **Build-time** by design: it runs single-threaded
     (~<1 s over the whole schema) when the artifact is regenerated. MSH-1/MSH-2 (the encoding-character
     fields) are structurally excluded — they are never value targets."""
-    from messagefoundry.hl7schema import hl7_schema
+    from messagefoundry_toolkit.hl7schema import hl7_schema
 
     schema = hl7_schema()
     out: dict[str, dict[str, list[int] | list[str]]] = {}

@@ -957,6 +957,62 @@ def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
     assert len(deps) == 1, f"the toolkit declares more than the engine pin: {deps}"
 
 
+def _toolkit_pin(dependencies: list[str]) -> str | None:
+    """The exact version a requirement on ``messagefoundry-toolkit`` pins, or ``None``.
+
+    ``None`` for every shape ``_engine_pin`` refuses, for the same reasons: no requirement, a
+    marker, a range, a floor or a wildcard. An extra is ``None`` too, since the toolkit declares
+    none.
+    """
+    found = [
+        req
+        for raw in dependencies
+        if _normalise((req := Requirement(raw)).name) == "messagefoundry-toolkit"
+    ]
+    if len(found) != 1 or found[0].marker is not None or found[0].extras:
+        return None
+    specs = list(found[0].specifier)
+    if len(specs) == 1 and specs[0].operator == "==" and "*" not in specs[0].version:
+        return specs[0].version
+    return None
+
+
+def test_the_toolkit_pin_check_refuses_the_shapes_it_exists_to_refuse() -> None:
+    """The control for the harness's toolkit pin below: a check never seen firing proves
+    nothing."""
+    for loose in (
+        "messagefoundry-toolkit",
+        "messagefoundry-toolkit>=0.3.2",
+        "messagefoundry-toolkit==0.3.*",
+        'messagefoundry-toolkit==0.3.2; sys_platform == "linux"',
+        "messagefoundry-toolkit[dev]==0.3.2",
+    ):
+        assert _toolkit_pin([loose]) is None, loose
+    assert _toolkit_pin(["messagefoundry[harness]==0.3.2", "messagefoundry_toolkit==0.3.2"]) == (
+        "0.3.2"
+    )
+    assert _toolkit_pin(["messagefoundry[harness]==0.3.2"]) is None
+
+
+def test_the_harness_pins_the_toolkit_at_the_version_it_ships_with() -> None:
+    """ADR 0201 AC-7, slice 7: the harness imports ``messagefoundry_toolkit.generators``, so it
+    depends on the toolkit, and pins it the way it pins the engine: at its own lockstep version.
+
+    A loose toolkit requirement would let a resolver pair this harness with a toolkit whose
+    generators it was never run against, and a missing one installs a harness whose GUI and load
+    profiles die on ImportError at the first generator call.
+    """
+    deps: list[str] = _project(_HARNESS_PYPROJECT.parent.name)["dependencies"]
+    shipped = _version_literal(version_path(_HARNESS_PYPROJECT))
+    assert _toolkit_pin(deps) == shipped, (
+        f"the harness must pin the toolkit at the version it ships with (ADR 0201 AC-7).\n"
+        f"  the harness ships at: {shipped}\n"
+        f"  {_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()} pins the toolkit at: "
+        f"{_toolkit_pin(deps)}\n"
+        f"A VERSION BUMP MOVES THIS PIN WITH THE OTHERS; {_BUMP_LIST} lists the others."
+    )
+
+
 #: Every separate distribution under packaging/, derived so a new one is covered on arrival.
 _SEPARATE_DISTRIBUTIONS = sorted(p.parent.name for p in _REPO.glob("packaging/*/pyproject.toml"))
 
