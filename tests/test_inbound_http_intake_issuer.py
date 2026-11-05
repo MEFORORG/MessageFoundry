@@ -20,6 +20,7 @@ import asyncio
 import datetime
 import logging
 import ssl
+import warnings
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -1082,8 +1083,8 @@ def _signed_der(tbs_fields: bytes, key: ec.EllipticCurvePrivateKey) -> bytes:
 
 
 def _v1_bundle(tmp_path: Path, signer: _CaPair) -> Path:
-    """:func:`_bundle`'s client certificate as version 1 (:func:`_as_version_1`), so with no
-    extensions and no authority key identifier, with its key."""
+    """:func:`_bundle`'s client certificate as version 1 (:func:`_as_version_1`), built with no
+    extensions, so with no authority key identifier, with its key."""
     key = ec.generate_private_key(ec.SECP256R1())
     now = datetime.datetime.now(datetime.UTC)
     v3 = (
@@ -1640,7 +1641,11 @@ def test_a_namesake_whose_extensions_cannot_be_read_is_warned_about_without_rais
     ("defects", "fault"),
     [
         pytest.param((), None, id="conforming"),
-        pytest.param(("no-key-usage",), "no-key-usage", id="fault-read-without-the-issuer"),
+        pytest.param(
+            ("no-key-usage", "no-authority-key-identifier"),
+            "no-key-usage",
+            id="fault-read-without-the-issuer",
+        ),
         pytest.param(("no-authority-key-identifier",), None, id="fault-needing-the-issuer"),
     ],
 )
@@ -1677,6 +1682,28 @@ def test_a_ca_whose_issuer_name_cannot_be_read_is_warned_about_without_raising(
         _source(tmp_path, [], {"CN=Acme CA": [SUBJECT]}, cadata=cadata)
     warned = [r.getMessage() for r in caplog.records]
     assert any("certificate block 2 (CN=Acme CA) is not a CA" in m for m in warned), warned
+
+
+def test_an_issuer_name_that_warns_does_not_raise_where_warnings_are_errors() -> None:
+    """A CA with no authority key identifier whose issuer holds a three-letter country.
+    ``cryptography`` warns reading that issuer, so where warnings are errors the read raises
+    ``UserWarning``, which escaped the check for a CA strict verification refuses before this fix
+    (BACKLOG #4948). The issuer is not read, so the fault needing it is not named."""
+    root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    with pytest.warns(UserWarning):
+        issuer = x509.Name(
+            [
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "USA", _validate=False),
+                x509.NameAttribute(NameOID.COMMON_NAME, "Root CA"),
+            ]
+        )
+        der = _der(_strict_ca("no-authority-key-identifier", by=root, issuer_name=issuer)[0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        (anchor,) = IssuerIndex(ssl.DER_cert_to_PEM_cert(der))._by_subject_name[
+            _dn((NameOID.COMMON_NAME, "Acme CA"))
+        ]
+        assert pki._strict_ca_faults(anchor) is None
 
 
 @pytest.mark.parametrize("surface", ["api", "mllp"])

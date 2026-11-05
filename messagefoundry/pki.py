@@ -903,7 +903,9 @@ def _crl_issuer_key(name: x509.Name) -> CrlIssuerKey:
     CRL. Comparing the exact text instead would reopen the T61String gap with no sign.
 
     **Latin-1 here covers UTF-8 bytes only.** A one-byte text type whose bytes are not valid
-    UTF-8 already fails ``cryptography``'s parse, so the file is refused."""
+    UTF-8 already fails ``cryptography``'s parse, so the file is refused. A certificate's issuer,
+    which :func:`_self_issued` reads, is parsed only when it is read, so there the read raises
+    and the caller handles it: the certificate itself loads."""
     return tuple(tuple(sorted(map(_crl_attribute_key, rdn))) for rdn in name.rdns)
 
 
@@ -1876,7 +1878,13 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
     if ca.cert.version == x509.Version.v1:
         try:
             bare = not len(ca.cert.extensions)
-        except (x509.DuplicateExtension, ValueError, *_UNREAD_EXTENSIONS):
+        except (x509.DuplicateExtension, ValueError, *_UNREAD_EXTENSIONS) as exc:
+            _log.debug(
+                "certificate block %d: its extensions cannot be read (%s); a version-1 CA "
+                "carrying them is refused either way",
+                ca.position,
+                type(exc).__name__,
+            )
             bare = False  # an extension that does not read is still there
         return [
             "it is version 1, so it has no extensions: no basic constraints, key usage or subject "
@@ -1929,7 +1937,9 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
     # this reads the issuer name, so one that does not read loses only this fault.
     try:
         issued = not _self_issued(ca.cert)
-    except ValueError as exc:
+    # A UserWarning is raised only where warnings are errors, for an attribute out of its range,
+    # such as a three-letter country.
+    except (ValueError, UserWarning) as exc:
         _log.debug(
             "certificate block %d: its issuer name cannot be read (%s); the namesake warning "
             "cannot tell whether it may omit its authority key identifier",
@@ -1948,7 +1958,7 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
 def _self_issued(cert: x509.Certificate) -> bool:
     """Whether ``cert``'s issuer and subject are one name, as :func:`_strict_ca_faults` reads it.
     Raises ``ValueError`` when ``cryptography`` cannot read the issuer name, or its string types
-    (:func:`_crl_issuer_key`)."""
+    (:func:`_crl_issuer_key`), and ``UserWarning`` where warnings are errors."""
     issuer, subject = cert.issuer, cert.subject
     return _namesake_key(issuer) == _namesake_key(subject) or (
         _crl_issuer_key(issuer) == _crl_issuer_key(subject)
