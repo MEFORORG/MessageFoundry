@@ -29,6 +29,7 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.name import _ASN1Type
 from cryptography.x509.oid import ExtensionOID, NameOID
 
 from messagefoundry import pki
@@ -1187,11 +1188,12 @@ async def test_a_namesake_of_a_ca_with_no_key_identifier_names_the_ca_as_the_cau
 #: The remedy the CA-cause namesake warning gives, for a CA in block 1, up to the namesakes.
 _CA_REMEDY = (
     "Re-issue block 1, with the same subject and key, as a version-3 CA with at least critical "
-    "basic constraints CA:TRUE, key usage keyCertSign, a subject key identifier and, unless it is "
-    "self-signed, an authority key identifier, neither key identifier critical; a client "
-    "certificate whose authority key identifier names the issuer and serial number of block 1 "
-    "must then be re-issued too. Or remove block 1 if it is not needed. While block 1 stays "
-    "loaded, also remove"
+    "basic constraints CA:TRUE, key usage keyCertSign, a subject key identifier equal to the key "
+    "identifier its client certificates' authority key identifiers carry, and, unless it is "
+    "self-signed, an authority key identifier carrying a key identifier, neither key identifier "
+    "critical; a client certificate whose authority key identifier names the issuer and serial "
+    "number of block 1, or another key identifier, must then be re-issued too. Or remove block 1 "
+    "if it is not needed. While block 1 stays loaded, also remove"
 )
 
 #: Each reason the CA-cause warning can name, by the defect that produces it.
@@ -1204,7 +1206,11 @@ _CA_FAULTS = {
     "no-key-cert-sign": "its key usage does not include keyCertSign",
     "no-subject-key-identifier": "it has no subject key identifier",
     "subject-key-identifier-critical": "its subject key identifier is critical",
-    "no-authority-key-identifier": "it has no authority key identifier",
+    "no-authority-key-identifier": "it is not self-signed and has no authority key identifier, "
+    "which strict verification requires once its issuer is loaded",
+    "authority-key-identifier-without-key-id": "it is not self-signed and its authority key "
+    "identifier carries no key identifier, which strict verification requires once its issuer is "
+    "loaded",
     "authority-key-identifier-critical": "its authority key identifier is critical",
 }
 
@@ -1254,7 +1260,13 @@ def _strict_ca(*defects: str, akid: bool = True, by: _CaPair | None = None) -> _
             x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
             critical="subject-key-identifier-critical" in defects,
         )
-    if akid and "no-authority-key-identifier" not in defects:
+    if "authority-key-identifier-without-key-id" in defects:
+        assert by is not None
+        builder = builder.add_extension(
+            x509.AuthorityKeyIdentifier(None, [x509.DirectoryName(issuer)], by[0].serial_number),
+            critical=False,
+        )
+    elif akid and "no-authority-key-identifier" not in defects:
         builder = builder.add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()),
             critical="authority-key-identifier-critical" in defects,
@@ -1307,7 +1319,7 @@ async def test_a_namesake_of_a_ca_strict_verification_refuses_names_the_ca_and_i
     says to remove the namesake, and a version-1 CA was said to lack only a key identifier (BACKLOG
     #4948)."""
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
-    issued = defect == "no-authority-key-identifier"
+    issued = defect in ("no-authority-key-identifier", "authority-key-identifier-without-key-id")
     acme = _strict_ca(defect, by=root if issued else None)
     assert pki._openssl_reads_as_ca(_der(acme[0])) is True  # the premise: it is a CA to OpenSSL
     warning = _ca_namesake_warning(acme, root)
@@ -1332,7 +1344,7 @@ async def test_a_namesake_of_a_ca_strict_verification_refuses_names_the_ca_and_i
             "these reasons: its basic constraints are not critical; it has no key usage.",
             id="two-faults",
         ),
-        # OpenSSL checks a CA's key identifiers only under CA:TRUE basic constraints.
+        # OpenSSL refuses a CA with no basic constraints as invalid before its other checks.
         pytest.param(
             ("no-basic-constraints", "no-subject-key-identifier"),
             "this reason: it has no basic constraints.",
@@ -1384,10 +1396,45 @@ async def test_a_namesake_of_a_ca_strict_verification_admits_still_names_the_nam
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     warning = _ca_namesake_warning(acme, root)
     assert "that CA issued with no authority key identifier" in warning, warning
-    assert "Remove it, or re-issue it under another subject" in warning, warning
+    assert "Remove block 2, or re-issue it under another subject" in warning, warning
     assert "as a CA for at least" not in warning, warning
     assert not any(fault in warning for fault in _CA_FAULTS.values()), warning
     assert await _ca_alone_refuses(tmp_path, acme) == (False, False)
+
+
+async def test_a_root_whose_names_differ_only_in_string_type_is_self_signed(
+    tmp_path: Path,
+) -> None:
+    """A self-signed root with no authority key identifier, its issuer's common name a
+    PrintableString and its subject's a UTF8String. OpenSSL compares the two as one name, so it is
+    self-signed there and may omit the identifier: measured on OpenSSL 3.5.7, a strict listener
+    trusting it alone admits its clients. So no fault is named for it (BACKLOG #4948)."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.UTC)
+    subject = _dn((NameOID.COMMON_NAME, "Acme CA"))
+    printable = x509.Name(
+        [x509.NameAttribute(NameOID.COMMON_NAME, "Acme CA", _ASN1Type.PrintableString)]
+    )
+    root = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(printable)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(True, False, False, False, False, True, True, False, False),
+            critical=True,
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    assert root.issuer.public_bytes() != root.subject.public_bytes()  # the premise
+    (anchor,) = IssuerIndex(_pem(root).decode("ascii"))._by_subject_name[subject]
+    assert anchor.ca and pki._strict_ca_faults(anchor) == []
+    assert await _ca_alone_refuses(tmp_path, (root, key)) == (False, False)
 
 
 async def test_a_key_usage_without_key_cert_sign_is_no_ca_to_openssl(tmp_path: Path) -> None:
@@ -1426,7 +1473,7 @@ def test_a_namesake_of_a_ca_whose_key_identifier_cannot_be_read_says_so(
         assert "refuse every client certificate of that CA" in warning, warning
         assert "extensions of block 1 cannot be read here" in warning, warning
         assert "whether block 1 itself is the cause" in warning, warning
-        assert "Check block 1 too. Remove it, or re-issue it" in warning, warning
+        assert "Check block 1 too. Remove block 2, or re-issue it" in warning, warning
         assert ("rules block 2 out" in warning) is skid, warning
         assert "has no subject key identifier" not in warning, warning
 

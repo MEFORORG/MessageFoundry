@@ -1757,8 +1757,10 @@ class IssuerIndex:
     def namesake_warnings(self) -> list[str]:
         """Warnings about each loaded certificate OpenSSL reads as no CA that has the subject of a
         loaded CA, naming the blocks, for the caller to log at start with the file it read: one per
-        such certificate and CA, or one per CA, naming each such certificate, for a CA strict
-        verification refuses (BACKLOG #4948). Never raises.
+        such certificate and CA, or one per CA, naming each such certificate, for a CA in which
+        :func:`_strict_ca_faults` finds a reason strict verification refuses it. That finds at
+        least some reasons, not every one, so a CA refused for another reason gets the first form
+        (BACKLOG #4948). Never raises.
 
         OpenSSL finds a leaf's issuer among the loaded certificates by name. It may take the
         namesake, then refuse the chain because it is no CA. It can rule the namesake out in at
@@ -1811,8 +1813,8 @@ class IssuerIndex:
                             "the CA's, as the issuer of a client certificate that CA issued with no "
                             "authority key identifier, and then refuse that client certificate. "
                             "Strict verification accepts such a certificate when it is version 1, "
-                            "which has no extensions. Remove it, or re-issue it under another "
-                            "subject"
+                            f"which has no extensions. Remove block {other.position}, or re-issue "
+                            "it under another subject"
                         )
                     else:
                         why = ""
@@ -1832,7 +1834,8 @@ class IssuerIndex:
                         effect = (
                             f"may take block {other.position} as the issuer of a client "
                             "certificate that CA issued, and then refuse every client certificate "
-                            f"of that CA.{why} Remove it, or re-issue it under another subject"
+                            f"of that CA.{why} Remove block {other.position}, or re-issue it under "
+                            "another subject"
                         )
                     warnings.append(
                         f"certificate block {other.position} ({other.subject}) is not a CA but has "
@@ -1849,11 +1852,13 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
     accepts it.
 
     Each was measured on OpenSSL 3.5.7, alone in a CA, to refuse a version-3 and a version-1
-    client (BACKLOG #4948); a CA that is not self-signed was measured beside its issuer. OpenSSL
-    checks the key usage, key identifiers and the criticality of the basic constraints only of a
-    certificate whose basic constraints say ``CA:TRUE``, so with none the other reasons are not
-    named. OpenSSL reads a certificate with a key usage without ``keyCertSign`` as no CA, so that
-    reason reaches here only where its read and this one differ."""
+    client (BACKLOG #4948); a CA that is not self-signed was measured beside its issuer, as
+    strict verification checks its authority key identifier only once it has a chain past it.
+    Whether it is self-signed is read by name, grouped as :func:`_namesake_key` groups names, at
+    least as loosely as OpenSSL, so a root is not called one with an issuer. OpenSSL refuses a CA
+    with no basic constraints as an invalid CA before any other strict check, so then only that
+    reason is named. OpenSSL reads a certificate with a key usage without ``keyCertSign`` as no
+    CA, so that reason reaches here only where its read and this one differ."""
     if ca.cert.version == x509.Version.v1:
         return [
             "it is version 1, so it has no extensions: no basic constraints, key usage or subject "
@@ -1883,19 +1888,29 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | None:
     else:
         if not usage.key_cert_sign:
             faults.append("its key usage does not include keyCertSign")
-    for kind, label in (
-        (x509.SubjectKeyIdentifier, "subject"),
-        (x509.AuthorityKeyIdentifier, "authority"),
-    ):
-        try:
-            critical = extensions.get_extension_for_class(kind).critical
-        except x509.ExtensionNotFound:
-            # A self-signed CA may omit its authority key identifier; one with an issuer may not.
-            if kind is x509.SubjectKeyIdentifier or not _directly_issued(ca.cert, ca.cert):
-                faults.append(f"it has no {label} key identifier")
-        else:
-            if critical:
-                faults.append(f"its {label} key identifier is critical")
+    try:
+        if extensions.get_extension_for_class(x509.SubjectKeyIdentifier).critical:
+            faults.append("its subject key identifier is critical")
+    except x509.ExtensionNotFound:
+        faults.append("it has no subject key identifier")
+    # A self-signed CA may omit its authority key identifier; one with an issuer may not.
+    issued = _namesake_key(ca.cert.issuer) != _namesake_key(ca.cert.subject)
+    try:
+        authority = extensions.get_extension_for_class(x509.AuthorityKeyIdentifier)
+    except x509.ExtensionNotFound:
+        if issued:
+            faults.append(
+                "it is not self-signed and has no authority key identifier, which strict "
+                "verification requires once its issuer is loaded"
+            )
+    else:
+        if authority.critical:
+            faults.append("its authority key identifier is critical")
+        if issued and authority.value.key_identifier is None:
+            faults.append(
+                "it is not self-signed and its authority key identifier carries no key "
+                "identifier, which strict verification requires once its issuer is loaded"
+            )
     return faults
 
 
@@ -1918,11 +1933,13 @@ def _ca_cause_warning(ca: _Anchor, others: list[_Anchor], faults: list[str]) -> 
         f"{numbers} {is_} loaded, because it refuses block {at} as a CA for at least {reasons}: "
         f"{'; '.join(faults)}. Re-issue block {at}, with the same subject and key, as a version-3 "
         "CA with at least critical basic constraints CA:TRUE, key usage keyCertSign, a subject key "
-        "identifier and, unless it is self-signed, an authority key identifier, neither key "
-        "identifier critical; a client certificate whose authority key identifier names the "
-        f"issuer and serial number of block {at} must then be re-issued too. Or remove block {at} "
-        f"if it is not needed. While block {at} stays loaded, also remove {blocks} {numbers} or "
-        f"re-issue {it} under another subject"
+        "identifier equal to the key identifier its client certificates' authority key "
+        "identifiers carry, and, unless it is self-signed, an authority key identifier carrying a "
+        "key identifier, neither key identifier critical; a client certificate whose authority "
+        f"key identifier names the issuer and serial number of block {at}, or another key "
+        f"identifier, must then be re-issued too. Or remove block {at} if it is not needed. While "
+        f"block {at} stays loaded, also remove {blocks} {numbers} or re-issue {it} under another "
+        "subject"
     )
 
 
