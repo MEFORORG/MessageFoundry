@@ -3,8 +3,8 @@
 """Vault BACKLOG #3411, key custody slice S3: the keyring table.
 
 Schema only: nothing writes the keyring yet. These tests pin that the table exists on all three
-backends with one set of columns, so S4 needs no second migration, and that each live-schema check
-expects it.
+backends with one set of columns, the ones the key-custody draft's rule 6 names for a row, and that
+each live-schema check expects it.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from messagefoundry.store.server_schema_verify import (
 )
 from tests._server_schema_rows import mssql_declared, pg_declared
 
-#: The keyring's columns, the same on every backend, so S4 needs no second migration.
+#: The keyring's columns, the same on every backend.
 _KEYRING_COLUMNS = frozenset(
     {
         "key_id",
@@ -56,11 +56,28 @@ async def test_a_sqlite_store_has_the_keyring_and_its_schema_check_passes(tmp_pa
     finally:
         conn.close()
     assert set(columns) == _KEYRING_COLUMNS
-    assert columns["key_id"] == ("TEXT", False, True)
+    assert columns["key_id"] == ("TEXT", True, True)  # NOT NULL, as on both server backends
     nullable = {name for name, (_, notnull, pk) in columns.items() if not notnull and not pk}
     assert nullable == {"period_from", "period_to", "proved_at"}
     store = await MessageStore.open(db)  # and a reopen passes the same check
     await store.close()
+
+
+async def test_a_sqlite_keyring_refuses_a_null_key_id(tmp_path: Path) -> None:
+    """SQLite lets a non-integer primary key hold NULL unless the column says NOT NULL; both server
+    backends refuse one, so this backend must too."""
+    db = tmp_path / "null.db"
+    store = await MessageStore.open(db)
+    await store.close()
+    conn = sqlite3.connect(db)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO keyring (key_id, purpose, state, wrapped_by, created_at, state_at)"
+                " VALUES (NULL, 'p', 's', 'w', 0, 0)"
+            )
+    finally:
+        conn.close()
 
 
 async def test_a_sqlite_keyring_missing_a_column_is_refused(tmp_path: Path) -> None:
@@ -69,7 +86,7 @@ async def test_a_sqlite_keyring_missing_a_column_is_refused(tmp_path: Path) -> N
     conn = sqlite3.connect(db)
     try:
         conn.execute(
-            "CREATE TABLE keyring (key_id TEXT PRIMARY KEY, purpose TEXT NOT NULL,"
+            "CREATE TABLE keyring (key_id TEXT NOT NULL PRIMARY KEY, purpose TEXT NOT NULL,"
             " key_class TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, period_from REAL,"
             " period_to REAL, wrapped_by TEXT NOT NULL, wrapped TEXT NOT NULL DEFAULT '',"
             " created_at REAL NOT NULL, state_at REAL NOT NULL)"

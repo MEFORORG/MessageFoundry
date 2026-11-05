@@ -807,7 +807,8 @@ async def a_genesis_row_may_record_a_store_id_and_a_malformed_one_is_refused(
     """The genesis row a store writes today records no store id, and its chain verifies. A genesis
     row recording one, sealed by its key's holder, verifies too, and the id reads back. A malformed
     one is refused, as an unknown scheme is: the walk reports it, and a handle with no key still
-    reads the chain as keyed, so it is never read as a record that names no store id."""
+    reads the chain as keyed, so it is never read as a record that names no store id. So is a
+    well-formed one on a record naming no scheme, a shape no release writes."""
     await b.reset()
     key = generate_key()
     store = await b.open_keyed(key, ())
@@ -834,14 +835,15 @@ async def a_genesis_row_may_record_a_store_id_and_a_malformed_one_is_refused(
         assert ok and store._audit_ranges_trusted, f"{b.name}: {message}"
     finally:
         await store.close()
-    for bad in MALFORMED_STORE_IDS[:2]:
+    unnamed = json.dumps({"genesis": 1, "key_id": key_id, "store_id": store_id.hex()})
+    malformed = [genesis_record_with_store_id(key_id, bad) for bad in MALFORMED_STORE_IDS[:2]]
+    for detail in [*malformed, unnamed]:
         await b.reset()
-        detail = genesis_record_with_store_id(key_id, bad)
         await _write_chain(b, [(AUDIT_KEY_EPOCH_ACTION, detail, mac), act])
         store = await b.open_keyed(key, ())
         try:
             ok, message = await store.verify_audit_chain()
-            assert not ok and "does not seal" in (message or ""), f"{b.name}: {message}"
+            assert not ok and "malformed store_id" in (message or ""), f"{b.name}: {message}"
             assert store._audit_ranges_trusted is False, b.name
         finally:
             await store.close()
