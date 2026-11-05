@@ -8,13 +8,16 @@ file checks are pure and run everywhere."""
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
+import struct
 import sys
 from pathlib import Path
 
 import pytest
 
+from messagefoundry import restricted_file
 from messagefoundry.restricted_file import RestrictedFileError
 from messagefoundry.secrets_dpapi import DpapiUnavailable
 from messagefoundry.store import custody
@@ -30,7 +33,9 @@ from messagefoundry.store.custody import (
 )
 
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="DPAPI is Windows-only")
-posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+linux_only = pytest.mark.skipif(
+    sys.platform != "linux", reason="custody files on POSIX are read on Linux only"
+)
 
 # Fixed, recognisable key material, so a test can look for it in text.
 _MASTER = bytes(range(32))
@@ -278,37 +283,154 @@ def test_the_key_types_are_not_hashable() -> None:
 # --- the POSIX file decisions, run everywhere -----------------------------------------------------
 
 
+_HOST = custody._HOST_FILE_POLICY
+_CREDENTIAL = custody._PosixPolicy(
+    owners=frozenset({0}), group_read_gids=frozenset({0, 1000}), named_euid_read=True
+)
+_REG = stat.S_IFREG
+_UNDEFINED_ID = 0xFFFFFFFF
+_R, _RW = 0o4, 0o6
+_USER_OBJ, _USER, _GROUP_OBJ = custody._ACL_USER_OBJ, custody._ACL_USER, custody._ACL_GROUP_OBJ
+_GROUP, _MASK, _OTHER = custody._ACL_GROUP, custody._ACL_MASK, custody._ACL_OTHER
+_ACL_XATTR = restricted_file.POSIX_ACL_XATTR
+
+
+def _entry(tag: int, perms: int, ident: int = _UNDEFINED_ID) -> bytes:
+    return custody._ACL_ENTRY.pack(tag, perms, ident)
+
+
+def _acl(*entries: bytes) -> bytes:
+    """A ``system.posix_acl_access`` value as Linux stores it: the version, then each entry."""
+    return custody._ACL_HEADER.pack(custody._ACL_VERSION) + b"".join(entries)
+
+
+def _systemd_acl(*named: bytes, group_perms: int = 0, uid: int = 1000) -> bytes:
+    """The list systemd leaves on a credential for a non-root service user (``uid``): the owner and
+    the named user read only, the group nothing, the mask read, and nothing for others."""
+    return _acl(
+        _entry(_USER_OBJ, _R),
+        *(named or (_entry(_USER, _R, uid),)),
+        _entry(_GROUP_OBJ, group_perms),
+        _entry(_MASK, _R),
+        _entry(_OTHER, 0),
+    )
+
+
+def _problem(
+    mode: int,
+    owner: int,
+    policy: custody._PosixPolicy,
+    *,
+    group: int = 1000,
+    acl: bytes | None = None,
+    kind: int = _REG,
+) -> str | None:
+    return custody._posix_file_problem(kind | mode, owner, group, 1000, policy, acl)
+
+
 def test_the_posix_host_file_check_refuses_any_group_or_other_bit_and_a_foreign_owner() -> None:
-    regular = stat.S_IFREG
-    none: frozenset[int] = frozenset()
+    assert _problem(0o600, 1000, _HOST) is None  # the control
+    assert "0644" in str(_problem(0o644, 1000, _HOST))
+    assert "0610" in str(_problem(0o610, 1000, _HOST))
+    # Owner only (draft rule 3b, mode 0600): group read is refused even for the engine's own group.
+    assert "gid 1000 read" in str(_problem(0o640, 1000, _HOST))
+    assert "uid 0" in str(_problem(0o600, 0, _HOST))
+    assert "not a regular file" in str(_problem(0o700, 1000, _HOST, kind=stat.S_IFDIR))
+    assert "not a regular file" in str(_problem(0o600, 1000, _HOST, kind=stat.S_IFIFO))
 
-    def host(mode: int, owner: int) -> str | None:
-        return custody._posix_file_problem(mode, owner, 1000, forbidden=0o077, owners=none)
 
-    def credential(mode: int, owner: int) -> str | None:
-        return custody._posix_file_problem(
-            mode, owner, 1000, forbidden=0o027, owners=frozenset({0})
-        )
+def test_a_systemd_credential_may_be_read_by_root_s_group_or_the_engine_s_own_only() -> None:
+    assert _problem(0o440, 0, _CREDENTIAL, group=0) is None
+    assert _problem(0o440, 1000, _CREDENTIAL, group=1000) is None
+    assert _problem(0o400, 1000, _CREDENTIAL, group=5) is None
+    assert "gid 5 read" in str(_problem(0o440, 0, _CREDENTIAL, group=5))
+    assert "0444" in str(_problem(0o444, 0, _CREDENTIAL, group=0))
+    assert "0460" in str(_problem(0o460, 0, _CREDENTIAL, group=0))
+    assert "0450" in str(_problem(0o450, 0, _CREDENTIAL, group=0))
+    assert "uid 2000" in str(_problem(0o400, 2000, _CREDENTIAL))
 
-    assert host(regular | 0o600, 1000) is None  # the control
-    assert "0644" in str(host(regular | 0o644, 1000))
-    assert "0610" in str(host(regular | 0o610, 1000))
-    assert "uid 0" in str(host(regular | 0o600, 0))
-    assert "not a regular file" in str(host(stat.S_IFDIR | 0o700, 1000))
-    assert "not a regular file" in str(host(stat.S_IFIFO | 0o600, 1000))
-    # A systemd credential: owned by root or the engine, readable by its group, never writable by
-    # it, and nothing for other accounts.
-    assert credential(regular | 0o440, 0) is None
-    assert credential(regular | 0o400, 1000) is None
-    assert "0444" in str(credential(regular | 0o444, 0))
-    assert "0460" in str(credential(regular | 0o460, 0))
-    assert "uid 2000" in str(credential(regular | 0o400, 2000))
+
+def test_the_access_control_list_systemd_writes_for_a_service_user_is_accepted() -> None:
+    # Owned by root at 0400, with read for the service user in a named entry, which shows the mode
+    # as 0440. The group bits are the mask, so the file's group (gid 5 here) reads nothing.
+    assert _problem(0o440, 0, _CREDENTIAL, group=0, acl=_systemd_acl()) is None
+    assert _problem(0o440, 0, _CREDENTIAL, group=5, acl=_systemd_acl()) is None
+    assert _problem(0o440, 0, _CREDENTIAL, group=0, acl=_systemd_acl(group_perms=_R)) is None
+
+
+@pytest.mark.parametrize(
+    ("acl", "group", "expected"),
+    [
+        (_systemd_acl(_entry(_USER, _R, 2000)), 0, "grants uid 2000 access"),
+        (_systemd_acl(_entry(_USER, 0, 2000)), 0, "grants uid 2000 access"),
+        (_systemd_acl(_entry(_USER, _RW, 1000)), 0, "own uid more than read"),
+        (_systemd_acl(_entry(_USER, _R, 1000), _entry(_GROUP, _R, 0)), 0, "grants gid 0 access"),
+        (_systemd_acl(group_perms=_R), 5, "group gid 5 read"),
+        (_systemd_acl(group_perms=_RW), 0, "more than read"),
+        (_acl(_entry(_USER_OBJ, _R), _entry(_OTHER, _R)), 0, "every other account"),
+        (_acl(_entry(0x40, _R)), 0, "of a kind this engine does not read"),
+        (_systemd_acl()[:-1], 0, "not in a form"),
+        (struct.pack("<I", 1) + _systemd_acl()[4:], 0, "not in a form"),
+        (b"", 0, "not in a form"),
+    ],
+)
+def test_an_access_control_list_entry_beyond_the_policy_is_refused(
+    acl: bytes, group: int, expected: str
+) -> None:
+    assert expected in str(_problem(0o440, 0, _CREDENTIAL, group=group, acl=acl))
+
+
+def test_the_host_file_takes_no_group_read_or_named_entry_from_an_access_control_list() -> None:
+    owner_only = _acl(_entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, 0), _entry(_OTHER, 0))
+    assert _problem(0o600, 1000, _HOST, acl=owner_only) is None
+    # Owner only: even the engine's own uid in a named entry is refused, though it grants nothing.
+    assert "grants uid 1000 access" in str(_problem(0o600, 1000, _HOST, acl=_systemd_acl()))
+    group_read = _acl(_entry(_USER_OBJ, _RW), _entry(_GROUP_OBJ, _R), _entry(_OTHER, 0))
+    assert "gid 1000 read" in str(_problem(0o640, 1000, _HOST, acl=group_read))
+    named = _systemd_acl(_entry(_USER, 0, 2000))
+    assert "uid 2000" in str(_problem(0o600, 1000, _HOST, acl=named))
+
+
+@pytest.mark.parametrize(
+    ("code", "no_list"),
+    [(errno.ENODATA, True), (errno.ENOTSUP, True), (errno.EOPNOTSUPP, True), (errno.EIO, False)],
+)
+def test_only_no_attribute_or_no_extended_attributes_reads_as_no_access_control_list(
+    code: int, no_list: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _getxattr(fd: int, name: str) -> bytes:
+        assert name == _ACL_XATTR
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "getxattr", _getxattr, raising=False)
+    if no_list:
+        assert restricted_file.posix_access_acl(3) is None
+    else:  # a list that could not be read is not a list shown absent
+        with pytest.raises(OSError) as excinfo:
+            restricted_file.posix_access_acl(3)
+        assert excinfo.value.errno == code
+
+
+def test_custody_files_are_refused_on_a_posix_host_other_than_linux(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "store-a").write_bytes(_blob().serialize())
+    environ = {"CREDENTIALS_DIRECTORY": str(tmp_path)}
+    monkeypatch.setattr(sys, "platform", "darwin")
+    with pytest.raises(CustodyError, match="Linux and Windows only"):
+        custody.read_host_file(tmp_path / "store-a")
+    with pytest.raises(CustodyError, match="Linux and Windows only"):
+        custody.write_host_file(tmp_path / "host.blob", _blob())
+    assert not (tmp_path / "host.blob").exists()
+    with pytest.raises(CredentialUnavailable, match="Linux only"):
+        custody.read_systemd_credential("store-a", environ=environ)
 
 
 # --- the POSIX host file, for real ----------------------------------------------------------------
 
 
-@posix_only
+@linux_only
 def test_posix_host_file_round_trips_at_mode_0600(tmp_path: Path) -> None:
     path = tmp_path / "host.blob"
     custody.write_host_file(path, _blob())
@@ -318,7 +440,7 @@ def test_posix_host_file_round_trips_at_mode_0600(tmp_path: Path) -> None:
         custody.write_host_file(path, _blob(0))
 
 
-@posix_only
+@linux_only
 def test_posix_host_file_at_0644_is_refused(tmp_path: Path) -> None:
     path = tmp_path / "host.blob"
     custody.write_host_file(path, _blob())
@@ -328,7 +450,7 @@ def test_posix_host_file_at_0644_is_refused(tmp_path: Path) -> None:
     assert not _leaks(str(excinfo.value), _MASTER)
 
 
-@posix_only
+@linux_only
 def test_posix_host_file_that_is_a_link_is_refused(tmp_path: Path) -> None:
     real = tmp_path / "host.blob"
     custody.write_host_file(real, _blob())
@@ -338,7 +460,7 @@ def test_posix_host_file_that_is_a_link_is_refused(tmp_path: Path) -> None:
         custody.read_host_file(link)
 
 
-@posix_only
+@linux_only
 def test_posix_host_file_that_is_a_fifo_is_refused_without_blocking(tmp_path: Path) -> None:
     fifo = tmp_path / "host.blob"
     os.mkfifo(fifo, 0o600)
@@ -346,7 +468,7 @@ def test_posix_host_file_that_is_a_fifo_is_refused_without_blocking(tmp_path: Pa
         custody.read_host_file(fifo)
 
 
-@posix_only
+@linux_only
 def test_systemd_credential_is_read_from_the_named_file(tmp_path: Path) -> None:
     (tmp_path / "store-a").write_bytes(_blob().serialize())
     os.chmod(tmp_path / "store-a", 0o400)
@@ -361,7 +483,7 @@ def test_systemd_credential_is_read_from_the_named_file(tmp_path: Path) -> None:
         custody.read_systemd_credential("store-a", environ={"CREDENTIALS_DIRECTORY": "relative"})
 
 
-@posix_only
+@linux_only
 def test_a_credentials_directory_that_does_not_exist_is_refused_not_unavailable(
     tmp_path: Path,
 ) -> None:
@@ -369,6 +491,104 @@ def test_a_credentials_directory_that_does_not_exist_is_refused_not_unavailable(
     with pytest.raises(CustodyError, match="names no directory") as excinfo:
         custody.read_systemd_credential("store-a", environ=environ)
     assert not isinstance(excinfo.value, CredentialUnavailable)
+
+
+def _set_acl_or_skip(path: Path, name: str, acl: bytes) -> None:
+    try:
+        os.setxattr(path, name, acl)
+    except OSError as exc:
+        if exc.errno in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+            pytest.skip("this file system keeps no POSIX access control list")
+        raise
+
+
+@linux_only
+def test_a_host_file_whose_access_control_list_names_another_account_is_refused(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+    other = os.geteuid() + 1
+    acl = _acl(
+        _entry(_USER_OBJ, _RW),
+        _entry(_USER, _R, other),
+        _entry(_GROUP_OBJ, 0),
+        _entry(_MASK, 0),
+        _entry(_OTHER, 0),
+    )
+    _set_acl_or_skip(path, _ACL_XATTR, acl)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600  # the mode alone would pass
+    with pytest.raises(CustodyError, match=f"grants uid {other} access") as excinfo:
+        custody.read_host_file(path)
+    assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@linux_only
+def test_a_credential_with_the_access_control_list_systemd_writes_is_read(tmp_path: Path) -> None:
+    path = tmp_path / "store-a"
+    path.write_bytes(_blob().serialize())
+    os.chmod(path, 0o400)
+    euid = os.geteuid()
+    _set_acl_or_skip(path, _ACL_XATTR, _systemd_acl(uid=euid))
+    assert stat.S_IMODE(path.stat().st_mode) == 0o440  # the group bits are now the mask
+    environ = {"CREDENTIALS_DIRECTORY": str(tmp_path)}
+    assert custody.read_systemd_credential("store-a", environ=environ) == _blob()
+    os.setxattr(path, _ACL_XATTR, _systemd_acl(_entry(_USER, _R, euid + 1)))
+    with pytest.raises(CustodyError, match=f"grants uid {euid + 1} access"):
+        custody.read_systemd_credential("store-a", environ=environ)
+
+
+@linux_only
+def test_a_host_file_written_under_a_default_access_control_list_reads_back(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "keys"
+    directory.mkdir()
+    default = _acl(
+        _entry(_USER_OBJ, 0o7),
+        _entry(_USER, _RW, os.geteuid() + 1),
+        _entry(_GROUP_OBJ, 0o5),
+        _entry(_MASK, 0o7),
+        _entry(_OTHER, 0o5),
+    )
+    _set_acl_or_skip(directory, "system.posix_acl_default", default)
+    path = directory / "host.blob"
+    custody.write_host_file(path, _blob())
+    with pytest.raises(OSError) as excinfo:  # no access control list is left on the file
+        os.getxattr(path, _ACL_XATTR)
+    assert excinfo.value.errno == errno.ENODATA
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert custody.read_host_file(path) == _blob()
+
+
+@linux_only
+def test_an_inherited_access_control_list_that_cannot_be_removed_leaves_no_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _removexattr(fd: int, name: str) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(restricted_file, "posix_access_acl", lambda fd: b"inherited")
+    monkeypatch.setattr(os, "removexattr", _removexattr)
+    path = tmp_path / "host.blob"
+    with pytest.raises(RestrictedFileError, match="inherited POSIX access control list"):
+        custody.write_host_file(path, _blob())
+    assert not path.exists()
+
+
+@linux_only
+def test_an_access_control_list_that_cannot_be_read_refuses_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "host.blob"
+    custody.write_host_file(path, _blob())
+
+    def _getxattr(fd: int, name: str) -> bytes:
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(os, "getxattr", _getxattr)
+    with pytest.raises(CustodyError, match="access control list could not be read"):
+        custody.read_host_file(path)
 
 
 def test_systemd_credential_refusals_that_need_no_file() -> None:

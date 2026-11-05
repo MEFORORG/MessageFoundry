@@ -29,6 +29,9 @@ one. ``CREATE_NEW`` with ``FILE_FLAG_OPEN_REPARSE_POINT`` refuses a name that is
 whether by a file or by a link.
 
 **POSIX.** ``O_CREAT | O_EXCL`` with mode ``0o600``, which also refuses an existing name or link.
+On Linux, a POSIX access control list the new file inherits from a default list on its directory is
+removed before a byte is written, and its absence read back, so the file's mode is its whole access
+(:func:`posix_access_acl`).
 
 All ``ctypes`` work sits behind ``sys.platform`` guards, so the module imports on every platform and
 type-checks on the Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`).
@@ -36,6 +39,7 @@ type-checks on the Linux CI leg (mirrors :mod:`messagefoundry.secrets_dpapi`).
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 import sys
@@ -60,6 +64,7 @@ __all__ = [
     "WINERROR_SHARING_VIOLATION",
     "RestrictedFileError",
     "broad_access_problem",
+    "posix_access_acl",
     "replace_generated",
     "ride_out_a_held_file",
     "unlink_generated",
@@ -236,6 +241,27 @@ def _posix_access_problem(mode: int) -> str | None:
     return None
 
 
+#: The extended attribute that holds a Linux file's POSIX access control list.
+POSIX_ACL_XATTR = "system.posix_acl_access"
+
+
+def posix_access_acl(fd: int) -> bytes | None:
+    """The raw POSIX access control list of the open file ``fd``, or ``None`` when it has none.
+
+    Linux only, because only Linux exposes the list as an extended attribute; raises
+    :class:`RestrictedFileError` elsewhere. No such attribute (``ENODATA``) and a file system that
+    keeps no extended attributes (``ENOTSUP``) both mean no list. Every other error propagates as
+    the ``OSError`` it is, because a list that could not be read is not a list shown absent."""
+    if sys.platform != "linux":
+        raise RestrictedFileError("a POSIX access control list is read on Linux only")
+    try:
+        return os.getxattr(fd, POSIX_ACL_XATTR)
+    except OSError as exc:
+        if exc.errno in {errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP}:
+            return None
+        raise
+
+
 def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
     """Why ``path`` is open beyond the accounts a key file is for, or ``None`` when it is not.
 
@@ -364,6 +390,8 @@ def _create_restricted(path: Path, read_grants: Sequence[str]) -> int:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     fd = os.open(path, flags, 0o600)
     try:
+        if sys.platform == "linux":
+            _drop_inherited_acl(path, fd)
         status = os.fstat(fd)
         if stat.S_IMODE(status.st_mode) & 0o077 or status.st_uid != os.geteuid():
             raise RestrictedFileError(
@@ -375,6 +403,29 @@ def _create_restricted(path: Path, read_grants: Sequence[str]) -> int:
         path.unlink(missing_ok=True)
         raise
     return fd
+
+
+def _drop_inherited_acl(path: Path, fd: int) -> None:
+    """Remove the access list a new, still empty file inherited from a default list on its
+    directory, and read back that it is gone, so the file's mode is its whole access.
+
+    The ``0o600`` create masks the inherited named entries to nothing, but they stay in the list,
+    where a later ``chmod`` would widen them again and a reader that judges the entries themselves
+    (the key custody reads) refuses them."""
+    if sys.platform != "linux":  # pragma: no cover - guard for the type checker off Linux
+        raise RestrictedFileError("a POSIX access control list is removed on Linux only")
+    reason: str | None = None
+    try:
+        if posix_access_acl(fd) is not None:
+            os.removexattr(fd, POSIX_ACL_XATTR)
+            if posix_access_acl(fd) is not None:
+                reason = "it still carries one after it was removed"
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+    if reason is not None:
+        raise RestrictedFileError(
+            f"{path} could not be created without an inherited POSIX access control list: {reason}"
+        )
 
 
 def _create_restricted_windows(path: Path, read_grants: Sequence[str]) -> int:
