@@ -66,6 +66,8 @@ from packaging.version import InvalidVersion, Version
 ENGINE = "messagefoundry"
 #: The lockstep sibling every arm stubs at the harness's own version (ADR 0201 slice 7).
 TOOLKIT = "messagefoundry-toolkit"
+#: Every distribution the arms stub, so every base requirement this check can resolve.
+STUBBED = (ENGINE, TOOLKIT)
 ARMS = ("older", "newer", "matched")
 
 #: The platforms a base requirement's marker is evaluated on. The harness installs on all three, so
@@ -113,7 +115,7 @@ def _other_base_requirements(requires: Iterable[str]) -> list[str]:
     others = []
     for raw in requires:
         req = Requirement(raw)
-        if canonicalize_name(req.name) in (ENGINE, TOOLKIT):
+        if canonicalize_name(req.name) in STUBBED:
             continue
         marker = req.marker
         if marker is not None and not any(
@@ -167,8 +169,8 @@ def stub_wheel(
 def _resolves(
     harness: Path, engine_version: str, toolkit_version: str, index: Path
 ) -> tuple[bool, str]:
-    """Does pip resolve ``harness`` when the only engine it can see is ``engine_version``, beside a
-    toolkit at ``toolkit_version``?"""
+    """Does pip resolve ``harness`` when the only engine it can see is ``engine_version``? The
+    toolkit is offered at ``toolkit_version``, which every arm holds at the harness's own version."""
     index.mkdir()
     stub_wheel(index, ENGINE, engine_version, provides_extra=["harness"])
     stub_wheel(index, TOOLKIT, toolkit_version)
@@ -231,9 +233,8 @@ def check(harness: Path, arms: Collection[str] = ARMS) -> list[str]:
     others = _other_base_requirements(requires)
     if others:
         return [
-            f"{harness.name} declares base dependencies besides {ENGINE} and {TOOLKIT}: "
-            f"{others}. This check stubs only those two and runs with --no-index, so every arm "
-            f"would read as refused. "
+            f"{harness.name} declares base dependencies besides {list(STUBBED)}: {others}. This "
+            f"check stubs only those and runs with --no-index, so every arm would read as refused. "
             f"Extend scripts/release/harness_resolution_check.py to stub them (BACKLOG #1585)."
         ]
     # The arms aim at the harness's OWN version, not at whatever its pin says: lockstep means the

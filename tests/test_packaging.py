@@ -603,7 +603,12 @@ def _engine_pin(dependencies: list[str]) -> str | None:
     anywhere else, so it passes on the ubuntu runner that grades it and fails on the Windows host the
     harness is for. A requirement that holds only somewhere is not a lockstep pin.
     """
-    req = _engine_requirement(dependencies)
+    return _exact_pin(_engine_requirement(dependencies))
+
+
+def _exact_pin(req: Requirement | None) -> str | None:
+    """The one exact version ``req`` pins, or ``None`` for a missing requirement, a marker, or any
+    specifier but a single wildcard-free ``==``. Shared by the engine and toolkit pin checks."""
     if req is None or req.marker is not None:
         return None
     specs = list(req.specifier)
@@ -960,21 +965,18 @@ def test_the_toolkit_pins_the_engine_at_the_version_it_ships_with() -> None:
 def _toolkit_pin(dependencies: list[str]) -> str | None:
     """The exact version a requirement on ``messagefoundry-toolkit`` pins, or ``None``.
 
-    ``None`` for every shape ``_engine_pin`` refuses, for the same reasons: no requirement, a
-    marker, a range, a floor or a wildcard. An extra is ``None`` too, since the toolkit declares
-    none.
+    ``None`` for every shape ``_engine_pin`` refuses (``_exact_pin`` is the one rule both use),
+    and for an extra too, since the toolkit declares none.
     """
-    found = [
-        req
-        for raw in dependencies
-        if _normalise((req := Requirement(raw)).name) == "messagefoundry-toolkit"
-    ]
-    if len(found) != 1 or found[0].marker is not None or found[0].extras:
-        return None
-    specs = list(found[0].specifier)
-    if len(specs) == 1 and specs[0].operator == "==" and "*" not in specs[0].version:
-        return specs[0].version
-    return None
+    req = next(
+        (
+            r
+            for raw in dependencies
+            if _normalise((r := Requirement(raw)).name) == "messagefoundry-toolkit"
+        ),
+        None,
+    )
+    return None if req is not None and req.extras else _exact_pin(req)
 
 
 def test_the_toolkit_pin_check_refuses_the_shapes_it_exists_to_refuse() -> None:
@@ -983,7 +985,9 @@ def test_the_toolkit_pin_check_refuses_the_shapes_it_exists_to_refuse() -> None:
     for loose in (
         "messagefoundry-toolkit",
         "messagefoundry-toolkit>=0.3.2",
+        "messagefoundry-toolkit~=0.3.2",
         "messagefoundry-toolkit==0.3.*",
+        "messagefoundry-toolkit>=0.3.2,<0.4",
         'messagefoundry-toolkit==0.3.2; sys_platform == "linux"',
         "messagefoundry-toolkit[dev]==0.3.2",
     ):
@@ -1004,11 +1008,11 @@ def test_the_harness_pins_the_toolkit_at_the_version_it_ships_with() -> None:
     """
     deps: list[str] = _project(_HARNESS_PYPROJECT.parent.name)["dependencies"]
     shipped = _version_literal(version_path(_HARNESS_PYPROJECT))
-    assert _toolkit_pin(deps) == shipped, (
+    pinned = _toolkit_pin(deps)
+    assert pinned == shipped, (
         f"the harness must pin the toolkit at the version it ships with (ADR 0201 AC-7).\n"
         f"  the harness ships at: {shipped}\n"
-        f"  {_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()} pins the toolkit at: "
-        f"{_toolkit_pin(deps)}\n"
+        f"  {_HARNESS_PYPROJECT.relative_to(_REPO).as_posix()} pins the toolkit at: {pinned}\n"
         f"A VERSION BUMP MOVES THIS PIN WITH THE OTHERS; {_BUMP_LIST} lists the others."
     )
 
