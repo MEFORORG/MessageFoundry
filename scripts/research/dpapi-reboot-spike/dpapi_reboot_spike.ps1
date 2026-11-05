@@ -164,10 +164,9 @@
   the next block.
 
   RESULTS, THE REBOOT ARMS (-Mode Host). The owner ran the owner command above on MEFORHV01 on
-  2026-11-05, about 00:52 to 01:04 UTC, the code at commit
-  47039223ae5ccd12072b7b0ae07770e9341a19da, on REVTEST01 at post-move-mefor-lab-2026-10-17. The
-  lines it printed, as the owner pasted them, unedited but for one host path, removed where
-  marked:
+  2026-11-05 (UTC), the code at commit 47039223ae5ccd12072b7b0ae07770e9341a19da, on REVTEST01
+  at post-move-mefor-lab-2026-10-17. Lines it printed, the selection the owner pasted, unedited
+  but for one host path, removed where marked:
     ----- guest step Uninstall  -----
     service=deleted
     folder=removed C:\mefor-dpapi-reboot
@@ -184,13 +183,14 @@
   Notes, not raw lines. The verdict is SURVIVES. A4 and A5 each read YES with every control
   held. Each carries boot_id=6 against A1 to A3's 5, an uptime_ms lower than A3's, and a
   boot_utc about 6 minutes after theirs (00:58:31Z against 00:52:45Z), so the boots line shows
-  the reboot for both. A3 reads INCONCLUSIVE because the profile stayed loaded. The
-  administrator's crosscheck was refused with the key-state code, -2146893813.
-  What is left open. These lines do not name the guest's OS. The pre-reboot runs on the same
-  checkpoint read Windows Server 2022, build 20348, so this answers the question on Server 2022,
-  not on Server 2025. A3, a profile unload without a reboot, stays unmeasured. Each reboot
-  reloads the profile, so A4 and A5 opened the blob after a profile reload, but not after an
-  unload alone.
+  the reboot for both. A3 reads INCONCLUSIVE: the profile was not seen unloaded before its
+  start. The administrator's crosscheck was refused with the key-state code, -2146893813.
+  What is left open, at least. These lines do not name the guest's OS. The pre-reboot runs on
+  the same checkpoint name read Windows Server 2022, build 20348; by that reading this answers
+  the question on Server 2022, not on Server 2025. A3, a profile unload without a reboot, stays
+  unmeasured. A reboot reloads the profile, so A4 and A5 ran after a profile reload by that
+  reasoning, not by a reading: no step reads the profile at A4 or A5. Nothing here shows the
+  blob opening after an unload alone.
 #>
 [CmdletBinding()]
 param(
