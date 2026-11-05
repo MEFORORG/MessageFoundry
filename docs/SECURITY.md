@@ -7477,8 +7477,9 @@ system lets that process write the target's memory. On a first deployment, code 
 service account could be such a process. It would then run Python inside the engine, with
 everything the engine holds.
 
-The first control is a start refusal under `enforce`, which `[security].allow_remote_debugging`
-lifts (vault BACKLOG #2700). When it fires is stated once, in
+The first control is a start refusal under `enforce`, in `serve` and `supervise` only, which
+`[security].allow_remote_debugging` lifts (vault BACKLOG #2700). The other commands neither
+refuse nor report. When it fires is stated once, in
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
 Three further controls answer it, and they differ in strength:
 

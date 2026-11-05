@@ -3491,19 +3491,18 @@ def test_serve_names_remote_debugging_in_its_loosening_warning_only_while_it_is_
         tmp_path,
         monkeypatch,
         "security.block_unlisted_outbound = true\n"
-        "security.allow_remote_debugging = true\n"
-        + _SECURE_RETENTION
-        + _CERT_REMINDER_OFF
-        + _ROTATION_REMINDER_OFF
-        + _SECURE_ALERTS,
+        "security.allow_remote_debugging = true\n" + _SECURE_RETENTION + _SECURE_ALERTS,
     )
     assert rc == 0
-    out = capsys.readouterr().out
-    # The control: the WARNING is written either way, for the silenced reminders.
-    assert "posture loosened from the secure defaults" in out
+    # The control: the WARNING is written either way, since the acceptance is a loosening itself.
+    warning = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "posture loosened from the secure defaults" in line
+    ]
+    assert len(warning) == 1, warning
     # The entry, "name (risk)"; the acceptance's own risk text names it bare.
-    i = out.find("remote_debug_enabled (")
-    assert (i >= 0) is interface_on, out[max(0, i - 600) : i + 300]
+    assert ("remote_debug_enabled (" in warning[0]) is interface_on, warning[0]
 
 
 def test_serve_reminder_recipient_gate_honours_the_audited_waiver(

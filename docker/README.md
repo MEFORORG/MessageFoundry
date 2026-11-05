@@ -67,8 +67,9 @@ interpreter it starts.
 Two things undo this, and the engine refuses or reports each:
 
 - **Overriding the entry point** (`--entrypoint messagefoundry`, or a `command:` that replaces it
-  in Kubernetes) starts the engine without the options, so remote debugging is on. Under
-  `enforce` the start refusal for it then stops the engine (vault BACKLOG #2700). A start that
+  in Kubernetes) starts the engine without the options, so remote debugging is on unless the
+  container's environment sets `PYTHON_DISABLE_REMOTE_DEBUG=1`. With it on, under `enforce` the
+  start refusal for it stops the engine (vault BACKLOG #2700). A start that
   goes on reports `interpreter_not_isolated`, and `remote_debug_enabled` while the interface is
   on. When the refusal fires and what lifts it are stated once, in
   [`docs/SECURITY-LOOSENING.md`](../docs/SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
