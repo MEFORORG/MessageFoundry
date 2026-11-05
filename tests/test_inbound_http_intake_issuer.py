@@ -28,7 +28,7 @@ import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import ExtensionOID, NameOID
 
 from messagefoundry import pki
 from messagefoundry.api.tls import _attach_issuer_index
@@ -991,8 +991,9 @@ async def _handshake_refused(source: HttpSource, bundle: Path) -> bool:
     return data == b""
 
 
+@pytest.mark.parametrize("cn", ["Acme CA", "ACME CA", " Acme  CA"], ids=["same", "case", "spacing"])
 async def test_a_namesake_that_is_no_ca_is_warned_about_at_start(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, cn: str
 ) -> None:
     """A loaded certificate that is no CA, with no key identifier, with the subject of a loaded CA.
     OpenSSL may take it as the issuer of a client certificate that CA issued, and then refuses the
@@ -1004,10 +1005,13 @@ async def test_a_namesake_that_is_no_ca_is_warned_about_at_start(
 
     Which of two certificates with one name OpenSSL tries first follows its sort of equal names,
     which differs by platform: on Windows, OpenSSL 3.5.7, it took the one listed later. So both
-    orders are started, each must warn, and at least one must refuse the CA's client."""
+    orders are started, each must warn, and at least one must refuse the CA's client. A namesake
+    differing from the CA only in ASCII case or white space is one name to OpenSSL, so it is
+    measured too."""
     acme = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
-    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root, skid=False)
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, cn)), root, skid=False)
+    named = namesake.subject.rfc4514_string()
     subjects = {"CN=Acme CA": [SUBJECT]}
     refused = []
     for order, (ca_at, other_at) in (("ca-first", (1, 2)), ("namesake-first", (2, 1))):
@@ -1019,7 +1023,7 @@ async def test_a_namesake_that_is_no_ca_is_warned_about_at_start(
         try:
             warned = [r.getMessage() for r in caplog.records]
             assert any(
-                f"tls_ca_file certificate block {other_at} (CN=Acme CA) is not a CA" in m
+                f"tls_ca_file certificate block {other_at} ({named}) is not a CA" in m
                 and f"the CA certificate in block {ca_at}" in m
                 and "refuse every client certificate of that CA" in m
                 for m in warned
@@ -1048,7 +1052,9 @@ async def test_a_namesake_that_is_no_ca_is_warned_about_at_start(
     [
         pytest.param("ACME CA", False, "every client certificate of that CA", id="case"),
         pytest.param(" Acme  CA", False, "every client certificate of that CA", id="spacing"),
-        pytest.param("Acme CA", True, "each one that carries no authority key", id="key-id"),
+        pytest.param(
+            "Acme CA", True, "only as the issuer of a client certificate with no", id="key-id"
+        ),
     ],
 )
 def test_a_namesake_warning_matches_names_as_openssl_does_and_says_whom_it_refuses(
@@ -1065,6 +1071,41 @@ def test_a_namesake_warning_matches_names_as_openssl_does_and_says_whom_it_refus
     # Control: another name is no namesake.
     other = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA 2")), acme, skid=skid)
     assert IssuerIndex((_pem(acme[0]) + _pem(other)).decode("ascii")).namesake_warnings() == []
+
+
+def test_a_namesake_whose_extensions_cannot_be_read_is_warned_about_without_raising() -> None:
+    """A namesake that is no CA whose extensions ``cryptography`` refuses to read, here a duplicate
+    key identifier, which OpenSSL loads. The warning reads the key identifier, so it must not raise
+    out of the start, which it would refuse; it warns as for a namesake with none (BACKLOG
+    #4948)."""
+    acme = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = datetime.datetime.now(datetime.UTC)
+    # The SKID's OID with its last arc set to 99, so it encodes to as many bytes.
+    arcs = ExtensionOID.SUBJECT_KEY_IDENTIFIER.dotted_string.rsplit(".", 1)[0]
+    placeholder = x509.ObjectIdentifier(f"{arcs}.99")
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(acme[0].subject)
+        .issuer_name(acme[0].subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+        .add_extension(x509.UnrecognizedExtension(placeholder, b"\x04\x01\x00"), critical=False)
+        .sign(acme[1], hashes.SHA256())
+    )
+    der = _der(cert)
+    assert der.count(b"\x06\x03\x55\x1d\x63") == 1
+    der = der.replace(b"\x06\x03\x55\x1d\x63", b"\x06\x03\x55\x1d\x0e")
+    with pytest.raises(x509.DuplicateExtension):  # the premise: cryptography refuses to read it
+        _ = x509.load_der_x509_certificate(der).extensions
+    cadata = (_pem(acme[0]) + _wrapped(der)).decode("ascii")
+    assert _openssl_loads(cadata) == 2  # the premise: OpenSSL loads it
+    (warning,) = IssuerIndex(cadata).namesake_warnings()
+    assert "block 2" in warning and "refuse every client certificate of that CA" in warning
 
 
 @pytest.mark.parametrize("surface", ["api", "mllp"])

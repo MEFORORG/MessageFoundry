@@ -1757,16 +1757,17 @@ class IssuerIndex:
     def namesake_warnings(self) -> list[str]:
         """One warning for each loaded certificate OpenSSL reads as no CA that has the subject of a
         loaded CA, naming both blocks, for the caller to log at start with the file it read
-        (BACKLOG #4948).
+        (BACKLOG #4948). Never raises.
 
         OpenSSL finds a leaf's issuer among the loaded certificates by name. It may take the
-        namesake, then refuse the chain because it is no CA. A key identifier on the namesake that
-        differs from the CA's rules it out only for a leaf whose authority key identifier names
-        the CA's key, so the warning says which clients it can refuse: every one, or those with no
-        authority key identifier. The index does not count such a namesake toward the same-DN
-        ambiguity unless it signs itself, so :meth:`unmatched_keys` may give no reason, and this
-        is the only start signal. Names are grouped by :func:`_namesake_key`, at least as loosely
-        as OpenSSL matches them. A warning only: it changes no allow, deny or refusal."""
+        namesake, then refuse the chain because it is no CA. It can rule the namesake out in at
+        least one way this reads: a key identifier on the namesake that differs from the CA's rules
+        it out for a leaf whose authority key identifier names the CA's key. Such a namesake can
+        then be taken only for a leaf with no authority key identifier, which strict verification
+        refuses anyway, so its warning says so. The index does not count a namesake toward the
+        same-DN ambiguity unless it signs itself, so :meth:`unmatched_keys` may give no reason,
+        and this is the only start signal. Names are grouped by :func:`_namesake_key`. A warning
+        only: it changes no allow, deny or refusal."""
         by_name: dict[_NameKey, list[_Anchor]] = {}
         for anchors in self._by_subject_name.values():
             for anchor in anchors:
@@ -1774,20 +1775,28 @@ class IssuerIndex:
         warnings: list[str] = []
         for anchors in by_name.values():
             cas = [anchor for anchor in anchors if anchor.ca]
+            if not cas:
+                continue
             for other in (anchor for anchor in anchors if not anchor.ca):
-                key_id = _key_identifier(other.cert)
+                key_id = _key_identifier(other)
                 for ca in cas:
-                    refused = (
-                        "every client certificate of that CA"
-                        if key_id is None or key_id == _key_identifier(ca.cert)
-                        else "each one that carries no authority key identifier"
-                    )
+                    if key_id is None or key_id == _key_identifier(ca):
+                        effect = (
+                            f"may take block {other.position} as the issuer of a client "
+                            "certificate that CA issued, and then refuse every client certificate "
+                            "of that CA. Remove it, or re-issue it under another subject"
+                        )
+                    else:
+                        effect = (
+                            f"can take block {other.position}, whose key identifier differs from "
+                            "the CA's, only as the issuer of a client certificate with no authority "
+                            "key identifier, which strict verification refuses anyway. Give it "
+                            "another subject if it is not meant to share the CA's"
+                        )
                     warnings.append(
                         f"certificate block {other.position} ({other.subject}) is not a CA but has "
                         f"the subject of the CA certificate in block {ca.position}. The TLS library "
-                        f"may take block {other.position} as the issuer of a client certificate "
-                        f"that CA issued, and then refuse {refused}. Remove it, or re-issue it "
-                        "under another subject"
+                        f"{effect}"
                     )
         return warnings
 
@@ -1795,7 +1804,11 @@ class IssuerIndex:
 def _namesake_key(name: x509.Name) -> _NameKey:
     """``name`` as :meth:`IssuerIndex.namesake_warnings` groups it: :func:`_issuer_name_key`'s
     form, with white space around a value dropped and each run of it inside read as one space, as
-    OpenSSL reads it. Looser than OpenSSL here costs only a warning, so it is never tightened."""
+    OpenSSL reads it. Looser than OpenSSL here would cost only a warning. It still differs from
+    OpenSSL in at least the ways :func:`_issuer_name_key` records for string types, and it reads a
+    value in a one-byte text type as ``cryptography`` decodes it, where OpenSSL reads Latin-1
+    (:func:`_crl_issuer_key`), so a namesake that differs from a CA only there is not warned
+    about."""
     return tuple(tuple(sorted(map(_namesake_attribute, rdn))) for rdn in name.rdns)
 
 
@@ -1806,11 +1819,22 @@ def _namesake_attribute(
     return oid, is_bytes, " ".join(value.split()) if isinstance(value, str) else value
 
 
-def _key_identifier(cert: x509.Certificate) -> bytes | None:
-    """``cert``'s subject key identifier, or ``None`` when it has none or it cannot be read."""
+def _key_identifier(anchor: _Anchor) -> bytes | None:
+    """``anchor``'s subject key identifier, or ``None`` when it has none or its extensions cannot
+    be read. ``None`` gives the wider warning, so an unreadable one can only overstate it."""
     try:
-        return cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value.digest
-    except (x509.ExtensionNotFound, ValueError, *_UNREAD_EXTENSIONS):
+        return anchor.cert.extensions.get_extension_for_class(
+            x509.SubjectKeyIdentifier
+        ).value.digest
+    except x509.ExtensionNotFound:
+        return None
+    except (x509.DuplicateExtension, ValueError, *_UNREAD_EXTENSIONS) as exc:
+        _log.debug(
+            "certificate block %d: its key identifier cannot be read (%s); the namesake warning "
+            "assumes it has none",
+            anchor.position,
+            type(exc).__name__,
+        )
         return None
 
 
