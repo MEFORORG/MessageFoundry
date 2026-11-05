@@ -277,6 +277,9 @@ if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
     throw "remove.ps1: $coordRootScript is missing, so the coordination root cannot be resolved. Nothing was removed."
 }
 . $coordRootScript
+# Test-PresentOrThrow, Get-EntriesOrThrow and $REGENERABLE_IGNORED_PATTERN, shared with the nightly
+# .claude/worktrees removal so its claim, allocation and nested-checkout reads fail closed the same way.
+. "$PSScriptRoot\worktree-gates.ps1"
 if ($byPath -or $listing) {
     # Every registered worktree, primary first. FAIL CLOSED: an unreadable list is the same empty
     # answer as a clone with none, and must never read as permission.
@@ -433,52 +436,9 @@ $ownTop = "$(& git -C $WorktreePath rev-parse --path-format=absolute --show-topl
 if ($LASTEXITCODE -ne 0) { $ownTop = '' }
 $targetNorms = @(@($WorktreePath, $ownTop) | Where-Object { $_ } | ForEach-Object { ConvertTo-Norm $_ } | Sort-Object -Unique)
 
-# Test-Path answers $false for a path it may not read, so access-denied would read as "absent" and an
-# unreadable claims directory as "no claims" (vault BACKLOG #2985, item 15). This answers $false only
-# for a path that is not there, and throws for anything else.
-function Test-PresentOrThrow([string]$LiteralPath, [string]$What) {
-    try {
-        $null = Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
-        return $true
-    }
-    catch [System.Management.Automation.ItemNotFoundException] { return $false }
-    catch { throw "Could not tell whether $What exists ($($_.Exception.Message)). Nothing was removed." }
-}
-
-# THE SAME TRAP ONE LEVEL DOWN. `Get-ChildItem -ErrorAction Stop` on a directory this user may not
-# LIST returns nothing and does not throw (measured on pwsh 7, a directory denied list rights), so an
-# unlistable claims directory read as "no claims". This enumerates through .NET, which throws, and
-# turns that into a refusal. Every entry is listed, a link included, but a recursive walk never
-# descends into a linked directory, so it never leaves the tree. Hidden and system entries are kept,
-# which .NET's own default would drop. -Max stops the walk one entry past it, so a cap bounds the work
-# and not only the answer. The enumerable is walked by foreach directly: assigning it to a variable
-# through an `if` would make PowerShell read it all first.
-function Get-EntriesOrThrow([string]$Dir, [string]$What, [string]$Filter = '*', [switch]$Recurse, [switch]$FilesOnly,
-    [int]$Max = [int]::MaxValue) {
-    $opts = [System.IO.EnumerationOptions]::new()
-    $opts.IgnoreInaccessible = $false
-    $opts.AttributesToSkip = [System.IO.FileAttributes]0
-    $found = [System.Collections.Generic.List[System.IO.FileSystemInfo]]::new()
-    $pending = [System.Collections.Generic.Stack[string]]::new()
-    $pending.Push($Dir)
-    try {
-        while ($pending.Count -gt 0 -and $found.Count -le $Max) {
-            $here = $pending.Pop()
-            foreach ($e in [System.IO.DirectoryInfo]::new($here).EnumerateFileSystemInfos('*', $opts)) {
-                $isDir = $e -is [System.IO.DirectoryInfo]
-                if ($Recurse -and $isDir -and -not ($e.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-                    $pending.Push($e.FullName)
-                }
-                if ($FilesOnly -and $isDir) { continue }
-                if ($Filter -ne '*' -and $e.Name -notlike $Filter) { continue }
-                $found.Add($e)
-                if ($found.Count -gt $Max) { break }
-            }
-        }
-    }
-    catch { throw "Could not list $What under '$Dir' ($($_.Exception.Message)), so $What are unknown. Nothing was removed." }
-    return $found.ToArray()
-}
+# Test-PresentOrThrow and Get-EntriesOrThrow, the two readers every refusal below lists through, live
+# in worktree-gates.ps1 (dot-sourced above): Test-Path reads access-denied as absent, and Get-ChildItem
+# lists an unlistable directory as empty, so neither may stand in for them here.
 
 # A DETACHED HEAD WHOSE COMMIT NO REF HOLDS is lost with the worktree: removal deletes the HEAD reflog
 # too, so nothing reaches it afterwards. -Force does not override it -- -Force means
@@ -991,7 +951,9 @@ if ($byPath) {
     # .venv is tolerated at the ROOT only (vault BACKLOG #1017, owner point (i)): one deeper down is
     # not the tree's own environment. node_modules and the four caches at any depth, because this
     # repository's own ide/node_modules is one (new.ps1 -Ide). The clones inside both are checked above.
-    $exemptIgnored = '\A!! (?:(?:.*/)?(?:node_modules|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache)|\.venv)/\z'
+    # The pattern lives in worktree-gates.ps1, so the nightly .claude/worktrees removal tolerates
+    # exactly this list and no other.
+    $exemptIgnored = $REGENERABLE_IGNORED_PATTERN
     $pending = @($statusLines | Where-Object { $_ -and $_ -cnotmatch $exemptIgnored })
     # A TOLERATED NAME IS NOT ENOUGH: THE DIRECTORY MUST BE A REAL ONE, INSIDE THE TREE. A junction or
     # symlink named `node_modules` points at a directory somewhere else, so it is not this tree's

@@ -11,6 +11,15 @@
     -- which is exactly the race these re-checks exist for: a tree that looked finished when the list
     was made and stopped looking finished before it was acted on.
 
+    THIS STEP OVERRIDES BACKLOG #1038's DECLINE, ON THE OWNER'S EXPLICIT REQUEST OF 2026-11-05. #1038
+    (Manager decision, batch 184) gave .claude/worktrees no scripted deletion route, because the liveness
+    fence cannot see an `isolation: worktree` subagent and a route whose check fails open on a population
+    is worse than none. The owner asked for this route anyway. What stands in for the fence on that
+    population is listed under WHAT THESE DO NOT SEE below, with the residual it leaves.
+
+    THIS HEADER IS THE ONE STATEMENT OF THE RE-CHECK LIST. docs/WORKTREES.md links here rather than
+    restating it (SDS-3.5); change the list here.
+
     WHY THIS IS SEPARATE FROM prune-merged.ps1, WHICH STILL REMOVES NOTHING UNDER .claude/worktrees.
     That script's exclusion is deliberate: .claude/worktrees is where EnterWorktree relocates a LIVE
     session, and that tool once removed an occupied worktree with --force, deregistering it and then
@@ -29,32 +38,45 @@
       * it is still a registered worktree of -Primary (a fresh `git worktree list --porcelain` that
         must read), and git does not report it locked or prunable;
       * no file in it is flagged skip-worktree or assume-unchanged, whose edits git status cannot see;
-      * `git status --porcelain --untracked-files=all` exits 0, prints nothing, and warns of no folder it
-        could not open. IGNORED files do not count, and plain `git worktree remove` deletes them;
-      * no git clone sits in an ignored .venv/src, venv/src or node_modules (one @scope level);
+      * `git status --porcelain --untracked-files=all`, run with LC_ALL=C so its warning text is
+        untranslated, exits 0, prints nothing, and warns of no folder it could not open;
+      * no rebase, am, cherry-pick, merge, revert or bisect is in progress in its own git dir;
+      * it holds no IGNORED entry but a regenerable cache (worktree-gates.ps1's
+        $REGENERABLE_IGNORED_PATTERN, remove.ps1 -Path's list: .venv at the root; node_modules,
+        __pycache__, .pytest_cache, .mypy_cache and .ruff_cache at any depth), each a plain directory, so
+        a .env, a *.db store or a build output refuses the tree rather than going with it;
+      * no git checkout (an entry named .git, file or directory) is nested anywhere in it, ignored
+        directories included; the whole working tree is walked, and a folder that cannot be listed refuses;
       * its private git metadata, and its working tree (the top level, plus the files in .pytest_cache
         and .ruff_cache), are both idle beyond -IdleHours;
       * no commit is held only by its own HEAD reflog or per-worktree refs, which the removal deletes (a
         commit the branch's own reflog holds survives, so it does not count; a detached tip is covered);
-      * it owns no allocation (alloc.ps1) whose item is not provably on origin/main;
-      * no coordination claim names it, in this clone's registry or the one its mefor.claimsRoot names,
-        and every claim file and directory there could be read;
+      * it owns no allocation (alloc.ps1) whose item is not provably on origin/main, matched by the path
+        `git worktree list` gives or the toplevel git prints inside it;
+      * no coordination claim names it by either spelling, in this clone's registry or the one its
+        mefor.claimsRoot names, and every claim file and directory there could be read;
       * LAST, so the window before the removal is as short as it can be: the liveness fence
         (scripts/coord/occupancy.ps1, read fresh) is available, still lists the tree unlocked, finds no
         registered session launched in it or in a worktree nested inside it, and finds no other
         registered worktree inside it.
     Every gate is the shared copy in worktree-gates.ps1 or occupancy.ps1 where one exists. The claim and
-    allocation readers follow remove.ps1's rules, cannot-tell refusing, without sharing its code.
+    allocation readers list through Test-PresentOrThrow and Get-EntriesOrThrow, the readers remove.ps1
+    uses (both now in worktree-gates.ps1), so an unreachable coordination root refuses rather than
+    reading as empty; the record parsing follows remove.ps1's rules, cannot-tell refusing, without
+    sharing its code.
 
     WHAT THESE DO NOT SEE, said rather than implied. The fence reads the directory a session was
     LAUNCHED in, and a subagent under `isolation: worktree` is recorded under its parent's directory, so
     the fence alone fails open on this population (docs/WORKTREES.md, *What -Path does not reach*). What
     covers that case is the rest: the harness locks a live agent's worktree (observed 2026-11-05, reason
     "claude agent <id> (pid <n>)"), and a session working there moves the git metadata or the watched
-    working-tree mtimes within -IdleHours (72 h by default). A session that holds no lock, runs no git
-    command and writes none of those for that long is not seen. EVERY IGNORED FILE IS DELETED WITH THE
-    TREE, the .venv included: a local .env, a *.db store, a generated corpus. A tree a killed run left
-    half-deleted reads REFUSED (prunable or not clean) on later nights rather than raising the code.
+    working-tree mtimes within -IdleHours (72 h by default). THE RESIDUAL: a session that holds no lock,
+    runs no git command and writes none of those for that long is not seen, and its tree can be removed
+    under it. Its committed work survives through refs (the branch is never deleted, and a commit only
+    the tree's own reflog holds refuses the tree); what it had not committed was already refused by the
+    clean check. THE IGNORED CACHES ARE DELETED WITH THE TREE, the .venv included; every other ignored
+    entry refuses the tree. A tree a killed run left half-deleted reads REFUSED (prunable or not clean)
+    on later nights rather than raising the code.
     -Apply refuses inside Claude Code, here and in run-daily-prune.ps1.
     THE REMOVAL IS `git -C <primary> worktree remove <path>`, WITH NO --force, EVER. There is no switch
     to add one. git's own refusal on a locked or dirty tree is then a last fence this step keeps.
@@ -68,32 +90,40 @@
 . "$PSScriptRoot\..\coord\coord-root.ps1"
 . "$PSScriptRoot\worktree-gates.ps1"
 
-# Allocation records (alloc.ps1) naming $Norm whose item is not provably on origin/main. Removing the tree
-# BURNS such a number: ledger_check.py's owns() is a path comparison against the recorded worktree, so
-# once the directory is gone nobody owns it again. remove.ps1 refuses the same case (BACKLOG #1293).
-# CANNOT-TELL IS AT-RISK: an unreadable record, a backlog number (no longer answerable from this repo),
-# or an origin/main that cannot be listed all refuse. Returns '' or the refusal.
+# Allocation records (alloc.ps1) naming the tree, by any of -Norms, whose item is not provably on
+# origin/main. Removing the tree does not burn such a number outright: ledger_check.py's owns() falls
+# back to the recorded BRANCH once the recorded path is gone, and this step never deletes a branch. But
+# ownership then rests on that branch alone, and a later branch deletion (prune-merged.ps1's, or a
+# hand's) strands the number with nothing reporting it. remove.ps1 refuses the same case (BACKLOG #1293).
+# CANNOT-TELL IS AT-RISK: an unreadable record or registry, a backlog number (no longer answerable from
+# this repo), or an origin/main that cannot be listed all refuse. Returns '' or the refusal.
 function Get-AllocationRefusal {
-    param([string]$Primary, [string]$Norm, [string]$AllocDir)
-    if (-not (Test-Path -LiteralPath $AllocDir)) { return '' }
-    try { $files = @(Get-ChildItem -LiteralPath $AllocDir -Filter *.json -File -Recurse -ErrorAction Stop) }
-    catch [System.IO.IOException], [System.UnauthorizedAccessException] { return 'the allocation registry could not be listed, so an allocation may name it' }
+    param([string]$Primary, [string[]]$Norms, [string]$AllocDir)
+    # Through the throwing readers, so an unreachable registry refuses rather than reading as empty.
+    try {
+        if (-not (Test-PresentOrThrow $AllocDir 'the allocation directory')) { return '' }
+        $files = @(Get-EntriesOrThrow $AllocDir 'allocations' '*.json' -Recurse -FilesOnly)
+    }
+    catch { return "the allocation registry could not be read, so an allocation may name it: $($_.Exception.Message)" }
     $atRisk = @()
     foreach ($f in $files) {
         $r = Read-CoordRecord $f.FullName
         if ($r.Tombstone) { continue }
         if ($r.Problem) { return "allocation record $($f.Name) cannot be read ($($r.Problem)), and it might name this tree" }
-        if ($r.Holder -ne $Norm) { continue }
+        if ($Norms -notcontains $r.Holder) { continue }
         $kind = [string]$r.Record.kind
         $number = [string]$r.Record.number
         $onMain = $null
-        if ($kind -eq 'adr') {
+        # A number that is not all digits cannot name an ADR file, so it stays cannot-tell. Escaped
+        # anyway, so the record's text is never read as a pattern.
+        if ($kind -eq 'adr' -and $number -match '\A\d+\z') {
+            $pad = [regex]::Escape($number.PadLeft(4, '0'))
             $listed = @(& git -C $Primary ls-tree -r --name-only origin/main docs/adr/ 2>$null)
-            if ($LASTEXITCODE -eq 0) { $onMain = [bool]@($listed | Where-Object { $_ -match "/$($number.PadLeft(4, '0'))-" }).Count }
+            if ($LASTEXITCODE -eq 0) { $onMain = [bool]@($listed | Where-Object { $_ -match "/$pad-" }).Count }
         }
         if ($onMain -ne $true) { $atRisk += "$kind #$number" }
     }
-    if ($atRisk.Count -gt 0) { return "it owns allocation(s) not provably on origin/main ($($atRisk -join ', ')); removing it would burn them" }
+    if ($atRisk.Count -gt 0) { return "it owns allocation(s) not provably on origin/main ($($atRisk -join ', ')); removing it would leave them owned through the branch alone" }
     return ''
 }
 
@@ -139,8 +169,14 @@ function Get-FinishedWorktreeRefusal {
     if ($flagged -ne 0) { return $(if ($flagged -lt 0) { 'its flagged files could not be read' } else { "$flagged file(s) flagged skip-worktree or assume-unchanged, whose edits git status cannot see" }) }
     $clean = Test-WorktreeClean -Path $Path -AllUntracked
     if (-not $clean.Clean) { return "not clean: $($clean.Reasons -join '; ')" }
-    $clones = Get-IgnoredCloneCount $Path
-    if ($clones -ne 0) { return $(if ($clones -lt 0) { 'its ignored package folders could not be listed' } else { "$clones git clone(s) inside an ignored .venv/src, venv/src or node_modules, which git status cannot see" }) }
+    $ops = Get-InProgressOperation $Path
+    if ($null -eq $ops) { return 'its git dir could not be read for an operation in progress' }
+    if ($ops.Count -gt 0) { return "an operation is in progress in its git dir ($($ops -join ', ')), whose state the removal deletes" }
+    $ignored = Get-UnsafeIgnoredEntries $Path
+    if ($null -eq $ignored) { return 'its ignored files could not be listed' }
+    if ($ignored.Count -gt 0) { return "$($ignored.Count) ignored entr(ies) that are not a regenerable cache, which the removal would delete (first: $($ignored[0]))" }
+    $clones = Get-NestedRepoCount $Path
+    if ($clones -ne 0) { return $(if ($clones -lt 0) { 'its working tree could not be listed in full, so a nested git checkout may be there' } else { "$clones git checkout(s) nested inside it, which git status does not read into" }) }
 
     $cut = (Get-Date).AddHours(-1 * $IdleHours)
     $act = Get-WorktreeActivity -Path $Path
@@ -155,13 +191,18 @@ function Get-FinishedWorktreeRefusal {
     $only = Get-WorktreeOnlyCommitCount -Path $Path -Repo $Primary -Branch $branch
     if ($only -ne 0) { return $(if ($only -lt 0) { 'the commits its HEAD reflog and own refs hold could not be checked' } else { "$only commit(s) held only by its HEAD reflog or its own refs, which the removal deletes" }) }
 
-    $alloc = Get-AllocationRefusal -Primary $Primary -Norm $norm -AllocDir $AllocDir
+    # A record may name the tree by either spelling remove.ps1 matches: the path `git worktree list`
+    # gives, or the toplevel git prints inside it, which is what claim.ps1 and alloc.ps1 record.
+    $top = "$(& git -C $Path rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $top) { return 'git could not name its toplevel, so a record naming it by that spelling cannot be matched' }
+    $norms = @(@($norm, (ConvertTo-Norm $top)) | Sort-Object -Unique)
+    $alloc = Get-AllocationRefusal -Primary $Primary -Norms $norms -AllocDir $AllocDir
     if ($alloc) { return $alloc }
     $dirs = Get-TreeClaimsDirs -Path $Path -OwnClaimsDir $OwnClaimsDir
     if ($dirs.Error) { return "claims are unknown: $($dirs.Error)" }
     $claims = Get-ClaimedWorktreeIndex $dirs.Dirs
     if ($claims.Unreadable) { return 'a claim file or directory could not be read, so any tree may be claimed' }
-    if ($claims.Claimed.ContainsKey($norm)) { return 'a coordination claim names it' }
+    if (@($norms | Where-Object { $claims.Claimed.ContainsKey($_) }).Count -gt 0) { return 'a coordination claim names it' }
 
     # The fence, read FRESH for this path and last of all.
     $occ = Get-WorktreeOccupancy -Repo $Primary
@@ -262,9 +303,12 @@ function Invoke-FinishedWorktreeRemoval {
         }
         catch [System.Management.Automation.RuntimeException], [System.IO.IOException], [System.UnauthorizedAccessException] {
             # Before git was asked, a throw is a check that could not complete: nothing was attempted.
-            # After, it is a failure, because the tree's state is no longer known.
+            # While the end state is being read, it is a failure, because that state is no longer known.
+            # Once a verdict on the end state is in (ORPHANED, say), a later throw must not relabel it:
+            # an orphan re-read as REFUSED would drop the exit code 3 that makes a human look.
             if ($row.Outcome -eq 'ATTEMPTING') { $row.Outcome = 'FAILED'; $row.Reason = "the removal was attempted and then a read threw: $($_.Exception.Message)" }
-            else { $row.Outcome = 'REFUSED'; $row.Reason = "a check could not complete: $($_.Exception.Message)" }
+            elseif ($row.Outcome -in 'REFUSED', 'WOULD-REMOVE') { $row.Outcome = 'REFUSED'; $row.Reason = "a check could not complete: $($_.Exception.Message)" }
+            else { $row.Reason = "$($row.Reason); then an error: $($_.Exception.Message)" }
         }
         $row
     }
@@ -305,7 +349,10 @@ function Invoke-OneRemoval {
     elseif (-not $stillRegistered -and $dirExists) {
         $Row.Outcome = 'ORPHANED'
         $Row.Reason = "deregistered but the directory is still on disk (git exit $removeExit): $gitText"
-        $note = Add-OrphanLedgerEntry -Primary $Primary -Path $path -Branch $branch -Detail $Row.Reason
+        # Deliberately broad: whatever the ledger write throws, the verdict above stands and the error
+        # is logged with it. The runner still exits 3 on the row.
+        try { $note = Add-OrphanLedgerEntry -Primary $Primary -Path $path -Branch $branch -Detail $Row.Reason }
+        catch { $note = "the orphan ledger was not written: $($_.Exception.Message)" }
         if ($note) { $Row.Reason += "; $note" }
     }
     else {

@@ -12,10 +12,12 @@
     prune-merged.ps1, so the nightly removal judges a tree exactly the way the report that listed it
     did. Two copies of a safety check drift, and the copy that drifts is the one nobody tests.
 
-    Defines in the caller's scope: $IDLE_FLOOR_HOURS, $ACTIVITY_MTIME_FILES, Get-ReflogLastEntry,
-    Get-WorktreeActivity (occupancy signal 2; prune-merged.ps1's header says what it can and cannot
-    see), Test-WorktreeClean, Get-TipHolders, Test-ClaudeManagedPath, Get-FlaggedFileCount,
-    Get-WorkingTreeActivity, Get-WorktreeOnlyCommitCount, Read-CoordRecord, Get-ClaimedWorktreeIndex and Get-IgnoredCloneCount.
+    Defines in the caller's scope: $IDLE_FLOOR_HOURS, $ACTIVITY_MTIME_FILES, $REGENERABLE_IGNORED_PATTERN,
+    Test-PresentOrThrow, Get-EntriesOrThrow (both moved here from remove.ps1, which dot-sources this file
+    for them), Get-ReflogLastEntry, Get-WorktreeActivity (occupancy signal 2; prune-merged.ps1's header
+    says what it can and cannot see), Test-WorktreeClean, Get-TipHolders, Test-ClaudeManagedPath,
+    Get-FlaggedFileCount, Get-WorkingTreeActivity, Get-WorktreeOnlyCommitCount, Read-CoordRecord,
+    Get-ClaimedWorktreeIndex, Get-NestedRepoCount, Get-InProgressOperation and Get-UnsafeIgnoredEntries.
 #>
 
 # The floor under -IdleHours. Signal 2 has been measured at 10.4h on a worktree that was demonstrably
@@ -25,6 +27,60 @@ $IDLE_FLOOR_HOURS = 12
 #: Metadata whose MTIME is the activity reading. `logs/HEAD` is deliberately NOT in this list; it is
 #: read by content instead, for the reason written out over Get-ReflogLastEntry.
 $ACTIVITY_MTIME_FILES = @('index', 'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'MERGE_MSG')
+
+#: The ignored entries a removal may delete without asking: a `git status --porcelain --ignored` line
+#: for an IGNORED DIRECTORY named node_modules, __pycache__, .pytest_cache, .mypy_cache or .ruff_cache
+#: at any depth, or .venv at the tree root. Every one is regenerable. remove.ps1 -Path's comment over
+#: its use says why each part of the pattern is shaped as it is; the nightly removal refuses any other
+#: ignored line, so a .env or a *.db is never deleted by it.
+$REGENERABLE_IGNORED_PATTERN = '\A!! (?:(?:.*/)?(?:node_modules|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache)|\.venv)/\z'
+
+# Test-Path answers $false for a path it may not read, so access-denied would read as "absent" and an
+# unreadable claims directory as "no claims" (vault BACKLOG #2985, item 15). This answers $false only
+# for a path that is not there, and throws for anything else.
+function Test-PresentOrThrow([string]$LiteralPath, [string]$What) {
+    try {
+        $null = Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
+        return $true
+    }
+    catch [System.Management.Automation.ItemNotFoundException] { return $false }
+    catch { throw "Could not tell whether $What exists ($($_.Exception.Message)). Nothing was removed." }
+}
+
+# THE SAME TRAP ONE LEVEL DOWN. `Get-ChildItem -ErrorAction Stop` on a directory this user may not
+# LIST returns nothing and does not throw (measured on pwsh 7, a directory denied list rights), so an
+# unlistable claims directory read as "no claims". This enumerates through .NET, which throws, and
+# turns that into a refusal. Every entry is listed, a link included, but a recursive walk never
+# descends into a linked directory, so it never leaves the tree. Hidden and system entries are kept,
+# which .NET's own default would drop. -Max stops the walk one entry past it, so a cap bounds the work
+# and not only the answer. The enumerable is walked by foreach directly: assigning it to a variable
+# through an `if` would make PowerShell read it all first.
+function Get-EntriesOrThrow([string]$Dir, [string]$What, [string]$Filter = '*', [switch]$Recurse, [switch]$FilesOnly,
+    [int]$Max = [int]::MaxValue) {
+    $opts = [System.IO.EnumerationOptions]::new()
+    $opts.IgnoreInaccessible = $false
+    $opts.AttributesToSkip = [System.IO.FileAttributes]0
+    $found = [System.Collections.Generic.List[System.IO.FileSystemInfo]]::new()
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $pending.Push($Dir)
+    try {
+        while ($pending.Count -gt 0 -and $found.Count -le $Max) {
+            $here = $pending.Pop()
+            foreach ($e in [System.IO.DirectoryInfo]::new($here).EnumerateFileSystemInfos('*', $opts)) {
+                $isDir = $e -is [System.IO.DirectoryInfo]
+                if ($Recurse -and $isDir -and -not ($e.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                    $pending.Push($e.FullName)
+                }
+                if ($FilesOnly -and $isDir) { continue }
+                if ($Filter -ne '*' -and $e.Name -notlike $Filter) { continue }
+                $found.Add($e)
+                if ($found.Count -gt $Max) { break }
+            }
+        }
+    }
+    catch { throw "Could not list $What under '$Dir' ($($_.Exception.Message)), so $What are unknown. Nothing was removed." }
+    return $found.ToArray()
+}
 
 function Get-ReflogLastEntry {
     param([string]$LogPath)
@@ -121,8 +177,21 @@ function Test-WorktreeClean {
     # reports clean. Measured while writing this: a dirty tree read clean.
     $statusArgs = @('-C', $Path, '--no-optional-locks', 'status', '--porcelain')
     if ($AllUntracked) { $statusArgs += '--untracked-files=all' }
-    $raw = @(& git @statusArgs 2>&1)
-    $statusExit = $LASTEXITCODE
+    # The "could not open" warning below is matched as TEXT, so git is run untranslated: a localised
+    # build would print it in another language, the match would miss, and an unreadable folder would
+    # read clean. LC_ALL=C also makes gettext ignore LANGUAGE; LANGUAGE is cleared anyway.
+    $savedLocale = @{}
+    foreach ($k in 'LC_ALL', 'LANG', 'LANGUAGE') { $savedLocale[$k] = [Environment]::GetEnvironmentVariable($k) }
+    try {
+        [Environment]::SetEnvironmentVariable('LC_ALL', 'C')
+        [Environment]::SetEnvironmentVariable('LANG', 'C')
+        [Environment]::SetEnvironmentVariable('LANGUAGE', $null)
+        $raw = @(& git @statusArgs 2>&1)
+        $statusExit = $LASTEXITCODE
+    }
+    finally {
+        foreach ($k in $savedLocale.Keys) { [Environment]::SetEnvironmentVariable($k, $savedLocale[$k]) }
+    }
     if ($statusExit -ne 0) {
         return @{ Clean = $false; Reasons = @("git status failed (exit $statusExit) -- cannot establish it is clean") }
     }
@@ -250,9 +319,13 @@ function Get-ClaimedWorktreeIndex([string[]]$ClaimsDir) {
     $claimed = @{}
     $unreadable = $false
     foreach ($dir in @($ClaimsDir | Where-Object { $_ })) {
-        if (-not (Test-Path -LiteralPath $dir)) { continue }
-        try { $files = @(Get-ChildItem -LiteralPath $dir -Filter *.json -File -ErrorAction Stop) }
-        catch [System.IO.IOException], [System.UnauthorizedAccessException] { $unreadable = $true; continue }
+        # Through the throwing readers: Test-Path reads an unreachable directory as absent, and
+        # Get-ChildItem lists an unlistable one as empty, so either would read as "no claims".
+        try {
+            if (-not (Test-PresentOrThrow $dir 'the claims directory')) { continue }
+            $files = @(Get-EntriesOrThrow $dir 'claims' '*.json' -FilesOnly)
+        }
+        catch { $unreadable = $true; continue }
         foreach ($f in $files) {
             $r = Read-CoordRecord $f.FullName
             if ($r.Tombstone) { continue }
@@ -263,26 +336,66 @@ function Get-ClaimedWorktreeIndex([string[]]$ClaimsDir) {
     return @{ Claimed = $claimed; Unreadable = $unreadable }
 }
 
-# Git clones hidden inside IGNORED directories, where git status never looks and `git worktree remove`
-# deletes without asking: pip's editable clones in .venv/src or venv/src, and packages in node_modules
-# (one @scope level included). Their unpushed commits would go with the tree. Returns the count, or -1
-# when a directory that exists cannot be listed. A clone deeper than that is not looked for.
-function Get-IgnoredCloneCount([string]$Path) {
+# Git checkouts nested anywhere in the working tree: an entry named `.git`, file or directory, at any
+# depth below the tree's own. git status never reads into an IGNORED directory, and an ignored
+# directory holding nothing but nested repositories is not even listed (measured, remove.ps1), so
+# pip's editable clones in .venv/src, a package in node_modules, or a checkout under an ignored
+# .claude/ would all go with the tree, unpushed commits and all. So the whole tree is walked rather
+# than the directories git lists: about 20,000 entries in a tenth of a second on a tree with a .venv
+# (measured 2026-11-05). A link is not descended, because git does not delete through one
+# (remove.ps1 records the measurement). Returns the count, or -1 when any directory cannot be listed.
+function Get-NestedRepoCount([string]$Path) {
+    $root = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
     $n = 0
     try {
-        foreach ($base in '.venv/src', 'venv/src', 'node_modules') {
-            $dir = Join-Path $Path $base
-            if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
-            foreach ($d in @(Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction Stop)) {
-                if (Test-Path -LiteralPath (Join-Path $d.FullName '.git')) { $n++ }
-                elseif ($base -eq 'node_modules' -and $d.Name.StartsWith('@')) {
-                    foreach ($s in @(Get-ChildItem -LiteralPath $d.FullName -Directory -Force -ErrorAction Stop)) {
-                        if (Test-Path -LiteralPath (Join-Path $s.FullName '.git')) { $n++ }
-                    }
-                }
-            }
+        foreach ($e in @(Get-EntriesOrThrow $Path 'working-tree entries' -Recurse)) {
+            if ($e.Name -ne '.git') { continue }
+            # The tree's own .git file sits directly under the root; every other one is a nested checkout.
+            if ([System.IO.Path]::GetDirectoryName($e.FullName).TrimEnd('\', '/') -ieq $root) { continue }
+            $n++
         }
     }
-    catch [System.IO.IOException], [System.UnauthorizedAccessException] { return -1 }
+    catch { return -1 }
     return $n
+}
+
+# An operation git has started in the tree's own git dir and not finished: a rebase, am, cherry-pick,
+# merge, revert or bisect. Its state lives in the per-worktree git dir, which the removal deletes, and
+# the commits it is part way through may be held by nothing else. Returns the names present, or $null
+# when the git dir or any marker cannot be read.
+function Get-InProgressOperation([string]$Path) {
+    $gitdir = "$(& git -C $Path rev-parse --absolute-git-dir 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $gitdir) { return $null }
+    $present = @()
+    try {
+        foreach ($m in 'rebase-merge', 'rebase-apply', 'CHERRY_PICK_HEAD', 'MERGE_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'sequencer') {
+            if (Test-PresentOrThrow (Join-Path $gitdir $m) "the $m marker") { $present += $m }
+        }
+    }
+    catch { return $null }
+    return , $present
+}
+
+# Every IGNORED entry `git worktree remove` would delete that is not a regenerable cache
+# ($REGENERABLE_IGNORED_PATTERN): a .env, a *.db store, a build output, a generated corpus. A cache
+# directory that is a link, or cannot be read, counts too, as in remove.ps1 -Path. Returns the status
+# lines, or $null when git status cannot be read.
+function Get-UnsafeIgnoredEntries([string]$Path) {
+    # --ignored=matching, not the traditional mode: a directory that matches no pattern but holds only
+    # ignored content (ide/ around ide/node_modules/) is then listed by what it holds, so the cache
+    # inside it can be told from a .env beside it. Traditional mode lists it as one `!! ide/` line.
+    $lines = @(& git -C $Path --no-optional-locks status --porcelain --ignored=matching --untracked-files=normal 2>$null)
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $unsafe = @()
+    foreach ($line in @($lines | Where-Object { "$_".StartsWith('!! ') })) {
+        if ($line -cnotmatch $REGENERABLE_IGNORED_PATTERN) { $unsafe += $line; continue }
+        $isRealDirectory = $false
+        try {
+            $item = Get-Item -LiteralPath (Join-Path $Path $line.Substring(3).TrimEnd('/')) -Force -ErrorAction Stop
+            $isRealDirectory = $item.PSIsContainer -and -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+        }
+        catch { $isRealDirectory = $false }
+        if (-not $isRealDirectory) { $unsafe += "$line (a link, or unreadable: not a plain directory)" }
+    }
+    return , $unsafe
 }

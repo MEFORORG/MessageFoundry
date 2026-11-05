@@ -67,7 +67,10 @@ UNSAFE = (
     "rewritten",
     "claimed",
     "cloned",
+    "deepclone",
+    "hiddenclone",
     "allocated",
+    "dotenv",
 )
 
 
@@ -135,9 +138,14 @@ def fx(tmp_path: Path) -> Fx:
     _git(f.primary, "config", "user.email", "t@example.invalid")
     _git(f.primary, "config", "user.name", "t")
     _git(f.primary, "remote", "add", "origin", str(origin))
-    (f.primary / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    (f.primary / ".gitignore").write_text(
+        ".venv/\nnode_modules/\n__pycache__/\n.env\n*.db\n/.claude/\n", encoding="utf-8"
+    )
     (f.primary / "seed.txt").write_text("seed", encoding="utf-8")
-    _git(f.primary, "add", "--", ".gitignore", "seed.txt")
+    # One ADR on origin/main, so an allocation check has a file to match, and to mismatch.
+    (f.primary / "docs" / "adr").mkdir(parents=True)
+    (f.primary / "docs" / "adr" / "0001-seed.md").write_text("# seed\n", encoding="utf-8")
+    _git(f.primary, "add", "--", ".gitignore", "seed.txt", "docs/adr/0001-seed.md")
     _git(f.primary, "commit", "-qm", "seed")
     _git(f.primary, "push", "-q", "origin", "main")
     _git(f.primary, "fetch", "-q", "origin")
@@ -148,6 +156,13 @@ def fx(tmp_path: Path) -> Fx:
     venv = f.tree("venv") / ".venv"
     venv.mkdir()
     (venv / "pyvenv.cfg").write_text("home = nowhere\n", encoding="utf-8")
+    # Regenerable caches deeper down: the allowlist covers these at any depth, so they do not refuse.
+    (f.tree("venv") / "pkg" / "__pycache__").mkdir(parents=True)
+    (f.tree("venv") / "pkg" / "__pycache__" / "m.pyc").write_bytes(b"\0")
+    (f.tree("venv") / "ide" / "node_modules" / "left-pad").mkdir(parents=True)
+    (f.tree("venv") / "ide" / "node_modules" / "left-pad" / "index.js").write_text("//\n", "utf-8")
+    # An ignored file that is not a cache: the removal would delete it, so it refuses.
+    (f.tree("dotenv") / ".env").write_text("MEFOR_X=1\n", encoding="utf-8")
     (f.tree("dirty") / "seed.txt").write_text("modified", encoding="utf-8")
     (f.tree("untracked") / "deep" / "er").mkdir(parents=True)
     (f.tree("untracked") / "deep" / "er" / "never_committed.py").write_text("#\n", encoding="utf-8")
@@ -186,6 +201,14 @@ def fx(tmp_path: Path) -> Fx:
     clone = f.tree("cloned") / ".venv" / "src" / "pkg"
     clone.mkdir(parents=True)
     _git(clone, "init", "-q")
+    # Deeper than the old one-level look reached: a clone two levels inside a nested node_modules.
+    deep = f.tree("deepclone") / "ide" / "node_modules" / "pkg" / "vendor" / "lib"
+    deep.mkdir(parents=True)
+    _git(deep, "init", "-q")
+    # A checkout under an ignored .claude/, where git status lists nothing at all.
+    hidden = f.tree("hiddenclone") / ".claude" / "worktrees" / "inner"
+    hidden.mkdir(parents=True)
+    _git(hidden, "init", "-q")
 
     for name in (*FINISHED, *UNSAFE):
         if name == "touched":
@@ -229,17 +252,19 @@ def remove(
     apply: bool,
     idle_hours: str = "72",
     protect: list[Path] | None = None,
+    prelude: str = "",
 ) -> dict[str, dict[str, Any]]:
     """Call Invoke-FinishedWorktreeRemoval directly, keyed by tree name.
 
     Inputs travel as environment JSON, never spliced into the command text, so no path needs quoting.
+    ``prelude`` runs after the helper is dot-sourced, so a test can stand a function in for git.
     """
     env = fx.env()
     env["T_PRIMARY"] = str(fx.primary)
     env["T_PATHS"] = json.dumps([str(p) for p in paths])
     env["T_PROTECT"] = json.dumps([str(p) for p in protect or []])
     command = (
-        f". '{HELPER}'; "
+        f". '{HELPER}'; {prelude}; "
         "$r = Invoke-FinishedWorktreeRemoval -Primary $env:T_PRIMARY "
         "-Paths @($env:T_PATHS | ConvertFrom-Json) -Protect @($env:T_PROTECT | ConvertFrom-Json) "
         f"-IdleHours {idle_hours} -Apply:${'true' if apply else 'false'}; "
@@ -300,7 +325,11 @@ def test_apply_refuses_every_unsafe_tree_and_leaves_it(fx: Fx, sleeper: int) -> 
         "claimed": r"a coordination claim names it",
         "occupied": r"occupied: live0000 LIVE",
         "stranded": r"1 commit\(s\) held only by its HEAD reflog",
-        "cloned": r"1 git clone\(s\) inside an ignored",
+        "cloned": r"1 git checkout\(s\) nested inside it",
+        "deepclone": r"1 git checkout\(s\) nested inside it",
+        # The ignored-entry check runs first and lists .claude/ itself; the nested walk would also refuse.
+        "hiddenclone": r"ignored entr\(ies\) that are not a regenerable cache.*!! \.claude/",
+        "dotenv": r"1 ignored entr\(ies\) that are not a regenerable cache.*!! \.env",
         "allocated": r"owns allocation\(s\) not provably on origin/main \(adr #9999\)",
         "gone": r"no longer a registered worktree",
         "repo-sibling": r"outside \.claude/worktrees",
@@ -471,3 +500,101 @@ def test_the_helper_refuses_apply_inside_claude_code(fx: Fx) -> None:
         proc.stderr + proc.stdout
     )
     assert fx.tree("clean").is_dir()
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "MERGE_HEAD", "REVERT_HEAD", "BISECT_LOG"],
+)
+def test_an_operation_in_progress_refuses(fx: Fx, marker: str) -> None:
+    """Its state lives in the tree's own git dir, which the removal deletes."""
+    gitdir = Path(_git(fx.tree("clean"), "rev-parse", "--absolute-git-dir").strip())
+    if marker.startswith("rebase-"):
+        (gitdir / marker).mkdir()
+    else:
+        (gitdir / marker).write_text("0" * 40 + "\n", encoding="utf-8")
+    rows = remove(fx, [fx.tree("clean")], apply=True)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert f"operation is in progress in its git dir ({marker})" in rows["clean"]["Reason"]
+    assert fx.tree("clean").is_dir()
+
+
+def _allocate(fx: Fx, number: str, tree: Path) -> None:
+    rec = {"number": number, "kind": "adr", "title": "t", "worktree": str(tree)}
+    (fx.coord / "alloc" / "adr" / f"x{len(number)}.json").write_text(json.dumps(rec), "utf-8")
+
+
+def test_an_allocation_number_is_never_read_as_a_pattern(fx: Fx) -> None:
+    """Red before the fix: ".*" padded to "00.*" matched docs/adr/0001-seed.md, so it read as landed."""
+    _allocate(fx, ".*", fx.tree("clean"))
+    rows = remove(fx, [fx.tree("clean")], apply=True)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert "(adr #.*)" in rows["clean"]["Reason"]
+    assert fx.tree("clean").is_dir()
+
+
+def test_an_allocation_whose_adr_is_on_origin_main_does_not_refuse(fx: Fx) -> None:
+    """The positive control for the test above: the same check, on a number that has landed."""
+    _allocate(fx, "1", fx.tree("clean"))
+    rows = remove(fx, [fx.tree("clean")], apply=False)
+    assert rows["clean"]["Outcome"] == "WOULD-REMOVE", rows["clean"]
+
+
+@pytest.mark.parametrize("registry", ["claims", "alloc"])
+def test_a_registry_that_cannot_be_listed_refuses(fx: Fx, registry: str) -> None:
+    """Red before the fix: Test-Path saw the entry and Get-ChildItem listed a FILE standing where the
+    directory should be as no records, so claims or allocations read as none."""
+    shutil.rmtree(fx.coord / registry)
+    (fx.coord / registry).write_text("not a directory", encoding="utf-8")
+    rows = remove(fx, [fx.tree("clean")], apply=True)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert "could not be read" in rows["clean"]["Reason"], rows["clean"]
+    assert fx.tree("clean").is_dir()
+
+
+#: A function named git takes precedence over git.exe, so it intercepts only the removal call, which
+#: the helper runs as `git -C <primary> worktree remove <path>`, and passes every other call through.
+_GIT_SHIM = (
+    "function global:git {{ "
+    "if ($args.Count -ge 5 -and $args[2] -eq 'worktree' -and $args[3] -eq 'remove') {{ {body} }} "
+    "else {{ & git.exe @args }} }}"
+)
+
+
+def test_git_declining_a_tree_every_check_passed_is_declined_not_refused(fx: Fx) -> None:
+    """A race: the tree is locked between the last re-check and the removal, and git refuses."""
+    shim = _GIT_SHIM.format(
+        body="& git.exe -C $args[1] worktree lock --reason race $args[4]; & git.exe @args"
+    )
+    rows = remove(fx, [fx.tree("clean")], apply=True, prelude=shim)
+    assert rows["clean"]["Outcome"] == "DECLINED", rows["clean"]
+    assert "git declined" in rows["clean"]["Reason"]
+    assert fx.tree("clean").is_dir()
+    assert fx.is_registered(fx.tree("clean"))
+
+
+def _orphan_shim() -> str:
+    # The real removal, then the directory put back: deregistered, still on disk.
+    return _GIT_SHIM.format(
+        body="& git.exe @args; $c = $LASTEXITCODE; "
+        "$null = New-Item -ItemType Directory -Path $args[4]; $global:LASTEXITCODE = $c"
+    )
+
+
+def test_a_tree_left_on_disk_after_deregistering_is_orphaned_and_ledgered(fx: Fx) -> None:
+    rows = remove(fx, [fx.tree("clean")], apply=True, prelude=_orphan_shim())
+    assert rows["clean"]["Outcome"] == "ORPHANED", rows["clean"]
+    assert not fx.is_registered(fx.tree("clean"))
+    common = Path(
+        _git(fx.primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    )
+    ledger = json.loads((common / "prune-merged-orphans.json").read_text(encoding="utf-8"))
+    assert any(Path(e["path"]).name == "clean" for e in ledger), ledger
+
+
+def test_an_error_after_the_orphaned_verdict_keeps_it(fx: Fx) -> None:
+    """Red before the fix: the throw relabelled the row REFUSED, and the runner's exit 3 was lost."""
+    prelude = _orphan_shim() + "; function Add-OrphanLedgerEntry { throw 'ledger boom' }"
+    rows = remove(fx, [fx.tree("clean")], apply=True, prelude=prelude)
+    assert rows["clean"]["Outcome"] == "ORPHANED", rows["clean"]
+    assert "ledger boom" in rows["clean"]["Reason"]

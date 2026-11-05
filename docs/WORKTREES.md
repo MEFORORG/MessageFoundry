@@ -694,37 +694,19 @@ pwsh -File scripts\worktree\install-daily-prune.ps1 -At 03:00 -Apply -RemoveFini
 time, after the prune, and takes that fresh list, never an earlier table. It keeps the rows under a
 `.claude/worktrees/` segment and hands them to
 [`finished-worktree-removal.ps1`](../scripts/worktree/finished-worktree-removal.ps1), which re-checks
-each one immediately before acting. At least these re-checks run, and any one failing refuses that tree:
+each one immediately before acting; any one failing refuses that tree. **The list of re-checks is
+stated once, in that script's header**; read it there. Cannot-tell refuses, as in `remove.ps1`.
 
-- it is not the primary, not the worktree the run executes from, and contains neither;
-- it is still registered, and `git worktree list --porcelain` reads and reports it neither locked nor
-  prunable;
-- no file is flagged skip-worktree or assume-unchanged, whose edits `git status` cannot see;
-- `git status --porcelain --untracked-files=all` is empty and warns of no folder it could not open;
-- no git clone sits in an ignored `.venv/src`, `venv/src` or `node_modules`;
-- its git metadata and its working tree (the top level, plus the files in `.pytest_cache` and
-  `.ruff_cache`) are both idle beyond the `-IdleHours` that `prune-merged.ps1` used, and that window
-  is a number not under the 12 h floor;
-- no commit is held only by its own HEAD reflog or per-worktree refs, which the removal deletes;
-- it owns no allocation whose item is not provably on `origin/main`, the case `remove.ps1` refuses
-  too, because removing the tree burns the number;
-- no coordination claim names it, including in the registry its `mefor.claimsRoot` names, and every
-  claim file and directory could be read;
-- last, so the gap before the removal is short: the liveness fence, read fresh, is available, finds no
-  registered session launched in it or nested in it, and finds no other registered worktree inside it.
-
-Each gate is the one `prune-merged.ps1` decides with where it has one, shared through
-[`worktree-gates.ps1`](../scripts/worktree/worktree-gates.ps1) and `scripts/coord/occupancy.ps1`.
-Cannot-tell refuses, as in `remove.ps1`.
-
-**The fence alone fails open on this population, and the step does not rest on it.** The fence reads
-the directory a session was launched in, and a subagent under `isolation: worktree` is recorded under
-its parent's (*What `-Path` does not reach* above). What covers a live subagent is the rest: the
+**This step overrides BACKLOG #1038's decline, on the owner's explicit request of 2026-11-05.** #1038
+gave this population no scripted deletion route, because the fence alone fails open on it. The fence
+reads the directory a session was launched in, and a subagent under `isolation: worktree` is recorded
+under its parent's (*What `-Path` does not reach* above). What covers a live subagent is the rest: the
 harness locks a live agent's worktree (observed 2026-11-05 with the reason `claude agent <id> (pid
 <n>)`), and work there moves the git metadata or the watched working-tree mtimes within `-IdleHours`.
-A session that holds no lock, runs no git command, and writes none of those for that long is not
-seen. **Every ignored file goes with the tree, the `.venv` included**: a local `.env`, a `*.db` store,
-a generated corpus. That is what the owner's hand removal of 2026-11-05 did too.
+**The residual: a session that holds no lock, runs no git command, and writes none of those for that
+long is not seen**, and its tree can be removed under it. Its committed work survives through refs,
+since the branch is never deleted. The ignored caches (the `.venv`, `node_modules` and the tool
+caches) go with the tree; any other ignored entry, such as a `.env` or a `*.db` store, refuses it.
 The removal is a plain `git -C <primary> worktree remove <path>` with **no `--force`**, so git's own
 refusal on a locked or dirty tree stays a last fence. The branch survives it. Each path is logged as it
 is decided, as `REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `DECLINED` (every re-check
