@@ -195,7 +195,6 @@ messagefoundry/
   auth/            # authn + RBAC core (no FastAPI): permissions/roles, Identity, passwords, tokens, ldap, service.py
   api/             # FastAPI app.py + models.py + security.py (auth deps) + auth_routes.py (the engine's only external surface)
   apiclient/       # Qt-free / FastAPI-free engine-client library (ADR 0088) — the shared HTTP client (httpx)
-  generators/      # conformant synthetic HL7 generators (adt.py, …) — `messagefoundry-toolkit generate`; corpus git-ignored
   security/        # security assets shipped in the wheel (ADR 0144)
   support/         # support-bundle assembly + redaction (bundle.py, redact.py)
   verify/          # deployment verifier — `messagefoundry verify` (checks.py, smoke.py, federation.py)
@@ -203,6 +202,8 @@ messagefoundry/
   checks.py        # `messagefoundry check` commit/CI gate (validate + dryrun + advisory lint)
 messagefoundry_toolkit/  # the `messagefoundry-toolkit` distribution's package: authoring commands (ADR 0201)
   anon/            # de-identification framework (ADR 0030; vendored to tee/anon/)
+  generators/      # conformant synthetic HL7 generators (adt.py, …) — `messagefoundry-toolkit generate`; corpus git-ignored
+  hl7schema.py, hl7structures.py  # HL7 v2.5.1 schema emitters behind the IDE's bundled JSON (ADR 0104)
 ide/               # VS Code extension (TypeScript): setup, promote, test bench, AI commands
 environments/      # per-environment <env>.toml value files for env() lookups (dev/staging/prod)
 samples/           # config/ (example Connection/Router/Handler modules) + send_mllp.py sender

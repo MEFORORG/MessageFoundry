@@ -228,7 +228,7 @@ three, and none of them is a guarantee:
 | `messagefoundry.api` | Localhost FastAPI surface (`app.py` + response `models.py`) — the engine's only external interface. The `/ui` browser web console mounts onto this app from a separate wheel (see below) via `mount_ui`, pinned against the `api/_ui_seam.py` contract ([WEBCONSOLE-PACKAGE.md](WEBCONSOLE-PACKAGE.md)) |
 | `messagefoundry.apiclient` | Qt-free / FastAPI-free engine-client library (ADR 0088) — a small typed httpx wrapper over the API, shared by the test harness and any future client |
 | `messagefoundry.auth` | Authn + RBAC core (no FastAPI): permissions/roles, `Identity`, password hashing, opaque session tokens, LDAP/Kerberos (`service.py`) — enforced by `api` |
-| `messagefoundry.generators` | Conformant synthetic HL7 generators (ADT, ORM, ORU, …) behind `messagefoundry-toolkit generate` |
+| `messagefoundry_toolkit.generators` | Conformant synthetic HL7 generators (ADT, ORM, ORU, …) behind `messagefoundry-toolkit generate`. It ships in the `messagefoundry-toolkit` distribution, not the engine wheel (ADR 0201 slice 7), with `messagefoundry_toolkit.hl7schema` and `hl7structures`, the HL7 schema emitters |
 | `messagefoundry.service` | Local Windows service control (`messagefoundry service {install,start,stop,status}`; ADR 0088), wrapping the NSSM scripts |
 | `__main__.py`, `checks.py` | CLI entrypoint (`serve` / `check` / `service`; the authoring commands are `messagefoundry_toolkit/__main__.py`, ADR 0201) + the `check` commit/CI gate |
 
