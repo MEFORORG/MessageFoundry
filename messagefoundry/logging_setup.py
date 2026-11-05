@@ -1282,7 +1282,11 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             level = logging.getLevelName(entry.level)
             replayed = logging.makeLogRecord(
                 {
-                    "msg": entry.line,
+                    # The near-side chain already escaped what this listener spooled, and the scrub
+                    # is idempotent, so that text is unchanged. A line from a raw LogSpool caller
+                    # may hold a lone surrogate, which the send's UTF-8 encode would refuse, and
+                    # the entry would be dropped as undeliverable (BACKLOG #2279 item 2a).
+                    "msg": scrub_control_chars(entry.line),
                     "levelname": entry.level,
                     "levelno": level if isinstance(level, int) else logging.WARNING,
                 }
