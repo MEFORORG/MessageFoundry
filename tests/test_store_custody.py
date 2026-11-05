@@ -37,6 +37,23 @@ linux_only = pytest.mark.skipif(
     sys.platform != "linux", reason="custody files on POSIX are read on Linux only"
 )
 
+
+@pytest.fixture
+def tmp_path(tmp_path: Path) -> Path:
+    """pytest's own, but on Linux only where a host file may be kept: a ``/tmp`` on tmpfs, the
+    default on at least Fedora and Arch, is not on the host file system allowlist, so a test that
+    writes a real host file there is skipped, saying why, rather than failing."""
+    if sys.platform == "linux":
+        fd = os.open(tmp_path, os.O_RDONLY)
+        try:
+            magic = restricted_file.linux_file_system_type(fd)
+        finally:
+            os.close(fd)
+        if magic not in restricted_file.LINUX_HOST_FILE_SYSTEMS:
+            pytest.skip(f"the temporary directory is on file system type {magic:#010x}")
+    return tmp_path
+
+
 # Fixed, recognisable key material, so a test can look for it in text.
 _MASTER = bytes(range(32))
 _RECOVERY = bytes(range(100, 132))
@@ -349,6 +366,7 @@ def test_the_posix_host_file_mode_is_exactly_0600(mode: int) -> None:
 def test_each_production_policy_names_its_own_file_system_allowlist() -> None:
     assert _HOST.file_systems is restricted_file.LINUX_HOST_FILE_SYSTEMS
     assert _CREDENTIAL.file_systems is restricted_file.LINUX_CREDENTIAL_FILE_SYSTEMS
+    assert len({_HOST, _CREDENTIAL}) == 2  # a policy hashes, by identity
 
 
 def test_the_production_credential_policy_fixes_no_mode_and_admits_root() -> None:
@@ -1047,18 +1065,22 @@ def test_windows_a_handoff_made_for_another_account_is_refused(tmp_path: Path) -
         ("*S-1-5-20", "many services share"),
         ("NT AUTHORITY\\SYSTEM", "many services share"),
         ("*S-1-5-18", "many services share"),
-        ("*S-1-5-32-544", "already holds full control"),
+        # Not one account: groups and aliases, and a SID Windows maps to no account.
+        ("*S-1-5-32-544", "to an alias"),  # Administrators
+        ("*S-1-5-32-551", "to an alias"),  # Backup Operators
+        ("*S-1-5-21-1-2-3-512", "to no account"),  # a Domain Admins SID of no domain here
+        ("*S-1-5-80-0", "well-known group"),  # ALL SERVICES
     ],
 )
 def test_windows_a_handoff_for_a_shared_account_is_not_written(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: str, expected: str
+    tmp_path: Path, dpapi_scopes: list[bool], shared: str, expected: str
 ) -> None:
-    # Refused before the token is asked about, so this runs off-admin too.
-    monkeypatch.setattr(restricted_file, "_administrators_enabled", lambda: True)
+    # Refused before the token is asked about, so this runs off-admin too, unstubbed.
     path = tmp_path / "handoff.key"
     with pytest.raises(CustodyError, match=expected):
         custody.write_handoff_file(path, _blob(), service_account=shared)
     assert not path.exists()
+    assert dpapi_scopes == []  # refused before the blob was protected
 
 
 def _engine_as(monkeypatch: pytest.MonkeyPatch, sid: str) -> None:
@@ -1163,10 +1185,10 @@ def test_windows_a_key_file_with_an_extra_entry_is_refused(tmp_path: Path) -> No
         "*S-1-15-2-3624051433-2125758914-1423191267-1740899205-1073925389-3782572162-737981194",
     ],
 )
-@elevated_only
 def test_windows_handoff_refuses_a_package_sid(tmp_path: Path, package: str) -> None:
+    # Refused before the token is asked about, so this runs off-admin too.
     path = tmp_path / "handoff.key"
-    with pytest.raises(RestrictedFileError, match="application package"):
+    with pytest.raises(CustodyError, match="application package"):
         custody.write_handoff_file(path, _blob(), service_account=package)
     assert not path.exists()
 
@@ -1376,11 +1398,43 @@ def test_windows_a_handoff_the_delete_refuses_is_a_custody_refusal(
 
     monkeypatch.setattr(restricted_file, "delete_through_handle", _refuse)
     converted: list[HostBlob] = []
-    with pytest.raises(CustodyError, match="could not be deleted") as excinfo:
+    with pytest.raises(custody.HandoffLeftBehind, match="could not be deleted") as excinfo:
         custody.consume_handoff_file(path, converted.append)
     assert converted == [_blob()] and path.exists()
     assert not _leaks(str(excinfo.value), _MASTER)
     assert excinfo.value.__cause__ is None and excinfo.value.__context__ is None
+
+
+@windows_only
+def test_windows_a_handoff_whose_name_outlives_the_delete_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "handoff.key"
+    _handoff_as_this_account(path)
+    # A delete Windows accepted whose name stays: here, one that did nothing.
+    monkeypatch.setattr(restricted_file, "delete_through_handle", lambda handle: None)
+    with pytest.raises(custody.HandoffLeftBehind, match="its name is still there"):
+        custody.consume_handoff_file(path, lambda blob: None)
+    assert path.exists()
+
+
+@windows_only
+def test_windows_reading_a_handoff_asks_for_no_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "handoff.key"
+    _handoff_as_this_account(path)
+    asked: list[dict[str, bool]] = []
+    real_open = custody._open_windows_held
+
+    def _open(p: Path, **kw: bool) -> int:
+        asked.append(kw)
+        return real_open(p, **kw)
+
+    monkeypatch.setattr(custody, "_open_windows_held", _open)
+    assert custody.read_handoff_file(path) == _blob()
+    assert asked == [{"delete": False}]
+    assert path.exists()
 
 
 @windows_only

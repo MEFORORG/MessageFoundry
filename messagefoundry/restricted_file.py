@@ -73,9 +73,10 @@ __all__ = [
     "RestrictedFileError",
     "broad_access_problem",
     "custody_account_problem",
-    "delete_through_handle",
-    "key_file_handle_problem",
     "custody_engine_problem",
+    "delete_through_handle",
+    "handoff_grantee_problem",
+    "key_file_handle_problem",
     "linux_file_system_problem",
     "linux_file_system_refusal",
     "linux_file_system_type",
@@ -163,6 +164,109 @@ def custody_account_problem(sid: str | None) -> str | None:
     return None
 
 
+#: SID_NAME_USE SidTypeUser: one account.
+_SID_TYPE_USER = 1
+_SID_TYPE_NAMES: Mapping[int, str] = MappingProxyType(
+    {
+        2: "a group",
+        3: "a domain",
+        4: "an alias",
+        5: "a well-known group",
+        6: "a deleted account",
+        7: "an invalid account",
+        8: "an unknown account",
+        9: "a computer",
+        10: "a label",
+        11: "a logon session",
+    }
+)
+
+
+def _is_service_sid(sid: str) -> bool:
+    """Whether ``sid`` has the shape of one service's own SID, ``S-1-5-80-`` and five more
+    sub-authorities: what Windows derives from a service's name for its virtual account. ALL
+    SERVICES (``S-1-5-80-0``), the one group under that authority, has one."""
+    parts = sid.upper().split("-")
+    return len(parts) == 9 and parts[:4] == ["S", "1", "5", "80"]
+
+
+def handoff_grantee_problem(sid: str, kind: int | None) -> str | None:
+    """Why the account ``sid``, of SID_NAME_USE ``kind`` (``None`` when Windows maps it to no
+    account), must not be granted a handoff, or ``None`` when it may.
+
+    The grantee must be ONE account: a user account, or one service's own SID, which Windows
+    reports as a well-known group, or maps to nothing before the service is installed. A group, an
+    alias, a domain or any other kind is refused, and so is any other SID Windows maps to nothing,
+    since an unmapped SID may be a domain group whose controller did not answer. SYSTEM, LOCAL
+    SERVICE and NETWORK SERVICE are refused first (:func:`custody_account_problem`). Kept free of
+    ctypes so the decision is testable on every platform."""
+    shared = custody_account_problem(sid)
+    if shared is not None:
+        return shared
+    if _is_package_sid(sid):
+        return f"the application package {sid} is not the account the service runs as"
+    if kind == _SID_TYPE_USER or _is_service_sid(sid):
+        return None
+    what = "no account" if kind is None else _SID_TYPE_NAMES.get(kind, f"an account of kind {kind}")
+    return (
+        f"Windows maps {describe_sid(sid)} to {what}, not to one account, and a handoff is granted "
+        "to the one account the service runs as: a user account, or a virtual service account "
+        "(S-1-5-80-...)"
+    )
+
+
+def _lookup_sid_kind(sid: str) -> int | None:
+    """The SID_NAME_USE ``LookupAccountSidW`` reports for ``sid``, or ``None`` when it maps the SID
+    to no account (ERROR_NONE_MAPPED). Raises :class:`RestrictedFileError` for any other failure.
+    Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise RestrictedFileError("an account's kind is read on Windows only")
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    advapi32.LookupAccountSidW.argtypes = [
+        wintypes.LPCWSTR,  # lpSystemName (NULL = this machine)
+        ctypes.c_void_p,  # Sid
+        wintypes.LPWSTR,  # Name
+        ctypes.POINTER(wintypes.DWORD),  # cchName
+        wintypes.LPWSTR,  # ReferencedDomainName
+        ctypes.POINTER(wintypes.DWORD),  # cchReferencedDomainName
+        ctypes.POINTER(ctypes.c_int),  # peUse
+    ]
+    advapi32.LookupAccountSidW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    pointer = ctypes.c_void_p()
+    if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(pointer)):
+        raise RestrictedFileError(f"the account {sid} could not be read as a SID")
+    try:
+        name = ctypes.create_unicode_buffer(256)
+        domain = ctypes.create_unicode_buffer(256)
+        name_size, domain_size = wintypes.DWORD(256), wintypes.DWORD(256)
+        use = ctypes.c_int(0)
+        if advapi32.LookupAccountSidW(
+            None,
+            pointer,
+            name,
+            ctypes.byref(name_size),
+            domain,
+            ctypes.byref(domain_size),
+            ctypes.byref(use),
+        ):
+            return int(use.value)
+        error = ctypes.get_last_error()
+    finally:
+        kernel32.LocalFree(pointer)
+    if error == 1332:  # ERROR_NONE_MAPPED
+        return None
+    raise RestrictedFileError(f"the account {sid} could not be looked up (Win32 error {error})")
+
+
 def custody_engine_problem(engine_sid: str | None) -> str | None:
     """Why the engine, running as ``engine_sid``, may keep no key custody file, or ``None``: the
     one refusal both the custody writers and :func:`key_file_handle_problem` give."""
@@ -179,7 +283,7 @@ _REACH_MASK = (
     0x00000001  # FILE_READ_DATA
     | 0x00000002  # FILE_WRITE_DATA
     | 0x00000004  # FILE_APPEND_DATA
-    | 0x00010000  # DELETE
+    | _DELETE
     | 0x00040000  # WRITE_DAC
     | 0x00080000  # WRITE_OWNER
     | 0x10000000  # GENERIC_ALL
@@ -342,6 +446,8 @@ def linux_file_system_problem(magic: int, allowed: Mapping[int, str], what: str)
     if magic in allowed:
         return None
     names = list(allowed.values())
+    if not names:
+        return f"it is on a file system of type {magic:#010x}, and no file system holds a {what}"
     listed = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} or {names[-1]}"
     return f"it is on a file system of type {magic:#010x}, and a {what} is kept on {listed} only"
 
@@ -725,17 +831,24 @@ def key_file_handle_problem(handle: int, *, engine_read_only: bool) -> str | Non
     return _exact_descriptor_problem(_read_handle_security(handle), expected, engine_sid=engine_sid)
 
 
-#: FILE_INFO_BY_HANDLE_CLASS FileDispositionInfo.
+#: FILE_INFO_BY_HANDLE_CLASS FileDispositionInfo and FileDispositionInfoEx, the delete and POSIX
+#: semantics flags, and the errors that say a volume has no POSIX-semantics delete
+#: (ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER).
 _FILE_DISPOSITION_INFO = 4
+_FILE_DISPOSITION_INFO_EX = 21
+_DISPOSITION_DELETE_POSIX = 0x1 | 0x2
+_WIN_UNSUPPORTED = frozenset({1, 50, 87})
 
 
 def delete_through_handle(handle: int) -> None:
     """Windows: delete the file open as ``handle``, through that handle, so what is deleted is the
     file the handle reached and never whatever its name reaches now.
 
-    ``SetFileInformationByHandle`` with ``FileDispositionInfo``: the name goes when the last handle
-    to the file closes, so a caller that holds the only handle closes it next. The handle must hold
-    DELETE. Raises ``OSError`` when Windows refuses, and :class:`RestrictedFileError` off Windows."""
+    ``SetFileInformationByHandle``, POSIX semantics first (``FileDispositionInfoEx``), so the name
+    goes at once even while another handle holds the file open. Where the volume has no such
+    delete, the classic ``FileDispositionInfo``, which removes the name only when the last handle
+    to the file closes. The handle must hold DELETE. Raises ``OSError`` when Windows refuses, and
+    :class:`RestrictedFileError` off Windows."""
     if sys.platform != "win32":
         raise RestrictedFileError("a file is deleted through its handle on Windows only")
     import ctypes
@@ -749,6 +862,14 @@ def delete_through_handle(handle: int) -> None:
         wintypes.DWORD,
     ]
     kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    flags = ctypes.c_uint32(_DISPOSITION_DELETE_POSIX)  # FILE_DISPOSITION_INFO_EX.Flags
+    if kernel32.SetFileInformationByHandle(
+        handle, _FILE_DISPOSITION_INFO_EX, ctypes.byref(flags), ctypes.sizeof(flags)
+    ):
+        return
+    error = ctypes.get_last_error()
+    if error not in _WIN_UNSUPPORTED:
+        raise ctypes.WinError(error)
     delete = ctypes.c_ubyte(1)  # FILE_DISPOSITION_INFO.DeleteFile
     if not kernel32.SetFileInformationByHandle(
         handle, _FILE_DISPOSITION_INFO, ctypes.byref(delete), ctypes.sizeof(delete)
@@ -901,12 +1022,14 @@ def write_restricted_file(
     :data:`LINUX_HOST_FILE_SYSTEMS` does not name (``fstatfs`` on the creating descriptor). The
     empty file is then removed, so no byte reaches a network, cluster or user-mode file system. Any
     other POSIX host refuses it before a file is made. The key custody writers pass it; it is off
-    by default, so the other key files are written as before.
+    by default, so the volume of every other key file is not checked.
 
-    On Windows the new file's owner and access list are read back through the creating handle and
-    judged by the same exact check a key custody read makes (:func:`_exact_descriptor_problem`):
-    owned by SYSTEM, Administrators or the creating account (or by ``owner``, when given), a
-    protected list, and exactly the entries asked for, with no inheritance flag.
+    On Windows every new file's owner and access list, whatever the flags, are read back through the
+    creating handle and judged by the same exact check a key custody read makes
+    (:func:`_exact_descriptor_problem`): owned by SYSTEM, Administrators or the creating account (or
+    by ``owner``, when given), a protected list, and exactly the entries asked for, with no
+    inheritance flag. So a file that reads back owned by anyone else, as a share's server may
+    report it, is refused and removed.
 
     Raises ``FileExistsError`` when ``path`` already exists, as a file or as a link, and leaves
     what is there untouched. Raises :class:`RestrictedFileError` when the file cannot be created

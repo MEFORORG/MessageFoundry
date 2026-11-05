@@ -292,6 +292,50 @@ def test_a_host_file_system_the_allowlist_does_not_name_is_refused_by_its_magic(
         assert restricted_file.linux_file_system_problem(local, allowed, "host file") is None
 
 
+def test_an_empty_allowlist_refuses_every_file_system() -> None:
+    from types import MappingProxyType
+
+    assert "no file system holds" in str(
+        restricted_file.linux_file_system_problem(_EXT4, MappingProxyType({}), "host file")
+    )
+
+
+@pytest.mark.parametrize(
+    ("sid", "kind", "allowed"),
+    [
+        (_CREATOR, 1, True),  # a user account
+        (_SERVICE, 5, True),  # a virtual service account, as Windows reports one
+        (_SERVICE, None, True),  # the same, for a service not yet installed
+        (_ADMINS, 4, False),  # an alias
+        ("S-1-5-32-551", 4, False),  # Backup Operators
+        ("S-1-5-21-1-2-3-512", 2, False),  # a domain group
+        ("S-1-5-21-1-2-3-512", None, False),  # one whose domain did not answer
+        ("S-1-5-80-0", 5, False),  # ALL SERVICES
+        ("S-1-1-0", 5, False),  # Everyone
+        ("S-1-15-2-1", 5, False),  # ALL APPLICATION PACKAGES
+        (_SYSTEM, 5, False),
+        ("S-1-5-19", 5, False),
+        ("S-1-5-80-1-2-3-4-5-6", 5, False),  # not the shape of one service's own SID
+    ],
+)
+def test_a_handoff_is_granted_to_one_account_only(
+    sid: str, kind: int | None, allowed: bool
+) -> None:
+    problem = restricted_file.handoff_grantee_problem(sid, kind)
+    assert (problem is None) is allowed, problem
+
+
+@windows_only
+def test_windows_an_account_kind_is_read_from_windows() -> None:
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    me = _win32_config_source_probes().self_sid
+    assert me is not None
+    assert restricted_file._lookup_sid_kind(me) == 1  # a user account
+    assert restricted_file._lookup_sid_kind(_ADMINS) == 4  # an alias
+    assert restricted_file._lookup_sid_kind("S-1-5-21-1-2-3-512") is None  # mapped to nothing
+
+
 def test_a_credential_is_read_from_an_in_memory_file_system_only() -> None:
     allowed = restricted_file.LINUX_CREDENTIAL_FILE_SYSTEMS
     assert restricted_file.linux_file_system_problem(_TMPFS, allowed, "credential") is None
@@ -925,6 +969,13 @@ def test_posix_refuses_a_read_grant_it_cannot_honour(tmp_path: Path) -> None:
 def test_linux_a_key_custody_file_off_a_local_disk_is_refused_before_a_byte_is_written(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, magic: int
 ) -> None:
+    fd = os.open(tmp_path, os.O_RDONLY)
+    try:
+        here = restricted_file.linux_file_system_type(fd)
+    finally:
+        os.close(fd)
+    if here not in restricted_file.LINUX_HOST_FILE_SYSTEMS:  # a /tmp on tmpfs, at least
+        pytest.skip(f"the temporary directory is on file system type {here:#010x}")
     control = tmp_path / "control.key"
     write_restricted_file(control, b"k", local_volume_only=True)  # the control: the real disk
     assert control.read_bytes() == b"k"

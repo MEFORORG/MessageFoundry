@@ -70,6 +70,7 @@ __all__ = [
     "STORE_ID_BYTES",
     "CredentialUnavailable",
     "CustodyError",
+    "HandoffLeftBehind",
     "HostBlob",
     "MasterKey",
     "RecoveryKey",
@@ -103,6 +104,13 @@ class CredentialUnavailable(CustodyError):
     or empty, and when the directory it names holds no file of that name. A caller may take this as
     "use another provider"; every other refusal it may not, a set ``$CREDENTIALS_DIRECTORY`` this
     engine cannot honour included."""
+
+
+class HandoffLeftBehind(CustodyError):
+    """The handoff was converted, and ``convert`` returned, but the handoff file is still there: its
+    delete was refused, or its name outlived the delete. Told apart from every other refusal of
+    :func:`consume_handoff_file`, which all come before the conversion ran, because the host file
+    this conversion wrote now exists."""
 
 
 # --- the three minted values ----------------------------------------------------------------------
@@ -470,7 +478,7 @@ def unprotect_host_blob(protected: bytes) -> HostBlob:
     return _unprotect_in_scope(protected, machine_scope=False, what="host blob")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, eq=False)
 class _PosixPolicy:
     """What a POSIX custody file is: which file systems may hold it, who beside the engine's own
     account may own it, whether it may carry a POSIX access control list, and whether its whole
@@ -483,7 +491,8 @@ class _PosixPolicy:
     :func:`_posix_acl_entries_problem` judges the list entry by entry and refuses any named entry
     but read for the engine's own uid. ``mode``, when set, is the only permission mode the file may
     have, its owner's own bits and the setuid, setgid and sticky bits included.
-    :func:`_posix_file_problem` says what it checks of the mode, owner and list."""
+    :func:`_posix_file_problem` says what it checks of the mode, owner and list. Compared and
+    hashed by identity, since ``file_systems`` is a read-only view that does not hash."""
 
     what: str
     file_systems: Mapping[int, str]
@@ -710,9 +719,10 @@ def _open_windows_held(path: Path, *, delete: bool = False) -> int:
 
     The share mode admits other readers only, so while the descriptor is open the file at the final
     name cannot be renamed, replaced or deleted by anyone else. With ``delete`` the handle also
-    holds DELETE, so the file can be deleted through it (:func:`consume_handoff_file`); while it is
-    open no other handle can be opened at all, since none shares delete. A brief hold by another
-    process is ridden out.
+    holds DELETE, so the file can be deleted through it (:func:`consume_handoff_file`), and while
+    it is open another open that asks for data or delete access and does not share delete is
+    refused; one that asks only for attributes or the security descriptor is not. A brief hold by
+    another process is ridden out.
     Anything but a disk file (a pipe, a device) is refused. Raises ``FileNotFoundError`` when there
     is no file, and :class:`CustodyError` for every other failure."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
@@ -777,7 +787,9 @@ def _open_windows_held(path: Path, *, delete: bool = False) -> int:
 
 
 @contextlib.contextmanager
-def _windows_checked(path: Path, *, engine_read_only: bool) -> Iterator[tuple[bytes, int]]:
+def _windows_checked(
+    path: Path, *, engine_read_only: bool, delete: bool = False
+) -> Iterator[tuple[bytes, int]]:
     """Open and read a custody file on Windows, refusing a link, anything but a disk file, and a
     file not owned and listed exactly as a key file is
     (:func:`~messagefoundry.restricted_file.key_file_handle_problem`), and yield its bytes with the
@@ -787,9 +799,9 @@ def _windows_checked(path: Path, *, engine_read_only: bool) -> Iterator[tuple[by
     attributes, volume, owner and access list are read through that open handle, never by name, so
     a link or junction in a parent directory re-pointed after the open does not change what is
     judged. ``engine_read_only`` is whether the engine's own account holds read and delete (the
-    handoff, whose handle is opened with DELETE so the file can be deleted through it) or full
-    control (the host file). ``FileNotFoundError`` propagates as it is; every other failure is a
-    :class:`CustodyError`."""
+    handoff) or full control (the host file). ``delete`` opens the handle with DELETE too, so the
+    file can be deleted through it (:func:`_open_windows_held`). ``FileNotFoundError`` propagates
+    as it is; every other failure is a :class:`CustodyError`."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise CustodyError("the Windows custody file read runs on Windows only")
     import ctypes
@@ -797,7 +809,7 @@ def _windows_checked(path: Path, *, engine_read_only: bool) -> Iterator[tuple[by
 
     from messagefoundry.restricted_file import key_file_handle_problem
 
-    fd = _open_windows_held(path, delete=engine_read_only)
+    fd = _open_windows_held(path, delete=delete)
     try:
         handle = os.fdopen(fd, "rb")
     except BaseException:
@@ -928,7 +940,10 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
     A ``service_account`` that is SYSTEM, LOCAL SERVICE or NETWORK SERVICE is refused with
     :class:`CustodyError` before anything is written, unconditionally: the read grant would reach
     every service that runs as it, and a grant to SYSTEM would collapse into SYSTEM's own entry. So
-    is Administrators, a group whose entry already holds full control.
+    is any account that is not ONE account, as ``LookupAccountSidW`` reports it
+    (:func:`~messagefoundry.restricted_file.handoff_grantee_problem`): a group or an alias, such as
+    Administrators or Backup Operators, a domain, or a SID it maps to nothing, unless that SID has
+    the shape of one service's own SID. A user account and a virtual service account pass.
 
     Windows only: raises :class:`~messagefoundry.secrets_dpapi.DpapiUnavailable` elsewhere, because
     a POSIX host needs no handoff."""
@@ -940,15 +955,17 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
     from messagefoundry.auth.anchor_path import ADMINISTRATORS_SID
     from messagefoundry.restricted_file import (
         _administrators_enabled,
+        _lookup_sid_kind,
         _OwnerRefused,
         _resolve_sid,
         custody_account_problem,
+        handoff_grantee_problem,
     )
 
     service_sid = _resolve_sid(service_account)
-    refused = custody_account_problem(service_sid)
-    if refused is None and service_sid == ADMINISTRATORS_SID:
-        refused = "it is a group whose entry already holds full control, not the service account"
+    refused = custody_account_problem(service_sid) or handoff_grantee_problem(
+        service_sid, _lookup_sid_kind(service_sid)
+    )
     if refused is not None:
         raise CustodyError(f"the handoff was not written for {service_account!r}: {refused}")
     if not _administrators_enabled():
@@ -975,10 +992,10 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
 def read_handoff_file(path: Path) -> HostBlob:
     """Read a handoff blob as the service it was made for.
 
-    The file is opened with DELETE, as :func:`consume_handoff_file` opens it, and judged before it
-    is read by :func:`_windows_checked`, with the engine's own account at read and delete: the
-    descriptor :func:`write_handoff_file` writes, with the engine's account as the service. This
-    reads the handoff and leaves it; :func:`consume_handoff_file` is the first start's read. Machine scope opens for every account, so the owner and
+    The file is judged before it is read by :func:`_windows_checked`, with the engine's own account
+    at read and delete: the descriptor :func:`write_handoff_file` writes, with the engine's account
+    as the service. This reads the handoff and leaves it, so it opens it for reading only;
+    :func:`consume_handoff_file`, the first start's read, also opens it with DELETE. Machine scope opens for every account, so the owner and
     list checks are what keep a handoff another local account made around a key it chose from being
     read: that account owns its file. They do not keep out an account that holds a privilege to set
     any owner, such as the restore privilege Administrators and Backup Operators hold. A blob that
@@ -1005,31 +1022,35 @@ def consume_handoff_file(path: Path, convert: Callable[[HostBlob], None]) -> Hos
     and never whatever the name reaches by then. Returns the blob.
 
     ``convert`` re-wraps the key in the service's own user scope, writes the host file and checks
-    that it opens. The handle stays open, and no other handle can open the file, until this
-    returns. When ``convert`` raises, the handoff is left as it is and the error propagates, so a
-    start that cannot convert refuses and never runs from the handoff (step 3). When Windows refuses
-    the delete, :class:`CustodyError` says so, after ``convert`` has run; the handoff is then still
-    there and must be deleted by hand. Otherwise raises as :func:`read_handoff_file` does. Windows
-    only."""
+    that it opens. The handle, opened with DELETE, stays open until this returns, so the file cannot
+    be renamed, replaced or deleted under it. When ``convert`` raises, the handoff is left as it is
+    and the error propagates, so a start that cannot convert refuses and never runs from the
+    handoff (step 3). When Windows refuses the delete, or the name is still there once the handle
+    closes (a volume with no POSIX-semantics delete, while another handle holds the file),
+    :class:`HandoffLeftBehind` says so, after ``convert`` has run; the handoff must then be deleted
+    by hand. Otherwise raises as :func:`read_handoff_file` does. Windows only."""
     from messagefoundry.restricted_file import delete_through_handle
     from messagefoundry.secrets_dpapi import DpapiUnavailable
 
     if sys.platform != "win32":
         raise DpapiUnavailable("the handoff blob is Windows-only; a POSIX host needs no handoff")
     reason: str | None = None
-    with _windows_checked(path, engine_read_only=True) as (data, handle):
+    with _windows_checked(path, engine_read_only=True, delete=True) as (data, handle):
         blob = _unprotect_in_scope(data, machine_scope=True, what="handoff blob")
         convert(blob)
         try:
             delete_through_handle(handle)
         except OSError as exc:
-            reason = _os_reason(exc)
-    if reason is not None:
-        raise CustodyError(
-            f"{path} was converted, but could not be deleted through the handle that read it "
-            f"({reason}); delete it by hand"
-        )
-    return blob
+            reason = f"could not be deleted through the handle that read it ({_os_reason(exc)})"
+    if reason is None:
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return blob
+        except OSError:
+            pass  # a name still pending its delete answers access denied: it is still there
+        reason = "was deleted through the handle that read it, but its name is still there"
+    raise HandoffLeftBehind(f"{path} was converted, but {reason}; delete it by hand")
 
 
 # --- the systemd credential (POSIX, draft rule 3b) ------------------------------------------------

@@ -480,7 +480,9 @@ pure-Python equivalent:
   and access list are read back through the creating handle with `advapi32`'s `GetSecurityInfo`,
   never by name, and judged by the same exact check the key custody reads below make. A handoff
   file is made owned by Administrators in that same call, after `advapi32`'s
-  `CheckTokenMembership` says this process holds that group enabled. For a key custody file the
+  `CheckTokenMembership` says this process holds that group enabled, and only for one account, which
+  `advapi32`'s `LookupAccountSidW` must report as a user account unless the SID has the shape of one
+  service's own SID (`handoff_grantee_problem`). For a key custody file the
   volume is read through the creating handle too, with `kernel32`'s
   `GetVolumeInformationByHandleW` and `ntdll`'s `NtQueryVolumeInformationFile`, and a file on
   anything but a local NTFS or ReFS disk is removed while still empty. Creating the file on POSIX
@@ -495,10 +497,12 @@ pure-Python equivalent:
   checked, and `GetFileType` refuses anything but a disk file (vault BACKLOG #3411). Its owner and
   access list are read through that handle with `advapi32`'s `GetSecurityInfo`, and its volume
   with `kernel32`'s `GetVolumeInformationByHandleW` and `ntdll`'s `NtQueryVolumeInformationFile`
-  (`restricted_file.key_file_handle_problem`), never by name. A handoff is opened with DELETE as
-  well, and once the service has converted it, `consume_handoff_file` deletes it through that same
-  handle with `kernel32`'s `SetFileInformationByHandle` (`restricted_file.delete_through_handle`),
-  so the file deleted is the file read. Nothing calls these yet. On Linux it opens the file with
+  (`restricted_file.key_file_handle_problem`), never by name. To consume a handoff,
+  `consume_handoff_file` opens it with DELETE as well, and once the service has converted it,
+  deletes it through that same handle with `kernel32`'s `SetFileInformationByHandle`, POSIX
+  semantics first and the classic disposition where the volume has none
+  (`restricted_file.delete_through_handle`), so the file deleted is the file read. Nothing calls
+  these yet. On Linux it opens the file with
   `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list from the open
   descriptor. It asks for that descriptor's file system through
   `restricted_file.linux_file_system_type` (`fstatfs64`, or `fstatfs` where the C library has no
