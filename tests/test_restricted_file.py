@@ -120,7 +120,7 @@ def test_a_created_file_must_read_back_exactly_as_asked() -> None:
 
 
 def test_a_new_file_without_its_creators_access_is_the_drafts_descriptor() -> None:
-    access = restricted_file._expected_access(None, [_SERVICE])
+    access = restricted_file._expected_access(_CREATOR, [_SERVICE], creator_access=False)
     assert access == {_SYSTEM: _FULL, _ADMINS: _FULL, _SERVICE: _READ}
     assert restricted_file._protected_sddl(access) == (
         f"D:P(A;;FA;;;{_SYSTEM})(A;;FA;;;{_ADMINS})(A;;FR;;;{_SERVICE})"
@@ -147,7 +147,7 @@ _EXACT_READ = (
 
 def _exact(security: Any, *, engine_access: int = _READ) -> str | None:
     if engine_access == _READ:  # the handoff's list
-        expected = restricted_file._expected_access(None, [_SERVICE])
+        expected = restricted_file._expected_access(_CREATOR, [_SERVICE], creator_access=False)
     else:  # the host file's list
         expected = restricted_file._expected_access(_SERVICE, ())
     return restricted_file._exact_descriptor_problem(security, expected, engine_sid=_SERVICE)
@@ -209,18 +209,21 @@ def test_the_exact_check_refuses_what_it_could_not_read_or_an_open_list() -> Non
 _HandleVolume = restricted_file._HandleVolume
 
 
-def test_a_key_file_volume_must_be_local_ntfs_or_refs() -> None:
-    assert restricted_file._volume_problem(_HandleVolume(file_system="NTFS")) is None  # controls
-    assert restricted_file._volume_problem(_HandleVolume(file_system="ReFS")) is None
-    # A server or a user-mode file system reports the owner and list; this host keeps neither.
-    remote = _HandleVolume(file_system="NTFS", characteristics=0x10)
-    assert "network volume" in str(restricted_file._volume_problem(remote))
-    network = _HandleVolume(file_system="NTFS", device_type=0x14)
-    assert "network volume" in str(restricted_file._volume_problem(network))
-    assert "FAT32 volume" in str(
-        restricted_file._volume_problem(_HandleVolume(file_system="FAT32"))
+def _volume(file_system: str = "NTFS", device_type: int = 0x07, **fields: Any) -> str | None:
+    return restricted_file._volume_problem(
+        _HandleVolume(file_system=file_system, device_type=device_type, **fields)
     )
-    assert "nameless volume" in str(restricted_file._volume_problem(_HandleVolume()))
+
+
+def test_a_key_file_volume_must_be_a_local_ntfs_or_refs_disk() -> None:
+    assert _volume("NTFS") is None  # the controls: what a local disk answered, measured
+    assert _volume("ReFS") is None
+    # A server or a user-mode file system reports the owner and list; this host keeps neither.
+    assert "network volume" in str(_volume(characteristics=0x10))
+    for device_type in (0x14, 0x12, 0x06, 0x28, 0x35, 0x36):  # network and DFS redirectors
+        assert f"device type {device_type:#04x}" in str(_volume(device_type=device_type))
+    assert "FAT32 volume" in str(_volume("FAT32"))
+    assert "nameless volume" in str(_volume(""))
     failed = _HandleVolume(error="Win32 error 1")
     assert "could not be read (Win32 error 1)" in str(restricted_file._volume_problem(failed))
 
@@ -237,13 +240,20 @@ def test_a_file_that_cannot_be_removed_after_a_failure_says_so(
         raise PermissionError(errno.EACCES, "Access is denied")
 
     monkeypatch.setattr(Path, "unlink", _refuse)
+    original = RestrictedFileError("the original failure")
     with pytest.raises(RestrictedFileError, match="left behind") as excinfo:
-        try:
-            raise RestrictedFileError("the original failure")
-        except RestrictedFileError:
-            restricted_file._remove_failed(tmp_path / "store.key")
-    # The original failure is kept as the context, not replaced by the unlink error.
-    assert "the original failure" in str(excinfo.value.__context__)
+        restricted_file._remove_failed(tmp_path / "store.key", original)
+    # The original failure is named, and chained, not replaced by the unlink error.
+    assert "the original failure" in str(excinfo.value)
+    assert excinfo.value.__cause__ is original
+    # A BaseException that is not an Exception keeps its type and gains a note.
+    interrupt = KeyboardInterrupt()
+    restricted_file._remove_failed(tmp_path / "store.key", interrupt)
+    assert "left behind" in " ".join(getattr(interrupt, "__notes__", []))
+
+
+def test_a_file_already_gone_after_a_failure_is_no_second_error(tmp_path: Path) -> None:
+    restricted_file._remove_failed(tmp_path / "absent.key", RestrictedFileError("x"))
 
 
 # --- pure policy: the read check ------------------------------------------------------------------

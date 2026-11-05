@@ -650,24 +650,30 @@ def _read_posix_checked(path: Path, policy: _PosixPolicy) -> bytes:
     with handle:
         status = os.fstat(fd)
         acl: bytes | None = None
+        # Only a regular file's file system and list are read; anything else is refused on its
+        # type below. The file system is judged before its list is asked for, so a foreign one
+        # is not asked.
+        regular = stat.S_ISREG(status.st_mode)
         magic = 0
-        what = "file system"
         try:
-            # Only a regular file's file system and list are read; anything else is refused on its
-            # type below.
-            if stat.S_ISREG(status.st_mode):
-                magic = linux_file_system_type(fd)
-                what = "access control list"
-                acl = posix_access_acl(fd)
+            magic = linux_file_system_type(fd) if regular else 0
         except OSError as exc:
             reason = _os_reason(exc)
         if reason is not None:
-            raise CustodyError(f"{path} is refused: its {what} could not be read ({reason})")
+            raise CustodyError(f"{path} is refused: its file system could not be read ({reason})")
         foreign = LINUX_FOREIGN_ACCESS_MODEL_FILE_SYSTEMS.get(magic)
         if foreign is not None:
             raise CustodyError(
                 f"{path} is refused: it is on a {foreign} file system, which keeps an access model "
                 "of its own that this engine cannot read; keep custody files on a local file system"
+            )
+        try:
+            acl = posix_access_acl(fd) if regular else None
+        except OSError as exc:
+            reason = _os_reason(exc)
+        if reason is not None:
+            raise CustodyError(
+                f"{path} is refused: its access control list could not be read ({reason})"
             )
         problem = _posix_file_problem(
             status.st_mode,
@@ -800,14 +806,16 @@ def write_host_file(path: Path, blob: HostBlob) -> None:
     """Write the host blob to a NEW file at ``path``, created restricted in the call that makes it.
 
     Windows: the blob under user-scope DPAPI (:func:`protect_host_blob`), in a file whose protected
-    access list names SYSTEM, Administrators and the calling account, each with full control. Linux: the blob itself, in a file of mode
-    ``0600`` owned by the calling account and carrying no POSIX access control list, one it inherits
-    from its directory's default list included (draft rules 3b and 5), so :func:`read_host_file`
-    accepts what this writes. Any other platform is refused before a file is made, because
-    :func:`read_host_file` refuses every file there. Raises :class:`CustodyError` on such a
-    platform, ``FileExistsError`` when ``path`` exists, and what
-    :func:`~messagefoundry.restricted_file.write_restricted_file` raises otherwise; after any failure
-    but ``FileExistsError`` there is no file at ``path``."""
+    access list names SYSTEM, Administrators and the calling account, each with full control.
+    Linux: the blob itself, in a file of mode ``0600`` owned by the calling account and carrying no
+    POSIX access control list, one it inherits from its directory's default list included (draft
+    rules 3b and 5). :func:`read_host_file` accepts what this writes on a volume or file system it
+    reads; this does not check the volume or the file system, so a file written on one the read
+    refuses (a network share, for one) is refused only when it is read. Any other platform is
+    refused before a file is made, because :func:`read_host_file` refuses every file there. Raises
+    :class:`CustodyError` on such a platform, ``FileExistsError`` when ``path`` exists, and what
+    :func:`~messagefoundry.restricted_file.write_restricted_file` raises otherwise, which also says
+    whether a failure left a file behind."""
     from messagefoundry.restricted_file import write_restricted_file
 
     if sys.platform not in {"win32", "linux"}:
@@ -848,10 +856,14 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
     the handoff lives only from install to the service's first start (draft rule 3).
 
     :func:`read_handoff_file` accepts the file only when SYSTEM, Administrators or the service owns
-    it. An elevated administrator's file is owned by Administrators under the Windows default; where
-    the policy *System objects: Default owner for objects created by members of the Administrators
-    group* names the object creator instead, the administrator owns it, and the read refuses it.
-    Any other caller owns the file itself, and is refused unless it is the service.
+    it. This writes no owner, so the owner is the creating token's default: an elevated
+    administrator's file is owned by Administrators under the Windows default, but where the policy
+    *System objects: Default owner for objects created by members of the Administrators group*
+    names the object creator, the administrator owns it, and the read refuses it. So does it, at
+    least, for a caller that is not elevated and is not SYSTEM or the service.
+
+    A ``service_account`` many services share (LOCAL SERVICE, NETWORK SERVICE) is refused with
+    :class:`CustodyError` before anything is written: the read grant would reach all of them.
 
     Windows only: raises :class:`~messagefoundry.secrets_dpapi.DpapiUnavailable` elsewhere, because
     a POSIX host needs no handoff."""
@@ -860,6 +872,14 @@ def write_handoff_file(path: Path, blob: HostBlob, *, service_account: str) -> N
 
     if sys.platform != "win32":
         raise DpapiUnavailable("the handoff blob is Windows-only; a POSIX host needs no handoff")
+    from messagefoundry.auth.anchor_path import _SHARED_SERVICE_SIDS
+    from messagefoundry.restricted_file import _resolve_sid
+
+    if _resolve_sid(service_account) in _SHARED_SERVICE_SIDS:
+        raise CustodyError(
+            f"{service_account!r} is an account many services share, so a handoff granted to it "
+            "is open to all of them; run the service as its own account (NT SERVICE\\<name>)"
+        )
     # write_restricted_file refuses a grant that resolves to a package SID or a broad group.
     write_restricted_file(
         path,

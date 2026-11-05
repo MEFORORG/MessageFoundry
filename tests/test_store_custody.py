@@ -868,7 +868,9 @@ def _aces(path: Path) -> set[tuple[int, int, str]]:
     return set(security.aces)
 
 
-_SYSTEM, _ADMINS, _LOCAL_SERVICE = "S-1-5-18", "S-1-5-32-544", "S-1-5-19"
+_SYSTEM, _ADMINS = "S-1-5-18", "S-1-5-32-544"
+#: A per-service account's SID shape (NT SERVICE\<name>); no such service need exist.
+_SERVICE = "S-1-5-80-1-2-3-4-5"
 _FULL, _READ = 0x1F01FF, 0x120089
 
 
@@ -885,21 +887,51 @@ def test_windows_handoff_carries_exactly_the_drafts_descriptor(
     tmp_path: Path, dpapi_scopes: list[bool]
 ) -> None:
     path = tmp_path / "handoff.key"
-    custody.write_handoff_file(path, _blob(), service_account="NT AUTHORITY\\LOCAL SERVICE")
+    custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
     assert dpapi_scopes == [True]  # machine scope, so the service account can open it
     # D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;<service>), and no entry for the account that wrote it.
-    assert _aces(path) == {(0, _FULL, _SYSTEM), (0, _FULL, _ADMINS), (0, _READ, _LOCAL_SERVICE)}
+    assert _aces(path) == {(0, _FULL, _SYSTEM), (0, _FULL, _ADMINS), (0, _READ, _SERVICE)}
     assert _engine_sid() not in {sid for _type, _mask, sid in _aces(path)}
 
 
 @windows_only
 def test_windows_a_handoff_made_for_another_account_is_refused(tmp_path: Path) -> None:
     path = tmp_path / "handoff.key"
-    custody.write_handoff_file(path, _blob(), service_account="NT AUTHORITY\\LOCAL SERVICE")
+    custody.write_handoff_file(path, _blob(), service_account=f"*{_SERVICE}")
     # Off-admin the open itself is denied; elevated, the list names another account. Both refuse.
     with pytest.raises(CustodyError) as excinfo:
         custody.read_handoff_file(path)
     assert not _leaks(str(excinfo.value), _MASTER)
+
+
+@windows_only
+@pytest.mark.parametrize("shared", ["NT AUTHORITY\\LOCAL SERVICE", "*S-1-5-20"])
+def test_windows_a_handoff_for_a_shared_service_account_is_not_written(
+    tmp_path: Path, shared: str
+) -> None:
+    path = tmp_path / "handoff.key"
+    with pytest.raises(CustodyError, match="many services share"):
+        custody.write_handoff_file(path, _blob(), service_account=shared)
+    assert not path.exists()
+
+
+@windows_only
+def test_windows_an_engine_on_a_shared_service_account_reads_no_handoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.config import wiring
+
+    path = tmp_path / "handoff.key"
+    custody.write_handoff_file(path, _blob(), service_account=f"*{_engine_sid()}")
+    real = wiring._win32_config_source_probes()
+
+    class _Shared:
+        self_sid = "S-1-5-19"
+        read_path = real.read_path
+
+    monkeypatch.setattr(wiring, "_win32_config_source_probes", _Shared)
+    with pytest.raises(CustodyError, match="many services share"):
+        custody.read_handoff_file(path)
 
 
 @windows_only

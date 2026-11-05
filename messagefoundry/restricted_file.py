@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING
 
 from messagefoundry.auth.anchor_path import (
     _GRANTING_ACE_TYPES,
+    _SHARED_SERVICE_SIDS,
     ACCESS_ALLOWED_ACE_TYPE,
     ADMINISTRATORS_SID,
     SYSTEM_SID,
@@ -95,14 +96,16 @@ _READ_ACCESS = 0x00120089
 _SDDL_RIGHT: Mapping[int, str] = {_FULL_ACCESS: "FA", _READ_ACCESS: "FR"}
 
 
-def _expected_access(creator_sid: str | None, read_sids: Sequence[str]) -> dict[str, int]:
+def _expected_access(
+    creator_sid: str, read_sids: Sequence[str], *, creator_access: bool = True
+) -> dict[str, int]:
     """The whole access list of a new file, as SID to access mask, in the order it is written.
 
-    Full control for SYSTEM, Administrators and the creating account (none when ``creator_sid`` is
-    ``None``); read for each account in ``read_sids``. An account already holding full control keeps
-    it and gets no second entry."""
+    Full control for SYSTEM, Administrators and the creating account (not the creating account when
+    ``creator_access`` is off); read for each account in ``read_sids``. An account already holding
+    full control keeps it and gets no second entry."""
     access = {SYSTEM_SID: _FULL_ACCESS, ADMINISTRATORS_SID: _FULL_ACCESS}
-    if creator_sid is not None:
+    if creator_access:
         access.setdefault(creator_sid, _FULL_ACCESS)
     for sid in read_sids:
         access.setdefault(sid, _READ_ACCESS)
@@ -310,13 +313,19 @@ def linux_file_system_type(fd: int) -> int:
     ``OSError`` when the call fails or the C library offers no ``fstatfs``."""
     if sys.platform != "linux":
         raise RestrictedFileError("a file system type is read on Linux only")
-    import ctypes
-
-    # The process's own symbols, which hold the C library's; no library search, so no subprocess.
+    fstatfs = None
     try:
-        fstatfs = ctypes.CDLL(None, use_errno=True).fstatfs
-    except AttributeError:  # a static or musl build that exports no C library symbols
-        raise OSError(errno.ENOSYS, "this process's C library offers no fstatfs") from None
+        import ctypes
+
+        # The process's own symbols, which hold the C library's; no library search, so no
+        # subprocess. fstatfs64 first: on a 32-bit C library plain fstatfs refuses a large file
+        # system with EOVERFLOW. Both structs open with f_type.
+        libc = ctypes.CDLL(None, use_errno=True)
+        fstatfs = getattr(libc, "fstatfs64", None) or libc.fstatfs
+    except (ImportError, AttributeError):  # no ctypes, or a build that exports no C library
+        pass
+    if fstatfs is None:  # raised outside the handler, so it chains nothing
+        raise OSError(errno.ENOSYS, "this process's C library offers no fstatfs")
     fstatfs.argtypes = [ctypes.c_int, ctypes.c_void_p]
     fstatfs.restype = ctypes.c_int
     # struct statfs opens with f_type: an unsigned int on s390x, and a native long (__fsword_t) on
@@ -533,8 +542,9 @@ def _read_handle_security(handle: int) -> _HandleSecurity:
 #: or a user-mode file system reports them, and can report any owner and any list.
 _LOCAL_ACCESS_MODEL_VOLUMES = frozenset({"NTFS", "REFS"})
 _FILE_REMOTE_DEVICE = 0x00000010
-#: FILE_DEVICE_NETWORK and FILE_DEVICE_NETWORK_FILE_SYSTEM.
-_NETWORK_DEVICE_TYPES = frozenset({0x12, 0x14})
+#: FILE_DEVICE_DISK, what a file on a local disk volume answers (measured on Windows 11, NTFS and
+#: ReFS). Every other device type, a network or DFS redirector's included, is refused.
+_FILE_DEVICE_DISK = 0x07
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,8 +564,13 @@ def _volume_problem(volume: _HandleVolume) -> str | None:
     not caught here. Kept free of ctypes so the decision is testable on every platform."""
     if volume.error is not None:
         return f"its volume could not be read ({volume.error})"
-    if volume.characteristics & _FILE_REMOTE_DEVICE or volume.device_type in _NETWORK_DEVICE_TYPES:
+    if volume.characteristics & _FILE_REMOTE_DEVICE:
         return "it is on a network volume, whose owner and access list this host does not keep"
+    if volume.device_type != _FILE_DEVICE_DISK:
+        return (
+            f"it is on a volume of device type {volume.device_type:#04x}, not a local disk, so "
+            "this host may not keep its owner and access list"
+        )
     if volume.file_system.upper() not in _LOCAL_ACCESS_MODEL_VOLUMES:
         return (
             f"it is on a {volume.file_system or 'nameless'} volume, and a key file is read on "
@@ -647,9 +662,16 @@ def key_file_handle_problem(handle: int, *, engine_read_only: bool) -> str | Non
     engine_sid = _win32_config_source_probes().self_sid
     if engine_sid is None:
         return "this process's own account could not be read, so the file's owner cannot be judged"
+    if engine_read_only and engine_sid in _SHARED_SERVICE_SIDS:
+        # Every service that runs as LOCAL SERVICE or NETWORK SERVICE holds this account, so a
+        # handoff made for it, or owned by it, is open to all of them.
+        return (
+            f"the engine runs as {describe_sid(engine_sid)}, an account many services share, and "
+            "a handoff is made for an account the engine alone runs as"
+        )
     # The two lists write_restricted_file makes: the handoff's and the host file's.
     if engine_read_only:
-        expected = _expected_access(None, [engine_sid])
+        expected = _expected_access(engine_sid, [engine_sid], creator_access=False)
     else:
         expected = _expected_access(engine_sid, ())
     return _exact_descriptor_problem(_read_handle_security(handle), expected, engine_sid=engine_sid)
@@ -740,31 +762,37 @@ def write_restricted_file(
             raise
         with handle:
             handle.write(data)
-    except BaseException:
+    except BaseException as failure:
         # A write that dies partway (a full volume) would otherwise leave a TRUNCATED file that
-        # nothing removes, and the exclusive create then refuses it on every retry. Nothing is
-        # relabelled: the error is re-raised as it came. This runs after the `with` closed the
-        # handle, which Windows requires before an unlink.
-        _remove_failed(path)
+        # nothing removes, and the exclusive create then refuses it on every retry. The error is
+        # re-raised as it came unless the file cannot be removed (_remove_failed). This runs after
+        # the `with` closed the handle, which Windows requires before an unlink.
+        _remove_failed(path, failure)
         raise
 
 
-def _remove_failed(path: Path) -> None:
-    """Remove the file a failed create or write left at ``path``. Called while that failure is
-    handled, so a removal that fails raises a :class:`RestrictedFileError` saying the file is still
-    there, with the failure as its context, rather than replacing it with a bare unlink error. A
-    creator with no entry of its own (``creator_access`` off) and no right to delete in the
-    directory is that case."""
+def _remove_failed(path: Path, failure: BaseException) -> None:
+    """Remove the file ``failure`` left at ``path``, riding out a brief Windows hold on it.
+
+    Called while ``failure`` is handled, and the caller re-raises it. Where the file cannot be
+    removed (a creator with no entry of its own, ``creator_access`` off, and no right to delete in
+    the directory, or a hold that outlasts the retry), an ``Exception`` is replaced by a
+    :class:`RestrictedFileError` that names both, chained from it; any other ``BaseException`` keeps
+    its own type and gains a note. Neither message carries the bytes that were to be written."""
     reason: str | None = None
     try:
-        path.unlink(missing_ok=True)
+        unlink_generated(path)
+    except FileNotFoundError:
+        pass  # nothing was left
     except OSError as exc:
         reason = exc.strerror or type(exc).__name__
-    if reason is not None:
-        raise RestrictedFileError(
-            f"{path} was left behind by a create that failed, and could not be removed ({reason}); "
-            "remove it by hand before trying again"
-        )
+    if reason is None:
+        return
+    left = f"{path} was left behind and could not be removed ({reason}); remove it by hand"
+    if not isinstance(failure, Exception):
+        failure.add_note(left)
+        return
+    raise RestrictedFileError(f"{left}. It was left by this failure: {failure}") from failure
 
 
 def _create_restricted(path: Path, read_grants: Sequence[str], *, creator_access: bool) -> int:
@@ -803,9 +831,9 @@ def _create_restricted(path: Path, read_grants: Sequence[str], *, creator_access
                 f"{path} could not be created readable by its owner alone: it reads back as mode "
                 f"{stat.S_IMODE(status.st_mode):04o}, owner {status.st_uid}"
             )
-    except BaseException:
+    except BaseException as failure:
         os.close(fd)
-        _remove_failed(path)
+        _remove_failed(path, failure)
         raise
     return fd
 
@@ -865,7 +893,7 @@ def _create_restricted_windows(
                 "hold, and a key file cannot be granted to it. Name the one account the engine "
                 "runs as"
             )
-    expected = _expected_access(probes.self_sid if creator_access else None, read_sids)
+    expected = _expected_access(probes.self_sid, read_sids, creator_access=creator_access)
 
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -943,9 +971,9 @@ def _create_restricted_windows(
         if mismatch is not None:
             raise RestrictedFileError(f"{path} could not be created restricted: {mismatch}")
         return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
-    except BaseException:
+    except BaseException as failure:
         kernel32.CloseHandle(handle)
-        _remove_failed(path)
+        _remove_failed(path, failure)
         raise
 
 
