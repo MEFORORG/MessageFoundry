@@ -1929,9 +1929,8 @@ async def test_what_a_ca_whose_issuer_cannot_be_read_does_to_its_clients_is_meas
     UTF-8, its warning read beside a namesake with a key identifier of its own, and its clients
     measured behind a real strict listener without the namesake, so each refusal is the CA's.
     Each case asserts a version-3 client naming the CA's key and a version-1 client, both
-    refused or both admitted. This is the one record of these measurements; the code and
-    ``docs/SECURITY.md`` point here. Measured on OpenSSL 3.5.7, which reads those bytes as
-    Latin-1:
+    refused or both admitted. The code and ``docs/SECURITY.md`` point here for the cases
+    measured. Measured on OpenSSL 3.5.7, which reads those bytes as Latin-1:
 
     * with no authority key identifier, or one carrying an issuer and serial number but no key
       identifier, and an issuer OpenSSL reads as another name, loaded or not, both are refused;
