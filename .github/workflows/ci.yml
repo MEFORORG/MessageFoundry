@@ -3349,10 +3349,35 @@ jobs:
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
           fi
           # The container image smoke runs on PRs that touch the image, the per-profile locks, packaging,
-          # or this workflow (engine-wide regressions are already covered by the `test` job + push-to-main).
+          # this workflow, an engine module on the image's start path, or a rig file its steps run.
           # ci/locks/release-tools.lock is in because the image's builder stage installs from it
           # (BACKLOG #1193), so a bump to it can break the image build.
-          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|\.github/workflows/ci\.yml)'; then
+          #
+          # THE START-PATH ARM (vault BACKLOG #3455). The image's ENTRYPOINT is `python -m
+          # messagefoundry` (docker/Dockerfile), and this job is the only one that starts `serve` the
+          # way the container does: a non-root uid, root-owned anchors and config, a minted TLS pair,
+          # the enforcing PHI posture and an isolated interpreter. The `test` job runs the engine's
+          # unit tests, not that start. Push-to-main does not cover it either, because the push arm
+          # above writes docker=false. Engine PR 2284 touched only __main__.py, api/app.py and
+          # auth/trust_anchors.py, so this job skipped on it, and the nightly run was the first to
+          # see the engine refuse the rig's syslog CA.
+          #
+          # The named modules, and what each is in for: __main__ (serve and its start gates),
+          # api/__init__ and api/app (the app factory and lifespan), api/tls and pki (the minted pair),
+          # auth/trust_anchors and auth/anchor_path (the anchor ownership rule), config/settings (the
+          # MEFOR_* values the rig sets), logging_setup (the TLS log forwarder), and startupcode and
+          # remotedebug (the interpreter posture the serve step reads back). harness/load/rigadmin.py
+          # and scripts/ci/make_syslog_ca_crl.py are run by the serve step itself.
+          #
+          # NAMED MODULES, NOT `^messagefoundry/`, which would run this job on nearly every engine PR
+          # on the contended ubuntu pool. Measured 2026-11-04 over the 541 commits on main since
+          # 2026-10-04: the other arms fired on 68 of them, and the arms added here fire on 172 more.
+          # config/wiring.py holds the config-source ownership check but is left out: it changes on
+          # about one commit in ten, mostly for reasons that never reach start, and that check's POSIX
+          # arm has unit tests on the ubuntu `test` leg. An engine start change outside this list is
+          # still first run by the nightly. The merge_group and push arms are unchanged (#1830).
+          # tests/test_ci_docker_gate.py pins this alternation.
+          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|messagefoundry/(__main__|api/(__init__|app|tls)|auth/(trust_anchors|anchor_path)|pki|config/settings|logging_setup|startupcode|remotedebug)\.py$|harness/load/rigadmin\.py$|scripts/ci/make_syslog_ca_crl\.py$|\.github/workflows/ci\.yml)'; then
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
@@ -6016,14 +6041,14 @@ jobs:
   # signed in, sends one synthetic ADT^A01 over the in-container MLLP listener, and asserts it FINALIZES
   # to PROCESSED (not merely RECEIVED — that distinguishes ACK-on-receipt from final disposition). Then
   # it verifies a graceful `docker stop`: tini forwards SIGTERM -> uvicorn lifespan -> engine.stop().
-  # Runs NIGHTLY + on dispatch; on PRs only when the image/locks/packaging/this workflow change
-  # (gated by `changes`), so docs/unrelated PRs don't pay the build. No longer per push-to-main —
+  # Runs NIGHTLY + on dispatch; on PRs only when `changes` sets docker=true (its comment lists the
+  # paths), so docs/unrelated PRs don't pay the build. No longer per push-to-main --
   # an image-touching merge was path-gated on its own PR minutes earlier (same rationale as the
   # server-DB legs; `changes` sets docker=false on push, the other half of this guard).
   docker-smoke:
     name: docker image smoke (slim, linux)
     needs: changes
-    # Nightly / on-demand, or a PR that touches the image/locks/packaging.
+    # Nightly / on-demand, or a PR that touches the image/locks/packaging or the engine start path.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     steps:

@@ -145,6 +145,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # (BACKLOG #1193). A Dockerfile edit sets `code=true` but NOT `tooling=true`, so listed as
         # tooling it would be deselected on the engine legs and unreached by the tooling path gate.
         "test_container_build_pins.py",
+        # Reads docker/Dockerfile's ENTRYPOINT and rglobs messagefoundry/**.py, and holds ci.yml's
+        # `docker` path arm to the named engine start-path modules (vault BACKLOG #3455). What
+        # breaks it is a start-path module renamed or removed, an ENGINE diff, or an ENTRYPOINT
+        # edit, a docker/ diff. Neither trips the tooling path gate.
+        "test_ci_docker_gate.py",
         "test_cp1252_console_safety.py",
         # Arrived with #421 while this branch was in flight. Same shape as cp1252_console_safety and
         # licence_header_gate above: a repo-wide scanner over TRACKED TEXT, which includes
