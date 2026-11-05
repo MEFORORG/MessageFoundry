@@ -4811,7 +4811,7 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `GET /ui/sso` answer as they do for any failed sign-in, and the `auth.login_failed` row carries
   `reason=federated_sign_in_required`. **Every bind also ends every live session of that
   account**, in the bind's own transaction, so nothing minted before the bind outlives it,
-  with one limit on the SQL Server store that *Limits of the session sweep* below states. The
+  a session rotated while the bind runs included (*Limits of the session sweep* below). The
   audit row, the route's answer and the holder's notice carry the count. A Windows SSO sign-in
   already in flight cannot slip past either: its session insert requires an unbound row. The
   binding decides, not `oidc_enabled`: an account bound while federation is off, or under an
@@ -4823,15 +4823,29 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   has no Windows SSO fallback during an IdP outage. If every enabled Administrator is bound,
   no Administrator can sign in to unbind one. Since vault BACKLOG #2711, `provision-admin` at the
   host can make a local Administrator then, because a bound one does not block it.
-- **Limits of the session sweep.** On the SQL Server store, a session whose token is rotated
-  in the instant the sweep runs can be missed by it. The same holds on that store for an
-  unbind and for every other whole-account revoke, which run the same sweep: at least an
-  administrator's revoke of a user's sessions, a role change and a password reset. The
-  every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) runs
-  its own table-wide statement of the same `UPDATE ... OUTPUT` shape, so treat it as having this
-  limit too. That is a reading by likeness to the per-account sweep, not one traced for the
-  table-wide statement, and the lock-order bullet below does not cover its every-account lock
-  footprint. **A missed session is refused the next time it is presented** (BACKLOG #2592),
+- **Limits of the session sweep.** **A session whose token is rotated while a whole-account
+  sweep runs is swept too, on all three stores (BACKLOG #4974).** Until then the SQL Server
+  store could miss one. That store's re-key moves the session row to a new clustered key, so a
+  sweep that met the row locked mid-move would find the old key gone and the new one outside its
+  read. Its rotation now takes the account's row under `UPDLOCK` before the session row, the order
+  each whole-account sweep there read for this takes them in, through the account write or the
+  epoch raise: a bind, an unbind, a TOTP re-enrolment, and the whole-account revokes, at least an
+  administrator's revoke of a user's sessions, a role change and a password reset. The session
+  cap's trim takes no account row, so it is not covered. So a rotation either commits before the
+  sweep locks the account's row, and the sweep reads the new key, or waits until the sweep
+  commits and then finds the session ended. That holds where the account's record fails its
+  seal too, because the raise reads the row under that lock before it checks the seal. The
+  every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) takes
+  the row of each account its read of the account list returns before its table-wide sweep, so
+  the same holds for those accounts. A session of an account created after that read is outside
+  its sweep; the global epoch below ends it. The Postgres store's rotation takes no account row:
+  its sweep waits on the rotated row and then re-checks that row's newest version, which still
+  matches. The SQLite store runs one writer at a time. `test_rotation_racing_a_sweep_is_swept`
+  replays a rotation paused mid-re-key against a bind, an unbind and a revoke of a user's
+  sessions on both server legs, from `tests/_federated_unbind_store_contract.py`, and on the SQL
+  Server leg a rotation started while a bind holds the account's row. That the old SQL Server
+  order missed the session was read from the code and was not run.
+  **A session a sweep missed is refused the next time it is presented** (BACKLOG #2592),
   within the limits the rest of this bullet states. Each of these raises the
   account's session epoch in the same transaction, and a rotation keeps the epoch the session was
   sealed under. So the gate refuses and ends the session, and the user's own session list hides
@@ -4919,16 +4933,12 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   The count the bind, the unbind or the revoke reports leaves out each session it missed. The
   bind's and the unbind's are read from the driver's row count, so where a session-wide
   `SET NOCOUNT ON` has leaked onto the connection they report -1 instead (BACKLOG #2283). And
-  until the session is presented or listed, the store still holds it as live. A follow-up row,
-  not yet filed, is to carry the fix for the missed session: a sweep that follows a rotated
-  session, so no rotated session is missed. That would not change the -1 count. The Postgres
-  store follows a rotated row and the SQLite store runs one writer at a time, so neither misses a
-  rotated session. The rotation miss was read from the code and has not
-  been reproduced against a server. A bind ends sessions only: an engine factor already enrolled
-  on the account stays.
+  until the session is presented or listed, the store still holds it as live. BACKLOG #4974,
+  which closed the rotation miss as the opening of this bullet states, did not change the -1
+  count. A bind ends sessions only: an engine factor already enrolled on the account stays.
 - **A bind and a user delete take one lock order on both server stores** (BACKLOG #2738). A
-  bind, an unbind and a whole-account revoke lock the account's row and then its sessions.
-  Deleting a user now takes the account's row first too, on SQL Server since BACKLOG #2733 and
+  bind, an unbind and a whole-account revoke lock the account's row and then its sessions, and
+  on SQL Server so does a session rotation (BACKLOG #4974). Deleting a user now takes the account's row first too, on SQL Server since BACKLOG #2733 and
   on Postgres since #2738, so the two cannot deadlock against one account. The order was read
   from the code. `test_bind_and_user_delete_take_one_lock_order` runs on both server legs: it
   pauses a bind while it holds the row, waits until the delete is queued behind it, then

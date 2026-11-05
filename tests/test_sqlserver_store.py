@@ -1177,6 +1177,32 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
     )
 
 
+async def test_rotation_racing_a_sweep_is_swept(store) -> None:
+    """BACKLOG #4974 (#2738 step 2) on the real SQL Server backend: a session rotated while a bind,
+    an unbind or a revoke of the user's sessions runs is swept under its new hash, and a rotation
+    started while a bind holds the account row waits for it and re-keys nothing.
+
+    ``rotate_session`` takes the account's ``users`` row before its session row, so the rotation
+    and the sweep take one lock order. The shared body is the one the Postgres suite runs, plus
+    the second order, which only this store's rotation has. Probes as the lock-order test above."""
+    from tests._federated_unbind_store_contract import _assert_rotation_racing_a_sweep_is_swept
+
+    async def _session_id(cur: Any) -> object:
+        await cur.execute("SELECT @@SPID")
+        rows = await cur.fetchall()
+        return int(rows[0][0])
+
+    async def _is_blocking(spid: object) -> bool:
+        row = await store._fetchone(
+            "SELECT COUNT(*) AS n FROM sys.dm_exec_requests WHERE blocking_session_id = ?", (spid,)
+        )
+        return bool(row and row["n"])
+
+    await _assert_rotation_racing_a_sweep_is_swept(
+        store, holder_of=_session_id, is_blocking=_is_blocking, rotation_takes_account_row=True
+    )
+
+
 async def test_directory_binding_column_is_unconstrained_and_username_is_not(store) -> None:
     """The layer under the lookup, on the real SQL Server backend.
 

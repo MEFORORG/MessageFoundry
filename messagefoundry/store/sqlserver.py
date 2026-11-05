@@ -15631,16 +15631,20 @@ class SqlServerStore:
         token_hash: str,
         change: Callable[[SessionRecord], SessionRecord],
         *,
+        first: Callable[[Any], Awaitable[None]] | None = None,
         landed: Callable[[Any], Awaitable[None]] | None = None,
         after_commit: bool = False,
     ) -> SessionRecord | None:
         """:meth:`_write_session` in a transaction of its own, committed before it returns.
+        ``first`` runs on the same cursor, in the same transaction, before the write.
         ``landed`` runs on the same cursor, in the same transaction, only when the write landed.
         ``after_commit`` borrows through :meth:`_acquire_after_commit`; only ``rotate_session``
         passes it."""
         borrow = self._acquire_after_commit() if after_commit else self._acquire()
         async with borrow as conn, self._cursor(conn) as cur:
             try:
+                if first is not None:
+                    await first(cur)
                 updated = await self._write_session(cur, token_hash, change)
                 if updated is not None and landed is not None:
                     await landed(cur)
@@ -15710,7 +15714,29 @@ class SqlServerStore:
         clustered-PK row move is width-safe. The lineage link goes in the same transaction, only
         when the re-key landed (vault BACKLOG #3028), its time read then, after any wait for the
         borrow or the row lock. The borrow is :meth:`_acquire_after_commit`'s, for the reason it
-        gives (BACKLOG #3023)."""
+        gives (BACKLOG #3023).
+
+        LOCK ORDER (BACKLOG #4974). The re-key takes its account's ``users`` row under ``UPDLOCK,
+        ROWLOCK`` before its session row, the order every whole-account sweep here takes them in:
+        each locks the account row first, through the write helper or the epoch raise, and sweeps
+        after. The re-key moves the row to a new clustered key, and a sweep that met the row
+        locked mid-move would find the old key gone and the new one out of its read, so it would
+        miss the session. With the account row first, a re-key either commits before a sweep of
+        its account locks that row, and the sweep reads the new key, or waits until the sweep
+        commits and then finds the session ended. The session's account is read unlocked first:
+        ``user_id`` never changes, and a session already gone locks nothing. Each path in this file
+        read for this change that locks both rows takes the account row first, so the re-key
+        closes no cycle with any of them. Read from the code; the race is replayed on the SQL
+        Server leg by ``tests/_federated_unbind_store_contract.py``."""
+
+        async def _account_first(cur: Any) -> None:
+            await cur.execute("SELECT user_id FROM sessions WHERE token_hash=?", (token_hash,))
+            owners = await cur.fetchall()
+            if owners:
+                await cur.execute(
+                    "SELECT id FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?", (str(owners[0][0]),)
+                )
+                await cur.fetchall()
 
         async def _link(cur: Any) -> None:
             retired_at = time.time() if now is None else now
@@ -15719,6 +15745,7 @@ class SqlServerStore:
         rotated = await self._write_session_txn(
             token_hash,
             lambda s: replace(s, token_hash=new_token_hash),
+            first=_account_first,
             landed=_link,
             after_commit=True,
         )

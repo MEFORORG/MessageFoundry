@@ -16569,14 +16569,14 @@ class AuthService:
         used to say a first bind "adds a way in and withdraws none" and revoked nothing.
 
         The sweep is the write's own transaction (``Store.set_user_federated_subject``), so there
-        is no moment at which the pair is written and the earlier sessions are live, with the one
-        SQL Server exception at the end of this paragraph. A Windows SSO
+        is no moment at which the pair is written and the earlier sessions are live. A Windows SSO
         sign-in that read the row unbound either inserts its session before that transaction,
         which ends it, or after, and then its guarded insert in :meth:`_complete_ad_login` finds
         the row bound and is refused. The account's own session never performs the bind: both
-        routes refuse a caller binding its own account. One limit (BACKLOG #2738): on SQL Server
-        the sweep can miss a session rotated mid-scan. docs/SECURITY.md, *Limits of the session
-        sweep*, states what becomes of that session.
+        routes refuse a caller binding its own account. A session rotated while the bind runs is
+        swept too (BACKLOG #4974): on SQL Server the rotation and the bind take the account row
+        first, so one waits for the other, and on Postgres the sweep follows the rotated row.
+        docs/SECURITY.md, *Limits of the session sweep*, says how.
 
         Emits ``auth.federated_subject_bound`` or ``auth.federated_subject_rebound`` naming the
         actor, and notifies the account holder naming the issuer but not the subject (ASVS 6.3.7).

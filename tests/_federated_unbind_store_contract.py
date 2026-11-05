@@ -19,7 +19,7 @@ implementation and the test would see nothing.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
 ISSUER = "https://idp.example/tenant"
@@ -445,3 +445,210 @@ async def _assert_bind_and_user_delete_take_one_lock_order(
     assert swept == 1, swept
     assert await store.get_user(account) is None
     assert await store.get_session("bd-live") is None
+
+
+async def _probe_queued(
+    waiter: asyncio.Task[Any], holder: object, is_blocking: Callable[[object], Awaitable[bool]]
+) -> bool:
+    """Poll until a lock request waits on ``holder``; ``False`` if ``waiter`` finishes first or the
+    polls run out."""
+    for _ in range(_PROBE_POLLS):
+        if waiter.done():
+            return False
+        if await is_blocking(holder):
+            return True
+        await asyncio.sleep(_PROBE_INTERVAL)
+    return False
+
+
+async def _settle(tasks: list[asyncio.Task[Any]]) -> None:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _sweep_by_bind(store: Any, account: str) -> int:
+    return int(await store.set_user_federated_subject(account, ISSUER, f"S-1-{account}", now=3.0))
+
+
+async def _sweep_by_unbind(store: Any, account: str) -> int:
+    outcome = await store.clear_user_federated_subject(
+        account, expected_issuer=ISSUER, expected_subject=f"S-1-{account}", now=3.0
+    )
+    assert outcome is not None
+    return int(outcome.sessions_revoked)
+
+
+async def _sweep_by_revoke(store: Any, account: str) -> int:
+    return int((await store.revoke_user_sessions(account, now=3.0)).count)
+
+
+#: Each whole-account sweep the race is replayed against, and whether its account starts bound.
+_SWEEPS: tuple[tuple[str, Callable[[Any, str], Coroutine[Any, Any, int]], bool], ...] = (
+    ("bind", _sweep_by_bind, False),
+    ("unbind", _sweep_by_unbind, True),
+    ("revoke", _sweep_by_revoke, False),
+)
+
+
+async def _new_account(store: Any, account: str, *, bound: bool) -> None:
+    await store.create_user(
+        user_id=account,
+        username=account,
+        auth_provider="ad",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    if bound:
+        await store.set_user_federated_subject(account, ISSUER, f"S-1-{account}", now=1.0)
+
+
+async def _assert_rotation_racing_a_sweep_is_swept(
+    store: Any,
+    *,
+    holder_of: Callable[[Any], Awaitable[object]],
+    is_blocking: Callable[[object], Awaitable[bool]],
+    rotation_takes_account_row: bool,
+) -> None:
+    """A session rotated while a whole-account sweep runs is swept too (BACKLOG #4974, #2738).
+
+    The rotation is paused right after its re-key, holding the session's row, and the sweep is
+    started; the probe requires that the sweep really waits on the rotation. Released, the rotation
+    commits, and the sweep must end the session under its NEW hash. On SQL Server the re-key moves
+    the row to a new clustered key, so a sweep that met it locked would find the old key gone and
+    the new one outside its read. The new hash sorts before the old one, so a scan in key order has
+    passed it too. On SQL Server the rotation takes the account row first, so the sweep waits there,
+    before it reads any session. On Postgres the sweep waits on the session row and then follows the
+    row to its new version. The bind, the unbind and a revoke of the user's sessions are each
+    replayed. By the reading in ``rotate_session``, SQL Server without the account row first would
+    count 0 and leave the new hash live; that was not run.
+
+    ``rotation_takes_account_row`` adds the other order, on the store whose rotation takes the
+    account row: a bind paused while it holds that row, and a rotation started then, must wait for
+    the bind, then find the session ended and re-key nothing.
+
+    ``holder_of`` and ``is_blocking`` are the lock-order test's: no timing decides either case.
+    """
+    real_write_session = store._write_session
+    for name, sweep, bound in _SWEEPS:
+        account = f"fed-rotate-{name}"
+        old, new = f"rs-z-{name}-old", f"rs-a-{name}-new"
+        await _new_account(store, account, bound=bound)
+        await store.create_session(token_hash=old, user_id=account, expires_at=_EXPIRES, now=2.0)
+
+        holding = asyncio.Event()
+        release = asyncio.Event()
+        holder: list[object] = []
+
+        async def _paused_write(
+            handle: Any,
+            token_hash: str,
+            change: Any,
+            _old: str = old,
+            _holding: asyncio.Event = holding,
+            _release: asyncio.Event = release,
+            _holder: list[object] = holder,
+        ) -> Any:
+            written = await real_write_session(handle, token_hash, change)
+            if not _holder and token_hash == _old:  # the rotation's re-key, still uncommitted
+                _holder.append(await holder_of(handle))
+                _holding.set()
+                await _release.wait()
+            return written
+
+        store._write_session = _paused_write
+        tasks: list[asyncio.Task[Any]] = []
+        try:
+            rotation = asyncio.create_task(store.rotate_session(old, new_token_hash=new, now=2.5))
+            held = asyncio.create_task(holding.wait())
+            tasks += [rotation, held]
+            await asyncio.wait(
+                {rotation, held}, timeout=_STEP_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
+            )
+            if rotation.done():
+                rotation.result()  # a rotation that failed before its pause raises its own error
+            assert holding.is_set(), f"{name}: the rotation never reached its re-key"
+
+            sweeping = asyncio.create_task(sweep(store, account))
+            tasks.append(sweeping)
+            queued = await _probe_queued(sweeping, holder[0], is_blocking)
+            if sweeping.done():
+                sweeping.result()  # a sweep that failed fast raises its own error here
+                raise AssertionError(f"{name}: the sweep finished while the rotation held its row")
+            assert queued, f"{name}: the sweep never queued behind the rotation"
+
+            release.set()
+            assert await asyncio.wait_for(rotation, timeout=_STEP_TIMEOUT) is True
+            swept = await asyncio.wait_for(sweeping, timeout=_STEP_TIMEOUT)
+        finally:
+            release.set()
+            del store._write_session  # the instance attribute only; the class method is untouched
+            await _settle(tasks)
+
+        assert swept == 1, f"{name}: the sweep counted {swept}, not the rotated session"
+        assert await store.get_session(old) is None, f"{name}: the old hash still has a row"
+        assert not await _live(store, new), f"{name}: the rotated session outlived the sweep"
+
+    if rotation_takes_account_row:
+        await _assert_rotation_waits_for_a_bind(store, holder_of=holder_of, is_blocking=is_blocking)
+
+
+async def _assert_rotation_waits_for_a_bind(
+    store: Any,
+    *,
+    holder_of: Callable[[Any], Awaitable[object]],
+    is_blocking: Callable[[object], Awaitable[bool]],
+) -> None:
+    """The other order (BACKLOG #4974): a bind holds the account row, and a rotation of one of its
+    sessions waits for it, then re-keys nothing, because the bind ended the session."""
+    account = "fed-rotate-after-bind"
+    old, new = "rb-z-old", "rb-a-new"
+    await _new_account(store, account, bound=False)
+    await store.create_session(token_hash=old, user_id=account, expires_at=_EXPIRES, now=2.0)
+
+    real_write = store._write_user
+    holding = asyncio.Event()
+    release = asyncio.Event()
+    holder: list[object] = []
+
+    async def _paused_write(handle: Any, user_id: str, change: Any) -> Any:
+        written = await real_write(handle, user_id, change)
+        if not holder and user_id == account:  # the bind's write, the first to this account
+            holder.append(await holder_of(handle))
+            holding.set()
+            await release.wait()
+        return written
+
+    store._write_user = _paused_write
+    tasks: list[asyncio.Task[Any]] = []
+    try:
+        bind = asyncio.create_task(_sweep_by_bind(store, account))
+        held = asyncio.create_task(holding.wait())
+        tasks += [bind, held]
+        await asyncio.wait({bind, held}, timeout=_STEP_TIMEOUT, return_when=asyncio.FIRST_COMPLETED)
+        if bind.done():
+            bind.result()  # a bind that failed before its pause raises its own error here
+        assert holding.is_set(), "the bind never reached its user write"
+
+        rotation = asyncio.create_task(store.rotate_session(old, new_token_hash=new, now=2.5))
+        tasks.append(rotation)
+        queued = await _probe_queued(rotation, holder[0], is_blocking)
+        if rotation.done():
+            rotation.result()
+            raise AssertionError("the rotation finished while the bind held the account's row")
+        assert queued, "the rotation never queued behind the bind"
+
+        release.set()
+        swept = await asyncio.wait_for(bind, timeout=_STEP_TIMEOUT)
+        rotated = await asyncio.wait_for(rotation, timeout=_STEP_TIMEOUT)
+    finally:
+        release.set()
+        del store._write_user  # the instance attribute only; the class method is untouched
+        await _settle(tasks)
+
+    assert swept == 1, swept
+    assert rotated is False, "the rotation re-keyed a session the bind had ended"
+    assert await store.get_session(new) is None
+    assert not await _live(store, old)

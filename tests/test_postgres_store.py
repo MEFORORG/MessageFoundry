@@ -1400,6 +1400,34 @@ async def test_bind_and_user_delete_take_one_lock_order(store) -> None:
     )
 
 
+async def test_rotation_racing_a_sweep_is_swept(store) -> None:
+    """BACKLOG #4974 on the real Postgres backend: a session rotated while a bind, an unbind or a
+    revoke of the user's sessions runs is swept under its new hash.
+
+    This store's rotation takes no account row. Its sweep waits on the rotated session's row and,
+    under READ COMMITTED, then re-checks the row's newest version, which the re-key left in place
+    under its new hash. docs/SECURITY.md stated that from the code; this runs it. The shared body
+    is the one the SQL Server suite runs, without the second order, which only that store's
+    rotation has. Probes as the lock-order test above."""
+    from tests._federated_unbind_store_contract import _assert_rotation_racing_a_sweep_is_swept
+
+    async def _backend_pid(conn: Any) -> object:
+        return conn.get_server_pid()
+
+    async def _is_blocking(pid: object) -> bool:
+        return bool(
+            await store._fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted"
+                " AND $1::int = ANY(pg_blocking_pids(pid)))",
+                pid,
+            )
+        )
+
+    await _assert_rotation_racing_a_sweep_is_swept(
+        store, holder_of=_backend_pid, is_blocking=_is_blocking, rotation_takes_account_row=False
+    )
+
+
 async def test_directory_id_comparison_is_byte_exact_on_postgres(store) -> None:
     """Postgres compares ``directory_object_id`` byte-for-byte, so case is significant.
 
