@@ -67,6 +67,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
+from messagefoundry.file_lock import lock_exclusive
+from messagefoundry.file_lock import unlock as _unlock
+
 #: The on-disk format version written into every entry. A reader skips an entry of any other version
 #: (counted as unreadable) rather than guessing at its shape.
 SPOOL_FORMAT_VERSION = 1
@@ -141,35 +144,13 @@ def count_segments(directory: str | Path) -> int:
 
 
 def _try_lock(fd: int) -> bool:
-    """Take a non-blocking exclusive lock on ``fd``; ``False`` if another process holds it."""
-    if sys.platform == "win32":
-        import msvcrt
-
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)  # msvcrt locks from the current position
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        except OSError:
-            return False
-        return True
-    import fcntl
-
+    """Take a non-blocking exclusive lock on ``fd``; ``False`` if another process holds it. Any
+    other ``OSError`` reads as ``False`` too, as it always has here, so :meth:`LogSpool.open`
+    reports it as the directory being in use and the process runs without a spool."""
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_exclusive(fd)
     except OSError:
         return False
-    return True
-
-
-def _unlock(fd: int) -> None:
-    if sys.platform == "win32":
-        import msvcrt
-
-        os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        return
-    import fcntl
-
-    fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 class LogSpool:

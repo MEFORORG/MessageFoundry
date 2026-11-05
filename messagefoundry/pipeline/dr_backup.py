@@ -62,6 +62,8 @@ from messagefoundry.config import atomic_edit
 from messagefoundry.config.settings import BackupSettings, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.controlchars import scrub_log_argument
+from messagefoundry.file_lock import lock_exclusive as _lock_exclusive
+from messagefoundry.file_lock import unlock
 from messagefoundry.last_resort import run_guarded
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink, utc_or_unknown
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
@@ -2414,51 +2416,11 @@ _HELD_MARKER_NAME = ".lock-held"
 _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP})
 
 
-def _lock_exclusive(fd: int, *, wait: bool) -> bool:
-    """Take an exclusive OS lock on ``fd``. ``True`` when held. With ``wait`` False, ``False`` means
-    another handle holds it. The OS drops the lock when the process dies, which is what lets a crashed
-    run's directory be told apart from a live one.
-
-    ``flock`` on POSIX, not ``lockf``: a ``lockf`` lock belongs to the process, so a second handle in
-    the same process would not conflict, and a live run could not be told apart from a dead one by an
-    engine that shares its process. ``msvcrt.locking`` on Windows is per handle already."""
-    if sys.platform == "win32":
-        import msvcrt
-
-        os.lseek(fd, 0, os.SEEK_SET)
-        try:
-            msvcrt.locking(fd, msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
-        except OSError as exc:
-            # A held range refuses with EACCES, or EDEADLOCK, the CRT's other contention code (the
-            # same reading as `api/tls.py`). Anything else is a real fault and propagates.
-            if wait or exc.errno not in (errno.EACCES, errno.EDEADLOCK):
-                raise
-            return False
-        return True
-    import fcntl
-
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        if wait:
-            raise
-        return False
-    return True
-
-
 def _unlock_and_close(fd: int) -> None:
     """Drop the lock and close the handle. Never raises."""
     # A failed unlock is harmless: closing the handle below drops the lock anyway.
     with contextlib.suppress(OSError):
-        if sys.platform == "win32":
-            import msvcrt
-
-            os.lseek(fd, 0, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        unlock(fd)
     with contextlib.suppress(OSError):
         os.close(fd)
 
