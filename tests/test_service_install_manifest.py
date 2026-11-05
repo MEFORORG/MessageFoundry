@@ -1442,7 +1442,7 @@ def test_the_installer_still_calls_the_lockdown_on_the_data_dir(tmp_path: Path) 
     test green. The behavioural arms above run the FUNCTION and say nothing about whether the
     script invokes it."""
     facts = _preflight_facts(tmp_path)
-    calls = [c for c in facts["commands"] if c["name"] == "Set-SecureDataDirAcl"]
+    calls = [c for c in facts["commands"] if _named(c, "Set-SecureDataDirAcl")]
     assert len(calls) == 1, (
         f"expected exactly one Set-SecureDataDirAcl call in install-service.ps1, found {len(calls)}"
     )
@@ -1474,9 +1474,7 @@ def test_the_smoke_leg_reads_the_dacl_it_produced() -> None:
 
 
 # --- the smoke step also requires the RUN-AS grant, and is RUN here (BACKLOG #1699) ---------------
-# The step above refused broad principals and nothing else, so a lockdown that dropped -Account left
-# SYSTEM and Administrators only and read clean, over a service that could not write its own logs.
-# The step now requires the run-as account's (OI)(CI)(M) on both directories. Its leg cannot run on a
+# What the step requires, and why, is in the step's own comment in ci.yml. Its leg cannot run on a
 # pull request, so the arms below run the step's own script, read from the parsed workflow, against
 # stand-in icacls output: a wrong matcher fails here rather than first in the merge queue.
 
@@ -1505,19 +1503,27 @@ def _run_dacl_step(
 ) -> subprocess.CompletedProcess[str]:
     """Run the step's script with icacls and Test-Path stood in, under ``SMOKE_ACCOUNT=account``.
 
-    A function shadows the executable of the same name, so no real icacls runs, and the other
-    spellings that could change a real DACL are stand-ins that throw. Wrapped as the runner wraps
+    A function shadows the bare name ``icacls`` and nothing else: a path to the executable would
+    run the real one. So the script's DACL-tool lines are read first, and the bare call must be the
+    only one. A few other spellings are stand-ins that throw as well. Wrapped as the runner wraps
     a powershell step, as _run_smoke_stop says: 'stop' first, $LASTEXITCODE last. The step is
     ``shell: powershell``, so Windows PowerShell 5.1 runs it where it is on PATH; pwsh elsewhere.
     """
     shell = shutil.which("powershell") or shutil.which("pwsh")
     if shell is None:
         pytest.skip("SKIP (nothing run): neither powershell nor pwsh on PATH")
+    script = _smoke_step(_DACL_STEP)
+    # Message text is not a call, so double-quoted strings are blanked before the search.
+    unquoted = [re.sub(r'"[^"]*"', '""', line).strip() for line in script.splitlines()]
+    tools = [line for line in unquoted if re.search(r"(?i)cacls|set-acl|takeown|system32", line)]
+    assert tools == ["$acl = (& icacls $d | Out-String)"], (
+        f"expected the step's one DACL-tool line to be the bare, read-only icacls call: {tools}"
+    )
     acls = {_DATA: _icacls(_DATA, data), _LOGS: _icacls(_LOGS, logs)}
     table = "; ".join(f"{_psq(k)} = {_psq(v)}" for k, v in acls.items())
     stand_ins = f"""$ErrorActionPreference = 'stop'
 $global:Acls = @{{ {table} }}
-foreach ($changes in 'icacls.exe', 'Set-Acl', 'takeown', 'takeown.exe') {{
+foreach ($changes in 'icacls.exe', 'cacls', 'cacls.exe', 'Set-Acl', 'takeown', 'takeown.exe') {{
   Set-Item -Path "function:global:$changes" -Value {{
     throw "the step ran $($MyInvocation.MyCommand.Name), which this harness does not stand in for"
   }}
@@ -1532,12 +1538,14 @@ function icacls {{ param($Path) if ($args.Count) {{ throw "the step changed a DA
     f = tmp_path / f"smoke-dacl-{uuid.uuid4().hex}.ps1"
     f.write_text(
         stand_ins
-        + _smoke_step(_DACL_STEP)
+        + script
         + "\nif ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }\n",
         encoding="utf-8",
     )
+    # Bypass for this process only: 5.1's default policy refuses to dot-source a script file.
     return subprocess.run(
-        [shell, "-NoProfile", "-NonInteractive", "-Command", f". {_psq(str(f))}"],
+        [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
+        + [f". {_psq(str(f))}"],
         capture_output=True,
         text=True,
         timeout=180,
@@ -1555,7 +1563,7 @@ def test_the_smoke_dacl_step_passes_a_lockdown_that_kept_the_run_as_grant(tmp_pa
     data directory, inherited onto logs."""
     r = _run_dacl_step(tmp_path, account="virtual", data=_GRANTED, logs=_inherited(_GRANTED))
     assert r.returncode == 0, r.stderr + r.stdout
-    assert f"{_VIRTUAL} holds its (OI)(CI)(M) entry on both" in r.stdout, r.stdout
+    assert f"{_VIRTUAL} holds (OI)(CI)(M) on the data directory and (I)(OI)(CI)(M)" in r.stdout
 
 
 _DENY = f"{_VIRTUAL}:(OI)(CI)(DENY)(W)"
@@ -1608,7 +1616,7 @@ def test_the_smoke_dacl_step_requires_systems_entry_on_the_localsystem_leg(tmp_p
     that is the entry this leg requires. A SYSTEM entry that cannot write is refused."""
     r = _run_dacl_step(tmp_path, account="localsystem", data=_LOCKED, logs=_inherited(_LOCKED))
     assert r.returncode == 0, r.stderr + r.stdout
-    assert r"NT AUTHORITY\SYSTEM holds its (OI)(CI)(F) entry on both" in r.stdout, r.stdout
+    assert r"NT AUTHORITY\SYSTEM holds (OI)(CI)(F) on the data directory" in r.stdout, r.stdout
     read_only = [r"NT AUTHORITY\SYSTEM:(OI)(CI)(RX)", r"BUILTIN\Administrators:(OI)(CI)(F)"]
     weak = _run_dacl_step(
         tmp_path, account="localsystem", data=read_only, logs=_inherited(read_only)
@@ -1738,7 +1746,7 @@ def test_the_acl_calls_never_receive_the_literal_localsystem(tmp_path: Path) -> 
     """
     facts = _preflight_facts(tmp_path)
     for fn in _ACL_CALLS:
-        for call in [c for c in facts["commands"] if c["name"] == fn]:
+        for call in [c for c in facts["commands"] if _named(c, fn)]:
             assert "LocalSystem" not in call["text"], (
                 f"{fn} is being handed a literal LocalSystem at line {call['line']}: {call['text']}"
             )
@@ -1784,7 +1792,7 @@ def test_all_three_acl_sites_are_still_wired(tmp_path: Path) -> None:
     """
     facts = _preflight_facts(tmp_path)
     for fn in _ACL_CALLS:
-        calls = [c for c in facts["commands"] if c["name"] == fn]
+        calls = [c for c in facts["commands"] if _named(c, fn)]
         assert len(calls) == 1, f"expected exactly one {fn} call, found {len(calls)}"
 
 
@@ -1798,7 +1806,9 @@ def test_all_three_acl_sites_are_still_wired(tmp_path: Path) -> None:
 #
 # ORDER BY SOURCE OFFSET. That is execution order only while every one of these calls sits outside
 # any function, whose body runs when it is called rather than where it is written, so the guard
-# checks that as well. A scriptblock stored in a variable and invoked later would still escape it.
+# checks that as well. It does not cover every way a call can run elsewhere than it is written; at
+# least a stored scriptblock, a trap body, Invoke-Expression and a computed command name escape it.
+# Nor does it check WHICH branch a call sits in, so a lockdown moved into one branch still passes.
 
 _RUN_AS_ASSIGNMENT = "$RunAsObjectName = if ("
 

@@ -5429,7 +5429,7 @@ jobs:
           if ($missing.Count -gt 0) {
             throw "the data/log directory does not show the grant '$grantee' needs to write the store and logs (BACKLOG #1699); the icacls output above shows what it holds"
           }
-          "data-directory DACL OK: no broad principal on either directory, and $grantee holds its (OI)(CI)($rights) entry on both"
+          "data-directory DACL OK: no broad principal on either directory, and $grantee holds (OI)(CI)($rights) on the data directory and (I)(OI)(CI)($rights) on logs"
 
       - name: Start and verify /health
         run: |
