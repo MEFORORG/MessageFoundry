@@ -900,7 +900,11 @@ def _crl_issuer_key(name: x509.Name) -> CrlIssuerKey:
     **It reads a private attribute.** The string type comes from ``cryptography``'s
     ``NameAttribute._type``. If a release drops it, every CRL is refused. A start and a reload
     name that cause. The expiry monitor's check of a CA file says only that it cannot judge the
-    CRL. Comparing the exact text instead would reopen the T61String gap with no sign.
+    CRL. The namesake warning's self-signed read (:func:`_self_issued`) can no longer compare
+    names, so a CA whose authority key identifier carries no key identifier, or that has none,
+    beside a namesake gets the
+    warning that the engine cannot compare them. Comparing the exact text instead would reopen
+    the T61String gap with no sign.
 
     **Latin-1 here covers UTF-8 bytes only.** A one-byte text type whose bytes are not valid
     UTF-8 already fails ``cryptography``'s parse, so the file is refused. A certificate's issuer,
@@ -1786,8 +1790,9 @@ class IssuerIndex:
         that every client may be refused, says what it cannot tell, and says to check the CA too.
         For a CA whose issuer name ``cryptography`` cannot read, only the authority key identifier
         faults go unread; with no other fault found, its warning, in whichever wording the
-        namesake's key identifier gives, says the issuer name cannot be read and to check the CA
-        too. Where an engine defect stops the names being compared, it says that instead. The index does not count a namesake toward the
+        namesake's key identifier gives, says the issuer name cannot be read, that strict
+        verification refuses every client through the CA if it is not self-signed, and to check
+        the CA too (:data:`_UNREAD_TEXT`). Where an engine defect stops the names being compared, it says that instead. The index does not count a namesake toward the
         same-DN ambiguity unless it signs itself, so :meth:`unmatched_keys` may give no reason, and
         this is the only start signal. Names are grouped by :func:`_namesake_key`. A warning only:
         it changes no allow, deny or refusal."""
@@ -1808,16 +1813,13 @@ class IssuerIndex:
             other_ids: list[tuple[_Anchor, bytes | None]] | None = None  # read only if needed
             for ca in ca_anchors:
                 faults = _strict_ca_faults(ca)
-                if isinstance(faults, str):
-                    unread: _Unread | None = faults
-                    # Extensions that did not read are not read again.
-                    ca_key_id = None if faults == "extensions" else _key_identifier(ca)[0]
-                elif faults:
+                unread = faults if isinstance(faults, str) else None
+                if faults and not isinstance(faults, str):
                     warnings.append(_ca_cause_warning(ca, others, faults))
                     continue
-                else:
-                    ca_key_id, ca_read = _key_identifier(ca)
-                    unread = None if ca_read else "extensions"
+                # Extensions that did not read are not read again. Ones that did are cached, so
+                # the CA's key identifier reads here.
+                ca_key_id = None if unread == "extensions" else _key_identifier(ca)[0]
                 if other_ids is None:
                     other_ids = [(other, _key_identifier(other)[0]) for other in others]
                 for other, key_id in other_ids:
@@ -1830,12 +1832,7 @@ class IssuerIndex:
                             if key_id is not None and unread == "extensions"
                             else ""
                         )
-                        why = (
-                            f" {_UNREAD_TEXT[unread].format(ca.position)}, so this check cannot "
-                            f"tell whether block {ca.position} itself is the cause, as a CA strict "
-                            f"verification refuses would be{rules_out}. Check block {ca.position} "
-                            "too."
-                        )
+                        why = " " + _UNREAD_TEXT[unread].format(n=ca.position, rules_out=rules_out)
                     if key_id is not None and ca_key_id is not None and key_id != ca_key_id:
                         effect = (
                             f"may take block {other.position}, whose key identifier differs from "
@@ -1865,13 +1862,24 @@ class IssuerIndex:
 #: where warnings are errors.
 _UNREAD_CA_EXTENSIONS = (x509.DuplicateExtension, ValueError, UserWarning, *_UNREAD_EXTENSIONS)
 
-#: What :func:`_strict_ca_faults` could not read of a CA, and how the namesake warning says so,
-#: given the CA's block number.
+#: What :func:`_strict_ca_faults` could not read of a CA, and what the namesake warning adds for
+#: it, given the CA's block number ``n``. A CA whose issuer name is not read has no authority key
+#: identifier carrying a key identifier, and the two outcomes left were each measured on OpenSSL
+#: 3.5.7 behind a strict listener: every client refused when OpenSSL reads its issuer as another
+#: name, and its version-3 client admitted when it reads the CA as self-signed (BACKLOG #4948).
 _Unread = Literal["extensions", "issuer name", "name comparison"]
+_NOT_SELF_SIGNED = (
+    ", so this check cannot tell whether block {n} is self-signed. If it is not, strict "
+    "verification refuses every client certificate whose chain runs through block {n}, as it has "
+    "no authority key identifier carrying a key identifier. Check block {n} too."
+)
 _UNREAD_TEXT: dict[_Unread, str] = {
-    "extensions": "The extensions of block {} cannot be read here",
-    "issuer name": "The issuer name of block {} cannot be read here",
-    "name comparison": "The engine cannot compare the issuer name of block {} with its subject",
+    "extensions": "The extensions of block {n} cannot be read here, so this check cannot tell "
+    "whether block {n} itself is the cause, as a CA strict verification refuses would be"
+    "{rules_out}. Check block {n} too.",
+    "issuer name": "The issuer name of block {n} cannot be read here" + _NOT_SELF_SIGNED,
+    "name comparison": "The engine cannot compare the issuer name of block {n} with its subject"
+    + _NOT_SELF_SIGNED,
 }
 
 
@@ -1954,8 +1962,10 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | _Unread:
         lacks = "its authority key identifier carries no key identifier"
     # A self-signed CA may omit its authority key identifier; one with an issuer may not. Only
     # this reads the issuer name, so one that does not read loses only this fault.
+    # The subject parsed when the index was built, so only the issuer can fail here, unless
+    # warnings became errors after the build.
     try:
-        issuer = ca.cert.issuer
+        issuer, subject = ca.cert.issuer, ca.cert.subject
     except (ValueError, UserWarning) as exc:
         _log.debug(
             "certificate block %d: its issuer name cannot be read (%s); the namesake warning "
@@ -1965,15 +1975,17 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | _Unread:
         )
         return faults or "issuer name"
     try:
-        issued = not _self_issued(issuer, ca.cert.subject)
+        issued = not _self_issued(issuer, subject)
     # _crl_attribute_key: an engine defect, not a fault in the file. The namesake warning, which
-    # the caller logs with its file, says so in its own words; this records the detail.
+    # the caller logs with its file, says so. Only the type is logged: an exception's text can
+    # carry a certificate field.
     except ValueError as exc:
         _log.debug(
-            "certificate block %d: %s; the namesake warning cannot tell whether it may omit its "
-            "authority key identifier",
+            "certificate block %d: the engine cannot compare its issuer name with its subject "
+            "(%s); the namesake warning cannot tell whether it may omit its authority key "
+            "identifier",
             ca.position,
-            exc,
+            type(exc).__name__,
         )
         return faults or "name comparison"
     if issued:
@@ -2083,7 +2095,7 @@ def _key_identifier(anchor: _Anchor) -> tuple[bytes | None, bool]:
         ).value.digest, True
     except x509.ExtensionNotFound:
         return None, True
-    except (x509.DuplicateExtension, ValueError, *_UNREAD_EXTENSIONS) as exc:
+    except _UNREAD_CA_EXTENSIONS as exc:
         _log.debug(
             "certificate block %d: its key identifier cannot be read (%s); the namesake warning "
             "assumes it may have none",
