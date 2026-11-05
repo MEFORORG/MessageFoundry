@@ -3,8 +3,9 @@
 """BACKLOG #3759 items 3.1 and 3.2: the ``MSH``-boundary readings in ``parsing/split.py``.
 
 The four readings (the split, the ingress guard's, the delivery's and the whole-file byte scan)
-spelled the boundary each its own way, and a clean outbound payload paid two scans. They now share
-their literals, and one scan settles a clean payload. That was a refactor, so every decision must
+spelled the boundary each its own way, and a clean outbound payload paid two scans. They now find
+it through one predicate, ``split._next_boundary`` (BACKLOG #4972), and one scan settles a clean
+payload. Those were refactors, so every decision must
 be the one the code made before it: each reading is checked against a copy of its body as it
 stood before, over every string of up to four tokens drawn from the shapes the readings tell
 apart, and a seeded sample of longer ones.
