@@ -473,28 +473,37 @@ pure-Python equivalent:
   lock file's from the open handle with `advapi32`'s `GetSecurityInfo`, never by path, so a rename
   in the staging root cannot choose the owner a sweep goes by (BACKLOG #4988). POSIX needs no
   `ctypes` for this; it reads `fstat` of each one's open descriptor
-- Key file creation: `restricted_file.py`, which on Windows calls `kernel32`'s `CreateFileW` with
-  the file's access list attached and `CREATE_NEW`, so a file that holds a key is restricted in
-  the call that creates it and an existing file or link is refused. It asks `advapi32` to build
-  that list and to resolve an account name to its SID. A handoff file is made owned by
-  Administrators in that same call, after `advapi32`'s `CheckTokenMembership` says this process
-  holds that group enabled, and its owner is read back through the creating handle with
-  `GetSecurityInfo`. Creating the file on POSIX needs no `ctypes`; it creates the file with
-  `O_CREAT | O_EXCL` and mode `0o600`, and on Linux removes a
-  POSIX access control list the file inherits from its directory before writing to it. The module
-  still loads the C library through `ctypes` on Linux for one read: `linux_file_system_type` calls
-  `fstatfs` on an open descriptor, for the key custody file reads below
+- Key file creation: `restricted_file.py`, which on Windows calls at least `kernel32`'s
+  `CreateFileW` with the file's access list attached and `CREATE_NEW`, so a file that holds a key
+  is restricted in the call that creates it and an existing file or link is refused. It asks
+  `advapi32` to build that list and to resolve an account name to its SID. The new file's owner
+  and access list are read back through the creating handle with `advapi32`'s `GetSecurityInfo`,
+  never by name, and judged by the same exact check the key custody reads below make. A handoff
+  file is made owned by Administrators in that same call, after `advapi32`'s
+  `CheckTokenMembership` says this process holds that group enabled. For a key custody file the
+  volume is read through the creating handle too, with `kernel32`'s
+  `GetVolumeInformationByHandleW` and `ntdll`'s `NtQueryVolumeInformationFile`, and a file on
+  anything but a local NTFS or ReFS disk is removed while still empty. Creating the file on POSIX
+  needs no `ctypes` of its own; it creates the file with `O_CREAT | O_EXCL` and mode `0o600`, and
+  on Linux removes a POSIX access control list the file inherits from its directory before writing
+  to it. For a key custody host file it first asks the C library, through `ctypes`, for the file
+  system of the still-empty file (`linux_file_system_type`, below), and removes the file unless
+  that file system is on an allowlist (`LINUX_HOST_FILE_SYSTEMS`)
 - Key custody file reads: `store/custody.py`, which on Windows opens a host or handoff key file with
   `kernel32`'s `CreateFileW`, `FILE_FLAG_OPEN_REPARSE_POINT` and a share mode that admits only other
   readers, so a link is opened as itself and the file at that name cannot be replaced while it is
   checked, and `GetFileType` refuses anything but a disk file (vault BACKLOG #3411). Its owner and
   access list are read through that handle with `advapi32`'s `GetSecurityInfo`, and its volume
   with `kernel32`'s `GetVolumeInformationByHandleW` and `ntdll`'s `NtQueryVolumeInformationFile`
-  (`restricted_file.key_file_handle_problem`), never by name. Nothing calls these reads yet. On
-  Linux it opens the file with `O_NOFOLLOW` and reads its mode, owner, group and POSIX access
-  control list from the open descriptor, and calls the C library's `fstatfs` through `ctypes` on
-  that descriptor, to refuse a file system that keeps an access model of its own. Any other POSIX
-  host opens none of these files
+  (`restricted_file.key_file_handle_problem`), never by name. A handoff is opened with DELETE as
+  well, and once the service has converted it, `consume_handoff_file` deletes it through that same
+  handle with `kernel32`'s `SetFileInformationByHandle` (`restricted_file.delete_through_handle`),
+  so the file deleted is the file read. Nothing calls these yet. On Linux it opens the file with
+  `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list from the open
+  descriptor. It asks for that descriptor's file system through
+  `restricted_file.linux_file_system_type` (`fstatfs64`, or `fstatfs` where the C library has no
+  `fstatfs64`), and refuses any file system not on the allowlist for that kind of file. Any other
+  POSIX host opens none of these files
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
@@ -536,8 +545,10 @@ pure-Python equivalent:
 **What holds them.** Every library whose code runs is loaded by a name fixed in the code, never by a
 path from configuration. On Windows that is a system library such as `kernel32` or `advapi32`. The
 non-Windows loads include at least `store/crypto.py`, which reaches the C library already loaded
-into the process to call `mlock`, and `restricted_file.linux_file_system_type`, which reaches the
-same library on Linux to call `fstatfs`. One load takes a computed path: `tray/branding.py` opens the tray's own
+into the process to call at least `mlock` and `munlock`, and
+`restricted_file.linux_file_system_type`, which reaches the same library on Linux to call
+`fstatfs64` or `fstatfs`. Both reach it with `CDLL(None)`, which opens the process's own symbols and
+loads no new library. One load takes a computed path: `tray/branding.py` opens the tray's own
 launcher with `LoadLibraryExW`, but as a data file, to read its version resource, so none of that
 file's code runs. Most sites declare argument and return types before the call, so a wrong-width
 argument fails at the boundary rather than corrupting the stack. Not all do: at least `service.py`,
