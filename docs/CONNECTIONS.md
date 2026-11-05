@@ -362,12 +362,14 @@ An inbound connection's `encoding` is the charset the engine decodes each receiv
 `utf-8` when it is unset or `None`. It must be a literal string naming a usable text codec:
 `messagefoundry check` and `serve` refuse anything else when the config loads, an `env()` reference
 included, in Python config and `connections.toml` alike (BACKLOG #2431). A name that gets past that
-check, on a graph that skipped it, is a **configuration refusal** at run time. What each source
-does with it, at least:
+check, on a graph that skipped it, is a **configuration refusal** at run time for every non-empty
+body. An empty body decodes under any name, since Python does not look the codec up for it, and
+meets what any empty body meets. What each source does with a non-empty one, at least:
 
 - **MLLP and TCP listeners** record each body as an `ERROR` row. Where the inbound sends HL7
   replies, the answer is `AE`; a non-HL7 inbound gets no `AE`. **An `X12()` listener** records the
-  row too, but sends no `AE`: it encodes its reply in the inbound's own charset, which fails.
+  row too, and sends no `AE` either: an `x12` inbound owes no HL7 reply, and one that declares HL7
+  encodes its reply in the inbound's own charset, which fails.
 - **`Http()`** records the row and answers `503` with **no** `Retry-After`.
 - **A DICOM SCP** never decodes: its inbound must declare a binary `content_type` such as `dicom`,
   and one that declares a text type is refused when the config loads. Should a configuration

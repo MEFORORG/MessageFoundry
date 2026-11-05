@@ -192,7 +192,7 @@ def split_batch_bytes(raw: bytes, encoding: str) -> list[bytes]:
     except (UnicodeError, LookupError):
         # UnicodeError, not only UnicodeDecodeError: a codec that refuses every conversion, such as
         # "undefined", raises the bare base class, and it too must reach the listener's decode,
-        # which records it as a configuration refusal, rather than escape the hand-off (BACKLOG #5102).
+        # which records it as an ERROR row, rather than escape the hand-off (BACKLOG #5102).
         return [raw]
     messages = split_batch(text)
     if len(messages) == 1:

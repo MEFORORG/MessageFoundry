@@ -1705,8 +1705,8 @@ decoded-text, streaming-detach and strict-timeout arms. The parse and strict-fai
   tag are what tell them apart. Nor does it stop a sender from re-sending: one that retries a `503` on its own schedule still does, at
   its own pace, and may re-send sooner than 5 seconds, leaving one `ERROR` row each time. The
   engine's own `Rest()` outbound never read the header, so on an engine-to-engine hop it retries
-  this `503` under its `RetryPolicy` and dead-letters the row after `max_attempts`, as for a
-  temporary one.
+  this `503` under its `RetryPolicy`, as for a temporary one: it dead-letters the row after
+  `max_attempts`, or retries it forever where `max_attempts` is `None`.
 * **MLLP keeps the re-send class.** It has no code that says "after an operator acts", and its
   final class tells a sender to drop the message. So on MLLP a configuration refusal invites the
   same re-send a temporary one does; only `Http()` tells the two apart on the wire. An `X12()`
