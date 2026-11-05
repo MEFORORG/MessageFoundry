@@ -1809,14 +1809,14 @@ class IssuerIndex:
                 faults = _strict_ca_faults(ca)
                 if isinstance(faults, str):
                     # What did not read is not read again, and the narrow wording never applies.
-                    unread: str | None = faults
-                    ca_key_id, ca_read = None, faults != "extensions"
+                    unread: _Unread | None = faults
+                    ca_key_id = None
                 elif faults:
                     warnings.append(_ca_cause_warning(ca, others, faults))
                     continue
                 else:
-                    unread = None
                     ca_key_id, ca_read = _key_identifier(ca)
+                    unread = None if ca_read else "extensions"
                 if other_ids is None:
                     other_ids = [(other, _key_identifier(other)[0]) for other in others]
                 for other, key_id in other_ids:
@@ -1831,19 +1831,19 @@ class IssuerIndex:
                         )
                     else:
                         why = ""
-                        if unread or not ca_read:
+                        if unread:
                             # Only unread extensions hide which clients rule the namesake out.
                             rules_out = (
                                 ", or which client certificates of that CA carry an authority key "
                                 f"identifier that rules block {other.position} out"
-                                if key_id is not None and not ca_read
+                                if key_id is not None and unread == "extensions"
                                 else ""
                             )
                             why = (
-                                f" The {unread or 'extensions'} of block {ca.position} cannot be "
-                                f"read here, so this check cannot tell whether block {ca.position} "
-                                "itself is the cause, as a CA strict verification refuses would be"
-                                f"{rules_out}. Check block {ca.position} too."
+                                f" {_UNREAD_TEXT[unread].format(ca.position)}, so this check "
+                                f"cannot tell whether block {ca.position} itself is the cause, as "
+                                f"a CA strict verification refuses would be{rules_out}. Check "
+                                f"block {ca.position} too."
                             )
                         effect = (
                             f"may take block {other.position} as the issuer of a client "
@@ -1864,12 +1864,22 @@ class IssuerIndex:
 #: where warnings are errors.
 _UNREAD_CA_EXTENSIONS = (x509.DuplicateExtension, ValueError, UserWarning, *_UNREAD_EXTENSIONS)
 
+#: What :func:`_strict_ca_faults` could not read of a CA, and how the namesake warning says so,
+#: given the CA's block number.
+_Unread = Literal["extensions", "issuer name", "name comparison"]
+_UNREAD_TEXT: dict[_Unread, str] = {
+    "extensions": "The extensions of block {} cannot be read here",
+    "issuer name": "The issuer name of block {} cannot be read here",
+    "name comparison": "The engine cannot compare the issuer name of block {} with its subject",
+}
 
-def _strict_ca_faults(ca: _Anchor) -> list[str] | Literal["extensions", "issuer name"]:
+
+def _strict_ca_faults(ca: _Anchor) -> list[str] | _Unread:
     """At least some of the reasons strict verification refuses ``ca`` as a CA, read from its own
-    version and extensions. When it finds none and ``cryptography`` cannot read what it needs, it
-    says what: a version-3 CA's ``"extensions"``, or its ``"issuer name"`` where an authority key
-    identifier fault needs it. A version-1 CA whose extensions do not read still carries
+    version and extensions. When it finds none and cannot read what it needs, it says what: a
+    version-3 CA's ``"extensions"``, or, where an authority key identifier fault needs it, its
+    ``"issuer name"``, or the ``"name comparison"`` an engine defect stops (:func:`_self_issued`).
+    A version-1 CA whose extensions do not read still carries
     extensions, so it gets that fault. The reasons read are not complete: an empty list means
     none of these was found, not that strict verification accepts it.
 
@@ -1962,7 +1972,7 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | Literal["extensions", "issuer 
             ca.position,
             exc,
         )
-        return faults or "issuer name"
+        return faults or "name comparison"
     if issued:
         faults.append(
             f"it is not self-signed and {lacks}, which strict verification requires once its "
@@ -1986,6 +1996,8 @@ def _self_issued(issuer: x509.Name, subject: x509.Name) -> bool:
 
 
 def _openssl_name_key(name: x509.Name) -> CrlIssuerKey:
+    """``name`` as :func:`_self_issued` compares it: :func:`_crl_issuer_key`'s form with ASCII
+    white space folded in each text value. Compare it only with another key from here."""
     return tuple(
         tuple(
             sorted(

@@ -1498,6 +1498,21 @@ async def test_a_root_whose_names_differ_only_in_string_type_is_self_signed(
     assert await _ca_alone_refuses(tmp_path, (root, key)) == (False, False)
 
 
+def _name(*attributes: tuple[x509.ObjectIdentifier, str, _ASN1Type | None]) -> x509.Name:
+    """A name of one attribute per RDN, each in the string type given, or the default."""
+    return x509.Name(
+        [
+            x509.NameAttribute(oid, value) if kind is None else x509.NameAttribute(oid, value, kind)
+            for oid, value, kind in attributes
+        ]
+    )
+
+
+_SPELLED = b"Acm\xc3\xa9 CA"  # UTF-8 bytes of a name with one letter outside ASCII
+_CN = NameOID.COMMON_NAME
+_T61 = _ASN1Type.T61String
+
+
 async def test_a_root_whose_issuer_openssl_reads_as_latin_1_is_self_signed(tmp_path: Path) -> None:
     """A root with no authority key identifier, its issuer's common name a T61String holding the
     UTF-8 bytes of a name with one letter outside ASCII, and its subject's the UTF8String those
@@ -1534,73 +1549,66 @@ async def test_a_root_whose_issuer_openssl_reads_as_latin_1_is_self_signed(tmp_p
         await source.stop()
 
 
-def _name(*attributes: tuple[x509.ObjectIdentifier, str, _ASN1Type | None]) -> x509.Name:
-    """A name of one attribute per RDN, each in the string type given, or the default."""
-    return x509.Name(
-        [
-            x509.NameAttribute(oid, value) if kind is None else x509.NameAttribute(oid, value, kind)
-            for oid, value, kind in attributes
-        ]
-    )
-
-
-_SPELLED = b"Acm\xc3\xa9 CA"  # UTF-8 bytes of a name with one letter outside ASCII
-_CN = NameOID.COMMON_NAME
-_T61 = _ASN1Type.T61String
-
-
 @pytest.mark.parametrize(
-    ("subject", "issuer"),
+    ("subject", "issuer", "one_name"),
     [
-        pytest.param(
-            _name((_CN, _SPELLED.decode("latin-1"), None)),
-            _name((_CN, _SPELLED.decode("utf-8"), _T61)),
-            id="t61-read-as-latin-1",
-        ),
         pytest.param(
             _name((_CN, _SPELLED.decode("utf-8"), None)),
             _name((_CN, _SPELLED.decode("utf-8"), _T61)),
+            False,
             id="t61-read-as-utf-8",
         ),
         pytest.param(
             _name((_CN, _SPELLED.decode("latin-1"), None)),
             _name((_CN, " " + _SPELLED.decode("utf-8").replace(" ", "  "), _T61)),
+            True,
             id="latin-1-and-white-space",
         ),
         pytest.param(
-            _name((_CN, "Acme CA", None)), _name((_CN, " ACME \t ca ", None)), id="ascii-folds"
+            _name((_CN, "Acme CA", None)),
+            _name((_CN, " ACME \t ca ", None)),
+            True,
+            id="ascii-folds",
         ),
         pytest.param(
-            _name((_CN, "Acme CA", None)), _name((_CN, "Acme CA", None)), id="no-break-space"
+            _name((_CN, "Acme CA", None)),
+            _name((_CN, "Acme" + chr(0xA0) + "CA", None)),
+            False,
+            id="no-break-space",
         ),
         pytest.param(
             _name((_CN, "Acme CA", None), (NameOID.SERIAL_NUMBER, "123", None)),
             _name((_CN, "Acme CA", None), (NameOID.SERIAL_NUMBER, "123", _ASN1Type.NumericString)),
+            False,
             id="numeric-string",
         ),
     ],
 )
 async def test_whether_a_root_is_self_signed_is_read_as_openssl_reads_it(
-    tmp_path: Path, subject: x509.Name, issuer: x509.Name
+    tmp_path: Path, subject: x509.Name, issuer: x509.Name, one_name: bool
 ) -> None:
     """Whether a root with no authority key identifier is self-signed, as the CA-cause check reads
-    it, against OpenSSL's own answer, measured, not written down: a strict listener trusting the
-    root alone admits its client only when OpenSSL reads its issuer and subject as one name, and
-    otherwise looks for an issuer it does not hold and refuses (error 2 under ``openssl verify``).
-    Before this fix, on this branch, the check read a T61String as UTF-8 where OpenSSL reads
-    Latin-1, folded white space outside ASCII, and ignored a NumericString's type, so a root with
-    an issuer could read as self-signed and its missing authority key identifier go unnamed; and
-    a name differing in white space and a Latin-1 value at once read as another (BACKLOG
-    #4948)."""
+    it, against OpenSSL's own answer. A strict listener trusting the root alone admits its client
+    (202) only when OpenSSL reads the root's issuer and subject as one name, and otherwise looks
+    for an issuer it does not hold and refuses at the handshake (error 2 under ``openssl
+    verify``). ``one_name`` pins the answer measured on OpenSSL 3.5.7, so a refusal for another
+    reason fails the case. Before this fix, on this branch, the check disagreed with OpenSSL on
+    every case here but the ASCII folds: it read a T61String as UTF-8 where OpenSSL reads Latin-1,
+    folded white space outside ASCII, ignored a NumericString's type, and read a name differing
+    in white space and a Latin-1 value at once as another. The Latin-1 reading alone is the case
+    above (BACKLOG #4948)."""
     root, key = _strict_ca(akid=False, subject=subject, issuer_name=issuer)
     source = await _started(_source(tmp_path, [root], {subject.rfc4514_string(): [SUBJECT]}))
     try:
-        refused = await _handshake_refused(source, _bundle(tmp_path, (root, key)))
+        if one_name:
+            assert await _admitted(source, _bundle(tmp_path, (root, key))) == 202
+        else:
+            assert await _handshake_refused(source, _bundle(tmp_path, (root, key)))
     finally:
         await source.stop()
     (anchor,) = IssuerIndex(_pem(root).decode("ascii"))._by_subject_name[subject]
-    named = [_CA_FAULTS["no-authority-key-identifier"]] if refused else []
-    assert pki._strict_ca_faults(anchor) == named, refused
+    named = [] if one_name else [_CA_FAULTS["no-authority-key-identifier"]]
+    assert pki._strict_ca_faults(anchor) == named
 
 
 async def test_a_key_usage_without_key_cert_sign_is_no_ca_to_openssl(tmp_path: Path) -> None:
@@ -1802,9 +1810,15 @@ def test_an_engine_defect_reading_string_types_is_logged_as_one(
 
     monkeypatch.setattr(pki, "_crl_attribute_key", defect)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.pki"):
-        assert pki._strict_ca_faults(anchor) == "issuer name"
+        assert pki._strict_ca_faults(anchor) == "name comparison"
     warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("stand-in engine defect" in m for m in warned), warned
+    # The namesake warning says the engine could not compare, not that the file is unreadable.
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root)
+    cadata = (_pem(acme[0]) + _pem(namesake)).decode("ascii")
+    (warning,) = IssuerIndex(cadata).namesake_warnings()
+    assert "The engine cannot compare the issuer name of block 1 with its subject" in warning
+    assert "cannot be read" not in warning, warning
 
 
 def test_extensions_that_warn_do_not_raise_out_of_the_namesake_warning() -> None:
