@@ -819,8 +819,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    PR #377).** Where the DEK *comes from* is now routed through a pluggable **KeyProvider** seam
    ([store/keyprovider.py](../messagefoundry/store/keyprovider.py)) selected by the `[store].key_provider`
    setting — built-in `auto`/`env`/`dpapi` (the default `auto` is **byte-identical** to the prior
-   env-then-DPAPI ladder above) plus lazy `aws_kms`/`azure_kv`/`gcp_kms`/`vault`/`pkcs11` hooks that
-   **envelope-decrypt** a wrapped DEK inside an **isolated security module** (HSM/KMS/Vault). The seam
+   env-then-DPAPI ladder above) plus the lazy `vault` provider, which **envelope-decrypts** a wrapped
+   DEK inside an **isolated security module**, HashiCorp Vault Transit. The four other external names
+   ADR 0019 declared, `aws_kms`, `azure_kv`, `gcp_kms` and `pkcs11`, were never built and are no longer
+   accepted (vault BACKLOG #2595). The seam
    changes only *how* the key bytes are provisioned, never how they are used — the AES-256-GCM keyring,
    the `mfenc:v1` format, and `rotate-key` are unchanged. Selecting an unbuilt/unknown provider **fails
    closed** (`KeyProviderError` → `serve` won't start), never silently to the identity (plaintext) cipher.

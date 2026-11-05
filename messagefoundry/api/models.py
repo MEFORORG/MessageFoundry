@@ -1674,7 +1674,7 @@ class SecurityPosture(BaseModel):
     environment: str | None = None  # the active-environment NAME (ADR 0017)
     backend: str  # store backend: "sqlite" | "postgres" | "sqlserver"
     encryption_enabled: bool  # whether the LIVE store cipher encrypts at rest
-    key_source: str  # [store].key_provider name (auto|env|dpapi|aws_kms|...); NOT key material
+    key_source: str  # [store].key_provider name (auto|env|dpapi|vault); NOT key material
     key_id: str | None = (
         None  # active key FINGERPRINT only (first 16 hex of SHA-256(key)); never bytes
     )

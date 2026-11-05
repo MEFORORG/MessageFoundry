@@ -23,12 +23,14 @@ consumes — ``active_key()`` is the base64 of a 32-byte DEK (or ``None`` → id
 * ``auto`` (default) — the env-then-DPAPI ladder, **byte-identical** to the pre-seam ``resolve_active_key``.
 * ``env`` — the ``MEFOR_STORE_ENCRYPTION_KEY`` value (``settings.encryption_key``).
 * ``dpapi`` — the Windows DPAPI-protected ``encryption_key_file`` decrypted into memory.
-* ``aws_kms`` | ``azure_kv`` | ``gcp_kms`` | ``vault`` | ``pkcs11`` — external HSM/KMS/Vault providers that
-  **envelope-decrypt** a wrapped DEK inside an isolated security module. These are **lazy, optional
-  extras** that are **not built here** (ADR 0019 §3/§5 — one provider per follow-on PR), so the base
-  install pulls **zero** cloud SDKs. Selecting one before its module ships **fails closed** (ADR 0019
-  §4) — it raises :class:`KeyProviderError` out of ``resolve_active_key``, never a silent degrade to the
-  identity (plaintext) cipher.
+* ``vault`` — the one external provider: it **envelope-decrypts** a wrapped DEK inside HashiCorp Vault
+  Transit (``keyprovider_vault.py``), a **lazy, optional extra**, so the base install pulls no SDK for it.
+
+Any other name **fails closed** (ADR 0019 §4): it raises :class:`KeyProviderError` out of
+``resolve_active_key``, never a silent degrade to the identity (plaintext) cipher. That includes the
+four external names ADR 0019 declared and nobody built, ``aws_kms``, ``azure_kv``, ``gcp_kms`` and
+``pkcs11``, which are no longer accepted (vault BACKLOG #2595 slice D; ADR 0019, *Amendment
+2026-11-05*).
 """
 
 from __future__ import annotations
@@ -150,9 +152,9 @@ _BUILTIN_PROVIDER_CLASSES: dict[
 _BUILTIN_PROVIDERS = tuple(_BUILTIN_PROVIDER_CLASSES)
 
 #: External provider name → optional ``pyproject`` extra that carries its SDK. Each envelope-decrypts
-#: a wrapped DEK inside an isolated security module (ADR 0019 §3). Each lives in its own module, loaded
-#: by :func:`_load_external_provider`: ``vault`` ships (``keyprovider_vault.py``), and the rest are not
-#: built yet and fail closed if selected. The keyless at-rest gate
+#: a wrapped DEK inside an isolated security module (ADR 0019 §3) and lives in its own module, loaded
+#: by :func:`_load_external_provider`. ``vault`` (``keyprovider_vault.py``) is the only one: a name is
+#: added here with its module, never ahead of it (vault BACKLOG #2595 slice D). The keyless at-rest gate
 #: (:func:`provider_reads_a_configured_key`, via ``_store_key_configured`` in ``__main__.py``) counts
 #: every name here as a configured key, before it resolves. That is safe because
 #: ``store.base._checked_active_key`` refuses "no key" from any of them, on both the
@@ -160,11 +162,7 @@ _BUILTIN_PROVIDERS = tuple(_BUILTIN_PROVIDER_CLASSES)
 #: file-secret: it names a provider, not key material, so it must never be added to
 #: ``_FILE_SECRET_KEYS`` (ADR 0019 §2).
 _EXTERNAL_PROVIDERS: dict[str, str] = {
-    "aws_kms": "aws_kms",
-    "azure_kv": "azure_kv",
-    "gcp_kms": "gcp_kms",
     "vault": "vault",
-    "pkcs11": "pkcs11",
 }
 
 #: Every accepted ``[store].key_provider`` value (built-in + external), for validation + error messages.
@@ -230,11 +228,11 @@ def _load_external_provider(
 ) -> KeyProvider:
     """Lazy hook for an external HSM/KMS/Vault envelope-decrypt provider (ADR 0019 §3).
 
-    The seam: a future per-provider PR ships ``messagefoundry/store/keyprovider_<name>.py`` exposing
-    ``build_provider(settings, *, posture) -> KeyProvider`` behind the optional ``<extra>`` extra;
-    this dispatch picks it up by import with **no edit here**. Until that module ships the import
-    fails and we **fail closed** — the base install pulls **zero** cloud SDKs (no dependency lands
-    from ADR 0019).
+    The seam: each provider is ``messagefoundry/store/keyprovider_<name>.py`` exposing
+    ``build_provider(settings, *, posture) -> KeyProvider`` behind the optional ``<extra>`` extra,
+    imported only when selected, so the base install pulls no provider SDK. A provider is added by
+    shipping that module and naming it in :data:`_EXTERNAL_PROVIDERS` in the same change. An import
+    that fails **fails closed**.
 
     ``posture`` is handed to every external provider, because each one dials a network hop that
     a posture-keyed guard may judge (vault BACKLOG #2983). It is ``None`` where the caller holds
@@ -245,14 +243,13 @@ def _load_external_provider(
         module = importlib.import_module(module_name)
     except ModuleNotFoundError as exc:
         if exc.name == module_name:
-            # The provider module itself hasn't shipped yet (the common case today).
+            # Every named provider ships its module, so this install is missing a file of its own.
             raise KeyProviderError(
-                f"[store].key_provider={name!r} (external HSM/KMS/Vault envelope decryption, ADR 0019 "
-                f"§3) is designed but not built yet — it lands per-provider under WP-BL3-04 behind the "
-                f"optional {extra!r} extra. Use 'auto' (default), 'env', or 'dpapi' until then."
+                f"[store].key_provider={name!r}: its provider module {module_name} is missing from "
+                "this install. Reinstall MessageFoundry."
             ) from exc
-        # The provider module shipped but a backend it imports (e.g. its cloud SDK) is missing — a
-        # distinct, actionable failure: install the extra rather than "not built yet".
+        # The provider module shipped but a backend it imports (e.g. its SDK) is missing -- a
+        # distinct, actionable failure: install the extra.
         raise KeyProviderError(
             f"[store].key_provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra."
@@ -267,8 +264,8 @@ def resolve_key_provider(
 ) -> KeyProvider:
     """Build the :class:`KeyProvider` selected by ``[store].key_provider`` (ADR 0019 §2).
 
-    ``auto`` (default) / ``env`` / ``dpapi`` are the built-ins; the external HSM/KMS/Vault names are
-    lazy optional extras (:func:`_load_external_provider`). An unknown name **fails closed** with
+    ``auto`` (default) / ``env`` / ``dpapi`` are the built-ins; the external ``vault`` is a lazy
+    optional extra (:func:`_load_external_provider`). An unknown name **fails closed** with
     :class:`KeyProviderError` rather than silently falling back to the identity cipher.
 
     ``posture`` reaches an external provider only; the built-ins dial nothing. ``None`` counts as

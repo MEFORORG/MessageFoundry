@@ -230,9 +230,9 @@ for, not how it is protected before it gets there.
   pulls no SDK); or `[store].cipher_provider = vault_transit`, where there is no local key material at
   all, because the bulk encrypt/decrypt happens inside Transit and `encryption_key` / `key_provider` go
   unused. `[store].key_provider` also accepts `auto` (the default: environment then DPAPI) and the
-  pinned `env` / `dpapi`. The remaining external provider names — `aws_kms`, `azure_kv`, `gcp_kms`,
-  `pkcs11` — are designed but **not built**, and selecting one fails closed at store open rather than
-  degrading to the plaintext cipher. Restrict the data-volume and service account (see
+  pinned `env` / `dpapi`, and no other value: the four external names ADR 0019 declared and nobody
+  built, `aws_kms`, `azure_kv`, `gcp_kms` and `pkcs11`, were removed (vault BACKLOG #2595), and an
+  unknown name fails closed at store open rather than degrading to the plaintext cipher. Restrict the data-volume and service account (see
   [SERVICE.md](SERVICE.md)); volume encryption (BitLocker/LUKS) is the required at-rest layer for the
   columns outside the cipher.
 - **Distribution / holders** — the engine needs exactly **one** holder: the process account, by

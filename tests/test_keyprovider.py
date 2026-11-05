@@ -27,6 +27,7 @@ from messagefoundry.store.keyprovider import (
     EnvKeyProvider,
     KeyProvider,
     KeyProviderError,
+    provider_reads_a_configured_key,
     resolve_key_provider,
 )
 
@@ -47,18 +48,10 @@ def test_builtins_satisfy_the_runtime_checkable_protocol() -> None:
         assert isinstance(provider, KeyProvider)
 
 
-def test_known_providers_is_the_full_adr_enum() -> None:
-    # auto/env/dpapi (built-in) + the five external envelope-decrypt providers (ADR 0019 §2).
-    assert KNOWN_PROVIDERS == (
-        "auto",
-        "env",
-        "dpapi",
-        "aws_kms",
-        "azure_kv",
-        "gcp_kms",
-        "vault",
-        "pkcs11",
-    )
+def test_known_providers_is_the_built_set() -> None:
+    # auto/env/dpapi (built-in) + vault, the one external provider that is built. Vault BACKLOG #2595
+    # slice D removed the four names ADR 0019 declared and nobody built.
+    assert KNOWN_PROVIDERS == ("auto", "env", "dpapi", "vault")
 
 
 def test_default_key_provider_is_auto_and_not_a_secret() -> None:
@@ -139,18 +132,30 @@ def test_retired_keys_empty_by_default() -> None:
     assert list(EnvKeyProvider(StoreSettings()).retired_keys()) == []
 
 
-# --- external providers: lazy + fail-closed (not built yet) ------------------
+# --- external providers: lazy + fail-closed ---------------------------------
 
 
-# `vault` is intentionally omitted: its provider module (store/keyprovider_vault.py) now ships (BACKLOG
-# #196), so selecting it no longer fails closed as "not built yet" — its own fail-closed paths (missing
-# hvac / missing config / Transit failure) are covered in tests/test_keyprovider_vault.py.
+# `vault`'s own fail-closed paths (missing hvac / missing config / Transit failure) are covered in
+# tests/test_keyprovider_vault.py.
 @pytest.mark.parametrize("name", ["aws_kms", "azure_kv", "gcp_kms", "pkcs11"])
-def test_external_provider_fails_closed_until_built(name: str) -> None:
-    # Selecting an external provider before its module ships raises (never a silent degrade to the
-    # identity cipher), and the message names the optional extra so the operator knows what to install.
-    with pytest.raises(KeyProviderError, match=name):
+def test_a_removed_provider_name_is_refused_as_unknown(name: str) -> None:
+    # Vault BACKLOG #2595 slice D: the four names nobody built are no longer accepted. Selecting one
+    # raises as any unknown name does (never a silent degrade to the identity cipher), naming it.
+    with pytest.raises(KeyProviderError, match=rf"unknown \[store\]\.key_provider '{name}'"):
         resolve_key_provider(StoreSettings(key_provider=name))
+    assert not provider_reads_a_configured_key(StoreSettings(key_provider=name))
+
+
+def test_a_named_provider_whose_module_is_missing_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Every name in the dispatch ships its module, so a missing one is a broken install, refused.
+    def _missing(name: str) -> ModuleType:
+        raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+
+    monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _missing)
+    with pytest.raises(KeyProviderError, match="provider module .* is missing from this install"):
+        resolve_key_provider(StoreSettings(key_provider="vault"))
 
 
 def test_external_provider_lazy_hook_wires_a_shipped_module(
@@ -308,7 +313,7 @@ def test_faked_provider_key_decrypts_existing_mfenc_v1_rows_without_rotation() -
     mfenc:v1 format are byte-identical."""
 
     class FakeExternalProvider:
-        """Stands in for a future aws_kms/vault provider — returns the unwrapped DEK as base64."""
+        """Stands in for an external provider such as vault — returns the unwrapped DEK as base64."""
 
         def __init__(self, active: str, retired: list[str]) -> None:
             self._active, self._retired = active, retired
@@ -357,7 +362,7 @@ def test_wrong_provider_key_fails_loudly() -> None:
 
 
 class _FixedExternalProvider:
-    """Stands in for a future aws_kms/azure_kv/gcp_kms/vault/pkcs11 provider: envelope-decrypts a
+    """Stands in for an external provider such as vault, or a later one: envelope-decrypts a
     wrapped DEK and surfaces the SAME base64 DEK bytes the built-ins do, with NO re-encoding (the Vault
     'return plaintext with no re-encoding' contract, keyprovider_vault.py). A provider that silently
     re-encoded/normalized/double-base64'd the DEK here is exactly what this parity test must catch."""

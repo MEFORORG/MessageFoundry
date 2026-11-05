@@ -781,9 +781,9 @@ class StoreSettings(_Section):
     # KeyProvider seam (ADR 0019, ASVS 13.3.3): selects HOW the active/retired DEK bytes are *sourced* —
     # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the
     # default) is the env-then-DPAPI ladder, BYTE-IDENTICAL to the pre-seam behavior; `env`/`dpapi` pin a
-    # single built-in source; `aws_kms`|`azure_kv`|`gcp_kms`|`vault`|`pkcs11` are external HSM/KMS/Vault
-    # envelope-decrypt providers (lazy, optional extras; `vault` ships in store/keyprovider_vault.py, the
-    # rest are not built yet and fail closed if selected). Every external provider counts as a
+    # single built-in source; `vault` is the one external envelope-decrypt provider (a lazy, optional
+    # extra, store/keyprovider_vault.py). Any other name fails closed (vault BACKLOG #2595 slice D
+    # removed the external names nobody built). Every external provider counts as a
     # configured key for the keyless at-rest gate, before it resolves (BACKLOG #1998). This
     # names a *provider*, not key material, so it is NOT a secret — it must never be added to
     # `_FILE_SECRET_KEYS`. Unknown/unresolvable values fail closed at `open_store` (store/keyprovider.py).

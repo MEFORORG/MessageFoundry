@@ -642,7 +642,7 @@ environment.
 > Each one's settings and preconditions are in [CONFIGURATION.md](CONFIGURATION.md), under
 > [`[store]`](CONFIGURATION.md#store--message-store--db) and
 > [`[secrets]`](CONFIGURATION.md#secrets--connector-secretprovider-selection); the `[store]` row also
-> says which other key providers are not built. For any other source, fetch the secret in your
+> lists every key provider the engine accepts. For any other source, fetch the secret in your
 > service-start wrapper and export it as the corresponding `MEFOR_*` variable, or place the DPAPI key
 > file via your provisioning tool. That covers Windows Credential Manager, Azure Key Vault via a
 > **managed identity**, and any credential with no reference field. An AD **gMSA** has no

@@ -3,7 +3,10 @@
 - **Status:** **Accepted (2026-06-17); Amended 2026-06-18 — core seam BUILT; Amended 2026-07-10 — `vault`
   provider (BACKLOG #196) + secret-rotation reminder (§5.1, BACKLOG #195b) BUILT; Amended 2026-07-12 —
   connector `SecretProvider` (§5) promoted design → BUILT, AD-bind + SMTP credential points wired (see
-  the [2026-07-12 amendment](#amendment-2026-07-12--connector-secretprovider-5-promoted-to-built)).**
+  the [2026-07-12 amendment](#amendment-2026-07-12--connector-secretprovider-5-promoted-to-built));
+  Amended 2026-11-05 — the four unbuilt external provider names `aws_kms`, `azure_kv`, `gcp_kms` and
+  `pkcs11` removed, so `vault` is the one external provider (see the
+  [2026-11-05 amendment](#amendment-2026-11-05--the-four-unbuilt-external-provider-names-are-removed-vault-backlog-2595-slice-d)).**
   Designs the pluggable
   **KeyProvider** seam (work package **WP-BL3-04**) that lets the store's at-rest data-encryption key be
   sourced from an external HSM / cloud KMS / Vault via **envelope decryption**. **As of the 2026-06-18
@@ -878,3 +881,26 @@ those nonces. `ide/src/webviewMessaging.ts`
 3. **A reported failure raises.** Node's synchronous form throws, and `nonce` does not catch it.
    CPython raises when `BCryptGenRandom` reports a failure. No source read here says whether a
    generator can return weak bytes without reporting a failure, or how often a failure happens.
+
+## Amendment 2026-11-05 — the four unbuilt external provider names are removed (vault BACKLOG #2595 slice D)
+
+**What changed.** `[store].key_provider` no longer accepts `aws_kms`, `azure_kv`, `gcp_kms` or
+`pkcs11`. The accepted values are `auto`, `env`, `dpapi` and `vault`, and `vault` is the one external
+provider, built in [store/keyprovider_vault.py](../../messagefoundry/store/keyprovider_vault.py).
+A removed name is now refused as an unknown name, with the same `KeyProviderError` at store open,
+so selecting one still fails closed and never degrades to the identity (plaintext) cipher. The
+keyless at-rest gate no longer counts a removed name as a configured key: it is judged as any
+unknown name is, keyed only when a local key is set.
+
+**Why.** No module for any of the four was ever built, and a name the engine accepts but cannot
+serve reads to an operator as a supported option. The secrets-architecture review's decisions
+index asked, as its question 12, whether to remove them. The Manager answered yes on 2026-10-01,
+under the owner's driver rule, and the owner may overturn it. That index is in the maintainer
+vault.
+
+**What stands.** The seam itself is unchanged: `_load_external_provider` imports
+`keyprovider_<name>.py` for a name in `_EXTERNAL_PROVIDERS`, so a later provider is added by shipping
+its module and its name in the same change, never the name ahead of the module. The sections above
+that list the four names, at least the *Built* bullet in the header, section 2's value set and
+section 3's provider table, record the design as it was accepted. Read them as the design of
+providers that are not offered, not as accepted values.

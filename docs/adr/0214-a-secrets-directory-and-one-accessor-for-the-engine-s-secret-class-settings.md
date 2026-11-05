@@ -148,3 +148,11 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 - [ ] Whether the directory's location becomes a fixed path under the data directory once the
       installer creates it (slice C), or stays operator-named.
 - [ ] Whether a Windows file is also DPAPI-wrapped, after the user-scope DPAPI spike.
+
+## Amendments
+
+- **2026-11-05, slice D built.** `[store].key_provider` no longer accepts the four external names
+  ADR 0019 declared and nobody built, `aws_kms`, `azure_kv`, `gcp_kms` and `pkcs11`; each is now
+  refused as an unknown name. Question 12 of the maintainer-internal decisions index answered yes
+  (Manager decision 2026-10-01, under the owner's driver rule). ADR 0019 carries the matching
+  amendment.
