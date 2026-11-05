@@ -5360,17 +5360,6 @@ def _supervise(args: argparse.Namespace) -> int:
     # forwarder (BACKLOG #2356).
     configure_logging("INFO")
 
-    # The supervisor has no API and builds no loosening list, so its own reading is reported here.
-    # Each shard reports its own through `serve`.
-    security_lines: list[tuple[str, str]] = []
-    remote_debug_reading = remote_debug_posture()
-    remote_debug = remote_debug_loosening(remote_debug_reading)
-    if remote_debug is not None:
-        security_lines.append(remote_debug)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
-        )
-
     # ADR 0050 AC-9: anchor the discovery --config and the --db base under the project root HERE, before
     # discover_shard_specs runs load_config() — so `supervise --project-root R --config <relative>` from a
     # non-root CWD discovers shards under R, and each shard's <stem>_<shard>.db composes under R in the
@@ -5437,7 +5426,7 @@ def _supervise(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2701: the start-up code check each engine shard's `serve` makes, for the same
     # reason as the gates around it, and because the supervisor's own interpreter ran that code
     # too. The supervisor builds no loosening list, so its own reading is logged here, like the
-    # remote-debugging one above. Each engine shard reports its own through `serve`. The reading
+    # remote-debugging one below. Each engine shard reports its own through `serve`. The reading
     # also searches the import path the engine shards inherit, so a module only they would run
     # refuses here.
     from messagefoundry.config.ai_policy import SecurityEnforcement
@@ -5455,10 +5444,21 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
     # Vault BACKLOG #2700: the supervisor's OWN process. Its engine shards start with the
     # interface off (messagefoundry/childenv.py), so none of them would refuse on it.
+    remote_debug_reading = remote_debug_posture()
     if _remote_debug_refused(
         settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
     ):
         return 2
+    # The supervisor has no API and builds no loosening list, so its own reading is reported here,
+    # and only after the refusal above (vault BACKLOG #3795 item 8): a fleet refused on the
+    # reading does not first log it as a residual.
+    security_lines: list[tuple[str, str]] = []
+    remote_debug = remote_debug_loosening(remote_debug_reading)
+    if remote_debug is not None:
+        security_lines.append(remote_debug)
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
+        )
     if settings.security.allow_remote_debugging:
         accepted = REMOTE_DEBUG_ACCEPTANCE_LOOSENING
         security_lines.append(accepted)

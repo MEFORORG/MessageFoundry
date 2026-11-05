@@ -121,6 +121,7 @@ from messagefoundry.controlchars import scrub_log_argument
 
 __all__ = [
     "REMOTE_DEBUG_ACCEPTANCE",
+    "REMOTE_DEBUG_ACCEPTANCE_KEY",
     "REMOTE_DEBUG_ACCEPTANCE_LOOSENING",
     "REMOTE_SCRIPT_EVENT",
     "RemoteDebugPosture",
@@ -131,14 +132,18 @@ __all__ = [
     "remote_debug_refusal",
 ]
 
-#: The named acceptance that lifts :func:`remote_debug_refusal` under ``enforce`` (owner ruling
-#: 2026-10-16, vault BACKLOG #2700). One spelling, for the refusal and the docs.
-REMOTE_DEBUG_ACCEPTANCE: Final = "[security].allow_remote_debugging"
+#: The ``[security]`` key of the named acceptance that lifts :func:`remote_debug_refusal` under
+#: ``enforce`` (owner ruling 2026-10-16, vault BACKLOG #2700). The one literal spelling: the
+#: qualified name and the loosening name below derive from it (vault BACKLOG #3795 item 7).
+REMOTE_DEBUG_ACCEPTANCE_KEY: Final = "allow_remote_debugging"
+
+#: That acceptance by its qualified name, for the refusal and the docs.
+REMOTE_DEBUG_ACCEPTANCE: Final = f"[security].{REMOTE_DEBUG_ACCEPTANCE_KEY}"
 
 #: The loosening entry for that acceptance, while it is set: one wording for
 #: ``security_loosenings()`` and the ``supervise`` start-up line.
 REMOTE_DEBUG_ACCEPTANCE_LOOSENING: Final = (
-    "allow_remote_debugging",
+    REMOTE_DEBUG_ACCEPTANCE_KEY,
     "serve and supervise may start under enforcement = enforce with the interpreter's remote "
     "debugging (PEP 768) enabled in their process -- the start-up refusal is acknowledged away "
     "wherever it would fire. Whether the interface is on in this process is the "
