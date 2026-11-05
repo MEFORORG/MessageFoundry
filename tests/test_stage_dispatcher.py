@@ -1210,10 +1210,7 @@ async def test_busy_violation_soak_200_lanes(store: Any) -> None:
         contention = (
             f"claim head skips={d.claim_head_skips}, lock-timeout aborts={d.claim_lock_timeouts}"
         )
-        assert drained, (
-            f"soak did not reach quiescence; still pending: {await _pending_lanes(store, lanes)}"
-            f" ({contention})"
-        )
+        assert drained, await _drain_failure(d, store, lanes, "soak")
 
         # --- invariants ---
         assert d.busy_violations == 0
@@ -2991,6 +2988,15 @@ async def test_drain_failure_names_a_task_held_outside_the_drained_lanes(store: 
     await d.start()
     try:
         # Both heads dispatched (the stub records before it waits on a gate); only the held one stays.
+        # Per lane through `_wait_lane_until`, not a bare `_wait_until`: the periodic sweep is off, so
+        # a start-up claim that comes back EMPTY (a 1222 lock timeout or a head skip on a server
+        # store) strands that lane in terminal IDLE with its head undispatched, and only the stand-in
+        # re-readies it. The subject is the dispatch record, so a re-ready cannot mask the assertion.
+        def head_dispatched(lane: str) -> Callable[[], bool]:
+            return lambda: any(r.lane == lane for r in stub.records)
+
+        for lane in (held, drained_lane):
+            await _wait_lane_until(d, lane, head_dispatched(lane), note="its head dispatched")
         assert await _wait_until(lambda: d.processing_lanes == 1 and len(stub.records) == 2)
         # A short budget still runs one full round of the unchanged drain, including its fixed 3 s idle
         # wait; it cannot go idle while the gate holds, so the drain returns False.
