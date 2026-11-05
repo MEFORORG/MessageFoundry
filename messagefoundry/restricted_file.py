@@ -347,12 +347,7 @@ def broad_access_problem(path: Path, *, directory: bool = False) -> str | None:
 
 # --- the exact check, through an open handle (Windows) --------------------------------------------
 
-#: Who may own a key file: SYSTEM, Administrators (the owner of a file an elevated administrator
-#: creates) and the account the engine runs as. An owner keeps READ_CONTROL and WRITE_DAC whatever
-#: the access list says, so a file any other account owns could be re-granted by that account.
-_KEY_FILE_OWNERS = frozenset({SYSTEM_SID, ADMINISTRATORS_SID})
 _SE_DACL_PROTECTED = 0x1000
-_ACCESS_DENIED_ACE_TYPE = 0x01
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,22 +369,22 @@ def _who(sid: str) -> str:
 
 
 def _exact_descriptor_problem(
-    security: _HandleSecurity, engine_sid: str, *, engine_access: int
+    security: _HandleSecurity, expected: Mapping[str, int], *, engine_sid: str
 ) -> str | None:
     """Why the file ``security`` was read from is not owned and listed exactly as a key file is,
     or ``None`` when it is.
 
-    Exactly means: owned by SYSTEM, Administrators or ``engine_sid``; a protected list; and the
-    list :func:`_expected_access` gives for no creator and a read grant to ``engine_sid``, with
-    ``engine_access`` in place of read for that account, entry for entry: no extra entry of any
-    kind, a deny included, no missing one and no inheritance flag. Kept free of ctypes so the
-    decision is testable on every platform."""
+    Exactly means: owned by SYSTEM, Administrators (the owner of a file an elevated administrator
+    creates) or ``engine_sid``, because an owner keeps READ_CONTROL and WRITE_DAC whatever the list
+    says; a protected list; and ``expected`` (an :func:`_expected_access` result) entry for entry:
+    no extra entry of any kind, a deny included, no missing one and no inheritance flag. Kept free
+    of ctypes so the decision is testable on every platform."""
     if security.error is not None:
         return f"its owner and access list could not be read ({security.error})"
     owner = security.owner_sid
     if owner is None:
         return "its owner could not be read"
-    if owner not in _KEY_FILE_OWNERS | {engine_sid}:
+    if owner not in {SYSTEM_SID, ADMINISTRATORS_SID, engine_sid}:
         return (
             f"it is owned by {_who(owner)}, not by SYSTEM, Administrators or the account the "
             "engine runs as"
@@ -398,22 +393,19 @@ def _exact_descriptor_problem(
         return "it has no access list at all, so every account on the host can read or change it"
     if not security.protected:
         return "its access list does not block inheritance from the directory"
-    expected = _expected_access(None, ())
-    expected.setdefault(engine_sid, engine_access)
     wanted = sorted((ACCESS_ALLOWED_ACE_TYPE, 0, mask, sid) for sid, mask in expected.items())
+    if sorted(security.aces) == wanted:
+        return None
     for ace_type, flags, mask, sid in security.aces:
         if (ace_type, flags, mask, sid) in wanted:
             continue
         if ace_type != ACCESS_ALLOWED_ACE_TYPE or flags:
-            who = f" for {_who(sid)}" if sid else ""
             return (
-                f"its access list holds an entry of type {ace_type:#04x} with flags {flags:#04x}"
-                f"{who}, beyond the key file's own"
+                f"its access list holds an entry of type {ace_type:#04x} with flags {flags:#04x}, "
+                "beyond the key file's own"
             )
         return f"its access list grants {_who(sid)} access {mask:#010x}, beyond the key file's own"
-    if sorted(security.aces) != wanted:
-        return "its access list lacks or repeats an entry the key file's own list names"
-    return None
+    return "its access list lacks or repeats an entry the key file's own list names"
 
 
 def _read_handle_security(handle: int) -> _HandleSecurity:
@@ -502,8 +494,9 @@ def _read_handle_security(handle: int) -> _HandleSecurity:
             ace_flags = ctypes.cast(base + 1, ctypes.POINTER(ctypes.c_ubyte))[0]
             ace_mask = ctypes.cast(base + 4, ctypes.POINTER(wintypes.DWORD))[0]
             sid = ""
-            if ace_type in (ACCESS_ALLOWED_ACE_TYPE, _ACCESS_DENIED_ACE_TYPE):
-                # Both carry the account's SID right after the 4-byte header and the mask.
+            if ace_type == ACCESS_ALLOWED_ACE_TYPE:
+                # The account's SID follows the 4-byte header and the mask. Any other type is
+                # refused on its type alone, so its account is not read.
                 parsed = sid_text(base + 8)
                 if parsed is None:
                     return _HandleSecurity(error=f"the account in entry {index} could not be read")
@@ -537,11 +530,12 @@ def key_file_handle_problem(handle: int, *, engine_read_only: bool) -> str | Non
     engine_sid = _win32_config_source_probes().self_sid
     if engine_sid is None:
         return "this process's own account could not be read, so the file's owner cannot be judged"
-    return _exact_descriptor_problem(
-        _read_handle_security(handle),
-        engine_sid,
-        engine_access=_READ_ACCESS if engine_read_only else _FULL_ACCESS,
-    )
+    # The two lists write_restricted_file makes: the handoff's and the host file's.
+    if engine_read_only:
+        expected = _expected_access(None, [engine_sid])
+    else:
+        expected = _expected_access(engine_sid, ())
+    return _exact_descriptor_problem(_read_handle_security(handle), expected, engine_sid=engine_sid)
 
 
 # --- removing a file the engine wrote -------------------------------------------------------------

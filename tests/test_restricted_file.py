@@ -146,9 +146,11 @@ _EXACT_READ = (
 
 
 def _exact(security: Any, *, engine_access: int = _READ) -> str | None:
-    return restricted_file._exact_descriptor_problem(
-        security, _SERVICE, engine_access=engine_access
-    )
+    if engine_access == _READ:  # the handoff's list
+        expected = restricted_file._expected_access(None, [_SERVICE])
+    else:  # the host file's list
+        expected = restricted_file._expected_access(_SERVICE, ())
+    return restricted_file._exact_descriptor_problem(security, expected, engine_sid=_SERVICE)
 
 
 def test_the_exact_check_accepts_the_drafts_descriptor_and_each_allowed_owner() -> None:

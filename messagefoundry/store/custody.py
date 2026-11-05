@@ -650,29 +650,24 @@ def _read_posix_checked(path: Path, policy: _PosixPolicy) -> bytes:
     with handle:
         status = os.fstat(fd)
         acl: bytes | None = None
-        # Only a regular file's file system and list are read; anything else is refused on its
-        # type below.
-        regular = stat.S_ISREG(status.st_mode)
         magic = 0
+        what = "file system"
         try:
-            magic = linux_file_system_type(fd) if regular else 0
+            # Only a regular file's file system and list are read; anything else is refused on its
+            # type below.
+            if stat.S_ISREG(status.st_mode):
+                magic = linux_file_system_type(fd)
+                what = "access control list"
+                acl = posix_access_acl(fd)
         except OSError as exc:
             reason = _os_reason(exc)
         if reason is not None:
-            raise CustodyError(f"{path} is refused: its file system could not be read ({reason})")
+            raise CustodyError(f"{path} is refused: its {what} could not be read ({reason})")
         foreign = LINUX_FOREIGN_ACCESS_MODEL_FILE_SYSTEMS.get(magic)
         if foreign is not None:
             raise CustodyError(
                 f"{path} is refused: it is on a {foreign} file system, which keeps an access model "
                 "of its own that this engine cannot read; keep custody files on a local file system"
-            )
-        try:
-            acl = posix_access_acl(fd) if regular else None
-        except OSError as exc:
-            reason = _os_reason(exc)
-        if reason is not None:
-            raise CustodyError(
-                f"{path} is refused: its access control list could not be read ({reason})"
             )
         problem = _posix_file_problem(
             status.st_mode,
