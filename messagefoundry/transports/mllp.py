@@ -110,10 +110,12 @@ from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
     DestinationConnector,
+    HandlerFaultUnrecovered,
     InboundHandler,
     NegativeAckError,
     SourceConnector,
     float_setting,
+    hold_and_retry,
     intake_open,
     owes_hl7_reply,
     port_setting,
@@ -2982,10 +2984,9 @@ class MLLPSource(SourceConnector):
         exc: Exception,
         peer: object,
         peer_host: str | None,
-        *,
-        closing: bool = False,
     ) -> tuple[bool, bytes | None]:
-        """Log and record a handler fault. Returns whether a reply is owed, and the framed NAK.
+        """Log and record a handler fault that is not held. Returns whether a reply is owed, and
+        the framed NAK.
 
         BACKLOG #1619. The runner lets a store exception at the ingress commit propagate, so a
         store outage used to reach the listener's last-resort catch. That catch dropped the
@@ -2996,8 +2997,14 @@ class MLLPSource(SourceConnector):
         connection closes, as before. Closing keeps two things the old drop gave for free. Frames
         the sender pipelined behind this one go unanswered, so it resends them after this one and
         order holds. And a sender pinned to a node whose store is down reconnects, which lets a
-        load balancer move it. A sender that expects no reply keeps its socket instead: it never
-        resends, so closing would only lose the frames it already sent behind this one.
+        load balancer move it.
+
+        A sender that expects no reply never resends, so ``_on_client`` holds its frame with
+        :func:`~messagefoundry.transports.base.hold_and_retry` instead and does not call this
+        (BACKLOG #5022). The one no-reply case that does come here is a refused sender (BACKLOG
+        #4907), whose connection closes after this read either way: a hold would keep a refused
+        peer's socket open for a whole store outage, so its frame gets this one attempt, and the
+        refusal's ``ERROR`` row is lost, as docs/CONNECTIONS.md states for that case.
 
         Nothing is ACKed here, so the ACK-after-commit rule holds. A fault that came after a
         commit does mean the resend commits another copy, which at-least-once delivery allows.
@@ -3009,13 +3016,11 @@ class MLLPSource(SourceConnector):
             outcome = f"answering MSA-1 {_CODES[self.ack_mode]['AE']}, then closing the connection"
         elif owed:
             outcome = "no reply could be framed; closing the connection"
-        elif closing:
-            # BACKLOG #4907: a refused sender's connection closes after this read either way.
+        else:
+            # BACKLOG #4907: only a refused sender reaches here with no reply owed.
             outcome = (
                 "this inbound sends no reply; the sender is refused, so closing the connection"
             )
-        else:
-            outcome = "this inbound sends no reply; keeping the connection"
         logger.error(
             "MLLP message from %s failed unexpectedly in the inbound handler: %s (%s)",
             peer,
@@ -3147,27 +3152,55 @@ class MLLPSource(SourceConnector):
                         handler_dropped = False
                         for message in decoder.feed(chunk):
                             decoded += 1
+                            fault: str | None = None
                             try:
                                 # BACKLOG #1725 act 3: bounded per listener; see the method.
                                 reply = await self._handle_bounded(message, handle)
                             except Exception as exc:  # noqa: BLE001 -- see _answer_handler_failure
                                 # BACKLOG #1619: the handler faulted on a frame the decoder read
                                 # cleanly, which is not a framing fault. A store outage at the
-                                # ingress commit is one reachable case. NAK it, then close.
-                                owed, nak = await self._answer_handler_failure(
-                                    message,
-                                    exc,
-                                    writer.get_extra_info("peername"),
-                                    peer_host,
-                                    closing=unlisted,
-                                )
-                                if not owed:
-                                    continue  # no reply on this inbound: handle what follows
-                                if nak is not None:
-                                    writer.write(nak)
-                                    await self._drain_ack(writer)
-                                handler_dropped = True
-                                break
+                                # ingress commit is one reachable case.
+                                if unlisted or self._owes_handler_failure_reply():
+                                    owed, nak = await self._answer_handler_failure(
+                                        message,
+                                        exc,
+                                        writer.get_extra_info("peername"),
+                                        peer_host,
+                                    )
+                                    if not owed:
+                                        # A refused sender is not held: it closes after this read.
+                                        continue
+                                    if nak is not None:
+                                        writer.write(nak)
+                                        await self._drain_ack(writer)
+                                    handler_dropped = True
+                                    break
+                                # BACKLOG #5022: no reply is owed, so the sender never resends
+                                # and this frame is its only copy. Only the scrubbed text leaves
+                                # this clause; recover_handler_fault in transports/base.py says why.
+                                fault = safe_exc(exc)
+                            if fault is not None:
+                                # Set until recovered, so a cancel inside the hold is no clean close.
+                                failed = True
+                                try:
+                                    # Each retry runs through _handle_bounded, so it takes an
+                                    # in-flight slot and gives it back before the next pause.
+                                    reply = await hold_and_retry(
+                                        lambda raw: self._handle_bounded(raw, handle),
+                                        message,
+                                        fault,
+                                        transport="MLLP",
+                                        peer=writer.get_extra_info("peername"),
+                                        log=logger,
+                                        stopped=lambda: self._stopping,
+                                        report=lambda reason: self._emit_event(
+                                            "handler_error", peer_host=peer_host, reason=reason
+                                        ),
+                                    )
+                                except HandlerFaultUnrecovered:
+                                    handler_dropped = True  # handler_error is recorded; close
+                                    break
+                                failed = False
                             if reply is not None:
                                 # ADR 0205: a reply never carries a second frame boundary.
                                 writer.write(
