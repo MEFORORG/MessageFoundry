@@ -1102,9 +1102,10 @@ async def test_a_namesake_with_another_key_identifier_is_warned_to_refuse_a_vers
     """A loaded certificate that is no CA, with a key identifier that differs from the CA's, with
     the CA's subject. OpenSSL rules it out for a client certificate whose authority key identifier
     names the CA's key, but not for one with none. A version-1 client certificate has none, and the
-    listener's strict verification accepts it (the control below). In the shipped code the warning
-    said such a namesake could be taken only for a certificate strict verification refuses anyway,
-    which would have told an operator a harmful namesake was harmless (BACKLOG #4948).
+    listener's strict verification accepts it (the control below). Before this fix, on this
+    branch, the warning said such a namesake could be taken only for a certificate strict
+    verification refuses anyway, which would have told an operator a harmful namesake was
+    harmless (BACKLOG #4948).
 
     Measured on Windows, OpenSSL 3.5.7: listed after the CA, the namesake refused the version-1
     client at the handshake, and listed first it did not; the version-3 client was admitted in both
@@ -1155,10 +1156,10 @@ async def test_a_namesake_of_a_ca_with_no_key_identifier_names_the_ca_as_the_cau
     """A CA with no subject key identifier, beside a namesake that is no CA. The listener verifies
     strictly, and strict verification refuses every client of such a CA with the CA ALONE,
     measured here for a version-3 client naming its key and a version-1 client. So the warning
-    says every client of the CA is refused, and names the CA as the cause rather than the
-    namesake. In the shipped code a namesake with a key identifier took the
-    differing-key-identifier warning, which named only clients with no authority key identifier
-    and blamed the namesake (BACKLOG #4948)."""
+    says every client whose chain runs through the CA is refused, and names the CA as the cause
+    rather than the namesake. Before this fix, on this branch, a namesake with a key identifier
+    took the differing-key-identifier warning, which named only clients with no authority key
+    identifier and blamed the namesake (BACKLOG #4948)."""
     acme = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), key_usage=True, key_ids=False)
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root, skid=namesake_skid)
@@ -1166,9 +1167,10 @@ async def test_a_namesake_of_a_ca_with_no_key_identifier_names_the_ca_as_the_cau
         acme[0].extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
     cadata = (_pem(acme[0]) + _pem(namesake)).decode("ascii")
     (warning,) = IssuerIndex(cadata).namesake_warnings()
-    assert "refuses every client certificate of that CA under strict verification" in warning
-    assert "whether or not block 2 is loaded" in warning, warning
+    assert "under strict verification, every client certificate whose chain runs" in warning
+    assert "through block 1, whether or not block 2 is loaded" in warning, warning
     assert "because block 1 has no subject key identifier" in warning, warning
+    assert "as a version-3 CA with basic constraints" in warning, warning
     # The cause, measured: with the CA alone, the strict listener refuses both kinds of client.
     source = await _started(_source(tmp_path, [acme[0]], {"CN=Acme CA": [SUBJECT]}))
     try:
@@ -1181,21 +1183,26 @@ async def test_a_namesake_of_a_ca_with_no_key_identifier_names_the_ca_as_the_cau
 def test_a_namesake_of_a_ca_whose_key_identifier_cannot_be_read_says_so(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A CA whose extensions ``cryptography`` cannot read may still have a key identifier OpenSSL
-    reads, so the check cannot tell which of its clients rule a namesake with one out. The warning
-    then says every client may be refused, and why (BACKLOG #4948). The unreadable read is stood
-    in for, as a CA OpenSSL loads whose extensions ``cryptography`` refuses is not built here."""
+    """A CA whose extensions ``cryptography`` cannot read may or may not have a key identifier
+    OpenSSL reads, so the check cannot tell whether the CA itself is the cause, or, for a namesake
+    with a key identifier, which clients rule it out. The warning then says every client may be
+    refused, and what it cannot tell, with or without a key identifier on the namesake (BACKLOG
+    #4948). The unreadable read is stood in for, as a CA OpenSSL loads whose extensions
+    ``cryptography`` refuses is not built here."""
     acme = _ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
-    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), acme)
     real = pki._key_identifier
     monkeypatch.setattr(
         pki, "_key_identifier", lambda anchor: (None, False) if anchor.ca else real(anchor)
     )
-    (warning,) = IssuerIndex((_pem(acme[0]) + _pem(namesake)).decode("ascii")).namesake_warnings()
-    assert "refuse every client certificate of that CA" in warning, warning
-    assert "key identifier of block 1 cannot be read here" in warning, warning
-    assert "rules block 2 out" in warning, warning
-    assert "has no subject key identifier" not in warning, warning
+    for skid in (True, False):
+        namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), acme, skid=skid)
+        cadata = (_pem(acme[0]) + _pem(namesake)).decode("ascii")
+        (warning,) = IssuerIndex(cadata).namesake_warnings()
+        assert "refuse every client certificate of that CA" in warning, warning
+        assert "key identifier of block 1 cannot be read here" in warning, warning
+        assert "whether block 1 itself is the cause" in warning, warning
+        assert ("rules block 2 out" in warning) is skid, warning
+        assert "has no subject key identifier" not in warning, warning
 
 
 @pytest.mark.parametrize(

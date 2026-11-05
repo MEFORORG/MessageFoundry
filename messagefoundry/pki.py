@@ -1768,16 +1768,20 @@ class IssuerIndex:
         3.5.7, a real listener refused one in at least one listing order. So a namesake with a
         differing key identifier still warns, naming those leaves.
 
-        A CA with no subject key identifier at all is a different fault. Every context that builds
-        this index verifies strictly (``harden_verify_flags``), and strict verification refuses a
-        client of such a CA whether or not a namesake is loaded: measured on OpenSSL 3.5.7, with
-        the CA alone, for a version-3 client naming its key and for a version-1 client. So that
-        warning names the CA as the cause. A CA whose key identifier ``cryptography`` cannot read
-        may still have one OpenSSL reads, so this cannot tell which of its clients rule the
-        namesake out; that case gets the warning that every client may be refused, and says so.
-        The index does not count a namesake toward the same-DN ambiguity unless it signs itself, so
-        :meth:`unmatched_keys` may give no reason, and this is the only start signal. Names are
-        grouped by :func:`_namesake_key`. A warning only: it changes no allow, deny or refusal."""
+        A CA with no subject key identifier at all is a different fault. At least the contexts the
+        API and the HTTP and MLLP listeners build this index beside verify strictly
+        (``harden_verify_flags``, a no-op only where the runtime lacks the flag), and strict
+        verification refuses a client verified through such a CA whether or not a namesake is
+        loaded: measured on OpenSSL 3.5.7, with the CA alone, for a version-3 client naming its key
+        and for a version-1 client. So that warning names the CA as the cause, under strict
+        verification. A version-1 CA has no extensions, so it lands here too, and strict
+        verification refuses it for its missing basic constraints as well, so the remedy names a
+        version-3 CA. A CA whose key identifier ``cryptography`` cannot read may or may not have one
+        OpenSSL reads, so that case gets the warning that every client may be refused, and says
+        what it cannot tell. The index does not count a namesake toward the same-DN ambiguity unless
+        it signs itself, so :meth:`unmatched_keys` may give no reason, and this is the only start
+        signal. Names are grouped by :func:`_namesake_key`. A warning only: it changes no allow,
+        deny or refusal."""
         by_name: dict[_NameKey, list[_Anchor]] = {}
         for anchors in self._by_subject_name.values():
             for anchor in anchors:
@@ -1785,18 +1789,21 @@ class IssuerIndex:
         warnings: list[str] = []
         for anchors in by_name.values():
             others = [anchor for anchor in anchors if not anchor.ca]
-            if not others:
-                continue  # read no CA's key identifier for nothing
-            cas = [(anchor, _key_identifier(anchor)) for anchor in anchors if anchor.ca]
+            ca_anchors = [anchor for anchor in anchors if anchor.ca]
+            if not others or not ca_anchors:
+                continue  # no namesake here, so read no key identifier for nothing
+            cas = [(ca, _key_identifier(ca)) for ca in ca_anchors]
             for other in others:
                 key_id, _ = _key_identifier(other)
                 for ca, (ca_key_id, ca_read) in cas:
                     if ca_key_id is None and ca_read:
                         effect = (
-                            "refuses every client certificate of that CA under strict "
-                            f"verification, whether or not block {other.position} is loaded, "
-                            f"because block {ca.position} has no subject key identifier. Re-issue "
-                            f"block {ca.position} with one, and remove block {other.position} or "
+                            "refuses, under strict verification, every client certificate whose "
+                            f"chain runs through block {ca.position}, whether or not block "
+                            f"{other.position} is loaded, because block {ca.position} has no "
+                            "subject key identifier. Re-issue or remove block "
+                            f"{ca.position}, as a version-3 CA with basic constraints, key usage "
+                            f"and a subject key identifier, and remove block {other.position} or "
                             "re-issue it under another subject"
                         )
                     elif key_id is not None and ca_key_id is not None and key_id != ca_key_id:
@@ -1809,13 +1816,19 @@ class IssuerIndex:
                             "subject"
                         )
                     else:
-                        why = (
-                            f" The key identifier of block {ca.position} cannot be read here, so "
-                            "this check cannot tell which client certificates of that CA carry an "
-                            f"authority key identifier that rules block {other.position} out."
-                            if ca_key_id is None and key_id is not None
-                            else ""
-                        )
+                        why = ""
+                        if ca_key_id is None:  # unreadable: one with none took the branch above
+                            rules_out = (
+                                ", or which client certificates of that CA carry an authority key "
+                                f"identifier that rules block {other.position} out"
+                                if key_id is not None
+                                else ""
+                            )
+                            why = (
+                                f" The key identifier of block {ca.position} cannot be read here, "
+                                f"so this check cannot tell whether block {ca.position} itself is "
+                                f"the cause, as a CA with none would be{rules_out}."
+                            )
                         effect = (
                             f"may take block {other.position} as the issuer of a client "
                             "certificate that CA issued, and then refuse every client certificate "
