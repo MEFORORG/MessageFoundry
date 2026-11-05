@@ -2794,6 +2794,17 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # the digest's reader only; the decision record itself names the recommendation, and any
     # session can read the record.
     "scripts/coord/digest.ps1": frozenset({"csprng:RandomNumberGenerator", "hash:SHA256"}),
+    # --- Lab research, run by hand against a throwaway lab VM. Not a security control. ---
+    # The DPAPI reboot spike (BACKLOG #3411). Its one PowerShell hash is a SHA-256 of the throwaway
+    # service executable its install step has just compiled, emitted beside the path so the step's
+    # output records which binary was built. Nothing compares it to a pin, so it is a record and not
+    # a check. The C# that script compiles from a here-string also draws from the CSPRNG, calls
+    # CryptProtectData and CryptUnprotectData through P/Invoke, and takes SHA-256 of the plaintext
+    # and of the user-scope blob (plain_sha256, user_blob_sha256). No pattern here matches those C#
+    # spellings, so this row does not list them.
+    "scripts/research/dpapi-reboot-spike/dpapi_reboot_spike.ps1": frozenset(
+        {"hash:Get-FileHash[SHA256]"}
+    ),
 }
 
 
