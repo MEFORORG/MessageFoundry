@@ -1591,8 +1591,9 @@ async def test_whether_a_root_is_self_signed_is_read_as_openssl_reads_it(
     it, against OpenSSL's own answer. A strict listener trusting the root alone admits its client
     (202) only when OpenSSL reads the root's issuer and subject as one name, and otherwise looks
     for an issuer it does not hold and refuses at the handshake (error 2 under ``openssl
-    verify``). ``one_name`` pins the answer measured on OpenSSL 3.5.7, so a refusal for another
-    reason fails the case. Before this fix, on this branch, the check disagreed with OpenSSL on
+    verify``). ``one_name`` pins the answer measured on OpenSSL 3.5.7, so an admitted case that is
+    refused for another reason fails. A refused case does not check the reason for its refusal;
+    the admitted cases are its control that the listener and the client work. Before this fix, on this branch, the check disagreed with OpenSSL on
     every case here but the ASCII folds: it read a T61String as UTF-8 where OpenSSL reads Latin-1,
     folded white space outside ASCII, ignored a NumericString's type, and read a name differing
     in white space and a Latin-1 value at once as another. The Latin-1 reading alone is the case
@@ -1714,19 +1715,35 @@ def test_a_namesake_whose_extensions_cannot_be_read_is_warned_about_without_rais
 
 
 @pytest.mark.parametrize(
-    ("defects", "fault"),
+    ("defects", "outcome", "namesake_skid"),
     [
-        pytest.param((), None, id="conforming"),
+        pytest.param((), "namesake wording", True, id="conforming"),
         pytest.param(
             ("no-key-usage", "no-authority-key-identifier"),
-            "no-key-usage",
+            "fault named",
+            True,
             id="fault-read-without-the-issuer",
         ),
-        pytest.param(("no-authority-key-identifier",), "", id="fault-needing-the-issuer"),
+        pytest.param(
+            ("no-authority-key-identifier",),
+            "cannot tell",
+            True,
+            id="fault-needing-the-issuer",
+        ),
+        pytest.param(
+            ("no-authority-key-identifier",),
+            "cannot tell",
+            False,
+            id="fault-needing-the-issuer-bare-namesake",
+        ),
     ],
 )
 def test_a_ca_whose_issuer_name_cannot_be_read_is_warned_about_without_raising(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, defects: tuple[str, ...], fault: str | None
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    defects: tuple[str, ...],
+    outcome: str,
+    namesake_skid: bool,
 ) -> None:
     """A CA whose issuer name is a T61String holding bytes that are not UTF-8. OpenSSL loads it as
     a CA, and ``cryptography`` parses it but raises ``ValueError`` reading its issuer. The check
@@ -1734,11 +1751,11 @@ def test_a_ca_whose_issuer_name_cannot_be_read_is_warned_about_without_raising(
     CA is self-signed, so before this fix, on this branch, the namesake warning raised out of the
     listener's start and refused it. Only the authority key identifier faults need the issuer, so
     a fault read without it is still named. A CA with an authority key identifier needs no issuer
-    read, and gets the namesake wording (``fault`` None). One whose authority key identifier
-    fault needed the issuer (``fault`` empty) gets the warning that every client may be refused,
-    that the check cannot tell whether the CA is the cause, and to check it too: the narrower
-    namesake wording, given there before, told an operator to remove the namesake when strict
-    verification may refuse every client through the CA (BACKLOG #4948)."""
+    read, and gets the namesake wording. One whose authority key identifier fault needed the
+    issuer gets the wording its namesake's key identifier gives, and also says the issuer name
+    cannot be read, that the check cannot tell whether the CA is the cause, and to check it too:
+    the namesake wording alone, given there before, told an operator to remove the namesake when
+    strict verification may refuse every client through the CA (BACKLOG #4948)."""
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Root ZZ", _ASN1Type.T61String)])
     v3 = _strict_ca(*defects, by=root, issuer_name=issuer)[0]
@@ -1748,21 +1765,22 @@ def test_a_ca_whose_issuer_name_cannot_be_read_is_warned_about_without_raising(
     with pytest.raises(ValueError):  # the premise: cryptography cannot read the issuer
         _ = x509.load_der_x509_certificate(der).issuer
     assert pki._openssl_reads_as_ca(der) is True  # and OpenSSL loads it as a CA
-    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root)
+    namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root, skid=namesake_skid)
     cadata = _wrapped(der) + _pem(namesake)
     (warning,) = IssuerIndex(cadata.decode("ascii")).namesake_warnings()
     assert warning.startswith("certificate block 2 (CN=Acme CA) is not a CA"), warning
-    if fault is None:
-        assert "that CA issued with no authority key identifier" in warning, warning
+    if outcome == "fault named":
+        assert f"as a CA for at least this reason: {_CA_FAULTS['no-key-usage']}." in warning
+    else:
         assert "as a CA for at least" not in warning, warning
-    elif not fault:
-        assert "refuse every client certificate of that CA" in warning, warning
-        assert "The issuer name of block 1 cannot be read here" in warning, warning
+        narrow = "that CA issued with no authority key identifier"
+        assert (narrow in warning) is namesake_skid, warning
+        cannot_tell = "The issuer name of block 1 cannot be read here"
+        assert (cannot_tell in warning) is (outcome == "cannot tell"), warning
+    if outcome == "cannot tell":
         assert "whether block 1 itself is the cause" in warning, warning
         assert "Check block 1 too. Remove block 2" in warning, warning
         assert "rules block 2 out" not in warning, warning
-    else:
-        assert f"as a CA for at least this reason: {_CA_FAULTS[fault]}." in warning, warning
     # The start builds the listener and logs the warning.
     with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.http_listener"):
         _source(tmp_path, [], {"CN=Acme CA": [SUBJECT]}, cadata=cadata)
@@ -1792,14 +1810,14 @@ def test_an_issuer_name_that_warns_does_not_raise_where_warnings_are_errors() ->
         assert pki._strict_ca_faults(anchor) == "issuer name"
 
 
-def test_an_engine_defect_reading_string_types_is_logged_as_one(
+def test_an_engine_defect_reading_string_types_is_reported_as_one(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """If ``cryptography`` stops exposing an attribute's string type, the self-signed read cannot
-    compare names. That is an engine defect, not a fault in the file, so it is logged as a warning
-    with its own text, rather than at debug level as an issuer name that cannot be read, which
-    is how it was caught before this fix, on this branch (BACKLOG #4948). The check never
-    raises, and the fault needing the read is not named."""
+    compare names. That is an engine defect, not a fault in the file, so the namesake warning says
+    the engine cannot compare the names, and the debug record keeps the defect's own text. Before
+    this fix, on this branch, it was caught as an issuer name that cannot be read (BACKLOG #4948).
+    The check never raises, and the fault needing the read is not named."""
     root = _ca(_dn((NameOID.COMMON_NAME, "Root CA")))
     acme = _strict_ca("no-authority-key-identifier", by=root)
     (anchor,) = IssuerIndex(_pem(acme[0]).decode("ascii"))._by_subject_name[acme[0].subject]
@@ -1809,10 +1827,10 @@ def test_an_engine_defect_reading_string_types_is_logged_as_one(
         raise ValueError("stand-in engine defect")
 
     monkeypatch.setattr(pki, "_crl_attribute_key", defect)
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.pki"):
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.pki"):
         assert pki._strict_ca_faults(anchor) == "name comparison"
-    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("stand-in engine defect" in m for m in warned), warned
+    logged = [r.getMessage() for r in caplog.records]
+    assert any("stand-in engine defect" in m for m in logged), logged
     # The namesake warning says the engine could not compare, not that the file is unreadable.
     namesake = _issued_no_ca(_dn((NameOID.COMMON_NAME, "Acme CA")), root)
     cadata = (_pem(acme[0]) + _pem(namesake)).decode("ascii")

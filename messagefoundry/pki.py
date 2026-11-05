@@ -1785,8 +1785,9 @@ class IssuerIndex:
         verification refuses, or have a key identifier OpenSSL reads, so that case gets the warning
         that every client may be refused, says what it cannot tell, and says to check the CA too.
         For a CA whose issuer name ``cryptography`` cannot read, only the authority key identifier
-        faults go unread; with no other fault found, it gets that same warning, saying the issuer
-        name cannot be read. The index does not count a namesake toward the
+        faults go unread; with no other fault found, its warning, in whichever wording the
+        namesake's key identifier gives, says the issuer name cannot be read and to check the CA
+        too. Where an engine defect stops the names being compared, it says that instead. The index does not count a namesake toward the
         same-DN ambiguity unless it signs itself, so :meth:`unmatched_keys` may give no reason, and
         this is the only start signal. Names are grouped by :func:`_namesake_key`. A warning only:
         it changes no allow, deny or refusal."""
@@ -1808,9 +1809,9 @@ class IssuerIndex:
             for ca in ca_anchors:
                 faults = _strict_ca_faults(ca)
                 if isinstance(faults, str):
-                    # What did not read is not read again, and the narrow wording never applies.
                     unread: _Unread | None = faults
-                    ca_key_id = None
+                    # Extensions that did not read are not read again.
+                    ca_key_id = None if faults == "extensions" else _key_identifier(ca)[0]
                 elif faults:
                     warnings.append(_ca_cause_warning(ca, others, faults))
                     continue
@@ -1820,31 +1821,31 @@ class IssuerIndex:
                 if other_ids is None:
                     other_ids = [(other, _key_identifier(other)[0]) for other in others]
                 for other, key_id in other_ids:
+                    why = ""
+                    if unread:
+                        # Only unread extensions hide which clients rule the namesake out.
+                        rules_out = (
+                            ", or which client certificates of that CA carry an authority key "
+                            f"identifier that rules block {other.position} out"
+                            if key_id is not None and unread == "extensions"
+                            else ""
+                        )
+                        why = (
+                            f" {_UNREAD_TEXT[unread].format(ca.position)}, so this check cannot "
+                            f"tell whether block {ca.position} itself is the cause, as a CA strict "
+                            f"verification refuses would be{rules_out}. Check block {ca.position} "
+                            "too."
+                        )
                     if key_id is not None and ca_key_id is not None and key_id != ca_key_id:
                         effect = (
                             f"may take block {other.position}, whose key identifier differs from "
                             "the CA's, as the issuer of a client certificate that CA issued with no "
                             "authority key identifier, and then refuse that client certificate. "
                             "Strict verification accepts such a certificate when it is version 1, "
-                            f"which has no extensions. Remove block {other.position}, or re-issue "
-                            "it under another subject"
+                            f"which has no extensions.{why} Remove block {other.position}, or "
+                            "re-issue it under another subject"
                         )
                     else:
-                        why = ""
-                        if unread:
-                            # Only unread extensions hide which clients rule the namesake out.
-                            rules_out = (
-                                ", or which client certificates of that CA carry an authority key "
-                                f"identifier that rules block {other.position} out"
-                                if key_id is not None and unread == "extensions"
-                                else ""
-                            )
-                            why = (
-                                f" {_UNREAD_TEXT[unread].format(ca.position)}, so this check "
-                                f"cannot tell whether block {ca.position} itself is the cause, as "
-                                f"a CA strict verification refuses would be{rules_out}. Check "
-                                f"block {ca.position} too."
-                            )
                         effect = (
                             f"may take block {other.position} as the issuer of a client "
                             "certificate that CA issued, and then refuse every client certificate "
@@ -1965,8 +1966,10 @@ def _strict_ca_faults(ca: _Anchor) -> list[str] | _Unread:
         return faults or "issuer name"
     try:
         issued = not _self_issued(issuer, ca.cert.subject)
-    except ValueError as exc:  # _crl_attribute_key: an engine defect, not a fault in the file
-        _log.warning(
+    # _crl_attribute_key: an engine defect, not a fault in the file. The namesake warning, which
+    # the caller logs with its file, says so in its own words; this records the detail.
+    except ValueError as exc:
+        _log.debug(
             "certificate block %d: %s; the namesake warning cannot tell whether it may omit its "
             "authority key identifier",
             ca.position,
