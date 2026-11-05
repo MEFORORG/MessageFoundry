@@ -607,7 +607,7 @@ def _counters(d: StageDispatcher, i: int = 0) -> str:
         f" claim_lock_timeouts={d.claim_lock_timeouts}"  # BACKLOG #1270 — the route discriminator
         f" claim_head_skips={d.claim_head_skips}"  # BACKLOG #1270 — the other route's counter
         f" busy_violations={d.busy_violations} processing_lanes={d.processing_lanes}"
-        f" slots_free={d._slots_free}"
+        f" slots_free={d.slots_free}"
     )
 
 
@@ -796,18 +796,31 @@ async def _drain_to_quiescence(
 async def _drain_failure(d: StageDispatcher, store: Any, lanes: list[str], what: str) -> str:
     """The failure message for a ``_drain_to_quiescence`` that returned False (BACKLOG #2273).
 
-    ``_idle()`` also requires ``processing_lanes == 0``, so the lane phases and the pending rows alone
-    cannot explain every miss: a processing slot held by a lane whose phase reads IDLE fails the drain
-    with both lists empty. The counters line and a report per lane still holding a processing task
-    name that case."""
-    lines = [
-        f"{what} did not reach quiescence; not idle: {_not_idle(d, lanes)}"
-        f"; still pending: {await _pending_lanes(store, lanes)}",
-        f"  {_counters(d)}",
+    ``_idle()`` also requires ``processing_lanes == 0``, which counts live serializer tasks
+    (``_lane_tasks``), so the lane phases and the pending rows alone cannot explain every miss: a task
+    still alive under a lane that reads IDLE, or under a lane outside ``lanes``, fails the drain with
+    both lists empty. The counters line and a report per lane holding a task name that case."""
+    # Every dispatcher reading first, in one instant: the store read below awaits, and the claimer and
+    # serializer tasks keep running across it, so a reading taken after it could contradict one before.
+    not_idle = _not_idle(d, lanes)
+    i = _LIVE_DISPATCHERS.index(d) if d in _LIVE_DISPATCHERS else 0
+    head = [
+        f"{what} did not reach quiescence; not idle: {not_idle}",
+        f"  paused or pause-pending: {_pause_state(d, lanes)}",
+        f"  {_counters(d, i)}",
     ]
-    # Bounded by max_processing_lanes: these are the lanes counted in processing_lanes.
-    lines.extend(_lane_report(d, ln) for ln in d._lane_tasks)
-    return "\n".join(lines)
+    # Each lane holding a serializer task (bounded by max_processing_lanes), then each other lane that
+    # is not IDLE, so a READY, CLAIMING, PARKED or STOPPED lane carries its timer and dirty state too.
+    tasked = list(d._lane_tasks)
+    head.extend(_lane_report(d, ln) for ln in tasked + [x for x, _ in not_idle if x not in tasked])
+    # Bounded and swallowed, as in _expiry_report: a diagnostic that hangs or raises would mask the
+    # failure it is meant to explain.
+    try:
+        pending: object = await asyncio.wait_for(_pending_lanes(store, lanes), timeout=5.0)
+    except Exception as exc:  # noqa: BLE001 — a diagnostic must never mask the real failure
+        pending = f"<store read unavailable: {exc!r}>"
+    head[0] += f"; still pending: {pending}"
+    return "\n".join(head)
 
 
 def _first_occurrence_order(
@@ -2937,12 +2950,22 @@ def _counters_line(report: str) -> str:
     return lines[0]
 
 
-async def test_drain_failure_names_a_slot_held_outside_the_drained_lanes(store: Any) -> None:
+def _lane_lines(msg: str) -> dict[str, str]:
+    """The per-lane report lines of a drain-failure message, keyed by lane."""
+    return {
+        ln.strip().split(":", 1)[0]: ln.strip()
+        for ln in msg.splitlines()
+        if ": phase=" in ln and ln.startswith("      ")
+    }
+
+
+async def test_drain_failure_names_a_task_held_outside_the_drained_lanes(store: Any) -> None:
     """A drain that fails on ``processing_lanes`` alone says so (BACKLOG #2273).
 
     The held lane is gated in PROCESSING but is not among the lanes the drain reads, which is the
-    shape a slot held by an IDLE-reading lane leaves: the lane phases and the pending rows are both
-    empty, and only the counters line and the per-lane report show what held the drain."""
+    shape a serializer task alive under an IDLE-reading lane leaves: the lane phases and the pending
+    rows are both empty, and only the counters line and the per-lane report show what held the drain.
+    The release arm is the control: the same helper, once the task ends, reads zero and no lane."""
     mc = ManualClock(1000.0)
     stub = RecordingStub(store, mc.time)
     held, drained_lane = "IB_DRAIN_HELD", "IB_DRAIN_FREE"
@@ -2955,20 +2978,35 @@ async def test_drain_failure_names_a_slot_held_outside_the_drained_lanes(store: 
     try:
         # Both heads dispatched (the stub records before it waits on a gate); only the held one stays.
         assert await _wait_until(lambda: d.processing_lanes == 1 and len(stub.records) == 2)
-        # A short budget is one round of the unchanged drain; it cannot go idle while the gate holds.
+        # A short budget still runs one full round of the unchanged drain, including its fixed 3 s idle
+        # wait; it cannot go idle while the gate holds, so the drain returns False.
         assert not await _drain_to_quiescence(d, store, [drained_lane], mc, budget=0.01)
         msg = await _drain_failure(d, store, [drained_lane], "drain probe")
         # The two lists the old message carried are empty here, so they alone could not explain it.
-        assert msg.startswith(
-            "drain probe did not reach quiescence; not idle: []; still pending: []"
-        )
+        first = msg.splitlines()[0]
+        assert first == "drain probe did not reach quiescence; not idle: []; still pending: []", msg
         counters = _counters_line(msg).split()
         assert "processing_lanes=1" in counters, msg
         assert "slots_free=3" in counters, msg  # 4 slots, one held
         # Present, not a value: a server store's real locking may move either contention counter.
         for name in ("claim_head_skips=", "claim_lock_timeouts="):
             assert any(tok.startswith(name) for tok in counters), msg
-        assert f"{held}: phase=PROCESSING" in msg and "lane_task=ALIVE" in msg, msg
+        lanes_reported = _lane_lines(msg)
+        assert set(lanes_reported) == {held}, msg  # the task-less, IDLE drained lane is left out
+        assert "phase=PROCESSING" in lanes_reported[held], msg
+        assert "lane_task=ALIVE" in lanes_reported[held], msg
+
+        gate.set()
+        assert await _wait_until(
+            lambda: (
+                d.processing_lanes == 0
+                and all(d.phase(x) in (None, _LanePhase.IDLE) for x in (held, drained_lane))
+            )
+        )
+        released = await _drain_failure(d, store, [drained_lane], "drain probe")
+        rel_counters = _counters_line(released).split()
+        assert "processing_lanes=0" in rel_counters and "slots_free=4" in rel_counters, released
+        assert _lane_lines(released) == {}, released
     finally:
         gate.set()
         await d.stop()
