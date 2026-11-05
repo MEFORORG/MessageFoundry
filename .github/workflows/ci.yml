@@ -5368,11 +5368,36 @@ jobs:
           # windows-2025, in the unit arm that runs the function against a temp directory: an
           # explicit one came through /inheritance:r /grant:r with icacls exiting 0 and reached the
           # logs directory beneath it.
+          #
+          # THE RUN-AS ACCOUNT MUST HOLD MODIFY ON BOTH (BACKLOG #1699). A lockdown that dropped
+          # -Account passes every check above, since it leaves SYSTEM and Administrators only, and
+          # the service could then not write its own store or logs. Set-SecureDataDirAcl writes
+          # "<account>:(OI)(CI)M"; icacls prints it (OI)(CI)(M) on the data directory and
+          # (I)(OI)(CI)(M) on logs, which inherits it. MATCHED AS THE NAME, A COLON AND THE RIGHTS
+          # TOGETHER, NEVER AS A BARE NAME: the path icacls echoes on its first line holds
+          # "MessageFoundry" too, so a substring test on the name passes with the entry gone.
+          # tests/test_service_install_manifest.py runs this script against stand-in icacls output.
+          # It reads icacls on purpose rather than lifting the installer's Get-WriteGrantProblem:
+          # a witness that shares the installer's code would pass the installer's own bug, and the
+          # installer only warns on a missing grant, so this is the one place it fails a run.
+          #
+          # THE LOCALSYSTEM LEG HAS NO NAMED GRANT TO ASSERT. The installer writes none for
+          # LocalSystem ($ServiceAccount is empty on that leg), and LocalSystem writes through the
+          # SYSTEM entry the control below already requires. $grantee mirrors the Install step's.
+          $grantee = $null
+          if ($env:SMOKE_ACCOUNT -eq "virtual") {
+            $grantee = "NT SERVICE\MessageFoundry"
+          } elseif ($env:SMOKE_ACCOUNT -eq "localuser") {
+            $grantee = "$env:COMPUTERNAME\$env:SMOKE_LOCAL_USER"
+          } elseif ($env:SMOKE_ACCOUNT -ne "localsystem") {
+            throw "unknown SMOKE_ACCOUNT '$env:SMOKE_ACCOUNT'"
+          }
           $dirs = @("C:\ProgramData\MessageFoundry", "C:\ProgramData\MessageFoundry\logs")
           $broad = @("S-1-1-0", "Everyone", "S-1-5-32-545", "BUILTIN\Users",
                      "S-1-5-11", "Authenticated Users", "S-1-5-32-546", "BUILTIN\Guests",
                      "S-1-3-4", "OWNER RIGHTS")
           $bad = @()
+          $missing = @()
           foreach ($d in $dirs) {
             if (-not (Test-Path $d)) { throw "expected directory is missing: $d" }
             $acl = (& icacls $d | Out-String)
@@ -5385,12 +5410,24 @@ jobs:
             foreach ($p in $broad) {
               if ($acl -match [regex]::Escape($p)) { $bad += "$d grants $p" }
             }
+            if ($grantee) {
+              $held = "(?m)(?:^|\s)" + [regex]::Escape($grantee) + ":(?:\(I\))?\(OI\)\(CI\)\(M\)"
+              if ($acl -notmatch $held) { $missing += "$d does not grant $grantee (OI)(CI)(M)" }
+            }
           }
+          $bad | ForEach-Object { "BROAD ACCESS: $_" }
+          $missing | ForEach-Object { "NO RUN-AS GRANT: $_" }
           if ($bad.Count -gt 0) {
-            $bad | ForEach-Object { "BROAD ACCESS: $_" }
             throw "the data/log directory is reachable by a broad principal - the captured engine logs are a PHI sink (H-13, BACKLOG #1699)"
           }
-          "data-directory DACL OK: no broad principal on either directory"
+          if ($missing.Count -gt 0) {
+            throw "the run-as account '$grantee' cannot write the data/log directory: the lockdown dropped its grant (BACKLOG #1699)"
+          }
+          if ($grantee) {
+            "data-directory DACL OK: no broad principal on either directory, and $grantee holds (OI)(CI)(M) on both"
+          } else {
+            "data-directory DACL OK: no broad principal on either directory; LocalSystem writes through the SYSTEM entry"
+          }
 
       - name: Start and verify /health
         run: |
