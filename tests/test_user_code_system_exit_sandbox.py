@@ -41,6 +41,7 @@ inbound("IB_OK", File(directory={inbox_ok!r}, poll_seconds=0.05), router="r_ok")
 inbound("IB_EXIT", File(directory={inbox_exit!r}, poll_seconds=0.05), router="r_to_exit")
 inbound("IB_REXIT", File(directory={inbox_rexit!r}, poll_seconds=0.05), router="r_exit")
 inbound("IB_PRED", File(directory={inbox_pred!r}, poll_seconds=0.05), router="r_pred")
+inbound("IB_GEN", File(directory={inbox_gen!r}, poll_seconds=0.05), router="r_gen_exit")
 outbound("OB", File(directory={outbox!r}))
 
 
@@ -64,6 +65,18 @@ def r_pred(msg):
     return "h_guarded"
 
 
+@router("r_gen_exit")
+def r_gen_exit(msg):
+    # A generator Router: its body runs when the worker iterates it, after the call returns.
+    yield "h_ok"
+    sys.exit(4)
+
+
+class _Loud(Exception):
+    def __str__(self):
+        sys.exit(6)
+
+
 def _exits(msg):
     sys.exit(5)
 
@@ -83,12 +96,17 @@ def h_exit_text(msg):
     sys.exit("PID-5 was DOE^JANE")
 
 
+@handler("h_loud")
+def h_loud(msg):
+    raise _Loud()
+
+
 @handler("h_guarded", accepts=_exits)
 def h_guarded(msg):
     return Send("OB", "NEVER")
 """
 
-_DIRS = ("inbox_ok", "inbox_exit", "inbox_rexit", "inbox_pred", "outbox", "cfg")
+_DIRS = ("inbox_ok", "inbox_exit", "inbox_rexit", "inbox_pred", "inbox_gen", "outbox", "cfg")
 
 
 @pytest.fixture
@@ -154,6 +172,16 @@ def test_sys_exit_in_worker_user_code_is_a_handler_error_and_the_worker_survives
         assert str(predicate.value).endswith(_exited(5))
         assert _worker_pid(session) == pid
 
+        with pytest.raises(SandboxError, match="sandbox failed router 'r_gen_exit'") as generated:
+            _route(registry, "IB_GEN", session)
+        assert str(generated.value).endswith(_exited(4))
+        assert _worker_pid(session) == pid
+
+        # An exception whose __str__ calls sys.exit() is reported by its class name alone.
+        with pytest.raises(SandboxError, match=r"sandbox failed transform 'h_loud': _Loud$"):
+            _deliveries(registry, "h_loud", sandbox=session, run_context=RunContext())
+        assert _worker_pid(session) == pid
+
         assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == [
             ("OB", "DELIVERED")
         ]
@@ -187,8 +215,8 @@ async def test_the_runner_dead_letters_the_message_and_keeps_running(
         await dead_letter_now(item_id, reason)
 
     monkeypatch.setattr(store, "dead_letter_now", _recorded)
-    await runner.start()
     try:
+        await runner.start()
         bad = await store.enqueue_ingress(
             channel_id="IB_EXIT", raw=RAW, control_id="MSG00001", message_type="ADT^A01"
         )

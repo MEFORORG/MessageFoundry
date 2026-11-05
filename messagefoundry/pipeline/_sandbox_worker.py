@@ -343,7 +343,6 @@ def _run_one(
     from messagefoundry.config.run_context import run_contexts
     from messagefoundry.config.wiring import handler_result_items
     from messagefoundry.pipeline._sandbox_codec import SandboxError
-    from messagefoundry.pipeline.wiring_runner import UserCodeCalledSysExit
 
     phase = req.phase
     name = req.name
@@ -400,6 +399,17 @@ def _run_one(
                 items = handler_result_items(result)
                 if items is not None:
                     result = items
+            elif phase == "router" and result is not None and not isinstance(result, str):
+                # The same for a generator Router: iterate it here, inside the run context and the
+                # arms below, so a raise or a sys.exit() in its body is this Router's error rather
+                # than an escape from the codec's list() in `_respond` that ends the worker (vault
+                # BACKLOG #3134). A non-iterable is left for the codec to refuse with its own text.
+                try:
+                    names = iter(result)
+                except TypeError:
+                    pass
+                else:
+                    result = list(names)
         if phase == "accepts":
             # HandlerAccepts is contractually ``(msg) -> bool`` and the PARENT coerces the verdict with
             # ``bool(...)`` (dryrun._accepted). Coerce HERE too, BEFORE the result is described back: a
@@ -434,6 +444,8 @@ def _run_one(
         # the worker, so the message read as a crash and the next paid a respawn. No shutdown of this
         # worker raises here: the parent closes the pipe (EOF in main()) or kills it. KeyboardInterrupt
         # and every other BaseException are not converted, as at mode=off.
+        from messagefoundry.pipeline.wiring_runner import UserCodeCalledSysExit
+
         return False, None, "error", _error_text(UserCodeCalledSysExit.from_exit(exc))
     except Exception as exc:  # noqa: BLE001 — a handler raise is content, reported not crashed
         return False, None, "error", _error_text(exc)
@@ -446,13 +458,14 @@ def _error_text(exc: BaseException) -> str:
     attributes, so this boundary must too. An error that HOLDS one, as ``ValueError("bad", exc)``,
     prints that error's repr, the whole input, so it renders the same way (vault BACKLOG #3295).
     Never raises: the error's own __str__ may, and so may the import after untrusted config has
-    run, and either would kill the worker mid-report."""
+    run, and either would kill the worker mid-report. That covers a __str__ calling sys.exit(),
+    which is user code too (vault BACKLOG #3134)."""
     try:
         # cached: logging_setup imported it at load
         from messagefoundry.redaction import codec_safe_line
 
         return codec_safe_line(exc)
-    except Exception:  # noqa: BLE001 — the class name is all that is left to report
+    except (Exception, SystemExit):  # noqa: BLE001 — the class name is all that is left to report
         return type(exc).__name__
 
 
