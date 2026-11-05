@@ -463,6 +463,30 @@ def test_out_goes_through_the_owner_only_writer(
     assert calls == [(str(out), command in _IN_PLACE_COMMANDS)]
 
 
+@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
+def test_out_is_written_off_the_event_loop(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # export and anonymize-captures run inside asyncio.run, and the writer fsyncs; called on the
+    # loop's thread it would block the loop (PR 2390 note 4, vault BACKLOG #3166).
+    import tee.__main__ as tee_main
+
+    on_loop: list[bool] = []
+    real = tee_main._write_owner_only
+
+    def spy(path: str, text: str, *, in_place_on_windows: bool) -> None:
+        try:
+            asyncio.get_running_loop()
+            on_loop.append(True)
+        except RuntimeError:
+            on_loop.append(False)
+        real(path, text, in_place_on_windows=in_place_on_windows)
+
+    monkeypatch.setattr(tee_main, "_write_owner_only", spy)
+    assert _write_out(command, tmp_path, monkeypatch, tmp_path / "out.json") == 0
+    assert on_loop == [False]
+
+
 @pytest.mark.parametrize("command", _OUT_COMMANDS)
 def test_out_newline(command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # The dataset is JSONL, read back line by line by the harness corpus, so the in-place commands

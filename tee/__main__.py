@@ -430,7 +430,10 @@ async def _export(args: argparse.Namespace) -> int:
     text = json.dumps(data, indent=2)
     if args.out:
         try:
-            _write_owner_only(args.out, text + "\n", in_place_on_windows=True)
+            # Off the event loop: the writer opens, writes and fsyncs synchronously.
+            await asyncio.to_thread(
+                _write_owner_only, args.out, text + "\n", in_place_on_windows=True
+            )
         except OSError as exc:
             print(f"error: could not write the export to {args.out}: {exc}", file=sys.stderr)
             return 1
@@ -836,7 +839,9 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         )
         return 1
     try:
-        _write_owner_only(args.out, "\n".join(lines) + "\n", in_place_on_windows=True)
+        await asyncio.to_thread(
+            _write_owner_only, args.out, "\n".join(lines) + "\n", in_place_on_windows=True
+        )
     except OSError as exc:
         print(f"error: could not write the dataset to {args.out}: {exc}", file=sys.stderr)
         return 1
