@@ -349,8 +349,21 @@ def test_the_installer_hardens_the_token_after_it_sets_the_account(tmp_path: Pat
         ),
         ("$problem = Get-WriteGrantProblem -Path $dir", "$problem = '' # -Path $dir", "read back"),
         ("$writeDirs += $storeDir", "", "store's own directory"),
+        (
+            'if ($SidChoice.SidType -eq "restricted") {',
+            "Set-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName\n"
+            'if ($SidChoice.SidType -eq "restricted") {',
+            "before the run-as account",
+        ),
     ],
-    ids=["call-removed", "switch-unwired", "privilege-added", "grant-not-read", "store-not-read"],
+    ids=[
+        "call-removed",
+        "switch-unwired",
+        "privilege-added",
+        "grant-not-read",
+        "store-not-read",
+        "account-set-after",
+    ],
 )
 def test_the_wiring_guard_fails_when_a_piece_is_changed(
     tmp_path: Path, old: str, new: str, expect: str

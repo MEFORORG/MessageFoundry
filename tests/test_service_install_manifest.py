@@ -1818,26 +1818,31 @@ def test_all_three_acl_sites_are_still_wired(tmp_path: Path) -> None:
 #
 # The rule pins the installer's real shape: it sets the account in three places, all inside one run-as
 # if/else, and locks down once, after that whole if/else. So a lockdown placed inside a run-as branch
-# reads red BY DESIGN, even after that branch's own Set-ServiceAccount, and so does a lockdown inside
-# an unrelated if statement written before the run-as if. An ACL call nested in a Set-ServiceAccount
-# argument sits inside that call, and reads red too.
+# reads red BY DESIGN, even after that branch's own Set-ServiceAccount, and so does one in any order
+# inside an if statement that also wraps the run-as if, such as a -WhatIf gate around the install
+# body. An ACL call nested in a Set-ServiceAccount argument sits inside that call, and reads red too.
+# An if statement that does not wrap the run-as if is not read at all: the real Set-SecureConfigAcl
+# sits in one after it, and a lockdown in one before it is simply earlier.
 #
 # It does NOT check, at least:
-#   * a loop around both the run-as if and an ACL call, where an earlier pass runs the ACL call
-#     before a later pass sets the account;
+#   * code that runs more than once around both, such as a loop, a switch over several values or a
+#     ForEach-Object block, where an earlier pass runs an ACL call written after a Set-ServiceAccount
+#     that only a later pass runs. One with an if around the account call inside it still reads red;
 #   * an exit, return or throw between the run-as if and the lockdown, which leaves the account set
 #     and nothing locked;
-#   * whether each run-as branch actually sets the account. Only the count of three calls in
-#     test_objectname_is_written_on_every_run_as_branch pins that, and it places none in a branch;
+#   * whether each run-as branch actually sets the account.
+#     test_objectname_is_written_on_every_run_as_branch counts three calls, and
+#     test_the_localsystem_optout_writes_objectname_rather_than_leaving_it places one in the opt-out
+#     branch; neither places one in each named-account branch;
 #   * a call that runs elsewhere than it is written: a stored scriptblock, a trap body,
 #     Invoke-Expression, a computed command name.
 
 _RUN_AS_ASSIGNMENT = "$RunAsObjectName = if ("
-_RUNS_BEFORE = "runs before the run-as account is set"
+_NOT_AFTER = "is not after the whole run-as block"
 
 
 def _acl_order_problems(facts: dict) -> list[str]:
-    """Why an ACL call in install-service.ps1 could run before the run-as account is set."""
+    """Why the ACL calls in install-service.ps1 break the rule above."""
     accounts = _objectname_calls(facts)
     if not accounts:
         return ["no Set-ServiceAccount call sets the run-as account the ACLs name"]
@@ -1852,8 +1857,8 @@ def _acl_order_problems(facts: dict) -> list[str]:
         if not calls:
             problems.append(f"{fn} is not called")
         problems += [
-            f"{fn} at line {c['line']} {_RUNS_BEFORE}: it does not start after the"
-            f" Set-ServiceAccount at line {last['line']} and every if statement around it"
+            f"{fn} at line {c['line']} {_NOT_AFTER}: it starts before the end of the"
+            f" Set-ServiceAccount at line {last['line']}, or of the outermost if statement around it"
             for c in calls
             if c["start"] < last["outerIfEnd"]
         ]
@@ -1888,11 +1893,6 @@ def _replace(call: str, template: str) -> Callable[[str], str]:
     return _rewrite((call, template.format(call=call)))
 
 
-def _account_set_last(source: str) -> str:
-    """A further Set-ServiceAccount after every ACL call: the order swapped from the other side."""
-    return source + "\nSet-ServiceAccount -ServiceName $ServiceName -Account $RunAsObjectName\n"
-
-
 _LOCKDOWN = "Set-SecureDataDirAcl -Path $DataDir -Account $ServiceAccount"
 _CONFIG_LOCK = "Set-SecureConfigAcl -Path $LockPath -Account $ServiceAccount"
 _CONFIG_READ = "Set-ConfigReadAcl -Path $Config -Account $ServiceAccount"
@@ -1908,6 +1908,11 @@ def _after(anchor: str, line: str) -> tuple[str, str]:
     return anchor, f"{anchor}{line}\n"
 
 
+def _then(mutate: Callable[[str], str], line: str) -> Callable[[str], str]:
+    """``mutate``, then ``line`` appended as the script's last top-level statement."""
+    return lambda source: f"{mutate(source)}\n{line}\n"
+
+
 def _commented(call: str) -> tuple[str, str]:
     return call, call.replace(_ACCOUNT_CALL, f"# {_ACCOUNT_CALL}")
 
@@ -1916,16 +1921,16 @@ def _commented(call: str) -> tuple[str, str]:
     ("mutate", "expect"),
     [
         pytest.param(
-            _hoist(_LOCKDOWN), ("Set-SecureDataDirAcl at line", _RUNS_BEFORE), id="lockdown-hoisted"
+            _hoist(_LOCKDOWN), ("Set-SecureDataDirAcl at line", _NOT_AFTER), id="lockdown-hoisted"
         ),
         pytest.param(
             _hoist(_CONFIG_LOCK),
-            ("Set-SecureConfigAcl at line", _RUNS_BEFORE),
+            ("Set-SecureConfigAcl at line", _NOT_AFTER),
             id="config-lock-hoisted",
         ),
         pytest.param(
             _hoist(_CONFIG_READ),
-            ("Set-ConfigReadAcl at line", _RUNS_BEFORE),
+            ("Set-ConfigReadAcl at line", _NOT_AFTER),
             id="config-read-hoisted",
         ),
         # $null, not a comment: the read call shares its line with the closing brace of its if.
@@ -1952,8 +1957,19 @@ def _commented(call: str) -> tuple[str, str]:
         # Red BY DESIGN: after its own branch's account, yet inside the run-as if/else.
         pytest.param(
             _rewrite((_LOCKDOWN, "$null"), _after(_NAMED_BRANCH_END, f"    {_LOCKDOWN}")),
-            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
+            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
             id="lockdown-moved-into-a-run-as-branch",
+        ),
+        # With no account call in the else, only the OUTERMOST if puts this lockdown inside: the
+        # innermost if around each remaining call ends above it.
+        pytest.param(
+            _rewrite(
+                _commented(_LOCALSYSTEM_CALL),
+                (_LOCKDOWN, "$null"),
+                _after(_NAMED_BRANCH_END, f"    {_LOCKDOWN}"),
+            ),
+            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
+            id="lockdown-in-the-named-branch-with-no-account-in-the-else",
         ),
         pytest.param(
             _rewrite(
@@ -1961,24 +1977,40 @@ def _commented(call: str) -> tuple[str, str]:
                 _after(_NAMED_BRANCH_END, f"    {_LOCKDOWN}"),
                 _after(_LOCALSYSTEM_CALL, f"    {_LOCKDOWN}"),
             ),
-            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
+            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
             id="lockdown-moved-into-each-run-as-branch",
+        ),
+        # Red BY DESIGN: in order, but inside an if that also wraps the run-as if.
+        pytest.param(
+            _rewrite(
+                (_RUN_AS_ASSIGNMENT, f"if ($true) {{\n{_RUN_AS_ASSIGNMENT}"),
+                (_LOCKDOWN, f"{_LOCKDOWN}\n}}"),
+            ),
+            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
+            id="lockdown-and-run-as-if-in-one-wrapping-if",
         ),
         pytest.param(
             _hoist(_LOCKDOWN, "if ($LockConfigDir) {{ {call} }}"),
-            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
+            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
             id="lockdown-in-an-unrelated-if-before-the-run-as-if",
         ),
+        # At top level, so only the account call's own END puts the lockdown inside it.
         pytest.param(
-            _rewrite(
-                (_LOCKDOWN, "$null"),
-                (
-                    _LOCALSYSTEM_CALL,
-                    f"\n    Set-ServiceAccount -ServiceName $ServiceName -Account ({_LOCKDOWN})\n",
-                ),
+            _then(
+                _replace(_LOCKDOWN, "$null"),
+                _ACCOUNT_CALL.replace("$RunAsObjectName", f"({_LOCKDOWN})"),
             ),
-            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
+            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
             id="lockdown-in-a-run-as-argument",
+        ),
+        pytest.param(
+            _replace(
+                _LOCKDOWN,
+                "foreach ($step in 'acl', 'account') {{ if ($step -eq 'acl') {{ {call} }}"
+                f" else {{{{ {_ACCOUNT_CALL} }}}} }}}}",
+            ),
+            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
+            id="lockdown-and-account-in-one-loop",
         ),
         pytest.param(
             _rewrite(*map(_commented, (_PASSWORD_CALL, _NO_PASSWORD_CALL, _LOCALSYSTEM_CALL))),
@@ -1988,10 +2020,11 @@ def _commented(call: str) -> tuple[str, str]:
         # A second lockdown, spelled in lower case, above the run-as block. PowerShell runs it.
         pytest.param(
             _rewrite((_RUN_AS_ASSIGNMENT, f"{_LOCKDOWN.lower()}\n{_RUN_AS_ASSIGNMENT}")),
-            ("Set-SecureDataDirAcl at line", _RUNS_BEFORE),
+            ("Set-SecureDataDirAcl at line", _NOT_AFTER),
             id="early-call-in-lower-case",
         ),
-        pytest.param(_account_set_last, (_RUNS_BEFORE,), id="account-set-last"),
+        # A further account call after every ACL call: the order swapped from the other side.
+        pytest.param(_then(_rewrite(), _ACCOUNT_CALL), (_NOT_AFTER,), id="account-set-last"),
     ],
 )
 def test_the_acl_order_guard_fails_when_the_order_is_broken(
