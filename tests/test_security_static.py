@@ -1798,6 +1798,9 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     "harness/load/connscale/runner.py": frozenset({"messagefoundry.config.tls_policy"}),
     "harness/load/shardcert.py": frozenset({"messagefoundry.config.tls_policy"}),
     "tee/__main__.py": frozenset({"ssl"}),
+    # ADR 0030's keyed BLAKE2b, moved out of messagefoundry/ by ADR 0201 slice 6. Its vendored twin
+    # is the next row. See the INVENTORY row this duplicates.
+    "messagefoundry_toolkit/anon/keying.py": frozenset({"hashlib"}),
     "tee/anon/keying.py": frozenset({"hashlib"}),
     "tee/mefor_api.py": frozenset({"ssl"}),
     # ADR 0155: the DAST scan target mints a throwaway per-run password for the two ephemeral scan
@@ -1851,11 +1854,8 @@ def test_crypto_roots_carry_no_unrecorded_call_site() -> None:
         "crypto call site(s) in the walked roots that no inventory covers — document them in "
         f"scripts/security/crypto_inventory_check.py (or here, for non-package roots): {undocumented}"
     )
-    # The toolkit receives code that moves out of messagefoundry/ (ADR 0201), and the gate's own
-    # INVENTORY governs it as it does the engine, so neither needs a row here.
-    package_roots = ("messagefoundry/", "messagefoundry_toolkit/")
     outside = {
-        path: mods for path, mods in discovered.items() if not path.startswith(package_roots)
+        path: mods for path, mods in discovered.items() if not path.startswith("messagefoundry/")
     }
     assert outside == _CRYPTO_SITES_OUTSIDE_THE_PACKAGE
 

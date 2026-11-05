@@ -1601,8 +1601,9 @@ def test_the_toolkit_search_sees_a_planted_name(tmp_path: Path, plant: str) -> N
 #
 # TWO SEARCHES HOLD THAT STATE, because each sees what the other misses.
 #
-# The first searches source TEXT with one pattern, the one the record's verifier uses. So a
-# docstring example or a comment that looks like an import counts exactly as a real import does.
+# The first searches source TEXT with one pattern, the record verifier's pattern written for the
+# package's current home. The record keeps its own copy, so a move of the package re-points
+# both, the record's after this tree's. So a docstring example or a comment that looks like an import counts exactly as a real import does.
 # The `CaptureSink` docstring in `harness/` once opened its example with two such lines, with no
 # import anywhere in those trees. The fix for a line like that is to name the package in a
 # sentence. Do not change the pattern to make a hit go away. Change the text.
@@ -1653,6 +1654,8 @@ _ANON_IMPORT = re.compile(
 #: The dotted package both searches are about, its parent package, and the directory it lives in.
 _ANON_MODULE = "messagefoundry_toolkit.anon"
 _ANON_PARENT = _ANON_MODULE.rpartition(".")[0]
+#: The parents whose imported names the parse expands: the engine's, and the anon package's.
+_ANON_NAME_PARENTS = frozenset({_ROOT_PACKAGE, _ANON_PARENT})
 _ANON_PACKAGE_DIR = PurePosixPath(*_ANON_MODULE.split("."))
 
 #: Every import shape the parse is named to see spells ``anon`` as a whole word, whether as
@@ -1720,8 +1723,8 @@ _REAL_ANON_IMPORT_ADVICE = (
     "imports the package, and its correction says none does. The record's absence claim says no "
     "file outside the package imports it. "
     "The owner ruled that the import gives way to the claim (owner ruling 2026-10-12, BACKLOG "
-    "#3006 part 3). The package has moved to messagefoundry_toolkit/anon/ (BACKLOG #1192), "
-    "and the claim moved with it. Do not "
+    "#3006 part 3). The package moved to messagefoundry_toolkit/anon/ (BACKLOG #1192), and "
+    "the record's absence claim follows it there. Do not "
     "hide the import from these searches by rewording it or building its name at run time."
 )
 
@@ -1787,9 +1790,7 @@ def _parsed_anon_imports(rel: PurePosixPath, source: str) -> list[str]:
     # The file's `__package__`, for a module and for an `__init__.py` alike.
     own_package = ".".join(rel.parent.parts)
     # `from messagefoundry_toolkit import anon` names the package as an imported NAME of its parent.
-    named = _modules_imported_by(
-        tree, own_package, name_parents=frozenset({_ROOT_PACKAGE, _ANON_PARENT})
-    )
+    named = _modules_imported_by(tree, own_package, name_parents=_ANON_NAME_PARENTS)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue

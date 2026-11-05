@@ -485,6 +485,8 @@ _TOOLKIT_WHEEL = "messagefoundry_toolkit-0.4.0-py3-none-any.whl"
         "messagefoundry/anon/__init__.py",
         "messagefoundry/anon/leak.py",
         "messagefoundry-0.4.0/messagefoundry/anon/keying.py",
+        "messagefoundry/anon.py",  # a one-file module restoring the import name
+        "messagefoundry-0.4.0/messagefoundry/anon.py",
         "messagefoundry_toolkit/__init__.py",  # the toolkit package inside the engine
         "messagefoundry-0.4.0/messagefoundry_toolkit/__main__.py",
         "messagefoundry_toolkit.py",  # the import name as a top-level module

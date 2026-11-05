@@ -78,7 +78,9 @@ class CaptureSink:
       does not parse gets no ACK at all, with or without an anonymizer.
 
     The example below uses four names. ``Keyer``, ``load_rules`` and ``anonymize_checked`` are in
-    the ``messagefoundry_toolkit.anon`` package. ``CoverageTally`` is in that package's ``leak`` module.
+    the ``messagefoundry_toolkit.anon`` package. ``CoverageTally`` is in that package's ``leak``
+    module. That package ships in the ``messagefoundry-toolkit`` distribution, which the harness
+    does not depend on, so install the toolkit beside the harness to run the example.
 
     For example::
 

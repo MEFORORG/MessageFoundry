@@ -804,9 +804,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # The standalone tee CLI builds the ssl context (create_default_context, or a cafile via --cacert;
     # CERT_NONE only under the explicit --insecure escape) for the tee's https engine-API pulls.
     "tee/__main__.py": frozenset({"ssl"}),
-    # ADR 0030: the byte-identical vendored twin of messagefoundry_toolkit/anon/keying.py — keyed BLAKE2b
-    # (hashlib) derives the deterministic, per-dataset, one-way pseudonymization seed. Kept in lockstep
-    # with the engine copy by the parity test.
+    # ADR 0030: the byte-identical vendored twin of messagefoundry_toolkit/anon/keying.py -- keyed
+    # BLAKE2b (hashlib) derives the deterministic, per-dataset, one-way pseudonymization seed. Kept in
+    # lockstep with the toolkit copy by the parity test.
     "tee/anon/keying.py": frozenset({"hashlib"}),
     # #14: the tee's stdlib MEFOR engine-API client accepts an optional ssl.SSLContext for authenticated
     # GETs against an https engine (the tee stays stdlib-only; no mTLS / rich-retry client).

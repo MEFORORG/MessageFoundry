@@ -741,9 +741,9 @@ def leak_report(
 ) -> LeakReport:
     """The full :class:`LeakReport` for ``text`` using the tee's vendored token authority.
 
-    Behaviourally parallel to the engine's :func:`messagefoundry_toolkit.anon.leak.leak_report`: the token
-    hits come from the tee's local :func:`scan_text` (and the field-anchored site-code check) rather
-    than the engine's ``_scanner()`` delegate, but the structural walk, coverage report, and
+    Behaviourally parallel to the toolkit's :func:`messagefoundry_toolkit.anon.leak.leak_report`: the
+    token hits come from the tee's local :func:`scan_text` (and the field-anchored site-code check)
+    rather than the toolkit's ``_scanner()`` delegate, but the structural walk, coverage report, and
     token-floor signal are the byte-identical shared logic above. Structural detection engages **only
     when ``rules`` is supplied**; a bare-string call is the legacy token-only behaviour.
 

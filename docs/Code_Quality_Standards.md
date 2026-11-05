@@ -459,9 +459,10 @@ stayed green. Reading the source is not sufficient evidence of scope.*
 - **In scope, mutation-verified red:** the five engine packages `pipeline/`, `transports/`,
   `parsing/`, `store/`, `config/` under `messagefoundry/`. A planted `import fastapi` fails the
   gate in `transports/` and `store/`.
-- **Out of scope, mutation-verified green:** `messagefoundry/auth/`, `messagefoundry_toolkit/anon/`,
+- **Out of scope, mutation-verified green:** `messagefoundry/auth/`, `messagefoundry/anon/`,
   `messagefoundry/checks.py`, and the `harness/`, `tee/` and `scripts/` trees entirely. The gate
-  never opens those files, so a planted violation there ships.
+  never opens those files, so a planted violation there ships. ADR 0201 slice 6 later moved
+  `messagefoundry/anon/` to `messagefoundry_toolkit/anon/`; no mutation was run at the new path.
 - **What that means for the claim:** the engine's **one-way dependency rule** is genuinely
   enforced, and this row is Strong for it. The **client-side** layering convention — CLAUDE.md §4's
   rule that a client may import `parsing/` and `apiclient/` but no other engine package — has **no

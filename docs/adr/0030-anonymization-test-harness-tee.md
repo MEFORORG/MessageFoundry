@@ -83,7 +83,8 @@
   this bullet records the sign-off. The four items below are ratified. The sign-off builds nothing:
   the package is still at `messagefoundry/anon/`, and every path in this ADR describes the tree
   until ADR 0201 slice 6 moves it. That slice re-points the guards and tests that pin the path, in
-  the same change. **Built by ADR 0201 slice 6:** the package now lives at
+  the same change. **Built by ADR 0201 slice 6, after the sign-off:** the three sentences before
+  this one describe the tree on the day of the sign-off, and the package now lives at
   `messagefoundry_toolkit/anon/`. So `messagefoundry/anon/` and `messagefoundry.anon`, in this
   bullet and elsewhere in this ADR, name the package's home before the move.
   1. **The home becomes `messagefoundry_toolkit/anon/`**, in the `messagefoundry-toolkit`
@@ -114,7 +115,7 @@
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
-  with **deterministic keyed surrogates**; the engine **owns** it beside `parsing/` *(amended: the home is to move to `messagefoundry_toolkit/anon/` in ADR 0201 slice 6; see the status banner)* and the tee **vendors a
+  with **deterministic keyed surrogates**; the engine **owns** it beside `parsing/` *(amended: the home moved to `messagefoundry_toolkit/anon/` in ADR 0201 slice 6; see the status banner)* and the tee **vendors a
   byte-identical copy** (mirroring [`tee/hl7_fields.py`](../../tee/hl7_fields.py)), every output proven clean
   by `scan_forbidden` before it can be committed. *(On landing this would be the first built slice of the
   de-id capability PHI.md §9 / CLAUDE.md §9 still call planned-not-built — see §8; the docs only flip on
@@ -168,7 +169,7 @@ that **vendoring it costs nothing and the rule *table* is the single authority**
 
 ### 1. A pure, dependency-free `anon` package — engine-owned, tee-vendored (additive only)
 
-*(Amended: the home is to move to `messagefoundry_toolkit/anon/` in ADR 0201 slice 6; see the status banner.)*
+*(Amended: the home moved to `messagefoundry_toolkit/anon/` in ADR 0201 slice 6; see the status banner.)*
 
 The anonymizer ships as **`messagefoundry/anon/`**: a small, **pure-stdlib** package — no `hl7apy`, no
 `python-hl7`, no engine state, I/O, or DB — sitting beside [`parsing/`](../../messagefoundry/parsing/). Like
@@ -499,7 +500,7 @@ AI-assistant `deidentified` data-scope source (PHI.md §9 forward-links to it on
 ## To resolve on acceptance
 
 - [ ] Confirm `messagefoundry/anon/` (engine-owned) + `tee/anon/` (vendored byte-identical, CI-parity-checked)
-      as the home *(amended: the home is to move to `messagefoundry_toolkit/anon/` in ADR 0201 slice 6; see the status banner)* — vs a single installable package — and that the rule *table* is the named engine-side
+      as the home *(amended: the home moved to `messagefoundry_toolkit/anon/` in ADR 0201 slice 6; see the status banner)* — vs a single installable package — and that the rule *table* is the named engine-side
       authority with a parity-pinned tee copy.
 - [ ] Ratify the **two-layer rule model** — declarative field-*selection* map (data, overlay-able by
       `anon.toml`) over a code `SURROGATES` registry — as the §12-safe line, and confirm `load_rules`

@@ -354,11 +354,13 @@ while the script was read as out is stale on this point until someone re-reads i
 **One file is classified by a Manager's reading, not by the owner, and the owner may overrule
 it.** That reading is recorded in the 2026-10-02 vault file, under R3. The file is out:
 
-* `scripts/security/scan_forbidden.py` is the CI and pre-commit leak gate. The engine's
-  `messagefoundry_toolkit/anon/leak.py` loads it by path for the anonymizer's leak check, but no shipped
-  engine code path calls that check. `anon/leak.py` itself, and the hazard of a by-path load, are
-  engine code and stay inside the scope through the engine. **The reading covers engine call paths
-  only.** The harness's `CaptureSink` takes an optional anonymizer, and its code comment suggests
+* `scripts/security/scan_forbidden.py` is the CI and pre-commit leak gate.
+  `messagefoundry_toolkit/anon/leak.py` loads it by path for the anonymizer's leak check, but no
+  shipped engine code path calls that check. Until ADR 0201 slice 6, `anon/leak.py` itself, and
+  the hazard of a by-path load, were engine code and stayed inside the scope through the engine.
+  Slice 6 moved them into the `messagefoundry-toolkit` distribution, which the **Included** list
+  in section 2 does not name. Whether they are still in scope is OPEN, and it is the owner's to
+  settle. **The reading covers engine call paths only.** The harness's `CaptureSink` takes an optional anonymizer, and its code comment suggests
   wiring `anonymize_checked` there, which would reach the same load from the harness. The vault file
   names that wiring as a reason to revisit this reading; until someone does, treat it as open.
 

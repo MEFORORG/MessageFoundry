@@ -4,7 +4,7 @@
 
 A de-identified dataset is only safe to commit/share once it is **proven** free of known
 customer/partner/site tokens — and that token set must be the SINGLE source of truth, not a third
-copy that drifts (the very drift that already bit ``tests/test_load_config.py``). So the engine-side
+copy that drifts (the very drift that already bit ``tests/test_load_config.py``). So the toolkit-side
 leak-check delegates to ``scripts/security/scan_forbidden.py`` — the owner-managed guard — via
 its importable :func:`scan_text`. The standalone ``tee/anon/leak.py`` vendors the same token data
 (held identical by the parity test), since the tee cannot reach ``scripts/``.

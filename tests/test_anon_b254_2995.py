@@ -53,7 +53,7 @@ def _stand_in(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: ModuleTyp
     """Make ``module`` believe it lives in the scanner tests' made-up tree, so the shared depth
     table indexes one layout. Only the folders above the file matter to the loader, so that
     tree's ``leak.py`` file name is left as it is."""
-    package = "tee" if module is tee_surrogates else "messagefoundry"
+    package = "tee" if module is tee_surrogates else "messagefoundry_toolkit"
     module_file = _module_file(tmp_path, package)
     monkeypatch.setattr(module, "__file__", str(module_file))
     return module_file
