@@ -42,8 +42,9 @@ __all__ = [
 # separator so a batch whose MSH-1 isn't ``|`` (e.g. ``MSH^...``) still splits per-message instead
 # of being read as one giant message — after a line break a segment id is always exactly three
 # chars, so only an ``MSH`` segment starts with "MSH". Every reading in this module finds it through
-# the one predicate, :func:`_next_boundary`; what differs between them is only which line breaks
-# end a line in the text each is given, held in a :class:`_Boundary`. AC-7's test in
+# the one predicate, :func:`_next_boundary`, and a :class:`_Boundary` says how the text each is
+# given spells it. Each reading still reads its own lead (whitespace, a byte order mark, an
+# FHS/BHS header, or none), so keep the leads in step by hand. AC-7's test in
 # tests/test_one_frame_one_message.py compares the delivery reading with the ingress one on a
 # handful of shapes, not every input, and tests/test_msh_boundary_parity.py holds each reading to
 # its answer before the BACKLOG #3759 refactor.
@@ -62,14 +63,22 @@ _BOM = "\N{ZERO WIDTH NO-BREAK SPACE}"
 class _Boundary[S: (str, bytes)]:
     """How one kind of text spells a boundary, for :func:`_next_boundary`.
 
-    ``lines`` holds each line break that can end a line in that text, followed by ``msh``.
+    ``lines`` holds each line break that can end a line in that text, followed by ``msh``. Each
+    break is one character: :func:`_next_boundary` begins its searches one before the first
+    ``msh``, so a longer break would be missed, and ``__post_init__`` refuses one.
     ``marked``, when set, is a mark and a pattern for a wider boundary: a line break, then one or
-    more of that mark, then ``msh``. The pattern is searched only when the text holds the mark, so a
-    text without one never pays it."""
+    more of that mark, then ``msh``. The pattern is searched only when the text holds the mark past
+    the start, so a text without one never pays it."""
 
     msh: S
     lines: tuple[S, ...]
     marked: tuple[S, re.Pattern[S]] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.lines or any(
+            len(line) != len(self.msh) + 1 or not line.endswith(self.msh) for line in self.lines
+        ):
+            raise ValueError("each boundary spelling is one line-break character, then MSH")
 
 
 #: Text :func:`~messagefoundry.parsing.peek.normalize` wrote, which ends every line with CR alone.
@@ -109,8 +118,9 @@ def _next_boundary[S: (str, bytes)](text: S, start: int, boundary: _Boundary[S])
             return at
         if hit >= 0:
             best = hit
-    # A marked boundary's marks sit between its break and its MSH, so its break can be before `at`.
-    if marked is not None and marked[0] in text:
+    # A marked boundary's marks sit between its break and its MSH, so its break can be before `at`,
+    # and its first mark is past `start`, so a mark in the lead alone does not start the search.
+    if marked is not None and text.find(marked[0], start + 1) >= 0:
         found = marked[1].search(text, start)
         if found is not None and (best < 0 or found.start() < best):
             best = found.start()

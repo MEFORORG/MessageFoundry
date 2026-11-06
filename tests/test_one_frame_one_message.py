@@ -57,6 +57,7 @@ from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
 from messagefoundry.transports.tcp import TcpDestination, TcpSource
 from messagefoundry.transports.timer import TimerSource
 from messagefoundry.transports.x12 import X12Source
+from tests._mllp_recorder import MllpRecorder
 
 SB, EB, CR, BS, NUL = "\x0b", "\x1c", "\r", chr(92), "\x00"
 ENC = "^~" + BS + "&"
@@ -469,17 +470,9 @@ DONE = (MessageStatus.PROCESSED.value, OutboxStatus.DONE.value)
 DEAD = (MessageStatus.ERROR.value, OutboxStatus.DEAD.value)
 
 
-class _SendRecorder(MLLPDestination):
-    """A real MLLP destination, so its ``check_frame`` is the real one, whose send only records."""
-
-    def __init__(self, **field: Any) -> None:
-        settings: dict[str, object] = {"host": "127.0.0.1", "port": 1}
-        config = Destination(name=DEST, type=ConnectorType.MLLP, settings=settings, **field)
-        super().__init__(config)
-        self.sent: list[str] = []
-
-    async def send(self, payload: str, *, metadata: Any = None) -> None:
-        self.sent.append(payload)
+def _send_recorder(**field: Any) -> MllpRecorder:
+    """The shared recording MLLP destination, on this file's lane."""
+    return MllpRecorder(DEST, **field)
 
 
 async def _enqueue(store: MessageStore, bodies: list[str]) -> list[str]:
@@ -504,7 +497,7 @@ async def test_check_frame_sees_the_payload_after_the_send_rewrites(
     # shadow outbound would dead-letter what a live one delivers.
     settings: dict[str, object] = {"host": "127.0.0.1", "port": 1, **setting}
     config = Destination(name=DEST, type=ConnectorType.MLLP, settings=settings, **field)
-    async with aclosing(MLLPDestination(config)) as rewriting, aclosing(_SendRecorder()) as plain:
+    async with aclosing(MLLPDestination(config)) as rewriting, aclosing(_send_recorder()) as plain:
         rewriting.check_frame(CLEAN + EB)
         with pytest.raises(NegativeAckError):
             rewriting.check_frame(EMBEDDED_SB)  # an interior start byte survives any rewrite
@@ -551,7 +544,7 @@ async def test_a_shadow_outbound_records_what_a_live_send_would(
     # marked the smuggled row PROCESSED, where a live send would have dead-lettered it. The batch
     # twin is in tests/test_outbound_batch.py, which runs on every store backend.
     (mid,) = await _enqueue(store, [body])
-    dest = _SendRecorder(**field)
+    dest = _send_recorder(**field)
     runner = wiring_runner.RegistryRunner(
         Registry(), store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
     )
@@ -820,10 +813,10 @@ async def test_the_tcp_send_carries_one_message_and_an_opaque_relay(
 @pytest.mark.parametrize(
     ("dest", "kwargs", "transport"),
     [
-        pytest.param(lambda: _SendRecorder(), {}, "MLLP", id="mllp"),
-        pytest.param(lambda: _SendRecorder(), {"rewrite": False}, "MLLP", id="mllp-as-stored"),
+        pytest.param(lambda: _send_recorder(), {}, "MLLP", id="mllp"),
+        pytest.param(lambda: _send_recorder(), {"rewrite": False}, "MLLP", id="mllp-as-stored"),
         pytest.param(
-            lambda: _SendRecorder(hl7_raw_separators=True), {}, "MLLP", id="mllp-raw-separators"
+            lambda: _send_recorder(hl7_raw_separators=True), {}, "MLLP", id="mllp-raw-separators"
         ),
         # The delimiter override re-encodes first; the refusal is still this one, not "reencode".
         pytest.param(

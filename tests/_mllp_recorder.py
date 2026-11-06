@@ -39,7 +39,9 @@ async def run_one_batch(runner: RegistryRunner, lane: str) -> str:
     try:
         head = await runner.store.claim_next_fifo(lane)
         cfg = runner._batch[lane]
-        assert head is not None and cfg is not None
+        # A raise, not an assert: this module is not assert-rewritten, and -O would strip one.
+        if head is None or cfg is None:
+            raise AssertionError(f"lane {lane!r}: no FIFO head ({head!r}) or no batch ({cfg!r})")
         await runner._process_delivery_batch(lane, head, cfg)
         return head.id
     finally:
