@@ -2727,12 +2727,18 @@ async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row
 
 
 @pytest.mark.parametrize(
-    "fault",
-    [NotImplementedError("a backend without the revoke"), asyncio.CancelledError()],
-    ids=["defect", "cancelled"],
+    "faults",
+    [
+        (NotImplementedError("a backend without the revoke"),),
+        (asyncio.CancelledError(),),
+        # A refusal, then a retry that raises: the retry's exception propagates.
+        (RuntimeError("the store refused the revoke"), NotImplementedError("no revoke")),
+        (RuntimeError("the store refused the revoke"), asyncio.CancelledError()),
+    ],
+    ids=["defect", "cancelled", "refusal-then-defect", "refusal-then-cancelled"],
 )
 async def test_a_refused_enable_whose_revoke_hits_a_defect_still_writes_its_refusal_row(
-    monkeypatch: pytest.MonkeyPatch, fault: BaseException
+    monkeypatch: pytest.MonkeyPatch, faults: tuple[BaseException, ...]
 ) -> None:
     """RED when: a defect the revoke raises, which the soft write re-raises rather than logs, skips
     the ``auth.mfa_enroll_refused`` row (vault BACKLOG #3113 item 2, round two), or a defect or a
@@ -2765,13 +2771,13 @@ async def test_a_refused_enable_whose_revoke_hits_a_defect_still_writes_its_refu
 
         async def broken_revoke(token_hash: str, *, now: float | None = None) -> None:
             revokes.append(token_hash)
-            raise fault
+            raise faults[len(revokes) - 1]
 
         monkeypatch.setattr(store, "enable_totp", reset_then_enable)
         monkeypatch.setattr(store, "revoke_session", broken_revoke)
-        with pytest.raises(type(fault)):
+        with pytest.raises(type(faults[-1])):
             await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
-        assert len(revokes) == 1, "a defect or a cancellation from the revoke was retried"
+        assert len(revokes) == len(faults), "a defect or a cancellation from the revoke was retried"
         rows = await store.list_audit(
             actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
         )

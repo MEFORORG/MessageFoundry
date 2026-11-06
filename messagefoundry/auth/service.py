@@ -1211,8 +1211,8 @@ class Elevation:
       as that ``auth.temp_password_expired`` row records; or (``confirm_mfa_enrollment`` only,
       BACKLOG #2224) the proof was good but turning TOTP on matched no row, so the confirm asked
       the store to end the session it had just rotated, as its ``auth.mfa_enroll_refused`` row
-      records. That row's ``session_ended`` says whether the store did; when it is false, the
-      rotated session may still exist, but its token was never handed back (vault BACKLOG #3113,
+      records. That row's ``session_ended`` says whether a revoke landed, as far as the confirm
+      saw; when it is false, the rotated session may still exist, but its token was never handed back (vault BACKLOG #3113,
       #3025; THE RETRY comment in :meth:`AuthService.confirm_mfa_enrollment`). Or (the TOTP and
       passkey legs, BACKLOG #3068) the session or its account went while the leg waited on the
       directory lookup, the account queue or the proof check, with the proof checked or not. Fails
@@ -13611,8 +13611,8 @@ class AuthService:
         still OFF (BACKLOG #1902), so a lost session never leaves MFA on with codes nobody saw. So
         does a good code whose activation matches no row, for example because a reset cleared the
         staged secret, a second confirm enabled first (BACKLOG #2224), or a second begin staged a
-        secret this confirm never verified (BACKLOG #3025). That confirm ends the session it rotated,
-        hands back no codes, and audits ``auth.mfa_enroll_refused``, whose ``session_ended`` says
+        secret this confirm never verified (BACKLOG #3025). That confirm asks the store to end the
+        session it rotated, hands back no codes, and audits ``auth.mfa_enroll_refused``, whose ``session_ended`` says
         whether the store took the revoke (vault BACKLOG #3113; THE RETRY comment in the body,
         BACKLOG #3025).
 
@@ -13762,14 +13762,17 @@ class AuthService:
             #
             # THE RETRY (BACKLOG #3025). Left live, the rotated session stays stamped MFA-verified
             # on a factor that is not enabled, so a revoke the store REFUSED, which the helper
-            # logged and answered False, is tried once more. Only a refusal is retried: a defect
-            # or a cancellation from the first attempt propagates without a second one, so the
-            # retry never widens the window in which the ``finally`` below awaits a store write
-            # while an exception is propagating. The retry recovers only a refusal that has
-            # cleared by then, such as a deadlock victim; at least a closed connection refuses
-            # it too. ``session_ended`` records whether either attempt landed. Where neither did,
-            # the session may stay live until its own timers end it, and no caller holds its
-            # token, which is never handed back. The row's own write is soft too, so a store
+            # logged and answered False, is tried once more. A refusal here is what ``refused``
+            # catches, and that set also reads some defects as refusals, at least an engine
+            # ``RuntimeError`` or a ``ValueError``; those are retried too. A cancellation, or a
+            # defect the helper re-raises, from the first attempt propagates with no second
+            # one, so the retry is never awaited while an exception is propagating; a
+            # cancellation can still land during the retry itself. The retry recovers only a
+            # refusal that has cleared by then, such as a deadlock victim; at least a closed
+            # connection refuses it too. ``session_ended`` records whether either attempt
+            # landed. Where neither did, or the first attempt raised, the session may stay live
+            # until its own timers end it, and no caller holds its token, which is never handed
+            # back. The row's own write is soft too, so a store
             # fault there is logged at ERROR rather than replacing the answer, or a defect
             # already propagating. Known limit: a cancellation can land after the store committed
             # a revoke, and the row then says ``session_ended: false`` for a session that did end.
