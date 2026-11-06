@@ -5765,13 +5765,15 @@ request to `/ui/logout` whose session cookie ends no session writes an `auth.log
 Each source writes at most 3 such rows in any 60 seconds, and all sources together at most 120. A
 source is the caller's address, folded as the sign-in limiter folds it, and every caller with no
 address shares one source. So ten distinct sources flooding the route write 30 rows a minute and
-leave every other source its rows. Forty sources at their share fill the 120 ceiling, and then no
+leave the other 90 rows to everyone else, 30 more sources' worth. Forty sources at their share fill the 120 ceiling, and then no
 source writes its own row until earlier rows age out of the window. A sign-out past either limit
 is not written as its own row but counted: one `auth.logout` row a minute, with no actor and no
 client, has `outcome` `unrecorded` and `"count": N`, the sign-outs left unwritten since the last
 such row, and a WARNING log line gives the same N. Its own outcome keeps a reader that counts
 `nothing_to_revoke` rows from reading it as one sign-out. The first sign-out past a limit writes
-that row at once. The count left when a flood stops is written by the next sign-out that ends
+that row at once, unless a count row was written in the minute before; then it waits for that
+minute to pass. The row's time is when it was written, not when the misses it counts arrived. The
+count left when a flood stops is written by the next sign-out that ends
 nothing after the minute. With the audit store refusing writes, the ERROR line each refused write
 logs is bounded the same way.
 
@@ -5783,7 +5785,8 @@ IPv6 host that holds a /64 can be 40 sources by itself and fill the ceiling. The
 count are in-process, so each engine shard keeps its own, and a restart loses a count not yet
 written. Nothing prunes `audit_log` (see
 [retention](CONFIGURATION.md#retention)), so the rows still grow, by at most 121 a minute for each
-engine process. The bound gates the row only: the sign-out itself is never refused or delayed. A
+engine process. The bound gates the row only: the sign-out itself is never refused, though one
+that writes a count row waits for that write too. A
 sign-out that ended a session always writes its row, and so does one that names its caller, as
 `POST /auth/logout` does: concurrent `POST /auth/logout` calls on one token each write a row,
 all but one `nothing_to_revoke`, and that is kept on purpose, because each is an authenticated

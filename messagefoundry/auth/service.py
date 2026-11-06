@@ -2819,7 +2819,7 @@ _LOGOUT_LINEAGE_SECONDS: Final = 5.0
 #: writes at most _LOGOUT_MISS_ROWS_PER_SOURCE such rows a window, and every caller with no address
 #: shares one source. All sources together write at most _LOGOUT_MISS_ROWS_ALL, so a flood from many
 #: addresses cannot grow audit_log without limit. That is 40 sources' worth, so ten addresses at
-#: their cap leave room for every other caller's rows. A miss past either is counted, and the count
+#: their cap leave 30 more sources their rows. A miss past either is counted, and the count
 #: is written in one row a window (AuthService._count_unrecorded_logout_misses). A sign-out that
 #: ended a session, or that names its caller, is never bounded. docs/SECURITY.md states the bound.
 _LOGOUT_MISS_ROW_WINDOW_SECONDS: Final = 60.0
@@ -11406,11 +11406,10 @@ class AuthService:
             # Emit the documented auth.logout event (SECURITY.md, ASVS 16.3.3) even when nothing
             # ended, so the trail still records the sign-out request: within the bound when it
             # names no caller, and in a count past it (BACKLOG #4735).
-            if actor is None:
-                admitted = self._admit_logout_miss_row(client)
-                await self._count_unrecorded_logout_misses(refused=not admitted)
-                if not admitted:
-                    return "nothing_to_revoke"
+            bounded = actor is None
+            if bounded and not self._admit_logout_miss_row(client):
+                await self._count_unrecorded_logout_misses(refused=True)
+                return "nothing_to_revoke"
             await write_audit_soft(
                 lambda: self._audit(
                     "auth.logout",
@@ -11424,6 +11423,10 @@ class AuthService:
                 # without clearing the cookie (BACKLOG #3884).
                 defects=(),
             )
+            if bounded:
+                # After its own row, whose slot is already charged, so a fault in this write
+                # cannot cost it that row.
+                await self._count_unrecorded_logout_misses(refused=False)
             return "nothing_to_revoke"
         after = time.time()
         session = ended.token_hash[:12]
@@ -11506,8 +11509,9 @@ class AuthService:
         """Count a miss :meth:`_admit_logout_miss_row` ``refused``, and write the count once no
         count row was written in the last window (BACKLOG #4735).
 
-        Called for every sign-out that names no caller and ended nothing, admitted or not, so a
-        count left when a flood stops is written by the next such sign-out after the window. The
+        Called for every sign-out that names no caller and ended nothing, admitted or not (after
+        an admitted one's own row), so a count left when a flood stops is written by the next such
+        sign-out after the window. The
         row's detail is ``{"outcome": "unrecorded", "count": N}``, N being the misses left
         unwritten since the last count row; its own outcome keeps it from reading as one
         ``nothing_to_revoke`` sign-out. It names no actor and no client, because it counts misses
@@ -11524,20 +11528,25 @@ class AuthService:
             "counts them",
             count,
         )
-        await write_audit_soft(
-            lambda: self._audit(
-                "auth.logout", detail=_json({"outcome": "unrecorded", "count": count})
-            ),
-            log=_log,
-            message="%d sign-outs that ended nothing went past the audit bound, and the "
-            "auth.logout row that counts them failed",
-            args=(count,),
-            # A raise would answer a sign-out the caller is owed with a failure (BACKLOG #3884).
-            defects=(),
-        )
-        # Taken off after the write, not zeroed before it: misses counted during the await stay
-        # for the next row, and a cancelled write, which escapes with no ERROR line, keeps these.
+        # Taken off before the await, so a second count row cannot start on these while this
+        # write stalls; misses counted during the await stay for the next row. A cancelled write
+        # escapes with no ERROR line, so it puts them back.
         self._logout_misses_unrecorded -= count
+        try:
+            await write_audit_soft(
+                lambda: self._audit(
+                    "auth.logout", detail=_json({"outcome": "unrecorded", "count": count})
+                ),
+                log=_log,
+                message="%d sign-outs that ended nothing went past the audit bound, and the "
+                "auth.logout row that counts them failed",
+                args=(count,),
+                # A raise would answer a sign-out the caller is owed with a failure (#3884).
+                defects=(),
+            )
+        except BaseException:
+            self._logout_misses_unrecorded += count
+            raise
 
     async def _ended_owner(self, row: SessionRecord) -> VerifiedUser | None:
         """The account that owns ``row``, a session a revoke has just ended: the one owner lookup

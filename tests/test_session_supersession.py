@@ -662,17 +662,31 @@ async def _counted(store: MessageStore) -> list[tuple[object, object, object]]:
 
 
 async def test_a_source_writes_its_share_of_miss_rows_and_its_next_miss_is_counted(
-    store: MessageStore, miss_clock: list[float]
+    store: MessageStore, miss_clock: list[float], caplog: pytest.LogCaptureFixture
 ) -> None:
-    """RED when: a source's share is not the stated one, or a miss past it is dropped uncounted."""
+    """RED when: a source's share is not the stated one, or a miss past it is dropped uncounted,
+    or its count row raises no WARNING line giving the same count."""
     service = await _service(store)
-    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, "203.0.113.9")
-    # CONTROL: at its share, every miss wrote its own row, and nothing was counted.
-    assert await _own_miss_rows(store) == ["203.0.113.9"] * _LOGOUT_MISS_ROWS_PER_SOURCE
-    assert await _counted(store) == []
-    await _misses(service, 1, "203.0.113.9")
+
+    def _warnings() -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "messagefoundry.auth.service" and r.levelno == logging.WARNING
+        ]
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+        await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, "203.0.113.9")
+        # CONTROL: at its share, every miss wrote its own row, and nothing was counted.
+        assert await _own_miss_rows(store) == ["203.0.113.9"] * _LOGOUT_MISS_ROWS_PER_SOURCE
+        assert await _counted(store) == []
+        assert _warnings() == []
+        await _misses(service, 1, "203.0.113.9")
     assert len(await _own_miss_rows(store)) == _LOGOUT_MISS_ROWS_PER_SOURCE
     assert await _counted(store) == [(None, None, 1)], "the first miss past the bound was dropped"
+    assert _warnings() == [
+        "1 sign-outs that ended nothing went past the audit bound; one auth.logout row counts them"
+    ]
 
 
 async def test_ten_flooding_sources_and_the_unaddressed_leave_another_source_its_rows(
@@ -742,8 +756,8 @@ async def test_a_cancelled_count_row_keeps_its_count_for_the_next_one(
         await _misses(service, 1, "203.0.113.9")
     monkeypatch.setattr(service, "_audit", real)
     miss_clock[0] += _LOGOUT_MISS_ROW_WINDOW_SECONDS + 1
-    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE + 1, "203.0.113.9")
-    # The cancelled row's 1 is written by the first miss of the next window.
+    # Admitted misses only, so the one count row can only be the cancelled row's 1.
+    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, "203.0.113.9")
     assert [n for _, _, n in await _counted(store)] == [1]
 
 
