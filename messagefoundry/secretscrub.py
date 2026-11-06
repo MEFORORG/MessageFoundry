@@ -128,8 +128,9 @@ line are level, 1.29 against 1.26 us and 5.08 against 4.97, inside this box's no
 holds a "{" now walks rather than taking the fast path: a token value then a braced ``PWD=``, the line
 the change is for, costs 7.5 against 6.1 us, and a ``MEFOR_STORE_DSN`` holding one 7.8 against 5.0.
 Three 6 KB runs built to make every check walk are level within 6 percent: braced runs, unclosed
-``PWD={`` labels, and closed spaced ones, the last 1.21 against 1.15 ms. Folding the walk's two token
-classes (BACKLOG #3114) is level on every one of those lines against the module just before it.
+``PWD={`` labels, and closed spaced ones, the last 1.21 against 1.15 ms. Those figures were measured
+before the braced tail began checking for a label and the fold characters became tokens of their own
+(BACKLOG #3114); the growth tests in ``tests/test_log_redaction_secret_domain.py`` still bound both.
 """
 
 from __future__ import annotations
@@ -401,17 +402,18 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # right after the placeholder.
 #
 # A KEYWORD SPELLED WITH A FOLD CHARACTER AS ITS FIRST LETTER IS CHECKED TOO (BACKLOG #3114), such as
-# U+017F in ``secret`` or U+0130 and U+0131 in ``intake_api_key_next``. The walk's two token classes
-# fold case in every pattern, so the walk reads that character as a letter that starts a run, and
-# checks the stop there. They did not fold where the pattern did not: ``_MEFOR_SECRET`` here, the one
-# pattern in this module compiled without ``(?i)``, and in ``support/redact.py`` every stopped pattern
-# but ``_AUTH_SCHEME``, which fold their keywords alone. There the walk read the character as a
-# separator and checked only from the next letter, so ``MEFOR_X=a;<U+017F>ecret='v w'`` printed
-# "v w'" on both copies. THE STOP KEEPS ITS OWN PATTERN'S FOLD, and only the tokens fold. Folding
-# the stop as well, in a pattern that did not fold it before, let its underscored-prefix branch read a
-# run holding a fold character as a later label's prefix, so in ``MEFOR_B_PW=a:b_<U+0130>_passwd:
-# "c d"`` the "b" printed, which the patterns before hid. No keyword begins with "k", so U+212A can
-# only head a label as part of a prefix, which the walk already stopped in front of.
+# U+017F in ``secret`` or U+0130 and U+0131 in ``intake_api_key_next``. Where a pattern does not fold
+# globally, ``_MEFOR_SECRET`` here and in ``support/redact.py`` every stopped pattern but
+# ``_AUTH_SCHEME``, the walk read that character as a separator and checked the stop only from the
+# next run, so ``MEFOR_X=a;<U+017F>ecret='v w'`` printed "v w'" on both copies. The walk now takes each
+# of the four characters in :data:`_WALK_FOLD_CHARS` as a token of its own and checks the stop in front
+# of it, and still checks the run after it. FOLDING THE RUN CLASS INSTEAD WAS BUILT FIRST AND PRINTED
+# VALUES the old walk hid: it joined a fold character onto the run before it, so the run after it was
+# no longer checked, and ``MEFOR_X=b2<U+017F>token='c3 d4'`` printed "c3 d4'", U+212A included.
+# Folding the stop as well let its underscored-prefix branch read a run holding a fold character as a
+# later label's prefix: in ``MEFOR_B_PW=a:b_<U+0130>_passwd: "c d"`` the "b" printed. The stop keeps
+# its own pattern's fold. A label spelled this way now reads as its ASCII spelling does, so it also
+# takes part in the cascade shapes pinned under OPEN DEFECTS; those print as the ASCII line does.
 #
 # AND ONE DELIBERATE TRADE, which is the one place a single pass prints text the old class hid. After a
 # hard separator, an underscored run in front of a keyword is read as the later label's prefix, so in
@@ -541,6 +543,18 @@ _MEFOR_LABEL_HEAD = r"\b(?-i:" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]++)\b['\"]?
 _QUOTED_LABEL = _LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 
+#: A label of any family up to where its value starts, for :data:`_KV_QUOTED_VALUE`. Unlike
+#: :data:`_LABEL_HEAD` it takes no quote after the keyword and no line break, so a run-on can never
+#: cross a line or end on a ``'label'=`` echo's own quote.
+_RUN_ON_LABEL = (
+    r"(?:(?=(?i:[" + _KEYWORD_INITIALS + r"]))"
+    r"(?:(?i:" + _alternation(_CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS) + r")\b"
+    r"[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"|(?i:" + _alternation(_TOKEN_WORDS) + r")\b[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"(?:(?i:bearer|basic|digest)[^\S\r\n]++)?)"
+    r"|\b(?-i:" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
+)
+
 # A LATER ``_CREDENTIAL_KV`` LABEL WHOSE VALUE IS BRACED AND HOLDS WHITE SPACE (BACKLOG #2966). The
 # plain class ran on over such a label and stopped at the space inside its braces, so the tail of the
 # braced value printed, under every label whose class is :data:`_PLAIN_VALUE` or one of its siblings:
@@ -551,13 +565,16 @@ _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 #
 # THE VALUE STOPS IN FRONT OF THE LABEL AND THEN TAKES IT, THROUGH THE BRACED VALUE, UP TO THE CLOSER.
 # What the old class printed, from the first white space in the braces to the closer, is written back
-# MASKED rather than dropped: every character but white space and ASCII punctuation becomes "x"
-# (:func:`_braced_tail`), and the closer stays. So ``MEFOR_X=a;PWD={pp ww}`` becomes
-# ``MEFOR_X=<redacted> xx}``, the old ``MEFOR_X=<redacted> ww}`` with its letters masked, and the
-# label is hidden with the value, as it was before. Every later pass therefore reads text of the same
-# shape the old class left: the same white space, separators and closer, at the same places, and no
-# label, since no keyword is spelled in "x". Both simpler forms were built first and measured printing
-# values the old class hid, by changing that shape:
+# MASKED rather than dropped, by :func:`_mask_member_value`, the connection-string member mask, and the
+# closer stays. So ``MEFOR_X=a;PWD={pp ww}`` becomes ``MEFOR_X=<redacted> xx}``, the old
+# ``MEFOR_X=<redacted> ww}`` with its letters masked, and the label is hidden with the value, as it was
+# before. That mask keeps each word's length and the class of each character, and keeps whole what a
+# later pass reads: a placeholder an earlier pass wrote, the bundle's ``mfb64:v1:`` marker, and a scheme
+# word such as ``Bearer`` before a space. So every later pass reads text of the shape the old class
+# left. A first form masked every letter and digit to "x" and printed values the old class hid: in
+# ``token=a;PWD={pp Bearer abcdefgh}ijkl`` the later bearer pass no longer saw ``Bearer`` and "}ijkl"
+# printed, and a placeholder in the tail stopped being one. Both simpler forms were built first and
+# measured printing values the old class hid, by changing that shape:
 #
 # * Leaving the label to ``_CREDENTIAL_KV`` let it take the closer, so a braced value under an EARLIER
 #   label, which the old text closed on that "}", ran to the end of the line and fell back to its plain
@@ -573,11 +590,23 @@ _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 #   would print what followed the closer.
 # * No quote and no line break, as :data:`_GUARDED_BRACED_VALUE` refuses them, so the walk cannot end
 #   on another label's quote or cross a line the old class never crossed.
+# * No label, of any family, after the first white space, and no character outside ASCII there. The
+#   old class stopped at that white space, so the rest of the line, a label in the braces included,
+#   was still in front of the pass that wrote the placeholder and of every pass after it. A run-on
+#   takes the label out of the text that pass still scans: in ``MEFOR_X=a;PWD={pp token=abc}def`` and
+#   ``api_key=a&passwd={b session=c}d`` the later label's value ran on past the closer, which the old
+#   text hid and the run-on printed. A character outside ASCII is refused for the same reason, so a
+#   label spelled with a fold character cannot slip past the check.
 # * No "{", which keeps the scan linear. A walk from one label's "{" ends at the next "{" at the
 #   latest, so walks started by two labels cannot overlap, and a line of unclosed ``PWD={`` labels costs
 #   one walk per label, not one per pair.
 #
-# AND WHAT THE LABEL MUST BE: a credential word, with a ``\b`` in front of it and no quote after it.
+# AND WHAT THE LABEL MUST BE: a credential word, with a ``\b`` in front of it, no quote after it, and
+# the "{" right after its ":" or "=", with no line break before them. A line break, because the
+# run-on would otherwise delete it and join the lines of a multi-line record. White space after the
+# separator, because the fast path below ends a run there and never checks the stop, so with it the
+# two paths disagreed and ``token=a;PWD= {b c}`` printed or not by whether a "{" came earlier in the
+# value; that shape now prints as it did before, on both paths.
 # The ``\b``, because a keyword glued on by "_", as in ``x-client_secret={a b}``, is one no pass can
 # resume at, and stopping there printed the whole braced value. No underscored prefix after a hard
 # separator, unlike the quoted stop, because in ``x_pwd: a:b_pwd={c d}`` that prints "b", which the
@@ -587,14 +616,19 @@ _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 # the old behaviour.
 _BRACED_HEAD = (
     r"\b(?=(?i:[" + "".join(sorted({word[0] for word in _CREDENTIAL_WORDS})) + r"]))"
-    r"(?i:" + _alternation(_CREDENTIAL_WORDS) + r")\b\s*+[:=]\s*+"
+    r"(?i:" + _alternation(_CREDENTIAL_WORDS) + r")\b[^\S\r\n]*+[:=]"
 )
 #: The braced value up to its first white space, then the rest up to its closer. :data:`_BRACED_LABEL`
 #: adds the closer and its guard, and is what the stop checks for; :data:`_BRACED_RUN_ON` is what the
 #: value then takes, the part from the white space on in the group ``braced_tail``. One walk, so the
 #: two agree at every position.
 _SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s]|\}\})*+"
-_SPACED_BRACED_TAIL = r"[^\S\r\n](?:[^{}'\"\r\n]|\}\})*+"
+_SPACED_BRACED_TAIL = (
+    r"[^\S\r\n](?:[^{}'\"\r\nA-Za-z0-9\x80-\U0010ffff]|\}\}"
+    + r"|(?!"
+    + _RUN_ON_LABEL
+    + r")(?-i:[A-Za-z0-9])++)*+"
+)
 _BRACED_LABEL = _BRACED_HEAD + _SPACED_BRACED_HEAD + _SPACED_BRACED_TAIL + r"\}(?!\})"
 _BRACED_RUN_ON = (
     _BRACED_HEAD
@@ -623,21 +657,39 @@ _NOT_BEFORE_QUOTED_LABEL = (
     + r")"
 )
 
+#: Every character outside ASCII that Python's case-insensitive matching reads as an ASCII letter:
+#: U+0130, U+0131, U+017F and U+212A, the set :data:`_GATE_FOLDS` measures (BACKLOG #3114). In a
+#: pattern compiled without a global fold, a value walk read such a character as a separator and
+#: checked the stop only from the next run, so a keyword it headed was never checked. The walks take
+#: each one as a token of its own, with the stop checked in front of it, and still check the run after
+#: it. In a pattern that folds globally the walk's run class already holds these characters, so that
+#: branch is never reached there and the walk is the one it was. Built with ``chr()`` so no encoding
+#: layer between here and disk can change a character; the support bundle imports both.
+_WALK_FOLD_CHARS = "".join(map(chr, (0x0130, 0x0131, 0x017F, 0x212A)))
+_FOLD_HEAD = "[" + _WALK_FOLD_CHARS + "]"
 
-#: A label of any family up to where its value starts, for :data:`_KV_QUOTED_VALUE`. Unlike
-#: :data:`_LABEL_HEAD` it takes no quote after the keyword and no line break, so a run-on can never
-#: cross a line or end on a ``'label'=`` echo's own quote.
-_RUN_ON_LABEL = (
-    r"(?:(?=(?i:[" + _KEYWORD_INITIALS + r"]))"
-    r"(?:(?i:" + _alternation(_CREDENTIAL_WORDS + _KEY_MATERIAL_WORDS) + r")\b"
-    r"[^\S\r\n]*+[:=][^\S\r\n]*+"
-    r"|(?i:" + _alternation(_TOKEN_WORDS) + r")\b[^\S\r\n]*+[:=][^\S\r\n]*+"
-    r"(?:(?i:bearer|basic|digest)[^\S\r\n]++)?)"
-    r"|\b(?-i:" + re.escape(_ENV_PREFIX) + r"[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
-)
+
 #: The outer walk: up to the next quote of one kind, or to a label whose value opens with one.
-_SQ_RUN_ON_WALK = r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"')[A-Za-z0-9]++)*+"
-_DQ_RUN_ON_WALK = r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"\")[A-Za-z0-9]++)*+"
+_SQ_RUN_ON_WALK = (
+    r"(?:[^'\r\nA-Za-z0-9"
+    + _WALK_FOLD_CHARS
+    + r"]|(?!"
+    + _RUN_ON_LABEL
+    + r"')"
+    + r"(?:[A-Za-z0-9]++|"
+    + _FOLD_HEAD
+    + r"))*+"
+)
+_DQ_RUN_ON_WALK = (
+    r"(?:[^\"\r\nA-Za-z0-9"
+    + _WALK_FOLD_CHARS
+    + r"]|(?!"
+    + _RUN_ON_LABEL
+    + r"\")"
+    + r"(?:[A-Za-z0-9]++|"
+    + _FOLD_HEAD
+    + r"))*+"
+)
 #: The inner walk, over the later label's value. It stops at anything a later pass could read past
 #: the closer: either quote, a "{", a "://", any label at all, and any character outside ASCII, so
 #: a keyword spelled with a fold character stops it in both copies alike.
@@ -705,9 +757,10 @@ _KV_QUOTED_VALUE = (
 # ``_NO_QUOTED_LABEL_AFTER`` rules all of those out, and when it holds the whole run is taken with no
 # check at all; only otherwise does the value walk token by token. The two paths give the same result,
 # because a stop is impossible whenever this lookahead passes. What it saves an ordinary credential
-# line is measured once, in the module docstring. A run holding a "{" never takes it, since the stop
-# before a braced label (BACKLOG #2966) needs a "{" inside the run and nothing after it gives that
-# away; such a run walks, which the run-on walk tests time.
+# line is measured once, in the module docstring. A run holding a "{", or followed by one, never takes
+# it, because the stop before a braced label (BACKLOG #2966) needs a "{" right after a ":" or "=" in the
+# run, or after white space that the lookahead already refuses; such a run walks, which the run-on
+# walk tests time.
 _NO_QUOTED_LABEL_AFTER = r"(?!\s*+[:='\"]|\s++(?i:bearer|basic|digest)\s)"
 
 # The plain value classes. Each pattern keeps the terminator set it always had, stated once here and
@@ -720,26 +773,26 @@ _KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL
 _SCHEME_TERMINATORS = r"\s'\",;"  # _AUTH_SCHEME
 _PLAIN_VALUE = (
     rf"['\"]?(?:[^{_PLAIN_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_PLAIN_TERMINATORS}]))"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_PLAIN_TERMINATORS}]))*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_PLAIN_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_PLAIN_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KV_VALUE = (
     rf"['\"]?(?:[^{_KV_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KV_TERMINATORS}]))"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KV_TERMINATORS}]))*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KV_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KV_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KEY_VALUE = (
     rf"['\"]?(?:[^{_KEY_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KEY_TERMINATORS}]))"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KEY_TERMINATORS}]))*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KEY_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KEY_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_SCHEME_VALUE = (
     rf"['\"]?(?:[^{_SCHEME_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_SCHEME_TERMINATORS}]))"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_SCHEME_TERMINATORS}]))*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_SCHEME_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_SCHEME_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 
@@ -863,7 +916,11 @@ _MEFOR_SECRET = re.compile(
 #   braced value holds white space (BACKLOG #2966): ``MEFOR_STORE_DSN=Server=h;PWD={p w}`` and
 #   ``token=a;PWD={p w}`` print nothing now. A label or braced value that :data:`_BRACED_RUN_ON`'s
 #   conditions refuse still prints all or part of the braced value, as before, and so does a
-#   key-material or token label with one, as in ``token=a;session={p w}``.
+#   key-material or token label with one, as in ``token=a;session={p w}``. At least these shapes are
+#   among them: ``PWD= {p w}`` with white space after the separator, a URL-encoded separator as in
+#   ``%3BPWD={p w}``, and braces holding a label or a character outside ASCII after their first
+#   white space. On the installed log chain a ``token=`` line still prints the tail, because the query
+#   filter runs first and takes the head of the braced value before this pass sees it.
 # Each of the residuals above, from the unclosed quote on, printed the same text before BACKLOG
 # #1685's remainder; none is new.
 _CREDENTIAL_KV = re.compile(
@@ -1316,15 +1373,16 @@ def _keep_label(m: re.Match[str], placeholder: str) -> str:
     return f"{m.group(1)}={placeholder}{_braced_tail(m)}"
 
 
-#: What :func:`_braced_tail` keeps: white space and ASCII punctuation. Everything else becomes "x".
-_BRACED_TAIL_MASKED = re.compile(r"[^\s!-/:-@\[-`{-~]")
-
-
 def _braced_tail(m: re.Match[str]) -> str:
-    """The masked ``braced_tail`` of a match that took a braced label after its value, or "" when it
-    took none. :data:`_BRACED_RUN_ON` says why the tail is written back masked rather than dropped."""
-    tail = m.groupdict().get("braced_tail")
-    return "" if tail is None else _BRACED_TAIL_MASKED.sub("x", tail)
+    """The ``braced_tail`` of a match that took a braced label after its value, masked by
+    :func:`_mask_member_value`, or "" when it took none. :data:`_BRACED_RUN_ON` says why the tail is
+    written back masked rather than dropped, and why with that mask. A pattern without the group
+    gets "", so a rebuilt pattern without the run-on still works here."""
+    group = m.re.groupindex.get("braced_tail")
+    if group is None:
+        return ""
+    start, end = m.span(group)
+    return "" if start < 0 else _mask_member_value(m.string, start, end)
 
 
 # --- ADMISSION GATING: what makes a per-record credential pass affordable --------------------------

@@ -149,14 +149,29 @@ _LABEL_HEAD = (
 _MEFOR_LABEL_HEAD = r"\b(?-i:MEFOR_[A-Z0-9_]++)\b['\"]?\s*+[:=]\s*+"
 _QUOTED_LABEL = _LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
 _MEFOR_QUOTED_LABEL = _MEFOR_LABEL_HEAD + r"(?:" + _GUARDED_QUOTED_VALUE + r")"
+_RUN_ON_LABEL = (
+    r"(?:(?=(?i:[abceipst]))"
+    r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"
+    r"|intake_api_key_next)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"|(?i:bearer|authorization|token|session|api[_-]?key)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
+    r"(?:(?i:bearer|basic|digest)[^\S\r\n]++)?)"
+    r"|\b(?-i:MEFOR_[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
+)
 # The stop fires before a ``_CREDENTIAL_KV`` label whose braced value holds white space and no "{"
 # too, and the value then takes that label up to the braced value's closer (BACKLOG #2966), so
 # ``MEFOR_X=a;PWD={pp ww}`` no longer prints " ww}". Why the closer stays, why those conditions on
 # the braces and the label are what keep it from printing a value, and why the scan stays linear, are
 # stated once, on the same fragments in ``messagefoundry/secretscrub.py``.
-_BRACED_HEAD = r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b\s*+[:=]\s*+"
+_BRACED_HEAD = (
+    r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[^\S\r\n]*+[:=]"
+)
 _SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s]|\}\})*+"
-_SPACED_BRACED_TAIL = r"[^\S\r\n](?:[^{}'\"\r\n]|\}\})*+"
+_SPACED_BRACED_TAIL = (
+    r"[^\S\r\n](?:[^{}'\"\r\nA-Za-z0-9\x80-\U0010ffff]|\}\}"
+    + r"|(?!"
+    + _RUN_ON_LABEL
+    + r")(?-i:[A-Za-z0-9])++)*+"
+)
 _BRACED_LABEL = _BRACED_HEAD + _SPACED_BRACED_HEAD + _SPACED_BRACED_TAIL + r"\}(?!\})"
 _BRACED_RUN_ON = (
     _BRACED_HEAD
@@ -182,6 +197,12 @@ _NOT_BEFORE_QUOTED_LABEL = (
 )
 
 
+# The four characters outside ASCII that case-insensitive matching reads as an ASCII letter, and
+# the one-character token the walks take each as (BACKLOG #3114). Why, on the same constants in
+# ``messagefoundry/secretscrub.py``; spelled out here so the regex scanner can resolve this copy.
+_WALK_FOLD_CHARS = "\u0130\u0131\u017f\u212a"
+_FOLD_HEAD = "[\u0130\u0131\u017f\u212a]"
+
 # ``_CREDENTIAL_KV``'s quoted value: the plain quoted form, except where the quote that would close it
 # opens a later label's value. There it takes that label and its value too, through the value's own
 # closer, so ``password='abc, private_key='p w q'`` no longer prints "p w q'". When it runs on and
@@ -189,16 +210,26 @@ _NOT_BEFORE_QUOTED_LABEL = (
 # linear, are stated once, on the same fragment in ``messagefoundry/secretscrub.py``. Written as plain
 # concatenation, not built by a helper, so ``tests/test_security_static.py`` can resolve this copy and
 # scan it.
-_RUN_ON_LABEL = (
-    r"(?:(?=(?i:[abceipst]))"
-    r"(?:(?i:pass(?:word|wd|phrase)?|pwd|secret|credential|encryption_key(?:s_retired)?|private_key"
-    r"|intake_api_key_next)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
-    r"|(?i:bearer|authorization|token|session|api[_-]?key)\b[^\S\r\n]*+[:=][^\S\r\n]*+"
-    r"(?:(?i:bearer|basic|digest)[^\S\r\n]++)?)"
-    r"|\b(?-i:MEFOR_[A-Z0-9_]++)\b[^\S\r\n]*+[:=][^\S\r\n]*+)"
+_SQ_RUN_ON_WALK = (
+    r"(?:[^'\r\nA-Za-z0-9"
+    + _WALK_FOLD_CHARS
+    + r"]|(?!"
+    + _RUN_ON_LABEL
+    + r"')"
+    + r"(?:[A-Za-z0-9]++|"
+    + _FOLD_HEAD
+    + r"))*+"
 )
-_SQ_RUN_ON_WALK = r"(?:[^'\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"')[A-Za-z0-9]++)*+"
-_DQ_RUN_ON_WALK = r"(?:[^\"\r\nA-Za-z0-9]|(?!" + _RUN_ON_LABEL + r"\")[A-Za-z0-9]++)*+"
+_DQ_RUN_ON_WALK = (
+    r"(?:[^\"\r\nA-Za-z0-9"
+    + _WALK_FOLD_CHARS
+    + r"]|(?!"
+    + _RUN_ON_LABEL
+    + r"\")"
+    + r"(?:[A-Za-z0-9]++|"
+    + _FOLD_HEAD
+    + r"))*+"
+)
 _RUN_ON_INNER = (
     r"(?:[^'\"{:\r\nA-Za-z0-9\x80-\U0010ffff]|:(?!//)"
     r"|(?!" + _RUN_ON_LABEL + r")(?-i:[A-Za-z0-9])++)*+"
@@ -226,7 +257,7 @@ _KV_QUOTED_VALUE = (
 # stop is possible, and otherwise walks the value as tokens -- a run of letters and digits, or one
 # other character -- checking the stop in front of each run. Each pattern's terminator set is stated
 # once and spliced into all three places. Why the two paths agree, why per run agrees with per
-# character, and why the two token classes fold case though this copy's stop folds its keywords alone
+# character, and why a fold character is a token of its own with the stop checked in front of it
 # (BACKLOG #3114), are stated on the same constants in ``messagefoundry/secretscrub.py``.
 _NO_QUOTED_LABEL_AFTER = r"(?!\s*+[:='\"]|\s++(?i:bearer|basic|digest)\s)"
 _PLAIN_TERMINATORS = r"\s'\""  # _MEFOR_SECRET, _BEARER
@@ -235,26 +266,26 @@ _KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL
 _SCHEME_TERMINATORS = r"\s'\",;"  # _AUTH_SCHEME
 _PLAIN_VALUE = (
     rf"['\"]?(?:[^{_PLAIN_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_PLAIN_TERMINATORS}]))"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_PLAIN_TERMINATORS}]))*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_PLAIN_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_PLAIN_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KV_VALUE = (
     rf"['\"]?(?:[^{_KV_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KV_TERMINATORS}]))"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KV_TERMINATORS}]))*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KV_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KV_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KEY_VALUE = (
     rf"['\"]?(?:[^{_KEY_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KEY_TERMINATORS}]))"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KEY_TERMINATORS}]))*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KEY_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KEY_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_SCHEME_VALUE = (
     rf"['\"]?(?:[^{_SCHEME_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_SCHEME_TERMINATORS}]))"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_SCHEME_TERMINATORS}]))*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_SCHEME_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_SCHEME_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 
@@ -590,14 +621,16 @@ _LEADING_TS = re.compile(
 # full probe. That test file's fold-head control arm going red is the signal to re-run the probe, not
 # the proof.
 #
-# RE-RUN 2026-11-06 (BACKLOG #3114), AND THE COPY STAYS. After the braced run-on (#2966) and the fold
-# of the walk's tokens (#3114), over about 1.45 million reconstructed synthetic lines (the generator
-# behind the 822,616 above is not in the tree), the shared pass alone, where the copy runs, printed a
+# RE-RUN 2026-11-06 (BACKLOG #3114), AND THE COPY STAYS. After the braced run-on (#2966) and a first
+# form of the fold-character stop (#3114), which review later replaced, over about 1.45 million
+# reconstructed synthetic lines (the generator behind the 822,616 above is not in the tree), the
+# shared pass alone, where the copy runs, printed a
 # value the copy hid on 30,786 lines; placed after the PHI pass, where the second layer runs today,
 # on 35,181, ASCII lines among them. Each of the 30,786 carries a fold character heading a label's
 # prefix, as in ``<U+0130>_password=``: the residual above, unchanged.
 # Closing it the way the copy reads such a label, by scoping ``secretscrub``'s fold to its keywords,
-# made the write-time pass print a value it hid on 159,840 of those lines, so it was not taken.
+# made the write-time pass print a value it hid on 159,840 of those lines, so it was not taken. The
+# replacement form has not been put through this probe; the copy stays until it is.
 def redact_log_line(line: str) -> str:
     """Return ``line`` with PHI/secret patterns replaced by a redaction placeholder.
 

@@ -2436,17 +2436,19 @@ def test_a_plain_value_does_not_print_a_later_braced_password(line: str) -> None
 
 
 def test_the_braced_tail_is_written_back_masked_with_its_closer() -> None:
-    """The tail keeps its white space, punctuation and closer, and loses every letter and digit, so a
-    later pass reads text of the shape the old class left. Pinned exactly, on both copies."""
+    """The tail keeps its white space, punctuation and closer, and its words are masked by the
+    connection-string member mask, letters to "x" and digits to "0", so a later pass reads text of the
+    shape the old class left. Pinned exactly, on both copies."""
     assert scrub_credentials("MEFOR_X=a;PWD={pp ww}") == "MEFOR_X=<redacted> xx}"
-    assert scrub_credentials("token=a;PWD={pp w;9!} tail") == "token=<redacted> x;x!} tail"
+    assert scrub_credentials("token=a;PWD={pp w;9!} tail") == "token=<redacted> x;0!} tail"
     assert redact_log_line("MEFOR_X=a;PWD={pp ww}") == f"MEFOR_X={REDACTION_PLACEHOLDER} xx}}"
 
 
 def _without_the_braced_run_on(module: ModuleType) -> dict[str, re.Pattern[str]]:
-    """``module``'s stopped patterns with the braced stop and run-on cut out: the plain classes as
-    ``origin/main`` had them, for the swallow shapes. Each source must hold both, or the cut proves
-    nothing."""
+    """``module``'s stopped patterns with the braced stop and run-on cut out. That is not the plain
+    classes as they stood before BACKLOG #2966: the fast path still refuses a "{" and the fold-character
+    token stays. It is enough for the braced shapes, which hold neither. Each source must hold both
+    fragments, or the cut proves nothing."""
     never = NEVER_MATCHES.pattern
     rebuilt: dict[str, re.Pattern[str]] = {}
     for name in _STOPPED_PATTERNS:
@@ -2473,6 +2475,51 @@ def test_the_braced_shapes_print_without_the_run_on(monkeypatch: pytest.MonkeyPa
         ):
             out = apply(line)
             assert _BRACED_WORDS[1] in out, f"{surface}: {line!r} did not print -- got {out!r}"
+
+
+#: Lines review found printing a value on the first form of the braced run-on, each hidden by the
+#: patterns before BACKLOG #2966, with the value that printed. A label inside the braces after their
+#: first white space, which the old class left for the pass that wrote the placeholder and every pass
+#: after it; a placeholder in the tail; a line break before the separator; and white space after it,
+#: where the fast path and the walk disagreed. Each must print nothing on the write-time pass or the
+#: bundle. On the first form each one printed its value, or for the line break joined three lines.
+_BRACED_REVIEW_LINES: tuple[tuple[str, str], ...] = (
+    ("MEFOR_X=a;PWD={pp token=tA1-x}tB2-x", "tB2-x"),
+    ("token=a;PWD={pp Bearer bA1-xyzw}bB2-x", "bB2-x"),
+    ("password=a.PWD={pp private_key=kA1-x}kB2-x", "kB2-x"),
+    ("api_key=a&passwd={pA1-x session=sA1-x}sB2-x", "sB2-x"),
+    ("passwd='qA1-x{pa\u017f\u017fword={qB2-x x_pwd=qC3-x}qD4-x", "qD4-x"),
+)
+
+
+@pytest.mark.parametrize("line, value", _BRACED_REVIEW_LINES, ids=range(len(_BRACED_REVIEW_LINES)))
+def test_a_label_inside_the_braces_is_left_to_the_passes(line: str, value: str) -> None:
+    """A braced value holding a label after its first white space is not taken by the run-on, so the
+    later label's value is hidden as it was before BACKLOG #2966."""
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        assert value not in out, f"{surface}: {value} printed -- got {ascii(out)}"
+
+
+def test_a_placeholder_and_a_line_break_in_a_braced_value_survive() -> None:
+    """The tail mask keeps a placeholder an earlier pass wrote, and the run-on does not cross a line
+    break before the separator."""
+    bundled = redact_log_line("token=a;PWD={p mfb64:v1:QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=} next")
+    assert bundled == f"token={REDACTION_PLACEHOLDER} {REDACTION_PLACEHOLDER}}} next"
+    assert (
+        scrub_credentials("token=a;PWD={p MEFOR_Y=b c}") == "token=<redacted> MEFOR_Y=<redacted> c}"
+    )
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply("MEFOR_X=a;PWD\n=\n{b c} rest")
+        assert out.count("\n") == 2, f"{surface}: a line break was lost -- got {ascii(out)}"
+
+
+def test_white_space_after_the_separator_gives_the_old_result_on_both_paths() -> None:
+    """``PWD= {b c}`` is not a braced label, so the fast path and the walk agree: the line prints as
+    it did before BACKLOG #2966 whether or not a "{" comes earlier in the value. A residual."""
+    for apply in (scrub_credentials, redact_log_line):
+        assert apply("token=a;PWD= {b c}").endswith(" {b c}")
+        assert apply("token=a{;PWD= {b c}").endswith(" {b c}")
 
 
 def _braced_check_run(length: int) -> str:
@@ -3165,18 +3212,19 @@ def test_a_label_headed_by_a_fold_character_stops_a_plain_value(char: str, lette
 def test_a_fold_headed_label_prints_with_the_tokens_unfolded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """THE POSITIVE CONTROL. With the walk's token classes unfolded again in both copies, which is
-    how ``origin/main`` had them, every line whose keyword starts with a fold character prints its
-    quoted value on the write-time pass under ``MEFOR_X`` and on the bundle under both labels. U+212A
-    is the exception: no keyword begins with "k", so it only heads a prefix, and that was stopped in
-    front of already, so its line is hidden with or without the fold."""
+    """THE POSITIVE CONTROL. With the fold-character token cut out of the walk in both copies, which
+    is how the walk read before BACKLOG #3114, every line whose keyword starts with a fold character
+    prints its quoted value on the write-time pass under ``MEFOR_X`` and on the bundle under both
+    labels. U+212A is the exception: no keyword begins with "k", so it only heads a prefix, and that
+    was stopped in front of already, so its line is hidden with or without the token."""
     for module in (scrub_mod, redact_mod):
+        token = "(?:[A-Za-z0-9]++|" + module._FOLD_HEAD + ")"
+        separator = "[^A-Za-z0-9" + module._WALK_FOLD_CHARS
         for name in _STOPPED_PATTERNS:
             pattern: re.Pattern[str] = getattr(module, name)
             source = pattern.pattern
-            assert "(?i:[A-Za-z0-9])++" in source, f"{module.__name__}.{name} has no folded run"
-            source = source.replace("(?i:[A-Za-z0-9])++", "[A-Za-z0-9]++")
-            source = re.sub(r"\(\?i:(\[\^A-Za-z0-9[^\]]*\])\)", r"\1", source)
+            assert token in source, f"{module.__name__}.{name} has no fold-character token"
+            source = source.replace(token, "[A-Za-z0-9]++").replace(separator, "[^A-Za-z0-9")
             monkeypatch.setattr(module, name, re.compile(source, pattern.flags))
     surfaces = (
         ("scrub_credentials", scrub_credentials, "MEFOR_X"),
@@ -3194,6 +3242,46 @@ def test_a_fold_headed_label_prints_with_the_tokens_unfolded(
                 f"{surface}/{first}: U+{ord(char):04X} hid -- {ascii(out)}"
             )
     assert controlled >= 3, f"only {controlled} fold characters reach a keyword's first letter"
+
+
+#: A fold character joined onto the run before a keyword, then a quoted value. The first form of the
+#: BACKLOG #3114 fix folded the walk's run class, so the keyword was no longer a run of its own and
+#: the stop was not checked there: each of these printed "fA1-x fB2-x'", which the walk before it
+#: hid. One line per fold character, U+212A included.
+_FOLD_JOINED_LINES = tuple(
+    f"{first}=b2{char}{word}='fA1-x fB2-x'"
+    for char in sorted(scrub_mod._WALK_FOLD_CHARS)
+    for first, word in (("MEFOR_X", "token"), ("MEFOR_X", "password"), ("token", "password"))
+)
+
+
+@pytest.mark.parametrize("line", _FOLD_JOINED_LINES, ids=ascii)
+def test_a_fold_character_before_a_keyword_still_lets_the_keyword_stop(line: str) -> None:
+    """The run after a fold character is still checked, so a keyword glued on behind one stops the
+    value as it did before BACKLOG #3114, on the write-time pass under ``MEFOR_X`` and on the bundle
+    under every label."""
+    surfaces: list[tuple[str, Callable[[str], str]]] = [("redact_log_line", redact_log_line)]
+    if line.startswith("MEFOR_X"):
+        surfaces.append(("scrub_credentials", scrub_credentials))
+    for surface, apply in surfaces:
+        out = apply(line)
+        assert "fA1-x" not in out, f"{surface}: printed -- got {ascii(out)}"
+
+
+def test_a_fold_headed_label_in_a_quoted_value_is_read_by_the_bundle_run_on() -> None:
+    """The bundle's quoted run-on walk checks a fold character for a label too, so it does not close
+    on the opening quote of a fold-headed label the plain value now stops in front of."""
+    out = redact_log_line("PWD='a1 MEFOR_X: b2.\u017fecret='c3 d4' tail")
+    assert out == f"PWD={REDACTION_PLACEHOLDER} tail", ascii(out)
+
+
+def test_the_walk_fold_characters_are_every_measured_fold() -> None:
+    """Both copies' fold-character token holds exactly the characters this interpreter's
+    case-insensitive matching reads as an ASCII letter."""
+    measured = set(_measured_letter_folds())
+    for module in (scrub_mod, redact_mod):
+        assert set(module._WALK_FOLD_CHARS) == measured, module.__name__
+        assert module._FOLD_HEAD == "[" + module._WALK_FOLD_CHARS + "]", module.__name__
 
 
 def test_both_copies_of_each_stopped_pattern_agree() -> None:
