@@ -13,7 +13,9 @@
   `StoreCipherConfigError`, any other class as `KeyProviderError`, which at least every CLI
   command with a key arm, `rotate-key` among them, reports as a key that could not be resolved,
   exit 2. An error whose chain cannot be read whole is refused the same way, and says so, whether
-  or not it holds a codec error, and so is one whose judgement raised. A `BaseException` that is
+  or not it holds a codec error. One whose judgement raised is refused as the same two classes
+  with a fixed text that names no class, since reading the class name may be what raised. A
+  `BaseException` that is
   not an `Exception`, such as a `KeyboardInterrupt` or `SystemExit`, raised by the judgement's own
   code still propagates, in place of the refusal, with no cause and no context. That cuts only
   those two links: at least one whose own arguments or group members hold the judged error still

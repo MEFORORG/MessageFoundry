@@ -3508,8 +3508,9 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
     rendering the codec error, is refused the same way, as one that could not be judged, with a
     fixed text that names no class, so the fallback runs none of ``exc``'s code. A
     ``BaseException`` that is not an ``Exception``, such as a ``KeyboardInterrupt`` from a link's
-    own code, from an attribute read of the codec error or from the fallback, propagates in place
-    of any refusal, as :func:`_unchained` leaves it."""
+    own code or from an attribute read of the codec error, and anything the fallback itself
+    raises, such as a ``MemoryError``, propagate in place of any refusal, as :func:`_unchained`
+    leaves them."""
     try:
         try:
             return _refusal_for(exc)

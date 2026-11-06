@@ -927,10 +927,12 @@ def test_an_error_whose_class_name_cannot_be_read_is_still_refused(
         error = exc
     assert any(spelling in str(error) for spelling in _BYTE_SPELLINGS), "the fixture holds none"
     _with_provider(monkeypatch, error)
+    # Not pytest.raises: on a red result pytest reads the escaped error's class name to report
+    # it, so the flag must be off by then. A real KeyboardInterrupt is not caught here.
     _NamelessMeta.armed = True
     try:
         getattr(store_base, entry)(StoreSettings())
-    except BaseException as exc:  # noqa: BLE001 -- what left is the measurement
+    except Exception as exc:  # noqa: BLE001 -- what left is the measurement
         escaped: BaseException = exc
     else:
         escaped = AssertionError("nothing was raised")
