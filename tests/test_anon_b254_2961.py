@@ -21,9 +21,9 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.anon import anonymize as engine_anonymize
-from messagefoundry.anon import anonymize_checked as engine_anonymize_checked
-from messagefoundry.anon import surrogates as engine_surrogates
+from messagefoundry_toolkit.anon import anonymize as engine_anonymize
+from messagefoundry_toolkit.anon import anonymize_checked as engine_anonymize_checked
+from messagefoundry_toolkit.anon import surrogates as engine_surrogates
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
 from tee.anon import surrogates as tee_surrogates

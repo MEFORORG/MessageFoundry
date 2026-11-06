@@ -277,6 +277,9 @@ if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
     throw "remove.ps1: $coordRootScript is missing, so the coordination root cannot be resolved. Nothing was removed."
 }
 . $coordRootScript
+# Test-PresentOrThrow, Get-EntriesOrThrow and $REGENERABLE_IGNORED_PATTERN, shared with the nightly
+# .claude/worktrees removal so its claim, allocation and nested-checkout reads fail closed the same way.
+. "$PSScriptRoot\worktree-gates.ps1"
 if ($byPath -or $listing) {
     # Every registered worktree, primary first. FAIL CLOSED: an unreadable list is the same empty
     # answer as a clone with none, and must never read as permission.
@@ -432,53 +435,6 @@ $GitRoot = if ($byPath) { $PrimaryRoot } else { $RepoRoot }
 $ownTop = "$(& git -C $WorktreePath rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
 if ($LASTEXITCODE -ne 0) { $ownTop = '' }
 $targetNorms = @(@($WorktreePath, $ownTop) | Where-Object { $_ } | ForEach-Object { ConvertTo-Norm $_ } | Sort-Object -Unique)
-
-# Test-Path answers $false for a path it may not read, so access-denied would read as "absent" and an
-# unreadable claims directory as "no claims" (vault BACKLOG #2985, item 15). This answers $false only
-# for a path that is not there, and throws for anything else.
-function Test-PresentOrThrow([string]$LiteralPath, [string]$What) {
-    try {
-        $null = Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
-        return $true
-    }
-    catch [System.Management.Automation.ItemNotFoundException] { return $false }
-    catch { throw "Could not tell whether $What exists ($($_.Exception.Message)). Nothing was removed." }
-}
-
-# THE SAME TRAP ONE LEVEL DOWN. `Get-ChildItem -ErrorAction Stop` on a directory this user may not
-# LIST returns nothing and does not throw (measured on pwsh 7, a directory denied list rights), so an
-# unlistable claims directory read as "no claims". This enumerates through .NET, which throws, and
-# turns that into a refusal. Every entry is listed, a link included, but a recursive walk never
-# descends into a linked directory, so it never leaves the tree. Hidden and system entries are kept,
-# which .NET's own default would drop. -Max stops the walk one entry past it, so a cap bounds the work
-# and not only the answer. The enumerable is walked by foreach directly: assigning it to a variable
-# through an `if` would make PowerShell read it all first.
-function Get-EntriesOrThrow([string]$Dir, [string]$What, [string]$Filter = '*', [switch]$Recurse, [switch]$FilesOnly,
-    [int]$Max = [int]::MaxValue) {
-    $opts = [System.IO.EnumerationOptions]::new()
-    $opts.IgnoreInaccessible = $false
-    $opts.AttributesToSkip = [System.IO.FileAttributes]0
-    $found = [System.Collections.Generic.List[System.IO.FileSystemInfo]]::new()
-    $pending = [System.Collections.Generic.Stack[string]]::new()
-    $pending.Push($Dir)
-    try {
-        while ($pending.Count -gt 0 -and $found.Count -le $Max) {
-            $here = $pending.Pop()
-            foreach ($e in [System.IO.DirectoryInfo]::new($here).EnumerateFileSystemInfos('*', $opts)) {
-                $isDir = $e -is [System.IO.DirectoryInfo]
-                if ($Recurse -and $isDir -and -not ($e.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-                    $pending.Push($e.FullName)
-                }
-                if ($FilesOnly -and $isDir) { continue }
-                if ($Filter -ne '*' -and $e.Name -notlike $Filter) { continue }
-                $found.Add($e)
-                if ($found.Count -gt $Max) { break }
-            }
-        }
-    }
-    catch { throw "Could not list $What under '$Dir' ($($_.Exception.Message)), so $What are unknown. Nothing was removed." }
-    return $found.ToArray()
-}
 
 # A DETACHED HEAD WHOSE COMMIT NO REF HOLDS is lost with the worktree: removal deletes the HEAD reflog
 # too, so nothing reaches it afterwards. -Force does not override it -- -Force means
@@ -991,8 +947,11 @@ if ($byPath) {
     # .venv is tolerated at the ROOT only (vault BACKLOG #1017, owner point (i)): one deeper down is
     # not the tree's own environment. node_modules and the four caches at any depth, because this
     # repository's own ide/node_modules is one (new.ps1 -Ide). The clones inside both are checked above.
-    $exemptIgnored = '\A!! (?:(?:.*/)?(?:node_modules|__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache)|\.venv)/\z'
-    $pending = @($statusLines | Where-Object { $_ -and $_ -cnotmatch $exemptIgnored })
+    # The pattern and Test-PlainDirectory live in worktree-gates.ps1, shared with the nightly
+    # .claude/worktrees removal. That route reads status in --ignored=matching mode, so a cache inside
+    # an untracked folder whose whole content is ignored is listed by name there and tolerated, where
+    # this traditional-mode read lists the folder itself and refuses it.
+    $pending = @($statusLines | Where-Object { $_ -and $_ -cnotmatch $REGENERABLE_IGNORED_PATTERN })
     # A TOLERATED NAME IS NOT ENOUGH: THE DIRECTORY MUST BE A REAL ONE, INSIDE THE TREE. A junction or
     # symlink named `node_modules` points at a directory somewhere else, so it is not this tree's
     # cache to throw away. A tolerated directory that is a reparse point, or that cannot be read,
@@ -1002,16 +961,10 @@ if ($byPath) {
     # drop the registration, exit 0 and leave the directory behind, which this guard prevents for a
     # top-level junction. A junction INSIDE a tolerated directory still ends that way; the script
     # then reports the leftover and exits 1, after the removal.
-    foreach ($line in @($statusLines | Where-Object { $_ -cmatch $exemptIgnored })) {
-        $rel = $line.Substring(3).TrimEnd('/')
-        $isRealDirectory = $false
-        try {
-            $item = Get-Item -LiteralPath (Join-Path $WorktreePath $rel) -Force -ErrorAction Stop
-            $isRealDirectory = $item.PSIsContainer -and
-                -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+    foreach ($line in @($statusLines | Where-Object { $_ -cmatch $REGENERABLE_IGNORED_PATTERN })) {
+        if (-not (Test-PlainDirectory $WorktreePath $line.Substring(3).TrimEnd('/'))) {
+            $pending += "$line  (a link, or unreadable: not a plain directory)"
         }
-        catch { $isRealDirectory = $false }
-        if (-not $isRealDirectory) { $pending += "$line  (a link, or unreadable: not a plain directory)" }
     }
     # git status does not look at a file flagged skip-worktree (S) or assume-unchanged (lower case), so
     # an edit to one is invisible above. Count every flagged file as pending: nothing here can tell an
@@ -1095,9 +1048,12 @@ function Test-LedgerNumberOnMain([string]$Kind, [string]$Number) {
     `git show` on a missing path prints nothing and can exit 0 through a pipe, so EXISTENCE is
     probed with ls-tree and only then read -- the trap the fleet hit twice reading role playbooks. #>
     if ($Kind -eq 'adr') {
+        # A number that is not all digits names no ADR file, so it is cannot-tell; escaped anyway, so
+        # the record's text is never read as a pattern (the nightly removal's reader does the same).
+        if ($Number -notmatch '\A\d+\z') { return $null }
         $listed = & git -C $GitRoot ls-tree -r --name-only 'origin/main' 'docs/adr/' 2>$null
         if ($LASTEXITCODE -ne 0) { return $null }
-        $pad = $Number.PadLeft(4, '0')
+        $pad = [regex]::Escape($Number.PadLeft(4, '0'))
         foreach ($n in @($listed)) { if ($n -match "/$pad-") { return $true } }
         return $false
     }
