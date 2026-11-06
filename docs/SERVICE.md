@@ -373,9 +373,8 @@ icacls "C:\ProgramData\MessageFoundry" /grant "NT SERVICE\MessageFoundry:(OI)(CI
 ```
 
 A domain **gMSA** or a dedicated local user works the same way (pass `-ServiceAccountPassword`
-for a password-based account — it's taken as a `SecureString`). What the store files grant at
-runtime, and the fallback when the store refuses the data directory, are stated once, in ADR 0163,
-*Note (2026-11-05)*.
+for a password-based account — it's taken as a `SecureString`). The fallback when the store
+refuses the data directory is in ADR 0163, *Note (2026-11-05)*.
 
 **gMSA preflight + "Log on as a service" (#99).** When `-ServiceAccount` names a **gMSA** (a name ending
 in `$`, e.g. `CORP\mefor-svc$`), the installer runs `Test-ADServiceAccount` first (verifying the account
