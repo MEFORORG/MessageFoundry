@@ -2269,8 +2269,9 @@ async def _ask_directory[**P, T](call: Callable[P, T], /, *args: P.args, **kwarg
             )
         else:
             _log.error(
-                "directory call %s raised %s at %s, not while reading the directory's answer, so "
-                "it is read as an engine defect; the request is refused",
+                "directory call %s raised %s at %s, not in ldap3's read of the directory's answer, "
+                "so it is read as an engine defect, or a directory value engine code could not "
+                "handle; the request is refused",
                 name,
                 kind,
                 where,
@@ -2279,7 +2280,7 @@ async def _ask_directory[**P, T](call: Callable[P, T], /, *args: P.args, **kwarg
         raise LdapError(f"directory call failed: unexpected {kind}") from exc
 
 
-def _engine_frame(exc: BaseException) -> str | None:
+def _engine_frame(exc: Exception) -> str | None:
     """``module:line in function`` of the frame ``exc`` was raised in, or ``None`` when ldap3
     raised it while reading what the directory sent, or it is a network error that says the
     directory was not reached (``_unreached_directory``, the reconciler's reading).
@@ -2292,7 +2293,7 @@ def _engine_frame(exc: BaseException) -> str | None:
     if _reading_connection(exc) is not None:
         return None
     # The reconciler's own reading: a network error says the directory was not reached.
-    if isinstance(exc, Exception) and _unreached_directory(exc):
+    if _unreached_directory(exc):
         return None
     tb = exc.__traceback__
     if tb is None:
@@ -2314,7 +2315,8 @@ def _directory_error_detail(exc: LdapError) -> dict[str, str | int]:
     mapped. The reason is ``directory_error``, which names the class and claims no cause: the
     error may be an outage or a configuration fault. Beside it, at least: ``error``, the error's
     type; for an unanswered operation, ``code`` and ``code_name``, the result code and ldap3's
-    name for it from its fixed table; ``cause``, the chained error's type, such as the
+    name for it from its fixed table, and ``operation``, the engine's own name for what was
+    refused; ``cause``, the chained error's type, such as the
     ``TypeError`` behind an unexpected fault; and ``interpreter_error``, the interpreter error an
     ldap3 socket error merges in (``interpreter_error`` in ``ldap.py``). Whatever else the text
     said is not on the row; where the raising code logs a diagnostic, the log keeps it."""
@@ -2323,6 +2325,8 @@ def _directory_error_detail(exc: LdapError) -> dict[str, str | int]:
         if exc.code is not None:
             detail["code"] = exc.code
         detail["code_name"] = exc.code_name
+        if exc.operation:
+            detail["operation"] = exc.operation
     cause = exc.__cause__
     if cause is not None:
         detail["cause"] = _type_name(cause)

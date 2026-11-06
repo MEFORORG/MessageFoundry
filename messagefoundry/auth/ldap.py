@@ -235,17 +235,25 @@ class LdapUnansweredError(LdapError):
     (``AuthService._reauth_ad``) reads it as ``directory_unavailable``, not counted. ``code`` is
     the result code, or ``None`` when the result held none that is an integer or a paged search was
     refused for its paging (:func:`_search_paged`); ``code_name`` is ldap3's name for the code, or
-    the engine's for the case, never text the directory sent.
-    Both default, so the exception survives a copy or a pickle, which rebuild it from its message
-    and then restore both from its ``__dict__``.
+    the engine's for the case, never text the directory sent. ``operation`` is the engine's own
+    name for what was refused, such as ``service-account bind`` or ``user search``, or empty when
+    the raiser named none, so a refused bind DN and a refused search base read apart.
+    All three default, so the exception survives a copy or a pickle, which rebuild it from its
+    message and then restore them from its ``__dict__``.
     """
 
     def __init__(
-        self, message: str, *, code: int | None = None, code_name: str = "no code"
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        code_name: str = "no code",
+        operation: str = "",
     ) -> None:
         super().__init__(message)
         self.code = code
         self.code_name = code_name
+        self.operation = operation
 
     @property
     def configuration(self) -> bool:
@@ -1022,7 +1030,7 @@ def _unanswered(operation: str, code: int | None, *, bind: bool = False) -> Ldap
     # Keyed on ldap3's name, not the raw code: a directory chooses the code, and ldap3's table is
     # finite, so the set of warnings stays bounded.
     _warn_once(f"unanswered: {operation}: {name}", "%s Reported once per code.", message)
-    return LdapUnansweredError(message, code=code, code_name=name)
+    return LdapUnansweredError(message, code=code, code_name=name, operation=operation)
 
 
 #: The result codes that end a user bind without judging its password (BACKLOG #3169): busy (51),
@@ -1131,7 +1139,12 @@ def _close_without_sending(conn: Any, why: str) -> None:
     engine defect, such as an ldap3 upgrade that renamed the close, which would leave every such
     socket open: it is logged at ERROR, by type only, and still not raised, because raised in
     place of the caller's answer it would replace a refusal every caller reads as an
-    ``LdapError`` with an unhandled one (BACKLOG #3017)."""
+    ``LdapError`` with an unhandled one (BACKLOG #3017).
+
+    ldap3 2.9.1's ``close`` shuts the socket only once an open has completed. An open that failed
+    after the TCP connect, such as a refused TLS handshake, leaves the connected socket on
+    ``conn.socket`` with ``conn.closed`` still true, so ``close`` passes it by. That socket is
+    closed here directly, whatever ``close`` did."""
     import ldap3
 
     try:
@@ -1144,6 +1157,21 @@ def _close_without_sending(conn: Any, why: str) -> None:
             why,
             _type_name(failed),
         )
+    leftover = getattr(conn, "socket", None)
+    if leftover is None:
+        return
+    try:
+        leftover.close()
+    except OSError as failed:
+        logger.debug("AD socket close %s, of a socket left open: %s", why, _type_name(failed))
+    except Exception as failed:  # noqa: BLE001 -- logged loud; the caller's error is the answer
+        logger.error(
+            "AD socket close %s raised %s on a socket left open, an engine defect; the socket "
+            "may be left open",
+            why,
+            _type_name(failed),
+        )
+    conn.socket = None
 
 
 @contextlib.contextmanager
@@ -1472,7 +1500,7 @@ def _paging_refused(
         f"({item})."
     )
     _warn_once(f"unanswered: {operation}: {case}", "%s Reported once.", message)
-    return LdapUnansweredError(message, code_name=case)
+    return LdapUnansweredError(message, code_name=case, operation=operation)
 
 
 #: What opening an ldap3 socket can raise that is not an ldap3 error (BACKLOG #2566). ldap3's

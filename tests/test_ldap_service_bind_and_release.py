@@ -9,8 +9,9 @@ Six properties are pinned, each with the test that failed before the change:
 * an ldap3 error's text, which can list every address the engine tried, never reaches the
   ``LdapError`` or the ``auth.login_error`` row;
 * ``authenticate`` and ``probe_principal`` unbind the service account's connection on every path;
-* a failed service-account bind closes its socket on every error, even one raised after the
-  socket opened, such as on a password SASLprep refuses (L4);
+* a failed service-account bind closes its socket, at least on an error raised after the socket
+  opened, such as on a password SASLprep refuses, and on an open that failed after the connect,
+  such as a refused TLS wrap (L4);
 * a service-account bind refused with a referral is refused as a referral, and any other refusal
   names its result code, through a real ldap3 stack;
 * a sign-in or step-up leg answers a directory error for any fault the authenticator raises, with
@@ -46,12 +47,11 @@ from messagefoundry.store.store import MessageStore
 from tests.test_ldap_error_mapping import _faulting
 from tests.test_ldap_referrals import _BIND_RESPONSE
 from tests.test_ldap_search_result_codes import _done, _scripted_dc
-from tests.test_ldap_timeouts import _ad_settings, _install_fakes, _shape_search
+from tests.test_ldap_timeouts import _SERVICE_DN, _ad_settings, _install_fakes, _shape_search
 
 #: Stands for the addresses an ``LDAPSocketOpenError`` lists. It must never reach an error or a row.
 _ADDRESSES = "[('10.20.30.40', 636), ('fd00::synthetic-leak-3017', 636)]"
 _PASSWORD = "synthetic-user-pw-3017"
-_SERVICE_DN = "CN=svc,DC=example,DC=com"  # tests/test_ldap_timeouts.py's ad_bind_dn
 _OBJECT_ID = "75920276-799f-51a3-9e67-4e4b9c43fd0c"
 
 
@@ -399,6 +399,38 @@ def test_a_service_bind_that_raises_after_the_socket_opens_closes_it() -> None:
     assert conn.closed and conn.socket is None
 
 
+def test_a_service_bind_whose_open_fails_after_the_connect_closes_its_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Through a real ldap3 stack. An open that fails after the TCP connect, here a TLS wrap that
+    raises, leaves ldap3's ``closed`` true, and ldap3's own close then skips the socket. The
+    connected socket is closed anyway, and the domain controller sees it end."""
+    import ssl
+
+    built: list[Any] = []
+    real = ldap3.Connection
+
+    class Kept(real):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            built.append(self)
+            super().__init__(*args, **kwargs)
+
+    def refused_wrap(*_args: Any, **_kwargs: Any) -> None:
+        raise ssl.SSLError("synthetic-leak-3017")
+
+    with _scripted_dc(lambda _raw: []) as (dc, _plain):
+        monkeypatch.setattr(ldap3, "Connection", Kept)
+        authenticator = LdapAuthenticator(_ad_settings(ad_server=f"ldaps://127.0.0.1:{dc.port}"))
+        monkeypatch.setattr(type(authenticator._tls), "wrap_socket", refused_wrap)
+        with pytest.raises(LdapError) as err:
+            authenticator.probe_principal("alice")
+        assert dc.ended.wait(timeout=5), "the domain controller never saw the socket close"
+        assert dc.opened == 1 and dc.searches == []
+    assert "synthetic-leak" not in str(err.value)
+    [conn] = built
+    assert conn.socket is None
+
+
 @pytest.mark.parametrize(
     "fault",
     [
@@ -543,7 +575,7 @@ async def test_ask_directory_names_an_engine_defect_at_error(
     assert [level for level, _m in lines] == [logging.ERROR] * 3, lines
     engine_line, stdlib_line, ldap3_line = (m for _l, m in lines)
     assert "raised TypeError at messagefoundry.auth.ldap:" in engine_line
-    assert "in _escape_filter, not while reading the directory's answer" in engine_line
+    assert "in _escape_filter, not in ldap3's read of the directory's answer" in engine_line
     assert "at json.decoder:" in stdlib_line and "at ldap3.utils.dn:" in ldap3_line
     assert not any("synthetic-leak" in m or "NoneType" in m or "empty dn" in m for _l, m in lines)
 
@@ -598,8 +630,9 @@ def test_an_engine_defect_names_the_line_that_raised_not_its_cleanup() -> None:
 
 
 def test_the_login_error_detail_holds_only_names_the_code_defines() -> None:
-    """BACKLOG #3196, #3727: the code and ldap3's name for it, and the interpreter error an ldap3
-    socket error merges in, which tells a CA mismatch from a refused port. None of the text."""
+    """BACKLOG #3196, #3727: the code, ldap3's name for it and the engine's name for the operation,
+    and the interpreter error an ldap3 socket error merges in, which tells a CA mismatch from a
+    refused port. None of the text."""
     import ssl
 
     from ldap3.core.exceptions import LDAPSocketOpenError, communication_exception_factory
@@ -610,6 +643,7 @@ def test_the_login_error_detail_holds_only_names_the_code_defines() -> None:
         "error": "LdapUnansweredError",
         "code": 51,
         "code_name": "busy",
+        "operation": "user search",
     }
     merged = communication_exception_factory(
         LDAPSocketOpenError, ssl.SSLCertVerificationError("synthetic")
