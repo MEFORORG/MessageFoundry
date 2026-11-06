@@ -11,12 +11,16 @@ import hashlib
 import http.client
 import inspect
 import logging
+import os
+import platform
 import random
 import re
+import sys
 import threading
 import time
+import warnings
 from collections.abc import Callable, Iterator
-from typing import Any, SupportsIndex
+from typing import Any, Literal, SupportsIndex
 
 import pytest
 from _phi_log_capture import IDENTIFIER_SHAPED_NAMES, SAFE_NAME_SUFFIXES
@@ -221,6 +225,84 @@ def _best_of(work: Callable[[], object], reps: int = 3) -> float:
     return best
 
 
+def _probe(tag: str, kind: str, test: str, **fields: float) -> None:
+    """PROBE, NOT FOR MERGE (BACKLOG #2958, #3721): one measurement out through pytest's warnings
+    summary, so a PASSING hosted run records the margin a green check does not. Emitted before the
+    assertion it describes, and it changes none. Under xdist a worker sends each test's warnings to
+    the controller when that test's call phase ends, so a worker that dies in a LATER test does not
+    take the line with it; a test killed mid-call loses its own.
+
+    One line of space-free ``key=value`` tokens, so it splits on whitespace. ``os_version`` tells
+    windows-2022 (build 20348) from windows-2025 (build 26100); ``image`` is the runner's
+    ``ImageOS``; ``workers`` is the xdist worker count sharing ``usable_cpus``."""
+    body = " ".join(f"{key}={value:.6g}" for key, value in fields.items())
+    context = (
+        f"platform={sys.platform} os_version={platform.version().replace(' ', '_')} "
+        # The hosted runner spells it ImageOS, and a Linux environment is case-sensitive.
+        f"image={os.environ.get('ImageOS', '-')} cpus={os.cpu_count()} "  # noqa: SIM112
+        f"usable_cpus={os.process_cpu_count()} "
+        f"workers={os.environ.get('PYTEST_XDIST_WORKER_COUNT', '-')}"
+    )
+    warnings.warn(
+        f"{tag} kind={kind} test={test.replace(' ', '_')} {body} {context}",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def _times_clear(reading: float, line: float, under: bool) -> float:
+    """How many times clear of ``line`` the reading is, in the direction the assertion wants:
+    under it when ``under``, over it otherwise. A zero reading is infinitely clear of a line it
+    must stay under, rather than a ``ZeroDivisionError`` that would error a passing arm."""
+    if under:
+        return line / reading if reading > 0 else float("inf")
+    return reading / line
+
+
+def _probe_budget(kind: Literal["budget-arm", "budget-control"], test: str, best: float) -> None:
+    """``margin_x`` is :func:`_times_clear` against ``_SCAN_BUDGET_SECONDS``."""
+    _probe(
+        "MEFOR-PROBE-2958",
+        kind,
+        test,
+        best_s=best,
+        budget_s=_SCAN_BUDGET_SECONDS,
+        margin_x=_times_clear(best, _SCAN_BUDGET_SECONDS, kind == "budget-arm"),
+    )
+
+
+def _probe_ratio(
+    kind: Literal["ratio-arm", "ratio-control"], test: str, ratio: float, large: float
+) -> None:
+    """``margin_x`` is :func:`_times_clear` against ``_CPU_GROWTH_LINE``. ``small_cpu_s`` is
+    ``large / ratio``, which is how ``_interleaved_growth`` formed the ratio, read back rather than
+    changing that helper's return. Only an arm asserts ``_CPU_CEILING_SECONDS``, so only an arm
+    carries ``ceiling_margin_x``."""
+    fields = {
+        "ratio": ratio,
+        "line": _CPU_GROWTH_LINE,
+        "margin_x": _times_clear(ratio, _CPU_GROWTH_LINE, kind == "ratio-arm"),
+        "small_cpu_s": large / ratio if ratio > 0 else float("nan"),
+        "large_cpu_s": large,
+    }
+    if kind == "ratio-arm":
+        fields["ceiling_s"] = _CPU_CEILING_SECONDS
+        fields["ceiling_margin_x"] = _times_clear(large, _CPU_CEILING_SECONDS, True)
+    _probe("MEFOR-PROBE-3721", kind, test, **fields)
+
+
+def test_this_probe_never_runs_where_it_could_be_merged() -> None:
+    """PROBE, NOT FOR MERGE: the mechanical half of that. A draft pull request runs on
+    ``pull_request``; the merge queue runs on ``merge_group`` and ``main`` on ``push``. Red on both,
+    so a probe that leaves draft by mistake cannot land."""
+    event = os.environ.get("GITHUB_EVENT_NAME", "")
+    ref = os.environ.get("GITHUB_REF", "")
+    assert event != "merge_group" and ref != "refs/heads/main", (
+        f"this branch is a measurement probe (BACKLOG #2958, #3721) and must not merge; "
+        f"event {event!r}, ref {ref!r}"
+    )
+
+
 #: The line the CPU-time cost arms share. Each arm divides a large input's CPU time by a small one's,
 #: and the sizes are chosen so the shipped code and the regression it guards land on opposite sides
 #: of 24, each with room. **The number is borrowed, the clock is not:**
@@ -391,6 +473,7 @@ def test_a_delimiter_free_run_stays_inside_the_scan_budget() -> None:
     2026-10-13, three runs on an unloaded Windows box: 0.77 to 1.19 ms, at least 42 times under the
     line. The token walk that failed #2896 had about 7 times."""
     seconds = _redact_seconds(5)
+    _probe_budget("budget-arm", "test_a_delimiter_free_run_stays_inside_the_scan_budget", seconds)
     assert seconds < _SCAN_BUDGET_SECONDS, (
         f"redacting one {_HOSTILE_RUN_CHARS}-character delimiter-free run cost {seconds:.4f}s of the "
         f"event loop against a {_SCAN_BUDGET_SECONDS}s budget"
@@ -409,6 +492,7 @@ def test_the_pre_guard_pattern_blows_that_same_budget(monkeypatch: pytest.Monkey
     One rep, deliberately. The assertion is that the scan is SLOW, so noise moves it the safe way."""
     monkeypatch.setattr(redaction, "_HL7_FIELD_RUN", _PRE_GUARD_FIELD_RUN)
     seconds = _redact_seconds(1)
+    _probe_budget("budget-control", "test_the_pre_guard_pattern_blows_that_same_budget", seconds)
     assert seconds > _SCAN_BUDGET_SECONDS, (
         f"the pre-guard pattern redacted the hostile run in {seconds:.4f}s, inside the "
         f"{_SCAN_BUDGET_SECONDS}s budget. The budget no longer separates a linear scan from a "
@@ -641,6 +725,9 @@ def test_the_separator_sniff_stays_inside_the_scan_budget() -> None:
 
     for label, text in (("ops text", ops_block), ("300-segment custom message", custom)):
         best = _best_of(lambda text=text: redact(text), 5)  # type: ignore[misc]
+        _probe_budget(
+            "budget-arm", f"test_the_separator_sniff_stays_inside_the_scan_budget[{label}]", best
+        )
         assert best < _SCAN_BUDGET_SECONDS, (
             f"redacting {len(text)} characters of {label} cost {best:.4f}s of the event loop against "
             f"a {_SCAN_BUDGET_SECONDS}s budget"
@@ -1235,6 +1322,12 @@ def test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer() -> None:
     batch 255 Manager ruling on #2952 and #2958 (2026-10-13) chose that trade for headroom on a loaded
     runner. The ratio's own margin is smaller, about 2.4 times, so load can still turn it red."""
     growth, large = _credential_walk_growth()
+    _probe_ratio(
+        "ratio-arm",
+        "test_the_credential_walk_is_bounded_by_the_window_not_by_the_peer",
+        growth,
+        large,
+    )
     assert growth < _CPU_GROWTH_LINE, (
         f"an eight times wider window cost the credential walk {growth:.1f} times the CPU time, over "
         f"the {_CPU_GROWTH_LINE} line -- the walk is no longer linear in the window"
@@ -1279,7 +1372,13 @@ def test_a_credential_search_from_index_0_is_quadratic_on_the_same_line(
         return -1
 
     monkeypatch.setattr(redaction, "_first_truncated_userinfo", search_from_zero)
-    growth, _ = _credential_walk_growth(large_reps=1)
+    growth, large = _credential_walk_growth(large_reps=1)
+    _probe_ratio(
+        "ratio-control",
+        "test_a_credential_search_from_index_0_is_quadratic_on_the_same_line",
+        growth,
+        large,
+    )
     assert growth > _CPU_GROWTH_LINE, (
         f"a search from index 0 grew only {growth:.1f} times for an eight times wider window, under "
         f"the {_CPU_GROWTH_LINE} line. The ratio no longer separates a bounded search from an "
@@ -1440,6 +1539,9 @@ def test_a_frame_cap_sized_input_no_longer_buys_the_event_loop(label: str) -> No
     text = _FRAME_CAP_SHAPES[label]()
     assert len(text) >= 16_000_000
     best = _best_of(lambda: safe_text(text))
+    _probe_budget(
+        "budget-arm", f"test_a_frame_cap_sized_input_no_longer_buys_the_event_loop[{label}]", best
+    )
     assert best < _SCAN_BUDGET_SECONDS, (
         f"safe_text on {len(text)} characters of {label} cost {best:.4f}s of the event loop against "
         f"a {_SCAN_BUDGET_SECONDS}s budget"
@@ -1455,6 +1557,9 @@ def test_control_the_budget_shapes_are_expensive_unbounded(label: str) -> None:
     the segment shape. One sample, because noise can only make it slower."""
     text = _FRAME_CAP_SHAPES[label]()
     best = _best_of(lambda: redact(text), 1)
+    _probe_budget(
+        "budget-control", f"test_control_the_budget_shapes_are_expensive_unbounded[{label}]", best
+    )
     assert best > _SCAN_BUDGET_SECONDS, (
         f"the unbounded scan of {label} cost only {best:.4f}s, under the {_SCAN_BUDGET_SECONDS}s "
         f"budget the bounded arm clears -- this fixture no longer discriminates"
@@ -1493,6 +1598,9 @@ def test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs() -> None:
     the old line: it passes a scan up to about 69 times today's, on the re-measured 7.25 ms. ``safe_text`` runs the whole clamp on
     this input, the name walk included."""
     growth, large = _frame_cap_prose_growth(safe_text)
+    _probe_ratio(
+        "ratio-arm", "test_a_frame_cap_sized_prose_costs_what_a_window_of_it_costs", growth, large
+    )
     assert growth < _CPU_GROWTH_LINE, (
         f"safe_text on the frame-cap prose cost {growth:.1f} times one window of it, over the "
         f"{_CPU_GROWTH_LINE} line -- the scan is no longer bounded by the window"
@@ -1510,7 +1618,10 @@ def test_control_the_same_inputs_are_expensive_unbounded() -> None:
     the bound. **The same pair, the same clock and the same line as the arm**, so the line provably
     separates a bounded scan from an unbounded one. One rep for the large input, because a slow
     sample there only helps this assertion."""
-    growth, _ = _frame_cap_prose_growth(redact, large_reps=1)
+    growth, large = _frame_cap_prose_growth(redact, large_reps=1)
+    _probe_ratio(
+        "ratio-control", "test_control_the_same_inputs_are_expensive_unbounded", growth, large
+    )
     assert growth > _CPU_GROWTH_LINE, (
         f"the unbounded scan cost only {growth:.1f} times one window of it, under the "
         f"{_CPU_GROWTH_LINE} line the bounded arm clears -- this fixture no longer discriminates "
