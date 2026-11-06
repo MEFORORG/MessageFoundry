@@ -3519,8 +3519,12 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
     directly or through the judgement's own error, and that error's text may quote the byte. The
     handler clears ``__cause__`` and ``__context__``, and resets ``__suppress_context__``, which
     clearing the cause sets, then re-raises with a bare ``raise``, which sets neither again. It
-    does so inline, with no call: at the recursion limit a call raises a fresh
-    ``RecursionError`` in the handler, chained back to the judged error. At least these are left
+    writes each through ``BaseException``'s own descriptor (:data:`_CAUSE` and its siblings), as
+    ``BaseException.__cause__.__set__(escaping, None)``, never by assignment to the instance,
+    which runs a subclass's ``__setattr__``; one that raises would leave in the handler with the
+    judged error as context (the third hold). It makes no Python call of its own: at the
+    recursion limit a call raises a fresh ``RecursionError`` in the handler, chained back to the
+    judged error. At least these are left
     as they are: an exception group's members, the escaping error's own arguments, its
     traceback's frame locals, and an interrupt delivered in the caller's handler outside the
     judgement's code."""
@@ -3530,14 +3534,21 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
         except Exception:  # noqa: BLE001 -- fail closed: the judgement ran exc's own code
             return _refused(exc, _UNJUDGED)
     except BaseException as escaping:
-        escaping.__cause__ = None
-        escaping.__context__ = None
-        escaping.__suppress_context__ = False
+        _CAUSE.__set__(escaping, None)
+        _CONTEXT.__set__(escaping, None)
+        _SUPPRESS_CONTEXT.__set__(escaping, False)
         raise
 
 
 #: The fallback refusal's text. It names no class: reading the name may be what raised.
 _UNJUDGED = "an error that could not be judged, its class and text not shown"
+
+#: ``BaseException``'s own link descriptors, which ``BaseException.__cause__`` and its siblings
+#: resolve to, so clearing a link runs no subclass code (the third hold on engine PR 2818). Typed
+#: ``Any`` because the stubs give the class attribute the instance attribute's type.
+_CAUSE: Any = vars(BaseException)["__cause__"]
+_CONTEXT: Any = vars(BaseException)["__context__"]
+_SUPPRESS_CONTEXT: Any = vars(BaseException)["__suppress_context__"]
 
 
 def _refusal_for(exc: Exception) -> Exception | None:
@@ -3590,14 +3601,14 @@ def _codec_chain_reading(exc: BaseException) -> str | None:
     ``"from a codec error"`` where a codec error is on its chain as :func:`_codec_error_on` reads
     it, ``"whose chain cannot be read whole"`` where that read did not finish, else ``None``, and
     the text may be kept (BACKLOG #3471, #4882). A ``BaseException`` from the walk, such as a
-    ``KeyboardInterrupt``, propagates with no cause and no context, its links cleared inline as
-    :func:`_codec_safe_refusal` says."""
+    ``KeyboardInterrupt``, propagates with no cause and no context, its links cleared through
+    ``BaseException``'s descriptors as :func:`_codec_safe_refusal` says."""
     try:
         codec, read_whole = _codec_error_on(exc)
     except BaseException as interrupt:
-        interrupt.__cause__ = None
-        interrupt.__context__ = None
-        interrupt.__suppress_context__ = False
+        _CAUSE.__set__(interrupt, None)
+        _CONTEXT.__set__(interrupt, None)
+        _SUPPRESS_CONTEXT.__set__(interrupt, False)
         raise
     if not read_whole:
         return "whose chain cannot be read whole"

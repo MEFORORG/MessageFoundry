@@ -622,7 +622,8 @@ def test_the_postgres_tls_wrap_says_a_chain_it_cannot_read_is_not_a_codec_error(
     with pytest.raises(StoreTlsRefused) as caught:
         postgres._verifying_context_at_open(StoreSettings())
     text = str(caught.value)
-    assert "_UnreadableReason whose chain cannot be read whole" in text, text
+    assert "an error whose chain cannot be read whole" in text, text
+    assert "_UnreadableReason" not in text, text  # the class name is not read (third hold)
     assert "codec" not in text and "could not be judged" not in text, text
     assert caught.value.__cause__ is None and caught.value.__context__ is None
 
@@ -769,10 +770,18 @@ def _call_the_postgres_wrap(error: Exception, monkeypatch: pytest.MonkeyPatch) -
     postgres._verifying_context_at_open(StoreSettings())
 
 
+class _StubbornInterrupt(KeyboardInterrupt):
+    """An interrupt whose own ``__setattr__`` raises, so clearing its links by assignment raises
+    in the handler, with the judged error as context (the third hold on engine PR 2818)."""
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"synthetic: {name} cannot be set")
+
+
 @pytest.mark.parametrize(
     "make_interrupt",
-    [KeyboardInterrupt, lambda: SystemExit(3)],
-    ids=["keyboard-interrupt", "system-exit"],
+    [KeyboardInterrupt, lambda: SystemExit(3), _StubbornInterrupt],
+    ids=["keyboard-interrupt", "system-exit", "setattr-raises"],
 )
 @pytest.mark.parametrize(
     "entry",
@@ -1037,3 +1046,35 @@ def test_no_depth_near_the_recursion_limit_leaves_the_judged_error_on_a_chain(
     assert any(isinstance(e, KeyProviderError | StoreCipherConfigError) for e in results)
     leaks = [e for e in results if any(link is error for link in _links(e))]
     assert not leaks, [[type(link).__name__ for link in _links(e)] for e in leaks]
+
+
+def test_the_postgres_tls_wrap_refuses_an_error_whose_class_name_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The third hold on engine PR 2818: the TLS wrap read the class name inside its handler for
+    the refusal text, so a read that raised left as a bare LookupError with the judged error,
+    which quotes the byte, as its context. The text names no class now."""
+    from messagefoundry.config.tls_policy import StoreTlsRefused
+    from messagefoundry.store import postgres
+
+    try:
+        decode_error = _decode_error()
+        raise _NamelessValueError(f"synthetic CRL refused: {decode_error}") from decode_error
+    except _NamelessValueError as exc:
+        error = exc
+    monkeypatch.setattr(postgres, "_verifying_context", _raising(error))
+    # Not pytest.raises: on a red result pytest reads the escaped error's class name to report it.
+    _NamelessMeta.armed = True
+    try:
+        postgres._verifying_context_at_open(StoreSettings())
+    except Exception as exc:  # noqa: BLE001 -- what left is the measurement
+        escaped: BaseException = exc
+    else:
+        escaped = AssertionError("nothing was raised")
+    finally:
+        _NamelessMeta.armed = False
+    assert isinstance(escaped, StoreTlsRefused), _whole(escaped)
+    text = str(escaped)
+    _assert_no_key_byte(_whole(escaped))
+    assert escaped.__cause__ is None and escaped.__context__ is None
+    assert "an error from a codec error, not quoted" in text, text

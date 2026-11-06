@@ -1671,8 +1671,10 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
     :func:`~messagefoundry.store.base.build_store_cipher` does not chain one (BACKLOG #2532,
     #3471): its text names a byte of what it decoded. A ``ValueError`` that is one, holds one, or
     has one on its chain, or whose chain cannot be read whole, is refused with a fixed text naming
-    the settings, the class and which of the two it is, raised outside the handler (BACKLOG
-    #4882). Not its ``codec_safe_str`` rendering: the CRL judge re-raises a codec error as a
+    the settings and which of the two it is, raised outside the handler (BACKLOG #4882). It names
+    no class, since reading the class name runs the error's own code and may raise in the handler
+    with the error as context (the third hold on engine PR 2818). Not its ``codec_safe_str``
+    rendering: the CRL judge re-raises a codec error as a
     ``ValueError`` whose own text already quotes the byte, which that rendering prints whole.
     Every other ``ValueError`` keeps its text and its chain."""
     try:
@@ -1683,10 +1685,9 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
         reading = _codec_chain_reading(exc)
         if reading is None:
             raise StoreTlsRefused(str(exc)) from exc
-        kind = type(exc).__name__
     raise StoreTlsRefused(
         "the PostgreSQL store's TLS context could not be built from [store].ssl_root_cert, "
-        f"[store].ssl_crl_file or the system trust store: a {kind} {reading}, not quoted"
+        f"[store].ssl_crl_file or the system trust store: an error {reading}, not quoted"
     )
 
 
