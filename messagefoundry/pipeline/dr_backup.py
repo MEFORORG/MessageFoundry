@@ -3640,7 +3640,8 @@ def _full_open_check(
     engine_version: str = "",
     posture: HopPosture | None = None,
 ) -> tuple[str, str, int]:
-    """Open the snapshot through the real ``open_store`` path, then decrypt + authenticate its PHI.
+    """Decrypt + authenticate the snapshot's PHI as archived, then open it through the real
+    ``open_store`` path.
     Returns ``(status, message, decrypted_cells)`` — the ``VerifyResult`` status this leg earned, so the
     caller can hand it straight on. Heavier; only run for ``full_restore_verify``.
 
@@ -3677,6 +3678,12 @@ def _full_open_check(
         # from one says nothing about an encrypted archive — which is the archive worth verifying.
         return "FAIL", "no live store settings were supplied for the full restore-verify", 0
     snap_settings = settings.model_copy(update={"path": str(snap), "backend": StoreBackend.SQLITE})
+    # The cells are read FIRST, from the snapshot as the archive holds it (BACKLOG #1719). The open
+    # below is a keyed open, and its at-open sweep seals what it reads as legacy plaintext: under
+    # the opt-out, or on a surface no keyed open recorded, that includes a value whose marker is
+    # damaged, which would then open cleanly and PASS. Read first, the walk judges that value as
+    # it was archived, and the verdict matches `cipher-audit`'s on the same store.
+    walked = _decrypt_check(snap, snap_settings, posture=posture)
     # ADR 0196 AC-8: the snapshot is a copy of the LIVE store and carries its salt. Opened as it is,
     # anything the open seals (the at-open sweep) would land under the live store's data sub-key and
     # be counted only in this throwaway copy's row. Dropping the salt makes the open mint a new one,
@@ -3708,20 +3715,28 @@ def _full_open_check(
         finally:
             await store.close()
 
+    # Verdict order: an incompatible snapshot first, since its cells may read wrongly only because
+    # this build reads them differently, and the remedy is the version that wrote it; then the
+    # walk's verdict, which read the archive before the open could change it; then the open's.
     try:
         ok, msg = run_guarded(_open())
-    except StoreKeylessError as exc:
-        # The store's own eager `state`/`reference` warm-ups fail closed on a keyless open of an
-        # encrypted store, and they reach this before the decrypt pass below ever runs. Same cause,
-        # same verdict — an absent keyring, not a bad archive.
-        return "KEY_MISMATCH", safe_exc(exc), 0
     except SchemaMismatchError as exc:
         return "FAIL", _incompatible_snapshot(exc, engine_version), 0
+    except StoreKeylessError as exc:
+        # The store's own eager `state`/`reference` warm-ups fail closed on a keyless open of an
+        # encrypted store. Same cause, same verdict — an absent keyring, not a bad archive. Its
+        # text names the setting to fix, so it leads; a walk that found the same keeps its line.
+        if walked[0] == "FAIL":
+            return walked
+        reason = safe_exc(exc) if walked[0] == "PASS" else f"{safe_exc(exc)}; {walked[1]}"
+        return "KEY_MISMATCH", reason, 0
     except Exception as exc:  # a restore that won't even open is the thing we're trying to catch
-        return "FAIL", safe_exc(exc), 0
+        return walked if walked[0] != "PASS" else ("FAIL", safe_exc(exc), 0)
+    if walked[0] != "PASS":
+        return walked
     if not ok:
         return "FAIL", msg, 0
-    return _decrypt_check(snap, snap_settings, posture=posture)
+    return walked
 
 
 #: Longer than safe_exc's default, so the remedy and at least the first differences survive.
@@ -3785,9 +3800,13 @@ def _decrypt_check(
     key opened, then a failure. Under a key no keyless reading can come, so this pass stops at the
     first value that does not open. With no key it reads on past a BLOB, which fails under any
     cipher, so a sealed value later in the walk still decides KEY_MISMATCH, as ``cipher-audit``
-    decides it, whichever row comes first. That agreement is this pass's: in a full verify the
-    store's own open runs first, and its warm-up of ``state`` and ``reference`` can decide before
-    this pass reads anything.
+    decides it, whichever row comes first. A full verify runs this pass before the store's own
+    open (:func:`_full_open_check`), so the open cannot decide first or change a cell this reads.
+
+    It also reads the non-blank values with no marker, as ``cipher-audit`` does: one on a surface
+    the keyed store has sealed fails, unless ``allow_unmarked_ciphertext`` is set, because the
+    store refuses it at read. Selecting by the marker alone never read such a value, which is where
+    a damaged marker lands. One on a surface no keyed open recorded is legacy plaintext, and passes.
     """
     cipher = build_store_cipher(settings, posture=posture)
     cells = 0
@@ -3799,7 +3818,24 @@ def _decrypt_check(
         mismatch = keyed_store_mismatch(conn, cipher, store_tables(conn), source="snapshot")
         if mismatch is not None:
             return "KEY_MISMATCH", mismatch, cells
-        for reading in read_cipher_cells(conn, cipher):
+        for reading in read_cipher_cells(conn, cipher, unmarked=True):
+            if reading.kind == "unmarked":
+                # A non-blank value with no marker on a surface the keyed store sealed: the store
+                # refuses it at read, so it is a damaged or stripped marker or a planted row, as
+                # `cipher-audit` reports it. Under the audited opt-out the store reads it as
+                # plaintext, and so does this. Only a keyed walk yields one.
+                if settings.allow_unmarked_ciphertext:
+                    continue
+                return (
+                    "FAIL",
+                    f"{reading.cell.table}.{reading.cell.column} {reading.where} carries no "
+                    "at-rest marker on a surface this keyed store has sealed, so the store "
+                    "refuses it at read: a damaged or stripped marker, or a planted row",
+                    cells,
+                )
+            if reading.kind == "legacy":
+                # Plaintext on a surface no keyed open recorded, which the next keyed open seals.
+                continue
             if reading.kind == "keyless":
                 # The #241 F2 keyless-open trap: the snapshot holds sealed text and these settings
                 # resolved no key for it. Nothing could have opened it, so the keyring is

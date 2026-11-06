@@ -466,28 +466,18 @@ def test_a_damaged_marker_passes_the_restore_walk_and_fails_the_audit(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The marker hole. A value whose ``mfenc:`` prefix is damaged is not selected by the marker,
-    so the restore-verify's walk never reads it and PASSes. The audit counts it as unmarked, and in
-    a keyed store, where the store refuses such a value at read, that is a FAIL. Under the audited
-    ``allow_unmarked_ciphertext`` opt-out the store reads it as plaintext, so it is reported and
-    passes."""
+    """The marker hole. A value whose ``mfenc:`` prefix is damaged is not selected by the marker.
+    The audit counts it as unmarked, and in a keyed store, where the store refuses such a value at
+    read, that is a FAIL; the restore-verify's walk reads it the same way (BACKLOG #1719, the
+    marker limb). Under the audited ``allow_unmarked_ciphertext`` opt-out the store reads it as
+    plaintext, so it is reported and passes."""
     db, settings = _copy(_template, tmp_path)
     _keyed(monkeypatch, settings)
-    conn = sqlite3.connect(db)
-    try:
-        rowid, value, ident = conn.execute(
-            "SELECT rowid, raw, id FROM messages WHERE raw LIKE ? ORDER BY rowid LIMIT 1",
-            (f"{MARKER_PREFIX}%",),
-        ).fetchone()
-        conn.execute("UPDATE messages SET raw = ? WHERE rowid = ?", ("x" + value[1:], rowid))
-        conn.commit()
-    finally:
-        conn.close()
+    ident = _damage_one_marker(db)
 
-    # The restore-verify's walk still selects by the marker, so it does not read this value: the
-    # marker limb that stays open on the restore path (BACKLOG #1719's remainder).
     status, message, _ = dr_backup._decrypt_check(db, settings)
-    assert status == "PASS", message
+    assert status == "FAIL", message
+    assert message.startswith(f"messages.raw id={ident} carries no at-rest marker"), message
 
     rc, payload = _audit(db, monkeypatch, capsys)
     assert rc == 1 and payload["status"] == "FAIL", payload
@@ -499,6 +489,67 @@ def test_a_damaged_marker_passes_the_restore_walk_and_fails_the_audit(
     rc, payload = _audit(db, monkeypatch, capsys)
     assert rc == 0 and payload["status"] == "PASS", payload
     assert payload["unmarked"] == 1 and "allow_unmarked_ciphertext" in payload["reason"]
+    opted_out = settings.model_copy(update={"allow_unmarked_ciphertext": True})
+    status, message, _ = dr_backup._decrypt_check(db, opted_out)
+    assert status == "PASS", message
+
+
+def _damage_one_marker(db: Path) -> str:
+    """Change the first letter of one sealed ``messages.raw`` value's marker; return its row id.
+    Through a separate connection, so it also works under a store that is still open."""
+    conn = sqlite3.connect(db)
+    try:
+        rowid, value, ident = conn.execute(
+            "SELECT rowid, raw, id FROM messages WHERE raw LIKE ? ORDER BY rowid LIMIT 1",
+            (f"{MARKER_PREFIX}%",),
+        ).fetchone()
+        conn.execute("UPDATE messages SET raw = ? WHERE rowid = ?", ("x" + value[1:], rowid))
+        conn.commit()
+    finally:
+        conn.close()
+    return str(ident)
+
+
+async def test_a_full_restore_verify_fails_an_archived_value_whose_marker_is_damaged(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """The restore path's marker limb (BACKLOG #1719). The archive holds a ``messages.raw`` value
+    whose marker is damaged, on a surface the keyed store sealed, so the store refuses it at read.
+    The full verify used to PASS it: its walk selected by the marker and never read it. It now
+    reads it, and FAILs naming the row, never the value."""
+    db, settings = _copy(_template, tmp_path)
+    store = await _open(db, settings)
+    try:
+        ident = _damage_one_marker(db)
+        archive = await _backup(store, settings, tmp_path / "b")
+    finally:
+        await store.close()
+    res = await run_restore_verify(archive, store_settings=settings, full=True)
+    assert res.status == "FAIL", res.reason
+    reason = res.reason or ""
+    assert f"messages.raw id={ident} carries no at-rest marker" in reason, reason
+    assert _SYNTH not in reason
+
+
+async def test_the_full_verify_reads_the_cells_before_its_open_can_seal_one(
+    tmp_path: Path, _template: tuple[Path, StoreSettings]
+) -> None:
+    """Under the opt-out the verify's own keyed open seals an unmarked value as plaintext, so a
+    walk after the open counted a damaged value as one more cell that decrypted. The walk now reads
+    the archive first: the damaged value is not among the cells it opened, and the verify passes
+    only because the opt-out reads unmarked values as plaintext, as ``cipher-audit`` says."""
+    db, settings = _copy(_template, tmp_path)
+    opted_out = settings.model_copy(update={"allow_unmarked_ciphertext": True})
+    sealed = sum(_sealed_by_cell(db).values())
+    store = await _open(db, settings)
+    try:
+        _damage_one_marker(db)
+        archive = await _backup(store, settings, tmp_path / "b")
+    finally:
+        await store.close()
+    res = await run_restore_verify(archive, store_settings=opted_out, full=True)
+    assert res.status == "PASS", res.reason
+    assert res.decrypted_cells == sealed - 1, (res.decrypted_cells, sealed)
 
 
 def test_a_shell_without_the_key_reports_key_mismatch(
