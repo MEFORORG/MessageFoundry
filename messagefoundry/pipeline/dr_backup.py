@@ -2434,7 +2434,9 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
     (``secretscrub.CREDENTIAL_PLACEHOLDER``); ``[redacted]``, which ``RedactionFilter``, and
     ``safe_exc`` on the failure record and alert, write (``redaction._REDACTED``); and
     ``[REDACTED]``, which the support bundle writes over its copy of the log
-    (``support/redact.py``).
+    (``support/redact.py``). The text names the first two and covers the third as "any other
+    redaction marker", since a log line that already holds ``[REDACTED]`` takes
+    ``redact_log_line``'s whole-line credential pass, and engine prose must not choose that.
 
     It names the directory by its verbatim path only, as a PowerShell single-quoted literal
     (:func:`_ps_literal`), whose closing quote shows a trailing space and in which nothing expands,
@@ -2495,13 +2497,13 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
             f"failed: {safe_exc(exc)})"
         )
     return (
-        f"{ban}; it is {literal}{ends}{fault}; a path here that shows <redacted>, [redacted], "
-        "[REDACTED] or any other redaction marker was rewritten by redaction and is not the "
+        f"{ban}; it is {literal}{ends}{fault}; a path here that shows <redacted>, [redacted] "
+        "or any other redaction marker was rewritten by redaction and is not the "
         "directory's path, so run no command here; otherwise, in PowerShell, not cmd.exe, first "
         "run the Test-Path line that comes right after this text and names this same path; it "
         "must print True, and a False means that line does not reach this directory, whether it "
         "is gone, cannot be read or is named wrong, so run nothing more; only after a True, "
-        f"remove it with this command: Remove-Item -LiteralPath {literal} -Recurse -Force ; then "
+        f"remove it only with this command: Remove-Item -LiteralPath {literal} -Recurse -Force ; then "
         f"run that Test-Path line again, which must print False and no error:\n{_TEST_PATH} {literal}"
     )
 

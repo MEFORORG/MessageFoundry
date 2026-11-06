@@ -835,6 +835,12 @@ def test_the_refusal_for_a_rewritten_staging_name_advises_no_removal_by_hand(
             f"{dr_backup._ps_literal(verbatim)} -Recurse -Force ;" in text
         )
         assert "PowerShell, not cmd.exe" in text
+        # A redacted path is not the directory's, and a command on it would find nothing.
+        assert (
+            "a path here that shows <redacted>, [redacted] or any other redaction marker was "
+            "rewritten by redaction and is not the directory's path, so run no command here"
+            in (text)
+        )
         # The plain path appears only inside the verbatim one.
         assert str(staging) not in text.replace(verbatim, "")
     # Nothing was removed, emptied or re-marked.
@@ -933,17 +939,19 @@ def test_the_refusal_names_every_marker_redaction_writes(
 
     refusal = _refusal_for("mefor-backup-x.", tmp_path / "pwd=nightly", monkeypatch)
     warning = (
-        "a path here that shows <redacted>, [redacted], [REDACTED] or any other redaction marker "
+        "a path here that shows <redacted>, [redacted] or any other redaction marker "
         "was rewritten by redaction and is not the directory's path, so run no command here"
     )
     assert warning in refusal
-    # Each marker the warning names is the one its writer still writes.
+    # Each marker the warning names is the one its writer still writes. The support bundle's
+    # marker is covered by "any other", and is not written: a line holding it takes the bundle's
+    # whole-line credential pass.
     from messagefoundry import redaction
     from messagefoundry.support.redact import REDACTION_PLACEHOLDER
 
     assert CREDENTIAL_PLACEHOLDER == "<redacted>"
     assert redaction._REDACTED == "[redacted]"
-    assert REDACTION_PLACEHOLDER == "[REDACTED]"
+    assert REDACTION_PLACEHOLDER not in refusal
     scrubbed = scrub_credentials(refusal)
     assert warning in scrubbed
     assert "pwd=<redacted>" in scrubbed.split("\n")[-1]
@@ -959,7 +967,8 @@ def test_the_check_is_a_two_step_control(tmp_path: Path, monkeypatch: pytest.Mon
     )
     stop = refusal.index(
         "a False means that line does not reach this directory, whether it is gone, cannot be read "
-        "or is named wrong, so run nothing more; only after a True, remove it with this command:"
+        "or is named wrong, so run nothing more; only after a True, remove it only with this "
+        "command:"
     )
     removal = refusal.index("Remove-Item -LiteralPath")
     assert first < stop < removal
@@ -1034,11 +1043,21 @@ async def test_the_kept_for_diagnosis_append_starts_a_line_of_its_own(
         await store.close()
 
 
+@pytest.mark.parametrize(
+    ("raised_error", "expected"),
+    [
+        (
+            dr_backup.BackupError("snapshot", "synthetic build refusal"),
+            "the build failed: synthetic build refusal",
+        ),
+        (OSError("synthetic disk fault"), "the build failed: OSError: synthetic disk fault"),
+    ],
+)
 async def test_the_build_failed_append_starts_a_line_of_its_own(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised_error: Exception, expected: str
 ) -> None:
-    """`_build_in_staging` leads a build's own refusal with the release's leftover. Red before the
-    fix: `; the build failed: ...` followed the command on its line."""
+    """`_build_in_staging` leads a build's own refusal, and an OSError, with the release's
+    leftover. Red before the fix: `; the build failed: ...` followed the command on its line."""
     store, runner = await _store_and_runner(tmp_path, monkeypatch)
     try:
         name = "mefor-backup-x."
@@ -1056,7 +1075,7 @@ async def test_the_build_failed_append_starts_a_line_of_its_own(
                 return refusal
 
         def refused_build(**kwargs: Any) -> Any:
-            raise dr_backup.BackupError("snapshot", "synthetic build refusal")
+            raise raised_error
 
         monkeypatch.setattr(runner, "_build_archive_blocking", refused_build)
         with pytest.raises(dr_backup.BackupError) as raised:
@@ -1072,9 +1091,7 @@ async def test_the_build_failed_append_starts_a_line_of_its_own(
             )
         message = str(raised.value)
         lines = message.split("\n")
-        assert lines[_the_test_path_line(message, literal) + 1] == (
-            "the build failed: synthetic build refusal"
-        )
+        assert lines[_the_test_path_line(message, literal) + 1] == expected
     finally:
         await store.close()
 
