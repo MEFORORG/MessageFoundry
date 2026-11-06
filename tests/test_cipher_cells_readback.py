@@ -27,6 +27,7 @@ from typing import Any, cast
 
 import pytest
 
+import messagefoundry.store.base as store_base
 import messagefoundry.store.cipher_cells as cipher_cells_module
 from messagefoundry.__main__ import main
 from messagefoundry.config.settings import BackupSettings, StoreSettings
@@ -515,20 +516,19 @@ def test_a_shell_without_the_key_reports_key_mismatch(
     assert "resolved no key" in payload["reason"]
 
 
-def test_a_server_backend_is_not_covered_and_never_exit_0(
+def test_a_server_backend_whose_store_is_unreachable_could_not_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A PostgreSQL store: nothing is read, and the exit is neither PASS's 0 nor FAIL's 1."""
-    monkeypatch.chdir(tmp_path)
-    cfg = tmp_path / "messagefoundry.toml"
-    cfg.write_text(
-        '[store]\nbackend = "postgres"\nserver = "db.invalid"\ndatabase = "mefor"\n'
-        'username = "mefor"\n',
-        encoding="utf-8",
-    )
-    rc = main(["cipher-audit", "--service-config", str(cfg), "--json"])
-    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert rc == 3 and payload["status"] == "NOT_COVERED", payload
+    """A PostgreSQL store the open cannot reach: exit 2, could not start, never PASS's 0 or FAIL's
+    1. It was exit 3, NOT COVERED, while this command read SQLite only (BACKLOG #1719)."""
+
+    async def unreachable(settings: StoreSettings, **_kw: Any) -> object:
+        raise ConnectionRefusedError("synthetic: no server")
+
+    monkeypatch.setattr(store_base, "open_store", unreachable)
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 2 and "error" in payload, out
+    assert "db.invalid/mefor" in payload["error"], payload
 
 
 def test_the_audit_reads_a_path_with_uri_characters_and_writes_nothing(
@@ -1380,3 +1380,172 @@ def test_an_unreachable_key_service_stops_the_server_audit(
     with pytest.raises(CipherError):
         _server_audit(db, cast(Cipher, down))
     assert down.calls == 1, "the walk kept asking a key service that was down"
+
+
+# --- `cipher-audit` on a server backend (BACKLOG #1719) ----------------------------------------
+
+_SERVER_TOML = {
+    "postgres": (
+        '[store]\nbackend = "postgres"\nserver = "db.invalid"\ndatabase = "mefor"\n'
+        'username = "mefor"\n'
+    ),
+    "sqlserver": (
+        '[store]\nbackend = "sqlserver"\nserver = "db.invalid"\ndatabase = "mefor"\n'
+        'username = "mefor"\n'
+    ),
+}
+
+
+class _FakeServerStore(_SqliteSource):
+    """What ``open_store`` hands ``cipher-audit`` for a server backend, over a SQLite file: the
+    walk's four reads, the store's cipher, and a close that is counted."""
+
+    def __init__(self, conn: sqlite3.Connection, cipher: Cipher) -> None:
+        super().__init__(conn)
+        self._cipher = cipher
+        self.closed = False
+
+    def cipher(self) -> Cipher:
+        return self._cipher
+
+    async def close(self) -> None:
+        self.closed = True
+        self.conn.close()
+
+
+def _run_server_cli(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    backend: str,
+    *extra: str,
+) -> tuple[int, dict[str, Any], str]:
+    cfg = tmp_path / "server.toml"
+    cfg.write_text(_SERVER_TOML[backend], encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    rc = main(["cipher-audit", "--service-config", str(cfg), "--json", *extra])
+    out = capsys.readouterr().out
+    assert _SYNTH not in out, f"cipher-audit printed a plaintext or a key: {out}"
+    return rc, json.loads(out.strip().splitlines()[-1]), out
+
+
+def _serve_from(
+    monkeypatch: pytest.MonkeyPatch, db: Path, cipher: Cipher
+) -> list[tuple[dict[str, Any], _FakeServerStore]]:
+    """Make ``open_store`` hand back a fake server store over ``db``; return each call's
+    arguments and handle."""
+    opened: list[tuple[dict[str, Any], _FakeServerStore]] = []
+
+    async def fake_open_store(settings: StoreSettings, **kw: Any) -> _FakeServerStore:
+        handle = _FakeServerStore(connect_readonly(db, busy_timeout=5.0), cipher)
+        opened.append((kw, handle))
+        return handle
+
+    monkeypatch.setattr(store_base, "open_store", fake_open_store)
+    return opened
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+def test_cipher_audit_reads_every_sealed_value_of_a_server_store(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    backend: str,
+) -> None:
+    """PASS on a server backend, from a READ-ONLY open, with each cell's count the number sealed
+    in it, and the handle closed after."""
+    db, settings = _copy(_template, tmp_path)
+    opened = _serve_from(monkeypatch, db, build_store_cipher(settings))
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, backend)
+    assert rc == 0 and payload["status"] == "PASS", out
+    assert payload["keyed"] is True
+    assert {name: row["opened"] for name, row in _cells(payload).items()} == _sealed_by_cell(db)
+    [(kw, handle)] = opened
+    assert kw["read_only"] is True and handle.closed
+
+
+def test_cipher_audit_fails_a_server_store_with_a_corrupted_cell(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A flipped byte is exit 1, FAIL, naming the cell and its position, never the key."""
+    db, settings = _copy(_template, tmp_path)
+    state = next(c for c in SQLITE_CIPHER_CELLS if c.table == "state")
+    _flip_one_aead_byte(db, state)
+    _serve_from(monkeypatch, db, build_store_cipher(settings))
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 1 and payload["status"] == "FAIL", out
+    first = _cells(payload)["state.value"]["first_failure"]
+    assert first.startswith("state.value position=1 did not decrypt"), first
+
+
+def test_cipher_audit_of_a_keyed_server_store_with_no_key_is_a_key_mismatch(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    db, _settings = _copy(_template, tmp_path)
+    _serve_from(monkeypatch, db, build_store_cipher(StoreSettings(path=str(db))))
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 4 and payload["status"] == "KEY_MISMATCH", out
+
+
+def test_a_server_walk_that_loses_its_connection_part_way_fails(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A connection lost after the walk began is FAIL with no counts, never a PASS over the cells
+    read before it, and the handle is still closed."""
+    db, settings = _copy(_template, tmp_path)
+    opened = _serve_from(monkeypatch, db, build_store_cipher(settings))
+    real_chunk = _SqliteSource.cipher_walk_chunk
+    calls = 0
+
+    async def flaky(self: _SqliteSource, *args: Any, **kwargs: Any) -> list[tuple[Any, ...]]:
+        nonlocal calls
+        calls += 1
+        if calls > 2:
+            raise ConnectionResetError("synthetic: connection lost")
+        return await real_chunk(self, *args, **kwargs)
+
+    monkeypatch.setattr(_SqliteSource, "cipher_walk_chunk", flaky)
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "postgres")
+    assert rc == 1 and payload["status"] == "FAIL", out
+    assert "stopped part way" in payload["reason"] and payload["opened"] is None, payload
+    assert opened[0][1].closed
+
+
+def test_a_server_database_with_no_store_tables_could_not_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A database holding none of the cipher tables is not a store this can audit: exit 2, not a
+    PASS over cells all absent."""
+    empty = tmp_path / "empty.db"
+    sqlite3.connect(empty).close()
+    _serve_from(monkeypatch, empty, build_store_cipher(StoreSettings(path=str(empty))))
+    rc, payload, out = _run_server_cli(tmp_path, monkeypatch, capsys, "sqlserver")
+    assert rc == 2 and "none of the cipher-covered tables" in payload["error"], out
+
+
+def test_table_narrows_a_server_audit_to_that_backends_inventory(
+    tmp_path: Path,
+    _template: tuple[Path, StoreSettings],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    db, settings = _copy(_template, tmp_path)
+    _serve_from(monkeypatch, db, build_store_cipher(settings))
+    rc, payload, out = _run_server_cli(
+        tmp_path, monkeypatch, capsys, "postgres", "--table", "state"
+    )
+    assert rc == 0 and set(_cells(payload)) == {"state.value"}, out
+    rc, payload, out = _run_server_cli(
+        tmp_path, monkeypatch, capsys, "postgres", "--table", "synth_none"
+    )
+    assert rc == 2 and "no cipher-covered table named synth_none" in payload["error"], out
