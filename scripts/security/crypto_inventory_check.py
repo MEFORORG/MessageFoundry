@@ -1583,8 +1583,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
-            # ADR 0217: the Transit sealer asks Transit to check a stored HMAC (its backend's
-            # verify_seal_hmac); a MAC check inside Vault, not a signature.
+            # ADR 0217: RowSealer.verify_async awaits nothing and calls its own self.verify, the
+            # local constant-time HMAC check above, so a store's await reaches every backend; a
+            # MAC check, not a signature.
             "sign_verify:.verify()",
         }
     ),

@@ -48,6 +48,9 @@ from messagefoundry.store.crypto import (
     derive_row_seal_key,
     row_seal_key_id,
 )
+from messagefoundry.store.crypto import (
+    TransitSealRefused as TransitSealRefused,
+)
 
 log = logging.getLogger(__name__)
 
@@ -102,9 +105,9 @@ class RowSealError(Exception):
 
     The helper never re-seals such a row, because the next honest write would otherwise turn a
     change made outside the helper into a sealed row. ``args`` are exactly ``(kind, subject)``
-    (ADR 0217 (c) step 1, #4739 item 12): ``subject`` is the bounded, readable subject a caller
-    builds for the row, never a key, a token hash or any other row value, so ``repr()``, copy and
-    pickle carry nothing more. Empty where the raising site has no subject to give."""
+    (ADR 0217 (c) step 1, #4739 item 12): ``subject`` is the bounded, readable reference a caller
+    builds for the row, such as a stored id or a 12-hex prefix, never a key or a whole token hash,
+    so ``repr()``, copy and pickle carry nothing more. Empty where the raising site has no subject to give."""
 
     def __init__(self, kind: str, subject: str = "") -> None:
         super().__init__(kind, subject)
@@ -327,10 +330,12 @@ class TransitSealUnavailableError(Exception):
 
     Deliberately neither a :class:`~messagefoundry.store.crypto.CipherError` nor a
     :class:`RowSealError` (ADR 0217 (c) step 2), so no ``except CipherError`` and no forged-row
-    fallback catches it. Its text is fixed: never row data, a token hash or Vault's text."""
+    fallback catches it. Raised outside any handler, so it chains nothing, and its text is fixed:
+    never row data, a token hash or Vault's text. Its ``args`` are empty, so copy and pickle
+    rebuild it."""
 
-    def __init__(self) -> None:
-        super().__init__("a row seal could not be made or checked through Vault transit")
+    def __str__(self) -> str:
+        return "a row seal could not be made or checked through Vault transit"
 
 
 class TransitSealUnverifiableError(Exception):
@@ -341,7 +346,7 @@ class TransitSealUnverifiableError(Exception):
     Neither a :class:`~messagefoundry.store.crypto.CipherError` nor a :class:`RowSealError`.
     ``args`` are exactly ``(kind, stored_version, probe_version)``: the row kind and two integers
     of at most ten digits parsed from Transit-shaped strings, triage detail that no decision reads
-    (ADR 0217 (a)). Its text is fixed."""
+    (ADR 0217 (a)). Raised outside any handler; its text is fixed."""
 
     def __init__(self, kind: str, stored_version: int, probe_version: int) -> None:
         super().__init__(kind, stored_version, probe_version)
@@ -353,18 +358,10 @@ class TransitSealUnverifiableError(Exception):
         return f"the {self.kind} row's integrity seal cannot be verified by Vault transit"
 
 
-class TransitSealRefused(Exception):
-    """What a :class:`TransitSealBackend` raises when Transit answered a ``verify`` with HTTP 400 or
-    403. ``status`` is that code and nothing else; the sealer classifies it with the probe."""
-
-    def __init__(self, status: int) -> None:
-        super().__init__(status)
-        self.status = status
-
-
 class TransitSealBackend(Protocol):
     """The three Transit calls the sealer makes. Each blocks; the sealer runs it in a worker thread
-    so a seal or a check never blocks the event loop (CLAUDE.md section 6).
+    so a seal or a check never blocks the event loop (CLAUDE.md section 6). Each returns Transit's
+    raw value, and the sealer checks its shape.
     :class:`~messagefoundry.store.crypto_transit.TransitCipher` is the implementation."""
 
     @property
@@ -377,20 +374,18 @@ class TransitSealBackend(Protocol):
         """The Transit mount the key lives on."""
         ...
 
-    def seal_hmac(self, digest: bytes) -> str:
-        """Transit's ``hmac`` of ``digest`` under the active key's latest version. Raises
-        :class:`~messagefoundry.store.crypto.CipherError` on any failure."""
+    def seal_hmac(self, digest: bytes) -> object:
+        """Transit's ``hmac`` of ``digest`` under the active key's latest version."""
         ...
 
-    def verify_seal_hmac(self, key_name: str, digest: bytes, mac: str) -> bool:
+    def verify_seal_hmac(self, key_name: str, digest: bytes, mac: str) -> object:
         """Transit's ``verify`` of ``mac`` over ``digest`` under ``key_name`` at the version ``mac``
-        names. ``False`` is Transit's ``valid: false``. Raises :class:`TransitSealRefused` for an
-        HTTP 400 or 403 and :class:`~messagefoundry.store.crypto.CipherError` for anything else."""
+        names, its raw ``valid``. Raises :class:`~messagefoundry.store.crypto.TransitSealRefused`
+        for an HTTP 400 or 403."""
         ...
 
-    def seal_probe(self) -> str:
-        """Transit's ``hmac`` over a fixed input under the active key's latest version. Raises
-        :class:`~messagefoundry.store.crypto.CipherError` on any failure."""
+    def seal_probe(self) -> object:
+        """Transit's ``hmac`` over a fixed input under the active key's latest version."""
         ...
 
 
@@ -512,13 +507,14 @@ class TransitRowSealer:
     def _digest(self, kind: str, fields: Iterable[tuple[str, object]]) -> bytes:
         return hashlib.sha256(self._prefix + _part(seal_bytes(kind, fields))).digest()
 
-    def _outage(self, exc: Exception) -> TransitSealUnavailableError:
-        # Throttled ERROR line; the exception TYPE only, since Vault's text is not ours to vouch for.
+    def _outage(self, exc: BaseException | None = None) -> TransitSealUnavailableError:
+        # Throttled ERROR line. A CipherError's text is this package's own fixed wording, so it is
+        # logged; any other exception by TYPE only, since its text is not ours to vouch for.
         if self._throttle.due("transit"):
             log.error(
                 "a row seal could not be made or checked through Vault transit (%s); the operation"
                 " was refused and no seal failure was recorded",
-                type(exc).__name__,
+                _failure_text(exc),
             )
         return TransitSealUnavailableError()
 
@@ -542,26 +538,42 @@ class TransitRowSealer:
     async def seal_async(self, kind: str, fields: Iterable[tuple[str, object]]) -> str:
         """The stored seal for a row of ``kind`` holding ``fields``: one Transit ``hmac`` call."""
         digest = self._digest(kind, fields)
+        failure: BaseException | None = None
+        mac: object = None
         try:
             mac = await asyncio.to_thread(self._backend.seal_hmac, digest)
-        except CipherError as exc:
-            raise self._outage(exc) from None
-        if not isinstance(mac, str) or transit_mac_version(mac) is None:
-            raise self._outage(CipherError("Transit returned a MAC of an unexpected shape"))
+        except Exception as exc:  # every failure of the call is an Outage (ADR 0217 (a))
+            failure = exc
+        if failure is not None or not isinstance(mac, str) or transit_mac_version(mac) is None:
+            raise self._outage(
+                failure or CipherError("Transit returned a MAC of an unexpected shape")
+            )
         return f"{SEAL_PREFIX}{self.key_id}:{mac}"
 
     async def verify_async(
-        self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None
+        self,
+        kind: str,
+        fields: Iterable[tuple[str, object]],
+        stored: str | None,
+        *,
+        fresh: bool = False,
     ) -> bool:
         """The session check: whether ``stored`` holds under the ACTIVE key. A seal under a retired
-        key is ``False`` with no Transit call (:meth:`sealed_by_retired_key_async` tells it apart)."""
-        return await self._check(kind, fields, stored, accept_retired=False)
+        key is ``False`` with no Transit call (:meth:`sealed_by_retired_key_async` tells it apart).
+        ``fresh`` skips the cache read, for a check that must ask Transit now; its answer is still
+        cached."""
+        return await self._check(kind, fields, stored, accept_retired=False, fresh=fresh)
 
     async def verify_held_async(
-        self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None
+        self,
+        kind: str,
+        fields: Iterable[tuple[str, object]],
+        stored: str | None,
+        *,
+        fresh: bool = False,
     ) -> bool:
         """The record check: whether ``stored`` holds under the active key or a listed retired one."""
-        return await self._check(kind, fields, stored, accept_retired=True)
+        return await self._check(kind, fields, stored, accept_retired=True, fresh=fresh)
 
     async def sealed_by_retired_key_async(
         self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None
@@ -571,7 +583,7 @@ class TransitRowSealer:
         parsed = self._parse(stored)
         if parsed is None or parsed[0] == self.key_id or parsed[0] not in self._keys:
             return False
-        return await self._check(kind, fields, stored, accept_retired=True)
+        return await self._check(kind, fields, stored, accept_retired=True, fresh=False)
 
     async def _check(
         self,
@@ -580,6 +592,7 @@ class TransitRowSealer:
         stored: str | None,
         *,
         accept_retired: bool,
+        fresh: bool,
     ) -> bool:
         parsed = self._parse(stored)
         if parsed is None:
@@ -595,7 +608,7 @@ class TransitRowSealer:
         entry = hashlib.sha256(
             _part(digest) + _part(key_id.encode("ascii")) + _part(mac.encode("ascii"))
         ).digest()
-        cached = self._cache.get(entry)
+        cached = None if fresh else self._cache.get(entry)
         if cached is not None:
             expires, answer, cached_stored, cached_probe = cached
             if self._clock() < expires:
@@ -604,48 +617,73 @@ class TransitRowSealer:
                 return answer == _HOLDS
             del self._cache[entry]
         generation = self._generation
+        refused_status: int | None = None
+        failure: BaseException | None = None
+        valid: object = None
         try:
             valid = await asyncio.to_thread(self._backend.verify_seal_hmac, key_name, digest, mac)
         except TransitSealRefused as refused:
-            if refused.status != 400 and not (refused.status == 403 and retired):
-                raise self._outage(refused) from None
-            probe_version = await self._probe()
-            self._remember(entry, generation, _UNVERIFIABLE, stored_version, probe_version)
-            raise TransitSealUnverifiableError(kind, stored_version, probe_version) from None
-        except CipherError as exc:
-            raise self._outage(exc) from None
+            refused_status = refused.status
+        except Exception as exc:  # every other failure of the call is an Outage (ADR 0217 (a))
+            failure = exc
+        if refused_status is not None:
+            if refused_status != 400 and not (refused_status == 403 and retired):
+                raise self._outage(
+                    CipherError(f"Transit refused a seal check (HTTP {refused_status})")
+                )
+            probe_version, moved = await self._probe()
+            if moved or self._generation == generation:
+                self._remember(entry, _UNVERIFIABLE, stored_version, probe_version)
+            raise TransitSealUnverifiableError(kind, stored_version, probe_version)
+        if failure is not None:
+            raise self._outage(failure)
         if not isinstance(valid, bool):
             raise self._outage(
                 CipherError("Transit returned a verify reply of an unexpected shape")
             )
-        self._remember(entry, generation, _HOLDS if valid else _FORGED, 0, 0)
+        if self._generation == generation:
+            # A check that began before the cache was emptied keeps its answer for its own caller.
+            self._remember(entry, _HOLDS if valid else _FORGED, 0, 0)
         return valid
 
-    async def _probe(self) -> int:
-        """The latest version the active key's fixed-input probe names, emptying both caches when
-        it moved. Raises :class:`TransitSealUnavailableError` when the probe fails or answers in an
-        unexpected shape: then a refusal is an Outage, never Unverifiable."""
+    async def _probe(self) -> tuple[int, bool]:
+        """``(version, moved)``: the latest version the active key's fixed-input probe names, and
+        whether this probe moved it, emptying both caches. Raises
+        :class:`TransitSealUnavailableError` when the probe fails or answers in an unexpected
+        shape: then a refusal is an Outage, never Unverifiable."""
+        failure: BaseException | None = None
+        answered: object = None
         try:
             answered = await asyncio.to_thread(self._backend.seal_probe)
-        except CipherError as exc:
-            raise self._outage(exc) from None
+        except Exception as exc:  # a probe that fails makes the refusal an Outage (ADR 0217 (a))
+            failure = exc
         version = transit_mac_version(answered) if isinstance(answered, str) else None
-        if version is None:
-            raise self._outage(CipherError("Transit's key probe returned an unexpected shape"))
-        if version != self._probed_version:
-            self._probed_version = version
-            self._cache.clear()
-            self._generation += 1
-        return version
+        if failure is not None or version is None:
+            failure = failure or CipherError("Transit's key probe returned an unexpected shape")
+            log.warning(
+                "the Vault transit key probe failed (%s), so a refused row seal check counts as"
+                " an outage",
+                _failure_text(failure),
+            )
+            raise self._outage(failure)
+        if version == self._probed_version:
+            return version, False
+        self._probed_version = version
+        self._cache.clear()
+        self._generation += 1
+        return version, True
 
-    def _remember(
-        self, entry: bytes, generation: int, answer: str, stored_version: int, probe_version: int
-    ) -> None:
-        # A check that began before the cache was emptied keeps its answer for its own caller only.
-        # An Unverifiable answer whose own probe emptied the cache is stored under the new state.
-        if answer != _UNVERIFIABLE and self._generation != generation:
-            return
+    def _remember(self, entry: bytes, answer: str, stored_version: int, probe_version: int) -> None:
+        self._cache.pop(entry, None)
         if len(self._cache) >= TRANSIT_SEAL_CACHE_MAX:
             self._cache.pop(next(iter(self._cache)))
         expires = self._clock() + TRANSIT_SEAL_CACHE_TTL_SECONDS
         self._cache[entry] = (expires, answer, stored_version, probe_version)
+
+
+def _failure_text(exc: BaseException | None) -> str:
+    """What a log line may say about a failed Transit call: a CipherError's own fixed text, any
+    other exception's TYPE only, since Vault's or a library's text is not ours to vouch for."""
+    if isinstance(exc, CipherError):
+        return str(exc)
+    return type(exc).__name__

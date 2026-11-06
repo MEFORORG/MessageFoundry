@@ -608,6 +608,16 @@ class CipherError(Exception):
     JSON. The message says which, so an operator is not sent looking for a missing key."""
 
 
+class TransitSealRefused(Exception):
+    """Transit answered a row seal ``verify`` with HTTP 400 or 403 (ADR 0217). ``status`` is that
+    code and nothing else; the row sealer classifies it with its probe. Raised by the backend
+    (``crypto_transit``), read by the sealer (``row_seal``). Not a :class:`CipherError`."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(status)
+        self.status = status
+
+
 class UnauthenticatedCipherError(CipherError):
     """No configured key's AEAD tag verified the value (BACKLOG #2593).
 

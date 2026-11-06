@@ -8,6 +8,7 @@ is reached without Vault. Synthetic data only.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import hashlib
@@ -18,6 +19,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.store import row_seal
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.store.row_seal import (
     SEAL_PREFIX,
@@ -54,6 +56,10 @@ class FakeBackend:
         self.probe_down = False
         self.probe_reply: str | None = None
         self.forbid: set[str] = set()
+        self.other_failure = False
+        self.hold_mac: str | None = None
+        self.entered = threading.Event()
+        self.release = threading.Event()
         self.verify_calls = 0
         self.probe_calls = 0
         self.inputs: list[bytes] = []
@@ -77,14 +83,21 @@ class FakeBackend:
         self.inputs.append(digest)
         if self.down:
             raise CipherError("synthetic outage")
+        if self.other_failure:
+            raise RuntimeError("synthetic library failure")
         return self._mac(self.active, self.latest[self.active], digest)
 
     def verify_seal_hmac(self, key_name: str, digest: bytes, mac: str) -> bool:
         self.threads.add(threading.get_ident())
         self.inputs.append(digest)
         self.verify_calls += 1
+        if mac == self.hold_mac:
+            self.entered.set()
+            assert self.release.wait(5)
         if self.down:
             raise CipherError("synthetic outage")
+        if self.other_failure:
+            raise RuntimeError("synthetic library failure")
         if key_name in self.forbid:
             raise TransitSealRefused(403)
         version = int(mac.removeprefix("vault:v").partition(":")[0])
@@ -96,6 +109,8 @@ class FakeBackend:
         self.probe_calls += 1
         if self.probe_down:
             raise CipherError("synthetic probe outage")
+        if self.other_failure:
+            raise RuntimeError("synthetic library failure")
         if self.probe_reply is not None:
             return self.probe_reply
         return self._mac(self.active, self.latest[self.active], b"probe")
@@ -280,6 +295,101 @@ async def test_the_success_cache_expires_and_empties_when_the_probe_moves() -> N
     assert backend.verify_calls == calls
 
 
+async def test_a_probe_naming_the_same_version_keeps_the_cache() -> None:
+    backend = FakeBackend()
+    sealer = _sealer(backend)
+    stored = await sealer.seal_async(USER_KIND, FIELDS)
+    with pytest.raises(TransitSealUnverifiableError):  # the first probe records version 1
+        await sealer.verify_held_async(USER_KIND, FIELDS, _with_version(stored, "5"))
+    assert await sealer.verify_held_async(USER_KIND, FIELDS, stored)
+    with pytest.raises(TransitSealUnverifiableError):  # this probe names version 1 again
+        await sealer.verify_held_async(USER_KIND, FIELDS, _with_version(stored, "4"))
+    calls = backend.verify_calls
+    assert await sealer.verify_held_async(USER_KIND, FIELDS, stored)
+    assert backend.verify_calls == calls  # still cached: the version did not move again
+    # Control: a probe that names a new version empties it.
+    backend.latest[ACTIVE] = 2
+    with pytest.raises(TransitSealUnverifiableError):
+        await sealer.verify_held_async(USER_KIND, FIELDS, _with_version(stored, "6"))
+    assert await sealer.verify_held_async(USER_KIND, FIELDS, stored)
+    assert backend.verify_calls == calls + 2
+
+
+async def test_a_check_that_began_before_the_cache_emptied_is_not_cached() -> None:
+    backend = FakeBackend()
+    sealer = _sealer(backend)
+    stored = await sealer.seal_async(USER_KIND, FIELDS)
+    with pytest.raises(TransitSealUnverifiableError):  # records version 1 as the probed version
+        await sealer.verify_held_async(USER_KIND, FIELDS, _with_version(stored, "5"))
+    backend.hold_mac = stored.split(":", 3)[3]
+    slow = asyncio.create_task(sealer.verify_held_async(USER_KIND, FIELDS, stored))
+    assert await asyncio.to_thread(backend.entered.wait, 5)
+    backend.latest[ACTIVE] = 2  # a rotation lands while the slow check is in Transit
+    with pytest.raises(TransitSealUnverifiableError):
+        await sealer.verify_held_async(USER_KIND, FIELDS, _with_version(stored, "6"))
+    backend.release.set()
+    assert await slow is True  # its own caller still gets its answer
+    backend.hold_mac = None
+    calls = backend.verify_calls
+    assert await sealer.verify_held_async(USER_KIND, FIELDS, stored)
+    assert backend.verify_calls == calls + 1  # but it was not stored under the new state
+
+
+async def test_fresh_skips_the_cache_read() -> None:
+    backend = FakeBackend()
+    sealer = _sealer(backend)
+    stored = await sealer.seal_async(USER_KIND, FIELDS)
+    assert await sealer.verify_async(USER_KIND, FIELDS, stored)
+    assert await sealer.verify_async(USER_KIND, FIELDS, stored)
+    assert backend.verify_calls == 1
+    assert await sealer.verify_async(USER_KIND, FIELDS, stored, fresh=True)
+    assert await sealer.verify_held_async(USER_KIND, FIELDS, stored, fresh=True)
+    assert backend.verify_calls == 3
+
+
+async def test_any_other_failure_of_a_call_is_an_outage() -> None:
+    backend = FakeBackend()
+    sealer = _sealer(backend)
+    stored = await sealer.seal_async(USER_KIND, FIELDS)
+    backend.other_failure = True
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.seal_async(USER_KIND, FIELDS)
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.verify_held_async(USER_KIND, FIELDS, stored)
+    backend.other_failure = False
+    planted = _with_version(stored, "5")
+    original = backend.seal_probe
+
+    def failing_probe() -> str:
+        raise RuntimeError("synthetic library failure")
+
+    backend.seal_probe = failing_probe  # type: ignore[method-assign]
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.verify_held_async(USER_KIND, FIELDS, planted)
+    backend.seal_probe = original  # type: ignore[method-assign]
+    with pytest.raises(TransitSealUnverifiableError):
+        await sealer.verify_held_async(USER_KIND, FIELDS, planted)
+
+
+async def test_re_storing_an_answer_does_not_evict_another(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(row_seal, "TRANSIT_SEAL_CACHE_MAX", 2)
+    backend = FakeBackend()
+    sealer = _sealer(backend)
+    first = await sealer.seal_async(USER_KIND, FIELDS)
+    second = await sealer.seal_async(SESSION_KIND, FIELDS)
+    assert await sealer.verify_held_async(USER_KIND, FIELDS, first)
+    assert await sealer.verify_held_async(SESSION_KIND, FIELDS, second)
+    assert await sealer.verify_held_async(SESSION_KIND, FIELDS, second, fresh=True)
+    calls = backend.verify_calls
+    assert await sealer.verify_held_async(USER_KIND, FIELDS, first)
+    assert backend.verify_calls == calls  # the first answer survived
+    # Control: a third distinct answer does evict the oldest.
+    third = await sealer.seal_async(USER_KIND, [*FIELDS, ("x", 1)])
+    assert await sealer.verify_held_async(USER_KIND, [*FIELDS, ("x", 1)], third)
+    assert await sealer.verify_held_async(USER_KIND, FIELDS, first)
+    assert backend.verify_calls == calls + 2
+
+
 async def test_transit_receives_a_fixed_length_digest_and_runs_off_the_event_loop() -> None:
     backend = FakeBackend()
     sealer = _sealer(backend)
@@ -336,6 +446,9 @@ def test_the_refusal_types_are_siblings_and_carry_no_token_hash() -> None:
     for cls2 in (TransitSealUnavailableError, TransitSealUnverifiableError):
         assert not issubclass(cls2, CipherError | RowSealError | RowSealUnverifiableError)
     assert RowSealError(USER_KIND).args == (USER_KIND, "")
+    outage = TransitSealUnavailableError()
+    assert outage.args == ()
+    assert str(pickle.loads(pickle.dumps(outage))) == str(outage) == str(copy.copy(outage))
     verdict = TransitSealUnverifiableError(USER_KIND, 9, 1)
     assert pickle.loads(pickle.dumps(verdict)).args == (USER_KIND, 9, 1)
 

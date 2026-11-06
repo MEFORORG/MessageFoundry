@@ -58,6 +58,7 @@ from messagefoundry.store.crypto import (
     AuditKeyVersionRefusedError,
     AuditMacFn,
     CipherError,
+    TransitSealRefused,
     _UnmarkedPolicy,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
@@ -292,63 +293,57 @@ class TransitCipher(_UnmarkedPolicy):
         """The Transit mount every call here reaches (hvac's default)."""
         return TRANSIT_MOUNT
 
-    def seal_hmac(self, digest: bytes) -> str:
-        """Transit's ``hmac`` of a row seal input's 32-byte ``digest`` under the latest version.
-        Blocking; any failure raises :class:`CipherError` naming the key, never the input."""
+    def _seal_generate(self, hash_input: str, what: str) -> object:
+        """One Transit ``hmac`` under the active audit key's latest version, for a row seal or its
+        probe. Returns Transit's raw value; the sealer checks its shape. Any failure raises
+        :class:`CipherError` naming the key and Vault's failure text, never the input."""
         try:
             response: Any = self._client.secrets.transit.generate_hmac(
-                name=self._audit_key,
-                hash_input=base64.b64encode(digest).decode("ascii"),
-                algorithm=AUDIT_TRANSIT_HASH_ALGO,
+                name=self._audit_key, hash_input=hash_input, algorithm=AUDIT_TRANSIT_HASH_ALGO
             )
-            return str(response["data"]["hmac"])
+            return response["data"]["hmac"]
         except Exception as exc:
             raise CipherError(
-                f"Transit row seal HMAC failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
+                f"Transit row seal {what} failed (key={self._audit_key!r}): "
+                f"{vault_failure_text(exc)}"
             ) from exc
 
-    def verify_seal_hmac(self, key_name: str, digest: bytes, mac: str) -> bool:
+    def seal_hmac(self, digest: bytes) -> object:
+        """Transit's ``hmac`` of a row seal input's 32-byte ``digest`` under the latest version.
+        Blocking."""
+        return self._seal_generate(base64.b64encode(digest).decode("ascii"), "HMAC")
+
+    def seal_probe(self) -> object:
+        """Transit's ``hmac`` over fixed input under the active audit key's latest version: the
+        probe that tells an unverifiable seal from an outage. Fixed input, so no row decides it.
+        Blocking."""
+        return self._seal_generate(_VERSION_PROBE_INPUT, "probe")
+
+    def verify_seal_hmac(self, key_name: str, digest: bytes, mac: str) -> object:
         """Transit's ``verify`` of ``mac`` over ``digest`` under ``key_name``, at the version ``mac``
         names; it never regenerates and compares, since a MAC under a newer version differs from
-        every stored one. ``False`` is Transit's ``valid: false``. An HTTP 400 or 403 raises
-        :class:`~messagefoundry.store.row_seal.TransitSealRefused` with that status, for the sealer
-        to classify with its probe; anything else raises :class:`CipherError`. Blocking."""
-        from messagefoundry.store.row_seal import TransitSealRefused  # noqa: PLC0415
-
+        every stored one. Returns Transit's raw ``valid`` (``False`` is ``valid: false``); the sealer
+        checks its shape. An HTTP 400 or 403 raises
+        :class:`~messagefoundry.store.crypto.TransitSealRefused` with that status, raised outside the
+        handler so no chain carries Vault's reply; anything else raises :class:`CipherError`.
+        Blocking."""
+        hash_input = base64.b64encode(digest).decode("ascii")
+        refused = 0
         try:
             response: Any = self._client.secrets.transit.verify_signed_data(
                 name=key_name,
-                hash_input=base64.b64encode(digest).decode("ascii"),
+                hash_input=hash_input,
                 hmac=mac,
                 hash_algorithm=AUDIT_TRANSIT_HASH_ALGO,
             )
-            valid = response["data"]["valid"]
+            return response["data"]["valid"]
         except Exception as exc:
-            status = 400 if is_vault_bad_request(exc) else 403 if is_vault_forbidden(exc) else 0
-            if status:
-                raise TransitSealRefused(status) from None
-            raise CipherError(
-                f"Transit row seal verify failed (key={key_name!r}): {vault_failure_text(exc)}"
-            ) from exc
-        if not isinstance(valid, bool):
-            raise CipherError(f"Transit returned a malformed verify reply (key={key_name!r})")
-        return valid
-
-    def seal_probe(self) -> str:
-        """Transit's ``hmac`` over fixed input under the active audit key's latest version: the
-        probe that tells an unverifiable seal from an outage. Fixed input, so no row decides it.
-        Blocking; any failure raises :class:`CipherError`."""
-        try:
-            response: Any = self._client.secrets.transit.generate_hmac(
-                name=self._audit_key,
-                hash_input=_VERSION_PROBE_INPUT,
-                algorithm=AUDIT_TRANSIT_HASH_ALGO,
-            )
-            return str(response["data"]["hmac"])
-        except Exception as exc:
-            raise CipherError(
-                f"Transit row seal probe failed (key={self._audit_key!r}): {vault_failure_text(exc)}"
-            ) from exc
+            refused = 400 if is_vault_bad_request(exc) else 403 if is_vault_forbidden(exc) else 0
+            if not refused:
+                raise CipherError(
+                    f"Transit row seal verify failed (key={key_name!r}): {vault_failure_text(exc)}"
+                ) from exc
+        raise TransitSealRefused(refused)
 
     def audit_mac_fn(self) -> AuditMacFn:
         """The audit-chain MAC provider: route each row's MAC through Transit (:meth:`audit_hmac`). The
