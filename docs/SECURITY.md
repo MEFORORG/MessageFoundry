@@ -4940,8 +4940,9 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   re-alert throttle, or only to the log where no alert notifier is running.
   **That is a known false alarm, not intended behaviour:** nothing was altered, and neither the
   alert nor the audit row says which case it is, so an operator cannot tell it from tampering.
-  The count the bind, the unbind or the revoke reports leaves out each session it missed. The
-  bind's and the unbind's are read from the driver's row count, so where a session-wide
+  The count the every-account revoke reports leaves out each session it missed: on SQL Server, a
+  session of an account its list read did not return, rotated while it ran. The bind's and the
+  unbind's are read from the driver's row count, so where a session-wide
   `SET NOCOUNT ON` has leaked onto the connection they report -1 instead (BACKLOG #2283). And
   until the session is presented or listed, the store still holds it as live. BACKLOG #4974,
   which closed the rotation miss as the opening of this bullet states, did not change the -1
