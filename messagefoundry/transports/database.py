@@ -1226,8 +1226,8 @@ _LIBPQ_STAT_LEFT_ERRNOS = frozenset(
 #: ``ERROR_UNEXP_NET_ERR``, 64 ``ERROR_NETNAME_DELETED``, 121 ``ERROR_SEM_TIMEOUT`` and 1231
 #: ``ERROR_NETWORK_UNREACHABLE``, all EINVAL but 53 and 67, and the ``PermissionError`` faults
 #: 21 ``ERROR_NOT_READY``, 23 ``ERROR_CRC``, 31 ``ERROR_GEN_FAILURE``, 32
-#: ``ERROR_SHARING_VIOLATION``, 33 ``ERROR_LOCK_VIOLATION`` and 65 ``ERROR_NETWORK_ACCESS_DENIED``
-#: on a path that is not a directory.
+#: ``ERROR_SHARING_VIOLATION``, 33 ``ERROR_LOCK_VIOLATION`` and 65 ``ERROR_NETWORK_ACCESS_DENIED``,
+#: on a directory too.
 _LIBPQ_STAT_LEFT_WINERRORS = frozenset({2, 3, 5, 15, _WINDOWS_INVALID_NAME, 161, 206, 267, 1921})
 
 
@@ -1389,9 +1389,10 @@ def _refuse_encrypted_libpq_root_cert(
     A path that names another host (:func:`names_another_host`) is refused unread, with
     ``PGSSLROOTCERT`` as the way out. A ``stat`` failure that says no file is there, or that libpq
     could not ``stat`` it either, is left to libpq (:func:`_libpq_cannot_stat_either`): at least a
-    missing name and a permission denial (on Windows, ``ERROR_ACCESS_DENIED`` only). Every other
-    ``stat`` failure is judged as a failed read is, so it is refused unless it says no file is
-    there, since libpq stats again at every connect and may load the file once the fault clears.
+    missing name other than a share Windows could not reach, and a permission denial (on Windows,
+    ``ERROR_ACCESS_DENIED`` only). Every other ``stat`` failure is judged as a failed read is, with
+    no second look for a directory, so it is refused unless it says no file is there, since libpq
+    stats again at every connect and may load the file once the fault clears.
     Past the ``stat``, the path takes :func:`_read_driver_file`'s read,
     as an ``sslca`` does: a directory is left to libpq, and a file that cannot be opened or read,
     or one past :data:`_MAX_DRIVER_CA_FILE_BYTES`, is refused, as libpq would fail the connect on
@@ -1514,9 +1515,10 @@ def _read_driver_file(
     With ``leave_unstatable``, for a driver that loads a file only once its ``stat`` succeeds, as
     libpq loads its root certificate, a ``stat`` failure that says no file is there, or that the
     driver could not ``stat`` it either (:func:`_libpq_cannot_stat_either`), is left to the driver
-    too: at least a missing name and a permission denial (on Windows, ``ERROR_ACCESS_DENIED``
-    only). Every other ``stat`` failure is judged as a failed read is, so it is refused unless it
-    says no file is there, since the driver stats again at each connect and may then load the file.
+    too: at least a missing name other than a share Windows could not reach, and a permission
+    denial (on Windows, ``ERROR_ACCESS_DENIED`` only). Every other ``stat`` failure is judged as a
+    failed read is, with no second look for a directory, so it is refused unless it says no file is
+    there, since the driver stats again at each connect and may then load the file.
     That costs a second ``stat`` of a path that passes, which :func:`read_if_regular` makes again.
 
     The file is read by :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which says
@@ -1529,7 +1531,7 @@ def _read_driver_file(
             except OSError as exc:
                 if not _libpq_cannot_stat_either(exc):
                     stat_failed = True
-                    raise  # judged below as a failed read is, so refused unless no file is there
+                    raise  # judged below as a failed read, with no second look for a directory
                 logger.debug("%s: the driver loads no file it cannot stat, so it is left", setting)
                 return None
         data = read_if_regular(path, _MAX_DRIVER_CA_FILE_BYTES + 1)

@@ -548,6 +548,23 @@ def test_a_refused_stat_failure_takes_no_second_look(
         database._read_driver_file(target, "setting", "file", "it", leave_unstatable=True)
 
 
+def test_a_directory_swapped_in_after_a_passing_stat_is_still_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the test above: when the stat passes and the open then fails with a
+    ``PermissionError`` on what is now a directory, the read's directory look still runs and leaves
+    it. Red when a passing stat also skipped that look."""
+    target = str(tmp_path)
+
+    def swapped(path: Any, limit: int) -> bytes | None:
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(database, "read_if_regular", swapped)
+    assert (
+        database._read_driver_file(target, "setting", "file", "it", leave_unstatable=True) is None
+    )
+
+
 def test_an_unreached_share_at_the_stat_still_honours_leave_unreachable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
