@@ -372,7 +372,7 @@ _SIGN_IN_ARMS: dict[str, tuple[_ArmSetup, str, str | None, str | None]] = {
     "login_error": (
         _directory_down,
         "auth.login_error",
-        "directory_unavailable",
+        "directory_error",
         "directory_unavailable",
     ),
     "binding_changed": (

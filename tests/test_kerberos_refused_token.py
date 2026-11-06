@@ -370,7 +370,7 @@ async def test_a_failed_principal_read_is_audited_as_an_outage_not_a_500(
     assert json.loads(rows[0]["detail"]) == {
         "provider": "ad",
         "mech": "kerberos",
-        "reason": "directory_unavailable",
+        "reason": "directory_error",
         "error": "LdapError",
     }
     assert _LEAK not in json.dumps(rows[0])
@@ -419,7 +419,7 @@ async def test_a_directory_error_after_an_accepted_token_stores_no_text(
     assert json.loads(rows[0]["detail"]) == {
         "provider": "ad",
         "mech": "kerberos",
-        "reason": "directory_unavailable",
+        "reason": "directory_error",
         "error": type(error).__name__,
     }
     assert _PLANTED not in json.dumps(rows[0])

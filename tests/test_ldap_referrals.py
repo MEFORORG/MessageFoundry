@@ -277,7 +277,7 @@ async def test_a_referred_kerberos_sign_in_is_audited_as_a_login_error(
         assert json.loads(rows[0]) == {
             "provider": "ad",
             "mech": "kerberos",
-            "reason": "directory_unavailable",
+            "reason": "directory_error",
             "error": "LdapReferralError",
         }
         assert _BIND_PASSWORD not in rows[0]

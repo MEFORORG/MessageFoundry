@@ -1341,13 +1341,14 @@ async def test_a_busy_kerberos_sign_in_is_audited_as_a_login_error(
         assert not out.ok
         rows = [str(dict(r)["detail"]) for r in await store.list_audit(action="auth.login_error")]
         assert len(rows) == 1, rows
-        # The type, never the refusal's text (BACKLOG #3196); the code is in the WARNING the
-        # refusal logs once (_unanswered).
+        # The type and ldap3's name for the code, never the refusal's text (BACKLOG #3196).
         assert json.loads(rows[0]) == {
             "provider": "ad",
             "mech": "kerberos",
-            "reason": "directory_unavailable",
+            "reason": "directory_error",
             "error": "LdapUnansweredError",
+            "code": 51,
+            "code_name": "busy",
         }
         assert _LEAK not in rows[0]
         assert await store.list_audit(action="auth.login_success") == []

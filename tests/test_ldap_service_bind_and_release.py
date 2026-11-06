@@ -278,9 +278,9 @@ def test_a_failed_service_unbind_does_not_change_the_answer(
 
 
 def test_a_service_bind_referral_with_no_referral_field_is_a_referral() -> None:
-    """ldap3 decodes a referral result with no referral field, and raises a plain
-    ``LDAPBindError`` for it from the ``auto_bind``. Before #3017 that read as a directory failure,
-    which the session reconciler reads as an outage. A referral that carries its hosts never
+    """ldap3 decodes a referral result with no referral field, and its ``bind()`` answers
+    ``False`` for it. Before #3017 that read as a directory failure, which the session reconciler
+    reads as an outage. A referral that carries its hosts never
     decodes, and ``tests/test_ldap_decode_boundary.py`` pins that one."""
     referral = _done(10, tag=_BIND_RESPONSE)
     with (
@@ -313,23 +313,33 @@ def test_any_other_service_bind_refusal_names_its_result_code() -> None:
     assert dc.searches == []
 
 
+_REFUSED = "which refused the bind; the engine reads the directory as unavailable until it is fixed"
+_CONFIGURATION = "which refused the bind; the engine reads it as a fault in the configuration"
+_NO_ANSWER = "which is not an answer; the engine reads it as the directory not answering"
+
+
 @pytest.mark.parametrize(
-    ("operation", "code", "verdict"),
+    ("operation", "code", "bind", "verdict"),
     [
-        pytest.param("service-account bind", 49, "which refused the bind", id="bind-49"),
-        pytest.param("user bind", 49, "which refused the bind", id="user-bind-49"),
-        pytest.param("user bind", 51, "which is not an answer", id="user-bind-51-busy"),
-        pytest.param("service-account bind", 52, "which is not an answer", id="bind-52"),
-        pytest.param("service-account bind", None, "which is not an answer", id="bind-no-code"),
-        pytest.param("user search", 32, "which is not an answer", id="search-32"),
+        pytest.param("service-account bind", 49, True, _REFUSED, id="bind-49"),
+        pytest.param("service-account bind", 34, True, _CONFIGURATION, id="bind-34"),
+        pytest.param("service-account bind", 8, True, _NO_ANSWER, id="bind-8-judged-nothing"),
+        pytest.param("service-account bind", 52, True, _NO_ANSWER, id="bind-52-outage"),
+        pytest.param("service-account bind", None, True, _NO_ANSWER, id="bind-no-code"),
+        pytest.param("user bind", 51, False, _NO_ANSWER, id="user-bind-51-busy"),
+        pytest.param("user search", 49, False, _NO_ANSWER, id="not-a-bind-49"),
     ],
 )
-def test_only_a_bind_refused_on_its_merits_is_called_refused(
-    operation: str, code: int | None, verdict: str
+def test_only_a_bind_the_directory_refused_is_called_refused(
+    operation: str, code: int | None, bind: bool, verdict: str
 ) -> None:
-    """L3. An outage code judged nothing (#3169) and no code said nothing, so neither is a
-    refusal; a search that did not finish is no answer either."""
-    assert f", {verdict};" in str(ldap_module._unanswered(operation, code))
+    """L3. A bind refused with invalidCredentials or a code pointing at its DN is a refusal, and
+    its reading does not also call it no answer. A code that judged nothing (an outage code,
+    strongerAuthRequired) and no code at all are no answer, and the caller says which operation is
+    a bind, so a label never decides it."""
+    assert f", {verdict} (BACKLOG #3010)" in str(
+        ldap_module._unanswered(operation, code, bind=bind)
+    )
 
 
 def test_a_refused_service_bind_with_no_result_code_still_refuses(
@@ -351,7 +361,9 @@ def test_a_refused_service_bind_with_no_result_code_still_refuses(
     with pytest.raises(LdapError) as err:
         LdapAuthenticator(_ad_settings()).probe_principal("alice")
     assert not isinstance(err.value, LdapReferralError)
-    assert str(err.value) == "AD refused the service-account bind, with no result code to name"
+    assert str(err.value) == (
+        "AD refused the service-account bind, with no refusing result code to name"
+    )
     assert rec.closes == [_SERVICE_DN]
 
 
@@ -410,6 +422,30 @@ def test_every_failed_service_bind_closes_its_socket(
         assert err.value.__cause__ is fault
     assert rec.closes == [_SERVICE_DN]
     assert rec.unbinds == [], "a connection that never bound is closed, not unbound"
+
+
+def test_a_close_that_raises_never_replaces_the_bind_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The close is best effort: whatever it raises is logged by type, and the caller still gets
+    the bind's own refusal as an ``LdapError``, which every sign-in arm audits."""
+    _install_fakes(monkeypatch)
+    _faulting(
+        monkeypatch, at="open", fault=ldap3.core.exceptions.LDAPSocketReceiveError("synthetic")
+    )
+    base = ldap3.Connection
+
+    def broken_close() -> None:
+        raise AttributeError("synthetic: a half-built strategy")
+
+    class BrokenClose(base):  # type: ignore[misc, valid-type]
+        def __init__(self, server: Any = None, **kwargs: Any) -> None:
+            super().__init__(server, **kwargs)
+            self.strategy = SimpleNamespace(close=broken_close)
+
+    monkeypatch.setattr(ldap3, "Connection", BrokenClose)
+    with pytest.raises(LdapError, match="ldap3 raised LDAPSocketReceiveError"):
+        LdapAuthenticator(_ad_settings()).probe_principal("alice")
 
 
 def test_the_service_connection_is_built_without_auto_bind() -> None:
@@ -479,30 +515,73 @@ async def test_ask_directory_passes_an_ldap_error_through_unchanged() -> None:
 async def test_ask_directory_names_an_engine_defect_at_error(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """BACKLOG #3017 L6. Every fault still fails closed as an ``LdapError``. Only one raised inside a
-    directory library stays at WARNING; any other is logged at ERROR as an engine defect, naming
-    the frame and no text. ``_escape_filter(None)`` raises inside ``auth/ldap.py``, ``json.loads``
-    inside the standard library on a bad argument, and ``parse_dn(None)`` inside ldap3."""
+    """BACKLOG #3017 L6. Every fault still fails closed as an ``LdapError``, and every one ldap3
+    did not raise while reading the directory's response is logged at ERROR as an engine defect,
+    naming the frame and no text. ``_escape_filter(None)`` raises inside ``auth/ldap.py``,
+    ``json.loads`` inside the standard library on a bad argument, and ``parse_dn(None)`` inside
+    ldap3 on an engine-supplied ``None``, which is the engine's defect too."""
     engine_fault = functools.partial(ldap_module._escape_filter, None)  # type: ignore[arg-type]
     stdlib_fault = functools.partial(json.loads, "{synthetic-leak-3017")
-    directory_fault = functools.partial(ldap3.utils.dn.parse_dn, None)
+    ldap3_fault = functools.partial(ldap3.utils.dn.parse_dn, None)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
         for fault, kind in (
             (engine_fault, "TypeError"),
             (stdlib_fault, "JSONDecodeError"),
-            (directory_fault, "LDAPInvalidDnError"),
+            (ldap3_fault, "LDAPInvalidDnError"),
         ):
             with pytest.raises(LdapError, match=f"^directory call failed: unexpected {kind}$"):
                 await service_module._ask_directory(fault)
     lines = [(r.levelno, r.getMessage()) for r in caplog.records]
-    assert len(lines) == 3, lines
-    (engine_level, engine_line), (stdlib_level, stdlib_line), (dir_level, dir_line) = lines
-    assert engine_level == logging.ERROR
+    assert [level for level, _m in lines] == [logging.ERROR] * 3, lines
+    engine_line, stdlib_line, ldap3_line = (m for _l, m in lines)
     assert "raised TypeError at messagefoundry.auth.ldap:" in engine_line
     assert "in _escape_filter, outside the directory libraries" in engine_line
-    assert stdlib_level == logging.ERROR and "at json.decoder:" in stdlib_line
-    assert dir_level == logging.WARNING and "engine defect" not in dir_line
+    assert "at json.decoder:" in stdlib_line and "at ldap3.utils.dn:" in ldap3_line
     assert not any("synthetic-leak" in m or "NoneType" in m or "empty dn" in m for _l, m in lines)
+
+
+async def test_ask_directory_reads_a_fault_raised_reading_a_response_as_the_directorys(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control for the test above: a fault whose origin ``ldap.py``'s rule reads as a response
+    ldap3 was reading stays at WARNING, as the directory not answering."""
+    monkeypatch.setattr(service_module, "_reading_connection", lambda _exc: object())
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"),
+        pytest.raises(LdapError),
+    ):
+        await service_module._ask_directory(functools.partial(ldap3.utils.dn.parse_dn, None))
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING and "engine defect" not in record.getMessage()
+
+
+def test_the_login_error_detail_holds_only_names_the_code_defines() -> None:
+    """BACKLOG #3196, #3727: the code and ldap3's name for it, and the interpreter error an ldap3
+    socket error merges in, which tells a CA mismatch from a refused port. None of the text."""
+    import ssl
+
+    from ldap3.core.exceptions import LDAPSocketOpenError, communication_exception_factory
+
+    unanswered = ldap_module._unanswered("user search", 51)
+    assert service_module._directory_error_detail(unanswered) == {
+        "reason": "directory_error",
+        "error": "LdapUnansweredError",
+        "code": 51,
+        "code_name": "busy",
+    }
+    merged = communication_exception_factory(
+        LDAPSocketOpenError, ssl.SSLCertVerificationError("synthetic")
+    )(f"socket ssl wrapping error: {_ADDRESSES}")
+    failed = ldap_module._ldap3_failed(merged)
+    failed.__cause__ = merged
+    detail = service_module._directory_error_detail(failed)
+    assert detail == {
+        "reason": "directory_error",
+        "error": "LdapError",
+        "cause": "ldap3.core.exceptions.LDAPSocketOpenError",
+        "interpreter_error": "SSLCertVerificationError",
+    }
+    assert "10.20.30.40" not in str(detail)
 
 
 #: The callers of the authenticator that keep their own reading of a fault, and why.
@@ -520,7 +599,10 @@ def _uses_of_the_authenticator(source: str) -> tuple[set[str], set[str], list[st
     BACKLOG #3017 L7. The guard this replaced matched only the literal shape
     ``to_thread(self._ldap.X, ...)``. A method called on the event loop, an alias
     (``ldap = self._ldap``), a ``getattr`` or a ``partial`` passed it. Here only a comparison
-    (``self._ldap is None``) and an assignment to the attribute are not reads of the authenticator.
+    (``self._ldap is None``) and an assignment to the attribute are not reads of the authenticator,
+    and the attribute's name as a string, as ``getattr(self, "_ldap")`` reads it, is a stray too.
+    Not caught, at least: a name built at runtime, and a read through another object that holds
+    the authenticator under another name.
     """
     tree = ast.parse(source)
     parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
@@ -536,6 +618,10 @@ def _uses_of_the_authenticator(source: str) -> tuple[set[str], set[str], list[st
     direct: set[str] = set()
     stray: list[str] = []
     for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and node.value == "_ldap":
+            # The attribute reached by name, as getattr(self, "_ldap") or vars(self)["_ldap"].
+            stray.append(f"line {node.lineno} in {enclosing(node)}: {ast.unparse(parents[node])}")
+            continue
         if not (isinstance(node, ast.Attribute) and node.attr == "_ldap"):
             continue
         parent = parents[node]
@@ -575,6 +661,8 @@ def test_the_authenticator_guard_catches_each_shape_the_literal_match_missed() -
         "    await asyncio.to_thread(getattr(self._ldap, 'authenticate'), 'a', 'b')\n"
         "async def bound_later(self):\n"
         "    await _ask_directory(partial(self._ldap.authenticate, 'a'), 'b')\n"
+        "async def by_string(self):\n"
+        "    getattr(self, '_ldap').authenticate('a', 'b')\n"
     )
     mapped, direct, stray = _uses_of_the_authenticator(planted)
     assert mapped == {"ok"} and direct == {"raw"}
@@ -582,6 +670,7 @@ def test_the_authenticator_guard_catches_each_shape_the_literal_match_missed() -
         "alias",
         "bound_later",
         "by_name",
+        "by_string",
         "on_the_loop",
     ], stray
 

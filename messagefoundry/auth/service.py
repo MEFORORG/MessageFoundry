@@ -70,7 +70,9 @@ from messagefoundry.auth.ldap import (
     LdapUnansweredError,
     LdapUndecodableError,
     _innermost_frame,
+    _reading_connection,
     _type_name,
+    interpreter_error,
     kerberos_principal,
     normalise_object_guid,
 )
@@ -2245,9 +2247,10 @@ async def _ask_directory[**P, T](call: Callable[P, T], /, *args: P.args, **kwarg
     **An engine defect is told apart, at ERROR (BACKLOG #3017 L6).** Catching an engine
     programming error here is deliberate: these legs grant, so they fail closed rather than answer
     a 500 with no audit row. But read as a plain outage it would hide among them. Only a fault
-    raised inside a directory library, such as ldap3 meeting a response it cannot read, stays at
-    WARNING. Any other is logged at ERROR, naming the frame's module, line and function, and still
-    no text (:func:`_engine_frame`).
+    ldap3 raised while reading what the directory sent stays at WARNING. Any other is logged at
+    ERROR, naming the frame's module, line and function, and still no text (:func:`_engine_frame`).
+    That includes a runtime fault such as the thread pool refusing work at shutdown, which is not
+    the directory's either.
     """
     try:
         return await asyncio.to_thread(call, *args, **kwargs)
@@ -2276,39 +2279,48 @@ async def _ask_directory[**P, T](call: Callable[P, T], /, *args: P.args, **kwarg
         raise LdapError(f"directory call failed: unexpected {kind}") from exc
 
 
-#: The packages that read what a directory or a Kerberos client sent. A fault raised inside one is
-#: read as the directory's (:func:`_engine_frame`).
-_DIRECTORY_LIBRARIES = ("ldap3", "pyasn1", "spnego")
-
-
 def _engine_frame(exc: BaseException) -> str | None:
-    """``module:line in function`` of the frame ``exc`` was raised in, or ``None`` when that frame
-    belongs to one of :data:`_DIRECTORY_LIBRARIES`. Any other frame counts as the engine's: its own
-    code, or a standard-library call it made with a bad argument. With no traceback the origin is
-    unknown, and it counts as the engine's too, so a defect never hides by losing its frame.
-    Code-defined names and a line number only, never a value (:func:`_ask_directory`)."""
+    """``module:line in function`` of the frame ``exc`` was raised in, or ``None`` when ldap3
+    raised it while reading what the directory sent.
+
+    The origin rule is ``ldap.py``'s own (``_reading_connection``), which tells the directory's
+    fault from one ldap3 raises while building a request from the engine's arguments. Any other
+    origin counts as the engine's: its own code, a library call it made with a bad argument, or no
+    traceback at all, so a defect never hides by losing its frame. Code-defined names and a line
+    number only, never a value (:func:`_ask_directory`)."""
+    if _reading_connection(exc) is not None:
+        return None
     frame = _innermost_frame(exc)
     if frame is None:
         return "an unknown frame"
     module = str(frame.f_globals.get("__name__", ""))
-    if any(module == lib or module.startswith(f"{lib}.") for lib in _DIRECTORY_LIBRARIES):
-        return None
     return f"{module}:{frame.f_lineno} in {frame.f_code.co_name}"
 
 
-def _directory_error_detail(exc: LdapError) -> dict[str, str]:
-    """What an ``auth.login_error`` row records of a directory error: a closed reason and type
-    names, never the error's text (BACKLOG #3196, #3727).
+def _directory_error_detail(exc: LdapError) -> dict[str, str | int]:
+    """What an ``auth.login_error`` row records of a directory error: a closed reason and names the
+    code defines, never the error's text (BACKLOG #3196, #3727).
 
     The text can carry what an outside party chose: a referral's hosts, a value read after a
     Kerberos step accepted the caller's token, or a message from a fault ``_ask_directory``
-    mapped. So the row keeps only names the code defines. ``cause`` is the chained error's type,
-    where there is one, such as the ``TypeError`` behind an unexpected fault. What the text said
-    beyond that is not on the row; where the raising code logs a diagnostic, a WARNING line or a
-    DEBUG traceback, the log keeps it."""
-    detail = {"reason": "directory_unavailable", "error": type(exc).__name__}
-    if exc.__cause__ is not None:
-        detail["cause"] = _type_name(exc.__cause__)
+    mapped. The reason is ``directory_error``, which names the class and claims no cause: the
+    error may be an outage or a configuration fault. Beside it, at least: ``error``, the error's
+    type; for an unanswered operation, ``code`` and ``code_name``, the result code and ldap3's
+    name for it from its fixed table; ``cause``, the chained error's type, such as the
+    ``TypeError`` behind an unexpected fault; and ``interpreter_error``, the interpreter error an
+    ldap3 socket error merges in (``interpreter_error`` in ``ldap.py``). Whatever else the text
+    said is not on the row; where the raising code logs a diagnostic, the log keeps it."""
+    detail: dict[str, str | int] = {"reason": "directory_error", "error": type(exc).__name__}
+    if isinstance(exc, LdapUnansweredError):
+        if exc.code is not None:
+            detail["code"] = exc.code
+        detail["code_name"] = exc.code_name
+    cause = exc.__cause__
+    if cause is not None:
+        detail["cause"] = _type_name(cause)
+        underlying = interpreter_error(cause)
+        if underlying is not None and underlying != type(cause).__name__:
+            detail["interpreter_error"] = underlying
     return detail
 
 

@@ -225,7 +225,9 @@ class LdapReferralError(LdapError):
 
 
 class LdapUnansweredError(LdapError):
-    """The directory ended an operation with a result code that is not an answer (BACKLOG #3010).
+    """The directory ended an operation with a result code that is not an answer the operation can
+    use (BACKLOG #3010): a search it did not finish, or a service-account bind it refused or did
+    not judge (:func:`_unanswered` words the two apart, BACKLOG #3017 L3).
 
     A subclass, so every ``except LdapError`` handles it as before; :func:`_refuse_unanswered` says
     what that means for each of its callers. A user bind raises it too, through
@@ -923,7 +925,9 @@ _UNANSWERED_HINTS: dict[int, str] = {
 _CONFIGURATION_CODES = frozenset({32, 34, 50})
 
 
-def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | None = None) -> None:
+def _refuse_unanswered(
+    conn: Any, operation: str, *, answers: frozenset[int] | None = None, bind: bool = False
+) -> None:
     """Raise :class:`LdapReferralError` for a referral, and otherwise :class:`LdapUnansweredError`
     unless ``conn``'s last operation ended with a result code in ``answers``, which is success alone
     unless the caller names another set.
@@ -964,7 +968,8 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
     without one. Only a test double can.
 
     ``answers`` is a parameter so an operation whose answers differ, such as a bind, can reuse this
-    with its own set. A referral is refused first, as a referral, whatever ``answers`` holds, so
+    with its own set; ``bind`` names the operation a bind, for the refusal's wording
+    (:func:`_unanswered`). A referral is refused first, as a referral, whatever ``answers`` holds, so
     the reconciler still reads it as referred (BACKLOG #2538).
     """
     from ldap3.core.results import RESULT_SUCCESS  # lazy, like every ldap3 import here
@@ -975,13 +980,22 @@ def _refuse_unanswered(conn: Any, operation: str, *, answers: frozenset[int] | N
         return
     code = result.get("result")
     if type(code) is not int:  # not isinstance: a bool is an int, and is no result code
-        raise _unanswered(operation, None)
+        raise _unanswered(operation, None, bind=bind)
     if code not in (answers if answers is not None else (RESULT_SUCCESS,)):
-        raise _unanswered(operation, code)
+        raise _unanswered(operation, code, bind=bind)
 
 
-def _unanswered(operation: str, code: int | None) -> LdapUnansweredError:
+#: The result codes with which a bind judges what it was asked and refuses it (BACKLOG #3017 L3):
+#: invalidCredentials (49) on the password, and noSuchObject (32), invalidDNSyntax (34) and
+#: insufficientAccessRights (50) on the DN. Any other code, such as an outage code or
+#: strongerAuthRequired (8), judged nothing, so it is not called a refusal.
+_REFUSING_BIND_CODES = frozenset({49}) | _CONFIGURATION_CODES
+
+
+def _unanswered(operation: str, code: int | None, *, bind: bool = False) -> LdapUnansweredError:
     """The refusal for ``operation`` ending with ``code``, warned once per operation and code name.
+    ``bind`` says the operation was a bind, whose refusing codes (:data:`_REFUSING_BIND_CODES`)
+    are named as a refusal rather than as no answer.
 
     The text carries the code, ldap3's name for it and the operation, never directory text.
     """
@@ -994,20 +1008,17 @@ def _unanswered(operation: str, code: int | None) -> LdapUnansweredError:
         shown, hint = f"result code {code} ({name})", _UNANSWERED_HINTS.get(code, "")
     # A configuration code is not read as the directory not answering: the session reconciler
     # reads it as a configuration refusal, which alerts (LdapUnansweredError.configuration).
-    reading = (
-        "a fault in the configuration"
-        if code in _CONFIGURATION_CODES
-        else "the directory not answering"
-    )
-    # A bind the directory refused on its merits, such as invalidCredentials, is an answer, so it
-    # is not called "not an answer" (BACKLOG #3017 L3). A bind ended by an outage code judged
-    # nothing (#3169), and one with no readable code said nothing, so both still are.
-    refused = operation.endswith(" bind") and code is not None and code not in _UNJUDGED_BIND_CODES
+    # A bind the directory refused, such as with invalidCredentials, is an answer, so it is
+    # called a refusal, not "not an answer" (BACKLOG #3017 L3).
+    refused = bind and code in _REFUSING_BIND_CODES
+    if code in _CONFIGURATION_CODES:
+        reading = "the engine reads it as a fault in the configuration"
+    elif refused:
+        reading = "the engine reads the directory as unavailable until it is fixed"
+    else:
+        reading = "the engine reads it as the directory not answering"
     verdict = "which refused the bind" if refused else "which is not an answer"
-    message = (
-        f"AD ended the {operation} with {shown}, {verdict}; the engine reads it as "
-        f"{reading} (BACKLOG #3010).{hint}"
-    )
+    message = f"AD ended the {operation} with {shown}, {verdict}; {reading} (BACKLOG #3010).{hint}"
     # Keyed on ldap3's name, not the raw code: a directory chooses the code, and ldap3's table is
     # finite, so the set of warnings stays bounded.
     _warn_once(f"unanswered: {operation}: {name}", "%s Reported once per code.", message)
@@ -1115,13 +1126,13 @@ def _reading_connection(exc: BaseException) -> Any:
 
 def _close_without_sending(conn: Any, why: str) -> None:
     """Shut ``conn``'s socket with ldap3's ``BaseStrategy.close``, which sends nothing on a stream
-    that may be out of step or already failed. Best effort: an error is logged at DEBUG, by type
-    only, because the caller's answer stands either way."""
-    import ldap3
-
+    that may be out of step or already failed. Best effort: any error is logged at DEBUG, by type
+    only, because the caller's answer stands either way. A close that raised in its place would
+    replace that answer, such as a refusal every caller reads as an ``LdapError``, with an
+    unhandled one (BACKLOG #3017)."""
     try:
         conn.strategy.close()
-    except (ldap3.core.exceptions.LDAPException, OSError) as failed:
+    except Exception as failed:  # noqa: BLE001 -- best effort; the caller's error is the answer
         logger.debug("AD socket close %s: %s", why, _type_name(failed))
 
 
@@ -1516,19 +1527,31 @@ def _ldap3_failed(exc: BaseException) -> LdapError:
 
     BACKLOG #3017. The text is fixed and names ldap3's error type, never its text. That text can
     carry each address the engine tried and the error at each (``LDAPSocketOpenError``), or the
-    directory's diagnostic message, and the sign-in callers write this text into
-    ``auth.login_error``. ``check-privileges`` prints the same text. It differs from
+    directory's diagnostic message. ``check-privileges`` prints this text; the sign-in callers'
+    ``auth.login_error`` row holds type names only (``AuthService``'s
+    ``_directory_error_detail``, BACKLOG #3196). It differs from
     :func:`_socket_faults_as_ldap_error`'s text, so a reader can tell an ldap3 error from a bare
     socket fault.
 
-    **The cause's type is named too.** ldap3 builds a socket error as a class that also
-    subclasses the error the interpreter raised (``communication_exception_factory``), such as
-    ``SSLCertVerificationError`` or ``ConnectionRefusedError``. Its name tells a pinned-CA mismatch
-    from a refused port without quoting anything. The full text goes to a DEBUG traceback only.
+    **The cause's type is named too** (:func:`interpreter_error`). The full text goes to a DEBUG
+    traceback only.
     """
     logger.debug("AD directory call failed", exc_info=exc)
-    name = type(exc).__name__
-    cause = next(
+    cause = interpreter_error(exc)
+    return LdapError(
+        f"AD directory call failed: ldap3 raised {type(exc).__name__}"
+        + (f" ({cause})" if cause else "")
+    )
+
+
+def interpreter_error(exc: BaseException) -> str | None:
+    """The name of the interpreter error an ldap3 error merges in, or ``None``.
+
+    ldap3 builds a socket error as a class that also subclasses the error the interpreter raised
+    (``communication_exception_factory``), such as ``SSLCertVerificationError`` or
+    ``ConnectionRefusedError``. Its name tells a pinned-CA mismatch from a refused port without
+    quoting anything."""
+    return next(
         (
             kind.__name__
             for kind in type(exc).__mro__
@@ -1536,9 +1559,6 @@ def _ldap3_failed(exc: BaseException) -> LdapError:
             and kind not in (Exception, BaseException, object)
         ),
         None,
-    )
-    return LdapError(
-        f"AD directory call failed: ldap3 raised {name}" + (f" ({cause})" if cause else "")
     )
 
 
@@ -1562,11 +1582,11 @@ def _refuse_service_bind(conn: Any) -> NoReturn:
     ldap3's name for it and the hint for it, never the directory's diagnostic message, so an
     operator still sees ``invalidCredentials`` for a wrong service password. A bind response
     carrying the referral's hosts never reaches here: ldap3 cannot decode one, and
-    :func:`_ldap3_call` refuses it first. A result with no code to name still refuses, because the
-    bind did not bind.
+    :func:`_ldap3_call` refuses it first. A result that is not a dict, or one that reads success
+    although the bind did not bind, still refuses, naming no code.
     """
-    _refuse_unanswered(conn, "service-account bind")
-    raise LdapError("AD refused the service-account bind, with no result code to name")
+    _refuse_unanswered(conn, "service-account bind", bind=True)
+    raise LdapError("AD refused the service-account bind, with no refusing result code to name")
 
 
 @dataclass(slots=True)

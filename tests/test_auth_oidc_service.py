@@ -1387,7 +1387,7 @@ async def test_a_directory_error_on_the_federated_re_resolve_stores_no_text(
         assert json.loads(row["detail"]) == {
             "provider": "ad",
             "mech": "oidc",
-            "reason": "directory_unavailable",
+            "reason": "directory_error",
             "error": type(error).__name__,
         }
         assert _PLANTED not in json.dumps(dict(row))
