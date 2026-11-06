@@ -6,8 +6,8 @@
   the codec error without its bytes, and with no chain: a `ValueError` as
   `StoreCipherConfigError`, any other class as `KeyProviderError`, which at least every CLI
   command with a key arm, `rotate-key` among them, reports as a key that could not be resolved,
-  exit 2. A chain that cannot be read whole is refused the same way. An error with no codec error
-  on it is unchanged. (`BACKLOG #4882`, `BACKLOG #3471`)
+  exit 2. An error whose chain cannot be read whole is refused the same way, and says so. Any
+  other error is unchanged. (`BACKLOG #4882`, `BACKLOG #3471`)
 - **`check-privileges`' AD bind probe keeps a hop refusal's text only when the LDAPS revocation
   guard raised it.** Any other hop refusal on that probe, at least one from resolving a Vault-held
   bind password, is named by its type, as on the Vault probe. (`BACKLOG #4883`, `BACKLOG #3471`)

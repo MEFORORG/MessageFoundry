@@ -3405,7 +3405,8 @@ def resolve_decrypt_keys(
     try:
         provider = resolve_key_provider(settings, posture=posture)
         active = _checked_active_key(provider.active_key(), settings)
-        retired_keys = provider.retired_keys()
+        # Copied here, so a provider whose sequence reads as it is iterated is refused here too.
+        retired_keys = list(provider.retired_keys())
     except Exception as exc:
         refusal = _codec_safe_refusal(exc)
         if refusal is None:
@@ -3455,9 +3456,9 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     decoded, and its ``.object`` holds all of it, so a key source that yields bytes that are not
     text would put key material in the refusal and in any traceback of it. An error from the build
     of any class with a codec error on it is raised as :func:`_codec_safe_refusal` gives it, with
-    no byte and no chain. Every other ``ValueError`` keeps its text and its chain, and an error of
-    another class with no codec error on it, such as a ``KeyProviderError`` or ``DpapiError``,
-    passes through untouched."""
+    no byte and no chain, and so is one whose chain cannot be read whole. Every other
+    ``ValueError`` keeps its text and its chain, and every other error, such as a
+    ``KeyProviderError`` or ``DpapiError``, passes through untouched."""
     try:
         return _build_store_cipher(settings, posture)
     except Exception as exc:
@@ -3489,6 +3490,26 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
     ``KeyProviderError``, which at least every CLI command with a key arm reports as a key that
     could not be resolved."""
     name = type(exc).__name__
+    codec, read_whole = _codec_error_on(exc)
+    if not read_whole:
+        text = f"a {name} whose chain cannot be read whole, its own text not shown"
+    elif codec is None:
+        return None
+    elif codec is exc:
+        text = codec_safe_line(exc)
+    else:
+        text = (
+            f"a {name} whose chain holds a codec error, its own text not shown "
+            f"({codec_safe_line(codec)})"
+        )
+    return StoreCipherConfigError(text) if isinstance(exc, ValueError) else KeyProviderError(text)
+
+
+def _codec_error_on(exc: BaseException) -> tuple[BaseException | None, bool]:
+    """The first error :func:`~messagefoundry.exception_origin.exception_chain` reaches from
+    ``exc``, ``exc`` first, that is a codec error or prints one, or ``None``; and whether the chain
+    was read whole. It was not when the walk raised, too long or from a link's own code, and then
+    no error is named (BACKLOG #4882)."""
     try:
         codec = next(
             (
@@ -3499,26 +3520,19 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
             None,
         )
     except Exception:  # noqa: BLE001 -- fail closed: ExceptionChainTooLong, or a link's own code
-        text: str | None = f"a {name} whose chain cannot be read whole, its own text not shown"
-    else:
-        if codec is None:
-            text = None
-        elif codec is exc:
-            text = codec_safe_line(exc)
-        else:
-            text = (
-                f"a {name} whose chain holds a codec error, its own text not shown "
-                f"({codec_safe_line(codec)})"
-            )
-    if text is None:
-        return None
-    return StoreCipherConfigError(text) if isinstance(exc, ValueError) else KeyProviderError(text)
+        return None, False
+    return codec, True
 
 
-def _carries_a_codec_error(exc: Exception) -> bool:
-    """Whether :func:`_codec_safe_refusal` would refuse ``exc`` (BACKLOG #3471, #4882), for the
-    PostgreSQL store's TLS context wrap."""
-    return _codec_safe_refusal(exc) is not None
+def _codec_chain_reading(exc: BaseException) -> str | None:
+    """For the PostgreSQL store's TLS context wrap, what to say of ``exc`` in place of its text:
+    ``"from a codec error"`` where a codec error is on its chain as :func:`_codec_error_on` reads
+    it, ``"whose chain cannot be read whole"`` where that read did not finish, else ``None``, and
+    the text may be kept (BACKLOG #3471, #4882)."""
+    codec, read_whole = _codec_error_on(exc)
+    if not read_whole:
+        return "whose chain cannot be read whole"
+    return None if codec is None else "from a codec error"
 
 
 class StoreCipherConfigError(ValueError):

@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import re
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -592,9 +592,82 @@ def test_rotate_key_prints_no_byte_of_a_chained_codec_error(
 
 
 def test_the_postgres_tls_wrap_reads_a_context_beside_a_cause() -> None:
-    """``_carries_a_codec_error`` is also the PostgreSQL TLS wrap's test (BACKLOG #2532)."""
-    assert store_base._carries_a_codec_error(_context_beside_cause(_decode_error()))
-    assert not store_base._carries_a_codec_error(ValueError("synthetic plain"))
+    """``_codec_chain_reading`` is the PostgreSQL TLS wrap's test (BACKLOG #2532)."""
+    reading = store_base._codec_chain_reading
+    assert reading(_context_beside_cause(_decode_error())) == "from a codec error"
+    assert reading(ValueError("synthetic plain")) is None
+
+
+def _unreadable_reason() -> _UnreadableReason:
+    """A raised ValueError whose own text names no codec error and whose chain cannot be read."""
+    try:
+        raise _UnreadableReason("synthetic: the CA file could not be judged")
+    except _UnreadableReason as exc:
+        return exc
+
+
+def test_the_postgres_tls_wrap_says_a_chain_it_cannot_read_is_not_a_codec_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round two of the review: a chain that cannot be read whole was refused as one "from a
+    codec error", which no codec error made true. It keeps no text, and says what is true."""
+    from messagefoundry.config.tls_policy import StoreTlsRefused
+    from messagefoundry.store import postgres
+
+    assert store_base._codec_chain_reading(_unreadable_reason()) == (
+        "whose chain cannot be read whole"
+    )
+    monkeypatch.setattr(postgres, "_verifying_context", _raising(_unreadable_reason()))
+    with pytest.raises(StoreTlsRefused) as caught:
+        postgres._verifying_context_at_open(StoreSettings())
+    text = str(caught.value)
+    assert "_UnreadableReason whose chain cannot be read whole" in text, text
+    assert "codec" not in text and "could not be judged" not in text, text
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+class _LazyRetiredKeys(Sequence[str]):
+    """A retired keyring that decodes as it is read, so the codec error rises on iteration."""
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, index: Any) -> Any:
+        if index:
+            raise IndexError(index)
+        raise _built_from(_decode_error(), KeyProviderError)
+
+
+class _RetiredCodecProvider:
+    def __init__(self, retired: Callable[[], Sequence[str]]) -> None:
+        self._retired = retired
+
+    def active_key(self) -> str | None:
+        return generate_key()
+
+    def retired_keys(self) -> Sequence[str]:
+        return self._retired()
+
+
+@pytest.mark.parametrize(
+    "retired",
+    [_raising(_built_from(_decode_error(), KeyProviderError)), _LazyRetiredKeys],
+    ids=["retired-keys-raises", "retired-keys-decode-as-read"],
+)
+def test_the_keyring_refuses_a_codec_error_from_the_retired_keys(
+    retired: Callable[[], Sequence[str]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round two of the review: the retired keys were iterated outside the refusing try."""
+    monkeypatch.setattr(
+        store_base,
+        "resolve_key_provider",
+        lambda settings, posture=None: _RetiredCodecProvider(retired),
+    )
+    with pytest.raises(KeyProviderError) as caught:
+        store_base.resolve_decrypt_keys(StoreSettings())
+    _assert_no_key_byte(_whole(caught.value))
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert f"KeyProviderError {_CHAINED}" in str(caught.value), str(caught.value)
 
 
 @pytest.mark.parametrize("command", _KEY_REFUSING_COMMANDS)
