@@ -130,7 +130,8 @@ async def test_a_file_swapped_after_the_read_is_judged_as_read(
 
 def _path_verdict(ok: bool | None) -> Any:
     """A path check that finds one directory insecure (``ok`` False) or unjudged (``ok`` None)."""
-    finding = ChainFinding("/anchors", "directory", ok is False, "writable by another account")
+    reason = "writable by another account" if ok is False else "could not read its ACL"
+    finding = ChainFinding("/anchors", "directory", ok is False, reason)
     return lambda _p: PathVerdict(ok, (finding,))
 
 
@@ -267,7 +268,8 @@ async def test_a_pass_the_store_stopped_is_not_remembered(
     only under two mutations together: the pass remembered before its rows were all written, and
     a pass that wrote a violation row remembered at all. The baseline then names the bytes, and
     the repeat skips the row for good. For a clean pass the only rows are ``observed`` and
-    ``changed``, and the hit's baseline read already catches a lost one."""
+    ``changed``, and the hit's baseline read already catches a lost one, so remembering a pass
+    only once its rows were all written is no longer load-bearing on its own."""
     import json
 
     store = await MessageStore.open(tmp_path / "faulty.db")

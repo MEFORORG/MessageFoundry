@@ -1430,8 +1430,9 @@ def _is_clean(verdict: AnchorVerdict) -> bool:
     """Whether ``verdict``'s ACL and path are both plainly fine. A verdict that passes logs a
     warning from :func:`_enforce_verdict`, and gets a violation row from :func:`_audit_verdict`,
     exactly when this is False: an ``acl_insecure``, ``acl_indeterminate``, ``path_insecure`` or
-    ``path_indeterminate`` row. The lane check remembers only a clean pass (vault BACKLOG
-    #3188), so a change to which pass gets a row changes this too."""
+    ``path_indeterminate`` row today. The lane check remembers only a clean pass (vault BACKLOG
+    #3188), so a change to which pass gets a row must change this too, or the lane check's
+    repeats would skip that row."""
     return verdict.acl_ok is True and verdict.path_ok is True
 
 
@@ -2694,17 +2695,18 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
     takes in place of the PEM shape check) and the audit pass. It skips them only when the spec
     and the whole verdict match, and the audited baseline still names these bytes. The verdict
     compared holds the fingerprint of the bytes, the result of the ACL read rather than the ACL
-    itself (``acl_ok``, True for owner-only, False or None for unjudged, and always True in a
-    remembered pass), the pin result and each path finding. It still reads that baseline, so a store that refuses the read raises as
-    above, and a baseline another writer moved is judged and audited again. A changed file, ACL
-    result or setting is judged and audited again.
+    itself (``acl_ok``: True for owner-only, False for writable by a non-owner, None for
+    unjudged, and always True in a remembered pass), the pin result and each path finding. It
+    still reads that baseline, so a store that refuses the read raises as above, and a baseline
+    another writer moved is judged and audited again. A changed file, ACL result or setting is
+    judged and audited again.
 
     **A pass that wrote a violation row is never remembered.** Under ``warn`` a CA whose ACL or
-    path is exposed or unjudged passes and writes its ``acl_insecure``, ``acl_indeterminate``,
-    ``path_insecure`` or ``path_indeterminate`` row. Every check judges it again and writes that
-    row again, as before #3188, so this detective control records no less than it did. That
-    keeps the cost the refusal memo above avoids: a poller retrying such a lane at every window
-    tick adds those rows at every tick, as it did before #3188.
+    path is exposed or unjudged passes and writes its violation row (:func:`_is_clean` names
+    them). Every check judges it again and writes that row again, as each check did before this
+    pass memo, so this detective control records no less than it did. That keeps the cost the
+    refusal memo above avoids: a poller retrying such a lane at every window tick adds those rows
+    at every tick, as it did before this pass memo.
 
     **Each check reads the CA once.** What is remembered and what was judged come from that one
     read (:func:`_preflight_one`'s ``verdict``), so a file swapped during a check cannot pair one
@@ -2736,8 +2738,8 @@ async def _baseline_names(store: Store, spec: AnchorSpec, verdict: AnchorVerdict
 
 @runtime_checkable
 class RetainsLanes(Protocol):
-    """A lane check that remembers each lane's last result, and so must be told which lanes
-    still exist (vault BACKLOG #3188). The runner calls it once a reload commits."""
+    """A lane check that remembers a lane's last refusal or clean pass, and so must be told which
+    lanes still exist (vault BACKLOG #3188). The runner calls it once a reload commits."""
 
     def retain_lanes(self, lanes: Collection[tuple[str, str]]) -> None: ...
 
@@ -2756,7 +2758,8 @@ class _LaneAnchorCheck:
         self._enforcing = enforcing
         self._read = read
         # (direction, name) -> (the spec and what its one read found, the refusal's text, or None
-        # for a pass whose rows were all written).
+        # for a clean pass whose rows were all written). A pass that wrote a violation row has no
+        # entry.
         self._last: dict[tuple[str, str], tuple[tuple[object, ...], str | None]] = {}
 
     def retain_lanes(self, lanes: Collection[tuple[str, str]]) -> None:
@@ -2821,10 +2824,9 @@ class _LaneAnchorCheck:
                 self._last[lane] = (now, str(exc))
             raise
         # Reached only when every row was written: a store fault raised AnchorStoreUnavailable.
-        # Only a clean pass, which wrote no violation row, is remembered. One whose ACL or path is
-        # exposed or unjudged, which a lane CA passes with only under warn, is judged again at the
-        # next check and writes its row again, as every check did before #3188, so this detective
-        # control records no less than it did. An unreadable file raised above, so read is a
-        # verdict here.
+        # Only a clean pass is remembered. A pass that wrote a violation row, which a lane CA
+        # passes with only under warn, is judged again at the next check and writes its row
+        # again, as each check did before this pass memo (make_lane_anchor_check's docstring).
+        # An unreadable file raised above, so read is a verdict here.
         if isinstance(read, AnchorVerdict) and _is_clean(read):
             self._last[lane] = (now, None)
