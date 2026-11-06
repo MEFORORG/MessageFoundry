@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -214,10 +215,10 @@ async def test_a_file_that_cannot_be_written_is_a_skip_and_the_pass_goes_on(
     bad, good = await _seed(seeder), await _seed(seeder)
     real_write = uploads_module._atomic_write_text
 
-    def _write(root_: Path, path: Path, text: str) -> None:
+    def _write(root_: Path, path: Path, text: str, *, seen: os.stat_result | None = None) -> None:
         if path.name.startswith(bad):
             raise PermissionError("read-only file")
-        real_write(root_, path, text)
+        real_write(root_, path, text, seen=seen)
 
     monkeypatch.setattr(uploads_module, "_atomic_write_text", _write)
     result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()

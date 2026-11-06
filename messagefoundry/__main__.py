@@ -10341,7 +10341,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
     roll's head check refuses an audit row that lands inside its read, and nothing refuses a data
     write. A store the probe cannot read, or one not in WAL mode, is not checked, and the command
     prints a note. And on PostgreSQL or SQL Server nothing is checked; the command prints a note
-    there too.
+    there too. Whatever the backend, the uploads pass never re-creates an upload a running engine
+    removes while it runs (BACKLOG #3181 item 5, ``uploads._pair_lock``); that upload is a skip.
 
     **Invocation bound (ASVS 11.3.4).** A ``cipher_meta`` row is keyed on the one-way SHA-256
     fingerprint of the AES key values are sealed under. Since ADR 0196 that is the store's data

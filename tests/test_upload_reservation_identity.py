@@ -27,6 +27,7 @@ from messagefoundry.config.settings import EgressSettings, StoreSettings
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 from messagefoundry.uploads import UploadedFileMeta, UploadStore, _Observed
+from tests._upload_root import upload_entries
 from tests.test_uploads import _cancel_once_landed, _GatedLedger, _hold_after_the_sidecar_lands
 
 _ADT = "MSH|^~\\&|A|B|C|D|202601011200||ADT^A01|MSGID1|P|2.5\rPID|1||MRN123^^^HOSP||DOE^JOHN\r"
@@ -99,7 +100,7 @@ async def test_a_reserve_that_raises_after_its_commit_is_released_by_its_id(
         await store.save(data=b"x\n", filename="a.txt", uploader="op", uploader_id="u-op")
     assert not store._stragglers, "the release by id was not awaited"
     assert await ledger_db.upload_quota_in_flight("u-op") == (0, 0)
-    assert not (tmp_path / "uploads").exists() or not list((tmp_path / "uploads").iterdir())
+    assert not (tmp_path / "uploads").exists() or not upload_entries(tmp_path / "uploads")
 
 
 async def test_a_late_release_is_cancelled_at_its_cap_rather_than_absorbed(

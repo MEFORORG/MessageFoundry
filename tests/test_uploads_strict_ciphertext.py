@@ -57,6 +57,7 @@ from messagefoundry.uploads import (
     _Observed,
     _UnsealableUpload,
 )
+from tests._upload_root import upload_names
 
 _ADT = "MSH|^~\\&|A|B|C|D|202601011200||ADT^A01|MSGID1|P|2.5\rPID|1||MRN123^^^HOSP||DOE^JOHN\r"
 # A filename that would be PHI if it leaked into a log or an alert.
@@ -419,7 +420,7 @@ def _age(root: Path, fid: str, days: float) -> None:
 
 
 def _files(root: Path) -> list[str]:
-    return sorted(p.name for p in root.iterdir())
+    return upload_names(root)
 
 
 @_BREAKS
