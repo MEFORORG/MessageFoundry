@@ -695,9 +695,10 @@ _STALE_CASES = [
         "acme-hl7-utils is in requirements.txt but not in requirements.lock",
         None,
     ),
-    # A range must be met by the locked version.
-    ("messagefoundry==0.5.1\nsspilib>=0.5\n", None, None),
-    ("messagefoundry==0.5.1\nsspilib>=0.7\n", "requirements.txt asks for sspilib>=0.7", None),
+    # A range must be met by the locked version. The engine's pin carries no marker, so these
+    # hold on every host; a marked pin is skipped wherever its marker is false.
+    ("messagefoundry>=0.5\n", None, None),
+    ("messagefoundry>=0.6\n", "requirements.txt asks for messagefoundry>=0.6", None),
     # A marker that holds here is checked like any other requirement.
     (
         "messagefoundry==0.5.1\nuvloop==0.23.0 ; python_version >= '3'\n",
