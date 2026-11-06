@@ -720,6 +720,33 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     admin_unlock.add_argument("--json", action="store_true", help="emit JSON")
 
+    # ADR 0207 section 6: a site whose every enabled Administrator is a directory account with no
+    # engine factor has nobody who can issue an enrolment code. This is the host's exit, on
+    # admin-unlock's gate, for any directory account.
+    issue_enrolment_code = sub.add_parser(
+        "issue-enrolment-code",
+        help="issue a directory account's one-time enrolment code from the host (offline)",
+        description="Issue the single-use enrolment code a directory account needs to bind its "
+        "first engine factor, for a site where no Administrator can issue one from the console. "
+        "Runs against the store directly, on the same host gate as admin-unlock. On SQLite it "
+        "refuses while another connection holds the store, and when it cannot tell; on a server "
+        "store it cannot tell, so run it with the engine stopped. It prints the code once; hand it "
+        "over after confirming who is asking, never through the account's own mail or chat. It "
+        "refuses a local account, a disabled account and an account that holds a factor.",
+    )
+    issue_enrolment_code.add_argument(
+        "--username", required=True, help="the directory account the code is for"
+    )
+    issue_enrolment_code.add_argument(
+        "--service-config",
+        default=None,
+        help="service settings TOML (default: ./messagefoundry.toml if present)",
+    )
+    issue_enrolment_code.add_argument(
+        "--db", default=None, help="store path (overrides [store].path)"
+    )
+    issue_enrolment_code.add_argument("--json", action="store_true", help="emit JSON")
+
     # BACKLOG #2614. DELETE /sessions ends sessions in bulk through the API; this is the same act
     # from the host, for when the API itself is what is not trusted. Same host gate as admin-unlock.
     admin_revoke_sessions = sub.add_parser(
@@ -6855,6 +6882,187 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     return 0
 
 
+#: The 16-byte header every SQLite database file starts with.
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _starts_as_sqlite(path: str) -> bool:
+    """Whether ``path`` is empty or begins with the SQLite header. An empty file is the probe's
+    ``not_a_store`` case, so it is let through to that refusal; an unreadable one is the probe's
+    ``unchecked`` case."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(len(_SQLITE_HEADER))
+    except OSError:
+        return True
+    return head == b"" or head == _SQLITE_HEADER
+
+
+def _enrolment_code_host_refusal(settings: ServiceSettings) -> str | None:
+    """Why ``issue-enrolment-code`` refuses the store before it opens it, or ``None`` (ADR 0207
+    Amendment A, A4). On SQLite: another connection holds it, it is not a SQLite database, it holds
+    no store, or the probe cannot tell; a command that issues a credential fails closed when it
+    cannot tell, which is stricter than ``rotate-key``. A server store has no probe, so it proceeds
+    and the caller prints a note; the audit append there is serialized by the chain's own lock."""
+    from messagefoundry.config.settings import StoreBackend
+
+    if settings.store.backend != StoreBackend.SQLITE:
+        return None
+    where = _shown_path(settings.store.path)
+    probe = _sqlite_store_held_elsewhere(settings.store.path)
+    if probe.held:
+        return f"another connection holds the store at {where}; stop the engine and re-run"
+    if not _starts_as_sqlite(settings.store.path):
+        # The probe answers all-clear on a file SQLite cannot read as a database at all and leaves
+        # it to the store open, which rotate-key relies on. Here it is refused first (A4).
+        return f"{where} is not a SQLite database; check --db / [store].path"
+    if probe.not_a_store:
+        return (
+            f"{where} holds no MessageFoundry store; refusing to create one and issue a code into "
+            "it (check --db / [store].path)"
+        )
+    if probe.unchecked is not None:
+        return (
+            f"could not check whether an engine holds the store at {where}: {probe.unchecked}. "
+            "Stop the engine, make the store readable and writable by this account in WAL mode, "
+            "and re-run"
+        )
+    return None
+
+
+def _issue_enrolment_code(args: argparse.Namespace) -> int:
+    """Issue a directory account's single-use enrolment code from the host (ADR 0207 section 6).
+
+    THE GATE IS ``admin-unlock``'s HOST GATE (ADR 0171): whoever holds the service config, the store
+    and its key already holds the database. It issues for any directory account, not only an
+    Administrator, since host access already grants everything. It refuses a local account, a
+    disabled one and one that holds an engine factor, and its write is the same conditional sealed
+    write the route makes, so a disable or a factor that lands meanwhile leaves no code. It writes
+    the route's ``auth.enrolment_code_issued`` row, with ``via`` ``host``, the actor naming the OS
+    user, and no issuer, so a spend of it notifies nobody. Never logs the code; prints it once."""
+    import getpass
+    import time
+
+    from messagefoundry.auth.notifications import deadline_utc
+    from messagefoundry.auth.service import (
+        ENROLMENT_CODE_ISSUE_REFUSALS,
+        ENROLMENT_CODE_LIFETIME_SECONDS,
+    )
+    from messagefoundry.auth.tokens import enrolment_code_digest, mint_enrolment_code
+    from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.store.base import (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        open_store,
+    )
+    from messagefoundry.store.row_seal import RowSealError
+
+    settings = _host_gated_store_settings(args)
+    if isinstance(settings, int):
+        return settings
+    refusal = _enrolment_code_host_refusal(settings)
+    if refusal is not None:
+        _emit_error(refusal, as_json=args.json)
+        return 2
+    if settings.store.backend != StoreBackend.SQLITE:
+        print(
+            f"note: a {settings.store.backend.value} store cannot be checked for a serving engine; "
+            "run this with the engine stopped",
+            file=sys.stderr,
+        )
+    posture = _command_hop_posture(settings)
+
+    async def run() -> tuple[str, dict[str, Any]]:
+        _warn_on_an_unrevoked_store_hop(settings)
+        store = await _open_store_or_refuse(
+            open_store(
+                settings.store,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+        )
+        try:
+            user = await store.get_user_by_username(args.username)
+            if user is None:
+                return ("no-such-user", {})
+            if user.auth_provider != "ad":
+                return ("local_account", {})
+            if user.disabled:
+                return ("disabled", {})
+            if user.totp_enabled or await store.has_webauthn_credentials(user.id):
+                return ("factor_present", {})
+            _refuse_an_unauditable_write(store)  # before the issue's write, not after it
+            code = mint_enrolment_code()
+            code_digest = enrolment_code_digest(code)
+            if code_digest is None:  # pragma: no cover - a minted code always normalises
+                raise RuntimeError("an enrolment code failed its own shape check")
+            now = time.time()
+            expires_at = now + ENROLMENT_CODE_LIFETIME_SECONDS
+            outcome = await store.issue_enrolment_code(
+                user.id, code_digest=code_digest, expires_at=expires_at, issuer_id=None, now=now
+            )
+            if outcome is None:
+                return ("changed", {})
+            await store.record_audit(
+                "auth.enrolment_code_issued",
+                actor=f"cli:{getpass.getuser()}",
+                detail=json.dumps(
+                    {
+                        "user_id": user.id,
+                        "username": user.username,
+                        "expires_at": expires_at,
+                        "via": "host",
+                        "replaced": outcome.replaced,
+                        "bound": user.oidc_issuer is not None and user.oidc_subject is not None,
+                    }
+                ),
+            )
+            return (
+                "issued",
+                {"code": code, "expires_at": expires_at, "replaced": outcome.replaced},
+            )
+        finally:
+            await store.close()
+
+    try:
+        outcome, report = run_guarded(run())
+    except (
+        KeylessAuditChainRefused,
+        StoreNotFoundError,
+        _UnauditableWrite,
+        _StoreOpenRefused,
+    ) as exc:
+        _emit_error(str(exc), as_json=args.json)
+        return 2
+    except RowSealError:
+        return _emit_error(
+            _seal_refusal(args.username, "enrolment code issue") + ". Nothing was written",
+            as_json=args.json,
+        )
+    except sqlite3.DatabaseError as exc:
+        return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    if outcome == "no-such-user":
+        return _emit_error(f"no account named {args.username!r}", as_json=args.json)
+    if outcome != "issued":
+        return _emit_error(
+            f"no enrolment code issued for {args.username!r}: "
+            f"{ENROLMENT_CODE_ISSUE_REFUSALS[outcome]}",
+            as_json=args.json,
+        )
+    if args.json:
+        print(json.dumps({"ok": True, "username": args.username, **report}))
+    else:
+        replaced = " It replaces the code issued before it." if report["replaced"] else ""
+        print(
+            f"Enrolment code for {args.username!r}, shown once: {report['code']}\n"
+            f"It expires at {deadline_utc(report['expires_at']) or 'its 24-hour limit'}."
+            f"{replaced} Hand it over "
+            "after confirming who is asking, never through the account's own mail or chat."
+        )
+    return 0
+
+
 class _PasswordEntryRefused(RuntimeError):
     """The interactive credential prompt declined. The message is operator-facing."""
 
@@ -12563,6 +12771,7 @@ _DISPATCH = {
     "cert": _cert,
     "protect-key": _protect_key,
     "admin-unlock": _admin_unlock,
+    "issue-enrolment-code": _issue_enrolment_code,
     "provision-admin": _provision_admin,
     "store": _store,
     "check-privileges": _check_privileges,

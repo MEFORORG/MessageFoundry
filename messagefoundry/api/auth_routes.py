@@ -43,6 +43,8 @@ from messagefoundry.api.auth_models import (
     CustomRoleRequest,
     DirectoryUserCreateRequest,
     ElevatedResponse,
+    EnrolmentCodeResponse,
+    EnrolmentCodeRevokeResponse,
     ExpectedFederatedPair,
     FederatedIdentityRequest,
     FederatedIdentityView,
@@ -130,6 +132,8 @@ from messagefoundry.auth.ldap import LdapError, canonical_group_dn
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
     ENROL_AUTHENTICATOR_FIRST,
+    STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_ISSUE,
+    STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_REVOKE,
     STEP_UP_ACTION_ADMIN_FEDERATED_IDENTITY,
     STEP_UP_ACTION_ADMIN_RESET_MFA,
     STEP_UP_ACTION_ADMIN_RESET_PASSWORD,
@@ -148,6 +152,7 @@ from messagefoundry.auth.service import (
     DirectoryAccountRefused,
     DirectoryObjectIdMissing,
     DirectoryRefusal,
+    EnrolmentCodeIssueRefused,
     FactorEnrolmentRequired,
     FederatedBindingChanged,
     FederatedSubjectHeld,
@@ -942,10 +947,19 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.get("/me/mfa", response_model=MfaStatusResponse)
     async def my_mfa(
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
     ) -> MfaStatusResponse:
-        """The caller's current MFA posture (enabled, enrolled-at, recovery codes left, required)."""
+        """The caller's current MFA posture (enabled, enrolled-at, recovery codes left, required),
+        and whether binding its first factor would ask an enrolment code (ADR 0207)."""
+        return await _my_mfa_core(service=service, identity=identity, token=bearer_token(request))
+
+    async def _my_mfa_core(
+        *, service: AuthService, identity: Identity, token: str | None
+    ) -> MfaStatusResponse:
+        """:func:`my_mfa` for a session ``token``: the bearer on the JSON route, the cookie session
+        on the console's account page, which calls this through ``AdminHandlers.my_mfa``."""
         st = await service.mfa_status(identity)
         return MfaStatusResponse(
             enabled=st.enabled,
@@ -954,6 +968,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             required=st.required,
             webauthn_enrolled=st.webauthn_enrolled,
             totp_reenrolment_recommended=st.totp_reenrolment_recommended,
+            enrolment_code_required=await service.enrolment_code_required(token, identity),
         )
 
     @app.post(
@@ -999,7 +1014,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not authenticated")
         try:
             elevation = await service.confirm_mfa_enrollment(
-                identity, body.code, token=token, client=client_ip(request)
+                identity,
+                body.code,
+                token=token,
+                client=client_ip(request),
+                enrolment_code=body.enrolment_code,
             )
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -1770,12 +1789,99 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(code, detail) from exc
         # ADR 0197 Amendment A, AC-A4: a local account's reset also issued a generated credential,
         # returned ONCE here for the administrator to convey out-of-band.
+        # ADR 0207 section 5: an enabled directory account's reset issued an enrolment code instead,
+        # returned once in the same reply.
         issued = reset.credential
+        enrolment = reset.enrolment_code
         return MfaResetResponse(
             detail="MFA reset",
             temp_password=None if issued is None else issued.password,
             expires_at=None if issued is None else issued.expires_at,
+            enrolment_code=None if enrolment is None else enrolment.code,
+            enrolment_code_expires_at=None if enrolment is None else enrolment.expires_at,
         )
+
+    # --- a directory account's enrolment code (ADR 0207 section 4) -------------------------------
+    #
+    # Both are action-bound, single-use and MFA-gated, as the resets are: the code decides who may
+    # bind the account's first factor. USERS_MANAGE is Administrator-only (no custom role may grant
+    # it), so the issuer has proved its own factor and just re-proved. The console leg calls these
+    # handlers by reference through AdminHandlers and re-asserts the same action-bound gate.
+
+    @app.post("/users/{user_id}/enrolment-code", response_model=EnrolmentCodeResponse)
+    async def issue_user_enrolment_code(
+        user_id: ResourceId,
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(
+            require_step_up_action(
+                STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_ISSUE, Permission.USERS_MANAGE
+            )
+        ),
+    ) -> EnrolmentCodeResponse:
+        """Issue a single-use enrolment code for a directory account's first engine factor,
+        returned ONCE. Refused for the caller's own account, a local account, an account that holds
+        a factor, a disabled account (400) and an unknown one (404). The engine never sends the code:
+        hand it over after confirming who is asking by something the directory password does not
+        give, never through the account's own mail or chat (docs/SECURITY.md)."""
+        return await _issue_enrolment_code_core(
+            request=request, service=service, identity=identity, user_id=user_id, via="api"
+        )
+
+    async def _issue_enrolment_code_core(
+        *, request: Request, service: AuthService, identity: Identity, user_id: str, via: str
+    ) -> EnrolmentCodeResponse:
+        """The issue past :func:`issue_user_enrolment_code`'s gate. The console's
+        ``/ui/users/{id}/enrolment-code`` calls it with ``via="ui"`` after re-asserting the same
+        action-bound gate; ``via`` is never read from the request, so the audit row's plane is the
+        route's own word."""
+        await _refuse_if_self(
+            request,
+            service,
+            identity,
+            user_id,
+            op="enrolment_code_issue",
+            detail="an Administrator cannot issue an enrolment code for its own account",
+        )
+        try:
+            issued = await service.issue_enrolment_code(
+                user_id, actor=identity.username, issuer_id=identity.user_id, via=via
+            )
+        except EnrolmentCodeIssueRefused as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        return EnrolmentCodeResponse(
+            code=issued.code, expires_at=issued.expires_at, replaced=issued.replaced
+        )
+
+    @app.delete("/users/{user_id}/enrolment-code", response_model=EnrolmentCodeRevokeResponse)
+    async def revoke_user_enrolment_code(
+        user_id: ResourceId,
+        request: Request,
+        service: AuthService = Depends(_service),
+        identity: Identity = Depends(
+            require_step_up_action(
+                STEP_UP_ACTION_ADMIN_ENROLMENT_CODE_REVOKE, Permission.USERS_MANAGE
+            )
+        ),
+    ) -> EnrolmentCodeRevokeResponse:
+        """Clear an outstanding enrolment code, for a handover that went wrong. ``revoked`` is False
+        when none was outstanding. Refused for the caller's own account (400) and an unknown one
+        (404)."""
+        await _refuse_if_self(
+            request,
+            service,
+            identity,
+            user_id,
+            op="enrolment_code_revoke",
+            detail="an Administrator cannot revoke an enrolment code on its own account",
+        )
+        try:
+            revoked = await service.revoke_enrolment_code(user_id, actor=identity.username)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+        return EnrolmentCodeRevokeResponse(revoked=revoked)
 
     # --- federated identity binding (BACKLOG #1143 / #295, ADR 0184) ---------------------------------
     #
@@ -2443,6 +2549,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         refuse_own_channel_scope=_refuse_own_channel_scope,
         reset_user_password=reset_user_password,
         reset_user_mfa=reset_user_mfa,
+        # ADR 0207: the issue core (the console passes via="ui") and the revoke route.
+        issue_user_enrolment_code=_issue_enrolment_code_core,
+        revoke_user_enrolment_code=revoke_user_enrolment_code,
         bind_user_federated_identity=bind_user_federated_identity,
         unbind_user_federated_identity=unbind_user_federated_identity,
         admin_revoke_user_sessions=admin_revoke_user_sessions,
@@ -2456,7 +2565,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         get_ad_group_scope_map=get_ad_group_scope_map,
         set_ad_group_map=_set_ad_group_map_core,
         set_ad_group_scope_map=_set_ad_group_scope_map_core,
-        my_mfa=my_mfa,
+        # ADR 0207: the core, given the console's cookie session, so the page can say whether the
+        # account's first factor needs an enrolment code.
+        my_mfa=_my_mfa_core,
         change_password=change_password,
         enroll_mfa=enroll_mfa,
         # BACKLOG #3393: the core past the JSON route's gate, given the console's cookie session.

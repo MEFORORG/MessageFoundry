@@ -378,6 +378,27 @@ class MfaResetResponse(CredentialReply):
     detail: str
     temp_password: str | None = None
     expires_at: float | None = None
+    #: ADR 0207 section 5: on an ENABLED DIRECTORY account the reset also issued an enrolment code
+    #: for the account's next first factor, returned once. ``None`` on a local or disabled account.
+    enrolment_code: str | None = None
+    enrolment_code_expires_at: float | None = None
+
+
+class EnrolmentCodeResponse(CredentialReply):
+    """``POST /users/{id}/enrolment-code`` (ADR 0207 section 4): the code, returned **once** for
+    the Administrator to hand over out of band after confirming who is asking by something the
+    directory password does not give. The engine keeps only its digest. ``replaced`` says an
+    unexpired code was outstanding and no longer works."""
+
+    code: str
+    expires_at: float
+    replaced: bool = False
+
+
+class EnrolmentCodeRevokeResponse(BaseModel):
+    """``DELETE /users/{id}/enrolment-code``: whether an outstanding code was cleared."""
+
+    revoked: bool
 
 
 class PasswordResetResponse(CredentialReply):
@@ -416,6 +437,9 @@ class MfaConfirmRequest(RequestModel):
     """Confirm a staged enrollment by proving a live TOTP code from the authenticator app."""
 
     code: str = Field(max_length=16)
+    #: ADR 0207: the enrolment code an Administrator issued, which a directory account's first
+    #: factor needs on a session not stamped MFA-verified. Ignored where none is owed.
+    enrolment_code: str | None = Field(default=None, max_length=64)
 
 
 class MfaConfirmResponse(CredentialReply):
@@ -475,6 +499,9 @@ class MfaStatusResponse(BaseModel):
     required: bool = False
     webauthn_enrolled: bool = False
     totp_reenrolment_recommended: bool = False
+    #: ADR 0207: this session would be asked for an Administrator's enrolment code to bind the
+    #: account's first factor (a directory account with no factor, on an unstamped session).
+    enrolment_code_required: bool = False
 
 
 class RoleInfo(BaseModel):

@@ -32,6 +32,7 @@ from ._common import _deadline_stamp, _seg
 
 __all__ = [
     "ad_groups_page",
+    "enrolment_code_page",
     "federated_identity_page",
     "federated_unlink_confirm_page",
     "role_form_page",
@@ -575,6 +576,27 @@ def user_detail_page(
             class_="ctl",
         )
     )
+    # ADR 0207 section 4: a directory account's first factor binds only with an enrolment code an
+    # Administrator issues. Never offered on the caller's own account, which the route refuses too.
+    if user.auth_provider == "ad" and not is_self:
+        danger.append(
+            el(
+                "form",
+                el("button", "Issue enrolment code", type="submit"),
+                method="post",
+                action=f"/ui/users/{user.id}/enrolment-code",
+                class_="ctl",
+            )
+        )
+        danger.append(
+            el(
+                "form",
+                el("button", "Revoke enrolment code", type="submit"),
+                method="post",
+                action=f"/ui/users/{user.id}/enrolment-code/revoke",
+                class_="ctl",
+            )
+        )
     if is_self:
         sign_out: Markup = el(
             "p",
@@ -916,6 +938,46 @@ def temp_password_page(
         class_="card",
     )
     return page("Temporary password", body, active="users")
+
+
+def enrolment_code_page(
+    username: str,
+    code: str,
+    expires_at: float,
+    *,
+    replaced: bool = False,
+    heading: str = "Enrolment code issued",
+) -> Markup:
+    """The one-time result of an enrolment-code issue (ADR 0207 section 4), shown once and never
+    stored or logged. It states the handover rule, since the code is worth only what the handover
+    checks: confirm who is asking by something the directory password does not give, and never send
+    it through the account's own mail or chat."""
+    when = _deadline_stamp(expires_at)
+    deadline = (
+        el("p", f"It stops working at {when}, and works once.", class_="muted")
+        if when is not None
+        else Markup("")
+    )
+    body = el(
+        "div",
+        el("h1", heading),
+        el(
+            "p",
+            f"Give this code to {username} yourself, after confirming who is asking in person, by "
+            "a call-back to a number on file, or through your organization's identity check. Do "
+            "not send it by the account's own mail or chat: the directory password may open them. "
+            "It is shown once.",
+            class_="muted",
+        ),
+        el("p", el("code", code)),
+        deadline,
+        el("p", "It replaces the code issued before it.", class_="muted")
+        if replaced
+        else Markup(""),
+        el("p", el("a", "← Users", href="/ui/users")),
+        class_="card",
+    )
+    return page("Enrolment code", body, active="users")
 
 
 # --- roles ---------------------------------------------------------------------

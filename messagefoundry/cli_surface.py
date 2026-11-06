@@ -108,6 +108,8 @@ CLI_TIERS: Final[Mapping[str, Tier]] = MappingProxyType(
         "admin-set-notify-email": "production",
         "admin-reset-totp": "production",
         "admin-revoke-sessions": "production",
+        # ADR 0207 section 6: the host's way to a directory account's first enrolment code.
+        "issue-enrolment-code": "production",
         # Audit log.
         "audit-verify": "production",
         "audit-anchor": "production",

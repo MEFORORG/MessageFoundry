@@ -1063,6 +1063,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # BACKLOG #1719: cipher-audit decrypts the live store's sealed cells through the store
             # cipher, by cipher_cells' walk. It never encrypts.
             "cipher:via messagefoundry.store.cipher_cells",
+            # ADR 0207: issue-enrolment-code mints a directory account's enrolment code
+            # (tokens.mint_enrolment_code) and stores only its digest.
+            "csprng:via messagefoundry.auth.tokens",
             "csprng:via messagefoundry.auth.totp",
             "csprng:via messagefoundry.store.crypto",
             "hash:via messagefoundry.api.tls",

@@ -811,12 +811,17 @@ from typing import Any
 #: ``messagefoundry`` floor instead. An older console on this engine passes the handshake and still
 #: answers a scoped caller's bad flag direction with the unaudited 404.
 #:
+#: ADR 0207 (vault BACKLOG #2609 item 2): ``AdminHandlers`` gained the required
+#: ``issue_user_enrolment_code`` and ``revoke_user_enrolment_code``, ``my_mfa`` is now the core that
+#: takes the console's session ``token``, and the MFA reset and status replies gained the
+#: enrolment-code fields the console renders. The digest moved from ``734e7007fb95eb75``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "734e7007fb95eb75"
+ENGINE_UI_SEAM: str = "348fe2ce7f78d903"
 
 
 @dataclass(frozen=True, slots=True)
@@ -948,6 +953,11 @@ class AdminHandlers:
     refuse_own_channel_scope: Callable[..., Awaitable[Any]]
     reset_user_password: Callable[..., Awaitable[Any]]
     reset_user_mfa: Callable[..., Awaitable[Any]]
+    # ADR 0207 section 4: POST and DELETE /users/{id}/enrolment-code. The issue is the core past
+    # the JSON route's gate and takes ``via``; the /ui route in front of each must be
+    # require_ui_step_up_action with that route's own action and USERS_MANAGE.
+    issue_user_enrolment_code: Callable[..., Awaitable[Any]]
+    revoke_user_enrolment_code: Callable[..., Awaitable[Any]]
     # BACKLOG #1143 / #295 (ADR 0184 slice B): PUT and DELETE /users/{id}/federated-identity. Their
     # JSON gate is require_step_up_action(admin_federated_identity, USERS_MANAGE), so the /ui route in
     # front of each must be require_ui_step_up_action with that same action.

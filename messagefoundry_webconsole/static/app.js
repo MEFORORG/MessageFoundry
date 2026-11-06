@@ -517,6 +517,8 @@
           c.id = b64urlToBytes(c.id);
         });
         var cred = await navigator.credentials.create({ publicKey: options });
+        // ADR 0207: a directory account's first factor carries the Administrator's enrolment code.
+        var codeInput = document.querySelector("input[name=enrolment_code]");
         var resp = await fetch("/ui/account/webauthn/verify", {
           method: "POST",
           credentials: "same-origin",
@@ -525,6 +527,7 @@
           cache: "no-store",
           body: JSON.stringify({
             label: label,
+            enrolment_code: codeInput ? codeInput.value.trim() : null,
             response: {
               id: cred.id,
               rawId: bytesToB64url(cred.rawId),

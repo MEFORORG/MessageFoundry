@@ -1845,7 +1845,7 @@ class EnrolmentCodeIssueRefused(ValueError):
 
 
 #: Each issue refusal, by reason, with its operator-facing message (ADR 0207 sections 4 and 6).
-_ISSUE_REFUSALS: Final = {
+ENROLMENT_CODE_ISSUE_REFUSALS: Final = {
     "local_account": (
         "an enrolment code is only for a directory account; a local account is given a generated "
         "password instead"
@@ -2923,6 +2923,9 @@ SelfTargetOp = Literal[
     "revoke_sessions",
     "set_roles",
     "channel_scope",
+    # ADR 0207 section 4: an Administrator never issues or revokes its own enrolment code.
+    "enrolment_code_issue",
+    "enrolment_code_revoke",
 ]
 
 _SUSPICIOUS_LOGIN_ACTIONS: Final[Mapping[str, str]] = MappingProxyType(
@@ -14988,7 +14991,7 @@ class AuthService:
         elif await self._second_factor_enrolled(user):
             reason = "factor_present"
         if reason is not None:
-            raise EnrolmentCodeIssueRefused(reason, _ISSUE_REFUSALS[reason])
+            raise EnrolmentCodeIssueRefused(reason, ENROLMENT_CODE_ISSUE_REFUSALS[reason])
         code = mint_enrolment_code()
         code_digest = enrolment_code_digest(code)
         if code_digest is None:  # pragma: no cover - a minted code always normalises
@@ -15012,7 +15015,7 @@ class AuthService:
                 reason = "factor_present"
             else:
                 reason = "changed"
-            raise EnrolmentCodeIssueRefused(reason, _ISSUE_REFUSALS[reason])
+            raise EnrolmentCodeIssueRefused(reason, ENROLMENT_CODE_ISSUE_REFUSALS[reason])
         await self._audit(
             "auth.enrolment_code_issued",
             actor=actor,
