@@ -405,15 +405,23 @@ issue in one synchronous step, with no await between its read and its take, righ
 leg's re-proof awaits, so a second re-auth arriving meanwhile, from another tab or the other leg,
 finds nothing and mints nothing. A password re-auth that fails puts the issue back. The
 federated start holds an unlock page's issue for its flow: the callback puts it back when the flow
-ends refused, so the retry the IdP's refusal page offers still mints, and drops it when the flow
-mints. A new re-auth also takes an issue back from a flow that has not returned, an abandoned IdP
-prompt for example, and from then on that flow mints no grant even if it does return: the engine
-mints the bound grant only when the flow still holds its issue, not yet lapsed, as its callback
-starts, and no other re-auth can take the issue while that callback runs. Without it the engine
-elevates the session with no grant, and its `auth.reauth` row records no purpose. So one issue
-mints at most one grant, whichever flow cookie the browser holds. A flow whose held issue has
-lapsed (300 seconds from the gate's refusal that issued it) when its callback starts mints no
-grant, whether or not a later federated start has pruned the issue yet, and neither does a flow
-whose issue the bound on held issues evicted. An auto-retry action's issue is still spent at the federated start, as before. Each kind of
+ends refused, and drops it when the flow mints. A put-back drops an issue that has lapsed (300
+seconds from the gate's refusal that issued it), so the retry the refusal page offers continues
+only while the issue has not lapsed; after that the retry lands on the console's landing page and
+mints nothing, although the refusal page does not say so. A new re-auth also takes an issue back
+from a flow that has not returned, an abandoned IdP prompt for example, and from then on that flow
+mints no grant even if it does return. The console enforces this, not the engine: its callback
+(`take_flow_claim`) passes `mint_grant=False` to `complete_oidc_step_up` unless the flow still
+holds its issue, not yet lapsed, as the callback starts, and no other re-auth can take the issue
+while that callback runs. The engine defaults `mint_grant=True` and does not check the issue
+itself. With `mint_grant=False` it elevates the session with no grant, and its `auth.reauth` row
+records no purpose. So one issue mints at most one grant, whichever flow cookie the browser holds.
+A flow whose held issue has lapsed when its callback starts mints no grant, whether or not a later
+federated start has pruned the issue yet, and neither does a flow whose issue the bound on held
+issues evicted. The lapse is the issue's, not the flow's: an IdP return that arrives inside its
+flow's TTL (`oidc_flow_ttl_seconds`) but after its issue lapsed elevates the session with no
+grant, and the operator re-authenticates from the action to run it. That fail-closed cost is
+accepted.
+An auto-retry action's issue is still spent at the federated start, as before. Each kind of
 issue, auto-retry actions and action-bound unlock pages, now has its own per-session cap, so unlock
 pages cannot evict an auto-retry action the operator is confirming.

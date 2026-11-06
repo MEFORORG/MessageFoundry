@@ -1336,8 +1336,8 @@ def claim_continuation(
 
 #: The claims a federated step-up start leg holds for its staged flow, by flow id (vault BACKLOG
 #: #3241, added items 7 and 9). The callback carries no session cookie, so the claim waits here
-#: until the flow resolves: a refusal puts the entry back, so the retry the IdP's refusal page offers
-#: still continues, and a success drops it. Bounded like the issued table; an entry for a flow that
+#: until the flow resolves: a refusal puts the entry back, so the retry the refusal page offers
+#: continues while the entry has not lapsed, and a success drops it. Bounded like the issued table; an entry for a flow that
 #: never returns lapses with the continuation's TTL, which costs only that continuation.
 _FLOW_CLAIMS: OrderedDict[str, ContinuationClaim] = OrderedDict()
 #: The same claims by session hash and then ``next``, to their flow id: at most one per pair, since a
@@ -1416,7 +1416,7 @@ def settle_flow_claim(
 ) -> None:
     """End the callback :func:`take_flow_claim` marked. A return that consumed nothing leaves the
     flow, and its claim, for the IdP's real return. A consumed flow that minted nothing puts the
-    issue back, for the retry the refusal page offers; one that minted drops it. ``consumed=None``
+    issue back, unless it lapsed, for the retry the refusal page offers; one that minted drops it. ``consumed=None``
     is a callback that raised, which may have minted, so the issue is dropped and not put back."""
     if claim is None:
         return
