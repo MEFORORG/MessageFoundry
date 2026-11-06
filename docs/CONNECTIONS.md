@@ -2285,8 +2285,9 @@ Two limits follow from this:
   A `stat` failure that says no file is there, or that libpq could not `stat` it either, is left
   to libpq, which loads no such file. That covers at least a missing name, a path through a file,
   a name too long, a link loop and a permission denial. Every other `stat` failure is refused, at
-  least an I/O or network fault and a share Windows could not reach. libpq stats the file again
-  at every connect, so it may load the file once the fault clears.
+  least an I/O fault such as `EIO`, `ETIMEDOUT` or `ESTALE`, and a share Windows could not reach.
+  libpq stats the file again at every connect, so it may load the file once the fault clears. A
+  network fault the system reports as a missing name or a denial is left, like any other.
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
   application-data folder. Elsewhere it is under `~/.postgresql`. The engine finds this home as

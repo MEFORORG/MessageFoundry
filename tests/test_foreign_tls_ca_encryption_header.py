@@ -421,10 +421,36 @@ class _ShareNotReached(FileNotFoundError):
     winerror = 53
 
 
-def _windows_stat_failure(winerror: int, mapped: int) -> OSError:
-    """A ``stat`` failure as Windows raises it: ``winerror`` set, ``errno`` as CPython maps it."""
-    failure_type = type(f"_WinError{winerror}", (OSError,), {"winerror": winerror})
+#: CPython's class and errno for each Win32 code below, as ``OSError(None, "", None, code)``
+#: maps them on Windows 11.
+_WINDOWS_MAPPED: dict[int, tuple[type[OSError], int]] = {
+    2: (FileNotFoundError, errno.ENOENT),
+    3: (FileNotFoundError, errno.ENOENT),
+    5: (PermissionError, errno.EACCES),
+    15: (FileNotFoundError, errno.ENOENT),
+    59: (OSError, errno.EINVAL),
+    64: (OSError, errno.EINVAL),
+    67: (FileNotFoundError, errno.ENOENT),
+    121: (OSError, errno.EINVAL),
+    123: (OSError, errno.EINVAL),
+    161: (FileNotFoundError, errno.ENOENT),
+    206: (FileNotFoundError, errno.ENOENT),
+    267: (NotADirectoryError, errno.ENOTDIR),
+    1231: (OSError, errno.EINVAL),
+    1921: (OSError, errno.EINVAL),
+}
+
+
+def _windows_stat_failure(winerror: int) -> OSError:
+    """A ``stat`` failure as Windows raises it, on any platform: ``winerror`` set, and the class
+    and ``errno`` CPython maps it to."""
+    base, mapped = _WINDOWS_MAPPED[winerror]
+    failure_type = type(f"_WinError{winerror}", (base,), {"winerror": winerror})
     return cast(OSError, failure_type(mapped, f"Windows error {winerror}"))
+
+
+def _win(winerror: int, refused: bool) -> Any:
+    return pytest.param(_windows_stat_failure(winerror), refused, id=f"win-{winerror}")
 
 
 @pytest.mark.parametrize("source", ["default", "PGSSLROOTCERT"])
@@ -438,29 +464,22 @@ def _windows_stat_failure(winerror: int, mapped: int) -> OSError:
         pytest.param(OSError(errno.ELOOP, "Too many levels of symbolic links"), False, id="ELOOP"),
         pytest.param(PermissionError(errno.EACCES, "Permission denied"), False, id="EACCES"),
         pytest.param(PermissionError(errno.EPERM, "Not permitted"), False, id="EPERM"),
-        pytest.param(_windows_stat_failure(2, errno.ENOENT), False, id="win-2"),
-        pytest.param(_windows_stat_failure(3, errno.ENOENT), False, id="win-3"),
-        pytest.param(_windows_stat_failure(5, errno.EACCES), False, id="win-5"),
-        pytest.param(_windows_stat_failure(123, errno.EINVAL), False, id="win-123"),
-        pytest.param(_windows_stat_failure(206, errno.ENOENT), False, id="win-206"),
-        pytest.param(_windows_stat_failure(1921, errno.EINVAL), False, id="win-1921"),
+        pytest.param(ValueError("embedded null byte"), False, id="NUL"),
+        *(_win(code, False) for code in (2, 3, 5, 15, 123, 161, 206, 267, 1921)),
         # Refused: a fault that may clear before a later connect, when libpq loads the file.
         pytest.param(OSError(errno.EIO, "Input/output error"), True, id="EIO"),
         pytest.param(OSError(errno.ETIMEDOUT, "Timed out"), True, id="ETIMEDOUT"),
         pytest.param(OSError(errno.ESTALE, "Stale file handle"), True, id="ESTALE"),
         pytest.param(OSError(errno.ENOTCONN, "Not connected"), True, id="ENOTCONN"),
         pytest.param(_ShareNotReached(errno.ENOENT, "No network path"), True, id="share"),
-        pytest.param(_windows_stat_failure(67, errno.ENOENT), True, id="win-67"),
-        pytest.param(_windows_stat_failure(64, errno.EINVAL), True, id="win-64"),
-        pytest.param(_windows_stat_failure(121, errno.EINVAL), True, id="win-121"),
-        pytest.param(_windows_stat_failure(1231, errno.EINVAL), True, id="win-1231"),
+        *(_win(code, True) for code in (59, 64, 67, 121, 1231)),
     ],
 )
 def test_a_root_certificate_the_engine_cannot_stat(
     _no_libpq_root: Path,
     monkeypatch: pytest.MonkeyPatch,
     source: str,
-    failure: OSError,
+    failure: Exception,
     refused: bool,
 ) -> None:
     """libpq 17's ``initialize_SSL`` loads the root file only when its ``stat`` succeeds; any
@@ -486,6 +505,24 @@ def test_a_root_certificate_the_engine_cannot_stat(
             _build_psql()
     else:
         assert "SSLmode=verify-full;" in _build_psql()
+
+
+def test_an_unreached_share_at_the_stat_still_honours_leave_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused ``stat`` failure is judged as a failed read is, so ``leave_unreachable`` still
+    turns a share Windows could not reach into :class:`_UnreachedShare`, not a refusal. Red when
+    the stat branch raised the refusal itself."""
+    target = str(tmp_path / "root.crt")
+
+    def unreached(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        raise _ShareNotReached(errno.ENOENT, "No network path")
+
+    monkeypatch.setattr(os, "stat", unreached)
+    with pytest.raises(database._UnreachedShare):
+        database._read_driver_file(
+            target, "setting", "file", "it", leave_unstatable=True, leave_unreachable=True
+        )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="libpq reads the password file off Windows")
