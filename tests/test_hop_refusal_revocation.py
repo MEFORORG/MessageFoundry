@@ -967,8 +967,8 @@ def test_http_family_opener_context_checks_revocation_with_a_configured_crl(
 ) -> None:
     """The HTTP family resolves the same anchor through ``http_family_trust_anchor``.
 
-    A CRL-only anchor has to ``narrow``, or these cells fall back to the module-level opener that was
-    built at import time and can carry no CRL -- the hop would then keep an unrevoked context."""
+    A CRL-only anchor has to ``narrow``, or these cells fall back to the shared opener, which can carry no
+    CRL -- the hop would then keep an unrevoked context."""
     _ctype, factory, url = _HTTPS[cell]
     anchor = http_family_trust_anchor(
         factory(url=url).settings, url=url, trust_anchor_policy=_crl_policy(bare_crl)

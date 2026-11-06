@@ -358,12 +358,15 @@ _shared_opener_lock = threading.Lock()
 def _shared_no_redirect_opener() -> urllib.request.OpenerDirector:
     """The shared opener, reused for every webhook POST: built on first use, the same object after.
 
-    Built on first use, not at import (BACKLOG #2484): an OpenSSL build that refuses the engine's
-    TLS 1.3 or signature-scheme list raises ``EngineTlsListRefused`` from the build, and at import
-    that surfaced as a failed import of this module, not as a refusal of the webhook. A build that raises
+    Built on first use, not at import (BACKLOG #2484): an OpenSSL build that refuses a list the engine
+    sets on every TLS context raises ``EngineTlsListRefused`` from the build, and at import that
+    surfaced as a failed import of this module, not as a refusal of the webhook. A build that raises
     caches nothing, so the next POST is refused the same way. The lock keeps two threads racing the
     first POST to one opener, as the REST twin does."""
     global _shared_opener
+    opener = _shared_opener
+    if opener is not None:
+        return opener
     with _shared_opener_lock:
         if _shared_opener is None:
             _shared_opener = _build_no_redirect_opener()

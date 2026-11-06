@@ -446,8 +446,8 @@ def _refused(opener: urllib.request.OpenerDirector, url: str) -> ProxyCredential
 _CREDENTIALED = f"http://{_CRED}@{_PROXY_HOST}"
 
 #: One builder per opener family, each called after the environment is set, as in
-#: tests/test_loopback_hop_never_proxied.py. The shared module-level openers are built by these
-#: same functions at import.
+#: tests/test_loopback_hop_never_proxied.py. The shared openers are built by these same
+#: functions.
 _FAMILIES: dict[str, Callable[[], urllib.request.OpenerDirector]] = {
     "bare": build_strict_opener,
     "http-family-shared": rest._no_redirect_opener,

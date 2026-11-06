@@ -458,15 +458,18 @@ _shared_opener_lock = threading.Lock()
 def _shared_no_redirect_opener() -> urllib.request.OpenerDirector:
     """The shared verifying, no-redirect opener, built on first use and the same object after.
 
-    Built on first use, not at import (BACKLOG #2484): an OpenSSL build that refuses the engine's
-    TLS 1.3 or signature-scheme list raises ``EngineTlsListRefused`` from the build, and at import
-    that surfaced as a failed import of every module that names this opener, not as a configuration
+    Built on first use, not at import (BACKLOG #2484): an OpenSSL build that refuses a list the engine
+    sets on every TLS context raises ``EngineTlsListRefused`` from the build, and at import that
+    surfaced as a failed import of every module that names this opener, not as a configuration
     refusal. A build that raises caches nothing, so the next caller is refused the same way.
 
     Callers compare an opener to this one by identity to learn whether it is shared and so must never
     be mutated, which is why the build is under a lock: two threads racing the first call must not
     each get an opener of their own."""
     global _shared_opener
+    opener = _shared_opener
+    if opener is not None:
+        return opener
     with _shared_opener_lock:
         if _shared_opener is None:
             _shared_opener = _no_redirect_opener()
