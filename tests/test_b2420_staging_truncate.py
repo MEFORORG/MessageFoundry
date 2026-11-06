@@ -831,8 +831,14 @@ def test_the_refusal_for_a_rewritten_staging_name_advises_no_removal_by_hand(
         assert "by hand" not in text
         assert "delete it" not in text
         assert (
-            f"remove it only in PowerShell, not cmd.exe, with Remove-Item -LiteralPath '{verbatim}'"
-            in text
+            "PowerShell, not cmd.exe: Remove-Item -LiteralPath "
+            f"{dr_backup._ps_literal(verbatim)} -Recurse -Force ;" in text
+        )
+        # A redacted path is not the directory's, and a command on it would find nothing and read
+        # as gone.
+        assert (
+            "if a path here shows [redacted], it is not the directory's path, so run neither"
+            in (text)
         )
         # The plain path appears only inside the verbatim one.
         assert str(staging) not in text.replace(verbatim, "")
@@ -853,7 +859,8 @@ def test_the_refusals_verbatim_path_names_the_planted_directory_not_the_other(
     planted = win_tmp / "mefor-backup-x."
     leftover = dr_backup._teardown_staging(planted)
     verbatim = dr_backup._win_verbatim(planted)
-    assert leftover is not None and f"; it is '{verbatim}', whose name ends in a dot;" in leftover
+    literal = dr_backup._ps_literal(verbatim)
+    assert leftover is not None and f"; it is {literal}, whose name ends in a dot;" in leftover
     assert os.listdir(verbatim) == ["planted.tar"]
 
 
@@ -874,7 +881,7 @@ def test_a_trailing_space_is_visible_in_the_refusal(
     refusal = _refusal_for("mefor-backup-x ", tmp_path, monkeypatch)
     verbatim = dr_backup._win_verbatim(tmp_path / "mefor-backup-x ")
     assert verbatim.endswith("mefor-backup-x ")
-    assert f"it is '{verbatim}', whose name ends in a space;" in refusal
+    assert f"it is {dr_backup._ps_literal(verbatim)}, whose name ends in a space;" in refusal
     dotted = _refusal_for("mefor-backup-x. ", tmp_path, monkeypatch)
     assert "whose name ends in a dot then a space;" in dotted
 
@@ -887,8 +894,9 @@ def test_a_percent_in_the_name_cannot_expand_in_the_advised_command(
     single-quoted literal, in which nothing expands, and no cmd.exe form is given."""
     name = "mefor-backup-x%PATH% "
     refusal = _refusal_for(name, tmp_path, monkeypatch)
-    literal = f"'{dr_backup._win_verbatim(tmp_path / name)}'"
-    assert f"not cmd.exe, with Remove-Item -LiteralPath {literal} -Recurse -Force" in refusal
+    literal = dr_backup._ps_literal(dr_backup._win_verbatim(tmp_path / name))
+    assert literal.endswith("%PATH% '")
+    assert f"not cmd.exe: Remove-Item -LiteralPath {literal} -Recurse -Force ;" in refusal
     assert '"' not in refusal
     assert "rd /s" not in refusal
 
@@ -911,9 +919,9 @@ def test_the_refusal_names_the_exact_path_to_check(
     path."""
     name = "mefor-backup-x%PATH% "
     refusal = _refusal_for(name, tmp_path, monkeypatch)
-    literal = f"'{dr_backup._win_verbatim(tmp_path / name)}'"
+    literal = dr_backup._ps_literal(dr_backup._win_verbatim(tmp_path / name))
     assert refusal.endswith(
-        f"then check that Test-Path -LiteralPath {literal} prints False and no error"
+        f"; then this command must print False and no error: Test-Path -LiteralPath {literal}"
     )
 
 
@@ -991,7 +999,8 @@ def test_a_screen_that_raises_does_not_replace_the_verify_verdict(
     assert result.status == "FAIL"
     assert result.reason is not None and result.reason.startswith("the archive verified, but ")
     (staging,) = tmp_path.glob("mefor-verify-*")
-    assert f"; it is '{dr_backup._win_verbatim(staging)}'; " in result.reason
+    literal = dr_backup._ps_literal(dr_backup._win_verbatim(staging))
+    assert f"; it is {literal} (the engine's screen of its name failed: " in result.reason
     assert "could not be checked" in result.reason
     assert (staging / dr_backup._LOCK_NAME).exists()
 

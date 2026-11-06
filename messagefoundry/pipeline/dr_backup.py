@@ -2414,14 +2414,19 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
 
     The ban on the plain path comes before any path. So the first 200 characters a failure record
     keeps hold it, whatever the path's length, where this sentence leads the error or follows only
-    a passing verify's ``the archive verified, but``. A verify that failed with its own reason puts
-    that reason first, and it can push the ban past the cut. The cut rarely keeps the path; the
-    whole sentence is in the ERROR log line. Then it names the directory by its verbatim path only,
-    as a PowerShell single-quoted literal (:func:`_ps_literal`), whose closing quote shows a
-    trailing space and in which nothing expands, names any trailing dot or space in words, and
-    names ``Remove-Item -LiteralPath`` and ``Test-Path -LiteralPath`` on that literal as the only
-    removal and its check. No ``cmd.exe`` form is given: interactive ``cmd.exe`` expands ``%VAR%``
-    even inside double quotes. A fault's detail comes last, since it can carry the plain path.
+    a passing verify's bare ``the archive verified, but``. A verify that gives a reason of its own,
+    a failed one or a config-only pass, puts that reason first, and it can push the ban, or its
+    ``without the \\\\?\\ prefix``, past the cut. The cut rarely keeps the path. The ERROR log line
+    holds the whole sentence, but after redaction, which can rewrite a path in it, hence the
+    instruction to run neither command when a path shows ``[redacted]``.
+
+    It names the directory by its verbatim path only, as a PowerShell single-quoted literal
+    (:func:`_ps_literal`), whose closing quote shows a trailing space and in which nothing expands,
+    names any trailing dot or space in words, and names ``Remove-Item -LiteralPath`` and
+    ``Test-Path -LiteralPath`` on that literal as the only removal and its check, each set off by
+    a colon before it and a `` ;`` or the end after it. No ``cmd.exe`` form is given: interactive
+    ``cmd.exe`` expands ``%VAR%`` even inside double quotes. A screen fault's detail comes before
+    the commands and after the verbatim path, since it can carry the plain path.
 
     Measured on Windows 11 build 26300, with synthetic files: a removal by the plain path, by
     ``rd /s /q`` or ``Remove-Item -Recurse``, removes the OTHER directory and leaves this one, and
@@ -2440,7 +2445,7 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
         why = "Windows opens that path as another directory"
     except Exception as exc:  # never raise over the verdict or the error in flight
         why = "whether that path reaches another directory could not be checked"
-        fault = f" (the check failed: {safe_exc(exc)})"
+        fault = f" (the engine's screen of its name failed: {safe_exc(exc)})"
     ban = (
         "a plaintext staging directory was not removed or emptied; never remove it by its plain "
         f"path, without the \\\\?\\ prefix, since {why}"
@@ -2463,9 +2468,10 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
             f"failed: {safe_exc(exc)})"
         )
     return (
-        f"{ban}; it is {literal}{ends}; remove it only in PowerShell, not cmd.exe, with "
-        f"Remove-Item -LiteralPath {literal} -Recurse -Force, then check that Test-Path "
-        f"-LiteralPath {literal} prints False and no error{fault}"
+        f"{ban}; it is {literal}{ends}{fault}; if a path here shows [redacted], it is not the "
+        "directory's path, so run neither command; otherwise remove it only with this command, in "
+        f"PowerShell, not cmd.exe: Remove-Item -LiteralPath {literal} -Recurse -Force ; then this "
+        f"command must print False and no error: Test-Path -LiteralPath {literal}"
     )
 
 
