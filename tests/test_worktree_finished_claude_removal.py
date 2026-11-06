@@ -86,7 +86,9 @@ class Fx:
         return self.primary / ".claude" / "worktrees" / name
 
     def env(self, *, claudecode: bool = False) -> dict[str, str]:
-        env = dict(os.environ)
+        # Without the git config carriers the step refuses on, so an inherited one (git exports
+        # GIT_CONFIG_PARAMETERS to a hook run under `git -c`) cannot fail every positive control.
+        env = {k: v for k, v in os.environ.items() if not re.match(r"GIT_CONFIG(_|$)", k, re.I)}
         env["USERPROFILE"] = str(self.home)
         env["MEFOR_COORD_ROOT"] = str(self.coord)
         if claudecode:
@@ -1160,6 +1162,49 @@ def test_a_root_swapped_after_the_late_fence_refuses(fx: Fx) -> None:
     ), rows["clean"]
     assert (away / "seed.txt").is_file()
     assert fx.is_registered(tree)
+
+
+def test_a_root_moved_away_after_the_late_fence_refuses(fx: Fx) -> None:
+    """Red on c91761f75d: the last root check passed a root that was not there, and no gate followed
+    it, so git deregistered the moved tree and deleted its admin dir, its reflog and refs with it."""
+    tree = fx.tree("clean")
+    away = fx.root / "clean-moved"
+    rows = remove(
+        fx,
+        [tree],
+        apply=True,
+        prelude=_AFTER_LATE_FENCE.format(
+            write="Move-Item -LiteralPath $env:T_TREE -Destination $env:T_AWAY"
+        ),
+        env_extra={"T_TREE": str(tree), "T_AWAY": str(away)},
+    )
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert (
+        "re-checked just before the removal: its root is no longer there" in rows["clean"]["Reason"]
+    ), rows["clean"]
+    assert fx.is_registered(tree)
+    assert (away / "seed.txt").is_file()
+
+
+#: The real removal, then the directory put back and its parent folder renamed away, nothing in its
+#: place: the leftover now sits under the moved folder.
+_PARENT_GONE = _GIT_SHIM.format(
+    body="& git.exe @args; $c = $LASTEXITCODE; "
+    "$null = New-Item -ItemType Directory -Path $args[4]; "
+    "Move-Item -LiteralPath (Split-Path -Parent $args[4]) -Destination $env:T_MOVED; "
+    "$global:LASTEXITCODE = $c"
+)
+
+
+def test_an_end_state_whose_parent_is_gone_is_never_removed(fx: Fx) -> None:
+    """Red on c91761f75d: the end state walked up past a parent that was gone, read the tree as gone
+    because .claude listed without `worktrees`, and the leftover under the moved folder went
+    unreported. The end state still needs the tree's own parent to be there."""
+    tree = fx.tree("clean")
+    moved = fx.root / "worktrees-moved"
+    rows = remove(fx, [tree], apply=True, prelude=_PARENT_GONE, env_extra={"T_MOVED": str(moved)})
+    assert rows["clean"]["Outcome"] == "ORPHANED", rows["clean"]
+    assert (moved / "clean").is_dir()
 
 
 #: The real removal, then .claude/worktrees swapped for a junction: to a folder that is then deleted

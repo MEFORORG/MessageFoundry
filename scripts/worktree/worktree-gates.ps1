@@ -20,7 +20,7 @@
     Get-ClaimedWorktreeIndex, Test-RegistryPresentOrThrow, $CACHE_DATA_NAME_PATTERN, Get-NestedHazard,
     Get-InProgressOperation, Get-UnsafeIgnoredEntries, Test-PlainDirectory, Test-PlainDirectoryItem,
     Get-ItemOrThrow, Test-ConfirmedGoneOrThrow, Test-PlainFile, $GIT_REDIRECT_NAMES, Assert-NoGitRedirect,
-    $GIT_CONFIG_CARRIER_PREFIX, Get-GitConfigCarriers and $SEAT_LOCAL_REL.
+    $GIT_CONFIG_CARRIER_PATTERN, Get-GitConfigCarriers and $SEAT_LOCAL_REL.
 #>
 
 #: The variables that falsify a `git -C <path>` reading: the first three point git at another
@@ -40,18 +40,20 @@ function Assert-NoGitRedirect([string]$Who) {
     }
 }
 
-#: git config carried in the environment, a separate list from the redirects above: every variable whose
-#: name starts GIT_CONFIG. git reads config from GIT_CONFIG_COUNT with its GIT_CONFIG_KEY_n and
-#: GIT_CONFIG_VALUE_n, from GIT_CONFIG_PARAMETERS, and from the files GIT_CONFIG_GLOBAL and
+#: git config carried in the environment, a separate list from the redirects above: GIT_CONFIG and every
+#: variable named GIT_CONFIG_<anything>. git reads config from GIT_CONFIG_COUNT with its GIT_CONFIG_KEY_n
+#: and GIT_CONFIG_VALUE_n, from GIT_CONFIG_PARAMETERS, and from the files GIT_CONFIG_GLOBAL and
 #: GIT_CONFIG_SYSTEM name (GIT_CONFIG_NOSYSTEM drops the system file), so any of them can steer every
 #: `git -C <tree>` reading, for example through a core.fsmonitor hook. GIT_CONFIG_GLOBAL is refused on
-#: purpose: it swaps the global config for a file nothing here has read. The worktree gate's argv rules
-#: cannot see this carrier (vault BACKLOG #1070); this guards only the nightly removal's own git calls.
-$GIT_CONFIG_CARRIER_PREFIX = 'GIT_CONFIG'
+#: purpose: it swaps the global config for a file the operator did not set up as theirs. What this does
+#: NOT cover, at least: the global file HOME, XDG_CONFIG_HOME or USERPROFILE names, the repository's own
+#: config, and other GIT_* variables. The worktree gate's argv rules cannot see this carrier (vault
+#: BACKLOG #1070); this guards only the nightly removal's own git calls, not prune-merged.ps1's.
+$GIT_CONFIG_CARRIER_PATTERN = '\AGIT_CONFIG(?:_|\z)'
 
-# The GIT_CONFIG* variables set in this process, sorted. Wrap the call in @(): one name unrolls to a string.
+# The GIT_CONFIG carriers set in this process, sorted. Wrap the call in @(): one name unrolls to a string.
 function Get-GitConfigCarriers {
-    [Environment]::GetEnvironmentVariables().Keys | Where-Object { $_ -like "$GIT_CONFIG_CARRIER_PREFIX*" } | Sort-Object
+    [Environment]::GetEnvironmentVariables().Keys | Where-Object { $_ -match $GIT_CONFIG_CARRIER_PATTERN } | Sort-Object
 }
 
 # The floor under -IdleHours. Signal 2 has been measured at 10.4h on a worktree that was demonstrably
@@ -373,24 +375,26 @@ function Test-RegistryPresentOrThrow([string]$Dir, [string]$What) {
 # nightly removal's end state both read it here. $false when $What is there, $true only when it is
 # CONFIRMED gone, a throw for anything else. Confirmed gone means two things. The path is not found. And
 # the nearest item above it that IS there lists as a folder, in full, without the next name down, so a
-# not-found under a link that leads nowhere, or under a folder this user may not list, is not gone. A path
-# whose parent is gone too clears once a folder further up lists without it. At least these throw: an
-# item above it that cannot be listed (a file, a dead link, a folder this user may not list), and a path
-# with nothing above it that can be found, such as a share that does not answer. -Plain also throws when
-# the item it lists is not a plain directory, so a link there, wherever it leads, is not read as gone.
-function Test-ConfirmedGoneOrThrow([string]$Path, [string]$What, [switch]$Plain) {
+# not-found under a link, wherever it leads, or under a folder this user may not list, is not gone: the
+# folder listed must be a plain directory. A path whose parent is gone too clears once a folder further
+# up lists without it, unless -RequireParent, which throws instead. At least these throw: an item above
+# it that is not a plain directory or cannot be listed (a file, a link, a folder this user may not list),
+# and a path with nothing above it that can be found, such as a share that does not answer.
+function Test-ConfirmedGoneOrThrow([string]$Path, [string]$What, [switch]$RequireParent) {
     if (Get-ItemOrThrow $Path $What) { return $false }
     $below = $Path.TrimEnd('\', '/')
     while ($true) {
         $above = [System.IO.Path]::GetDirectoryName($below)
         if (-not $above) { throw "Neither $What ('$Path') nor any folder above it can be found, so its drive or share may be unreachable. Nothing was removed." }
         $item = Get-ItemOrThrow $above "a folder above $What"
+        if (-not $item -and $RequireParent) { throw "Neither $What ('$Path') nor the folder that holds it can be found. Nothing was removed." }
         if ($item) {
-            if ($Plain -and -not (Test-PlainDirectoryItem $item)) { throw "'$above', the folder above $What, is not a plain directory (a file or a link). Nothing was removed." }
             $leaf = [System.IO.Path]::GetFileName($below)
             $listed = @(Get-EntriesOrThrow $above "the entries above $What" |
                     Where-Object { [string]::Equals($_.Name, $leaf, [StringComparison]::OrdinalIgnoreCase) })
             if ($listed.Count -gt 0) { throw "'$below' is listed in '$above' but could not be found. Nothing was removed." }
+            # After the listing, so a file or an unlistable folder keeps the listing's own refusal.
+            if (-not (Test-PlainDirectoryItem $item)) { throw "'$above', the folder above $What, is a link, so a listing through it does not show where $What was. Nothing was removed." }
             return $true
         }
         $below = $above
@@ -502,7 +506,7 @@ function Get-UnsafeIgnoredEntries([string]$Path) {
     foreach ($line in @($lines | Where-Object { "$_".StartsWith('!! ') })) {
         # A directory of that name prints with a trailing slash, so it never matches here.
         if ($line -ceq "!! $SEAT_LOCAL_REL") {
-            if (-not (Test-PlainFile (Join-Path $Path $SEAT_LOCAL_REL))) { $unsafe += "$line (a link, or unreadable: not a plain file)" }
+            if (-not (Test-PlainFile (Join-Path $Path $SEAT_LOCAL_REL) 'the seat record')) { $unsafe += "$line (a link: not a plain file)" }
             continue
         }
         if ($line -cnotmatch $REGENERABLE_IGNORED_PATTERN) { $unsafe += $line; continue }
@@ -523,9 +527,9 @@ function Test-PlainDirectoryItem([object]$Item) {
     return ($Item -is [System.IO.DirectoryInfo]) -and -not ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
 }
 
-# A file that is not a link. Unreadable is not plain.
-function Test-PlainFile([string]$LiteralPath) {
-    try { $item = Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop }
-    catch { return $false }
+# A file that is not a link: $false for a folder, a link or nothing there, and a throw (Get-ItemOrThrow)
+# when it cannot be read, so cannot-tell is told apart from not-plain.
+function Test-PlainFile([string]$LiteralPath, [string]$What) {
+    $item = Get-ItemOrThrow $LiteralPath $What
     return ($item -is [System.IO.FileInfo]) -and -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
 }
