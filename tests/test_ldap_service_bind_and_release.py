@@ -11,7 +11,7 @@ Six properties are pinned, each with the test that failed before the change:
 * ``authenticate`` and ``probe_principal`` unbind the service account's connection on every path;
 * a failed service-account bind closes its socket, at least on an error raised after the socket
   opened, such as on a password SASLprep refuses, and on an open that failed after the connect,
-  such as a refused TLS wrap (L4);
+  such as a ``wrap_socket`` that raised before any handshake (L4);
 * a service-account bind refused with a referral is refused as a referral, and any other refusal
   names its result code, through a real ldap3 stack;
 * a sign-in or step-up leg answers a directory error for any fault the authenticator raises, with

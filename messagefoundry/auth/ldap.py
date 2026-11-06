@@ -1142,8 +1142,11 @@ def _close_without_sending(conn: Any, why: str) -> None:
     ``LdapError`` with an unhandled one (BACKLOG #3017).
 
     ldap3 2.9.1's ``close`` shuts the socket only once an open has completed. An open that failed
-    after the TCP connect, such as a refused TLS handshake, leaves the connected socket on
-    ``conn.socket`` with ``conn.closed`` still true, so ``close`` passes it by. That socket is
+    after the TCP connect but before a TLS handshake ran leaves the connected socket on
+    ``conn.socket`` with ``conn.closed`` still true, so ``close`` passes it by. That covers at least
+    a receive timeout that ``settimeout`` or ``setsockopt`` could not set, and a TLS context or
+    ``wrap_socket`` that raised before the handshake, such as one ``NarrowedTls`` refuses to build.
+    A handshake that fails is not one of them: ``ssl`` closes that socket itself. That socket is
     closed here directly, whatever ``close`` did."""
     import ldap3
 
