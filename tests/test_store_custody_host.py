@@ -1188,8 +1188,8 @@ async def test_the_sqlserver_census_refuses_when_the_server_does_not_answer_the_
 async def test_the_sqlserver_census_refuses_without_view_definition_on_the_schema(
     monkeypatch: pytest.MonkeyPatch, schema_select: int
 ) -> None:
-    # PR 2804 N4, the grant arm, and hold 3: schema select (db_datareader grants it) does not
-    # stand in for view definition, since a table-level DENY of select hides a table from
+    # PR 2804 N4, the grant arm, and hold 3: select (db_datareader grants it on the database) does
+    # not stand in for view definition, since a table-level DENY of select hides a table from
     # sys.tables under select alone.
     from messagefoundry.store.base import TableCensusIncomplete
 
@@ -1198,11 +1198,16 @@ async def test_the_sqlserver_census_refuses_without_view_definition_on_the_schem
 
 
 @host_file_platforms
+@pytest.mark.parametrize("holds_data", [False, True])
 def test_a_rerun_over_a_chain_never_started_names_the_key_file_to_remove(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    holds_data: bool,
 ) -> None:
     # PR 2804 hold 2: a mint that failed before its genesis record keeps its key file, and the
-    # re-run is refused until the operator removes that file by hand. The refusal names it.
+    # re-run is refused until the operator removes that file by hand. The refusal names it, but
+    # only over a store that holds no data: an empty chain alone does not show the key is spare.
     import asyncio
 
     from messagefoundry.__main__ import main
@@ -1212,7 +1217,17 @@ def test_a_rerun_over_a_chain_never_started_names_the_key_file_to_remove(
     async def _unstarted() -> None:
         # A store whose chain was never started, made before the key: a keyless open refuses a
         # directory that holds a host blob.
-        await (await _keyless_store(Path(settings.path))).close()
+        store = await _keyless_store(Path(settings.path))
+        try:
+            if holds_data:
+                await store.record_connection_event(
+                    connection="IB_TEST_ADT",
+                    transport="mllp",
+                    direction="inbound",
+                    kind="established",
+                )
+        finally:
+            await store.close()
 
     asyncio.run(_unstarted())
     _mint(settings)
@@ -1224,10 +1239,14 @@ def test_a_rerun_over_a_chain_never_started_names_the_key_file_to_remove(
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
     assert main([*argv, "--db", settings.path]) == 2
     err = capsys.readouterr().err
-    assert f"remove {kept}" in err and "by hand" in err, err
-    assert settings.path in err  # a SQLite store file goes too, or the next run reads it as taken
     assert "Traceback" not in err
     assert kept.exists()
+    if holds_data:
+        assert "by hand" not in err, err
+        return
+    assert f"remove {kept}" in err and "by hand" in err, err
+    # A SQLite store file goes too, or the next run reads it as taken; its -wal file with it.
+    assert f"{Path(settings.path).resolve()}" in err and "-wal" in err
 
 
 @host_file_platforms
@@ -1235,14 +1254,17 @@ async def test_a_pin_refusal_before_any_write_is_told_apart_from_one_after(
     tmp_path: Path,
 ) -> None:
     # Item 3: a refusal raised after the salt bind must not read as "nothing written".
-    from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
+    from messagefoundry.store.store import StoreChainNeverStarted, StoreIdPinRefusedBeforeWrite
 
     settings = _settings(tmp_path)
     blob = _mint(settings)
     await _create(settings, blob)
     stranger = HostBlob(blob.master_key, StoreId.mint(), (), blob.recovery_proved_at)
-    with pytest.raises(StoreIdPinRefusedBeforeWrite):
+    with pytest.raises(StoreIdPinRefusedBeforeWrite) as refused:
         await open_store(settings, custody=stranger)
+    # Another store's blob is not a never-started chain, whose refusal tells the operator to
+    # remove the key file.
+    assert not isinstance(refused.value, StoreChainNeverStarted)
 
 
 def test_a_minted_key_is_kept_when_the_pin_refused_after_a_write(tmp_path: Path) -> None:

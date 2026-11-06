@@ -8475,8 +8475,9 @@ def _provision_open_refusal(exc: BaseException, store: StoreSettings) -> str:
 def _never_started_refusal(store: StoreSettings) -> str:
     """``provision-admin``'s text when the host blob here opens a store whose audit chain was
     never started: a mint that failed before its genesis record kept its key file, and only the
-    operator removes it (PR 2804 hold 2). Names the file, and on SQLite the store file too, which
-    the next run would otherwise read as a store another key made. Names paths, never a key."""
+    operator removes it (PR 2804 hold 2). Only for a store the census read as holding no data.
+    Names the file, and on SQLite the store file and its side files too, which the next run would
+    otherwise read as a store another key made. Names paths, never a key."""
     import os
 
     from messagefoundry.config.settings import StoreBackend
@@ -8485,15 +8486,16 @@ def _never_started_refusal(store: StoreSettings) -> str:
     paths = check_host_custody_settings(store)
     present = [str(path) for path in paths if os.path.lexists(path)] or [str(paths[0])]
     files = " and ".join(present)
-    store_file = (
-        f", and the store file {store.path}" if store.backend is StoreBackend.SQLITE else ""
-    )
+    store_file = ""
+    if store.backend is StoreBackend.SQLITE:
+        db = Path(store.path).resolve()
+        store_file = f", and the store file {db} with any {db.name}-wal and {db.name}-shm beside it"
     return (
-        f"the store's audit chain was never started, so the run that minted the store key in "
-        f"{files} stopped before it started the chain. That key file is not removed for you, and "
-        f"no second key is minted over it: remove {files} by hand{store_file}, then run the "
-        "command again. It mints a new key, and the recovery key the earlier run showed is then "
-        "void"
+        f"the store's audit chain was never started and the store holds no data, so a run that "
+        f"minted the store key now in {files} stopped before it started the chain. That key file "
+        f"is not removed for you, and no second key is minted over it: remove {files} by "
+        f"hand{store_file}, then run the command again. It mints a new key, and the recovery key "
+        "the earlier run showed is then void"
     )
 
 
@@ -8800,6 +8802,45 @@ def _provision_admin(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
+    async def unstarted_store_holds_nothing() -> bool:
+        """Whether the store a host blob here opens, whose audit chain was never started, holds
+        no data, so its key file may go (PR 2804 hold 2): an empty chain alone does not show it.
+        Read-only, so the pin passes the empty chain and nothing is written. ``False`` whenever
+        the open or the census cannot say."""
+        from messagefoundry.store.base import (
+            TableCensusIncomplete,
+            store_connect_errors,
+            store_driver_errors,
+        )
+        from messagefoundry.store.custody_host import store_holds_data
+
+        unopened: tuple[type[Exception], ...] = (
+            StoreNotFoundError,
+            CipherError,
+            KeylessAuditChainRefused,
+            *_key_unresolved(),
+        )
+        unread: tuple[type[Exception], ...] = (
+            TableCensusIncomplete,
+            *store_driver_errors(),
+            *store_connect_errors(),
+        )
+        try:
+            store = await open_store(
+                settings.store,
+                read_only=True,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            )
+        except unopened:
+            return False
+        try:
+            return not await store_holds_data(store)
+        except unread:
+            return False
+        finally:
+            await store.close()
+
     # The store key could not be resolved. The texts of these classes name settings, environment
     # variables and files, never a key (see `_key_unresolved`). Exit 2, as `rotate-key` exits on
     # the same errors: the store could not be opened, so the command could not start. Before
@@ -8840,6 +8881,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             absent, exists = True, None
         except StoreChainNeverStarted as unstarted:
             # A mint that failed before its genesis record kept its key file (PR 2804 hold 2).
+            # Over a store that holds data the key may be its only one: the pin's own text then.
+            if not run_guarded(unstarted_store_holds_nothing()):
+                raise
             raise HostCustodyRefused(_never_started_refusal(settings.store)) from unstarted
         if host_custody and absent:
             # Checked before the prompts, so a refused or repeated mint asks for nothing. The mint

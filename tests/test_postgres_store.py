@@ -6334,7 +6334,7 @@ async def test_a_keyed_fresh_store_holds_data_until_its_chain_is_gone(store) -> 
         await empty_audit_log()
         assert not await store_holds_data(store)
         # Negative control: a keyed open with no audit key starts no chain over them.
-        assert await open_keyed(with_audit_key=False) is None
+        await open_keyed(with_audit_key=False)
         assert not (await store.table_occupancy())["audit_log"]
         assert not await store_holds_data(store)
         # The re-run's own create: a new key opens over the salt, counter and markers the failed

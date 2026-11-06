@@ -16084,8 +16084,9 @@ class SqlServerStore:
         ``sys.tables`` lists only the tables the login may see the metadata of. Without
         ``VIEW DEFINITION`` on that schema (held directly, through a role or from the database) it
         raises :class:`TableCensusIncomplete` rather than report a census a gap may have cut
-        short. Schema ``SELECT``, which ``db_datareader`` grants, does not stand in for it: under
-        it alone a table-level ``DENY`` of ``SELECT`` hides that table from ``sys.tables``. What
+        short. ``SELECT``, which ``db_datareader`` grants on the database, does not stand in for
+        it: under it alone a table-level ``DENY`` of ``SELECT`` hides that table from
+        ``sys.tables``. What
         the check does not show is stated on :meth:`Store.table_occupancy`."""
         anchor = await self._fetchone(
             "SELECT a.s, HAS_PERMS_BY_NAME(QUOTENAME(a.s), N'SCHEMA', N'VIEW DEFINITION') AS vd"
@@ -16104,7 +16105,8 @@ class SqlServerStore:
                 f"this login does not hold the view definition permission on schema"
                 f" {store_schema!r}, so SQL Server may hide a table there that holds rows, and"
                 " whether the store holds data cannot be read. Grant this login view definition"
-                " on that schema; select on it, which the db_datareader role grants, is not enough"
+                " on that schema; select, which the db_datareader role grants on the database, is"
+                " not enough"
             )
         rows = await self._fetchall(
             "SELECT t.name AS t FROM sys.tables t"
