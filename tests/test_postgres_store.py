@@ -6287,32 +6287,50 @@ async def test_table_occupancy_reads_the_store_schema_and_counts_a_connection_ev
 async def test_a_keyed_fresh_store_holds_data_until_its_chain_is_gone(store) -> None:
     # PR 2804 hold (A): a keyed open, the shape a mint makes, starts the chain and so holds data. A
     # mint that failed after the keyed open's own commits but before its genesis record leaves only
-    # the salt, counter and markers, which do not count, so the mint can be run again. Each open
-    # passes the audit MAC key, as open_store derives it from the cipher: without it the handle
-    # holds no keying secret and _load_audit_chain writes no genesis row.
+    # the salt, counter and markers, which do not count, so the mint can be run again.
+    #
+    # open_store hands the backend's open the cipher's audit MAC key. Without it the handle has no
+    # active audit key, so _load_audit_chain writes no genesis row. The first arm pins that.
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import audit_key_id
     from messagefoundry.store.custody_host import store_holds_data
     from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.store import AUDIT_KEY_EPOCH_ACTION, parse_audit_genesis
+
+    settings = load_settings(environ=os.environ).store
+
+    async def open_keyed(*, with_audit_key: bool = True) -> str:
+        """Open and close a keyed handle, and return the key id its genesis row should name."""
+        cipher = make_cipher(generate_key(), write_v2=True)
+        mac_key = cipher.audit_mac_key()
+        assert mac_key is not None
+        opened = await PostgresStore.open(
+            settings, cipher=cipher, audit_mac_key=mac_key if with_audit_key else None
+        )
+        await opened.close()
+        return audit_key_id(mac_key)
+
+    async def assert_chain_started_under(key_id: str) -> None:
+        assert (await store.table_occupancy())["audit_log"]
+        genesis = await store._audit_genesis_row()
+        assert genesis is not None
+        assert genesis["action"] == AUDIT_KEY_EPOCH_ACTION
+        assert parse_audit_genesis(genesis["detail"]) == key_id
 
     await _empty_every_census_table(store)
-
-    async def open_keyed() -> PostgresStore:
-        cipher = make_cipher(generate_key(), write_v2=True)
-        return await PostgresStore.open(
-            load_settings(environ=os.environ).store,
-            cipher=cipher,
-            audit_mac_key=cipher.audit_mac_key(),
-        )
-
-    await (await open_keyed()).close()
+    # Negative control: a keyed open with no audit key leaves the salt, counter and markers only.
+    await open_keyed(with_audit_key=False)
     occupancy = await store.table_occupancy()
-    assert occupancy["audit_log"]  # the genesis row
-    assert occupancy["keyed_surface"]  # the markers the keyed open writes before it
+    assert not occupancy["audit_log"]
+    assert occupancy["keyed_surface"]
+    assert not await store_holds_data(store)
+
+    await assert_chain_started_under(await open_keyed())
     assert await store_holds_data(store)
     async with store._pool.acquire() as conn:
         await conn.execute("TRUNCATE audit_log RESTART IDENTITY CASCADE")
     assert not await store_holds_data(store)
     # The re-run's own create: a new key opens over the salt, counter and markers the failed one left,
     # and starts its chain.
-    await (await open_keyed()).close()
+    await assert_chain_started_under(await open_keyed())
     assert await store_holds_data(store)
