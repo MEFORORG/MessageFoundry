@@ -7135,8 +7135,9 @@ def _lookup_sid_type(sid: str) -> tuple[int | None, int]:
     A domain account's SID resolves through a domain controller, or through the LSA's lookup cache
     when none answers. ERROR_NONE_MAPPED (1332) does not prove the SID names no account: Windows
     documents that it also follows a network time-out that kept the lookup from finding the name,
-    so a controller that did not answer in time can read as 1332, as can other failures (1722,
-    say). Every failure, 1332 included, is refused, so a domain account that did not resolve gets
+    so a controller that did not answer in time can read as 1332. Other failures report their own
+    status (1722, say). Every failure, 1332 included, is refused, so a domain account that did not
+    resolve gets
     the owner-only rewrite: fail-closed by design. Nothing is logged here: the status goes into the
     refusal, which the caller logs once, beside the directory it refused."""
     if sys.platform != "win32":

@@ -346,17 +346,23 @@ the directory grants. On a `-ServiceAccount` install that is the account the ins
 any other directory it is whichever user someone granted. Making such a grant takes WRITE_DAC on
 the directory and leaving it owned by SYSTEM or Administrators, which at least SYSTEM, an
 Administrator and a holder of `SeRestorePrivilege` can do: that privilege writes any DACL and sets
-any owner, and Windows' default policy grants it to Backup Operators as well as Administrators.
-`SeTakeOwnershipPrivilege` alone is not enough, because taking ownership makes the holder's own
-account the owner, which the owner rule refuses, and setting another owner takes
-`SeRestorePrivilege`. The widening is then exactly this:
+any owner, and Windows' default policies grant it beyond Administrators, at least to Backup
+Operators, and to Server Operators on a domain controller. `SeTakeOwnershipPrivilege` alone is not
+enough to admit a user for a holder outside SYSTEM and Administrators: taking ownership makes the
+holder's own account the owner, a directory that admits a user must be owned by SYSTEM or
+Administrators, and setting another owner takes `SeRestorePrivilege`. The widening is at least
+this, where "a user" is any account that resolves to `SidTypeUser` with a RID of 1000 or more, a
+computer account included if it resolves that way (*Left open*, below):
 
 - On a directory that names no run-as, as a `-AllowLocalSystem` install leaves it, a grant of
   Modify in the installer's shape to one user now shares the store with that user. Before this
-  note it left the store owner-only.
+  note that directory was refused, and the store fell back to the owner-only rewrite.
 - On a directory that already names a run-as, a virtual account or a user, a grant to one more user
-  is refused as a second principal, so the store is owner-only, as it was before this note for a
-  virtual run-as. A user is admitted there only when its grant REPLACES the existing run-as grant.
+  is refused as a second principal, and the store falls back to the owner-only rewrite, as it did
+  before this note for a virtual run-as. That rewrite keeps an existing store file's explicit
+  entries (*Left open*, below), so it does not by itself remove a run-as the trio already named. A
+  user is admitted there only when its grant REPLACES the existing run-as grant and SYSTEM or
+  Administrators owns the directory.
 
 Tying the admitted SID to the service's configured account was not chosen.
 

@@ -147,13 +147,17 @@ def test_a_localsystem_install_grants_system_and_administrators_only() -> None:
         ),
     ],
 )
-def test_a_directory_that_admits_anyone_else_is_not_hardened(label: str, sddl: str) -> None:
+def test_a_directory_that_admits_anyone_else_is_not_hardened(
+    monkeypatch: pytest.MonkeyPatch, label: str, sddl: str
+) -> None:
     # Each row admits (or may admit) a principal beyond SYSTEM, Administrators and one run-as
     # account (a per-service virtual account, or one resolved user account), grants a principal
     # outside the installer's shape, lets an outsider rewrite the directory, or cannot be read with
-    # confidence. Every one is refused before any account lookup, so the rows need no stand-in for
-    # it, and every one must fall back to the owner-only rewrite.
+    # confidence. Every one must fall back to the owner-only rewrite, and is refused before any
+    # account lookup, which the stand-in records.
+    lookup = _install_lookup(monkeypatch, _Lookup(default=1))
     assert _grants(sddl) is None, label
+    assert lookup.asked == [], label
 
 
 def test_a_directory_with_a_deny_entry_is_not_hardened() -> None:
