@@ -623,7 +623,7 @@ def test_the_postgres_tls_wrap_says_a_chain_it_cannot_read_is_not_a_codec_error(
         postgres._verifying_context_at_open(StoreSettings())
     text = str(caught.value)
     assert "an error whose chain cannot be read whole" in text, text
-    assert "_UnreadableReason" not in text, text  # the class name is not read (third hold)
+    assert "_UnreadableReason" not in text, text  # no class name in the text (third hold)
     assert "codec" not in text and "could not be judged" not in text, text
     assert caught.value.__cause__ is None and caught.value.__context__ is None
 
@@ -956,8 +956,8 @@ def test_an_error_whose_class_name_cannot_be_read_is_still_refused(
 
 @pytest.mark.parametrize(
     "make_interrupt",
-    [KeyboardInterrupt, lambda: SystemExit(3)],
-    ids=["keyboard-interrupt", "system-exit"],
+    [KeyboardInterrupt, lambda: SystemExit(3), _StubbornInterrupt],
+    ids=["keyboard-interrupt", "system-exit", "setattr-raises"],
 )
 @pytest.mark.parametrize(
     "entry", ["build_store_cipher", "resolve_active_key", "resolve_decrypt_keys"]

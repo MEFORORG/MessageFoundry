@@ -3522,21 +3522,24 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
     writes each through ``BaseException``'s own descriptor (:data:`_CAUSE` and its siblings), as
     ``BaseException.__cause__.__set__(escaping, None)``, never by assignment to the instance,
     which runs a subclass's ``__setattr__``; one that raises would leave in the handler with the
-    judged error as context (the third hold). It makes no call into Python code: at the
+    judged error as context (the third hold). It makes no Python call of its own: at the
     recursion limit such a call raises a fresh ``RecursionError`` in the handler, chained back to
-    the judged error. The three descriptor calls are C calls, but each is a point where a signal
-    handler can run. At least these are left as they are: an exception group's members, the
-    escaping error's own arguments, its traceback's frame locals, an interrupt delivered in the
-    caller's handler outside the judgement's code, and one delivered between those three calls,
-    which keeps the escaping error, still chained to the judged one, as its context."""
+    the judged error. The context is cleared first, since it is the link every escaping error
+    has. At least these are left as they are: an exception group's members, the escaping error's
+    own arguments, its traceback's frame locals, an interrupt delivered in the caller's handler
+    outside the judgement's code, a finalizer that dropping a link's last reference runs, and an
+    interrupt a signal handler raises at one of the three descriptor calls, each a C call where a
+    signal handler can run. Raised before the first call clears the context, such an interrupt
+    keeps the escaping error, still chained to the judged one, as its context; raised after it,
+    only a cause the escaping error was given."""
     try:
         try:
             return _refusal_for(exc)
         except Exception:  # noqa: BLE001 -- fail closed: the judgement ran exc's own code
             return _refused(exc, _UNJUDGED)
     except BaseException as escaping:
-        _CAUSE.__set__(escaping, None)
         _CONTEXT.__set__(escaping, None)
+        _CAUSE.__set__(escaping, None)
         _SUPPRESS_CONTEXT.__set__(escaping, False)
         raise
 
@@ -3608,8 +3611,8 @@ def _codec_chain_reading(exc: BaseException) -> str | None:
     try:
         codec, read_whole = _codec_error_on(exc)
     except BaseException as interrupt:
-        _CAUSE.__set__(interrupt, None)
         _CONTEXT.__set__(interrupt, None)
+        _CAUSE.__set__(interrupt, None)
         _SUPPRESS_CONTEXT.__set__(interrupt, False)
         raise
     if not read_whole:

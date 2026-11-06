@@ -21,7 +21,9 @@
   propagate, in place of the refusal, with no cause and no context. That cuts only
   those two links: at least one whose own arguments or group members hold the judged error still
   prints it, its traceback's frame locals still hold it for a renderer that prints locals, and an
-  interrupt delivered in the handler outside the judgement's code keeps it as its context. Any
+  interrupt delivered in the handler outside the judgement's code, or before the links are
+  cleared, keeps it as its context. The links are cleared through `BaseException`'s own
+  descriptors, so an interrupt class's own `__setattr__` does not run. Any
   other error is unchanged. (`BACKLOG #4882`, `BACKLOG #3471`)
 - **`check-privileges`' AD bind probe keeps a hop refusal's text only when the LDAPS revocation
   guard raised it.** Any other hop refusal on that probe, at least one from resolving a Vault-held
