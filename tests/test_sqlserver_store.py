@@ -7226,26 +7226,27 @@ async def test_webauthn_rehash_contract(store) -> None:
 
 async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
     """BACKLOG #2705 limb 1: Microsoft's ODBC Driver 18 reads the ``}}`` escape in a braced
-    password, so a password holding ``}``, a ``}}`` run, a trailing ``}``, ``{``, ``;`` and ``=``
-    logs in as written and adds no keyword.
+    password, so a password holding ``};``, ``}=``, a trailing ``}}``, ``{``, ``;`` and ``=`` logs
+    in as written and adds no keyword.
 
     MEASURES ODBC Driver 18 for SQL Server on Linux (``msodbcsql18`` under unixODBC), on the CI
-    ``sql server`` leg. The comment above ``_DRIVER_FAMILIES`` in
+    ``sql server`` legs. The comment above ``_DRIVER_FAMILIES`` in
     ``messagefoundry/transports/database.py`` holds what stays unmeasured, Windows
     ``msodbcsql18.dll`` among it.
 
-    Three strings are sent, each with the password braced by
-    :func:`~messagefoundry.odbc_dsn.odbc_brace`: the generic builder's (:func:`_build_odbc_dsn`,
-    whose password goes through :func:`_odbc_password` for the ``msodbc`` family), the SQL Server
-    preset's (:func:`_build_dsn`), and the store's (:func:`connection_string`). The generic one has
-    ``TrustServerCertificate=yes`` appended, which its ``odbc_params`` allowlist does not take and
-    the container's self-signed certificate needs. They go through aioodbc and pyodbc, as the
-    connector's pool sends them.
+    Every string braces the password with :func:`~messagefoundry.odbc_dsn.odbc_brace`. The generic
+    builder's (:func:`_build_odbc_dsn`, whose password goes through :func:`_odbc_password` for the
+    ``msodbc`` family) names the host alone, as the generic dialect's egress check requires, so it
+    reaches the default port; it has ``TrustServerCertificate=yes`` appended, which its
+    ``odbc_params`` allowlist does not take and the container's self-signed certificate needs. The
+    SQL Server preset's (:func:`_build_dsn`) and the store's (:func:`connection_string`) take that
+    keyword from the leg's settings, and where the two strings match byte for byte one login
+    covers both. They go through aioodbc and pyodbc.
 
-    A driver that ended a braced value at its first ``}``, or did not turn ``}}`` into ``}``, would
-    send another password, and the login would be refused. The controls show a refusal is what a
-    wrong password gets here: the same escaped shape with one generated part changed is refused
-    with SQLSTATE 28000, and the password sent unbraced, cut at its ``;``, is refused. No
+    A driver that ended a braced value at its first ``}`` or its first ``};``, or did not turn
+    ``}}`` into ``}``, would send another password, and the login would be refused. The controls
+    show a refusal is what a wrong password gets here: the same escaped shape with only its head
+    changed is refused with SQLSTATE 28000, and the password sent unbraced is refused. No
     assertion expression or message holds the password, since pytest prints the parts of a
     failed assert, and only a refusal's SQLSTATE is kept, never the driver's message."""
     import secrets
@@ -7260,19 +7261,26 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
     from messagefoundry.transports.database import _build_dsn, _build_odbc_dsn
     from tests._live_scratch import scratch_name, sqlserver_admin
 
-    disable_driver_manager_pooling()  # BACKLOG #2049: a closed probe must end its server session
+    # BACKLOG #2049. Effective only if no earlier test has touched ODBC in this process; teardown's
+    # KILL ends any probe session pooling keeps alive either way.
+    disable_driver_manager_pooling()
     base = load_settings(environ=os.environ).store
+    on_default_port = base.port == 1433
+    assert on_default_port, (
+        "the generic dialect reaches Microsoft's driver on its default port only"
+    )
     login = scratch_name("mefor_brace")
+    tail = secrets.token_hex(8)
 
     def shaped(head: str) -> str:
         """A password of the measured shape. No quote character, so the CREATE LOGIN literal below
-        needs no escaping: the password cannot be bound as a parameter in that statement."""
-        return f"T}}{head};s=t{{{secrets.token_hex(8)}}}}}"
+        needs no escaping, as the other live tests here and tests/_live_scratch.py write it."""
+        return f"T}};{head}}}=s=t{{{tail}}}}}"
 
     password = shaped(secrets.token_hex(8))
     escaped = odbc_brace(password)
-    has_escape = "}}}}" in escaped and escaped.endswith("}}}")
-    assert has_escape, "the premise: the escaped password holds a doubled run and a closing run"
+    has_escape = "}};" in escaped and "}}=" in escaped and escaped.endswith("}}}}}")
+    assert has_escape, "the premise: the escaped password holds }}; and }}= and closes on }}}}}"
 
     async def login_outcome(dsn: str) -> tuple[str | None, str]:
         """``(login, "")`` with the login the server names, or ``(None, SQLSTATE)`` when the connect
@@ -7292,12 +7300,11 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
             await conn.close()
         return (None if row is None else str(row[0])), ""
 
-    server = base.server or "localhost"
     generic = (
         _build_odbc_dsn(
             {
                 "odbc_driver": "ODBC Driver 18 for SQL Server",
-                "server": f"{server},{base.port}",
+                "server": base.server or "localhost",
                 "database": "master",
                 "username": login,
                 "password": password,
@@ -7308,7 +7315,7 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
     )
     preset = _build_dsn(
         {
-            "server": server,
+            "server": base.server or "localhost",
             "port": base.port,
             "database": "master",
             "username": login,
@@ -7323,10 +7330,11 @@ async def test_microsoft_odbc_driver_reads_the_braced_password_escape() -> None:
     for label, dsn in strings.items():
         sent_escaped = _odbc_value(dsn, "PWD") == escaped
         assert sent_escaped, f"the {label} string did not send the password braced with the escape"
+    distinct = {dsn: label for label, dsn in reversed(strings.items())}  # first label wins
     async with sqlserver_admin(base.model_copy(update={"database": "master"})) as admin:
         try:
             await admin.run(f"CREATE LOGIN [{login}] WITH PASSWORD='{password}', CHECK_POLICY=OFF")
-            for label, dsn in strings.items():
+            for dsn, label in distinct.items():
                 who, state = await login_outcome(dsn)
                 assert who == login, f"the {label} string did not log in (SQLSTATE {state!r})"
             wrong = odbc_brace(shaped(secrets.token_hex(8)))
