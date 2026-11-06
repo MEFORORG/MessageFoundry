@@ -16072,14 +16072,17 @@ class SqlServerStore:
         )
 
     async def table_occupancy(self) -> dict[str, bool]:
-        """See :meth:`Store.table_occupancy`: the user tables in ``SCHEMA_ID()``, the default
-        schema the store's unqualified names resolve to, read from ``sys.tables``, each probed for
-        one row through its bracket-quoted, schema-qualified name. ``sys.tables`` lists only
-        tables the login has some permission on, so a table hidden from it is one the store
-        could not read either."""
+        """See :meth:`Store.table_occupancy`: the tables in the schema that holds the store's own
+        ``schema_meta``, as ``OBJECT_ID`` resolves the unqualified name (the login's default
+        schema, then ``dbo``, as the store's DDL resolved it), read from ``sys.tables`` less the
+        tables SQL Server itself ships (``is_ms_shipped``), each probed for one row through its
+        bracket-quoted, schema-qualified name. No ``schema_meta`` reads as no tables.
+        ``sys.tables`` lists only tables the login has some permission on, so a table it has none
+        on is not listed at all."""
         rows = await self._fetchall(
             "SELECT SCHEMA_NAME(t.schema_id) AS s, t.name AS t FROM sys.tables t"
-            " WHERE t.schema_id = SCHEMA_ID()"
+            " WHERE t.is_ms_shipped = 0 AND t.schema_id = (SELECT o.schema_id FROM sys.objects o"
+            " WHERE o.object_id = OBJECT_ID(N'schema_meta', N'U'))"
         )
         occupancy: dict[str, bool] = {}
         for row in rows:

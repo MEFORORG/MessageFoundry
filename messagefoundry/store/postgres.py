@@ -11465,16 +11465,17 @@ class PostgresStore:
         )
 
     async def table_occupancy(self) -> dict[str, bool]:
-        """See :meth:`Store.table_occupancy`: the ordinary and partitioned tables in
-        ``current_schema()``, read from ``pg_catalog`` by the stored name (not re-parsed as an
-        identifier, as the privilege census reads it), each probed for one row. Each probe names
-        the schema too, because an unqualified name would resolve through ``pg_catalog`` first.
-        No schema on the search path reads as no tables, which the caller must not take as
-        empty."""
+        """See :meth:`Store.table_occupancy`: the ordinary and partitioned tables in the schema
+        that holds the store's own ``schema_meta``, as ``to_regclass`` resolves the unqualified
+        name through the pool's ``search_path`` (the way every store statement resolves it), read
+        from ``pg_catalog`` by the stored name, each probed for one row. Each probe names the
+        schema too, because an unqualified name would resolve through ``pg_catalog`` first. No
+        ``schema_meta`` reads as no tables, which the caller must not take as empty."""
         rows = await self._fetchall(
             "SELECT n.nspname AS s, c.relname AS t FROM pg_catalog.pg_class c"
             " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
-            " WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p')"
+            " WHERE c.relkind IN ('r', 'p') AND c.relnamespace = (SELECT m.relnamespace"
+            " FROM pg_catalog.pg_class m WHERE m.oid = to_regclass('schema_meta'))"
         )
         occupancy: dict[str, bool] = {}
         for row in rows:

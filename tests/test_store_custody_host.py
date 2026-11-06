@@ -868,6 +868,21 @@ async def test_a_fresh_store_holds_only_the_bookkeeping_it_seeds(tmp_path: Path)
     assert {name for name, held in occupancy.items() if held} <= SCHEMA_BOOKKEEPING_TABLES
 
 
+def test_every_row_a_schema_build_seeds_is_named_bookkeeping() -> None:
+    # A seed added to any backend's schema would make every fresh server store read as holding
+    # data, and refuse every mint, so each seeded table must be named in the exclusion. The control
+    # is that the pattern finds the one seed every backend has.
+    from messagefoundry.store import postgres, sqlserver
+    from messagefoundry.store import store as sqlite_store
+    from messagefoundry.store.custody_host import SCHEMA_BOOKKEEPING_TABLES
+
+    seed = re.compile(r"\bINSERT\s+(?:OR\s+\w+\s+)?INTO\s+(\w+)\s*\([^)]*\)\s*VALUES\b", re.I)
+    for ddl in (postgres._SCHEMA, sqlserver._SCHEMA, [sqlite_store._SCHEMA]):
+        seeded = {table.lower() for statement in ddl for table in seed.findall(statement)}
+        assert "global_session_epoch" in seeded
+        assert seeded <= SCHEMA_BOOKKEEPING_TABLES
+
+
 async def test_a_census_that_cannot_see_the_store_tables_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
