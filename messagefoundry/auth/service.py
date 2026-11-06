@@ -6596,9 +6596,8 @@ class AuthService:
         """Redeem a step-up flow and, when the IdP proof holds, elevate the staged session.
 
         ``mint_grant=False`` elevates without minting the purpose-bound grant the flow staged, and
-        the ``auth.reauth`` row then records no purpose. The console passes it at least for a flow
-        whose continuation another re-auth took meanwhile, or whose held continuation lapsed or was
-        evicted (vault BACKLOG #3241, added item 9).
+        the ``auth.reauth`` row then records no purpose. When the console passes it is ADR 0065,
+        *Change of 2026-11-05* (vault BACKLOG #3241, added item 9).
 
         Checks, in order, each failing CLOSED with nothing elevated: the flow exists and ``state``
         matches; it is a step-up flow; the callback is not too soon after the flow started (BACKLOG

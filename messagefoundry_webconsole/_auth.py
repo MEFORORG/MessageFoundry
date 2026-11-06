@@ -1400,14 +1400,15 @@ def take_flow_claim(flow_id: str, return_to: str) -> tuple[ContinuationClaim | N
     A flow toward an action-bound unlock page mints only while it still holds its issue. Another
     re-auth for the page takes the issue from the flow first (:func:`claim_continuation`), and from
     then on that re-auth, or the table it gives the issue back to, holds the only right to mint from
-    it. So one issue mints at most one grant, whatever the cookie jar holds. Any other flow mints
-    as it was staged."""
+    it. So one issue mints at most one grant, whatever the cookie jar holds. A held issue that has
+    lapsed mints nothing either, whether or not a later start pruned it, so the answer does not
+    depend on other sessions' traffic. Any other flow mints as it was staged."""
     claim = _FLOW_CLAIMS.get(flow_id)
     if claim is not None:
         claim._returns += 1
     action = lookup_ui_action(return_to)
     bound = action is not None and action.binds_unlock_grant
-    return claim, not bound or (claim is not None and claim.holds_entry)
+    return claim, not bound or (claim is not None and claim.deadline() > time.monotonic())
 
 
 def settle_flow_claim(

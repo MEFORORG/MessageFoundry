@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -851,3 +852,27 @@ def test_a_flow_return_in_progress_keeps_its_issue_from_other_reauths(
     assert _auth.claim_continuation(action, "tok", page).continues
     claim, mint = _auth.take_flow_claim("flow-1", page)
     assert claim is None and not mint  # its issue was taken: the flow mints no grant
+
+
+def test_a_lapsed_held_issue_mints_nothing_even_unpruned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A flow whose held issue lapsed before its callback mints no grant, though no later start has
+    pruned the issue from the held claims. RED when: the take answers from whether an issue is held
+    and not whether it is live, so a lapsed issue mints or not by other sessions' traffic.
+    CONTROL: the same flow with its issue still live mints."""
+    monkeypatch.setattr(_auth, "_ISSUED_CONTINUATIONS", _auth._IssuedContinuations())
+    monkeypatch.setattr(_auth, "_FLOW_CLAIMS", type(_auth._FLOW_CLAIMS)())
+    monkeypatch.setattr(_auth, "_FLOW_CLAIM_IDS", {})
+    page = "/ui/connections/purge-confirm"
+    action = _auth.lookup_ui_action(page)
+    assert action is not None and action.binds_unlock_grant
+    _auth._ISSUED_CONTINUATIONS.issue("tok", page, unlock=True)
+    _auth.hold_claim_for_flow("flow-1", _auth.claim_continuation(action, "tok", page))
+
+    claim, mint = _auth.take_flow_claim("flow-1", page)
+    assert mint and claim is not None  # control: live, so it mints
+    _auth.settle_flow_claim("flow-1", claim, consumed=False, minted=False)
+
+    claim._entry = _auth._Entry(time.monotonic() - 1.0, unlock=True)  # lapsed, still held
+    assert _auth._FLOW_CLAIMS.get("flow-1") is claim and claim.holds_entry
+    claim, mint = _auth.take_flow_claim("flow-1", page)
+    assert claim is not None and not mint
