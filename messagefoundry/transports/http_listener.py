@@ -1468,18 +1468,19 @@ class HttpSource(SourceConnector):
             self._admission.release(*slot)
             writer.close()
             return
+        # A slot `_handshake_accepted` took is this call's from its first line, so the finally below
+        # releases it however the call ends (BACKLOG #2479). Otherwise `epoch` is set by the admit,
+        # and the finally releases exactly what it took.
+        epoch: int | None = None
+        if slot is not None:
+            peer_host, epoch = slot
+        else:
+            peer_host = _peer_host(writer)
         # Register before anything else so stop() can always find + close this connection (H-2).
         task = asyncio.current_task()
         self._clients.add(writer)
         if task is not None:
             self._client_tasks.add(task)
-        # Kill Nagle on the accepted socket, as MLLPSource does. One request per connection
-        # (build_response hardcodes Connection: close), so the 202 receipt is a single small write with
-        # no unacked data outstanding — precisely the shape Nagle holds until the peer's delayed-ACK
-        # timer fires. Best-effort and framing-neutral; see _set_tcp_nodelay.
-        _set_tcp_nodelay(writer)
-        peer_host = _peer_host(writer)
-        epoch: int | None = None  # set by the admit; the finally releases exactly what it took
         established = False
         failed = False
         # True from the start of a TLS handshake this listener runs until it succeeds; see
@@ -1489,10 +1490,14 @@ class HttpSource(SourceConnector):
         # then: a TLS client cannot read a plaintext answer (BACKLOG #2479).
         answerable = not self._upgrade_tls
         try:
+            # Kill Nagle on the accepted socket, as MLLPSource does. One request per connection
+            # (build_response hardcodes Connection: close), so the 202 receipt is a single small
+            # write with no unacked data outstanding — precisely the shape Nagle holds until the
+            # peer's delayed-ACK timer fires. Best-effort and framing-neutral; see
+            # _set_tcp_nodelay. Inside the try, so a fault here still releases a slot already held.
+            _set_tcp_nodelay(writer)
             if slot is not None:
-                # Admitted before its handshake, by `_handshake_accepted` (BACKLOG #2479).
-                peer_host, epoch = slot
-                refusal = None
+                refusal = None  # admitted before its handshake, by `_handshake_accepted`
             else:
                 # vault BACKLOG #2606: stop, allowlist, global cap and per-host cap, decided in one
                 # place for every socket listener (transports/admission.py). Refused before a

@@ -6,8 +6,8 @@ A TLS socket is admitted before its handshake on every loop (BACKLOG #2479): upg
 ``start_tls`` on the stdlib loops (``_upgrades_tls_itself``), and through the listener's own accept
 loop on every other, so it holds a ``max_connections`` slot until the handshake ends, up to the 10 s
 handshake bound. The tests below that open sockets run both ways (``tls_path``).
-``max_connections_per_host`` ships off on ``Http()`` (vault BACKLOG #2606), so before this row one address that never finished a handshake, at least an mTLS peer with no client
-certificate, could have held every one of the 256 slots. ``max_handshakes_per_host`` bounds only the
+``max_connections_per_host`` ships off on ``Http()`` (vault BACKLOG #2606), so before this row one
+address that never finished a handshake, at least an mTLS peer with no client certificate, could have held every one of the 256 slots. ``max_handshakes_per_host`` bounds only the
 handshake: a socket leaves the count the moment its handshake ends, so a completed connection never
 counts against it, and the per-host cap stays off for established traffic behind an L4 load
 balancer.

@@ -9,8 +9,8 @@ Two parts, shared by the MLLP listener, the HTTP intake listener and the API:
   it throttles, and how, is stated once, in ``docs/PHI.md`` section 7, row 7 (vault BACKLOG #3785
   item 2).
 * :func:`watch_loop_handshakes` sees a failure the EVENT LOOP had, where no listener code runs.
-  Only the API arms it now: the MLLP and HTTP listeners run or await every handshake themselves,
-  on every loop (BACKLOG #1606, #2479), and count each failure with its peer.
+  At least the API arms it. The MLLP and HTTP listeners do not: they run or await every
+  handshake themselves, on every loop (BACKLOG #1606, #2479), and count each failure with its peer.
 
 **Why the second part exists.** Where the loop runs the handshake, through
 ``asyncio.start_server(ssl=...)`` or ``loop.create_server(ssl=...)`` as uvicorn calls it, a failed

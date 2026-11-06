@@ -812,14 +812,15 @@ def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
     class _SubclassedLoop(asyncio.SelectorEventLoop):
         pass
 
+    # One predicate for both listeners, so they cannot disagree on which loop gets the accept loop.
+    assert http_module._upgrades_tls_itself is mllp_module._upgrades_tls_itself
     stdlib = asyncio.new_event_loop()
     selector = asyncio.SelectorEventLoop()
     subclassed = _SubclassedLoop()
     try:
-        for predicate in (mllp_module._upgrades_tls_itself, http_module._upgrades_tls_itself):
-            assert predicate(stdlib) is True
-            assert predicate(selector) is True
-            assert predicate(subclassed) is False
+        assert mllp_module._upgrades_tls_itself(stdlib) is True
+        assert mllp_module._upgrades_tls_itself(selector) is True
+        assert mllp_module._upgrades_tls_itself(subclassed) is False
     finally:
         stdlib.close()
         selector.close()
@@ -827,7 +828,6 @@ def test_only_the_stdlib_loop_upgrades_tls_itself() -> None:
     # Never run: the probe only asks which class the loop is, so its abstract methods stay unbound.
     other = _OtherLoop()  # type: ignore[abstract]
     assert mllp_module._upgrades_tls_itself(other) is False
-    assert http_module._upgrades_tls_itself(other) is False
 
 
 # --- stop() on a loop whose server has no close_clients() (BACKLOG #1606) ------------------------

@@ -472,7 +472,8 @@ def test_no_listener_is_kept_alive_by_its_hook_or_its_counter(tmp_path: Path) ->
 
     def http() -> object:
         source, _cert_path = _http_tls_source(tmp_path / "http")
-        # What start() does where the loop runs the handshake.
+        # A hooked context, as start() left one where the loop ran the handshake before BACKLOG
+        # #2479. start() no longer hooks it on any loop; the hook's references are what is tested.
         assert source._ssl is not None
         source._tls_failures.watch(source._ssl)
         return source
