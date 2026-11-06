@@ -589,9 +589,10 @@ def keep_the_key_step(
         if service_account is not None:
             text += f', --service-account "{service_account}" among them'
         # --db overrides [store].path, for serve as for provision-admin, so the old --db would
-        # point a new SQLite store's re-run and its service back at the old store. Leaving it out of
-        # both lets the [store].path the step above points serve them both. A server store is
-        # named by [store].server/database, which --db does not set (PR 2804 seventh hold).
+        # point a new SQLite store's re-run and its service back at the old store. The shipped
+        # service paths always pass one (install-service.ps1 writes serve --db <DbPath>, and
+        # supervise passes its --db to each shard), so --db must name the new path in both (PR 2804
+        # eighth hold). A server store is named by [store].server/database, which --db does not set.
         if new_store and server:
             text += (
                 ", once [store] names that new database, here and for the service (--db sets only "
@@ -599,8 +600,9 @@ def keep_the_key_step(
             )
         elif new_store:
             text += (
-                ", except --db, which overrides [store].path: leave it out, and take it off the "
-                "service's own command too, if it has one"
+                ", but with --db naming that new SQLite path, here and wherever the service passes "
+                "--db: at least -DbPath on a reinstall with install-service.ps1, and supervise "
+                "--db, the base each shard's file is named from"
             )
         if service_account is None and sys.platform == "win32":
             text += (

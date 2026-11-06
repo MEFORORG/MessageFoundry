@@ -1335,10 +1335,11 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
     tmp_path: Path, backend: StoreBackend, new_store: bool, service_account: str | None
 ) -> None:
     # PR 2804 seventh hold, finding 1: --db overrides [store].path, so "the same arguments" would
-    # point a new store's re-run, and its service, back at the old store. A new SQLite store leaves
-    # --db out of both, so the [store].path the step points serves them; a server store is named by
-    # [store].server/database, here and for the service. With the store kept, the re-run keeps
-    # every argument, --db and --service-config among them.
+    # point a new store's re-run, and its service, back at the old store. A new SQLite store's --db
+    # names the new path, on the re-run and wherever the service passes one (eighth hold: the
+    # shipped service paths always do); a server store is named by [store].server/database, here
+    # and for the service. With the store kept, the re-run keeps every argument, --db and
+    # --service-config among them.
     settings = _settings(tmp_path).model_copy(update={"backend": backend})
     step = custody_host.keep_the_key_step(
         settings, new_store=new_store, service_account=service_account
@@ -1351,14 +1352,22 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
     if service_account is not None:
         command += f', --service-account "{service_account}" among them'
     sqlite_path = (
-        ", except --db, which overrides [store].path: leave it out, and take it off the service's "
-        "own command too, if it has one"
+        ", but with --db naming that new SQLite path, here and wherever the service passes --db: "
+        "at least -DbPath on a reinstall with install-service.ps1, and supervise --db, the base "
+        "each shard's file is named from"
     )
     database = (
         ", once [store] names that new database, here and for the service (--db sets only "
         "[store].path, which does not name a server store)"
     )
     server = backend is not StoreBackend.SQLITE
+    # PR 2804 eighth hold: install-service.ps1 and supervise always pass --db, so it is named, not
+    # left out, and the service's own commands are named concretely.
+    assert "leave it out" not in step and "take it off" not in step, step
+    named = "--db naming that new SQLite path" in step
+    assert named is (new_store and not server), step
+    for service_command in ("-DbPath on a reinstall with install-service.ps1", "supervise --db"):
+        assert (service_command in step) is (new_store and not server), step
     assert (command + sqlite_path in step) is (new_store and not server), step
     assert (command + database in step) is (new_store and server), step
     assert command in step, step
