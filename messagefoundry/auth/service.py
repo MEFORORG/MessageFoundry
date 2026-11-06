@@ -1787,6 +1787,11 @@ PASSKEY_NOT_DISCOVERABLE = (
     "authenticator app first"
 )
 
+#: The detail ``finish_webauthn_registration`` refuses with when the store refused the passkey on
+#: an integrity rule and a re-read finds neither the credential nor the label held (BACKLOG #2733,
+#: pass F findings 3 and 5). Before, every such refusal read as a label clash.
+_PASSKEY_NOT_STORED = "this passkey could not be stored; start the enrolment again"
+
 
 class FactorEnrolmentRequired(ValueError):
     """The account ``[security].require_mfa`` covers holds no factor with a way past the sign-in lock,
@@ -15022,6 +15027,15 @@ class AuthService:
         await self._audit("auth.webauthn_enroll_started", actor=identity.username)
         return options
 
+    async def _passkey_label_held(self, user_id: str, label: str) -> bool:
+        """Whether a passkey of ``user_id`` already carries ``label``, compared without case, as
+        SQL Server's collation compares the (user_id, label) index (BACKLOG #2733, pass F)."""
+        wanted = label.casefold()
+        return any(
+            held.label.casefold() == wanted
+            for held in await self._store.list_webauthn_credentials(user_id)
+        )
+
     async def finish_webauthn_registration(
         self,
         identity: Identity,
@@ -15080,7 +15094,11 @@ class AuthService:
         if user is None:
             raise ValueError("no such user")
         label = label.strip()
-        if not label or len(label) > self._WEBAUTHN_LABEL_MAX:
+        # Counted in UTF-16 code units (BACKLOG #2733, pass F finding 4): SQL Server's NVARCHAR(100)
+        # counts those, so a label of astral-plane characters that passed a code-point count was
+        # refused by the column there, as a 500. The same cap on every backend, so a label one
+        # store takes, all three take.
+        if not label or len(label.encode("utf-16-le")) // 2 > self._WEBAUTHN_LABEL_MAX:
             raise ValueError("label must be 1-100 characters")
         # No staged ceremony is answered BEFORE the floor, as confirm_mfa_enrollment answers "no
         # enrollment in progress" before it: otherwise the same request would get "verification
@@ -15188,6 +15206,11 @@ class AuthService:
         credential_id_hash = _credential_id_hash(result.credential_id)
         if await self._store.get_webauthn_credential(credential_id_hash) is not None:
             raise ValueError("this passkey is already enrolled")
+        # Without case (BACKLOG #2733, pass F finding 4): SQL Server's default collation makes the
+        # (user_id, label) index refuse "laptop" beside "Laptop", where SQLite and Postgres took
+        # both. Refused here on every backend, so the three agree.
+        if await self._passkey_label_held(user.id, label):
+            raise ValueError("label already in use")
         now = time.time()
         cred = WebAuthnCredential(
             credential_id_hash=credential_id_hash,
@@ -15228,7 +15251,12 @@ class AuthService:
             # holding this credential id is that refusal, whatever label it carries.
             if await self._store.get_webauthn_credential(credential_id_hash) is not None:
                 raise ValueError("this passkey is already enrolled") from exc
-            raise ValueError("label already in use") from exc
+            # Pass F findings 3 and 5: the label clash is told apart the same way, by a passkey of
+            # this account now holding the label. Anything else, such as a competing row deleted
+            # before these re-reads, or another integrity refusal, is not called a label clash.
+            if await self._passkey_label_held(user.id, label):
+                raise ValueError("label already in use") from exc
+            raise ValueError(_PASSKEY_NOT_STORED) from exc
         if not bound:
             # The store fails closed on a dead session and on an account record that fails its seal
             # too (a missing account it leaves to the foreign key above), so those are told apart
