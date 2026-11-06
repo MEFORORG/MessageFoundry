@@ -41,6 +41,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     Database,
+    DatabasePoll,
     File,
     Registry,
     build_inbound_connection,
@@ -1128,9 +1129,9 @@ def _db_connector(direction: str, folder: Path) -> Any:
 async def test_hold_f2_no_runner_build_runs_on_the_event_loop_thread(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
 ) -> None:
-    """Every connector the runner builds from a coroutine is built on a worker thread: a lane
-    start of an inbound and an outbound, a reload's build check and rebuild, the dry run's build
-    check, and the connection test. Red: each built on the loop thread."""
+    """Each of these builds runs on a worker thread: a lane start of an inbound and an outbound,
+    a reload's build check, inbound rebind and outbound rebuild, the dry run's build check, and the
+    connection test. The next test covers an operator start. Red: each built on the loop thread."""
     from messagefoundry.pipeline import wiring_runner
 
     built: list[tuple[str, int]] = []
@@ -1163,5 +1164,84 @@ async def test_hold_f2_no_runner_build_runs_on_the_event_loop_thread(
         await runner.stop()
     kinds = {kind for kind, _thread in built}
     assert kinds == {"build_source", "build_destination"}, built
-    assert len(built) >= 7, built  # start 2, reload 3, dry-run check 2, connection test 1
+    assert len(built) == 9, built  # start 2, reload 4 (check 2, rebind, rebuild), dry run 2, test 1
     assert threading.get_ident() not in {thread for _kind, thread in built}
+
+
+async def test_hold_f2_an_operator_start_of_an_unbuilt_lane_builds_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
+) -> None:
+    """An outbound the boot gates left unbuilt is built when an operator starts it, and that
+    build lists the folder off the event loop too."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    reg = Registry()
+    reg.add_outbound(build_outbound_connection(_OUT, _db_spec(folder), auto_start=False))
+    runner = _db_runner(db_store, reg)
+    await runner.start()
+    try:
+        assert _OUT not in cast(Any, runner)._destinations
+        watch = _LoopWatch(monkeypatch)
+        await runner.start_outbound(_OUT)
+        assert _OUT in cast(Any, runner)._destinations
+        assert len(watch.threads) == 1 and threading.get_ident() not in watch.threads
+    finally:
+        await runner.stop()
+
+
+async def test_hold_f2_a_refused_entry_fails_a_database_inbound_at_its_lane_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore
+) -> None:
+    """The inbound arm of the lane start: a DATABASE poll whose sslcapath entry leads off the
+    host fails its lane with the build's refusal, built off the event loop, and never polls."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
+    watch = _LoopWatch(monkeypatch)
+    reg = Registry()
+    spec = DatabasePoll(
+        server="db.synthetic.test",
+        poll_statement="SELECT a FROM t",
+        dialect="generic",
+        odbc_driver="MySQL ODBC 9.1 Unicode Driver",
+        odbc_params={"SSLMODE": "VERIFY_IDENTITY", "SSLCAPATH": str(folder)},
+    )
+    reg.add_inbound(build_inbound_connection(_IN, spec, router="r"))
+    reg.add_router("r", lambda _m: [])
+    runner = _db_runner(db_store, reg)
+    await runner.start()
+    try:
+        assert watch.threads and threading.get_ident() not in watch.threads
+        assert _IN not in cast(Any, runner)._sources
+        failure = cast(Any, runner)._failed.get(("inbound", _IN))
+        assert failure is not None
+        assert "'sslcapath' must name a folder it can list" in str(failure)
+    finally:
+        await runner.stop()
+
+
+async def test_hold_f2_a_build_its_caller_abandons_is_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cancellation of the task awaiting a build does not stop the worker thread. What the
+    thread builds is closed rather than dropped, as a connector built in place and then cancelled
+    is (``_ensure_destination_built``)."""
+    from messagefoundry.pipeline import wiring_runner
+
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    _LoopWatch(monkeypatch, seconds=0.3)
+    closed = asyncio.Event()
+
+    async def close(_self: object) -> None:
+        closed.set()
+
+    monkeypatch.setattr(database.DatabaseDestination, "aclose", close)
+    task = asyncio.create_task(
+        wiring_runner._build_off_loop(None, lambda: _db_connector("outbound", folder))
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not closed.is_set()
+    await asyncio.wait_for(closed.wait(), timeout=5)

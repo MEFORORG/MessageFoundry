@@ -1417,6 +1417,42 @@ class Engine:
             held += (await self.store.pending_depth(name))[0]
         return held
 
+    def _check_runner(self, registry: Registry) -> RegistryRunner:
+        """A throwaway runner for a build check of ``registry``, carrying the same bind host,
+        egress, posture and env values a real reload would, and never installed or started: a dry
+        run checks with it when no runner is live, and the first load checks with it before
+        :meth:`add_registry` installs the runner it starts."""
+        return RegistryRunner(
+            registry,
+            self.store,
+            poll_interval=self._poll_interval,
+            fifo_claim_batch=self._fifo_claim_batch,
+            inbound_bind_host=self._inbound_bind_host,
+            reserved_bindings=self._reserved_bindings,
+            # build_check now runs the inbound exposure gates (vault BACKLOG #2622 item 1), so
+            # the throwaway checker needs the engine's escape or a dry run refuses what a real
+            # reload accepts.
+            allow_insecure_bind=self._allow_insecure_bind,
+            delivery_defaults=self._delivery_defaults,
+            ordering_default=self._ordering_default,
+            internal_error_default=self._internal_error_default,
+            buildup_default=self._buildup_default,
+            stall_default=self._stall_default,
+            saturation_default=self._saturation_default,
+            ack_after_default=self._ack_after_default,
+            stream_inflight_budget_bytes=self._stream_inflight_budget_bytes,
+            priority_default=self._priority_default,
+            dr_threshold=self._dr_run_threshold(),
+            dr_standby=self._dr_standby_threshold(),
+            alert_sink=self._alert_sink,
+            egress=self._egress_settings,
+            hop_posture=self._hop_posture,
+            trust_anchor_policy=self._trust_anchor_policy,
+            simulate_all=self._shadow_settings.simulate_all_egress,
+            env_values=self._env_values,
+            coordinator=self._coordinator,
+        )
+
     def add_registry(self, registry: Registry) -> RegistryRunner:
         """Run a code-first Connection/Router/Handler graph (one runner for the whole graph)."""
         # ADR 0087 (#197): render [sandbox] into the runner's policy + the (config_dir, env) source a
@@ -3392,46 +3428,21 @@ class Engine:
             # resolves env() refs against this instance's values and raises on a missing key or bad
             # spec), then discard. Reuse the live runner if present; else a throwaway one carrying the
             # same bind host + env values, so the check sees exactly what a real reload would.
-            checker = runner or RegistryRunner(
-                registry,
-                self.store,
-                poll_interval=self._poll_interval,
-                fifo_claim_batch=self._fifo_claim_batch,
-                inbound_bind_host=self._inbound_bind_host,
-                reserved_bindings=self._reserved_bindings,
-                # build_check now runs the inbound exposure gates (vault BACKLOG #2622 item 1), so
-                # the throwaway checker needs the engine's escape or a dry run refuses what a real
-                # reload accepts.
-                allow_insecure_bind=self._allow_insecure_bind,
-                delivery_defaults=self._delivery_defaults,
-                ordering_default=self._ordering_default,
-                internal_error_default=self._internal_error_default,
-                buildup_default=self._buildup_default,
-                stall_default=self._stall_default,
-                saturation_default=self._saturation_default,
-                ack_after_default=self._ack_after_default,
-                stream_inflight_budget_bytes=self._stream_inflight_budget_bytes,
-                priority_default=self._priority_default,
-                dr_threshold=self._dr_run_threshold(),
-                dr_standby=self._dr_standby_threshold(),
-                alert_sink=self._alert_sink,
-                egress=self._egress_settings,
-                hop_posture=self._hop_posture,
-                trust_anchor_policy=self._trust_anchor_policy,
-                simulate_all=self._shadow_settings.simulate_all_egress,
-                env_values=self._env_values,
-                coordinator=self._coordinator,
-            )
+            checker = runner or self._check_runner(registry)
             # The values it re-read are checked, never applied: a dry run changes nothing live.
             await checker.build_check_off_loop(registry, env_values)
             return ReloadOutcome(registry=registry, applied=False, directory=path)
         # Every check has passed, so the values go live with the graph, and a refused swap keeps
         # the old values with the old graph (vault BACKLOG #2596).
         if runner is None:
+            # Bad connector -> WiringError (422), before any start. The check awaits a worker
+            # thread, so it runs on a runner that is not installed yet: installed first, a
+            # concurrent reload could take it, unstarted, as the live runner in that window. Nothing
+            # yields between add_registry below and the start taking the runner's reload lock.
+            await self._check_runner(registry).build_check_off_loop(registry, env_values)
             previous_env_values, self._env_values = self._env_values, env_values
             try:
                 runner = self.add_registry(registry)
-                await runner.build_check_off_loop(registry)  # bad connector → WiringError (422)
                 # That check warned for this graph, so this start does not (vault BACKLOG #2910).
                 await runner.start(warn_query_credentials=False)
             except Exception:

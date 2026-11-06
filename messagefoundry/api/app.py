@@ -4185,10 +4185,9 @@ async def _run_connection_test(rr: RegistryRunner, name: str, direction: str) ->
         # vault BACKLOG #2371: the dialling CA first, as a lane build checks it.
         await rr.check_test_anchor(name)
         checked = True
-        # Off the event loop: a build can list folders and read files, such as a DATABASE
-        # connector's sslcapath entries (engine PR 2815, hold F2). The method only reads the
-        # runner, and it normalises a build failure to WiringError there as here.
-        _direction, connector = await asyncio.to_thread(rr.build_test_connector, name)
+        # The build runs off the event loop: it can list folders and read files, such as a
+        # DATABASE connector's sslcapath entries (engine PR 2815, hold F2).
+        _direction, connector = await rr.build_test_connector_off_loop(name)
     except WiringError as exc:
         # This catch is EXHAUSTIVE only because build_test_connector normalizes every build failure to
         # WiringError; it did not always, and the escape cost more than a 500. The credential route's
