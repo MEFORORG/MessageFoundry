@@ -9,7 +9,7 @@ server thread, so each claim is a handshake rather than an attribute read:
 * the anchored CA verifies, a foreign CA is refused, and ldap3's own host name check still runs
   after the handshake (and still does not run with verification off, as in ldap3);
 * a host name refusal closes the TLS socket it wrapped, where ldap3's own ``Tls``, the control,
-  leaves it to the collector (BACKLOG #3017);
+  leaves it open while the refusal's traceback is held (BACKLOG #3017);
 * the copy of ldap3's wrap step is pinned to the ldap3 source it was taken from;
 * on an interpreter with ``SSLContext.set_ciphersuites`` (CPython 3.15) the hop refuses a TLS 1.3
   peer offering only ``TLS_AES_128_GCM_SHA256``, while ldap3's own ``Tls`` accepts it as the
@@ -239,8 +239,8 @@ def _dc_sees_the_end_of_a_host_name_refusal(tls: Any, pki: _Pki, wait: float) ->
 def test_a_host_name_refusal_closes_the_tls_socket_it_wrapped(pki: _Pki) -> None:
     """A real host name mismatch after a completed handshake: the engine's ``Tls`` closes the TLS
     socket it wrapped, so the domain controller sees the end while the refusal is still held.
-    ldap3's own ``Tls`` is the control: it leaves that socket to the collector, so the same
-    instrument sees no end. The rule this pins is stated once, in
+    ldap3's own ``Tls`` is the control: it leaves that socket open while the refusal is held, so
+    the same instrument sees no end. The rule this pins is stated once, in
     :func:`messagefoundry.auth.ldap._close_without_sending` (BACKLOG #3017)."""
     ca = Path(pki.ca).read_text()
     control = ldap3.Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=ca)

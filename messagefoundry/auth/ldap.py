@@ -1153,7 +1153,7 @@ def _close_without_sending(conn: Any, why: str) -> None:
       ``settimeout`` or ``setsockopt`` could not set.
     * Once ``ssl`` has taken it over, ``conn.socket`` holds only the detached socket. A failed
       handshake is closed by ``ssl`` itself. A host name refusal after a completed handshake is
-      closed by ``NarrowedTls.wrap_socket`` before it re-raises, for every LDAPS or StartTLS bind.
+      closed by ``NarrowedTls.wrap_socket`` before it re-raises, for every LDAPS bind.
       Through ldap3's ``open`` that socket was already freed promptly, because ``open`` re-raises a
       copy of the error without its traceback; the close removes the reliance on that."""
     import ldap3
