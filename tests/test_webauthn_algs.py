@@ -34,6 +34,8 @@ from fractions import Fraction
 
 import pytest
 
+from tests._log_absence import assert_capture_sees
+
 pytest.importorskip("webauthn")
 
 from cryptography.hazmat.primitives import hashes  # noqa: E402
@@ -393,6 +395,7 @@ def test_es256_on_a_curve_other_than_p256_is_refused_at_registration(
     ):
         wa.verify_registration(response_json=response, challenge=challenge, rp_id=RP, origin=ORIGIN)
     assert "-7" in str(caught.value)
+    assert_capture_sees(caplog, logger)
     assert not [r for r in caplog.records if r.name == logger]
 
 
@@ -486,6 +489,7 @@ def test_a_raw_library_failure_is_logged_by_type_and_a_library_refusal_is_not(
 
     with caplog.at_level(logging.WARNING, logger=logger):
         assert_with(soft.cose_public_key(crv=99))  # UnsupportedEC2Curve: the library's own
+    assert_capture_sees(caplog, logger)
     assert not [r for r in caplog.records if r.name == logger]
 
     caplog.clear()
@@ -603,6 +607,7 @@ def test_a_stand_in_for_a_cose_integer_is_refused_at_registration(
             origin=ORIGIN,
         )
     assert str(caught.value).startswith(refusal)
+    assert_capture_sees(caplog, logger)
     assert not [r for r in caplog.records if r.name == logger]
 
 
@@ -694,6 +699,7 @@ def _refused_at_sign_in(
         pytest.raises(wa.WebAuthnVerificationError) as caught,
     ):
         _signs_in(respond, stored)
+    assert_capture_sees(caplog, logger)
     assert not [r for r in caplog.records if r.name == logger]
     return caught.value
 

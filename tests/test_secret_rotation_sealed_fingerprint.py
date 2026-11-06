@@ -46,6 +46,7 @@ from messagefoundry.store.crypto import (
 )
 from messagefoundry.store.crypto_transit import TransitCipher
 from messagefoundry.store.store import MessageStore
+from tests._log_absence import assert_capture_sees
 
 _AD = "MEFOR_AUTH_AD_BIND_PASSWORD"
 _SMTP = "MEFOR_ALERTS_EMAIL_PASSWORD"
@@ -152,6 +153,7 @@ async def test_a_store_key_rotation_keeps_every_clock(
     assert stamps[_AD].last_rotated == _OLD
     assert stamps[_AD].tracked_since == _OLD
     assert stored == after, "an unchanged secret must not be rewritten"
+    assert_capture_sees(caplog, _LOGGER)
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 

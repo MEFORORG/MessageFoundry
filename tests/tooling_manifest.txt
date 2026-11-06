@@ -146,6 +146,7 @@ tests/test_dependabot_automerge_guardrails.py
 tests/test_dependabot_cap_ignores.py
 tests/test_docs_runbooks.py
 tests/test_appcontainer_spike_judge.py
+tests/test_dpapi_reboot_spike_judge.py
 tests/test_dpapi_spike_judge.py
 tests/test_failure_signal.py
 tests/test_feature_map_claims.py
@@ -201,7 +202,6 @@ tests/test_security_txt_expiry_reminder.py
 tests/test_selfheal_installed_parity.py
 tests/test_selfhosted_sql_runner_isolation.py
 tests/test_semgrep_install_retry.py
-tests/test_serverdb_ci_coverage.py
 tests/test_session_context_presence.py
 tests/test_session_mail_held.py
 tests/test_session_mail.py
@@ -226,6 +226,7 @@ tests/test_workflow_local_action_check.py
 tests/test_workflow_pipefail_screen.py
 tests/test_workflow_shell_syntax.py
 tests/test_worktree_ensure_venv.py
+tests/test_worktree_finished_claude_removal.py
 tests/test_worktree_gate_command_parsing.py
 tests/test_worktree_gate_control_plane.py
 tests/test_worktree_gate_default_reposfile.py

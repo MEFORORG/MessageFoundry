@@ -1990,8 +1990,9 @@ def _posture_loosenings(
     ``graph`` is passed. The start passes the graph its snapshot took, so a reload that swaps the
     graph before its row is written cannot change what the row says the start loaded (vault BACKLOG
     #3076). ``graph_env_values`` are the ``env()`` values that graph resolves against, taken with it,
-    so a DATABASE hop's ``env()`` dialect reads as the route reads it off the runner; with none it
-    reads as unresolved. The settings-scoped entries are the same for either graph: a reload
+    so a DATABASE hop's ``env()`` dialect and an ``env()`` endpoint ``url`` read as the route reads
+    them off the runner. With none, the dialect reads as unresolved and the ``url`` as its literal
+    default. The settings-scoped entries are the same for either graph: a reload
     changes no settings."""
     store = getattr(state, "store_settings", None) or StoreSettings()
     cred_settings = getattr(state, "static_credential_settings", None)
@@ -2051,7 +2052,6 @@ def _posture_loosenings(
     cleartext_hops = hops(accepted_cleartext_hops)
     expired_hops = hops(expiry_relaxed_hops)
     hostname_hops = hops(hostname_unchecked_hops)
-    query_hops = hops(query_credential_hops)
     # A DATABASE dialect given as env() is resolved against the values the graph builds with, so a
     # hop is listed as generic only when it resolves to generic. One the values cannot resolve keeps
     # the reader's marker beside its name, because this entry keeps names only and its text states
@@ -2062,6 +2062,9 @@ def _posture_loosenings(
         if graph is not None
         else (runner.env_values if runner is not None else None)
     )
+    # An env() url is read against the same values, so the entry names the URL the build dials
+    # (vault BACKLOG #3766 items 14 and 15).
+    query_hops = hops(partial(query_credential_hops, env_values=db_env_values))
     db_hops = (
         []
         if registry is None
@@ -10332,8 +10335,10 @@ def create_app(
         code.
 
         **Which refusals get their own audit row.** Only the ones this body reaches. ``require_step_up``
-        already records the permission / step-up / MFA 403s as ``auth.permission_denied`` and the body
-        never runs on those, so a second denied row there would double-count. The ``409`` needs none
+        records at least the permission 403 as ``auth.permission_denied``, the MFA 403 as
+        ``auth.mfa_denied``, and the step-up 403 and the pacing 429 as ``auth.gate_refused``
+        (BACKLOG #1197). The body never runs on any gate refusal, so a second denied row there
+        would double-count, and the gate refusals that write no row stay the gate's to record. The ``409`` needs none
         either — the ``cluster_stepdown`` row written from the coordinator's return already reads
         ``was_leader: false, lease_released: false``, which IS the refusal. That leaves the
         not-clustered ``400``, the no-sibling ``412`` and the three ``503``s, which nothing else would

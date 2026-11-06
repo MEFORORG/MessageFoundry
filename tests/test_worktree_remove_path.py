@@ -69,10 +69,12 @@ def _git(cwd: Path, *args: str) -> str:
     return proc.stdout
 
 
-#: remove.ps1 and the three scripts it dot-sources. A test that runs a COPY of the script needs all
-#: four: without coord-root.ps1 it refuses. One list, shared with tests/test_worktree_gate_removal_route.py.
+#: remove.ps1 and the four scripts it dot-sources. A test that runs a COPY of the script needs all
+#: five: without coord-root.ps1 it refuses, and without worktree-gates.ps1 it cannot load its readers.
+#: One list, shared with tests/test_worktree_gate_removal_route.py.
 REAL_SCRIPTS = (
     "scripts/worktree/remove.ps1",
+    "scripts/worktree/worktree-gates.ps1",
     "scripts/coord/occupancy.ps1",
     "scripts/coord/session-registry.ps1",
     "scripts/coord/coord-root.ps1",

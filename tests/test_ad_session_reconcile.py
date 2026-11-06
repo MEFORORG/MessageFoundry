@@ -73,6 +73,7 @@ from messagefoundry.store.store import (
     audit_row_hash,
 )
 from tests._admin_account import create_local_user_chosen
+from tests._log_absence import assert_capture_sees
 from tests.test_ad_user_account_control import _InverseSink
 from tests.test_approval_requester_recheck import _Sink
 from tests.test_user_seal import _raw_for
@@ -3935,6 +3936,7 @@ async def test_a_stale_plan_is_skipped_not_filed_as_a_conflict_when_another_row_
         assert after is not None and after.username == "jdoe-remarried"
         assert not await _rename_audits(store), "a stale plan was audited"
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert_capture_sees(caplog, "messagefoundry.auth.service")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
             "a stale plan warned of a lockout"
         )
@@ -4100,6 +4102,7 @@ async def test_a_stale_held_row_is_not_a_conflict_when_this_row_already_has_the_
             if a["action"] == "auth.ad_username_refresh_conflict"
         ], "a stale held row filed a conflict for a rename already in place"
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert_capture_sees(caplog, "messagefoundry.auth.service")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     finally:
         await store.close()
@@ -4139,6 +4142,7 @@ async def test_a_stale_held_row_that_let_the_name_go_files_no_conflict(
         assert [a["action"] for a in await _rename_audits(store)] == [
             "auth.ad_username_refreshed"
         ], "a stale held row filed a conflict for a name nobody holds"
+        assert_capture_sees(caplog, "messagefoundry.auth.service")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
             "a stale held row warned of a lockout nobody faces"
         )
@@ -4231,6 +4235,7 @@ async def test_a_pass_whose_holder_read_went_stale_writes_the_rename(
         assert [a["action"] for a in await _rename_audits(store)] == [
             "auth.ad_username_refreshed"
         ], "a stale held read in the pass filed a conflict"
+        assert_capture_sees(caplog, "messagefoundry.auth.service")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
             "a stale held read in the pass warned"
         )
@@ -4270,6 +4275,7 @@ async def test_a_stale_held_row_is_no_conflict_when_this_row_took_the_name_since
         assert after is not None and after.username == "jdoe-married"
         assert not await _rename_audits(store), "this row filed a conflict against itself"
         assert not [e for e in notifier.sent if e.event_type == USERNAME_CHANGED]
+        assert_capture_sees(caplog, "messagefoundry.auth.service")
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert any("BACKLOG #2290" in r.getMessage() for r in caplog.records)
     finally:
