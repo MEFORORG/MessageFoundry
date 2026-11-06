@@ -284,8 +284,9 @@ class TransitCipher(_UnmarkedPolicy):
     @property
     def seal_key_name(self) -> str:
         """The Transit key row seals are made under: the audit key, which is the data key when no
-        audit key is set. The seal input carries its own label, so a seal never reads as an audit
-        row's MAC."""
+        audit key is set. Transit receives only a 32-byte digest per seal, so a seal stays apart from
+        the key's other MACs only while no other caller MACs a bare 32-byte value under it; the
+        seal's label sits inside the digest's preimage and plays no part in that (ADR 0217)."""
         return self._audit_key
 
     @property

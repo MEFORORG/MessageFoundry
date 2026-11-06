@@ -33,6 +33,7 @@ from messagefoundry.store.row_seal import (
     TransitSealRefused,
     TransitSealUnavailableError,
     TransitSealUnverifiableError,
+    require_seal_for_write,
     transit_mac_version,
     transit_seal_key_id,
 )
@@ -65,6 +66,7 @@ class FakeBackend:
         self.probe_calls = 0
         self.inputs: list[bytes] = []
         self.threads: set[int] = set()
+        self.thread_names: set[str] = set()
 
     @property
     def seal_key_name(self) -> str:
@@ -81,6 +83,7 @@ class FakeBackend:
 
     def seal_hmac(self, digest: bytes) -> str:
         self.threads.add(threading.get_ident())
+        self.thread_names.add(threading.current_thread().name)
         self.inputs.append(digest)
         if self.down:
             raise CipherError("synthetic outage")
@@ -90,6 +93,7 @@ class FakeBackend:
 
     def verify_seal_hmac(self, key_name: str, digest: bytes, mac: str) -> bool:
         self.threads.add(threading.get_ident())
+        self.thread_names.add(threading.current_thread().name)
         self.inputs.append(digest)
         self.verify_calls += 1
         if mac == self.hold_mac:
@@ -351,14 +355,16 @@ async def test_fresh_skips_the_cache_read() -> None:
     assert backend.verify_calls == 3
 
 
-async def test_any_other_failure_of_a_call_is_an_outage() -> None:
+async def test_a_defect_in_a_call_is_not_reported_as_an_outage() -> None:
+    """Only the backend's CipherError is an Outage; any other exception is a defect and
+    propagates as itself, so a wiring bug never reads as a Vault outage."""
     backend = FakeBackend()
     sealer = _sealer(backend)
     stored = await sealer.seal_async(USER_KIND, FIELDS)
     backend.other_failure = True
-    with pytest.raises(TransitSealUnavailableError):
+    with pytest.raises(RuntimeError):
         await sealer.seal_async(USER_KIND, FIELDS)
-    with pytest.raises(TransitSealUnavailableError):
+    with pytest.raises(RuntimeError):
         await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     backend.other_failure = False
     planted = _with_version(stored, "5")
@@ -368,11 +374,87 @@ async def test_any_other_failure_of_a_call_is_an_outage() -> None:
         raise RuntimeError("synthetic library failure")
 
     backend.seal_probe = failing_probe  # type: ignore[method-assign]
-    with pytest.raises(TransitSealUnavailableError):
+    with pytest.raises(RuntimeError):
         await sealer.verify_held_async(USER_KIND, FIELDS, planted)
     backend.seal_probe = original  # type: ignore[method-assign]
     with pytest.raises(TransitSealUnverifiableError):
         await sealer.verify_held_async(USER_KIND, FIELDS, planted)
+
+
+async def test_a_non_canonical_encoding_is_forged_with_no_transit_call() -> None:
+    backend = FakeBackend()
+    sealer = _sealer(backend)
+    stored = await sealer.seal_async(USER_KIND, FIELDS)
+    head, _, body = stored.rpartition(":")
+    # 32 bytes encode to 43 characters and one pad; the last character carries two spare bits.
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    last = body[-2]
+    variant = body[:-2] + alphabet[alphabet.index(last) ^ 1] + body[-1]
+    assert base64.b64decode(variant, validate=True) == base64.b64decode(body)  # same MAC
+    assert transit_mac_version(stored.split(":", 3)[3]) == 1
+    assert transit_mac_version(f"vault:v1:{variant}") is None
+    calls = backend.verify_calls
+    assert await sealer.verify_held_async(USER_KIND, FIELDS, f"{head}:{variant}") is False
+    assert backend.verify_calls == calls
+
+
+async def test_transit_calls_run_on_their_own_bounded_pool() -> None:
+    backend = FakeBackend()
+    sealer = _sealer(backend)
+    stored = await sealer.seal_async(USER_KIND, FIELDS)
+    assert await sealer.verify_held_async(USER_KIND, FIELDS, stored)
+    assert backend.thread_names
+    assert all(n.startswith("mefor-transit-seal") for n in backend.thread_names)
+    assert row_seal._transit_pool()._max_workers == row_seal.TRANSIT_SEAL_WORKERS
+
+
+async def test_the_start_probe() -> None:
+    backend = FakeBackend()
+    sealer = _sealer(backend)
+    assert await sealer.probe_async() == 1
+    backend.probe_down = True
+    with pytest.raises(TransitSealUnavailableError):
+        await sealer.probe_async()
+
+
+async def test_require_seal_for_write_names_each_cause() -> None:
+    backend = FakeBackend()
+    sealer = _sealer(backend)
+    stored = await sealer.seal_async(USER_KIND, FIELDS)
+    subject = "user:u-1"
+    await require_seal_for_write(sealer, USER_KIND, FIELDS, stored, subject=subject)
+    await require_seal_for_write(None, USER_KIND, FIELDS, "", subject=subject)
+    with pytest.raises(RowSealError) as forged:
+        await require_seal_for_write(
+            sealer, USER_KIND, [*FIELDS, ("x", 1)], stored, subject=subject
+        )
+    assert forged.value.args == (USER_KIND, subject)
+    assert forged.value.__cause__ is None and forged.value.__context__ is None
+    with pytest.raises(RowSealUnverifiableError) as unverifiable:
+        await require_seal_for_write(
+            sealer, USER_KIND, FIELDS, _with_version(stored, "5"), subject=subject
+        )
+    assert unverifiable.value.args == (USER_KIND, subject)
+    assert unverifiable.value.__cause__ is None and unverifiable.value.__context__ is None
+    backend.down = True
+    with pytest.raises(TransitSealUnavailableError):
+        await require_seal_for_write(sealer, USER_KIND, FIELDS, stored, subject=subject)
+    backend.down = False
+    # held=False is the session check: a seal under a retired key does not hold.
+    old = await _sealer(FakeBackend(active=RETIRED)).seal_async(SESSION_KIND, FIELDS)
+    with_retired = _sealer(backend, retired_key_names=[RETIRED])
+    await require_seal_for_write(with_retired, SESSION_KIND, FIELDS, old, subject="s")
+    with pytest.raises(RowSealError):
+        await require_seal_for_write(
+            with_retired, SESSION_KIND, FIELDS, old, subject="s", held=False
+        )
+    # The local sealer serves the same call.
+    local = RowSealer(b"k" * 32)
+    await require_seal_for_write(
+        local, USER_KIND, FIELDS, local.seal(USER_KIND, FIELDS), subject=subject
+    )
+    with pytest.raises(RowSealError):
+        await require_seal_for_write(local, USER_KIND, FIELDS, stored, subject=subject)
 
 
 async def test_re_storing_an_answer_does_not_evict_another(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -421,13 +503,13 @@ async def test_each_outage_cause_is_logged(caplog: pytest.LogCaptureFixture) -> 
         with pytest.raises(TransitSealUnavailableError):
             await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     backend.down = False
-    backend.other_failure = True
+    backend.forbid = {ACTIVE}
     with pytest.raises(TransitSealUnavailableError):
         await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     lines = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert len(lines) == 2  # one per cause: the repeat inside the window is throttled
-    assert "synthetic outage" in lines[0] and "RuntimeError" in lines[1]
-    assert all("library failure" not in line and TOKEN_HASH not in line for line in lines)
+    assert "synthetic outage" in lines[0] and "HTTP 403" in lines[1]
+    assert all(TOKEN_HASH not in line for line in lines)
 
 
 async def test_transit_receives_a_fixed_length_digest_and_runs_off_the_event_loop() -> None:
