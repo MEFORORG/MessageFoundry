@@ -275,8 +275,10 @@ async def test_salvage_swallows_a_release_failure() -> None:
 #: finishes in 4: the task's first step, the borrow task, the shield's callback, and the wake of
 #: the waiting task.
 #: A path that waits on a timer cannot finish inside them while they take microseconds, as they do
-#: idle. Under contention they can span milliseconds, and a timer shorter than that can come due
-#: within them, so a sub-millisecond wait may pass here on a loaded runner.
+#: idle: 20 turns read 37 to 69 us on 2026-11-06 on Windows. Under contention they can span far
+#: longer: beside a GIL-holding thread at ``sys.setswitchinterval(0.1)`` the same 20 turns read
+#: 0.435 to 0.869 s, and a timer shorter than that span can come due within them. So on a loaded
+#: runner this catches only a wait longer than the turns took, not every wait.
 _HEALTHY_BORROW_TURNS = 20
 
 
@@ -292,18 +294,22 @@ class _SlowReadyPool(_ReadyPool):
 async def _borrow_within_turns(pool: Any) -> asyncio.Task[Any] | None:
     """The borrow, if it finished within ``_HEALTHY_BORROW_TURNS`` loop turns at the shipped timeout;
     otherwise ``None``, with the borrow cancelled and waited for. ``asyncio.wait`` rather than an
-    await, so a cancellation aimed at the test itself still propagates."""
+    await, so a cancellation aimed at the test itself still propagates; the ``finally`` cancels the
+    borrow on that path too, so no borrow outlives the test."""
     borrow = asyncio.create_task(
         acquire_pooled(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT, backend="sqlserver")
     )
-    for _ in range(_HEALTHY_BORROW_TURNS):
+    try:
+        for _ in range(_HEALTHY_BORROW_TURNS):
+            if borrow.done():
+                return borrow
+            await asyncio.sleep(0)
         if borrow.done():
             return borrow
-        await asyncio.sleep(0)
-    if borrow.done():
-        return borrow
-    borrow.cancel()
-    await asyncio.wait({borrow})
+    finally:
+        if not borrow.done():
+            borrow.cancel()
+            await asyncio.wait({borrow})
     return None
 
 
@@ -321,8 +327,11 @@ async def test_a_healthy_borrow_is_unaffected() -> None:
     within a few turns, unreleased, which a path that waits out a timer cannot do. The control
     arm shows that on this loop: a borrow behind an hour-long timer is still waiting after the same
     turns."""
-    assert await _borrow_within_turns(_SlowReadyPool()) is None, (
-        "a borrow behind an hour-long timer finished inside the turn budget -- it no longer discriminates"
+    control = await _borrow_within_turns(_SlowReadyPool())
+    assert control is None, (
+        "a borrow behind an hour-long timer finished inside the turn budget, with "
+        f"{control.exception()!r} -- either it no longer discriminates or the helper ended the "
+        "borrow early"
     )
     pool = _ReadyPool()
     borrow = await _borrow_within_turns(pool)
@@ -330,6 +339,7 @@ async def test_a_healthy_borrow_is_unaffected() -> None:
         f"a borrow from a ready pool was still waiting after {_HEALTHY_BORROW_TURNS} turns"
     )
     assert borrow.result() is pool.conn
+    await _settle()  # a release the helper scheduled on its success path would run here
     assert pool.released == []  # the CALLER releases, not the helper
 
 
