@@ -7137,11 +7137,11 @@ def _lookup_sid_type(sid: str) -> tuple[int | None, int]:
 
     A domain account's SID resolves through a domain controller, or through the LSA's lookup cache
     when none answers. On every failure the directory is refused as not hardened, and each store
-    file takes the owner-only fallback, :func:`_secure_file` (decision
-    d20261106T140017335-d24848). Why ERROR_NONE_MAPPED (1332) does not prove the SID names no
-    account, and what that fallback leaves on each file, are stated once, in ADR 0163,
-    *Note (2026-11-05)*, *Left open*. Nothing is logged here: the status goes into the refusal,
-    which the caller logs once, beside the directory it refused."""
+    file takes the fallback restricted by :func:`_secure_file` (see ADR 0163,
+    *Note (2026-11-05)*; decision d20261106T140017335-d24848). Why ERROR_NONE_MAPPED (1332) does
+    not prove the SID names no account, and what that fallback leaves on each file, are stated
+    once, in ADR 0163, *Note (2026-11-05)*, *Left open*. Nothing is logged here: the status goes
+    into the refusal, which the caller logs once, beside the directory it refused."""
     if sys.platform != "win32":
         return None, 0
     import ctypes
