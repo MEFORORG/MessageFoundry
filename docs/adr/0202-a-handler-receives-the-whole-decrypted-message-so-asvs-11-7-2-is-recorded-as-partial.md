@@ -25,8 +25,10 @@
   - Decision item 5 now says the cache keys stay plaintext. It said nothing about them.
   - Option 4 and *Negative / risks* said *"engine memory"*. Each now names the per-inbound worker
     process under `[sandbox].mode = "subprocess"` too, as *What a Handler receives* already did.
-  - *What a Handler receives* named only *"`[security].allow_unencrypted_phi`"* as the keyless
-    opt-out. It now names `[security].encrypt_stored_data = false` beside it, since either sets it.
+  - *What a Handler receives* ended *"`[security].allow_unencrypted_phi` is the audited keyless
+    opt-out (a second flag under strict enforcement)."* `[security].encrypt_stored_data = false`
+    sets the same opt-out, so it now points to `docs/PHI.md` §3, which names both.
+  - The line above the decision list now says when item 5's key sentence was read.
 - **Related:** BACKLOG #1174 (ASVS 11.7.2), #1185 (ASVS 14.2.2) · [ADR 0005](0005-transform-accessible-state.md) ·
   [ADR 0105](0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md) · CLAUDE.md §1, §2, §9 · [`docs/PHI.md`](../PHI.md) §3
 
@@ -72,15 +74,14 @@ off-by-default detach described below. A Router receives the whole message too: 
 memory, as immutable Python strings and in every copy the Router's or Handler's own code makes, for
 as long as that code and the garbage collector keep it. That memory is the engine process's, and
 also the per-inbound worker process's under `[sandbox].mode = "subprocess"`. By default, the persisted copy is
-re-encrypted by the store cipher on every write (`store/crypto.py`). The audited keyless opt-out is
-`[security].allow_unencrypted_phi = true` or `[security].encrypt_stored_data = false`, with a second
-flag under strict enforcement.
+re-encrypted by the store cipher on every write (`store/crypto.py`). `docs/PHI.md` §3, under
+*Fail-closed*, names the audited keyless opt-out and the second flag strict enforcement adds.
 
 ### Where minimization is enforced
 
 Each of these was read against the tree on 2026-09-29, at engine `origin/main` `8d389ad7b`. Item 5's
-cache sentences and item 2's property list were re-read on 2026-10-10 at `1d55295f66`; see
-*Correction* above. The list is
+cache sentences and item 2's property list were re-read on 2026-10-10 at `1d55295f66`, and item 5's
+key sentence was read on 2026-11-06 at `a1a686e0a1`; see the corrections above. The list is
 at least these; it is not complete.
 
 1. **The strict object model is built only on request.** Ingress reads the control id, message
@@ -173,6 +174,8 @@ surfaces this ADR relies on. Each links to an existing test that already guards 
    is the verb's subject.
    > **Superseded text, kept as a record (corrected 2026-10-10).** The parenthesis ended *"the
    > per-read decrypt of the caches that #1174 part C proposes"*.
+   > **Superseded text, kept as a record (corrected 2026-11-06).** The rejection read *"none of
+   > them is the clinical body in engine memory, which is the verb's subject."*
 
 ## Consequences
 
@@ -185,6 +188,11 @@ per-inbound worker process's under `[sandbox].mode = "subprocess"`. Reading it n
 process's memory: a core dump, a debugger, unencrypted swap, or a local administrator. That
 exposure is the in-use residual `docs/PHI.md` §3 describes, which §10 carries as a stated
 deployment requirement.
+
+> **Superseded text, kept as a record (corrected 2026-11-06).** The first two sentences read: *"On
+> a first deployment, the decrypted body of every message a Handler processes would live in engine
+> memory until garbage collection. Reading it needs access to the engine process's memory: a core
+> dump, a debugger, unencrypted swap, or a local administrator."*
 
 **Out of scope** — The ASVS record's own wording (the ASVS cell for 11.7.2, a record act); the
 in-process caches (BACKLOG #1185, and #1174 part C, which seals them on `main`); host-level

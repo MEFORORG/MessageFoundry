@@ -1212,14 +1212,13 @@ route and transform it (BACKLOG #1174).
 - **Re-encryption happens on write.** With a key set, the store cipher re-encrypts each column it
   covers the moment it is written back ([store/crypto.py](../messagefoundry/store/crypto.py)). So
   those columns do not linger in plaintext at rest, and the staged queue carries the message forward
-  rather than holding it open. That is not every column that can hold PHI: at least `state.key` and
-  `reference.key` stay plaintext by construction, and
-  [section 2](#2-where-phi-lives--data-at-rest-inventory) says when they would carry an identifier.
-  The audited keyless opt-out is
-  `[security].allow_unencrypted_phi = true` or `[security].encrypt_stored_data = false`, either of
-  which sets it; [section 3](#3-encryption-at-rest) gives the rest of the rule. The decrypted body in
-  process memory is never re-encrypted. It lives at least in the engine's heap, and also in a
-  per-inbound worker's under `[sandbox].mode = "subprocess"`. It stays there as immutable Python
+  rather than holding it open. That is not every column that can hold PHI: at least the state and
+  reference key columns stay plaintext, which the sealed-cache bullet below and
+  [section 2](#2-where-phi-lives--data-at-rest-inventory) cover. The audited keyless opt-out is
+  under *Fail-closed* in [section 3](#3-encryption-at-rest). The
+  decrypted body in process memory is never re-encrypted. It lives in the engine's heap, and also in
+  a per-inbound worker's under `[sandbox].mode = "subprocess"`. Those are at least the processes
+  that hold it. It stays there as immutable Python
   strings, and so does every copy the Router's or Handler's own code makes. It is gone only when that
   code and the garbage collector let it go
   ([ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)).
