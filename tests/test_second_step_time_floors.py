@@ -606,14 +606,14 @@ def _is_floor_guard(stmt: ast.stmt) -> bool:
     )
 
 
-def _unfloored_legs(source: str) -> tuple[set[str], list[str]]:
+def _unfloored_legs(tree: ast.Module) -> tuple[set[str], list[str]]:
     """``(every function that stamps directly, those with no floor guard ahead of the stamp)``.
 
     The guard must be a statement of the function's OWN body, not one nested in a branch, a loop,
     a ``try`` or an inner function, and it must come before the function's first stamp in source
     order, so it runs on every path that reaches a stamp. Direct stamps only: a stamp through a
-    helper is not followed, because the mint is such a helper and every sign-in calls it."""
-    tree = parse_source(source)
+    helper is not followed, because the mint is such a helper and every sign-in calls it. Nor is
+    what the guard's body returns read, so a body that returns into a stamping helper passes."""
     first_stamp = {
         node.name: min(call.lineno for call in sites)
         for node in ast.walk(tree)
@@ -638,7 +638,7 @@ def test_every_leg_that_stamps_a_sessions_factor_asks_the_floor_first() -> None:
     must be floored, so it cannot complete the login-to-MFA pair faster than a person can.
     ``tests/test_auth_session_lifecycle.py`` follows stamps through helpers for its own question,
     which ceremonies stamp."""
-    stamping, unfloored = _unfloored_legs(_service_source())
+    stamping, unfloored = _unfloored_legs(parse_source(_service_source()))
     assert stamping >= _STAMPS_AT_MINT, "the mint no longer stamps; drop its exemption"
     # Positive control: the four factor legs the floor was built for are found, so an empty walk
     # cannot pass.
@@ -670,7 +670,8 @@ def test_the_stamping_guard_reds_on_a_floor_that_does_not_guard(mutation: str) -
     broken = (
         source[:guard] + mutation + source[guard + len("if await self._second_factor_too_early(") :]
     )
-    assert _unfloored_legs(broken)[1] == ["finish_webauthn_assertion"]
+    # A plain parse: the shared cache is for real sources, and a mutant would only evict them.
+    assert _unfloored_legs(ast.parse(broken))[1] == ["finish_webauthn_assertion"]
 
 
 def test_both_floor_helpers_read_one_predicate() -> None:
@@ -698,8 +699,9 @@ async def test_the_floor_predicate() -> None:
             (0.0, None, 0.0, False),  # floor off
         ]:
             service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=floor))
-            session = SimpleNamespace(created_at=100.0, mfa_verified_at=verified_at)
-            got = service._mfa_floor_holds(session, 100.0 + elapsed)  # type: ignore[arg-type]
+            # A mint at 0.0, so `now - created_at` is `elapsed` exactly, whatever the floor.
+            session = SimpleNamespace(created_at=0.0, mfa_verified_at=verified_at)
+            got = service._mfa_floor_holds(session, elapsed)  # type: ignore[arg-type]
             assert got is held, (floor, verified_at, elapsed)
     finally:
         await store.close()
@@ -854,10 +856,11 @@ async def test_a_step_up_callback_just_inside_the_floor_is_refused_and_just_past
 async def test_the_step_up_callbacks_own_store_reads_do_not_count_as_the_persons_time(
     rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED when: ``complete_oidc_step_up`` reads the callback's age after the store reads that name
-    the refusal's account (vault BACKLOG #3221 item K5). The callback arrives inside the floor and
-    each session read then takes longer than the floor. The age is read as the flow is redeemed,
-    so a slow store cannot carry a too-early callback past the floor."""
+    """RED when: the step-up callback's age counts the store reads made after its flow is consumed
+    (vault BACKLOG #3221 item K5), as it did while the age ran to the moment it was read, below
+    ``_step_up_actor``'s reads. The callback arrives inside the floor and each session read then
+    takes longer than the floor. The flow cache stamps the consume and the age ends there, so a
+    slow store cannot carry a too-early callback past the floor."""
     store = await MessageStore.open(":memory:")
     try:
         service, clock = await _floored_federated_service(store, rsa_key, monkeypatch)

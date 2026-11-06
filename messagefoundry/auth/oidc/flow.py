@@ -151,9 +151,10 @@ class PendingFlow:
     #: Declared last so the positional order of the fields above did not move.
     step_up_user_id: str | None = None
     #: Stamped by :meth:`FlowCache.pop_if_state_matches` on the cache's clock when it consumes the
-    #: flow, so :meth:`FlowCache.age` ends at the callback's arrival, wherever in the callback leg it
-    #: is read: no store read or exchange after the consume counts as the person's time (BACKLOG
-    #: #3221). ``None`` on a flow not consumed, which :meth:`FlowCache.age` reads up to now.
+    #: flow, so :meth:`FlowCache.age` ends at the consume, wherever in the callback leg it is read:
+    #: no store read or exchange after the consume counts as the person's time, though the route's
+    #: work before it still does (BACKLOG #3221). ``None`` on a flow not consumed, which
+    #: :meth:`FlowCache.age` reads up to now.
     redeemed: float | None = None
 
     def __post_init__(self) -> None:

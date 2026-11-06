@@ -6591,8 +6591,8 @@ class AuthService:
 
         Checks, in order, each failing CLOSED with nothing elevated: the flow exists and ``state``
         matches; it is a step-up flow; the callback is not too soon after the flow started (BACKLOG
-        #2301), its age read as the flow is redeemed so no store read counts as the person's time
-        (BACKLOG #3221), a check that moves after the exchange when
+        #2301), its age measured to the flow's consume so no later store read counts as the
+        person's time (BACKLOG #3221), a check that moves after the exchange when
         ``oidc_callback_floor_exempt_amr`` is set, because only the exchange yields the ``amr`` it
         exempts by (BACKLOG #2388), so a too-early
         callback whose exchange fails is then refused with that failure's reason, not ``too_early``,
@@ -6629,10 +6629,6 @@ class AuthService:
         flow = await self._redeem_step_up_flow(flow_id, state, client=client)
         if isinstance(flow, OidcStepUp):
             return flow
-        # BACKLOG #2301, #3221: the age ends at the consume, which the flow cache stamps, and it is
-        # read here too, before the actor lookup's store reads, so store latency never counts as
-        # the person's time. The refusal itself comes further down.
-        arrived_too_early = self._oidc_callback_too_early(flow)
         return_to = flow.return_to
         actor = await self._step_up_actor(flow)
         token_hash = flow.step_up_session_hash
@@ -6645,10 +6641,13 @@ class AuthService:
         )
         # BACKLOG #2301 (ASVS 2.4.2): max_age=0 and prompt=login make the person authenticate at the
         # IdP, so a step-up callback faster than a person can do that is refused. Before the code is
-        # redeemed, so the refused flow spends nothing at the token endpoint.
+        # redeemed, so the refused flow spends nothing at the token endpoint. The age ends at the
+        # flow's consume, which the flow cache stamps, so the actor lookup's store reads above never
+        # count as the person's time (BACKLOG #3221).
         # BACKLOG #2388: with oidc_callback_floor_exempt_amr set, the exemption needs the verified
         # amr, which only the exchange yields, so an opted-in site pays for the exchange and the
         # refusal waits for it below. With the list empty (the default) nothing changes here.
+        arrived_too_early = self._oidc_callback_too_early(flow)
         exempt_values = (
             self._oidc_callback_floor_exempt_values() if arrived_too_early else frozenset()
         )
@@ -14205,32 +14204,30 @@ class AuthService:
         *,
         event: str,
         client: str | None,
-        phase: str | None = None,
     ) -> bool:
         """Whether a second factor arrived too soon after sign-in, auditing the refusal if so.
 
         The ASVS 2.4.2 floor on the login-then-MFA pair (BACKLOG #2301), measured from the session's
         mint, which is the sign-in. It never applies with the floor at ``0``, or to a session whose
-        factor is already satisfied, so a step-up there is not floored. Those are not the only
-        exemptions: through :meth:`_enrolment_too_early` an enrolment leg also skips it on a session
-        that owes no factor. The caller answers with its leg's ordinary failure, so the refusal says
-        nothing about timing. The caller spends and charges nothing it would have spent past the
-        floor, such as a lockout count, a TOTP step, a recovery code, a passkey challenge, a
-        directory lookup, or on an enrolment leg minted recovery codes or a stored credential. The
-        floor and why it sits where it does: ``[auth].mfa_verify_min_elapsed_seconds``.
+        factor is already satisfied, so a step-up there is not floored. The caller answers with its
+        leg's ordinary failure, so the refusal says nothing about timing. The caller spends and
+        charges nothing it would have spent past the floor, such as a lockout count, a TOTP step, a
+        recovery code, a passkey challenge or a directory lookup. The floor and why it sits where it
+        does: ``[auth].mfa_verify_min_elapsed_seconds``.
 
         Called by :meth:`verify_mfa` and :meth:`finish_webauthn_assertion`, the legs that prove an
         ENROLLED factor. The two enrolment legs, :meth:`confirm_mfa_enrollment` and
         :meth:`finish_webauthn_registration`, which can also satisfy a pending session (BACKLOG
-        #2389), call :meth:`_enrolment_too_early`, which reads the same predicate. A new leg that can satisfy a pending session
-        calls one of the two. ``tests/test_second_step_time_floors.py`` reads this module's syntax
+        #2389), call :meth:`_enrolment_too_early` instead, which reads the same predicate and also
+        skips a session that owes no factor. A new leg that can satisfy a pending session calls
+        one of the two. ``tests/test_second_step_time_floors.py`` reads this module's syntax
         tree and fails on a function here that calls ``mark_session_mfa_verified`` itself without a
         top-level ``if await`` of either, which refuses, ahead of the call. It reads source order,
         not every path, and does not follow a stamp made through a helper, so a new leg is still
         checked by hand."""
         if not self._mfa_floor_holds(session, now):
             return False
-        await self._audit_mfa_too_early(user, event=event, client=client, phase=phase)
+        await self._audit_mfa_too_early(user, event=event, client=client, phase=None)
         return True
 
     async def _enrolment_too_early(
