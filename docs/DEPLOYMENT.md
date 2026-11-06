@@ -868,9 +868,9 @@ loud warning):
   `ad_tls_verify = false` a refusal with no escape. The AI-broker endpoint was on it until vault
   BACKLOG #3533 did the same for its `http` endpoint, since every call sends `[ai].api_key`. The
   webhook alert sink was on it until vault BACKLOG #3533 item 5 did the same for an `http`
-  `[alerts].webhook_url`, since every POST carries the path token the webhook service issues. The
-  escape has no effect on the webhook: an `http` URL refuses the start in every posture when `serve`
-  builds the alert notifier, and no setting turns off the `https` webhook's peer verification.)*
+  `[alerts].webhook_url`, which can carry the hop's credential as a path token. The escape has no
+  effect on the webhook: an `http` URL refuses the start in every posture when `serve` builds the
+  alert notifier, and no setting turns off the `https` webhook's peer verification.)*
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
