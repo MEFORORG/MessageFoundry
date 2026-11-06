@@ -19,21 +19,19 @@ Every list here is "at least", and so is the page. A new connector or command ca
 before this page is edited. The code named in each section is the source of record. Where this page
 and the code disagree, the code is right.
 
-**Some surfaces are not mapped here.** They include at least:
-
-- the Python modules and code sets in a configuration directory, beyond what the
-  `connections.toml` section says;
-- the results of the read-only lookups a Handler may make, `db_lookup` and `fhir_lookup`;
-- the command lines of the separate toolkit, the test harness and the tray manager.
-
 | Surface | Where its structure is defined |
 |---|---|
 | [Inbound listeners and sources](#most-inbound-bodies-pass-the-same-ingress-checks) | This page for the shared checks; [CONNECTIONS.md](CONNECTIONS.md) for each connector |
-| [HL7 v2 messages and field content](#hl7-v2-the-engine-checks-the-envelope-and-your-code-checks-the-fields) | [HL7-VALIDATION.md](HL7-VALIDATION.md) |
+| [HL7 v2 messages and field content](#hl7-v2-the-engine-checks-the-envelope-and-your-code-checks-the-fields) | [HL7-VALIDATION.md](HL7-VALIDATION.md), and this page for a field's own structure |
 | [Non-HL7 payloads](#non-hl7-payloads-are-checked-for-type-then-parsed-on-demand) | This page, with one owner document per type |
+| [Rules over two or more items in a payload](#rules-over-two-or-more-items-in-a-payload) | This page |
 | [`connections.toml`](#connectionstoml-is-held-to-the-connector-factories) | [CONNECTIONS.md](CONNECTIONS.md) |
+| [Configuration-directory modules](#configuration-directory-modules-are-held-to-the-loader) | This page; [CONNECTIONS.md](CONNECTIONS.md) for authoring |
+| [Results of Handler lookups](#a-handler-lookup-result-has-a-fixed-shape) | This page; [ADR 0010](adr/0010-handler-callable-db-lookup.md), [ADR 0043](adr/0043-fhir-read-lookup.md) |
 | [Service settings](#service-settings-are-defined-in-configurationmd) | [CONFIGURATION.md](CONFIGURATION.md) |
-| [The command line](#the-command-line-is-defined-by-its-parser-and-no-prose-page-lists-it) | The parser itself |
+| [The command line](#the-command-line-is-defined-by-its-parser-and-its-help) | The parser and its `--help`; this page names the options whose help does not state a form |
+| [The toolkit, harness and tray](#the-toolkit-harness-and-tray-take-input-of-their-own) | Their parsers and help; [TRAY.md](TRAY.md); [`harness/README.md`](../harness/README.md) |
+| [Operator scripts](#the-operator-scripts-check-their-parameters-in-powershell) | This page |
 | [The VS Code extension](#the-vs-code-extension-is-a-client-and-the-engine-rule-is-the-control) | The engine rules it calls into |
 | [Web console rows marked `-`](#some-web-console-parameters-carry-no-named-rule) | A generated table; no document defines a structure for each |
 
@@ -196,7 +194,21 @@ gets an `ERROR` row and, on a replying inbound, a negative acknowledgment.
 **Tier 2 is opt-in per inbound.** It checks the message structure against the HL7 version.
 HL7-VALIDATION.md lists what that covers. It does not check field content.
 
-**The engine defines no structure for the content of a field.** A date, a code, an identifier or a
+**The parser gives every field one structure, and it never refuses a field for breaking it.**
+
+- The separators are the message's own, read from `MSH-1` and `MSH-2` by `_extract_separators` in
+  [`parsing/_builtin_hl7.py`](../messagefoundry/parsing/_builtin_hl7.py). A missing encoding
+  character takes its default: `^`, `~`, `\` and `&`.
+- A field splits into repetitions, each repetition into components, and each component into
+  subcomponents (`_split_reps`, same module).
+- When your code reads a value, `unescape` decodes it. `\F\`, `\S\`, `\R\`, `\T\` and `\E\` become
+  the message's own delimiters, and `\Xhh\` is read as hex. A sequence it cannot map is dropped from
+  the value, not refused. An escape character that nothing closes is kept as data.
+- Inside a field, ingress checks only the escape expansion budget above. It does not check at least
+  that the separators differ from each other, that an escape sequence is known, or how many
+  components a field holds.
+
+**The engine defines no rule for what a field's value means.** A date, a code, an identifier or a
 name inside a field is not checked at ingress, at either tier. Checking it is the job of your Router
 or Handler. Two tools exist for that:
 
@@ -232,7 +244,7 @@ the `reply_from` path described above.
 |---|---|---|---|
 | `json` | `{` or `[` | `RawMessage.json()` | [ADR 0004](adr/0004-payload-agnostic-ingress.md). The engine defines no JSON schema. |
 | `fhir` | `{` or `[` | `FhirPeek` and `FhirResource` in [`parsing/fhir/`](../messagefoundry/parsing/fhir/) | [ADR 0022](adr/0022-fhir-resource-codec-rest-client.md) |
-| `xml` | `<` | The hardened parser and the opt-in schema validation in [`parsing/xml/`](../messagefoundry/parsing/xml/) | That package's own docstring. No XML schema is defined unless you supply one. |
+| `xml` | `<` | `RawMessage.xml()`, and the hardened parser and opt-in schema validation in [`parsing/xml/`](../messagefoundry/parsing/xml/) | This page, below. No XML schema is defined unless you supply one. |
 | `x12` | `ISA` | `X12Peek`, `X12Message` and the opt-in implementation-guide validation in [`parsing/x12/`](../messagefoundry/parsing/x12/) | [ADR 0012](adr/0012-x12-edi-codec.md) |
 | `dicom` | A 128-byte preamble, then `DICM` | `DicomPeek` and `DicomDataset` in [`parsing/dicom/`](../messagefoundry/parsing/dicom/) | [DICOM.md](DICOM.md), [ADR 0025](adr/0025-dicom-codec-store-connectors.md) |
 | `binary` | None. Opaque bytes have no reliable signature. | `RawMessage.raw_bytes` | [ADR 0028](adr/0028-base64-binary-carriage-codec.md) |
@@ -243,6 +255,47 @@ of record for the middle-left column.
 
 **A FHIR body is held to the JSON type check and no more at ingress.** Whether it is a valid FHIR
 resource is decided only when a Handler builds a `FhirResource`.
+
+### What a codec holds a body to
+
+These are the structures the engine itself applies when your code parses a body. A schema, guide or
+model you supply adds its own.
+
+| `content_type` | Structure | Symbol |
+|---|---|---|
+| `json` | Any JSON text Python's `json.loads` accepts. A repeated key is not refused: the last value wins. `NaN` and `Infinity` are accepted. No depth or size limit applies beyond the ingress size limit; a body nested too deeply raises a `JSONDecodeError`. | `RawMessage.json` in `parsing/message.py` |
+| `fhir` | A JSON object, never a scalar or an array. `FhirPeek` refuses an XML body and a key repeated anywhere in the body. `FhirResource` then needs a known `resourceType` and checks the resource against its model. | `FhirPeek.parse` and `FhirResource.parse` in `parsing/fhir/` |
+| `xml` | Well-formed XML with no `DOCTYPE`. `RawMessage.xml()` also refuses entity declarations and external references. The hardened parser resolves no entity, loads no DTD and fetches nothing over the network. A schema you pass to `validate_against` is loaded from local sources only. | `RawMessage.xml`; `hardened_parser` and `parse_bytes` in `parsing/xml/harden.py`; `validate_against` in `parsing/xml/schema.py` |
+| `x12` | One interchange that opens with `ISA`, with a full 106-character `ISA` header. The element separator must sit at every position the header fixes, and the delimiters must all differ. | `find_isa_start` and `discover_delimiters` in `parsing/x12/delimiters.py` |
+| `dicom` | A DICOM Part 10 object: the preamble, `DICM`, then a dataset `pydicom` can read. A deflated object is held to an inflate limit. | `DicomPeek.parse` and `DicomDataset.parse` in `parsing/dicom/` |
+| `binary` | Any bytes. The engine carries them as `mfb64:v1:` followed by standard base64. `RawMessage.raw_bytes` refuses a value without that prefix, or with base64 that does not decode strictly. | `carry_binary_ingress` in `pipeline/ingress_guards.py`; `encode` and `decode` in `parsing/binary.py` |
+| `text` | Text that decodes in the connection's declared encoding, holds no NUL and fits the ingress size limit. Nothing else. `RawMessage.text` is the decoded text as received. | `decode_body` and `check_decoded` in `pipeline/ingress_guards.py` |
+
+---
+
+## Rules over two or more items in a payload
+
+**A rule over two or more items checks that values in one payload fit each other.** Each value can
+pass its own rule and the payload can still be refused. This section lists what the engine itself
+enforces for each payload type, from a search of the parsing and connector code. Where the search
+found nothing, the row says so. A rule worded unusually, or held in code the search did not open,
+would not be listed, so read the rows as "at least".
+
+Every rule here runs only when your Handler calls it, except where a row says otherwise. A rule you
+need and the engine does not enforce is written in your Handler, as
+[USER-GUIDE.md](USER-GUIDE.md) describes for non-HL7 payloads.
+
+| Payload | Rules the engine enforces over two or more items | Where |
+|---|---|---|
+| HL7 v2 | None at ingress. Six opt-in primitives compare fields, at least `same_across` and `dates_in_order`; HL7-VALIDATION.md, Tier 3, describes them. `extract_obx_document` reads an embedded document only when `OBX-2` is `ED` and `OBX-5.4` is `Base64`. | `parsing/consistency.py`; `parsing/binary.py` |
+| `json` | None. | |
+| `text` | None. | |
+| `binary` | None. | |
+| `xml` | None of its own. An XML Schema you supply may define some. | `validate_against` in `parsing/xml/schema.py` |
+| `x12` | `check_integrity` compares the envelope with itself: `ISA13` with `IEA02`, `IEA01` with the number of groups, `GS06` with `GE02`, `GE01` with the number of sets in the group, `ST02` with `SE02`, and `SE01` with the number of segments in the set. The engine applies no rule of its own inside a transaction set. The implementation-guide check in `validate` applies the guide's rules. | `parsing/x12/interchange.py`; `parsing/x12/validate.py` |
+| `fhir`, inbound | None of its own. `FhirResource.parse` applies the resource model. | `parsing/fhir/resource.py` |
+| `fhir`, outbound `transaction` or `batch` Bundle | At least these, enforced before the engine sends the Bundle: no JSON object repeats a key; each entry's `request.url` has the form its `request.method` needs; and a `POST` or `PUT` entry's resource has the resource type its URL names. The screen also compares the Bundle with the connection's own settings. [CONNECTIONS.md](CONNECTIONS.md), section "A Bundle connection screens every entry", lists the screen's rules. | `_bundle_refusal` and `_entry_refusal` in `transports/fhir.py` |
+| `dicom` | None. In particular, the C-STORE receiver does not compare the request's SOP class or instance with the dataset's own `SOPClassUID` or `SOPInstanceUID`, and does not refuse an object where they differ. | `DicomScpSource._on_c_store` in `transports/dicom.py` |
 
 ---
 
@@ -277,6 +330,49 @@ The per-environment value files that `env()` references read are a related input
 
 ---
 
+## Configuration-directory modules are held to the loader
+
+The Python modules in a configuration directory are code, so the engine cannot check what they do.
+It does hold them to a structure when it loads them. The rules live in
+[`config/wiring.py`](../messagefoundry/config/wiring.py), at least these:
+
+- The loader runs each top-level `.py` file whose name does not start with `_`. A `_` file is a
+  helper, loaded only when a sibling imports it. A helper named like a standard-library module is
+  refused.
+- A module declares nothing by being loaded. It registers objects by calling `inbound()`,
+  `outbound()`, `@router` and `@handler`, at least. Those calls outside a load are refused.
+- Two objects of one kind may not share a name, and that covers a name declared both in a module
+  and in `connections.toml`. A connection name must match the rule
+  [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md) states.
+- An inbound that names a router no module declares is refused. So is a graph that declares no
+  connection.
+
+**A module that breaks a rule does not load.** The loader raises a `WiringError`. Two references are
+checked only when a message runs: a router that returns a handler name nobody declared, and a
+handler that sends to an unknown outbound. Each takes the message to the `ERROR` disposition.
+[CONNECTIONS.md](CONNECTIONS.md) describes how to author the modules, and
+[CODESETS.md](CODESETS.md) defines the code-set files.
+
+---
+
+## A Handler lookup result has a fixed shape
+
+The two read-only lookups return data from outside the engine, so treat the result as untrusted.
+
+| Lookup | Result | Checks on the result |
+|---|---|---|
+| `db_lookup` | A list of rows, each a `{column: value}` dict, with the driver's own value types. An empty list when nothing matched. | More rows than the connection's `max_rows` (default 500) are refused, never truncated. The engine does not check the columns or the values. Two columns with one name keep the last value. |
+| `fhir_lookup` | A dict: one resource for a read by id, or a search Bundle. | The body must be a JSON object that repeats no key, as `FhirPeek` requires, and fit the response size limit. The engine does not check that the resource type matches the query. |
+
+A result that fails a check raises `DbLookupError` or `FhirLookupError`, and the message takes the
+`ERROR` or dead-letter disposition. The code is `db_lookup` in
+[`config/db_lookup.py`](../messagefoundry/config/db_lookup.py) and `fhir_lookup` in
+[`config/fhir_lookup.py`](../messagefoundry/config/fhir_lookup.py).
+[ADR 0010](adr/0010-handler-callable-db-lookup.md) and [ADR 0043](adr/0043-fhir-read-lookup.md)
+record the decisions.
+
+---
+
 ## Service settings are defined in CONFIGURATION.md
 
 [CONFIGURATION.md](CONFIGURATION.md) is the structure of the service settings. It catalogs the
@@ -294,18 +390,43 @@ exact scope; read them there.
 
 ---
 
-## The command line is defined by its parser, and no prose page lists it
+## The command line is defined by its parser and its help
 
 **No single document defines the structure of every command.** The parser is the definition.
 `_build_parser` in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py) declares each
 subcommand of the `messagefoundry` command, with its flags, their types and their allowed choices.
 `messagefoundry --help` and `messagefoundry <command> --help` print it.
 
-This section covers the `messagefoundry` command only. `CLI_TIERS` in
-[`cli_surface.py`](../messagefoundry/cli_surface.py) names subcommands across two commands: this
-one and the separate `messagefoundry-toolkit` command, whose parser is in
-`messagefoundry_toolkit/__main__.py`. The test harness and the tray manager have entry points of
-their own. This page does not map those three.
+**Most options' help states the form of the value.** Every option has a help string except the
+`action` positional of `connection`, `codeset`, `alert`, `security` and `service`, and argparse
+prints those choices in the usage line. At least these options' help names the item but not its
+form:
+
+| Command | Options |
+|---|---|
+| `serve` | `--host`, `--shard` |
+| `supervise` | `--env`, `--project-root` |
+| `dryrun`, `verify` | `--inbound` |
+| `connection` | `--name`, `--data` |
+| `codeset` | `--to`, `--data` |
+| `alert`, `security` | `--data` |
+| `admin-unlock`, `provision-admin`, `admin-set-notify-email`, `admin-reset-totp` | `--username` |
+| `provision-admin` | `--display-name` |
+| `store provision-schema` | `--username` |
+| `store attest-transit-bound`, `store withdraw-transit-bound` | `--reason` |
+| `cipher-audit` | `--table` |
+| `verify` | `--engine-host`, `--fed-nonce`, `--report-md`, `--report-json` |
+| `service` | `--name`, `--env` |
+
+A `--data` value is JSON. `_load_operator_json` in [`cli_common.py`](../messagefoundry/cli_common.py)
+checks only that it parses; the command then checks its fields. Only some subcommands set a
+`description`, so `<command> --help` prints the command's own summary for at least `dryrun`,
+`check`, `provision-admin` and the store attestation commands, and only usage and options for most
+others.
+
+`CLI_TIERS` in [`cli_surface.py`](../messagefoundry/cli_surface.py) names subcommands across two
+commands: this one and the separate `messagefoundry-toolkit` command. The next section covers the
+toolkit, the test harness and the tray manager.
 
 Individual commands are described where they are used, for example in
 [USER-GUIDE.md](USER-GUIDE.md), [SERVICE.md](SERVICE.md) and [CONFIGURATION.md](CONFIGURATION.md).
@@ -329,6 +450,61 @@ Some commands read message files, at least `dryrun` and `check`. Those bodies go
 decode and guard functions as live ingress. The module docstring of
 [`pipeline/ingress_guards.py`](../messagefoundry/pipeline/ingress_guards.py) states where the dry run
 differs.
+
+---
+
+## The toolkit, harness and tray take input of their own
+
+**`messagefoundry-toolkit`** holds the authoring commands. `_build_parser` in
+`messagefoundry_toolkit/__main__.py` defines them, and `--help` prints them as the engine command's
+help does. At least these options' help names the item but not its form: `--repo-root` on
+`adr-analyze`, `name` and `--rename-to` on `impact`, `--seed` on `generate`, and `--contract` on
+`lens rewrite`. A refused input exits non-zero with a one-line error.
+
+**The test harness** (`messagefoundry-harness`, or `python -m harness`) parses its options in
+`harness/__main__.py`, and `--help` prints them. [`harness/README.md`](../harness/README.md)
+describes its modes. It also reads at least the `MEFOR_STORE_*` variables and
+`MEFOR_VALUE_HARNESS_<KEY>` endpoint overrides; `Endpoints.validate` in `harness/endpoints/` holds an
+endpoint to a non-empty value, and a port endpoint to a port number.
+
+**The tray manager** (`messagefoundry-tray`) takes no command-line arguments. It reads `tray.toml`,
+which [TRAY.md](TRAY.md), section "Configuration", defines, and the engine service's registry
+parameters and settings file. `load_config` in
+[`tray/config.py`](../messagefoundry/tray/config.py) holds each `tray.toml` key to a type, and a
+key that fails falls back to its default without a message. It sends the engine no input but two
+unauthenticated reads, `GET /health` and `GET /ui`.
+
+---
+
+## The operator scripts check their parameters in PowerShell
+
+The scripts under [`scripts/service/`](../scripts/service/) take parameters from an operator.
+[SERVICE.md](SERVICE.md) shows how to run them. **`Get-Help` prints only a script's syntax line,
+not its parameter descriptions,** so this table is where their structure is written down. Each rule
+is in the script's `param()` block or its body. A parameter not listed has no rule of its own beyond
+its PowerShell type.
+
+| Script | Parameter | Rule |
+|---|---|---|
+| `install-service.ps1` | `-ServiceName` | A letter or digit, then letters, digits, spaces, `.`, `_` and `-` |
+| | `-Environment` | Required. Letters, digits, `.`, `_` and `-` |
+| | `-Config` | Required. An existing directory |
+| | `-ListenHost` | An IP address, or a host name whose last label is not all digits |
+| | `-LogLevel` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
+| | `-EngineWheelSha256`, `-RequirementsLockSha256` | 64 hex characters |
+| `install-net-helper.ps1` | `-HelperSource` | Required |
+| | `-HelperSha256` | Required. 64 hex characters |
+| | `-ServiceName`, `-EngineServiceName` | The `-ServiceName` rule above |
+| `uninstall-net-helper.ps1` | `-ServiceName` | The `-ServiceName` rule above |
+| `measure-store-access.ps1` | `-Order` | Required. One of `ProvisionFirst`, `StartFirst`, `StartFirstEndToEnd` |
+| | `-DataDir` | Required |
+| `import-db-ca.ps1` | `-CaPath` | Required. A file that reads as an X.509 certificate |
+
+`install-service.ps1` also relates parameters to each other. `-EngineWheel` refuses `-AppExe` and
+`-PythonExe`. `-EngineWheelSha256`, `-RequirementsLock`, `-RequirementsLockSha256` and
+`-BasePython` are refused without `-EngineWheel`. An `-NssmDir` inside the install root
+`-EngineWheel` builds is refused. A rule in the `param()` block refuses the run before any line of
+the script runs.
 
 ---
 

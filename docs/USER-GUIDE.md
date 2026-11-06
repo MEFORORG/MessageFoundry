@@ -215,16 +215,25 @@ The complete procedure — least-privilege accounts, locking down the config/log
 
 ### Command options that depend on each other
 
-Some `messagefoundry` commands refuse a set of options that do not fit together. The rule is about the combination, not about one option's value. The table lists at least the rules a search of the command-line code found. It is not a complete list, so run a command with `--help` for its own options.
+Some `messagefoundry` and `messagefoundry-toolkit` commands refuse a set of options that do not fit together. The rule is about the combination, not about one option's value. The table lists at least the rules a search of the command-line code found. It is not a complete list, so run a command with `--help` for its own options.
 
 | Command | Options | Rule | When the rule is broken |
 |---|---|---|---|
-| `impact` | `--rename-to` and `--delete` | Never both. Either one alone is fine, and so is neither. | An error message and a non-zero exit |
-| `impact` | `--apply` | Valid only with `--rename-to`. | An error message and a non-zero exit |
+| `messagefoundry-toolkit impact` | `--rename-to` and `--delete` | Never both. Either one alone is fine, and so is neither. | An error message and a non-zero exit |
+| `messagefoundry-toolkit impact` | `--apply` | Valid only with `--rename-to`. | An error message and a non-zero exit |
+| `messagefoundry-toolkit lens rewrite` | `--edit` and a `module` of `-` | When the source comes from stdin, the edit must come from `--edit`. | An error message and a non-zero exit |
 | `audit-verify` | `--expected-anchor` and `--expected-anchor-file` | Never both, because they carry the same anchor. Neither is required. | The argument parser refuses the command |
+| `audit-verify` | `--expected-row` and `--expected-rows-file` | Together they may not give one sequence number two different row hashes. | An error message and exit code 2 |
 | `serve` | `--shard` and the `[cluster].enabled` setting | Engine sharding cannot run with active-passive clustering. | An error message and exit code 2 |
+| `cert inventory` | `--cert`, `--config` and `--service-config` | At least one of the three. | An error message and exit code 2 |
+| `restore` | `--to` and `--config-to` | At least one of the two. `--config-to` alone restores only a config-only archive. | An error message and a non-zero exit |
+| `protect-key` | `--generate` and the `MEFOR_STORE_ENCRYPTION_KEY` variable | One of the two supplies the key. | An error message and exit code 2 |
+| `backup` | `--destination` and the `[backup].destination` setting | One of the two names the destination. | An error message and a non-zero exit |
+| `provision-admin` | `--no-totp` and the `[security].require_mfa` setting | `--no-totp` is refused while MFA is required. | An error message and a non-zero exit |
+| `store provision-schema` | `--username` and the `[store].auth` setting | `--username` applies only to SQL authentication. | An error message and a non-zero exit |
+| `verify` | `--fed-id-token` and `--fed-jwks` | Both or neither. | The federation check is reported as skipped |
 
-All four rules are in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py). The table leaves out a rule that one action needs one option, such as `service install` needing `--env`. The rules for the engine's API and the web console are in [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md#rules-over-two-or-more-items), which also says how the search ran.
+The `messagefoundry` rules are in [`messagefoundry/__main__.py`](../messagefoundry/__main__.py), except `verify`'s, which is in `verify/federation.py`. The toolkit rules are in `messagefoundry_toolkit/__main__.py`. The table leaves out a rule that one action needs one option, such as `service install` needing `--env`. The rules for the engine's API and the web console are in [API-INPUT-VALIDATION.md](API-INPUT-VALIDATION.md#rules-over-two-or-more-items), which also says how the search ran. The rules over two or more items in a message payload are in [INPUT-SURFACES.md](INPUT-SURFACES.md#rules-over-two-or-more-items-in-a-payload).
 
 ---
 
