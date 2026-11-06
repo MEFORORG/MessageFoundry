@@ -1417,29 +1417,6 @@ function Remove-ClaimsHeldBy {
     return $released
 }
 
-# $false when the orphaned directory is there, $true only when it is CONFIRMED gone, a throw for
-# anything else. Confirmed gone means two things. The directory is not found. And the nearest item
-# above it that IS there lists as a folder, in full, without the next name down. So a fully deleted
-# entry clears as it did under Test-Path, even when its parent is gone too. An item above it that
-# cannot be listed (a file, or a folder this user may not list) throws. So does a path with nothing
-# above it that can be found, such as a share that does not answer.
-function Test-OrphanGoneOrThrow([string]$Path) {
-    if (Get-ItemOrThrow $Path 'the orphaned directory') { return $false }
-    $below = $Path.TrimEnd('\', '/')
-    while ($true) {
-        $above = [System.IO.Path]::GetDirectoryName($below)
-        if (-not $above) { throw "Neither the orphaned directory ('$Path') nor any folder above it can be found, so its drive or share may be unreachable. Nothing was removed." }
-        if (Get-ItemOrThrow $above 'a folder above the orphaned directory') {
-            $leaf = [System.IO.Path]::GetFileName($below)
-            $listed = @(Get-EntriesOrThrow $above 'the entries above the orphaned directory' |
-                    Where-Object { [string]::Equals($_.Name, $leaf, [StringComparison]::OrdinalIgnoreCase) })
-            if ($listed.Count -gt 0) { throw "'$below' is listed in '$above' but could not be found. Nothing was removed." }
-            return $true
-        }
-        $below = $above
-    }
-}
-
 # Still broken RIGHT NOW: on disk, and not registered. An entry that was repaired (re-added) or fully
 # deleted clears itself, so the ledger cannot nag about a state that no longer exists.
 function Get-LiveOrphans([object[]]$Ledger) {
@@ -1455,7 +1432,8 @@ function Get-LiveOrphans([object[]]$Ledger) {
         # Dropped only once CONFIRMED gone. Test-Path answers $false for a path it may not read, and the
         # nightly removal ledgers exactly that case (an unreadable leftover), so it must keep reporting.
         $why = 'a previous run of this script failed to finish removing it'
-        try { if (Test-OrphanGoneOrThrow $p) { continue } }
+        # worktree-gates.ps1's one rule for "gone", which the nightly removal's end state reads too.
+        try { if (Test-ConfirmedGoneOrThrow $p 'the orphaned directory') { continue } }
         catch { $why = "it is not confirmed gone: $($_.Exception.Message -replace '\s*Nothing was removed\.\s*$', '')" }
         if ($seen.ContainsKey($n)) { continue }
         $seen[$n] = $true

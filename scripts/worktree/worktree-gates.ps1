@@ -19,7 +19,8 @@
     Get-FlaggedFileCount, Get-WorkingTreeActivity, Get-WorktreeOnlyCommitCount, Read-CoordRecord,
     Get-ClaimedWorktreeIndex, Test-RegistryPresentOrThrow, $CACHE_DATA_NAME_PATTERN, Get-NestedHazard,
     Get-InProgressOperation, Get-UnsafeIgnoredEntries, Test-PlainDirectory, Test-PlainDirectoryItem,
-    Get-ItemOrThrow, Test-PresentUnderParentOrThrow, $GIT_REDIRECT_NAMES and Assert-NoGitRedirect.
+    Get-ItemOrThrow, Test-ConfirmedGoneOrThrow, Test-PlainFile, $GIT_REDIRECT_NAMES, Assert-NoGitRedirect,
+    $GIT_CONFIG_CARRIER_PREFIX, Get-GitConfigCarriers and $SEAT_LOCAL_REL.
 #>
 
 #: The variables that falsify a `git -C <path>` reading: the first three point git at another
@@ -37,6 +38,20 @@ function Assert-NoGitRedirect([string]$Who) {
     if ($set.Count -gt 0) {
         throw "$Who refuses: $($set -join ', ') is set, so git's readings of the tree named could come from another repository, working tree or index. Unset it and re-run. Nothing was removed."
     }
+}
+
+#: git config carried in the environment, a separate list from the redirects above: every variable whose
+#: name starts GIT_CONFIG. git reads config from GIT_CONFIG_COUNT with its GIT_CONFIG_KEY_n and
+#: GIT_CONFIG_VALUE_n, from GIT_CONFIG_PARAMETERS, and from the files GIT_CONFIG_GLOBAL and
+#: GIT_CONFIG_SYSTEM name (GIT_CONFIG_NOSYSTEM drops the system file), so any of them can steer every
+#: `git -C <tree>` reading, for example through a core.fsmonitor hook. GIT_CONFIG_GLOBAL is refused on
+#: purpose: it swaps the global config for a file nothing here has read. The worktree gate's argv rules
+#: cannot see this carrier (vault BACKLOG #1070); this guards only the nightly removal's own git calls.
+$GIT_CONFIG_CARRIER_PREFIX = 'GIT_CONFIG'
+
+# The GIT_CONFIG* variables set in this process, sorted. Wrap the call in @(): one name unrolls to a string.
+function Get-GitConfigCarriers {
+    [Environment]::GetEnvironmentVariables().Keys | Where-Object { $_ -like "$GIT_CONFIG_CARRIER_PREFIX*" } | Sort-Object
 }
 
 # The floor under -IdleHours. Signal 2 has been measured at 10.4h on a worktree that was demonstrably
@@ -342,27 +357,44 @@ function Read-CoordRecord([string]$File) {
 # "present", and the registry under it then reads as absent, so no records; a junction is listed
 # through, wherever it points.
 function Test-RegistryPresentOrThrow([string]$Dir, [string]$What) {
-    return Test-PresentUnderParentOrThrow $Dir $What -Plain
-}
-
-# The rule above without the registry's wording: $true present, $false absent under a parent folder
-# that is there, a throw for anything else. -Plain also requires each item read to be a plain directory.
-# The nightly removal reads its end state through this too. prune-merged.ps1's orphan ledger uses a
-# different rule, Test-OrphanGoneOrThrow, and it is not a stricter copy of this one. It accepts a
-# parent that is gone too, which this helper refuses. It also requires the folder it stops at to list
-# without the name, which this helper does not ask.
-function Test-PresentUnderParentOrThrow([string]$Dir, [string]$What, [switch]$Plain) {
     $notPlain = "exists but is not a plain directory (a file or a link), so what it holds is unknown. Nothing was removed."
     $item = Get-ItemOrThrow $Dir $What
-    if ($item -and -not $Plain) { return $true }
     if ($item -and -not (Test-PlainDirectoryItem $item)) { throw "$What ('$Dir') $notPlain" }
     $parent = [System.IO.Path]::GetDirectoryName($Dir.TrimEnd('\', '/'))
     $held = if ($parent) { Get-ItemOrThrow $parent "the folder that holds $What" } else { $null }
     if ($held) {
-        if ($Plain -and -not (Test-PlainDirectoryItem $held)) { throw "The folder that holds $What ('$parent') $notPlain" }
+        if (-not (Test-PlainDirectoryItem $held)) { throw "The folder that holds $What ('$parent') $notPlain" }
         return [bool]$item
     }
     throw "Neither $What ('$Dir') nor the folder that holds it can be found, so the folder above it may be unreachable. Nothing was removed."
+}
+
+# THE ONE RULE FOR "GONE", for what a removal leaves behind: prune-merged.ps1's orphan ledger and the
+# nightly removal's end state both read it here. $false when $What is there, $true only when it is
+# CONFIRMED gone, a throw for anything else. Confirmed gone means two things. The path is not found. And
+# the nearest item above it that IS there lists as a folder, in full, without the next name down, so a
+# not-found under a link that leads nowhere, or under a folder this user may not list, is not gone. A path
+# whose parent is gone too clears once a folder further up lists without it. At least these throw: an
+# item above it that cannot be listed (a file, a dead link, a folder this user may not list), and a path
+# with nothing above it that can be found, such as a share that does not answer. -Plain also throws when
+# the item it lists is not a plain directory, so a link there, wherever it leads, is not read as gone.
+function Test-ConfirmedGoneOrThrow([string]$Path, [string]$What, [switch]$Plain) {
+    if (Get-ItemOrThrow $Path $What) { return $false }
+    $below = $Path.TrimEnd('\', '/')
+    while ($true) {
+        $above = [System.IO.Path]::GetDirectoryName($below)
+        if (-not $above) { throw "Neither $What ('$Path') nor any folder above it can be found, so its drive or share may be unreachable. Nothing was removed." }
+        $item = Get-ItemOrThrow $above "a folder above $What"
+        if ($item) {
+            if ($Plain -and -not (Test-PlainDirectoryItem $item)) { throw "'$above', the folder above $What, is not a plain directory (a file or a link). Nothing was removed." }
+            $leaf = [System.IO.Path]::GetFileName($below)
+            $listed = @(Get-EntriesOrThrow $above "the entries above $What" |
+                    Where-Object { [string]::Equals($_.Name, $leaf, [StringComparison]::OrdinalIgnoreCase) })
+            if ($listed.Count -gt 0) { throw "'$below' is listed in '$above' but could not be found. Nothing was removed." }
+            return $true
+        }
+        $below = $above
+    }
 }
 
 # Which worktrees hold a coordination claim, across every claims directory given. UNREADABLE IS NOT
@@ -456,8 +488,10 @@ function Get-InProgressOperation([string]$Path) {
 
 # Every IGNORED entry `git worktree remove` would delete that is not a regenerable cache
 # ($REGENERABLE_IGNORED_PATTERN): a .env, a *.db store, a build output, a generated corpus. A cache
-# directory that is a link, or cannot be read, counts too, as in remove.ps1 -Path. Returns the status
-# lines, or $null when git status cannot be read.
+# directory that is a link, or cannot be read, counts too, as in remove.ps1 -Path. One more entry is
+# tolerated, by the owner's ruling of 2026-11-06: the seat record $SEAT_LOCAL_REL at the tree's root, as
+# a plain file only. Returns the status lines, or $null when git status cannot be read.
+$SEAT_LOCAL_REL = '.claude/seat.local.txt'
 function Get-UnsafeIgnoredEntries([string]$Path) {
     # --ignored=matching, not the traditional mode: a directory that matches no pattern but holds only
     # ignored content (ide/ around ide/node_modules/) is then listed by what it holds, so the cache
@@ -466,6 +500,11 @@ function Get-UnsafeIgnoredEntries([string]$Path) {
     if ($LASTEXITCODE -ne 0) { return $null }
     $unsafe = @()
     foreach ($line in @($lines | Where-Object { "$_".StartsWith('!! ') })) {
+        # A directory of that name prints with a trailing slash, so it never matches here.
+        if ($line -ceq "!! $SEAT_LOCAL_REL") {
+            if (-not (Test-PlainFile (Join-Path $Path $SEAT_LOCAL_REL))) { $unsafe += "$line (a link, or unreadable: not a plain file)" }
+            continue
+        }
         if ($line -cnotmatch $REGENERABLE_IGNORED_PATTERN) { $unsafe += $line; continue }
         if (-not (Test-PlainDirectory $Path $line.Substring(3).TrimEnd('/'))) { $unsafe += "$line (a link, or unreadable: not a plain directory)" }
     }
@@ -482,4 +521,11 @@ function Test-PlainDirectory([string]$Root, [string]$Rel) {
 
 function Test-PlainDirectoryItem([object]$Item) {
     return ($Item -is [System.IO.DirectoryInfo]) -and -not ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+}
+
+# A file that is not a link. Unreadable is not plain.
+function Test-PlainFile([string]$LiteralPath) {
+    try { $item = Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop }
+    catch { return $false }
+    return ($item -is [System.IO.FileInfo]) -and -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
 }
