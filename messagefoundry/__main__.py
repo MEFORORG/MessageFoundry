@@ -2582,7 +2582,8 @@ def _remote_debug_refused(
     """True, with the reason printed, when :func:`messagefoundry.remotedebug.remote_debug_refusal`
     refuses ``posture`` and nothing lifts it (vault BACKLOG #2700). ``what`` is what is refused.
     Where the acceptance lifts it, the :func:`_remote_debug_audit` line is logged instead. The
-    caller logs it again once its log handlers exist, as BACKLOG #1989 does for its audit lines."""
+    caller logs it again once its log handlers exist, as BACKLOG #1989 does for its audit lines.
+    A refusal with the engine's hook missing also logs the ``remote_debug_unguarded`` entry."""
     audit = _remote_debug_audit(settings, posture, enforcing=enforcing, what=what)
     if audit is not None:
         logging.getLogger(__name__).warning("%s", audit)

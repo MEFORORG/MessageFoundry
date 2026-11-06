@@ -387,15 +387,25 @@ def test_supervise_reports_the_residual_once_past_this_gate(
     audits = _audit_lines(caplog, "start the fleet")
     assert len(audits) == int(accept), messages
     assert all(messages.index(a) < messages.index(residual[0]) for a in audits), messages
+    # The first pass's order, which the forwarder's re-log repeats: the residual, then the acceptance.
+    accepted = _cli_lines(caplog, f"[security] {REMOTE_DEBUG_ACCEPTANCE_KEY}:")
+    assert len(accepted) == int(accept), messages
+    assert all(messages.index(residual[0]) < messages.index(a) for a in accepted), messages
 
 
 def test_supervise_reports_no_residual_with_the_interface_off(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING, logger=cli.__name__):
-        _supervise(tmp_path, monkeypatch, _OFF, warn=True)
+        rc, spawned = _supervise(tmp_path, monkeypatch, _OFF, warn=True)
         # The control in the same capture: a WARNING on this logger is recorded here.
         logging.getLogger(cli.__name__).warning("[security] remote_debug_ control")
+    # The fleet went on past the residual to the store-key gate, so the residual's place ran.
+    err = capsys.readouterr().err
+    assert rc == 2 and not spawned and "no store key is set" in err, err[-2000:]
     assert _residual_lines(caplog) == ["[security] remote_debug_ control"]
 
 

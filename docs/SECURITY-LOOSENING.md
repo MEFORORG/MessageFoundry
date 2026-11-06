@@ -2369,8 +2369,9 @@ count is above `0` (vault BACKLOG #2613).
   the refusal.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
   the engine's own process. `supervise` logs one WARNING for the supervisor process once its
-  start has passed its remote-debugging gate, so a fleet refused there or at an earlier gate logs
-  none. It logs the line a second time once its off-box log forwarder is installed, so the collector's
+  start has passed its remote-debugging gate, so a fleet refused at an earlier gate logs none.
+  Where that gate refuses, `serve` and `supervise` log `remote_debug_unguarded` if the hook did not
+  answer, and nothing for `remote_debug_enabled`. `supervise` logs the line a second time once its off-box log forwarder is installed, so the collector's
   copy has it. No API reports that process afterwards. The engine's Python children start with the interface
   off (`messagefoundry/childenv.py`), so an engine shard reports nothing.
   `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
@@ -2407,8 +2408,8 @@ count is above `0` (vault BACKLOG #2613).
   `python -P -X disable-remote-debug -m pdb -m messagefoundry <command>`, which does not use
   the interface. The debugger reaches the command's own process. Router and Handler bodies that
   run in a sandbox worker (`[sandbox].mode = "subprocess"`) are in a child process, which it does
-  not reach. Keep the option: without it, the start refusal above stops `serve` and `supervise`
-  under `enforce`.
+  not reach. Keep the option: a start with the interface on meets the start refusal above in
+  `serve` and `supervise` under `enforce`.
 
 ### `allow_remote_debugging = true` -- start under `enforce` with the interpreter's remote debugging on
 
