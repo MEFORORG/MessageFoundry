@@ -727,6 +727,12 @@ SITES: dict[str, Site] = {
         "A listed name joined to its directory only to ask whether Win32 would rewrite it; never "
         "opened (BACKLOG #2420).",
     ),
+    "messagefoundry/pipeline/dr_backup.py::_win_verbatim": Site(
+        1,
+        REVIEWED,
+        "A staging directory's own name joined to its parent only to print the verbatim path an "
+        "operator may remove it by; never opened (BACKLOG #2420).",
+    ),
     "messagefoundry/pipeline/dr_backup.py::_fd_walk": Site(
         1,
         REVIEWED,

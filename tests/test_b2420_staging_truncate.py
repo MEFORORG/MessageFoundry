@@ -710,7 +710,7 @@ def test_the_teardown_touches_no_other_directory_for_a_rewritten_name(win_tmp: P
     other.mkdir()
     (other / "archive.tar").write_bytes(_PLAINTEXT)
     leftover = dr_backup._teardown_staging(planted)
-    assert leftover is not None and "Windows would open its name as another" in leftover
+    assert leftover is not None and "Windows would open its plain path as another" in leftover
     assert sorted(p.name for p in other.iterdir()) == ["archive.tar"]
     assert (other / "archive.tar").read_bytes() == _PLAINTEXT
     assert _size(win_tmp, "mefor-backup-x.", "planted.tar") == len(_PLAINTEXT)
@@ -803,17 +803,16 @@ def test_a_file_renamed_after_its_screen_is_reported_not_read_as_nothing_to_empt
 
 # --- the refusal for a rewritten staging name, and the screens' never-raise guard ----------------
 #
-# Engine PR 2814's hold, final-round items 4 and 6. Each test patches the screen, so it runs on both
-# platforms: the advice and the guard are the same code on each.
+# BACKLOG #2420. Most tests here patch the screen, so they run on both platforms: the advice and the
+# guards are the same code on each.
 
 
 def test_the_refusal_for_a_rewritten_staging_name_advises_no_removal_by_hand(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Explorer, `rd /s` and PowerShell apply the same Win32 rewrite as the engine's own open, so an
-    operator who deleted `mefor-backup-x.` by hand would delete `mefor-backup-x`, which may be a live
-    staging directory, and leave the planted one. Red before the fix: the refusal said "delete it by
-    hand", in the sentence returned and in the log line."""
+    """A removal by the plain path removes the other directory (see `_rewritten_staging_refusal`).
+    Red before the fix: the refusal said "delete it by hand", in the sentence returned and in the log
+    line. It now names the directory by its verbatim path alone, and that path as the only removal."""
     import logging
 
     staging = tmp_path / "mefor-backup-x"
@@ -824,14 +823,45 @@ def test_the_refusal_for_a_rewritten_staging_name_advises_no_removal_by_hand(
         leftover = dr_backup._teardown_staging(staging)
     logged = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert leftover is not None and len(logged) == 1
+    verbatim = dr_backup._win_verbatim(staging)
     for text in (leftover, logged[0]):
         assert "by hand" not in text
         assert "delete it" not in text
-        assert "do not delete, move or rename it with any tool" in text
-        assert text.endswith("leave both in place and ask for support")
+        assert f'remove it only by that verbatim path, as rd /s /q "{verbatim}" does' in text
+        assert "a removal by its plain path" in text
+        # The plain path appears only inside the verbatim one.
+        assert str(staging) not in text.replace(verbatim, "")
     # Nothing was removed, emptied or re-marked.
     assert sorted(p.name for p in staging.iterdir()) == ["archive.tar"]
     assert (staging / "archive.tar").read_bytes() == _PLAINTEXT
+
+
+@_windows_only
+def test_the_refusals_verbatim_path_names_the_planted_directory_not_the_other(
+    win_tmp: Path,
+) -> None:
+    """The path the refusal tells the operator to remove by reaches `mefor-backup-x.` itself."""
+    os.mkdir(_verbatim(win_tmp, "mefor-backup-x."))
+    _plant(win_tmp, "mefor-backup-x.", "planted.tar")
+    (win_tmp / "mefor-backup-x").mkdir()
+    (win_tmp / "mefor-backup-x" / "archive.tar").write_bytes(_PLAINTEXT)
+    planted = win_tmp / "mefor-backup-x."
+    leftover = dr_backup._teardown_staging(planted)
+    verbatim = dr_backup._win_verbatim(planted)
+    assert leftover is not None and f'rd /s /q "{verbatim}"' in leftover
+    assert os.listdir(verbatim) == ["planted.tar"]
+
+
+@_windows_only
+def test_the_verbatim_path_of_a_share_takes_the_unc_form() -> None:
+    assert (
+        dr_backup._win_verbatim(Path("\\\\server\\share\\root\\mefor-backup-x."))
+        == "\\\\?\\UNC\\server\\share\\root\\mefor-backup-x."
+    )
+    assert (
+        dr_backup._win_verbatim(Path("\\\\?\\C:\\root\\mefor-backup-x."))
+        == "\\\\?\\C:\\root\\mefor-backup-x."
+    )
 
 
 class _ScreenFault(ValueError):
@@ -871,10 +901,13 @@ def test_a_screen_that_raises_in_the_discard_does_not_replace_the_verify_verdict
     result = dr_backup._verify_archive_blocking(
         archive_path=_plaintext_archive(tmp_path), keys=[], full=False, staging_root=tmp_path
     )
-    # The verdict survives, and the directory the teardown never reached is still named.
+    # The verdict survives. A name the screen could not check is not touched, and is named.
     assert result.status == "FAIL"
     assert result.reason is not None and result.reason.startswith("the archive verified, but ")
-    assert "could not be cleared" in result.reason
+    (staging,) = tmp_path.glob("mefor-verify-*")
+    assert f"the staging directory {dr_backup._win_verbatim(staging)} " in result.reason
+    assert "could not be checked" in result.reason
+    assert (staging / dr_backup._LOCK_NAME).exists()
 
 
 def test_a_screen_that_raises_in_the_discard_does_not_replace_the_error_in_flight(
@@ -888,7 +921,8 @@ def test_a_screen_that_raises_in_the_discard_does_not_replace_the_error_in_fligh
         dr_backup._verify_archive_blocking(
             archive_path=_plaintext_archive(tmp_path), keys=[], full=False, staging_root=tmp_path
         )
-    assert any("could not be cleared" in note for note in raised.value.__notes__)
+    (note,) = raised.value.__notes__
+    assert "could not be checked" in note and "by hand" not in note
 
 
 def test_a_screen_that_raises_in_the_teardown_does_not_replace_the_verify_verdict(
