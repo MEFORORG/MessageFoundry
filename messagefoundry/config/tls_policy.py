@@ -3121,7 +3121,11 @@ def build_verifying_client_context(
     ``cafile=`` argument cannot express. Verification stays ON (``CERT_REQUIRED`` + ``check_hostname``,
     the ``create_default_context`` secure defaults) — the caller layers the TLS floor / KEX / strict
     flags / optional mTLS client cert exactly as before. Purpose is a parameter only so a future
-    client-auth context could reuse it; every current caller verifies a *server* cert."""
+    client-auth context could reuse it.
+
+    The ``tls_verify=false`` arms of the SMTP, MLLP and FTPS contexts build here too, with the empty
+    policy, and turn verification off afterwards (vault BACKLOG #2370). So a step added here must
+    not assume the hop it builds verifies its peer."""
     ctx: ssl.SSLContext
     if anchor.load_system_roots:
         ctx = ssl.create_default_context(purpose)
@@ -3348,7 +3352,7 @@ def build_smtp_tls_context(
     never turns verification off.
     """
     # The verify-off arm takes the empty policy: it verifies nothing, so an instance CA or CRL could
-    # only add a way to refuse. It loads ca_file through the anchor for the named refusal (#2370).
+    # only add a way to refuse. It loads ca_file through the anchor for the named refusal (vault #2370).
     anchor = resolve_trust_anchor(
         connection_ca_file=ca_file,
         host=host,

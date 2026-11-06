@@ -237,9 +237,8 @@ def test_a_named_ca_is_the_ftps_hops_only_anchor(tmp_path: Path) -> None:
 
 
 def test_a_policy_less_ftps_build_still_pins_the_ca(tmp_path: Path) -> None:
-    """A direct build with no ``[tls]`` policy takes the ``create_default_context(cafile=...)``
-    branch. The runner no longer reaches it for the poller (vault BACKLOG #2370), but it must
-    still pin."""
+    """A direct build with no ``[tls]`` policy still pins the connection's CA. The runner no longer
+    builds the poller that way (vault BACKLOG #2370)."""
     ca = _ca_pem(tmp_path, "mefor-ftps-inbound-ca")
     spec = Ftp(host="ftp.internal.example.org", tls=True, remote_dir="/in", tls_ca_file=ca)
     assert _ca_subjects(_ftps_ssl_context(dict(spec.settings))) == {"mefor-ftps-inbound-ca"}
@@ -343,13 +342,15 @@ def test_a_blank_env_ca_on_an_inbound_names_it_in_its_namespace() -> None:
         )
 
 
-def test_a_missing_alerts_smtp_ca_names_its_own_setting(tmp_path: Path) -> None:
+@pytest.mark.parametrize("verify", [True, False], ids=["verify", "verify-off"])
+def test_a_missing_alerts_smtp_ca_names_its_own_setting(verify: bool, tmp_path: Path) -> None:
     """The alerts sink has no connection; it passes its own key, so the operator is not sent
-    looking for a connection's tls_ca_file."""
+    looking for a connection's tls_ca_file. Its verify-off arm too (vault BACKLOG #2370)."""
     with pytest.raises(CaFileUnreadable, match=r"^\[alerts\]\.email_tls_ca_file names"):
         build_smtp_tls_context(
             host="smtp.internal.example.org",
             cell="alerts SMTP transport",
+            verify=verify,
             ca_file=str(tmp_path / "gone.pem"),
             ca_setting="[alerts].email_tls_ca_file",
         )
@@ -441,9 +442,10 @@ def test_a_missing_dicom_or_mllp_ca_file_names_the_connection(
 _MLLP = {"tls": True, "host": "lis.internal.example.org"}
 _FTPS = {"host": "ftp.internal.example.org"}
 
-# Each arm that loaded its CA file with its own create_default_context(cafile=...). The verify-off
-# arms pass the clamped escape through the escape_at_warn fixture, the real shape that honours it.
-_ARMS_WITHOUT_A_POLICY = [
+# Each arm that loaded its CA file with its own create_default_context(cafile=...): the ones built
+# with no [tls] policy, and the verify-off ones, which ignore the policy they are given. The
+# verify-off arms pass the clamped escape through escape_at_warn, the shape that honours it.
+_SELF_LOADING_ARMS = [
     pytest.param(
         lambda ca: build_smtp_tls_context(
             host="smtp.internal.example.org", cell="Email", verify=False, ca_file=ca, name="OB"
@@ -485,7 +487,7 @@ _ARMS_WITHOUT_A_POLICY = [
 
 
 @pytest.mark.usefixtures("escape_at_warn")
-@pytest.mark.parametrize("build", _ARMS_WITHOUT_A_POLICY)
+@pytest.mark.parametrize("build", _SELF_LOADING_ARMS)
 @pytest.mark.parametrize(
     ("junk", "problem", "cause"),
     [
@@ -494,7 +496,7 @@ _ARMS_WITHOUT_A_POLICY = [
     ],
     ids=["missing", "not-pem"],
 )
-def test_an_unreadable_ca_file_on_an_arm_without_a_policy_names_the_setting(
+def test_an_unreadable_ca_file_on_a_self_loading_arm_names_the_setting(
     build: Callable[[str], object],
     junk: bool,
     problem: str,
@@ -517,7 +519,7 @@ def test_an_unreadable_ca_file_on_an_arm_without_a_policy_names_the_setting(
 
 
 @pytest.mark.usefixtures("escape_at_warn")
-@pytest.mark.parametrize("build", _ARMS_WITHOUT_A_POLICY)
+@pytest.mark.parametrize("build", _SELF_LOADING_ARMS)
 def test_a_readable_ca_file_on_those_arms_is_still_the_only_root(
     build: Callable[[str], object], tmp_path: Path
 ) -> None:

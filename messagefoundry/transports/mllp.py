@@ -749,7 +749,7 @@ def _mllp_ssl_context(
     # #190 (ADR 0093): resolve the trust anchor — the connection's own tls_ca_file wins verbatim, else an
     # internal hop may anchor on the [tls] internal CA. Only the VERIFY path uses the policy; the
     # tls_verify=false branch below stays CERT_NONE, reached only through the clamped escape above,
-    # and takes the empty policy. Every arm loads through the anchor for the named refusal (#2370).
+    # and takes the empty policy. Every arm loads through the anchor for the named refusal (vault #2370).
     anchor = resolve_trust_anchor(
         connection_ca_file=str(ca) if ca else None,
         host=str(s.get("host", "127.0.0.1")),
