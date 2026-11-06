@@ -124,5 +124,11 @@ class NarrowedTls(ldap3.Tls):  # type: ignore[misc]  # ldap3 ships no type infor
             server_hostname=self.sni or None,
         )
         if do_handshake and self.validate in (ssl.CERT_REQUIRED, ssl.CERT_OPTIONAL):
-            check_hostname(wrapped, connection.server.host, self.valid_names)
+            try:
+                check_hostname(wrapped, connection.server.host, self.valid_names)
+            except BaseException:
+                # ssl took the socket over, so ``connection.socket`` holds a detached one and no
+                # caller can reach ``wrapped``: close it here (``_close_without_sending``).
+                wrapped.close()
+                raise
         connection.socket = wrapped

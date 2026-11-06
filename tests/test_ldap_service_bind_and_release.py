@@ -10,8 +10,9 @@ Six properties are pinned, each with the test that failed before the change:
   ``LdapError`` or the ``auth.login_error`` row;
 * ``authenticate`` and ``probe_principal`` unbind the service account's connection on every path;
 * a failed service-account bind closes its socket, at least on an error raised after the socket
-  opened, such as on a password SASLprep refuses, and on an open that failed after the connect,
-  such as a ``wrap_socket`` that raised before ``ssl`` took the socket over (L4);
+  opened, such as on a password SASLprep refuses, and on a failed open the rule in
+  ``ldap._close_without_sending`` names (L4; the host name refusal is pinned in
+  ``tests/test_ldap_tls.py``);
 * a service-account bind refused with a referral is refused as a referral, and any other refusal
   names its result code, through a real ldap3 stack;
 * a sign-in or step-up leg answers a directory error for any fault the authenticator raises, with
@@ -402,9 +403,9 @@ def test_a_service_bind_that_raises_after_the_socket_opens_closes_it() -> None:
 def test_a_service_bind_whose_open_fails_after_the_connect_closes_its_socket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Through a real ldap3 stack. An open that fails after the TCP connect, here a TLS wrap that
-    raises, leaves ldap3's ``closed`` true, and ldap3's own close then skips the socket. The
-    connected socket is closed anyway, and the domain controller sees it end."""
+    """Through a real ldap3 stack, the first case of the rule in ``ldap._close_without_sending``:
+    a TLS wrap that raises before ``ssl`` takes the socket over. The domain controller sees the
+    socket end."""
     import ssl
 
     built: list[Any] = []

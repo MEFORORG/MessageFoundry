@@ -182,6 +182,51 @@ def test_ldap3s_host_name_check_still_runs_after_the_handshake(pki: _Pki) -> Non
         _bind(_tls(Path(pki.ca).read_text()), _server(pki), host="dc1.example.test")
 
 
+def test_a_host_name_refusal_closes_the_tls_socket_it_wrapped(pki: _Pki) -> None:
+    """A real host name mismatch after a completed handshake, against a TLS listener on localhost
+    whose leaf names ``localhost`` while the bind checks ``dc1.example.test``. The refusal is raised
+    and still held, so its traceback keeps every frame alive, and the domain controller must
+    still see the socket end. The rule this pins is stated once, in
+    :func:`messagefoundry.auth.ldap._close_without_sending` (BACKLOG #3017)."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(10)
+    ended = threading.Event()
+    server = _server(pki)
+
+    def serve() -> None:
+        # The client may close before this side's handshake finishes, so an end read during the
+        # handshake counts as well as one read after it. A timeout is not an end.
+        with contextlib.suppress(TimeoutError):
+            raw, _addr = listener.accept()
+            raw.settimeout(10)
+            try:
+                with server.wrap_socket(raw, server_side=True) as wrapped:
+                    if wrapped.recv(1) == b"":
+                        ended.set()
+            except TimeoutError:
+                raise
+            except (ssl.SSLError, OSError):
+                ended.set()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    client = socket.create_connection(listener.getsockname(), timeout=10)
+    conn = SimpleNamespace(socket=client, server=SimpleNamespace(host="dc1.example.test"))
+    held: LDAPCertificateError | None = None
+    try:
+        try:
+            _tls(Path(pki.ca).read_text()).wrap_socket(conn, do_handshake=True)
+        except LDAPCertificateError as refused:
+            held = refused
+        assert held is not None, "the host name check did not refuse"
+        assert ended.wait(timeout=5), "the domain controller never saw the TLS socket close"
+    finally:
+        held = None
+        client.close()
+        listener.close()
+        thread.join(10)
+
+
 def test_a_dc_outside_the_anchor_is_refused(pki: _Pki, tmp_path: Path) -> None:
     """``ca_certs_data`` reaches the engine's context: a CA other than the anchor is refused."""
     other_ca, _key = _self_signed(tmp_path)

@@ -1141,13 +1141,18 @@ def _close_without_sending(conn: Any, why: str) -> None:
     place of the caller's answer it would replace a refusal every caller reads as an
     ``LdapError`` with an unhandled one (BACKLOG #3017).
 
-    ldap3 2.9.1's ``close`` shuts the socket only once an open has completed. An open that failed
-    after the TCP connect but before ``ssl`` took the socket over leaves the last connected socket
-    on ``conn.socket`` with ``conn.closed`` still true, so ``close`` passes it by. Read from the
-    ldap3 and ``ssl`` source, that covers at least a TLS context ``NarrowedTls`` could not build,
-    and a receive timeout ``settimeout`` or ``setsockopt`` could not set. A failed handshake is not
-    one of them: ``ssl`` has already detached the socket and closes it itself. The socket left on
-    ``conn.socket`` is closed here directly, whatever ``close`` did."""
+    **The rule, stated here once (BACKLOG #3017): a socket a failed open leaves connected is closed
+    by the engine at once, not by the collector, at least at the two points where ldap3 2.9.1's
+    ``close`` would pass it by.** That ``close`` shuts the socket only once an open has completed,
+    and a failed open leaves ``conn.closed`` true.
+
+    * Before ``ssl`` takes the socket over, it is the last connected socket on ``conn.socket``, and
+      it is closed here directly, whatever ``close`` did. Read from the ldap3 and ``ssl`` source,
+      that covers at least a TLS context ``NarrowedTls`` could not build, and a receive timeout
+      ``settimeout`` or ``setsockopt`` could not set.
+    * Once ``ssl`` has taken it over, ``conn.socket`` holds only the detached socket. A failed
+      handshake is closed by ``ssl`` itself. A host name refusal after a completed handshake is
+      closed by ``NarrowedTls.wrap_socket``, which closes the TLS socket before it re-raises."""
     import ldap3
 
     try:
