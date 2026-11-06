@@ -652,8 +652,8 @@ class ReloadResult(BaseModel):
     is not a clean reload — the new graph is live and an operator has a step to finish by hand.
     Reporting outright failure there would describe an engine that does not exist; reporting plain
     success would hide the step. The step labels are stable and PHI-free
-    (``config_fingerprint``, ``reference_sync``, ``cluster_propagate``, and ``audit`` when the
-    ``config_reload`` audit row failed after the swap, BACKLOG #1940).
+    (``config_fingerprint``, ``reference_sync``, ``cluster_propagate``, ``outbound_close``, and
+    ``audit`` when the ``config_reload`` audit row failed after the swap, BACKLOG #1940).
 
     ``restart_required`` names each settings trust anchor whose consumer loaded its bytes at start
     (for example ``[auth].ad_tls_ca_cert_file``) and whose file has changed on disk since. The

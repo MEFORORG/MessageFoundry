@@ -357,8 +357,9 @@ class ReloadStepFailure:
     """One named step of a config reload that did not complete, with a PHI-free reason.
 
     ``step`` is a stable machine-readable label (``config_fingerprint``, ``reference_sync``,
-    ``cluster_propagate``); ``detail`` is a :func:`~messagefoundry.redaction.safe_exc` rendering, so
-    it carries the exception type and a redacted message and never a message body."""
+    ``cluster_propagate``, ``outbound_close``); ``detail`` is a
+    :func:`~messagefoundry.redaction.safe_exc` rendering, so it carries the exception type and a
+    redacted message and never a message body."""
 
     step: str
     detail: str
@@ -3463,6 +3464,7 @@ class Engine:
         # Every check has passed, so the values go live with the graph, and a refused swap keeps
         # the old values with the old graph (vault BACKLOG #2596).
         first_load = False
+        close_failures: tuple[tuple[str, str], ...] = ()
         if runner is None:
             async with self._first_load_lock:
                 # A first load that held the lock before this one may have installed a runner,
@@ -3474,7 +3476,7 @@ class Engine:
         if not first_load:
             try:
                 # The runner swaps the values under its reload lock and restores them on a rollback.
-                await runner.reload(registry, env_values)
+                close_failures = await runner.reload(registry, env_values)
             finally:
                 # Whatever the runner holds now, committed or rolled back, cancelled or not.
                 self._env_values = runner.env_values
@@ -3488,6 +3490,12 @@ class Engine:
         # the directory it came from. Set together and only here (vault BACKLOG #2598).
         self.loaded_config_fingerprint = fingerprint
         self.last_reload_dir = path
+        # A connector the swap replaced and could not close: the new one is live, so it is a step
+        # an operator may still have to finish, not a failed reload (engine PR 2815).
+        for outbound_name, detail in close_failures:
+            failures.append(
+                ReloadStepFailure("outbound_close", f"outbound {outbound_name!r}: {detail}")
+            )
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh
         # interval) and a 0->N change actually starts the loop. Idempotent when nothing changed.

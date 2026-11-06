@@ -1245,3 +1245,52 @@ async def test_hold_f2_a_build_its_caller_abandons_is_closed(
         await task
     assert not closed.is_set()
     await asyncio.wait_for(closed.wait(), timeout=5)
+
+
+@pytest.mark.parametrize("worker_alive", [True, False], ids=["in-place", "worker-dead"])
+async def test_hold_f2_a_replaced_connector_whose_close_raises_leaves_the_reload_consistent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, db_store: MessageStore, worker_alive: bool
+) -> None:
+    """A reload rebuild swaps the new connector in, then closes the one it replaced. A close that
+    raises leaves the swap standing, as the reload's other outbound reconciles do: the new graph
+    and the new connector are live, the old connector is in no mapping, and the reload returns the
+    lane whose close failed. Red (engine PR 2815): the close raised into the reload's rollback,
+    which put the old graph back while the mapping kept the connector built from the new one.
+    Both rebuild sites: a live lane rebuilt in place, and a per-lane lane whose worker is dead."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
+    runner = RegistryRunner(
+        _db_graph(folder),
+        db_store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+        claim_mode="pooled" if worker_alive else "per_lane",
+    )
+    await runner.start()
+    try:
+        state = cast(Any, runner)
+        stale = state._destinations[_OUT]
+        if not worker_alive:
+            worker = state._workers[_OUT]
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
+        real_close = database.DatabaseDestination.aclose
+
+        async def close(self: database.DatabaseDestination) -> None:
+            if self is stale:
+                raise OSError("synthetic close failure")
+            await real_close(self)
+
+        monkeypatch.setattr(database.DatabaseDestination, "aclose", close)
+        changed = _db_graph(folder, "INSERT INTO t (b) VALUES (:b)")
+        failures = await runner.reload(changed)
+        live = state._destinations[_OUT]
+        assert runner.registry is changed
+        assert live is not stale and isinstance(live, database.DatabaseDestination)
+        assert stale not in state._destinations.values()
+        assert [name for name, _detail in failures] == [_OUT]
+        assert "synthetic close failure" in failures[0][1]
+        assert state._failed.get(("outbound", _OUT)) is None
+    finally:
+        await runner.stop()

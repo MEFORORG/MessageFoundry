@@ -7433,13 +7433,15 @@ class RegistryRunner:
         # first Reference(...) onto a backend with no snapshot store must fail 422 here, before the swap.
         check_reference_backend_supported(registry, self.store)
 
-    async def _reconcile_outbounds(self, old: Registry, new: Registry) -> None:
+    async def _reconcile_outbounds(self, old: Registry, new: Registry) -> list[tuple[str, str]]:
         """Bring the outbound connectors/workers in line with ``new`` without tearing down a live
         worker (so its in-flight outbox batch keeps draining). A worker re-resolves its connector
         per item, so a changed connector is swapped in place; the old one is closed (a single racing
         send at most fails and retries — outbounds are idempotent). An outbound dropped by ``new`` is
         left running so rows already queued to it still drain. Connector builds here cannot fail —
-        :meth:`_build_check` already validated them before any quiesce."""
+        :meth:`_build_check` already validated them before any quiesce. Returns the lanes whose
+        replaced connector failed to close (:meth:`_close_replaced`)."""
+        close_failures: list[tuple[str, str]] = []
         # #122 (ADR 0162) THE DOORS A RELOAD OPENS INTO RESUMING DELIVERY, and there are TWO — the
         # `_unpark_outbound_lane` below, and the lane this reload ADDS (ADR 0189 door six). One gate
         # below covers both; it carries the reasoning, and :meth:`start_outbound` carries the
@@ -7733,9 +7735,9 @@ class RegistryRunner:
             # that changed nothing. MEASURED in both claim modes on a reload with the connector spec
             # identical: `same_connector` False in per_lane against True in pooled, and True in per_lane
             # once this disjunct was added. Besides the warm MLLP socket / DB pool / SMART token the
-            # paragraph above is written to keep, that churn made the unguarded `await stale.aclose()`
-            # below newly reachable for a halted lane, where a raising close propagates into `reload`'s
-            # own except and rolls a routine reload's intake back.
+            # paragraph above is written to keep, that churn made the then-unguarded `stale.aclose()`
+            # below newly reachable for a halted lane, where a raising close propagated into `reload`'s
+            # own except and rolled a routine reload's intake back (now :meth:`_close_replaced`).
             live = (
                 (worker is not None and not worker.done())
                 if self._per_lane_delivery(name) and not self._delivery_halted
@@ -7762,7 +7764,7 @@ class RegistryRunner:
                 stale = self._destinations.pop(name, None)
                 self._destinations[name] = built
                 if stale is not None:
-                    await stale.aclose()
+                    await self._close_replaced(name, stale, close_failures)
                 self._failed.pop(("outbound", name), None)
                 self._spawn_worker(name)
             elif (
@@ -7802,7 +7804,7 @@ class RegistryRunner:
                 self._destinations[name] = built
                 self._failed.pop(("outbound", name), None)
                 if old_conn is not None:
-                    await old_conn.aclose()
+                    await self._close_replaced(name, old_conn, close_failures)
             # else: unchanged & live → leave the worker/connector as-is.
         # A lane the new graph dropped has no spec to build again from.
         self._dr_unbuilt = {n: f for n, f in self._dr_unbuilt.items() if n in new.outbound}
@@ -7819,6 +7821,25 @@ class RegistryRunner:
             ]:
                 self._filtered.pop(("outbound", name), None)
                 self._unpark_outbound_lane(name)
+        return close_failures
+
+    async def _close_replaced(
+        self, name: str, replaced: DestinationConnector, failures: list[tuple[str, str]]
+    ) -> None:
+        """Close the connector a reload rebuild has just swapped out of ``name``'s lane. A close
+        that raises is logged and appended to ``failures`` rather than raised: the new connector is
+        already live, and the reload's rollback restores intake and never the outbound mapping, so
+        raising would put the old graph back beside a connector built from the new one (engine PR
+        2815). A cancellation still propagates."""
+        try:
+            await replaced.aclose()
+        except Exception as exc:  # noqa: BLE001 - a connector's close can fail in any way; logged
+            log.warning(
+                "reload: closing the replaced connector of outbound %r failed: %s",
+                name,
+                safe_exc(exc),
+            )
+            failures.append((name, safe_exc(exc)))
 
     # --- atomic reload (quiesce-and-swap) ------------------------------------
 
@@ -7935,8 +7956,12 @@ class RegistryRunner:
 
     async def reload(
         self, new_registry: Registry | None = None, env_values: Mapping[str, Any] | None = None
-    ) -> None:
+    ) -> tuple[tuple[str, str], ...]:
         """Atomically swap to ``new_registry`` on the running graph (whole-config swap).
+
+        Returns ``(outbound name, reason)`` for each connector step 3 replaced and could not close.
+        The swap stands for those lanes, so they are reported rather than raised; empty when there
+        are none, and on a graph that is not running.
 
         ``None`` re-applies the graph that is current once the reload lock is held, so a reload
         queued behind another one re-evaluates that one's graph rather than reverting it. A DR
@@ -8000,7 +8025,7 @@ class RegistryRunner:
                     self._park_outbounds_while_passive()
             if not self._running:
                 self.registry = new_registry
-                return
+                return ()
 
             old = self.registry
             old_inbound_names = list(self._sources)
@@ -8166,7 +8191,7 @@ class RegistryRunner:
                     for name in new_registry.inbound:
                         self._ensure_inbound_workers(name)
                 # 3. Reconcile outbound connectors/workers (intake already live).
-                await self._reconcile_outbounds(old, new_registry)
+                close_failures = await self._reconcile_outbounds(old, new_registry)
             except BaseException as exc:
                 # Roll back to the previous graph's intake so a failed reload leaves the engine
                 # accepting exactly what it did before (the realistic failure is an inbound bind).
@@ -8251,6 +8276,7 @@ class RegistryRunner:
         report = asyncio.create_task(self._warn_stranded_by_dropped_inbounds(old, new_registry))
         self._reload_report_tasks.add(report)
         report.add_done_callback(self._reload_report_tasks.discard)
+        return tuple(close_failures)
 
     # --- inbound path --------------------------------------------------------
 
