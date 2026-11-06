@@ -178,7 +178,7 @@ def test_a_limit_the_operator_sets_and_the_fleet_fits_passes_the_check(
     [
         (_PER_IP, "5"),
         (_PER_IP, "3.0"),  # the engine's loader reads this as 3
-        (_PER_IP, "-1"),  # a negative rate count refuses every sign-in
+        (_PER_IP, "-1"),  # a negative rate count refuses every sign-in after an address's first
         (_GLOBAL, "5"),
     ],
 )
@@ -202,6 +202,25 @@ def test_a_session_cap_is_checked_while_the_rate_limiter_is_off() -> None:
     """Switching the rate limiter off leaves the session cap in force."""
     with pytest.raises(ConnScaleError, match=_SESSIONS):
         bb.check_operator_sign_in_limits(6, {_SESSIONS: "3", _ENABLED: "false"})
+
+
+def test_a_mixed_case_name_the_engine_reads_is_checked_too() -> None:
+    """The engine folds the case after ``MEFOR_``, so a mixed-case name is the same setting."""
+    with pytest.raises(ConnScaleError, match="below the 6 driver processes"):
+        bb.check_operator_sign_in_limits(6, {"MEFOR_AUTH_login_rate_limit_per_ip": "3"})
+    bb.check_operator_sign_in_limits(
+        6, {_PER_IP: "3", "MEFOR_AUTH_login_rate_limit_enabled": "false"}
+    )
+
+
+def test_env_setting_reads_the_spelling_the_engine_loader_keeps() -> None:
+    """Of two spellings of one setting the later wins, in the engine's loader and here alike."""
+    from messagefoundry.config.settings import load_settings
+
+    environ = {_PER_IP: "14", "MEFOR_AUTH_login_rate_limit_per_ip": "3"}
+    assert bb.env_setting(environ, _PER_IP) == "3"
+    assert load_settings(environ=environ, default_file=False).auth.login_rate_limit_per_ip == 3
+    assert bb.env_setting({"MEFOR_AUTH": "x"}, _PER_IP) is None
 
 
 @pytest.mark.parametrize("held", ["3", "3.0"])

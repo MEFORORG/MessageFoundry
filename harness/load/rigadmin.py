@@ -193,7 +193,8 @@ class RigSignInRefused(RigAdminError):
 
 class RigSignInRateLimited(RigSignInRefused):
     """The engine answered the rig's sign-in with HTTP 429, its sign-in rate limit, on every
-    attempt :func:`sign_in` made. It is transient: it clears once the engine's window passes.
+    attempt :func:`sign_in` made. It is usually transient: it clears once the engine's window
+    passes, unless the limit itself is set so no attempt fits (a negative count, for one).
 
     A kind of :class:`RigSignInRefused`, so a caller that stops on a refusal still stops; one that
     can wait longer may tell the transient limit from a refused credential by this type."""
@@ -335,8 +336,10 @@ _pause = time.sleep
 #: past the engine's shipped sign-in window (``[auth].login_rate_limit_window_seconds``; a test pins
 #: the sum past that default), so when only the rig's own burst filled the window, every hit made
 #: before the first refusal has aged out by the last attempt. An account with a key makes no such
-#: wait: each attempt already waits for a later TOTP step than the one before, a step or more apart,
-#: and as many attempts span past the window the same way (a test pins that too).
+#: wait: each attempt already waits for a later TOTP step than the one before. Two attempts may be
+#: only seconds apart, at the turn of a step, but N attempts take N distinct steps, so the first and
+#: the last are more than N - 2 steps apart, and as many attempts span past the window the same way
+#: (a test pins that arithmetic).
 _RATE_LIMITED_WAITS_S = (2.0, 4.0, 8.0, 16.0, 32.0)
 
 

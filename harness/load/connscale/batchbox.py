@@ -127,17 +127,34 @@ def rig_sign_in_env(procs: int) -> dict[str, str]:
     those are sized with them. Each process signing in for itself keeps the rig's sessions apart;
     one session handed to every process would need none of this, and is not what the rig does.
     """
-    size = 2 * procs + 2
+    size = _fleet_sign_in_size(procs)
     return {name: str(max(size, shipped)) for name, shipped in _RIG_SIGN_IN_LIMITS}
+
+
+def _fleet_sign_in_size(procs: int) -> int:
+    """The sign-ins and sessions a fleet of ``procs`` driver processes may need: one each, doubled
+    for a process that signs in again, plus two."""
+    return 2 * procs + 2
+
+
+def env_setting(environ: Mapping[str, str], name: str) -> str | None:
+    """The value ``environ`` gives the engine setting ``name`` (an upper-case ``MEFOR_`` name), or
+    None. The engine's loader folds the case of everything after ``MEFOR_``, and of two spellings
+    the later one wins, so this reads the setting the same way."""
+    found: str | None = None
+    for key, value in environ.items():
+        if key.startswith("MEFOR_") and key.upper() == name:
+            found = value
+    return found
 
 
 def _rate_limiter_off(environ: Mapping[str, str]) -> bool:
     """Whether ``environ`` turns the engine's sign-in rate limiter off: switched off, or a window
-    of 0 or less."""
-    if environ.get(_RATE_LIMIT_ENABLED_ENV, "").strip().lower() in _FALSE_WORDS:
+    of 0 or less. A ``messagefoundry.toml`` the engine also reads is not consulted."""
+    if (env_setting(environ, _RATE_LIMIT_ENABLED_ENV) or "").lower() in _FALSE_WORDS:
         return True
     try:
-        return float(environ.get(_RATE_LIMIT_WINDOW_ENV, "60")) <= 0
+        return float(env_setting(environ, _RATE_LIMIT_WINDOW_ENV) or "60") <= 0
     except ValueError:
         return False  # the engine's loader refuses it
 
@@ -163,15 +180,15 @@ def check_operator_sign_in_limits(procs: int, environ: Mapping[str, str]) -> Non
     here as a number too.
     """
     limiter_off = _rate_limiter_off(environ)
+    size = _fleet_sign_in_size(procs)
     for name, _shipped in _RIG_SIGN_IN_LIMITS:
-        held = environ.get(name)
+        held = env_setting(environ, name)
         if held is None:
             continue
         try:
             value = float(held)
         except ValueError:
             continue
-        size = 2 * procs + 2
         if name == _SESSIONS_ENV:
             if 0 < value < size:
                 raise ConnScaleError(
@@ -729,10 +746,11 @@ async def run_batch_engine(
         )
         # RIGS SIGN IN, AND THIS RIG'S DRIVE IS SPLIT OVER PROCESSES: the session cap and the
         # sign-in rate limits are sized to the fleet this cell advertises (rig_sign_in_env says why).
-        # setdefault, so a value the operator's environment sets stands; the check before the loop
+        # Only where unset, so a value the operator's environment sets stands; the check before the loop
         # refused one too small for the largest cell.
         for key, value in rig_sign_in_env(procs).items():
-            node_env.setdefault(key, value)
+            if env_setting(node_env, key) is None:  # any spelling the engine reads stands
+                node_env[key] = value
         node = EngineNode(
             f"batch-{cell.cell_id}", api_port, env=node_env, config_dir=_CONFIG_DIR, cwd=cwd
         )
