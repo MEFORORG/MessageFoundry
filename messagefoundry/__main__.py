@@ -7634,8 +7634,9 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
 
     Under ``vault_transit`` a local key counts whichever provider is pinned, as it did before #2077:
     the store's cipher never resolves ``key_provider`` there, so an ignored local key cannot make the
-    store open plaintext. The DR backup and ``rotate-key`` paths DO resolve it, and refuse an ignored
-    key there through ``store.base._checked_active_key``."""
+    store open plaintext. The DR backup path DOES resolve it, and refuses an ignored key there
+    through ``store.base._checked_active_key``. ``rotate-key`` refuses this mode before it resolves
+    a key (BACKLOG #2109)."""
     from messagefoundry.store.keyprovider import provider_reads_a_configured_key
 
     store = settings.store
@@ -10395,19 +10396,20 @@ def _rotate_key(args: argparse.Namespace) -> int:
         print(f"error: {detail}", file=sys.stderr)
         return 2
     if settings.store.cipher_provider == "vault_transit":
-        # BACKLOG #2109. Every value is sealed inside Transit, and the re-encrypt pass refuses that
-        # cipher (BACKLOG #1165), so no run here can finish. Refuse before the key, the Vault hop
-        # and the writable open, each of which a run reached before it learned that, and before the
-        # "needs an active key" refusal below, which names a key this mode never reads.
+        # BACKLOG #2109. The re-encrypt pass refuses the Transit cipher (BACKLOG #1165), so no run
+        # here can finish. Refuse before the key, the Vault hop and the writable open, which a run
+        # with a local key reached first, and before the "needs an active key" refusal below,
+        # which sends a run without one to set a key the Transit cipher never reads.
         print(
-            'error: rotate-key does not run under [store].cipher_provider = "vault_transit": the '
-            "store's values are sealed inside Vault Transit, and rotate-key re-encrypts only "
-            "under the in-process aesgcm cipher. To rotate the Transit data key, rotate it in Vault, "
-            "which makes a new version of the key named by MEFOR_STORE_TRANSIT_KEY; new values "
-            "are then sealed under that version, and values under an older version still read "
-            "while Vault keeps that version decryptable. No rotate-key run is needed for that. "
-            "No command moves Transit ciphertext between keys, or out of Transit (BACKLOG #2109). "
-            "Nothing was changed.",
+            'error: rotate-key does not run under [store].cipher_provider = "vault_transit". It '
+            "re-encrypts only under the in-process aesgcm cipher, and no command moves values "
+            "between that cipher and Transit, in either direction, or between two Transit keys "
+            "(BACKLOG #2109). To rotate the Transit data key, rotate it in Vault: that makes a "
+            "new version of the key named by MEFOR_STORE_TRANSIT_KEY, new values are sealed under "
+            "it, and values under an older version still read. Nothing re-seals those older "
+            "values, so do not raise the key's min_decryption_version past a version that still "
+            "seals a value or MACs an audit row: they would no longer read or verify. The same "
+            "holds for MEFOR_STORE_TRANSIT_AUDIT_KEY when it is set. Nothing was changed.",
             file=sys.stderr,
         )
         return 2
