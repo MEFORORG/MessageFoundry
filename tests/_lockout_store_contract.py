@@ -151,6 +151,7 @@ async def _assert_lockout_contract(store: Any, *, corrupt_passkeys: PasskeyCorru
     for race in ("enabled", "replaced", "rekeyed"):
         await _assert_no_verdict_falls_back_to_the_enabled_rule(store, race)
     await _assert_a_wrong_password_below_the_threshold_opens_no_cell(store)
+    await _assert_get_totp_secret_opens_off_the_loop(store)
 
 
 async def _assert_single_counter_policy(store: Any) -> None:
@@ -1110,3 +1111,44 @@ async def _assert_conditional_rotation(store: Any) -> None:
         "no-such-user", password_hash="x", password_generated=False, must_change_password=False
     )
     await store.delete_user("rot-u1")
+
+
+async def _assert_get_totp_secret_opens_off_the_loop(store: Any) -> None:
+    """BACKLOG #3929, on every backend: ``get_totp_secret`` opens the cell in a worker thread.
+    Under a Transit cipher the open is a blocking ``decrypt_data`` HTTP call, and the
+    lockable-account census reads every enrolled account through this method. A spy stands in for
+    the store's opener and notes the thread each open runs on. The control calls the same spy
+    directly and sees the loop's own thread, so the instrument can tell the two apart."""
+    import threading
+
+    await store.create_user(
+        user_id="loop-u1",
+        username="loop-alice",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    secret = "JBSWY3DPEHPK3PXP"
+    cell = await store.set_totp_secret("loop-u1", secret=secret, now=2.0)
+    real_open = store.open_totp_secret
+    threads: list[threading.Thread] = []
+
+    def spy(user_id: str, stored: str | None) -> str | None:
+        threads.append(threading.current_thread())
+        return real_open(user_id, stored)
+
+    store.open_totp_secret = spy
+    try:
+        assert await store.get_totp_secret("loop-u1") == secret
+        assert len(threads) == 1, f"get_totp_secret opened the cell {len(threads)} times"
+        loop_thread = threading.current_thread()
+        assert threads[0] is not loop_thread, "get_totp_secret opened the TOTP cell on the loop"
+        # The control: the spy run on the loop records the loop's thread.
+        assert spy("loop-u1", cell) == secret
+        assert threads[1] is loop_thread
+    finally:
+        del store.open_totp_secret
+    assert store.open_totp_secret == real_open
+    await store.delete_user("loop-u1")

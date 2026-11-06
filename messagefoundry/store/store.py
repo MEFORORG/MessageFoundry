@@ -17334,11 +17334,15 @@ class MessageStore:
         return None if written is None else sealed
 
     async def get_totp_secret(self, user_id: str) -> str | None:
-        """The user's decrypted base32 TOTP secret, or ``None`` when not enrolled/staged."""
+        """The user's decrypted base32 TOTP secret, or ``None`` when not enrolled/staged. The cell is
+        opened OFF THE EVENT LOOP (BACKLOG #3929): under a Transit cipher the decrypt is a blocking
+        HTTP call, and the lockable-account census reads every enrolled account through here."""
         async with self._read() as db:
             cur = await db.execute("SELECT totp_secret FROM users WHERE id=?", (user_id,))
             row = await cur.fetchone()
-        return self.open_totp_secret(user_id, row["totp_secret"] if row else None)
+        return await asyncio.to_thread(
+            self.open_totp_secret, user_id, row["totp_secret"] if row else None
+        )
 
     def open_totp_secret(self, user_id: str, cell: str | None) -> str | None:
         """``cell``, a ``users.totp_secret`` value the caller already read, decrypted (BACKLOG

@@ -170,14 +170,53 @@ async def test_a_combined_sign_in_does_not_stall_the_loop_on_a_blocking_decrypt(
         await store.close()
 
 
+@pytest.mark.parametrize("on_loop", [False, True], ids=["off-loop", "control-on-loop"])
+async def test_the_lockable_account_census_does_not_stall_the_loop_on_a_blocking_decrypt(
+    monkeypatch: pytest.MonkeyPatch, on_loop: bool
+) -> None:
+    """The lockable-account census reads every enrolled account's TOTP cell through the store's
+    ``get_totp_secret``, at startup and in ``verify``. Each open runs in a worker thread, so a
+    decrypt that blocks for :data:`_BLOCK` leaves the loop serving the heartbeat (BACKLOG #3929).
+
+    The control makes the store's hand-off run the blocking stub inline, and shows the instrument
+    sees the stall, so the off-loop arm can fail."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _identity, _password, _steps, _codes = await _totp_admin(
+            store, monkeypatch, before_confirm=lambda: None
+        )
+        loop_thread = threading.current_thread()
+        blocking_open, threads = _blocking_cipher(store, monkeypatch)
+        if on_loop:
+            real_to_thread = asyncio.to_thread
+
+            async def inline_for_the_cipher(fn: Callable[..., Any], /, *a: Any, **kw: Any) -> Any:
+                if fn is blocking_open:
+                    return fn(*a, **kw)
+                return await real_to_thread(fn, *a, **kw)
+
+            monkeypatch.setattr(asyncio, "to_thread", inline_for_the_cipher)
+        census, stall = await _longest_stall(service.lockable_account_census())
+        assert census.clean, census
+        assert len(threads) == 1, f"the census opened {len(threads)} cells, not the admin's one"
+        if on_loop:
+            assert stall >= _BLOCK * 0.9, f"the control saw no stall ({stall:.3f}s)"
+            assert threads == [loop_thread]
+            return
+        assert stall < _TOLERATED_STALL, f"the loop stalled {stall:.3f}s on a blocking decrypt"
+        assert threads[0] is not loop_thread, "the census opened a TOTP cell on the event loop"
+    finally:
+        await store.close()
+
+
 async def test_the_service_paths_that_open_the_totp_cell_open_it_off_the_loop(
     monkeypatch: pytest.MonkeyPatch, store: MessageStore
 ) -> None:
     """At least these service paths open the TOTP cell in a worker thread: the enrolment's confirm,
     the combined sign-in, the two-step verify (its code check and its before-and-after enrolment
     reads), a replayed code's failed spend (its after-read), a way-past gate (``_totp_state``), and
-    the status read where a re-enrolment is possible. The lockable-account census is not among them:
-    it reads through the store's ``get_totp_secret``, whose decrypt is the store's own."""
+    the status read where a re-enrolment is possible. The lockable-account census reads through the
+    store's ``get_totp_secret``, which has its own test above."""
     real_open = store.open_totp_secret
     seen: dict[str, list[threading.Thread]] = {}
     path = ["setup"]

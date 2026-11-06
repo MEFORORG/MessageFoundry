@@ -9804,8 +9804,11 @@ class PostgresStore:
         return None if written is None else sealed
 
     async def get_totp_secret(self, user_id: str) -> str | None:
+        """See :meth:`MessageStore.get_totp_secret`: opened off the event loop (BACKLOG #3929)."""
         d = await self._fetchone("SELECT totp_secret FROM users WHERE id=$1", user_id)
-        return self.open_totp_secret(user_id, d["totp_secret"] if d else None)
+        return await asyncio.to_thread(
+            self.open_totp_secret, user_id, d["totp_secret"] if d else None
+        )
 
     def open_totp_secret(self, user_id: str, cell: str | None) -> str | None:
         """See :meth:`MessageStore.open_totp_secret` (BACKLOG #3510)."""
