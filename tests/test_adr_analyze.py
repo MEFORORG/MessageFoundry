@@ -190,8 +190,8 @@ def test_the_error_line_on_stderr_escapes_what_the_path_held(
 ) -> None:
     """BACKLOG #2891, PR 2390 note 6: the ``error:`` line printed the path raw. A directory name,
     or a symlink's resolved target, can hold an ESC, a newline or a bidirectional override; a
-    newline would start a line of its own. stderr takes the strict rule, so even a printable
-    accented letter is an escape there. Faked, since Windows refuses such a name."""
+    newline would start a line of its own. A printable accented letter prints as itself. Faked,
+    since Windows refuses such a name."""
     shown = "no ADR directory found or readable at /srv/caf\u00e9\x1b]0;owned\x07\n\u202eok"
     monkeypatch.setattr(
         adr_analyze,
@@ -201,8 +201,20 @@ def test_the_error_line_on_stderr_escapes_what_the_path_held(
     assert main(["adr-analyze", "--adr-dir", str(tmp_path)]) == 2
     err = capsys.readouterr().err
     assert err == (
-        "error: no ADR directory found or readable at /srv/caf\\u00e9\\x1b]0;owned\\x07\\x0a\\u202eok\n"
+        "error: no ADR directory found or readable at /srv/caf\u00e9\\x1b]0;owned\\x07\\x0a\\u202eok\n"
     )
+
+
+def test_the_error_line_on_stderr_prints_a_non_ascii_path_as_typed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #2891: only controls are escaped on the ``error:`` line, so a directory name
+    with an accented or CJK letter in it prints as typed and the operator can paste the path
+    back. Not a name that STARTS with one: the shared rule doubles the backslash before it."""
+    missing = tmp_path / "Jos\u00e9" / "a\u6771\u4eac" / "nope"
+    assert main(["adr-analyze", "--adr-dir", str(missing), "--repo-root", str(tmp_path)]) == 2
+    err = capsys.readouterr().err
+    assert err == f"error: no ADR directory found or readable at {missing}\n"
 
 
 def test_cli_missing_adr_dir_exits_two_under_strict_too(

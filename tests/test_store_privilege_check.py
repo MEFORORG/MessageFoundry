@@ -446,18 +446,12 @@ def test_the_store_hop_prints_a_control_in_the_principal_escaped_once(over: bool
     assert "'mefor\\x1b[2Jsvc' on 'Message\\u202eFoundry'" in shown
     assert "\\\\x1b" not in shown and "\\\\u202e" not in shown
     assert "\x1b" not in shown and "\u202e" not in shown
-    # The other sinks keep repr for the principal and database, the only names that go through
-    # quote; an excess entry still embeds the raw database name.
+    # The other sinks keep repr for the principal and database.
     assert "'mefor\\x1b[2Jsvc' on 'Message\\u202eFoundry'" in report.summary()
 
 
-def test_the_store_hop_still_shows_a_space_separator_and_a_domain_backslash() -> None:
-    """A no-break space prints as itself under the terminal rule, so a name holding one keeps
-    ``repr``, which shows it; and a ``DOMAIN\\user`` principal prints as ``repr`` printed it."""
-    nbsp = dataclasses.replace(_clean_report(), principal="mefor\u00a0svc")
-    assert "'mefor\\\\xa0svc' on 'MessageFoundry'" in "\n".join(
-        render_text([store_hop(nbsp, _mssql())])
-    )
+def test_the_store_hop_prints_a_domain_backslash_as_repr_printed_it() -> None:
+    """A ``DOMAIN\\user`` principal reads as it did under ``repr``."""
     shown = "\n".join(render_text([store_hop(_clean_report(), _mssql())]))
     assert "'CORP\\\\mefor-svc$' on 'MessageFoundry'" in shown
 

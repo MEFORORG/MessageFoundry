@@ -355,12 +355,11 @@ def _adr_analyze(args: argparse.Namespace) -> int:
         # with `error` inside it, and so is NOT _emit_store_open_error's bare {"error": ...}: `ok`
         # has to stay readable for a consumer that branches on it and nothing else.
         if not args.json:
-            # Not _safe_print (see its docstring), and the STRICT rule, not _print_record_line's:
-            # main() runs harden_console_streams(), which sets stderr to errors='replace', so a
-            # kept character the console cannot encode would print as '?'; the strict rule's
-            # output is pure ASCII. The path, a symlink's resolved target included, is text
-            # whoever made the link chose (BACKLOG #2891).
-            shown = escape_for_terminal(result.error, single_line=True)
+            # _print_record_line's rule, on stderr: a control in the path, a symlink's resolved
+            # target included, is escaped, and a non-ASCII letter prints as itself, so the
+            # operator can paste most paths back; the rule doubles a backslash before a component
+            # that starts with one (BACKLOG #2891).
+            shown = escape_for_terminal(result.error, single_line=True, keep_printable_unicode=True)
             print(f"error: {shown}", file=sys.stderr)
         return 2
     if not args.json:
@@ -388,8 +387,8 @@ def _adr_analyze(args: argparse.Namespace) -> int:
 def _print_record_line(line: str) -> None:
     """``_safe_print`` a line that carries record text, with each character a terminal would act
     on written as a visible escape (BACKLOG #2516). Every human stdout line goes through here, so
-    a new one cannot forget the escape. The ``error:`` line on stderr does not; it takes the
-    strict rule, and its comment says why.
+    a new one cannot forget the escape. The ``error:`` line on stderr does not go through here,
+    but takes the same rule.
 
     THE RULE IS THE ENGINE'S SHARED ONE, :func:`messagefoundry.terminal_text.escape_for_terminal`
     (BACKLOG #2891), so a later hardening there reaches this command too; its docstring says what

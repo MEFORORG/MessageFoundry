@@ -203,7 +203,7 @@ def store_hop(report: StorePrivilegeReport, store: StoreSettings) -> HopPrivileg
         state=state,
         identity=_store_identity(store, report),
         minimal=_store_minimal(store),
-        detail=report.summary(quote=_quoted_store_name),
+        detail=report.summary(quote=_quoted),
     )
 
 
@@ -358,16 +358,6 @@ def _quoted(text: str | None) -> str:
         return "None"  # as repr writes it, for an unset setting
     quote = '"' if "'" in text and '"' not in text else "'"
     return quote + text.replace("\\", "\\\\").replace(quote, "\\" + quote) + quote
-
-
-def _quoted_store_name(text: str) -> str:
-    """:func:`_quoted` for the store summary's principal and database (BACKLOG #2891), so a
-    control in one is escaped once, by :func:`render_text`. ``repr`` instead for a name holding a
-    space separator other than U+0020 (a no-break or ideographic space): the terminal rule keeps
-    those, and only ``repr`` shows one, at the cost of the doubled escape."""
-    if any(ch != " " and unicodedata.category(ch) == "Zs" for ch in text):
-        return repr(text)
-    return _quoted(text)
 
 
 #: Vault's capability words. Any other string a server returns is shown escaped, so a value that
