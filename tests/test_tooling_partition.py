@@ -176,8 +176,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_licence_header_gate.py",
         # NOT engine source, so this entry widens the list's stated rule, as
         # test_conftest_name_collision_guard.py does and for the same reason. Its subject is
-        # tests/_log_absence.py, the positive control the engine tests' log-absence checks call
-        # (vault BACKLOG #3766 item 9). A change to that helper arrives as a tests/ diff, which sets
+        # tests/_log_absence.py, the positive control that at least the engine and console suites'
+        # log-absence checks call (vault BACKLOG #3766 item 9). A change to that helper arrives as a tests/ diff, which sets
         # `code=true` but NOT `tooling=true`, so listed as tooling this would run on no leg for the
         # change that breaks it.
         "test_log_absence_helper.py",
@@ -313,10 +313,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # engine, which arrives as an ENGINE diff. Its one import of a test module is how it
         # shares that module's walk of the package.
         "test_vault_posture_census.py",
-        # Reads messagefoundry/** off disk through tests/_ast_sites.package_trees and pins every
-        # caller of the warn_query_credentials keyword (vault BACKLOG #3766 item 4). What breaks it
-        # is a new caller in the engine, which arrives as an ENGINE diff the tooling path gate does
-        # not see.
+        # Reads messagefoundry/**, messagefoundry_webconsole/** and messagefoundry_toolkit/** off
+        # disk through tests/_ast_sites.package_trees and pins the warn_query_credentials callers it
+        # can see there; its docstring lists at least the shapes it misses (vault BACKLOG #3766
+        # item 4). What breaks it is a caller added, moved or removed in one of those packages,
+        # which arrives as an ENGINE, console or toolkit diff the tooling path gate does not see.
         "test_warn_query_credentials_callers.py",
     }
 )
