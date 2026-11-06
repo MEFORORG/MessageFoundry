@@ -1492,10 +1492,15 @@ _TOOLKIT_DIST = "messagefoundry-toolkit"
 #: The separately-versioned console distribution (ASVS 15.2.4).
 _WEBCONSOLE_DIST = "messagefoundry-webconsole"
 
-#: A ``python -m build`` call and its flags, up to the end of the line or the next shell separator
-#: (``&&``, ``||``, ``;``, ``&``, ``|``), so a second build chained on the same line is its own match
-#: and the first call's flags do not leak into it. ``python3`` and ``python3.14`` count too.
-_BUILD_CALL = re.compile(r"\bpython[0-9.]*\s+-m\s+build\b([^\n;&|]*)")
+#: A ``python -m build`` call and its flags. ``python3`` and ``python3.14`` count too. The flags stop
+#: at the end of the line, at a ``&&``, ``||`` or ``;``, or at an inline `` #`` comment, which the
+#: match then consumes to the end of the line. So a second build chained on the same line is its own
+#: match, the first call's flags do not leak into it, and a build quoted in a trailing comment is not
+#: counted. A lone ``&`` or ``|`` does not stop them, so ``2>&1`` keeps the flags after it. This is a
+#: line scan, not a shell parser: a ``\`` continuation or a subshell still cuts or glues the flags.
+_BUILD_CALL = re.compile(
+    r"\bpython[0-9.]*\s+-m\s+build\b((?:(?!&&|\|\||;|[ \t]#)[^\n])*)(?:[ \t]#[^\n]*)?"
+)
 
 
 def _wheel_builds(shell: str) -> int:
@@ -1524,6 +1529,20 @@ def _wheel_builds(shell: str) -> int:
         ("python -m build --wheel a; python -m build --wheel b", 2),
         # The first call's --sdist must not leak into the bare build after the separator.
         ("python -m build --sdist && python -m build", 1),
+        # A redirect's `&` is not a separator: the --wheel after it still counts, and so does --sdist.
+        ("python -m build --sdist >log 2>&1 --wheel", 1),
+        ("python -m build 2>&1 --sdist", 0),
+        # A build quoted in a trailing comment runs nothing.
+        ("python -m build --wheel a  # x && python -m build --wheel b", 1),
+    ],
+    ids=[
+        "and",
+        "or",
+        "semicolon",
+        "sdist-then-bare",
+        "redirect-wheel",
+        "redirect-sdist",
+        "comment",
     ],
 )
 def test_wheel_builds_counts_every_build_on_one_line(shell: str, expected: int) -> None:
