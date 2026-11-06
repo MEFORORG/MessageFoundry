@@ -2427,11 +2427,11 @@ def test_a_plain_value_does_not_print_a_later_braced_password(line: str) -> None
 
     The installed chain is not one of these surfaces: its query filter still prints the tail on the
     ``token=`` line, before this pass runs. That half is the query filter's own."""
+    first = line.split()[2].split("=")[0]
     for surface, apply in _SWALLOW_SURFACES:
         out = apply(line)
         printed = [word for word in _BRACED_WORDS if word in out]
         assert not printed, f"{surface}: {printed} printed -- got {out!r}"
-        first = line.split()[2].split("=")[0]
         assert f"{first}=" in out, f"{surface}: the label {first} was lost -- got {out!r}"
 
 
@@ -2494,20 +2494,22 @@ def test_the_braced_stop_grows_linearly_in_line_length() -> None:
             shipped.pattern.replace(head, head.replace("[^{}", "[^}")), shipped.flags
         )
 
-        def growth(pattern: re.Pattern[str]) -> float:
+        def growth(pattern: re.Pattern[str], short: int, long: int) -> float:
             return _growth_between(
                 lambda text: pattern.sub("x", text),
-                _braced_check_run(_GROWTH_LENGTHS[0]),
-                _braced_check_run(_GROWTH_LENGTHS[1]),
+                _braced_check_run(short),
+                _braced_check_run(long),
                 rounds=5,
             )
 
-        control_growth = growth(control)
+        # The control at an eighth of the length, the same 8x span: a quadratic still reads far
+        # above the bound there, and at the full length it cost about 6.5 s a run.
+        control_growth = growth(control, 512, 4096)
         assert control_growth > _MAX_GROWTH, (
             f"{module.__name__}: the quadratic control grew only {control_growth:.1f}x, so this "
             "input cannot show the hazard and the shipped reading proves nothing"
         )
-        shipped_growth = growth(shipped)
+        shipped_growth = growth(shipped, *_GROWTH_LENGTHS)
         assert shipped_growth <= _MAX_GROWTH, (
             f"{module.__name__}._BEARER grew {shipped_growth:.1f}x for 8x the line length, against "
             f"{control_growth:.1f}x for the quadratic control"
@@ -3176,16 +3178,16 @@ def test_a_fold_headed_label_prints_with_the_tokens_unfolded(
             source = source.replace("(?i:[A-Za-z0-9])++", "[A-Za-z0-9]++")
             source = re.sub(r"\(\?i:(\[\^A-Za-z0-9[^\]]*\])\)", r"\1", source)
             monkeypatch.setattr(module, name, re.compile(source, pattern.flags))
+    surfaces = (
+        ("scrub_credentials", scrub_credentials, "MEFOR_X"),
+        ("bundle", redact_log_line, "MEFOR_X"),
+        ("bundle", redact_log_line, "token"),
+    )
     controlled = 0
     for char, letter in sorted(_measured_letter_folds().items()):
         if letter == "k":
             continue
         controlled += 1
-        surfaces = (
-            ("scrub_credentials", scrub_credentials, "MEFOR_X"),
-            ("bundle", redact_log_line, "MEFOR_X"),
-            ("bundle", redact_log_line, "token"),
-        )
         for surface, apply, first in surfaces:
             out = apply(_fold_stop_line(char, letter, first))
             assert _FOLD_STOP_VALUES[1] in out, (

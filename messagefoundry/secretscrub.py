@@ -861,12 +861,9 @@ _MEFOR_SECRET = re.compile(
 #   closing on a later label's quote, so loosening it is a trade to measure, not a free edit.
 # * A plain value running on into a later braced value is CLOSED for a ``_CREDENTIAL_KV`` label whose
 #   braced value holds white space (BACKLOG #2966): ``MEFOR_STORE_DSN=Server=h;PWD={p w}`` and
-#   ``token=a;PWD={p w}`` print nothing now, through :data:`_BRACED_RUN_ON`. Still printing all or
-#   part of the braced value, as before, at least: that label glued on by "_" or carrying an
-#   underscored prefix, as in ``MEFOR_X=a;db_pwd={p w}``; that label with a quote before its ":" or
-#   "="; braces holding a quote or a "{"; and a key-material or token label with a braced value, as in
-#   ``token=a;session={p w}``. :data:`_BRACED_RUN_ON` gives the measured reason for each condition
-#   on the label and the braces.
+#   ``token=a;PWD={p w}`` print nothing now. A label or braced value that :data:`_BRACED_RUN_ON`'s
+#   conditions refuse still prints all or part of the braced value, as before, and so does a
+#   key-material or token label with one, as in ``token=a;session={p w}``.
 # Each of the residuals above, from the unclosed quote on, printed the same text before BACKLOG
 # #1685's remainder; none is new.
 _CREDENTIAL_KV = re.compile(
