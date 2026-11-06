@@ -871,10 +871,11 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
     # a guard that gets its number bumped without thought. The property worth pinning is "EVERY wheel
     # smoke normalises", so derive the expected set of smokes rather than a literal.
     # The same count section (8) uses: a bare `python -m build` (the engine's) produces a wheel too,
-    # so it owes a smoke like any other (BACKLOG #1583). Over every string in the PARSED workflow,
-    # `with:`, `env:` and `name:` included, so it never counts below main's whole-file count; only a
-    # YAML comment, which runs nothing, is outside it (:func:`_builds_in` says why).
-    wheel_builds = _builds_in(_workflow())
+    # so it owes a smoke like any other (BACKLOG #1583). The larger of two counts: every string in
+    # the PARSED workflow, `with:`, `env:` and `name:` included, and the RAW file, which main
+    # counted and which still holds what the parse drops, at least a YAML comment and a duplicate
+    # key (:func:`_builds_in` says why). The raw count alone is at least main's by construction.
+    wheel_builds = max(_builds_in(_workflow()), _wheel_builds(rel))
     assert wheel_builds >= 4, (
         f"expected the engine, toolkit, console and harness wheel builds, found {wheel_builds}"
     )
@@ -1524,9 +1525,10 @@ def _wheel_builds(shell: str) -> int:
     string nothing executes, and an sdist-only build. A build in a heredoc body or a ``bash -c``
     argument is counted too, and is a real build whenever that text reaches a shell, so it is not
     an overcount there. It undercounts in at least one, which main's count shares: a build inside a
-    shell loop runs many times and counts once. Other front ends (``pyproject-build``, ``uv build``, ``hatch build``) are not recognised;
-    the release workflow runs none, and the floor in :func:`_wheel_smoke_steps` names every
-    distribution it ships, so a wheel built another way still has to be added there.
+    shell loop runs many times and counts once. Other front ends (``pyproject-build``, ``uv build``,
+    ``hatch build``) are not recognised; the release workflow runs none, and the floor in
+    :func:`_wheel_smoke_steps` names every distribution it ships, so a wheel built another way
+    still has to be added there.
 
     Pass RAW text, never :func:`_executed_shell`'s, which drops comment lines main counted. The
     callers reach it through :func:`_builds_in`, which hands it every string in the parsed workflow
@@ -1544,21 +1546,24 @@ def _builds_in(value: object) -> int:
     Main counted ``count("python -m build --wheel")`` over the whole raw file, so it saw a build in
     a step's ``with:`` (a retry action's ``command:``), its ``env:``, its ``name:``, and anything a
     job or the workflow holds outside its steps. A count over each step's ``run:`` alone saw none of
-    those, and a build there could ship a wheel with no smoke step. So this walks every value, and
-    every string key, of whatever node it is given, and sums :func:`_wheel_builds` over each string
-    separately. A parsed scalar holds every occurrence its raw text held, so the only text main saw
-    that this does not is a YAML comment, which no runner executes.
+    those, and a build there could ship a wheel with no smoke step. So this walks every key and
+    value of whatever node it is given, through mappings, lists, tuples and sets (``!!pairs``,
+    ``!!omap`` and ``!!set`` load as the last two), and sums :func:`_wheel_builds` over each leaf's
+    ``str()`` separately, as main's per-step ``str(s.get("run"))`` did for a non-string ``run:``.
+
+    The parse still loses text the raw file held, in at least these cases: a YAML comment, and the
+    earlier of two duplicate keys, which PyYAML drops silently. A total over the whole file should
+    therefore also take :func:`_wheel_builds` of the raw text, as
+    :func:`test_both_wheel_smokes_compare_versions_not_strings` does.
 
     Strings in a ``name:`` or in prose count too. That overcount only demands a smoke step nothing
     runs, which reds the per-job and total checks; it never lets a wheel through.
     """
-    if isinstance(value, str):
-        return _wheel_builds(value)
     if isinstance(value, dict):
         return sum(_builds_in(k) + _builds_in(v) for k, v in value.items())
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple, set, frozenset)):
         return sum(_builds_in(v) for v in value)
-    return 0
+    return _wheel_builds(str(value))
 
 
 #: ``(shell, expected)`` for :func:`test_wheel_builds_counts_every_build_on_one_line`, by id.
@@ -1628,7 +1633,8 @@ def test_wheel_builds_never_counts_fewer_than_mains_substring_count(shell: str) 
 
 
 #: Steps whose only build is OUTSIDE ``run:``. Main's whole-file ``count("python -m build --wheel")``
-#: saw each one; a count over each step's ``run:`` text alone saw none (red at 31ec7e1e67).
+#: saw each one. The first three counted 0 under the 31ec7e1e67 callers' expression,
+#: ``_wheel_builds(str(step.get("run") or ""))``, run against them in place of :func:`_builds_in`.
 _VALUE_FLOOR_CASES = [
     pytest.param(
         {"uses": "nick-fields/retry@v3", "with": {"command": "python -m build --wheel ./x"}},
@@ -1642,11 +1648,15 @@ _VALUE_FLOOR_CASES = [
         {"env": {"BUILD": "python -m build --wheel ./x"}, "run": "$BUILD"},
         id="env-value",
     ),
+    # How PyYAML loads ``!!pairs``/``!!omap`` (a list of tuples) and ``!!set`` (a set). A walk of
+    # dicts and lists alone counted 0 here.
+    pytest.param({"env": [("BUILD", "python -m build --wheel ./x")]}, id="pairs"),
+    pytest.param({"with": {"args": {"python -m build --wheel ./x"}}}, id="set"),
 ]
 
 
 @pytest.mark.parametrize("step", _VALUE_FLOOR_CASES)
-def test_builds_in_counts_a_build_in_any_value_of_a_step(step: dict) -> None:
+def test_builds_in_counts_a_build_in_any_value_of_a_step(step: dict[str, Any]) -> None:
     """A build a step runs from ``with:`` or ``env:`` still owes a smoke step.
 
     Main counted ``count("python -m build --wheel")`` over the whole file, which saw a retry
@@ -1655,7 +1665,7 @@ def test_builds_in_counts_a_build_in_any_value_of_a_step(step: dict) -> None:
     """
     import yaml
 
-    dumped = yaml.safe_dump(step, width=10_000)
+    dumped = yaml.dump(step, width=10_000)
     assert dumped.count("python -m build --wheel") == 1  # the input is what main would have seen
     assert _builds_in(step) == 1
 
