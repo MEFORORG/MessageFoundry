@@ -424,8 +424,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         description="Run validate + dryrun (+ advisory ruff/mypy) as a commit/CI gate. The dryrun "
         "sub-check previews under [pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved "
         "best-effort from the settings the posture check reads: this instance's "
-        "messagefoundry.toml, or with no file, the MEFOR_* environment when MEFOR_AI_ENVIRONMENT "
-        "names the instance. When no settings load, the preview falls back to the "
+        "messagefoundry.toml, or with no file, the MEFOR_* environment when --env or "
+        "MEFOR_AI_ENVIRONMENT names the instance. When no settings load, the preview falls back to the "
         "setting's own default (ON) — matching the default engine, never a silent OFF (#230). "
         "Under --project-root with no --service-config, check reads the project root's "
         "messagefoundry.toml, else the config dir's, while serve with the same flags reads the "
@@ -437,7 +437,11 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "reaches it, fails the settings checks, as it stops serve.",
     )
     check.add_argument("--config", default="samples/config", help="config modules directory")
-    _add_anchor_flags(check)
+    _add_anchor_flags(
+        check,
+        env_help=" check also reads it as serve --env does, above [ai].environment, so with no "
+        "messagefoundry.toml its settings checks grade that instance instead of skipping.",
+    )
     check.add_argument(
         "--messages", default=None, help="HL7 fixtures dir (dryrun gates when it has *.hl7)"
     )
@@ -1319,7 +1323,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     return parser, _DISPATCH
 
 
-def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
+def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str = "") -> None:
     """Add the project-root / active-env / service-config trio to an OFFLINE subcommand (ADR 0050 §3).
 
     ``validate``/``graph``/``dryrun``/``check`` carried only ``--config`` before, so the commit/CI gate
@@ -1340,9 +1344,8 @@ def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
         "--env",
         default=None,
         help="active environment NAME (selects environments/<env>.toml values). With no --env the gate "
-        "behaves exactly as before (no env values loaded); it never adopts serve's required-env refusal. "
-        "check also reads it as serve --env does, above [ai].environment, so with no "
-        "messagefoundry.toml its settings checks grade that instance instead of skipping.",
+        "behaves exactly as before (no env values loaded); it never adopts serve's required-env refusal."
+        + env_help,
     )
     p.add_argument(
         "--service-config",

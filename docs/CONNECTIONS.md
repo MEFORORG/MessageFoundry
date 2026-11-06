@@ -2017,8 +2017,7 @@ load and `messagefoundry check`'s required `validate` fails, with or without a
 `messagefoundry.toml`. Every other case is refused when the connection is built: that fails a
 dry run, a reload and the required `build-check` where it runs (it skips with no
 `messagefoundry.toml` and no `check --env` or `MEFOR_AI_ENVIRONMENT`), and in the live build at
-`serve` start it
-fails that connection. The `[egress].allowed_db` check refuses the same name, whatever its entry for
+`serve` start it fails that connection. The `[egress].allowed_db` check refuses the same name, whatever its entry for
 the host says. An `env()` `dialect` or `odbc_driver` is resolved when the connection is built,
 and refused unless the driver resolves to a name above. `messagefoundry check` reads the graph
 without the values, so its advisory `generic-db-driver` line lists such a hop as possibly

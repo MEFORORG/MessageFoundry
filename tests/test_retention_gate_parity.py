@@ -283,7 +283,8 @@ def test_check_reaches_serves_verdict_in_serves_words(
 ) -> None:
     if not windows:
         _drop_warn_only_windows(monkeypatch)
-    # The environment is in the file as well as on serve's --env, because check has no --env.
+    # The environment is in the file as well as on serve's --env, because _retention_leg passes
+    # check no --env.
     toml = f'ai.environment = "{env}"\n' + _EGRESS + body + _SECURE_ALERTS
     rc, _ = _run_secure_serve(tmp_path, monkeypatch, toml, env=env)
     streams = capsys.readouterr()

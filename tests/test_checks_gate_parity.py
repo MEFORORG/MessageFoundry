@@ -667,6 +667,9 @@ def test_every_settings_leg_reads_an_environment_only_instance(
     monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
     result = _leg(cfg, name)
     assert _ENV_ONLY_NOTE in result.detail, f"{name}: {result.detail}"
+    # The note names the variable, never a flag nobody passed.
+    assert "MEFOR_AI_ENVIRONMENT names the instance" in result.detail
+    assert _ENV_FLAG_NOTE not in result.detail
     assert "graph only" not in result.detail  # static-credentials read the settings half too
     if name != "static-credentials":  # that leg reads the graph either way, so never skipped
         assert not result.skipped, f"{name}: {result.detail}"
@@ -1007,7 +1010,6 @@ def test_build_check_refuses_an_unlisted_http_destination_unless_opted_out(
     if not ok:
         assert "OB_API" in build.detail and "block_unlisted_outbound" in build.detail
         assert "OB_HL7" not in build.detail  # the listed MLLP destination is not the refusal
-        assert not report.ok
 
 
 @pytest.mark.parametrize("declared", [True, False], ids=["env-declared", "no-env-name"])

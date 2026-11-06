@@ -2302,8 +2302,8 @@ def _check_build(
 
     Required, but **fail-safe SKIP** when it can't resolve a real posture, so it never blocks a bare
     config dir or a dev checkout: no ``messagefoundry.toml`` and no ``check --env`` or
-    ``MEFOR_AI_ENVIRONMENT`` → SKIP (a bare dir has no declared posture, byte-identical to before this check); a graph that won't load →
-    SKIP (``validate`` already reports that). Only a genuine build/posture refusal on a fully-resolved
+    ``MEFOR_AI_ENVIRONMENT`` → SKIP (a bare dir has no declared posture, byte-identical to before
+    this check); a graph that won't load → SKIP (``validate`` already reports that). Only a genuine build/posture refusal on a fully-resolved
     config blocks. With no file but an environment declaration the settings come from the environment
     alone (:func:`_settings_source`, vault BACKLOG #2355)."""
     import os
@@ -3997,8 +3997,9 @@ def _check_retention_overrides(
 
     Required, with the fail-safe SKIPs of :func:`_check_build`: no ``messagefoundry.toml`` and no
     ``check --env`` or ``MEFOR_AI_ENVIRONMENT`` → SKIP; a graph that won't load → SKIP
-    (``validate`` reports it); settings that won't load → FAIL (BACKLOG #1318). :func:`_retention_posture` says what it does
-    with no active environment and with an unresolved production tier."""
+    (``validate`` reports it); settings that won't load → FAIL (BACKLOG #1318).
+    :func:`_retention_posture` says what it does with no active environment and with an unresolved
+    production tier."""
     from pydantic import ValidationError
 
     from messagefoundry.config.retention_classification import judge_keep_forever_overrides
@@ -4092,8 +4093,7 @@ def _check_reference_backend(
 
     Required, but **fail-safe SKIP** on the same convention as :func:`_check_build`: no
     ``messagefoundry.toml`` and no ``check --env`` or ``MEFOR_AI_ENVIRONMENT`` (vault BACKLOG #2355;
-    with one, a
-    ``MEFOR_STORE_BACKEND`` is read from the environment) → SKIP (a bare config dir declares no
+    with one, a ``MEFOR_STORE_BACKEND`` is read from the environment) → SKIP (a bare config dir declares no
     backend, and the SQLITE default supports reference sets anyway); a config that won't load → SKIP
     (``validate`` already reports it); settings that won't load → FAIL (BACKLOG #1318). A ``serve``-time backend override can still diverge from the toml this reads — the
     engine-start gate is the backstop for that, which is why both halves exist."""
