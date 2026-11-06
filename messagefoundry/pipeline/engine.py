@@ -802,6 +802,10 @@ class Engine:
         # once instead of waiting out a whole poll interval. _graph_stop stays the loop-exit latch.
         self._graph_wake = asyncio.Event()
         self._graph_lock = asyncio.Lock()
+        # Serializes a reload's first load, which yields in its build check before add_registry:
+        # unserialized, two overlapping first loads both installed and started a runner, and the
+        # first was orphaned (engine PR 2815). reload_detail says what the second one does.
+        self._first_load_lock = asyncio.Lock()
         self._graph_reconcile_interval = 1.0
         # The config writes started and not finished: today the connection flag's store write
         # (BACKLOG #2623), the one write this engine tracks. A caller that is cancelled stops
@@ -1452,6 +1456,30 @@ class Engine:
             env_values=self._env_values,
             coordinator=self._coordinator,
         )
+
+    async def _first_load(self, registry: Registry, env_values: dict[str, Any]) -> RegistryRunner:
+        """Install and start the runner for ``registry`` on an engine with none, for
+        :meth:`reload_detail`, which holds ``_first_load_lock`` across this call."""
+        # Bad connector -> WiringError (422), before any start. The check awaits a worker thread,
+        # so it runs on a runner that is not installed yet: installed first, a concurrent reload
+        # could take it, unstarted, as the live runner in that window. Nothing yields between
+        # add_registry below and the start taking the runner's reload lock.
+        await self._check_runner(registry).build_check_off_loop(registry, env_values)
+        previous_env_values, self._env_values = self._env_values, env_values
+        try:
+            runner = self.add_registry(registry)
+            # That check warned for this graph, so this start does not (vault BACKLOG #2910).
+            await runner.start(warn_query_credentials=False)
+        except Exception:
+            # Don't leave a half-started runner: a later reload would take the "runner exists"
+            # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
+            # Exception only: RegistryRunner.start() does not tear itself down on a cancellation,
+            # so clearing the reference then would orphan a running runner that engine.stop()
+            # could no longer reach.
+            self._registry_runner = None
+            self._env_values = previous_env_values
+            raise
+        return runner
 
     def add_registry(self, registry: Registry) -> RegistryRunner:
         """Run a code-first Connection/Router/Handler graph (one runner for the whole graph)."""
@@ -3434,27 +3462,16 @@ class Engine:
             return ReloadOutcome(registry=registry, applied=False, directory=path)
         # Every check has passed, so the values go live with the graph, and a refused swap keeps
         # the old values with the old graph (vault BACKLOG #2596).
+        first_load = False
         if runner is None:
-            # Bad connector -> WiringError (422), before any start. The check awaits a worker
-            # thread, so it runs on a runner that is not installed yet: installed first, a
-            # concurrent reload could take it, unstarted, as the live runner in that window. Nothing
-            # yields between add_registry below and the start taking the runner's reload lock.
-            await self._check_runner(registry).build_check_off_loop(registry, env_values)
-            previous_env_values, self._env_values = self._env_values, env_values
-            try:
-                runner = self.add_registry(registry)
-                # That check warned for this graph, so this start does not (vault BACKLOG #2910).
-                await runner.start(warn_query_credentials=False)
-            except Exception:
-                # Don't leave a half-started runner: a later reload would take the "runner exists"
-                # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
-                # Exception only: RegistryRunner.start() does not tear itself down on a
-                # cancellation, so clearing the reference then would orphan a running runner that
-                # engine.stop() could no longer reach.
-                self._registry_runner = None
-                self._env_values = previous_env_values
-                raise
-        else:
+            async with self._first_load_lock:
+                # A first load that held the lock before this one may have installed a runner,
+                # and this graph then applies to it as a reload, below.
+                runner = self._registry_runner
+                if runner is None:
+                    first_load = True
+                    runner = await self._first_load(registry, env_values)
+        if not first_load:
             try:
                 # The runner swaps the values under its reload lock and restores them on a rollback.
                 await runner.reload(registry, env_values)

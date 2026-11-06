@@ -506,6 +506,46 @@ async def test_engine_reload_starts_graph_when_none_loaded(tmp_path: Path) -> No
     assert (outdir / "MSG1.hl7").exists()
 
 
+async def test_engine_two_overlapping_first_loads_start_one_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two reloads on an engine with no graph overlap in the first load's build check, which awaits
+    a worker thread. Exactly one runner starts and the engine holds it; the second reload applies to
+    that runner. Red (engine PR 2815): both passed the check and both called add_registry, so the
+    first runner started and was orphaned, out of engine.stop()'s reach."""
+    good = tmp_path / "good"
+    _write_valid_config(good, tmp_path / "in", tmp_path / "out")
+    started: list[RegistryRunner] = []
+    real_start = RegistryRunner.start
+    real_check = RegistryRunner.build_check_off_loop
+
+    async def recording_start(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
+        started.append(self)
+        await real_start(self, *args, **kwargs)
+
+    async def slow_check(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
+        # Holds each check open long enough that the other reload reaches its own.
+        await asyncio.sleep(0.1)
+        await real_check(self, *args, **kwargs)
+
+    monkeypatch.setattr(RegistryRunner, "start", recording_start)
+    monkeypatch.setattr(RegistryRunner, "build_check_off_loop", slow_check)
+    eng = await Engine.create(
+        tmp_path / "e.db", poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+    await eng.start()
+    assert eng.registry_runner is None
+    try:
+        await asyncio.gather(eng.reload(good), eng.reload(good))
+        assert len(started) == 1, started
+        assert eng.registry_runner is started[0] and started[0].running
+    finally:
+        await eng.stop()
+        for orphan in started:
+            if orphan is not eng.registry_runner:
+                await orphan.stop()
+
+
 def _write_env_config(cfg: Path, inbox: Path) -> None:
     """A valid graph whose outbound peer is env()-driven (resolved per environment)."""
     cfg.mkdir(parents=True, exist_ok=True)
