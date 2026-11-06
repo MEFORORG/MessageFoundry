@@ -585,27 +585,40 @@ def test_the_filter_bounds_a_peer_sized_traceback() -> None:
     """The realistic vector, and the one the row calls the worst of the three surfaces: a Handler
     raises carrying the received body and an outer ``log.exception`` renders the whole thing.
 
-    Paired rounds, minimum per side, and which side goes first drawn each round from an unseeded
-    generator, the rule ``tests/_growth.py`` gives (BACKLOG #3721): a stretch of load with a fixed
-    rhythm cannot land on one side alone."""
+    Paired rounds, minimum per side, and which arm goes first drawn each round from an unseeded
+    generator, the rule ``tests/_growth.py`` gives (BACKLOG #3721). That makes a stretch of load
+    with a fixed rhythm unlikely to land on one arm alone, not impossible: ``_growth.py`` gives the
+    odds.
+
+    **The third arm is the negative control, run on the same runner.** It times the unbounded scan
+    the bound replaced, ``redact`` over the whole render. Put back into the filter, that scan must
+    cross the line, or a runner whose render is slow beside its regex engine would pass a filter
+    with the bound removed and this arm would prove nothing there."""
     exc_info = _raised_traceback()
+    rendered = logging.Formatter().formatException(exc_info)
     arms: dict[str, Callable[[], object]] = {
         "render": lambda: logging.Formatter().formatException(exc_info),
         "filter": lambda: RedactionFilter().filter(_record_of(exc_info)),
+        "unbounded scan": lambda: redact(rendered),
     }
     best = dict.fromkeys(arms, float("inf"))
     order = random.Random()
     for _ in range(3):
-        for side in order.sample(list(arms), k=len(arms)):
-            best[side] = min(best[side], _thread_cpu_per_call(arms[side]))
-    assert best["filter"] < _TRACEBACK_RENDER_RATIO * best["render"], (
+        for arm in order.sample(list(arms), k=len(arms)):
+            best[arm] = min(best[arm], _thread_cpu_per_call(arms[arm]))
+    render = best["render"]
+    assert best["filter"] < _TRACEBACK_RENDER_RATIO * render, (
         f"the filter cost {best['filter']:.4f} CPU s on a frame-cap traceback, "
-        f"{best['filter'] / best['render']:.2f} times the {best['render']:.4f} s the render alone "
-        f"costs, against a line of {_TRACEBACK_RENDER_RATIO}"
+        f"{best['filter'] / render:.2f} times the {render:.4f} s the render alone costs, "
+        f"against a line of {_TRACEBACK_RENDER_RATIO}"
+    )
+    assert render + best["unbounded scan"] > _TRACEBACK_RENDER_RATIO * render, (
+        f"a render plus the unbounded scan costs only {1 + best['unbounded scan'] / render:.2f} "
+        f"renders, inside the line of {_TRACEBACK_RENDER_RATIO} -- on this runner the arm above "
+        f"would pass a filter with the bound removed"
     )
 
     rec = _record_of(exc_info)
-    rendered = logging.Formatter().formatException(exc_info)
     RedactionFilter().filter(rec)
 
     # The part the bound is actually responsible for, measured apart from the render it cannot reach.

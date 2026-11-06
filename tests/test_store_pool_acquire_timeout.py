@@ -274,8 +274,9 @@ async def test_salvage_swallows_a_release_failure() -> None:
 
 #: How many event-loop turns a borrow from a ready pool may take. Measured 2026-11-06 on 3.14: it
 #: finishes in 4, for the borrow task, the shield's callback and the wake of the waiting task.
-#: A path that waits on any timer, however short, cannot finish inside any number of turns, because
-#: these turns take microseconds.
+#: A path that waits on a timer cannot finish inside them while they take microseconds, as they do
+#: idle. Under contention they can span milliseconds, and a timer shorter than that can come due
+#: within them, so a sub-millisecond wait may pass here on a loaded runner.
 _HEALTHY_BORROW_TURNS = 20
 
 
@@ -288,7 +289,7 @@ async def test_a_healthy_borrow_is_unaffected() -> None:
     the waiting task, and the timer won: windows-2022 on 2026-10-06 and windows-2025 on 2026-10-12
     raised StoreAcquireTimeout from a pool that was never empty. A GIL-holding neighbour thread
     does the same here on demand. What this asks instead is that a ready connection comes back
-    within a few turns, unreleased, which no path that waits on a timer can do."""
+    within a few turns, unreleased, which a path that waits out a timer cannot do."""
     pool = _ReadyPool()
     borrow = asyncio.create_task(
         acquire_pooled(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT, backend="sqlserver")
