@@ -245,9 +245,9 @@ def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
 
 
 def monitored_files_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
-    """Every file the service settings hand the expiry monitor: :func:`crls_from_settings`, then
-    :func:`certs_from_settings`. ``serve`` and ``cert inventory`` both call this, so the inventory
-    lists the same settings-level rows the monitor watches."""
+    """The settings-level rows that no connection or ``[api]`` parameter carries:
+    :func:`crls_from_settings`, then :func:`certs_from_settings`. ``serve`` and ``cert inventory``
+    both call this, so the inventory lists the same settings-level rows the monitor watches."""
     return [*crls_from_settings(settings), *certs_from_settings(settings)]
 
 

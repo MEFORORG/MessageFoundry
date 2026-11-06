@@ -40,6 +40,7 @@ from messagefoundry.pipeline.cert_expiry import (
     certs_from_settings,
     client_cert_label,
     crls_from_settings,
+    monitored_files_from_settings,
     peer_cert_expiry,
 )
 from messagefoundry.pipeline.engine import Engine
@@ -795,3 +796,18 @@ def test_no_store_pin_row_without_a_sqlserver_pin(tmp_path: Path) -> None:
     bundle = tmp_path / "db-ca.pem"
     _write_cert(bundle, not_after=_REF + datetime.timedelta(days=10))
     assert certs_from_settings(_store(StoreBackend.POSTGRES, bundle)) == []
+
+
+def test_monitored_files_from_settings_lists_the_crls_then_the_store_pin(tmp_path: Path) -> None:
+    # BACKLOG #3714 item 5: the one list serve and cert inventory both build.
+    crl = tmp_path / "tls_crl.pem"
+    _write_crl(crl, next_update=_REF + datetime.timedelta(days=5))
+    pin = tmp_path / "db-server.pem"
+    _write_cert(pin, not_after=_REF + datetime.timedelta(days=10))
+    settings = _store(StoreBackend.SQLSERVER, pin).model_copy(
+        update={"tls": TlsSettings(crl_file=str(crl))}
+    )
+    assert monitored_files_from_settings(settings) == [
+        MonitoredCert("tls.crl_file", str(crl), kind="crl"),
+        MonitoredCert("store.ssl_root_cert", str(pin)),
+    ]

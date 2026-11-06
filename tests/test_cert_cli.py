@@ -748,12 +748,12 @@ def test_inventory_reports_the_sqlserver_store_pin_as_a_cert_row(
     state.mkdir()
     pin = tmp_path / "db-server.pem"
     pin.write_bytes(_pem(_make_cert("mefor-db")[1]))
-    svc = tmp_path / "messagefoundry.toml"
+    svc = _svc(tmp_path, state)
+    # No api_lines, so these land in the [store] table _svc opened.
     svc.write_text(
-        "[store]\n"
-        f"path = {json.dumps(str(state / 'messagefoundry.db'))}\n"
-        'backend = "sqlserver"\nserver = "db"\ndatabase = "mefor"\nusername = "mefor"\n'
-        f"ssl_root_cert = {json.dumps(str(pin))}\n",
+        svc.read_text(encoding="utf-8")
+        + 'backend = "sqlserver"\nserver = "db"\ndatabase = "mefor"\nusername = "mefor"\n'
+        + f"ssl_root_cert = {json.dumps(str(pin))}\n",
         encoding="utf-8",
     )
     rc = main(["cert", "inventory", "--service-config", str(svc), "--json"])

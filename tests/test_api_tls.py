@@ -548,6 +548,21 @@ def test_serve_hands_the_settings_monitored_files_to_the_expiry_monitor(
     ]
 
 
+def test_serve_hands_the_monitored_files_helper_output_to_the_expiry_monitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3714 item 5: serve passes exactly what ``monitored_files_from_settings`` returns,
+    the helper ``cert inventory`` also calls. The CRL test above runs on SQLite, where the helper
+    and ``crls_from_settings`` agree, so only a sentinel tells a call to the helper apart."""
+    sentinel = [MonitoredCert("sentinel.row", str(tmp_path / "absent.pem"))]
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.cert_expiry.monitored_files_from_settings",
+        lambda _settings: sentinel,
+    )
+    handed, _captured = _serve_capturing(tmp_path, monkeypatch, _SYNTHETIC_LOOPBACK_TOML)
+    assert list(handed["settings_monitored_files"]) == sentinel
+
+
 def test_the_generated_api_certificate_is_watched_by_the_expiry_monitor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
