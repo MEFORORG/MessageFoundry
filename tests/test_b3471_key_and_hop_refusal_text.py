@@ -529,6 +529,68 @@ def test_a_runtime_error_with_no_codec_error_passes_through(
     assert caught.value is own
 
 
+def test_a_holder_of_another_class_is_named_by_its_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A DpapiError that holds the codec error names its class, so the refusal says what failed."""
+    _with_provider(monkeypatch, DpapiError(_decode_error()))
+    with pytest.raises(KeyProviderError) as caught:
+        build_store_cipher(StoreSettings())
+    _assert_no_key_byte(_whole(caught.value))
+    assert str(caught.value).startswith("DpapiError: "), str(caught.value)
+
+
+class _UnreadableReason(ValueError):
+    """An error whose ``reason``, which the chain walk reads, raises."""
+
+    @property
+    def reason(self) -> object:
+        raise KeyError("synthetic: reason cannot be read")
+
+
+def test_a_chain_that_raises_as_it_is_read_is_refused_without_its_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The walk runs a link's own code; an error from it must not leave with the original as its
+    context, which would carry the byte."""
+    try:
+        raise _UnreadableReason(f"synthetic: {_decode_error()}")
+    except _UnreadableReason as exc:
+        error = exc
+    _with_provider(monkeypatch, error)
+    with pytest.raises(StoreCipherConfigError) as caught:
+        build_store_cipher(StoreSettings())
+    _assert_no_key_byte(_whole(caught.value))
+    assert "cannot be read whole" in str(caught.value), str(caught.value)
+
+
+@pytest.mark.parametrize("resolve", ["resolve_active_key", "resolve_decrypt_keys"])
+def test_the_key_seam_refuses_a_chained_codec_error_without_its_byte(
+    resolve: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The callers that resolve the key without building the cipher: ``rotate-key`` through the
+    first, ``restore`` and ``restore-verify`` through the second."""
+    _with_provider(monkeypatch, _built_from(_decode_error(), KeyProviderError))
+    with pytest.raises(KeyProviderError) as caught:
+        getattr(store_base, resolve)(StoreSettings())
+    _assert_no_key_byte(_whole(caught.value))
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert f"KeyProviderError {_CHAINED}" in str(caught.value), str(caught.value)
+
+
+def test_rotate_key_prints_no_byte_of_a_chained_codec_error(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = shell / "keyed.db"
+    key = generate_key()
+    _keyed_chain(db, key)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key)
+    _with_provider(monkeypatch, _built_from(_decode_error(), KeyProviderError))
+    rc = main(_argv("rotate-key", db, shell))
+    captured = capsys.readouterr()
+    _assert_no_key_byte(captured.out + captured.err)
+    assert rc == 2, (captured.out, captured.err)
+    assert _CHAINED in captured.out + captured.err
+
+
 def test_the_postgres_tls_wrap_reads_a_context_beside_a_cause() -> None:
     """``_carries_a_codec_error`` is also the PostgreSQL TLS wrap's test (BACKLOG #2532)."""
     assert store_base._carries_a_codec_error(_context_beside_cause(_decode_error()))
