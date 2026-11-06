@@ -2412,13 +2412,16 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
     Never raises: the teardown runs from ``_Staging.release`` after a verdict, or while an error is
     in flight, and must replace neither. A fault is read as a name not to touch.
 
-    The ban on the plain path comes before any path, so it is inside the first 200 characters a
-    failure record keeps whatever the path's length, the verify route's prefix included. Then it
-    names the directory by its verbatim path only, as a PowerShell single-quoted literal
-    (:func:`_ps_literal`), whose closing quote shows a trailing space and in which nothing expands,
-    names any trailing dot or space in words, and names ``Remove-Item -LiteralPath`` and
-    ``Test-Path -LiteralPath`` on that literal as the only removal and its check. No ``cmd.exe``
-    form is given: interactive ``cmd.exe`` expands ``%VAR%`` even inside double quotes.
+    The ban on the plain path comes before any path. So the first 200 characters a failure record
+    keeps hold it, whatever the path's length, where this sentence leads the error or follows only
+    a passing verify's ``the archive verified, but``. A verify that failed with its own reason puts
+    that reason first, and it can push the ban past the cut. The cut rarely keeps the path; the
+    whole sentence is in the ERROR log line. Then it names the directory by its verbatim path only,
+    as a PowerShell single-quoted literal (:func:`_ps_literal`), whose closing quote shows a
+    trailing space and in which nothing expands, names any trailing dot or space in words, and
+    names ``Remove-Item -LiteralPath`` and ``Test-Path -LiteralPath`` on that literal as the only
+    removal and its check. No ``cmd.exe`` form is given: interactive ``cmd.exe`` expands ``%VAR%``
+    even inside double quotes. A fault's detail comes last, since it can carry the plain path.
 
     Measured on Windows 11 build 26300, with synthetic files: a removal by the plain path, by
     ``rd /s /q`` or ``Remove-Item -Recurse``, removes the OTHER directory and leaves this one, and
@@ -2427,13 +2430,17 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
     rewritten names inside it included, and left the other; the printed ``Test-Path`` line read
     ``True`` before it and ``False`` after. With no other directory there, that check read ``True``
     where the same check by the plain path read ``False``; with a file in it held open, the removal
-    printed its errors and the check still read ``True`` (BACKLOG #2420)."""
+    printed its errors and the check still read ``True``. On an existing path it could not read,
+    ``Test-Path`` printed ``False`` and an access-denied error, even with ``-ErrorAction Stop``,
+    hence "and no error" (BACKLOG #2420)."""
+    fault = ""
     try:
         if not _win_rewritten(staging):
             return None
         why = "Windows opens that path as another directory"
     except Exception as exc:  # never raise over the verdict or the error in flight
-        why = f"whether that path reaches another directory could not be checked ({safe_exc(exc)})"
+        why = "whether that path reaches another directory could not be checked"
+        fault = f" (the check failed: {safe_exc(exc)})"
     ban = (
         "a plaintext staging directory was not removed or emptied; never remove it by its plain "
         f"path, without the \\\\?\\ prefix, since {why}"
@@ -2448,17 +2455,17 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
     try:
         literal = _ps_literal(_win_verbatim(staging))
     except Exception as exc:  # never raise over the verdict or the error in flight
+        # No command: one assembled by hand from a name and a parent is the mistake this prevents.
         return (
             f"{ban}; it is named {_ps_literal(staging.name)}{ends}, in "
-            f"{_ps_literal(str(staging.parent))}, and its "
-            f"verbatim path could not be formed ({safe_exc(exc)}); remove it only in PowerShell, "
-            "not cmd.exe, with Remove-Item -LiteralPath and the \\\\?\\ form of that path in single "
-            "quotes, then check it with Test-Path -LiteralPath on the same form"
+            f"{_ps_literal(str(staging.parent))}, and since its verbatim path could not be formed, "
+            f"no removal can be named for it here; leave it in place{fault} (forming the path "
+            f"failed: {safe_exc(exc)})"
         )
     return (
         f"{ban}; it is {literal}{ends}; remove it only in PowerShell, not cmd.exe, with "
         f"Remove-Item -LiteralPath {literal} -Recurse -Force, then check that Test-Path "
-        f"-LiteralPath {literal} prints False"
+        f"-LiteralPath {literal} prints False and no error{fault}"
     )
 
 
@@ -2466,7 +2473,7 @@ def _ps_literal(text: str) -> str:
     """``text`` as a PowerShell single-quoted string literal: nothing in it expands, and each
     character PowerShell reads as a single quote is doubled, the escape PowerShell's own
     ``EscapeSingleQuotedStringContent`` applies."""
-    for quote in "'‘’‚‛":
+    for quote in "'\u2018\u2019\u201a\u201b":
         text = text.replace(quote, quote * 2)
     return f"'{text}'"
 

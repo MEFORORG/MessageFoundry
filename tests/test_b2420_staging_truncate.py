@@ -896,39 +896,50 @@ def test_a_percent_in_the_name_cannot_expand_in_the_advised_command(
 def test_a_quote_in_the_name_is_doubled_in_the_literal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A single quote, or a character PowerShell reads as one, would end the literal early."""
-    name = "mefor-backup-o'’x."
+    """A single quote, or any of the four characters PowerShell also reads as one, would end the
+    literal early."""
+    name = "mefor-backup-o'\u2018\u2019\u201a\u201bx."
     refusal = _refusal_for(name, tmp_path, monkeypatch)
-    assert "mefor-backup-o''’’x.'" in refusal
+    assert "mefor-backup-o''\u2018\u2018\u2019\u2019\u201a\u201a\u201b\u201bx.'" in refusal
 
 
 def test_the_refusal_names_the_exact_path_to_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A check by the plain path goes through the same rewrite. Red before the fix: "check that it is
-    gone" named no path."""
+    """A check by the plain path goes through the same rewrite, and a check that cannot read the path
+    prints False with an access-denied error. Red before the fix: "check that it is gone" named no
+    path."""
     name = "mefor-backup-x%PATH% "
     refusal = _refusal_for(name, tmp_path, monkeypatch)
     literal = f"'{dr_backup._win_verbatim(tmp_path / name)}'"
-    assert refusal.endswith(f"then check that Test-Path -LiteralPath {literal} prints False")
+    assert refusal.endswith(
+        f"then check that Test-Path -LiteralPath {literal} prints False and no error"
+    )
 
 
 def test_the_plain_path_ban_survives_the_failure_records_cut_on_the_verify_route(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The failure record and the alert keep the first 200 characters of the backup's verify error.
-    Red before the fix: the path came first, so a verbatim path over about 58 characters pushed the
-    ban past the cut."""
+    """The failure record and the alert keep the first 200 characters of the backup's verify error,
+    which leads with the passing verify's reason. Red before the fix: the path came first, so a
+    verbatim path over about 58 characters pushed the ban past the cut."""
     from messagefoundry.redaction import safe_exc
 
     deep = tmp_path / ("d" * 120)
-    refusal = _refusal_for("mefor-verify-abcd1234.", deep, monkeypatch)
-    error = dr_backup.BackupError(
-        "verify", f"restore-verify FAIL: the archive verified, but {refusal} (kept for diagnosis)"
+    deep.mkdir()
+    monkeypatch.setattr(dr_backup, "_verify_in_staging", _passing_verify)
+    monkeypatch.setattr(dr_backup, "_win_rewritten", lambda path: True)
+    result = dr_backup._verify_archive_blocking(
+        archive_path=_plaintext_archive(tmp_path), keys=[], full=False, staging_root=deep
     )
-    recorded = safe_exc(error)
-    assert len(recorded) <= 260
-    assert "never remove it by its plain path" in recorded
+    assert result.reason is not None and result.reason.startswith("the archive verified, but ")
+    # The backup's own wrapping of a verify that did not pass (`_verify_and_publish`).
+    error = dr_backup.BackupError(
+        "verify",
+        f"restore-verify {result.status}: {result.reason} (kept for diagnosis as synthetic.mfbak; "
+        "it holds no retention slot, and nothing in the engine expires it)",
+    )
+    assert "never remove it by its plain path" in safe_exc(error)
 
 
 @_windows_only
@@ -1020,7 +1031,7 @@ def test_a_verbatim_path_that_cannot_be_formed_still_forbids_the_plain_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A fault forming the verbatim path still leaves the refusal standing, never the discard's
-    generic "delete it" line."""
+    generic "delete it" line, and names no command an operator would have to assemble."""
     staging = tmp_path / "mefor-backup-x"
     staging.mkdir()
     monkeypatch.setattr(dr_backup, "_win_rewritten", lambda path: True)
@@ -1030,6 +1041,10 @@ def test_a_verbatim_path_that_cannot_be_formed_still_forbids_the_plain_one(
     assert leftover.startswith(
         "a plaintext staging directory was not removed or emptied; never remove it by its plain path"
     )
-    assert f"; it is named 'mefor-backup-x', in '{tmp_path}', and its verbatim path" in leftover
+    assert (
+        f"; it is named 'mefor-backup-x', in '{tmp_path}', and since its verbatim path" in leftover
+    )
+    assert "no removal can be named for it here; leave it in place" in leftover
+    assert "Remove-Item" not in leftover
     assert "delete it" not in leftover and "by hand" not in leftover
     assert staging.is_dir()
