@@ -22,7 +22,7 @@ import os
 import pickle
 import re
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -771,14 +771,61 @@ def test_closing_step_4_a_folder_that_cannot_be_listed_is_refused(
     assert warned and all("phi-capath" not in m for m in warned)
 
 
-def test_closing_step_4_a_missing_folder_or_a_file_is_left_to_the_driver(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("raised", [FileNotFoundError, NotADirectoryError, PermissionError])
+def test_closing_step_4_a_listing_that_fails_partway_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    raised: type[OSError],
 ) -> None:
+    """A folder that opens and then fails while it is listed was judged in part. Read as a missing
+    folder, the value was cleared with the remaining entries unjudged. Red: a not-found or
+    not-a-folder raised partway left it to the driver."""
+    folder = _capath(tmp_path, "a.0", "b.0")
     _entry_verdicts(monkeypatch, {})
-    database._build_odbc_dsn(_generic(SSLCAPATH=str(tmp_path / "absent")), connection=_OUT)
-    single = tmp_path / "ca.pem"
+    real = os.scandir
+
+    class Partway:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __enter__(self) -> Partway:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            self._inner.close()
+
+        def __iter__(self) -> Iterator[Any]:
+            yield next(self._inner)
+            raise raised(2, "gone partway", str(folder))
+
+    def partway(path: str) -> Any:
+        if os.fspath(path) == str(folder):
+            return Partway(real(path))
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", partway)
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
+        database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warned and all("phi-capath" not in m for m in warned)
+
+
+def test_closing_step_4_a_missing_folder_or_a_file_is_left_to_the_driver(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Left to the driver, as a missing file is, and said at DEBUG with the keyword and the
+    reason, never the path. Red: nothing was logged."""
+    _entry_verdicts(monkeypatch, {})
+    caplog.set_level(logging.DEBUG, logger=database.logger.name)
+    database._build_odbc_dsn(_generic(SSLCAPATH=str(tmp_path / "phi-absent")), connection=_OUT)
+    single = tmp_path / "phi-ca.pem"
     single.write_bytes(b"synthetic")
     database._build_odbc_dsn(_generic(SSLCAPATH=str(single)), connection=_OUT)
+    left = [r.getMessage() for r in caplog.records if "left to the driver" in r.getMessage()]
+    assert len(left) >= 2 and all("sslcapath" in m for m in left)
+    assert all("phi-" not in m and str(tmp_path) not in m for m in left)
 
 
 def test_closing_step_4_the_entries_are_not_listed_where_only_the_spelling_is_checked(

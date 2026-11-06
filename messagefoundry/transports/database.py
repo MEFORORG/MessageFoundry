@@ -1153,9 +1153,11 @@ def _capath_entries_leave_host(value: object, verdicts: FileVerdicts) -> bool:
     did not.
 
     Each spelling :func:`driver_file_spellings` gives that is a folder is listed, and every entry
-    in it, not only the hash-named ones, takes :func:`_path_verdict`: ``True`` or ``None`` for any
-    one refuses, as for the trimmed spelling of a file keyword. So does a folder that cannot be
-    listed, or one holding more than :data:`_MAX_CAPATH_ENTRIES`. A spelling that names no folder,
+    in it, not only the hash-named ones, is judged by :func:`_capath_entry_clear`. One ``lstat``
+    clears an entry it reads as a plain file or folder; any other entry takes
+    :func:`_path_verdict`, where ``True`` or ``None`` for any one refuses, as for the trimmed
+    spelling of a file keyword. So does a folder that cannot be listed, whether at open or partway
+    through, or one holding more than :data:`_MAX_CAPATH_ENTRIES`. A spelling that names no folder,
     or a file, is left to the driver, as a missing file is. Entries are not walked into: the driver
     reads none below the folder. ``False`` where only the spelling is checked
     (:data:`_WALKS_BEYOND_SPELLING`), with nothing listed. Like the rest of the check, it judges
@@ -1173,23 +1175,36 @@ def _capath_folder_clear(folder: str) -> bool:
     :func:`_capath_entries_leave_host`. A reason it is not is logged as the walk logs one
     (:func:`_not_cleared`)."""
     try:
-        with os.scandir(folder) as listing:
+        # Not found and not a folder are tolerated at the open only. Raised while the folder is
+        # listed, they leave part of it unjudged, so they refuse below as any listing error does.
+        try:
+            listing = os.scandir(folder)
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
+                # A share Windows could not reach, which CPython raises as not found, read as the
+                # walk's own probe reads it (_windows_path_verdict): the folder leads off the host.
+                _not_cleared("an sslcapath folder is on a share Windows could not reach", exc)
+                return False
+            # No folder at this spelling: left to the driver, as a missing file is. The reason
+            # only, since the exception's text names the path.
+            logger.debug(
+                "sslcapath names no folder to list, so it is left to the driver: %s", _why(exc)
+            )
+            return True
+        with listing:
             names = [entry.name for entry in islice(listing, _MAX_CAPATH_ENTRIES + 1)]
-    except (FileNotFoundError, NotADirectoryError) as exc:
-        if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
-            # A share Windows could not reach, which CPython raises as not found, read as the
-            # walk's own probe reads it (_windows_path_verdict): the folder leads off the host.
-            _not_cleared("an sslcapath folder is on a share Windows could not reach", exc)
-            return False
-        return True  # no folder at this spelling: left to the driver, as a missing file is
     except (OSError, ValueError) as exc:
-        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
-        _not_cleared(f"an sslcapath folder could not be listed: {reason}", exc)
+        _not_cleared(f"an sslcapath folder could not be listed: {_why(exc)}", exc)
         return False
     if len(names) > _MAX_CAPATH_ENTRIES:
         _not_cleared(f"an sslcapath folder holds more than {_MAX_CAPATH_ENTRIES} entries", folder)
         return False
     return all(_capath_entry_clear(os.path.join(folder, name), name) for name in names)
+
+
+def _why(exc: Exception) -> str:
+    """A reason ``exc`` gives that names no path: its ``strerror``, or failing that its type."""
+    return exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
 
 
 def _capath_entry_clear(path: str, name: str) -> bool:
