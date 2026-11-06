@@ -405,8 +405,9 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
 #:   comments name as re-run. Generic names they measured, such as @babel/helpers'
 #:   ``getDependencies`` and ``minVersion``, are left out. Some package names that ordinary prose
 #:   could hold are kept, as minimatch's is above, for the same reason. "semver" and "braces" are
-#:   not re-run: the words are common in other code's comments, and each package's own
-#:   identifiers above stand in for it.
+#:   not re-run: the words are common in other code's comments. semver's own identifiers above
+#:   stand in for it. braces' stand-in, ``CHAR_ZERO_WIDTH_NOBREAK_SPACE``, is not braces' alone:
+#:   picomatch defines it too, so it fires on either package's code.
 _ABSENT_FROM_BUNDLE = (
     re.compile("sprintf", re.IGNORECASE),  # sprintf-js
     re.compile("ArgumentParser"),  # argparse

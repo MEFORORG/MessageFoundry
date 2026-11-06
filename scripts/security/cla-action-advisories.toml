@@ -59,13 +59,18 @@
 # THE 2026-11-05 TRIAGE (BACKLOG #2492, slices a and b; dates in it are UTC). TRIAGED BY Claude,
 # an AI agent working as the batch 608 Builder, a subagent of the batch 608 Manager. It covers 29
 # entries in 12 comments. Each comment names by id every advisory it covers, says what was found,
-# and ends with their acceptance status under the owner's ruling of 2026-11-05. That ruling was
-# given in the batch 608 Manager's chat, and this Builder read it as the Manager relayed it in its
-# brief, not from the owner: a Manager may accept, under class B, an entry proven dev-only, or
-# absent from the bundle by discriminating probes; an entry present in the bundle keeps the
-# owner's per-entry acceptance. This triage found none of its 29 present, and rests none of them on
-# lockfile marks alone. The bundle carries code Babel compiled into other packages' pre-built
-# files (Babel's _interopRequireDefault helper appears 39 times), so each was probed.
+# and ends with their acceptance status under the owner's ruling of 2026-11-05, recorded as
+# decision d20261105T044506837-0038dd. That ruling was given in the batch 608 Manager's chat, and
+# this Builder read it as the Manager relayed it in its brief, not from the owner: a Manager may
+# accept, under class B, an entry proven dev-only, or absent from the bundle by discriminating
+# probes; an entry present in the bundle keeps the owner's per-entry acceptance. This triage found
+# none of its 29 present, and rests none of them on lockfile marks alone. The bundle carries code
+# Babel compiled into other packages' pre-built files (Babel's _interopRequireDefault helper
+# appears 39 times), so each was probed. THE BATCH 608 MANAGER ACCEPTED ALL 29 on 2026-11-06, as
+# decision d20261106T103129535-f83e0e, and a later Builder recorded that here as the Manager
+# relayed it in its brief. The entries on packages that are not dev-only, brace-expansion,
+# cross-spawn, flatted, js-yaml, minimatch and semver, were accepted as absent from the bundle by
+# discriminating probes, not as dev-only.
 # It follows the deepmerge and minimatch triages at the end of this file, and these words hold for
 # every comment that cites this paragraph:
 #   MARKS. Every lockfile node of the package was read for `dev`, `peer` and `optional`, and every
@@ -107,7 +112,8 @@
 # bundle (9 together in packages/babel-helpers/src/helpers/wrapRegExp.js at v7.22.15). Re-run in
 # the gate test: loadPartialConfig, NodePath and wrapRegExp. The other @babel/helpers names are
 # generic, so they are not.
-# PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-4x5r-pxfx-6jf8"
@@ -140,8 +146,8 @@ package = "@octokit/request-error"
 # these five brace-expansion entries, and the three recorded 2026-09-30 further down. NOT DEV-ONLY;
 # ABSENT FROM THE BUNDLE. The lockfile holds one brace-expansion, 1.1.11, marked neither `dev`,
 # `peer` nor `optional`. Its one parent is minimatch 3.1.2, whose chain to actions-toolkit, a root
-# runtime dependency, the minimatch GHSA-g3hv-75wg-m249 triage at the end of this file traces.
-# Probes, each 0 in the bundle: expandTop (2, in index.js at tag v1.1.11) and balanced (4 there;
+# runtime dependency, the separate minimatch GHSA-g3hv-75wg-m249 triage at the end of this file
+# traces; this comment does not cover GHSA-g3hv-75wg-m249. Probes, each 0 in the bundle: expandTop (2, in index.js at tag v1.1.11) and balanced (4 there;
 # the name brace-expansion gives balanced-match, its own dependency); braceExpand, minimatch's call
 # into it, and the rest of that minimatch triage's probes, each 0 again on this reading. Re-run in
 # the gate test: expandTop. All eight advisories are denials of service on a pattern
@@ -150,7 +156,8 @@ package = "@octokit/request-error"
 # GHSA-3jxr-9vmj-r5cp, GHSA-f886-m6hf-6m8v, GHSA-mh99-v99m-4gvg, GHSA-rgw5-rvv9-x895 and
 # GHSA-v6h2-p8h4-qcjw below, and GHSA-6j4f-fj2g-mc7p, GHSA-q2hr-2g5m-vwhr and GHSA-qhr7-859c-m2p7
 # further down.
-# PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-3jxr-9vmj-r5cp"
@@ -182,7 +189,8 @@ package = "brace-expansion"
 # offered as evidence. Re-run in the gate test: CHAR_ZERO_WIDTH_NOBREAK_SPACE, as before.
 # GHSA-grv7-fg5c-xmjg is uncontrolled resource consumption in braces, which needs braces code to
 # run.
-# PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-grv7-fg5c-xmjg"
@@ -198,7 +206,8 @@ package = "braces"
 # browserslist. GHSA-c83g-rgw3-j3cx is unbounded memory growth over distinct query results, and
 # GHSA-73wf-gq98-2v4g a crash or prototype write from a custom stats file. Each needs browserslist
 # code to run.
-# PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-73wf-gq98-2v4g"
@@ -210,8 +219,8 @@ package = "browserslist"
 
 # TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header.
 # NOT DEV-ONLY; ABSENT FROM THE BUNDLE. npm reports two nodes: cross-spawn 6.0.5, marked neither
-# `dev`, `peer` nor `optional`, and 7.0.3 under jest-changed-files, marked `dev`. 6.0.5's one
-# parent is execa 1.0.0, also unmarked. execa's parents are actions-toolkit 2.2.0, a root runtime
+# `dev`, `peer` nor `optional`, and 7.0.3 under jest-changed-files, marked `dev` and `peer`.
+# 6.0.5's one parent is execa 1.0.0, also unmarked. execa's parents are actions-toolkit 2.2.0, a root runtime
 # dependency, and windows-release 3.2.0. windows-release's parent is os-name 3.1.0. The
 # universal-user-agent 4.0.x copies nested under @octokit/endpoint, @octokit/request and
 # @octokit/rest need os-name, and so does the top-level universal-user-agent 2.1.0, which
@@ -230,7 +239,8 @@ package = "browserslist"
 # one getUserAgent definition reads navigator and process and calls no os-name. Re-run in the
 # gate test: hookChildProcess, verifyENOENT, joinCmd, windowsRelease and osName.
 # GHSA-3xgq-45jj-v275 is a ReDoS in cross-spawn, which needs cross-spawn code to run.
-# PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-3xgq-45jj-v275"
@@ -245,7 +255,8 @@ package = "cross-spawn"
 # triage also records why its flat-cache zeros are not offered as evidence. Re-run in the gate
 # test: flatted, case-insensitive. GHSA-25h7-pfq9-p65f is unbounded recursion in parse(), and
 # GHSA-rf6f-7fwh-wjgh prototype pollution through parse(). Each needs flatted code to run.
-# PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-25h7-pfq9-p65f"
@@ -267,7 +278,8 @@ package = "flatted"
 # again, and the gate test already re-runs each. GHSA-mh29-5h37-fv8m is prototype pollution through
 # merge keys. GHSA-h67p-54hq-rp68, GHSA-52cp-r559-cp3m, GHSA-5p4m-2wfm-xmqj and GHSA-2883-xcg3-v3hh
 # are CPU amplification in merge-key and !!omap handling. Each needs js-yaml's loader to run.
-# PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-2883-xcg3-v3hh"
@@ -314,22 +326,25 @@ package = "lodash.set"
 # is marked `dev` and `peer`. Probe, 0 in the bundle: micromatch, case-insensitive (40, in index.js
 # at tag 4.0.5). Re-run in the gate test: micromatch. GHSA-952p-6rrq-rcjv is a ReDoS in
 # micromatch, which needs micromatch code to run.
-# PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-952p-6rrq-rcjv"
 package = "micromatch"
 
 # TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header:
-# these three minimatch entries. NOT DEV-ONLY; ABSENT FROM THE BUNDLE, on the reading the minimatch
-# GHSA-g3hv-75wg-m249 triage at the end of this file records for the same node, minimatch 3.1.2,
-# and the same chain to actions-toolkit. That reading was taken again for this triage: every
+# these three minimatch entries. NOT DEV-ONLY; ABSENT FROM THE BUNDLE, on the reading the separate
+# minimatch GHSA-g3hv-75wg-m249 triage at the end of this file records for the same node, minimatch
+# 3.1.2, and the same chain to actions-toolkit; this comment does not cover GHSA-g3hv-75wg-m249,
+# which that triage covers. That reading was taken again for this triage: every
 # identifier it lists returned 0 in the bundle, and the control 2. Its probes' discrimination at
 # the upstream tags is recorded there and is not repeated here. The gate test already re-runs some
 # of them. GHSA-3ppc-4f35-3m26 and GHSA-7r86-cg39-jmmj are ReDoS through repeated wildcards and
 # through several GLOBSTAR segments, fixed in 3.1.3, and GHSA-23c5-xmqv-rm74 is a ReDoS through
 # nested extglobs, fixed in 3.1.4. Each needs minimatch code to run.
-# PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-23c5-xmqv-rm74"
@@ -351,7 +366,8 @@ package = "minimatch"
 # gate test: picomatch, and CHAR_ZERO_WIDTH_NOBREAK_SPACE, as before. GHSA-3v7f-55p6-f55p is
 # method injection in POSIX character classes, and GHSA-c2c7-rcm5-vvqj a ReDoS through extglob
 # quantifiers. Each needs picomatch code to run.
-# PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-3v7f-55p6-f55p"
@@ -372,7 +388,8 @@ package = "picomatch"
 # cross-spawn comment. Re-run in the gate test:
 # compareIdentifiers and MAX_SAFE_COMPONENT_LENGTH, with the chain's. GHSA-c2qf-rxjj-qqgw is a
 # ReDoS in semver, which needs semver code to run.
-# PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-c2qf-rxjj-qqgw"
@@ -395,7 +412,8 @@ package = "yaml"
 # Builder: GHSA-6j4f-fj2g-mc7p, GHSA-q2hr-2g5m-vwhr and GHSA-qhr7-859c-m2p7, with the five
 # brace-expansion entries above, on the reading in the comment above them. NOT DEV-ONLY; ABSENT
 # FROM THE BUNDLE.
-# PENDING ACCEPTANCE BY THE BATCH 608 MANAGER UNDER THE OWNER'S RULING OF 2026-11-05.
+# ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
+# OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
 [[advisory]]
 id = "GHSA-6j4f-fj2g-mc7p"
