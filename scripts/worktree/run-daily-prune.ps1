@@ -29,7 +29,9 @@
     with --force. That file's header lists the re-checks. Each removed or refused path is logged with its
     reason, then a summary line with the counts and the drive's free space. A refusal is data, not a
     failure, and leaves the exit code alone. Without -Apply the step only logs WOULD-REMOVE. With
-    -Apply it refuses to run inside Claude Code, the same refusal install-daily-prune.ps1 carries.
+    -Apply it refuses to run inside Claude Code, the same refusal install-daily-prune.ps1 carries. With
+    the switch, a GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE in the environment refuses the
+    whole run before the prune starts, logged, with exit 2.
 
 .PARAMETER RepoRoot
     The primary checkout to prune. Defaults to the value the shared liveness fence calls the primary --
@@ -95,6 +97,42 @@ $EXIT_MEANING = @{
 $prune = Join-Path $PSScriptRoot 'prune-merged.ps1'
 if (-not (Test-Path -LiteralPath $prune)) { throw "prune-merged.ps1 not found beside this script: $prune" }
 
+$mode = if ($Apply) { 'APPLY' } else { 'DRYRUN' }
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
+
+# The one way out after the log exists, so every exit writes its meaning and trims the log directory.
+function Exit-Run([int]$Code) {
+    $meaning = if ($EXIT_MEANING.ContainsKey($Code)) { $EXIT_MEANING[$Code] } else { "UNKNOWN exit code $Code" }
+    "=== exit $Code ($meaning) ===" | Add-Content -LiteralPath $log
+    # Keep the log directory bounded. -ErrorAction SilentlyContinue because a log a human has open must
+    # not turn a successful prune into a failed task run.
+    Get-ChildItem -LiteralPath $LogDir -Filter 'prune-*.log' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -Skip $KeepLogs |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    exit $Code
+}
+
+# BEFORE ANYTHING ASKS GIT, the primary's resolution below included: the helper refuses these too, but
+# by then the prune would already have run under them. Refused into the LOG, with exit 2 (nothing
+# attempted), so a scheduled run that hits it leaves a line saying why rather than a bare exit code.
+if ($RemoveFinishedClaudeWorktrees) {
+    $stepFault = ''
+    try { . (Join-Path $PSScriptRoot 'finished-worktree-removal.ps1') }
+    catch { $stepFault = "the -RemoveFinishedClaudeWorktrees step's scripts could not be loaded (a defect, not a safety finding): $($_.Exception.Message)" }
+    if (-not $stepFault) {
+        try { Assert-NoGitRedirect 'run-daily-prune.ps1 -RemoveFinishedClaudeWorktrees' }
+        catch { $stepFault = $_.Exception.Message }
+    }
+    if ($stepFault) {
+        "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode REFUSED before the prune; nothing was attempted: $stepFault ===" |
+            Add-Content -LiteralPath $log
+        Write-Error -Message $stepFault -ErrorAction Continue
+        Exit-Run 2
+    }
+}
+
 # Resolve the primary through the SAME helper prune-merged.ps1 validates against (occupancy.ps1's
 # PrimaryPath, which is git's first `worktree list` entry). Resolving it any other way -- a
 # --git-common-dir parent, say -- gives an answer that is right today by agreement rather than by
@@ -110,18 +148,12 @@ $pruneArgs = @('-RepoRoot', $RepoRoot)
 if ($Apply) { $pruneArgs += '-Apply' }
 if ($PSBoundParameters.ContainsKey('IdleHours')) { $pruneArgs += @('-IdleHours', $IdleHours) }
 
-$mode = if ($Apply) { 'APPLY' } else { 'DRYRUN' }
-
-New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-$log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
-
 "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode repo=$RepoRoot ===" | Add-Content -LiteralPath $log
 & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $prune @pruneArgs *>&1 |
     Add-Content -LiteralPath $log
 $code = $LASTEXITCODE
 
 if ($RemoveFinishedClaudeWorktrees) {
-    . (Join-Path $PSScriptRoot 'finished-worktree-removal.ps1')
     "--- finished .claude/worktrees: mode=$mode ---" | Add-Content -LiteralPath $log
 
     # A FRESH list, from a second prune-merged.ps1 run in this invocation, after the prune above. Always
@@ -193,14 +225,4 @@ if ($RemoveFinishedClaudeWorktrees) {
     }
 }
 
-$meaning = if ($EXIT_MEANING.ContainsKey($code)) { $EXIT_MEANING[$code] } else { "UNKNOWN exit code $code" }
-"=== exit $code ($meaning) ===" | Add-Content -LiteralPath $log
-
-# Keep the log directory bounded. -ErrorAction SilentlyContinue because a log a human has open must not
-# turn a successful prune into a failed task run.
-Get-ChildItem -LiteralPath $LogDir -Filter 'prune-*.log' -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -Skip $KeepLogs |
-    Remove-Item -Force -ErrorAction SilentlyContinue
-
-exit $code
+Exit-Run $code

@@ -253,13 +253,20 @@ def remove(
     idle_hours: str = "72",
     protect: list[Path] | None = None,
     prelude: str = "",
+    env_extra: dict[str, str | None] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Call Invoke-FinishedWorktreeRemoval directly, keyed by tree name.
 
     Inputs travel as environment JSON, never spliced into the command text, so no path needs quoting.
     ``prelude`` runs after the helper is dot-sourced, so a test can stand a function in for git.
+    ``env_extra`` sets a variable, or removes it where the value is None.
     """
     env = fx.env()
+    for key, value in (env_extra or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
     env["T_PRIMARY"] = str(fx.primary)
     env["T_PATHS"] = json.dumps([str(p) for p in paths])
     env["T_PROTECT"] = json.dumps([str(p) for p in protect or []])
@@ -376,7 +383,11 @@ def test_no_removal_command_carries_force(fx: Fx) -> None:
 
 
 def run_runner(
-    fx: Fx, log_dir: Path, *args: str, claudecode: bool = False
+    fx: Fx,
+    log_dir: Path,
+    *args: str,
+    claudecode: bool = False,
+    env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -394,7 +405,7 @@ def run_runner(
         capture_output=True,
         text=True,
         timeout=300,
-        env=fx.env(claudecode=claudecode),
+        env={**fx.env(claudecode=claudecode), **(env_extra or {})},
         check=False,
     )
 
@@ -475,12 +486,10 @@ def test_an_unreadable_claim_refuses_every_tree(fx: Fx) -> None:
     assert fx.tree("clean").is_dir()
 
 
-def test_the_helper_refuses_apply_inside_claude_code(fx: Fx) -> None:
-    """Dot-sourcing the helper must not be a way around the runner's refusal."""
-    env = fx.env(claudecode=True)
-    env["T_PRIMARY"] = str(fx.primary)
-    env["T_PATH"] = str(fx.tree("clean"))
-    proc = subprocess.run(
+def _helper_apply(fx: Fx, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """The helper called directly with -Apply on the clean tree, for a refusal that throws."""
+    env = {**env, "T_PRIMARY": str(fx.primary), "T_PATH": str(fx.tree("clean"))}
+    return subprocess.run(
         [
             "pwsh",
             "-NoProfile",
@@ -495,6 +504,11 @@ def test_the_helper_refuses_apply_inside_claude_code(fx: Fx) -> None:
         env=env,
         check=False,
     )
+
+
+def test_the_helper_refuses_apply_inside_claude_code(fx: Fx) -> None:
+    """Dot-sourcing the helper must not be a way around the runner's refusal."""
+    proc = _helper_apply(fx, fx.env(claudecode=True))
     assert proc.returncode != 0
     assert "Refusing Invoke-FinishedWorktreeRemoval -Apply inside Claude Code" in (
         proc.stderr + proc.stdout
@@ -608,12 +622,7 @@ def test_an_error_after_the_orphaned_verdict_keeps_it(fx: Fx) -> None:
     assert "ledger boom" in rows["clean"]["Reason"]
 
 
-def test_a_link_inside_a_tolerated_cache_refuses(fx: Fx) -> None:
-    """git does not delete through a link, so the removal would end ORPHANED (npm link makes these)."""
-    elsewhere = fx.root / "elsewhere"
-    elsewhere.mkdir()
-    modules = fx.tree("clean") / "ide" / "node_modules"
-    modules.mkdir(parents=True)
+def _junction(link: Path, target: Path) -> None:
     subprocess.run(
         [
             "pwsh",
@@ -625,8 +634,17 @@ def test_a_link_inside_a_tolerated_cache_refuses(fx: Fx) -> None:
         check=True,
         capture_output=True,
         timeout=60,
-        env={**os.environ, "T_LINK": str(modules / "linked"), "T_TARGET": str(elsewhere)},
+        env={**os.environ, "T_LINK": str(link), "T_TARGET": str(target)},
     )
+
+
+def test_a_link_inside_a_tolerated_cache_refuses(fx: Fx) -> None:
+    """git does not delete through a link, so the removal would end ORPHANED (npm link makes these)."""
+    elsewhere = fx.root / "elsewhere"
+    elsewhere.mkdir()
+    modules = fx.tree("clean") / "ide" / "node_modules"
+    modules.mkdir(parents=True)
+    _junction(modules / "linked", elsewhere)
     _age(fx.primary, fx.tree("clean"), 200)
     rows = remove(fx, [fx.tree("clean")], apply=True)
     assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
@@ -677,3 +695,339 @@ def test_a_registry_whose_holding_folder_is_gone_reads_as_unreadable(fx: Fx) -> 
     # The control: a registry not made yet, under a folder that is there, holds no claim.
     assert out["here"] is False, out
     assert "allocation registry could not be read" in out["alloc"], out
+
+
+# --- The five fail-open findings left on PR 2802. Each test below was red on that PR's code. ---
+
+#: Writes into the tree from inside the fence, the LAST gate of the first pass, which is the window
+#: the re-check just before the removal exists for. ``{write}`` runs once, in the tree ``T_TREE``.
+_LATE_WRITE = (
+    "$global:fence = ${{function:Get-WorktreeOccupancy}}; "
+    "function global:Get-WorktreeOccupancy {{ param($Repo) "
+    "if (-not $global:wrote) {{ $global:wrote = $true; {write} }}; & $global:fence -Repo $Repo }}"
+)
+
+#: Puts every top-level mtime of the tree back 30 days, so the idle reading does not refuse first and
+#: the gate under test is the one that has to see the write.
+_BACKDATE = (
+    "; $old = (Get-Date).AddDays(-30); "
+    "foreach ($p in @($env:T_TREE) + @(Get-ChildItem -LiteralPath $env:T_TREE -Force | "
+    "ForEach-Object FullName)) { (Get-Item -LiteralPath $p -Force).LastWriteTime = $old }"
+)
+
+_WRITE_ENV = "Set-Content -LiteralPath (Join-Path $env:T_TREE '.env') -Value 'MEFOR_X=1'"
+_WRITE_CLONE = "$null = & git.exe init -q (Join-Path $env:T_TREE 'ide/node_modules/pkg')"
+#: A commit no shared ref holds, kept by a per-worktree ref: it moves none of the idle readings.
+_WRITE_REF = (
+    "$c = & git.exe -C $env:T_TREE commit-tree 'HEAD^{tree}' -p HEAD -m keep; "
+    "& git.exe -C $env:T_TREE update-ref refs/worktree/keep $c"
+)
+#: A claim taken in the window, which nothing inside the tree records.
+_WRITE_CLAIM = (
+    "@{ key = 'late'; worktree = $env:T_TREE } | ConvertTo-Json | "
+    "Set-Content -LiteralPath $env:T_CLAIM"
+)
+
+
+@pytest.mark.parametrize(
+    ("write", "made", "pattern"),
+    [
+        (_WRITE_ENV + _BACKDATE, ".env", r"ignored entr\(ies\).*!! \.env"),
+        (_WRITE_CLONE + _BACKDATE, "ide/node_modules/pkg/.git", r"nested git checkout at ide/"),
+        (_WRITE_ENV, ".env", r"recently active: the working tree was written"),
+        (_WRITE_REF, "seed.txt", r"1 commit\(s\) held only by its HEAD reflog or its own refs"),
+        (_WRITE_CLAIM, "seed.txt", r"a coordination claim names it"),
+    ],
+    ids=["ignored-file", "nested-clone", "recent-write", "worktree-ref", "late-claim"],
+)
+def test_a_write_after_the_first_pass_refuses_at_the_last_recheck(
+    fx: Fx, write: str, made: str, pattern: str
+) -> None:
+    """Red on PR 2802: the content gates ran once, before the claim, allocation and fence reads, so a
+    write in that window went with the tree (a plain worktree remove deletes an ignored .env)."""
+    tree = fx.tree("clean")
+    rows = remove(
+        fx,
+        [tree],
+        apply=True,
+        prelude=_LATE_WRITE.format(write=write),
+        env_extra={"T_TREE": str(tree), "T_CLAIM": str(fx.coord / "claims" / "late.json")},
+    )
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert "just before the removal" in rows["clean"]["Reason"], rows["clean"]
+    assert re.search(pattern, rows["clean"]["Reason"]), rows["clean"]
+    assert (tree / made).exists()
+    assert fx.is_registered(tree)
+
+
+_REDIRECT_NAMES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")
+
+
+def _redirect_value(fx: Fx, var: str) -> str:
+    other = fx.root / "other"
+    if not other.exists():
+        other.mkdir()
+        _git(other, "init", "-q")
+    return {
+        "GIT_DIR": str(other / ".git"),
+        "GIT_WORK_TREE": str(other),
+        "GIT_COMMON_DIR": str(other / ".git"),
+        "GIT_INDEX_FILE": str(fx.root / "stray.index"),
+    }[var]
+
+
+@pytest.mark.parametrize("var", _REDIRECT_NAMES)
+def test_a_git_redirect_in_the_environment_refuses_the_whole_run(fx: Fx, var: str) -> None:
+    """Red on PR 2802: each makes `git -C <tree>` answer for another checkout, and nothing refused."""
+    proc = _helper_apply(fx, {**fx.env(), var: _redirect_value(fx, var)})
+    assert proc.returncode != 0, proc.stdout
+    assert f"{var} is set" in proc.stderr + proc.stdout
+    assert fx.tree("clean").is_dir()
+    assert fx.is_registered(fx.tree("clean"))
+
+
+def test_the_runner_refuses_a_git_redirect_before_it_prunes(fx: Fx, tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs-redirect"
+    proc = run_runner(
+        fx,
+        log_dir,
+        "-RemoveFinishedClaudeWorktrees",
+        env_extra={"GIT_DIR": _redirect_value(fx, "GIT_DIR")},
+    )
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "GIT_DIR is set" in proc.stderr + proc.stdout
+    # Up front, and into the log: a scheduled run leaves the reason, and no prune or step ran.
+    (log,) = log_dir.glob("prune-*.log")
+    text = log.read_text(encoding="utf-8")
+    assert "REFUSED before the prune; nothing was attempted" in text, text
+    assert "GIT_DIR is set" in text
+    assert "=== exit 2 " in text
+    assert "finished .claude/worktrees" not in text
+
+
+def test_the_runner_refuses_a_git_redirect_before_resolving_the_primary(
+    fx: Fx, tmp_path: Path
+) -> None:
+    """The scheduled task passes no -RepoRoot, so the runner resolves the primary itself, through git.
+    Under a GIT_DIR naming no repository that read used to throw before the log existed."""
+    log_dir = tmp_path / "logs-noroot"
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(RUNNER),
+            "-LogDir",
+            str(log_dir),
+            "-RemoveFinishedClaudeWorktrees",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**fx.env(), "GIT_DIR": str(fx.root / "not-a-repo")},
+        check=False,
+    )
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    (log,) = log_dir.glob("prune-*.log")
+    text = log.read_text(encoding="utf-8")
+    assert "REFUSED before the prune; nothing was attempted" in text, text
+    assert "GIT_DIR is set" in text
+
+
+def test_the_redirect_list_mirrors_remove_ps1() -> None:
+    """The nightly removal refuses exactly the base names remove.ps1 refuses on -Path and -List."""
+    names = re.compile(r"'([A-Z_]+)'")
+    remove_src = (ROOT / "scripts" / "worktree" / "remove.ps1").read_text(encoding="utf-8")
+    gates_src = (ROOT / "scripts" / "worktree" / "worktree-gates.ps1").read_text(encoding="utf-8")
+    theirs = re.search(r"\$redirectNames = @\(([^)]*)\)", remove_src)
+    ours = re.search(r"\$GIT_REDIRECT_NAMES = @\(([^)]*)\)", gates_src)
+    assert theirs and ours, "the instrument found no list to compare"
+    assert names.findall(theirs.group(1)) == list(_REDIRECT_NAMES)
+    assert names.findall(ours.group(1)) == list(_REDIRECT_NAMES)
+
+
+#: The real removal, then a flag the read stub below waits on, so every gate before it reads truly.
+_AFTER_REMOVAL = _GIT_SHIM.format(
+    body="& git.exe @args; $c = $LASTEXITCODE; $global:T_REMOVED = $true; $global:LASTEXITCODE = $c"
+)
+#: Get-Item cannot read the tree: access denied, which is neither present nor absent.
+_GET_ITEM_DENIED = (
+    "function global:Get-Item { if ($global:T_REMOVED -and $args -contains $env:T_HIDE) "
+    "{ throw [System.UnauthorizedAccessException]::new('stub: access to the path is denied') }; "
+    "Microsoft.PowerShell.Management\\Get-Item @args }"
+)
+
+
+def test_an_end_state_that_cannot_be_confirmed_absent_is_never_removed(fx: Fx) -> None:
+    """Red on PR 2802: the end state was read with Test-Path, so a leftover it could not read was
+    REMOVED. Only a confirmed absence, under a folder that is there, reads as gone. The leftover that
+    is plainly still there is test_a_tree_left_on_disk_after_deregistering_is_orphaned_and_ledgered."""
+    tree = fx.tree("clean")
+    prelude = _AFTER_REMOVAL + "; " + _GET_ITEM_DENIED
+    rows = remove(fx, [tree], apply=True, prelude=prelude, env_extra={"T_HIDE": str(tree)})
+    assert rows["clean"]["Outcome"] == "ORPHANED", rows["clean"]
+    # The readers' "Nothing was removed." is false once git has run, so it must not reach the row.
+    assert "Nothing was removed" not in rows["clean"]["Reason"], rows["clean"]
+    assert not fx.is_registered(tree)
+
+
+def _coord_not_plain(fx: Fx, case: str) -> dict[str, str | None]:
+    if case == "local-root-is-a-file":
+        common = Path(
+            _git(fx.primary, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+        )
+        (common / "mefor-coord").write_text("not a directory", encoding="utf-8")
+        return {"MEFOR_COORD_ROOT": None}
+    if case == "shared-root-is-a-junction":
+        # The registries under it are plain; only the folder holding them is a link.
+        link = fx.root / "coord-link"
+        _junction(link, fx.coord)
+        return {"MEFOR_COORD_ROOT": str(link)}
+    sub = {"alloc-kind-is-a-junction": "alloc/adr"}.get(case, case.split("-", 1)[0])
+    shutil.rmtree(fx.coord / sub)
+    empty = fx.root / f"empty-{sub.replace('/', '-')}"
+    empty.mkdir()
+    _junction(fx.coord / sub, empty)
+    return {}
+
+
+#: The text only the plain-directory gate writes, per case, so another gate's "could not be read"
+#: cannot pass for it. The allocation registry is read first, so its cases carry the gate's own text.
+_NOT_PLAIN = {
+    "local-root-is-a-file": r"allocation registry could not be read.*\('[^']*mefor-coord'\) exists but is not a plain directory",
+    "shared-root-is-a-junction": r"allocation registry could not be read.*folder that holds the allocation directory .* exists but is not a plain directory",
+    "alloc-is-a-junction": r"allocation registry could not be read.*the allocation directory .* exists but is not a plain directory",
+    "alloc-kind-is-a-junction": r"allocation registry could not be read in full: .*adr is a link, which the walk does not follow",
+}
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "local-root-is-a-file",
+        "shared-root-is-a-junction",
+        "claims-is-a-junction",
+        "alloc-is-a-junction",
+        "alloc-kind-is-a-junction",
+    ],
+)
+def test_a_coordination_folder_that_is_not_a_plain_directory_refuses(fx: Fx, case: str) -> None:
+    """Red on PR 2802: a file standing where mefor-coord should be read as a present parent, so its
+    claims and allocations read as none; a junction was listed through, wherever it pointed."""
+    env_extra = _coord_not_plain(fx, case)
+    rows = remove(fx, [fx.tree("clean")], apply=False, env_extra=env_extra)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    if case != "claims-is-a-junction":
+        assert re.search(_NOT_PLAIN[case], rows["clean"]["Reason"]), rows["clean"]
+        return
+    # The claim reader folds every failure into one "could not be read" verdict, so the gate is asked
+    # directly for its own text.
+    assert "a claim file or directory could not be read" in rows["clean"]["Reason"], rows["clean"]
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{HELPER}'; try {{ Test-RegistryPresentOrThrow $env:T_DIR 'the claims directory' }} "
+            "catch { $_.Exception.Message }",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**fx.env(), "T_DIR": str(fx.coord / "claims")},
+        check=False,
+    )
+    assert "the claims directory" in proc.stdout, proc.stdout + proc.stderr
+    assert "exists but is not a plain directory" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_a_tree_root_that_is_a_junction_refuses_before_any_other_gate(fx: Fx) -> None:
+    """Red on PR 2802: the root was never checked, so every gate and the removal read through it."""
+    tree = fx.tree("clean")
+    real = fx.root / "clean-real"
+    tree.rename(real)
+    _junction(tree, real)
+    # The junction's own mtime is new and the link itself cannot be aged from here, so the working-tree
+    # reading is held idle; without that, PR 2802's code refused it as recently active instead.
+    prelude = "function Get-WorkingTreeActivity { (Get-Date).AddDays(-30) }"
+    rows = remove(fx, [tree], apply=False, prelude=prelude)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert "its root is a junction or link" in rows["clean"]["Reason"], rows["clean"]
+    assert (real / "seed.txt").is_file()
+
+
+def test_a_root_swapped_for_a_junction_refuses_before_the_late_ownership_reads(fx: Fx) -> None:
+    """Red on 6b70161e6a: the late pass read ownership through the root before its link check, so a
+    root swapped for a junction during the first pass was read through (here into another repository,
+    whose own refusal came first) before the root check could refuse it."""
+    tree = fx.tree("clean")
+    other = fx.root / "swapped-in"
+    other.mkdir()
+    _git(other, "init", "-q", "-b", "main")
+    _git(other, "config", "user.email", "t@example.invalid")
+    _git(other, "config", "user.name", "t")
+    (other / "x.txt").write_text("x", encoding="utf-8")
+    _git(other, "add", "--", "x.txt")
+    _git(other, "commit", "-qm", "x")
+    swap = (
+        "Move-Item -LiteralPath $env:T_TREE -Destination $env:T_AWAY; "
+        "$null = New-Item -ItemType Junction -Path $env:T_TREE -Target $env:T_OTHER"
+    )
+    rows = remove(
+        fx,
+        [tree],
+        apply=True,
+        prelude=_LATE_WRITE.format(write=swap),
+        env_extra={
+            "T_TREE": str(tree),
+            "T_AWAY": str(fx.root / "clean-away"),
+            "T_OTHER": str(other),
+        },
+    )
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert (
+        "re-checked just before the removal: its root is a junction or link"
+        in (rows["clean"]["Reason"])
+    ), rows["clean"]
+    assert (fx.root / "clean-away" / "seed.txt").is_file()
+    assert (other / "x.txt").is_file()
+
+
+def test_a_file_link_in_the_allocation_registry_is_read_not_refused(fx: Fx) -> None:
+    """Red on 6b70161e6a: every reparse point refused, files included, but the walk reads a linked
+    FILE like any other record; only a linked directory hides records. The record here names another
+    tree, so the clean tree is not refused by it."""
+    target = fx.root / "linked-record.json"
+    rec = {"number": "1", "kind": "adr", "title": "t", "worktree": str(fx.tree("venv"))}
+    target.write_text(json.dumps(rec), encoding="utf-8")
+    try:
+        os.symlink(target, fx.coord / "alloc" / "adr" / "linked.json")
+    except OSError as exc:
+        pytest.skip(f"this account cannot create a file symlink: {exc}")
+    rows = remove(fx, [fx.tree("clean")], apply=False)
+    assert rows["clean"]["Outcome"] == "WOULD-REMOVE", rows["clean"]
+
+
+def test_the_header_states_the_allocation_link_rule_the_code_applies() -> None:
+    """Red on engine PR 2803 at 210c9cb278: the header, the one statement of the re-check list, said
+    a link of any kind below the allocation registry refuses, while the code and the test above read
+    a linked file as a record. Only a linked folder refuses."""
+    header = " ".join(HELPER.read_text(encoding="utf-8").split("#>", 1)[0].split())
+    assert "a link anywhere below the allocation registry" not in header
+    assert "a linked folder anywhere below the allocation registry" in header
+    assert "a linked file there is read as a record" in header
+
+
+def test_a_junction_above_the_tree_inside_its_claude_segment_refuses(fx: Fx) -> None:
+    """The tree root is plain, but .claude/worktrees is a link, so the tree lives elsewhere and the
+    path-shape gate would accept it."""
+    worktrees = fx.primary / ".claude" / "worktrees"
+    real = fx.root / "worktrees-real"
+    worktrees.rename(real)
+    _junction(worktrees, real)
+    rows = remove(fx, [fx.tree("clean")], apply=False)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert "a folder above it" in rows["clean"]["Reason"], rows["clean"]
+    assert (real / "clean" / "seed.txt").is_file()
