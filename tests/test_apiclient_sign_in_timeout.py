@@ -9,8 +9,8 @@ client's 5 s default, and a lost reply then leaves the client holding a token th
 ``login``, ``reauth``, ``verify_mfa``, ``confirm_mfa`` and ``change_password`` now wait at least
 ``SIGN_IN_TIMEOUT_SECONDS`` for their reply, which matches the IDE's ``SIGN_IN_TIMEOUT_MS``, or
 the client's own timeout when that is longer; their other phases, and every other request, keep
-the client's own timeout. The queue has no bound, so this makes the lost reply rarer, not
-impossible.
+the client's own timeout. The engine's 120 s request deadline is longer than that read, so this
+makes the lost reply rarer, not impossible.
 
 The transport is an ``httpx.MockTransport``: what is pinned is the timeout each request carries,
 read from ``request.extensions["timeout"]``, not what an engine does with it.
@@ -21,8 +21,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
+import pytest
 
-from messagefoundry.apiclient import EngineClient
+from messagefoundry.apiclient import ApiError, EngineClient
 from messagefoundry.apiclient.client import SIGN_IN_TIMEOUT_SECONDS
 
 _BASE = "http://127.0.0.1:8765"
@@ -120,6 +121,28 @@ def test_a_client_built_with_a_longer_timeout_keeps_it_on_the_queued_calls() -> 
     _send_every_queued_call_then_a_control(client)
     for path in (*_QUEUED, "/auth/me"):
         assert seen[path] == _every_phase(own), path
+
+
+def test_change_password_sends_no_password_over_a_cleartext_hop() -> None:
+    """RED when: ``change_password`` lets its two passwords reach the transport on a permitted
+    cleartext non-loopback hop. With no token held, ``_request`` has no bearer to refuse, so only
+    the entry-point refusal stops the body, as it does for ``login`` and ``reauth``."""
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={})
+
+    client = EngineClient("http://engine.example.com:8765", allow_insecure=True)
+    client._http.close()
+    client._http = httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(ApiError, match="never a credential") as excinfo:
+            client.change_password("a-strong-test-passphrase", "another-strong-test-passphrase")
+        assert "a password" in str(excinfo.value)
+    finally:
+        client.close()
+    assert sent == [], "a password reached the transport before the refusal"
 
 
 def test_the_timeout_matches_the_ides_sign_in_timeout() -> None:
