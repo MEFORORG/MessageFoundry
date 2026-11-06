@@ -2765,9 +2765,10 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
     a heuristic over names. This line stays advisory on every hop. The ``build-check`` leg refuses
     one on a hop the no-escape credential rule covers, but that leg can SKIP (its own detail says
     why), so a passing ``check`` does not prove the hop was judged.
-    It does not load the instance's environment values, as ``build-check`` does, so an ``env()`` URL
-    is read as its literal ``default=`` and one with no default is not read; the construction
-    WARNING and the posture entry read the resolved URL. SKIPs when the graph
+    Unlike ``build-check``, it does not load the instance's environment values, so an ``env()`` URL
+    is read as its literal ``default=`` and one with no default is not read, which the clean
+    detail says; the construction WARNING and the posture entry read the resolved URL. SKIPs when
+    the graph
     will not load, like its siblings."""
     from messagefoundry.config.wiring import WiringError, load_config, query_credential_hops
 
@@ -2784,7 +2785,10 @@ def _check_url_query_credentials(config_dir: str | Path) -> CheckResult:
             name,
             ok=True,
             required=False,
-            detail="no outbound or FhirLookup url carries a credential-like query parameter",
+            detail=(
+                "no outbound or FhirLookup url carries a credential-like query parameter; an "
+                "env() url is read by its default= only, so one with no default is not read here"
+            ),
         )
     listed = "; ".join(f"{conn} ({params})" for conn, params in found)
     return CheckResult(

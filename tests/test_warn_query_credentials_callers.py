@@ -10,9 +10,10 @@ caller passing False with no such step before it. This census does: a call site 
 module, class, method or nested function, or a new count under one key, fails here, and whoever
 adds it must show the line is logged before that build, then add it to ``_PINNED``.
 
-What it does not catch, at least: a call moved within one function, a call through ``**kwargs`` or
-``functools.partial``, a value computed elsewhere and forwarded, and any caller outside the
-packages :func:`tests._ast_sites.package_trees` reads.
+What it does not catch, at least: a call moved within one function, a keyword passed through
+``**kwargs``, a forwarded value whose source changed, and any caller outside the packages
+:func:`tests._ast_sites.package_trees` reads. It keys on the full nested owner rather than the
+outermost def, so wrapping a call in a nested helper also fails it, on purpose.
 """
 
 from __future__ import annotations

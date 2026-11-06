@@ -6908,7 +6908,8 @@ def query_credential_hops(
     no values at all, falls back to its literal ``default=`` (vault BACKLOG #3766 item 15); one with
     neither is not read. A ``deployed=False`` outbound with an ``env()`` URL is skipped, as the
     DATABASE and ECH readers skip one: its values are never resolved and it is never built (ADR
-    0111 AC-1). Pure."""
+    0111 AC-1). It touches nothing but the graph and the values, except that resolving runs an
+    ``env()`` URL's operator ``cast``, as the build does."""
     out: list[tuple[str, str]] = []
     for name, settings in (
         *(

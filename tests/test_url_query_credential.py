@@ -596,6 +596,29 @@ def test_check_names_the_connection_and_parameter(tmp_path: Path) -> None:
     assert "OB_PLAIN" not in r.detail and "SYNTHETIC" not in r.detail
 
 
+def test_check_reads_an_env_url_by_its_default(tmp_path: Path) -> None:
+    """Vault BACKLOG #3766 item 15, end to end through ``run_checks``: an ``env()`` URL is read by
+    its ``default=``. The clean control, a benign default, names none and says what it skipped."""
+    from messagefoundry.checks import run_checks
+
+    def detail(default: str, where: Path) -> str:
+        config = _CONFIG.replace("?sig=SYNTHETIC-4", "?fmt=xml").replace(
+            'outbound("OB_PLAIN", Rest(url="https://p.example.invalid/x?fmt=json"))',
+            f'outbound("OB_PLAIN", Rest(url=env("plain_url", default="{default}")))',
+        )
+        assert "env(" in config
+        config = config.replace("from messagefoundry import ", "from messagefoundry import env, ")
+        report = run_checks(_write(where, config), run_lint=False)
+        return next(x for x in report.results if x.name == "url-query-credential").detail
+
+    (tmp_path / "keyed").mkdir()
+    (tmp_path / "plain").mkdir()
+    keyed = detail("https://p.example.invalid/x?key=SYNTHETIC-12", tmp_path / "keyed")
+    assert "OB_PLAIN (key)" in keyed and "SYNTHETIC" not in keyed
+    plain = detail("https://p.example.invalid/x?fmt=json", tmp_path / "plain")
+    assert "no outbound or FhirLookup url carries" in plain and "default=" in plain
+
+
 def test_check_says_none_on_a_clean_graph(tmp_path: Path) -> None:
     from messagefoundry.checks import run_checks
 
