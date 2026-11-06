@@ -720,6 +720,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    and every re-seal write now hold one lock file in the uploads directory, `.mefor-edit.lock`, and
    the re-seal replaces a file only while it is still the one it read. Such an upload counts as a
    skip, so the run exits non-zero; re-run it. The lock file holds no data. Leave it in place.
+   **Run `rotate-key` as the account the engine runs as.** A lock file that another account created,
+   such as root or an administrator, can refuse every later engine removal of an upload. Each
+   refusal is logged at ERROR, naming the lock file and that likely cause. To fix it, give the file
+   to the engine's service account, or delete it while neither the engine nor `rotate-key` runs.
    **At least one kind of refused upload is never sealed, so it is kept inside retention another way
    (BACKLOG #2322).** It is a plaintext sidecar over a body that is missing or is not text. Sealing it would list an
    upload with no usable body, and would seal a planted lone sidecar too, so `rotate-key` leaves it

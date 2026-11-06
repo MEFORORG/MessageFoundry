@@ -47,8 +47,8 @@ from pathlib import Path
 from stat import S_ISLNK, S_ISREG
 from typing import Any, Literal, NamedTuple, Protocol
 
-from messagefoundry.config.atomic_edit import edit_lock
-from messagefoundry.controlchars import strip_control_chars
+from messagefoundry.config.atomic_edit import edit_lock, lock_path_for
+from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws
 from messagefoundry.parsing.split import split_batch
@@ -3221,7 +3221,8 @@ async def _wait_to_completion[T](
     return fut.result()
 
 
-def _pair_lock(path: Path) -> contextlib.AbstractContextManager[None]:
+@contextlib.contextmanager
+def _pair_lock(path: Path) -> Iterator[None]:
     """The cross-process lock over the pairs in ``path``'s directory, the uploads root (BACKLOG
     #3181 item 5). Blocking, so call it off the event loop; re-entrant in one thread.
 
@@ -3232,8 +3233,27 @@ def _pair_lock(path: Path) -> contextlib.AbstractContextManager[None]:
     backend: the re-seal either replaces the file before the removal takes the lock, and the removal
     then takes the new file away, or finds it gone and writes nothing. ``rotate-key`` is a separate
     process, so ``_quota_lock`` cannot do this. A file system that cannot lock is logged, and both
-    sides go on unlocked (:func:`~messagefoundry.config.atomic_edit.edit_lock`)."""
-    return edit_lock(path, timeout=_PAIR_LOCK_TIMEOUT_SECONDS)
+    sides go on unlocked (:func:`~messagefoundry.config.atomic_edit.edit_lock`).
+
+    **A lock file this account may not open refuses every removal, so it is never silent.** The
+    likely cause is a lock file another account created, as when ``rotate-key`` ran as root or as an
+    administrator rather than as the engine's service account. The refusal is logged at ERROR,
+    naming the lock file and that cause, then raised; each caller handles it as a refused unlink."""
+    with contextlib.ExitStack() as held:
+        try:
+            held.enter_context(edit_lock(path, timeout=_PAIR_LOCK_TIMEOUT_SECONDS))
+        except PermissionError as exc:
+            _log.error(
+                "uploaded-logs pair lock %s could not be opened (%s), so no upload can be removed "
+                "or re-sealed until it can. It is likely owned by another account, as when "
+                "rotate-key ran as an account other than the engine's service account, or on "
+                "Windows another program may hold it. Give it to the service account, or delete it "
+                "while neither the engine nor rotate-key runs",
+                scrub_log_argument(str(lock_path_for(path))),
+                exc.strerror or type(exc).__name__,
+            )
+            raise
+        yield
 
 
 class _ChangedUnderReseal(Exception):

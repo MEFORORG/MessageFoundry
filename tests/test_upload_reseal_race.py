@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 
 from messagefoundry import uploads as uploads_mod
-from messagefoundry.config.atomic_edit import edit_lock
+from messagefoundry.config.atomic_edit import LOCK_FILE_NAME, edit_lock
 from messagefoundry.store.crypto import AesGcmCipher, cell_aad, generate_key, make_cipher
 from messagefoundry.uploads import UploadStore
 from tests._upload_root import upload_names
@@ -192,7 +192,7 @@ def test_the_reseal_replaces_under_the_pair_lock(
         seen.append(_held_elsewhere(Path(dst)))
         real_replace(src, dst)
 
-    monkeypatch.setattr(uploads_mod.os, "replace", _replace)
+    monkeypatch.setattr(os, "replace", _replace)
     asyncio.run(_store(root, new, old).reseal_to_active())
     assert seen == [True, True], seen
 
@@ -231,3 +231,24 @@ async def test_discard_waits_through_run_to_completion_held_from_the_start(
         await asyncio.sleep(0.02)
     assert not store._stragglers
     assert await store.list_files() == []
+
+
+def test_a_lock_file_this_account_cannot_open_is_named_and_refuses_the_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lock file another account created (rotate-key run as root) refuses every removal. The
+    refusal names the lock file and that likely cause, and the pair is left, not half-removed."""
+    root = tmp_path / "uploads"
+    key = generate_key()
+    fid = _seed(root, key)
+    engine = _store(root, key)
+
+    def _refused(path: Path, **_: Any) -> Any:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(uploads_mod, "edit_lock", _refused)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
+        assert engine._discard_cancelled_sync(fid) is False
+    assert LOCK_FILE_NAME in caplog.text, caplog.text
+    assert "owned by another account" in caplog.text, caplog.text
+    assert upload_names(root) == [f"{fid}.blob", f"{fid}.meta"]
