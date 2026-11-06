@@ -5275,7 +5275,9 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
     # The supervisor has no API and builds no loosening list, so its own reading is reported here,
     # and only after the refusal above (vault BACKLOG #3795 item 8): a fleet refused on the
-    # reading does not first log it as a residual.
+    # reading does not first log it as a residual. One exception: where the engine's hook did not
+    # answer, _remote_debug_refused logs `remote_debug_unguarded` before its refusal, on the log
+    # stream (stdout here), while the refusal goes to stderr.
     security_lines: list[tuple[str, str]] = []
     remote_debug = remote_debug_loosening(remote_debug_reading)
     if remote_debug is not None:

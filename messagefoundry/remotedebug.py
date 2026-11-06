@@ -9,7 +9,8 @@ target's memory. On Windows a process running as the same account, at the same i
 has it. On Linux it depends on the kernel's ptrace policy: where Yama ``ptrace_scope`` is 1, as
 Ubuntu ships it, only a parent process or one with ``CAP_SYS_PTRACE`` has it. The interface is
 on unless the interpreter was started with ``-X disable-remote-debug`` or
-``PYTHON_DISABLE_REMOTE_DEBUG=1``. The engine's children are started with the option
+``PYTHON_DISABLE_REMOTE_DEBUG=1``, a variable the interpreter ignores under ``-I`` or ``-E``. The
+engine's children are started with the option
 (``messagefoundry/childenv.py``), and so is the engine by both shipped service launches. A start
 through the console-script launcher cannot pass an interpreter option, so it has the interface on
 unless ``PYTHON_DISABLE_REMOTE_DEBUG=1`` is set.

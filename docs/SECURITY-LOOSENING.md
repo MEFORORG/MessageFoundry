@@ -2228,7 +2228,8 @@ count is above `0` (vault BACKLOG #2613).
   the kernel's ptrace policy:
   where Yama `ptrace_scope` is `1`, as Ubuntu ships it, only a parent process or one with
   `CAP_SYS_PTRACE` can. The interface is on unless the interpreter starts with
-  `-X disable-remote-debug` or `PYTHON_DISABLE_REMOTE_DEBUG=1`.
+  `-X disable-remote-debug` or `PYTHON_DISABLE_REMOTE_DEBUG=1`, a variable the interpreter does
+  not always read (the console-script point below).
 - **`remote_debug_enabled`: the interface is on, and the engine refuses its scripts.** The
   `messagefoundry` command line installs an audit hook as it starts, before it parses its
   arguments, so each of its commands has it. The authoring toolkit (`messagefoundry-toolkit`)
