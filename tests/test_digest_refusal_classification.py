@@ -266,7 +266,7 @@ class _Challenger:
                     self.send_header(ask, challenge)
                 else:
                     self.send_response(200)
-                    # A HEAD reply and a CONNECT 200 (a tunnel) carry no body.
+                    # No body on a HEAD reply or a CONNECT 200. This peer relays no tunnel.
                     body = b"{}" if self.command not in ("HEAD", "CONNECT") else b""
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -644,13 +644,19 @@ def _token_provider_via(proxy_url: str, *, auth: str | None) -> OAuth2ClientCred
 
 
 @pytest.mark.usefixtures("no_bypass")
-def test_an_https_token_endpoints_digest_proxy_407_is_the_same_configuration_fault() -> None:
+@pytest.mark.parametrize(
+    "challenge", [_SHA256, 'Basic realm="proxy"'], ids=["sha256-digest", "basic"]
+)
+def test_an_https_token_endpoints_digest_proxy_407_is_the_same_configuration_fault(
+    challenge: str,
+) -> None:
     """Finding 3, the half engine PR 2280 left open (vault BACKLOG #3532 item 1). An https token
     endpoint is reached through a CONNECT tunnel, and ``http.client`` raises the proxy's 407 to
     that CONNECT as an ``OSError`` inside a ``URLError``, so the proxy Digest handler never sees
     it and a retry sends the same unanswered CONNECT. Before the fix this was a plain
-    ``DeliveryError``, retried."""
-    with _Challenger(407, _SHA256, refuse_answered=True) as proxy:
+    ``DeliveryError``, retried. The error carries no challenge, so a Basic one reads the same:
+    ADR 0095 B.1 records that."""
+    with _Challenger(407, challenge, refuse_answered=True) as proxy:
         provider = _token_provider_via(proxy.url, auth="digest")
         with pytest.raises(NegativeAckError) as ei:
             provider.access_token()
@@ -694,6 +700,7 @@ def test_an_https_token_endpoints_other_tunnel_refusal_still_retries(
 _TUNNEL_407 = "Tunnel connection failed: 407 x"
 
 
+@pytest.mark.usefixtures("no_bypass")
 @pytest.mark.parametrize(
     "reason",
     [
@@ -715,7 +722,9 @@ def test_the_tunnel_407_match_is_the_text_http_client_builds_and_nothing_near_it
     assert not is_refused_proxy_digest_tunnel(digest, urllib.error.URLError(reason))  # type: ignore[arg-type]
 
 
+@pytest.mark.usefixtures("no_bypass")
 def test_the_tunnel_407_match_needs_the_proxy_digest_handler() -> None:
+    # Bypass pinned off, so the Basic opener is credentialed and lacks Digest for that reason alone.
     plain = _token_provider_via("http://127.0.0.1:3128", auth="basic")._opener
     assert not is_refused_proxy_digest_tunnel(plain, urllib.error.URLError(OSError(_TUNNEL_407)))
 

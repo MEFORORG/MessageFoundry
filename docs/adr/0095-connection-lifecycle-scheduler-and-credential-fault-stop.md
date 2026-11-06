@@ -370,13 +370,15 @@ retried. That gap is left open.
 *Closed 2026-11-06 (vault BACKLOG #2989, #3532 item 1): where the token hop's web proxy is set up
 for Digest, `smart.request_token` now raises the same fault for the proxy's 407 to an `https://`
 token endpoint's `CONNECT`, which `rest.is_refused_proxy_digest_tunnel` recognises.* The Digest
-handler never sees that 407, so no retry can answer it. A `CONNECT` 407 on a token hop with no
-Digest set up, a rejected pre-emptive Basic credential among them, still reads as unreachable and
-retries, as the plain 407 an `http://` token endpoint meets does; that keeps the Basic case
-above. Any other `CONNECT` status retries too. The case needs a destination written `http://`,
-since proxy Digest is refused for an `https://` one. For the same reason the delivery hops need
-no change: a delivery hop that sends a `CONNECT` has no Digest set up, so its 407 retries as the
-token hop's does there.
+handler never sees that 407, so no retry can answer it, whatever the proxy's challenge says. The
+error carries no challenge, so a Digest-set-up proxy that challenges the `CONNECT` with Basic is
+read the same way; the engine holds no Basic credential there to answer it with. The remedy is
+`proxy_auth_type = "basic"`, which urllib sends on the `CONNECT`, or a bypass for the token host.
+A `CONNECT` 407 on a token hop with no Digest set up, a rejected pre-emptive Basic credential
+among them, still reads as unreachable and retries, which keeps the Basic case above. Any other
+`CONNECT` status retries too. The case needs a destination written `http://`, since proxy Digest
+is refused for an `https://` one. For the same reason the delivery hops need no change: a
+delivery hop that sends a `CONNECT` has no Digest set up.
 
 **A 407 on a request that went direct is not the proxy's.** The proxy Digest handler answered
 nothing on such a request, but it still screened the challenge, so an NTLM 407 from the origin or

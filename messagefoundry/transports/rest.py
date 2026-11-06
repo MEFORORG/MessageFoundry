@@ -387,8 +387,8 @@ def is_refused_proxy_digest_tunnel(
     The proxy Digest handler answers only a 407 that reaches it as a status, and ``_tunnel``
     raises a ``CONNECT`` 407 before any handler runs, as a bare ``OSError`` that ``do_open`` wraps
     in a ``URLError``. So a retry sends the same unanswered ``CONNECT``. Without a Digest handler
-    on the opener, the 407 is the plain status an ``http`` hop also leaves to retry: a refused
-    pre-emptive Basic credential, or a proxy the connection has no credential for.
+    on the opener, the 407 stays the plain status Amendment B keeps for a Basic challenge: a
+    refused pre-emptive Basic credential, or a proxy the connection has no credential for.
 
     Matched on the exact class and the one-argument text ``_tunnel`` builds from the int status,
     so a socket error, which carries an errno, never matches, and the proxy's bytes can only
