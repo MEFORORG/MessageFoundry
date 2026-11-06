@@ -3353,9 +3353,12 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
     ``posture`` is the instance posture the caller holds, for an external provider's hop guard
     (vault BACKLOG #2983). ``None`` counts as enforcing there.
 
-    A provider error with a codec error on it is raised as :func:`_codec_safe_refusal` gives it,
-    with no byte and no chain (BACKLOG #4882), as by :func:`build_store_cipher`, for at least the
-    callers that resolve the key without building the cipher, such as ``rotate-key``."""
+    Two kinds of provider error are raised as :func:`_codec_safe_refusal` gives them, with a fixed
+    text, no byte and no chain (BACKLOG #4882), as by :func:`build_store_cipher`: one that is a
+    codec error, holds one, or has one on a link :func:`_codec_error_on` reaches; and one whose
+    chain cannot be read whole, whether or not it holds a codec error. Any other provider error
+    passes through untouched. This covers at least the callers that resolve the key without
+    building the cipher, such as ``rotate-key``."""
     try:
         key = resolve_key_provider(settings, posture=posture).active_key()
     except Exception as exc:
@@ -3400,8 +3403,10 @@ def resolve_decrypt_keys(
     *any* value the store could read — e.g. the DR restore-verify checking a backup taken under a
     now-retired key after a rotation (ADR 0049 AC-5: "incl. retired keys") — uses this, not just the
     active key. Order is active-first; duplicates and empties are dropped; an unset active key yields an
-    empty list (identity cipher). ``posture`` is as on :func:`resolve_active_key`, and so is a
-    provider error with a codec error on it (BACKLOG #4882)."""
+    empty list (identity cipher). ``posture`` is as on :func:`resolve_active_key`, and so are the
+    two refusals there (BACKLOG #4882): an error from the provider or the key check that has a
+    codec error on it, or whose chain cannot be read whole whether or not it holds one, is raised
+    as :func:`_codec_safe_refusal` gives it, and any other passes through untouched."""
     try:
         provider = resolve_key_provider(settings, posture=posture)
         active = _checked_active_key(provider.active_key(), settings)
@@ -3509,7 +3514,13 @@ def _codec_error_on(exc: BaseException) -> tuple[BaseException | None, bool]:
     """The first error :func:`~messagefoundry.exception_origin.exception_chain` reaches from
     ``exc``, ``exc`` first, that is a codec error or prints one, or ``None``; and whether the chain
     was read whole. It was not when the walk raised, too long or from a link's own code, and then
-    no error is named (BACKLOG #4882)."""
+    no error is named (BACKLOG #4882).
+
+    A ``BaseException`` that is not an ``Exception``, such as a ``KeyboardInterrupt`` or a
+    ``SystemExit`` from a link's own code, still propagates, but with no cause and no context.
+    Every caller reads ``exc`` while handling it, so that interrupt's context is ``exc`` or an
+    error its walk reached, and ``exc``'s own text may quote the byte (the hold on engine PR
+    2818). Clearing them here holds for every caller, since a bare ``raise`` sets neither."""
     try:
         codec = next(
             (
@@ -3521,6 +3532,10 @@ def _codec_error_on(exc: BaseException) -> tuple[BaseException | None, bool]:
         )
     except Exception:  # noqa: BLE001 -- fail closed: ExceptionChainTooLong, or a link's own code
         return None, False
+    except BaseException as interrupt:
+        interrupt.__cause__ = None
+        interrupt.__context__ = None
+        raise
     return codec, True
 
 
@@ -3537,9 +3552,10 @@ def _codec_chain_reading(exc: BaseException) -> str | None:
 
 class StoreCipherConfigError(ValueError):
     """The store cipher could not be built from the settings; see :func:`build_store_cipher`. Its
-    text is the build error's, which names settings and variables, never a key, except for an
-    error with a codec error on it, which is refused with :func:`_codec_safe_refusal`'s fixed
-    text instead (BACKLOG #3471, #4882)."""
+    text is the build error's, which names settings and variables, never a key, except for two
+    kinds of ``ValueError``, which are refused with :func:`_codec_safe_refusal`'s fixed text
+    instead (BACKLOG #3471, #4882): one with a codec error on it, and one whose chain cannot be
+    read whole, whether or not it holds a codec error."""
 
 
 def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> Cipher:

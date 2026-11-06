@@ -719,3 +719,84 @@ def test_provision_admin_prints_no_byte_of_a_chained_codec_error(
     assert rc == 2, (captured.out, captured.err)
     assert _CHAINED in captured.out, captured.out
     assert not db.exists()
+
+
+# --- The hold on engine PR 2818, item 2: a BaseException from the chain walk -------------------
+
+
+class _InterruptingReason(ValueError):
+    """An error whose ``reason``, which the chain walk reads, raises ``interrupt``, a
+    BaseException that ``except Exception`` does not catch."""
+
+    interrupt: BaseException
+
+    @property
+    def reason(self) -> object:
+        raise self.interrupt
+
+
+def _interrupting(interrupt: BaseException) -> _InterruptingReason:
+    """A raised error whose own text quotes the codec error, and whose walk raises ``interrupt``."""
+    try:
+        raise _InterruptingReason(f"synthetic key source refused: {_decode_error()}")
+    except _InterruptingReason as exc:
+        exc.interrupt = interrupt
+        return exc
+
+
+def _every_link(exc: BaseException) -> list[BaseException]:
+    """``exc`` and every exception its cause, context, args and group members reach. It reads no
+    ``reason`` attribute, so the fixture's own property does not fire here."""
+    seen: list[BaseException] = []
+    todo: list[BaseException] = [exc]
+    while todo:
+        link = todo.pop()
+        if any(link is s for s in seen):
+            continue
+        seen.append(link)
+        inner: list[object] = [link.__cause__, link.__context__, *link.args]
+        if isinstance(link, BaseExceptionGroup):
+            inner += link.exceptions
+        todo += [i for i in inner if isinstance(i, BaseException)]
+    return seen
+
+
+def _call_the_postgres_wrap(error: Exception, monkeypatch: pytest.MonkeyPatch) -> None:
+    from messagefoundry.store import postgres
+
+    monkeypatch.setattr(postgres, "_verifying_context", _raising(error))
+    postgres._verifying_context_at_open(StoreSettings())
+
+
+@pytest.mark.parametrize(
+    "make_interrupt",
+    [KeyboardInterrupt, lambda: SystemExit(3)],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+@pytest.mark.parametrize(
+    "entry",
+    ["build_store_cipher", "resolve_active_key", "resolve_decrypt_keys", "postgres-tls-wrap"],
+)
+def test_a_base_exception_from_the_walk_leaves_without_the_codec_error_on_its_chain(
+    entry: str, make_interrupt: Callable[[], BaseException], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``except Exception`` in the walk does not catch it, so it left the refusing handler with
+    the error it was judging as its context, and that error's text quotes the byte. It still
+    propagates, as itself, with nothing of that error on its chain."""
+    interrupt = make_interrupt()
+    error = _interrupting(interrupt)
+    assert any(spelling in _whole(error) for spelling in _BYTE_SPELLINGS), "the fixture holds none"
+    with pytest.raises(type(interrupt)) as caught:
+        if entry == "postgres-tls-wrap":
+            _call_the_postgres_wrap(error, monkeypatch)
+        else:
+            _with_provider(monkeypatch, error)
+            getattr(store_base, entry)(StoreSettings())
+    assert caught.value is interrupt
+    links = _every_link(caught.value)
+    assert not any(link is error for link in links), links
+    for link in links:
+        _assert_no_key_byte(repr(link))
+        for arg in link.args:
+            _assert_no_key_byte(repr(arg))
+    _assert_no_key_byte("".join(traceback.format_exception(caught.value)))
