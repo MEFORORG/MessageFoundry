@@ -101,9 +101,13 @@ A **`MarkdownString` hover** is the primary diagnosis — it renders *at* the it
 needing **no command dispatch at all**, so it works even for a user who never realises the click opens anything.
 Plus a **state-gated QuickPick** on click (with a `title:`, never a `placeHolder:`), a **`$(sync~spin)` flip at the
 click site** (the only feedback that appears where the user actually clicked), and the extension's **first engine
-`LogOutputChannel`** ("MessageFoundry Engine") — one line per probe/action carrying URL, status or errno, duration
+output channel** ("MessageFoundry Engine") — one line per probe/action carrying URL, status or errno, duration
 and verdict, and **never a body, never a token** (CLAUDE.md §9; it is wired at the status-bar layer, *not* inside
-the shared `engineClient`, which would silently capture whatever every future caller sends).
+the shared `engineClient`, which would silently capture whatever every future caller sends). It was built as a
+`LogOutputChannel`, which the editor stamps in a format and zone the extension cannot set. Since vault BACKLOG #2349
+(ASVS 16.2.2) it is a plain output channel that `engineLog.ts` writes through `writeStamped` in `checksLog.ts`: each
+line starts with an ISO 8601 UTC instant and a level word (`INFO`, `WARN`, `ERROR`), and the editor's per-level
+filter on it is gone.
 
 A webview panel is **rejected**: it opens from the same command dispatch (so it fixes a missed click no better), it
 is an unbounded canvas into which queue depths and message lists creep, and its HTML+postMessage surface is the one

@@ -66,10 +66,9 @@ const vscodeStub = {
     },
   },
   window: {
+    // A plain channel, as engineLog.ts creates it: every line arrives stamped through `appendLine`.
     createOutputChannel: () => ({
-      info: log,
-      warn: log,
-      error: log,
+      appendLine: log,
       show: (): void => {},
       dispose: (): void => {},
     }),

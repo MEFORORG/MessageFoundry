@@ -14,24 +14,51 @@
 // inside the shared engineClient: there, it would silently capture whatever every future caller sends.
 import * as vscode from "vscode";
 
+import { writeStamped } from "./checksLog";
 import { PROBE_ENDPOINTS, type EngineLink, type ProbeOutcome } from "./engineStatusModel";
 
-let channel: vscode.LogOutputChannel | undefined;
+/** What a caller may do with the Engine channel: write one message at a level, or reveal it.
+ *
+ *  The method names are the ones the editor's LogOutputChannel had, so the call sites did not
+ *  change when the channel stopped being one (vault BACKLOG #2349). */
+export interface EngineLog {
+  info(message: string): void;
+  warn(message: string): void;
+  error(message: string): void;
+  show(preserveFocus?: boolean): void;
+}
 
-/** The singleton channel. Created lazily so merely importing this module costs nothing. */
-export function engineLog(): vscode.LogOutputChannel {
-  if (!channel) {
-    // A LogOutputChannel: the EDITOR stamps each line, in a format the extension cannot set. Do not
-    // add a stamp of our own here, or every line carries two. The plain Checks channel is the one
-    // this extension stamps itself (checksLog.ts).
-    channel = vscode.window.createOutputChannel("MessageFoundry Engine", { log: true });
+let channel: vscode.OutputChannel | undefined;
+let log: EngineLog | undefined;
+
+/** The singleton channel. Created lazily so merely importing this module costs nothing.
+ *
+ *  It is a PLAIN output channel, stamped by this extension, not a LogOutputChannel. That one is
+ *  stamped by the editor, in a format and zone the extension cannot set (ASVS 16.2.2). Every line
+ *  goes through `writeStamped`, so it starts with an ISO 8601 UTC instant and then its level word,
+ *  `INFO`, `WARN` or `ERROR`. The editor's per-level filter on this channel is gone with it. */
+export function engineLog(): EngineLog {
+  if (!log) {
+    const out = vscode.window.createOutputChannel("MessageFoundry Engine");
+    const at =
+      (level: string) =>
+      (message: string): void =>
+        writeStamped(out, message, undefined, level);
+    channel = out;
+    log = {
+      info: at("INFO"),
+      warn: at("WARN"),
+      error: at("ERROR"),
+      show: (preserveFocus) => out.show(preserveFocus),
+    };
   }
-  return channel;
+  return log;
 }
 
 export function disposeEngineLog(): void {
   channel?.dispose();
   channel = undefined;
+  log = undefined;
 }
 
 /** Reveal the channel (the "Show the engine log" action). */
