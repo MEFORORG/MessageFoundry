@@ -336,7 +336,7 @@ function Read-CoordRecord([string]$File) {
 # ItemNotFoundException as on a missing one (measured on a UNC host that does not answer), so a root
 # that drops after the run's one probe would otherwise read as "no records". $true present, $false
 # absent under a present parent, and a throw for anything else. BOTH MUST BE PLAIN DIRECTORIES, whether
-# or not the registry exists yet: a FILE standing where the parent should be (mefor-coord as a file) is
+# or not the registry exists yet: a FILE standing where the parent should be (the coordination folder as a file) is
 # "present", and the registry under it then reads as absent, so no records; a junction is listed
 # through, wherever it points.
 function Test-RegistryPresentOrThrow([string]$Dir, [string]$What) {

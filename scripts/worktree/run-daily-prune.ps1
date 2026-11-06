@@ -97,6 +97,42 @@ $EXIT_MEANING = @{
 $prune = Join-Path $PSScriptRoot 'prune-merged.ps1'
 if (-not (Test-Path -LiteralPath $prune)) { throw "prune-merged.ps1 not found beside this script: $prune" }
 
+$mode = if ($Apply) { 'APPLY' } else { 'DRYRUN' }
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
+
+# The one way out after the log exists, so every exit writes its meaning and trims the log directory.
+function Exit-Run([int]$Code) {
+    $meaning = if ($EXIT_MEANING.ContainsKey($Code)) { $EXIT_MEANING[$Code] } else { "UNKNOWN exit code $Code" }
+    "=== exit $Code ($meaning) ===" | Add-Content -LiteralPath $log
+    # Keep the log directory bounded. -ErrorAction SilentlyContinue because a log a human has open must
+    # not turn a successful prune into a failed task run.
+    Get-ChildItem -LiteralPath $LogDir -Filter 'prune-*.log' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -Skip $KeepLogs |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    exit $Code
+}
+
+# BEFORE ANYTHING ASKS GIT, the primary's resolution below included: the helper refuses these too, but
+# by then the prune would already have run under them. Refused into the LOG, with exit 2 (nothing
+# attempted), so a scheduled run that hits it leaves a line saying why rather than a bare exit code.
+if ($RemoveFinishedClaudeWorktrees) {
+    $stepFault = ''
+    try { . (Join-Path $PSScriptRoot 'finished-worktree-removal.ps1') }
+    catch { $stepFault = "the -RemoveFinishedClaudeWorktrees step's scripts could not be loaded (a defect, not a safety finding): $($_.Exception.Message)" }
+    if (-not $stepFault) {
+        try { Assert-NoGitRedirect 'run-daily-prune.ps1 -RemoveFinishedClaudeWorktrees' }
+        catch { $stepFault = $_.Exception.Message }
+    }
+    if ($stepFault) {
+        "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode REFUSED before the prune; nothing was attempted: $stepFault ===" |
+            Add-Content -LiteralPath $log
+        Write-Error -Message $stepFault -ErrorAction Continue
+        Exit-Run 2
+    }
+}
+
 # Resolve the primary through the SAME helper prune-merged.ps1 validates against (occupancy.ps1's
 # PrimaryPath, which is git's first `worktree list` entry). Resolving it any other way -- a
 # --git-common-dir parent, say -- gives an answer that is right today by agreement rather than by
@@ -112,29 +148,7 @@ $pruneArgs = @('-RepoRoot', $RepoRoot)
 if ($Apply) { $pruneArgs += '-Apply' }
 if ($PSBoundParameters.ContainsKey('IdleHours')) { $pruneArgs += @('-IdleHours', $IdleHours) }
 
-$mode = if ($Apply) { 'APPLY' } else { 'DRYRUN' }
-
-New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-$log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
-
 "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode repo=$RepoRoot ===" | Add-Content -LiteralPath $log
-
-# Before the prune run, not only inside the step: the helper refuses these too, but by then the prune
-# would already have run. Refused into the LOG, with exit 2 (nothing attempted), so a scheduled run that
-# hits it leaves a line saying why rather than a bare non-zero exit.
-if ($RemoveFinishedClaudeWorktrees) {
-    try {
-        . (Join-Path $PSScriptRoot 'finished-worktree-removal.ps1')
-        Assert-NoGitRedirect 'run-daily-prune.ps1 -RemoveFinishedClaudeWorktrees'
-    }
-    catch {
-        "=== REFUSED before the prune; nothing was attempted: $($_.Exception.Message) ===" | Add-Content -LiteralPath $log
-        "=== exit 2 ($($EXIT_MEANING[2])) ===" | Add-Content -LiteralPath $log
-        Write-Error -Message $_.Exception.Message -ErrorAction Continue
-        exit 2
-    }
-}
-
 & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $prune @pruneArgs *>&1 |
     Add-Content -LiteralPath $log
 $code = $LASTEXITCODE
@@ -211,14 +225,4 @@ if ($RemoveFinishedClaudeWorktrees) {
     }
 }
 
-$meaning = if ($EXIT_MEANING.ContainsKey($code)) { $EXIT_MEANING[$code] } else { "UNKNOWN exit code $code" }
-"=== exit $code ($meaning) ===" | Add-Content -LiteralPath $log
-
-# Keep the log directory bounded. -ErrorAction SilentlyContinue because a log a human has open must not
-# turn a successful prune into a failed task run.
-Get-ChildItem -LiteralPath $LogDir -Filter 'prune-*.log' -ErrorAction SilentlyContinue |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -Skip $KeepLogs |
-    Remove-Item -Force -ErrorAction SilentlyContinue
-
-exit $code
+Exit-Run $code

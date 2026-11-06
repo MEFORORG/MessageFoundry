@@ -805,6 +805,36 @@ def test_the_runner_refuses_a_git_redirect_before_it_prunes(fx: Fx, tmp_path: Pa
     assert "finished .claude/worktrees" not in text
 
 
+def test_the_runner_refuses_a_git_redirect_before_resolving_the_primary(
+    fx: Fx, tmp_path: Path
+) -> None:
+    """The scheduled task passes no -RepoRoot, so the runner resolves the primary itself, through git.
+    Under a GIT_DIR naming no repository that read used to throw before the log existed."""
+    log_dir = tmp_path / "logs-noroot"
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(RUNNER),
+            "-LogDir",
+            str(log_dir),
+            "-RemoveFinishedClaudeWorktrees",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={**fx.env(), "GIT_DIR": str(fx.root / "not-a-repo")},
+        check=False,
+    )
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    (log,) = log_dir.glob("prune-*.log")
+    text = log.read_text(encoding="utf-8")
+    assert "REFUSED before the prune; nothing was attempted" in text, text
+    assert "GIT_DIR is set" in text
+
+
 def test_the_redirect_list_mirrors_remove_ps1() -> None:
     """The nightly removal refuses exactly the base names remove.ps1 refuses on -Path and -List."""
     names = re.compile(r"'([A-Z_]+)'")

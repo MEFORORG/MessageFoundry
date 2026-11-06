@@ -72,13 +72,17 @@
         every check from the flagged files through the walk (Get-ContentRefusal); and the fence. So
         only the fence read sits between the content check and the removal, and nothing between the
         fence and the removal. A refusal here reads "re-checked just before the removal". THE
-        RESIDUAL: a write into the tree while the late fence is being read is not seen.
+        RESIDUAL, at least: a write into the tree while the late fence is being read, and a claim, an
+        allocation or a per-worktree ref written while the late content check or fence is being read,
+        are not seen. The content check is the slow read (a whole-tree walk), so that is the longer
+        window; it was put after the ownership reads so that the tree's own contents, the commonest
+        late write, get the shorter one.
     Every gate is the shared copy in worktree-gates.ps1 or occupancy.ps1 where one exists. The claim and
     allocation readers list through Test-PresentOrThrow and Get-EntriesOrThrow, the readers remove.ps1
     uses (both now in worktree-gates.ps1), and a registry directory reads as absent only while the
     folder holding it is there, so a coordination root that is unreachable, or drops mid-run, refuses
     rather than reading as empty. The registry and that folder must each be a plain directory, whether
-    or not the registry exists yet: a file standing where mefor-coord should be, or a junction, refuses
+    or not the registry exists yet: a file standing where the coordination folder should be, or a junction, refuses
     rather than reading as no records, and so does a link anywhere below the allocation registry, which
     the walk does not follow. The
     record parsing follows remove.ps1's rules, cannot-tell refusing, without sharing its code.
@@ -187,16 +191,20 @@ function Get-TreeRootRefusal([string]$Path) {
         if ($item -isnot [System.IO.DirectoryInfo]) { return 'its root is not a directory' }
         if (-not (Test-PlainDirectoryItem $item)) { return "its root is a junction or link ($($item.LinkType)), which the gates and the removal would follow somewhere else" }
         if (-not (Test-ClaudeManagedPath $Path)) { return '' }
+        # Up to the .claude folder whose child on this chain is `worktrees`; a chain that never reaches
+        # one (a `..` the shape test did not see) refuses rather than passing at the drive root.
+        $child = $item
         $dir = $item.Parent
         while ($dir) {
             $above = Get-ItemOrThrow $dir.FullName 'a folder above it'
             if (-not $above -or -not (Test-PlainDirectoryItem $above)) { return "a folder above it ($($dir.FullName)) is not a plain directory (a link, or missing), which the path-shape gate would read through" }
-            if ($dir.Name -ieq '.claude') { break }
+            if ($dir.Name -ieq '.claude' -and $child.Name -ieq 'worktrees') { return '' }
+            $child = $dir
             $dir = $dir.Parent
         }
+        return 'its path does not resolve to a folder under a .claude/worktrees folder'
     }
     catch { return $_.Exception.Message }
-    return ''
 }
 
 # What is IN the tree: flagged files, status, the two idle readings, an operation in progress, ignored
@@ -406,10 +414,18 @@ function Invoke-FinishedWorktreeRemoval {
 # FAIL CLOSED. Test-Path answers $false for a path it may not read, so it cannot say "gone". Absent is
 # only a not-found under a parent folder that is there (Test-PresentUnderParentOrThrow, the rule the
 # registries are read by), because an unreachable parent raises the same not-found.
-function Get-EndStatePresence([string]$Path) {
-    try { return $(if (Test-PresentUnderParentOrThrow $Path 'the removed tree') { 'present' } else { 'absent' }) }
-    # The readers end their message "Nothing was removed.", which is false once git has run.
-    catch { return "unknown: $($_.Exception.Message -replace '\s*Nothing was removed\.\s*$', '')" }
+# A directory git has just deleted can sit delete-pending for a moment while another process (an
+# indexer, an antivirus scan) still holds it, and answers access-denied until it goes; so an unreadable
+# reading is taken again a few times before it stands. Only 'unknown' is retried, never 'present'.
+function Get-EndStatePresence([string]$Path, [int]$Tries = 5, [int]$WaitMs = 400) {
+    for ($i = 1; ; $i++) {
+        try { return $(if (Test-PresentUnderParentOrThrow $Path 'the removed tree') { 'present' } else { 'absent' }) }
+        catch {
+            # The readers end their message "Nothing was removed.", which is false once git has run.
+            if ($i -ge $Tries) { return "unknown: $($_.Exception.Message -replace '\s*Nothing was removed\.\s*$', '')" }
+        }
+        Start-Sleep -Milliseconds $WaitMs
+    }
 }
 
 function Invoke-OneRemoval {

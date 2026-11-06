@@ -1428,10 +1428,15 @@ function Get-LiveOrphans([object[]]$Ledger) {
         $p = [string]$e.path
         if (-not $p) { continue }
         $n = ConvertTo-Norm $p
-        if ($registered.ContainsKey($n) -or -not (Test-Path -LiteralPath $p)) { continue }
+        if ($registered.ContainsKey($n)) { continue }
+        # Dropped only once CONFIRMED gone. Test-Path answers $false for a path it may not read, and the
+        # nightly removal ledgers exactly that case (an unreadable leftover), so it must keep reporting.
+        $why = 'a previous run of this script failed to finish removing it'
+        try { if (-not (Test-PresentUnderParentOrThrow $p 'the orphaned directory')) { continue } }
+        catch { $why = "it is not confirmed gone: $($_.Exception.Message -replace '\s*Nothing was removed\.\s*$', '')" }
         if ($seen.ContainsKey($n)) { continue }
         $seen[$n] = $true
-        $out += [pscustomobject]@{ Path = $p; Leaf = (Split-Path $p -Leaf); Branch = [string]$e.branch; At = [string]$e.at; Why = 'a previous run of this script failed to finish removing it' }
+        $out += [pscustomobject]@{ Path = $p; Leaf = (Split-Path $p -Leaf); Branch = [string]$e.branch; At = [string]$e.at; Why = $why }
     }
     # The ledger-free detector: an unregistered sibling directory whose .git pointer still names this
     # repo. Deliberately NOT "any unregistered <repo>-* directory" -- an unrelated folder sharing the
