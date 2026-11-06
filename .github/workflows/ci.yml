@@ -3822,6 +3822,7 @@ jobs:
           tests/test_adr0157_sqlserver_fence.py
           tests/test_uploads_shard_quota_interleave.py
           tests/test_adr0157_b1497_sqlserver_renew_clamp.py
+          tests/test_sqlserver_cipher_audit.py
 
       - name: Run the RTE capture / re-ingress loop on real SQL Server (ADR 0013/0016)
         env:
@@ -4261,6 +4262,7 @@ jobs:
           tests/test_stage_dispatcher.py
           tests/test_pooled_rider.py
           tests/test_uploads_shard_quota_interleave.py
+          tests/test_postgres_cipher_audit.py
 
       - name: Run the connection-scale pool-wait smoke on real Postgres (B11 wall #2, tiny pool)
         env:
