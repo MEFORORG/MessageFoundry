@@ -469,7 +469,7 @@ def check_lockable_accounts(
     keep_passkey = census.reset_would_remove_a_passkey
     reset_note = (
         ". Do NOT reset the factors of these accounts with a TOTP that is unusable or could not "
-        "be checked, which also hold a discoverable passkey that may still sign them in, since "
+        "be checked, which also hold a passkey they may still sign in with, since "
         "a reset removes it; fix the store key, or have the holder remove the authenticator app and "
         "enrol it again: " + ", ".join(keep_passkey)
         if keep_passkey

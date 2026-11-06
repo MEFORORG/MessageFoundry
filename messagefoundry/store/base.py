@@ -2353,10 +2353,11 @@ class AuthStore(Protocol):
     # ADR 0197 Amendment A: ``password_generated`` is REQUIRED, with no default, for the reason
     # ``create_user`` gives: the generated paths pass True and every holder-chosen path passes False.
     # ``require_way_past`` makes the write CONDITIONAL on a way past the sign-in lock, in the same
-    # transaction as the write: TOTP on with a secret, or (wave 2) a passkey recorded as
-    # discoverable, read from the set the account's seal covers. So an ``admin_reset_mfa`` or a
-    # passkey removal that lands between the caller's check and this write makes it match no row.
-    # Returns whether a row was written; a conditional caller refuses on False.
+    # transaction as the write: a TOTP the caller's rule does not refuse, or (wave 2) a passkey
+    # recorded as discoverable, read from the set the account's seal covers. So an
+    # ``admin_reset_mfa`` or a passkey removal that lands between the caller's check and this write
+    # makes it match no row. Returns whether a row was written; a conditional caller refuses on
+    # False.
     async def set_password(
         self,
         user_id: str,
@@ -2558,9 +2559,10 @@ class AuthStore(Protocol):
     # BACKLOG #3422), one parameter, so a condition with no rule cannot be written (BACKLOG #3948
     # finding 14); ``None`` is an unconditional write. The conditional writes count TOTP as a way
     # past unless it is a KNOWN refusal, so an unknown one counts as the plain enabled-TOTP rule
-    # counts it. The same keyword on ``set_password`` and ``disable_totp``. ``passkey_counts`` (BACKLOG #3937) is the caller's rule for which passkey
-    # counts, the auth service's narrowing to the configured relying party; ``None`` is
-    # ``passkey_is_way_past`` alone. The same keyword on ``set_password`` and ``disable_totp``.
+    # counts it. The same keyword on ``set_password`` and ``disable_totp``. ``passkey_counts``
+    # (BACKLOG #3937) is the caller's rule for which passkey counts, the auth service's narrowing to
+    # the configured relying party; ``None`` is ``passkey_is_way_past`` alone. The same keyword on
+    # ``set_password`` and ``disable_totp``.
     async def delete_webauthn_credential(
         self,
         user_id: str,
@@ -2619,9 +2621,9 @@ class AuthStore(Protocol):
     # still hold (``store.escalation_verdict``, BACKLOG #3422), and a passkey the caller's
     # ``passkey_escalates`` counts escalates it too, from the set read in the same transaction
     # (``store.escalation_passkeys``, BACKLOG #3937 item 8). Returns a ``LockoutIncrement``
-    # (``attempts``, ``just_locked``, ``cycles``, ``totp_state``); ``just_locked`` is decided INSIDE that atomic section and must not be recomputed
-    # outside it, where it is only the stale read again. See ``store.next_lockout_state`` for the
-    # policy.
+    # (``attempts``, ``just_locked``, ``cycles``, ``totp_state``); ``just_locked`` is decided
+    # INSIDE that atomic section and must not be recomputed outside it, where it is only the stale
+    # read again. See ``store.next_lockout_state`` for the policy.
     async def increment_login_failure(
         self,
         user_id: str,

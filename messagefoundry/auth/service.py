@@ -2408,12 +2408,13 @@ class LockableAccountCensus:
     #: factor reset would remove. Kept apart from ``passkey_only``, which reads as "the TOTP is no
     #: way past", a thing nobody knows of an unknown TOTP.
     unknown_beside_a_passkey: tuple[str, ...] = ()
-    #: Every account in ``undecryptable_totp`` that holds a discoverable passkey that may sign it
-    #: in, read from the set its seal covers: ``reset-mfa`` would also remove that passkey. Any
-    #: account, a directory account and one the requirement does not cover included, since the
-    #: reset removes every passkey whatever the scope (BACKLOG #3948 finding 11). The cure is the
-    #: store key for a cell that does not open, and removing and enrolling the app again for an
-    #: enrolment this release refuses.
+    #: Every account in ``undecryptable_totp`` that holds a passkey it may still sign in with, read
+    #: from the set its seal covers: ``reset-mfa`` would also remove that passkey. Any account the
+    #: requirement does not cover included, since the reset removes every passkey whatever the
+    #: scope (BACKLOG #3948 finding 11). A local account counts a discoverable passkey (the
+    #: combined passkey sign-in); a directory account counts any passkey, its second factor. The
+    #: cure is the store key for a cell that does not open, and removing and enrolling the app
+    #: again for an enrolment this release refuses.
     reset_would_remove_a_passkey: tuple[str, ...] = ()
 
     @property
@@ -2619,11 +2620,11 @@ async def lockable_account_census(
 
     Read-only, and it needs no :class:`AuthService`, so ``messagefoundry verify`` runs it without the
     trust-anchor preflights or a directory client. Disabled accounts are read too: one cannot sign in
-    now, but it is lockable the moment it is re-enabled. A local row with no password hash is
-    skipped: nobody can sign into it, so there is nothing to lock (an interrupted
-    ``provision-admin`` leaves one). Raises :class:`CensusNeedsTheStoreKey` when a TOTP cell is
-    still ciphertext, which means this shell lacks the store key. Usernames only; each secret is
-    dropped at once. :meth:`AuthService.report_lockable_account_census` warns and audits;
+    now, but it is lockable the moment it is re-enabled. A local row with no password hash is in no
+    list: nobody can sign into it, so there is nothing to lock and no passkey a reset would cost
+    (an interrupted ``provision-admin`` leaves one). Raises :class:`CensusNeedsTheStoreKey` when a
+    TOTP cell is still ciphertext, which means this shell lacks the store key. Usernames only; each
+    secret is dropped at once. :meth:`AuthService.report_lockable_account_census` warns and audits;
     ``verify`` reports. Neither refuses to start, since refusing would hand an account-level fact a
     site-wide veto.
 
@@ -2708,7 +2709,15 @@ async def lockable_account_census(
         # past the GATES count asks the configured rp_id, as the gates do. One digest check.
         trusted = not sealed or passkey_digest(creds) == digest
         signs_in = trusted and any(sign_in_counts(c) for c in creds)
-        if signs_in and state is not None:
+        # The reset list asks how THIS account can still sign in with a passkey (BACKLOG #3948
+        # finding 11). A local row with a password: the combined passkey sign-in, so the same
+        # rule. A directory account: its sign-in, then any passkey as the second factor. A local
+        # row with no password hash signs nobody in, so a reset costs it nothing.
+        if _is_directory_account(user):
+            reset_signs_in = trusted and bool(creds)
+        else:
+            reset_signs_in = signs_in and user.password_hash is not None
+        if reset_signs_in and state is not None:
             reset_removes.append(user.username)
         if not lockable:
             continue
@@ -13205,9 +13214,10 @@ class AuthService:
 
         This method opens the TOTP cell ONCE, in the store's conditional write (BACKLOG #3948
         finding 13); a route that asks :meth:`must_enrol_before_rotating` first opens it once more
-        there, before the current password. The early refusal here opens none: it refuses an account with no TOTP on and no
-        passkey that counts, as :meth:`_has_way_past` would, and leaves a TOTP that is on to the
-        write's own judgement, which refuses a KNOWN refusal there.
+        there, before the current password. The early refusal here opens none: it refuses an
+        account with no TOTP on and no passkey that counts, as :meth:`_has_way_past` would, and
+        leaves a TOTP that is on to the write's own judgement, which refuses a KNOWN refusal there.
+        The cost of that: such a refusal now comes after the argon2 hash.
         """
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
@@ -13263,8 +13273,8 @@ class AuthService:
         discoverable, cannot be found by the usernameless ceremony, so it is a second factor
         everywhere else but no way past the lock (the amendment's fact 11). It answers for the
         factor-drop gates, at least the rotation's courtesy check :meth:`must_enrol_before_rotating`
-        (the rotation's own write judges the TOTP itself, BACKLOG #3948 finding 13), so a passkey counts only under the configured relying
-        party (:meth:`_gate_counts`, BACKLOG #3937)."""
+        (the rotation's own write judges the TOTP itself, BACKLOG #3948 finding 13), so a passkey
+        counts only under the configured relying party (:meth:`_gate_counts`, BACKLOG #3937)."""
         return await self._totp_way_past(user) or await self._holds_gate_passkey(user)
 
     async def _totp_way_past(self, user: VerifiedUser) -> bool:
@@ -13494,9 +13504,10 @@ class AuthService:
         if keep_passkey:
             _log.warning(
                 "ADR 0197: %d account(s) with a TOTP that is unusable or could not be checked also "
-                "hold a discoverable passkey that may still sign them in: %s. A factor reset "
-                "(POST /users/{id}/reset-mfa) would also remove that passkey. For a cell that does not open, fix the store key; for an enrolment this "
-                "release refuses, ask the holder to remove the authenticator app and enrol it again.",
+                "hold a passkey they may still sign in with: %s. A factor reset "
+                "(POST /users/{id}/reset-mfa) would also remove that passkey. For a cell that does "
+                "not open, fix the store key; for an enrolment this release refuses, ask the "
+                "holder to remove the authenticator app and enrol it again.",
                 len(keep_passkey),
                 ", ".join(keep_passkey),
             )

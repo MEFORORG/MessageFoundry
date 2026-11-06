@@ -3726,7 +3726,8 @@ such a TOTP as a factor beside the last passkey, and such a TOTP does not escala
 lock; a discoverable passkey under the configured relying party beside it still does
 (BACKLOG #3937).
 The census names an account holding one beside a working
-discoverable passkey in both lists, and says that a factor reset would remove that passkey: the
+discoverable passkey whatever the requirement covers, and says that a factor reset would remove
+that passkey (BACKLOG #3948 finding 11): the
 cure is the holder removing the authenticator app and enrolling it again. **Only a KNOWN refusal
 changes a decision.** A TOTP the engine cannot judge, because its cell does not open (a store-key
 fault, or a cipher service such as Transit that does not answer) or its value will not compute, is

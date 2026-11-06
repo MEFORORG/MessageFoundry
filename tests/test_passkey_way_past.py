@@ -959,71 +959,103 @@ async def test_the_reset_list_names_an_account_the_requirement_does_not_lock(out
         await store.close()
 
 
-async def _directory_account_with_a_passkey(store: MessageStore) -> str:
-    """A directory account with a refused TOTP and a discoverable passkey under :data:`RP`: never
-    lockable, so read by the census for the reset list alone. Returns its username."""
+async def _directory_account_with_a_passkey(
+    store: MessageStore,
+    *,
+    user_id: str = "dir-u1",
+    auth_provider: str = "ad",
+    discoverable: bool = True,
+) -> str:
+    """An account with a refused TOTP and a passkey under :data:`RP`, by default a directory
+    account and a discoverable passkey: never lockable, so read by the census for the reset list
+    alone. Returns its username. A ``"local"`` provider makes a local row with no password hash."""
     from messagefoundry.auth.tokens import credential_id_hash
     from tests._webauthn_store_contract import _cred
 
+    username = "dir-alice" if user_id == "dir-u1" else f"{user_id}-alice"
     await store.create_user(
-        user_id="dir-u1",
-        username="dir-alice",
-        auth_provider="ad",
+        user_id=user_id,
+        username=username,
+        auth_provider=auth_provider,
         password_generated=False,
         now=1.0,
         audits=(),
     )
     await store.add_webauthn_credential(
         _cred(
-            "dir-u1",
+            user_id,
             "resident",
-            id_hash=credential_id_hash(b"dir-resident"),
+            id_hash=credential_id_hash(f"{user_id}-resident".encode()),
             rp_id=RP,
-            discoverable=True,
+            discoverable=discoverable,
         )
     )
-    await _enable_totp(store, "dir-u1", _REFUSED_TOTP)
-    return "dir-alice"
+    await _enable_totp(store, user_id, _REFUSED_TOTP)
+    return username
 
 
 async def test_the_reset_list_names_a_directory_account() -> None:
     """BACKLOG #3948 finding 11: a directory account is never lockable, and ``reset-mfa`` still
-    removes its passkey, so the reset list names it and no lockable list does."""
+    removes its passkey, so the reset list names it and no lockable list does. A directory account
+    signs in through its directory and then any passkey, so one that is not discoverable counts
+    too. A local row with no password hash signs nobody in, so it is not named."""
     store = await MessageStore.open(":memory:")
     try:
         username = await _directory_account_with_a_passkey(store)
+        plain = await _directory_account_with_a_passkey(store, user_id="dir-u2", discoverable=False)
+        hashless = await _directory_account_with_a_passkey(
+            store, user_id="nohash-u3", auth_provider="local"
+        )
         census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
-        assert census.undecryptable_totp == (username,)
+        assert census.undecryptable_totp == tuple(sorted((username, plain, hashless)))
         assert census.passkey_only == () and census.no_way_past == ()
-        assert census.reset_would_remove_a_passkey == (username,)
+        assert census.reset_would_remove_a_passkey == tuple(sorted((username, plain)))
     finally:
         await store.close()
 
 
-@pytest.mark.parametrize("decodes", [False, True], ids=["undecodable", "control-other-error"])
+@pytest.mark.parametrize("other_error", [False, True], ids=["undecodable", "control-other-error"])
 async def test_a_passkey_set_the_driver_cannot_decode_does_not_stop_the_census(
-    monkeypatch: pytest.MonkeyPatch, decodes: bool
+    monkeypatch: pytest.MonkeyPatch, other_error: bool
 ) -> None:
     """A passkey cell the driver cannot decode while fetching (sqlite3's message-only
     ``OperationalError``) counts that account's set for nothing, as a row that does not parse does,
-    so the census still reports every other account. The control: any other ``OperationalError``
-    still propagates, since it says nothing about that set."""
+    so the census still reports every other account: here a covered local account with a chosen
+    password and no factor, read after the directory one, is still named with no way past. The
+    control: any other ``OperationalError`` still propagates, since it says nothing about that
+    set."""
     store = await MessageStore.open(":memory:")
     try:
         await _directory_account_with_a_passkey(store)
-        message = "disk I/O error" if decodes else "Could not decode to UTF-8 column 'label'"
+        await store.create_user(
+            user_id="zz-local",
+            username="zz-local-bob",
+            auth_provider="local",
+            password_hash="h",
+            password_generated=False,
+            now=2.0,
+            audits=(),
+        )
+        message = "disk I/O error" if other_error else "Could not decode to UTF-8 column 'label'"
+        real_list = store.list_webauthn_credentials
+        reads: list[str] = []
 
         async def undecodable(user_id: str) -> Any:
-            raise sqlite3.OperationalError(message)
+            reads.append(user_id)
+            if user_id == "dir-u1":
+                raise sqlite3.OperationalError(message)
+            return await real_list(user_id)
 
         monkeypatch.setattr(store, "list_webauthn_credentials", undecodable)
-        if decodes:
+        if other_error:
             with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
                 await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
             return
         census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+        assert "dir-u1" in reads and "zz-local" in reads, reads
         assert census.undecryptable_totp == ("dir-alice",)
         assert census.reset_would_remove_a_passkey == ()
+        assert census.no_way_past == ("zz-local-bob",)
     finally:
         await store.close()
 

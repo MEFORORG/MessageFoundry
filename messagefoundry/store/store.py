@@ -3242,7 +3242,7 @@ async def judge_totp_cell(
         return "unknown"
     if state not in ("usable", "refused", "unknown"):
         # A bool rule (the old shape) would read False as "not refused", which fails open.
-        raise TypeError(f"totp_usable answered {state!r}, not a TotpState")
+        raise TypeError(f"the TOTP rule answered {state!r}, not a TotpState")
     return state
 
 
@@ -3303,7 +3303,8 @@ _SQLITE_DECODE_FAILURE = "Could not decode to UTF-8 column"
 def passkey_cell_undecodable(exc: BaseException) -> bool:
     """Whether ``exc`` is a driver failing to decode a passkey cell while fetching, before any row
     is parsed: pyodbc's ``UnicodeDecodeError``, or sqlite3's ``OperationalError`` told apart only by
-    its message (:func:`escalation_passkeys`). A reader that counts such a set for nothing asks it."""
+    its message (:func:`escalation_passkeys`). Every reader that counts such a set for nothing
+    asks it."""
     if isinstance(exc, UnicodeDecodeError):
         return True
     return isinstance(exc, sqlite3.OperationalError) and str(exc).startswith(_SQLITE_DECODE_FAILURE)
@@ -8249,8 +8250,8 @@ class LockoutIncrement(NamedTuple):
     counter, a cell that moved since the judgement, and a failure whose pre-lock read said it sets
     no later-cycle lock. The judgement runs on that pre-lock read, so a racing write can leave a
     verdict on a failure that sets a first lock or none: read it beside ``just_locked``, never as
-    proof of a later-cycle lock. The lock notice reads it, so it tells the owner what the escalation decided on
-    rather than judging the cell again (BACKLOG #3948 finding 16)."""
+    proof of a later-cycle lock. The lock notice reads it, so it tells the owner what the
+    escalation decided on rather than judging the cell again (BACKLOG #3948 finding 16)."""
 
     attempts: int
     just_locked: bool
@@ -17385,9 +17386,10 @@ class MessageStore:
         return None if written is None else sealed
 
     async def get_totp_secret(self, user_id: str) -> str | None:
-        """The user's decrypted base32 TOTP secret, or ``None`` when not enrolled/staged. The cell is
-        opened OFF THE EVENT LOOP (BACKLOG #3929): under a Transit cipher the decrypt is a blocking
-        HTTP call, and the lockable-account census reads every enrolled account through here."""
+        """The user's decrypted base32 TOTP secret, or ``None`` when not enrolled/staged. The cell
+        is opened OFF THE EVENT LOOP (BACKLOG #3929): under a Transit cipher the decrypt is a
+        blocking HTTP call, and the lockable-account census reads every enrolled account through
+        here."""
         async with self._read() as db:
             cur = await db.execute("SELECT totp_secret FROM users WHERE id=?", (user_id,))
             row = await cur.fetchone()
@@ -17914,8 +17916,8 @@ class MessageStore:
         BACKLOG #3422). The passkey half of the escalation is :func:`escalation_passkeys`
         (BACKLOG #3937 item 8). The count itself stays atomic.
 
-        Returns ``(0, False, 0)`` for an unknown user -- there is no row to count against, and a
-        caller that reached here on a missing account has already refused it."""
+        Returns ``LockoutIncrement(0, False, 0)`` for an unknown user -- there is no row to count
+        against, and a caller that reached here on a missing account has already refused it."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
         totp_counts = await escalation_verdict(

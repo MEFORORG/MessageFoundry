@@ -15035,7 +15035,7 @@ class SqlServerStore:
         the lock, only for a failure that would set a later-cycle lock, on a cell the locked row
         must still hold (``store.escalation_verdict``, BACKLOG #3422). The passkey half of the
         escalation is ``store.escalation_passkeys`` (BACKLOG #3937 item 8). Returns
-        ``(0, False, 0)`` for an unknown user."""
+        ``LockoutIncrement(0, False, 0)`` for an unknown user."""
         now = time.time() if now is None else now
         out: list[LockoutIncrement] = []
         totp_counts = await escalation_verdict(
