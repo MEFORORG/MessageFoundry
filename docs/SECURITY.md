@@ -1992,10 +1992,10 @@ else would need its own authorization rule stated here.
    so there a crafted link to the page itself still issues it and the re-auth mints the grant.**
    The operator must still confirm on the page. "Once" holds when two re-auths race one issue:
    each leg takes the issue in one synchronous step, with no await between its read and its take,
-   right before the leg's re-proof awaits, so the second finds nothing and mints nothing. An issue
-   a federated start holds for its flow can still be taken by a later re-auth, and that flow then
-   mints no grant. A re-auth that fails, a refused IdP prompt included, gives it back for the
-   retry (vault BACKLOG #3241, added items 7 and 9; [ADR 0065](adr/0065-web-ops-dashboard.md) change of
+   right before the leg's re-proof awaits, so the second finds nothing and mints nothing. A
+   federated flow mints only while it still holds its issue; the ADR 0065 change cited below
+   says when it does not. A re-auth that fails, a refused IdP prompt included, gives it back
+   for the retry (vault BACKLOG #3241, added items 7 and 9; [ADR 0065](adr/0065-web-ops-dashboard.md) change of
    2026-11-05). Auto-retry actions and action-bound unlock pages each have their own per-session
    cap of issues, so one kind cannot evict the other (added item 8). `GET /ui/reauth` toward an
    action-bound unlock page this session was not issued shows a link to the page, not a password

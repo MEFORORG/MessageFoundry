@@ -824,3 +824,30 @@ def test_a_window_only_unlock_page_is_never_issued() -> None:
     assert not continuation_issued(token, window_only)
     _issue_continuation(_get(bound), bound)
     assert continuation_issued(token, bound)
+
+
+def test_a_flow_return_in_progress_keeps_its_issue_from_other_reauths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While a flow's callback runs, no other re-auth may take the issue the flow holds, and a
+    return that consumed nothing leaves the issue with the flow for the real return. RED when: a
+    re-auth takes the issue mid-callback, so the flow and that re-auth could each mint, or a
+    non-consuming return strands or moves the issue. CONTROL: once settled, a re-auth takes it."""
+    monkeypatch.setattr(_auth, "_ISSUED_CONTINUATIONS", _auth._IssuedContinuations())
+    monkeypatch.setattr(_auth, "_FLOW_CLAIMS", type(_auth._FLOW_CLAIMS)())
+    monkeypatch.setattr(_auth, "_FLOW_CLAIM_IDS", {})
+    page = "/ui/connections/purge-confirm"
+    action = _auth.lookup_ui_action(page)
+    assert action is not None and action.binds_unlock_grant
+    _auth._ISSUED_CONTINUATIONS.issue("tok", page, unlock=True)
+    _auth.hold_claim_for_flow("flow-1", _auth.claim_continuation(action, "tok", page))
+
+    claim, mint = _auth.take_flow_claim("flow-1", page)
+    assert mint and claim is not None
+    assert not _auth.claim_continuation(action, "tok", page).continues  # pinned to its flow
+    _auth.settle_flow_claim("flow-1", claim, consumed=False, minted=False)
+    assert _auth._FLOW_CLAIMS.get("flow-1") is claim and claim.holds_entry
+
+    assert _auth.claim_continuation(action, "tok", page).continues
+    claim, mint = _auth.take_flow_claim("flow-1", page)
+    assert claim is None and not mint  # its issue was taken: the flow mints no grant

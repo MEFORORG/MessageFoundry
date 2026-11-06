@@ -709,6 +709,9 @@ async def test_two_idp_starts_racing_one_unlock_issue_mint_one_grant(
 
         assert landed.status_code == 200, landed.text
         assert _UNLOCK in landed.text
+        # The stale return consumed nothing, so the second flow still held its issue and minted.
+        page = await c.get(_UNLOCK, headers=_SAME, follow_redirects=False)
+        assert page.status_code == 200, page.headers
 
 
 async def test_a_second_start_refused_after_its_take_leaves_the_first_flow_minting_nothing(

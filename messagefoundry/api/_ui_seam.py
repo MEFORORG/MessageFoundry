@@ -812,8 +812,8 @@ from typing import Any
 #: answers a scoped caller's bad flag direction with the unaudited 404.
 #:
 #: Vault BACKLOG #3241, added item 9: ``AuthService.complete_oidc_step_up`` gained the keyword
-#: ``mint_grant``, which ``/ui/oidc/callback`` passes as False for a flow whose continuation another
-#: re-auth took. A keyword the console passes, so it forces a bump. Re-derived with ``--write`` (from
+#: ``mint_grant``, which ``/ui/oidc/callback`` passes as False at least for a flow whose continuation
+#: another re-auth took. A keyword the console passes, so it forces a bump. Re-derived with ``--write`` (from
 #: 734e7007fb95eb75).
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is

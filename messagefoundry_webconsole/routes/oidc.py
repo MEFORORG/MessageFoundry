@@ -553,33 +553,37 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # BACKLOG #296: the IdP is returning from a STEP-UP of a live session, not a sign-in.
             # The service pops the flow and re-checks its kind, so this branch only picks the leg.
             # Vault BACKLOG #3241, added items 7 and 9: the issue the start leg held for this flow
-            # is taken before the await, and a flow whose issue another re-auth took mints no grant,
-            # so one issue mints at most one. An exception in the await loses the issue, which costs
-            # only that continuation.
+            # is pinned to it before the await, and a flow whose issue another re-auth took mints
+            # no grant, so one issue mints at most one. An exception in the await loses the issue,
+            # which costs only that continuation.
             claim, mint_grant = take_flow_claim(flow_id, staged.return_to)
-            step_up = (
-                await auth.abandon_oidc_step_up(
-                    flow_id,
-                    # Checked before the flow is consumed, so a forged error= cannot cancel it.
-                    state=state,
-                    reason="idp_error" if error is not None else "malformed_callback",
-                    client=client,
+            try:
+                step_up = await (
+                    auth.abandon_oidc_step_up(
+                        flow_id,
+                        # Checked before the flow is consumed, so a forged error= cannot cancel it.
+                        state=state,
+                        reason="idp_error" if error is not None else "malformed_callback",
+                        client=client,
+                    )
+                    if error is not None or not code or not state
+                    else auth.complete_oidc_step_up(
+                        flow_id=flow_id,
+                        state=state,
+                        code=code,
+                        client=client,
+                        public_origin=getattr(request.app.state, "public_origin", "") or "",
+                        mint_grant=mint_grant,
+                    )
                 )
-                if error is not None or not code or not state
-                else await auth.complete_oidc_step_up(
-                    flow_id=flow_id,
-                    state=state,
-                    code=code,
-                    client=client,
-                    public_origin=getattr(request.app.state, "public_origin", "") or "",
-                    mint_grant=mint_grant,
-                )
-            )
+            except BaseException:
+                settle_flow_claim(flow_id, claim, consumed=None, minted=False)
+                raise
             settle_flow_claim(
                 flow_id,
                 claim,
                 consumed=step_up.flow_consumed,
-                minted=mint_grant and step_up.elevation.token is not None,
+                minted=step_up.elevation.token is not None,
             )
             return _step_up_landing(request, deps, auth, step_up)
         if error is not None or not code or not state:

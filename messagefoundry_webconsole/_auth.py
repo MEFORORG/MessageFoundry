@@ -1291,6 +1291,9 @@ class ContinuationClaim:
     _session_hash: str | None = None
     _next_path: str = ""
     _entry: _Entry | None = None
+    #: Callbacks of the flow holding this claim that are between :func:`take_flow_claim` and
+    #: :func:`settle_flow_claim`. While any is, no other re-auth may take the entry.
+    _returns: int = 0
 
     @property
     def holds_entry(self) -> bool:
@@ -1366,9 +1369,10 @@ def _flow_claim_held(session_hash: str, next_path: str) -> bool:
 def _take_flow_claim(session_hash: str, next_path: str) -> _Entry | None:
     """Take back the live entry a held flow claim keeps for this session and ``next_path``."""
     flow_id = _FLOW_CLAIM_IDS.get(session_hash, {}).get(next_path)
-    claim = _drop_flow_claim(flow_id) if flow_id is not None else None
-    if claim is None:
-        return None
+    claim = _FLOW_CLAIMS.get(flow_id) if flow_id is not None else None
+    if flow_id is None or claim is None or claim._returns:
+        return None  # nothing held, or the flow's own return is in progress and may mint from it
+    _drop_flow_claim(flow_id)
     entry, claim._entry = claim._entry, None
     return entry if entry is not None and entry.deadline > time.monotonic() else None
 
@@ -1387,33 +1391,40 @@ def hold_claim_for_flow(flow_id: str, claim: ContinuationClaim) -> None:
 
 
 def take_flow_claim(flow_id: str, return_to: str) -> tuple[ContinuationClaim | None, bool]:
-    """Take the claim held for ``flow_id`` for its callback, and say whether the flow may mint the
-    grant its staged continuation names. Call it before the callback's first await, so no re-auth
-    can take the claim while the callback awaits the IdP.
+    """Mark the claim held for ``flow_id`` as in its callback, and say whether the flow may mint
+    the grant its staged continuation names. Call it before the callback's first await. The claim
+    stays where it is, so a callback that consumes nothing (a forged ``state``) neither strands it
+    nor hides it from the flow's real return, but no other re-auth may take it until
+    :func:`settle_flow_claim` runs.
 
-    A flow toward an action-bound unlock page mints only while it still holds a live claim. Any
-    other re-auth for the page takes the issue from the flow first (:func:`claim_continuation`),
-    and from then on that re-auth, or the table it gives the issue back to, holds the only right to
-    mint from it. So one issue mints at most one grant, whatever the cookie jar holds. Any other
-    flow mints as it was staged."""
-    claim = _drop_flow_claim(flow_id)
+    A flow toward an action-bound unlock page mints only while it still holds its issue. Another
+    re-auth for the page takes the issue from the flow first (:func:`claim_continuation`), and from
+    then on that re-auth, or the table it gives the issue back to, holds the only right to mint from
+    it. So one issue mints at most one grant, whatever the cookie jar holds. Any other flow mints
+    as it was staged."""
+    claim = _FLOW_CLAIMS.get(flow_id)
+    if claim is not None:
+        claim._returns += 1
     action = lookup_ui_action(return_to)
-    bound = action is not None and action.unlock and action.continues_only_when_issued
-    return claim, not bound or (claim is not None and claim.deadline() > time.monotonic())
+    bound = action is not None and action.binds_unlock_grant
+    return claim, not bound or (claim is not None and claim.holds_entry)
 
 
 def settle_flow_claim(
-    flow_id: str, claim: ContinuationClaim | None, *, consumed: bool, minted: bool
+    flow_id: str, claim: ContinuationClaim | None, *, consumed: bool | None, minted: bool
 ) -> None:
-    """Resolve the claim :func:`take_flow_claim` took for ``flow_id``. A return that consumed
-    nothing leaves the flow staged for the IdP's real return, so the flow holds the claim again. A
-    consumed flow that minted nothing puts the issue back, for the retry the refusal page offers;
-    one that minted drops it."""
+    """End the callback :func:`take_flow_claim` marked. A return that consumed nothing leaves the
+    flow, and its claim, for the IdP's real return. A consumed flow that minted nothing puts the
+    issue back, for the retry the refusal page offers; one that minted drops it. ``consumed=None``
+    is a callback that raised, which may have minted, so the issue is dropped and not put back."""
     if claim is None:
         return
-    if not consumed:
-        hold_claim_for_flow(flow_id, claim)
-    elif not minted:
+    claim._returns -= 1
+    if consumed is False:
+        return
+    if _FLOW_CLAIMS.get(flow_id) is claim:
+        _drop_flow_claim(flow_id)
+    if consumed and not minted:
         claim.restore()
 
 
