@@ -139,32 +139,27 @@ def _assert_refused_before_accept(peer: _Peer) -> None:
 # --- /ws/stats, the engine's only WebSocket route -----------------------------------------------------
 
 
-async def test_ws_stats_refuses_an_unauthenticated_caller_before_accept(engine: Engine) -> None:
-    app = create_app(engine, auth=await _service(engine))
-    peer = _Peer(app, "/ws/stats", None)
-    await peer.run()
-    _assert_refused_before_accept(peer)
-
-
-async def test_ws_stats_refuses_a_caller_without_the_permission_before_accept(
+@pytest.mark.parametrize(
+    ("roles", "accepted"),
+    [(None, False), ((), False), ((Role.OPERATOR,), True)],
+    ids=["unauthenticated", "no-permission", "authorized"],
+)
+async def test_ws_stats_is_accepted_only_for_an_authorized_caller(
     engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    roles: tuple[Role, ...] | None,
+    accepted: bool,
 ) -> None:
-    service = await _service(engine)
-    token = await _token(service, "norole")  # no role, so no monitoring:read
-    peer = _Peer(create_app(engine, auth=service), "/ws/stats", token)
-    await peer.run()
-    _assert_refused_before_accept(peer)
-
-
-async def test_ws_stats_accepts_an_authorized_caller(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
-) -> None:
+    """``roles`` None sends no token; ``()`` signs in a user with no role, so no monitoring:read."""
     monkeypatch.setattr(app_module, "_WS_FRAME_SECONDS", 0.01)
     service = await _service(engine)
-    token = await _token(service, "op", Role.OPERATOR)
+    token = None if roles is None else await _token(service, "caller", *roles)
     peer = _Peer(create_app(engine, auth=service), "/ws/stats", token)
     await peer.run()
-    assert peer.kinds[:2] == [_ACCEPT, "websocket.send"], peer.sent
+    if accepted:
+        assert peer.kinds[:2] == [_ACCEPT, "websocket.send"], peer.sent
+    else:
+        _assert_refused_before_accept(peer)
 
 
 # --- planted sockets: the accept gate itself ----------------------------------------------------------
@@ -236,20 +231,21 @@ async def test_an_in_body_socket_that_never_calls_its_gate_is_refused_at_accept(
     assert outcome.send_error is not None, "a frame after the refused accept was not refused"
     lines = [r.getMessage() for r in caplog.records if "refused accept" in r.getMessage()]
     assert lines == [
-        "refused accept on WebSocket route /zz/no-gate: no gate admitted the caller before accept()"
+        "refused accept on WebSocket route /zz/no-gate: no gate admitted the caller before accept() "
+        "(1 refusals since the last log line, 1 in all)"
     ], lines
 
 
 @pytest.mark.parametrize(
     ("roles", "accepted"),
-    [((), False), ((Role.OPERATOR,), True)],
-    ids=["wrong-permission", "authorized"],
+    [(None, False), ((), False), ((Role.OPERATOR,), True)],
+    ids=["unauthenticated", "wrong-permission", "authorized"],
 )
 async def test_an_in_body_socket_that_ignores_its_gate_is_accepted_only_when_the_gate_admitted(
-    engine: Engine, roles: tuple[Role, ...], accepted: bool
+    engine: Engine, roles: tuple[Role, ...] | None, accepted: bool
 ) -> None:
     service = await _service(engine)
-    token = await _token(service, "caller", *roles)
+    token = None if roles is None else await _token(service, "caller", *roles)
     outcome = _Outcome()
     peer = _Peer(_planted(engine, service, outcome), "/zz/ignores-refusal", token)
     await peer.run()
@@ -258,15 +254,6 @@ async def test_an_in_body_socket_that_ignores_its_gate_is_accepted_only_when_the
         assert outcome.accept_error is None
     else:
         _assert_refused_before_accept(peer)
-
-
-async def test_an_in_body_socket_that_ignores_its_gate_refuses_an_unauthenticated_caller(
-    engine: Engine,
-) -> None:
-    outcome = _Outcome()
-    peer = _Peer(_planted(engine, await _service(engine), outcome), "/zz/ignores-refusal", None)
-    await peer.run()
-    _assert_refused_before_accept(peer)
 
 
 @pytest.mark.parametrize("path", ["/zz/public", "/zz/dependency-gated"])
@@ -284,10 +271,6 @@ def test_create_app_installs_the_accept_gate() -> None:
 
 
 def test_the_mark_is_the_only_way_an_in_body_scope_is_allowed() -> None:
-    class _NoScope:
-        pass
-
-    mark_ws_gate_admitted(_NoScope())  # type: ignore[arg-type]  # a double with no scope: no raise
     assert not ws_accept_allowed({})
 
     class _Handshake:

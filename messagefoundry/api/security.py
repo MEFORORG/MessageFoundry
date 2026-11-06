@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, get_args
 
@@ -898,19 +898,36 @@ def _record_refusal(route: object, routes: Sequence[BaseRoute]) -> None:
     is the key :func:`undeclared_route_refusal_counts` reports this count under, so the log and
     ``GET /security/posture`` name a refusal alike (vault BACKLOG #2956). It is worked out only when
     a line is written; :func:`_logged_key` says what it misses."""
-    tally = getattr(route, _REFUSALS_ATTR, None) if route is not None else _UNKNOWN_ROUTE_REFUSALS
+    _count_and_log(
+        _tally_on(route, _REFUSALS_ATTR, _UNKNOWN_ROUTE_REFUSALS),
+        "refused route %s: it has no gate dependency and no public declaration",
+        lambda: _logged_key(route, routes),
+    )
+
+
+def _tally_on(route: object, attr: str, fallback: _RefusalTally) -> _RefusalTally:
+    """The :class:`_RefusalTally` ``route`` holds under ``attr``, made on first use; ``fallback``
+    when there is no route."""
+    if route is None:
+        return fallback
+    tally = getattr(route, attr, None)
     if not isinstance(tally, _RefusalTally):
         tally = _RefusalTally()
-        setattr(route, _REFUSALS_ATTR, tally)
+        setattr(route, attr, tally)
+    return tally
+
+
+def _count_and_log(tally: _RefusalTally, message: str, key: Callable[[], str]) -> None:
+    """Count one refusal on ``tally``, and log ``message`` (one ``%s``, the route's ``key``) at
+    ERROR at most once per :data:`REFUSAL_LOG_INTERVAL_SECONDS`, with the counts appended."""
     tally.total += 1
     tally.unlogged += 1
     now = time.monotonic()
     if tally.logged_at is not None and now - tally.logged_at < REFUSAL_LOG_INTERVAL_SECONDS:
         return
     log.error(
-        "refused route %s: it has no gate dependency and no public declaration "
-        "(%d refusals since the last log line, %d in all)",
-        _logged_key(route, routes),
+        message + " (%d refusals since the last log line, %d in all)",
+        key(),
         tally.unlogged,
         tally.total,
     )
@@ -955,17 +972,16 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
 
 #: The scope key a WebSocket gate sets when it admits the caller. Its value is ``True``.
 _WS_GATE_ADMITTED_KEY = "mefor.ws_gate_admitted"
-#: The route attribute that holds when :class:`WebSocketAcceptGate` last logged a refusal there.
-_ACCEPT_REFUSAL_LOGGED_ATTR = "_mefor_accept_refusal_logged_at"
+#: The route attribute that holds the :class:`_RefusalTally` of accepts :class:`WebSocketAcceptGate`
+#: refused there. Apart from the undeclared-route tally, so neither count includes the other.
+_ACCEPT_REFUSALS_ATTR = "_mefor_accept_refusals"
+#: The tally for a refused accept whose scope named no route.
+_UNKNOWN_ROUTE_ACCEPT_REFUSALS = _RefusalTally()
 
 
 def mark_ws_gate_admitted(websocket: HTTPConnection) -> None:
-    """Record on ``websocket``'s scope that a gate admitted its caller. Only a gate calls this.
-
-    A test double with no scope is left unmarked, which leaves its accept refused: the safe side."""
-    scope = getattr(websocket, "scope", None)
-    if isinstance(scope, MutableMapping):
-        scope[_WS_GATE_ADMITTED_KEY] = True
+    """Record on ``websocket``'s scope that a gate admitted its caller. Only a gate calls this."""
+    websocket.scope[_WS_GATE_ADMITTED_KEY] = True
 
 
 def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
@@ -973,28 +989,20 @@ def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
     if scope.get(_WS_GATE_ADMITTED_KEY) is True:
         return True
     route = scope.get("route")
-    if route is None:
-        return False
-    if route_has_gate(route):
-        return True
-    declared = route_declaration_of(getattr(route, "endpoint", None))
-    return declared is not None and declared.public
+    # As the HTTP rule reads it: a gate dependency, or a public mark. An in-body mark is not enough.
+    return route is not None and route_is_declared(route, websocket=False)
 
 
-def _log_refused_accept(route: object) -> None:
-    """Log a refused accept at ERROR, at most once per :data:`REFUSAL_LOG_INTERVAL_SECONDS` a route.
-
-    The line names the route's path template, never the request's path."""
-    now = time.monotonic()
-    last = getattr(route, _ACCEPT_REFUSAL_LOGGED_ATTR, None)
-    if isinstance(last, float) and now - last < REFUSAL_LOG_INTERVAL_SECONDS:
-        return
-    log.error(
+def _record_refused_accept(scope: Scope) -> None:
+    """Count and log a refused accept as :func:`_record_refusal` does, naming the route by the
+    same key, a path template and never the request's path."""
+    route = scope.get("route")
+    routes = getattr(scope.get("app"), "routes", None) or ()
+    _count_and_log(
+        _tally_on(route, _ACCEPT_REFUSALS_ATTR, _UNKNOWN_ROUTE_ACCEPT_REFUSALS),
         "refused accept on WebSocket route %s: no gate admitted the caller before accept()",
-        getattr(route, "path", None) or UNKNOWN_ROUTE_KEY,
+        lambda: _logged_key(route, routes),
     )
-    if route is not None:
-        setattr(route, _ACCEPT_REFUSAL_LOGGED_ATTR, now)
 
 
 class WebSocketAcceptGate:
@@ -1013,20 +1021,25 @@ class WebSocketAcceptGate:
         if scope.get("type") != "websocket":
             await self.app(scope, receive, send)
             return
-        refused = False
+        accepted = refused = False
 
         async def guarded_send(message: Message) -> None:
-            nonlocal refused
+            nonlocal accepted, refused
+            if accepted:
+                await send(message)
+                return
             kind = message.get("type")
             if refused:
                 if kind == "websocket.close":
                     return
                 raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
-            if kind == "websocket.accept" and not ws_accept_allowed(scope):
-                refused = True
-                _log_refused_accept(scope.get("route"))
-                await send({"type": "websocket.close", "code": status.WS_1008_POLICY_VIOLATION})
-                raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
+            if kind == "websocket.accept":
+                if not ws_accept_allowed(scope):
+                    refused = True
+                    _record_refused_accept(scope)
+                    await send({"type": "websocket.close", "code": status.WS_1008_POLICY_VIOLATION})
+                    raise WebSocketException(status.WS_1008_POLICY_VIOLATION)
+                accepted = True
             await send(message)
 
         await self.app(scope, receive, guarded_send)

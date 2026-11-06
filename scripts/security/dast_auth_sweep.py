@@ -618,6 +618,27 @@ def websocket_rows_not_declared(receipt: dict[str, Any]) -> list[str]:
     )
 
 
+def _allowlist_drift(
+    policy: dict[str, Any],
+    key: str,
+    rows: list[dict[str, Any]],
+    what: str,
+    added_label: str,
+    why: str,
+) -> str | None:
+    """The error line when ``rows``' ``(METHOD, path)`` set differs from the policy's ``key``
+    allow-list, else ``None``. Raises :class:`PolicyError` on a malformed entry."""
+    expected = {_key(e) for e in policy.get(key, [])}
+    actual = {(str(r["method"]).upper(), str(r["path"])) for r in rows}
+    if actual == expected:
+        return None
+    return (
+        f"{what} no longer matches the documented allow-list. "
+        f"{added_label}: {sorted(actual - expected) or 'none'}; "
+        f"documented but absent: {sorted(expected - actual) or 'none'}. {why}"
+    )
+
+
 def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list[str]]:
     """``(exit code, error lines)`` for a receipt. Pure — the tests drive it with no target running.
 
@@ -663,46 +684,45 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
                 "Too little was measured for a clean result to mean anything."
             )
 
-    # A newly ungated route must red the run rather than quietly joining the background.
+    # A newly ungated route must red the run rather than quietly joining the background. Engine PR
+    # 2390 note 3 (vault BACKLOG #2955): a public socket is the one the engine accepts with no gate
+    # (api/security.py WebSocketAcceptGate), so that set is pinned the same way.
     try:
-        expected_anonymous = {_key(e) for e in policy.get("anonymous_allowlist", [])}
+        drift = [
+            _allowlist_drift(
+                policy,
+                "anonymous_allowlist",
+                receipt.get("ungated_routes", []),
+                "the ungated (anonymous) route set",
+                "Newly anonymous",
+                "A route with no require*() gate is reachable by anyone.",
+            ),
+            _allowlist_drift(
+                policy,
+                "public_websocket_allowlist",
+                [
+                    r
+                    for r in receipt.get("websocket_rows", [])
+                    if r.get("kind") == route_gates.KIND_PUBLIC
+                ],
+                "the public WebSocket route set",
+                "Newly public",
+                "A public socket is accepted with no gate.",
+            ),
+        ]
     except PolicyError as exc:
         return 2, [str(exc)]
-    actual_anonymous = {
-        (str(r["method"]).upper(), str(r["path"])) for r in receipt.get("ungated_routes", [])
-    }
-    if actual_anonymous != expected_anonymous:
-        added = sorted(actual_anonymous - expected_anonymous)
-        removed = sorted(expected_anonymous - actual_anonymous)
-        errors.append(
-            "the ungated (anonymous) route set no longer matches the documented allow-list. "
-            f"Newly anonymous: {added or 'none'}; documented but absent: {removed or 'none'}. "
-            "A route with no require*() gate is reachable by anyone."
-        )
+    anonymous_drift, public_ws_drift = drift
+    if anonymous_drift:
+        errors.append(anonymous_drift)
     undeclared = ungated_not_declared_public(receipt)
     if undeclared:
         errors.append(
             f"ungated route(s) not declared public with a reason: {undeclared}. The allow-list "
             "cannot tell such a route from one public by design."
         )
-    # Engine PR 2390 note 3 (vault BACKLOG #2955): a public socket is the one the engine accepts
-    # with no gate (api/security.py WebSocketAcceptGate), so the set is pinned like the HTTP one.
-    try:
-        expected_public_ws = {_key(e) for e in policy.get("public_websocket_allowlist", [])}
-    except PolicyError as exc:
-        return 2, [str(exc)]
-    actual_public_ws = {
-        (str(r["method"]).upper(), str(r["path"]))
-        for r in receipt.get("websocket_rows", [])
-        if r.get("kind") == route_gates.KIND_PUBLIC
-    }
-    if actual_public_ws != expected_public_ws:
-        errors.append(
-            "the public WebSocket route set no longer matches the documented allow-list. "
-            f"Newly public: {sorted(actual_public_ws - expected_public_ws) or 'none'}; "
-            f"documented but absent: {sorted(expected_public_ws - actual_public_ws) or 'none'}. "
-            "A public socket is accepted with no gate."
-        )
+    if public_ws_drift:
+        errors.append(public_ws_drift)
     undeclared_ws = websocket_rows_not_declared(receipt)
     if undeclared_ws:
         errors.append(
