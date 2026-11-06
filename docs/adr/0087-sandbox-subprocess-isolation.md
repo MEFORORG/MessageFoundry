@@ -508,7 +508,9 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   **What changed.** The sandbox worker, the DR hook and the engine shards are now each handed an
   environment that somebody chose. The other processes the engine starts, which run fixed system
   tools, still inherit; the guard below lists each with its reason. The sandbox worker gets an
-  allowlist, and no `MEFOR_*` variable except one switch its own `load_config` reads. The worker and
+  allowlist, and no `MEFOR_*` variable: settings load refuses one in `[sandbox].pass_environment`,
+  and `worker_environment` refuses one in its extra names. It loads the snapshot its parent read and
+  checked, with `load_snapshot`, not `load_config`. The worker and
   the engine shards also start by running a script, which keeps the engine's working directory off
   their import path. They start with `-P` and with the interpreter's remote debugging disabled.
   `messagefoundry/childenv.py` is the source of
@@ -516,6 +518,12 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   [CONFIGURATION.md](../CONFIGURATION.md) say what an operator sees. A guard in
   `tests/test_child_process_environment.py` fails a process start whose environment does not come
   from that module, unless the start is listed there with its reason.
+
+  **CORRECTED 2026-11-06 (vault BACKLOG #2587).** In the paragraph above, the two sentences from
+  "The sandbox worker gets an allowlist" replace one that read "The sandbox worker gets an
+  allowlist, and no `MEFOR_*` variable except one switch its own `load_config` reads." Since vault
+  BACKLOG #2596 the worker runs no config-source check, and the config-source escape and its dial
+  no longer cross.
 
   **What this does NOT claim.** An explicit environment is not an isolation boundary by itself. The
   child still runs as the engine's operating-system account, so it can still read the engine

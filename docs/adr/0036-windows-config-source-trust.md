@@ -236,7 +236,7 @@ caller. One process needs the variables handed to it: the sandbox worker starts 
 environment (vault BACKLOG #2587), so the sandbox carries the escape and every spelling of the dial
 into it by name. The dial is a posture switch and not a secret. Without it the worker would see the
 escape alone and refuse a directory the engine loaded at `warn`.
-**CORRECTED 2026-11-05 (vault BACKLOG #2587):** in this paragraph, "the sandbox worker's boot load" in the list of processes, "the worker reads no settings file", and the three sentences from "One process needs" no longer hold. Since vault
+**CORRECTED 2026-11-05 (vault BACKLOG #2587):** in this paragraph, "the sandbox worker's boot load" in the list of processes and the three sentences from "One process needs" no longer hold. Since vault
 BACKLOG #2596 the worker loads the snapshot its parent read with this check, sent in the boot frame,
 and runs no check of its own, so the sandbox now hands it neither the escape nor the dial. A
 sandbox session that reads its own directory runs the check in the parent.

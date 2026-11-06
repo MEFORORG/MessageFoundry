@@ -409,12 +409,17 @@ def test_a_variable_that_only_looks_like_the_interpreters_or_the_locales_does_no
     assert set(childenv.worker_environment(parent)) & set(parent) == set()
 
 
-def test_an_extra_name_crosses_and_nothing_else_in_the_engine_namespace_does() -> None:
-    switch = settings.INSECURE_CONFIG_SOURCE_ESCAPE_ENV
-    env = childenv.worker_environment(_parent_environment(), extra_names=(switch,))
-    assert {n for n in env if n.startswith(childenv.ENGINE_ENV_PREFIX)} == {switch}
+def test_an_extra_name_crosses_and_no_name_in_the_engine_namespace_does() -> None:
+    """The worker builder refuses an engine name itself, as the hook builder does, so a caller
+    that skipped settings cannot hand untrusted code a secret. The control is an ordinary name,
+    which crosses."""
+    env = childenv.worker_environment(_parent_environment(), extra_names=(_ORDINARY,))
+    assert env[_ORDINARY] == _MARKER
+    for name in (*sorted(_SECRET_NAMES), settings.INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "mefor_x"):
+        with pytest.raises(ValueError, match="engine's own variable"):
+            childenv.worker_environment(_parent_environment(), extra_names=(name,))
     with pytest.raises(TypeError):
-        childenv.worker_environment(_parent_environment(), extra_names=switch)
+        childenv.worker_environment(_parent_environment(), extra_names=_ORDINARY)
 
 
 def test_the_operator_page_names_each_library_secret_a_setting_refuses() -> None:
@@ -603,6 +608,22 @@ def test_a_name_that_only_starts_like_pips_does_not_reach_the_auditor() -> None:
     variable is not pip's."""
     parent = {"PIPENV_PYPI_MIRROR": _MARKER, "PIPX_HOME": _MARKER, "PIP_NO_INPUT": "1"}
     assert childenv.auditor_environment(parent) == {"PIP_NO_INPUT": "1"}
+
+
+@pytest.mark.parametrize("section", ["sandbox", "dr"])
+def test_a_console_variable_in_pass_environment_is_refused_at_load(
+    section: str, tmp_path: Path
+) -> None:
+    """A child started with ``PYTHONINSPECT`` waits at a prompt instead of exiting, so both
+    settings refuse it, by the rule the auditor's ``--pass-environment`` uses. The control is an
+    ordinary name, which loads."""
+    path = tmp_path / "messagefoundry.toml"
+    path.write_text(f'[{section}]\npass_environment = ["PYTHONINSPECT"]\n', encoding="utf-8")
+    with pytest.raises(ValidationError, match="console or a debugger"):
+        settings.load_settings(config_path=path, environ={})
+    path.write_text(f'[{section}]\npass_environment = ["{_PASSED}"]\n', encoding="utf-8")
+    loaded = settings.load_settings(config_path=path, environ={})
+    assert getattr(loaded, section).pass_environment == (_PASSED,)
 
 
 def test_dr_pass_environment_is_refused_at_load(tmp_path: Path) -> None:

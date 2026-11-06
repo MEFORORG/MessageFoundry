@@ -65,7 +65,7 @@ from pydantic import (
 )
 
 from messagefoundry.api_tls_source import api_tls_source
-from messagefoundry.childenv import outside_engine_namespace
+from messagefoundry.childenv import pass_environment_refusal
 from messagefoundry.config.ai_policy import (
     AiDataScope,
     AiMode,
@@ -2513,8 +2513,9 @@ def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -
     For the two ``pass_environment`` settings: ``[sandbox]``'s, read by the sandbox worker, and
     ``[dr]``'s, read by the DR hooks. Each child gets an allowlist
     (:mod:`messagefoundry.childenv`), and this keeps the engine's own names off both lists: no
-    ``MEFOR_*`` variable at all, and no secret a library reads on the engine's behalf
-    (:func:`messagefoundry.childenv.outside_engine_namespace`, reused so the two cannot drift).
+    ``MEFOR_*`` variable at all, no secret a library reads on the engine's behalf, and no
+    interpreter variable that starts a console or a debugger
+    (:func:`messagefoundry.childenv.pass_environment_refusal`, reused so the rules cannot drift).
     Refusing the whole namespace, not a list of secret names, cannot go stale when a secret is
     added. The text never echoes an entry that is not a name, since ``NAME=value`` typed by
     mistake would carry the value (vault BACKLOG #2600). Nor does it number one: the env form drops
@@ -2523,16 +2524,9 @@ def _checked_pass_environment(names: tuple[str, ...], key: str, receiver: str) -
     A secret reference under ``[secrets].provider = "env"`` is refused once the model is built,
     by :func:`_reject_passed_secret_references`, which sees every section."""
     for name in names:
-        if not (name.isascii() and name.isidentifier()):
-            raise ValueError(
-                f"{key}: an entry is not an environment variable name; "
-                "list names only, never NAME=value"
-            )
-        if not outside_engine_namespace(name):
-            raise ValueError(
-                f"{key}: {name} is one of the engine's own variables; "
-                f"it may not be passed to {receiver}"
-            )
+        refusal = pass_environment_refusal(name)
+        if refusal:
+            raise ValueError(f"{key}: {refusal}; it may not be passed to {receiver}")
     return names
 
 

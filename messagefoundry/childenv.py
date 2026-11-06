@@ -275,8 +275,9 @@ _INTERPRETER_CONTROL_NAMES: Final = frozenset(
 
 
 def pass_environment_refusal(name: str) -> str | None:
-    """Why ``name`` may not be named as an extra variable for the dependency auditor's children,
-    or ``None``. Refused: an entry that is not a variable name, a name of the engine's namespace
+    """Why ``name`` may not be named as an extra variable for a child, or ``None``: the rule for the
+    dependency auditor's ``--pass-environment`` and for the ``[sandbox]`` and ``[dr]``
+    ``pass_environment`` settings. Refused: an entry that is not a variable name, a name of the engine's namespace
     (:func:`outside_engine_namespace`), and an interpreter variable that hands control to a console
     or a debugger. The text never echoes an entry that is not a name, since ``NAME=value`` typed by
     mistake would carry the value (vault BACKLOG #2600)."""
@@ -419,7 +420,8 @@ def worker_environment(
     ``extra_names`` is what the caller adds: for the sandbox worker, the names an operator listed in
     ``[sandbox].pass_environment``. Never a secret there: whatever is named here is in the
     environment of the code this builder exists to keep secrets from. Settings load refuses the
-    engine's own.
+    engine's own, and so does this builder, raising :class:`ValueError` as :func:`hook_environment`
+    does.
 
     ``defaults`` are values for names the result does not already hold, so a value the operator
     passed through ``extra_names`` wins. They are set here, not on the returned dict, because
@@ -427,7 +429,7 @@ def worker_environment(
     writes to it (vault BACKLOG #2724). A default in the engine's own namespace is refused, as
     ``[sandbox].pass_environment`` refuses one: a builder call is all the spawn guard checks.
     """
-    extras = _extra_keys(extra_names)
+    extras = _outside_engine_keys(extra_names)
     env = _without_working_directory_entries(
         {n: v for n, v in _source(environ).items() if _allowed_for_a_worker(n, extras)}
     )
