@@ -34,6 +34,7 @@ from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import DIRECTORY, FILE, LINK, windows_chain
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.transports import database
+from messagefoundry.transports.base import validated_at_start
 
 _FIXED = 3  # GetDriveTypeW: a fixed disk
 _SHARE = r"\\files.test\share"
@@ -973,17 +974,19 @@ def _listing_threads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
 
 
 @pytest.mark.parametrize("direction", ["outbound", "inbound"])
-async def test_hold_f2_a_build_on_the_event_loop_judges_the_entries_off_it(
+async def test_hold_f2_a_lane_start_judges_the_entries_off_the_event_loop(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
 ) -> None:
-    """The build runs on the event loop, so it lists no folder there. The lane's start awaits the
-    judgement, which runs in a worker thread and still refuses before the lane serves. Red: the
-    constructor listed the folder and walked its entries on the loop thread."""
+    """A lane start builds the connector on the event loop, inside ``validated_at_start``, so the
+    build lists no folder there. ``validate_startup`` judges the entries in a worker thread and
+    still refuses before the lane serves. Red: the constructor listed the folder and walked its
+    entries on the loop thread."""
     folder = _capath(tmp_path, "0a1b2c3d.0", "readme.txt")
     _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
     threads = _listing_threads(monkeypatch)
     loop_thread = threading.get_ident()
-    connector = _db_connector(direction, folder)
+    with validated_at_start():
+        connector = _db_connector(direction, folder)
     assert threads == []
     with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list") as refused:
         await connector.validate_startup()
@@ -992,46 +995,30 @@ async def test_hold_f2_a_build_on_the_event_loop_judges_the_entries_off_it(
 
 
 @pytest.mark.parametrize("direction", ["outbound", "inbound"])
-async def test_hold_f2_the_pool_is_not_made_before_the_entries_are_judged(
+async def test_hold_f2_a_clear_folder_passes_the_lane_start(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
 ) -> None:
-    """A build no start awaited, such as a reload's, still has its folder judged before the
-    driver is handed it: making the pool runs the judgement first, off the loop."""
-    folder = _capath(tmp_path, "0a1b2c3d.0")
-    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
-    threads = _listing_threads(monkeypatch)
-    made: list[str] = []
-
-    async def make_pool(dsn: str, *_args: Any, **_kwargs: Any) -> object:
-        made.append(dsn)
-        return object()
-
-    monkeypatch.setattr(database, "_make_pool", make_pool)
-    connector = _db_connector(direction, folder)
-    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
-        await connector._get_pool()
-    assert made == []
-    assert threads and threading.get_ident() not in threads
-
-
-@pytest.mark.parametrize("direction", ["outbound", "inbound"])
-async def test_hold_f2_a_clear_folder_is_judged_once_and_the_lane_starts(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
-) -> None:
-    """The control: a folder whose entries stay on the host passes, and the pool's own check does
-    not list it again."""
+    """The control: a folder whose entries stay on the host passes, judged once, off the loop."""
     folder = _capath(tmp_path, "0a1b2c3d.0")
     _entry_verdicts(monkeypatch, {"0a1b2c3d.0": False})
     threads = _listing_threads(monkeypatch)
-
-    async def make_pool(*_args: Any, **_kwargs: Any) -> object:
-        return object()
-
-    monkeypatch.setattr(database, "_make_pool", make_pool)
-    connector = _db_connector(direction, folder)
+    with validated_at_start():
+        connector = _db_connector(direction, folder)
     await connector.validate_startup()
-    await connector._get_pool()
-    assert len(threads) == 1
+    assert len(threads) == 1 and threading.get_ident() not in threads
+
+
+@pytest.mark.parametrize("direction", ["outbound", "inbound"])
+async def test_hold_f2_a_build_no_start_follows_still_refuses_at_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, direction: str
+) -> None:
+    """The control: a build outside ``validated_at_start``, as a reload's, a dry run's
+    ``build_check`` or a connection test's, judges the entries itself and refuses, as before,
+    even on the event loop, since nothing awaits ``validate_startup`` after it."""
+    folder = _capath(tmp_path, "0a1b2c3d.0")
+    _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
+        _db_connector(direction, folder)
 
 
 @pytest.mark.parametrize("direction", ["outbound", "inbound"])
@@ -1044,3 +1031,21 @@ def test_hold_f2_a_build_off_the_event_loop_still_refuses_at_once(
     _entry_verdicts(monkeypatch, {"0a1b2c3d.0": True})
     with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
         _db_connector(direction, folder)
+
+
+def test_hold_f2_the_runner_marks_each_build_it_follows_with_validate_startup() -> None:
+    """Each runner site that builds a connector inside ``validated_at_start`` awaits
+    ``validate_startup`` on it a few lines later, and the reload's rebuilds, which await none,
+    are outside it. A source scan: a marked build with no ``validate_startup`` after it would
+    leave the entries unjudged."""
+    from messagefoundry.pipeline import wiring_runner
+
+    source = Path(wiring_runner.__file__).read_text(encoding="utf-8").splitlines()
+    marked = [i for i, line in enumerate(source) if "validated_at_start()" in line]
+    assert len(marked) == 3
+    for i in marked:
+        window = "\n".join(source[i : i + 70])
+        assert re.search(r"build_(source|destination)\(", "\n".join(source[i : i + 4]))
+        assert "await connector.validate_startup()" in window or (
+            "await source.validate_startup()" in window
+        )

@@ -263,6 +263,7 @@ from messagefoundry.transports.base import (
     guard_dir_settings,
     guarded_destination_dirs,
     guarded_source_dirs,
+    validated_at_start,
 )
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.egress import warn_url_query_credentials_before_build
@@ -4571,8 +4572,9 @@ class RegistryRunner:
             await self._check_lane_anchor("outbound", name, dest.settings)
             # #200 (ADR 0092): stamp the derived instance posture, exactly as _start_outbound does —
             # an unstamped build makes the posture-keyed insecure-hop cells decide against the wrong
-            # (fail-closed/no-op default) posture.
-            with active_hop_posture(self._hop_posture):
+            # (fail-closed/no-op default) posture. validated_at_start: validate_startup below runs
+            # before the lane serves, so a connector may move a blocking check there.
+            with active_hop_posture(self._hop_posture), validated_at_start():
                 # The step above has logged the warning, so the egress check does not repeat it.
                 connector = build_destination(
                     dest, egress=self._egress, warn_query_credentials=False
@@ -5155,7 +5157,8 @@ class RegistryRunner:
         warn_unbudgeted_streaming_inbound(ic, budget=self._stream_inflight_budget)
         # #200 (ADR 0092): stamp the posture for the source build too (a DATABASE poll source keys its
         # weakened-TLS refusal on it), matching the exposure-check posture threading above.
-        with active_hop_posture(self._hop_posture):
+        # validated_at_start: validate_startup below runs before the bind.
+        with active_hop_posture(self._hop_posture), validated_at_start():
             source = build_source(source_cfg, egress=self._egress)
         # Inject the connection-event sink (#46) BEFORE start so a listen source can emit accept/refuse/
         # close. None when capture is off (byte-identical). transports/ stays store-agnostic — the sink
@@ -5795,8 +5798,9 @@ class RegistryRunner:
             # would ship cleartext) and the HTTP guards fail-closed (a legit non-prod cleartext lane would
             # wrongly refuse) on the primary serve path. Mirrors _start_inbound_unsafe threading posture
             # into the exposure checks. None in a test/embedding that derives no posture: the guards no-op
-            # there, and a weakened-TLS escape is refused (vault BACKLOG #2354).
-            with active_hop_posture(self._hop_posture):
+            # there, and a weakened-TLS escape is refused (vault BACKLOG #2354). validated_at_start:
+            # validate_startup below runs before the lane serves.
+            with active_hop_posture(self._hop_posture), validated_at_start():
                 # The step above has logged the warning, so the egress check does not repeat it.
                 connector = build_destination(
                     dest, egress=self._egress, warn_query_credentials=False
