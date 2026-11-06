@@ -373,8 +373,8 @@ icacls "C:\ProgramData\MessageFoundry" /grant "NT SERVICE\MessageFoundry:(OI)(CI
 ```
 
 A domain **gMSA** or a dedicated local user works the same way (pass `-ServiceAccountPassword`
-for a password-based account — it's taken as a `SecureString`). The store file itself is further
-restricted to its owner at runtime; account choice governs who that owner is.
+for a password-based account — it's taken as a `SecureString`). The fallback when the store
+refuses the data directory is in ADR 0163, *Note (2026-11-05)*.
 
 **gMSA preflight + "Log on as a service" (#99).** When `-ServiceAccount` names a **gMSA** (a name ending
 in `$`, e.g. `CORP\mefor-svc$`), the installer runs `Test-ADServiceAccount` first (verifying the account
@@ -459,12 +459,44 @@ process and of the engine's processes runs as SYSTEM, carries no restricting SID
 `SeChangeNotifyPrivilege`. Its first run is in the merge queue.
 
 **No leg runs a named account yet, a local user or a gMSA.** A local-user leg is wired in `ci.yml`
-and left out of the matrix. Read from the code, a SQLite store in the data directory would lock
-such a service out when the operator provisions the first Administrator before the first start.
-The store shares its files between the service and the operator only when the data directory
-grants nobody but SYSTEM, Administrators and at most one per-service virtual account,
-`NT SERVICE\<name>`. A named account's grant is none of those. A gMSA also needs an Active
-Directory domain that the runner has joined, and no hosted runner has one.
+and left out of the matrix. Listing it now would still fail: the installer's read-back of the
+account it registered would refuse the `HOST\user` spelling the leg passes (BACKLOG #3938). A
+gMSA leg would also need an Active Directory domain that the runner has joined, and no hosted
+runner has one.
+
+**A SQLite store in the data directory admits one named account.** The store shares its files
+between the service and the operator only when the data directory grants SYSTEM, Administrators
+and at most one run-as account, in the shape the installer writes. A `-AllowLocalSystem` install
+grants none. The run-as account is either a per-service virtual account, `NT SERVICE\<name>`, or
+one account whose SID is machine- or domain-relative (`S-1-5-21-` plus three sub-authorities and
+the RID) and that Windows resolves to a user account with a RID of 1000 or more. A local user you
+create for the service and name with `-ServiceAccount` is such an account; a built-in one, such as
+Administrator (RID 500), is not. A gMSA is admitted only if `LookupAccountSid` resolves
+it to a user account, which is unmeasured here. Who may own the directory is stated in ADR 0163,
+*Note (2026-11-05)*. The engine does not check that this account is the one
+the service runs as. It admits whichever user the directory grants, so grant the data
+directory to the service account only, as the installer does.
+
+The engine resolves the account with `LookupAccountSid` each time it opens the store. It refuses
+the directory at least when the lookup fails, when the account resolves to anything but a user, such as a
+group, or when the directory names a second account. A refused directory gets a store restricted
+by `_secure_file` (see ADR 0163, *Note (2026-11-05)*), and the engine logs a WARNING naming the
+reason. Then the service and the operator who provisions the first Administrator can lock each
+other out of the store.
+
+At least these are unmeasured:
+
+- **A named account end to end.** No run has installed and started the service as a local user or
+  a gMSA.
+- **What a gMSA resolves to.** A gMSA is a kind of computer account in Active Directory, so it is
+  expected to resolve as a user. If it resolves as anything else, the WARNING names that type.
+- **A start with no domain controller.** A gMSA resolves through a domain controller, or through
+  the local lookup cache when no controller answers, and a slow or absent controller can delay
+  the open or fail the lookup. A later start does not always repair what a failed lookup leaves.
+  Why a time-out can read as an account that does not exist, and what a store restricted by
+  `_secure_file` leaves on each file, are in ADR 0163, *Note (2026-11-05)*, *Left open*.
+
+The rule and its reasons are in ADR 0163, *Note (2026-11-05)*.
 
 **`-SkipRestrictedServiceSid` opts out** for the default account. Use it only when the engine must
 write somewhere you cannot grant to `NT SERVICE\<ServiceName>`. The engine can then write wherever

@@ -91,6 +91,7 @@ from tests._live_scratch import (
     sqlserver_store_admin,
     throwaway_password,
 )
+from tests._log_absence import assert_capture_sees
 
 _SQLSERVER_ON = bool(os.getenv("MEFOR_TEST_SQLSERVER"))
 _POSTGRES_ON = bool(os.getenv("MEFOR_TEST_POSTGRES"))
@@ -451,6 +452,7 @@ async def test_a_clean_observation_is_not_a_warning(caplog: pytest.LogCaptureFix
             require_least_privilege=True,
             enforcing=True,
         )
+    assert_capture_sees(caplog, "messagefoundry.store.privilege")
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 

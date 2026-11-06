@@ -289,7 +289,7 @@ _TOPLEVEL_TRIGGERS = CRYPTO_MODULES | CRYPTO_LIBRARY_MODULES
 INVENTORY: dict[str, frozenset[str]] = {
     # ADR 0030: keyed BLAKE2b derives the deterministic, salt-keyed seed that picks a surrogate, so
     # the anonymizer's pseudonymization is consistent-within-a-dataset yet one-way (re-id-resistant).
-    "messagefoundry/anon/keying.py": frozenset({"hashlib"}),
+    "messagefoundry_toolkit/anon/keying.py": frozenset({"hashlib"}),
     "messagefoundry/api/tls.py": frozenset({"messagefoundry.config.tls_policy", "ssl"}),
     # BACKLOG #1352 / #1171: every private-key TLS load goes through keywrap.load_checked_cert_chain,
     # which checks the key's passphrase wrap and then calls load_cert_chain; ssl for that one call.
@@ -431,7 +431,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # `cryptography` directly — this is the single cert-tooling crypto call site. BACKLOG #1352:
     # .pfx import also decrypts each PKCS#12 EncryptedData part (PBKDF2 + AES-CBC) so keywrap can
     # check the key bags inside before the bundle loads.
-    "messagefoundry/pki.py": frozenset({"cryptography"}),
+    # BACKLOG #4948: IssuerIndex loads the client CA bytes the live context already loaded into a
+    # scratch ssl.SSLContext, to check it indexed exactly the CA certificates OpenSSL took, and a
+    # count of the others OpenSSL's count can match. The
+    # scratch context is discarded: it serves no handshake and changes no hop's trust.
+    "messagefoundry/pki.py": frozenset({"cryptography", "ssl"}),
     # BACKLOG #1748: hashlib = sha256 of a partner-chosen FILE NAME, so `safe_name` can put a short,
     # stable label in a log line where the cleartext name (which can embed an MRN) must never go. The
     # same derived-id, never-a-secret use as transports/file.py's dedup key below, and likewise not a
@@ -542,6 +546,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # DEK with the store salt in `info`, computed as its RFC 5869 HMAC steps so the cipher keeps an
     # OpenSSL HMAC context rather than the DEK; still the same two imports.
     "messagefoundry/store/crypto.py": frozenset({"hashlib", "cryptography"}),
+    # Vault BACKLOG #3411 (key custody, slice S3): the custody primitives. cryptography = the
+    # recovery wrap, AES-256-GCM under HKDF-SHA256 of the recovery key with the store id in the
+    # associated data; hashlib = the SHA-256 recovery-key checksum; hmac = compare_digest for that
+    # checksum and for key equality. The master key is minted from os.urandom.
+    "messagefoundry/store/custody.py": frozenset({"cryptography", "hashlib", "hmac"}),
     # ASVS 11.3.4 (#301): the persisted per-key_id AES-GCM invocation bound (cipher_meta table) reads
     # the cipher reserve-block size + AesGcmCipher/Cipher types through the store.crypto seam. ADR 0196
     # adds the store-salt bind at open, which draws a candidate salt through new_store_salt.
@@ -804,9 +813,9 @@ INVENTORY: dict[str, frozenset[str]] = {
     # The standalone tee CLI builds the ssl context (create_default_context, or a cafile via --cacert;
     # CERT_NONE only under the explicit --insecure escape) for the tee's https engine-API pulls.
     "tee/__main__.py": frozenset({"ssl"}),
-    # ADR 0030: the byte-identical vendored twin of messagefoundry/anon/keying.py — keyed BLAKE2b
-    # (hashlib) derives the deterministic, per-dataset, one-way pseudonymization seed. Kept in lockstep
-    # with the engine copy by the parity test.
+    # ADR 0030: the byte-identical vendored twin of messagefoundry_toolkit/anon/keying.py -- keyed
+    # BLAKE2b (hashlib) derives the deterministic, per-dataset, one-way pseudonymization seed. Kept in
+    # lockstep with the toolkit copy by the parity test.
     "tee/anon/keying.py": frozenset({"hashlib"}),
     # #14: the tee's stdlib MEFOR engine-API client accepts an optional ssl.SSLContext for authenticated
     # GETs against an https engine (the tee stays stdlib-only; no mTLS / rich-retry client).
@@ -1089,12 +1098,12 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "tls_context:via messagefoundry.store.postgres",
         }
     ),
-    "messagefoundry/anon/keying.py": frozenset({"hash:hashlib.blake2b"}),
+    "messagefoundry_toolkit/anon/keying.py": frozenset({"hash:hashlib.blake2b"}),
     # The reload preflight also reaches anchor_cadata's cadata= trial load (BACKLOG #2025), but
     # through asyncio.to_thread, a reference this scanner does not follow as a call.
     # BACKLOG #1167 (ASVS 11.2.4): the config-provenance drift compare, via fingerprint_matches.
     # Vault BACKLOG #2371: the SHA-256 of a dialling CA file, via make_lane_anchor_check. It
-    # fingerprints the file to tell a repeated refusal from a changed one. A digest, not a key.
+    # fingerprints the file to tell a repeated check from a changed one. A digest, not a key.
     # Vault BACKLOG #2615: app.py also runs store.crypto's audit_body_digests (HKDF-SHA256 off the
     # audit-chain key, then HMAC-SHA256 of each body, for the edit-resend and upload-inject audit
     # rows). It runs through asyncio.to_thread, a reference this scanner does not follow as a call,
@@ -1485,6 +1494,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:cryptography.x509.load_pem_x509_crl",
             "key_cert:cryptography.x509.random_serial_number",
             "key_cert:via messagefoundry.keywrap",
+            # BACKLOG #4948: IssuerIndex reads what OpenSSL loads from the client CA bytes, on a
+            # scratch context it then discards. Public certificates only; no trust is granted.
+            "tls_context:.load_verify_locations()",
+            "tls_context:ssl.SSLContext",
             "sign_verify:.sign()[sha256]",
             # Vault BACKLOG #2905: _verify_with asks a CA's public key whether it signed a CRL,
             # so a start can tell a proven bad signature from one it cannot check. Verification
@@ -1537,6 +1550,21 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.encrypt_data()",
             "mac:.generate_hmac()",
             "tls_context:via messagefoundry.store.keyprovider_vault",
+        }
+    ),
+    # Vault BACKLOG #3411: mints the master key, store id and recovery key (os.urandom); wraps and
+    # opens the master key under AES-256-GCM keyed by HKDF-SHA256 of the recovery key; checks a
+    # typed recovery key's SHA-256 checksum and compares keys in constant time.
+    "messagefoundry/store/custody.py": frozenset(
+        {
+            "cipher:.decrypt()",
+            "cipher:.encrypt()",
+            "cipher:cryptography.hazmat.primitives.ciphers.aead.AESGCM",
+            "compare:hmac.compare_digest",
+            "csprng:os.urandom",
+            "hash:hashlib.sha256",
+            "kdf:.derive()",
+            "kdf:cryptography.hazmat.primitives.kdf.hkdf.HKDF[sha256]",
         }
     ),
     # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.
@@ -2002,8 +2030,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # with, to prove the policy leaves one to issue; the value is discarded. Wave 2 (BACKLOG #3373):
     # the census hashes an account's passkey set (``passkey_digest``, SHA-256) to compare it with the
     # digest the account's seal covers, so a passkey row flipped outside the store is not counted.
+    # BACKLOG #1167 (ASVS 11.2.4): that digest compare is constant_time_equal now.
     "messagefoundry/verify/checks.py": frozenset(
         {
+            "compare:via messagefoundry.auth.service",
             "csprng:via messagefoundry.auth.service",
             "hash:via messagefoundry.auth.service",
             "mac:via messagefoundry.auth.service",
@@ -2827,6 +2857,17 @@ POWERSHELL_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # the digest's reader only; the decision record itself names the recommendation, and any
     # session can read the record.
     "scripts/coord/digest.ps1": frozenset({"csprng:RandomNumberGenerator", "hash:SHA256"}),
+    # --- Lab research, run by hand against a throwaway lab VM. Not a security control. ---
+    # The DPAPI reboot spike (BACKLOG #3411). Its one PowerShell hash is a SHA-256 of the throwaway
+    # service executable its install step has just compiled, emitted beside the path so the step's
+    # output records which binary was built. Nothing compares it to a pin, so it is a record and not
+    # a check. The C# that script compiles from a here-string also draws from the CSPRNG, calls
+    # CryptProtectData and CryptUnprotectData through P/Invoke, and takes SHA-256 of the plaintext
+    # and of the user-scope blob (plain_sha256, user_blob_sha256). No pattern here matches those C#
+    # spellings, so this row does not list them.
+    "scripts/research/dpapi-reboot-spike/dpapi_reboot_spike.ps1": frozenset(
+        {"hash:Get-FileHash[SHA256]"}
+    ),
 }
 
 

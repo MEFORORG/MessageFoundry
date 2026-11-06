@@ -10225,7 +10225,8 @@ def security_loosenings(
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
     ``tls_allow_expired`` (#129 / ADR 0094), ``hostname_unchecked_hops`` declares
     ``tls_check_hostname=false`` (ASVS 12.3.2), ``query_credential_hops`` is an outbound or
-    ``FhirLookup`` whose literal ``url`` carries a credential-like query parameter (ASVS 14.2.1),
+    ``FhirLookup`` whose ``url`` carries a credential-like query parameter (ASVS 14.2.1), read as
+    ``config.wiring.query_credential_hops`` says,
     ``unverified_db_hops`` is a
     generic-ODBC ``DATABASE``
     connection whose ``odbc_params`` set no usable TLS mode its driver family reads, or set one to

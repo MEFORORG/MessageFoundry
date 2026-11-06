@@ -307,6 +307,7 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
         lambda: store.set_password(
             bent, password_hash="h", password_generated=False, must_change_password=False
         ),
+        lambda: store.consume_totp_step(bent, 5),
     ):
         try:
             await write()

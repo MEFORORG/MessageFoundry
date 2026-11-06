@@ -7634,8 +7634,9 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
 
     Under ``vault_transit`` a local key counts whichever provider is pinned, as it did before #2077:
     the store's cipher never resolves ``key_provider`` there, so an ignored local key cannot make the
-    store open plaintext. The DR backup and ``rotate-key`` paths DO resolve it, and refuse an ignored
-    key there through ``store.base._checked_active_key``."""
+    store open plaintext. The DR backup path DOES resolve it, and refuses an ignored key there
+    through ``store.base._checked_active_key``. ``rotate-key`` refuses this mode before it resolves
+    a key (BACKLOG #2109)."""
     from messagefoundry.store.keyprovider import provider_reads_a_configured_key
 
     store = settings.store
@@ -10325,6 +10326,10 @@ def _uploads_root_refusal(uploads_dir: str) -> str | None:
         )
 
 
+#: The docs/SECURITY.md section ``rotate-key``'s vault_transit refusal cites, by its bold title.
+_TRANSIT_AUDIT_RETIRE_SECTION = "Retiring an old version of the audit key breaks the chain"
+
+
 def _rotate_key(args: argparse.Namespace) -> int:
     """Re-encrypt every cipher-covered value under the active key (WP-5 key rotation, ASVS 11.2.2).
 
@@ -10332,7 +10337,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
     rotate. After it finishes the retired key can be removed. The store pass re-seals the
     secret-rotation fingerprint cells too, so no engine start needs the retired key to read them
-    (BACKLOG #3472, ADR 0213).
+    (BACKLOG #3472, ADR 0213). Under ``[store].cipher_provider = "vault_transit"`` it refuses right
+    after the settings load, before it resolves or unwraps a key, dials Vault or opens the store,
+    since no run there can finish (BACKLOG #2109).
 
     **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
     a store another connection holds, which is how a serving engine holds it; see
@@ -10392,6 +10399,30 @@ def _rotate_key(args: argparse.Namespace) -> int:
     settings, detail = _load_service_settings(args.service_config, cli=cli)
     if settings is None:
         print(f"error: {detail}", file=sys.stderr)
+        return 2
+    if settings.store.cipher_provider == "vault_transit":
+        # BACKLOG #2109. The re-encrypt pass refuses the Transit cipher (BACKLOG #1165), so no run
+        # here can finish. Refuse before the key, the Vault hop and the writable open, which a run
+        # with a local key reached first, and before the "needs an active key" refusal below,
+        # which sends a run without one to set a key the Transit cipher never reads.
+        print(
+            'error: rotate-key does not run under [store].cipher_provider = "vault_transit". It '
+            "re-encrypts only under the in-process aesgcm cipher, and no command moves values "
+            "between that cipher and Transit, in either direction, or between two Transit keys "
+            "(BACKLOG #2109). To rotate the Transit data key, rotate it in Vault: that makes a "
+            "new version of the key named by MEFOR_STORE_TRANSIT_KEY, new values are sealed under "
+            "it, and values under an older version still read. Nothing re-seals those older "
+            "values, so rotating is safe and retiring a version that still seals a value or MACs "
+            "an audit row is not. At least these retire one. Raising the data key's "
+            "min_decryption_version above a version stops the values sealed under it from "
+            "decrypting. Raising the audit key's min_encryption_version above a version breaks "
+            "the audit chain at every row MACed under it; the audit key is the data key unless "
+            "MEFOR_STORE_TRANSIT_AUDIT_KEY names another. Trimming a version off either key does "
+            "the same to what it sealed or MACed, and cannot be undone. docs/SECURITY.md, under "
+            f"'{_TRANSIT_AUDIT_RETIRE_SECTION}', describes the audit chain break and what it "
+            "does to the attestation. Nothing was changed.",
+            file=sys.stderr,
+        )
         return 2
 
     posture = _command_hop_posture(settings)
@@ -10487,8 +10518,8 @@ def _rotate_key(args: argparse.Namespace) -> int:
         )
         from messagefoundry.store.store import SecretRotationMetaStore
 
-        # BACKLOG #2109: in vault_transit mode the Transit key-type check runs inside this open, not
-        # at resolve_active_key above, so its refusal needs the same clean exit 2.
+        # A key the open cannot resolve, or a store hop the posture refuses, exits 2 as one at
+        # resolve_active_key above does. vault_transit mode never gets here (BACKLOG #2109).
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         store = await _open_store_or_refuse(open_store(settings.store, posture=posture))
         try:

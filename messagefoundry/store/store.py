@@ -126,6 +126,8 @@ from messagefoundry.store.crypto import (
     AUDIT_SCHEME_TRANSIT,
     AUDIT_SCHEME_UNNAMED_IN_HEAP,
     AUDIT_SCHEME_UNNAMED_TRANSIT,
+    NO_STORE_ID,
+    STORE_ID_BYTES,
     AesGcmCipher,
     AuditKeyVersionRefusedError,
     AuditMacFn,
@@ -4978,6 +4980,58 @@ def _audit_unnamed_scheme(key_id: str) -> AuditScheme:
     return AUDIT_SCHEME_UNNAMED_IN_HEAP
 
 
+@dataclass(frozen=True)
+class _AuditStoreIdRefused(AuditScheme):
+    """What a genesis record whose ``store_id`` no release writes reads as (vault BACKLOG #3411): a
+    scheme no release holds, so :func:`audit_scheme_refusal` refuses it. The refusal names the
+    missing scheme when the record names none, whatever the store id; else the named scheme's own
+    refusal when it is refused; else the store id. A class of its own, so it never compares equal
+    to a scheme a record names and no record can produce one. ``named`` is the scheme the record
+    named, ``None`` for none; ``mac`` and ``kdf`` are empty."""
+
+    named: AuditScheme | None = None
+
+
+#: Each class of refusal, in fixed words, for a message that must carry no record-supplied text
+#: (vault BACKLOG #3411): a refusal's own words quote ``mac``, ``kdf`` and ``key_id``, which anyone
+#: who can write the audit log chooses. Each completes "audit row N's key range".
+_AUDIT_REFUSED_SCHEME: Final = "names an audit scheme this release does not hold"
+_AUDIT_REFUSED_KEYLESS: Final = "names the keyless store mode, which no audit record may name"
+_AUDIT_REFUSED_UNNAMED_STORE_ID: Final = (
+    "opens with a record that carries a store_id but names no scheme"
+)
+_AUDIT_REFUSED_STORE_ID: Final = "opens with a record that carries a malformed store_id"
+
+
+def _audit_refusal(key_id: str, scheme: AuditScheme | None) -> tuple[str, str] | None:
+    """``(class, text)`` of :func:`audit_scheme_refusal`, or ``None`` when the scheme is held. The
+    class is one of the fixed phrases above; the text may quote the record."""
+    if isinstance(scheme, _AuditStoreIdRefused):
+        # The scheme speaks first. A missing one is the real defect: every writer since BACKLOG
+        # #3420 names it, and the store id postdates that. A malformed label must not hide a record
+        # that also names the keyless mode or an unknown scheme.
+        if scheme.named is None:
+            return _AUDIT_REFUSED_UNNAMED_STORE_ID, (
+                "records a store_id but names no scheme: a genesis record carrying a store_id "
+                "names its scheme (vault BACKLOG #3411)"
+            )
+        return _audit_refusal(key_id, scheme.named) or (
+            _AUDIT_REFUSED_STORE_ID,
+            f"records a malformed store_id: a genesis record's store_id is the lowercase hex of "
+            f"{STORE_ID_BYTES} bytes, beside a named scheme (vault BACKLOG #3411)",
+        )
+    if scheme is None:
+        scheme = _audit_unnamed_scheme(key_id)
+    if scheme == audit_scheme_for(key_id):
+        return None
+    if scheme.mac == AUDIT_KEYLESS_MAC:
+        return _AUDIT_REFUSED_KEYLESS, _AUDIT_REFUSED_KEYLESS
+    return _AUDIT_REFUSED_SCHEME, (
+        f"names audit scheme {scheme.mac[:64]!r} with key derivation {scheme.kdf[:64]!r}; this "
+        f"release does not seal the range of audit key {key_id[:64]!r} with it"
+    )
+
+
 def audit_scheme_refusal(key_id: str, scheme: AuditScheme | None) -> str | None:
     """Why a genesis or range record's named ``scheme`` is refused, or ``None`` when it is the one
     this release seals ``key_id``'s range with (BACKLOG #3420). ``None`` for ``scheme`` is a record
@@ -4987,20 +5041,15 @@ def audit_scheme_refusal(key_id: str, scheme: AuditScheme | None) -> str | None:
     one today, so verifying a range under the scheme its record names is: refuse every other name,
     then verify under that one. The keyless store mode is never among them, whatever ``kdf`` says,
     so no record can declare its chain keyless."""
-    if scheme is None:
-        scheme = _audit_unnamed_scheme(key_id)
-    if scheme == audit_scheme_for(key_id):
-        return None
-    if scheme.mac == AUDIT_KEYLESS_MAC:
-        return "names the keyless store mode, which no audit record may name"
-    return (
-        f"names audit scheme {scheme.mac[:64]!r} with key derivation {scheme.kdf[:64]!r}; this "
-        f"release does not seal the range of audit key {key_id[:64]!r} with it"
-    )
+    refused = _audit_refusal(key_id, scheme)
+    return None if refused is None else refused[1]
 
 
 #: The fields a genesis or range record names its scheme in (BACKLOG #3420).
 _AUDIT_SCHEME_FIELDS: Final = frozenset({"mac", "kdf"})
+#: What a record of a shape no release writes reads as: a scheme no release holds, so
+#: :func:`audit_scheme_refusal` refuses it.
+_AUDIT_SCHEME_REFUSED: Final = AuditScheme(mac="", kdf="")
 
 
 def _audit_record_scheme(obj: Mapping[str, Any], fields: frozenset[str]) -> AuditScheme | None:
@@ -5020,7 +5069,7 @@ def _audit_record_scheme(obj: Mapping[str, Any], fields: frozenset[str]) -> Audi
         return None
     mac, kdf = obj.get("mac"), obj.get("kdf")
     if keys != fields | _AUDIT_SCHEME_FIELDS or not (isinstance(mac, str) and isinstance(kdf, str)):
-        return AuditScheme(mac="", kdf="")  # a shape no release writes, refused as such
+        return _AUDIT_SCHEME_REFUSED
     return AuditScheme(mac=mac, kdf=kdf)
 
 
@@ -5200,26 +5249,47 @@ def audit_seal_next(
     return seq, row_hash
 
 
-def audit_genesis_detail(key_id: str) -> str:
+#: A genesis record writes a store id (vault BACKLOG #3411) as the lowercase hex of its bytes.
+_AUDIT_STORE_ID_FIELD: Final = "store_id"
+#: ``2 * STORE_ID_BYTES`` lowercase hex digits, unanchored: use it with ``fullmatch`` only. The width
+#: is a literal, not interpolated, so the ReDoS scanner in tests/test_security_static.py reads the
+#: pattern; a test pins it to the constant.
+_AUDIT_STORE_ID_HEX: Final = re.compile("[0-9a-f]{32}")
+_ABSENT: Final = object()
+
+
+def audit_genesis_detail(key_id: str, store_id: bytes = NO_STORE_ID) -> str:
     """The ``detail`` of the genesis row: a typed record naming the key the first range is MAC'd
     under, and the scheme it is sealed with (BACKLOG #3420). JSON, so a later field can be added
-    beside them."""
-    scheme = _audit_scheme_fields(audit_scheme_for(key_id))
-    return json.dumps({"genesis": 1, "key_id": key_id, **scheme}, sort_keys=True)
+    beside them.
+
+    ``store_id``, when minted, is recorded as a label (vault BACKLOG #3411): the row MAC covers it,
+    and no key is derived from it. :data:`NO_STORE_ID`, the default, records none, so the record has
+    today's shape; no caller passes one yet. Raises ``ValueError`` for any other store id that is
+    not :data:`STORE_ID_BYTES` long."""
+    record: dict[str, object] = {"genesis": 1, "key_id": key_id}
+    record.update(_audit_scheme_fields(audit_scheme_for(key_id)))
+    if store_id != NO_STORE_ID:
+        if len(store_id) != STORE_ID_BYTES:
+            raise ValueError(f"a store id is {STORE_ID_BYTES} bytes, not {len(store_id)}")
+        record[_AUDIT_STORE_ID_FIELD] = store_id.hex()
+    return json.dumps(record, sort_keys=True)
 
 
 _AUDIT_GENESIS_FIELDS: Final = frozenset({"genesis", "key_id"})
 
 
-def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None] | None:
-    """``(key_id, scheme)`` from a genesis row's ``detail``, or ``None`` when ``detail`` is not one.
-    ``scheme`` is ``None`` for a record that names none. Whether a named one is held is
-    :func:`audit_scheme_refusal`'s question, not this parser's, so a record naming an unknown
-    scheme still reads as a genesis row, and its chain as keyed.
+def _parse_audit_genesis(detail: object) -> tuple[str, AuditScheme | None, bytes | None] | None:
+    """``(key_id, scheme, store_id)`` from a genesis row's ``detail``; see
+    :func:`parse_audit_genesis_record`. ``store_id`` is ``None`` when the record carries none, or
+    carries one that is refused.
 
-    Total over attacker-written input, like :func:`parse_audit_epoch`: a malformed value is ``None``,
-    never an exception. Exactly the fields a genesis record has, so a range row's detail (which
-    carries ``closes`` and ``handover``) is never read as one."""
+    A ``store_id`` field that is not the lowercase hex of :data:`STORE_ID_BYTES` bytes, or that sits
+    on a record naming no scheme (no release wrote one there: the field postdates BACKLOG #3420),
+    reads as :class:`_AuditStoreIdRefused`, never as ``None``, so :func:`audit_scheme_refusal`
+    refuses it, as it refuses a field beyond the record. Read as no record instead, a malformed
+    store id would turn a keyed chain's genesis row into none (:func:`_audit_record_scheme` says
+    why that matters)."""
     if not isinstance(detail, str):
         return None
     try:
@@ -5228,6 +5298,7 @@ def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None]
         return None
     if not isinstance(obj, dict):
         return None
+    raw_store_id = obj.pop(_AUDIT_STORE_ID_FIELD, _ABSENT)
     try:
         scheme = _audit_record_scheme(obj, _AUDIT_GENESIS_FIELDS)
     except ValueError:
@@ -5235,7 +5306,55 @@ def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None]
     marker, key_id = obj["genesis"], obj["key_id"]
     if isinstance(marker, bool) or marker != 1:
         return None
-    return (key_id, scheme) if isinstance(key_id, str) and key_id else None
+    if not isinstance(key_id, str) or not key_id:
+        return None
+    if raw_store_id is _ABSENT:
+        return key_id, scheme, None
+    if (
+        scheme is not None
+        and isinstance(raw_store_id, str)
+        and _AUDIT_STORE_ID_HEX.fullmatch(raw_store_id)
+    ):
+        return key_id, scheme, bytes.fromhex(raw_store_id)
+    return key_id, _AuditStoreIdRefused(mac="", kdf="", named=scheme), None
+
+
+def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None] | None:
+    """``(key_id, scheme)`` from a genesis row's ``detail``, or ``None`` when ``detail`` is not one.
+    ``scheme`` is ``None`` for a record that names none and carries no ``store_id``; one naming none
+    but carrying a ``store_id`` reads as a refused scheme (:func:`_parse_audit_genesis`). Whether
+    a named one is held is :func:`audit_scheme_refusal`'s question, not this parser's, so a record
+    naming an unknown scheme still reads as a genesis row, and its chain as keyed.
+
+    Total over attacker-written input, like :func:`parse_audit_epoch`: a malformed value is ``None``,
+    never an exception. Exactly the fields a genesis record has, with or without a ``store_id``, so a
+    range row's detail (which carries ``closes`` and ``handover``) is never read as one."""
+    parsed = _parse_audit_genesis(detail)
+    return None if parsed is None else parsed[:2]
+
+
+class AuditGenesisStoreId(NamedTuple):
+    """What a genesis record says of the store id (vault BACKLOG #3411). A label: the copy in the
+    database is not a pin, and nothing is keyed from it."""
+
+    #: The store id the record labels; ``None`` when it labels none, or when ``refused``.
+    store_id: bytes | None
+    #: The walk refuses the record (:func:`audit_scheme_refusal`): its scheme is refused, it names
+    #: none beside a store id, or its store id is malformed. So a caller comparing labels never
+    #: reads such a record as one with none.
+    refused: bool
+
+
+def parse_audit_genesis_store_id(detail: object) -> AuditGenesisStoreId | None:
+    """What a genesis row's ``detail`` says of the store id, or ``None`` when ``detail`` is not a
+    genesis record. Total over attacker-written input, like :func:`parse_audit_genesis_record`."""
+    parsed = _parse_audit_genesis(detail)
+    if parsed is None:
+        return None
+    key_id, scheme, store_id = parsed
+    if audit_scheme_refusal(key_id, scheme) is not None:
+        return AuditGenesisStoreId(store_id=None, refused=True)
+    return AuditGenesisStoreId(store_id=store_id, refused=False)
 
 
 def parse_audit_genesis(detail: object) -> str | None:
@@ -6829,8 +6948,11 @@ async def _secure_file_async(path: Path) -> None:
 # The data directory already names the right set. install-service.ps1 removes its inheritance and
 # grants SYSTEM, BUILTIN\Administrators and the run-as account. So where the store's directory is
 # HARDENED like that, every open writes the SAME explicit, protected DACL on the trio: SYSTEM and
-# Administrators full control, and the one per-service account Modify. It does not depend on who
-# opens, so the second opener finds it already exact and needs no WRITE_DAC; it is protected, so a
+# Administrators full control, and the one run-as account Modify. That account is a per-service
+# virtual account, or one named user account the host resolves (a local user, or a gMSA only if it
+# resolves to a user account, which is unmeasured; the -ServiceAccount install; BACKLOG #3760,
+# #2234, owner ruling 2026-11-05). It does not depend on who opens, so the second opener finds it
+# already exact and needs no WRITE_DAC; it is protected, so a
 # later edit to the directory does not reach the store. Anywhere else -- a developer checkout, a temp
 # directory, a directory admitting anyone else, one reached through a link, or one this code cannot
 # read -- the owner-only rewrite applies exactly as before. Every test below is an ALLOW-list.
@@ -6841,20 +6963,33 @@ _SDDL_SID_ALIASES: Mapping[str, str] = MappingProxyType({"SY": "S-1-5-18", "BA":
 _STORE_DIR_TRUSTED_SIDS = ("S-1-5-18", "S-1-5-32-544")
 #: One per-service virtual account, NT SERVICE\<name>: S-1-5-80 plus exactly five sub-authorities.
 #: NT SERVICE\ALL SERVICES is S-1-5-80-0 and does NOT match, because it admits every service.
-_SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+")
+_SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+", re.ASCII)
+#: A machine- or domain-relative account SID: S-1-5-21, the three sub-authorities naming the machine
+#: or the domain, then the RID. A local user, a domain user and a gMSA all have this shape; so do
+#: their groups, which is why the shape alone admits nothing (see :func:`_account_type_refusal`).
+#: ASCII digits only, here and in :data:`_SERVICE_SID`: ``\d`` alone also matches other scripts'
+#: digits, which ``int`` accepts.
+_ACCOUNT_SID = re.compile(r"S-1-5-21-\d+-\d+-\d+-(\d+)", re.ASCII)
+#: The lowest RID Windows hands an account or group it creates. Below it sit the built-in ones: at
+#: least Administrator (500), Guest (501), krbtgt (502), DefaultAccount (503) and the well-known
+#: domain groups from 512, Domain Users (513) among them.
+_FIRST_ASSIGNED_RID = 1000
+#: SidTypeUser, the SID_NAME_USE LookupAccountSidW reports for a user account. A group reports
+#: SidTypeGroup (2) or SidTypeAlias (4), a well-known SID SidTypeWellKnownGroup (5).
+_SID_TYPE_USER = 1
 _SDDL_DENY_TYPES = frozenset({"D", "OD", "XD"})
 _SDDL_ACE = re.compile(r"\(([^()]*)\)")
 _SDDL_OWNER = re.compile(r"O:(S-[0-9-]+|[A-Z]{2})")
 #: The SDDL right for each principal of the trio: full control (FA) for SYSTEM and Administrators,
-#: and Modify (0x1301bf, what install-service.ps1 grants the run-as account) for the service.
+#: and Modify (0x1301bf, what install-service.ps1 grants the run-as account) for that account.
 _TRIO_RIGHTS: Mapping[str, str] = MappingProxyType({"S-1-5-18": "FA", "S-1-5-32-544": "FA"})
-_SERVICE_RIGHTS = "0x1301bf"
+_RUN_AS_RIGHTS = "0x1301bf"
 
 
 def _trio_right(sid: str) -> str:
     """The one SDDL right the trio carries for ``sid``, upper-cased as the parser keeps rights. The
     writer and both checks use this, so they cannot drift apart."""
-    return _TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS).upper()
+    return _TRIO_RIGHTS.get(sid, _RUN_AS_RIGHTS).upper()
 
 
 @dataclass(frozen=True)
@@ -6906,7 +7041,29 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
 
 
 def _hardening_refusal(directory: _SddlDacl) -> str | None:
-    """Why ``directory`` is NOT hardened, or ``None`` when it is (see :func:`_hardened_trio_grants`).
+    """Why ``directory`` is NOT hardened, or ``None`` when it is.
+
+    Hardened means the directory is exactly what install-service.ps1 writes (Set-SecureDataDirAcl,
+    then Set-DataDirOwner): inheritance blocked; every ACE an allow with the installer's own
+    inheritance (``OICI``) and rights -- full control (``FA``) for SYSTEM and Administrators, both
+    present, and Modify (``0x1301bf``) for at most ONE run-as account -- and nothing else; no deny
+    ACE, because the trio's DACL does not carry denies over; and an owner of SYSTEM or
+    Administrators, or of the run-as account when it is a per-service virtual account, because an
+    owner keeps WRITE_DAC over the directory. The run-as account is a per-service virtual account,
+    or one user account this host resolves with a RID of 1000 or more (:func:`_account_shape_refusal`,
+    :func:`_account_type_refusal`). A user never qualifies as the OWNER: any standard user can own a
+    directory she made and grant herself the installer's shape, while install-service.ps1 makes
+    Administrators the owner (Set-DataDirOwner, which only warns when it cannot, and the directory is
+    then refused), and no standard user can own a directory as a virtual account.
+
+    NOT pure: for a user run-as it calls ``LookupAccountSidW``, which may block on a domain
+    controller and logs nothing itself. Call it once per decision (:func:`_hardening_verdict`), and
+    never on an event loop.
+
+    The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
+    written with FA/Modify: a directory granting Administrators read, or a service container-only,
+    or a different service read, would otherwise produce a store WIDER than its directory. Any shape
+    but the installer's falls back to the owner-only rewrite.
 
     The first failing condition, in a fixed order, as one operator-readable sentence. The checks read
     the whole DACL, so a directory that fails two ways is refused whichever entry comes first."""
@@ -6915,55 +7072,95 @@ def _hardening_refusal(directory: _SddlDacl) -> str | None:
     if not directory.aces:  # defence in depth: the both-built-ins check below also refuses this
         return "its DACL is empty"
     named: set[str] = set()
-    services: set[str] = set()
+    run_as: set[str] = set()
     for ace_type, flags, rights, sid in directory.aces:
         trusted = sid in _STORE_DIR_TRUSTED_SIDS
-        service = not trusted and bool(_SERVICE_SID.fullmatch(sid))
         if ace_type != "A":
             return f"it carries a {ace_type} entry for {sid}, which the trio would not carry over"
-        if not (trusted or service):
-            return f"it grants {sid}, which is not SYSTEM, Administrators or one service account"
+        if not trusted and not _SERVICE_SID.fullmatch(sid):
+            refusal = _account_shape_refusal(sid)
+            if refusal is not None:
+                return refusal
         if _sddl_flag_set(flags) != {"OI", "CI"} or rights != _trio_right(sid):
             return (
                 f"it grants {sid} ({flags};{rights}), not the installer's shape "
                 f"(OICI;{_trio_right(sid)})"
             )
-        (named if trusted else services).add(sid)
+        (named if trusted else run_as).add(sid)
     # Both built-in principals are required, as the installer always writes them: without
     # Administrators among the grants, a file it owns could never be made exact, and would be
     # rewritten -- and warned about -- on every start.
     if named != set(_STORE_DIR_TRUSTED_SIDS):
         return "it does not grant both SYSTEM and Administrators"
-    if len(services) > 1:
-        return "it grants more than one service account"
+    # At most ONE run-as principal, of either kind: two service accounts, two users, or a service
+    # account beside a user are all refused. The installer grants one, or none for LocalSystem.
+    if len(run_as) > 1:
+        return f"it grants more than one service or user account ({', '.join(sorted(run_as))})"
+    services = {sid for sid in run_as if _SERVICE_SID.fullmatch(sid)}
     if directory.owner is None or (
         directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in services
     ):
         return f"it is owned by {directory.owner}, which keeps WRITE_DAC over it"
+    # Last, because it is the one check that can leave the host: a gMSA's SID resolves through a
+    # domain controller. Every cheaper refusal has had its chance first.
+    user = next(iter(run_as - services), None)  # at most one, by the check above
+    return None if user is None else _account_type_refusal(user)
+
+
+def _account_shape_refusal(sid: str) -> str | None:
+    """Why ``sid`` cannot be the trio's one named run-as user account by its SHAPE alone, or ``None``
+    when it may be one, pending :func:`_account_type_refusal`.
+
+    The owner ruling of 2026-11-05 (BACKLOG #3760, #2234) admits one principal beyond SYSTEM,
+    Administrators and a per-service virtual account, and only a user account with a RID of 1000 or
+    more: the account ``install-service.ps1 -ServiceAccount`` grants, such as a local user, or a
+    gMSA only if it resolves to a user account, which is unmeasured. The SID must be machine- or
+    domain-relative (``S-1-5-21-...``), whose last sub-authority is the RID of an account or group
+    that machine or domain holds; the regex admits no other family, so a BUILTIN alias
+    (``S-1-5-32-...``), whose last sub-authority is also a RID, is refused by shape. Any alias the
+    SDDL writer emits (``NS``, ``LA``, ``DU``) is not of this shape either, so it is refused too. A RID
+    under 1000 is a built-in account or group, refused without a lookup: at least the built-in Administrator (500), Guest (501) and Domain Users (513)."""
+    match = _ACCOUNT_SID.fullmatch(sid)
+    if match is None:
+        return (
+            f"it grants {sid}, which is not SYSTEM, Administrators, one service account or one "
+            "user account"
+        )
+    if int(match.group(1)) < _FIRST_ASSIGNED_RID:
+        return (
+            f"it grants {sid}, a built-in account or group (a RID below {_FIRST_ASSIGNED_RID}), "
+            "not one user account"
+        )
     return None
 
 
-def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
-    """The principals the trio is granted when ``directory`` is HARDENED, else ``None``.
+def _account_type_refusal(sid: str) -> str | None:
+    """Why ``sid``, already of the account shape, is not a USER account on this host, or ``None``
+    when ``LookupAccountSidW`` resolves it to SidTypeUser. Refused when the lookup fails, and when it
+    returns any other type: a group or alias with an assigned RID has the same shape as a user, and
+    granting one Modify must not widen the store to every member."""
+    kind, status = _lookup_sid_type(sid)
+    if kind is None:
+        return (
+            f"it grants {sid}, which this host could not resolve to an account (Win32 status "
+            f"{status})"
+        )
+    if kind != _SID_TYPE_USER:
+        return f"it grants {sid}, which resolves to SID type {kind}, not a user account"
+    return None
 
-    Hardened means the directory is exactly what install-service.ps1 writes (Set-SecureDataDirAcl,
-    then Set-DataDirOwner): inheritance blocked; every ACE an allow with the installer's own
-    inheritance (``OICI``) and rights -- full control (``FA``) for SYSTEM and Administrators, both
-    present, and Modify (``0x1301bf``) for at most ONE per-service account -- and nothing else; no
-    deny ACE, because the trio's DACL does not carry denies over; and an owner of SYSTEM,
-    Administrators or that service account, because an owner keeps WRITE_DAC over the directory.
 
-    The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
-    written with FA/Modify: a directory granting Administrators read, or a service container-only,
-    or a different service read, would otherwise produce a store WIDER than its directory. Any shape
-    but the installer's falls back to the owner-only rewrite. The answer names only principals the
-    directory allows, never who happens to be opening."""
-    if _hardening_refusal(directory) is not None:
-        return None
-    services = sorted(
-        sid for _t, _f, _r, sid in directory.aces if sid not in _STORE_DIR_TRUSTED_SIDS
-    )
-    return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(services))
+def _hardening_verdict(directory: _SddlDacl) -> tuple[tuple[str, ...] | None, str | None]:
+    """``(grants, None)`` when ``directory`` is HARDENED, else ``(None, refusal)``: one check, so the
+    account lookup :func:`_hardening_refusal` may make runs once, and the grants are never built for
+    a directory that was not checked. The grants are SYSTEM, Administrators, then the run-as account
+    if the directory names one: only principals the directory allows, never who happens to be
+    opening."""
+    refusal = _hardening_refusal(directory)
+    if refusal is not None:
+        return None, refusal
+    run_as = (sid for _t, _f, _r, sid in directory.aces if sid not in _STORE_DIR_TRUSTED_SIDS)
+    return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(run_as)), None
 
 
 def _sddl_flag_set(flags: str) -> set[str]:
@@ -7052,6 +7249,71 @@ def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:
         kernel32.LocalFree(descriptor)
 
 
+def _lookup_sid_type(sid: str) -> tuple[int | None, int]:
+    """``(SID_NAME_USE, 0)`` for what ``LookupAccountSidW`` reports for ``sid`` on this host, or
+    ``(None, Win32 status)`` when the lookup fails, and ``(None, 0)`` off Windows. A seam for tests,
+    so the decision runs anywhere.
+
+    A domain account's SID resolves through a domain controller, or through the LSA's lookup cache
+    when none answers. On every failure the directory is refused as not hardened, and each store
+    file takes the fallback restricted by :func:`_secure_file` (see ADR 0163,
+    *Note (2026-11-05)*; decision d20261106T140017335-d24848). Why ERROR_NONE_MAPPED (1332) does
+    not prove the SID names no account, and what that fallback leaves on each file, are stated
+    once, in ADR 0163, *Note (2026-11-05)*, *Left open*. Nothing is logged here: the status goes
+    into the refusal, which the caller logs once, beside the directory it refused."""
+    if sys.platform != "win32":
+        return None, 0
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    convert = advapi32.ConvertStringSidToSidW
+    convert.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    convert.restype = wintypes.BOOL
+    lookup = advapi32.LookupAccountSidW
+    lookup.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.c_void_p,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    lookup.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    psid = ctypes.c_void_p()
+    if not convert(sid, ctypes.byref(psid)):
+        return None, ctypes.get_last_error()
+    try:
+        name_len, domain_len = wintypes.DWORD(256), wintypes.DWORD(256)
+        status = 0
+        # A name longer than the first buffers fails with ERROR_INSUFFICIENT_BUFFER (122) and sets
+        # both lengths to what is needed, so one retry at those lengths is enough.
+        for _attempt in range(2):
+            name = ctypes.create_unicode_buffer(name_len.value)
+            domain = ctypes.create_unicode_buffer(domain_len.value)
+            use = ctypes.c_int()
+            if lookup(
+                None,
+                psid,
+                name,
+                ctypes.byref(name_len),
+                domain,
+                ctypes.byref(domain_len),
+                ctypes.byref(use),
+            ):
+                return use.value, 0
+            status = ctypes.get_last_error()
+            if status != 122:
+                break
+        return None, status
+    finally:
+        kernel32.LocalFree(psid)
+
+
 def _is_windows() -> bool:
     """A seam the tests patch, instead of patching the process-wide ``os.name``."""
     return os.name == "nt"
@@ -7081,9 +7343,9 @@ def _reaches_through_a_link(path: Path) -> bool:
 
 
 def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
-    """The trio grants for a store in ``directory`` (see :func:`_hardened_trio_grants`), or ``None``
-    for the owner-only rewrite: off Windows, through a link, or when the DACL cannot be read or
-    parsed."""
+    """The trio grants for a store in ``directory`` (see :func:`_hardening_verdict`), or ``None``
+    for the owner-only rewrite: off Windows, through a link, when the DACL cannot be read or parsed,
+    or when the directory is refused as not hardened, a failed account lookup included."""
     if not _is_windows() or _reaches_through_a_link(directory):
         return None
     sddl = _read_dacl_sddl(directory, owner=True)
@@ -7092,7 +7354,7 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
     parsed = _parse_sddl_dacl(sddl)
     if parsed is None:
         return None
-    reason = _hardening_refusal(parsed)
+    grants, reason = _hardening_verdict(parsed)
     if reason is not None:
         # A locked-down directory (inheritance off) that still fails the test is the case an operator
         # needs to hear about: the fallback brings back the Wave 0 lockout, whose only other symptom
@@ -7103,15 +7365,14 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
         if parsed.protected and not any(sid == "OW" for _t, _f, _r, sid in parsed.aces):
             log.warning(
                 "%s is locked down but %s, so the store there is restricted owner-only; the service "
-                "account and an operator's provision-admin cannot then both open it (ADR 0163 note "
-                "of 2026-09-24)",
+                "account and an operator's provision-admin cannot then both open it (ADR 0163 notes "
+                "of 2026-09-24 and 2026-11-05)",
                 directory,
                 reason,
             )
         else:
             log.debug("%s is not a hardened store directory: %s", directory, reason)
-        return None
-    return _hardened_trio_grants(parsed)
+    return grants
 
 
 def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = None) -> bool:
@@ -7131,7 +7392,7 @@ def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = N
     from ctypes import wintypes
 
     # Written in the canonical SDDL spelling (lower-case ``0x`` hex); only COMPARISONS upper-case.
-    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS)};;;{sid})" for sid in grants)
+    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _RUN_AS_RIGHTS)};;;{sid})" for sid in grants)
     sddl = (f"O:{owner}" if owner else "") + f"D:P{aces}"
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -7703,9 +7964,10 @@ async def _audit_row_mac_check(
         parsed = parse_audit_epoch(opening["detail"])
         if parsed is not None:
             key_id, scheme = parsed.key_id, parsed.scheme
-    if key_id is not None and audit_scheme_refusal(key_id, scheme) is not None:
+    if key_id is not None and (refused := _audit_refusal(key_id, scheme)) is not None:
         # BACKLOG #3420: a range sealed under a scheme this release does not hold proves nothing.
-        return f"audit row {seq}'s key range names an audit scheme this release does not hold"
+        # Fixed words naming the class, never the record's own text, which the refusal quotes.
+        return f"audit row {seq}'s key range {refused[0]}"
     if only_key_id is not None and key_id != only_key_id:
         return f"audit row {seq} is not sealed under the active audit key"
     secret: tuple[bytes | None, AuditMacFn | None] | None
@@ -8703,6 +8965,33 @@ CREATE TABLE IF NOT EXISTS transit_bound_attestation (
     attested_at REAL NOT NULL,
     audit_seq   INTEGER NOT NULL,
     audit_hash  TEXT NOT NULL
+);
+
+-- The keyring (vault BACKLOG #3411; the key-custody draft's rules 4 and 6). One row per wrap of a key:
+-- in S3 only the recovery wrap, which is the master key sealed under a key derived from the recovery
+-- key, and whether that recovery key is proved. S4 adds its data, index and backup keys and its master
+-- handover row. One key can have several wraps (the recovery wrap and the master handover row both
+-- wrap a master key, and rule 14 holds a shared host wrap here), so the primary key is the key id, the
+-- purpose and the wrapping key's id. Rule 6 names key id, purpose, class, state, period and the sealed key;
+-- `wrapped_by` and the three times are this table's own. NOTHING WRITES IT YET. `wrapped`
+-- is for a SEALED key only, never a plain one, and the store id a seal binds is read from the host
+-- blob, never from this table. Not the in-memory `audit_mac_keyring`. No PHI. The seal rule 6 names
+-- binds key id, purpose, store id, state, class and period, NOT `proved_at`: a database writer could
+-- set it and so silence the unproved-recovery-key warning. Where the draft stores the proof is open
+-- for S4 to settle before anything reads this column.
+CREATE TABLE IF NOT EXISTS keyring (
+    key_id      TEXT NOT NULL,              -- the wrapped key's id: a one-way fingerprint. NO COMMA in these comments: SQLite DROP COLUMN scans back for one
+    purpose     TEXT NOT NULL,              -- what the key is for (such as the recovery wrap)
+    key_class   TEXT NOT NULL DEFAULT '',   -- a data key's class (period or standing; S4) or '' for none
+    state       TEXT NOT NULL,              -- where the key is in its life (such as pending or active)
+    period_from REAL,                       -- the period a period key seals for (S4); NULL for none
+    period_to   REAL,
+    wrapped_by  TEXT NOT NULL,              -- the id of the key `wrapped` is sealed under
+    wrapped     TEXT NOT NULL DEFAULT '',   -- the sealed key or '' when the row holds none
+    created_at  REAL NOT NULL,
+    state_at    REAL NOT NULL,              -- when `state` last changed
+    proved_at   REAL,                       -- recovery wrap: when the key last came back and opened it
+    PRIMARY KEY (key_id, purpose, wrapped_by)
 );
 
 -- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per upload IN

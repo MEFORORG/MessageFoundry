@@ -191,17 +191,19 @@ messagefoundry/
   pipeline/        # engine.py (Engine), wiring_runner.py (RegistryRunner), dryrun.py
   transports/      # base.py (connector registry), mllp.py, file.py, dicom.py (C-STORE SCP + SCU/C-ECHO), dicomweb.py (STOW-RS, ADR 0025), smart.py (SMART Backend Services token provider, ADR 0024)   ← "connectors"
   parsing/         # peek.py + _builtin_hl7.py (tolerant, hot path), tree.py, validate.py (hl7apy, strict); x12/ (X12 EDI codec, ADR 0012), dicom/ (DICOM codec, ADR 0025), binary.py (base64 carriage, ADR 0028)
-  anon/            # de-identification framework (ADR 0030; vendored to tee/anon/)
   store/           # base.py (Store protocol + open_store factory), store.py (SQLite WAL inbox/outbox), sqlserver.py, postgres.py
   auth/            # authn + RBAC core (no FastAPI): permissions/roles, Identity, passwords, tokens, ldap, service.py
   api/             # FastAPI app.py + models.py + security.py (auth deps) + auth_routes.py (the engine's only external surface)
   apiclient/       # Qt-free / FastAPI-free engine-client library (ADR 0088) — the shared HTTP client (httpx)
-  generators/      # conformant synthetic HL7 generators (adt.py, …) — `messagefoundry-toolkit generate`; corpus git-ignored
   security/        # security assets shipped in the wheel (ADR 0144)
   support/         # support-bundle assembly + redaction (bundle.py, redact.py)
   verify/          # deployment verifier — `messagefoundry verify` (checks.py, smoke.py, federation.py)
   tray/            # Windows tray service-manager (ADR 0113) — stdlib ctypes, no PySide6; wraps service/service_status only
   checks.py        # `messagefoundry check` commit/CI gate (validate + dryrun + advisory lint)
+messagefoundry_toolkit/  # the `messagefoundry-toolkit` distribution's package: authoring commands (ADR 0201)
+  anon/            # de-identification framework (ADR 0030; vendored to tee/anon/)
+  generators/      # conformant synthetic HL7 generators (adt.py, …) — `messagefoundry-toolkit generate`; corpus git-ignored
+  hl7schema.py, hl7structures.py  # HL7 v2.5.1 schema emitters behind the IDE's bundled JSON (ADR 0104)
 ide/               # VS Code extension (TypeScript): setup, promote, test bench, AI commands
 environments/      # per-environment <env>.toml value files for env() lookups (dev/staging/prod)
 samples/           # config/ (example Connection/Router/Handler modules) + send_mllp.py sender
@@ -937,7 +939,7 @@ these as hard rules:
 - **CLI `dryrun`/`generate` output can contain full message bodies** (stdout/stderr) — never run
   them against real PHI, and never redirect their output to a committed file, ticket, or CI log.
 - **De-identification is built** ([ADR 0030](docs/adr/0030-anonymization-test-harness-tee.md)). The
-  centralized framework lives in `messagefoundry/anon/` (vendored to `tee/anon/`): deterministic
+  centralized framework lives in `messagefoundry_toolkit/anon/` (vendored to `tee/anon/`): deterministic
   secret-per-dataset pseudonymization, HL7 v2 first. It builds test datasets via the tee
   `anonymize-captures` subcommand + the test harness. **Centralize the rules — don't inline
   ad-hoc de-id logic**; use this framework, don't reimplement one beside it.
