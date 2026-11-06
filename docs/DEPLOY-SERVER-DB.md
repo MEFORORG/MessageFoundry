@@ -799,7 +799,7 @@ the programs it starts do not get all of it, as the manual commands run in your 
 [`DANGEROUS-FUNCTIONALITY.md`](DANGEROUS-FUNCTIONALITY.md) section 4, *What each child is
 handed*, states what each one gets.
 
-**It reads the policy only where an ODBC Driver 18 hop is configured.** It needs `pyodbc`
+**It reads the policy only where an ODBC hop on a Microsoft SQL Server driver is configured.** It needs `pyodbc`
 installed in the Python that runs `verify`, found on the import path without being imported. It
 then asks whether the configuration takes such a hop: a `sqlserver` store backend in the service
 settings, or a deployed DATABASE connection, a `DatabaseRef` reference set or a

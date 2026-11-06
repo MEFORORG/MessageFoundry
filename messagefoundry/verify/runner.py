@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING
 from messagefoundry.config.settings import ServiceSettings, StoreBackend
 from messagefoundry.transports.db_endpoint import (
     SQLSERVER_DEFAULT_DRIVER,
+    _preset_driver,  # the preset's own driver test, so the census cannot drift from the build
     generic_driver_family,
-    sqlserver_preset_refusal,
 )
 from messagefoundry.verify.checks import (
     OdbcHops,
@@ -106,10 +106,7 @@ def _writable_dir(settings: ServiceSettings | None) -> Path:
 def _microsoft_driver(driver: str) -> bool:
     """Whether ``driver``, an ``odbc_driver`` as written, is a Microsoft SQL Server driver: one the
     SQL Server preset accepts, or the generic dialect's Microsoft family."""
-    return (
-        sqlserver_preset_refusal({"odbc_driver": driver}) is None
-        or generic_driver_family(driver) == "msodbc"
-    )
+    return _preset_driver(driver) or generic_driver_family(driver) == "msodbc"
 
 
 class _Graph:
@@ -154,16 +151,17 @@ def _odbc_hops(
     graph's entries are read by :func:`~messagefoundry.config.wiring.odbc_hops` from ``graph``, the
     run's one load of ``config_dir``, only when the store has not already shown a hop. A hop found
     either way is enough. For ``host.ciphers`` a hop is an entry on a Microsoft SQL Server driver,
-    whose TLS the host policy decides; for ``host.odbc`` it is an entry naming Driver 18, which
-    pyodbc must list, so an entry on another driver needs nothing of that row.
+    whose TLS the host policy decides, which every preset entry the engine builds is; for
+    ``host.odbc`` it is an entry naming Driver 18, which pyodbc must list, so an entry on another
+    driver needs nothing of that row.
 
     Anything not read leaves the answer unknown rather than "no hop", because a hop could sit in it:
     a graph that does not load, settings that did not load, or a shell with no
     ``MEFOR_STORE_BACKEND``. That variable overrides the settings file, and an operator's shell
     need not carry the service's own environment, so without it even a file that says sqlite does
-    not show the service's store (BACKLOG #3803 R1). An entry whose driver is an ``env()``
-    reference is unknown too, and so for ``host.ciphers`` is one on another vendor's driver, which
-    may bring its own TLS."""
+    not show the service's store (BACKLOG #3803 R1). An entry whose driver the row needs and is an
+    ``env()`` reference is unknown too, and so for ``host.ciphers`` is one off the preset on another
+    vendor's driver, which may bring its own TLS."""
     if settings is not None and settings.store.backend is StoreBackend.SQLSERVER:
         return OdbcHops(found=("the [store] backend is sqlserver",))
     from messagefoundry.config.settings import settings_file_path
@@ -183,12 +181,18 @@ def _odbc_hops(
         return OdbcHops(unknown=f"the config dir {config_dir!r} did not load: {reason}")
     found: list[str] = []
     undecided: list[str] = []
-    for kind, name, driver in odbc_hops(reg):
+    for kind, name, dialect, driver in odbc_hops(reg):
         label = f"{kind} {name}"
-        if driver is None:
+        # The preset builds only on a Microsoft driver, so any preset entry the engine builds takes
+        # the host policy; another driver is refused at build. Its driver decides Driver 18 alone.
+        if dialect == "sqlserver" and not driver_18:
+            found.append(label)
+        elif driver is None:
             undecided.append(f"{label} names its odbc_driver by an env() reference")
         elif driver_18:
-            if driver.strip().lower() == SQLSERVER_DEFAULT_DRIVER.lower():
+            # The preset sends the name as written; the generic dialect trims it.
+            sent = driver if dialect == "sqlserver" else driver.strip()
+            if sent.lower() == SQLSERVER_DEFAULT_DRIVER.lower():
                 found.append(label)
         elif _microsoft_driver(driver):
             found.append(label)

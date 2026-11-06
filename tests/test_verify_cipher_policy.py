@@ -1641,7 +1641,7 @@ def test_a_missing_driver_with_no_configured_hop_skips(monkeypatch: pytest.Monke
     _odbc_drivers(monkeypatch, "SQL Server")
     r = checks.check_sqlserver_odbc_driver(lambda: checks.OdbcHops(judged="the graph in 'cfg'"))
     assert (r.id, r.status) == ("host.odbc", Status.SKIP)
-    assert "no ODBC hop in the graph in 'cfg'" in r.detail
+    assert "no hop naming ODBC Driver 18 in the graph in 'cfg'" in r.detail
     assert "reads FAIL" in r.detail and "not found" in r.detail
 
 
@@ -1727,6 +1727,35 @@ def test_the_graph_is_loaded_once_per_run(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert loads == [True]
 
 
+def test_a_failed_shared_load_is_read_once_by_both(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The failure path of the one load: the census reads it as unknown and the smoke as a FAIL,
+    and the modules run once."""
+    from messagefoundry.config import wiring
+    from messagefoundry.verify.runner import run_verify
+
+    service = _isolate_settings(monkeypatch, tmp_path)
+    graph = tmp_path / "config"
+    graph.mkdir()
+    loads: list[str] = []
+
+    def broken(d: Any, allow_empty: bool = False, **kw: Any) -> Any:
+        loads.append(str(d))
+        raise wiring.WiringError("bad graph")
+
+    monkeypatch.setattr(wiring, "load_config", broken)
+    _odbc_drivers(monkeypatch, "SQL Server")
+    _with_pyodbc(monkeypatch, Status.FAIL)
+    results = run_verify(
+        config_dir=str(graph), service_config=str(service), sections=["host", "smoke"]
+    )
+    rows = {r.id: r for r in results}
+    assert rows["host.odbc"].status is Status.MANUAL and "bad graph" in rows["host.odbc"].detail
+    assert rows["smoke.self"].status is Status.FAIL and "bad graph" in rows["smoke.self"].detail
+    assert len(loads) == 1
+
+
 def test_the_wiring_reader_names_each_odbc_entry_and_its_driver() -> None:
     """BACKLOG #3803 R3: one wiring-level reader of the entries that open an ODBC connection. An
     ``env()`` driver is ``None``; a connection that is not deployed is never built, so it is left
@@ -1755,10 +1784,10 @@ def test_the_wiring_reader_names_each_odbc_entry_and_its_driver() -> None:
     )
     driver_18 = "ODBC Driver 18 for SQL Server"
     assert odbc_hops(reg) == [
-        ("DATABASE connection", "OB_B", driver_18),
-        ("DATABASE connection", "OB_ENV", None),
-        ("DATABASE connection", "OB_PG", "PostgreSQL Unicode"),
-        ("DATABASE connection", "inbound:OB_B", driver_18),
+        ("DATABASE connection", "OB_B", "sqlserver", driver_18),
+        ("DATABASE connection", "OB_ENV", "sqlserver", None),
+        ("DATABASE connection", "OB_PG", "generic", "PostgreSQL Unicode"),
+        ("DATABASE connection", "inbound:OB_B", "sqlserver", driver_18),
     ]
 
 
@@ -1773,6 +1802,13 @@ def test_the_wiring_reader_names_each_odbc_entry_and_its_driver() -> None:
         (None, "ODBC Driver 17 for SQL Server", "found", "none"),
         # Another vendor's driver needs no Driver 18 (finding 7); its own TLS is not read.
         ("generic", "PostgreSQL Unicode", "unknown", "none"),
+        # The preset builds only on a Microsoft driver, so an env() driver there still takes the
+        # host policy (round two, finding 1); whether it names Driver 18 is not known.
+        (None, "env", "found", "unknown"),
+        # A preset entry on another vendor's driver is refused at build: never "its own TLS".
+        (None, "PostgreSQL Unicode", "found", "none"),
+        # The preset sends the name as written, so a padded name is not Driver 18 there.
+        (None, " ODBC Driver 18 for SQL Server ", "found", "none"),
     ],
 )
 def test_each_row_counts_the_hops_its_driver_question_reaches(
@@ -1784,10 +1820,12 @@ def test_each_row_counts_the_hops_its_driver_question_reaches(
     odbc: str,
 ) -> None:
     from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.config.wiring import env
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlite")
-    _registry_with(monkeypatch, outbound={"OB_X": _database("OB_X", dialect, driver=driver)})
+    odbc_driver = env("db_driver") if driver == "env" else driver
+    _registry_with(monkeypatch, outbound={"OB_X": _database("OB_X", dialect, driver=odbc_driver)})
 
     def outcome(hops: checks.OdbcHops) -> str:
         return "found" if hops.found else "unknown" if hops.unknown else "none"

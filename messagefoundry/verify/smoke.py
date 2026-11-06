@@ -208,9 +208,9 @@ def smoke_self(
         else:
             reg = graph()
             # The run's shared load allows an empty graph, for the hop census; the smoke does not.
-            # That is the one rule the shared load skipped, and validate() names it as a load does.
-            if reg.declares_no_connections:
-                reg.validate()
+            # The whole check again, so the smoke refuses what its own load would, whatever
+            # allow_empty comes to suppress.
+            reg.validate()
     except WiringError as exc:
         return CheckResult(rid, title, Status.FAIL, f"config failed to load: {exc}")
     msg = synthetic_message()  # a module constant since #1192 — cannot fail

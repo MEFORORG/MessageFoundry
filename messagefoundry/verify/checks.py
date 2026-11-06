@@ -116,9 +116,9 @@ def _census(odbc_hops: Callable[[], OdbcHops]) -> OdbcHops:
         return OdbcHops(unknown=f"the hop census raised {type(exc).__name__}: {reason}")
 
 
-def _no_hop_detail(hops: OdbcHops, on: str) -> str:
+def _no_hop_detail(hops: OdbcHops, hop: str, on: str) -> str:
     return (
-        f"no ODBC hop in {hops.judged} (no SQL Server store, and no DATABASE connection, "
+        f"no {hop} in {hops.judged} (no SQL Server store, and no DATABASE connection, "
         f"DatabaseRef or DatabaseLookup {on})"
     )
 
@@ -161,7 +161,8 @@ def _odbc_driver_reading() -> CheckResult:
         disable_driver_manager_pooling()  # BACKLOG #2049; why is in messagefoundry/odbc_env.py
         drivers = list(pyodbc.drivers())
     except Exception as exc:  # pyodbc surfaces driver-manager errors as bare Exception
-        return CheckResult(rid, title, Status.ERROR, f"pyodbc.drivers() failed: {exc}")
+        reason = codec_safe_str(exc)  # the SKIP and MANUAL details now carry it too
+        return CheckResult(rid, title, Status.ERROR, f"pyodbc.drivers() failed: {reason}")
     target = "ODBC Driver 18 for SQL Server"
     if target in drivers:
         return CheckResult(
@@ -194,7 +195,8 @@ def check_sqlserver_odbc_driver(odbc_hops: Callable[[], OdbcHops]) -> CheckResul
             reading.id,
             reading.title,
             Status.SKIP,
-            f"{_no_hop_detail(hops, 'naming that driver')}, so no hop needs it; it reads "
+            f"{_no_hop_detail(hops, 'hop naming ODBC Driver 18', 'naming it')}, so none needs "
+            "it; it reads "
             f"{reading.status.value}: {reading.detail}",
             evidence=reading.evidence,
         )
@@ -202,7 +204,7 @@ def check_sqlserver_odbc_driver(odbc_hops: Callable[[], OdbcHops]) -> CheckResul
 
 
 def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
-    """DEPLOY-SERVER-DB.md section 5.4: the host TLS policy every ODBC Driver 18 hop takes.
+    """DEPLOY-SERVER-DB.md section 5.4: the host TLS policy every Microsoft ODBC driver hop takes.
 
     Without pyodbc, found on the import path without being imported, no ODBC hop runs from this
     Python, so the row SKIPs. With it, ``odbc_hops`` says whether the configuration takes one: the
@@ -231,7 +233,8 @@ def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
             rid,
             title,
             Status.SKIP,
-            f"{_no_hop_detail(hops, 'on a Microsoft SQL Server driver')}, so the host policy does "
+            f"{_no_hop_detail(hops, 'ODBC hop', 'on a Microsoft SQL Server driver')}, so the host "
+            "policy does "
             "not reach one",
         )
     try:
