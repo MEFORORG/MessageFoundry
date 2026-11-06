@@ -662,11 +662,46 @@ async def test_a_rename_rejoins_the_queue_under_the_new_name_before_the_code(
     verified = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
 
     assert verified.ok is True
-    assert queued_as[-1] == "jdoe-renamed"
+    assert queued_as == ["jdoe", "jdoe-renamed"]  # queued under the old name, rejoined once
     assert held_at_check == [{service_module._credential_lock_key("jdoe-renamed")}]
     assert e.service._credential_locks == {}
     rows = await store.list_audit(action="auth.mfa_verified")
     assert [r["actor"] for r in rows] == ["jdoe-renamed"]
+
+
+async def test_an_account_deleted_after_the_rejoin_is_audited_under_its_last_read_name(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3780 item 2, the #2291 class. A rename sends the attempt to the new name's queue,
+    and the account is deleted while it waits there. RED when: the ``session_lost`` row names the
+    account as it was before the lookup rather than as the first in-queue read found it."""
+    e = await _enrolled_directory_session(store, monkeypatch)
+    real_lock = e.service._account_credential_lock
+    queued_as: list[str] = []
+
+    @asynccontextmanager
+    async def _queue(username: str) -> AsyncIterator[None]:
+        queued_as.append(username)
+        if len(queued_as) == 1:
+            assert await store.set_user_username(
+                e.user_id, "jdoe-renamed", expected_username="jdoe", audits=()
+            )
+        else:
+            await store.delete_user(e.user_id)
+        async with real_lock(username):
+            yield
+
+    monkeypatch.setattr(e.service, "_account_credential_lock", _queue)
+
+    refused = await e.service.verify_mfa(e.token, totp.totp(e.secret, now=_T1))
+
+    assert refused.ok is False and refused.session_lost is True
+    assert queued_as == ["jdoe", "jdoe-renamed"]
+    rows = await store.list_audit(action="auth.mfa_failed")
+    lost = [
+        r for r in rows if r["detail"] and json.loads(r["detail"]) == {"reason": "session_lost"}
+    ]
+    assert [r["actor"] for r in lost] == ["jdoe-renamed"]
 
 
 async def test_a_second_rename_carries_on_in_the_queue_held(

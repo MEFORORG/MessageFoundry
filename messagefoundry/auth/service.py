@@ -13928,9 +13928,9 @@ class AuthService:
         # BACKLOG #3780 item 2, THE ONE STATEMENT OF THIS RULE: no re-read follows the lookup here,
         # because the in-queue re-read below is that read. Only the queue's acquisition awaits
         # between the two, and nothing is spent before the in-queue read, so it still refuses,
-        # before any code is checked, a revocation, a disable or a lock the lookup let land. It
-        # refuses them after the in-queue ``totp_enabled`` and lapse checks rather than before
-        # them, as it already did for a local account. The dropped read also supplied the queue's
+        # before any code is checked, a revocation, a disable or a lock the lookup let land. Only
+        # the lock refusal moves: it now comes after the in-queue ``totp_enabled`` and lapse
+        # checks, as it already did for a local account. The dropped read also supplied the queue's
         # key, so a rename during the lookup was queued under the new name; the in-queue read now
         # rejoins the queue under the new name instead, once (see below).
         vouched = await self._directory_vouches_for_factor(
@@ -13973,6 +13973,8 @@ class AuthService:
                 # second rename carries on in the queue then held, as a rename during the code
                 # check below does. Both windows stay open while the queue is keyed by name; the
                 # read this replaces, which ran before the queue, covered neither.
+                # Carried forward, so a refusal after the rejoin names the account as last read.
+                user = loaded
                 await queue.pop_all().aclose()
                 queued_as = loaded.username
             if not user.totp_enabled:
@@ -14386,9 +14388,8 @@ class AuthService:
 
         **Except under ``reread=False``,** which skips that re-read and returns ``user`` itself, as
         read BEFORE the lookup: nothing below about the re-read then holds, and the caller must
-        not use the returned row as fresh. Only :meth:`verify_mfa` passes it, whose own in-queue
-        read follows the lookup before anything is spent; the comment at its call says why
-        (BACKLOG #3780 item 2).
+        not use the returned row as fresh. Only :meth:`verify_mfa` passes it; the comment at its
+        call says why (BACKLOG #3780 item 2).
 
         The one copy of a block :meth:`verify_mfa` (BACKLOG #2023) and
         :meth:`finish_webauthn_assertion` (BACKLOG #2239) each used to spell out (BACKLOG #3068).
@@ -14448,10 +14449,9 @@ class AuthService:
 
         For a check that must land just before a factor is written, after awaits in which a
         revocation, a disable or a lock could have landed (BACKLOG #3068).
-        :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, unless told not to
-        (``reread``), both second-factor legs run it again right before ``mark_session_mfa_verified``, and
-        :meth:`verify_mfa` runs it on a matched code whose spend failed, before it decides the
-        charge. A session
+        :meth:`_directory_vouches_for_factor` runs it after a confirmed lookup, both second-
+        factor legs run it again right before ``mark_session_mfa_verified``, and :meth:`verify_mfa`
+        runs it on a matched code whose spend failed, before it decides the charge. A session
         revoked or gone, or an account disabled or gone, returns ``session_lost``: the token no longer
         authenticates, so the caller must not report a wrong proof. It is audited as ``event``
         with ``reason=session_lost``, filed under ``actor`` (the account name the caller last
