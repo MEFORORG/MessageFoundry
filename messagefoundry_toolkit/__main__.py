@@ -398,14 +398,14 @@ def _print_record_line(line: str) -> None:
 
 
 def _hl7schema(args: argparse.Namespace) -> int:
-    from messagefoundry.hl7schema import hl7_schema
+    from messagefoundry_toolkit.hl7schema import hl7_schema
 
     _print_json(hl7_schema(), compact=args.json)
     return 0
 
 
 def _hl7structures(args: argparse.Namespace) -> int:
-    from messagefoundry.hl7structures import to_json
+    from messagefoundry_toolkit.hl7structures import to_json
 
     _print_json(to_json(), compact=args.json)
     return 0
@@ -626,7 +626,7 @@ def _init(args: argparse.Namespace) -> int:
 
 
 def _generate(args: argparse.Namespace) -> int:
-    from messagefoundry.generators import (
+    from messagefoundry_toolkit.generators import (
         _core,
         all_types,  # noqa: F401  (registers every built-in type)
     )

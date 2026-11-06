@@ -21,8 +21,8 @@ from types import ModuleType
 
 import pytest
 
-import messagefoundry.anon
-import messagefoundry.anon.rules as engine_rules
+import messagefoundry_toolkit.anon
+import messagefoundry_toolkit.anon.rules as engine_rules
 import tee.anon
 import tee.anon.rules as tee_rules
 from tee.__main__ import main as tee_main
@@ -195,7 +195,7 @@ def test_a_weak_salt_refuses_a_run_with_no_captured_bodies(
 
 @pytest.mark.parametrize(
     ("package", "rules_module"),
-    [(messagefoundry.anon, engine_rules), (tee.anon, tee_rules)],
+    [(messagefoundry_toolkit.anon, engine_rules), (tee.anon, tee_rules)],
     ids=("engine", "tee"),
 )
 def test_kept_defaults_is_exported(package: ModuleType, rules_module: ModuleType) -> None:

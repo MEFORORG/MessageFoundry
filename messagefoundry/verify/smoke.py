@@ -17,7 +17,7 @@
   says which and what it still writes.
 
 Synthetic HL7 only — never real PHI. The smoke message is inlined below rather than generated, so
-the verifier never imports ``messagefoundry.generators`` (BACKLOG #1192 / ASVS 15.2.3).
+the verifier never imports the toolkit's ``generators`` package (BACKLOG #1192 / ASVS 15.2.3).
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 #:
 #: **Why it is a literal.** The deployment verifier is the one tool an operator runs on a real box,
 #: so anything it imports is functionality that install is required to carry. Generating the message
-#: pulled the whole ``messagefoundry.generators`` package — development tooling — into the verifier's
+#: pulled the whole ``generators`` package — development tooling — into the verifier's
 #: runtime dependency set. Inlining removes that edge. Nothing else under ``messagefoundry/verify/``
 #: touches the generators, and ``tests/test_verify.py`` pins that.
 #:
