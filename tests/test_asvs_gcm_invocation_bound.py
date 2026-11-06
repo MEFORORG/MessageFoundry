@@ -727,19 +727,21 @@ def test_the_bound_is_settled_only_AFTER_the_message_graph_has_quiesced() -> Non
 
     from messagefoundry.pipeline import engine as engine_mod
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(engine_mod.Engine.stop)))
+    def touches(method: object, attr: str) -> bool:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(method)))  # type: ignore[arg-type]
+        return any(isinstance(n, ast.Attribute) and n.attr == attr for n in ast.walk(tree))
 
-    def first_line(attr: str) -> int:
-        lines = [
-            node.lineno
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Attribute) and node.attr == attr
-        ]
-        assert lines, f"Engine.stop() no longer touches self.{attr} — this guard needs updating"
-        return min(lines)
+    # Engine.stop() runs its steps in the order _stop_steps() lists them (BACKLOG #3191). Building
+    # the list calls nothing, so an engine that never ran __init__ is enough.
+    steps = object.__new__(engine_mod.Engine)._stop_steps()
 
-    assert first_line("_gcm_invocation_runner") > first_line("_registry_runner"), (
+    def step_of(attr: str) -> int:
+        found = [i for i, step in enumerate(steps) if touches(step.run, attr)]
+        assert found, f"no Engine.stop() step touches self.{attr} — this guard needs updating"
+        return min(found)
+
+    assert step_of("_gcm_invocation_runner") > step_of("_registry_runner"), (
         "Engine.stop() settles the AES-GCM invocation bound before the registry runner has quiesced, "
         "so every encrypt performed during the shutdown drain is unreserved and uncheckpointed. Move "
-        "the _gcm_invocation_runner.stop() block to AFTER `await self._registry_runner.stop()`."
+        "the _gcm_invocation_runner.stop() block to a step AFTER the graph's stop."
     )

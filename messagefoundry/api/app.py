@@ -489,6 +489,9 @@ from messagefoundry.pipeline.security_signals import (
     SecuritySignalThresholds,
     install_security_signals,
 )
+from messagefoundry.pipeline.teardown import INNER_SHARE as _INNER_SHARE
+from messagefoundry.pipeline.teardown import TeardownStep as _TeardownStep
+from messagefoundry.pipeline.teardown import run_teardown as _run_teardown
 from messagefoundry.pipeline.wiring_runner import (
     DrParkedError,
     NotDeployedError,
@@ -1293,20 +1296,17 @@ async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
 #: engine.stop() included. NSSM sends Ctrl+C and escalates after AppStopMethodConsole, 15000 ms
 #: (scripts/service/install-service.ps1). Before the lifespan sees the shutdown, uvicorn drains the
 #: open connections, for at most ``__main__._UVICORN_DRAIN_SECONDS``, the bound serve passes
-#: uvicorn.run (BACKLOG #3256). This budget plus that bound, plus a cut step's grace (below) for
-#: each step cut, must stay inside the window with room left for the interpreter to exit.
+#: uvicorn.run (BACKLOG #3256). This budget plus that bound, plus a cut step's grace
+#: (``pipeline.teardown.CUT_GRACE_SECONDS``) for each step cut, must stay inside the window with
+#: room left for the interpreter to exit.
 _SHUTDOWN_BUDGET_SECONDS: Final = 10.0
-#: The share of that budget kept back for engine.stop(). Reserved, never a bound: the stop is not cut
-#: short, because it ends in store.close(), and a store left open keeps a non-daemon worker thread
-#: alive, which is the hang BACKLOG #2087 fixed. The stop's own waits are bounded inside the engine,
-#: and nothing here holds them to this reserve.
-_ENGINE_STOP_RESERVE_SECONDS: Final = 3.0
-#: The part of a step's bound handed to the step's own graceful wait, so that wait ends, and cancels
-#: what it owns, before the teardown cuts the step.
-_INNER_SHARE: Final = 0.8
-#: How long a step cut at its bound gets to unwind its cancellation before the teardown stops waiting
-#: for it and moves on, leaving it to finish or fail on its own.
-_CUT_GRACE_SECONDS: Final = 0.1
+#: The share of that budget kept back for engine.stop(), its step's floor. The step is handed its
+#: bound, never less than this, as engine.stop()'s ``budget_seconds``, and engine.stop() holds every
+#: wait of its own to that bound but its store's close (BACKLOG #3191). The step itself is not cut
+#: from here: it ends in store.close(), and a store left open keeps a non-daemon worker thread alive,
+#: which is the hang BACKLOG #2087 fixed. It must cover engine.stop()'s own floors and cut graces,
+#: which tests/test_lifespan_teardown.py checks against the real steps.
+_ENGINE_STOP_RESERVE_SECONDS: Final = 3.5
 #: The part of the long-operations drain's share it spends waiting before it cancels, the rest being
 #: the grace for the rollback arms. A policy, not derived from the drain's defaults (vault BACKLOG
 #: #3740 item 17): their ratio, 0.5 s to 6 s, would leave the wait about 0.2 s under the shipped
@@ -1317,134 +1317,6 @@ _OUTLIVING_WAIT_SHARE: Final = 0.25
 #: a path that runs ``_record_upload_create`` under another label drops out of that wait (vault
 #: BACKLOG #3740 item 6).
 _UPLOAD_CREATE_OPERATION: Final = "upload.create audit"
-
-#: Steps the teardown stopped waiting for. The event loop holds only a weak reference to a task, so
-#: this keeps one alive until it ends.
-_left_running: set[asyncio.Future[object]] = set()
-
-
-@dataclass(frozen=True)
-class _TeardownStep:
-    """One shutdown step for :func:`_run_teardown`.
-
-    ``floor`` is the time the step is guaranteed whatever the steps before it took. ``run`` is given
-    the step's bound and returns what to await. A step that does not apply is left out of the list,
-    which frees its floor. ``bounded=False`` runs the step to completion and is never cut. At least
-    two steps run that way: the reap of the managed lifespan's store-reading tasks, since a task left
-    running would meet the closed store, and engine.stop(), whose ``floor`` is the reserve the steps
-    before it leave it."""
-
-    label: str
-    floor: float
-    run: Callable[[float], Awaitable[object]]
-    bounded: bool = True
-
-
-def _log_late_outcome(label: str) -> Callable[[asyncio.Future[object]], None]:
-    """Log how a step the teardown left running ended, since nobody else reads it."""
-
-    def _done(work: asyncio.Future[object]) -> None:
-        _left_running.discard(work)
-        if not work.cancelled() and (error := work.exception()) is not None:
-            _log.error("shutdown: %s failed after the teardown moved on", label, exc_info=error)
-
-    return _done
-
-
-async def _await_step(work: asyncio.Future[object], bound: float | None, label: str) -> bool:
-    """Wait for one step, through any cancel of the caller, for at most ``bound`` seconds.
-
-    A cancel of the caller is noted once and does not reach the step: the step finishes, or is cut
-    at its bound, as it would have been with no cancel. At the bound the step is cancelled and gets
-    :data:`_CUT_GRACE_SECONDS` to unwind; one still running then is left to end on its own. Returns
-    whether the step ended on its own, so its outcome is the caller's to read.
-
-    The wait is asyncio.wait, never asyncio.shield: once the caller is cancelled, shield reports a
-    later failure of the step to the loop's exception handler as well, so it would be logged twice
-    (BACKLOG #2087, #2263)."""
-    loop = asyncio.get_running_loop()
-    give_up = None if bound is None else loop.time() + bound
-    cut = noted = False
-    while not work.done():
-        remaining = None if give_up is None else give_up - loop.time()
-        if remaining is not None and remaining <= 0:
-            if cut:
-                _log.error(
-                    "shutdown: %s was still running %.2fs after it was cut; continuing the "
-                    "teardown without it",
-                    label,
-                    _CUT_GRACE_SECONDS,
-                )
-                _left_running.add(work)
-                work.add_done_callback(_log_late_outcome(label))
-                return False
-            _log.error("shutdown: %s did not finish within %.2fs; cutting it", label, bound)
-            cut = True
-            work.cancel()
-            give_up = loop.time() + _CUT_GRACE_SECONDS
-            continue
-        try:
-            await asyncio.wait((work,), timeout=remaining)
-        except asyncio.CancelledError:
-            # Once per step: a cancel that is re-delivered on every pass of the loop, as an anyio
-            # cancel scope does, would otherwise log a line per pass.
-            if not noted:
-                noted = True
-                _log.warning(
-                    "shutdown: cancelled during %s; it and the remaining steps run before the "
-                    "cancel propagates",
-                    label,
-                )
-    return not (cut and work.cancelled())
-
-
-async def _run_teardown(steps: Sequence[_TeardownStep], budget: float) -> None:
-    """Run every step in order, whatever the steps before it did (BACKLOG #3191).
-
-    Each step runs as its own task. A step that raises, or overruns its bound and is cut, is logged,
-    and the next step runs. Each bounded step gets what is left of ``budget`` after the floors of the
-    steps still to come, and never less than its own floor, so a slow step spends slack and not a
-    later step's share. The whole run takes at most ``budget``, plus :data:`_CUT_GRACE_SECONDS` for
-    each step cut, plus whatever an unbounded step overruns its reserve by.
-
-    A cancel of the caller reaches no step (:func:`_await_step`), and is raised once every step has
-    run. So is the first other exception a step ends with that is not an :class:`Exception`: the
-    steps after it still run, so engine.stop() still closes the store. KeyboardInterrupt and
-    SystemExit are not among them, since asyncio raises those out of the event loop itself."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + budget
-    current = asyncio.current_task()
-    # Compared at the end, so a cancel that arrived while this ran is raised, and one already on its
-    # way out when the teardown began is left to the exception carrying it.
-    baseline = 0 if current is None else current.cancelling()
-    later = sum(step.floor for step in steps)
-    fatal: BaseException | None = None
-    for step in steps:
-        later -= step.floor
-        bound = max(step.floor, deadline - loop.time() - later)
-        # Called inside the task, so an error raised while building the awaitable is the step's
-        # failure like any other, and cannot skip the steps after it.
-        work = asyncio.ensure_future(_invoke(step.run, bound))
-        if not await _await_step(work, bound if step.bounded else None, step.label):
-            continue
-        try:
-            work.result()
-        except asyncio.CancelledError:
-            _log.error("shutdown: %s ended cancelled; continuing the teardown", step.label)
-        except Exception:
-            _log.exception("shutdown: %s failed; continuing the teardown", step.label)
-        except BaseException as exc:  # re-raised below, once the later steps have run
-            _log.exception("shutdown: %s raised; it is re-raised after the teardown", step.label)
-            fatal = fatal or exc
-    if fatal is not None:
-        raise fatal
-    if current is not None and current.cancelling() > baseline:
-        raise asyncio.CancelledError
-
-
-async def _invoke(run: Callable[[float], Awaitable[object]], bound: float) -> object:
-    """A step's body, as the coroutine :func:`_run_teardown` runs in the step's own task."""
-    return await run(bound)
 
 
 def _sync(fn: Callable[[], object]) -> Callable[[float], Awaitable[None]]:
@@ -1631,11 +1503,13 @@ def _managed_teardown_steps(
     # with the graph still serving: engine.stop() raises it through Engine.on_graph_stopped, and
     # gives that write a bounded chance before the store closes.
     steps.append(_TeardownStep("the security-signal removal", 0.05, _sync(remove_security_signals)))
+    # Handed its bound as its budget, and never cut from here: it holds its own waits to that bound,
+    # all but the store's close, which it must not leave open (_ENGINE_STOP_RESERVE_SECONDS).
     steps.append(
         _TeardownStep(
             "engine.stop()",
             _ENGINE_STOP_RESERVE_SECONDS,
-            lambda _b: engine.stop(),
+            lambda b: engine.stop(budget_seconds=b),
             bounded=False,
         )
     )
@@ -2352,8 +2226,9 @@ async def _reload_and_record(
 #: (:func:`_write_through_cancel`). A store write may have no bound of its own, so a hung write must
 #: not hold the shutdown. A drain's cancel waits for what its grace has left instead
 #: (:func:`_row_cancel_wait`). This is the bound for the rest, at least the convergence reload
-#: engine.stop() cancels and awaits with no bound: nothing hands engine.stop() a remaining time, so
-#: this cap is what keeps that wait well inside _ENGINE_STOP_RESERVE_SECONDS (BACKLOG #3191).
+#: engine.stop() cancels and awaits as one of its runner stops. Under the managed lifespan
+#: engine.stop() cuts that step at its share of its budget (BACKLOG #3191), so this cap keeps the
+#: wait well inside _ENGINE_STOP_RESERVE_SECONDS and the cut a backstop.
 #: tests/test_dual_control_reload.py pins it there.
 _ROW_CANCEL_WAIT_SECONDS: Final = 1.0
 #: The part of a drain's remaining grace a row wait leaves for the reload's task to unwind, so the
@@ -12788,7 +12663,8 @@ def create_managed_app(
             # closes both notifiers, and is re-raised once they have run. Without engine.stop()
             # the store's non-daemon worker keeps the process alive. The three store-reading tasks
             # are cancelled first, before any await, so no step can leave one running when
-            # engine.stop() closes the store. _SHUTDOWN_BUDGET_SECONDS bounds the steps that can be cut.
+            # engine.stop() closes the store. _SHUTDOWN_BUDGET_SECONDS bounds every step, engine.stop()
+            # through the budget it is handed, all but that store close.
             background = [t for t in (reconciler, reaper, credential_reminder) if t is not None]
             for task in background:
                 task.cancel()

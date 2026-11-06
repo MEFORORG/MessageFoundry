@@ -546,9 +546,9 @@ async def test_the_managed_teardown_drains_the_upload_stragglers_before_the_engi
             async def _drain(*_args: Any, **_kwargs: Any) -> None:
                 calls.append("uploads")
 
-            async def _stop() -> None:
+            async def _stop(**kwargs: Any) -> None:
                 calls.append("stop")
-                await real_stop[0]()
+                await real_stop[0](**kwargs)
 
             app.state.upload_store.drain_stragglers = _drain
             engine.stop = _stop
@@ -666,17 +666,17 @@ async def test_the_managed_teardown_hands_the_straggler_drain_a_share_of_its_ste
     """The drain is one step of the teardown, under its one budget (BACKLOG #3191). Its own two
     waits together fit inside the share of the step's bound it is handed, so it cancels what is
     left before the teardown cuts the step, and neither wait exceeds the drain's own default."""
-    from messagefoundry.api import app as app_module
     from messagefoundry.api import create_managed_app
+    from messagefoundry.pipeline import teardown as shutdown_steps
 
     bounds: list[float] = []
-    real_invoke = app_module._invoke
+    real_invoke = shutdown_steps._invoke
 
     async def _invoke(run: Any, bound: float) -> object:
         bounds.append(bound)
         return await real_invoke(run, bound)
 
-    monkeypatch.setattr(app_module, "_invoke", _invoke)
+    monkeypatch.setattr(shutdown_steps, "_invoke", _invoke)
     app = create_managed_app(
         store_settings=StoreSettings(
             path=str(tmp_path / "managed.db"),
@@ -696,7 +696,7 @@ async def test_the_managed_teardown_hands_the_straggler_drain_a_share_of_its_ste
         app.state.upload_store.drain_stragglers = _drain
     [(timeout, grace)] = waits
     bound = bounds[bounds.index(-1.0) - 1]
-    assert timeout + grace <= bound * app_module._INNER_SHARE + 1e-9
+    assert timeout + grace <= bound * shutdown_steps.INNER_SHARE + 1e-9
     assert timeout <= uploads_mod._STRAGGLER_DRAIN_SECONDS
     assert grace <= uploads_mod._STRAGGLER_CANCEL_GRACE_SECONDS
     assert grace > 0.0

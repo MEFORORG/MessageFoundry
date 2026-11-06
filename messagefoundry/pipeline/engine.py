@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -98,6 +99,12 @@ from messagefoundry.pipeline.secret_rotation import (
 )
 from messagefoundry.pipeline.sharding import join_shard_names, owned_destination_set
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
+from messagefoundry.pipeline.teardown import (
+    CUT_GRACE_SECONDS,
+    INNER_SHARE,
+    TeardownStep,
+    run_teardown,
+)
 from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckRunner
 from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
@@ -158,6 +165,19 @@ _CONFIG_WRITE_DRAIN_SECONDS = 5.0
 #: the shutdown budget the API reserves for stop (``_ENGINE_STOP_RESERVE_SECONDS`` in
 #: ``api/app.py``), and spent only while such a write is still running.
 _CONFIG_WRITE_LATE_DRAIN_SECONDS = 1.0
+
+#: How long stop waits for the graph supervisor to exit on its own, an in-flight reconcile included,
+#: before it cancels it. Under a budget the wait is the shorter of this and a share of its step's
+#: bound (BACKLOG #3191).
+_GRAPH_SUPERVISOR_STOP_SECONDS = 10.0
+
+
+def _within(bound: float, default: float) -> float:
+    """A stop step's own graceful wait: the share of the step's bound that ends the wait before the
+    step is cut, or its fixed ``default`` where that is shorter (BACKLOG #3191). With no budget the
+    bound is infinite, so the wait is the default."""
+    return min(default, bound * INNER_SHARE)
+
 
 #: How long a connection flag toggle waits for the lock, then again for the store (BACKLOG #2623). A
 #: write normally takes milliseconds, so this is a stuck or saturated store. Well under the API's
@@ -3774,60 +3794,113 @@ class Engine:
             count += 1
         return count
 
-    async def stop(self) -> None:
-        """Stop the retention task + the wired graph, then close the store."""
+    async def stop(self, *, budget_seconds: float | None = None) -> None:
+        """Stop the retention task + the wired graph, then close the store.
+
+        ``budget_seconds`` is the managed API lifespan's share of NSSM's stop window (BACKLOG #3191).
+        Under it each step of :meth:`_stop_steps` runs through
+        :func:`~messagefoundry.pipeline.teardown.run_teardown`: it gets a share of the budget, never
+        less than its floor, its own graceful waits end inside that share, and a step past it is cut,
+        logged, and the next step runs, so a hung supervisor or graph stop cannot take the steps after
+        it. The store's close is never cut, since a store left open keeps a non-daemon worker thread
+        alive (BACKLOG #2087). The cut graces are taken out of the budget first, so the whole stop
+        ends within the larger of the budget and the floors plus those graces, plus whatever the
+        close takes past its floor. A cut leaves what that step was stopping as a crash would, so a
+        claimed row stays INFLIGHT for ``reset_stale_inflight`` at the next start, and a step that
+        raises no longer skips the store's close.
+
+        Without a budget every step runs to completion, in order, with its fixed waits, and the first
+        failure is raised, as before."""
         log.info("engine stopping")
+        steps = self._stop_steps()
+        if budget_seconds is None:
+            for step in steps:
+                await step.run(math.inf)
+            return
+        graces = sum(step.bounded for step in steps) * CUT_GRACE_SECONDS
+        await run_teardown(steps, budget_seconds - graces)
+
+    def _stop_steps(self) -> list[TeardownStep]:
+        """:meth:`stop`'s steps, in order. Each is listed whether or not its part was built, so the
+        floors are the same on every engine, and the step of a part that is absent returns at once.
+        The floors and the cut graces must fit ``_ENGINE_STOP_RESERVE_SECONDS`` in ``api/app.py``,
+        which tests/test_lifespan_teardown.py checks against this list."""
+        return [
+            TeardownStep("the graph supervisor's exit", 0.25, self._stop_graph_supervisor),
+            TeardownStep("the background runners' stops", 0.25, self._stop_background_runners),
+            TeardownStep("the graph's stop", 0.75, self._stop_registry_runner),
+            TeardownStep("the after-graph stops", 0.25, self._stop_after_graph),
+            TeardownStep("the cluster coordinator's stop", 0.25, self._stop_coordinator),
+            TeardownStep("the late config-write drain", 0.1, self._drain_config_writes_at_stop),
+            TeardownStep("the alert-state drain", 0.25, self._drain_alert_state_at_stop),
+            TeardownStep("the store's close", 0.5, self._close_store_at_stop, bounded=False),
+        ]
+
+    async def _stop_graph_supervisor(self, bound: float) -> None:
         # Quiesce the active-passive graph supervisor FIRST (Workstream A1) so it can't reconcile (and
         # re-start the graph) while we tear down. A no-op single-node (never spawned). Cooperative: set
         # the stop event and let any in-flight reconcile finish under the lock (so we never abandon a
         # half-started graph), falling back to cancel only if a reconcile hangs past the timeout. The
-        # graph itself is then stopped by the registry_runner.stop() below, as before.
-        if self._graph_supervisor is not None:
-            self._graph_stop.set()
-            # Paired with _graph_stop: the loop now waits on _graph_wake, so without this the
-            # supervisor would sit out its poll interval and be CANCELLED by the wait_for below
-            # rather than exiting cooperatively.
-            self._graph_wake.set()
-            supervisor = self._graph_supervisor
-            self._graph_supervisor = None
-            try:
-                await asyncio.wait_for(supervisor, timeout=10.0)
-            except TimeoutError:
-                # wait_for already cancelled the task on timeout; absorb its cancellation.
-                await asyncio.gather(supervisor, return_exceptions=True)
-        if self._retention_runner is not None:
-            await self._retention_runner.stop()
-        if self._backup_runner is not None:
-            await self._backup_runner.stop()
-        if self._cert_expiry_runner is not None:
-            await self._cert_expiry_runner.stop()
-        if self._crl_reload_runner is not None:
-            await self._crl_reload_runner.stop()
-            self._crl_reload_runner = None
-        if self._log_forward_watch is not None:
-            await self._log_forward_watch.stop()
-            self._log_forward_watch = None
-        if self._secret_rotation_runner is not None:
-            await self._secret_rotation_runner.stop()
-        if self._update_check_runner is not None:
-            await self._update_check_runner.stop()
-        # Stop the leader sweep before deregistering membership (it consults the coordinator's gate, so
-        # it must quiesce while the coordinator is still up). A no-op when single-node (never spawned).
-        if self._leader_maintenance is not None:
-            await self._leader_maintenance.stop()
-        # Stop the config-convergence loop before the coordinator (it polls the coordinator's cached
-        # version). A no-op when single-node (never spawned).
-        if self._config_convergence is not None:
-            await self._config_convergence.stop()
-        # Stop the transform-state convergence loop before the coordinator/pool tear down (it polls the
-        # store). A no-op when single-node (never spawned). (Track B Step 6b.)
-        if self._state_convergence is not None:
-            await self._state_convergence.stop()
-            self._state_convergence = None
-        if self._reference_runner is not None:
-            await self._reference_runner.stop()
+        # graph itself is then stopped by the graph's stop step, as before.
+        if self._graph_supervisor is None:
+            return
+        self._graph_stop.set()
+        # Paired with _graph_stop: the loop now waits on _graph_wake, so without this the
+        # supervisor would sit out its poll interval and be CANCELLED by the wait_for below
+        # rather than exiting cooperatively.
+        self._graph_wake.set()
+        supervisor = self._graph_supervisor
+        self._graph_supervisor = None
+        wait = _within(bound, _GRAPH_SUPERVISOR_STOP_SECONDS)
+        try:
+            await asyncio.wait_for(supervisor, timeout=wait)
+        except TimeoutError:
+            log.warning(
+                "engine stop: the graph supervisor did not exit within %.2fs; cancelled it, and the "
+                "graph's stop next tears down whatever its reconcile left",
+                wait,
+            )
+            # wait_for already cancelled the task on timeout; absorb its cancellation.
+            await asyncio.gather(supervisor, return_exceptions=True)
+
+    async def _stop_background_runners(self, _bound: float) -> None:
+        # Concurrent, so one runner slow to stop, as a CRL pass hung on a share is, holds none of the
+        # others (BACKLOG #3191). Each stops its own loop and nothing else, and every one of them
+        # stops before the coordinator, as the leader sweep and both convergence loops need.
+        runners = [
+            runner
+            for runner in (
+                self._retention_runner,
+                self._backup_runner,
+                self._cert_expiry_runner,
+                self._crl_reload_runner,
+                self._log_forward_watch,
+                self._secret_rotation_runner,
+                self._update_check_runner,
+                self._leader_maintenance,
+                self._config_convergence,
+                self._state_convergence,
+                self._reference_runner,
+            )
+            if runner is not None
+        ]
+        self._crl_reload_runner = None
+        self._log_forward_watch = None
+        self._state_convergence = None
+        results = await asyncio.gather(
+            *(runner.stop() for runner in runners), return_exceptions=True
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        for failure in failures[1:]:
+            log.warning("engine stop: another runner's stop also failed: %s", safe_exc(failure))
+        if failures:
+            raise failures[0]
+
+    async def _stop_registry_runner(self, _bound: float) -> None:
         if self._registry_runner is not None:
             await self._registry_runner.stop()
+
+    async def _stop_after_graph(self, _bound: float) -> None:
         # After the graph, so the listeners are already closed when the monitor opens the gate on its
         # way out; stopping it first would let a paused listener read again during shutdown.
         if self._intake_monitor is not None:
@@ -3850,11 +3923,14 @@ class Engine:
         # unused remainder of this process's reserved block and unhooks the refill signal, so anything
         # that encrypts after it runs is charged against no reservation with no checkpointer left to
         # refill one. The registry runner is what drives those encrypts, so settling ahead of it would
-        # silently under-count every write performed during the shutdown drain.
+        # silently under-count every write performed during the shutdown drain. A cut here leaves the
+        # settlement to the store's own close, which settles too.
         if self._gcm_invocation_runner is not None:
             await self._gcm_invocation_runner.stop()
             self._gcm_invocation_runner = None
         self._disarm_cipher_refusal_alert()
+
+    async def _stop_coordinator(self, _bound: float) -> None:
         # Deregister cluster membership after the runner has quiesced but before the store closes (the
         # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
         # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.
@@ -3869,20 +3945,29 @@ class Engine:
             self._warm_pool_task.cancel()
             await asyncio.gather(self._warm_pool_task, return_exceptions=True)
             self._warm_pool_task = None
+
+    async def _drain_config_writes_at_stop(self, bound: float) -> None:
         # A config write whose caller was cancelled is still running, and its row needs the store
         # (BACKLOG #2623). Under the managed API lifespan a drain has already run, bounded by its
         # shutdown budget (BACKLOG #3191), and closed the gate. A write it left running gets only
-        # the short late wait here, inside this step's reserve; with none running it costs nothing.
+        # the short late wait here, inside this step's share; with none running it costs nothing.
         # A caller whose shutdown ran no drain gets the fixed bound.
         await self.drain_config_writes(
-            _CONFIG_WRITE_LATE_DRAIN_SECONDS
-            if self._config_writes_closed
-            else _CONFIG_WRITE_DRAIN_SECONDS
+            _within(
+                bound,
+                _CONFIG_WRITE_LATE_DRAIN_SECONDS
+                if self._config_writes_closed
+                else _CONFIG_WRITE_DRAIN_SECONDS,
+            )
         )
+
+    async def _drain_alert_state_at_stop(self, bound: float) -> None:
         # Clears raised on the way out are background writes: an unpinned cluster node's intake
         # alerts (BACKLOG #2272) and the coordinator's leadership release. Give them a bounded chance
         # to land before the store closes. Last, so it covers every stop step above.
         drain = getattr(self._alert_sink, "drain_state", None)
         if drain is not None:
-            await drain(_ALERT_STATE_DRAIN_SECONDS)
+            await drain(_within(bound, _ALERT_STATE_DRAIN_SECONDS))
+
+    async def _close_store_at_stop(self, _bound: float) -> None:
         await self.store.close()

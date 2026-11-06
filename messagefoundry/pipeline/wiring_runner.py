@@ -1244,7 +1244,8 @@ _PENDING_STOP_SETTLE_SECONDS = 10.0
 #: bound honours the caller's cancel: a hung stop is cut here and then hangs in the unbounded
 #: registry_runner.stop() that Engine.stop() runs later in its sequence, after its other stop
 #: steps, which covers the rest. It saves no shutdown time on that path; it ADDS up to its own
-#: length there.
+#: length there. Under a budget (BACKLOG #3191) Engine.stop() cuts that later stop at its share and
+#: goes on to close the store, so a hung stop then ends the process as a crash would.
 _CANCELLED_STOP_GRACE_SECONDS = 2.0
 
 

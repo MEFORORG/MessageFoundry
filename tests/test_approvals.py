@@ -2376,9 +2376,9 @@ def _spy_on_teardown(
     engine = app.state.engine
     real_stop.append(engine.stop)
 
-    async def _spy_stop() -> None:
+    async def _spy_stop(**kwargs: Any) -> None:
         calls.append("stop")
-        await real_stop[0]()
+        await real_stop[0](**kwargs)
 
     app.state.approval_gate.drain = drain
     engine.stop = _spy_stop

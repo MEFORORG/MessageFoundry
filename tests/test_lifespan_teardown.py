@@ -23,10 +23,12 @@ import pytest
 
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app, create_managed_app
-from messagefoundry.api.app import _run_teardown, _TeardownStep
 from messagefoundry.config.settings import ApprovalsSettings, EgressSettings
 from messagefoundry.pipeline import engine as engine_module
+from messagefoundry.pipeline import teardown as shutdown_steps
 from messagefoundry.pipeline.engine import Engine
+from messagefoundry.pipeline.teardown import TeardownStep as _TeardownStep
+from messagefoundry.pipeline.teardown import run_teardown as _run_teardown
 
 _WAIT_S = 10.0
 _REPO = Path(__file__).resolve().parents[1]
@@ -148,7 +150,7 @@ async def test_a_step_that_overruns_is_cut_and_every_later_step_keeps_its_floor(
     # The hanging step got the budget less the later floor, not the whole budget.
     assert bounds["hangs"] == pytest.approx(0.2, abs=0.05)
     assert bounds["later"] >= 0.1
-    assert elapsed < 0.3 + app_module._CUT_GRACE_SECONDS + 0.25
+    assert elapsed < 0.3 + shutdown_steps.CUT_GRACE_SECONDS + 0.25
 
 
 async def test_a_step_that_ignores_its_cut_is_left_running(
@@ -167,7 +169,7 @@ async def test_a_step_that_ignores_its_cut_is_left_running(
             raise RuntimeError("PROBE: failed after the teardown moved on") from None
 
     started = time.monotonic()
-    with caplog.at_level(logging.ERROR, logger="messagefoundry.api.app"):
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.teardown"):
         await _run_teardown(
             [
                 _TeardownStep("stubborn", 0.05, _stubborn),
@@ -177,7 +179,7 @@ async def test_a_step_that_ignores_its_cut_is_left_running(
         )
         elapsed = time.monotonic() - started
         assert calls == ["after"]
-        assert elapsed < 0.2 + app_module._CUT_GRACE_SECONDS + 0.25
+        assert elapsed < 0.2 + shutdown_steps.CUT_GRACE_SECONDS + 0.25
         release.set()
         for _ in range(50):
             if any("after the teardown moved on" in r.getMessage() for r in caplog.records):
@@ -279,21 +281,38 @@ def _every_managed_step(*, harness: bool) -> list[_TeardownStep]:
 
 
 def test_the_shutdown_budget_fits_the_nssm_stop_window() -> None:
-    """The install script's AppStopMethodConsole is the window. The budget, plus uvicorn's own drain
-    bound where serve sets one (BACKLOG #3256), plus a cut grace for every bounded step a
-    production shutdown can run, since each can be cut (vault BACKLOG #3740 item 15), must leave
-    room in it for the interpreter to exit. The steps are counted from the real list, so a new
-    bounded step is counted without anyone remembering to. The harness-only executor is not."""
+    """The install script's AppStopMethodConsole is the window. Every wait the stop can make is
+    summed at its worst, from the real step lists, so a new step is counted without anyone
+    remembering to; the harness-only executor is not counted.
+
+    uvicorn drains for at most its own bound where serve sets one (BACKLOG #3256). The lifespan's
+    steps take at most the larger of its budget and their floors, plus a cut grace for every bounded
+    step, since each can be cut (vault BACKLOG #3740 item 15). engine.stop() is one of those steps,
+    never cut and handed a bound no shorter than its reserve, so it adds nothing past that bound
+    once the reserve covers its own floors and cut graces (BACKLOG #3191 item 3). The one wait not
+    counted is the store's close past its floor, which is never cut; the 1 s left over is for it and
+    for the interpreter to exit."""
     script = (_REPO / "scripts" / "service" / "install-service.ps1").read_text(encoding="utf-8")
     match = re.search(r"AppStopMethodConsole\s+(\d+)", script)
     assert match is not None, "the install script no longer sets AppStopMethodConsole"
     window = int(match.group(1)) / 1000.0
     import messagefoundry.__main__ as cli
 
-    bounded = sum(step.bounded for step in _every_managed_step(harness=False))
-    graces = bounded * app_module._CUT_GRACE_SECONDS
-    shutdown = app_module._SHUTDOWN_BUDGET_SECONDS + cli._UVICORN_DRAIN_SECONDS + graces
-    assert shutdown + 1.0 <= window + 1e-9, (bounded, shutdown, window)
+    grace = shutdown_steps.CUT_GRACE_SECONDS
+    # Building the list calls nothing, so an engine that never ran __init__ is enough.
+    engine_steps = object.__new__(Engine)._stop_steps()
+    assert [step.label for step in engine_steps if not step.bounded] == ["the store's close"]
+    engine_worst = sum(step.floor for step in engine_steps)
+    engine_worst += sum(step.bounded for step in engine_steps) * grace
+    assert engine_worst <= app_module._ENGINE_STOP_RESERVE_SECONDS, engine_worst
+
+    app_steps = _every_managed_step(harness=False)
+    floors = sum(step.floor for step in app_steps)
+    assert floors <= app_module._SHUTDOWN_BUDGET_SECONDS, floors
+    lifespan = max(app_module._SHUTDOWN_BUDGET_SECONDS, floors)
+    lifespan += sum(step.bounded for step in app_steps) * grace
+    shutdown = cli._UVICORN_DRAIN_SECONDS + lifespan
+    assert shutdown + 1.0 <= window + 1e-9, (shutdown, window)
     assert app_module._ENGINE_STOP_RESERVE_SECONDS < app_module._SHUTDOWN_BUDGET_SECONDS
 
 
@@ -313,18 +332,20 @@ async def test_the_managed_lifespan_runs_its_real_steps_in_the_pinned_order(
 
     ran: list[str] = []
     labels: dict[int, str] = {}
-    real_run, real_invoke = app_module._run_teardown, app_module._invoke
+    real_run, real_invoke = shutdown_steps.run_teardown, shutdown_steps._invoke
 
     async def _run(steps: list[_TeardownStep], budget: float) -> None:
         labels.update((id(step.run), step.label) for step in steps)
         await real_run(steps, budget)
 
     async def _invoke(run: Callable[[float], Awaitable[object]], bound: float) -> object:
-        ran.append(labels[id(run)])
+        # engine.stop()'s own steps run through it too, under labels of their own.
+        if id(run) in labels:
+            ran.append(labels[id(run)])
         return await real_invoke(run, bound)
 
     monkeypatch.setattr(app_module, "_run_teardown", _run)
-    monkeypatch.setattr(app_module, "_invoke", _invoke)
+    monkeypatch.setattr(shutdown_steps, "_invoke", _invoke)
     settings = StoreSettings(path=str(tmp_path / "order.db"), uploads_dir=str(tmp_path / "up"))
     app = create_managed_app(
         store_settings=settings, egress_settings=EgressSettings(deny_by_default=False)
@@ -356,7 +377,7 @@ async def test_the_long_operations_drain_splits_its_share_by_its_named_wait_shar
     [step] = app_module._app_drain_steps(app, None, None, owns_auth=False)
     await step.run(2.5)
     [(wait, grace)] = calls
-    share = 2.5 * app_module._INNER_SHARE
+    share = 2.5 * shutdown_steps.INNER_SHARE
     assert (wait, grace) == pytest.approx((share / 2, share / 2))
 
 
@@ -483,7 +504,7 @@ class _Spies:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
-        self.real_stop: Callable[[], Awaitable[None]] | None = None
+        self.real_stop: Callable[..., Awaitable[None]] | None = None
 
     def attach(self, app: Any) -> None:
         calls = self.calls
@@ -501,9 +522,9 @@ class _Spies:
         async def _flush(store: Any) -> None:
             calls.append("flush")
 
-        async def _stop() -> None:
+        async def _stop(**kwargs: Any) -> None:
             calls.append("stop")
-            await real_stop()
+            await real_stop(**kwargs)
 
         class _Executor:
             def shutdown(self, wait: bool) -> None:
@@ -564,9 +585,9 @@ async def test_an_engine_stop_that_raises_does_not_skip_the_steps_after_it(
             real_stop = spies.real_stop
             assert real_stop is not None
 
-            async def _stop_raises() -> None:
+            async def _stop_raises(**kwargs: Any) -> None:
                 spies.calls.append("stop")
-                await real_stop()
+                await real_stop(**kwargs)
                 raise RuntimeError("PROBE: deliberate engine.stop() failure")
 
             app.state.engine.stop = _stop_raises
@@ -587,7 +608,7 @@ async def test_the_retention_runner_s_stop_waits_less_than_its_step_s_bound(
 
     bounds: list[float] = []
     timeouts: list[float | None] = []
-    real_invoke, real_stop = app_module._invoke, UploadRetentionRunner.stop
+    real_invoke, real_stop = shutdown_steps._invoke, UploadRetentionRunner.stop
 
     async def _invoke(run: Callable[[float], Awaitable[object]], bound: float) -> object:
         bounds.append(bound)
@@ -597,7 +618,7 @@ async def test_the_retention_runner_s_stop_waits_less_than_its_step_s_bound(
         timeouts.append(timeout)
         await real_stop(self, timeout)
 
-    monkeypatch.setattr(app_module, "_invoke", _invoke)
+    monkeypatch.setattr(shutdown_steps, "_invoke", _invoke)
     monkeypatch.setattr(UploadRetentionRunner, "stop", _stop)
     settings = StoreSettings(path=str(tmp_path / "runner.db"), uploads_dir=str(tmp_path / "up"))
     app = create_managed_app(
@@ -608,7 +629,7 @@ async def test_the_retention_runner_s_stop_waits_less_than_its_step_s_bound(
     # The runner's stop is the first step.
     [timeout] = timeouts
     assert timeout is not None
-    assert timeout == pytest.approx(bounds[0] * app_module._INNER_SHARE)
+    assert timeout == pytest.approx(bounds[0] * shutdown_steps.INNER_SHARE)
     assert timeout < bounds[0]
     # The premise: even with fewer steps than serve runs, the share is the shorter of the two waits.
     assert timeout < uploads_module._DEFAULT_STOP_TIMEOUT_SECONDS
@@ -622,7 +643,7 @@ async def test_the_managed_teardown_drains_config_writes_under_its_budget(
     wait as well, which would spend time past the budget."""
     labels: list[str] = []
     bounds: list[float] = []
-    real_run, real_invoke = app_module._run_teardown, app_module._invoke
+    real_run, real_invoke = shutdown_steps.run_teardown, shutdown_steps._invoke
 
     async def _run(steps: list[_TeardownStep], budget: float) -> None:
         labels.extend(step.label for step in steps)
@@ -633,7 +654,7 @@ async def test_the_managed_teardown_drains_config_writes_under_its_budget(
         return await real_invoke(run, bound)
 
     monkeypatch.setattr(app_module, "_run_teardown", _run)
-    monkeypatch.setattr(app_module, "_invoke", _invoke)
+    monkeypatch.setattr(shutdown_steps, "_invoke", _invoke)
     app = _managed(tmp_path / "config-drain.db")
     calls: list[tuple[str, float | None]] = []
     async with app.router.lifespan_context(app):
@@ -644,9 +665,9 @@ async def test_the_managed_teardown_drains_config_writes_under_its_budget(
             calls.append(("drain", timeout))
             await real_drain(timeout)
 
-        async def _stop() -> None:
+        async def _stop(**kwargs: Any) -> None:
             calls.append(("stop", None))
-            await real_stop()
+            await real_stop(**kwargs)
 
         async def _in_flight_write() -> None:
             # Stands in for a write whose caller went: it lands after the teardown began.
@@ -663,7 +684,7 @@ async def test_the_managed_teardown_drains_config_writes_under_its_budget(
     # The drain waited for the write before engine.stop() ran, and engine.stop() read the closed
     # gate and drained again with only the late wait, not its own fixed one.
     assert [name for name, _ in calls] == ["drain", "write landed", "stop", "drain"], calls
-    assert calls[0][1] == pytest.approx(bounds[step] * app_module._INNER_SHARE)
+    assert calls[0][1] == pytest.approx(bounds[step] * shutdown_steps.INNER_SHARE)
     assert calls[3][1] == engine_module._CONFIG_WRITE_LATE_DRAIN_SECONDS
     assert engine_module._CONFIG_WRITE_LATE_DRAIN_SECONDS < app_module._ENGINE_STOP_RESERVE_SECONDS
     assert engine._config_writes_closed
@@ -691,10 +712,10 @@ async def test_the_teardown_is_bounded_when_every_drain_hangs(
                 await asyncio.Event().wait()
                 return []
 
-            async def _timed_stop() -> None:
+            async def _timed_stop(**kwargs: Any) -> None:
                 spies.calls.append("stop")
                 began = time.monotonic()
-                await real_stop()
+                await real_stop(**kwargs)
                 stop_took.append(time.monotonic() - began)
 
             engine: Engine = app.state.engine
@@ -717,8 +738,165 @@ async def test_the_teardown_is_bounded_when_every_drain_hangs(
     finally:
         await spies.stop_if_needed()
     assert spies.calls == ["stop", "executor"]
-    graces = 4 * app_module._CUT_GRACE_SECONDS
+    graces = 4 * shutdown_steps.CUT_GRACE_SECONDS
     assert elapsed < budget + graces + stop_took[0] + 0.5, f"teardown took {elapsed:.2f}s"
+
+
+# --- engine.stop() under a budget (BACKLOG #3191 item 3) -----------------------------------------
+
+
+async def _bare_engine(path: Path) -> Engine:
+    return await Engine.create(
+        path, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
+    )
+
+
+def _record_close(engine: Engine, calls: list[str]) -> None:
+    real_close = engine.store.close
+
+    async def _close() -> None:
+        calls.append("close")
+        await real_close()
+
+    engine.store.close = _close  # type: ignore[method-assign]
+
+
+def _share_of_first_step(engine: Engine, budget: float) -> float:
+    """The first step's bound under ``budget``: what is left once the cut graces and every later
+    step's floor are taken out, as Engine.stop and run_teardown compute it."""
+    steps = engine._stop_steps()
+    graces = sum(step.bounded for step in steps) * shutdown_steps.CUT_GRACE_SECONDS
+    return max(steps[0].floor, budget - graces - sum(step.floor for step in steps[1:]))
+
+
+async def test_the_managed_lifespan_hands_engine_stop_its_bound(tmp_path: Path) -> None:
+    app = _managed(tmp_path / "handed.db")
+    budgets: list[float | None] = []
+    async with app.router.lifespan_context(app):
+        engine: Engine = app.state.engine
+        real_stop = engine.stop
+
+        async def _stop(*, budget_seconds: float | None = None) -> None:
+            budgets.append(budget_seconds)
+            await real_stop(budget_seconds=budget_seconds)
+
+        engine.stop = _stop  # type: ignore[method-assign]
+    [budget] = budgets
+    assert budget is not None
+    assert app_module._ENGINE_STOP_RESERVE_SECONDS <= budget <= app_module._SHUTDOWN_BUDGET_SECONDS
+
+
+async def test_a_hung_graph_supervisor_does_not_push_engine_stop_past_its_share(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A supervisor that never exits on its own is cancelled at its share of the budget, and every
+    later step, the store's close among them, still runs, inside the budget."""
+    engine = await _bare_engine(tmp_path / "hung-supervisor.db")
+    calls: list[str] = []
+    _record_close(engine, calls)
+    cancelled_at: list[float] = []
+
+    async def _hung_supervisor() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled_at.append(time.monotonic())
+            raise
+
+    supervisor = asyncio.ensure_future(_hung_supervisor())
+    engine._graph_supervisor = supervisor
+    budget = app_module._ENGINE_STOP_RESERVE_SECONDS
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.engine"):
+        began = time.monotonic()
+        await asyncio.wait_for(engine.stop(budget_seconds=budget), _WAIT_S)
+        elapsed = time.monotonic() - began
+    assert supervisor.cancelled()
+    assert calls == ["close"]
+    assert elapsed < budget, f"engine.stop() took {elapsed:.2f}s"
+    share = _share_of_first_step(engine, budget)
+    # Its own wait ended it, inside its share, so the teardown never had to cut it.
+    [at] = cancelled_at
+    assert at - began <= share * shutdown_steps.INNER_SHARE + 0.25, (at - began, share)
+    assert any("graph supervisor did not exit" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_supervisor_that_ignores_its_cancel_is_cut_and_the_stop_goes_on(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The cut is the backstop for a supervisor its own wait cannot end: the step is cut and logged,
+    and the stop still closes the store inside the budget."""
+    engine = await _bare_engine(tmp_path / "stubborn-supervisor.db")
+    calls: list[str] = []
+    _record_close(engine, calls)
+    release = asyncio.Event()
+
+    async def _stubborn() -> None:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+
+    supervisor = asyncio.ensure_future(_stubborn())
+    engine._graph_supervisor = supervisor
+    budget = app_module._ENGINE_STOP_RESERVE_SECONDS
+    try:
+        with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.teardown"):
+            began = time.monotonic()
+            await asyncio.wait_for(engine.stop(budget_seconds=budget), _WAIT_S)
+            elapsed = time.monotonic() - began
+    finally:
+        release.set()
+        await asyncio.wait_for(supervisor, _WAIT_S)
+        # The cut step the teardown moved on from ends once its supervisor does.
+        if left := set(shutdown_steps._left_running):
+            await asyncio.wait(left, timeout=_WAIT_S)
+    assert calls == ["close"]
+    assert elapsed < budget, f"engine.stop() took {elapsed:.2f}s"
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("the graph supervisor's exit did not finish within" in m for m in messages), messages
+
+
+async def test_a_hung_graph_stop_is_cut_and_the_later_steps_still_run(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    engine = await _bare_engine(tmp_path / "hung-graph.db")
+    calls: list[str] = []
+    _record_close(engine, calls)
+
+    async def _hung_stop(**_kwargs: Any) -> None:
+        calls.append("graph stop")
+        await asyncio.Event().wait()
+
+    async def _drain(timeout: float) -> None:
+        calls.append("config drain")
+
+    engine._registry_runner = SimpleNamespace(stop=_hung_stop)  # type: ignore[assignment]
+    engine.drain_config_writes = _drain  # type: ignore[method-assign]
+    budget = app_module._ENGINE_STOP_RESERVE_SECONDS
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.pipeline.teardown"):
+        began = time.monotonic()
+        await asyncio.wait_for(engine.stop(budget_seconds=budget), _WAIT_S)
+        elapsed = time.monotonic() - began
+    assert calls == ["graph stop", "config drain", "close"]
+    assert elapsed < budget, f"engine.stop() took {elapsed:.2f}s"
+    assert any("the graph's stop did not finish within" in r.getMessage() for r in caplog.records)
+
+
+async def test_engine_stop_with_no_budget_raises_the_first_failure_as_before(
+    tmp_path: Path,
+) -> None:
+    engine = await _bare_engine(tmp_path / "no-budget.db")
+
+    async def _boom(**_kwargs: Any) -> None:
+        raise RuntimeError("PROBE: deliberate graph stop failure")
+
+    real_runner = engine._registry_runner
+    engine._registry_runner = SimpleNamespace(stop=_boom)  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="PROBE"):
+        await engine.stop()
+    engine._registry_runner = real_runner
+    await engine.stop()
 
 
 # --- the embedded lifespan (create_app(engine=...)) ---------------------------------------------

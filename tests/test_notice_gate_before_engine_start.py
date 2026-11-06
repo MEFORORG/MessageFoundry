@@ -32,9 +32,9 @@ def _record_engine_start(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         calls.append("engine.start")
         raise RuntimeError("PROBE: engine.start reached")
 
-    async def _stop(self: Engine) -> None:
+    async def _stop(self: Engine, *, budget_seconds: float | None = None) -> None:
         calls.append("engine.stop")
-        await real_stop(self)
+        await real_stop(self, budget_seconds=budget_seconds)
 
     monkeypatch.setattr(Engine, "start", _probe)
     monkeypatch.setattr(Engine, "stop", _stop)
