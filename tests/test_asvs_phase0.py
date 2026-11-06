@@ -174,7 +174,7 @@ def test_dead_letter_replay_request_bounds_length() -> None:
         DeadLetterReplayRequest(channel_id="x" * 257)
 
 
-def test_webhook_rejects_non_http_scheme() -> None:
+def test_webhook_rejects_non_https_scheme() -> None:
     # Non-https schemes are refused at construction (urllib would otherwise honour file:/ftp:).
     with pytest.raises(ValueError, match="must be https"):
         WebhookTransport("ftp://host/hook")
@@ -186,6 +186,9 @@ def test_webhook_rejects_plaintext_http_by_default(monkeypatch: pytest.MonkeyPat
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with pytest.raises(ValueError, match="cleartext http"):
         WebhookTransport("http://hooks.example/x")
+    # The scheme is read case-folded, so an upper-case spelling meets the same no-escape text.
+    with pytest.raises(ValueError, match="cleartext http"):
+        WebhookTransport("HTTP://hooks.example/x")
 
 
 def test_webhook_refuses_plaintext_http_even_with_insecure_escape(

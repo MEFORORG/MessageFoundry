@@ -2211,8 +2211,9 @@ def _url_may_carry_a_credential(value: str) -> bool:
 
     Any of these withholds it: an ``@`` anywhere in it; a ``%40``, ``%3A``, ``%26``, ``%3B``,
     ``%3F``, ``%23`` or ``%25`` anywhere in it, any case (:data:`_WITHHELD_URL_ESCAPES`); a value
-    ``urlsplit`` refuses; a credential-looking query name by the warning detector
-    (:func:`~messagefoundry.secretscrub.credential_query_params`); a credential-looking name in any
+    ``urlsplit`` refuses; a credential-looking query name by the credential refusals' reading of
+    the warning detector (:func:`~messagefoundry.secretscrub.credential_query_params` with
+    ``refusal=True``, so ``?code=`` too); a credential-looking name in any
     ``name=value`` segment after a ``?``, ``&``, ``#`` or ``;``
     (:func:`~messagefoundry.secretscrub.has_credential_like_segment`), or a credential word anywhere
     in such a name (:func:`_has_credential_named_segment`); or a path segment that is a credential
@@ -2240,7 +2241,7 @@ def _url_may_carry_a_credential(value: str) -> bool:
         return True
     return (
         has_credential_like_segment(value)
-        or bool(credential_query_params(value))
+        or bool(credential_query_params(value, refusal=True))
         or _has_credential_named_segment(value)
         or _has_credential_path_segment(parts.path)
         # A hash route, ``#/token/SECRET/x``, is a path to the page that reads it.
