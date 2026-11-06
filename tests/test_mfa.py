@@ -2771,7 +2771,8 @@ async def test_a_refused_enable_whose_revoke_hits_a_defect_still_writes_its_refu
 
         async def broken_revoke(token_hash: str, *, now: float | None = None) -> None:
             revokes.append(token_hash)
-            raise faults[len(revokes) - 1]
+            fault = faults[len(revokes) - 1]
+            raise type(fault)(*fault.args)  # a fresh error per attempt, as a store raises
 
         monkeypatch.setattr(store, "enable_totp", reset_then_enable)
         monkeypatch.setattr(store, "revoke_session", broken_revoke)

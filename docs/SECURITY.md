@@ -3608,10 +3608,11 @@ confirm asks the store to end the session it just rotated, and answers as a lost
 `secret_cleared`, `secret_replaced` and `write_lost`. Each is read from the row after the refusal,
 so a `reason` points an operator at the likely cause rather than proving it. The row's
 `session_ended` is false when no revoke of the rotated session landed. A refused revoke is retried
-once (BACKLOG #3025); a cancellation is not, nor at least a `NotImplementedError` or a
-`RecursionError`, which read as defects. So the session can stay
-live, with its token never handed back, until its own timers end it, at least when its revoke is
-refused twice or the first attempt raises. The token is not handed back in any case,
+once (BACKLOG #3025). A cancellation is not retried, and neither is a defect, at least a
+`NotImplementedError` or a `RecursionError`. So the session can stay live, with its token never
+handed back, until its own timers end it, at least when both attempts are refused, or when the
+first attempt is cancelled or raises a defect; while it lives, it counts as a full session under
+`[auth].max_sessions_per_user`. The token is not handed back in any case,
 and the row is written whatever the revoke raised, unless its own write fails, which is logged at
 ERROR (vault BACKLOG #3113). The compare is
 on the stored ciphertext, so at least a store-key rotation that re-encrypts the column inside the
