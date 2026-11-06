@@ -449,15 +449,17 @@ def test_a_rate_limited_sign_in_with_a_key_sends_a_fresh_code_each_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The engine takes each step's code once, and a 429 is an answer, so its step is spent: the
-    next attempt must carry the code of a later step, never the refused one again."""
+    next attempt must carry the code of a later step, never the refused one again. The wait for
+    that step spaces the attempts, so no backoff wait is added to it."""
     calls = _answers(monkeypatch, _LIMITED, (200, {"token": "session-4"}))
-    _record_pauses(monkeypatch)
+    waited = _record_pauses(monkeypatch)
     steps = iter([("111111", 40), ("222222", 41)])
     monkeypatch.setattr(rigadmin, "_code_in_a_fresh_step", lambda key: next(steps))
     admin = RigAdmin("rig-operator", "ab" * 24, totp.generate_secret())
     assert rigadmin.sign_in("https://127.0.0.1:1", admin) == "session-4"
     assert [c["body"]["totp_code"] for c in calls] == ["111111", "222222"]
     assert rigadmin._spent.last == 41
+    assert waited == []
 
 
 def test_the_rate_limit_waits_outlast_the_engines_shipped_sign_in_window() -> None:
@@ -469,6 +471,9 @@ def test_the_rate_limit_waits_outlast_the_engines_shipped_sign_in_window() -> No
         call_default_factory=True
     )
     assert sum(rigadmin._RATE_LIMITED_WAITS_S) > window
+    # With a key, each attempt takes a later step than the one before, so the first and the last
+    # are at least this far apart.
+    assert (len(rigadmin._RATE_LIMITED_WAITS_S) - 1) * totp.DEFAULT_PERIOD > window
 
 
 def test_an_engine_that_does_not_answer_is_unreachable_and_not_a_refusal() -> None:

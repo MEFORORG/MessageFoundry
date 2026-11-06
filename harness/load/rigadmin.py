@@ -333,7 +333,9 @@ _pause = time.sleep
 #: refused attempt does not count against the limit, so each wait lets the window drain. They sum to
 #: past the engine's shipped sign-in window (``[auth].login_rate_limit_window_seconds``; a test pins
 #: the sum past that default), so when only the rig's own burst filled the window, every hit made
-#: before the first refusal has aged out by the last attempt.
+#: before the first refusal has aged out by the last attempt. An account with a key makes no such
+#: wait: each attempt already waits for a later TOTP step than the one before, a step or more apart,
+#: and as many attempts span past the window the same way (a test pins that too).
 _RATE_LIMITED_WAITS_S = (2.0, 4.0, 8.0, 16.0, 32.0)
 
 
@@ -767,13 +769,14 @@ def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None 
     An account with an authenticator key signs in with both factors in one request, the combined
     sign-in of ADR 0197, and first waits for a TOTP step to open (:func:`_code_in_a_fresh_step`).
 
-    An answer of HTTP 429, the sign-in rate limit, is transient: the attempt is made again after
-    each of :data:`_RATE_LIMITED_WAITS_S`, with a fresh code when the account has a key. Under
+    An answer of HTTP 429, the sign-in rate limit, is transient: the attempt is made again, once
+    for each of :data:`_RATE_LIMITED_WAITS_S`, after that wait, or for an account with a key after
+    the wait for a fresh step, which already spaces the attempts. Under
     :func:`session_token` and :func:`renew_session` the wait is made holding the session lock, on
     purpose: the process's other threads wait for the one sign-in rather than add to a full limit.
 
     Raises :class:`RigUnreachable` when the engine does not answer, :class:`RigSignInRateLimited`
-    when it still answers HTTP 429 after the last wait, and :class:`RigSignInRefused` when it
+    when it still answers HTTP 429 on the last attempt, and :class:`RigSignInRefused` when it
     answers anything else but a usable session, or when the key is unusable, which is checked
     before any wait.
     """
@@ -805,13 +808,14 @@ def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None 
         if wait is None:
             # The stale-Administrator advice below would send an operator after the wrong cause.
             raise RigSignInRateLimited(
-                "the engine rate-limited the rig Administrator's sign-in (HTTP 429) on every "
-                f"attempt across {sum(_RATE_LIMITED_WAITS_S):g} seconds of waiting: too many "
-                "sign-in attempts inside its window. A rig of many processes signing in from one "
+                "the engine rate-limited the rig Administrator's sign-in (HTTP 429) on all "
+                f"{len(_RATE_LIMITED_WAITS_S) + 1} attempts, spaced past its shipped window: too "
+                "many sign-in attempts inside its window. A rig of many processes signing in from one "
                 "address needs the engine's MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP, and past the "
                 "all-clients limit MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL, sized to its sign-ins."
             )
-        _pause(wait)
+        if step is None:  # with a key, the next fresh step is the wait
+            _pause(wait)
     if status != 200:
         raise RigSignInRefused(
             f"the engine refused the rig Administrator's sign-in (HTTP {status}). If this store "

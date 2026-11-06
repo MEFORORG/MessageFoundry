@@ -13,6 +13,7 @@ flow here (that + the ~450-500 msg/s number is the AWS rig's job).
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import types
@@ -150,19 +151,60 @@ def test_rig_sign_in_env_names_real_auth_settings() -> None:
     assert auth.login_rate_limit_global == 62
 
 
-@pytest.mark.parametrize("held", ["14", "500", "0", "not-a-number"])
-def test_a_limit_the_operator_sets_and_the_fleet_fits_passes_the_check(held: str) -> None:
-    """Enough for the fleet, 0 for no limit, or a value the engine's loader is left to refuse."""
-    bb.check_operator_sign_in_limits(6, {_PER_IP: held})
+_ENABLED = "MEFOR_AUTH_LOGIN_RATE_LIMIT_ENABLED"
+_WINDOW = "MEFOR_AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS"
 
 
-@pytest.mark.parametrize("name", [_SESSIONS, _PER_IP, _GLOBAL])
-@pytest.mark.parametrize("held", ["13", "1", "-1"])
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {_PER_IP: "6"},  # one sign-in per process fits; a second one is retried
+        {_PER_IP: "500"},
+        {_PER_IP: "0"},  # no limit
+        {_PER_IP: "not-a-number"},  # the engine's loader refuses it
+        {_SESSIONS: "-1"},  # a session cap of 0 or less is no cap
+        {_PER_IP: "3", _ENABLED: "False"},  # the rate limiter is off
+        {_GLOBAL: "3", _WINDOW: "0"},  # a window of 0 or less turns it off
+    ],
+)
+def test_a_limit_the_operator_sets_and_the_fleet_fits_passes_the_check(
+    environ: dict[str, str],
+) -> None:
+    bb.check_operator_sign_in_limits(6, environ)
+
+
+@pytest.mark.parametrize(
+    ("name", "held"),
+    [
+        (_SESSIONS, "5"),
+        (_SESSIONS, "1"),
+        (_PER_IP, "5"),
+        (_PER_IP, "3.0"),  # the engine's loader reads this as 3
+        (_PER_IP, "-1"),  # a negative rate count refuses every sign-in
+        (_GLOBAL, "5"),
+    ],
+)
 def test_a_limit_the_operator_sets_below_the_fleet_is_refused(name: str, held: str) -> None:
     """BACKLOG #2795 pass F finding 1: the operator's value stands over the rig's, so it is the
     value in effect, and one the fleet would meet is named rather than met as HTTP 429."""
-    with pytest.raises(ConnScaleError, match=rf"{name}={int(held)} .* below the 14 sign-ins"):
+    match = rf"{name}={re.escape(held)} .* below the 6 driver processes"
+    with pytest.raises(ConnScaleError, match=match):
         bb.check_operator_sign_in_limits(6, {name: held})
+
+
+def test_a_session_cap_is_checked_while_the_rate_limiter_is_off() -> None:
+    """Switching the rate limiter off leaves the session cap in force."""
+    with pytest.raises(ConnScaleError, match=_SESSIONS):
+        bb.check_operator_sign_in_limits(6, {_SESSIONS: "3", _ENABLED: "false"})
+
+
+@pytest.mark.parametrize("held", ["3", "3.0"])
+def test_the_engines_loader_reads_the_refused_spellings_as_the_value(held: str) -> None:
+    """The control for the refusals above: the engine loads ``3.0`` as 3, so the check must too."""
+    from messagefoundry.config.settings import load_settings
+
+    auth = load_settings(environ={_PER_IP: held}, default_file=False).auth
+    assert auth.login_rate_limit_per_ip == 3
 
 
 @pytest.mark.parametrize(
@@ -513,6 +555,7 @@ async def _run_engine_half_alone(profile: Any, *, claim_mode: str, sink_procs: i
         await asyncio.gather(engine, stub_driver())
 
 
+@pytest.mark.usefixtures("no_auth_env")
 async def test_batch_engine_claim_mode_per_lane(monkeypatch: pytest.MonkeyPatch) -> None:
     """--claim-mode threads to MEFOR_PIPELINE_CLAIM_MODE on every engine subprocess (ADR 0066 §8.2)."""
     eng_rec = _install_engine_fakes(monkeypatch)
@@ -548,23 +591,27 @@ async def test_a_fleet_past_the_all_clients_limit_gets_the_global_variable_end_t
 async def test_an_operator_limit_too_small_for_the_largest_cell_stops_before_any_engine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The refusal comes before the first cell's engine starts, not at the cell that needs more,
-    so the matrix never stops halfway with the driver waiting on a READY that never comes."""
-    monkeypatch.setenv(_PER_IP, "12")  # fits the 3-process cell (8), not the 6-process one (14)
+    """The refusal comes before the first cell's engine starts, not at the cell that needs more.
+    Every cell then fails as an engine that did not start fails: an error READY the driver box
+    skips past, and a report, so the driver never waits on a READY that never comes."""
+    monkeypatch.setenv(_PER_IP, "4")  # fits the 3-process cell, not the 6-process one
     eng_rec = _install_engine_fakes(monkeypatch)
     profile = load_connscale_profile_text(_MINIMAL_BATCH.replace("counts = [8]", "counts = [3, 8]"))
-    with (
-        tempfile.TemporaryDirectory() as tmp,
-        pytest.raises(ConnScaleError, match=f"{_PER_IP}=12 .* below the 14 sign-ins"),
-    ):
-        await bb.run_batch_engine(
-            profile=profile,
-            coord=FileDropCoord(tmp, run_id="batch_ab"),
-            store_env={},
-            sink_procs=6,
-            cell_timeout=10.0,
+    cells = bb.iter_batch_cells(profile, claim_mode="pooled")
+    with tempfile.TemporaryDirectory() as tmp:
+        coord = FileDropCoord(tmp, run_id="batch_ab")
+        stale = coord.for_run(f"batch_ab.{cells[0].cell_id}")
+        stale.post(BATCH_CELL_READY, {"cell_id": cells[0].cell_id, "api_port": 1})  # a past run's
+        report = await bb.run_batch_engine(
+            profile=profile, coord=coord, store_env={}, sink_procs=6, cell_timeout=10.0
         )
+        readies = [coord.for_run(f"batch_ab.{c.cell_id}").read(BATCH_CELL_READY) for c in cells]
+
     assert eng_rec.started == []
+    assert not report.ok
+    assert [c.cell_id for c in report.cells] == [c.cell_id for c in cells]
+    assert all(c.error and f"{_PER_IP}=4" in c.error for c in report.cells)
+    assert all(r is not None and f"{_PER_IP}=4" in r["error"] for r in readies)
 
 
 # --------------------------------------------------------------------------------------------------
