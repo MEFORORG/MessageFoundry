@@ -38,7 +38,9 @@ import pytest
 
 from tests.test_worktree_gate import assert_denied, bash, run_gate
 from tests.test_worktree_gate_emitter import _outside_single_quotes
-from tests.test_worktree_remove_path import REAL_SCRIPTS, settle_worktrees, write_registry
+
+# _ENV drops GIT_* and CLAUDE_CONFIG_DIR, so no child reads the real repository or session registry.
+from tests.test_worktree_remove_path import _ENV, REAL_SCRIPTS, settle_worktrees, write_registry
 
 pytestmark = pytest.mark.skipif(
     shutil.which("pwsh") is None or shutil.which("git") is None,
@@ -51,13 +53,6 @@ _REPO = Path(__file__).resolve().parents[1]
 _COMMAND_LINE = re.compile(r"^\s{4,}(?:pwsh|git)\s")
 
 _FAMILIES = ("sibling", "other", "managed")
-
-# CLAUDE_CONFIG_DIR goes with GIT_*: remove.ps1's occupancy fence would read the real registry it names.
-_ENV = {
-    k: v
-    for k, v in os.environ.items()
-    if not k.upper().startswith("GIT_") and k.upper() != "CLAUDE_CONFIG_DIR"
-}
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:
