@@ -10333,8 +10333,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     the prior key(s) in ``MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`` so existing rows can be decrypted, then
     rotate. After it finishes the retired key can be removed. The store pass re-seals the
     secret-rotation fingerprint cells too, so no engine start needs the retired key to read them
-    (BACKLOG #3472, ADR 0213). Under ``[store].cipher_provider = "vault_transit"`` it refuses before
-    it reads a key, dials Vault or opens the store, since no run there can finish (BACKLOG #2109).
+    (BACKLOG #3472, ADR 0213). Under ``[store].cipher_provider = "vault_transit"`` it refuses right
+    after the settings load, before it resolves or unwraps a key, dials Vault or opens the store,
+    since no run there can finish (BACKLOG #2109).
 
     **Offline is checked on SQLite, once, before the store opens (BACKLOG #1915).** The command refuses
     a store another connection holds, which is how a serving engine holds it; see
@@ -10408,8 +10409,10 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "new version of the key named by MEFOR_STORE_TRANSIT_KEY, new values are sealed under "
             "it, and values under an older version still read. Nothing re-seals those older "
             "values, so rotating is safe and retiring a version that still seals a value or MACs "
-            "an audit row is not; docs/SECURITY.md, under 'Retiring an old version of the audit "
-            "key breaks the chain', says which Vault settings retire one. Nothing was changed.",
+            "an audit row is not: raising the key's min_decryption_version above a version "
+            "retires that version, and no value sealed under it can be decrypted from then on. "
+            "docs/SECURITY.md, under 'Retiring an old version of the audit key breaks the chain', "
+            "says what retiring one does to the audit chain. Nothing was changed.",
             file=sys.stderr,
         )
         return 2

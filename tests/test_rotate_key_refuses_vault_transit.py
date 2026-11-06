@@ -89,6 +89,10 @@ def test_rotate_key_refuses_vault_transit_mode_before_vault_or_the_store(
     assert "does not run under [store].cipher_provider" in captured.err, captured.err
     assert "between two Transit keys" in captured.err, captured.err
     assert "Retiring an old version of the audit key" in captured.err, captured.err
+    # The setting that retires a version, and what raising it does. The pointer to SECURITY.md
+    # must not stand in for it: that section names min_encryption_version and trimming only.
+    assert "raising the key's min_decryption_version" in captured.err, captured.err
+    assert "says which Vault settings retire one" not in captured.err, captured.err
     assert "Nothing was changed." in captured.err, captured.err
     assert "needs an active key" not in captured.err, captured.err
     assert "Traceback" not in captured.err, captured.err
