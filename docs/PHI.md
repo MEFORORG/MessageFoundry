@@ -716,14 +716,19 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    waiting.** The run completes, and if that body later returns under a key you have since retired,
    no key reads it. So keep the prior key for as long as a missing body may come back.
    **An upload that a running engine deletes or prunes while `rotate-key` runs is not brought back
-   (BACKLOG #3181).** `rotate-key` refuses a running engine only on SQLite. So every engine removal
-   and every re-seal write now hold one lock file in the uploads directory, `.mefor-edit.lock`, and
-   the re-seal replaces a file only while it is still the one it read. Such an upload counts as a
-   skip, so the run exits non-zero; re-run it. The lock file holds no data. Leave it in place.
+   (BACKLOG #3181), as long as both can take the lock below.** `rotate-key` refuses a running
+   engine only on SQLite. So the engine's removals of an upload (delete, the retention prune and the
+   cleanup of a failed upload) and each re-seal write hold one lock file in the uploads directory,
+   `.mefor-edit.lock`, and the re-seal replaces a file only while it is still the one it read. Such
+   an upload counts as a skip, so the run exits non-zero; re-run it. The lock file holds no data.
+   Leave it in place. At least two cases are not covered: a file system that cannot lock, where both
+   sides log a warning and go on without it, and an engine that cannot take the lock.
    **Run `rotate-key` as the account the engine runs as.** A lock file that another account created,
-   such as root or an administrator, can refuse every later engine removal of an upload. Each
-   refusal is logged at ERROR, naming the lock file and that likely cause. To fix it, give the file
-   to the engine's service account, or delete it while neither the engine nor `rotate-key` runs.
+   such as root or an administrator, cannot be taken by the engine. The engine still removes uploads
+   without it, so retention and delete keep working, and it logs one ERROR per process naming the
+   lock file and that likely cause. A `rotate-key` that cannot take the lock re-seals nothing and
+   fails. To fix either, give the file to the engine's service account, or delete it while neither
+   the engine nor `rotate-key` runs.
    **At least one kind of refused upload is never sealed, so it is kept inside retention another way
    (BACKLOG #2322).** It is a plaintext sidecar over a body that is missing or is not text. Sealing it would list an
    upload with no usable body, and would seal a planted lone sidecar too, so `rotate-key` leaves it

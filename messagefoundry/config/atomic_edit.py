@@ -27,7 +27,8 @@ first. The lock
 is an OS lock on one hidden file per DIRECTORY, ``.mefor-edit.lock`` beside the edited file, held from
 the read through the replace. One per directory rather than one per file, so a code-set rename or
 remove covers both of its names with one lock and a renamed table leaves no lock file behind. It
-blocks, so it must not run on an event loop; the engine writes no config file and never takes it.
+blocks, so it must not run on an event loop; the engine writes no config file and never takes it
+there. The uploads store takes the same lock in the uploads root (``uploads._pair_lock``).
 
 :func:`read_text` and :func:`encode_text` keep a file's line endings: the editors parse and dump with
 ``\n``, and a file written wholly in ``\r\n`` is written back that way rather than reflowed.

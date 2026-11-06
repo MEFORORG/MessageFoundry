@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import os
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -969,8 +970,10 @@ def _hold_after_the_sidecar_lands(
     landed, finish = threading.Event(), threading.Event()
     real = uploads_mod._atomic_write_text
 
-    def _write_then_hold(root: Path, path: Path, text: str) -> None:
-        real(root, path, text)
+    def _write_then_hold(
+        root: Path, path: Path, text: str, *, seen: os.stat_result | None = None
+    ) -> None:
+        real(root, path, text, seen=seen)
         if path.suffix == ".meta":
             landed.set()
             finish.wait(10)

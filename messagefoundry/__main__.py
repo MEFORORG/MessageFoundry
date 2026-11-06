@@ -10341,8 +10341,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     roll's head check refuses an audit row that lands inside its read, and nothing refuses a data
     write. A store the probe cannot read, or one not in WAL mode, is not checked, and the command
     prints a note. And on PostgreSQL or SQL Server nothing is checked; the command prints a note
-    there too. Whatever the backend, the uploads pass never re-creates an upload a running engine
-    removes while it runs (BACKLOG #3181 item 5, ``uploads._pair_lock``); that upload is a skip.
+    there too. On any backend, the uploads pass and the engine's pair removals share a lock, so the
+    pass does not re-create an upload a running engine removes while it runs; that upload is a skip
+    (BACKLOG #3181 item 5). ``uploads._pair_lock`` names at least the cases it does not cover.
 
     **Invocation bound (ASVS 11.3.4).** A ``cipher_meta`` row is keyed on the one-way SHA-256
     fingerprint of the AES key values are sealed under. Since ADR 0196 that is the store's data
@@ -10691,8 +10692,11 @@ def _rotate_key(args: argparse.Namespace) -> int:
             f"error: {uploads.skipped} uploaded file(s) were NOT fully re-sealed -- part of each "
             "may still be under the prior key. It could not be read, written or decrypted, or it "
             "is a symlink, which rotate-key does not follow. The causes include at least a prior "
-            "key that was not supplied, a damaged file, a value sealed by another cipher, and a "
-            "file larger than [store].max_upload_bytes allows. The log names each file and its "
+            "key that was not supplied, a damaged file, a value sealed by another cipher, a "
+            "file larger than [store].max_upload_bytes allows, an upload a running engine removed "
+            "or replaced during the run, which a re-run settles, and an uploads pair lock this "
+            "account could not take, which running rotate-key as the engine's account settles "
+            "(BACKLOG #3181). The log names each file and its "
             "cause. Fix the cause and re-run rotate-key BEFORE retiring any prior key "
             "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). No key will ever open a damaged file, so restore "
             "that upload, or remove its two files from the uploads directory, before the re-run. "

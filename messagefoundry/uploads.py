@@ -47,7 +47,7 @@ from pathlib import Path
 from stat import S_ISLNK, S_ISREG
 from typing import Any, Literal, NamedTuple, Protocol
 
-from messagefoundry.config.atomic_edit import edit_lock, lock_path_for
+from messagefoundry.config.atomic_edit import LOCK_FILE_NAME, edit_lock, lock_path_for
 from messagefoundry.controlchars import scrub_log_argument, strip_control_chars
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws
@@ -116,9 +116,9 @@ _CANCELLED_REMOVAL_WORKERS = 2
 # How long a pair removal, or a ``rotate-key`` re-seal's replace, waits for the uploads root's
 # cross-process pair lock (:func:`_pair_lock`, BACKLOG #3181 item 5). Each holder keeps it only
 # across its unlinks, or across one re-check and one rename, so a wait this long means a stalled
-# file system. The wait then raises ``TimeoutError``, an ``OSError``, so each caller treats it as a
-# refused unlink or a failed write.
-_PAIR_LOCK_TIMEOUT_SECONDS = 5.0
+# file system. Then an engine removal goes on without the lock, and the re-seal skips the half.
+# Under the 5 s bounds above, so a removal that waits it out still ends inside them.
+_PAIR_LOCK_TIMEOUT_SECONDS = 2.0
 
 
 @functools.cache
@@ -1365,7 +1365,6 @@ class UploadStore:
         blob_path, meta_path = self._paths(file_id)
         try:
             # Under the pair lock, so a rotate-key re-seal cannot put either back (BACKLOG #3181).
-            # A lock that cannot be taken is an OSError, logged below like a refused unlink.
             with _pair_lock(meta_path):
                 blob_path.unlink(missing_ok=True)
                 try:
@@ -2163,6 +2162,15 @@ class UploadStore:
                 exc.strerror or type(exc).__name__,
             )
             return ResealResult(root_missing=True)
+        if pairs:
+            try:
+                # Once, before any file is read: a lock this account cannot take refuses every
+                # write, and finding that out per half would decrypt and re-encrypt each upload
+                # first. Every pair is then a skip, so the run fails and nothing is written.
+                with _pair_lock(self._root / LOCK_FILE_NAME, for_reseal=True):
+                    pass
+            except OSError:
+                return ResealResult(skipped=len(pairs))
         resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = 0
         for fid, _sidecar in pairs:
             try:
@@ -2567,44 +2575,37 @@ class UploadStore:
             _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
             return False
         # Under the pair lock, so a rotate-key re-seal cannot put either half back (BACKLOG
-        # #3181 item 5). One that cannot be taken leaves the pair, like a refused unlink: the
-        # body catches every OSError of its own unlinks, so the outer handler is the lock's.
-        try:
-            with _pair_lock(meta_path):
-                # The BODY goes first, and a pair is reported exactly when THIS pass removed its body,
-                # because the body is the PHI the audit row records the deletion of. Sidecar-first
-                # reported a pair whose body unlink was refused and left the body on disk, and it
-                # opened a window where a body with no sidecar is exactly what a concurrent pass's
-                # orphan sweep takes. Body-first keeps the sidecar in place until the body is gone,
-                # so the orphan sweep never sees a pair mid-prune. A body already gone was removed,
-                # and reported, by an earlier or overlapping pass (the save-time sweep and the runner
-                # can overlap), so only its leftover sidecar is cleared, with no second report.
-                try:
-                    blob_path.unlink()
-                except FileNotFoundError:
-                    with contextlib.suppress(OSError):
-                        meta_path.unlink(missing_ok=True)
-                    return False
-                except OSError as exc:
-                    _log.warning(
-                        "uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc
-                    )
-                    return False
-                # A refused sidecar unlink leaves a sidecar with no body. The next pass finds the
-                # body gone and clears the sidecar without reporting the pair again.
-                try:
+        # #3181 item 5).
+        with _pair_lock(meta_path):
+            # The BODY goes first, and a pair is reported exactly when THIS pass removed its body,
+            # because the body is the PHI the audit row records the deletion of. Sidecar-first
+            # reported a pair whose body unlink was refused and left the body on disk, and it
+            # opened a window where a body with no sidecar is exactly what a concurrent pass's
+            # orphan sweep takes. Body-first keeps the sidecar in place until the body is gone,
+            # so the orphan sweep never sees a pair mid-prune. A body already gone was removed,
+            # and reported, by an earlier or overlapping pass (the save-time sweep and the runner
+            # can overlap), so only its leftover sidecar is cleared, with no second report.
+            try:
+                blob_path.unlink()
+            except FileNotFoundError:
+                with contextlib.suppress(OSError):
                     meta_path.unlink(missing_ok=True)
-                except OSError as exc:
-                    _log.warning(
-                        "uploaded-logs prune removed the body of %s but not its sidecar; the next "
-                        "pass will clear it: %s",
-                        meta.file_id,
-                        exc,
-                    )
-                return True
-        except OSError as exc:
-            _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
-            return False
+                return False
+            except OSError as exc:
+                _log.warning("uploaded-logs prune left %s for the next pass: %s", meta.file_id, exc)
+                return False
+            # A refused sidecar unlink leaves a sidecar with no body. The next pass finds the
+            # body gone and clears the sidecar without reporting the pair again.
+            try:
+                meta_path.unlink(missing_ok=True)
+            except OSError as exc:
+                _log.warning(
+                    "uploaded-logs prune removed the body of %s but not its sidecar; the next "
+                    "pass will clear it: %s",
+                    meta.file_id,
+                    exc,
+                )
+            return True
 
     async def prune_on_save(
         self, audit: Callable[[UploadedFileMeta], Awaitable[None]]
@@ -3221,38 +3222,65 @@ async def _wait_to_completion[T](
     return fut.result()
 
 
+# The lock files whose refusal an engine removal has already logged at ERROR in this process, so a
+# lock that stays refused is one ERROR, not one per pair on every prune pass.
+_unlocked_logged: set[str] = set()
+_unlocked_logged_lock = threading.Lock()
+
+
 @contextlib.contextmanager
-def _pair_lock(path: Path) -> Iterator[None]:
+def _pair_lock(path: Path, *, for_reseal: bool = False) -> Iterator[None]:
     """The cross-process lock over the pairs in ``path``'s directory, the uploads root (BACKLOG
     #3181 item 5). Blocking, so call it off the event loop; re-entrant in one thread.
 
-    Every engine removal of a body or sidecar holds it across its unlinks (:meth:`UploadStore.delete`,
-    the retention prune, a discard), and ``rotate-key``'s re-seal holds it across the check that the
-    file it read is still there and the rename that replaces it (:func:`_replace_if_unchanged`). So a
-    pair an engine removes while ``rotate-key`` runs is never re-created by the re-seal, on any store
-    backend: the re-seal either replaces the file before the removal takes the lock, and the removal
-    then takes the new file away, or finds it gone and writes nothing. ``rotate-key`` is a separate
-    process, so ``_quota_lock`` cannot do this. A file system that cannot lock is logged, and both
-    sides go on unlocked (:func:`~messagefoundry.config.atomic_edit.edit_lock`).
+    The engine's removals of a pair (:meth:`UploadStore.delete`, the retention prune and a discard)
+    hold it across their unlinks, and ``rotate-key``'s re-seal holds it across the check that the
+    file it read is still there and the rename that replaces it (:func:`_replace_if_unchanged`). So
+    while both hold it, a pair an engine removes while ``rotate-key`` runs is not re-created by the
+    re-seal, on any store backend: the re-seal either replaces the file before the removal takes the
+    lock, and the removal then takes the new file away, or finds it gone and writes nothing.
+    ``rotate-key`` is a separate process, so ``_quota_lock`` cannot do this. At least these leave
+    the re-seal's check and rename unguarded: a file system that cannot lock, where both sides go on
+    unlocked with a WARNING (:func:`~messagefoundry.config.atomic_edit.edit_lock`), and an engine
+    removal that could not take the lock, below. The orphan sweep and a save's own cleanup do not
+    take it; neither removes a pair the re-seal walks.
 
-    **A lock file this account may not open refuses every removal, so it is never silent.** The
-    likely cause is a lock file another account created, as when ``rotate-key`` ran as root or as an
-    administrator rather than as the engine's service account. The refusal is logged at ERROR,
-    naming the lock file and that cause, then raised; each caller handles it as a refused unlink."""
+    **A lock the engine cannot take does not stop it removing uploads.** Retention and delete must
+    not depend on a file anyone who can write the uploads directory can plant, so the removal goes
+    on unlocked. It is logged at ERROR once per process per lock file, naming it and the likely
+    cause: a lock file another account created, as when ``rotate-key`` ran as root or as an
+    administrator. A lock whose directory is gone is not logged: there is nothing left to remove.
+    **The re-seal fails closed (``for_reseal``):** a lock it cannot take is logged at ERROR and
+    raised, so that half is a skip and nothing is written."""
     with contextlib.ExitStack() as held:
         try:
             held.enter_context(edit_lock(path, timeout=_PAIR_LOCK_TIMEOUT_SECONDS))
-        except PermissionError as exc:
-            _log.error(
-                "uploaded-logs pair lock %s could not be opened (%s), so no upload can be removed "
-                "or re-sealed until it can. It is likely owned by another account, as when "
-                "rotate-key ran as an account other than the engine's service account, or on "
-                "Windows another program may hold it. Give it to the service account, or delete it "
-                "while neither the engine nor rotate-key runs",
-                scrub_log_argument(str(lock_path_for(path))),
-                exc.strerror or type(exc).__name__,
-            )
-            raise
+        except OSError as exc:
+            lock = scrub_log_argument(str(lock_path_for(path)))
+            if for_reseal:
+                _log.error(
+                    "rotate-key could not take the uploads pair lock %s (%s), so it re-seals no "
+                    "upload. Run rotate-key as the account the engine runs as. If another account "
+                    "owns the lock file, or it is not a regular file, delete it while neither the "
+                    "engine nor rotate-key runs",
+                    lock,
+                    codec_safe_str(exc),
+                )
+                raise
+            if not isinstance(exc, FileNotFoundError):
+                with _unlocked_logged_lock:
+                    first = lock not in _unlocked_logged
+                    _unlocked_logged.add(lock)
+                _log.log(
+                    logging.ERROR if first else logging.DEBUG,
+                    "uploaded-logs pair lock %s could not be taken (%s), so uploads are removed "
+                    "without it, and a rotate-key run meanwhile could re-create a removed upload. "
+                    "If another account owns it, as when rotate-key ran as root or an "
+                    "administrator, give it to the engine's service account; if it is not a "
+                    "regular file, remove it. Logged once",
+                    lock,
+                    codec_safe_str(exc),
+                )
         yield
 
 
@@ -3267,9 +3295,14 @@ class _ChangedUnderReseal(Exception):
 
 def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
     """Whether two ``lstat`` results are one unchanged file. The engine never writes a pair in place,
-    only by temp-and-replace, so a rewrite gives a new file id, and the size and mtime catch a file
-    system that reports none."""
-    return os.path.samestat(a, b) and (a.st_size, a.st_mtime_ns) == (b.st_size, b.st_mtime_ns)
+    only by temp-and-replace, so a rewrite gives a new file id, and the size and times catch most of
+    what a file system that reports none would hide. The change time is a creation time on Windows,
+    so a replacement's is new there; a false "changed" is only a skip."""
+    return os.path.samestat(a, b) and (a.st_size, a.st_mtime_ns, a.st_ctime_ns) == (
+        b.st_size,
+        b.st_mtime_ns,
+        b.st_ctime_ns,
+    )
 
 
 def _replace_if_unchanged(tmp: Path, path: Path, seen: os.stat_result) -> None:
@@ -3277,7 +3310,7 @@ def _replace_if_unchanged(tmp: Path, path: Path, seen: os.stat_result) -> None:
     :func:`_pair_lock`. Raises :class:`_ChangedUnderReseal` and leaves ``path`` alone otherwise. A
     plain replace creates ``path`` when it is gone, which re-created a pair an engine deleted while
     ``rotate-key`` ran (BACKLOG #3181 item 5)."""
-    with _pair_lock(path):
+    with _pair_lock(path, for_reseal=True):
         try:
             now = path.lstat()
         except FileNotFoundError:

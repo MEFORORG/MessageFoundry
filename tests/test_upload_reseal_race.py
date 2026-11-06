@@ -233,22 +233,56 @@ async def test_discard_waits_through_run_to_completion_held_from_the_start(
     assert await store.list_files() == []
 
 
-def test_a_lock_file_this_account_cannot_open_is_named_and_refuses_the_removal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A lock file another account created (rotate-key run as root) refuses every removal. The
-    refusal names the lock file and that likely cause, and the pair is left, not half-removed."""
-    root = tmp_path / "uploads"
-    key = generate_key()
-    fid = _seed(root, key)
-    engine = _store(root, key)
+def _refuse_the_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every pair lock refused, as a 0600 lock file another account created refuses it."""
 
     def _refused(path: Path, **_: Any) -> Any:
         raise PermissionError(13, "Permission denied", str(path))
 
     monkeypatch.setattr(uploads_mod, "edit_lock", _refused)
+    monkeypatch.setattr(uploads_mod, "_unlocked_logged", set())
+
+
+def test_an_engine_that_cannot_take_the_lock_still_removes_and_says_so_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Retention and delete must not depend on a file anyone who can write the root can plant. The
+    removal goes on unlocked, and one ERROR names the lock file and the likely cause."""
+    root = tmp_path / "uploads"
+    key = generate_key()
+    first, second = _seed(root, key), _seed(root, key)
+    engine = _store(root, key)
+    _refuse_the_lock(monkeypatch)
     with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
-        assert engine._discard_cancelled_sync(fid) is False
-    assert LOCK_FILE_NAME in caplog.text, caplog.text
-    assert "owned by another account" in caplog.text, caplog.text
-    assert upload_names(root) == [f"{fid}.blob", f"{fid}.meta"]
+        assert engine._discard_cancelled_sync(first) is True
+        asyncio.run(engine.delete(second))
+    assert upload_names(root) == []
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, caplog.text
+    assert LOCK_FILE_NAME in errors[0].getMessage()
+    assert "another account owns it" in errors[0].getMessage()
+
+
+def test_a_reseal_that_cannot_take_the_lock_writes_nothing_and_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The re-seal fails closed, once, before it reads any upload."""
+    root = tmp_path / "uploads"
+    old, new = generate_key(), generate_key()
+    fids = [_seed(root, old), _seed(root, old)]
+    before = {n: (root / n).read_bytes() for n in upload_names(root)}
+    _refuse_the_lock(monkeypatch)
+    reads: list[str] = []
+    real = uploads_mod._reencrypt_value
+
+    def _reencrypt(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
+        reads.append("read")
+        return real(cipher, stored, aad)
+
+    monkeypatch.setattr(uploads_mod, "_reencrypt_value", _reencrypt)
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.uploads"):
+        result = asyncio.run(_store(root, new, old).reseal_to_active())
+    assert result.skipped == len(fids) and result.incomplete
+    assert reads == []
+    assert {n: (root / n).read_bytes() for n in upload_names(root)} == before
+    assert "Run rotate-key as the account the engine runs as" in caplog.text, caplog.text
