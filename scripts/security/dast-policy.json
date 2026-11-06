@@ -46,6 +46,7 @@
     { "method": "GET", "path": "/health" },
     { "method": "GET", "path": "/ai/policy" }
   ],
+  "public_websocket_allowlist": [],
   "low_privilege_role": "viewer",
   "path_param_placeholder": "dast-probe"
 }

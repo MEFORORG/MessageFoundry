@@ -159,7 +159,13 @@ def load_policy(path: Path) -> dict[str, Any]:
         raise PolicyError(f"the policy at {path} is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict):
         raise PolicyError(f"the policy at {path} must be a JSON object")
-    for key in ("floors", "canary_floors", "unreachable_allowlist", "anonymous_allowlist"):
+    for key in (
+        "floors",
+        "canary_floors",
+        "unreachable_allowlist",
+        "anonymous_allowlist",
+        "public_websocket_allowlist",
+    ):
         if key not in parsed:
             raise PolicyError(f"the policy at {path} is missing the required {key!r} section")
     return parsed
@@ -678,6 +684,24 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
         errors.append(
             f"ungated route(s) not declared public with a reason: {undeclared}. The allow-list "
             "cannot tell such a route from one public by design."
+        )
+    # Engine PR 2390 note 3 (vault BACKLOG #2955): a public socket is the one the engine accepts
+    # with no gate (api/security.py WebSocketAcceptGate), so the set is pinned like the HTTP one.
+    try:
+        expected_public_ws = {_key(e) for e in policy.get("public_websocket_allowlist", [])}
+    except PolicyError as exc:
+        return 2, [str(exc)]
+    actual_public_ws = {
+        (str(r["method"]).upper(), str(r["path"]))
+        for r in receipt.get("websocket_rows", [])
+        if r.get("kind") == route_gates.KIND_PUBLIC
+    }
+    if actual_public_ws != expected_public_ws:
+        errors.append(
+            "the public WebSocket route set no longer matches the documented allow-list. "
+            f"Newly public: {sorted(actual_public_ws - expected_public_ws) or 'none'}; "
+            f"documented but absent: {sorted(expected_public_ws - actual_public_ws) or 'none'}. "
+            "A public socket is accepted with no gate."
         )
     undeclared_ws = websocket_rows_not_declared(receipt)
     if undeclared_ws:

@@ -644,7 +644,8 @@ def test_a_receipt_with_no_websocket_rows_fails_closed() -> None:
         "findings": [],
     }
     assert evaluate({**receipt, "websocket_rows": _passing_ws_rows()}, policy) == (0, [])
-    for rows in ({}, {"websocket_rows": []}):
+    no_rows: tuple[dict[str, Any], ...] = ({}, {"websocket_rows": []})
+    for rows in no_rows:
         code, errors = evaluate({**receipt, **rows}, policy)
         assert code == 2, errors
         assert any("min_websocket_rows" in line for line in errors), errors
@@ -1113,6 +1114,11 @@ def test_a_websocket_row_the_engine_refuses_reds_the_run(row: dict[str, Any], re
         "findings": [],
     }
     assert evaluate(clean, policy) == (0, [])
+    if row.get("kind") == route_gates.KIND_PUBLIC:
+        # Allow-listed, so this case reads the kind check alone; the allow-list has its own test.
+        policy["public_websocket_allowlist"] = [
+            {"method": route_gates.WS_METHOD, "path": "/ws/planted"}
+        ]
     receipt = {**clean, "websocket_rows": [row]}
     code, errors = evaluate(receipt, policy)
     (summary,) = [line for line in receipt_lines(receipt, policy, "") if "WebSocket rows" in line]
@@ -1123,6 +1129,45 @@ def test_a_websocket_row_the_engine_refuses_reds_the_run(row: dict[str, Any], re
     else:
         assert (code, errors) == (0, [])
         assert summary.endswith(" -- 1/1"), summary
+
+
+@pytest.mark.parametrize("listed", [False, True], ids=["not-listed", "listed-and-present"])
+def test_the_public_websocket_set_is_pinned_to_the_allow_list(listed: bool) -> None:
+    """Engine PR 2390 note 3 (vault BACKLOG #2955). A public socket is the one the engine accepts
+    with no gate, so a new one reds the run unless the policy documents it, and a documented one
+    that went away reds it too. Before, a public row with a reason passed on the kind check alone."""
+    policy = _policy()
+    assert policy["public_websocket_allowlist"] == []
+    public = _ws_row(kind=route_gates.KIND_PUBLIC, declaration=_REASON)
+    receipt: dict[str, Any] = {
+        "gated_http_rows": 99,
+        "route_rows_examined": 105,
+        "negative_probes": 198,
+        "reached": 46,
+        "bfla_probes": 19,
+        "websocket_rows": [*_passing_ws_rows(), public],
+        "write_reached": 61,
+        "write_bfla_probes": 43,
+        "unreached_unexplained": 0,
+        "ungated_routes": _declared_public(policy),
+        "findings": [],
+    }
+    if listed:
+        policy["public_websocket_allowlist"] = [{"method": "WS", "path": "/ws/planted"}]
+        assert evaluate(receipt, policy) == (0, [])
+        receipt["websocket_rows"] = _passing_ws_rows()
+    code, errors = evaluate(receipt, policy)
+    assert code == 1, errors
+    expected = "documented but absent: [('WS', '/ws/planted')]" if listed else "Newly public: [("
+    assert any("public WebSocket" in line and expected in line for line in errors), errors
+
+
+def test_a_policy_without_the_public_websocket_allowlist_fails_closed(tmp_path: Path) -> None:
+    policy = _policy()
+    del policy["public_websocket_allowlist"]
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(policy), encoding="utf-8")
+    assert main(["--policy", str(path)]) == 2
 
 
 async def _planted_undeclared(websocket: WebSocket) -> None:
