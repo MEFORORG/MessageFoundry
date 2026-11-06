@@ -401,20 +401,74 @@ def test_an_answer_that_is_not_a_usable_session_is_a_refusal_and_never_carries_t
     assert admin.password not in str(refused.value)
 
 
+#: The engine's answer to a sign-in past its rate limit.
+_LIMITED = (429, {"detail": "too many attempts; please retry later"})
+
+
+def _record_pauses(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Replace the rig's wait with one that only records how long it was asked to wait."""
+    waited: list[float] = []
+    monkeypatch.setattr(rigadmin, "_pause", waited.append)
+    return waited
+
+
 def test_a_rate_limited_sign_in_names_the_limit_not_a_stale_administrator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """HTTP 429 is the sign-in rate limit, so the stale-store advice would send the operator after
-    the wrong cause (BACKLOG #2795)."""
-    _answers(monkeypatch, (429, {"detail": "too many attempts; please retry later"}))
+    the wrong cause (BACKLOG #2795). It is raised only once every wait has passed with a 429."""
+    calls = _answers(monkeypatch, *[_LIMITED] * (len(rigadmin._RATE_LIMITED_WAITS_S) + 1))
+    waited = _record_pauses(monkeypatch)
     admin = RigAdmin("rig-operator", "cd" * 24)
-    with pytest.raises(rigadmin.RigSignInRefused) as refused:
+    with pytest.raises(rigadmin.RigSignInRateLimited) as refused:
         rigadmin.sign_in("https://127.0.0.1:1", admin)
+    assert isinstance(refused.value, rigadmin.RigSignInRefused), "a caller that stops still stops"
+    assert waited == list(rigadmin._RATE_LIMITED_WAITS_S)
+    assert len(calls) == len(rigadmin._RATE_LIMITED_WAITS_S) + 1
     message = str(refused.value)
     assert "HTTP 429" in message
     assert "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP" in message
     assert rigadmin.ADMIN_NAME_ENV not in message, "the stale-Administrator advice is not the cause"
     assert admin.password not in message
+
+
+def test_a_rate_limited_sign_in_is_tried_again_and_takes_the_session_once_admitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429 is transient (BACKLOG #2795 pass F finding 2): a refused attempt does not count, so
+    the rig waits and signs in again rather than ending the run on the first one."""
+    calls = _answers(monkeypatch, _LIMITED, _LIMITED, (200, {"token": "session-3"}))
+    waited = _record_pauses(monkeypatch)
+    admin = RigAdmin("rig-operator", "ab" * 24)
+    assert rigadmin.sign_in("https://127.0.0.1:1", admin) == "session-3"
+    assert waited == list(rigadmin._RATE_LIMITED_WAITS_S[:2])
+    assert len(calls) == 3
+
+
+def test_a_rate_limited_sign_in_with_a_key_sends_a_fresh_code_each_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The engine takes each step's code once, and a 429 is an answer, so its step is spent: the
+    next attempt must carry the code of a later step, never the refused one again."""
+    calls = _answers(monkeypatch, _LIMITED, (200, {"token": "session-4"}))
+    _record_pauses(monkeypatch)
+    steps = iter([("111111", 40), ("222222", 41)])
+    monkeypatch.setattr(rigadmin, "_code_in_a_fresh_step", lambda key: next(steps))
+    admin = RigAdmin("rig-operator", "ab" * 24, totp.generate_secret())
+    assert rigadmin.sign_in("https://127.0.0.1:1", admin) == "session-4"
+    assert [c["body"]["totp_code"] for c in calls] == ["111111", "222222"]
+    assert rigadmin._spent.last == 41
+
+
+def test_the_rate_limit_waits_outlast_the_engines_shipped_sign_in_window() -> None:
+    """When only the rig's own burst filled the window, the last attempt comes after every earlier
+    hit has aged out of it. Pinned to the engine's default, so a longer shipped window fails here."""
+    from messagefoundry.config.settings import AuthSettings
+
+    window = AuthSettings.model_fields["login_rate_limit_window_seconds"].get_default(
+        call_default_factory=True
+    )
+    assert sum(rigadmin._RATE_LIMITED_WAITS_S) > window
 
 
 def test_an_engine_that_does_not_answer_is_unreachable_and_not_a_refusal() -> None:

@@ -71,12 +71,13 @@ _STOP_GRACE = 5.0
 _DEFAULT_SINK_PROCS = 6  # the >= 5-6 sink-PROCESS attribution gate
 
 
-# The engine's shipped ``[auth]`` defaults the rig compares against, copied rather than imported,
-# because tests/test_dependency_boundaries.py bans a direct ``messagefoundry.config`` import here
-# without an allow-list entry. (That rule is static: this module still loads engine config
-# transitively, through runner.py.) tests/test_bench_batch_two_box.py pins each copy to the
-# ``AuthSettings`` field default, so a moved engine default fails CI there. A rig run from a checkout
-# whose engine default moved ahead of these copies would compare against the stale copy.
+# The engine's shipped ``[auth]`` defaults, the floor the rig sets each sign-in limit no lower than,
+# copied rather than imported, because tests/test_dependency_boundaries.py bans a direct
+# ``messagefoundry.config`` import here without an allow-list entry. (That rule is static: this
+# module still loads engine config transitively, through runner.py.)
+# tests/test_bench_batch_two_box.py pins each copy to the ``AuthSettings`` field default, so a moved
+# engine default fails CI there. A rig run from a checkout whose engine default moved ahead of these
+# copies would use the stale copy as its floor.
 SHIPPED_MAX_SESSIONS_PER_USER = 5
 SHIPPED_LOGIN_RATE_LIMIT_PER_IP = 10
 SHIPPED_LOGIN_RATE_LIMIT_GLOBAL = 60
@@ -88,6 +89,12 @@ _RIG_SIGN_IN_LIMITS = (
     ("MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP", SHIPPED_LOGIN_RATE_LIMIT_PER_IP),
     ("MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL", SHIPPED_LOGIN_RATE_LIMIT_GLOBAL),
 )
+
+
+def _fleet_sign_ins(procs: int) -> int:
+    """The sign-ins a fleet of ``procs`` driver processes is sized for: each one, doubled for a
+    process that signs in again, plus two."""
+    return 2 * procs + 2
 
 
 def rig_sign_in_env(procs: int) -> dict[str, str]:
@@ -105,16 +112,48 @@ def rig_sign_in_env(procs: int) -> dict[str, str]:
     * the all-clients sign-in limit (``SHIPPED_LOGIN_RATE_LIMIT_GLOBAL`` per window), met the same
       way by one process past it.
 
-    Each is raised to the fleet, doubled for a process that signs in again, plus two, and only when
-    that size passes the shipped default, so a small fleet never runs below a stock engine whose
-    defaults match the copies above. The
-    per-address value also sets the engine's per-user credential-ceremony limit and its
+    Every one is named, at :func:`_fleet_sign_ins` or its shipped default, whichever is higher, so
+    the caller ALWAYS sets it explicitly unless the environment already does. That is what sizes
+    each limit against the value in effect: the engine ranks the environment above a
+    ``messagefoundry.toml`` in its working directory, so a stricter value there cannot refuse the
+    fleet, and a small fleet never runs below a stock engine whose defaults match the copies above.
+    A TOML value of 0 (no limit) is replaced by that finite size too; to run the rig's engine with
+    no limit, set the variable to 0 in the environment. A value the environment sets is checked by
+    :func:`check_operator_sign_in_limits`.
+
+    The per-address value also sets the engine's per-user credential-ceremony limit and its
     repeated-credential audit limit, and the all-clients value that audit limit's global ceiling, so
-    those are raised with them. Each process signing in for itself keeps the rig's sessions apart;
+    those are sized with them. Each process signing in for itself keeps the rig's sessions apart;
     one session handed to every process would need none of this, and is not what the rig does.
     """
-    size = 2 * procs + 2
-    return {name: str(size) for name, shipped in _RIG_SIGN_IN_LIMITS if size > shipped}
+    size = _fleet_sign_ins(procs)
+    return {name: str(max(size, shipped)) for name, shipped in _RIG_SIGN_IN_LIMITS}
+
+
+def check_operator_sign_in_limits(procs: int, environ: Mapping[str, str]) -> None:
+    """Refuse a sign-in limit ``environ`` sets that a fleet of ``procs`` would meet.
+
+    A value the operator's environment sets stands over :func:`rig_sign_in_env`'s, so it is the
+    value in effect. Below :func:`_fleet_sign_ins` and not 0 (no limit), this raises
+    :class:`ConnScaleError` naming it, rather than let the fleet meet HTTP 429 or lose sessions. A
+    value that is not a whole number is left for the engine's loader to refuse.
+    """
+    size = _fleet_sign_ins(procs)
+    for name, _shipped in _RIG_SIGN_IN_LIMITS:
+        held = environ.get(name)
+        if held is None:
+            continue
+        try:
+            value = int(held)
+        except ValueError:
+            continue
+        if value != 0 and value < size:
+            raise ConnScaleError(
+                f"{name}={value} in the environment is below the {size} sign-ins a fleet of "
+                f"{procs} driver processes needs, so the engine would refuse some with HTTP 429 "
+                f"or end their sessions. Unset it, set it to at least {size}, or set it to 0 "
+                "for no limit"
+            )
 
 
 # --- the matrix cell ---------------------------------------------------------
@@ -605,6 +644,11 @@ async def run_batch_engine(
     base_env = {**os.environ, **dict(store_env or {})}
     inbound = profile.base_port if inbound_base is None else inbound_base
     cells = iter_batch_cells(profile, claim_mode=claim_mode)
+    # Refuse an operator sign-in limit too small for the largest cell's fleet before any engine
+    # starts, so the matrix never stops halfway with the driver waiting on a READY that never comes.
+    # The cell fleet grows with the count, so the largest one covers every smaller one.
+    if cells:
+        check_operator_sign_in_limits(min(sink_procs, max(c.count for c in cells)), base_env)
     report = BatchEngineReport(profile=profile.name, claim_mode=claim_mode)
 
     for step, cell in enumerate(cells):
@@ -630,8 +674,8 @@ async def run_batch_engine(
         )
         # RIGS SIGN IN, AND THIS RIG'S DRIVE IS SPLIT OVER PROCESSES: the session cap and the
         # sign-in rate limits are sized to the fleet this cell advertises (rig_sign_in_env says why).
-        # setdefault, so a value the operator's environment already sets stands. A value set only in
-        # a messagefoundry.toml in cwd does not: the engine ranks env above the file.
+        # setdefault, so a value the operator's environment sets stands; the check before the loop
+        # refused one too small for the largest cell.
         for key, value in rig_sign_in_env(procs).items():
             node_env.setdefault(key, value)
         node = EngineNode(

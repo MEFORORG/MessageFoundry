@@ -111,40 +111,58 @@ _PER_IP = "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP"
 _GLOBAL = "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL"
 
 
+@pytest.fixture
+def no_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No sign-in limit inherited from the calling shell: the engine half lets one stand."""
+    for name in (_SESSIONS, _PER_IP, _GLOBAL):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.mark.parametrize(
     ("procs", "want"),
     [
-        (1, {}),  # 4 is under every shipped limit, so none is touched, never lowered
-        (2, {_SESSIONS: "6"}),
-        (4, {_SESSIONS: "10"}),  # 10 is the shipped per-address limit: not above it
-        (6, {_SESSIONS: "14", _PER_IP: "14"}),
-        (11, {_SESSIONS: "24", _PER_IP: "24"}),
-        (29, {_SESSIONS: "60", _PER_IP: "60"}),
+        # Every limit is named, at 2 * procs + 2 or its shipped default, whichever is higher.
+        (1, {_SESSIONS: "5", _PER_IP: "10", _GLOBAL: "60"}),
+        (2, {_SESSIONS: "6", _PER_IP: "10", _GLOBAL: "60"}),
+        (4, {_SESSIONS: "10", _PER_IP: "10", _GLOBAL: "60"}),
+        (6, {_SESSIONS: "14", _PER_IP: "14", _GLOBAL: "60"}),
+        (11, {_SESSIONS: "24", _PER_IP: "24", _GLOBAL: "60"}),
+        (29, {_SESSIONS: "60", _PER_IP: "60", _GLOBAL: "60"}),
         (30, {_SESSIONS: "62", _PER_IP: "62", _GLOBAL: "62"}),
     ],
 )
-def test_rig_sign_in_env_raises_each_limit_only_past_its_shipped_default(
+def test_rig_sign_in_env_always_names_each_limit_never_below_the_shipped_default(
     procs: int, want: dict[str, str]
 ) -> None:
+    """Every limit is set explicitly, so whatever the engine's working-directory TOML says, the
+    environment decides the value in effect (BACKLOG #2795 pass F finding 1)."""
     assert bb.rig_sign_in_env(procs) == want
 
 
-def test_rig_sign_in_env_names_real_auth_settings_and_their_shipped_defaults() -> None:
-    """The env names are spelled the way the engine's loader reads them, and the defaults the
-    docstring rests on are the shipped ones. A rename or a new default on the engine side fails
-    here rather than on the two-box rig."""
-    from messagefoundry.config.settings import AuthSettings, load_settings
-
-    shipped = AuthSettings()
-    assert shipped.max_sessions_per_user == 5
-    assert shipped.login_rate_limit_per_ip == 10
-    assert shipped.login_rate_limit_global == 60
-    assert shipped.login_rate_limit_window_seconds == 60.0
+def test_rig_sign_in_env_names_real_auth_settings() -> None:
+    """The env names are spelled the way the engine's loader reads them. A rename on the engine
+    side fails here rather than on the two-box rig. The floors are pinned by the test below."""
+    from messagefoundry.config.settings import load_settings
 
     auth = load_settings(environ=bb.rig_sign_in_env(30), default_file=False).auth
     assert auth.max_sessions_per_user == 62
     assert auth.login_rate_limit_per_ip == 62
     assert auth.login_rate_limit_global == 62
+
+
+@pytest.mark.parametrize("held", ["14", "500", "0", "not-a-number"])
+def test_a_limit_the_operator_sets_and_the_fleet_fits_passes_the_check(held: str) -> None:
+    """Enough for the fleet, 0 for no limit, or a value the engine's loader is left to refuse."""
+    bb.check_operator_sign_in_limits(6, {_PER_IP: held})
+
+
+@pytest.mark.parametrize("name", [_SESSIONS, _PER_IP, _GLOBAL])
+@pytest.mark.parametrize("held", ["13", "1", "-1"])
+def test_a_limit_the_operator_sets_below_the_fleet_is_refused(name: str, held: str) -> None:
+    """BACKLOG #2795 pass F finding 1: the operator's value stands over the rig's, so it is the
+    value in effect, and one the fleet would meet is named rather than met as HTTP 429."""
+    with pytest.raises(ConnScaleError, match=rf"{name}={int(held)} .* below the 14 sign-ins"):
+        bb.check_operator_sign_in_limits(6, {name: held})
 
 
 @pytest.mark.parametrize(
@@ -165,13 +183,16 @@ def test_rig_copied_auth_defaults_match_the_engine_settings_model(
     assert constant == AuthSettings.model_fields[field].get_default(call_default_factory=True)
 
 
-def _sign_ins_admitted(environ: Mapping[str, str], attempts: int) -> list[bool]:
+def _sign_ins_admitted(
+    environ: Mapping[str, str], attempts: int, *, config_path: Path | None = None
+) -> list[bool]:
     """``attempts`` sign-ins from one address, through the engine's own sign-in gate, built from
-    settings loaded from ``environ`` the way serve loads them. The gate runs before any store read."""
+    settings loaded from ``environ`` (and ``config_path``, as the engine's working-directory TOML)
+    the way serve loads them. The gate runs before any store read."""
     from messagefoundry.auth.service import AuthService
     from messagefoundry.config.settings import load_settings
 
-    auth = load_settings(environ=environ, default_file=False).auth
+    auth = load_settings(config_path=config_path, environ=environ, default_file=False).auth
     service = AuthService(cast(Any, None), auth)
     return [service.allow_login_attempt("10.0.0.9") for _ in range(attempts)]
 
@@ -180,9 +201,44 @@ def test_an_eleventh_process_meets_the_shipped_limit_and_the_sized_one_admits_th
     """The research answer: every process signs in once from the load-gen box's one address inside
     one window, and a success counts as an attempt, so a stock engine refuses the eleventh."""
     procs = 11
-    assert _sign_ins_admitted({}, procs) == [True] * 10 + [False]
+    stock = bb.SHIPPED_LOGIN_RATE_LIMIT_PER_IP
+    assert _sign_ins_admitted({}, procs) == [True] * stock + [False] * (procs - stock)
     # Sized, each process may sign in and then once more, as a process whose session was refused does.
     assert all(_sign_ins_admitted(bb.rig_sign_in_env(procs), 2 * procs))
+
+
+def test_a_stricter_toml_in_the_engines_directory_cannot_refuse_the_sized_fleet(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #2795 pass F finding 1. A fleet small enough to fit the shipped limits used to get
+    no variable at all, so a stricter ``messagefoundry.toml`` beside the engine was the value in
+    effect and refused it. The rig now always sets each limit, and the environment outranks the
+    file."""
+    toml = tmp_path / "messagefoundry.toml"
+    toml.write_text(
+        "[auth]\nmax_sessions_per_user = 2\nlogin_rate_limit_per_ip = 3\n"
+        "login_rate_limit_global = 4\n",
+        encoding="utf-8",
+    )
+    procs = 4  # 2 * 4 + 2 = 10 fits every shipped limit
+    # The control: with no rig variable the file is in effect, and the fourth sign-in is refused.
+    assert _sign_ins_admitted({}, 2 * procs, config_path=toml)[3] is False
+    assert all(_sign_ins_admitted(bb.rig_sign_in_env(procs), 2 * procs, config_path=toml))
+    from messagefoundry.config.settings import load_settings
+
+    auth = load_settings(config_path=toml, environ=bb.rig_sign_in_env(procs)).auth
+    assert auth.max_sessions_per_user >= 2 * procs + 2
+
+
+def test_the_global_limit_branch_admits_a_fleet_past_the_shipped_all_clients_limit() -> None:
+    """BACKLOG #2795 pass F finding 4: a fleet past the shipped all-clients limit, through the
+    engine's own gate. Without the global variable the per-address one alone still refuses it."""
+    procs = bb.SHIPPED_LOGIN_RATE_LIMIT_GLOBAL // 2  # 2 * procs + 2 passes the global default
+    sized = bb.rig_sign_in_env(procs)
+    assert all(_sign_ins_admitted(sized, 2 * procs + 2))
+    without_global = {name: value for name, value in sized.items() if name != _GLOBAL}
+    admitted = _sign_ins_admitted(without_global, 2 * procs + 2)
+    assert admitted.index(False) == bb.SHIPPED_LOGIN_RATE_LIMIT_GLOBAL
 
 
 def test_build_remote_argv_shape() -> None:
@@ -347,10 +403,8 @@ def _install_driver_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamesp
 # --------------------------------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("no_auth_env")
 async def test_batch_split_handshake_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The engine half setdefaults the sign-in env, so an exported value would stand in for it.
-    for name in (_SESSIONS, _PER_IP, _GLOBAL):
-        monkeypatch.delenv(name, raising=False)
     import asyncio
 
     eng_rec = _install_engine_fakes(monkeypatch)
@@ -434,36 +488,83 @@ async def test_batch_split_handshake_end_to_end(monkeypatch: pytest.MonkeyPatch)
     assert drv_report.exit_code == 0
 
 
-async def test_batch_engine_claim_mode_per_lane(monkeypatch: pytest.MonkeyPatch) -> None:
-    """--claim-mode threads to MEFOR_PIPELINE_CLAIM_MODE on every engine subprocess (ADR 0066 §8.2)."""
+async def _run_engine_half_alone(profile: Any, *, claim_mode: str, sink_procs: int) -> None:
+    """The engine half with a stand-in for the load-gen box, which takes each READY and posts DONE
+    at once."""
     import asyncio
-
-    eng_rec = _install_engine_fakes(monkeypatch)
-    profile = _profile()
 
     with tempfile.TemporaryDirectory() as tmp:
         coord = FileDropCoord(tmp, run_id="batch_ab")
 
         async def stub_driver() -> None:
-            # Stand in for the load-gen box: for each cell, consume READY and post DONE at once.
-            for cell in bb.iter_batch_cells(profile, claim_mode="per_lane"):
+            for cell in bb.iter_batch_cells(profile, claim_mode=claim_mode):
                 cc = coord.for_run(f"batch_ab.{cell.cell_id}")
                 await cc.await_message(BATCH_CELL_READY, timeout=10.0, interval=0.02)
                 cc.post(BATCH_CELL_DONE, {"cell_id": cell.cell_id})
 
-        engine = asyncio.create_task(
-            bb.run_batch_engine(
-                profile=profile,
-                claim_mode="per_lane",
-                coord=coord,
-                store_env={},
-                cell_timeout=10.0,
-            )
+        engine = bb.run_batch_engine(
+            profile=profile,
+            claim_mode=claim_mode,
+            coord=coord,
+            store_env={},
+            sink_procs=sink_procs,
+            cell_timeout=10.0,
         )
         await asyncio.gather(engine, stub_driver())
 
+
+async def test_batch_engine_claim_mode_per_lane(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--claim-mode threads to MEFOR_PIPELINE_CLAIM_MODE on every engine subprocess (ADR 0066 §8.2)."""
+    eng_rec = _install_engine_fakes(monkeypatch)
+    await _run_engine_half_alone(_profile(), claim_mode="per_lane", sink_procs=6)
+
     assert eng_rec.node_envs
     assert all(env["MEFOR_PIPELINE_CLAIM_MODE"] == "per_lane" for env in eng_rec.node_envs)
+
+
+@pytest.mark.usefixtures("no_auth_env")
+async def test_a_fleet_past_the_all_clients_limit_gets_the_global_variable_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #2795 pass F finding 4: the global-limit branch reaches the cell's engine env, for a
+    fleet the shipped all-clients limit would refuse. The engine's own gate admitting that env is
+    the unit test above."""
+    eng_rec = _install_engine_fakes(monkeypatch)
+    procs = bb.SHIPPED_LOGIN_RATE_LIMIT_GLOBAL // 2
+    profile = load_connscale_profile_text(
+        _MINIMAL_BATCH.replace("trials = 3", "trials = 1")
+        .replace("batch_modes = [false, true]", "batch_modes = [false]")
+        .replace("counts = [8]", f"counts = [{procs}]")
+    )
+    await _run_engine_half_alone(profile, claim_mode="pooled", sink_procs=procs)
+
+    assert len(eng_rec.node_envs) == 1
+    env = eng_rec.node_envs[0]
+    assert {name: env[name] for name in (_SESSIONS, _PER_IP, _GLOBAL)} == bb.rig_sign_in_env(procs)
+    assert int(env[_GLOBAL]) > bb.SHIPPED_LOGIN_RATE_LIMIT_GLOBAL
+
+
+@pytest.mark.usefixtures("no_auth_env")
+async def test_an_operator_limit_too_small_for_the_largest_cell_stops_before_any_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal comes before the first cell's engine starts, not at the cell that needs more,
+    so the matrix never stops halfway with the driver waiting on a READY that never comes."""
+    monkeypatch.setenv(_PER_IP, "12")  # fits the 3-process cell (8), not the 6-process one (14)
+    eng_rec = _install_engine_fakes(monkeypatch)
+    profile = load_connscale_profile_text(_MINIMAL_BATCH.replace("counts = [8]", "counts = [3, 8]"))
+    with (
+        tempfile.TemporaryDirectory() as tmp,
+        pytest.raises(ConnScaleError, match=f"{_PER_IP}=12 .* below the 14 sign-ins"),
+    ):
+        await bb.run_batch_engine(
+            profile=profile,
+            coord=FileDropCoord(tmp, run_id="batch_ab"),
+            store_env={},
+            sink_procs=6,
+            cell_timeout=10.0,
+        )
+    assert eng_rec.started == []
 
 
 # --------------------------------------------------------------------------------------------------
