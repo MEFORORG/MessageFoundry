@@ -463,7 +463,7 @@ async def test_ask_directory_names_an_engine_defect_at_error(
     is logged at ERROR as an engine defect, naming the frame and no text, where a library's fault
     stays at WARNING. ``_escape_filter(None)`` raises inside ``auth/ldap.py``; ``json.loads``
     raises inside the standard library."""
-    engine_fault = functools.partial(ldap_module._escape_filter, None)
+    engine_fault = functools.partial(ldap_module._escape_filter, None)  # type: ignore[arg-type]
     library_fault = functools.partial(json.loads, "{synthetic-leak-3017")
     with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
         with pytest.raises(LdapError, match="^directory call failed: unexpected TypeError$"):
