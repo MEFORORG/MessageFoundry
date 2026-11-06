@@ -70,7 +70,7 @@ Two things undo this, and the engine refuses or reports each:
   in Kubernetes) can start the engine without the options. Remote debugging is then on unless
   something turns it off, as at least these do: the start passes `-X disable-remote-debug`; or the start passes
   neither `-I` nor `-E`, as the `messagefoundry` console script does, and the container's
-  environment sets `PYTHON_DISABLE_REMOTE_DEBUG=1`. The interpreter ignores that variable under
+  environment sets `PYTHON_DISABLE_REMOTE_DEBUG`. The interpreter ignores that variable under
   either option, so an override that keeps `-I` and drops only `-X disable-remote-debug` has it
   on. With it on, under `enforce` the start refusal for it stops the engine unless
   `[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). A start that goes on

@@ -521,7 +521,7 @@ What that changes for you:
 - **A `pip install --user` copy of the engine will not start as the service.** Isolated mode
   leaves the user's site directory out. Install into a virtual environment.
 - **`messagefoundry serve` from a prompt has remote debugging on** unless its environment sets
-  `PYTHON_DISABLE_REMOTE_DEBUG=1`, so under `enforce` the start refusal for it stops the engine
+  `PYTHON_DISABLE_REMOTE_DEBUG`, so under `enforce` the start refusal for it stops the engine
   unless `[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). The variable works
   there only because the console script passes neither `-I` nor `-E`: a start by hand that keeps
   `-I` and drops `-X disable-remote-debug` has the interface on whatever the variable says, as

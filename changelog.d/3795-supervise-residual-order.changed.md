@@ -5,8 +5,8 @@
   `enforcement = enforce` because remote debugging is on in the supervisor's own process, or
   refused at any gate before that one under any enforcement setting, no longer logs that line. A
   fleet refused at a later gate has still logged it. One exception: where the engine's hook did
-  not answer, the remote-debugging refusal logs `remote_debug_unguarded` just before its error
-  line, in `serve` too, because the relaunch it names turns the interface off and says nothing of
+  not answer, the remote-debugging refusal logs `remote_debug_unguarded`, in `serve` too, because
+  the relaunch it names turns the interface off and says nothing of
   what stopped the hook. `supervise` logs that line to stdout and the refusal to stderr. Where the
   acceptance lifts the refusal, the residual line follows the remote-debugging `AUDIT:` line, and
   does so again in the off-box forwarder's copy once the start goes on to install that forwarder.
