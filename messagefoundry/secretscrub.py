@@ -423,10 +423,14 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 #
 # SO A LINE HOLDING A FOLD CHARACTER DOES NOT IN GENERAL READ AS ITS ASCII SPELLING: the keyword
 # glued on behind one, above, is checked where the ASCII run is not. What was measured is narrower.
-# A label whose FIRST letter is a fold character takes part in the cascade shapes under OPEN DEFECTS
-# as the ASCII label does, and prints there what the ASCII spelling prints; a fold-headed spelling
-# of each shape is pinned beside the ASCII one. A shape grid and seeded random lines found no other
-# line where such a label printed a value its ASCII spelling hid. That is a sample, not a proof.
+# A label whose FIRST letter is a fold character now stops a value, so it takes part in the cascade
+# shapes under OPEN DEFECTS as the ASCII label does: on those lines it prints, on every surface,
+# values the patterns before this change hid, and the same ones its ASCII spelling prints. A
+# fold-headed spelling of each shape is pinned beside the ASCII one, with more lines a review found.
+# On the support bundle it can also print a value its ASCII spelling hides, where the line holds a
+# label whose underscored prefix a fold character heads, as in ``<U+0130>_password=``, which the
+# bundle copy does not read as a label (the residual stated in ``support/redact.py``). One such
+# line is pinned. These are lines found, not a census.
 #
 # AND ONE DELIBERATE TRADE, which is the one place a single pass prints text the old class hid. After a
 # hard separator, an underscored run in front of a keyword is read as the later label's prefix, so in
@@ -623,10 +627,15 @@ _RUN_ON_LABEL = (
 #   one walk per label, not one per pair.
 #
 # AND WHAT THE LABEL MUST BE: a credential word, with a ``\b`` in front of it, no quote after it,
-# and the "{" right after its ":" or "=", with nothing but spaces and tabs before them. Not a line
-# break, nor any of the record breaks listed above or other white space, because the run-on deletes
-# what is between the keyword and the "{": a line break would join the lines of a multi-line record,
-# and ``PWD<U+2028>={pp ww}`` lost its U+2028. White space after the separator, because the fast
+# and the ":" or "=" right after the keyword, and the "{" right after that, with no white space at
+# either place. Not before the separator, for two reasons. The run-on deletes what is between the
+# keyword and the "{", so ``PWD<U+2028>={pp ww}`` lost its U+2028, and a line break there would join
+# the lines of a multi-line record. And the old class stopped at that white space, so the braced head
+# up to its first white space was still read by this pass and the later ones; the run-on takes that
+# head away, and with a scheme word, a label or an HL7 segment ID in it, a value past the closer
+# printed: ``MEFOR_STORE_DSN=Server=h;PWD ={Bearer vq1}vq2`` printed "vq2", and
+# ``token=a;PWD ={PID|vq1 vq2} rest vq3`` printed "vq3" in the bundle. White space after the
+# separator, because the fast
 # path below ends a run there and never checks the stop, so with it the two paths disagreed and
 # ``token=a;PWD= {b c}`` printed or not by whether a "{" came earlier in the value; that shape now
 # prints as it did before, on both paths. The ``\b``, because a keyword glued on by "_", as in
@@ -638,7 +647,7 @@ _RUN_ON_LABEL = (
 # did before; that is a residual. Whatever the conditions refuse gets the old behaviour.
 _BRACED_HEAD = (
     r"\b(?=(?i:[" + "".join(sorted({word[0] for word in _CREDENTIAL_WORDS})) + r"]))"
-    r"(?i:" + _alternation(_CREDENTIAL_WORDS) + r")\b[ \t]*+[:=]"
+    r"(?i:" + _alternation(_CREDENTIAL_WORDS) + r")\b[:=]"
 )
 #: The braced value up to its first white space, then the rest up to its closer. :data:`_BRACED_LABEL`
 #: adds the closer and its guard, and is what the stop checks for; :data:`_BRACED_RUN_ON` is what the
@@ -949,9 +958,9 @@ _MEFOR_SECRET = re.compile(
 #   ``token=a;PWD={p w}`` print nothing now. A label or braced value that :data:`_BRACED_RUN_ON`'s
 #   conditions refuse still prints all or part of the braced value, as before, and so does a
 #   key-material or token label with one, as in ``token=a;session={p w}``. At least these shapes are
-#   among them: ``PWD= {p w}`` with white space after the separator, a URL-encoded separator as in
-#   ``%3BPWD={p w}``, and braces holding a label or a character outside ASCII after their first
-#   white space. On the installed log chain a ``token=`` line still prints the tail, because the query
+#   among them: ``PWD= {p w}`` and ``PWD ={p w}``, with white space after or before the separator, a
+#   URL-encoded separator as in ``%3BPWD={p w}``, and braces holding a label or a character outside
+#   ASCII after their first white space. On the installed log chain a ``token=`` line still prints the tail, because the query
 #   filter runs first and takes the head of the braced value before this pass sees it.
 # Each of the residuals above, from the unclosed quote on, printed the same text before BACKLOG
 # #1685's remainder; none is new.

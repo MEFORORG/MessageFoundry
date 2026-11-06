@@ -2533,19 +2533,47 @@ def test_white_space_after_the_separator_gives_the_old_result_on_both_paths() ->
         assert apply("token=a{;PWD= {b c}").endswith(" {b c}")
 
 
-#: White space other than a space or a tab, between a braced label's keyword and its separator. The
-#: log and bundle readers split a record at most of these, and the run-on would delete them.
-_BRACED_HEAD_BREAKS = ("\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\u00a0")
+#: White space between a braced label's keyword and its separator. The log and bundle readers split
+#: a record at most of these, and the run-on would delete them.
+_BRACED_HEAD_BREAKS = (*(" ", "\t", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", " ", " ", " "),)
 
 
 def _braced_head_line(brk: str) -> str:
     return f"MEFOR_X=a;PWD{brk}={{pp ww}} rest"
 
 
+#: A braced label with white space before its separator, and a scheme word, a label or an HL7
+#: segment ID in the braces before their first white space, with the value it must not print. The
+#: value in front stops at that white space, so the head of the braces is left to the later passes,
+#: which hid the value past the closer. Review round 4 found each printing it while the head took
+#: spaces and tabs there; the last on the bundle only.
+_BRACED_SPACED_HEAD_LINES: tuple[tuple[str, str], ...] = (
+    ("MEFOR_STORE_DSN=Server=h;PWD ={Bearer vq1}vq2", "vq2"),
+    ("MEFOR_X=a;PWD ={MEFOR_Y: vq1}vq2 rest", "vq2"),
+    ("api_key=a;passwd :{token: vq1}vq2", "vq2"),
+    ("MEFOR_X=a;PWD\t:{x%3Bbearer vq1}vq2", "vq2"),
+    ("token=a;PWD ={PID|vq1 vq2} rest vq3", "vq3"),
+)
+
+
+def _widen_the_braced_head(monkeypatch: pytest.MonkeyPatch, gap: str) -> None:
+    """Both copies' stopped patterns with ``gap`` allowed between the braced label's keyword and its
+    separator, which takes none now."""
+    for module in (scrub_mod, redact_mod):
+        head = module._BRACED_HEAD
+        assert head.endswith(r"\b[:=]"), f"{module.__name__}._BRACED_HEAD takes a gap"
+        wide = head[: -len("[:=]")] + gap + "[:=]"
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            assert head in pattern.pattern, f"{module.__name__}.{name} has no braced head"
+            monkeypatch.setattr(
+                module, name, re.compile(pattern.pattern.replace(head, wide), pattern.flags)
+            )
+
+
 def test_a_break_before_the_braced_separator_is_kept() -> None:
-    """A braced label takes only a space or a tab before its ":" or "=", as its first white space in
-    the braces is one, so the run-on never deletes a record break there. Anything else gives the old
-    result, which keeps the character."""
+    """A braced label takes its ":" or "=" right after the keyword, so the run-on never deletes white
+    space there. Anything else gives the old result, which keeps the character."""
     for brk in _BRACED_HEAD_BREAKS:
         for surface, apply in _SWALLOW_SURFACES:
             out = apply(_braced_head_line(brk))
@@ -2556,24 +2584,42 @@ def test_a_break_before_the_braced_separator_is_deleted_by_a_wider_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """THE POSITIVE CONTROL. With the braced label's head widened back to any white space but a
-    line feed or carriage return, as it was before, the run-on deletes each break on both copies."""
-    for module in (scrub_mod, redact_mod):
-        head = module._BRACED_HEAD
-        assert "[ \\t]*+[:=]" in head, f"{module.__name__}._BRACED_HEAD lost its space-or-tab gap"
-        wide = head.replace("[ \\t]*+[:=]", "[^\\S\\r\\n]*+[:=]")
-        for name in _STOPPED_PATTERNS:
-            pattern: re.Pattern[str] = getattr(module, name)
-            assert head in pattern.pattern, f"{module.__name__}.{name} has no braced head"
-            monkeypatch.setattr(
-                module, name, re.compile(pattern.pattern.replace(head, wide), pattern.flags)
-            )
-    for brk in _BRACED_HEAD_BREAKS:
+    line feed or carriage return, as it was before, the run-on deletes each break but the space,
+    which the tail writes back, on both copies."""
+    _widen_the_braced_head(monkeypatch, r"[^\S\r\n]*+")
+    for brk in _BRACED_HEAD_BREAKS[1:]:
         for surface, apply in (
             ("scrub_credentials", scrub_credentials),
             ("bundle", redact_log_line),
         ):
             out = apply(_braced_head_line(brk))
             assert brk not in out, f"{surface}: {ascii(brk)} was kept -- got {ascii(out)}"
+
+
+@pytest.mark.parametrize(
+    ("line", "value"), _BRACED_SPACED_HEAD_LINES, ids=range(len(_BRACED_SPACED_HEAD_LINES))
+)
+def test_white_space_before_the_braced_separator_leaves_the_head_to_the_passes(
+    line: str, value: str
+) -> None:
+    """The run-on does not take a braced label with white space before its separator, so the head of
+    the braces is still read by the passes that hid the value past the closer."""
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        if "PID|" in line and surface != "redact_log_line":
+            continue  # The HL7 segment is read by the bundle's PHI pass alone, on either code.
+        assert value not in out, f"{surface}: {value} printed -- got {ascii(out)}"
+
+
+def test_the_spaced_head_lines_print_when_the_head_takes_a_space_or_tab(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL. With spaces and tabs allowed before the separator, as the previous form
+    did, each line prints its value on the write-time pass or the bundle."""
+    _widen_the_braced_head(monkeypatch, r"[ \t]*+")
+    for line, value in _BRACED_SPACED_HEAD_LINES:
+        outs = [scrub_credentials(line), redact_log_line(line)]
+        assert any(value in out for out in outs), f"{line!r} printed no value -- got {outs!r}"
 
 
 def test_the_bare_scheme_pass_writes_the_braced_tail_back_masked() -> None:
@@ -3101,7 +3147,42 @@ _OPEN_CASCADE_DEFECTS_FOLD_HEADED: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("private_key=password='vq0 token=''|\u0130ntake_api_key_next='vq2", ("vq2",)),
     ("\u017fecret=\",pw-IN-3 MEFOR_A\"=' mv-4'", ("pw-IN-3",)),
     ("pass='MEFOR_1:\u017fecret'=\"vq4\"'", ("vq4",)),
+    # Review round 4, on fold-character lines.
+    (
+        "password='vq1 MEFOR_X=vq2;\u0131ntake_api_key_next='"
+        "vq3MEFOR_Q=vq4 \u017fecret: vq5';x_\u017fecret='vq6'",
+        ("vq3MEFOR_Q", "vq4"),
+    ),
+    (
+        "private_key=vq1/MEFOR_X=vq2-a.\u017fecret='vq3 vq4'.private_\u212aey=\"vq5\u017f' rest",
+        ("vq5",),
+    ),
 )
+
+#: On the bundle a fold-headed label can print what its ASCII spelling hides: the stop in front of
+#: ``<U+017F>ecret`` changes where ``_KEY_MATERIAL``'s value ends, and it then runs over a label whose
+#: prefix a fold character heads, which the bundle copy does not read. The patterns before this
+#: change hid the values too. Pinned as still printing, as the rows above are.
+_BUNDLE_FOLD_PREFIX_DEFECTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("private_key=vq1/token=vq2.\u017fecret='vq3'\u0130_password='vq4 vq5 ' rest", ("vq4", "vq5")),
+)
+
+
+@pytest.mark.parametrize("case", _BUNDLE_FOLD_PREFIX_DEFECTS, ids=lambda case: ascii(case[0])[:40])
+def test_the_bundle_fold_prefix_defects_still_print(
+    case: tuple[str, tuple[str, ...]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bundle prints each value, the line spelled in ASCII hides it there, and the pre-change
+    patterns hide it."""
+    line, atoms = case
+    out = redact_log_line(line)
+    assert all(atom in out for atom in atoms), f"no longer prints -- got {ascii(out)}"
+    ascii_out = redact_log_line(line.translate(_TO_ASCII).replace("i_password", "I_password"))
+    assert not any(atom in ascii_out for atom in atoms), ascii(ascii_out)
+    _secret_passes_only(monkeypatch)
+    (before,) = _surface_outputs(monkeypatch, _pre_change(), [line])["redact_log_line"]
+    assert not any(atom in before for atom in atoms), f"the pre-change patterns print {before!r}"
+
 
 #: A fold character to the ASCII letter of the keyword it spells.
 _TO_ASCII = str.maketrans({"\u017f": "s", "\u0131": "i", "\u0130": "i", "\u212a": "k"})

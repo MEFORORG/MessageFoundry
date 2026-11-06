@@ -162,7 +162,7 @@ _RUN_ON_LABEL = (
 # ``MEFOR_X=a;PWD={pp ww}`` no longer prints " ww}". Why the closer stays, why those conditions on
 # the braces and the label are what keep it from printing a value, and why the scan stays linear, are
 # stated once, on the same fragments in ``messagefoundry/secretscrub.py``.
-_BRACED_HEAD = r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[ \t]*+[:=]"
+_BRACED_HEAD = r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[:=]"
 _SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
 _SPACED_BRACED_TAIL = (
     r"[ \t](?:[^{}'\"%;,&\r\n\v\f\x1c-\x1eA-Za-z0-9\x80-\U0010ffff]|\}\}"
