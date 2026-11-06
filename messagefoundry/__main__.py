@@ -6707,10 +6707,11 @@ def _host_gated_store_settings(
 ) -> ServiceSettings | int:
     """The host gate's settings for a command that acts on an EXISTING store, or an exit code.
 
-    Shared by ``admin-unlock``, ``admin-set-notify-email``, ``admin-reset-totp`` and
-    ``admin-revoke-sessions`` (BACKLOG #2614) so the gate is stated once (ADR 0171 and its
-    Amendment B, ADR 0183 Amendment A Wave 1c). ``provision-admin`` does not use it: it
-    legitimately creates the store, so it cannot carry the M-31 guard below.
+    Shared by ``admin-unlock``, ``admin-set-notify-email``, ``admin-reset-totp``,
+    ``admin-revoke-sessions`` (BACKLOG #2614) and ``issue-enrolment-code`` (ADR 0207) so the gate
+    is stated once (ADR 0171 and its Amendment B, ADR 0183 Amendment A Wave 1c).
+    ``provision-admin`` does not use it: it legitimately creates the store, so it cannot carry the
+    M-31 guard below.
     ``store attest-transit-bound`` and ``withdraw-transit-bound`` use it too (BACKLOG #2337). Each
     passes ``false_finding``, the result a fresh empty store would wrongly report for it.
 
