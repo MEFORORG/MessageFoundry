@@ -7222,3 +7222,88 @@ async def test_webauthn_rehash_contract(store) -> None:
     from tests._webauthn_store_contract import _assert_webauthn_rehash_contract
 
     await _assert_webauthn_rehash_contract(store)
+
+
+async def test_microsoft_odbc_driver_reads_the_generic_builders_braced_password() -> None:
+    """BACKLOG #2705 limb 1: Microsoft's ODBC Driver 18 reads the ``}}`` escape in the braced
+    password the generic dialect sends, so a password holding ``}``, ``;``, ``=`` and ``{`` logs in
+    as written and adds no keyword.
+
+    MEASURES Linux ``msodbcsql18`` under the unixODBC driver manager, on the CI ``sql server``
+    leg. Windows ``msodbcsql18.dll`` under the Windows driver manager stays UNMEASURED: no Windows
+    SQL Server leg exists.
+
+    The string is the generic builder's own (:func:`_build_odbc_dsn`), whose password goes through
+    :func:`_odbc_password` for the ``msodbc`` family. The SQL Server preset and the store brace with
+    the same :func:`~messagefoundry.odbc_dsn.odbc_brace`. One keyword is appended:
+    ``TrustServerCertificate=yes``, which the generic ``odbc_params`` allowlist does not take and
+    the container's self-signed certificate needs. It follows the password, as ``Encrypt`` does, so
+    the driver reaches both only if its brace parse ended where the engine meant it to. The string
+    goes to the driver through aioodbc and pyodbc, as the connector's pool sends it.
+
+    The controls send the same string with only the password's form changed, unbraced and braced
+    without the escape, and both must be refused. Without them a pass would not show that the
+    escape is what carried the password. No assertion expression or message holds the password,
+    since pytest prints the parts of a failed assert."""
+    import secrets
+
+    import aioodbc
+    import pyodbc
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.odbc_dsn import odbc_brace
+    from messagefoundry.odbc_env import disable_driver_manager_pooling
+    from messagefoundry.transports.database import _build_odbc_dsn
+    from tests._live_scratch import scratch_name, sqlserver_admin
+
+    disable_driver_manager_pooling()  # BACKLOG #2049: a closed probe must end its server session
+    base = load_settings(environ=os.environ).store
+    login = scratch_name("mefor_brace")
+    # Generated per run. No quote character, so the CREATE LOGIN literal below needs no escaping:
+    # the password cannot be bound as a parameter in that statement.
+    password = f"T}}{secrets.token_hex(8)};s=t{{{secrets.token_hex(8)}"
+    escaped = odbc_brace(password)
+    assert "}}" in escaped  # the premise: the escape is in the string under test
+
+    async def logged_in_as(dsn: str) -> str | None:
+        """The login the server names for ``dsn``, or ``None`` when the connect is refused."""
+        try:
+            conn = await aioodbc.connect(dsn=dsn, autocommit=True, timeout=15)
+        except pyodbc.Error:
+            return None
+        try:
+            cur = await conn.cursor()
+            try:  # the cursor closes before its connection (tests/_live_scratch.py says why)
+                await cur.execute("SELECT SUSER_SNAME()")
+                row = await cur.fetchone()
+            finally:
+                await cur.close()
+        finally:
+            await conn.close()
+        return None if row is None else str(row[0])
+
+    dsn = (
+        _build_odbc_dsn(
+            {
+                "odbc_driver": "ODBC Driver 18 for SQL Server",
+                "server": f"{base.server or 'localhost'},{base.port}",
+                "database": "master",
+                "username": login,
+                "password": password,
+                "odbc_params": {"Encrypt": "yes"},
+            }
+        )
+        + "TrustServerCertificate=yes;"
+    )
+    sent_escaped = _odbc_value(dsn, "PWD") == escaped
+    assert sent_escaped, "the generic builder did not send the password braced with the escape"
+    async with sqlserver_admin(base.model_copy(update={"database": "master"})) as admin:
+        try:
+            await admin.run(f"CREATE LOGIN [{login}] WITH PASSWORD='{password}', CHECK_POLICY=OFF")
+            braced = await logged_in_as(dsn)
+            assert braced == login, f"the escaped password did not log in (server named {braced!r})"
+            for form, label in ((password, "unbraced"), ("{" + password + "}", "unescaped")):
+                refused = await logged_in_as(_odbc_with(dsn, "PWD", form)) is None
+                assert refused, f"the {label} password logged in, so the control measures nothing"
+        finally:
+            await admin.teardown(logins=[login])

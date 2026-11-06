@@ -755,8 +755,11 @@ class _DriverFamily(NamedTuple):
 #
 # The escape list is the families with ``brace_escape`` set, whose password is always sent braced
 # with the ODBC ``}}`` escape (:func:`_odbc_password`, BACKLOG #2705): psqlODBC and MySQL, measured
-# on 2026-10-30 to read that escape, and Microsoft's, not probed then but relied on for the same
-# escape by the SQL Server preset and the store.
+# on 2026-10-30 to read that escape, and Microsoft's, which the SQL Server preset and the store also
+# rely on. Microsoft's is measured on Linux only, ``msodbcsql18`` under unixODBC, by
+# tests/test_sqlserver_store.py::test_microsoft_odbc_driver_reads_the_generic_builders_braced_password
+# on the CI ``sql server`` leg. Windows ``msodbcsql18.dll`` is unmeasured: no Windows SQL Server leg
+# exists.
 _DRIVER_FAMILIES: dict[str, _DriverFamily] = {
     "psqlodbc": _DriverFamily(
         "sslmode",
