@@ -289,7 +289,7 @@ def run_checks(
         env=env,
     )
     source_note = (
-        (_ENV_ONLY_SOURCE if env is None else _ENV_FLAG_SOURCE)
+        _env_only_source(env)
         if env_only
         else _serve_reads_other_note(
             toml,
@@ -2050,18 +2050,15 @@ def insecure_bind_note(detail: str, command: str) -> str:
     )
 
 
-#: Appended to a settings leg's line when no file was read (vault BACKLOG #2355), so a verdict about
-#: settings never reads as one about a file nobody wrote.
-_ENV_ONLY_SOURCE = (
-    "settings from environment only: no messagefoundry.toml, and MEFOR_AI_ENVIRONMENT names the "
-    "instance"
-)
-
-#: :data:`_ENV_ONLY_SOURCE` where ``check --env`` named the instance. The flag beats the variable,
-#: as ``serve --env`` does, so this is the line whichever of the two is also set.
-_ENV_FLAG_SOURCE = (
-    "settings from environment only: no messagefoundry.toml, and check --env names the instance"
-)
+def _env_only_source(env: str | None) -> str:
+    """Appended to a settings leg's line when no file was read (vault BACKLOG #2355), so a verdict
+    about settings never reads as one about a file nobody wrote. It names what named the instance:
+    ``check --env`` beats ``MEFOR_AI_ENVIRONMENT``, as ``serve --env`` does, so the flag is named
+    whenever it was given."""
+    trigger = "MEFOR_AI_ENVIRONMENT" if env is None else "check --env"
+    return (
+        f"settings from environment only: no messagefoundry.toml, and {trigger} names the instance"
+    )
 
 
 def _settings_source(
@@ -2122,7 +2119,8 @@ def _load_check_settings(
     from messagefoundry.config.settings import load_settings
 
     if env is not None:
-        cli = {**(cli or {}), "ai": {**(cli or {}).get("ai", {}), "environment": env}}
+        base = dict(cli or {})
+        cli = {**base, "ai": {**base.get("ai", {}), "environment": env}}
     if toml is not None:
         if toml.is_dir():
             # BACKLOG #3063 item 3: say what the path is, where opening it would report only an OS
@@ -2163,7 +2161,7 @@ def _serve_reads_other_note(
 
 def _with_source(result: CheckResult, note: str | None) -> CheckResult:
     """``result`` with ``note`` on its line, so where the settings came from shares a line with the
-    verdict: :data:`_ENV_ONLY_SOURCE`, or :func:`_serve_reads_other_note`'s text.
+    verdict: :func:`_env_only_source`'s text, or :func:`_serve_reads_other_note`'s text.
 
     A SKIP is left alone. Under an environment declaration no settings leg skips for a settings
     reason, so a skip there is about the graph (``config did not load``) or the fixtures, and the

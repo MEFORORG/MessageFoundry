@@ -622,11 +622,26 @@ def _bare_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str = _M
     return cfg
 
 
-def _leg(cfg: Path, name: str) -> CheckResult:
+def _legs(
+    cfg: Path, *, env: str | None = None, service_config: Path | None = None
+) -> dict[str, CheckResult]:
+    """Every leg of one run, by name. ``env`` is ``check --env``."""
     # suppress_service_toml_search confines the look to cfg, so no file anywhere above tmp_path can
     # stand in for the environment. _bare_config runs from an empty working directory.
-    report = run_checks(cfg, run_lint=False, suppress_service_toml_search=True)
-    return next(r for r in report.results if r.name == name)
+    report = run_checks(
+        cfg,
+        run_lint=False,
+        suppress_service_toml_search=True,
+        env=env,
+        service_config=service_config,
+    )
+    return {r.name: r for r in report.results}
+
+
+def _leg(
+    cfg: Path, name: str, *, env: str | None = None, service_config: Path | None = None
+) -> CheckResult:
+    return _legs(cfg, env=env, service_config=service_config)[name]
 
 
 _SETTINGS_LEGS = (
@@ -807,35 +822,20 @@ def test_reference_backend_reads_an_environment_only_backend(
 _ENV_FLAG_NOTE = "and check --env names the instance"
 
 
-def _flag_leg(
-    cfg: Path, name: str, env: str | None, *, service_config: Path | None = None
-) -> CheckResult:
-    """``name`` from a run of ``cfg`` with ``check --env`` set to ``env``, confined as :func:`_leg`."""
-    report = run_checks(
-        cfg,
-        run_lint=False,
-        env=env,
-        service_config=service_config,
-        suppress_service_toml_search=True,
-    )
-    return next(r for r in report.results if r.name == name)
-
-
-@pytest.mark.parametrize("name", _SETTINGS_LEGS)
 def test_every_settings_leg_reads_an_instance_named_by_check_env(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = _bare_config(tmp_path, monkeypatch)
-    result = _flag_leg(cfg, name, "dev")
-    assert _ENV_ONLY_NOTE in result.detail and _ENV_FLAG_NOTE in result.detail, result.detail
-    assert "graph only" not in result.detail  # static-credentials read the settings half too
-    if name != "static-credentials":  # that leg reads the graph either way, so never skipped
-        assert not result.skipped, f"{name}: {result.detail}"
-    # Control: the same run with no --env is the bare-dir answer.
-    control = _flag_leg(cfg, name, None)
-    assert _ENV_ONLY_NOTE not in control.detail, f"{name}: {control.detail}"
-    if name != "static-credentials":
-        assert control.skipped, f"{name}: {control.detail}"
+    named, control = _legs(cfg, env="dev"), _legs(cfg)
+    for name in _SETTINGS_LEGS:
+        result = named[name]
+        assert _ENV_ONLY_NOTE in result.detail and _ENV_FLAG_NOTE in result.detail, result.detail
+        assert "graph only" not in result.detail  # static-credentials read the settings half too
+        # Control: the same run with no --env is the bare-dir answer.
+        assert _ENV_ONLY_NOTE not in control[name].detail, f"{name}: {control[name].detail}"
+        if name != "static-credentials":  # that leg reads the graph either way, so never skipped
+            assert not result.skipped, f"{name}: {result.detail}"
+            assert control[name].skipped, f"{name}: {control[name].detail}"
 
 
 def test_check_env_beats_mefor_ai_environment_and_the_file(
@@ -845,16 +845,16 @@ def test_check_env_beats_mefor_ai_environment_and_the_file(
     # A custom name with no production tier is the refusal that shows which name was read.
     cfg = _bare_config(tmp_path, monkeypatch)
     monkeypatch.setenv("MEFOR_AI_ENVIRONMENT", "dev")
-    fail = _flag_leg(cfg, "posture", "poc")
+    fail = _leg(cfg, "posture", env="poc")
     assert fail.required and not fail.ok and not fail.skipped
     assert "production_instance" in fail.detail and _ENV_FLAG_NOTE in fail.detail
-    assert _flag_leg(cfg, "posture", None).ok  # control: the variable's own name passes
+    assert _leg(cfg, "posture", env=None).ok  # control: the variable's own name passes
 
     toml = tmp_path / "svc.toml"
     toml.write_text('[ai]\nenvironment = "dev"\n', encoding="utf-8")
-    fail = _flag_leg(cfg, "posture", "poc", service_config=toml)
+    fail = _leg(cfg, "posture", env="poc", service_config=toml)
     assert not fail.ok and "production_instance" in fail.detail, fail.detail
-    ok = _flag_leg(cfg, "posture", None, service_config=toml)
+    ok = _leg(cfg, "posture", env=None, service_config=toml)
     assert ok.ok and "environment 'dev'" in ok.detail, ok.detail
 
 
@@ -863,10 +863,10 @@ def test_build_check_refuses_an_exposed_listener_named_by_check_env(
 ) -> None:
     cfg = _bare_config(tmp_path, monkeypatch)
     monkeypatch.setenv("MEFOR_INBOUND_BIND_HOST", "0.0.0.0")
-    result = _flag_leg(cfg, "build-check", "dev")
+    result = _leg(cfg, "build-check", env="dev")
     assert result.required and not result.ok and not result.skipped
     assert "IB_ENV" in result.detail and "without TLS" in result.detail
-    assert _flag_leg(cfg, "build-check", None).skipped  # control
+    assert _leg(cfg, "build-check", env=None).skipped  # control
 
 
 def test_hop_ack_refuses_a_terminator_named_by_check_env(
@@ -875,10 +875,10 @@ def test_hop_ack_refuses_a_terminator_named_by_check_env(
     cfg = _bare_config(tmp_path, monkeypatch)
     monkeypatch.setenv("MEFOR_API_TLS_TERMINATED_UPSTREAM", "true")
     monkeypatch.setenv("MEFOR_API_TRUSTED_PROXIES", "10.0.0.1")
-    result = _flag_leg(cfg, "upstream-hop-ack", "dev")
+    result = _leg(cfg, "upstream-hop-ack", env="dev")
     assert result.required and not result.ok and not result.skipped
     assert "plaintext_upstream_hop_acknowledged" in result.detail
-    assert _flag_leg(cfg, "upstream-hop-ack", None).skipped  # control
+    assert _leg(cfg, "upstream-hop-ack", env=None).skipped  # control
 
 
 def test_reference_backend_reads_a_backend_named_by_check_env(
@@ -907,10 +907,10 @@ def test_reference_backend_reads_a_backend_named_by_check_env(
         ("USERNAME", "mefor_svc"),
     ):
         monkeypatch.setenv(f"MEFOR_STORE_{key}", value)
-    result = _flag_leg(cfg, "reference-backend", "dev")
+    result = _leg(cfg, "reference-backend", env="dev")
     assert result.required and not result.ok and not result.skipped
     assert "provider_npi" in result.detail and "sqlserver" in result.detail
-    assert _flag_leg(cfg, "reference-backend", None).skipped  # control
+    assert _leg(cfg, "reference-backend", env=None).skipped  # control
 
 
 _PLACEHOLDER = "so the name above is a placeholder"
@@ -924,10 +924,10 @@ def test_retention_names_the_environment_check_env_gives(
     cfg = _bare_config(tmp_path, monkeypatch)
     toml = tmp_path / "svc.toml"
     toml.write_text("security.delete_message_bodies_after_days = 0\n", encoding="utf-8")
-    named = _flag_leg(cfg, "retention", "prod", service_config=toml)
+    named = _leg(cfg, "retention", env="prod", service_config=toml)
     assert not named.ok and not named.skipped
     assert "('prod')" in named.detail and _PLACEHOLDER not in named.detail, named.detail
-    control = _flag_leg(cfg, "retention", None, service_config=toml)
+    control = _leg(cfg, "retention", env=None, service_config=toml)
     assert not control.ok and _PLACEHOLDER in control.detail, control.detail
 
 
@@ -942,11 +942,11 @@ def test_retention_overrides_names_the_environment_check_env_gives(
     override_graph(cfg, inbound_days=0, outbound_days=None)
     toml = tmp_path / "svc.toml"
     toml.write_text("", encoding="utf-8")
-    named = _flag_leg(cfg, "retention-overrides", "prod", service_config=toml)
+    named = _leg(cfg, "retention-overrides", env="prod", service_config=toml)
     assert not named.ok and not named.skipped
     assert "IB_FEED" in named.detail and "'prod'" in named.detail, named.detail
     assert _PLACEHOLDER not in named.detail
-    control = _flag_leg(cfg, "retention-overrides", None, service_config=toml)
+    control = _leg(cfg, "retention-overrides", env=None, service_config=toml)
     assert not control.ok and _PLACEHOLDER in control.detail, control.detail
 
 
