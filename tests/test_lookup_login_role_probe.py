@@ -19,6 +19,7 @@ Synthetic data only; no driver, no database. The live twin is
 
 from __future__ import annotations
 
+import ast
 import logging
 from pathlib import Path
 from typing import Any
@@ -234,7 +235,7 @@ async def test_a_clean_login_logs_info(caplog: pytest.LogCaptureFixture) -> None
     [record] = caplog.records
     assert record.levelno == logging.INFO
     assert "no database-wide write role" in record.getMessage()
-    assert "object-level grants are not read" in record.getMessage()
+    assert "permission grants at any scope" in record.getMessage()
 
 
 async def test_a_null_read_warns_that_it_cannot_judge(caplog: pytest.LogCaptureFixture) -> None:
@@ -333,6 +334,24 @@ async def test_a_probe_that_cannot_run_does_not_block_the_lookup(
     await executor.aclose()
 
 
+async def test_an_aclose_during_the_probe_still_hands_back_the_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Red before the fix: ``_get_pool`` re-read ``self._pools`` after the probe, and an
+    ``aclose()`` that ran during the probe had deleted the entry, so it raised ``KeyError``."""
+    pool = _Pool(_row())
+    _serve(monkeypatch, pool)
+    executor = DatabaseLookupExecutor(_LOOKUP, egress=_EGRESS)
+
+    async def probe_then_close(p: Any, *, label: str, acquire_timeout: float) -> LoginRoleReading:
+        await executor.aclose()  # a reload retiring this executor mid-probe
+        return LoginRoleReading(LoginRoleVerdict.CLEAN)
+
+    monkeypatch.setattr(database, "probe_login_roles", probe_then_close)
+    assert await executor._get_pool("clarity") is pool
+    assert pool.closed is True  # aclose still closed it
+
+
 # --- the DatabaseRef sync --------------------------------------------------------------------------
 
 _REF = {
@@ -429,3 +448,41 @@ async def test_the_runner_probes_each_set_once_across_passes(
         assert pool.probes == 1
     finally:
         await store.close()
+
+
+async def test_a_reference_probe_that_did_not_run_is_tried_on_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Red before the fix: a NOT_RUN reading was remembered, so the login stayed unjudged."""
+    pool = _Pool(_row(("db_owner",)))
+    pool.probe_error = Exception("08S01", "link reset")
+    _serve(monkeypatch, pool)
+    probed: set[tuple[str, ...]] = set()
+    assert await _load_database_source(dict(_REF), _EGRESS, name="codes", probed=probed) == {
+        "A": "1"
+    }
+    assert probed == set()
+    pool.probe_error = None
+    await _load_database_source(dict(_REF), _EGRESS, name="codes", probed=probed)
+    assert pool.probes == 2 and len(probed) == 1
+    await _load_database_source(dict(_REF), _EGRESS, name="codes", probed=probed)
+    assert pool.probes == 2  # a probe that ran is remembered
+
+
+def test_the_role_sets_module_stays_a_leaf() -> None:
+    """``transports/`` reaches the role sets through this module, and may not import ``store/``,
+    so the module must import no engine package at all."""
+    source = Path(__file__).resolve().parent.parent / "messagefoundry" / "sqlserver_roles.py"
+    imported = [
+        name
+        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8")))
+        for name in (
+            [a.name for a in node.names]
+            if isinstance(node, ast.Import)
+            else [node.module or ""]
+            if isinstance(node, ast.ImportFrom)
+            else []
+        )
+    ]
+    assert imported, "found no import at all: the walk has drifted"  # __future__ at least
+    assert not [n for n in imported if n.startswith("messagefoundry")], imported

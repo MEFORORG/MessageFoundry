@@ -2536,16 +2536,22 @@ writes. Each `DatabaseLookup` and `DatabaseRef` login is probed once, when its p
 
 - **A lookup** is probed on its first `db_lookup` call, since `serve` does not dial lookups at
   start. A pool that fails to open is not probed; the next lookup opens it and probes it then.
-- **A reference set** is probed on its first sync, and again only when its DSN changes, as when a
-  reload points it at another login.
+- **A reference set** is probed on its first sync, and again when its `server`, `port`,
+  `database`, `auth` or `username` changes, as when a reload points it at another login. A probe
+  that did not run is tried again on the next sync.
 
-The probe reads every SQL Server fixed server role with `IS_SRVROLEMEMBER` and every fixed database
-role with `IS_ROLEMEMBER`, by name, the same closed role sets the store's own login check reads.
-**"Clean" means no database-wide write role**: no fixed server role, and no fixed database role but
-`db_datareader`, `db_denydatareader` and `db_denydatawriter`. `db_datawriter` beside
-`db_denydatawriter` is clean too, since the deny takes back its table writes. The probe does not read
-object-level grants or user-defined roles, so a login granted `INSERT` on one table directly still
-reads clean.
+The probe reads the eight classic fixed server roles (`sysadmin`, `securityadmin`, `serveradmin`,
+`setupadmin`, `processadmin`, `diskadmin`, `dbcreator`, `bulkadmin`) with `IS_SRVROLEMEMBER` and the
+nine fixed database roles with `IS_ROLEMEMBER`, by name, the same closed role sets the store's own
+login check reads. **"Clean" means no database-wide write role**: none of those server roles, and no
+fixed database role but `db_datareader`, `db_denydatareader` and `db_denydatawriter`. `db_datawriter`
+beside `db_denydatawriter` is clean too, since the deny takes back its table writes.
+
+It reads role membership only, so at least these still read clean: a permission granted directly at
+any scope, such as `INSERT` on one table, database-scope `CONTROL` or `CONTROL SERVER`; a
+user-defined role; the `##MS_...##` fixed server roles SQL Server 2022 added; and a role held in
+another database on the same server, which a statement can still reach by a three-part name, since
+`IS_ROLEMEMBER` answers for the database the connection names.
 
 | What the probe reads | What the engine does |
 |---|---|

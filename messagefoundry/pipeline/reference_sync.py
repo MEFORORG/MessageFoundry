@@ -275,8 +275,10 @@ async def _load_database_source(
     role and never refuses or raises. ``probed`` remembers which set and login have been probed, so
     the runner probes each once rather than every pass; a set pointed at another login, server or
     database, as on a reload, is probed again. ``None`` probes on every call. A pool that fails to
-    open is not probed, and is not remembered, so the next pass probes it."""
+    open is not probed, and a probe that did not run is not remembered, so the next pass probes
+    either again."""
     from messagefoundry.transports.database import (
+        LoginRoleVerdict,
         _close_and_release,
         _close_pool_bounded,
         _login_timeout,
@@ -325,12 +327,13 @@ async def _load_database_source(
         # What names the login, never the password, so the remembered key holds no credential.
         probe_key = (str(name),) + tuple(str(settings.get(k, "")) for k in _LOGIN_KEYS)
         if probed is None or probe_key not in probed:
-            await probe_login_roles(
+            reading = await probe_login_roles(
                 pool,
                 label=connection or "DATABASE reference source",
                 acquire_timeout=acquire_timeout,
             )
-            if probed is not None:
+            # A probe that did not run judged nothing, so the next pass tries again.
+            if probed is not None and reading.verdict is not LoginRoleVerdict.NOT_RUN:
                 probed.add(probe_key)
         conn = await acquire_pooled(pool, timeout=acquire_timeout, backend="reference:database")
         cur: Any = None

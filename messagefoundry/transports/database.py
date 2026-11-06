@@ -4314,9 +4314,11 @@ def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
     clean. A role read as held is still reported when another read NULL, because a partial read can
     only understate an over-grant, never invent one.
 
-    "Clean" means **no database-wide write role**: no fixed server role, and no fixed database role
-    but ``db_datareader`` and the two ``db_deny*`` roles. It is not a read of object-level grants: a
-    login granted ``INSERT`` on one table directly, or holding a user-defined role, reads clean.
+    "Clean" means **no database-wide write role**: none of the classic fixed server roles, and no
+    fixed database role but ``db_datareader`` and the two ``db_deny*`` roles. It reads role
+    membership only: a permission granted directly at any scope (``INSERT`` on one table,
+    ``CONTROL SERVER``), a user-defined role, a ``##MS_...##`` server role or a role in another
+    database reads clean (``docs/CONNECTIONS.md`` lists them).
     ``db_datawriter`` held with ``db_denydatawriter`` is not a finding, since the deny takes back the
     table writes that role grants."""
     if len(row) != len(_LOGIN_ROLE_PROBE_ROLES):
@@ -4357,8 +4359,9 @@ def _log_login_role_reading(reading: LoginRoleReading, label: str) -> None:
     """One log line per probe. Only a clean read is INFO; every other answer WARNS, and none refuses."""
     if reading.verdict is LoginRoleVerdict.CLEAN:
         logger.info(
-            "%r: login role probe: no fixed server role and no database-wide write role "
-            "(object-level grants are not read)",
+            "%r: login role probe: none of the classic fixed server roles and no database-wide "
+            "write role in this database (role membership only: permission grants at any scope, "
+            "user-defined roles and other databases are not read)",
             label,
         )
     elif reading.verdict is LoginRoleVerdict.OVER_GRANTED:
@@ -4511,24 +4514,26 @@ class DatabaseLookupExecutor:
         if pool is not None:
             return pool
         async with self._locks[connection]:
-            if connection not in self._pools:
-                pool = await _make_pool(
-                    self._dsn[connection],
-                    self._pool_max[connection],
-                    autocommit=True,
-                    login_timeout=self._login_timeout[connection],
-                )
-                # Kept before the probe runs, so aclose() closes it whatever the probe does.
-                self._pools[connection] = pool
-                # BACKLOG #2617: once, when the pool first opens, since start does not dial
-                # lookups. It warns and never raises; a pool that failed to open is not probed,
-                # and the next lookup opens and probes it again.
-                self._role_readings[connection] = await probe_login_roles(
-                    pool,
-                    label=f"db_lookup:{connection}",
-                    acquire_timeout=self._acquire_timeout[connection],
-                )
-        return self._pools[connection]
+            if connection in self._pools:
+                return self._pools[connection]
+            pool = await _make_pool(
+                self._dsn[connection],
+                self._pool_max[connection],
+                autocommit=True,
+                login_timeout=self._login_timeout[connection],
+            )
+            # Kept before the probe runs, so aclose() closes it whatever the probe does.
+            self._pools[connection] = pool
+            # BACKLOG #2617: once, when the pool first opens, since start does not dial
+            # lookups. It warns and never raises; a pool that failed to open is not probed,
+            # and the next lookup opens and probes it again.
+            self._role_readings[connection] = await probe_login_roles(
+                pool,
+                label=f"db_lookup:{connection}",
+                acquire_timeout=self._acquire_timeout[connection],
+            )
+        # The local, not a re-read: an aclose() that ran during the probe has removed the entry.
+        return pool
 
     @property
     def role_readings(self) -> Mapping[str, LoginRoleReading]:

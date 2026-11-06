@@ -15,6 +15,9 @@ Both read each role with ``IS_SRVROLEMEMBER`` or ``IS_ROLEMEMBER``, by name rath
 enumeration: catalog visibility is permission-filtered, so an enumeration that comes back empty is
 indistinguishable from "a member of nothing". Both built-ins answer for the CURRENT login and need no
 catalog permission, and both answer NULL, not 0, for a name that does not resolve for the caller.
+
+The server set is the eight classic roles. The ``##MS_...##`` fixed server roles SQL Server 2022
+added are not in it, so neither probe reads them.
 """
 
 from __future__ import annotations

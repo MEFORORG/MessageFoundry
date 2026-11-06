@@ -15,10 +15,9 @@ server or nowhere, and a probe that read nothing would look the same as a clean 
 
 Two pool shapes are probed: the ``db_lookup`` executor's own pool, and the ``DatabaseRef`` sync's
 pool, built the way ``pipeline/reference_sync.py`` ``_load_database_source`` builds it (a read-intent
-``_build_dsn`` and an autocommit ``_make_pool``). That module is not imported here, because the
-``serverdb`` path gate in ``.github/workflows/ci.yml`` does not admit it, and
-``tests/test_serverdb_ci_coverage.py`` refuses a server-DB suite that imports a source the gate does
-not admit.
+``_build_dsn`` and an autocommit ``_make_pool``). The reference arm builds that pool by hand rather
+than calling ``_load_database_source``, which probes, runs its statement and closes the pool
+itself, so it would hand back no reading to assert on.
 
 **Gated**: skipped unless ``MEFOR_TEST_SQLSERVER`` is set (plus ``MEFOR_STORE_*``). Synthetic names
 only; every scratch login is unique per call and dropped afterwards.
