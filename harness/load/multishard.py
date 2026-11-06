@@ -87,8 +87,9 @@ _SEED = "messagefoundry-multishard"
 # not message-type spread).
 _MIX = TypeMix({"ADT^A01": 1.0})
 
-#: A check a caller runs against the live fleet: every engine is up, signed in and reporting its own
-#: inbound lanes, and no traffic has been offered yet. It is handed the nodes in engine order.
+#: A check a caller runs against the live fleet: every engine is up and reporting its own inbound
+#: lanes, the rig Administrator is provisioned in the shared store, and no traffic has been offered
+#: yet. It is handed the nodes in engine order.
 FleetProbe = Callable[[Sequence[EngineNode]], Awaitable[None]]
 
 

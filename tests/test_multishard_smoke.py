@@ -13,6 +13,10 @@ names (``MEFOR_CONNSCALE_NAME_PREFIX=E0``/``E1``). It drives a small, brief load
   report a peer's rows. This disjoint-lane isolation is the load-bearing correctness the gate needs, and it
   is config-derived so it holds regardless of the write lock.
 
+A third test is SECURITY evidence, not a load smoke: docs/SECURITY.md cites
+``test_a_scoped_operator_asking_the_wrong_engine_shard_gets_the_403_and_a_denial_row`` for the case of
+a channel-scoped operator asking one engine about an in-scope inbound another holds (BACKLOG #3031).
+
 End-to-end ZERO-LOSS is NOT asserted here. SQLite is single-writer: two ``serve`` processes writing one
 file serialize on the write lock, and a delivery-worker commit can hit ``SQLITE_LOCKED`` (which the
 store's busy_timeout does not retry), stranding a row past the drain window. That is a pathological
@@ -31,7 +35,6 @@ import json
 import os
 import secrets
 import socket
-import ssl
 import tempfile
 import time
 from collections.abc import Sequence
@@ -44,6 +47,7 @@ from harness.load import rigadmin
 from harness.load.enginepoll import rig_client
 from harness.load.failover import EngineNode
 from harness.load.multishard import FleetProbe, MultiShardReport, run_multishard
+from harness.load.tlsmat import harness_ssl_context
 from messagefoundry.api.message_scope import CONNECTION_DENIED_DETAIL
 from messagefoundry.apiclient import EngineClient
 
@@ -212,27 +216,30 @@ async def test_multishard_engine_index_base_offsets_lane_tags() -> None:
 #
 # Each engine of this rig loads only its own E{k}-tagged inbounds and serves its own API port, over ONE
 # shared store, so accounts, sessions, scopes and the audit trail are shared while each graph is not.
-# That is the shape of an engine-shard deployment that finding 2 of #3031 is about. A multi-shard
-# `serve --shard` config itself needs a server-DB store (ADR 0063), which this CI leg has none of.
+# The two engines are plain `serve` processes standing in for two engine shards: a `serve --shard`
+# config of more than one engine shard needs a server-DB store (ADR 0063), and this leg runs SQLite.
+# That an engine shard's graph holds only its own inbounds is filter_registry_for_shard's job, pinned
+# by tests/test_sharding.py::test_filter_selects_only_that_shards_inbounds; this run pins what the API
+# answers given such a graph.
 
 _OPERATOR = "ms-scoped-operator"
-_E0_OWN = "IB_E0_CS_00000"  # held by engine shard E0, in the operator's scope
-_E0_OUT_OF_SCOPE = "IB_E0_CS_00001"  # held by engine shard E0, outside the operator's scope
-_E1_OWN = "IB_E1_CS_00000"  # held by engine shard E1 only, in the operator's scope
+_E0_OWN = "IB_E0_CS_00000"  # held by engine E0, in the operator's scope
+_E0_OUT_OF_SCOPE = "IB_E0_CS_00001"  # held by engine E0, outside the operator's scope
+_E1_OWN = "IB_E1_CS_00000"  # held by engine E1 only, in the operator's scope
 
 
 def _api(node: EngineNode) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         base_url=node.url,
-        verify=ssl.create_default_context(cafile=node.cacert),
+        verify=harness_ssl_context(),  # the anchor EngineNode hands every rig engine
         trust_env=False,  # loopback only, never through a proxy the runner's environment names
         timeout=10.0,
     )
 
 
 def _scoped_operator_token(e0: EngineNode) -> str:
-    """Create a channel-scoped Operator through engine shard E0's own API with the shipped client, as
-    an administrator would, and return a session for it. The store is shared, so E1 honours it too."""
+    """Create a channel-scoped Operator through engine E0's own API with the shipped client, as an
+    administrator would, and return a session for it. The store is shared, so E1 honours it too."""
     with rig_client(e0.url, cacert=e0.cacert) as admin:
         created = admin.create_user(
             _OPERATOR, email="ms-scoped-operator@example.invalid", roles=["operator"]
@@ -251,11 +258,12 @@ def _scoped_operator_token(e0: EngineNode) -> str:
 
 
 class _WrongEngineShardProbe:
-    """Ask each engine shard about each name, as the scoped operator and as the unscoped rig
-    Administrator, then read the denial rows back. It records what it saw; the test asserts on it."""
+    """Make five fixed asks of GET /connections/{name}/metadata across the two engines, as the scoped
+    operator and as the unscoped rig Administrator, then read the denial rows back. It records each
+    answer's status and raw body; the test asserts on them."""
 
     def __init__(self) -> None:
-        self.answers: dict[tuple[str, str, str], tuple[int, object]] = {}
+        self.answers: dict[tuple[str, str, str], tuple[int, str]] = {}
         self.denials: list[dict[str, object]] = []
 
     async def __call__(self, nodes: Sequence[EngineNode]) -> None:
@@ -265,7 +273,7 @@ class _WrongEngineShardProbe:
         asks = [
             ("operator", operator, e0, _E0_OWN),
             ("operator", operator, e1, _E1_OWN),
-            ("operator", operator, e0, _E1_OWN),  # the case: in scope, held by the OTHER shard
+            ("operator", operator, e0, _E1_OWN),  # the case: in scope, held by the OTHER engine
             ("operator", operator, e0, _E0_OUT_OF_SCOPE),
             ("admin", admin, e0, _E1_OWN),
         ]
@@ -275,9 +283,8 @@ class _WrongEngineShardProbe:
                 reply = await clients[node.node_id].get(
                     f"/connections/{name}/metadata", headers={"Authorization": f"Bearer {token}"}
                 )
-                detail = reply.json().get("detail") if reply.status_code >= 400 else None
-                self.answers[(who, node.node_id, name)] = (reply.status_code, detail)
-            # Read the trail from engine shard E1, which wrote none of these rows: the store is shared.
+                self.answers[(who, node.node_id, name)] = (reply.status_code, reply.text)
+            # Read the trail from engine E1, which wrote none of these rows: the store is shared.
             reply = await c1.get(
                 "/audit",
                 params={"action": "auth.channel_denied", "actor": _OPERATOR},
@@ -296,24 +303,27 @@ async def test_a_scoped_operator_asking_the_wrong_engine_shard_gets_the_403_and_
     assert {e.name_tag for e in report.records[0].per_engine} == {"E0", "E1"}
     a = probe.answers
 
-    # Controls: each engine shard answers for its own in-scope inbound.
-    assert a[("operator", "ms-e0", _E0_OWN)] == (200, None)
-    assert a[("operator", "ms-e1", _E1_OWN)] == (200, None)
+    # Controls: each engine answers for its own in-scope inbound.
+    assert a[("operator", "ms-e0", _E0_OWN)][0] == 200, a
+    assert a[("operator", "ms-e1", _E1_OWN)][0] == 200, a
 
-    # The case. Engine shard E0 does not hold IB_E1_CS_00000, which the operator may reach on E1, and
-    # answers the one channel refusal: the same status and body an out-of-scope inbound E0 holds gets.
-    assert a[("operator", "ms-e0", _E1_OWN)] == (403, CONNECTION_DENIED_DETAIL)
-    assert a[("operator", "ms-e0", _E0_OUT_OF_SCOPE)] == (403, CONNECTION_DENIED_DETAIL)
-    # An unscoped caller asking the same wrong engine shard gets 404, as every caller did before #2640.
-    assert a[("admin", "ms-e0", _E1_OWN)][0] == 404
+    # The case. Engine E0 does not hold IB_E1_CS_00000, which the operator may reach on E1, and answers
+    # the one channel refusal, byte for byte the body an out-of-scope inbound E0 holds gets.
+    wrong_engine = a[("operator", "ms-e0", _E1_OWN)]
+    out_of_scope = a[("operator", "ms-e0", _E0_OUT_OF_SCOPE)]
+    assert wrong_engine[0] == 403, wrong_engine
+    assert json.loads(wrong_engine[1]) == {"detail": CONNECTION_DENIED_DETAIL}, wrong_engine
+    assert wrong_engine == out_of_scope
+    # An unscoped caller asking the same wrong engine gets 404, as every caller did before #2640.
+    assert a[("admin", "ms-e0", _E1_OWN)][0] == 404, a
 
-    # One auth.channel_denied row per refusal. The row names the channel and nothing that says which
-    # engine shard answered, so the in-scope miss reads like any other denial until the reader looks
-    # the name up in the whole config.
+    # One auth.channel_denied row per refusal. Each names its channel and the caller's address and
+    # nothing that says which engine answered, so the in-scope miss reads like any other denial until
+    # the reader looks the name up in the whole config.
     assert len(probe.denials) == 2, probe.denials
     rows = {row["channel_id"]: row for row in probe.denials}
     assert set(rows) == {_E1_OWN, _E0_OUT_OF_SCOPE}, probe.denials
-    wrong_shard = rows[_E1_OWN]
-    assert wrong_shard["actor"] == _OPERATOR
-    assert json.loads(str(wrong_shard["detail"])) == {"channel": _E1_OWN}
-    assert wrong_shard["client"] == rows[_E0_OUT_OF_SCOPE]["client"]
+    for channel, row in rows.items():
+        assert row["actor"] == _OPERATOR, row
+        assert row["client"] == "127.0.0.1", row
+        assert json.loads(str(row["detail"])) == {"channel": channel}, row
