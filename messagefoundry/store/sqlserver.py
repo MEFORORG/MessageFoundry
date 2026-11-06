@@ -15724,18 +15724,18 @@ class SqlServerStore:
         is that transaction's; the bind's own write and the TOTP re-enrolment take it through the
         write helper, and the per-account revoke through the epoch raise. ``enforce_session_cap``'s
         trim takes no account row. ``revoke_all_sessions`` locks only the accounts its list read
-        returns, so a session of any other account is not ordered against a re-key. The re-key moves the row to a new
-        clustered key, and a sweep that met the row locked mid-move could find the old key gone
-        and the new one out of its read, or deadlock with the re-key, depending on the plan. With
-        the account row first, a re-key either commits before a sweep of
+        returns, so a session of any other account is not ordered against a re-key. The re-key
+        moves the row to a new clustered key, and a sweep that met the row locked mid-move could
+        find the old key gone and the new one out of its read, or deadlock with the re-key,
+        depending on the plan. With the account row first, a re-key either commits before a sweep of
         its account locks that row, and the sweep reads the new key, or waits until the sweep
         commits and then finds the session ended. The session's account is read unlocked first:
         ``user_id`` never changes, and a session already gone locks nothing. Each path in this file
         read for this change that locks both rows takes the account row first, so the re-key
         closes no cycle with any of them. Read from the code; the race is replayed on the SQL
-        Server leg by ``tests/_federated_unbind_store_contract.py``, against the store calls
-        only. docs/SECURITY.md, *Limits of the session sweep*, says which are raced and which
-        are not."""
+        Server leg by ``tests/_federated_unbind_store_contract.py``, against store calls only, and
+        not against the TOTP re-enrolment's. docs/SECURITY.md, *Limits of the session sweep*, says
+        which are raced and which are not."""
 
         async def _account_first(cur: Any) -> None:
             await cur.execute("SELECT user_id FROM sessions WHERE token_hash=?", (token_hash,))
