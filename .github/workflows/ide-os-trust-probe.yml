@@ -1,0 +1,130 @@
+# Does a CA in the OS certificate store verify the VS Code extension's engine client? (BACKLOG #4576,
+# the last step of #1695.)
+#
+# WHAT IT MEASURES. On each hosted runner: mint a disposable test CA and a 127.0.0.1 leaf it signs,
+# import the CA into the runner's OS store, serve TLS under the leaf, and run the extension's own
+# engine client (`getJson` in ide/src/engineClient.ts) against it inside a real VS Code Extension
+# Host, once with `http.systemCertificates` on and once with it off, with no `caFile` pin and no
+# anchor for that target. The setting acts through the proxy-agent module VS Code's loader hands an
+# extension, so only a real Extension Host can measure it; ide/src/test/runOsTrustProbe.ts is the
+# launcher and ide/src/test/osTrustProbeHost.ts runs inside VS Code. Each leg prints one
+# `IDE-OS-TRUST-PROBE` line per request, into the log and the job summary, carrying the OS, the
+# VS Code, Electron, Node and proxy-agent versions, the settings as VS Code read them, the path, and
+# the result (trusted, or refused with its error code). Three controls ride along: a request with the
+# CA as its own `ca` (must be trusted), a plain-Node request outside VS Code (must be refused), and a
+# bare `https` request inside VS Code, which says whether the setting reaches a request at all.
+#
+# HOW TO READ IT. A refused engine client is a FINDING and leaves the job green, whichever case it
+# falls in. Only a broken instrument turns a leg red: a failed control, a setting VS Code did not read
+# back, a launch with no report, or a failed CA import. osTrustProbeModel.ts defines those once.
+# Record the lines, with this run's URL, on #4576.
+#
+# DISPATCH ONLY, OWNER-APPROVED 2026-11-06 (decision d20261106T101630309-6b6d34). No pull_request,
+# push or schedule trigger, so it never reports on a pull request or a queue entry, and it is not a
+# required context and must not become one. Run it with:
+#   gh workflow run ide-os-trust-probe.yml --repo MEFORORG/MessageFoundry --ref main
+#
+# IT TOUCHES NO REAL MACHINE STORE. The CA goes only into the store of a GitHub-hosted runner, which
+# is discarded when the job ends; the last step removes it anyway. The CA and leaf are made in the
+# job, valid for two days, never committed, and the CA's private key is deleted as soon as the leaf is
+# signed (scripts/ci/ide_os_trust_probe_ca.sh). Do not run the probe or the import on a workstation.
+# No secrets, read-only token.
+
+name: ide os trust probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      vscode-version:
+        description: "VS Code build to launch: stable, or an exact X.Y.Z"
+        default: stable
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ide os trust probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false # one OS's answer must not cancel the other's
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The launcher refuses anything but stable or X.Y.Z, so the input never reaches a shell.
+      MF_OS_TRUST_PROBE_VSCODE: ${{ inputs.vscode-version }}
+      # Linux only: where the import puts the CA and the last step removes it from. One name for both.
+      LINUX_CA_FILE: /usr/local/share/ca-certificates/mf-ide-os-trust-probe.crt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ide/package-lock.json
+
+      - name: Install and build the extension and the probe
+        working-directory: ide
+        # `pretest` is the build `npm test` runs: the bundle, then the compiled tests in out/.
+        run: |
+          npm ci
+          npm run pretest
+
+      - name: Mint the disposable test CA
+        # Forward slashes, so the one path reads the same in Git Bash, in pwsh and in Node.
+        run: |
+          dir="${RUNNER_TEMP//\\//}/os-trust-probe"
+          bash scripts/ci/ide_os_trust_probe_ca.sh "$dir"
+          echo "MF_OS_TRUST_PROBE_DIR=$dir" >> "$GITHUB_ENV"
+
+      - name: Import the CA into the runner's OS store (Linux)
+        if: runner.os == 'Linux'
+        # update-ca-certificates rebuilds /etc/ssl/certs/ca-certificates.crt, the bundle VS Code reads
+        # on Linux. The verify is the control that the import took.
+        run: |
+          sudo cp "$MF_OS_TRUST_PROBE_DIR/ca.pem" "$LINUX_CA_FILE"
+          sudo update-ca-certificates
+          openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt "$MF_OS_TRUST_PROBE_DIR/leaf.pem"
+
+      - name: Import the CA into the runner's OS store (Windows)
+        if: runner.os == 'Windows'
+        # LocalMachine\Root, which every user's Root view includes. CurrentUser\Root would raise a
+        # confirmation dialog that a service session cannot answer.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cert = Import-Certificate -FilePath (Join-Path $env:MF_OS_TRUST_PROBE_DIR 'ca.cer') -CertStoreLocation Cert:\LocalMachine\Root
+          if (-not (Test-Path "Cert:\LocalMachine\Root\$($cert.Thumbprint)")) { throw "the CA is not in LocalMachine\Root after the import" }
+          "imported $($cert.Subject) $($cert.Thumbprint)"
+          "MF_OS_TRUST_PROBE_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Run the probe (Linux)
+        if: runner.os == 'Linux'
+        working-directory: ide
+        # Electron needs a display on Linux; the hosted image carries xvfb.
+        run: xvfb-run -a node out/test/runOsTrustProbe.js
+
+      - name: Run the probe (Windows)
+        if: runner.os == 'Windows'
+        working-directory: ide
+        run: node out/test/runOsTrustProbe.js
+
+      - name: Remove the CA from the runner's OS store (Linux)
+        if: always() && runner.os == 'Linux'
+        run: |
+          sudo rm -f "$LINUX_CA_FILE"
+          sudo update-ca-certificates --fresh
+
+      - name: Remove the CA from the runner's OS store (Windows)
+        if: always() && runner.os == 'Windows' && env.MF_OS_TRUST_PROBE_THUMBPRINT != ''
+        shell: pwsh
+        run: Remove-Item -Path "Cert:\LocalMachine\Root\$env:MF_OS_TRUST_PROBE_THUMBPRINT"
