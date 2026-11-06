@@ -1504,37 +1504,53 @@ _BUILD_CALL = re.compile(r"\bpython[0-9.]*\s+-m\s+build\b")
 _FLAGS_END = re.compile(r"&&|\|\||;|(?<![<>])\|(?!\|)|(?<![<>|])&(?![>&])")
 
 
-def _strip_shell_comments(shell: str) -> str:
-    """``shell`` with each ``#`` comment cut to the end of its line.
-
-    A ``#`` starts a comment only at the start of a line or after whitespace, and never inside
-    quotes or after a backslash, so ``a#b`` and ``"x #"`` keep the text after them. Quote state runs
-    across lines, and an unclosed quote stops the cutting: this only ever removes text, so a quote
-    it misreads can make it keep a comment, never drop a command.
-    """
+def _lex_shell_line(line: str, *, cut_comment: bool) -> tuple[str, bool]:
+    """One line of :func:`_unquoted_code`, and whether it ends inside an open quote."""
     out: list[str] = []
     quote = ""
     escaped = False
-    in_comment = False
-    for i, ch in enumerate(shell):
-        if in_comment:
-            if ch != "\n":
-                continue
-            in_comment = False
-        elif escaped:
+    word_start = True
+    for ch in line:
+        if escaped:
             escaped = False
+            word_start = False
+            if ch in "&|;":
+                ch = "_"
         elif ch == "\\" and quote != "'":
             escaped = True
+            word_start = False
         elif quote:
             if ch == quote:
                 quote = ""
+            elif ch in "&|;":
+                ch = "_"
         elif ch in "'\"":
             quote = ch
-        elif ch == "#" and (i == 0 or shell[i - 1].isspace()):
-            in_comment = True
-            continue
+            word_start = False
+        elif ch == "#" and word_start and cut_comment:
+            break
+        else:
+            word_start = ch in " \t;&|()"
         out.append(ch)
-    return "".join(out)
+    return "".join(out), bool(quote)
+
+
+def _unquoted_code(shell: str) -> str:
+    """``shell`` with ``#`` comments cut and quoted or escaped ``&``, ``|`` and ``;`` blanked.
+
+    A ``#`` starts a comment only at the start of a word: at the start of a line, or after an
+    unescaped space, tab, ``;``, ``&``, ``|``, ``(`` or ``)``, and never inside quotes. So ``a#b``,
+    ``"x #"`` and a ``#`` after an escaped space keep the text after them, and ``a;#b`` does not.
+    Quote state stops at the end of each line. This is a line lexer, not a shell parser: a heredoc
+    body or a string spanning lines is lexed as if it were code. A line that, read whole, leaves a
+    quote open is one of those, so its quotes cannot be trusted and nothing on it is cut. A line
+    whose quotes pair up wrongly but evenly can still lose text after a ``#`` it misreads.
+    """
+    lines: list[str] = []
+    for line in shell.split("\n"):
+        whole, unbalanced = _lex_shell_line(line, cut_comment=False)
+        lines.append(whole if unbalanced else _lex_shell_line(line, cut_comment=True)[0])
+    return "\n".join(lines)
 
 
 def _wheel_builds(shell: str) -> int:
@@ -1547,12 +1563,13 @@ def _wheel_builds(shell: str) -> int:
     release workflow runs none, and the floor in :func:`_wheel_smoke_steps` names every
     distribution it ships, so a wheel built another way still has to be added there.
     """
-    code = _strip_shell_comments(shell)
+    code = _unquoted_code(shell)
     calls = list(_BUILD_CALL.finditer(code))
     count = 0
     for i, call in enumerate(calls):
         after = calls[i + 1].start() if i + 1 < len(calls) else len(code)
-        rest = _FLAGS_END.split(code[call.end() : after].split("\n", 1)[0], maxsplit=1)[0]
+        eol = code.find("\n", call.end(), after)
+        rest = _FLAGS_END.split(code[call.end() : after if eol < 0 else eol], maxsplit=1)[0]
         flags = set(rest.split())
         if flags & {"--wheel", "-w"} or not flags & {"--sdist", "-s"}:
             count += 1
@@ -1584,6 +1601,18 @@ def _wheel_builds(shell: str) -> int:
         ('python -m build --sdist "a #" && python -m build --wheel', 1),
         # A comment after a separator runs nothing either.
         ("python -m build --wheel a; # python -m build", 1),
+        ("python -m build --wheel a;#python -m build --wheel b", 1),
+        # A quoted or escaped `&`, `|`, space or `#` is part of a word: it ends no flags, starts no comment.
+        ('python -m build --sdist -C "k=a&b" --wheel', 1),
+        ("python -m build --sdist -C 'k=a|b' --wheel", 1),
+        ("python -m build --sdist --outdir a\\ #b && python -m build --wheel c", 1),
+        # Quote state stops at the end of a line, so a heredoc's apostrophe leaves later lines alone.
+        ("cat <<'EOF'\nthe engine's wheel\nEOF\ngrep -q 'x #y' n && python -m build --wheel b", 1),
+        # A line that closes a string opened on the line above leaves a quote open when lexed alone,
+        # so its quotes are not trusted and its `#` cuts nothing.
+        ("echo \"a\nit's\" 'x #' && python -m build --wheel", 1),
+        # `>|` is a redirect, not a pipe.
+        ("python -m build --sdist >|log --wheel", 1),
     ],
     ids=[
         "and",
@@ -1601,6 +1630,13 @@ def _wheel_builds(shell: str) -> int:
         "hash-in-word-hides-build",
         "hash-in-quotes",
         "comment-after-separator",
+        "hash-after-separator",
+        "quoted-amp",
+        "quoted-pipe",
+        "escaped-space-hash",
+        "heredoc-apostrophe",
+        "string-closed-on-next-line",
+        "noclobber-redirect",
     ],
 )
 def test_wheel_builds_counts_every_build_on_one_line(shell: str, expected: int) -> None:
