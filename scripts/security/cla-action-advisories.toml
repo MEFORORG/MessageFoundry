@@ -61,13 +61,13 @@
 # entries in 12 comments. Each comment names by id every advisory it covers, says what was found,
 # and ends with their acceptance status under the owner's ruling of 2026-11-05, recorded as
 # decision d20261105T044506837-0038dd. That ruling was given in the batch 608 Manager's chat, and
-# this Builder read it as the Manager relayed it in its brief, not from the owner: a Manager may
-# accept, under class B, an entry proven dev-only, or absent from the bundle by discriminating
-# probes; an entry present in the bundle keeps the owner's per-entry acceptance. This triage found
-# none of its 29 present, and rests none of them on lockfile marks alone. The bundle carries code
-# Babel compiled into other packages' pre-built files (Babel's _interopRequireDefault helper
-# appears 39 times), so each was probed. THE BATCH 608 MANAGER ACCEPTED ALL 29 on 2026-11-06, as
-# decision d20261106T103129535-f83e0e, and a later Builder recorded that here as the Manager
+# the batch 608 Builder read it as the Manager relayed it in its brief, not from the owner: a
+# Manager may accept, under class B, an entry proven dev-only, or absent from the bundle by
+# discriminating probes; an entry present in the bundle keeps the owner's per-entry acceptance. This
+# triage found none of its 29 present, and rests none of them on lockfile marks alone. The bundle
+# carries code Babel compiled into other packages' pre-built files (Babel's _interopRequireDefault
+# helper appears 39 times), so each was probed. THE BATCH 608 MANAGER ACCEPTED ALL 29 on 2026-11-06,
+# as decision d20261106T103129535-f83e0e, and a later Builder recorded that here as the Manager
 # relayed it in its brief. The entries on packages that are not dev-only, brace-expansion,
 # cross-spawn, flatted, js-yaml, minimatch and semver, were accepted as absent from the bundle by
 # discriminating probes, not as dev-only. The other nine are dev-only, and their comments record
