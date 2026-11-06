@@ -1205,9 +1205,11 @@ _WINDOWS_UNREACHABLE = frozenset({53, 67})
 #: Windows: no file is there, or libpq, running as the same identity, cannot ``stat`` it either and
 #: so loads nothing. ENOENT and ENOTDIR: no such file. ENAMETOOLONG: a name the filesystem cannot
 #: hold. ELOOP: a link loop no ``stat`` resolves. EACCES and EPERM: both raise ``PermissionError``,
-#: a denial of this identity, not a transient fault. Every other failure, at least EIO, ETIMEDOUT,
-#: ESTALE, EHOSTDOWN and ENOTCONN on a network mount, takes the read's handling, which refuses it:
-#: libpq stats again at every connect, and may then load a file the build never checked.
+#: which :func:`_libpq_cannot_stat_either` leaves on every platform, since libpq, as the same
+#: identity, is denied too; a denial on a Kerberos network mount can still clear once a ticket
+#: renews. Every other failure, at least EIO, ETIMEDOUT, ESTALE, EHOSTDOWN and ENOTCONN on a
+#: network mount, takes the read's handling, which refuses it: libpq stats again at every connect,
+#: and may then load a file the build never checked.
 _LIBPQ_STAT_LEFT_ERRNOS = frozenset(
     {errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG, errno.ELOOP, errno.EACCES, errno.EPERM}
 )
@@ -1218,7 +1220,8 @@ _LIBPQ_STAT_LEFT_ERRNOS = frozenset(
 #: (ENOTDIR, a path through a file); 123 ``ERROR_INVALID_NAME`` (EINVAL); 206
 #: ``ERROR_FILENAME_EXCED_RANGE`` (ENOENT, the ENAMETOOLONG case); 1921
 #: ``ERROR_CANT_RESOLVE_FILENAME`` (EINVAL, the ELOOP case); and 5 ``ERROR_ACCESS_DENIED``
-#: (EACCES). Every other code takes the read's handling, which refuses at least 53 and 67
+#: (EACCES), as any ``PermissionError`` is left, at least 32 and 65 too. Every other code takes
+#: the read's handling, which refuses at least 53 and 67
 #: (:data:`_WINDOWS_UNREACHABLE`), 59 ``ERROR_UNEXP_NET_ERR``, 64 ``ERROR_NETNAME_DELETED``, 121
 #: ``ERROR_SEM_TIMEOUT`` and 1231 ``ERROR_NETWORK_UNREACHABLE``, all EINVAL but 53 and 67.
 _LIBPQ_STAT_LEFT_WINERRORS = frozenset({2, 3, 5, 15, _WINDOWS_INVALID_NAME, 161, 206, 267, 1921})
@@ -1382,8 +1385,9 @@ def _refuse_encrypted_libpq_root_cert(
     A path that names another host (:func:`names_another_host`) is refused unread, with
     ``PGSSLROOTCERT`` as the way out. A ``stat`` failure that says no file is there, or that libpq
     could not ``stat`` it either, is left to libpq (:func:`_libpq_cannot_stat_either`). Every
-    other ``stat`` failure is refused, since libpq stats again at every connect and may load the
-    file once the fault clears. Past the ``stat``, the path takes :func:`_read_driver_file`'s read,
+    other ``stat`` failure is judged as a failed read is, so it is refused unless it says no file
+    is there, since libpq stats again at every connect and may load the file once the fault
+    clears. Past the ``stat``, the path takes :func:`_read_driver_file`'s read,
     as an ``sslca`` does: a directory is left to libpq, and a file that cannot be opened or read,
     or one past :data:`_MAX_DRIVER_CA_FILE_BYTES`, is refused, as libpq would fail the connect on
     a file it cannot load.
@@ -1578,10 +1582,12 @@ def _names_no_file(exc: OSError) -> bool:
 
 
 def _libpq_cannot_stat_either(exc: OSError) -> bool:
-    """Whether a failed ``stat`` of libpq's root certificate is left to libpq at once:
-    :data:`_LIBPQ_STAT_LEFT_WINERRORS` by ``winerror`` where Windows set one, else
-    :data:`_LIBPQ_STAT_LEFT_ERRNOS` by ``errno``. Any other failure takes
+    """Whether a failed ``stat`` of libpq's root certificate is left to libpq at once: any
+    ``PermissionError``, then :data:`_LIBPQ_STAT_LEFT_WINERRORS` by ``winerror`` where Windows set
+    one, else :data:`_LIBPQ_STAT_LEFT_ERRNOS` by ``errno``. Any other failure takes
     :func:`_read_driver_file`'s handling of a failed read."""
+    if isinstance(exc, PermissionError):
+        return True
     winerror = getattr(exc, "winerror", None)
     if winerror is not None:
         return winerror in _LIBPQ_STAT_LEFT_WINERRORS

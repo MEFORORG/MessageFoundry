@@ -22,6 +22,7 @@ Nothing here hands an encrypted block to a TLS library. Synthetic data only.
 
 from __future__ import annotations
 
+import copy
 import errno
 import functools
 import os
@@ -428,8 +429,10 @@ _WINDOWS_MAPPED: dict[int, tuple[type[OSError], int]] = {
     3: (FileNotFoundError, errno.ENOENT),
     5: (PermissionError, errno.EACCES),
     15: (FileNotFoundError, errno.ENOENT),
+    32: (PermissionError, errno.EACCES),
     59: (OSError, errno.EINVAL),
     64: (OSError, errno.EINVAL),
+    65: (PermissionError, errno.EACCES),
     67: (FileNotFoundError, errno.ENOENT),
     121: (OSError, errno.EINVAL),
     123: (OSError, errno.EINVAL),
@@ -453,6 +456,14 @@ def _win(winerror: int, refused: bool) -> Any:
     return pytest.param(_windows_stat_failure(winerror), refused, id=f"win-{winerror}")
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="CPython maps Win32 codes on Windows only")
+def test_the_windows_rows_match_cpythons_own_mapping() -> None:
+    """The table the Windows rows are built from is what this CPython raises for each code."""
+    for code, (base, mapped) in _WINDOWS_MAPPED.items():
+        made = OSError(None, "", None, code)
+        assert (type(made), made.errno) == (base, mapped), code
+
+
 @pytest.mark.parametrize("source", ["default", "PGSSLROOTCERT"])
 @pytest.mark.parametrize(
     ("failure", "refused"),
@@ -465,7 +476,7 @@ def _win(winerror: int, refused: bool) -> Any:
         pytest.param(PermissionError(errno.EACCES, "Permission denied"), False, id="EACCES"),
         pytest.param(PermissionError(errno.EPERM, "Not permitted"), False, id="EPERM"),
         pytest.param(ValueError("embedded null byte"), False, id="NUL"),
-        *(_win(code, False) for code in (2, 3, 5, 15, 123, 161, 206, 267, 1921)),
+        *(_win(code, False) for code in (2, 3, 5, 15, 32, 65, 123, 161, 206, 267, 1921)),
         # Refused: a fault that may clear before a later connect, when libpq loads the file.
         pytest.param(OSError(errno.EIO, "Input/output error"), True, id="EIO"),
         pytest.param(OSError(errno.ETIMEDOUT, "Timed out"), True, id="ETIMEDOUT"),
@@ -485,10 +496,10 @@ def test_a_root_certificate_the_engine_cannot_stat(
     """libpq 17's ``initialize_SSL`` loads the root file only when its ``stat`` succeeds; any
     other ``stat`` result skips the file, or fails a ``verify`` connect, without loading it. So a
     ``stat`` failure that says no file is there, or that libpq could not ``stat`` it either, is
-    left to libpq. Red before ``leave_unstatable``: the failure refused the build. Every other
-    failure is refused, an unreached share or an I/O fault, since libpq stats again at each connect
-    and may load the file once the fault clears, when the check does not run again. Red on the
-    I/O rows before the allowed set: the stat branch left every failure but 53 and 67."""
+    left to libpq. Red before ``leave_unstatable``: the failure refused the build. The sampled
+    others are refused, an unreached share or an I/O fault, since libpq stats again at each
+    connect and may load the file once the fault clears, when the check does not run again. Red
+    on the I/O rows before the allowed set: the stat branch left every failure but 53 and 67."""
     root = _write(_no_libpq_root, _headered(_certificate()), "root.crt")
     if source == "PGSSLROOTCERT":
         monkeypatch.setenv("PGSSLROOTCERT", root)
@@ -496,7 +507,7 @@ def test_a_root_certificate_the_engine_cannot_stat(
 
     def unstatable(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
         if str(path) == root:
-            raise failure
+            raise copy.copy(failure)  # a fresh one, so no traceback carries over between runs
         return real_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "stat", unstatable)
@@ -514,9 +525,12 @@ def test_an_unreached_share_at_the_stat_still_honours_leave_unreachable(
     turns a share Windows could not reach into :class:`_UnreachedShare`, not a refusal. Red when
     the stat branch raised the refusal itself."""
     target = str(tmp_path / "root.crt")
+    real_stat = os.stat
 
     def unreached(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
-        raise _ShareNotReached(errno.ENOENT, "No network path")
+        if str(path) == target:
+            raise _ShareNotReached(errno.ENOENT, "No network path")
+        return real_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "stat", unreached)
     with pytest.raises(database._UnreachedShare):
