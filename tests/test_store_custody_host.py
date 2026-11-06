@@ -1336,10 +1336,10 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
 ) -> None:
     # PR 2804 seventh hold, finding 1: --db overrides [store].path, so "the same arguments" would
     # point a new store's re-run, and its service, back at the old store. A new SQLite store's --db
-    # names the new path, on the re-run and wherever the service passes one (eighth hold: the
-    # shipped service paths always do); a server store is named by [store].server/database, here
-    # and for the service. With the store kept, the re-run keeps every argument, --db and
-    # --service-config among them.
+    # names the new path, on the re-run and wherever the service passes one (eighth hold: at least
+    # install-service.ps1 and supervise always do); a server store is named by
+    # [store].server/database, here and for the service. With the store kept, the re-run keeps
+    # every argument, --db and --service-config among them.
     settings = _settings(tmp_path).model_copy(update={"backend": backend})
     step = custody_host.keep_the_key_step(
         settings, new_store=new_store, service_account=service_account
@@ -1352,19 +1352,21 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
     if service_account is not None:
         command += f', --service-account "{service_account}" among them'
     sqlite_path = (
-        ", but with --db naming that new SQLite path, here and wherever the service passes --db: "
-        "at least -DbPath on a reinstall with install-service.ps1, and supervise --db, the base "
-        "each shard's file is named from"
+        ", but with --db, which overrides [store].path, naming that new SQLite path by its "
+        "absolute path, here and wherever the service passes --db, at least -DbPath on a "
+        "reinstall with install-service.ps1 on Windows, with its other install parameters "
+        "given again, and supervise --db, which supervise passes to its engine shard as "
+        "messagefoundry.db when its own command line leaves it out"
     )
     database = (
         ", once [store] names that new database, here and for the service (--db sets only "
         "[store].path, which does not name a server store)"
     )
     server = backend is not StoreBackend.SQLITE
-    # PR 2804 eighth hold: install-service.ps1 and supervise always pass --db, so it is named, not
-    # left out, and the service's own commands are named concretely.
+    # PR 2804 eighth hold: at least install-service.ps1 and supervise always pass --db, so it is
+    # named, not left out, and the service's own commands are named concretely.
     assert "leave it out" not in step and "take it off" not in step, step
-    named = "--db naming that new SQLite path" in step
+    named = "--db, which overrides [store].path, naming that new SQLite path" in step
     assert named is (new_store and not server), step
     for service_command in ("-DbPath on a reinstall with install-service.ps1", "supervise --db"):
         assert (service_command in step) is (new_store and not server), step
@@ -1372,6 +1374,24 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
     assert (command + database in step) is (new_store and server), step
     assert command in step, step
     assert ("--db" in step) is new_store, step
+
+
+def test_the_service_commands_the_fallback_names_exist() -> None:
+    # PR 2804 eighth hold: the step names install-service.ps1's -DbPath and supervise's --db, which
+    # passes messagefoundry.db when left out. Tie both names to the real interfaces.
+    from messagefoundry.__main__ import _build_parser
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "service" / "install-service.ps1"
+    source = script.read_text(encoding="utf-8")
+    assert "[string]$DbPath" in source
+    assert "serve --config $(Format-QuotedPath $Config) --db $(Format-QuotedPath $DbPath)" in source
+    parser, _ = _build_parser()
+    supervise = parser.parse_args(["supervise", "--config", "c"])
+    assert supervise.db == "messagefoundry.db"
+    step = custody_host.keep_the_key_step(
+        StoreSettings(key_provider="host", cipher_provider="aesgcm"), new_store=True
+    )
+    assert "-DbPath" in step and "supervise --db" in step and "messagefoundry.db" in step, step
 
 
 @host_file_platforms

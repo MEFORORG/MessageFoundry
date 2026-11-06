@@ -589,10 +589,12 @@ def keep_the_key_step(
         if service_account is not None:
             text += f', --service-account "{service_account}" among them'
         # --db overrides [store].path, for serve as for provision-admin, so the old --db would
-        # point a new SQLite store's re-run and its service back at the old store. The shipped
-        # service paths always pass one (install-service.ps1 writes serve --db <DbPath>, and
-        # supervise passes its --db to each shard), so --db must name the new path in both (PR 2804
-        # eighth hold). A server store is named by [store].server/database, which --db does not set.
+        # point a new SQLite store's re-run and its service back at the old store. At least two
+        # shipped service paths always pass one: install-service.ps1 writes serve --db <DbPath>, and
+        # supervise passes its --db, default messagefoundry.db, to its one SQLite engine shard. So
+        # --db must name the new path in both (PR 2804 eighth hold). Absolute, since provision-admin
+        # resolves a relative --db against its working directory and serve under --project-root.
+        # A server store is named by [store].server/database, which --db does not set.
         if new_store and server:
             text += (
                 ", once [store] names that new database, here and for the service (--db sets only "
@@ -600,9 +602,11 @@ def keep_the_key_step(
             )
         elif new_store:
             text += (
-                ", but with --db naming that new SQLite path, here and wherever the service passes "
-                "--db: at least -DbPath on a reinstall with install-service.ps1, and supervise "
-                "--db, the base each shard's file is named from"
+                ", but with --db, which overrides [store].path, naming that new SQLite path by its "
+                "absolute path, here and wherever the service passes --db, at least -DbPath on a "
+                "reinstall with install-service.ps1 on Windows, with its other install parameters "
+                "given again, and supervise --db, which supervise passes to its engine shard as "
+                "messagefoundry.db when its own command line leaves it out"
             )
         if service_account is None and sys.platform == "win32":
             text += (
