@@ -401,8 +401,9 @@ link to the page itself still issues it. The operator must still confirm on the 
 
 **Change of 2026-11-05 (vault BACKLOG #3241, added items 7 to 9).** "Once" now holds when two
 re-auths race one issue. Each re-auth leg, the password one and the federated start, takes the
-issue before its first await, so a second re-auth arriving meanwhile, from another tab or the other
-leg, finds nothing and mints nothing. A password re-auth that fails puts the issue back. The
+issue in one synchronous step, with no await between its read and its take, right before the
+leg's re-proof awaits, so a second re-auth arriving meanwhile, from another tab or the other leg,
+finds nothing and mints nothing. A password re-auth that fails puts the issue back. The
 federated start holds an unlock page's issue for its flow: the callback puts it back when the flow
 ends refused, so the retry the IdP's refusal page offers still mints, and drops it when the flow
 mints. A new re-auth also takes an issue back from a flow that never returned, an abandoned IdP

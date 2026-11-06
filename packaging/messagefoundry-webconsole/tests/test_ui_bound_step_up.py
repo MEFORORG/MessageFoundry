@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -643,6 +644,73 @@ def test_unlock_issues_do_not_evict_a_pending_auto_retry_issue() -> None:
         table.issue("tok", f"/ui/messages/{n}/replay", unlock=False)
     assert not table.issued("tok", "/ui/config/reload")  # its own kind pushed it out
     assert table.issued("tok", f"/ui/unlock/{cap + 2}")
+
+
+def test_a_put_back_entry_does_not_evict_one_issued_after_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A put-back entry keeps its older deadline but lands at the back of the session's entries.
+    Past the cap, eviction drops the entry that lapses soonest, so the put-back one goes, never a
+    page issued while it was out. RED when eviction follows insertion order."""
+    clock = [1000.0]
+    monkeypatch.setattr(_auth.time, "monotonic", lambda: clock[0])
+    table = _auth._IssuedContinuations()
+    cap = _auth._REAUTH_CONTINUATIONS_PER_SESSION
+    table.issue("tok", "/ui/unlock/old", unlock=True)
+    taken = table.take("tok", "/ui/unlock/old")
+    assert taken is not None
+    for n in range(cap):
+        clock[0] += 1.0
+        table.issue("tok", f"/ui/unlock/{n}", unlock=True)
+    table.put_back(_auth.hash_token("tok"), "/ui/unlock/old", taken)
+    assert not table.issued("tok", "/ui/unlock/old")
+    assert all(table.issued("tok", f"/ui/unlock/{n}") for n in range(cap))
+
+
+def test_a_put_back_follows_a_rotation_made_during_the_reauth() -> None:
+    """Tab A takes an issue and awaits its re-proof; tab B rotates the session meanwhile. A's put
+    back lands under the rotated session, where the retry with the new cookie finds it, not under the
+    retired hash. RED when put_back keys on the hash captured before the await."""
+    table = _auth._IssuedContinuations()
+    table.issue("old", "/ui/unlock/page", unlock=True)
+    taken = table.take("old", "/ui/unlock/page")
+    assert taken is not None
+    table.rekey("old", "new")
+    table.put_back(_auth.hash_token("old"), "/ui/unlock/page", taken)
+    assert table.issued("new", "/ui/unlock/page")
+    assert not table.issued("old", "/ui/unlock/page")
+
+
+def test_a_held_flow_claim_counts_as_continuing_and_follows_a_rotation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An issue a federated start holds for its flow is still the session's: the re-auth page's
+    read says the re-auth continues, as claim_continuation's take would, and a rotation the console
+    sees moves the claim to the new token. CONTROL: once taken, it is neither held nor continuing."""
+    monkeypatch.setattr(_auth, "_ISSUED_CONTINUATIONS", _auth._IssuedContinuations())
+    monkeypatch.setattr(_auth, "_FLOW_CLAIMS", type(_auth._FLOW_CLAIMS)())
+    monkeypatch.setattr(_auth, "_FLOW_CLAIM_IDS", {})
+    page = "/ui/unlock/page"
+    action = _auth.UiWriteAction(
+        re.compile(re.escape(page)),
+        None,
+        auto_retry=False,
+        unlock=True,
+        action="config_reload",
+        label="a page",
+    )
+    _auth._ISSUED_CONTINUATIONS.issue("old", page, unlock=True)
+    claim = _auth.claim_continuation(action, "old", page)
+    assert claim.continues and claim.holds_entry
+    _auth.hold_claim_for_flow("flow-1", claim)
+    assert not continuation_issued("old", page)  # held for the flow, not in the table
+    assert _auth.continues_after_reauth(action, "old", page)
+    _auth.rekey_continuations("old", "new")
+    assert _auth.continues_after_reauth(action, "new", page)
+    assert not _auth.continues_after_reauth(action, "old", page)
+    retry = _auth.claim_continuation(action, "new", page)
+    assert retry.continues and "flow-1" not in _auth._FLOW_CLAIMS
+    assert not _auth.continues_after_reauth(action, "new", page)
 
 
 def _get_request(path: str, token: str) -> Request:

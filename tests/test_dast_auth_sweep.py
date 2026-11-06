@@ -53,6 +53,7 @@ from scripts.security.dast_auth_sweep import (
 )
 from scripts.security.dast_target import (
     ADMIN_USERNAME,
+    DastReproofRefused,
     DastTargetUnusable,
     _login,
     dast_target,
@@ -807,7 +808,9 @@ def test_a_refused_re_proof_is_a_finding_and_the_sweep_goes_on(
 
             async def _refuse_one_action(token: str, action: str) -> str:
                 if action == refused_action:
-                    raise DastTargetUnusable("synthetic: the engine refused this re-proof")
+                    raise DastReproofRefused(
+                        "synthetic: the engine refused this re-proof", status=403
+                    )
                 return await real_reprove(token, action)
 
             yield replace(target, reprove=_refuse_one_action)
@@ -826,6 +829,35 @@ def test_a_refused_re_proof_is_a_finding_and_the_sweep_goes_on(
     assert receipt["step_up_reproofs"] > 0
     assert not set(receipt["step_up_reproof_rows"]) & expected
     assert refused_action not in json.dumps(receipt)  # the action is a header value
+
+
+@pytest.mark.parametrize("status", [401, 429])
+def test_a_run_wide_re_proof_refusal_still_ends_the_sweep(
+    status: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dead session (401) or a tripped limiter (429) would refuse every later re-proof too, so the
+    sweep does not go on probing with that token and listing rows that look measured: it ends with
+    exit 2 as before. RED when: the sweep goes on after such a refusal, or exits other than 2."""
+    import scripts.security.dast_auth_sweep as sweep
+
+    real = dast_target
+    calls: list[str] = []
+
+    @asynccontextmanager
+    async def _target(**kwargs: Any) -> AsyncIterator[Any]:
+        async with real(**kwargs) as target:
+
+            async def _refuse_all(token: str, action: str) -> str:
+                calls.append(action)
+                raise DastReproofRefused("synthetic run-wide refusal", status=status)
+
+            yield replace(target, reprove=_refuse_all)
+
+    monkeypatch.setattr(sweep, "dast_target", _target)
+    receipt_path = tmp_path / "receipt.json"
+    code = main(["--policy", str(_POLICY), "--receipt", str(receipt_path)])
+    assert code == 2, f"a run-wide re-proof refusal is a could-not-measure, exit 2, not {code}"
+    assert len(calls) == 1, f"the sweep went on re-proving after a {status}: {len(calls)} calls"
 
 
 def test_a_receipt_with_a_refused_re_proof_does_not_pass(

@@ -136,8 +136,9 @@ _CEREMONY_RETRY_AFTER = "30"
 #: What the MFA gate, the re-auth form and the account page's two enrolment finishes say when
 #: ``verify_mfa``, ``reauth``, ``finish_webauthn_assertion``, ``confirm_mfa_enrollment`` or
 #: ``finish_webauthn_registration`` refused a directory account the directory did not confirm
-#: (BACKLOG #2023, #2027, #2239, #3061). The code, password or passkey was never checked, so
-#: "invalid code", "incorrect password" or "passkey verification failed" would be false. One text
+#: (BACKLOG #2023, #2027, #2239, #3061). The code or password was never checked, and a passkey
+#: assertion had verified before the directory was asked (BACKLOG #3068), so "invalid code",
+#: "incorrect password" or "passkey verification failed" would be false. One text
 #: per fix, as the API's ``_DIRECTORY_UNCONFIRMED_DETAIL`` and ``_DIRECTORY_DEMOTED_DETAIL``
 #: (BACKLOG #3082): an account the directory did not confirm, an outage included, is never told to
 #: sign out, since a new sign-in fails the same way and the working session would be lost. A lost

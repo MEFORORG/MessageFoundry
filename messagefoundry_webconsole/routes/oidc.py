@@ -158,9 +158,10 @@ def _step_up_refusal(
     (#2764), so a fresh flow started from this page continues only to an unlock target; the page
     says so. (After a state mismatch the original flow is still staged and its real return would
     still continue -- the conservative wording errs toward "nothing will run".) An action-bound
-    unlock page arrives here as return_to only when the start leg found it issued, and that leg
-    leaves its issue unspent (owner ruling 2026-10-13, #3241 R3), so the retry this page offers
-    still continues to it.
+    unlock page arrives here as return_to only when the start leg found it issued. That leg holds
+    the issue for its flow, and the callback gives it back to the session when the flow ends
+    refused (owner ruling 2026-10-13, #3241 R3; vault BACKLOG #3241, added items 7 and 9), so the
+    retry this page offers still continues to it.
     """
     next_ = _step_up_target(return_to)
     return reauth_idp_response(

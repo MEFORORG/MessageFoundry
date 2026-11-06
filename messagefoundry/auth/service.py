@@ -958,8 +958,9 @@ IDP_STEP_UP_REQUIRED = "idp_step_up_required"
 #: :meth:`AuthService.finish_webauthn_assertion` (BACKLOG #2239) refuse a directory account with
 #: when the directory does not confirm it is present and enabled. Written into the
 #: ``auth.mfa_failed`` or ``auth.webauthn_failed`` audit row beside the probe's outcome, and carried
-#: on ``Elevation.directory_refusal``. The code or assertion is never checked and nothing is
-#: charged.
+#: on ``Elevation.directory_refusal``. Nothing is charged. The code is never checked; the passkey
+#: assertion is, since the lookup runs only once it verified (BACKLOG #3068), and the refusal puts
+#: its ceremony back.
 DIRECTORY_UNCONFIRMED = "directory_unconfirmed"
 
 #: The ``auth.reauth`` reason for a directory step-up re-bind sent with an empty password (BACKLOG
@@ -15412,10 +15413,9 @@ class AuthService:
                 break
         else:
             return await self._assertion_refused(user, client, "factor_unverified")
-        if standing == "account_gone":
-            # Gone during the passkey read: the token no longer authenticates, so the answer is the
-            # lost session the holder re-read gives, not a factor question.
-            return await self._assertion_refused(user, client, "session_lost", session_lost=True)
+        # An account gone at the passkey read is answered by the holder re-read after it, which
+        # finds no account and refuses session_lost inside the loop. Should a holder read ever pass
+        # after "account_gone", the refusal below is factor_removed, still fail-closed.
         if standing == "unverified":
             return await self._assertion_refused(user, client, "factor_unverified")
         if answer == "gone" or standing != "held":

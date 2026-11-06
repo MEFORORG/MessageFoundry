@@ -366,9 +366,18 @@ class ChallengeCache:
     def restore(self, key: tuple[str, str], entry: PendingCeremony) -> None:
         """Put back a ceremony :meth:`pop` handed out, its deadline unchanged (BACKLOG #3068): for
         a caller that took it and then refused for a reason that was not the ceremony's. Nothing is
-        put back once it lapsed, or when ``key`` has staged a newer ceremony meanwhile."""
-        if entry.deadline > self._clock() and key not in self._entries:
-            self._entries[key] = entry
+        put back once it lapsed, when ``key`` has staged a newer ceremony meanwhile, or when the
+        user's pending cap or the global bound filled while it was out: a put-back never evicts
+        another ceremony or overshoots a bound :meth:`put` enforces, and the caller's retry then
+        stages a new ceremony instead."""
+        now = self._clock()
+        self._prune(now)
+        if entry.deadline <= now or key in self._entries:
+            return
+        mine = sum(1 for e in self._entries.values() if e.user_id == entry.user_id)
+        if mine >= self._per_user_cap or len(self._entries) >= self._global_cap:
+            return
+        self._entries[key] = entry
 
     def peek(self, key: tuple[str, str]) -> PendingCeremony | None:
         """The pending ceremony for ``key`` WITHOUT consuming it; None if absent or expired.

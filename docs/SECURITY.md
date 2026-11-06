@@ -1991,7 +1991,8 @@ else would need its own authorization rule stated here.
    that sends no Fetch Metadata is judged only by the origin check, which accepts a top-level GET,
    so there a crafted link to the page itself still issues it and the re-auth mints the grant.**
    The operator must still confirm on the page. "Once" holds when two re-auths race one issue:
-   each leg takes the issue before its first await, so the second finds nothing and mints nothing,
+   each leg takes the issue in one synchronous step, with no await between its read and its take,
+   right before the leg's re-proof awaits, so the second finds nothing and mints nothing,
    and a re-auth that fails, a refused IdP prompt included, gives it back for the retry (vault
    BACKLOG #3241, added items 7 and 9; [ADR 0065](adr/0065-web-ops-dashboard.md) change of
    2026-11-05). Auto-retry actions and action-bound unlock pages each have their own per-session
@@ -6217,8 +6218,10 @@ engine verified itself, a signed `amr` or `acr` value its claim gate accepted, o
 refused, which grants nothing. The table covers at least these legs. Each cell was read against the
 code at engine commit `3345056505`, and the Where column names the code that does it, except the
 **WebAuthn passkey** cell and the enrolment sentence of the **Engine TOTP or recovery code** cell,
-which describe code merged after `3345056505` (BACKLOG #2239, #3061). Those were read against
-engine commit `aba973b282`.
+which describe code merged after `3345056505` (BACKLOG #2239, #3061). The passkey cell's directory
+sentence was read against `AuthService.finish_webauthn_assertion` as BACKLOG #3068 left it, and the
+enrolment sentences against `AuthService.confirm_mfa_enrollment` and
+`AuthService.finish_webauthn_registration` as BACKLOG #3061 left them.
 
 | Leg | What reaches the engine about strength or recency | What the engine assumes when that says nothing | Where |
 |---|---|---|---|

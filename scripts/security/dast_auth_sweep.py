@@ -97,6 +97,7 @@ from scripts.security.dast_target import (  # noqa: E402
     ADMIN_USERNAME,
     PREFLIGHT_PATH,
     VIEWER_USERNAME,
+    DastReproofRefused,
     DastTarget,
     DastTargetUnusable,
     dast_target,
@@ -244,6 +245,11 @@ async def _probe(client: httpx.AsyncClient, method: str, url: str, token: str | 
     return response.status_code
 
 
+#: ``POST /me/reauth`` answers to a re-proof that would refuse every later re-proof too: the session
+#: died, or the per-actor limiter tripped. Either still ends the sweep (see :func:`_reach_probe`).
+_RUN_WIDE_REPROOF_REFUSALS: Final = frozenset({401, 429})
+
+
 async def _reach_probe(
     client: httpx.AsyncClient,
     row: route_gates.RouteRow,
@@ -265,7 +271,10 @@ async def _reach_probe(
     A re-proof the engine refuses no longer ends the sweep (vault BACKLOG #3241, added item 3). The
     row goes into ``reproof_refused``, keeps its first 403, and is scored as unreached like any
     other refused row, so the run still fails, and every other row is still measured. The token is
-    unchanged: a refused re-proof re-keys nothing.
+    unchanged: a refused re-proof re-keys nothing. A refusal that is not the one action's still
+    ends the sweep, as every refusal did before: a 401 (the session died) or a 429 (the per-actor
+    limiter tripped) would refuse every later re-proof too, and the rows after it would be probed
+    with a dead token or spend the limiter again, so they would read as measured when they were not.
 
     The re-proof re-keys the session, so the caller must carry the returned token forward. Only
     the method and path template go into ``reproved`` and ``reproof_refused``, never the action: it
@@ -277,7 +286,9 @@ async def _reach_probe(
         return response.status_code, token
     try:
         token = await target.reprove(token, action)
-    except DastTargetUnusable:
+    except DastReproofRefused as refused:
+        if refused.status in _RUN_WIDE_REPROOF_REFUSALS:
+            raise
         reproof_refused.append(f"{row.method} {row.path}")
         return response.status_code, token
     reproved.append(f"{row.method} {row.path}")

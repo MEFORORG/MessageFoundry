@@ -576,6 +576,31 @@ async def test_challenge_single_use_ttl_and_per_user_bound() -> None:
         await store.close()
 
 
+def test_a_restored_ceremony_stays_under_both_bounds() -> None:
+    """BACKLOG #3068: a ceremony popped and then put back after a directory round trip must not
+    overshoot the per-user cap or the global bound that filled while it was out, and must not
+    evict another ceremony. CONTROL: with room, it goes back, deadline unchanged."""
+    clock = [0.0]
+    cache = wa.ChallengeCache(per_user_cap=2, global_cap=3, clock=lambda: clock[0])
+    cache.put(("a1", "assert"), "alice", b"a1")
+    taken = cache.pop(("a1", "assert"))
+    assert taken is not None
+    cache.restore(("a1", "assert"), taken)
+    assert cache.peek(("a1", "assert")) == taken  # the control: room, so it is back as it was
+    taken = cache.pop(("a1", "assert"))
+    assert taken is not None
+    cache.put(("a2", "assert"), "alice", b"a2")
+    cache.put(("a3", "assert"), "alice", b"a3")  # alice at her cap while a1 was out
+    cache.restore(("a1", "assert"), taken)
+    assert cache.peek(("a1", "assert")) is None
+    assert cache.peek(("a2", "assert")) is not None and cache.peek(("a3", "assert")) is not None
+    cache.put(("b1", "assert"), "bob", b"b1")  # the global bound is now full
+    cache.pop(("a2", "assert"))
+    cache.put(("c1", "assert"), "carol", b"c1")
+    cache.restore(("a1", "assert"), taken)
+    assert cache.peek(("a1", "assert")) is None
+
+
 # --- lifecycle + factor generalization -------------------------------------------
 
 

@@ -1132,7 +1132,7 @@ class _IssuedContinuations:
     ``/ui/reauth?next=<a destructive action>`` turned a routine re-auth into that action. Now a
     step-up gate that refuses a request records the continuation it hands out
     (:func:`_reauth_redirect`), and a re-auth continues only with an entry recorded for the session
-    presenting it, TAKING it before the re-proof's first await (:func:`claim_continuation`), so two
+    presenting it, TAKING it right before the re-proof's await (:func:`claim_continuation`), so two
     re-auths racing one entry cannot both mint its grant (vault BACKLOG #3241, added item 9). A
     re-auth that fails puts its entry back.
 
@@ -1146,14 +1146,20 @@ class _IssuedContinuations:
     Sessions are ordered least recently issued or re-keyed first, which is the order eviction
     drops them in. A re-key moves a session to the back with its deadlines unchanged, so that order
     is NOT deadline order, and pruning walks every session rather than stopping at the first live
-    one. That walk is bounded by the session cap and costs one dict read per session.
+    one. That walk is bounded by the session cap and reads every entry of every session, at most
+    twice the per-session cap each.
+
+    A rotation is also remembered, old hash to new, for the continuation's TTL, so an entry a
+    re-auth took before its await and gives back after it (:meth:`put_back`) follows a rotation
+    another tab of the same session made during that await, rather than landing under a dead hash.
     """
 
     def __init__(self) -> None:
         self._sessions: OrderedDict[str, OrderedDict[str, _Entry]] = OrderedDict()
+        self._rotated: OrderedDict[str, tuple[str, float]] = OrderedDict()
 
     def _prune(self, now: float) -> None:
-        """Drop every session whose every entry lapsed."""
+        """Drop every session whose every entry lapsed, and every lapsed rotation."""
         lapsed = [
             h
             for h, entries in self._sessions.items()
@@ -1161,19 +1167,38 @@ class _IssuedContinuations:
         ]
         for session_hash in lapsed:
             del self._sessions[session_hash]
+        for old in [h for h, (_new, until) in self._rotated.items() if until <= now]:
+            del self._rotated[old]
 
     def _put(self, session_hash: str, next_path: str, entry: _Entry) -> None:
-        """Record ``entry`` at the back of the session's entries, under both caps."""
+        """Record ``entry`` at the back of the session's entries, under both caps. Past the
+        per-kind cap the entries of that kind that lapse soonest are dropped, so a put-back entry,
+        which keeps its older deadline, cannot evict one issued after it."""
         self._prune(time.monotonic())
         entries = self._sessions.pop(session_hash, None) or OrderedDict()
         entries.pop(next_path, None)  # re-issuing refreshes the entry and moves it to the back
         entries[next_path] = entry
-        same_kind = [path for path, e in entries.items() if e.unlock == entry.unlock]
+        # Stable, so entries with equal deadlines keep issue order, oldest first.
+        same_kind = sorted(
+            (path for path, e in entries.items() if e.unlock == entry.unlock),
+            key=lambda path: entries[path].deadline,
+        )
         for path in same_kind[: max(0, len(same_kind) - _REAUTH_CONTINUATIONS_PER_SESSION)]:
             del entries[path]
         self._sessions[session_hash] = entries
         while len(self._sessions) > _REAUTH_CONTINUATION_SESSIONS_MAX:
             self._sessions.popitem(last=False)
+
+    def current_hash(self, session_hash: str) -> str:
+        """The hash ``session_hash`` was last rotated to within the continuation's TTL, or itself.
+        Bounded hops, so a cycle cannot spin."""
+        now = time.monotonic()
+        for _ in range(_REAUTH_CONTINUATIONS_PER_SESSION):
+            moved = self._rotated.get(session_hash)
+            if moved is None or moved[1] <= now:
+                break
+            session_hash = moved[0]
+        return session_hash
 
     def issue(self, token: str, next_path: str, *, unlock: bool | None = None) -> None:
         """Record ``next_path`` for this session. ``unlock`` is the entry's kind, read from the
@@ -1206,7 +1231,9 @@ class _IssuedContinuations:
 
     def put_back(self, session_hash: str, next_path: str, entry: _Entry) -> None:
         """Return an entry :meth:`take` handed out, its deadline unchanged, unless it lapsed or the
-        gate issued ``next_path`` again meanwhile: the fresher issue stands."""
+        gate issued ``next_path`` again meanwhile: the fresher issue stands. Under the session's
+        current hash, so a rotation during the re-auth's await does not strand it."""
+        session_hash = self.current_hash(session_hash)
         entries = self._sessions.get(session_hash)
         current = entries.get(next_path) if entries is not None else None
         if entry.deadline > time.monotonic() and (
@@ -1215,12 +1242,18 @@ class _IssuedContinuations:
             self._put(session_hash, next_path, entry)
 
     def rekey(self, old_token: str | None, new_token: str | None) -> None:
-        """Carry this session's entries across a token rotation, deadlines unchanged."""
+        """Carry this session's entries across a token rotation, deadlines unchanged, and remember
+        the rotation for the continuation's TTL (see :meth:`put_back`)."""
         if not old_token or not new_token or old_token == new_token:
             return
-        entries = self._sessions.pop(hash_token(old_token), None)
+        old_hash, new_hash = hash_token(old_token), hash_token(new_token)
+        self._rotated.pop(old_hash, None)
+        self._rotated[old_hash] = (new_hash, time.monotonic() + REAUTH_CONTINUATION_TTL_SECONDS)
+        while len(self._rotated) > _REAUTH_CONTINUATION_SESSIONS_MAX:
+            self._rotated.popitem(last=False)
+        entries = self._sessions.pop(old_hash, None)
         if entries:
-            self._sessions[hash_token(new_token)] = entries
+            self._sessions[new_hash] = entries
 
 
 _ISSUED_CONTINUATIONS = _IssuedContinuations()
@@ -1238,10 +1271,14 @@ def continues_after_reauth(action: UiWriteAction, token: str | None, next_path: 
     crafted ``/ui/reauth?next=<that page>`` therefore mints nothing bound. An unlock page that binds
     no action (a window-only form) still always continues: there is no grant to pre-arm, and the
     re-auth only sends the browser back to it. A READ, for rendering; a re-auth that mints takes the
-    entry with :func:`claim_continuation`. Ask it of the CURRENT token; a ceremony rotates."""
+    entry with :func:`claim_continuation`, which also takes an issue a federated start holds for a
+    flow that never came back, so this read counts that issue too. Ask it of the CURRENT token; a
+    ceremony rotates."""
     if not action.continues_only_when_issued:
         return True
-    return continuation_issued(token, next_path)
+    if not token:
+        return False
+    return continuation_issued(token, next_path) or _flow_claim_held(hash_token(token), next_path)
 
 
 @dataclass
@@ -1275,8 +1312,8 @@ class ContinuationClaim:
 def claim_continuation(
     action: UiWriteAction, token: str | None, next_path: str
 ) -> ContinuationClaim:
-    """Take the continuation a re-auth for ``next_path`` may mint toward, BEFORE the re-proof's
-    first await (vault BACKLOG #3241, added item 9). It answers as :func:`continues_after_reauth`
+    """Take the continuation a re-auth for ``next_path`` may mint toward, right BEFORE the
+    re-proof's await (vault BACKLOG #3241, added item 9). It answers as :func:`continues_after_reauth`
     does, and pops the entry in the same synchronous step, so of two re-auths racing one issue (two
     tabs, or a password and a federated start) only the first continues and mints the grant; the
     other mints nothing. A window-only unlock page takes nothing and always continues."""
@@ -1293,50 +1330,85 @@ def claim_continuation(
     return ContinuationClaim(True, hash_token(token), next_path, entry)
 
 
-def _take_flow_claim(session_hash: str, next_path: str) -> _Entry | None:
-    """Take back the live entry a held flow claim keeps for this session and ``next_path``."""
-    now = time.monotonic()
-    for flow_id, claim in list(_FLOW_CLAIMS.items()):
-        if (claim._session_hash, claim._next_path) == (session_hash, next_path):
-            del _FLOW_CLAIMS[flow_id]
-            entry, claim._entry = claim._entry, None
-            if entry is not None and entry.deadline > now:
-                return entry
-    return None
-
-
 #: The claims a federated step-up start leg holds for its staged flow, by flow id (vault BACKLOG
 #: #3241, added items 7 and 9). The callback carries no session cookie, so the claim waits here
 #: until the flow resolves: a refusal puts the entry back, so the retry the IdP's refusal page offers
 #: still continues, and a success drops it. Bounded like the issued table; an entry for a flow that
 #: never returns lapses with the continuation's TTL, which costs only that continuation.
 _FLOW_CLAIMS: OrderedDict[str, ContinuationClaim] = OrderedDict()
+#: The same claims by session hash and then ``next``, to their flow id: at most one per pair, since a
+#: new re-auth for the pair takes the held one first. Dict probes only, so a lookup neither walks
+#: :data:`_FLOW_CLAIMS` nor compares one session's hash against another's (the ASVS 11.2.4 reading
+#: :class:`messagefoundry.auth.webauthn.ChallengeCache.put` records for its probes holds here too).
+_FLOW_CLAIM_IDS: dict[str, dict[str, str]] = {}
+
+
+def _drop_flow_claim(flow_id: str) -> ContinuationClaim | None:
+    """Remove the claim held for ``flow_id`` from both indexes, and return it."""
+    claim = _FLOW_CLAIMS.pop(flow_id, None)
+    if claim is not None and claim._session_hash is not None:
+        paths = _FLOW_CLAIM_IDS.get(claim._session_hash)
+        if paths is not None and paths.get(claim._next_path) == flow_id:
+            del paths[claim._next_path]
+            if not paths:
+                del _FLOW_CLAIM_IDS[claim._session_hash]
+    return claim
+
+
+def _flow_claim_held(session_hash: str, next_path: str) -> bool:
+    """Whether a held flow claim keeps a live entry for this session and ``next_path``."""
+    flow_id = _FLOW_CLAIM_IDS.get(session_hash, {}).get(next_path)
+    claim = _FLOW_CLAIMS.get(flow_id) if flow_id is not None else None
+    return claim is not None and claim.deadline() > time.monotonic()
+
+
+def _take_flow_claim(session_hash: str, next_path: str) -> _Entry | None:
+    """Take back the live entry a held flow claim keeps for this session and ``next_path``."""
+    flow_id = _FLOW_CLAIM_IDS.get(session_hash, {}).get(next_path)
+    claim = _drop_flow_claim(flow_id) if flow_id is not None else None
+    if claim is None:
+        return None
+    entry, claim._entry = claim._entry, None
+    return entry if entry is not None and entry.deadline > time.monotonic() else None
 
 
 def hold_claim_for_flow(flow_id: str, claim: ContinuationClaim) -> None:
     """Keep ``claim`` until the federated step-up flow ``flow_id`` resolves."""
-    if not claim.holds_entry:
+    if not claim.holds_entry or claim._session_hash is None:
         return
     now = time.monotonic()
     for fid in [f for f, c in _FLOW_CLAIMS.items() if c.deadline() <= now]:
-        del _FLOW_CLAIMS[fid]
+        _drop_flow_claim(fid)
     _FLOW_CLAIMS[flow_id] = claim
+    _FLOW_CLAIM_IDS.setdefault(claim._session_hash, {})[claim._next_path] = flow_id
     while len(_FLOW_CLAIMS) > _REAUTH_CONTINUATION_SESSIONS_MAX:
-        _FLOW_CLAIMS.popitem(last=False)
+        _drop_flow_claim(next(iter(_FLOW_CLAIMS)))
 
 
 def settle_flow_claim(flow_id: str | None, *, minted: bool) -> None:
     """Resolve the claim held for ``flow_id``: put it back when the flow ended without minting,
     drop it when it minted. Call it only once the flow is consumed: a return that consumed nothing
     leaves the flow, and its claim, for the IdP's real return."""
-    claim = _FLOW_CLAIMS.pop(flow_id, None) if flow_id else None
+    claim = _drop_flow_claim(flow_id) if flow_id else None
     if claim is not None and not minted:
         claim.restore()
 
 
 def rekey_continuations(old_token: str | None, new_token: str | None) -> None:
-    """Move this session's issued continuations onto its rotated token."""
+    """Move this session's issued continuations, and the claims its federated starts hold, onto its
+    rotated token, so a held claim stays reachable from the rotated session."""
     _ISSUED_CONTINUATIONS.rekey(old_token, new_token)
+    if not old_token or not new_token or old_token == new_token:
+        return
+    old_hash, new_hash = hash_token(old_token), hash_token(new_token)
+    paths = _FLOW_CLAIM_IDS.pop(old_hash, None)
+    if not paths:
+        return
+    for flow_id in paths.values():
+        claim = _FLOW_CLAIMS.get(flow_id)
+        if claim is not None:
+            claim._session_hash = new_hash
+    _FLOW_CLAIM_IDS.setdefault(new_hash, {}).update(paths)
 
 
 def _request_is_same_origin(request: Request) -> bool:
@@ -1389,7 +1461,9 @@ def _issue_continuation(request: Request, next_path: str) -> None:
         )
         and _request_is_same_origin(request)
     ):
-        _ISSUED_CONTINUATIONS.issue(token, next_path)
+        _ISSUED_CONTINUATIONS.issue(
+            token, next_path, unlock=action is not None and action.binds_unlock_grant
+        )
 
 
 def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPException:
