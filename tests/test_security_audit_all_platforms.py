@@ -165,7 +165,7 @@ def test_the_committed_lock_is_install_checked_then_the_stripped_copy_audited(
     seen: list[tuple[list[str], str]] = []
 
     def run(cmd: list[str]) -> int:
-        seen.append((cmd, Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8")))
+        seen.append((cmd, Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8-sig")))
         return 0 if len(seen) == 1 else 1
 
     # The audit's status is the script's status, so a finding still reds the step.
@@ -192,8 +192,10 @@ def test_the_committed_lock_is_install_checked_then_the_stripped_copy_audited(
 
 #: Each ``(a requirement's first line, what the copy must read, the un-gated entry or None)``. Vault
 #: BACKLOG #3786 L2: the strip split at the first ``;`` and dropped everything after it, so the
-#: first case lost both hashes, the URL cases lost the end of their URL, and the comment case was
-#: listed as un-gated with its comment for a marker.
+#: first case lost both hashes, the bare URL case lost the end of its URL, and the comment case was
+#: listed as un-gated with its comment for a marker. Each split is where pip 26's
+#: parse_req_from_line makes it: at the first ``;`` of a ``name @ URL``, and at ``; `` after a bare
+#: URL.
 _ONE_LINE_CASES = [
     (
         "colorama==0.4.6; sys_platform == 'win32' --hash=sha256:aa --hash=sha256:bb",
@@ -201,14 +203,19 @@ _ONE_LINE_CASES = [
         "colorama==0.4.6 ; sys_platform == 'win32'",
     ),
     (
-        "pkg @ https://host.invalid/a;b.whl --hash=sha256:aa",
-        "pkg @ https://host.invalid/a;b.whl --hash=sha256:aa",
+        "pkg @ https://host.invalid/pkg-1.0-py3-none-any.whl;sys_platform == 'win32' --hash=sha256:aa",
+        "pkg @ https://host.invalid/pkg-1.0-py3-none-any.whl --hash=sha256:aa",
+        "pkg @ https://host.invalid/pkg-1.0-py3-none-any.whl ; sys_platform == 'win32'",
+    ),
+    (
+        "https://host.invalid/a;b.whl --hash=sha256:aa",
+        "https://host.invalid/a;b.whl --hash=sha256:aa",
         None,
     ),
     (
-        "pkg @ https://host.invalid/a;b.whl ; sys_platform == 'win32' --hash=sha256:aa",
-        "pkg @ https://host.invalid/a;b.whl --hash=sha256:aa",
-        "pkg @ https://host.invalid/a;b.whl ; sys_platform == 'win32'",
+        "https://host.invalid/a;b.whl ; sys_platform == 'win32' --hash=sha256:aa",
+        "https://host.invalid/a;b.whl --hash=sha256:aa",
+        "https://host.invalid/a;b.whl ; sys_platform == 'win32'",
     ),
     ("idna==3.2  # pinned; see the note", "idna==3.2  # pinned; see the note", None),
     (
@@ -221,7 +228,7 @@ _ONE_LINE_CASES = [
 
 @pytest.mark.parametrize(("line", "copy", "entry"), _ONE_LINE_CASES)
 def test_a_marker_is_found_where_pip_finds_it(line: str, copy: str, entry: str | None) -> None:
-    """Options after the marker stay, a ``;`` inside a URL or a comment is not a marker."""
+    """Options after the marker stay; a ``;`` inside a bare URL or a comment is not a marker."""
     text, stripped, requirements = strip_markers(f"{line}\n")
     assert (text, stripped, requirements) == (f"{copy}\n", [entry] if entry else [], 1)
 
@@ -233,7 +240,7 @@ def test_a_hash_after_the_marker_reaches_pip_audit(tmp_path: Path) -> None:
     seen: list[str] = []
 
     def run(cmd: list[str]) -> int:
-        seen.append(Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8"))
+        seen.append(Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8-sig"))
         return 0
 
     assert main([str(src)], run=run) == 0
@@ -263,6 +270,40 @@ def test_a_pep_263_declaration_is_honoured_and_kept_in_the_copy(tmp_path: Path) 
     assert main([str(src)], run=run) == 0
     copy = seen[1].replace(b"\r\n", b"\n")
     assert copy == _LATIN1_LOCK.replace(b" ; os_name == 'nt'", b"")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "# -*- coding: utf-16 -*-\nidna==3.20 ; os_name == 'nt'\n".encode("utf-16"),
+        b"# owner: \xc3\x81vila\nidna==3.20 ; os_name == 'nt'\n",
+    ],
+    ids=["bom-outranks-declaration", "plain-utf-8"],
+)
+def test_a_copy_not_ruled_by_a_declaration_carries_a_utf8_bom(tmp_path: Path, raw: bytes) -> None:
+    """Vault BACKLOG #3786: pip-audit's parser takes a byte-order mark first and the locale, not
+    UTF-8, last. A copy written as bare UTF-8 was read by a declaration the BOM had outranked, or by
+    a Windows runner's code page."""
+    src = tmp_path / "x.lock"
+    src.write_bytes(raw)
+    seen: list[bytes] = []
+
+    def run(cmd: list[str]) -> int:
+        seen.append(Path(cmd[cmd.index("-r") + 1]).read_bytes())
+        return 0
+
+    assert main([str(src)], run=run) == 0
+    assert seen[1].startswith(b"\xef\xbb\xbf")
+    assert b"idna==3.20\n" in seen[1].replace(b"\r\n", b"\n")
+
+
+def test_a_lock_that_cannot_be_read_is_refused_with_an_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    ran, run = _recorder(0)
+    assert main([str(tmp_path / "missing.lock")], run=run) == 2
+    assert not ran
+    assert "not readable" in capsys.readouterr().err
 
 
 def test_a_declaration_after_the_second_line_is_not_read(
@@ -344,7 +385,7 @@ def _seen_by(tmp_path: Path, argv: list[str]) -> tuple[int, list[tuple[list[str]
     seen: list[tuple[list[str], str]] = []
 
     def run(cmd: list[str]) -> int:
-        seen.append((cmd, Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8")))
+        seen.append((cmd, Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8-sig")))
         return 0
 
     return main([*argv, str(src)], run=run), seen

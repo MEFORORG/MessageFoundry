@@ -37,11 +37,11 @@ WHAT IT DOES, in order, exiting with the first non-zero status:
 2. Writes a copy of the lock with the ``; <marker>`` removed from every requirement line, the pins,
    their ``--hash`` options and any comment untouched, into a temporary directory (under
    ``$RUNNER_TEMP`` when set; never committed, never installed), and prints each pin it un-gated.
-   The marker is found as pip and PEP 508 find it (vault BACKLOG #3786 L2): pip hands everything
-   from a requirement's first word that starts with ``-`` to its option parser, so a ``--hash`` on
-   the requirement's own line, after its marker, is an option and stays; and in a URL requirement
-   (``name @ <url>``) a ``;`` inside the URL belongs to the URL, so only a ``;`` after it starts a
-   marker.
+   The marker is found as pip 26 finds it (vault BACKLOG #3786 L2): pip hands everything from a
+   requirement's first word that starts with ``-`` to its option parser, so a ``--hash`` on the
+   requirement's own line, after its marker, is an option and stays; then it splits off the marker
+   at the first ``;``, in a ``name @ <url>`` requirement too, and at the first ``; `` after a bare
+   URL. (pip refuses a ``name @ <url>`` whose URL holds a ``;``.)
 3. ``pip-audit -r <copy> --desc --disable-pip --strict`` plus any extra arguments (``--ignore-vuln
    <ID>`` for a triaged advisory, which therefore goes AFTER the lock).
 
@@ -83,8 +83,10 @@ before it (a line ending in a backslash continues, unless it is a comment), inde
 decodes the lock as pip 26 does (vault BACKLOG #3786 L3): by its UTF-8, UTF-16 or UTF-32
 byte-order mark; failing one, by a PEP 263 ``coding:`` declaration in a comment on either of the
 first two lines, and the copy is written in that encoding too; failing that, as UTF-8, and as the
-locale's encoding when it is not UTF-8. A lock none of those decodes is refused with exit 2, as is
-a declaration naming no codec this Python knows.
+locale's encoding when it is not UTF-8. Every other copy is written as UTF-8 with a byte-order mark,
+which every reader takes first, so pip-audit's parser, whose fallback is the locale and not UTF-8,
+reads it as it was decoded. A lock that cannot be read, or that none of those decodes, is refused
+with exit 2, as is a declaration naming no codec this Python knows.
 
 Both subprocesses start through ``messagefoundry.childenv.python_module_argv``, so with ``-P``
 (the checked-out tree, the current directory, is not on their ``sys.path`` and cannot shadow a
@@ -197,10 +199,11 @@ def _decode_lock(raw: bytes) -> tuple[str, str]:
 
     In pip's order: a byte-order mark; a PEP 263 declaration in a comment on either of the first two
     lines, which a copy must keep honouring, so it is written in that encoding; UTF-8; and, when
-    UTF-8 fails, the locale's encoding. Raises ``UnicodeDecodeError`` when the chosen encoding does
-    not decode the bytes, and ``LookupError`` for a declaration naming an unknown codec.
+    UTF-8 fails, the locale's encoding. Any other copy takes a UTF-8 byte-order mark, which outranks
+    a declaration the text still carries. Raises ``UnicodeError`` when the chosen encoding does not
+    decode the bytes, and ``LookupError`` for a declaration naming an unknown codec.
     """
-    copy_encoding = "utf-8"
+    copy_encoding = "utf-8-sig"
     codec = next((name for bom, name in _BOMS if raw.startswith(bom)), None)
     if codec is None:
         declared = (_CODING.search(ln) for ln in raw.split(b"\n")[:2] if ln[:1] == b"#")
@@ -225,11 +228,6 @@ def read_lock(path: Path) -> str:
 
 #: A comment as pip finds one: at the start of a line, or after whitespace.
 _COMMENT = re.compile(r"(^|\s+)#.*$")
-#: A PEP 508 URL requirement up to the end of its URL: a name, any extras, ``@``, then the URL,
-#: which runs to the first whitespace. A ``;`` inside it is part of the URL, not a marker.
-_URL_REQUIREMENT = re.compile(
-    r"\s*[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\s*(?:\[[^\]]*\])?\s*@\s*\S+"
-)
 
 
 def _split_marker(line: str) -> tuple[str, str, str] | None:
@@ -245,11 +243,9 @@ def _split_marker(line: str) -> tuple[str, str, str] | None:
     words = code.split(" ")
     first = next((n for n, word in enumerate(words) if word.startswith("-")), len(words))
     requirement, options = " ".join(words[:first]), " ".join(words[first:]).strip()
-    url = _URL_REQUIREMENT.match(requirement)
-    if url:
-        at = requirement.find(";", url.end())
-    elif "://" in requirement.lstrip().split(" ", 1)[0]:
-        at = requirement.find("; ")  # pip's marker separator after a bare URL
+    # pip's parse_req_from_line: "; " after a bare URL, else the first ";", a name @ URL's too.
+    if "://" in requirement.lstrip().split(" ", 1)[0]:
+        at = requirement.find("; ")
     else:
         at = requirement.find(";")
     if at < 0:
@@ -389,8 +385,13 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
     args = parser.parse_args(argv)
 
     try:
-        source, copy_encoding = _decode_lock(args.lock.read_bytes())
-    except (UnicodeDecodeError, LookupError) as exc:
+        raw = args.lock.read_bytes()
+    except OSError as exc:
+        print(f"::error::{args.lock}: not readable: {exc}", file=sys.stderr)
+        return 2
+    try:
+        source, copy_encoding = _decode_lock(raw)
+    except (UnicodeError, LookupError) as exc:
         print(
             f"::error::{args.lock}: not decodable the way pip decodes a requirements file: {exc}",
             file=sys.stderr,
@@ -455,7 +456,11 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         return status
     with tempfile.TemporaryDirectory(dir=os.environ.get("RUNNER_TEMP") or None) as tmp:
         copy = Path(tmp) / args.lock.name
-        copy.write_text("".join(kept), encoding=copy_encoding)
+        try:
+            copy.write_text("".join(kept), encoding=copy_encoding)
+        except UnicodeError as exc:
+            print(f"::error::{args.lock}: its copy is not writable as {copy_encoding}: {exc}")
+            return 2
         audit = [*python_module_argv("pip_audit"), "-r", str(copy), "--desc", "--disable-pip"]
         return run([*audit, "--strict", *args.pip_audit_args])
 
