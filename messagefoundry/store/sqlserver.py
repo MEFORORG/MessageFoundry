@@ -217,6 +217,7 @@ from messagefoundry.store.store import (
     AD_MAPS,
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
+    ANY_CLAIM_OWNER,
     AUDIT_KEY_EPOCH_ACTION,
     GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
@@ -247,6 +248,7 @@ from messagefoundry.store.store import (
     ClaimAbortPhase,
     ClaimedHeads,
     ClaimLockTimeout,
+    ClaimOwnerGuard,
     ClaimProcStatus,
     ConnectionEvent,
     ConnectionEventWrite,
@@ -319,6 +321,7 @@ from messagefoundry.store.store import (
     birth_notify_email,
     build_audit_mac_keys,
     check_caller_event_kind,
+    check_executing_owner_filter,
     check_password_generated,
     delivery_key,
     escalation_passkeys,
@@ -13797,6 +13800,7 @@ class SqlServerStore:
         from_status: str = "pending",
         audit: AuditAppend | None = None,
         claim_owner: str | None = None,
+        from_claim_owner: ClaimOwnerGuard = ANY_CLAIM_OWNER,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
@@ -13822,7 +13826,7 @@ class SqlServerStore:
                         current = ApprovalRow.from_mapping(found[0]) if found else None
                         moved = (
                             current is not None
-                            and current.status == from_status
+                            and current.moves_from(from_status, from_claim_owner)
                             and await self._write_approval(
                                 cur,
                                 current.decided(
@@ -13916,12 +13920,26 @@ class SqlServerStore:
         return bool(await cur.fetchall())
 
     async def list_executing_approvals(
-        self, *, claim_owner: str | None = None, limit: int = 1000
+        self,
+        *,
+        claim_owner: str | None = None,
+        not_claimed_by: str | None = None,
+        limit: int = 1000,
     ) -> list[dict[str, Any]]:
         """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
-        The Store protocol says who reads it, why, and what ``claim_owner`` filters. The owner
-        compares under BIN2, so two owners differing only in case stay two owners. Every column,
-        so the gate can check each row's seal (BACKLOG #2592)."""
+        The Store protocol says who reads it, why, and what ``claim_owner`` and
+        ``not_claimed_by`` filter. The owner compares under BIN2, so two owners differing only in
+        case stay two owners. Every column, so the gate can check each row's seal (BACKLOG
+        #2592)."""
+        check_executing_owner_filter(claim_owner, not_claimed_by)
+        if not_claimed_by is not None:
+            return await self._fetchall(
+                "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"
+                " WHERE status = 'executing' AND claim_owner IS NOT NULL"
+                " AND claim_owner COLLATE Latin1_General_100_BIN2 <> ?"
+                " ORDER BY decided_at ASC",
+                (limit, not_claimed_by),
+            )
         if claim_owner is None:
             return await self._fetchall(
                 "SELECT TOP (?) " + _MSSQL_APPROVAL_COLUMNS + " FROM pending_approvals"

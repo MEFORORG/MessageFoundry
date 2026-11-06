@@ -4217,6 +4217,18 @@ def report_role_reseal(resealed: int, refused: int) -> None:
 APPROVAL_SEAL_EXCLUDED: Final[Mapping[str, str]] = MappingProxyType({"seal": "the seal itself"})
 
 
+class _AnyClaimOwner(Enum):
+    ANY = "any"
+
+
+#: ``decide_pending_approval``'s default ``from_claim_owner``: the move does not check the owner.
+ANY_CLAIM_OWNER: Final = _AnyClaimOwner.ANY
+
+#: What ``decide_pending_approval`` guards the row's ``claim_owner`` on: one owner, ``None`` for a
+#: row with no owner, or :data:`ANY_CLAIM_OWNER` for no guard (BACKLOG #1562).
+type ClaimOwnerGuard = str | None | Literal[_AnyClaimOwner.ANY]
+
+
 @dataclass(frozen=True)
 class ApprovalRow:
     """Every column of one ``pending_approvals`` row, each in the one type every backend reads it
@@ -4290,6 +4302,15 @@ class ApprovalRow:
             current.seal,
         )
 
+    def moves_from(self, from_status: str, from_claim_owner: ClaimOwnerGuard) -> bool:
+        """Whether ``decide_pending_approval`` may move this row: it reads ``from_status`` and,
+        unless ``from_claim_owner`` is :data:`ANY_CLAIM_OWNER`, carries exactly that owner, ``None``
+        meaning no owner (BACKLOG #1562). One rule for every backend, which reads the row locked in
+        the write and checks it here."""
+        if self.status != from_status:
+            return False
+        return from_claim_owner is ANY_CLAIM_OWNER or self.claim_owner == from_claim_owner
+
     def decided(
         self, *, status: str, approver: str | None, decided_at: float, claim_owner: str | None
     ) -> ApprovalRow:
@@ -4302,6 +4323,14 @@ class ApprovalRow:
             decided_at=float(decided_at),
             claim_owner=self.claim_owner if claim_owner is None else claim_owner,
         )
+
+
+def check_executing_owner_filter(claim_owner: str | None, not_claimed_by: str | None) -> None:
+    """Refuse ``list_executing_approvals`` both owner filters at once: one keeps an owner's rows
+    and the other drops them, so together they would keep only the unowned ones, which no caller
+    means (BACKLOG #1562)."""
+    if claim_owner is not None and not_claimed_by is not None:
+        raise ValueError("list_executing_approvals takes claim_owner or not_claimed_by, not both")
 
 
 def new_approval_row(
@@ -16376,6 +16405,7 @@ class MessageStore:
         from_status: str = "pending",
         audit: AuditAppend | None = None,
         claim_owner: str | None = None,
+        from_claim_owner: ClaimOwnerGuard = ANY_CLAIM_OWNER,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
@@ -16399,7 +16429,7 @@ class MessageStore:
             current = None if found is None else ApprovalRow.from_mapping(found)
             moved = (
                 current is not None
-                and current.status == from_status
+                and current.moves_from(from_status, from_claim_owner)
                 and await self._write_approval(
                     current.decided(
                         status=status,
@@ -16474,13 +16504,24 @@ class MessageStore:
         return cur.rowcount > 0
 
     async def list_executing_approvals(
-        self, *, claim_owner: str | None = None, limit: int = 1000
+        self,
+        *,
+        claim_owner: str | None = None,
+        not_claimed_by: str | None = None,
+        limit: int = 1000,
     ) -> list[aiosqlite.Row]:
         """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
-        The Store protocol says who reads it, why, and what ``claim_owner`` filters. Every column,
-        so the gate can check each row's seal (BACKLOG #2592)."""
-        owned = "" if claim_owner is None else " AND (claim_owner = ? OR claim_owner IS NULL)"
-        args = (limit,) if claim_owner is None else (claim_owner, limit)
+        The Store protocol says who reads it, why, and what ``claim_owner`` and
+        ``not_claimed_by`` filter. Every column, so the gate can check each row's seal (BACKLOG
+        #2592)."""
+        check_executing_owner_filter(claim_owner, not_claimed_by)
+        owned = ""
+        args: tuple[object, ...] = (limit,)
+        if claim_owner is not None:
+            owned, args = " AND (claim_owner = ? OR claim_owner IS NULL)", (claim_owner, limit)
+        elif not_claimed_by is not None:
+            owned = " AND claim_owner IS NOT NULL AND claim_owner <> ?"
+            args = (not_claimed_by, limit)
         async with self._read() as db:
             cur = await db.execute(
                 _SQLITE_APPROVAL_SELECT + f" WHERE status = 'executing'{owned}"

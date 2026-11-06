@@ -218,6 +218,7 @@ from messagefoundry.store.store import (
     AD_MAPS,
     AD_ROLE_MAP,
     AD_SCOPE_MAP,
+    ANY_CLAIM_OWNER,
     AUDIT_KEY_EPOCH_ACTION,
     GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
@@ -246,6 +247,7 @@ from messagefoundry.store.store import (
     CapturedResponse,
     ChannelScopeSource,
     ClaimedHeads,
+    ClaimOwnerGuard,
     ClaimProcStatus,
     ConnectionEvent,
     ConnectionEventWrite,
@@ -315,6 +317,7 @@ from messagefoundry.store.store import (
     birth_notify_email,
     build_audit_mac_keys,
     check_caller_event_kind,
+    check_executing_owner_filter,
     check_password_generated,
     delivery_key,
     escalation_passkeys,
@@ -8969,6 +8972,7 @@ class PostgresStore:
         from_status: str = "pending",
         audit: AuditAppend | None = None,
         claim_owner: str | None = None,
+        from_claim_owner: ClaimOwnerGuard = ANY_CLAIM_OWNER,
     ) -> bool:
         """Atomically move a request in ``from_status`` to ``status``.
         Returns ``True`` iff this call made the transition — guards against a double decision.
@@ -8984,7 +8988,7 @@ class PostgresStore:
             current = None if found is None else ApprovalRow.from_mapping(found)
             moved = (
                 current is not None
-                and current.status == from_status
+                and current.moves_from(from_status, from_claim_owner)
                 and await self._write_approval(
                     conn,
                     current.decided(
@@ -9056,11 +9060,25 @@ class PostgresStore:
         return _rowcount(result) > 0
 
     async def list_executing_approvals(
-        self, *, claim_owner: str | None = None, limit: int = 1000
+        self,
+        *,
+        claim_owner: str | None = None,
+        not_claimed_by: str | None = None,
+        limit: int = 1000,
     ) -> Sequence[Row]:
         """Released requests still claimed as ``executing``, oldest claim first (BACKLOG #1562).
-        The Store protocol says who reads it, why, and what ``claim_owner`` filters. Every column,
-        so the gate can check each row's seal (BACKLOG #2592)."""
+        The Store protocol says who reads it, why, and what ``claim_owner`` and
+        ``not_claimed_by`` filter. Every column, so the gate can check each row's seal (BACKLOG
+        #2592)."""
+        check_executing_owner_filter(claim_owner, not_claimed_by)
+        if not_claimed_by is not None:
+            return await self._fetchall(
+                _PG_APPROVAL_SELECT + " WHERE status = 'executing'"
+                " AND claim_owner IS NOT NULL AND claim_owner <> $1"
+                " ORDER BY decided_at ASC LIMIT $2",
+                not_claimed_by,
+                limit,
+            )
         if claim_owner is None:
             return await self._fetchall(
                 _PG_APPROVAL_SELECT
