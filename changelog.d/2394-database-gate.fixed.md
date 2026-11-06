@@ -13,5 +13,4 @@
   destination's, the lookup's, a `DatabaseRef` sync's and a source's stop, so the connection test of
   a source no longer hangs behind a `SELECT 1` its own timeout cancelled. With no connection held
   back, a close waits for in-flight calls as before. After the 2 s a new pool can open beside the
-  one still closing. At least these are not covered: a cancellation while a cursor is still being
-  created, and a cancellation before the cancelled call has entered the gate. (`BACKLOG #2394`)
+  one still closing. (`BACKLOG #2394`)
