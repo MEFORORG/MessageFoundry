@@ -5433,8 +5433,8 @@ class AuthService:
         # name the account as enrolled to anyone who knows the username. The secret comes from the
         # checked record, so no driver runs here since BACKLOG #3510; the catch stays broad because
         # each backend's cipher raises its own classes, which ``auth/`` does not import, and every
-        # arm fails CLOSED (the code is wrong). ``consume_totp_step`` below is outside it, with its
-        # own narrower catch.
+        # arm fails CLOSED (the code is wrong). ``consume_totp_step`` below is outside it, and is
+        # reached only once a code matched.
         try:
             secret = await self._totp_secret(user)
             step = (
@@ -5454,25 +5454,15 @@ class AuthService:
                 user.username,
             )
             step = None
-        # Called whatever ``step`` is (ASVS 11.2.4, BACKLOG #1167): a ``None`` step takes the same
-        # locked read and seal check and writes nothing, so a wrong code makes the store call a
-        # replayed one makes rather than skipping it. The secret read above is not equalised by
-        # this: a missing or unreadable secret still skips the code's HMAC work.
-        #
-        # Because this call now runs on EVERY combined sign-in, any code and any password, a store
-        # refusal here is reachable without either factor, and only on an account with TOTP on. So
-        # a refusal is a wrong code, logged, for the reason the secret read above gives: escaping as
-        # an unpadded 500, it would name the account as enrolled. A seal refusal is not caught: it
-        # reaches ``login``'s own padded seal handler, as on every other write.
-        try:
-            code_ok = await self._store.consume_totp_step(user.id, step)
-        except store_open_errors():
-            _log.exception(
-                "combined sign-in: the store refused the TOTP step check for %s; treating the "
-                "code as wrong",
-                user.username,
-            )
-            code_ok = False
+        # The store is asked only once the code matched a step (ASVS 11.2.4, BACKLOG #1167: kept on
+        # purpose). Asked on every combined sign-in, it would be a store call only an account with
+        # TOTP on makes, reachable with neither factor: its refusal would escape ``login`` as an
+        # unpadded 500, and a pool wait can outlast the pad, so either would name the account as
+        # enrolled to anyone who knows the username. It would also take the account's row lock for
+        # every wrong code. So a wrong code makes the store calls a password-only sign-in makes. A
+        # refusal here still escapes, but only to a caller holding a live or just-used code, who
+        # learns nothing about enrolment from it.
+        code_ok = step is not None and await self._store.consume_totp_step(user.id, step)
         return password_ok, code_ok
 
     async def _check_password_and_passkey(

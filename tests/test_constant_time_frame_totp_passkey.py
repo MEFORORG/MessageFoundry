@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""ASVS 11.2.4 (BACKLOG #1167): three short-circuits removed, each pinned by a count.
+"""ASVS 11.2.4 (BACKLOG #1167): two short-circuits removed, each pinned by a count, and one kept.
 
 1. ``backup_codec.decrypt_stream`` runs BOTH AAD tries on every frame, the final one included.
-2. ``AuthService._check_both_factors`` calls ``consume_totp_step`` whatever the code was; a code
-   that matched no step passes ``None``, which writes nothing. A store refusal there answers as a
-   plain wrong code, through the same pad, since the call is now reachable without either factor.
+2. ``AuthService._check_both_factors`` KEEPS its short-circuit: ``consume_totp_step`` is asked only
+   once a code matched a step. Asked on every combined sign-in, it is a store call only a TOTP
+   account makes, reachable with neither factor, so a store refusal would escape ``login`` as an
+   unpadded 500 that names the account as enrolled. A wrong code beside a refusing store answers as
+   a plain wrong code, through the same pad.
 3. ``finish_webauthn_assertion`` compares every held passkey, each in constant time.
 
 The store side of ``step=None`` (nothing written, the seal still checked) is in
-``tests/_webauthn_store_contract.py`` and ``tests/_user_seal_contract.py``, run on every backend.
+``tests/_webauthn_store_contract.py`` and ``tests/_user_seal_contract.py``, run on every backend;
+the service no longer passes ``None``.
 
 Synthetic data only: random keys, a test administrator, software passkeys.
 """
@@ -19,7 +22,6 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import logging
 import os
 import sqlite3
 from collections import Counter
@@ -27,7 +29,6 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from _totp_clock import pin_totp_clock
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from messagefoundry import credential
@@ -39,6 +40,7 @@ from messagefoundry.store import backup_codec as bc
 from messagefoundry.store.base import StoreAcquireTimeout
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin
+from tests._totp_clock import pin_totp_clock
 
 # --- 1. decrypt_stream: both tries on every frame -------------------------------------------------
 
@@ -98,7 +100,7 @@ def test_a_tampered_frame_still_fails_closed() -> None:
         bc.decrypt_stream(io.BytesIO(bytes(blob)), io.BytesIO(), key)
 
 
-# --- 2. _check_both_factors: the store is asked whatever the code was ----------------------------
+# --- 2. _check_both_factors: the store is asked only once a code matched -----------------------
 
 
 @pytest.fixture
@@ -137,10 +139,11 @@ async def _factors(
     return service, admin.user_id, admin.password
 
 
-async def test_a_wrong_code_still_asks_the_store_and_writes_nothing(
+async def test_a_wrong_code_does_not_ask_the_store(
     monkeypatch: pytest.MonkeyPatch, store: MessageStore
 ) -> None:
-    """RED when: ``_check_both_factors`` short-circuits ``consume_totp_step`` on a ``None`` step."""
+    """RED when: ``_check_both_factors`` asks ``consume_totp_step`` on a ``None`` step. That call
+    would be one only a TOTP account makes, reachable with neither factor."""
     service, user_id, password = await _factors(monkeypatch, store, None)
     calls = _spy_consume(monkeypatch, store)
     user = await service._load_user(user_id)
@@ -149,7 +152,7 @@ async def test_a_wrong_code_still_asks_the_store_and_writes_nothing(
 
     assert await service._check_both_factors(user, password, "000000") == (True, False)
 
-    assert calls == [(user_id, None)]
+    assert calls == []
     assert await store.get_user(user_id) == before  # nothing written
 
 
@@ -187,15 +190,12 @@ async def _totp_enrolled(service: AuthService, monkeypatch: pytest.MonkeyPatch) 
     [sqlite3.OperationalError("database is locked"), StoreAcquireTimeout("pool borrow timed out")],
     ids=["lock", "pool"],
 )
-async def test_a_store_refusal_on_a_wrong_code_answers_as_a_plain_wrong_code(
-    monkeypatch: pytest.MonkeyPatch,
-    store: MessageStore,
-    caplog: pytest.LogCaptureFixture,
-    refusal: Exception,
+async def test_a_wrong_code_beside_a_refusing_store_answers_as_a_plain_wrong_code(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore, refusal: Exception
 ) -> None:
-    """RED when: the ``consume_totp_step`` call is outside any catch. It runs on every combined
-    sign-in, any code and any password, and only on an account with TOTP on, so a refusal that
-    escaped ``login`` as an unpadded 500 would name the account as enrolled."""
+    """RED when: ``consume_totp_step`` is asked on a wrong code. Its refusal then escapes ``login``
+    as an unpadded 500, on a path only an account with TOTP on takes, so it would name the account
+    as enrolled to anyone who knows the username."""
     service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
     user_id, password = await _totp_enrolled(service, monkeypatch)
     monkeypatch.setattr(totp, "verify_totp_step", lambda *a, **k: None)  # every code is wrong
@@ -213,15 +213,18 @@ async def test_a_store_refusal_on_a_wrong_code_answers_as_a_plain_wrong_code(
     plain = await service.login(ADMIN_USERNAME, password, totp_code="000000")
     after_plain = await store.get_user(user_id)
 
-    async def refused(_user_id: str, _step: int | None) -> bool:
+    asked: list[int | None] = []
+
+    async def refused(_user_id: str, step: int | None) -> bool:
+        asked.append(step)
         raise refusal
 
     monkeypatch.setattr(store, "consume_totp_step", refused)
-    with caplog.at_level(logging.ERROR, logger=service_mod.__name__):
-        failed = await service.login(ADMIN_USERNAME, password, totp_code="000000")
+    failed = await service.login(ADMIN_USERNAME, password, totp_code="000000")
     after_failed = await store.get_user(user_id)
 
-    # The same answer, through the same padded deadline.
+    # The same answer, through the same padded deadline, and the refusing call never made.
+    assert asked == []
     assert plain == failed == service_mod.LoginOutcome(ok=False, error="invalid credentials")
     assert padded == [plain, failed]
     # Counted as a right password with a wrong code, on the second-step counter, both times.
@@ -230,10 +233,6 @@ async def test_a_store_refusal_on_a_wrong_code_answers_as_a_plain_wrong_code(
     assert after_failed.second_step_failed_attempts == 2
     rows = await store.list_audit(actor=ADMIN_USERNAME, action="auth.login_failed")
     assert len(rows) == 2 and rows[0]["detail"] == rows[1]["detail"]
-    # Logged, never swallowed, and the code is not in the log.
-    logged = [r for r in caplog.records if "refused the TOTP step check" in r.getMessage()]
-    assert len(logged) == 1 and logged[0].exc_info is not None
-    assert all("000000" not in r.getMessage() for r in caplog.records)
 
 
 # --- 3. finish_webauthn_assertion: every held passkey compared ------------------------------------
