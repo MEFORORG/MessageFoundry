@@ -385,11 +385,16 @@ database file, and a `-wal` or `-shm` still on disk because another process has 
 crash left them. A file that start creates, a `-wal`, a `-shm` or a new store, carries no explicit
 entries, so where `icacls` succeeds it is left to that account alone. A later start that resolves
 the account rewrites the trio only after it has opened the store, so an opener the fallback shut
-out cannot heal it that way. A row on the fallback's behaviour is to be filed separately. A
-computer account (`DOMAIN\HOST$`) is expected to resolve the same way, and would then be admitted
-if a directory granted it Modify in the installer's shape; unmeasured too. No run has started the
-service as a named account. The local-user smoke leg is still not in the `windows-service-smoke` matrix (BACKLOG #3760 closing step 2, which waits on
-#3938).
+out cannot heal it that way. That rewrite also needs WRITE_DAC on each file, which the service,
+holding Modify, lacks on a file it does not own. So where an elevated operator's open took the
+fallback on a main database file the service does not own, the full-control entry it gave the
+operator's own user stays: each service start fails to remove it and logs a WARNING, until an
+elevated open with the lookup working rewrites the trio. Until then a UAC-filtered session of that
+user can open that file, which the 2026-09-24 note's narrowing no longer covers there. A row on the fallback's behaviour is to be
+filed separately. A computer account (`DOMAIN\HOST$`) is expected to resolve the same way, and
+would then be admitted if a directory granted it Modify in the installer's shape; unmeasured too.
+No run has started the service as a named account. The local-user smoke leg is still not in the
+`windows-service-smoke` matrix (BACKLOG #3760 closing step 2, which waits on #3938).
 
 ## How this was reached
 

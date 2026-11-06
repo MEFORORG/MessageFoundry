@@ -373,8 +373,10 @@ icacls "C:\ProgramData\MessageFoundry" /grant "NT SERVICE\MessageFoundry:(OI)(CI
 ```
 
 A domain **gMSA** or a dedicated local user works the same way (pass `-ServiceAccountPassword`
-for a password-based account — it's taken as a `SecureString`). The store file itself is further
-restricted to its owner at runtime; account choice governs who that owner is.
+for a password-based account — it's taken as a `SecureString`). In a data directory the installer
+hardened, the store shares its files with SYSTEM, Administrators and that account; see *A SQLite
+store in the data directory admits one named account*, below. Anywhere else, the store file is
+restricted at runtime to the account that opens it.
 
 **gMSA preflight + "Log on as a service" (#99).** When `-ServiceAccount` names a **gMSA** (a name ending
 in `$`, e.g. `CORP\mefor-svc$`), the installer runs `Test-ADServiceAccount` first (verifying the account
@@ -477,7 +479,7 @@ the service runs as. It admits whichever user the directory grants, so grant the
 directory to the service account only, as the installer does.
 
 The engine resolves the account with `LookupAccountSid` each time it opens the store. It refuses
-the directory when the lookup fails, when the account resolves to anything but a user, such as a
+the directory at least when the lookup fails, when the account resolves to anything but a user, such as a
 group, or when the directory names a second account. A refused directory gets the owner-only
 store, and the engine logs a WARNING naming the reason. Then the service and the operator who
 provisions the first Administrator would lock each other out of the store.
@@ -495,7 +497,9 @@ At least these are unmeasured:
   can send a start to the owner-only store too. A start where no controller or cache answers gets
   the owner-only store: the `-wal` and `-shm` files that start creates, and a new store, are then
   the service's alone. A later start that resolves the account restores the shared store only if
-  it can still open the store; ADR 0163 has the detail.
+  it can still open the store and rewrite each file's DACL. The service cannot rewrite a file it
+  does not own, so a full-control entry an operator's start added there stays, with a WARNING at
+  each service start, until an elevated open with the lookup working. ADR 0163 has the detail.
 
 The rule and its reasons are in ADR 0163, *Note (2026-11-05)*.
 

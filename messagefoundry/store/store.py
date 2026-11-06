@@ -6995,10 +6995,10 @@ def _account_shape_refusal(sid: str) -> str | None:
     The owner ruling of 2026-11-05 (BACKLOG #3760, #2234) admits one principal beyond SYSTEM,
     Administrators and a per-service virtual account, and only a user account with a RID of 1000 or
     more: the account ``install-service.ps1 -ServiceAccount`` grants, such as a local user, or a
-    gMSA only if it resolves to a user account, which is unmeasured. The SID must be machine- or domain-relative (``S-1-5-21-...``), the only shape whose last
-    sub-authority is a RID. Any alias the SDDL writer emits (``NS``, ``LA``, ``DU``) is not one, so
-    it is refused here too. A RID under 1000 is a built-in account or group, refused without a
-    lookup: at least the built-in Administrator (500), Guest (501) and Domain Users (513)."""
+    gMSA only if it resolves to a user account, which is unmeasured. The SID must be machine- or
+    domain-relative (``S-1-5-21-...``), the only shape whose last sub-authority is a RID. Any alias
+    the SDDL writer emits (``NS``, ``LA``, ``DU``) is not one, so it is refused here too. A RID
+    under 1000 is a built-in account or group, refused without a lookup: at least the built-in Administrator (500), Guest (501) and Domain Users (513)."""
     match = _ACCOUNT_SID.fullmatch(sid)
     if match is None:
         return (
@@ -7231,8 +7231,8 @@ def _reaches_through_a_link(path: Path) -> bool:
 
 def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
     """The trio grants for a store in ``directory`` (see :func:`_hardening_verdict`), or ``None``
-    for the owner-only rewrite: off Windows, through a link, or when the DACL cannot be read or
-    parsed."""
+    for the owner-only rewrite: off Windows, through a link, when the DACL cannot be read or parsed,
+    or when the directory is refused as not hardened, a failed account lookup included."""
     if not _is_windows() or _reaches_through_a_link(directory):
         return None
     sddl = _read_dacl_sddl(directory, owner=True)

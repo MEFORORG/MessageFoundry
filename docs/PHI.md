@@ -340,7 +340,8 @@ There each file gets an explicit, protected DACL naming only the principals the 
 the service account and the operator running `provision-admin` can both open the store in either
 order. What that widens and narrows, and why it was accepted, is stated once in the
 [ADR 0163](adr/0163-first-run-provisioning-without-a-default-account-the-not-present-arm-via-an-engine-consumed-request.md)
-note of 2026-09-24. It is best-effort and non-fatal: a skipped or
+note of 2026-09-24, and the further widening to one named run-as user account in its note of
+2026-11-05. It is best-effort and non-fatal: a skipped or
 failed restriction is **logged** (STORE-2), with directory-level ACLs ([SERVICE.md](SERVICE.md)) as
 the backstop. **This is the SQLite tier only.** On SQL Server / Postgres the engine creates no database
 file and applies no ACL — permissions on `.mdf`/`.ldf`/tempdb/native backups are entirely the DBA's.
