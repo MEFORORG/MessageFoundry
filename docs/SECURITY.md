@@ -4810,10 +4810,11 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   binds an account to a federated identity, Windows SSO refuses it. `POST /auth/negotiate` and
   `GET /ui/sso` answer as they do for any failed sign-in, and the `auth.login_failed` row carries
   `reason=federated_sign_in_required`. **Every bind also ends every live session of that
-  account**, in the transaction of the bind's own write; a rebind's clear, which runs in a
-  transaction of its own before that write, ends them first. So nothing minted before the bind
-  outlives it,
-  a session rotated while the bind runs included (*Limits of the session sweep* below). The
+  account**. On a first bind the transaction of the bind's own write ends them all. On a rebind
+  the clear, in a transaction of its own before that write, ends every session live at the
+  clear, and the write's transaction ends any minted between the two. So nothing minted before
+  the bind outlives it, a session rotated while the bind runs included (*Limits of the session
+  sweep* below). The
   audit row, the route's answer and the holder's notice carry the count. A Windows SSO sign-in
   already in flight cannot slip past either: its session insert requires an unbound row. The
   binding decides, not `oidc_enabled`: an account bound while federation is off, or under an
@@ -4854,18 +4855,25 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `admin-revoke-sessions` calls. Of the two, only `tests/test_b2614_revoke_all.py` reads back a
   session the revoke ended there: on such an account that form ends the session it was asked to
   keep, and that is the session it reads back. `tests/test_b5091_global_session_epoch.py` reads
-  back no session the revoke ended on such an account: it finds that account's session refused once raw writes have
-  put back the session and the account's pre-revoke row. That the administrator's revoke
+  back no session the revoke ended on such an account: it finds that account's session refused
+  once raw writes have put back the session and the account's pre-revoke row. That the
+  administrator's revoke
   of a user's sessions still ends such an account's sessions was read from the code and not run.
   The per-account revoke's other form, which spares the caller's session, is reached through the
   service on such an account only where the seal fails after identity resolution:
   at least `DELETE /me/sessions` and the console's `POST /ui/account/sessions/revoke-others`
-  resolve the caller through `identity_for_token` in their gate
-  (`messagefoundry/api/auth_routes.py:1155`, `messagefoundry_webconsole/routes/account.py:692`),
-  and then the handler calls `AuthService.revoke_other_sessions` with that identity
-  (`auth_routes.py:1158`, `account.py:697`). That resolution refuses an account whose record
-  fails its seal. It is run on such an
-  account only as a store call, where it ends that session too, by the body in
+  each resolve the caller in their gate, and then each route's handler calls
+  `AuthService.revoke_other_sessions` with that identity, which it does not resolve again. The
+  API route's gate is `require_reauth_only_action` (`messagefoundry/api/auth_routes.py:1155`),
+  which resolves through `identity_for_token` in `_session_caller`
+  (`messagefoundry/api/security.py:1140`), and its handler `revoke_my_other_sessions` makes the
+  call (`messagefoundry/api/auth_routes.py:1158`). The console route's gate is
+  `require_ui_reauth_only_action` (`messagefoundry_webconsole/routes/account.py:692`), which
+  resolves through `identity_for_token` in `require_ui`
+  (`messagefoundry_webconsole/_auth.py:519`), and its handler `ui_revoke_other_sessions` makes
+  the call (`messagefoundry_webconsole/routes/account.py:697`). That resolution refuses an
+  account whose record fails its seal. It is run on such an account only as a store call, where
+  it ends that session too, by the body in
   `tests/_session_seal_contract.py`, which `test_session_seal_contract` runs on both server legs.
   At least a bind, an unbind, a TOTP re-enrolment, an administrator's role change and a password
   reset of such an account end no session; that was read from the code. The
