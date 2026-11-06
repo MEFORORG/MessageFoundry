@@ -7,7 +7,7 @@
 # by hand (BACKLOG #1220) - so a newly rendered DTO is covered with nobody editing a list.
 
 ## ENGINE_UI_SEAM
-52de3dfad24ef9f3
+7daad4fef864f2db
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -124,11 +124,11 @@ enforce_phi_read_pacing: (request: 'Request', identity: 'Identity') -> 'None'
 get_auth: (request: 'Request') -> 'AuthService | None'
 initial_credential_window_hours: (auth: 'AuthService') -> 'float | None'
 mark_route_gate: (gate: 'G') -> 'G'
-mark_ws_gate_admitted: (websocket: 'HTTPConnection') -> 'None'
 pending_credential_deadline: (auth: 'AuthService', user: 'UserRecord | None') -> 'float | None'
 pending_credential_deadline_for: (auth: 'AuthService', user_id: 'str') -> 'float | None'
 public_route: (reason: 'str') -> 'Callable[[F], F]'
 record_repeated_credential: (conn: 'Request | WebSocket', credential: 'str') -> 'None'
+record_ws_gate: (websocket: 'HTTPConnection', *, admitted: 'bool') -> 'None'
 
 ## auth.service names imported by the console
 AuthService: class; its members are the AuthService section
@@ -483,4 +483,4 @@ middleware 0: messagefoundry_webconsole._security:UiFetchMetadataMiddleware()
 middleware 1: messagefoundry_webconsole._security:UiSecurityHeadersMiddleware()
 app.state.ui_connections_render: function
 app.state.ui_csp: str
-app.state.ui_ws_authorize: messagefoundry_webconsole._auth:authorize_ui_ws#cd630a0a62cb()
+app.state.ui_ws_authorize: messagefoundry_webconsole._auth:authorize_ui_ws#2dee08067b6c()

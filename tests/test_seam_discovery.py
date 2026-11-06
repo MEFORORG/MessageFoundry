@@ -164,7 +164,7 @@ def test_security_symbols_are_what_the_console_actually_imports(surface: Any) ->
     ``GET /ui/sso`` (BACKLOG #2454). ``RepeatedCredentialError`` and ``record_repeated_credential``
     joined when the session-cookie read took the same rule (BACKLOG #2454).
     ``ConfigWriteNotRecorded`` joined when the console's flag route took the audit refusal by type
-    (BACKLOG #3811). ``mark_ws_gate_admitted`` joined with the WebSocket accept gate (vault
+    (BACKLOG #3811). ``record_ws_gate`` joined with the WebSocket accept gate (vault
     BACKLOG #2955)."""
     assert surface.security_symbols == (
         "ConfigWriteNotRecorded",
@@ -177,11 +177,11 @@ def test_security_symbols_are_what_the_console_actually_imports(surface: Any) ->
         "get_auth",
         "initial_credential_window_hours",
         "mark_route_gate",
-        "mark_ws_gate_admitted",
         "pending_credential_deadline",
         "pending_credential_deadline_for",
         "public_route",
         "record_repeated_credential",
+        "record_ws_gate",
     )
 
 

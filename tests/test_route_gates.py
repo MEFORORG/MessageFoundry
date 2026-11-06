@@ -32,6 +32,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from messagefoundry.api import security as api_security
 from messagefoundry.api.app import create_app
 from messagefoundry.api.security import (
     authorize_ws,
@@ -373,6 +374,43 @@ def test_a_websocket_gate_dependency_taking_a_request_fails_the_walk() -> None:
         dependencies=[Depends(require_ws_probe(Permission.MONITORING_READ))],
     )
     assert row.gates == ("require_ws_probe",), row
+
+
+async def _records_its_own_admission(websocket: WebSocket) -> None:
+    await authorize_ws(websocket, Permission.MONITORING_READ)
+    api_security.record_ws_gate(websocket, admitted=True)
+    await websocket.accept()
+
+
+def test_a_websocket_body_that_records_its_own_admission_fails_the_walk() -> None:
+    """Vault BACKLOG #2955: the admission record is a gate's to write. A body that writes it would
+    pass the engine's accept gate whatever its gate answered, so the walk refuses to vouch for it,
+    whether the call is bare or through an attribute."""
+    with pytest.raises(ValueError, match="calls record_ws_gate itself"):
+        route_gates.route_rows(_app_with(_records_its_own_admission))
+
+
+def _request_reader(request: Request) -> None:
+    return None
+
+
+def test_a_websocket_gate_whose_sub_dependency_takes_a_request_fails_the_walk() -> None:
+    """Vault BACKLOG #2955: FastAPI cannot supply a ``Request`` anywhere under a socket's gate."""
+
+    def require_reading_a_request(*permissions: Permission) -> Callable[..., Awaitable[None]]:
+        async def dependency(websocket: WebSocket, _r: None = Depends(_request_reader)) -> None:
+            assert permissions
+
+        return mark_route_gate(dependency)
+
+    app = FastAPI()
+    app.add_api_websocket_route(
+        "/ws/planted",
+        _dependency_gated,
+        dependencies=[Depends(require_reading_a_request(Permission.MONITORING_READ))],
+    )
+    with pytest.raises(ValueError, match="takes a Request"):
+        route_gates.route_rows(app)
 
 
 class _CallableGate:

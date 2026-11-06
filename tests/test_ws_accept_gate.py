@@ -23,17 +23,19 @@ from typing import Any
 
 import pytest
 from fastapi import Depends, FastAPI, WebSocket
+from starlette.responses import PlainTextResponse
 from starlette.websockets import WebSocketDisconnect
 
 from messagefoundry.api import app as app_module
 from messagefoundry.api import create_app
+from messagefoundry.api.header_floor import SecurityHeaderFloorMiddleware
 from messagefoundry.api.security import (
     WebSocketAcceptGate,
     authorize_ws,
     authorizes_in_body,
     mark_route_gate,
-    mark_ws_gate_admitted,
     public_route,
+    record_ws_gate,
     ws_accept_allowed,
 )
 from messagefoundry.auth import Permission, Role
@@ -95,10 +97,13 @@ class _Peer:
     connection on the first data frame, so a feed that streams forever ends: Starlette turns the
     ``OSError`` a send raises into ``WebSocketDisconnect``, as for a peer that went away."""
 
-    def __init__(self, app: object, path: str, token: str | None) -> None:
+    def __init__(
+        self, app: object, path: str, token: str | None, *, denial_extension: bool = False
+    ) -> None:
         self._app = app
         self._path = path
         self._token = token
+        self._denial_extension = denial_extension
         self._to_server: asyncio.Queue[dict[str, object]] = asyncio.Queue()
         self.sent: list[dict[str, Any]] = []
 
@@ -116,7 +121,7 @@ class _Peer:
 
     async def run(self) -> None:
         headers = [(b"authorization", f"Bearer {self._token}".encode())] if self._token else []
-        scope = {
+        scope: dict[str, Any] = {
             "type": "websocket",
             "path": self._path,
             "headers": headers,
@@ -125,6 +130,8 @@ class _Peer:
             "client": ("127.0.0.1", 9999),
             "scheme": "ws",
         }
+        if self._denial_extension:
+            scope["extensions"] = {"websocket.http.response": {}}
         await self._to_server.put({"type": "websocket.connect"})
         await asyncio.wait_for(self._app(scope, self._receive, self._send), 20.0)  # type: ignore[operator]
 
@@ -207,6 +214,23 @@ def _planted(engine: Engine, service: AuthService | None, outcome: _Outcome) -> 
     async def public(websocket: WebSocket) -> None:
         await accept_then_send(websocket)
 
+    @app.websocket("/zz/denial-200")
+    @authorizes_in_body("a synthetic socket that answers with a denial response and no gate")
+    async def denial_200(websocket: WebSocket) -> None:
+        await websocket.send_denial_response(PlainTextResponse("synthetic-body", status_code=200))
+
+    @app.websocket("/zz/denial-403")
+    @authorizes_in_body("a synthetic socket that refuses with a denial response")
+    async def denial_403(websocket: WebSocket) -> None:
+        await websocket.send_denial_response(PlainTextResponse("refused", status_code=403))
+
+    @app.websocket("/zz/lax-then-strict")
+    @authorizes_in_body("a synthetic socket whose stricter gate's refusal is ignored")
+    async def lax_then_strict(websocket: WebSocket) -> None:
+        await authorize_ws(websocket)
+        await authorize_ws(websocket, Permission.MONITORING_READ)
+        await accept_then_send(websocket)
+
     async def admit(websocket: WebSocket) -> None:
         return None
 
@@ -256,6 +280,45 @@ async def test_an_in_body_socket_that_ignores_its_gate_is_accepted_only_when_the
         _assert_refused_before_accept(peer)
 
 
+async def test_a_non_refusal_denial_response_needs_an_admitted_caller(engine: Engine) -> None:
+    """A denial response is an HTTP answer the body chooses, so one below 400 would hand a caller no
+    gate admitted whatever the body sends. A 403 is how a gate refuses, and still goes out."""
+    refused = _Peer(
+        _planted(engine, None, _Outcome()), "/zz/denial-200", None, denial_extension=True
+    )
+    await refused.run()
+    assert [m for m in refused.sent if m["type"] == "websocket.http.response.start"] == [
+        m for m in refused.sent[:1] if m.get("status") == 403
+    ], refused.sent
+    assert not any(b"synthetic-body" in m.get("body", b"") for m in refused.sent), refused.sent
+    allowed = _Peer(
+        _planted(engine, None, _Outcome()), "/zz/denial-403", None, denial_extension=True
+    )
+    await allowed.run()
+    assert any(b"refused" in m.get("body", b"") for m in allowed.sent), allowed.sent
+
+
+async def test_a_later_refusal_clears_an_earlier_admission(engine: Engine) -> None:
+    """The body asks a lax gate, then ignores a stricter gate's refusal: the latest answer stands."""
+    service = await _service(engine)
+    token = await _token(service, "norole")  # signed in, but no monitoring:read
+    peer = _Peer(_planted(engine, service, _Outcome()), "/zz/lax-then-strict", token)
+    await peer.run()
+    _assert_refused_before_accept(peer)
+
+
+async def test_the_refusal_gets_the_header_floors_403(engine: Engine) -> None:
+    """With the denial extension offered, the floor outside turns the refusal close into a 403
+    carrying the baseline headers, as for a gate's own refusal."""
+    peer = _Peer(_planted(engine, None, _Outcome()), "/zz/no-gate", None, denial_extension=True)
+    await peer.run()
+    start = peer.sent[0]
+    assert start["type"] == "websocket.http.response.start" and start["status"] == 403, peer.sent
+    names = {bytes(n).lower() for n, _ in start.get("headers", [])}
+    assert b"x-content-type-options" in names, start
+    assert _ACCEPT not in peer.kinds, peer.sent
+
+
 @pytest.mark.parametrize("path", ["/zz/public", "/zz/dependency-gated"])
 async def test_a_socket_declared_another_way_needs_no_mark(engine: Engine, path: str) -> None:
     """A public socket has no gate by design, and a dependency gate ran before the body did."""
@@ -265,12 +328,14 @@ async def test_a_socket_declared_another_way_needs_no_mark(engine: Engine, path:
     assert peer.kinds[:2] == [_ACCEPT, "websocket.send"], peer.sent
 
 
-def test_create_app_installs_the_accept_gate() -> None:
+def test_create_app_installs_the_accept_gate_inside_the_header_floor() -> None:
+    """Index 0 is outermost. Inside the floor, so its refusal close gets the floor's 403."""
     registered: list[object] = [m.cls for m in create_app().user_middleware]
-    assert WebSocketAcceptGate in registered
+    assert registered.count(WebSocketAcceptGate) == 1, registered
+    assert registered.index(SecurityHeaderFloorMiddleware) < registered.index(WebSocketAcceptGate)
 
 
-def test_the_mark_is_the_only_way_an_in_body_scope_is_allowed() -> None:
+def test_the_latest_recorded_answer_decides_an_in_body_scope() -> None:
     assert not ws_accept_allowed({})
 
     class _Handshake:
@@ -278,5 +343,22 @@ def test_the_mark_is_the_only_way_an_in_body_scope_is_allowed() -> None:
             self.scope: dict[str, Any] = {}
 
     handshake = _Handshake()
-    mark_ws_gate_admitted(handshake)  # type: ignore[arg-type]
+    record_ws_gate(handshake, admitted=True)  # type: ignore[arg-type]
     assert ws_accept_allowed(handshake.scope)
+    record_ws_gate(handshake, admitted=False)  # type: ignore[arg-type]
+    assert not ws_accept_allowed(handshake.scope)
+
+
+def test_a_plain_route_with_no_route_in_scope_is_read_by_its_endpoint() -> None:
+    """A plain Starlette WebSocket route sets no ``route``: its endpoint's public mark decides."""
+
+    @public_route("a synthetic public socket")
+    async def public(websocket: WebSocket) -> None:
+        return None
+
+    @authorizes_in_body("a synthetic in-body socket")
+    async def in_body(websocket: WebSocket) -> None:
+        return None
+
+    assert ws_accept_allowed({"endpoint": public})
+    assert not ws_accept_allowed({"endpoint": in_body})

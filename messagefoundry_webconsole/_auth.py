@@ -29,8 +29,8 @@ from messagefoundry.api.security import (
     enforce_phi_read_hop,
     get_auth,
     mark_route_gate,
-    mark_ws_gate_admitted,
     record_repeated_credential,
+    record_ws_gate,
 )
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService
@@ -1856,6 +1856,8 @@ async def authorize_ui_ws(
     at all. A native client sends no ``Origin``, so
     this returns ``(None, None)`` and does not interfere with the header path.
     """
+    # Vault BACKLOG #2955: not admitted until the end below, so a refusal clears an earlier answer.
+    record_ws_gate(websocket, admitted=False)
     origin = websocket.headers.get("origin")
     if not origin:
         return None, None  # native client (no Origin) — the header path handles it
@@ -1919,8 +1921,8 @@ async def authorize_ui_ws(
                 identity, permission, websocket.url.path, client=client_ip(websocket)
             )
             return None, None
-    # Vault BACKLOG #2955: the engine refuses to accept an in-body socket no gate marked admitted.
-    mark_ws_gate_admitted(websocket)
+    # Vault BACKLOG #2955: the engine refuses to accept an in-body socket no gate admitted.
+    record_ws_gate(websocket, admitted=True)
     return identity, token
 
 

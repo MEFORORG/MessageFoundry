@@ -376,6 +376,22 @@ def _own_nodes(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST]:
     return found
 
 
+def _takes_a_request(dependant: Any) -> bool:
+    """Whether ``dependant`` or any dependency under it takes a ``Request``."""
+    if getattr(dependant, "request_param_name", None) is not None:
+        return True
+    return any(_takes_a_request(sub) for sub in getattr(dependant, "dependencies", None) or ())
+
+
+def _callee_name(func: ast.expr) -> str | None:
+    """The name a call's callee ends in: ``f`` for ``f()`` and ``a.b.f()``, else ``None``."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
 def websocket_gates(
     route: APIWebSocketRoute, app: Starlette
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -403,10 +419,10 @@ def websocket_gates(
     for dep in route.dependant.dependencies:
         found = gate_of(dep.call)
         if found is not None:
-            if dep.request_param_name is not None:
+            if _takes_a_request(dep):
                 # Vault BACKLOG #2955, engine PR 2390 note 2: a WebSocket scope carries no Request, so
-                # FastAPI fails this dependency's handshake for every caller. Reading it as a gate
-                # would vouch for a dead route.
+                # FastAPI fails this dependency's handshake for every caller, a sub-dependency's need
+                # included. Reading it as a gate would vouch for a dead route.
                 raise ValueError(
                     f"WebSocket route {route.path}: its gate dependency {found[0]} takes a Request, "
                     "which a WebSocket handshake cannot supply, so it refuses every caller"
@@ -418,6 +434,14 @@ def websocket_gates(
         func = _endpoint_node(endpoint)
     except (OSError, TypeError, SyntaxError, ValueError) as exc:
         raise ValueError(f"cannot read the source of WebSocket route {route.path}: {exc}") from exc
+    for node in ast.walk(func):
+        if isinstance(node, ast.Call) and _callee_name(node.func) == "record_ws_gate":
+            # The admission record is a gate's to write (api/security.py); a body that writes its own
+            # answer would pass the engine's accept gate whatever its gate said.
+            raise ValueError(
+                f"WebSocket route {route.path}: its endpoint body calls record_ws_gate itself, "
+                "so it could admit a caller its gate refused"
+            )
     slots = _state_hook_slots(func)
     code = getattr(endpoint, "__code__", None)
     # A local or a closure variable cannot be read from the module globals, so it stays unresolved.

@@ -549,11 +549,14 @@ def _row_record(row: route_gates.RouteRow) -> dict[str, Any]:
 
 
 #: What a WebSocket row may be and pass (vault BACKLOG #2955). Gated outright passes. Marked
-#: ``public_route`` passes with its reason. Marked ``authorizes_in_body``, or outside the engine's
-#: refusal, passes only with a reason AND a gate the walk found: the engine accepts any declaration
-#: on a socket, and outside the refusal nothing reads it, so the reason alone would vouch for a
-#: socket that authorizes nobody. The walk finds a gate by its call, not by what the endpoint does
-#: with the answer, so a pass here is evidence of a gate call, not proof it is enforced.
+#: ``public_route`` passes with its reason, and only if the policy allow-lists it. Marked
+#: ``authorizes_in_body``, or outside the engine's refusal, passes only with a reason AND a gate the
+#: walk found that demands a permission: the refusal accepts either declaration on a socket, and
+#: outside the refusal nothing reads one, so the reason alone would vouch for a socket that
+#: authorizes nobody. The walk finds a gate by its call, not by what the endpoint does with the
+#: answer. At run time the engine's ``WebSocketAcceptGate`` (api/security.py) refuses the accept of
+#: an in-body socket no gate admitted, so a body that ignores its gate's refusal is refused there;
+#: this check is the sweep's own reading, not a substitute for that control.
 _WS_PASSES: Final = frozenset({route_gates.KIND_GATED})
 _WS_NEEDS_REASON: Final = frozenset(
     {route_gates.KIND_PUBLIC, route_gates.KIND_IN_BODY, route_gates.KIND_OUTSIDE}
@@ -835,6 +838,7 @@ def receipt_lines(receipt: dict[str, Any], policy: dict[str, Any], verdict: str)
             ("min_bfla_probes", receipt.get("bfla_probes", 0)),
             ("min_write_rows_reached", receipt.get("write_reached", 0)),
             ("min_write_bfla_probes", receipt.get("write_bfla_probes", 0)),
+            ("min_websocket_rows", len(ws)),
         )
     )
     outcomes = receipt.get("write_probe_outcomes", {})
@@ -987,6 +991,7 @@ def main(argv: list[str] | None = None) -> int:
             ("min_bfla_probes", receipt["bfla_probes"]),
             ("min_write_rows_reached", receipt["write_reached"]),
             ("min_write_bfla_probes", receipt["write_bfla_probes"]),
+            ("min_websocket_rows", len(receipt["websocket_rows"])),
         )
     }
     receipt["floors"]["max_unexplained_unreached"] = {

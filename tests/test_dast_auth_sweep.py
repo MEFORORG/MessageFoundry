@@ -1162,12 +1162,16 @@ def test_the_public_websocket_set_is_pinned_to_the_allow_list(listed: bool) -> N
     assert any("public WebSocket" in line and expected in line for line in errors), errors
 
 
-def test_a_policy_without_the_public_websocket_allowlist_fails_closed(tmp_path: Path) -> None:
+def test_a_policy_without_the_public_websocket_allowlist_fails_closed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     policy = _policy()
     del policy["public_websocket_allowlist"]
     path = tmp_path / "policy.json"
     path.write_text(json.dumps(policy), encoding="utf-8")
     assert main(["--policy", str(path)]) == 2
+    # The refusal must be the policy check's own, not some later failure that also exits 2.
+    assert "'public_websocket_allowlist'" in capsys.readouterr().err
 
 
 async def _planted_undeclared(websocket: WebSocket) -> None:

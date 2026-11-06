@@ -811,9 +811,9 @@ from typing import Any
 #: ``messagefoundry`` floor instead. An older console on this engine passes the handshake and still
 #: answers a scoped caller's bad flag direction with the unaudited 404.
 #:
-#: Vault BACKLOG #2955: the console imports ``api.security.mark_ws_gate_admitted`` and
-#: ``authorize_ui_ws`` calls it when it admits a handshake, because the engine's
-#: ``WebSocketAcceptGate`` now refuses ``accept()`` on an in-body socket no gate marked. An older
+#: Vault BACKLOG #2955: the console imports ``api.security.record_ws_gate``, and
+#: ``authorize_ui_ws`` records with it whether it admitted a handshake, because the engine's
+#: ``WebSocketAcceptGate`` now refuses ``accept()`` on an in-body socket no gate admitted. An older
 #: console on this engine would have its browser socket refused; a newer console on an older
 #: engine would raise ImportError at mount. Both force a bump. Re-derived with ``--write`` (from
 #: 734e7007fb95eb75).
@@ -823,7 +823,7 @@ from typing import Any
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "52de3dfad24ef9f3"
+ENGINE_UI_SEAM: str = "7daad4fef864f2db"
 
 
 @dataclass(frozen=True, slots=True)
