@@ -62,6 +62,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import asynccontextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from dataclasses import fields as _dc_fields
 from enum import Enum, StrEnum
@@ -160,6 +161,7 @@ from messagefoundry.store.gcm_bound import (
     counts_under_dek,
     reserve_invocations_ahead,
 )
+from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_reference_value,
@@ -5264,9 +5266,10 @@ def audit_genesis_detail(key_id: str, store_id: bytes = NO_STORE_ID) -> str:
     beside them.
 
     ``store_id``, when minted, is recorded as a label (vault BACKLOG #3411): the row MAC covers it,
-    and no key is derived from it. :data:`NO_STORE_ID`, the default, records none, so the record has
-    today's shape; no caller passes one yet. Raises ``ValueError`` for any other store id that is
-    not :data:`STORE_ID_BYTES` long."""
+    and no key is derived from it. :data:`NO_STORE_ID`, the default, records none. A store opened
+    under the ``host`` key provider records the host blob's current store id
+    (:class:`StorePin`). Raises ``ValueError`` for any other store id that is not
+    :data:`STORE_ID_BYTES` long."""
     record: dict[str, object] = {"genesis": 1, "key_id": key_id}
     record.update(_audit_scheme_fields(audit_scheme_for(key_id)))
     if store_id != NO_STORE_ID:
@@ -5355,6 +5358,69 @@ def parse_audit_genesis_store_id(detail: object) -> AuditGenesisStoreId | None:
     if audit_scheme_refusal(key_id, scheme) is not None:
         return AuditGenesisStoreId(store_id=None, refused=True)
     return AuditGenesisStoreId(store_id=store_id, refused=False)
+
+
+class StorePin(NamedTuple):
+    """The store ids a host blob names (vault BACKLOG #3411; the key custody draft, rules 1 and 4),
+    which every open of a store under the ``host`` key provider holds the store to.
+
+    ``current`` is the id a new genesis record is written with. ``accepted`` is every id the blob
+    names, the current one and the earlier ones: an earlier id is the one a store restored under a
+    new id still carries in its genesis record (draft rule 4, *What a restore does*)."""
+
+    current: bytes
+    accepted: frozenset[bytes]
+
+
+class StoreIdPinRefused(KeyProviderError):
+    """The store's audit genesis record does not name a store id the host blob names, so the key
+    custody host blob belongs to another store, or the store to no host blob (vault BACKLOG #3411).
+    A :class:`~messagefoundry.store.keyprovider.KeyProviderError`, so every command that treats an
+    unresolved store key as "could not start" treats this the same way. The message names store ids,
+    which are not secret, and never a key."""
+
+
+#: The pin of the store open in progress, set by ``store.base.open_store`` around the backend open
+#: and read by :func:`_load_audit_chain`, which all three backends share. A context variable rather
+#: than a parameter of each backend's open, as the hop posture is held during connector
+#: construction; ``None`` for every open that is not under the ``host`` key provider.
+OPEN_STORE_PIN: ContextVar[StorePin | None] = ContextVar("mefor_open_store_pin", default=None)
+
+
+def store_pin_problem(genesis: Mapping[str, Any] | None, pin: StorePin) -> str | None:
+    """Why the audit row at sequence number 1, ``genesis`` (``None`` when there is none), does not
+    hold the store to ``pin``, or ``None`` when it names an id the pin accepts.
+
+    Refused: no row there, a row that is not a genesis record, a genesis record the walk refuses, one
+    that names no store id, and one that names an id the host blob does not. Total over
+    attacker-written rows: every answer is a string or ``None``."""
+    if genesis is None:
+        return (
+            "the store's audit chain has no genesis record, so the store id the host blob names "
+            "cannot be compared with the store's"
+        )
+    try:  # a driver row (sqlite3.Row among them) is read by key, and has no .get
+        detail = genesis["detail"]
+    except (KeyError, IndexError):
+        detail = None
+    label = parse_audit_genesis_store_id(detail)
+    if label is None:
+        return "the row at the start of the store's audit chain is not a genesis record"
+    if label.refused:
+        return "the store's audit genesis record is one this engine refuses"
+    if label.store_id is None:
+        return (
+            "the store's audit genesis record names no store id, so the store was not created "
+            "under this host blob"
+        )
+    if label.store_id in pin.accepted:
+        return None
+    return (
+        f"the store's audit genesis record names store id {label.store_id.hex()}, and the host "
+        f"blob names {pin.current.hex()}"
+        + (f" and {len(pin.accepted) - 1} earlier id(s)" if len(pin.accepted) > 1 else "")
+        + ": the host blob belongs to another store"
+    )
 
 
 def parse_audit_genesis(detail: object) -> str | None:
@@ -6023,6 +6089,7 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
     host._audit_range_keys = []
     host._audit_ranges_trusted = True
     active_id = audit_active_key_id(host._audit_mac_key, host._audit_mac_fn)
+    pin = OPEN_STORE_PIN.get()
     first = await host._audit_genesis_row()
     if first is None and active_id is not None and not read_only:
         # The append requires an EMPTY log, so it writes nothing when any row is there. Suppressed:
@@ -6032,10 +6099,14 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
             await host.record_audit(
                 AUDIT_KEY_EPOCH_ACTION,
                 actor=AUDIT_GENESIS_ACTOR,
-                detail=audit_genesis_detail(active_id),
+                detail=audit_genesis_detail(active_id, NO_STORE_ID if pin is None else pin.current),
                 expect_prev="",
             )
         first = await host._audit_genesis_row()
+    if pin is not None and (problem := store_pin_problem(first, pin)) is not None:
+        # Vault BACKLOG #3411: at EVERY open under the host key provider, the host blob's store id
+        # must be the one the store was created under, or an earlier one of the same blob.
+        raise StoreIdPinRefused(f"refusing to open the store: {problem}")
     genesis = _audit_genesis(first) if first is not None else None
     if first is None or genesis is None:
         # No genesis row at seq 1. On an empty log that is a chain nobody has started, and a

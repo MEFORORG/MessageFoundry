@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
+    from messagefoundry.store.custody import HostBlob
     from messagefoundry.store.store import UserRecord
 
 
@@ -776,6 +777,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--no-totp",
         action="store_true",
         help="do not enrol an authenticator app (refused while [security].require_mfa is on)",
+    )
+    # Vault BACKLOG #3411 (key custody S3): under [store].key_provider = 'host' this command mints
+    # the store key. Without this option it keeps the key for the account running it; with it, it
+    # writes the machine-scope handoff the named service account converts on its first start.
+    provision_admin.add_argument(
+        "--service-account",
+        default=None,
+        help="under [store].key_provider = 'host', mint the store key for this Windows service "
+        "account (such as 'NT SERVICE\\MessageFoundry') as a handoff it converts on its first "
+        "start; without it the key is kept for the account running this command",
     )
 
     # ADR 0183 Amendment A, Wave 1c (BACKLOG #1136). An enabled Administrator with no address is
@@ -7035,6 +7046,35 @@ def _enrol_totp_at_terminal(
     )
 
 
+class _RecoveryKeyConsole:
+    """The console ``provision-admin`` shows a new store's recovery key on and reads it back from
+    (vault BACKLOG #3411): the console device itself for what is shown, never stdout, stderr or a
+    log, and a line of stdin for the entry. Either raises ``OSError`` when the console is gone."""
+
+    def show(self, text: str) -> None:
+        _show_on_terminal(text)
+
+    def read(self) -> str:
+        return sys.stdin.readline()
+
+
+def _discard_minted_custody(path: Path) -> None:
+    """Remove the host blob or handoff ``provision-admin`` minted when the store it was minted for
+    could not be created, so a second run can mint again. A file that cannot be removed is named
+    on stderr; its text never carries the key."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(
+            f"WARNING: the store could not be created, and the store key minted for it in {path} "
+            f"could not be removed ({exc.strerror or type(exc).__name__}). Remove it before "
+            "running provision-admin again",
+            file=sys.stderr,
+        )
+
+
 def _read_new_password(prompt: str) -> str:
     """Read a new password twice from the controlling terminal, or raise with an explanation.
 
@@ -8663,11 +8703,48 @@ def _provision_admin(args: argparse.Namespace) -> int:
     # the same errors: the store could not be opened, so the command could not start. Before
     # BACKLOG #2081 they escaped to the dispatch floor, and a malformed key did until #3054.
     key_unresolved = _key_unresolved()
+    # Vault BACKLOG #3411: under [store].key_provider = 'host' a new store's key is minted here.
+    from messagefoundry.store.custody_host import HOST_PROVIDER, HostCustodyMissing, mint_target
+
+    host_custody = settings.store.key_provider == HOST_PROVIDER
+    if args.service_account is not None and not host_custody:
+        return _emit_error(
+            "--service-account mints a store key, which only [store].key_provider = 'host' does",
+            as_json=args.json,
+        )
+    mint_custody = False
 
     try:
         service = _build_provision_auth_service(settings, store_slot, posture=posture)
-        absent, exists = run_guarded(administrator_exists())
-        if absent and settings.store.backend is StoreBackend.SQLITE:
+        try:
+            absent, exists = run_guarded(administrator_exists())
+        except HostCustodyMissing:
+            # A SQLite store that exists has no key here, and minting one cannot open it. A server
+            # database may hold no store yet; if it holds one, the store id pin refuses the mint.
+            if settings.store.backend is StoreBackend.SQLITE:
+                raise
+            absent, exists = True, None
+        if host_custody and absent:
+            # Checked before the prompts, so a refused or repeated mint asks for nothing. The mint
+            # itself, and the recovery key it shows, come last, once nothing else can refuse.
+            mint_custody = True
+            if not sys.stdin.isatty():
+                return _emit_error(
+                    "refusing to provision without a terminal: the store's recovery key is shown "
+                    "once and entered back interactively. Run this from a console.",
+                    as_json=args.json,
+                )
+            mint_target(
+                settings.store,
+                service_account=args.service_account,
+                enforcing=posture.enforcing,
+            )
+        elif args.service_account is not None:
+            return _emit_error(
+                "--service-account mints a new store's key, and this store already exists",
+                as_json=args.json,
+            )
+        elif absent and settings.store.backend is StoreBackend.SQLITE:
             # `open_store` refuses an absent SQLite file before it resolves the key, so a key that
             # cannot be resolved (Vault with no Vault environment in this shell) would otherwise
             # first fail at the write, after the prompt. Resolved now and discarded; the write
@@ -8705,6 +8782,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
         return _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
     except sqlite3.DatabaseError as exc:  # #1670: a path that is not a database
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
+    except FileExistsError as exc:
+        # Vault BACKLOG #3411: a host blob or a handoff is already in the custody directory.
+        _emit_error(f"{_sentence(exc)} {_NOTHING_PROVISIONED}", as_json=args.json)
+        return 2
     if exists is not None:
         return _emit_error(exists, as_json=args.json)
 
@@ -8774,6 +8855,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
 
     # Set just before the service's write, which stores the seed (BACKLOG #5067).
     write_started = False
+    # Vault BACKLOG #3411: the minted blob, held in memory for the store's creation, and the file
+    # it was written to, removed if the store cannot be created.
+    minted: tuple[HostBlob, Path] | None = None
 
     def after_the_key(refusal: str, before_write: str) -> str:
         """The text for a refusal the write's arms catch, after the key was shown (BACKLOG #5067).
@@ -8803,12 +8887,20 @@ def _provision_admin(args: argparse.Namespace) -> int:
     async def run() -> tuple[ProvisionedAdministrator, str]:
         nonlocal write_started
         # create=True (BACKLOG #1780): this bootstrap runs before the first serve, see the note below.
-        store = await open_store(
-            settings.store,
-            create=True,
-            posture=posture,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-        )
+        # Under the host key provider the store is created with the blob minted above, so its
+        # genesis record carries that blob's store id (vault BACKLOG #3411).
+        try:
+            store = await open_store(
+                settings.store,
+                create=True,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+                custody=None if minted is None else minted[0],
+            )
+        except BaseException:
+            if minted is not None:
+                _discard_minted_custody(minted[1])
+            raise
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:
                 # BACKLOG #1905: the settings name a key but the store opened keyless. Refuse before
@@ -8882,6 +8974,23 @@ def _provision_admin(args: argparse.Namespace) -> int:
             "is refused the same way again, the store has a fault this command cannot repair",
             as_json=args.json,
         )
+
+    if mint_custody:
+        # Vault BACKLOG #3411: last before the write, so nothing after it can refuse for want of
+        # an answer the operator could have given first. The recovery key goes to the console
+        # device only, and nothing is written until it has been entered back.
+        from messagefoundry.store.custody_host import HostCustodyRefused, mint_host_custody
+
+        try:
+            minted = mint_host_custody(
+                settings.store,
+                service_account=args.service_account,
+                enforcing=posture.enforcing,
+                terminal=_RecoveryKeyConsole(),
+            )
+        except (HostCustodyRefused, FileExistsError, OSError) as exc:
+            _emit_error(after_the_key(str(exc), str(exc)), as_json=args.json)
+            return 2
 
     # No TrustAnchorError arm: the anchors are checked at the build, before the prompt (#2081).
     try:

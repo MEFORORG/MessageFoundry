@@ -819,6 +819,12 @@ SITES: dict[str, Site] = {
         "The credential name the caller configures, refused unless it is a plain file name, under "
         "the directory systemd names in $CREDENTIALS_DIRECTORY.",
     ),
+    "messagefoundry/store/custody_host.py::_custody_paths": Site(
+        2,
+        OPERATOR,
+        "The two fixed custody file names under the directory MEFOR_SECRETS_DIRECTORY names, or "
+        "the operator's [store].path directory.",
+    ),
     "messagefoundry/store/store.py::MessageStore._db_size_bytes": Site(
         1, OPERATOR, _SQLITE_SIDECARS
     ),

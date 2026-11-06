@@ -551,6 +551,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     # associated data; hashlib = the SHA-256 recovery-key checksum; hmac = compare_digest for that
     # checksum and for key equality. The master key is minted from os.urandom.
     "messagefoundry/store/custody.py": frozenset({"cryptography", "hashlib", "hmac"}),
+    # Vault BACKLOG #3411 (key custody S3 part B3b): the host key provider's wiring. cryptography =
+    # HKDF-SHA256 of the master key into the store key the in-process cipher opens with; the
+    # keyprovider import is its KeyProviderError base. Minting and the recovery wrap go through
+    # store/custody.py.
+    "messagefoundry/store/custody_host.py": frozenset(
+        {"cryptography", "messagefoundry.store.keyprovider"}
+    ),
     # ASVS 11.3.4 (#301): the persisted per-key_id AES-GCM invocation bound (cipher_meta table) reads
     # the cipher reserve-block size + AesGcmCipher/Cipher types through the store.crypto seam. ADR 0196
     # adds the store-salt bind at open, which draws a candidate salt through new_store_salt.
@@ -600,7 +607,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # (ADR 0193): it also names each audit key by store.crypto.audit_key_id, a one-way SHA-256 id of
     # the DERIVED audit key, so a verify after a rotation picks the key each keyed range was MAC'd
     # under. The id is non-secret: neither key can be recovered from it.
-    "messagefoundry/store/store.py": frozenset({"hashlib", "hmac", "messagefoundry.store.crypto"}),
+    # Vault BACKLOG #3411: the keyprovider import is KeyProviderError, the base of the store id pin's
+    # refusal; the pin compares store ids, which are not secret, and runs no crypto.
+    "messagefoundry/store/store.py": frozenset(
+        {"hashlib", "hmac", "messagefoundry.store.crypto", "messagefoundry.store.keyprovider"}
+    ),
     # BACKLOG #1178 (ASVS 12.3.1): probe_tcp_reachable builds NO context -- it accepts the caller's
     # and hands it to asyncio.open_connection, so the connection test crosses the same hop the send
     # path does instead of opening a plaintext socket to a tls=true partner. ssl is imported for the
@@ -973,10 +984,6 @@ IMPORT_ONLY: dict[str, str] = {
         "names HopPosture, a value type, to hand the caller's posture to the provider it loads; "
         "the guard that reads it is in transports/strict_requests.py, which is inventoried"
     ),
-    "messagefoundry/store/keyprovider.py": (
-        "names HopPosture, a value type, to hand the caller's posture to the provider it loads; "
-        "the guard that reads it is in transports/strict_requests.py, which is inventoried"
-    ),
     "messagefoundry/config/loaded_crls.py": (
         "keys a weak registry on ssl.SSLContext and stores public CRL metadata; the CRL load it "
         "records runs in config/tls_policy.py harden_crl_check, which is inventoried"
@@ -1073,6 +1080,11 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:via messagefoundry.store.cipher_cells",
             "csprng:via messagefoundry.auth.totp",
             "csprng:via messagefoundry.store.crypto",
+            # Vault BACKLOG #3411: under the host key provider provision-admin mints the store's
+            # master key, store id and recovery key, and proves the recovery key against its wrap.
+            "cipher:via messagefoundry.store.custody_host",
+            "csprng:via messagefoundry.store.custody_host",
+            "kdf:via messagefoundry.store.custody_host",
             "hash:via messagefoundry.api.tls",
             # BACKLOG #3778: admin-reset-totp pins the account's opened TOTP seed across the prompt
             # by its SHA-256 digest (auth.tokens.hash_token), compared in constant time.
@@ -1524,9 +1536,18 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     ),
     # BACKLOG #300: building the Transit cipher now builds its Vault client's narrowed TLS context.
     # This row replaced an IMPORT_ONLY entry, which the operation arm then refused as untrue.
+    # Vault BACKLOG #3411: under the host key provider open_store derives the store key from the
+    # host blob's master key (HKDF-SHA256 in store/custody_host.py).
     "messagefoundry/store/base.py": frozenset(
-        {"tls_context:via messagefoundry.store.crypto_transit"}
+        {
+            "kdf:via messagefoundry.store.custody_host",
+            "tls_context:via messagefoundry.store.crypto_transit",
+        }
     ),
+    # Vault BACKLOG #3411: the host key provider derives the store key from the host blob's master
+    # key (HKDF-SHA256 in store/custody_host.py). The other providers name HopPosture, a value
+    # type, only to hand the caller's posture to the provider they load.
+    "messagefoundry/store/keyprovider.py": frozenset({"kdf:via messagefoundry.store.custody_host"}),
     "messagefoundry/store/crypto.py": frozenset(
         {
             "cipher:.decrypt()",
@@ -1565,6 +1586,17 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "hash:hashlib.sha256",
             "kdf:.derive()",
             "kdf:cryptography.hazmat.primitives.kdf.hkdf.HKDF[sha256]",
+        }
+    ),
+    # Vault BACKLOG #3411 (B3b): derives the store key from the master key (HKDF-SHA256), and mints
+    # and proves the recovery key through store/custody.py.
+    "messagefoundry/store/custody_host.py": frozenset(
+        {
+            "cipher:via messagefoundry.store.custody",
+            "csprng:via messagefoundry.store.custody",
+            "kdf:.derive()",
+            "kdf:cryptography.hazmat.primitives.kdf.hkdf.HKDF[sha256]",
+            "kdf:via messagefoundry.store.custody",
         }
     ),
     # ADR 0196: the store-salt bind at open draws a candidate salt (os.urandom) via new_store_salt.

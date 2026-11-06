@@ -39,6 +39,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.config.tls_policy import HopPosture
+from messagefoundry.custody_posture import HOST_KEY_PROVIDER
 from messagefoundry.redaction import codec_safe_str, prints_a_codec_error
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.content_search import (
@@ -67,6 +68,7 @@ from messagefoundry.store.privilege import (
 )
 from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import (
+    OPEN_STORE_PIN,
     UPLOAD_RESERVATION_STALE_AFTER,
     AdMap,
     AdminGrant,
@@ -114,6 +116,7 @@ from messagefoundry.store.store import (
     SessionRecord,
     SignCountAnswer,
     Stage,
+    StorePin,
     StreamingAttachmentsUnsupported,
     TotpUsable,
     UserRecord,
@@ -124,6 +127,7 @@ from messagefoundry.store.store import (
 log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; both carry an optional driver, imported lazily
+    from messagefoundry.store.custody import HostBlob
     from messagefoundry.store.postgres import PostgresStore
     from messagefoundry.store.sqlserver import SqlServerStore
 
@@ -3408,7 +3412,9 @@ def resolve_decrypt_keys(
     return keyring
 
 
-def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = None) -> Cipher:
+def build_store_cipher(
+    settings: StoreSettings, *, posture: HopPosture | None = None, host_key: str | None = None
+) -> Cipher:
     """Build the at-rest cipher for ``settings`` — the SAME construction ``open_store`` uses (active key
     + retired decrypt-only keyring, ``write_v2=aad_bind``). Exposed so a store-DECOUPLED PHI-at-rest
     surface — the offline uploaded-logs files (ADR 0134) — encrypts under the identical DEK / keyring /
@@ -3420,6 +3426,10 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     client setting it refuses. Each comes from the settings or the key provider before the store
     reads a row, so a caller can treat that class as "could not start" where a bare ``ValueError``
     from the open could mean anything (vault BACKLOG #3054, item 8).
+
+    ``host_key`` is the key :func:`open_store` derived from the host blob it read itself, under the
+    ``host`` key provider (vault BACKLOG #3411), so the blob is read once per open; ``None`` resolves
+    the key through the provider as every other caller does.
 
     ``posture`` is the instance posture the caller holds. It reaches the two Vault hops a cipher
     build can dial, the key provider and the Transit cipher, whose revocation guard is keyed on it
@@ -3434,7 +3444,7 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     Every other ``ValueError`` keeps its text and its chain. An error of another class, such as a
     ``KeyProviderError`` or ``DpapiError``, passes through untouched."""
     try:
-        return _build_store_cipher(settings, posture)
+        return _build_store_cipher(settings, posture, host_key)
     except ValueError as exc:
         if not _carries_a_codec_error(exc):
             raise StoreCipherConfigError(str(exc)) from exc
@@ -3462,7 +3472,9 @@ class StoreCipherConfigError(ValueError):
     is rendered without the bytes it names (BACKLOG #3471)."""
 
 
-def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> Cipher:
+def _build_store_cipher(
+    settings: StoreSettings, posture: HopPosture | None, host_key: str | None = None
+) -> Cipher:
     if settings.cipher_provider == "vault_transit":
         # ADR 0138: bulk at-rest crypto INSIDE Vault/OpenBao Transit — the plaintext DEK never enters
         # engine heap (ASVS 13.3.3). Lazy-imported so the base install pulls no Vault SDK; fails closed at
@@ -3477,7 +3489,7 @@ def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> 
         )
     retired = [k.strip() for k in settings.encryption_keys_retired.split(",") if k.strip()]
     return make_cipher(
-        resolve_active_key(settings, posture=posture),
+        host_key if host_key is not None else resolve_active_key(settings, posture=posture),
         retired,
         write_v2=settings.aad_bind,
         allow_unmarked=settings.allow_unmarked_ciphertext,
@@ -3896,6 +3908,7 @@ async def open_store(
     posture: HopPosture | None = None,
     keyless_chain_refusal: str | None = KEYLESS_REFUSED_BY_NO_OPT_OUT,
     refusal_hook: UnmarkedRefusalHook | None = None,
+    custody: HostBlob | None = None,
 ) -> Store:
     """Open the store for the configured backend — the single backend-selection seam.
 
@@ -3959,6 +3972,17 @@ async def open_store(
     refuse an unmarked value -- the sweep finds a planted row, or the eager ``state``/``reference``
     cache load reads one and aborts the open -- and only a hook armed this early can alert on those.
     ``None`` leaves the refusal to the log, as a CLI utility's open does.
+
+    **Key custody (vault BACKLOG #3411).** Under ``[store].key_provider = 'host'`` the open reads
+    the host blob itself (:func:`~messagefoundry.store.custody_host.load_host_custody`; a writable
+    open converts a handoff on the service's first start), derives the store key from it, and holds
+    the store to the blob's store ids at EVERY open: a new store's audit genesis record is written
+    with the current id, and an existing store's must name one the blob names, or the open raises
+    :class:`~messagefoundry.store.store.StoreIdPinRefused` with the handle closed. ``custody`` is
+    the blob a minting command holds in memory and passes instead (``provision-admin`` creating the
+    store it minted for; a handoff it wrote is not its to read). Under any other provider a host
+    blob or a handoff in the custody directory refuses the open, and ``custody`` must be ``None``.
+    Every custody refusal is a :class:`~messagefoundry.store.keyprovider.KeyProviderError`.
     """
     if create and read_only:
         raise ValueError("open_store: create and read_only exclude each other")
@@ -3972,7 +3996,15 @@ async def open_store(
     # crypto inside Vault/OpenBao Transit so the DEK never enters heap (ASVS 13.3.3). No key → identity.
     # The posture goes to the cipher build as it is. `None` is not replaced by the ambient
     # posture there: on a Vault hop an unknown posture counts as enforcing (vault BACKLOG #2983).
-    cipher = build_store_cipher(settings, posture=posture)
+    # The host blob's checked read, a DPAPI call and, on a first start, a conversion: off the loop.
+    pin, host_key = (
+        await asyncio.to_thread(
+            _host_custody_for_open, settings, custody, posture=posture, read_only=read_only
+        )
+        if settings.key_provider == HOST_KEY_PROVIDER
+        else _host_custody_for_open(settings, custody, posture=posture, read_only=read_only)
+    )
+    cipher = build_store_cipher(settings, posture=posture, host_key=host_key)
     setter = getattr(cipher, "set_refusal_hook", None)
     if refusal_hook is not None and callable(setter):
         setter(refusal_hook)
@@ -3987,16 +4019,22 @@ async def open_store(
     # while the posture claimed the most isolated MAC available. Every backend now takes both and
     # gates on "either secret present" (`_audit_keyed_capable`).
     audit_mac_fn = cipher.audit_mac_fn()
-    store = await _open_backend(
-        settings,
-        cipher=cipher,
-        audit_mac_key=audit_mac_key,
-        audit_mac_fn=audit_mac_fn,
-        message_events=message_events,
-        posture=posture,
-        create=create,
-        read_only=read_only,
-    )
+    # The pin rides a context variable to the genesis read every backend shares (vault BACKLOG
+    # #3411); reset at once, so no later open in this context inherits it.
+    pinned = OPEN_STORE_PIN.set(pin)
+    try:
+        store = await _open_backend(
+            settings,
+            cipher=cipher,
+            audit_mac_key=audit_mac_key,
+            audit_mac_fn=audit_mac_fn,
+            message_events=message_events,
+            posture=posture,
+            create=create,
+            read_only=read_only,
+        )
+    finally:
+        OPEN_STORE_PIN.reset(pinned)
     if keyless_chain_refusal is not None and audit_mac_key is None and audit_mac_fn is None:
         await _refuse_to_start_a_keyless_chain(
             store,
@@ -4004,6 +4042,42 @@ async def open_store(
             key_named=bool(settings.encryption_key or settings.encryption_key_file),
         )
     return store
+
+
+def _host_custody_for_open(
+    settings: StoreSettings,
+    custody: HostBlob | None,
+    *,
+    posture: HopPosture | None,
+    read_only: bool,
+) -> tuple[StorePin | None, str | None]:
+    """``(pin, key)`` for an open under the ``host`` key provider, or ``(None, None)`` for any other
+    provider once no host blob or handoff is found beside it (vault BACKLOG #3411). See
+    :func:`open_store`."""
+    from messagefoundry.store.custody_host import (
+        HostCustodyRefused,
+        check_host_custody_settings,
+        foreign_custody_refusal,
+        host_store_key,
+        load_host_custody,
+        store_pin,
+    )
+
+    if settings.key_provider != HOST_KEY_PROVIDER:
+        if custody is not None:
+            raise ValueError("open_store: custody is for the 'host' key provider only")
+        refusal = foreign_custody_refusal(settings)
+        if refusal is not None:
+            raise HostCustodyRefused(refusal)
+        return None, None
+    if custody is None:
+        enforcing = posture is None or posture.enforcing
+        custody = load_host_custody(
+            settings, enforcing=enforcing, convert=not read_only, observe=True
+        )
+    else:
+        check_host_custody_settings(settings)
+    return store_pin(custody), host_store_key(custody)
 
 
 async def _refuse_to_start_a_keyless_chain(

@@ -1,0 +1,549 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The ``host`` key provider: key custody wired into the engine (vault BACKLOG #3411, slice S3
+part B3b; the key custody ADR draft, rules 1 to 4, 3b and 13).
+
+* **Mint** (:func:`mint_host_custody`). The command that creates the store mints the master key,
+  the store id and the recovery key (:mod:`messagefoundry.store.custody`). The recovery key is shown
+  once to the person at the terminal, who enters it back; nothing is written until that entry has
+  opened the recovery wrap, so every blob written here records its recovery key as proved.
+* **Where the blob goes.** A fixed name in the custody directory (:func:`custody_directory`): the
+  directory ``MEFOR_SECRETS_DIRECTORY`` names, or else a SQLite store's own data directory.
+  :data:`HOST_FILE_NAME` is the host blob in the engine account's own scope, written by an account
+  minting for itself; :data:`HANDOFF_FILE_NAME` is the machine-scope handoff an administrator writes
+  for the service account (Windows only). A second mint over either is ``FileExistsError``.
+* **First start** (:func:`load_host_custody`). A start that finds only the handoff converts it: the
+  service re-wraps the key in its own user scope, writes the host file, checks that it opens, and
+  deletes the handoff through the handle it read it with. A start that finds both applies the crash
+  rule: the handoff is deleted when it names the host file's store id, and the start refuses when it
+  names another.
+* **The store id pin.** Every open under this provider holds the store to the blob's store ids
+  (:class:`~messagefoundry.store.store.StorePin`): a new store's genesis record is written with
+  the current id, and an existing store's must name one the blob names.
+* **Precedence.** A host blob is never read beside another store key source, and a host blob or a
+  handoff in the custody directory refuses every other key provider (rules 2 and 13).
+* **The account.** SYSTEM, LOCAL SERVICE and NETWORK SERVICE are refused always, and on Linux root
+  and nobody (the custody primitives refuse them). An account that is not local to this host, at
+  least a domain user or a group managed service account, is refused under ``enforce`` and named as
+  a loosening outside it.
+
+**Not wired here (slice B3c), each failing closed:** ``serve`` does not mint (a store under this
+provider with no host blob refuses, naming ``provision-admin``); the installer does not pass
+``--service-account``; there is no no-terminal probe beyond the terminal check; and an offline
+command run by an account that cannot open the host blob refuses rather than asking for the
+recovery key. Nothing here writes the keyring table.
+
+**No key material reaches a log, an exception message, argv or the environment.** This module
+logs nothing at all. The recovery key's text goes only to the terminal callable the caller passes,
+which writes the console device, and an entry read back is dropped once it is parsed.
+"""
+
+from __future__ import annotations
+
+import base64
+import os
+import sys
+import time
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
+
+from messagefoundry.custody_posture import (
+    HOST_KEY_PROVIDER,
+    KeyCustodyPosture,
+    record_key_custody,
+)
+from messagefoundry.engine_secrets import (
+    CUSTODY_FILE_NAMES,
+    KEY_CLASS_NAMES,
+    SECRETS_DIRECTORY_VARIABLE,
+)
+from messagefoundry.store.keyprovider import KeyProviderError
+
+if TYPE_CHECKING:
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.custody import HostBlob, MasterKey, StoreId
+    from messagefoundry.store.store import StorePin
+
+__all__ = [
+    "HANDOFF_FILE_NAME",
+    "HOST_FILE_NAME",
+    "HOST_PROVIDER",
+    "HostCustodyMissing",
+    "HostCustodyRefused",
+    "RecoveryKeyTerminal",
+    "custody_directory",
+    "foreign_custody_refusal",
+    "host_store_key",
+    "load_host_custody",
+    "mint_host_custody",
+    "store_pin",
+]
+
+HOST_PROVIDER = HOST_KEY_PROVIDER  # the one spelling, in the custody_posture leaf
+#: The host blob, in the engine account's own scope, and the machine-scope handoff an administrator
+#: writes for the service's first start (Windows). Named once, in ``engine_secrets``.
+HOST_FILE_NAME, HANDOFF_FILE_NAME = CUSTODY_FILE_NAMES
+#: How many times the recovery key may be entered back before the mint stops, writing nothing.
+RECOVERY_KEY_ATTEMPTS = 3
+#: The HKDF label the store's data key is derived from the master key under, until slice S4 puts the
+#: master key over wrapped data keys (draft rule 6). The master key itself never seals data.
+_HOST_STORE_KEY_INFO = b"mefor/host-store-key/v1"
+
+
+class HostCustodyRefused(KeyProviderError):
+    """The ``host`` key provider could not provide the store key. A
+    :class:`~messagefoundry.store.keyprovider.KeyProviderError`, so every command that already
+    reports an unresolved store key as "could not start" reports this the same way. The message
+    names files, settings and accounts, never key material."""
+
+
+class HostCustodyMissing(HostCustodyRefused):
+    """Neither a host blob nor a handoff is in the custody directory: no store key was minted here."""
+
+
+class RecoveryKeyTerminal(Protocol):
+    """The terminal the recovery key is shown on and entered back at. ``show`` writes to the
+    console device itself, never to stdout, stderr or a log; ``read`` returns one entry, never
+    echoed anywhere else. Either raises ``OSError`` when the console is gone."""
+
+    def show(self, text: str) -> None: ...
+
+    def read(self) -> str: ...
+
+
+# --- where the blob lives -------------------------------------------------------------------------
+
+
+def custody_directory(
+    settings: StoreSettings, *, environ: Mapping[str, str] | None = None
+) -> Path | None:
+    """The directory the host blob and the handoff live in, or ``None`` when there is none.
+
+    The directory ``MEFOR_SECRETS_DIRECTORY`` names when it is set (an absolute path, or
+    :class:`HostCustodyRefused`); otherwise a SQLite store's data directory, the one that holds the
+    database file. A server store, or an in-memory one, has no data directory."""
+    from messagefoundry.config.settings import StoreBackend
+
+    environ = os.environ if environ is None else environ
+    raw = environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
+    if raw:
+        path = Path(raw)
+        if not path.is_absolute():
+            raise HostCustodyRefused(f"{SECRETS_DIRECTORY_VARIABLE} must be an absolute path")
+        return path
+    if settings.backend is StoreBackend.SQLITE and settings.path != ":memory:":
+        return Path(settings.path).resolve().parent
+    return None
+
+
+def _custody_paths(directory: Path) -> tuple[Path, Path]:
+    return directory / HOST_FILE_NAME, directory / HANDOFF_FILE_NAME
+
+
+def _key_sources_beside(settings: StoreSettings, environ: Mapping[str, str]) -> list[str]:
+    """Every other store key source that is set: the settings' own and the key-class variables."""
+    named = []
+    if settings.encryption_key:
+        named.append("MEFOR_STORE_ENCRYPTION_KEY")
+    if settings.encryption_key_file:
+        named.append("[store].encryption_key_file")
+    if settings.encryption_keys_retired.strip():
+        named.append("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED")
+    for name in KEY_CLASS_NAMES:
+        if environ.get(name) and name not in named:
+            named.append(name)
+    return named
+
+
+def _precedence_refusal(settings: StoreSettings, environ: Mapping[str, str]) -> str | None:
+    """Why the ``host`` provider must not run with these settings (draft rules 2 and 13)."""
+    beside = _key_sources_beside(settings, environ)
+    if beside:
+        return (
+            f"[store].key_provider = 'host' reads the store key from its host blob only, and "
+            f"{', '.join(beside)} is set beside it. Remove it: a second key source would sit "
+            "readable and could be taken for the store's key"
+        )
+    if settings.cipher_provider != "aesgcm":
+        return (
+            f"[store].key_provider = 'host' supplies the in-process cipher, and "
+            f"[store].cipher_provider is {settings.cipher_provider!r}. Use 'aesgcm'"
+        )
+    return None
+
+
+def foreign_custody_refusal(
+    settings: StoreSettings, *, environ: Mapping[str, str] | None = None
+) -> str | None:
+    """Why a store under any key provider but ``host`` must not open, or ``None``: a host blob or a
+    handoff sits in its custody directory, so the store's key would be taken from somewhere other
+    than the blob minted for it. An unusable directory setting is left for the reader of that
+    setting to refuse."""
+    environ = os.environ if environ is None else environ
+    try:
+        directory = custody_directory(settings, environ=environ)
+    except HostCustodyRefused:
+        return None
+    if directory is None:
+        return None
+    found = [p.name for p in _custody_paths(directory) if os.path.lexists(p)]
+    if not found:
+        return None
+    return (
+        f"{' and '.join(found)} is in {directory}, but [store].key_provider is "
+        f"{settings.key_provider!r}. A store with a host blob takes its key from that blob only: "
+        "set [store].key_provider = 'host' and remove every other store key, or remove the file"
+    )
+
+
+# --- the account ----------------------------------------------------------------------------------
+
+
+def _engine_sid() -> str | None:
+    """The SID of the account this process runs as. Windows only."""
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    return _win32_config_source_probes().self_sid
+
+
+def non_local_account_reading(
+    *, enforcing: bool, sid_of: Callable[[], str | None] | None = None
+) -> str | None:
+    """Why this process's account is not local to this host, or ``None`` when it is (or off
+    Windows). Under ``enforcing`` that is a refusal (:class:`HostCustodyRefused`); outside it the
+    reason is returned for the caller to name as a loosening. SYSTEM and the shared service accounts
+    are refused by the custody files themselves, whatever the setting. ``sid_of`` stands in for the
+    account read in a test."""
+    if sys.platform != "win32" and sid_of is None:
+        return None
+    from messagefoundry.restricted_file import (
+        custody_non_local_account_problem,
+        local_account_domain_sid,
+    )
+
+    sid = (sid_of or _engine_sid)()
+    if sid is None:
+        problem: str | None = "the account the engine runs as could not be read"
+    else:
+        problem = custody_non_local_account_problem(sid, local_account_domain_sid())
+    if problem is not None and enforcing:
+        raise HostCustodyRefused(
+            f"the store key is not held for this account: {problem}. "
+            "[security].enforcement = enforce refuses it"
+        )
+    return problem
+
+
+# --- the key the store opens with, and its pin ----------------------------------------------------
+
+
+def host_store_key(blob: HostBlob) -> str:
+    """The base64 store key the in-process cipher opens with: HKDF-SHA256 over the master key under
+    its own label, so the master key itself seals nothing (draft rule 6). Never log the result."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=_HOST_STORE_KEY_INFO)
+    return base64.b64encode(hkdf.derive(blob.master_key.material())).decode("ascii")
+
+
+def store_pin(blob: HostBlob) -> StorePin:
+    """The store ids ``blob`` holds a store to: its current id, and every earlier one."""
+    from messagefoundry.store.store import StorePin
+
+    current = blob.store_id.value
+    return StorePin(current, frozenset({current, *(s.value for s in blob.earlier_store_ids)}))
+
+
+# --- reading, converting and settling at open -----------------------------------------------------
+
+
+def _refused(what: str, exc: BaseException) -> HostCustodyRefused:
+    """A refusal naming ``what`` and the reason ``exc`` gives. Every error this module wraps comes
+    from the custody primitives, the DPAPI calls or the file system, whose texts carry no key."""
+    return HostCustodyRefused(f"{what}: {exc}")
+
+
+def _custody_errors() -> tuple[type[BaseException], ...]:
+    from messagefoundry.secrets_dpapi import DpapiError, DpapiUnavailable
+    from messagefoundry.store.custody import CustodyError
+
+    # OSError covers RestrictedFileError and a refused file system call.
+    return (CustodyError, DpapiError, DpapiUnavailable, OSError)
+
+
+def _settle_left_handoff(handoff: Path, blob: HostBlob) -> None:
+    """The crash rule (draft rule 3 step 3): a handoff found beside a host file that opens is
+    deleted when it names the host file's store id, through the handle that read it, and refused
+    when it names another."""
+    from messagefoundry.store.custody import CustodyError, HandoffLeftBehind, consume_handoff_file
+
+    def same_store(left: HostBlob) -> None:
+        if left.store_id != blob.store_id:
+            raise CustodyError(
+                f"it names store id {left.store_id.hex()} and the host file names "
+                f"{blob.store_id.hex()}, so it is not this store's; remove it once you know why "
+                "it is there"
+            )
+
+    try:
+        consume_handoff_file(handoff, same_store)
+    except FileNotFoundError:
+        return  # another start settled it first
+    except HandoffLeftBehind as exc:
+        raise _refused(f"the handoff {handoff} beside the host file", exc) from exc
+    except _custody_errors() as exc:
+        raise _refused(f"the handoff {handoff} beside the host file was refused", exc) from exc
+
+
+def _convert_handoff(host: Path, handoff: Path) -> HostBlob:
+    """The service's first start (draft rule 3 step 2): re-wrap the handoff's key in this account's
+    own scope as the host file, check that the host file opens to the same blob, then delete the
+    handoff through the handle that read it. A conversion that fails leaves the handoff, and the
+    start refuses (step 3)."""
+    from messagefoundry.store.custody import (
+        CustodyError,
+        consume_handoff_file,
+        read_host_file,
+        write_host_file,
+    )
+
+    def convert(blob: HostBlob) -> None:
+        write_host_file(host, blob)
+        if read_host_file(host) != blob:
+            raise CustodyError("the host file written does not open to the handoff's key")
+
+    return consume_handoff_file(handoff, convert)
+
+
+def _read_host(host: Path) -> HostBlob | None:
+    """The host blob at ``host``, or ``None`` when there is no file; every refusal wrapped."""
+    from messagefoundry.store.custody import read_host_file
+
+    try:
+        return read_host_file(host)
+    except FileNotFoundError:
+        return None
+    except _custody_errors() as exc:
+        raise _refused(f"the host file {host} was refused", exc) from exc
+
+
+def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
+    from messagefoundry.store.custody import HandoffLeftBehind
+
+    blob = _read_host(host)
+    if blob is not None:
+        if os.path.lexists(handoff):
+            _settle_left_handoff(handoff, blob)
+        return blob
+    if not os.path.lexists(handoff):
+        raise HostCustodyMissing(
+            f"no host blob ({host}) and no handoff ({handoff}): no store key was minted for this "
+            "store here. Run `messagefoundry provision-admin`, which mints it with the store"
+        )
+    if not convert:
+        raise HostCustodyRefused(
+            f"the handoff {handoff} has not been converted yet: start the service once, as its "
+            "own account, and it converts the handoff into its host blob"
+        )
+    try:
+        return _convert_handoff(host, handoff)
+    except FileNotFoundError:
+        pass  # another start (an engine shard) converted it between the two reads
+    except HandoffLeftBehind as exc:
+        raise _refused("the handoff was converted, but", exc) from exc
+    except _custody_errors() as exc:
+        raise _refused(
+            f"the handoff {handoff} could not be converted, and the start refuses rather than "
+            "run from it",
+            exc,
+        ) from exc
+    blob = _read_host(host)
+    if blob is None:
+        raise HostCustodyMissing(f"the handoff {handoff} went away and left no host file")
+    return blob
+
+
+def check_host_custody_settings(
+    settings: StoreSettings, *, environ: Mapping[str, str] | None = None
+) -> tuple[Path, Path]:
+    """The host blob's and the handoff's paths, once the settings pass: no other store key source
+    beside the blob, the ``aesgcm`` cipher, and a custody directory. Raises
+    :class:`HostCustodyRefused` otherwise. A blob a minting command passes in is held to the same
+    settings a read is."""
+    environ = os.environ if environ is None else environ
+    refusal = _precedence_refusal(settings, environ)
+    if refusal is not None:
+        raise HostCustodyRefused(refusal)
+    directory = custody_directory(settings, environ=environ)
+    if directory is None:
+        raise HostCustodyRefused(
+            "[store].key_provider = 'host' needs a directory for the host blob: set "
+            f"{SECRETS_DIRECTORY_VARIABLE}, since this store has no data directory of its own"
+        )
+    return _custody_paths(directory)
+
+
+def load_host_custody(
+    settings: StoreSettings,
+    *,
+    enforcing: bool,
+    convert: bool = True,
+    observe: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> HostBlob:
+    """The host blob a store under the ``host`` key provider opens with.
+
+    Refuses, with :class:`HostCustodyRefused`: what :func:`check_host_custody_settings` refuses, an
+    account the custody rules refuse (and one not local to this host under ``enforcing``), a host
+    file or handoff the custody reads refuse, and a handoff the crash rule refuses.
+    :class:`HostCustodyMissing` when neither file is there. ``convert`` lets a handoff be
+    converted; a read-only open passes ``False``. ``observe`` records what was found as this
+    process's custody observation; only a store open passes it, so a key read for another purpose
+    (a backup, the upload cipher) never overwrites what the open found."""
+    host, handoff = check_host_custody_settings(settings, environ=environ)
+    account = non_local_account_reading(enforcing=enforcing)
+    blob = _read_or_convert(host, handoff, convert=convert)
+    if observe:
+        record_key_custody(
+            KeyCustodyPosture(
+                recovery_key_proved=blob.recovery_proved_at is not None, non_local_account=account
+            )
+        )
+    return blob
+
+
+# --- the mint -------------------------------------------------------------------------------------
+
+
+def mint_target(
+    settings: StoreSettings,
+    *,
+    service_account: str | None,
+    enforcing: bool,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """The file a mint would write, checked before anything is minted or shown.
+
+    Refuses as :func:`load_host_custody` does for the settings and, when minting for this account
+    (``service_account`` of ``None``), for the account. ``FileExistsError`` when a host blob or a
+    handoff is already there: a second mint over a store's key is never made. A handoff is Windows
+    only; a POSIX host mints as the service user itself."""
+    host, handoff = check_host_custody_settings(settings, environ=environ)
+    for path in (host, handoff):
+        if os.path.lexists(path):
+            raise FileExistsError(
+                f"{path} already exists, so a store key was already minted here; a second mint "
+                "is never made over it"
+            )
+    if service_account is None:
+        non_local_account_reading(enforcing=enforcing)
+        return host
+    if sys.platform != "win32":
+        raise HostCustodyRefused(
+            "--service-account writes a Windows handoff; on this host run provision-admin as the "
+            "service user itself, and it writes that account's host file"
+        )
+    from messagefoundry.store.custody import check_handoff_writable
+
+    try:
+        check_handoff_writable(service_account, enforcing=enforcing)
+    except _custody_errors() as exc:
+        raise _refused("no store key was minted", exc) from exc
+    return handoff
+
+
+def _prove_recovery_key(
+    terminal: RecoveryKeyTerminal, wrapped: bytes, *, master_key: MasterKey, store_id: StoreId
+) -> bool:
+    """Read the recovery key back until an entry opens ``wrapped`` to ``master_key``, at most
+    :data:`RECOVERY_KEY_ATTEMPTS` times. Each entry is dropped once it is parsed."""
+    from messagefoundry.store.custody import CustodyError, RecoveryKey, unwrap_master_key
+
+    for attempt in range(1, RECOVERY_KEY_ATTEMPTS + 1):
+        terminal.show("Enter the recovery key back: ")
+        entry = terminal.read()
+        problem: str | None = None
+        try:
+            parsed = RecoveryKey.parse(entry)
+        except CustodyError as exc:
+            problem = str(exc)
+        del entry
+        if problem is None:
+            try:
+                opened = unwrap_master_key(wrapped, parsed, store_id)
+            except CustodyError:
+                problem = "that is a recovery key, but not the one shown above"
+            else:
+                if opened == master_key:
+                    return True
+                problem = "that entry did not open the store key"
+        if attempt < RECOVERY_KEY_ATTEMPTS:
+            terminal.show(f"{problem}. Try again.\n")
+    return False
+
+
+def mint_host_custody(
+    settings: StoreSettings,
+    *,
+    service_account: str | None,
+    enforcing: bool,
+    terminal: RecoveryKeyTerminal,
+    environ: Mapping[str, str] | None = None,
+    now: Callable[[], float] = time.time,
+) -> tuple[HostBlob, Path]:
+    """Mint a store's key custody, prove the recovery key, and write the blob (draft rules 1, 3, 4).
+
+    Mints the master key, the store id and the recovery key; shows the recovery key once on
+    ``terminal``; and reads it back until an entry opens the recovery wrap to the master key. Only
+    then is anything written: the host blob in this account's own scope when ``service_account`` is
+    ``None``, else the machine-scope handoff for that account. Returns the blob, which records the
+    proof, and the file written. The caller creates the store with that blob, so its genesis record
+    is written with the blob's store id, and removes the file if the store cannot be created.
+
+    Raises what :func:`mint_target` raises before anything is minted; :class:`HostCustodyRefused`
+    when the entries run out, writing nothing, or when a write is refused; ``FileExistsError`` when
+    the file appeared since the check; and ``OSError`` when the terminal goes away."""
+    from messagefoundry.store.custody import (
+        HostBlob,
+        MasterKey,
+        RecoveryKey,
+        StoreId,
+        wrap_master_key,
+        write_handoff_file,
+        write_host_file,
+    )
+
+    target = mint_target(
+        settings,
+        service_account=service_account,
+        enforcing=enforcing,
+        environ=environ,
+    )
+    master_key, store_id, recovery_key = MasterKey.mint(), StoreId.mint(), RecoveryKey.mint()
+    wrapped = wrap_master_key(master_key, recovery_key, store_id)
+    terminal.show(
+        "\nThis store's RECOVERY KEY is shown once, now. It is what moves the store to another "
+        "host, and the only way back in if this host is lost: with neither, the data is gone for "
+        "good. Copy it somewhere off this host, then clear this terminal's scrollback.\n\n  "
+        + recovery_key.text()
+        + "\n\n"
+    )
+    del recovery_key
+    if not _prove_recovery_key(terminal, wrapped, master_key=master_key, store_id=store_id):
+        raise HostCustodyRefused(
+            f"the recovery key was not entered back in {RECOVERY_KEY_ATTEMPTS} tries, so it is not "
+            "shown to be kept; nothing was written. Run the command again: it mints a new one"
+        )
+    blob = HostBlob(master_key, store_id, (), int(now()))
+    try:
+        if service_account is None:
+            write_host_file(target, blob)
+        else:
+            write_handoff_file(target, blob, service_account=service_account, enforcing=enforcing)
+    except FileExistsError:
+        raise
+    except _custody_errors() as exc:
+        raise _refused(f"the store key was not written to {target}", exc) from exc
+    return blob, target
