@@ -1212,7 +1212,8 @@ async def test_the_sqlserver_census_refuses_without_view_definition_on_the_schem
 _CHANGING = re.compile(
     r"\.aside|\bput (?:it |them )?back\b|\brm\b|\boverwritten\b"
     r"|\b(?:mov|renam|remov|delet|overwrit|replac|eras|wip)(?:e|es|ed|ing)\b"
-    r"|\b(?:drop|unlink)(?:s|ped|ping|ed|ing)?\b",
+    r"|\b(?:drop|unlink)(?:s|ped|ping|ed|ing)?\b|\bmv\b"
+    r"|\b(?:removal|deletion|replacement|discard|purge|truncat|relocat)\w*",
     re.IGNORECASE,
 )
 
@@ -1254,8 +1255,12 @@ def test_the_keep_the_key_step_names_the_variable_the_engine_reads() -> None:
 def test_no_keep_the_key_text_advises_changing_what_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # PR 2804 fifth hold, the proof: every text the one helper's callers emit, rendered here,
-    # creates only new things. The positive control is the fourth hold's own text.
+    # PR 2804 fifth hold, the proof: the texts the one helper's callers emit advise changing
+    # nothing that exists. The positive control is the fourth hold's own text. Rendered here are
+    # at least the existing-store refusal, the pin refusal, the never-started refusal,
+    # foreign_custody_refusal, mint_target's refusal and both failed-mint warnings. Not here: the
+    # crash rule's handoff refusal, which its own Windows-only test checks, and the pin refusal's
+    # race backstop in _load_audit_chain, which prints the same _pin_needs_the_wrap text.
     import asyncio
 
     from messagefoundry import __main__ as cli
@@ -1274,6 +1279,8 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         "drop the database",
         "moving the store aside",
         "removing the key file",
+        "the key file needs removal first",
+        "discard the old store",
     ):
         assert _advises_changing(advice), advice
     assert not _advises_changing("the key file could not be removed (Access is denied).")
@@ -1307,12 +1314,14 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
     def _held(self: Path, missing_ok: bool = False) -> None:
         raise PermissionError(13, "Access is denied")
 
-    monkeypatch.setattr(Path, "unlink", _held)
-    cli._discard_minted_custody(kept, server, StoreIdPinRefusedBeforeWrite("before"))
-    monkeypatch.undo()
-    warnings = capsys.readouterr().err
-    assert warnings.count("WARNING:") == 2 and "could not be removed" in warnings, warnings
-    texts.append(warnings)
+    texts.append(capsys.readouterr().err)
+    with monkeypatch.context() as patched:
+        patched.setattr(Path, "unlink", _held)
+        cli._discard_minted_custody(kept, server, StoreIdPinRefusedBeforeWrite("before"))
+    held = capsys.readouterr().err
+    assert "could not be removed" in held, held
+    texts.append(held)
+    assert all(text.count("WARNING:") == 1 for text in texts[-2:]), texts[-2:]
     offending = [text for text in texts if _advises_changing(text)]
     assert not offending, offending
     for text in texts:
