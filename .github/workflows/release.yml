@@ -625,7 +625,7 @@ jobs:
           # `-I` over `-P`: -P drops only the cwd and leaves PYTHONPATH and the user site-packages as
           # two more routes back onto sys.path; -I is -P plus -E plus -s, so one flag closes all three
           # and this step needs none of them. A `cd` out of the checkout would work too, but this same
-          # step later reads constraints.lock and dist/*.whl by RELATIVE path, so it would need a
+          # step reads constraints.lock and dist/*.whl by RELATIVE path, so it would need a
           # subshell and would break quietly on a later edit.
           #
           # `packaging` pin DERIVED from constraints.lock, never hardcoded — it IS a DEP-1 dependency
@@ -646,8 +646,8 @@ jobs:
           # off sys.path, but a green import alone still cannot say WHICH tree answered or what the
           # artifact will publish as. So, the toolkit/console/harness smokes' shape: the imported
           # module must lie inside this venv and be a file the installed distribution's RECORD lists,
-          # and the version handed to the tag guard is the INSTALLED METADATA's — the version PyPI and
-          # every installer see — after it has been checked equal to the module's own __version__.
+          # and the version handed to the tag guard is the INSTALLED METADATA's — the version the
+          # artifact declares — after it has been checked equal to the module's own __version__.
           # A failure inside the command substitution fails the step; the console smoke's step
           # below carries the measurement.
           built=$(/tmp/relsmoke/bin/python -I - <<'PYSMOKE'
@@ -697,9 +697,10 @@ jobs:
                   f"belongs to something else on sys.path, so the wheel was never inspected"
               )
 
-          # METADATA AGAINST THE MODULE, as PEP 440 versions: hatchling canonicalises `Version:`
-          # and leaves the __version__ literal as typed, so a string compare would reject
-          # `0.3.0-rc1` against `0.3.0rc1`, the same release. An empty or missing __version__ is
+          # METADATA AGAINST THE MODULE, as PEP 440 versions: whether `Version:` keeps the typed
+          # spelling or the canonical one depends on the hatchling release (pyproject.toml's
+          # [build-system] note), so a string compare could reject `0.3.0-rc1` against
+          # `0.3.0rc1`, the same release. An empty or missing __version__ is
           # refused here too, so the dry-run arm (no tag to compare against) cannot pass on one.
           # Imported after the stdlib-only guards above, so a broken wheel reports as a broken wheel.
           from packaging.version import InvalidVersion, Version
@@ -748,8 +749,8 @@ jobs:
           # the gate — while hatchling/PyPI normalise it to 0.3.0rc1 everywhere else, meaning the tag,
           # the module attribute and the wheel filename could not all be canonical at once. Version()
           # normalises both sides, so canonical "0.3.0rc1" in __init__.py matches tag v0.3.0-rc1 and the
-          # check still fails loudly on a genuine mismatch. `-I` as for the inspection: the checkout
-          # carries a `packaging/` directory of its own, and nothing from the cwd belongs on sys.path.
+          # check still fails loudly on a genuine mismatch. `-I` as for the inspection: nothing
+          # from the cwd belongs on sys.path.
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#v}"
             /tmp/relsmoke/bin/python -I - "$built" "$want" <<'PYVER'
@@ -2110,7 +2111,7 @@ jobs:
           # so the old step passed it and the release shipped an empty distribution. The wheel is now
           # installed into the smoke venv and its entry module imported out of it.
           #
-          # PEP 440 comparison below, for a STRONGER reason than the engine's copy of this check: `built`
+          # PEP 440 comparison below, for the reason the engine's copy has too since BACKLOG #1583: `built`
           # comes from the wheel's own METADATA, which hatchling has already normalised. On tag
           # v0.3.0-rc1 the metadata says 0.3.0rc1 while want=0.3.0-rc1, so a string compare could NEVER
           # match — this job failed on every pre-release tag by construction, whatever __version__ said.

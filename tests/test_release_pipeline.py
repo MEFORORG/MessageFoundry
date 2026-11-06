@@ -1508,7 +1508,7 @@ def _wheel_builds(shell: str) -> int:
     """
     count = 0
     for rest in _BUILD_CALL.findall(shell):
-        flags = set(rest.split())
+        flags = set(rest.split("#", 1)[0].split())
         if flags & {"--wheel", "-w"} or not flags & {"--sdist", "-s"}:
             count += 1
     return count
@@ -1678,7 +1678,7 @@ def test_each_wheel_smoke_installs_the_built_wheel_into_a_throwaway_venv() -> No
             # holding `id-token: write`. A bare --no-deps is not the fix: the same step's PYEXPOSE
             # check imports messagefoundry.__main__, which needs those dependencies. What this does
             # pin is that the engine installs its OWN built wheel into the throwaway venv.
-            assert "--no-deps" not in shell, (
+            assert not re.search(r"pip install[^\n]*--no-deps[^\n]*dist/\S*\.whl", shell), (
                 "the engine smoke has gained --no-deps, so BACKLOG #1583 option (c) has landed: "
                 "delete this carve-out so the engine is held to the --no-deps assertion below"
             )
@@ -1789,7 +1789,12 @@ def _write_install(
         if dist == _TOOLKIT_DIST
         else f"messagefoundry[harness]=={version}"
     )
-    declared = [default] if requires is None else list(requires)
+    if requires is not None:
+        declared = list(requires)
+    elif dist == _ENGINE_DIST:
+        declared = []  # the engine's script reads no Requires-Dist; never a self-dependency
+    else:
+        declared = [default]
     if dist == _HARNESS_DIST:
         declared += (
             [f"messagefoundry-toolkit=={version}"] if toolkit_requires is None else toolkit_requires
@@ -2128,7 +2133,9 @@ def test_the_engine_tag_gate_compares_the_installed_metadata_version(
     """The tag guard reads the INSTALLED METADATA, not ``__version__`` (BACKLOG #1583 half b).
 
     Discriminated by SPELLING: the module carries the hyphen spelling a pre-release tag needs, and
-    the metadata carries hatchling's canonical form. The two are the same PEP 440 version, so the
+    the metadata the canonical form. The pinned hatchling writes `Version:` in the typed spelling
+    (pyproject.toml's [build-system] note), so a real build need not split them; the split is the
+    instrument, not a claim about the backend. The two are the same PEP 440 version, so the
     smoke accepts the wheel; what it hands the tag guard on stdout must be the METADATA's spelling,
     and the guard then passes the matching tag and refuses another.
     """
@@ -2977,11 +2984,11 @@ def test_the_engine_wheel_smoke_cannot_read_its_version_from_the_checkout(tmp_pa
     holding intact source the bare command prints the SOURCE version and exits 0. Arm 2 is the fix.
 
     ARM 3 IS WHY ARM 2 MEANS ANYTHING, AND IT ASKS THE HARDER QUESTION. Arm 2 asserts a NON-ZERO
-    exit, and flags that break the interpreter exit non-zero too — ``-IX`` dies on a missing ``-X``
-    argument, and ``-I -S`` starts fine but puts the relsmoke venv's site-packages, where the WHEEL
-    WAS JUST INSTALLED, off sys.path. Both satisfy arm 2 and the static flag check while killing
-    every release run. So arm 3 keeps ``site`` on and imports ``packaging``, which is the dependency
-    this very step installs into the venv and imports a few lines later: it fails for either shape.
+    exit, and flags that break the interpreter exit non-zero too — ``-I -S`` starts fine but puts
+    the relsmoke venv's site-packages, where the WHEEL WAS JUST INSTALLED, off sys.path. That
+    satisfies arm 2 and the static flag check while killing every release run. So arm 3 keeps
+    ``site`` on and imports ``packaging``, which is the dependency this very step installs into
+    the venv and imports from its inspection: it fails for that shape.
 
     ARM 4 IS WHY THE FLAG IS ``-I`` AND NOT ``-P``. ``-P`` drops the cwd and stops there, so a
     ``PYTHONPATH`` naming any source tree walks straight back in; ``-I`` implies ``-E`` and ignores
