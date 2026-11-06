@@ -295,7 +295,8 @@ async def _borrow_within_turns(pool: Any) -> asyncio.Task[Any] | None:
     """The borrow, if it finished within ``_HEALTHY_BORROW_TURNS`` loop turns at the shipped timeout;
     otherwise ``None``, with the borrow cancelled and waited for. ``asyncio.wait`` rather than an
     await, so a cancellation aimed at the test itself still propagates; the ``finally`` cancels the
-    borrow on that path too, so no borrow outlives the test."""
+    borrow on that path too. The pool's own inner acquire is cancelled by ``acquire_pooled`` but not
+    awaited here, so it finishes on a later turn of this loop."""
     borrow = asyncio.create_task(
         acquire_pooled(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT, backend="sqlserver")
     )
@@ -324,15 +325,23 @@ async def test_a_healthy_borrow_is_unaffected() -> None:
     does the same here on demand: measured 2026-11-06 on Windows, Python 3.14, with a spinning
     thread and ``sys.setswitchinterval(0.1)``, the old shape failed 49 of 50 runs and this one 0
     of 50; idle, both passed 50 of 50. What this asks instead is that a ready connection comes back
-    within a few turns, unreleased, which a path that waits out a timer cannot do. The control
-    arm shows that on this loop: a borrow behind an hour-long timer is still waiting after the same
-    turns."""
+    within a few turns, unreleased. Idle, a path that waits out a timer cannot do that; on a loaded
+    runner it can if the timer is shorter than the turns took (``_HEALTHY_BORROW_TURNS`` gives the
+    span), so this catches a long wait everywhere and a short one only on a quiet runner. The
+    control arm shows the discrimination on this loop: a borrow behind an hour-long timer is still
+    waiting after the same turns."""
     control = await _borrow_within_turns(_SlowReadyPool())
-    assert control is None, (
-        "a borrow behind an hour-long timer finished inside the turn budget, with "
-        f"{control.exception()!r} -- either it no longer discriminates or the helper ended the "
-        "borrow early"
-    )
+    if control is not None:
+        if control.cancelled():
+            ended = "cancelled"
+        elif control.exception() is not None:
+            ended = f"raised {control.exception()!r}"
+        else:
+            ended = f"returned {control.result()!r}"
+        pytest.fail(
+            f"a borrow behind an hour-long timer finished inside the turn budget ({ended}) -- either "
+            "it no longer discriminates or the helper ended the borrow early"
+        )
     pool = _ReadyPool()
     borrow = await _borrow_within_turns(pool)
     assert borrow is not None, (

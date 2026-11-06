@@ -593,8 +593,8 @@ def test_the_filter_bounds_a_peer_sized_traceback() -> None:
 
     Paired rounds, minimum per side, and which arm goes first drawn each round from an unseeded
     generator, the rule ``tests/_growth.py`` gives (BACKLOG #3721). A stretch of load with a fixed
-    rhythm can still land on one arm in every round: ``_growth.py`` puts that at 1 in 2**rounds per
-    trial, so 1 in 8 here. The unbounded scan is an arm of the same rounds, so one load-skewed
+    rhythm can still land on one arm in every round: with three arms shuffled each round, a given
+    arm takes the same slot in all three rounds 1 time in 27. The unbounded scan is an arm of the same rounds, so one load-skewed
     sample of it cannot move the line on its own.
 
     The render arm is ``safe_traceback``, the render the filter itself runs, so ``filter - render``
