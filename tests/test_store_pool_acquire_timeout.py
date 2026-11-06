@@ -30,6 +30,7 @@ discards the connection. Hence shield-then-cancel-then-salvage.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import types
 from pathlib import Path
@@ -271,10 +272,39 @@ async def test_salvage_swallows_a_release_failure() -> None:
     await _settle()  # no unhandled exception escapes
 
 
+#: How many event-loop turns a borrow from a ready pool may take. Measured 2026-11-06 on 3.14: it
+#: finishes in 4, for the borrow task, the shield's callback and the wake of the waiting task.
+#: A path that waits on any timer, however short, cannot finish inside any number of turns, because
+#: these turns take microseconds.
+_HEALTHY_BORROW_TURNS = 20
+
+
 async def test_a_healthy_borrow_is_unaffected() -> None:
-    """Positive control: the bound must not change the ordinary path."""
+    """Positive control: the bound must not change the ordinary path.
+
+    **Counted in loop turns, at the shipped timeout, not raced against a 0.05 s timer (BACKLOG
+    #3130, #3456).** The timer and the borrow share the loop, so a runner that kept the loop off
+    the core for 0.05 s after arming the timer let it come due before the borrow's result reached
+    the waiting task, and the timer won: windows-2022 on 2026-10-06 and windows-2025 on 2026-10-12
+    raised StoreAcquireTimeout from a pool that was never empty. A GIL-holding neighbour thread
+    does the same here on demand. What this asks instead is that a ready connection comes back
+    within a few turns, unreleased, which no path that waits on a timer can do."""
     pool = _ReadyPool()
-    assert await acquire_pooled(pool, timeout=FAST, backend="sqlserver") is pool.conn
+    borrow = asyncio.create_task(
+        acquire_pooled(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT, backend="sqlserver")
+    )
+    for _ in range(_HEALTHY_BORROW_TURNS):
+        if borrow.done():
+            break
+        await asyncio.sleep(0)
+    if not borrow.done():
+        borrow.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await borrow
+        pytest.fail(
+            f"a borrow from a ready pool was still waiting after {_HEALTHY_BORROW_TURNS} turns"
+        )
+    assert borrow.result() is pool.conn
     assert pool.released == []  # the CALLER releases, not the helper
 
 

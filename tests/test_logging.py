@@ -14,6 +14,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import random
 import re
 import sys
 import threading
@@ -21,7 +22,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from functools import lru_cache, partial
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType, SimpleNamespace, TracebackType
 from typing import Any, cast
 
 import pytest
@@ -47,7 +48,7 @@ from messagefoundry.logging_setup import (
 from messagefoundry.redaction import clamp_untrusted, redact
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER
 from messagefoundry.support import redact as support_redact
-from tests._cpu_clock import cpu_seconds
+from tests._cpu_clock import CPU_SAMPLE_FLOOR_SECONDS, cpu_seconds
 from tests._phi_gate_provisions import make_syslog_ca_and_crl
 
 #: Synthetic HL7 (never real PHI) embedded in a log record so a redaction assertion has something to
@@ -525,24 +526,87 @@ def test_control_the_same_record_is_expensive_unbounded() -> None:
 #: So the fix takes the filter from about 314 ms to about 60 ms, and what is left is the render.
 #:
 #: The unbounded RENDER is a real residual and it is named in ``RedactionFilter``'s docstring rather
-#: than hidden inside a loose budget here. This number is set to catch a regression in the scan while
+#: than hidden inside a loose budget here. This line is set to catch a regression in the scan while
 #: tolerating the render, and the scan is asserted separately below at its own budget.
-_TRACEBACK_BUDGET_SECONDS = 0.20
+#:
+#: **A ratio to the stdlib's own render, in thread CPU time, not a number of wall seconds (BACKLOG
+#: #2306, #3456).** This was one wall-clock sample against 0.20 s, and nearly all of that sample is
+#: the render, a linear copy whose speed is the runner's memory and whose wall time is the runner's
+#: load. windows-2025 merge groups read 0.2005 to 0.2248 s against it in November 2026 with the scan
+#: at about 1 ms. Measured 2026-11-06 on a 32-way Windows box, idle and beside 32 to 96 processes
+#: copying 48 MiB buffers: the filter costs 0.81 to 1.33 renders. With ``redact_untrusted`` swapped
+#: for the unbounded ``redact`` it costs 7.1 to 13.1 idle but only 3.17 to 4.75 under that load,
+#: because contention slows the memory-bound render more than the CPU-bound scan. The line sits
+#: near the geometric mean of the worst reading on each side.
+_TRACEBACK_RENDER_RATIO = 2.0
+
+
+type _ExcInfo = tuple[type[BaseException], BaseException, TracebackType | None]
+
+
+def _raised_traceback() -> _ExcInfo:
+    """The frame-cap exception, raised here so the rendered frames name this file."""
+    try:
+        raise ValueError(f"cannot transform {_hostile_text()}")
+    except ValueError as exc:
+        return type(exc), exc, exc.__traceback__
+
+
+def _record_of(exc_info: _ExcInfo) -> logging.LogRecord:
+    """A fresh record each call, because the filter renders ``exc_info`` into ``exc_text`` and clears
+    it, so a second pass over one record would time nothing. The exception itself is not changed, so
+    every record can share one."""
+    return logging.LogRecord(
+        "t", logging.ERROR, __file__, 1, "transform worker failed", (), exc_info
+    )
+
+
+def _thread_cpu_per_call(work: Callable[[], object]) -> float:
+    """CPU seconds per call of ``work`` on the CALLING thread, over one sample at least
+    ``CPU_SAMPLE_FLOOR_SECONDS`` long, the floor ``tests._cpu_clock`` sets for the 15.625 ms tick
+    this clock moves in on Windows.
+
+    The thread clock rather than ``cpu_seconds``'s process clock because both arms run
+    synchronously on this thread, and a thread an earlier test left running would otherwise be
+    billed to whichever arm it overlapped. A runner that takes the core away charges neither arm.
+    **The same sampler as ``tests/test_redaction.py::_thread_cpu_sample``,** which is private to
+    that module; the two belong together in ``tests/_cpu_clock.py``."""
+    calls = 0
+    start = time.thread_time()
+    while True:
+        work()
+        calls += 1
+        spent = time.thread_time() - start
+        if spent >= CPU_SAMPLE_FLOOR_SECONDS:
+            return spent / calls
 
 
 def test_the_filter_bounds_a_peer_sized_traceback() -> None:
     """The realistic vector, and the one the row calls the worst of the three surfaces: a Handler
-    raises carrying the received body and an outer ``log.exception`` renders the whole thing."""
-    try:
-        raise ValueError(f"cannot transform {_hostile_text()}")
-    except ValueError:
-        rec = logging.LogRecord(
-            "t", logging.ERROR, __file__, 1, "transform worker failed", (), sys.exc_info()
-        )
-        rendered = logging.Formatter().formatException(sys.exc_info())
+    raises carrying the received body and an outer ``log.exception`` renders the whole thing.
 
-    elapsed = _best_of(lambda: RedactionFilter().filter(rec), reps=1)
-    assert elapsed < _TRACEBACK_BUDGET_SECONDS
+    Paired rounds, minimum per side, and which side goes first drawn each round from an unseeded
+    generator, the rule ``tests/_growth.py`` gives (BACKLOG #3721): a stretch of load with a fixed
+    rhythm cannot land on one side alone."""
+    exc_info = _raised_traceback()
+    arms: dict[str, Callable[[], object]] = {
+        "render": lambda: logging.Formatter().formatException(exc_info),
+        "filter": lambda: RedactionFilter().filter(_record_of(exc_info)),
+    }
+    best = dict.fromkeys(arms, float("inf"))
+    order = random.Random()
+    for _ in range(3):
+        for side in order.sample(list(arms), k=len(arms)):
+            best[side] = min(best[side], _thread_cpu_per_call(arms[side]))
+    assert best["filter"] < _TRACEBACK_RENDER_RATIO * best["render"], (
+        f"the filter cost {best['filter']:.4f} CPU s on a frame-cap traceback, "
+        f"{best['filter'] / best['render']:.2f} times the {best['render']:.4f} s the render alone "
+        f"costs, against a line of {_TRACEBACK_RENDER_RATIO}"
+    )
+
+    rec = _record_of(exc_info)
+    rendered = logging.Formatter().formatException(exc_info)
+    RedactionFilter().filter(rec)
 
     # The part the bound is actually responsible for, measured apart from the render it cannot reach.
     scan = _best_of(lambda: redact(clamp_untrusted(rendered)))
