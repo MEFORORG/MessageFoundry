@@ -309,6 +309,17 @@ Restart-Service MessageFoundry
 Run them from an elevated prompt. Services.msc and `sc.exe` work too. NSSM's own start, stop and
 restart commands send the same request, so there is no reason to use them.
 
+**The stop is sized to NSSM's window.** The installer sets `AppStopMethodConsole` to 15000 ms;
+after that NSSM escalates. uvicorn first drains open connections for a fixed bound, then the
+shutdown runs under one fixed budget, `engine.stop()` included: it is handed what that budget has
+left, and holds each of its own waits to a share of it. A step that overruns its share is cut,
+logged at ERROR, and the next step runs, so a hung step costs that step's work and no other. A
+message a cut step left claimed is recovered at the next start, as after a crash. The one wait never
+cut is the store's close. The figures are constants in `messagefoundry/__main__.py`
+(`_UVICORN_DRAIN_SECONDS`) and `messagefoundry/api/app.py` (`_SHUTDOWN_BUDGET_SECONDS`,
+`_ENGINE_STOP_RESERVE_SECONDS`), and `tests/test_lifespan_teardown.py` sums their worst case
+against the installer's value.
+
 The service's own `nssm.exe` is in `C:\Program Files\MessageFoundry\nssm` (the installer's
 `-NssmDir`). The installer checked that copy's hash, and keeps it where only administrators can
 write ([DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md) section 8). It never puts that

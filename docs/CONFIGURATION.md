@@ -3135,7 +3135,9 @@ restarts never checks. The tee is the only control that sees the trail as it is 
 **Not a section.** There is **no `EngineSettings` model**, so an `[engine]` block in
 `messagefoundry.toml` is **refused at load** as an unknown section, like any other. Earlier versions of
 this page listed `shutdown_timeout_seconds` and `data_dir` here as proposed keys; neither does anything.
-The ASGI lifespan's `engine.stop()` is not bounded by a setting, and for relative paths use
+The ASGI lifespan's `engine.stop()` is not bounded by a setting: the managed lifespan holds it to a
+share of a fixed shutdown budget sized to NSSM's stop window ([SERVICE.md](SERVICE.md), *Start / stop /
+status*). For relative paths use
 `[environments].base_dir` / `serve --project-root` for `env()` value files, and `--db` / `[store].path`
 for the store.
 
