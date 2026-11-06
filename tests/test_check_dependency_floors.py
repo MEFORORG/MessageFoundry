@@ -113,6 +113,25 @@ def test_the_named_extras_are_read_and_combine_with_the_runtime_lines(tmp_path: 
     }
 
 
+def test_a_line_naming_the_project_itself_reads_the_extras_it_names(tmp_path: Path) -> None:
+    """``x[harness]`` in [dev] is not a dependency with no floor; it installs [harness]."""
+    path = _pyproject(
+        tmp_path,
+        "runtime-dev-only>=4.0; extra == 'dev'",
+        dev=["x[harness]", "pytest>=9.0.3"],
+        harness=["PySide6>=6.6,<6.12", "x[gone]; sys_platform == 'never'"],
+        gone=["unread>=1.0"],
+    )
+    assert declared_floors(path, ["dev"]) == {
+        "runtime-dev-only": Version("4.0"),
+        "pytest": Version("9.0.3"),
+        "pyside6": Version("6.6"),
+    }
+    assert declared_floors(path) == {}
+    with pytest.raises(UndeclaredExtra, match="'missing'"):
+        declared_floors(_pyproject(tmp_path, dev=["x[missing]"]), ["dev"])
+
+
 def test_two_extra_keys_that_canonicalize_alike_are_both_read(tmp_path: Path) -> None:
     path = _pyproject(tmp_path, dev=["first>=1.0"], Dev=["second>=2.0"])
     assert declared_floors(path, ["dev"]) == {"first": Version("1.0"), "second": Version("2.0")}
@@ -136,8 +155,10 @@ def test_main_reads_the_dev_floors_unless_told_which_extras(tmp_path: Path) -> N
     path = _pyproject(tmp_path, installed, dev=["not-a-real-distribution-3177>=1.0"], ok=[])
     assert main(["--pyproject", str(path)]) == 1
     assert main(["--pyproject", str(path), "--extra", "ok"]) == 0
-    # A bare --extra reads the runtime dependencies alone.
-    assert main(["--pyproject", str(path), "--extra"]) == 0
+    assert main(["--pyproject", str(path), "--no-extras"]) == 0
+    # An empty --extra (an unset variable, say) is refused rather than read as runtime-only.
+    with pytest.raises(SystemExit):
+        main(["--pyproject", str(path), "--extra"])
 
 
 def test_the_shipped_pyproject_declares_a_readable_floor_for_every_default_dependency() -> None:

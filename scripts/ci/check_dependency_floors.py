@@ -20,7 +20,7 @@ A dependency installed above its floor fails the check, with no exception list: 
 install on this Python is raised in ``pyproject.toml`` instead (vault BACKLOG #3177).
 
 USAGE
-    python scripts/ci/check_dependency_floors.py [--pyproject PATH] [--extra NAME ...]
+    python scripts/ci/check_dependency_floors.py [--pyproject PATH] [--extra NAME ... | --no-extras]
 """
 
 from __future__ import annotations
@@ -62,29 +62,56 @@ def declared_floors(pyproject: Path, extras: Iterable[str] = ()) -> dict[str, Ve
     combines them, whether they are runtime lines, extra lines or one of each: a bare line adds no
     bound, and an exclusion on one line applies to the floor another line declares.
 
+    A line naming the project itself (``messagefoundry[harness]`` in ``[dev]``) is no dependency
+    with a floor: the extras it names are read too, as an installer would install them. Each line
+    applies when its marker holds for any extra read, or for none, as an installer evaluates the
+    project's metadata against every extra it was asked for.
+
     Raises :class:`UndeclaredExtra` for an extra ``pyproject.toml`` does not declare, so a misspelt
     or removed extra cannot pass as one with nothing to check. Two keys that canonicalize alike
     (``dev`` and ``Dev``) are both read, so neither list's floors go unmeasured."""
     project = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]
+    own_name = canonicalize_name(project.get("name", ""))
     declared_extras: dict[str, list[str]] = {}
     for extra, lines in project.get("optional-dependencies", {}).items():
         declared_extras.setdefault(canonicalize_name(extra), []).extend(lines)
-    groups: list[tuple[str, list[str]]] = [("", project.get("dependencies", []))]
-    for extra in extras:
+    requirements = [Requirement(line) for line in project.get("dependencies", [])]
+    read: list[str] = []
+    pending = [*extras, *_own_extras(requirements, own_name, "")]
+    while pending:
+        extra = pending.pop(0)
         key = canonicalize_name(extra)
+        if key in read:
+            continue
         if key not in declared_extras:
             raise UndeclaredExtra(f"extra {extra!r} is not declared in {pyproject}")
-        groups.append((key, declared_extras[key]))
+        read.append(key)
+        added = [Requirement(line) for line in declared_extras[key]]
+        requirements += added
+        pending += _own_extras(added, own_name, key)
+    environments = [{"extra": extra} for extra in ("", *read)]
     specifiers: dict[str, SpecifierSet] = {}
-    for extra, lines in groups:
-        for line in lines:
-            requirement = Requirement(line)
-            marker = requirement.marker
-            if marker is not None and not marker.evaluate({"extra": extra}):
-                continue
-            name = canonicalize_name(requirement.name)
-            specifiers[name] = specifiers.get(name, SpecifierSet()) & requirement.specifier
+    for requirement in requirements:
+        marker = requirement.marker
+        name = canonicalize_name(requirement.name)
+        if name == own_name or (
+            marker is not None and not any(marker.evaluate(env) for env in environments)
+        ):
+            continue
+        specifiers[name] = specifiers.get(name, SpecifierSet()) & requirement.specifier
     return {name: _floor(specifier) for name, specifier in specifiers.items()}
+
+
+def _own_extras(requirements: Iterable[Requirement], own_name: str, extra: str) -> list[str]:
+    """The extras named by the lines among ``requirements``, read under ``extra``, that point back
+    at the project and whose marker applies here."""
+    return [
+        named
+        for requirement in requirements
+        if canonicalize_name(requirement.name) == own_name
+        and (requirement.marker is None or requirement.marker.evaluate({"extra": extra}))
+        for named in sorted(requirement.extras)
+    ]
 
 
 def _floor(specifier: SpecifierSet) -> Version | None:
@@ -134,18 +161,20 @@ def check(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--pyproject", type=Path, default=_ROOT / "pyproject.toml")
-    parser.add_argument(
+    # Runtime-only is its own flag, never an empty --extra: an unset shell variable expanding to
+    # nothing must not narrow the check silently.
+    which = parser.add_mutually_exclusive_group()
+    which.add_argument(
         "--extra",
-        action="extend",
-        nargs="*",
+        action="append",
         metavar="NAME",
-        help=(
-            f"extras whose floors to read; repeatable (default: {', '.join(DEFAULT_EXTRAS)}); "
-            "--extra with no NAME reads the runtime dependencies alone"
-        ),
+        help=f"an extra whose floors to read; repeatable (default: {', '.join(DEFAULT_EXTRAS)})",
+    )
+    which.add_argument(
+        "--no-extras", action="store_true", help="read the runtime dependencies alone"
     )
     args = parser.parse_args(argv)
-    extras = DEFAULT_EXTRAS if args.extra is None else args.extra
+    extras = () if args.no_extras else DEFAULT_EXTRAS if args.extra is None else args.extra
     try:
         floors = declared_floors(args.pyproject, extras)
     except UndeclaredExtra as exc:

@@ -17,8 +17,10 @@
 # NO OVERRIDE. At least six declared floors did not install as written and were raised in
 # pyproject.toml (vault BACKLOG #3177): yanked, never released, conflicting with another floor, or
 # with no cp314 wheel. If one stops installing, raise it there rather than adding an override here.
-# The floor check reads the runtime dependencies and the [dev] extra installed below, so a floor the
-# resolver skips for any of those reasons reds the check rather than resolving above silently.
+# The floor check reads the engine's runtime dependencies and its [dev] extra, so a floor there that
+# the resolver skips for any of those reasons reds the check rather than resolving above silently.
+# It does not read at least the floors of every other extra, which this leg never installs, or the
+# web console package's own dependencies.
 #
 # A red weekly run reaches nobody on its own, so nightly-notice.yml watches this workflow by name.
 name: dependency floors

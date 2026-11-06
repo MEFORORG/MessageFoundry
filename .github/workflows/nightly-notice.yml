@@ -271,6 +271,9 @@ jobs:
             \`pyproject.toml\`.
           - The floor check said a dependency \`declares no floor this check can read\`: give it a
             \`>=X\` lower bound that no specifier for the same name excludes.
+          - The floor check said an extra \`is not declared\`: restore that extra in
+            \`pyproject.toml\`, or change the check's default extras and this workflow's install line
+            together.
           - The run concluded cancelled or timed out, so no step shows red: the job hit its
             \`timeout-minutes\`, most likely an install that hung or a build from source, unless
             someone stopped it by hand. Read the install step.
@@ -297,7 +300,7 @@ jobs:
           A scheduled run is not a PR context, so this result appears nowhere else.
           $DETAIL
 
-          This issue is opened once and commented on each subsequent failure; it closes itself when a
+          This issue is opened once and commented on each later run reported here; it closes itself when a
           nightly goes green again."
 
           if [ -n "$existing" ]; then
