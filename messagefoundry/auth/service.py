@@ -15317,10 +15317,10 @@ class AuthService:
         flight, the sign count does not move, and nothing is charged, so the same assertion
         verifies once the directory confirms the account. After the sign-count write the passkey set is
         read, then the session, the account and the lock, so the last read before the factor write
-        is the holder re-read, with no other await between it and the write (BACKLOG #3068). A
-        store fault in the passkey re-read refuses, audited with ``reason=store_error`` (BACKLOG
-        #3775); which faults that covers, and which still raise, is ADR 0068, amendment of
-        2026-10-17."""
+        is the holder re-read, with no other await between it and the write (BACKLOG #3068). At
+        least some store faults in the passkey re-read refuse, audited with ``reason=store_error``
+        (BACKLOG #3775), and others still raise, ``sqlite3.InterfaceError`` among them; ADR 0068,
+        amendment of 2026-10-17, says which."""
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))

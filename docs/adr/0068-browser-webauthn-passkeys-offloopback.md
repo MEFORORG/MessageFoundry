@@ -673,8 +673,9 @@ lost connection and a pool acquire timeout, and, since 2026-11-06 (vault BACKLOG
 every `ValueError` and every `RuntimeError` other than the audit-write defects, which takes a
 closed SQLite connection and the engine's other refusals, and also a defect that raises either,
 audited as `store_error` too. At least SQLite's `ProgrammingError` and `InterfaceError` still raise
-there, as do `NotImplementedError` and `RecursionError`, the `RuntimeError` subclasses in
-`AUDIT_WRITE_DEFECTS`, which the read re-raises before it refuses anything, and so
+there, as do at least `NotImplementedError` and `RecursionError`, the `RuntimeError` subclasses in
+`AUDIT_WRITE_DEFECTS` (`messagefoundry/audit_write.py` holds the set), which the read re-raises
+before it refuses anything, and so
 does a store error in the session, account and lock re-read, which since 2026-11-05 follows that
 set read rather than preceding it (BACKLOG #3068).
 
