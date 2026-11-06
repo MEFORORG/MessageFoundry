@@ -287,8 +287,9 @@ on 2026-09-19, NOTHING replaced it, and NO SEAT ATTRIBUTES A RED NOW.** A red is
 triage and route, or the owner's to rule on. The Watchdog is **not the Regulator's successor**: it
 returns evidence and no verdict. **The STEWARD is retired too: the owner said so on 2026-11-05, and
 when it went is not recorded.** No successor seat is recorded, and the usage controls stayed: korus
-`roles/COMMON.md`, *The three usage states*, holds them and names the seats they bind. The
-user-scope usage watch hook, `watch.py`, prints the weekly ladder and the Workflow gate only on a
+`roles/COMMON.md`, read at `origin/main`, holds them, the states under *The three usage states*,
+which names the seats they bind, and the Workflow gate under *Prohibitions that bind before any
+task starts*. The user-scope usage watch hook, `watch.py`, prints the weekly ladder and the Workflow gate only on a
 config root that wires it; where nothing prints them, for example in a cloud session or on an
 unwired root, they bind all the same. `docs/roles/seats.json` resolves all three names to a
 retirement notice. The full notices, the Steward's under *The Steward, retired before 2026-11-05*,

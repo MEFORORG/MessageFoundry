@@ -1461,22 +1461,32 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
         "the three usage states",
         "lifted",
         "open owner question",
+        "every seat but the lander",
+        "never on hook silence",
     )
+
+    @staticmethod
+    def _flat(text: str) -> str:
+        return " ".join(text.lower().split())
 
     @classmethod
     def _missing_caveat(cls, notice: str) -> list[str]:
-        flat = " ".join(notice.lower().split())
+        flat = cls._flat(notice)
         return [part for part in cls.CAVEAT if part not in flat]
 
-    def test_every_steward_spelling_carries_the_usage_caveat(self):
-        """A session that declares `stewart` reads only that entry, never the canonical one.
+    @classmethod
+    def _steward_spellings(cls, retired: dict[str, str]) -> set[str]:
+        """SPELLINGS, plus any later entry that points at the canonical one, in any case or wrap.
 
-        A spelling added later counts too, by the pointer it carries, so a new bare pointer cannot
-        pass by staying out of SPELLINGS.
+        AT LEAST these: an entry that names the seat some other way still escapes.
         """
+        return set(cls.SPELLINGS) | {k for k, v in retired.items() if "'steward'" in cls._flat(v)}
+
+    def test_every_steward_spelling_carries_the_usage_caveat(self):
+        """A session that declares `stewart` reads only that entry, never the canonical one."""
         retired = seats()["retired"]
-        added = {k for k, v in retired.items() if "a spelling of 'steward'" in v}
-        gaps = {s: self._missing_caveat(retired.get(s, "")) for s in sorted(self.SPELLINGS | added)}
+        spellings = sorted(self._steward_spellings(retired))
+        gaps = {s: self._missing_caveat(retired.get(s, "")) for s in spellings}
         self.assertEqual(
             {},
             {s: m for s, m in gaps.items() if m},
@@ -1488,6 +1498,8 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
         """Positive control: the wording the spellings carried before this check existed."""
         bare = "Retired, a spelling of 'steward'. See the 'steward' entry."
         self.assertEqual(list(self.CAVEAT), self._missing_caveat(bare))
+        planted = {"steward2": "Retired. See the  'Steward'\n entry.", "regulator": "Retired."}
+        self.assertEqual({"steward2", *self.SPELLINGS}, self._steward_spellings(planted))
 
     #: The one date the notice may carry: the day the owner said the seat was gone. Any other date
     #: in it, ISO or a month name, is a retirement date the tree does not record. AT LEAST these two
@@ -1534,17 +1546,18 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
 
     def test_the_agreement_retires_the_steward_rather_than_going_quiet(self):
         text = read(AGREEMENT)
+        flat = " ".join(text.split())
         self.assertIsNone(self._ROW.search(text), "CLAUDE.md keeps a Steward row")
         self.assertIn(
             "The STEWARD is retired too",
-            " ".join(text.split()),
+            flat,
             "CLAUDE.md no longer states the retirement, so a document routing work to a Steward "
             "has nothing contradicting it",
         )
         self.assertIn(
             "where nothing prints them, for example in a cloud session or on an unwired root, "
             "they bind all the same",
-            " ".join(text.split()),
+            flat,
             "CLAUDE.md no longer says the usage controls bind where watch.py prints nothing",
         )
 
