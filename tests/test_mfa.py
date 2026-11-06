@@ -2501,12 +2501,22 @@ async def test_a_reset_between_rotation_and_enable_leaves_mfa_off_with_no_null_s
                 now=now,
             )
 
+        real_revoke = store.revoke_session
+        revokes: list[str] = []
+
+        async def counted_revoke(token_hash: str, *, now: float | None = None) -> None:
+            revokes.append(token_hash)
+            await real_revoke(token_hash, now=now)
+
         monkeypatch.setattr(store, "enable_totp", reset_then_enable)
+        monkeypatch.setattr(store, "revoke_session", counted_revoke)
         refused = await service.confirm_mfa_enrollment(
             identity, fresh_totp(enroll.secret), token=token
         )
         assert refused.ok is False and refused.session_lost is True
         assert refused.recovery_codes == ()
+        # BACKLOG #3025: the retry runs only when the first revoke did not land.
+        assert len(revokes) == 1, "a revoke that landed was tried again"
         user = await store.get_user(identity.user_id)
         assert user is not None and user.totp_enabled is False, (
             "TOTP was turned on over a secret the reset cleared"
@@ -2678,7 +2688,7 @@ async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row
         async def refused_revoke(token_hash: str, *, now: float | None = None) -> None:
             revokes.append(token_hash)
             if len(revokes) == 1 or retry_refused:
-                raise fault
+                raise type(fault)(*fault.args)  # a fresh error per attempt, as a store raises
             await real_revoke(token_hash, now=now)
 
         monkeypatch.setattr(store, "enable_totp", reset_then_enable)

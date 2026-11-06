@@ -1212,8 +1212,8 @@ class Elevation:
       BACKLOG #2224) the proof was good but turning TOTP on matched no row, so the confirm ended
       the session it had just rotated, as its ``auth.mfa_enroll_refused`` row records. That row's
       ``session_ended`` is false when neither of the confirm's two revoke attempts landed (vault
-      BACKLOG #3113, #3025): the rotated session then still exists, stamped MFA-verified, but its
-      token was never handed back. Or (the TOTP and
+      BACKLOG #3113, #3025): the rotated session may then still exist, stamped MFA-verified, but
+      its token was never handed back. Or (the TOTP and
       passkey legs, BACKLOG #3068) the session or its account went while the leg waited on the
       directory lookup, the account queue or the proof check, with the proof checked or not. Fails
       CLOSED: no token is handed back. Held apart from a wrong proof so a route answers 401 rather
@@ -13759,16 +13759,16 @@ class AuthService:
             # too, which it raises as a bare ``ValueError`` before sqlite3 is reached. A defect
             # the helper re-raises still propagates, and the outer ``finally`` writes the refusal
             # row first, so no exception the revoke raises can skip it. A revoke that did not land
-            # is tried once more (BACKLOG #3025), whatever the first attempt raised: left live,
-            # the rotated session stays stamped MFA-verified on a factor that is not enabled. The
-            # retry recovers only a refusal that has cleared by then, such as a deadlock victim;
-            # at least a closed connection refuses it too. ``session_ended`` records whether
-            # either attempt landed. Where neither did, the session stays live until its own
-            # timers end it, and no caller holds its token, which is never handed back. The row's
-            # own write is soft too, so a store fault there is logged at ERROR rather than
-            # replacing the answer, or a defect already propagating. Known limit: a cancellation
-            # can land after the store committed a revoke, and the row then says
-            # ``session_ended: false`` for a session that did end.
+            # is tried once more (BACKLOG #3025), whatever the first attempt raised, a cancellation
+            # included: left live, the rotated session stays stamped MFA-verified on a factor that
+            # is not enabled. The retry recovers only a refusal that has cleared by then, such as
+            # a deadlock victim; at least a closed connection refuses it too. ``session_ended``
+            # records whether either attempt landed. Where neither did, the session may stay live
+            # until its own timers end it, and no caller holds its token, which is never handed
+            # back. The row's own write is soft too, so a store fault there is logged at ERROR
+            # rather than replacing the answer, or a defect already propagating. Known limit: a
+            # cancellation can land after the store committed the second attempt, and the row
+            # then says ``session_ended: false`` for a session that did end.
             rotated = hash_token(elevation.token)
             refused = audit_write_errors()
             session_ended = False
