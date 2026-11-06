@@ -699,6 +699,40 @@ def test_a_staging_root_whose_name_windows_rewrites_is_not_walked(win_tmp: Path)
 
 
 @_windows_only
+def test_the_teardown_touches_no_other_directory_for_a_rewritten_name(win_tmp: Path) -> None:
+    """The teardown's own removal goes by path before any fail-safe runs. Red before the fix: it
+    removed `mefor-backup-x` for `mefor-backup-x.`, then found the name gone and returned clean,
+    while the planted directory kept its file. Now nothing is removed, emptied or re-marked."""
+    planted = win_tmp / "mefor-backup-x."
+    os.mkdir(_verbatim(win_tmp, "mefor-backup-x."))
+    _plant(win_tmp, "mefor-backup-x.", "planted.tar")
+    other = win_tmp / "mefor-backup-x"
+    other.mkdir()
+    (other / "archive.tar").write_bytes(_PLAINTEXT)
+    leftover = dr_backup._teardown_staging(planted)
+    assert leftover is not None and "Windows would open its name as another" in leftover
+    assert sorted(p.name for p in other.iterdir()) == ["archive.tar"]
+    assert (other / "archive.tar").read_bytes() == _PLAINTEXT
+    assert _size(win_tmp, "mefor-backup-x.", "planted.tar") == len(_PLAINTEXT)
+
+
+@_windows_only
+def test_the_root_final_path_compare_refuses_a_rewritten_root_the_screen_missed(
+    win_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backstop for the root: with the screen told to pass every name, the directory held for
+    `mefor-backup-x.` is `mefor-backup-x`, whose final path names another directory."""
+    os.mkdir(_verbatim(win_tmp, "mefor-backup-x."))
+    other = win_tmp / "mefor-backup-x"
+    other.mkdir()
+    (other / "archive.tar").write_bytes(_PLAINTEXT)
+    monkeypatch.setattr(dr_backup, "_win_opens_another", lambda path: False)
+    unproven = dr_backup._empty_files_in_place(win_tmp / "mefor-backup-x.")
+    assert unproven == ["mefor-backup-x./ (changed while being emptied, not walked)"]
+    assert (other / "archive.tar").read_bytes() == _PLAINTEXT
+
+
+@_windows_only
 def test_the_final_path_compare_refuses_a_rewritten_name_the_screen_missed(
     win_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2047,8 +2047,17 @@ def _win_opens_another(path: Path) -> bool:
     is never opened, only reported: the open would reach some other object, and the listed file
     would keep its bytes while the report called it empty. The final-path compare on the opened
     handle backs this up (:func:`_open_unfollowed`)."""
+    # The trailing dot or space is tested as such too: `abspath` falls back to a pure-Python join that
+    # rewrites nothing if `GetFullPathNameW` raises, and this must not then pass the name.
+    if path.name.endswith((".", " ")):
+        return True
     plain = os.path.join(os.path.abspath(path.parent), path.name)
     return os.path.abspath(plain) != plain
+
+
+def _win_rewritten(path: Path) -> bool:
+    """:func:`_win_opens_another` on Windows; never on POSIX, which opens every name as itself."""
+    return sys.platform == "win32" and _win_opens_another(path)
 
 
 class _HardLinked(OSError):
@@ -2073,7 +2082,7 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> s
     was listed, so it was renamed or removed since, and a rename leaves the file full under a name
     this walk may never list (BACKLOG #2420)."""
     name = entry.name
-    if sys.platform == "win32" and _win_opens_another(entry):
+    if _win_rewritten(entry):
         return f"{name} {_REWRITTEN_FILE}"
     try:
         if dir_fd is not None:
@@ -2313,8 +2322,9 @@ def _win_held_walk(
 def _win_hold_root(staging: Path, unproven: list[str]) -> tuple[list[int], str] | None:
     """Hold ``staging`` itself and return its handle with its final path, or ``None`` once what
     stopped it is reported. A link or a junction there is never walked, nor a name Windows would
-    open as another directory (:func:`_win_opens_another`), as a sweep's planted ``mefor-backup-x.``
-    would open ``mefor-backup-x``."""
+    open as another directory (:func:`_win_opens_another`), as a planted ``mefor-backup-x.`` would
+    open ``mefor-backup-x``, nor a held directory whose final path does not end in ``staging``'s
+    name, the backstop the walk below it keeps too (BACKLOG #2420)."""
     if _win_opens_another(staging):
         unproven.append(f"{staging.name}/ {_REWRITTEN_DIR}")
         return None
@@ -2332,11 +2342,16 @@ def _win_hold_root(staging: Path, unproven: list[str]) -> tuple[list[int], str] 
         _win_unlisted(unproven, staging, exc)
         return None
     try:
-        return root, _win_final_path(root[0]).rstrip("\\") + "\\"
+        final = _win_final_path(root[0]).rstrip("\\")
     except OSError as exc:
         _win_release(root)
         _win_unlisted(unproven, staging, exc, final_path=True)
         return None
+    if os.path.basename(final) != os.path.normcase(staging.name):
+        _win_release(root)
+        unproven.append(f"{staging.name}/ (changed while being emptied, not walked)")
+        return None
+    return root, final + "\\"
 
 
 def _win_hold_below(
@@ -2395,7 +2410,22 @@ def _discard_verify_staging(staging: Path) -> str | None:
     Truncation rather than an overwrite with zeros: on an SSD or a copy-on-write volume an overwrite
     lands on new blocks and proves nothing, so the promise that can be kept is that the FILE no
     longer holds the plaintext. The blocks it freed still do until reused, and only full-disk
-    encryption on the staging volume covers them (docs/PHI.md section 10)."""
+    encryption on the staging volume covers them (docs/PHI.md section 10).
+
+    On Windows a directory whose name Windows would open as another (:func:`_win_opens_another`) is
+    not touched at all: its removal by path would remove that other directory and then find the
+    name gone, and so report it clean while it keeps its files (BACKLOG #2420). The engine never
+    names a staging directory that way, so one reaches here only from a sweep of a shared root."""
+    if _win_rewritten(staging):
+        log.error(
+            "DR staging directory %s was not removed or emptied: Windows would open its name as "
+            "another directory; delete it by hand",
+            staging,
+        )
+        return (
+            f"the plaintext staging directory {staging} was not removed or emptied, because "
+            "Windows would open its name as another directory; delete it by hand"
+        )
     unproven: list[str] = []
     try:
         if _remove_tree(staging):
@@ -2579,7 +2609,8 @@ def _teardown_staging(path: Path) -> str | None:
     plaintext and no proof, and every later sweep would skip it. Nobody holds the lock now, so the
     files are all the proof needs."""
     leftover = _discard_verify_staging(path)
-    if os.path.lexists(path):
+    # A name Windows rewrites is not re-marked either: the marks would land in the other directory.
+    if os.path.lexists(path) and not _win_rewritten(path):
         # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would
         # otherwise hold this thread in the open until a reader came, which may be never.
         flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK
