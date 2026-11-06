@@ -798,8 +798,10 @@ def test_a_base_exception_from_the_walk_leaves_without_the_codec_error_on_its_ch
 def _assert_left_unchained(
     escaped: BaseException, interrupt: BaseException, error: BaseException
 ) -> None:
-    """``escaped`` is ``interrupt`` itself, and nothing its chain reaches is or quotes ``error``."""
+    """``escaped`` is ``interrupt`` itself, and nothing its chain reaches is or quotes ``error``.
+    Its context is not left suppressed either, which clearing a cause would do."""
     assert escaped is interrupt
+    assert escaped.__suppress_context__ is False
     links = _every_link(escaped)
     assert not any(link is error for link in links), links
     for link in links:
@@ -843,3 +845,48 @@ def test_a_base_exception_from_rendering_the_codec_error_leaves_without_it(
     with pytest.raises(type(interrupt)) as caught:
         getattr(store_base, entry)(StoreSettings())
     _assert_left_unchained(caught.value, interrupt, error)
+
+
+class _ClassUnreadable(RuntimeError):
+    """A holder of a codec error whose ``__class__``, which ``isinstance`` falls back to, raises."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # the read is the point
+        raise LookupError("synthetic: the class cannot be read")
+
+
+@pytest.mark.parametrize(
+    "entry", ["build_store_cipher", "resolve_active_key", "resolve_decrypt_keys"]
+)
+def test_a_class_test_that_raises_is_still_a_typed_refusal(
+    entry: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round two of the repair's review: the class test ran the error's own code, and a bare
+    LookupError left in place of the typed refusal. The class is read with ``type`` now."""
+    _with_provider(monkeypatch, _ClassUnreadable(_decode_error()))
+    with pytest.raises(KeyProviderError) as caught:
+        getattr(store_base, entry)(StoreSettings())
+    _assert_no_key_byte(_whole(caught.value))
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "entry", ["build_store_cipher", "resolve_active_key", "resolve_decrypt_keys"]
+)
+def test_an_error_from_rendering_the_codec_error_is_refused_as_not_judged(
+    entry: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round two of the repair's review: an Exception from the judgement's code after the walk
+    is refused with a fixed text, as a chain that cannot be read is, never raised in its place."""
+
+    def _rendering_fails(exc: BaseException) -> str:
+        raise RuntimeError(f"synthetic rendering failure: {exc}")
+
+    monkeypatch.setattr(store_base, "codec_safe_line", _rendering_fails)
+    error = _built_from(_decode_error(), ValueError)
+    _with_provider(monkeypatch, error)
+    with pytest.raises(StoreCipherConfigError) as caught:
+        getattr(store_base, entry)(StoreSettings())
+    _assert_no_key_byte(_whole(caught.value))
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert "ValueError that could not be judged" in str(caught.value), str(caught.value)

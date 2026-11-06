@@ -3357,10 +3357,11 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
     text, no byte and no chain (BACKLOG #4882), as by :func:`build_store_cipher`: one that is a
     codec error, holds one, or has one on a link :func:`_codec_error_on` reaches; and one whose
     chain cannot be read whole, whether or not it holds a codec error. Any other provider error
-    passes through untouched, unless a ``BaseException`` such as a ``KeyboardInterrupt`` is
-    raised while it is judged: that propagates in its place, with no cause and no context. This
-    covers at least the callers that resolve the key without building the cipher, such as
-    ``rotate-key``. The key check after a provider answers is not judged here."""
+    passes through untouched. Either way, a ``BaseException`` such as a ``KeyboardInterrupt``
+    that the judgement's own code raises propagates in place of the refusal or the error, with
+    no cause and no context. This covers at least the callers that resolve the key without
+    building the cipher, such as ``rotate-key``. The key check after a provider answers is not
+    judged here."""
     try:
         key = resolve_key_provider(settings, posture=posture).active_key()
     except Exception as exc:
@@ -3410,8 +3411,8 @@ def resolve_decrypt_keys(
     The two refusals there apply here too, and here also to the key check (BACKLOG #4882): an
     error from the provider or the key check that has a codec error on it, or whose chain cannot
     be read whole whether or not it holds one, is raised as :func:`_codec_safe_refusal` gives it.
-    Any other passes through untouched, unless a ``BaseException`` raised while it is judged
-    propagates in its place, with no cause and no context."""
+    Any other passes through untouched. Either way, a ``BaseException`` that the judgement's own
+    code raises propagates in place of the refusal or the error, with no cause and no context."""
     try:
         provider = resolve_key_provider(settings, posture=posture)
         active = _checked_active_key(provider.active_key(), settings)
@@ -3500,25 +3501,33 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
     ``KeyProviderError``, which at least every CLI command with a key arm reports as a key that
     could not be resolved.
 
-    Whatever this raises instead, such as a ``KeyboardInterrupt`` from a link's own code or from
-    an attribute read of the codec error, leaves with no cause and no context, as
-    :func:`_unchained` says."""
+    An ``Exception`` the judgement's own code raises after the walk, as from rendering the codec
+    error, is refused the same way, as one that could not be judged. A ``BaseException`` that is
+    not an ``Exception``, such as a ``KeyboardInterrupt`` from a link's own code or from an
+    attribute read of the codec error, propagates in place of any refusal, as :func:`_unchained`
+    leaves it."""
     try:
         return _refusal_for(exc)
-    except BaseException as escaping:
-        _unchained(escaping)
+    except Exception:  # noqa: BLE001 -- fail closed: the rendering ran the codec error's own code
+        return _refused(exc, f"a {type(exc).__name__} that could not be judged, its text not shown")
+    except BaseException as interrupt:
+        _unchained(interrupt)
         raise
 
 
-def _unchained(escaping: BaseException) -> None:
-    """Clear ``escaping``'s cause and context, then let the caller re-raise it with a bare
+def _unchained(interrupt: BaseException) -> None:
+    """Clear ``interrupt``'s cause and context, for the caller to re-raise it with a bare
     ``raise``, which sets neither again (the hold on engine PR 2818). Each caller judges an error
-    while handling it, so whatever is raised during the judgement has that error, or one its walk
-    reached, as its context, and that error's own text may quote the byte. Only those two links
-    are cut: an exception group's members, the escaping error's own arguments and its traceback's
-    frame locals are left as they are."""
-    escaping.__cause__ = None
-    escaping.__context__ = None
+    while handling it, so what the judgement's own code raises has that error, or one its walk
+    reached, as its context, and that error's own text may quote the byte. ``__suppress_context__``
+    is reset too, which clearing the cause sets, so a later handler's context still prints.
+
+    Only those two links are cut. At least these are left as they are: an exception group's
+    members, ``interrupt``'s own arguments, its traceback's frame locals, and an interrupt
+    delivered in the caller's handler outside the judgement's code."""
+    interrupt.__cause__ = None
+    interrupt.__context__ = None
+    interrupt.__suppress_context__ = False
 
 
 def _refusal_for(exc: Exception) -> Exception | None:
@@ -3536,19 +3545,22 @@ def _refusal_for(exc: Exception) -> Exception | None:
             f"a {name} whose chain holds a codec error, its own text not shown "
             f"({codec_safe_line(codec)})"
         )
-    return StoreCipherConfigError(text) if isinstance(exc, ValueError) else KeyProviderError(text)
+    return _refused(exc, text)
+
+
+def _refused(exc: Exception, text: str) -> Exception:
+    """``text`` as :class:`StoreCipherConfigError` for a ``ValueError``, else as
+    ``KeyProviderError``. The class is read with ``type``, which runs none of ``exc``'s code."""
+    is_value_error = issubclass(type(exc), ValueError)
+    return StoreCipherConfigError(text) if is_value_error else KeyProviderError(text)
 
 
 def _codec_error_on(exc: BaseException) -> tuple[BaseException | None, bool]:
     """The first error :func:`~messagefoundry.exception_origin.exception_chain` reaches from
     ``exc``, ``exc`` first, that is a codec error or prints one, or ``None``; and whether the chain
     was read whole. It was not when the walk raised, too long or from a link's own code, and then
-    no error is named (BACKLOG #4882).
-
-    A ``BaseException`` that is not an ``Exception``, such as a ``KeyboardInterrupt`` or a
-    ``SystemExit`` from a link's own code, still propagates, with its cause and context cleared
-    by :func:`_unchained` here too, for a caller that does not route through
-    :func:`_codec_safe_refusal`, such as :func:`_codec_chain_reading`."""
+    no error is named (BACKLOG #4882). A ``BaseException`` that is not an ``Exception``
+    propagates; each caller unchains it (:func:`_unchained`)."""
     try:
         codec = next(
             (
@@ -3560,9 +3572,6 @@ def _codec_error_on(exc: BaseException) -> tuple[BaseException | None, bool]:
         )
     except Exception:  # noqa: BLE001 -- fail closed: ExceptionChainTooLong, or a link's own code
         return None, False
-    except BaseException as interrupt:
-        _unchained(interrupt)
-        raise
     return codec, True
 
 
@@ -3570,8 +3579,13 @@ def _codec_chain_reading(exc: BaseException) -> str | None:
     """For the PostgreSQL store's TLS context wrap, what to say of ``exc`` in place of its text:
     ``"from a codec error"`` where a codec error is on its chain as :func:`_codec_error_on` reads
     it, ``"whose chain cannot be read whole"`` where that read did not finish, else ``None``, and
-    the text may be kept (BACKLOG #3471, #4882)."""
-    codec, read_whole = _codec_error_on(exc)
+    the text may be kept (BACKLOG #3471, #4882). A ``BaseException`` from the walk, such as a
+    ``KeyboardInterrupt``, propagates as :func:`_unchained` leaves it."""
+    try:
+        codec, read_whole = _codec_error_on(exc)
+    except BaseException as interrupt:
+        _unchained(interrupt)
+        raise
     if not read_whole:
         return "whose chain cannot be read whole"
     return None if codec is None else "from a codec error"
