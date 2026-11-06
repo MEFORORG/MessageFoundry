@@ -1126,9 +1126,9 @@ def test_supervise_reports_its_own_remote_debugging_only_while_it_is_on(
 ) -> None:
     """Vault BACKLOG #3795: tests/conftest.py pins this reading off for every in-process start, so
     this is the start that carries it on into the supervisor's own WARNING. Under ``warn``, so the
-    test does not depend on where ``supervise`` logs that line among its gates: under ``enforce``
-    with the interface on, its start refusal for remote debugging stops the fleet, and a line
-    logged after that gate would never be written."""
+    test does not depend on whether ``supervise`` logs that line before or after its start
+    refusal for remote debugging: under ``enforce`` with the interface on, that refusal stops the
+    fleet, and a line logged after it would never be written."""
     from messagefoundry import __main__ as cli
     from messagefoundry.remotedebug import RemoteDebugPosture
 
