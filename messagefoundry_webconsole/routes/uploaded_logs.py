@@ -154,6 +154,7 @@ BROWSE_LOCKED_CODE = "browse_locked"
 BROWSE_HOP_REFUSED_CODE = "browse_hop_refused"
 BROWSE_THROTTLED_CODE = "browse_throttled"
 UPLOADS_UNAVAILABLE_CODE = "uploads_unavailable"
+KEY_SERVICE_BUSY_CODE = "key_service_busy"
 
 #: The status the engine answers when the store cipher refuses an uploaded file (BACKLOG #1169).
 _LOCKED_STATUS = status.HTTP_423_LOCKED
@@ -227,6 +228,16 @@ UPLOADS_UNAVAILABLE_NOTICE = (
     "removed until an administrator sets an uploads directory in the engine's store settings."
 )
 
+#: 503 WITH ``Retry-After`` is the engine's other 503 on a by-id route and on an upload: the store
+#: cipher's key service gave no verdict on the file, so nothing was read, stored or removed
+#: (BACKLOG #3734). The no-store 503 above carries no ``Retry-After``, which is how the two are told
+#: apart. One text serves browse, resend and delete, so it names no single action.
+KEY_SERVICE_BUSY_NOTICE = (
+    "That request did not complete, and nothing was opened, injected or removed. The engine could "
+    "not reach the service that holds the store's encryption key. Try again in a moment. If it "
+    "keeps happening, an administrator should check that service."
+)
+
 #: The allow-list itself: an EXACT-match lookup from code to fixed module text. ``e`` is compared, never
 #: rendered — an unrecognized value maps to no banner at all rather than being echoed.
 _LIST_NOTICES: dict[str, str] = {
@@ -240,6 +251,7 @@ _LIST_NOTICES: dict[str, str] = {
     BROWSE_LOCKED_CODE: BROWSE_LOCKED_NOTICE,
     BROWSE_HOP_REFUSED_CODE: BROWSE_HOP_REFUSED_NOTICE,
     BROWSE_THROTTLED_CODE: BROWSE_THROTTLED_NOTICE,
+    KEY_SERVICE_BUSY_CODE: KEY_SERVICE_BUSY_NOTICE,
     # UPLOADS_UNAVAILABLE_CODE is deliberately absent. With no uploads store the list page answers
     # 503 and renders UPLOADS_UNAVAILABLE_NOTICE without reading ``e``. A listing that loads proves
     # the store is back, so a banner saying it is missing would be false there.
@@ -290,6 +302,19 @@ _BROWSE_CODES: dict[int, str] = {
 #: minted shape is logged as a fixed placeholder instead. This is a log-injection guard, not a second
 #: copy of the path-traversal rule — that one stays in ``UploadStore._paths``.
 _MINTED_FILE_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+
+
+def _refusal_code(exc: HTTPException, codes: dict[int, str]) -> str | None:
+    """The allow-listed code for an engine refusal, or ``None`` for one ``codes`` does not map.
+
+    A 503 that carries ``Retry-After`` is a key-service outage (BACKLOG #3734), whatever ``codes``
+    maps 503 to, because there an uploads store IS configured. It is told apart by its header, not
+    by a type as the flag route's 503 is (BACKLOG #3811), so that this console needs no new seam
+    import; the cost is that a later 503 with ``Retry-After`` from these handlers would read as an
+    outage too. At least today, the handlers raise no other."""
+    if exc.status_code == _UNAVAILABLE_STATUS and "Retry-After" in (exc.headers or {}):
+        return KEY_SERVICE_BUSY_CODE
+    return codes.get(exc.status_code)
 
 
 def _log_file_id(file_id: str) -> str:
@@ -494,7 +519,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             cannot be missed on the bad-criteria path, which is how the 404 retry bug arose."""
             if exc.status_code == 404:  # bad/absent id (incl. path-traversal): back to the list
                 return RedirectResponse("/ui/uploaded-logs", status_code=303)
-            code = _BROWSE_CODES.get(exc.status_code)
+            code = _refusal_code(exc, _BROWSE_CODES)
             if code is None:
                 return None
             return _refused_by_engine("browse", file_id, exc.status_code, code)
@@ -688,7 +713,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # sink fed by the form body. Every status in :data:`_RESEND_CODES` is handled rather than
             # re-raised because an escaping HTTPException renders as application/json inside the
             # HTML console, with that same caller-supplied name quoted in it.
-            code = _RESEND_CODES.get(exc.status_code)
+            code = _refusal_code(exc, _RESEND_CODES)
             if code is None:
                 raise
             # And the refusal is recorded SERVER-SIDE; see :func:`_refused_by_engine`.
@@ -770,7 +795,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # when it was not — including on an ASVS 8.2.2 owner denial, which the engine answers 404
             # so it stays indistinguishable from an absent file. The flag is what separates the two,
             # and the WARNING carries the record server-side (file_id shape-checked + status only).
-            code = _DELETE_CODES.get(exc.status_code)
+            code = _refusal_code(exc, _DELETE_CODES)
             if code is None:
                 raise
             return _refused_by_engine("delete", file_id, exc.status_code, code)

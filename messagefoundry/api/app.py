@@ -548,6 +548,7 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     TestNotSupportedError,
 )
+from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
 from messagefoundry.uploads import (
     UploadContentError,
     UploadedFileMeta,
@@ -558,6 +559,7 @@ from messagefoundry.uploads import (
     UploadRetentionRunner,
     UploadStore,
     UploadTooLargeError,
+    UploadUnavailableError,
     UploadUnreadableError,
     browse_messages,
     split_uploaded,
@@ -8677,6 +8679,21 @@ def create_app(
         "rotate-key reports it as unsealable, an operator can only delete it"
     )
 
+    class _UploadUnavailable(HTTPException):
+        """BACKLOG #3734: the store cipher's key service (Vault Transit) gave no verdict on the
+        file, so nothing was read, stored or removed and a later try may succeed. 503 with the
+        ``Retry-After`` of the engine's other temporary refusals, where 423 would send an operator
+        to rotate-key or a delete for a file that is fine. Like the 423, the body names no file
+        and no cipher detail."""
+
+        def __init__(self) -> None:
+            super().__init__(
+                503,
+                "the store's key service did not answer, so nothing was read, stored or removed. "
+                "Try again shortly",
+                headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
+            )
+
     class _UploadSidecarRefused(HTTPException):
         """The 423 an override holder gets when an upload's sidecar is refused. Every other route
         answers it as is. DELETE alone catches it and asks ``UploadStore.delete``. That call can
@@ -8703,22 +8720,25 @@ def create_app(
         the check has to sit in the handler BODY, not in a ``Depends`` gate, because the web console
         invokes these handlers directly through the CoreHandlers seam and never runs their gates.
         One exception: DELETE catches :class:`_UploadSidecarRefused`, which only an override holder
-        gets, and lets ``UploadStore.delete`` decide (BACKLOG #2322)."""
+        gets, and lets ``UploadStore.delete`` decide (BACKLOG #2322). An override holder whose read
+        met a key-service outage gets the 503 instead, which DELETE does not catch (BACKLOG #3734)."""
+        override_answer: Callable[[], HTTPException] | None = None
         try:
             meta = await us.get_meta(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnavailableError:
+            override_answer = _UploadUnavailable  # BACKLOG #3734: an outage, not the 423
         except UploadUnreadableError:
-            unreadable = True
-        else:
-            unreadable = False
-        if unreadable:
+            override_answer = _UploadSidecarRefused
+        if override_answer is not None:
             # The owner cannot be read, so ownership cannot be checked. Keep the 404 contract above
             # for everyone but an override holder, who may see any file anyway and is the one who
-            # can act on it; the refused sidecar is not an existence oracle for anyone else. Both
-            # raises sit after the handler ends, so neither chain carries the cipher's error.
+            # can act on it; neither a refused sidecar nor an outage is an existence oracle for
+            # anyone else. Both raises sit after the handler ends, so neither chain carries the
+            # cipher's error.
             if identity.has(Permission.FILES_ACCESS_ANY):
-                raise _UploadSidecarRefused()
+                raise override_answer()
             raise HTTPException(404, "no such uploaded file")
         if not _may_access_upload(identity, meta):
             await engine.store.record_audit(
@@ -8838,6 +8858,10 @@ def create_app(
                 client=client_ip(request),
             )
             raise HTTPException(409, str(exc)) from None
+        except UploadUnavailableError:
+            # BACKLOG #3734: nothing was written, so a retry stores the file once. Not audited as a
+            # reject, because the file was not refused.
+            raise _UploadUnavailable() from None
         # Vault BACKLOG #3178: the creation row outlives the request, so a deadline that fires now
         # still leaves the stored file with its row. A row that cannot be written removes the file.
         #
@@ -8993,6 +9017,8 @@ def create_app(
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnavailableError:
+            raise _UploadUnavailable() from None
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         result = await asyncio.to_thread(
@@ -9149,6 +9175,8 @@ def create_app(
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnavailableError:
+            raise _UploadUnavailable() from None
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         parts = await asyncio.to_thread(split_uploaded, data)
@@ -9241,7 +9269,12 @@ def create_app(
                 nonlocal detail
                 try:
                     removed = await us.delete(file_id, sidecar_refused=refused)
-                except (UploadPathError, UploadNotFoundError, UploadUnreadableError) as exc:
+                except (
+                    UploadPathError,
+                    UploadNotFoundError,
+                    UploadUnavailableError,
+                    UploadUnreadableError,
+                ) as exc:
                     # Each is raised before any unlink, so no row is owed, and a cancel landing
                     # meanwhile must not log one as lost. Returned, so the route still answers it.
                     return exc
@@ -9271,6 +9304,8 @@ def create_app(
             meta = await outliving.run(_delete_and_record(), "upload delete")
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadUnavailableError:
+            raise _UploadUnavailable() from None
         except UploadUnreadableError:
             raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_UNREADABLE) from None
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
