@@ -11,7 +11,7 @@
 - **Date:** 2026-11-05
 - **Related:** vault BACKLOG #4739 (this design), #2592 (its parent: identity and authorization
   row seals), #4350 and #6357 (the `vault_transit` seal gap; see *The duplicate question*), #3411
-  (the store-id pin), #3637 (the console flag) -- engine PR 2565 (draft, parked by the owner ruling
+  (the store-id pin) -- engine PR 2565 (draft, parked by the owner ruling
   of 2026-10-28, comment `6474801844`; branch `b435-2592-transit-seals` at
   `e48a5780750ee137c503cdd32082006e695d0368`, the reference implementation this design reads) --
   [ADR 0138](0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md) (the Transit cipher)
@@ -27,8 +27,8 @@ Each is a `CONTROL DECISION: yes` below. Confidence is in the recommendation.
    could tell a planted version from a lagging node in its reply.
 2. **(b) Reconcile on a map that does not hold:** end the sessions of PRESENT accounts whose
    groups moved since a new sealed record (`users.directory_groups_digest`), under the existing
-   brake; on a trip, drop those and re-judge ABSENT and DISABLED alone (Forged maps too, which
-   changes `main`). Recommend: yes. Medium. Would change if the group digest cannot be kept current
+   brake; on every trip, whatever the maps' state, drop the map-derived revocations and re-judge
+   ABSENT and DISABLED alone, which changes `main`. Recommend: yes. Medium. Would change if the group digest cannot be kept current
    (for example a leg that changes groups without a verified write), or if the owner prefers
    exempting the session ends from the brake (no freeze, unbraked mass sign-out).
 3. **(b) Sign-in and the certificate leg refuse** while a map is Unverifiable; every map that does
@@ -44,7 +44,9 @@ Each is a `CONTROL DECISION: yes` below. Confidence is in the recommendation.
    burst signal. Recommend: yes. Medium. Would change if the owner wants every refused sign-in
    counted, accepting burst alerts during a Vault fault.
 7. **Residuals accepted by name:** no cross-store binding until #3411; up to 60 seconds of cached
-   trust after a version retirement; the writer-lock timing difference `main` already has. High.
+   trust after a version retirement; the writer-lock timing difference `main` already has; a
+   Forged scope map keeps a manual stored scope on every leg, as on `main`, recorded on #2592.
+   High.
 
 ## Context
 
@@ -108,8 +110,17 @@ call, so no malformed body reaches Transit to draw a 400.
 with the stored Transit string**, never by a row id or the seal alone, so a change
 to any sealed field misses the cache. The cache is emptied whenever a refused check's probe names
 a different latest version than the last one did, and a check that began before that emptying
-keeps its answer for its own caller only. Nothing but Holds is cached. Every request still reads
-the row afresh, so a blanked seal or a bumped epoch takes effect at once.
+keeps its answer for its own caller only. Every request still reads the row afresh, so a blanked
+seal or a bumped epoch takes effect at once.
+
+**The refusal cache.** A Forged or Unverifiable answer is cached the same way for 60 seconds, under
+the same key plus, for Unverifiable, the latest version the probe named, and it is emptied with the
+success cache. A Forged answer is a property of its key, so caching it changes no decision; an
+Unverifiable one can outlive the lag that caused it by up to 60 seconds, which only extends a
+denial. An Outage is never cached. The cache bounds what planted rows cost Vault: each pays its
+Transit calls once per window, not on every scan (item 3.5), and an Unverifiable hit skips the
+probe (item 3.r6). The sign-in path checks a user row past both caches, (e) says why; a hit never
+skips the audit row or the throttled page a refusal writes.
 
 **The probe rule is the audit chain's.** A 400 is a version refusal only when the probe names a
 different version (`crypto_transit._refuses_only_version` on `main`). Item 3.6's shared helper
@@ -126,12 +137,21 @@ the same row.
 
 The API answers an Outage with HTTP 503 and `Retry-After`, an Unverifiable write refusal with HTTP
 409 and fixed recovery text, and the CLI each with one error line and a non-zero exit. The
-`<ref>` of a session is the first 12 hex characters of its token hash (`SESSION_REF_LEN`), never
-the whole hash, everywhere: log line, audit detail, alert subject, exception arguments, `str()`,
+`<ref>` of a session is the first 12 hex characters of its token hash (`main`'s
+`_SESSION_REF_LEN` in `auth/service.py`, which the build moves where the store can import it),
+never the whole hash, everywhere: log line, audit detail, alert subject, exception arguments, `str()`,
 `repr()` and any chained cause a traceback logs. The `<ref>` of any other row is its stored id,
 which a database writer chooses, so it is scrubbed of control characters and bounded with
 `main`'s one rule for shortening an alert subject (`shorten_with_checksum`) before it reaches a
 subject, a reason or an exception. No other field of a row ever does.
+
+**A ref is for reading, never a key.** A 12-character prefix and a shortened id both collide, and a
+database writer who can read a genuine row can plant one that shares its ref. So every throttle and
+the unverifiable-row cap are keyed by the SHA-256 of the kind and the **whole** stored id, held in
+memory only and never written to a subject, a log line, an exception or an audit row, and each
+alert subject carries the first 16 hex characters of that digest after the readable ref, so a
+planted row that copies a genuine ref still pages under a subject of its own. The digest is of the
+stored id, never of a token, so it gives nothing toward a session (item 12's test covers it).
 
 ### (a) A `verify` HTTP 400 while the fixed-input probe works
 
@@ -216,12 +236,18 @@ signed in retains nothing a verified pass would take away.
 
 **The group record is new state, and it is sealed.** No such record exists on `main`: `UserRow`
 holds no group field, and a probe's `groups` live only for the pass. The build adds one column,
-`users.directory_groups_digest`: the SHA-256 of the account's sorted, length-prefixed group names,
-written by a directory sign-in and by a reconcile pass that read both maps verified, and only when
-it changes. `USER_SEAL_EXCLUDED` leaves out only `authz_seal`, so the column is inside the user
+`users.directory_groups_digest`: the SHA-256 of the account's group keys as `main` normalizes
+them (`ad_group_keys` in `store/store.py`), sorted and length-prefixed. It is written only in the
+same sealed write that records a verified decision: a directory sign-in that read both maps
+verified, or a reconcile pass that read both maps verified and applied that account's role and
+scope sync. A pass that trips the brake, aborts, or reads a map that does not hold writes no
+digest, so the digest always names the groups the last verified decision saw. `USER_SEAL_EXCLUDED` leaves out only `authz_seal`, so the column is inside the user
 seal from the start, and a writer who edits it makes the row Forged or Unverifiable, which denies
 the account. An account with no digest yet (one that has not signed in since the column landed)
 counts as differing, so the rule fails toward ending its session. The digest stores no group name.
+It covers every group, not only the mapped ones: restricting it to the groups the last verified maps
+name would need that group set stored and sealed as well, and a change to an unmapped group then
+ends a session that did not need ending, which is the conservative error.
 
 **Under the default brake the narrowed set trips only on a mass group change.** `main`'s breaker
 (`reconcile.breaker_tripped`) trips when a pass would revoke more than `ad_session_revoke_max` (5)
@@ -231,10 +257,14 @@ a pass trips only when more than five of its probed accounts, and more than a th
 changed groups since their last verified record or are being offboarded: 40 probed accounts need
 at least 14, and an estate of any size needs at least 6. That is the condition under which a verified
 map's role changes already trip it on `main`, so an unverifiable map adds no trip a directory
-change would not cause, except after the column first lands, when every account counts as
-differing and a large estate trips once (paged, below), until its accounts have signed in.
+change would not cause, with one exception. Until an account's first verified decision after the
+column lands, it has no digest and counts as differing. The first verified pass writes every
+account's digest, so the exception lasts only while no verified pass has run since the upgrade.
+If a map is unverifiable through that whole window, a large estate trips on **every** pass while it
+stays so, since sign-in is refused too and no digest can be written; each such pass still applies
+the re-judged ABSENT and DISABLED set (below) and pages.
 
-**The brake keeps its one budget, and a trip drops the map-derived revocations first.** `main`'s
+**The brake keeps its one budget, and every trip drops the map-derived revocations first.** `main`'s
 breaker counts a role change against "the SAME breaker budget as an absence", because, in `main`'s
 own comment in `reconcile.py`, "a mass role change (e.g. an emptied ad_group_role_map) is exactly
 as suspicious as a mass disable, and must not slip past the brake". So the map-decided session
@@ -243,40 +273,64 @@ pass, so a map that does not hold, tripping the brake, would also drop every ABS
 revocation. So the pass, planned in full before anything is written as on `main`, splits its
 revocations into **map-derived** ones (role and scope diffs, or the map-decided session ends above)
 and **probe-derived** ones (ABSENT, DISABLED and the other striking outcomes, which read no map).
-The breaker judges the whole set first, exactly as `main` does. If it trips **and** the pass read
-a map that does not hold, the map-derived set is dropped and the breaker judges the probe-derived
-set alone, which is applied if it passes. No pass applies more than one budget's worth of
-revocations, so the brake is not loosened. **This applies to a Forged map too**, which on `main`
-freezes offboarding the same way, because a malformed or `valid: false` seal is the cheaper plant.
-A pass whose maps both hold keeps `main`'s rule unchanged.
+The breaker judges the whole set first, exactly as `main` does. If it trips, the map-derived set
+is dropped and the breaker judges the probe-derived set alone, which is applied if it passes. That
+holds **whatever the maps' state**, a verified map included: a map that holds can still be a
+planted one that was sealed (an empty map reads as Holds, since no pair is left to fail), and a
+Forged map freezes offboarding on `main` the same way, so the rule cannot hinge on reading which map
+is to blame. No pass applies more than one budget's worth of revocations, and the probe-derived set
+alone is judged against the same thresholds, so the brake is not loosened; what changes from `main`
+is only that a mass role change no longer drops the pass's offboarding with it.
+
+**The apply order.** For each account the pass ends the sessions first and then writes its role
+and scope rows and its digest in one sealed write. A write that fails (an Outage on that row's
+`hmac`) leaves the sessions ended, is recorded for that account, and does not stop the loop, so
+one row's fault never skips the revocations after it. On `main` the role write comes first.
 
 **How a partial pass is recorded.** On `main`, `ReconcilePlan.aborted` set means "apply nothing",
-the lifespan task pages the breaker only when it is set and the per-revocation alerts only when it
-is not, and `breaker_clear` needs it unset. A pass that dropped its map-derived set but applied its
-probe-derived set leaves `aborted` unset, so the applied revocations raise their usual alerts, and
-sets a new field, `map_derived_dropped`, naming the reason, which the lifespan task pages through
-the breaker's alert. Such a pass never sets `breaker_clear` or the hold's clear: a missed clear,
-never a false one. A pass whose probe-derived set also trips sets `aborted` as `main` does.
+the lifespan task (`api/app.py`, the reconcile alert function) pages the breaker only when it is
+set and the per-revocation alerts only when it is not, and `AuthService._mark_reconcile_clears`
+sets `breaker_clear` only on a pass that is evidence the breaker is not tripped, which #2136's
+auto-resolve of the open `ad_reconcile_aborted` instance reads. A pass that dropped its map-derived
+set but applied its probe-derived set leaves `aborted` unset, so the applied revocations raise
+their usual `ad_session_revoked` alerts, and sets a new field, `map_derived_dropped` (reason
+`breaker`), on which the lifespan task raises `ad_reconcile_aborted("directory-reconciler", ...)`
+after those alerts, with the dropped count as its detail. The breaker tripped on that pass, so
+`_mark_reconcile_clears` treats it as tripped: no `breaker_clear`, and the open instance stays open,
+a missed clear and never a false one. The hold's, the referral's and the outage's clears judge
+their own conditions and are unchanged. A pass whose probe-derived set also trips sets `aborted`
+as `main` does.
 
 **Other legs that read a map** decide access and write nothing: at least the client-certificate
 identity (`identity_for_cert_user_id`), the step-up role test (`_directory_roles_lost`) and the
-enrolment and re-bind legs. On the step-up, enrolment and re-bind legs an Unverifiable map reads
+enrolment and re-bind legs. On the step-up, enrolment and re-bind legs an Unverifiable role map reads
 as granting nothing for that decision, as a Forged map does on `main`. **The certificate leg
 refuses the identity instead** (returns `None`) while either map is Unverifiable, as sign-in does,
-because there an empty scope map does not narrow: `decide_ad_channel_scope` keeps a manual stored
-scope when the mapped set is empty, so "grants nothing" would keep a wider scope than a holding map
-gives. A Forged scope map has the same effect on that leg on `main` today; the build records it as
-an item on #2592 rather than changing it here.
+because an empty scope map does not narrow: `decide_ad_channel_scope` keeps a manual stored scope
+when the mapped set is empty, so "grants nothing" would keep a wider scope than a holding map gives.
 
-**A map read that is an Outage drops only the map-derived set.** The pass plans no map-derived
-revocation, judges the probe-derived set under the brake and applies it, and records
-`map_derived_dropped = seal_unavailable`, which pages under `authority-seal-transit`. The probe-
-derived set needs the user rows' seals, so where the Outage is Vault-wide those checks fail too and
+**Residual: a Forged scope map keeps a manual stored scope on `main`, on every leg.** Sign-in, the
+reconciler and the certificate leg all read a Forged scope map as empty, and the same rule keeps a
+manual stored scope. So "a Forged map grants nothing" is not true of the scope map anywhere on
+`main`. This ADR does not change Forged behaviour; the build records it as an item on #2592. Under
+this design an Unverifiable scope map refuses at sign-in and on the certificate leg and writes no
+scope row on a reconcile, so the gap stays the Forged map's alone.
+
+**Other readers of another row's seal never propagate Unverifiable.** A check that reads rows other
+than the one it decides on, at least `admin_guard_counts` (the last-Administrator guard) and the
+holder census of (d), counts an Unverifiable row as it counts a Forged one on `main`: as not
+counting toward any grant, and never as an error that aborts the check. A guard that would then
+see no Administrator refuses, as on `main`.
+
+**A map read that is an Outage is handled as an Unverifiable one.** The pass writes no role or
+scope row and plans the groups-moved session ends, which read only the probe and the digest, never
+the map, so they still run, under the brake as above; the map pages under
+`authority-seal-transit`. The probe-derived set and the digest need the user rows' seals, so where the Outage is Vault-wide those checks fail too and
 the pass aborts under its own slug, `seal_unavailable`, not `main`'s `OUTAGE_ABORT`, which names
 the directory and feeds the directory's outage-run paging. In that case no access is retained
 either, since every authenticated request also checks its session's seal past the 60-second
 success cache and meets the same Outage. Where the Outage touches the map row alone (a lagging
-node that answers for older seals), offboarding still runs.
+node that answers for older seals), offboarding and the groups-moved session ends still run.
 
 **The map page has no latch, and a map that does not hold always pages as itself.** Every pass
 that reads a map Unverifiable or Forged pages it under that map's own fixed subject:
@@ -286,23 +340,25 @@ that reads a map Unverifiable or Forged pages it under that map's own fixed subj
 it). Neither goes through the sealer's per-row throttle or a latch; repetition is left to the
 sink's own per-subject re-alert throttle. An engine cannot learn whether a page was delivered
 (`AlertSink.integrity_drift` returns nothing, and the notifier only enqueues), so a latch that
-suppresses later pages can always lose the only one; with none, items 10 and 11 have nothing to go
-wrong in. A move from one map to the other is a new subject and pages.
+suppresses later pages can always lose the only one. With none, a lost page is bounded by one sink
+re-alert interval: the sink stamps its last-sent time before it enqueues, so an enqueue that fails
+costs that page, and the next pass after the interval pages again. A move from one map to the other is a new subject and pages.
 
 **The cap exemption.** The unverifiable-row cap (`MAX_SUBJECT_ALERTS` distinct subjects per window,
 then one shared `:*` subject) **exempts exactly the four map subjects**, whose names are fixed in
 code, so no stored value can open an uncapped subject through the exemption.
 
 - **Control kept:** a map that does not hold cannot keep a directory account signed in after its
-  groups moved, below the brake's thresholds, and cannot freeze an ABSENT or DISABLED revocation
-  unless the probe-derived set trips the brake on its own (or Vault is down everywhere, when no
-  request is served either). The brake keeps its one budget. Every pass that reads a map that does
+  groups moved, below the brake's thresholds, and no map, holding or not, can freeze an ABSENT or
+  DISABLED revocation unless the probe-derived set trips the brake on its own (or Vault is down
+  everywhere, when no request is served either). The brake keeps its one budget. Every pass that reads a map that does
   not hold pages under that map's own uncapped subject.
 - **Failure accepted:** past the thresholds, a map that does not hold freezes the map-derived
   session ends while it stands, paged every pass by the map's subject and the breaker's alert.
   An account whose groups have not moved keeps its live session while the map is unverifiable,
-  though sign-in stays refused. The first unverifiable pass after the column lands counts every
-  account as differing.
+  though sign-in stays refused. Until the first verified pass after the column lands, every
+  account counts as differing, so a large estate trips on every pass while a map stays
+  unverifiable through that window.
 - **Rejected: every PRESENT account as the map-decided set (the previous revision).** In any estate
   of more than about five signed-in accounts it trips the brake on every pass, which behaves as the
   rejected hold.
@@ -319,8 +375,8 @@ code, so no stored value can open an uncapped subject through the exemption.
 - **Rejected: a per-map latch set after delivery.** No sink reports delivery.
 
 `CONTROL DECISION: yes` -- it changes what a reconcile pass revokes and writes while a map does not
-hold, adds the sealed group digest, re-judges the probe-derived revocations alone on a trip (Forged
-maps included, which changes `main`), refuses the certificate identity on an unverifiable map,
+hold, adds the sealed group digest, re-judges the probe-derived revocations alone on every trip
+(which changes `main`), reorders the apply phase, refuses the certificate identity on an unverifiable map,
 gives a Transit outage its own handling, and changes how a map that does not hold pages.
 
 ### (c) Write-path refusals: paging, and keeping unverifiable apart from forged
@@ -328,10 +384,11 @@ gives a Transit outage its own handling, and changes how a map that does not hol
 **Answer.** One shape for every store write that checks a stored seal first (user, role, map,
 session, approval, on SQLite, PostgreSQL and SQL Server):
 
-1. The store's helper (`require_seal_for_write`) raises
+1. A new store helper (named `require_seal_for_write` on PR 2565's branch; `main` has none) raises
    `RowSealError(kind, cause, subject)`. `cause` is an enum, `FAILED` or `UNVERIFIABLE`, set where
    `TransitSealUnverifiableError` was caught and never inferred from text. `subject` is
-   `seal_row_key(kind, stored_id)`: the id the row holds **as stored**, so one row has one subject
+   built from the kind and the id the row holds **as stored** (a helper PR 2565's branch names
+   `seal_row_key`), with the digest suffix of *A ref is for reading*, so one row has one subject
    on a case-insensitive collation, and for a session only its 12-character ref. Those three are
    the exception's whole `args`, so `repr()`, copy and pickle carry no full token hash (item 12).
    An Outage never becomes a `RowSealError`; it propagates as `TransitSealUnavailableError`.
@@ -371,7 +428,9 @@ session, approval, on SQLite, PostgreSQL and SQL Server):
   allowing it would seal in content nobody checked (a planted role survives into a row that then
   verifies). So it is refused with HTTP 409, and the service then **ends every session of that
   account** (session rows carry their own seals and revoking one needs no key) and audits the
-  refused narrowing with the account's subject. Access is cut at once, and sign-in stays refused
+  refused narrowing with the account's subject. The same holds when a narrowing write fails for an
+  Outage, such as an `hmac`-only fault while sealing the new row: the write rolls back, the service
+  ends the account's sessions through `revoke_user_sessions`, which needs no seal, and answers 503. Access is cut at once, and sign-in stays refused
   while the row is Unverifiable. If the row later verifies (the cause was a lag), the narrowing
   itself is lost and must be made again; the audit row and the 409 say so. Deleting the account,
   which keeps nothing, is allowed meanwhile.
@@ -457,9 +516,10 @@ dummy password hash checked.
 `verify` and an unknown name costs none, so latency, and an Outage's HTTP 503 against an unknown
 name's 401, would tell them apart. The build closes that the way the dummy password hash closes
 it for argon2: a sign-in for a name with no row makes one Transit `verify` over a dummy
-seal that the start probe made under the key's latest version (re-made when the probe's version
-moves, so it always verifies), and the sign-in path checks a user row's seal **past the success
-cache**, so a recently checked name and an unknown one each make exactly one `verify` and meet the
+seal minted at each start under the key's latest version and minted again whenever its own
+`verify` is refused, for any reason a retirement included, so it verifies whenever a genuine row
+under the latest version would (a refusal of the dummy is never reported as a row), and the sign-in
+path checks a user row's seal **past the success and refusal caches**, so a recently checked name and an unknown one each make exactly one `verify` and meet the
 same Outage. The probe call an Unverifiable row
 adds is not equalized: it shows only that a row exists whose seal Transit will not check, which a
 database writer who planted it already knows, and which a genuine row shows only during a lag.
@@ -515,7 +575,7 @@ Lander files them (korus `roles/BUILDER.md` 1c routes filings to the Lander):
 
 | Item | Finding (short) | Disposition |
 |---|---|---|
-| 3.5 | Seal checks in loops (roles, sessions, approvals) run one after another | **Kept:** the 60-second cache holds successes only, so rows that fail pay one or two Transit calls on every scan, and a database writer can plant many. Enough load can push Vault into refusing calls, an Outage, which (b) shows denies everywhere and retains no grant; bounded concurrency waits on a measurement. |
+| 3.5 | Seal checks in loops (roles, sessions, approvals) run one after another | **Fixed in build, in part:** the refusal cache (*The four answers*) makes a planted row pay its Transit calls once per 60-second window rather than on every scan. **Kept:** the checks still run one after another; bounded concurrency waits on a measurement. |
 | 3.6 | `seal_hmac` duplicates `audit_hmac`; `_transit_version` duplicates `store.py`'s `_TRANSIT_MAC_VERSION` | **Fixed in build:** one Transit-HMAC call helper in `crypto_transit.py` and one MAC-shape parser both callers import; the shared refusal classifier keeps the audit chain's probe rule (table in *The four answers*), so the audit chain's classification does not change. |
 | 3.7 | `for_cipher` special-cases `TransitCipher` with `isinstance` | **Fixed in build:** a `Cipher` method that returns the cipher's row-seal backend, or none, replaces the `sys.modules` and `isinstance` test. |
 | 3.r1 | The Outage alert says Vault "did not answer" | **Fixed in build:** wording in (c) step 4. |
@@ -523,9 +583,9 @@ Lander files them (korus `roles/BUILDER.md` 1c routes filings to the Lander):
 | 3.r3 | `_key_answers` swallows the probe's exception unlogged | **Fixed in build:** the probe logs its failure at WARNING with Vault's failure text and no input (as `_probe_mac` does at `e48a5780`). |
 | 3.r4 | Docstrings say any failure raises `CipherError` | **Fixed in build:** the docstrings name what can escape. |
 | 3.r5 | `test_transit_row_seal.py:247` reads `caplog.text` before the redaction filter | **Fixed in build:** the assertion reads the filtered handler's output. |
-| 3.r6 | A 400 on a planted seal costs a second Transit round trip, with no negative cache | **Kept:** the probe is the only Outage-versus-Unverifiable discriminator in (a); a negative cache would misfile an Outage inside its window. |
+| 3.r6 | A 400 on a planted seal costs a second Transit round trip, with no negative cache | **Fixed in build:** the refusal cache holds an Unverifiable answer for 60 seconds keyed with the probe's version, so the probe runs once per window; an Outage is never cached, so none is misfiled. |
 | 3.r7 | The same base64 line at three call sites | **Fixed in build:** with 3.6's helper. |
-| 4 | Unverifiable AD map holds every diff; demotions stop revoking; no reconcile alert; page can fold into the cap | **Moot under design:** (b) ends the sessions of accounts whose groups moved, under the brake, re-judges offboarding alone on a trip, and pages every such pass under the map's uncapped subject. |
+| 4 | Unverifiable AD map holds every diff; demotions stop revoking; no reconcile alert; page can fold into the cap | **Moot under design:** (b) ends the sessions of accounts whose groups moved, under the brake, re-judges offboarding alone on every trip, and pages every such pass under the map's uncapped subject. |
 | 5 | Role delete raw-deletes map pairs of an unverifiable map | **Fixed in build:** (d) step 2 refuses it. |
 | 6 | `provision-admin` unverifiable refusal falls to the CLI defect report | **Fixed in build:** (c) step 3. |
 | 7 | Writes and the approval gate page under the request id | **Fixed in build:** (c) step 1, the stored id. |
@@ -533,7 +593,7 @@ Lander files them (korus `roles/BUILDER.md` 1c routes filings to the Lander):
 | 9 | Forgery wording on unverifiable refusals; stale changelog fragment and `docs/PHI.md` lines; simplifications | **Fixed in build:** (c) step 4 wording; the docs slice rewrites the fragment and the `docs/PHI.md` recovery and seal text to this ADR; simplifications are taken where a slice touches the code. |
 | 10 | Map-hold latch set before the alert, so a failed page is lost and later ones suppressed | **Moot under design:** (b) has no latch; every pass that reads a map Unverifiable pages, and the sink's re-alert throttle governs repetition. |
 | 11 | Latch does not record which map, so a move between maps raises no alert | **Moot under design:** no latch, and each map pages under its own fixed subject, so a move is a new subject. |
-| 12 | `RowSealError` keeps the full session token hash in `args` | **Fixed in build (designed out):** (c) step 1, `args` are `(kind, cause, subject)` with the 12-character ref; the fixed-length input keeps the hash out of anything Transit receives; a test raises one for a session and asserts that no encoding of the token hash appears in `args`, `str()`, `repr()` or the logged traceback with its chained causes: lowercase and uppercase hex, standard and URL-safe base64 of the raw digest and of the hex string, and any 16-character run of the hex. |
+| 12 | `RowSealError` keeps the full session token hash in `args` | **Fixed in build (designed out):** (c) step 1, `args` are `(kind, cause, subject)` with the 12-character ref; the fixed-length input keeps the hash out of anything Transit receives; a test raises one for a session and asserts that no encoding of the token hash appears in `args`, `str()`, `repr()` or the logged traceback with its chained causes: lowercase and uppercase hex, standard and URL-safe base64 of the raw digest and of the hex string, and any 16-character run of the hex; and that the throttle key of *A ref is for reading* appears in none of them. |
 | 13 | Web console role delete shows raw JSON on the 409 | **Fixed in build:** (d) step 6. |
 | 14 | Sessions revoked before a late store refusal, with no audit row | **Fixed in build:** (d) step 5. |
 | 15 | Role delete refused even when no map pair names the role | **Fixed in build:** (d) step 2. |
@@ -569,8 +629,8 @@ is fail-closed on its own head.
 | Slice | What | Paths | Tests |
 |---|---|---|---|
 | 1 | The Transit sealer and the four answers; async seal seams on every backend; the start probe; `RowSealError(kind, cause, subject)`; the required `transit/verify` capability | `store/row_seal.py`, `store/crypto_transit.py`, `store/crypto.py`, `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/base.py`, `pipeline/engine.py`, `api/app.py`, `privilege_check.py`, `scripts/security/crypto_inventory_check.py` | new `tests/test_transit_row_seal.py` and `tests/_transit_seal_fake.py`; the seal contracts (`tests/_*_seal_contract.py`); `test_row_seal.py`, `test_crypto_transit.py`, `test_postgres_store.py`, `test_sqlserver_transit_row_seal.py`; item 12's args test |
-| 2 | Service loaders and reporting: the unverifiable action, subjects and cap with the map exemption, the sign-in refusals and the dummy `verify` of (e), the CLI mapping and the catch-site audit of (c) step 3 | `auth/service.py`, `pipeline/alerts.py`, `pipeline/security_signals.py`, `cli_common.py`, `api/auth_routes.py`, `api/approvals.py` | `test_user_seal.py` (run unchanged, item 19), `test_session_seal.py`, `test_role_seal.py`, `test_approval_seal.py`, `test_api_auth.py`, `test_security_signals.py`, `test_provision_first_administrator.py` |
-| 3 | AD sign-in deny, the group digest, the reconciler's end-sessions rule under the brake with the probe-derived re-judge, `map_derived_dropped`, the Outage handling, the certificate refusal and the map paging of (b) | `auth/service.py`, `auth/reconcile.py` (the two revocation sets and the re-judge), `store/store.py`, `store/postgres.py`, `store/sqlserver.py` (the `directory_groups_digest` column, inside the user seal), `pipeline/alerts.py`, `api/app.py` (lifespan paging) | `test_ad_session_reconcile.py`, `test_mfa_directory_recheck.py`, `test_reauth_directory_demotion.py`, and new cases: a planted unverifiable map ends the session of an account whose groups moved and leaves one whose groups did not; an account with no digest counts as moved; past the thresholds a planted map (Unverifiable, and Forged) trips the brake, a DISABLED account is still revoked and the total stays within one budget, with `map_derived_dropped` set, `aborted` unset and no clear marked; a map-row Outage drops only the map-derived set; a Vault-wide Outage aborts under `seal_unavailable`; the certificate leg refuses on an unverifiable map; a forged map pages under its own subject; two consecutive passes each page the map; a move between maps pages under the other subject |
+| 2 | Service loaders and reporting: the unverifiable action, the refusal cache, subjects with the digest suffix and the cap keyed by the whole id, the map exemption, Unverifiable as not-counting in other-row readers, the sign-in refusals and the dummy `verify` of (e), the CLI mapping and the catch-site audit of (c) step 3 | `auth/service.py`, `pipeline/alerts.py`, `pipeline/security_signals.py`, `cli_common.py`, `api/auth_routes.py`, `api/approvals.py` | `test_user_seal.py` (run unchanged, item 19), `test_session_seal.py`, `test_role_seal.py`, `test_approval_seal.py`, `test_api_auth.py`, `test_security_signals.py`, `test_provision_first_administrator.py` |
+| 3 | AD sign-in deny, the group digest, the reconciler's end-sessions rule under the brake with the probe-derived re-judge on every trip, the apply order, `map_derived_dropped`, the Outage handling, the certificate refusal and the map paging of (b) | `auth/service.py`, `auth/reconcile.py` (the two revocation sets and the re-judge), `store/store.py`, `store/postgres.py`, `store/sqlserver.py` (the `directory_groups_digest` column, inside the user seal), `pipeline/alerts.py`, `api/app.py` (lifespan paging) | `test_ad_session_reconcile.py`, `test_mfa_directory_recheck.py`, `test_reauth_directory_demotion.py`, and new cases: a planted unverifiable map ends the session of an account whose groups moved and leaves one whose groups did not; an account with no digest counts as moved; past the thresholds a planted map (Unverifiable, Forged, and a sealed empty map that Holds) trips the brake, a DISABLED account is still revoked and the total stays within one budget, with `map_derived_dropped` set, `aborted` unset, the breaker's alert raised and no `breaker_clear`; no digest is written on a tripped or unverified pass; a role-row Outage mid-pass leaves that account's sessions ended and the later accounts processed; a map-row Outage still ends the groups-moved sessions; a Vault-wide Outage aborts under `seal_unavailable`; the certificate leg refuses on an unverifiable map; a forged map pages under its own subject; two consecutive passes each page the map; a move between maps pages under the other subject |
 | 4 | Role delete and map edits of (d), the console 409 | `auth/service.py`, `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `messagefoundry_webconsole/routes/admin.py` | new cases for items 14, 15 and 16; the web console suite under `packaging/messagefoundry-webconsole/tests` |
 | 5 | Docs, in the same pull request | `docs/PHI.md`, `docs/SECURITY.md` (including the one-Transit-key-per-store guidance until #3411), the changelog fragment | the doc tests that pin those files |
 
@@ -580,17 +640,16 @@ No step is met by loosening an existing check or test. The hosted PostgreSQL, SQ
 ## Consequences
 
 **Positive.** An unverifiable seal, which a database writer can produce at will, is never weaker
-than a forged one: it denies, audits and pages. A map that does not hold no longer drops ABSENT and
-DISABLED revocations unless they trip the brake on their own, and the brake keeps its one budget.
+than a forged one: it denies, audits and pages. No map, holding or not, drops ABSENT and DISABLED
+revocations unless they trip the brake on their own, and the brake keeps its one budget.
 Each refusal is audited under its true cause, and the burst signal stays a credential signal.
 
-**Negative.** A map that does not hold can still freeze offboarding in two cases: when the
-probe-derived revocations trip the brake on their own, and when Vault is down everywhere (when no
-request is served either). A **verified** map that an operator empties keeps `main`'s rule, so its
-mass role change trips the brake and drops every revocation of the pass, offboarding included; the
-console warns on that save, and the acknowledged full replacement of (d) avoids the empty interim.
-Past the brake, a map that does not hold freezes the map-derived session ends while it stands,
-paged every pass. A Vault fault or lag below the brake signs out the accounts whose groups moved
+**Negative.** Offboarding can still freeze in two cases: when the probe-derived revocations trip
+the brake on their own, and when Vault is down everywhere (when no request is served either). A
+map that an operator empties still trips the brake with its mass role change, which drops the
+map-derived revocations of that pass while offboarding runs; the console warns on that save, and the
+acknowledged full replacement of (d) avoids the empty interim. Past the brake, the map-derived
+session ends freeze while the condition stands, paged every pass. A Vault fault or lag below the brake signs out the accounts whose groups moved
 and refuses directory sign-in. A genuine row sealed under a version not yet on the answering node
 is denied for the lag. Until the verify-then-reseal tool (item 2) exists, no row can be carried
 across a version retirement, so an operator must not raise `min_decryption_version` on the audit
@@ -601,7 +660,8 @@ accept each other's rows until #3411.
 **Neutral, and what changes off `vault_transit`.** The local sealer never answers Unverifiable or
 Outage, so (a) and (e) change nothing under another cipher. At least these do change for every
 cipher: `RowSealError`'s arguments and the subject bounding (c), the audit of every revocation on a
-role delete (d), the breaker's re-judging of the probe-derived revocations when a Forged map trips
-it, a Forged map's own page subject and the group digest column (b), the narrowing-write
-session ends (c), the `Cipher`-level sealer hook (item 3.7), and the cause-keyed throttles. A reviewer of a
+role delete (d), the breaker's re-judging of the probe-derived revocations on every trip, the
+apply order, a Forged map's own page subject and the group digest column (b), the narrowing-write
+session ends (c), the `Cipher`-level sealer hook (item 3.7), the refusal cache, and the cause-keyed
+throttles keyed by the whole stored id. A reviewer of a
 local-cipher store reads those call sites.
