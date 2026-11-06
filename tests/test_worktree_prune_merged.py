@@ -1811,17 +1811,22 @@ def test_an_orphan_under_an_unreadable_ancestor_stays_reported(
     assert later["_exit"] == 3
 
 
-def test_an_orphan_under_a_linked_ancestor_stays_reported(fx: Fixture, sleeper: int) -> None:
-    """Red on engine c91761f75d: the nearest item above the orphan that is there was a junction to an
-    empty folder, the listing through it held no such name, and the entry cleared. The nightly
-    removal had just read the same state as ORPHANED, so its ledger entry was dropped the next run.
-    The folder listed must be a plain directory, the one rule both read (Test-ConfirmedGoneOrThrow)."""
+@pytest.mark.parametrize("where", ["claude-worktrees", "sibling"])
+def test_an_orphan_under_a_linked_ancestor(fx: Fixture, sleeper: int, where: str) -> None:
+    """The nearest item above the orphan that is there is a junction to an empty folder. A
+    .claude/worktrees entry is the nightly removal's, which reads that state as ORPHANED, so it stays
+    reported: red on engine c91761f75d, which cleared it the next run. A sibling under a linked folder
+    (a junctioned D:\\Code, say) still clears once it is gone: red on engine 7c2e9aacd2, which kept it
+    reported every run with nothing a human could clear."""
     if os.name != "nt":
         pytest.skip("a directory junction is a Windows construct")
     live_record(fx, sleeper, fx.primary)
     target = fx.root / "link-target"
     target.mkdir()
     linked = fx.root / "linked"
+    if where == "claude-worktrees":
+        linked = linked / ".claude" / "worktrees"
+        linked.parent.mkdir(parents=True)
     subprocess.run(
         ["cmd", "/c", "mklink", "/J", str(linked), str(target)],
         check=True,
@@ -1831,6 +1836,10 @@ def test_an_orphan_under_a_linked_ancestor_stays_reported(fx: Fixture, sleeper: 
     gone = linked / "repo-deleted"
     _write_orphan_ledger(fx, gone)
     later = run(fx)
+    if where == "sibling":
+        assert later["orphansFromEarlierRuns"] == [], later
+        assert later["_exit"] == 0
+        return
     assert [o["path"] for o in later["orphansFromEarlierRuns"]] == [str(gone)], later
     assert "is a link" in later["orphansFromEarlierRuns"][0]["why"], later
     assert later["_exit"] == 3

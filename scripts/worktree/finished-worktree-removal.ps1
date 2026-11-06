@@ -109,8 +109,8 @@
     record parsing follows remove.ps1's rules, cannot-tell refusing, without sharing its code.
     THE END STATE IS READ FAIL-CLOSED: only a tree git no longer lists, whose directory is confirmed
     gone by the rule prune-merged.ps1's orphan ledger uses (Test-ConfirmedGoneOrThrow in
-    worktree-gates.ps1: not found, and the nearest folder above it that is there is a plain directory
-    and lists without it), here with that folder required to be its own parent, is REMOVED. A
+    worktree-gates.ps1: not found, and the nearest folder above it that is there lists without it),
+    here with that folder required to be its own parent and a plain directory, is REMOVED. A
     directory that is present or cannot be confirmed gone is ORPHANED, for a human.
 
     WHAT THESE DO NOT SEE, said rather than implied. The fence reads the directory a session was
@@ -450,13 +450,14 @@ function Invoke-FinishedWorktreeRemoval {
 # Whether the tree's directory is still there after the removal: 'present', 'absent', or 'unknown: <why>'.
 # FAIL CLOSED. Test-Path answers $false for a path it may not read, so it cannot say "gone". Absent is
 # only what Test-ConfirmedGoneOrThrow confirms, the rule prune-merged.ps1's orphan ledger is read by,
-# with -RequireParent, so a tree whose parent folder is gone too is not confirmed gone here.
+# with -Plain, as the root check required of the folders above the tree, and -RequireParent, so a tree
+# whose parent folder is gone too is not confirmed gone here.
 # A directory git has just deleted can sit delete-pending for a moment while another process (an
 # indexer, an antivirus scan) still holds it, and answers access-denied until it goes; so an unreadable
 # reading is taken again a few times before it stands. Only 'unknown' is retried, never 'present'.
 function Get-EndStatePresence([string]$Path, [int]$Tries = 5, [int]$WaitMs = 400) {
     for ($i = 1; ; $i++) {
-        try { return $(if (Test-ConfirmedGoneOrThrow $Path 'the removed tree' -RequireParent) { 'absent' } else { 'present' }) }
+        try { return $(if (Test-ConfirmedGoneOrThrow $Path 'the removed tree' -Plain -RequireParent) { 'absent' } else { 'present' }) }
         catch {
             # The readers end their message "Nothing was removed.", which is false once git has run.
             if ($i -ge $Tries) { return "unknown: $($_.Exception.Message -replace '\s*Nothing was removed\.\s*$', '')" }

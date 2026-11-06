@@ -375,12 +375,13 @@ function Test-RegistryPresentOrThrow([string]$Dir, [string]$What) {
 # nightly removal's end state both read it here. $false when $What is there, $true only when it is
 # CONFIRMED gone, a throw for anything else. Confirmed gone means two things. The path is not found. And
 # the nearest item above it that IS there lists as a folder, in full, without the next name down, so a
-# not-found under a link, wherever it leads, or under a folder this user may not list, is not gone: the
-# folder listed must be a plain directory. A path whose parent is gone too clears once a folder further
-# up lists without it, unless -RequireParent, which throws instead. At least these throw: an item above
-# it that is not a plain directory or cannot be listed (a file, a link, a folder this user may not list),
-# and a path with nothing above it that can be found, such as a share that does not answer.
-function Test-ConfirmedGoneOrThrow([string]$Path, [string]$What, [switch]$RequireParent) {
+# not-found under a dead link or under a folder this user may not list is not gone. -Plain also requires
+# that folder to be a plain directory, so a link there, wherever it leads, is not read as gone; the
+# folders above it are not checked. A path whose parent is gone too clears once a folder further up
+# lists without it, unless -RequireParent, which throws instead. At least these throw: an item above it
+# that cannot be listed (a file, a dead link, a folder this user may not list), and a path with nothing
+# above it that can be found, such as a share that does not answer.
+function Test-ConfirmedGoneOrThrow([string]$Path, [string]$What, [switch]$Plain, [switch]$RequireParent) {
     if (Get-ItemOrThrow $Path $What) { return $false }
     $below = $Path.TrimEnd('\', '/')
     while ($true) {
@@ -394,7 +395,7 @@ function Test-ConfirmedGoneOrThrow([string]$Path, [string]$What, [switch]$Requir
                     Where-Object { [string]::Equals($_.Name, $leaf, [StringComparison]::OrdinalIgnoreCase) })
             if ($listed.Count -gt 0) { throw "'$below' is listed in '$above' but could not be found. Nothing was removed." }
             # After the listing, so a file or an unlistable folder keeps the listing's own refusal.
-            if (-not (Test-PlainDirectoryItem $item)) { throw "'$above', the folder above $What, is a link, so a listing through it does not show where $What was. Nothing was removed." }
+            if ($Plain -and -not (Test-PlainDirectoryItem $item)) { throw "'$above', the folder above $What, is a link, so a listing through it does not show where $What was. Nothing was removed." }
             return $true
         }
         $below = $above
@@ -506,7 +507,9 @@ function Get-UnsafeIgnoredEntries([string]$Path) {
     foreach ($line in @($lines | Where-Object { "$_".StartsWith('!! ') })) {
         # A directory of that name prints with a trailing slash, so it never matches here.
         if ($line -ceq "!! $SEAT_LOCAL_REL") {
-            if (-not (Test-PlainFile (Join-Path $Path $SEAT_LOCAL_REL) 'the seat record')) { $unsafe += "$line (a link: not a plain file)" }
+            try { $plain = Test-PlainFile (Join-Path $Path $SEAT_LOCAL_REL) 'the seat record' }
+            catch { $plain = $false }
+            if (-not $plain) { $unsafe += "$line (not a plain file, or unreadable)" }
             continue
         }
         if ($line -cnotmatch $REGENERABLE_IGNORED_PATTERN) { $unsafe += $line; continue }

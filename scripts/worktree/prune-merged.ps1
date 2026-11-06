@@ -1432,8 +1432,10 @@ function Get-LiveOrphans([object[]]$Ledger) {
         # Dropped only once CONFIRMED gone. Test-Path answers $false for a path it may not read, and the
         # nightly removal ledgers exactly that case (an unreadable leftover), so it must keep reporting.
         $why = 'a previous run of this script failed to finish removing it'
-        # worktree-gates.ps1's one rule for "gone", which the nightly removal's end state reads too.
-        try { if (Test-ConfirmedGoneOrThrow $p 'the orphaned directory') { continue } }
+        # worktree-gates.ps1's one rule for "gone", which the nightly removal's end state reads too. A
+        # .claude/worktrees entry is the nightly's, whose root check required the folders above it to be
+        # plain, so it is read with -Plain as the nightly read it; a sibling under a linked folder is not.
+        try { if (Test-ConfirmedGoneOrThrow $p 'the orphaned directory' -Plain:(Test-ClaudeManagedPath $p)) { continue } }
         catch { $why = "it is not confirmed gone: $($_.Exception.Message -replace '\s*Nothing was removed\.\s*$', '')" }
         if ($seen.ContainsKey($n)) { continue }
         $seen[$n] = $true
