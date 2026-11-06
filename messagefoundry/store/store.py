@@ -19059,25 +19059,25 @@ class MessageStore:
             )
 
     async def table_occupancy(self) -> dict[str, bool]:
-        """See :meth:`Store.table_occupancy`: the main schema's ordinary tables in
-        ``pragma_table_list``, which names a virtual table (whose module may not be loaded here)
-        and its shadow tables apart, less SQLite's own ``sqlite_*`` tables, each probed for one
-        row. The names come from the file, so each is quoted as an identifier, never interpolated
-        bare."""
-        from messagefoundry.store.base import SCHEMA_SEED_FILTERS
+        """See :meth:`Store.table_occupancy`: the main schema's tables in ``sqlite_master`` less
+        virtual tables, as ``schema_verify`` skips them (a probe of one whose module is not loaded
+        raises), and less SQLite's own ``sqlite_*`` tables, each probed for one row. The names
+        come from the file, so each is quoted as an identifier, never interpolated bare."""
+        from messagefoundry.store.base import seed_filter_clause
 
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT name FROM pragma_table_list WHERE schema = 'main' AND type = 'table'"
+                "SELECT name FROM main.sqlite_master WHERE type = 'table'"
+                " AND sql NOT LIKE 'CREATE VIRTUAL TABLE%'"
                 " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             )
             names = [str(row[0]) for row in await cur.fetchall()]
             occupancy: dict[str, bool] = {}
             for name in names:
                 quoted = '"' + name.replace('"', '""') + '"'
-                seed = SCHEMA_SEED_FILTERS.get(name)
-                where = f" WHERE {seed}" if seed is not None else ""
-                cur = await db.execute(f"SELECT 1 FROM main.{quoted}{where} LIMIT 1")
+                cur = await db.execute(
+                    f"SELECT 1 FROM main.{quoted}{seed_filter_clause(name)} LIMIT 1"
+                )
                 occupancy[name] = await cur.fetchone() is not None
             return occupancy
 

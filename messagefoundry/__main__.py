@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
+    from messagefoundry.store.custody import HostBlob
     from messagefoundry.store.custody_host import MintedCustody
     from messagefoundry.store.store import UserRecord
 
@@ -7061,20 +7062,59 @@ class _RecoveryKeyConsole:
         return getpass.getpass("")
 
 
-def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseException) -> None:
+async def _failed_mint_left_nothing(
+    settings: ServiceSettings, blob: HostBlob, *, posture: HopPosture | None
+) -> bool:
+    """After a mint's create-open failed past its first write: whether the store still holds
+    nothing the minted key must be kept for, as :func:`store_holds_data` reads it (an empty chain,
+    and no row past the salt, counter and markers the keyed open commits first). Read-only, under
+    the minted blob. Any failure to answer reads as False, so the key is kept; the reason is
+    logged by class name only."""
+    from messagefoundry.config.settings import keyless_opt_out_refusal
+    from messagefoundry.store.base import open_store
+    from messagefoundry.store.custody_host import store_holds_data
+
+    try:
+        probe = await open_store(
+            settings.store,
+            read_only=True,
+            posture=posture,
+            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+            custody=blob,
+        )
+        try:
+            return not await store_holds_data(probe)
+        finally:
+            await probe.close()
+    except Exception as exc:  # noqa: BLE001 - any failure keeps the key, the safe answer
+        logging.getLogger(__name__).warning(
+            "provision-admin: could not read what the failed create left (%s); the minted key "
+            "is kept",
+            type(exc).__name__,
+        )
+        return False
+
+
+def _discard_minted_custody(
+    path: Path, store: StoreSettings, failure: BaseException, *, left_nothing: bool = False
+) -> None:
     """Remove the host blob or handoff ``provision-admin`` minted when the store it was minted for
-    could not be created, so a second run can mint again, but only where the open wrote nothing
+    could not be created, so a second run can mint again, but only where the open left nothing
     under it: the store id pin refused before the open's first write
     (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
-    once the salt bind may have run, does not count), or a SQLite store whose file was never
-    made. Otherwise the store may already hold rows under that key, so the file is kept
-    and named on stderr. Neither text carries the key."""
+    once the salt bind may have run, does not count), a SQLite store whose file was never made,
+    or ``left_nothing``, which the caller passes when :func:`_failed_mint_left_nothing` read the
+    store back as holding only what a keyed open commits before its genesis record. Otherwise the
+    store may already hold rows under that key, so the file is kept and named on stderr. Neither
+    text carries the key."""
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.store.base import _absent_sqlite_store
     from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
 
-    nothing_written = isinstance(failure, StoreIdPinRefusedBeforeWrite) or (
-        store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None
+    nothing_written = (
+        left_nothing
+        or isinstance(failure, StoreIdPinRefusedBeforeWrite)
+        or (store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None)
     )
     if not nothing_written:
         print(
@@ -8734,7 +8774,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
         that holds no data either, is absent; a chain with a genesis record, or data under an empty
         chain, is a store this mint must not take. Connection and hop
         refusals surface here, before the prompts, as the ordinary pre-check's do."""
-        from messagefoundry.store.base import TableCensusIncomplete
+        from messagefoundry.redaction import codec_safe_str
+        from messagefoundry.store.base import TableCensusIncomplete, store_driver_errors
         from messagefoundry.store.custody import HostBlob, MasterKey, StoreId
         from messagefoundry.store.custody_host import HostCustodyRefused, store_holds_data
         from messagefoundry.store.store import StoreIdPinRefused
@@ -8758,9 +8799,15 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except TableCensusIncomplete as incomplete:
             # Fail closed, and say why: "the store already exists" would send the operator to
             # remove a store that may hold nothing, when the fix is a grant.
+            raise HostCustodyRefused(f"{incomplete}, then run the command again") from incomplete
+        except store_driver_errors() as unread:
+            # A table the census listed could not be read: fail closed, naming the driver's text
+            # (a table and a grant, never a row) rather than ending at the dispatch floor.
             raise HostCustodyRefused(
-                f"{incomplete}, then run the command again. Nothing was minted"
-            ) from incomplete
+                "whether the store already holds data could not be read, so no key is minted"
+                f" over it: {_sentence(codec_safe_str(unread))} Grant this login select on every"
+                " table in the store's schema, then run the command again"
+            ) from unread
         finally:
             await store.close()
 
@@ -8977,7 +9024,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
             )
         except BaseException as exc:
             if minted is not None:
-                _discard_minted_custody(minted.path, settings.store, exc)
+                # A server create-open may commit the salt, counter and markers before its genesis
+                # record; read back whether that is all it left, so the next run can mint again.
+                left_nothing = (
+                    isinstance(exc, Exception)
+                    and settings.store.backend is not StoreBackend.SQLITE
+                    and await _failed_mint_left_nothing(settings, minted.blob, posture=posture)
+                )
+                _discard_minted_custody(minted.path, settings.store, exc, left_nothing=left_nothing)
             raise
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:

@@ -1344,6 +1344,9 @@ _CLI_OPENERS = {
     # vault BACKLOG #3411: the read-only "does this server database hold a store" probe, under a
     # throwaway host blob, before a store key is minted for it
     "_provision_admin.server_store_absent",
+    # vault BACKLOG #3411: after a mint's create-open failed, the read-only read-back of what it
+    # left, under the minted blob, which decides whether that key may be removed
+    "_failed_mint_left_nothing",
     # vault BACKLOG #3849 B5: the reopen after the codes are shown, so the administrator_granted
     # alert's open instance lands in the store, on the write's verdict and posture. It passes no
     # create; this guard reads only the verdict, so nothing here pins that

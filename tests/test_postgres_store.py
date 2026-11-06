@@ -19,6 +19,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import AsyncIterator
@@ -6264,13 +6265,15 @@ async def test_table_occupancy_reads_the_store_schema_and_counts_a_connection_ev
     # PR 2804 hold (A): the mint's server probe reads every table in the store's schema from the
     # catalog, so a connection event alone holds data. The negative arm reads a store nothing has
     # used as absent first, so the positive one is not true of every store.
+    from messagefoundry.store import postgres
     from messagefoundry.store.custody_host import store_holds_data
 
     await _empty_every_census_table(store)
     before = await store.table_occupancy()
-    assert {"messages", "message_events", "audit_log", "users", "connection_event", "sessions"} <= (
-        set(before)
-    )
+    # The control on the census itself, from this build's DDL rather than from the census: every
+    # table the schema batch creates is listed, so emptying "every census table" emptied them all.
+    created = re.compile(r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)", re.I)
+    assert {t for statement in postgres._SCHEMA for t in created.findall(statement)} <= set(before)
     assert before["connection_event"] is False
     assert not await store_holds_data(store)
     await store.record_connection_event(
@@ -6300,3 +6303,10 @@ async def test_a_keyed_fresh_store_holds_data_until_its_chain_is_gone(store) -> 
     async with store._pool.acquire() as conn:
         await conn.execute("TRUNCATE audit_log RESTART IDENTITY CASCADE")
     assert not await store_holds_data(store)
+    # The re-run's own create: a new key opens over the salt, counter and markers the failed one left,
+    # and starts its chain.
+    again = await PostgresStore.open(
+        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    await again.close()
+    assert await store_holds_data(store)

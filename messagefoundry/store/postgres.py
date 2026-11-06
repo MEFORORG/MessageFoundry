@@ -114,6 +114,7 @@ from messagefoundry.store.base import (
     _carries_a_codec_error,
     acquire_pooled,
     driver_sqlstate,
+    seed_filter_clause,
     warm_pool_connections,
     warm_pool_target,
     warn_stale_schema_read_only,
@@ -11467,28 +11468,28 @@ class PostgresStore:
     async def table_occupancy(self) -> dict[str, bool]:
         """See :meth:`Store.table_occupancy`: the ordinary and partitioned tables in the schema
         that holds the store's own ``schema_meta`` (``pg_catalog.to_regclass`` resolves the
-        unqualified name through the pool's ``search_path``) and owned by ``schema_meta``'s owner,
-        the scope ``_verify_runtime_grants`` uses, so an extension's or a DBA's own table there
-        is not the store's. Read from ``pg_catalog`` by the stored name; each probe names the
-        schema too, because an unqualified name would resolve through ``pg_catalog`` first. No
-        ``schema_meta`` reads as no tables, which the caller must not take as empty."""
-        from messagefoundry.store.base import SCHEMA_SEED_FILTERS
-
+        unqualified name through the pool's ``search_path``), less the tables an extension owns
+        (a ``pg_depend`` row of type ``e``). A table of another owner there still counts: a later
+        ``provision-schema`` run under another role may have made a store table. Read from
+        ``pg_catalog`` by the stored name; each probe names the schema too, because an
+        unqualified name would resolve through ``pg_catalog`` first."""
         rows = await self._fetchall(
             "SELECT n.nspname AS s, c.relname AS t FROM pg_catalog.pg_class c"
             " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
             " JOIN pg_catalog.pg_class m ON m.oid = pg_catalog.to_regclass('schema_meta')"
             " WHERE c.relkind IN ('r', 'p') AND c.relnamespace = m.relnamespace"
-            " AND c.relowner = m.relowner"
+            " AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d"
+            " WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass AND d.objid = c.oid"
+            " AND d.deptype = 'e')"
         )
         occupancy: dict[str, bool] = {}
         for row in rows:
             schema, table = str(row["s"]), str(row["t"])
             qualified = ".".join('"' + name.replace('"', '""') + '"' for name in (schema, table))
-            seed = SCHEMA_SEED_FILTERS.get(table)
-            where = f" WHERE {seed}" if seed is not None else ""
             occupancy[table] = bool(
-                await self._fetchval(f"SELECT EXISTS (SELECT 1 FROM {qualified}{where})")
+                await self._fetchval(
+                    f"SELECT EXISTS (SELECT 1 FROM {qualified}{seed_filter_clause(table)})"
+                )
             )
         return occupancy
 

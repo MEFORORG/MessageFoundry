@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry import custody_posture, restricted_file
-from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.config.settings import ServiceSettings, StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.custody_posture import KeyCustodyPosture, key_custody_loosenings
 from messagefoundry.store import custody, custody_host
@@ -973,21 +973,7 @@ async def test_a_mint_that_failed_before_its_genesis_record_can_run_again(tmp_pa
     from messagefoundry.store.custody_host import store_holds_data
 
     settings = _settings(tmp_path)
-    path = Path(settings.path)
-    await (await _keyless_store(path)).close()
-    keyed = tmp_path / "keyed.db"
-    store = await open_store(
-        StoreSettings(path=str(keyed), encryption_key=base64.b64encode(os.urandom(32)).decode()),
-        create=True,
-    )
-    await store.close()
-    _seeded(
-        path,
-        f"ATTACH DATABASE '{keyed}' AS keyed",
-        "INSERT INTO store_salt SELECT * FROM keyed.store_salt",
-        "INSERT INTO cipher_meta SELECT * FROM keyed.cipher_meta",
-        "INSERT INTO keyed_surface SELECT * FROM keyed.keyed_surface",
-    )
+    await _failed_mint_leftovers(Path(settings.path), tmp_path)
     throwaway = HostBlob(MasterKey.mint(), StoreId.mint())
     probe = await open_store(settings, read_only=True, custody=throwaway)
     try:
@@ -1036,11 +1022,65 @@ async def test_a_census_that_cannot_see_the_store_tables_refuses(
         await store.close()
 
 
+async def _failed_mint_leftovers(path: Path, tmp_path: Path) -> None:
+    """A keyless store at ``path`` holding the salt, counter and markers a keyed open commits
+    before its genesis record, copied from a keyed store made beside it."""
+    await (await _keyless_store(path)).close()
+    keyed = tmp_path / "keyed.db"
+    store = await open_store(
+        StoreSettings(path=str(keyed), encryption_key=base64.b64encode(os.urandom(32)).decode()),
+        create=True,
+    )
+    await store.close()
+    _seeded(
+        path,
+        f"ATTACH DATABASE '{keyed}' AS keyed",
+        "INSERT INTO store_salt SELECT * FROM keyed.store_salt",
+        "INSERT INTO cipher_meta SELECT * FROM keyed.cipher_meta",
+        "INSERT INTO keyed_surface SELECT * FROM keyed.keyed_surface",
+    )
+
+
+@host_file_platforms
+async def test_a_failed_mint_that_left_only_the_keyed_open_tables_gives_up_its_key(
+    tmp_path: Path,
+) -> None:
+    # PR 2804 hold, finding 2: a create-open that failed after its own commits but before the
+    # genesis record kept the minted key, so the next run could never mint. Read back holding only
+    # those tables, the key is removed; with a row of data, or unreadable, it is kept.
+    from messagefoundry import __main__ as cli
+
+    settings = _settings(tmp_path)
+    await _failed_mint_leftovers(Path(settings.path), tmp_path)
+    blob = HostBlob(MasterKey.mint(), StoreId.mint())
+
+    async def _left_nothing(store: StoreSettings) -> bool:
+        service = ServiceSettings().model_copy(update={"store": store})
+        return await cli._failed_mint_left_nothing(service, blob, posture=None)
+
+    assert await _left_nothing(settings)
+    key = tmp_path / "minted.key"
+    key.write_bytes(b"k")
+    cli._discard_minted_custody(key, settings, StoreIdPinRefused("after"), left_nothing=True)
+    assert not key.exists()
+    missing = settings.model_copy(update={"path": str(tmp_path / "missing.db")})
+    assert not await _left_nothing(missing)  # cannot be read: the key is kept
+    store = await open_store(StoreSettings(path=settings.path), keyless_chain_refusal=None)
+    try:
+        await store.record_connection_event(
+            connection="IB_TEST_ADT", transport="mllp", direction="inbound", kind="established"
+        )
+    finally:
+        await store.close()
+    assert not await _left_nothing(settings)
+
+
 @pytest.mark.parametrize(
     ("census", "refusal"),
     [
         ("connection event", "the store already exists"),
         ("incomplete", "neither the view definition nor the select permission"),
+        ("unreadable", "could not be read, so no key is minted"),
     ],
 )
 def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absent(
@@ -1082,6 +1122,11 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absen
             "this login holds neither the view definition nor the select permission on schema 'app' (stand-in)"
         )
 
+    async def _unreadable() -> dict[str, bool]:
+        import sqlite3
+
+        raise sqlite3.OperationalError("permission denied for table stand_in")
+
     async def _open(settings: StoreSettings, **kwargs: object) -> Store:
         if kwargs.get("custody") is not None:  # the server probe, under its throwaway blob
             probes.append(bool(kwargs.get("read_only")))
@@ -1090,6 +1135,8 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absen
             )
             if census == "incomplete":
                 monkeypatch.setattr(store, "table_occupancy", _incomplete)
+            elif census == "unreadable":
+                monkeypatch.setattr(store, "table_occupancy", _unreadable)
             return store
         raise HostCustodyMissing("no host blob and no handoff here (stand-in)")
 

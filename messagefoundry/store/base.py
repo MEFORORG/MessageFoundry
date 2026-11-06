@@ -178,6 +178,7 @@ __all__ = [
     "open_store",
     "probe_store_privileges",
     "provision_store_schema",
+    "seed_filter_clause",
     "sqlite_settings",
     "store_driver_errors",
     "warm_pool_connections",
@@ -213,6 +214,13 @@ class TableCensusIncomplete(RuntimeError):
 SCHEMA_SEED_FILTERS: Final[Mapping[str, str]] = MappingProxyType(
     {"global_session_epoch": "NOT (id = 1 AND epoch = 0)"}
 )
+
+
+def seed_filter_clause(table: str) -> str:
+    """The ``WHERE`` clause a census probe of ``table`` appends, from :data:`SCHEMA_SEED_FILTERS`
+    by exact name, or nothing. Each backend's :meth:`Store.table_occupancy` calls this one."""
+    seed = SCHEMA_SEED_FILTERS.get(table)
+    return "" if seed is None else f" WHERE {seed}"
 
 
 class ReferenceKeyCollision(ValueError):
@@ -1840,21 +1848,23 @@ class QueueStore(StoreLifecycle, Protocol):
         held only when it holds a row past the one a schema build seeds. Names are exactly as the
         catalog stores them.
 
-        Which tables: on SQLite, the main schema's ordinary tables (``pragma_table_list`` type
-        ``table``: no virtual or shadow table, no view, none of SQLite's ``sqlite_*``). On
-        Postgres, the ordinary and partitioned tables in the schema of the store's own
-        ``schema_meta`` (as ``search_path`` resolves it) and owned by its owner, the role that
-        built the schema, as ``_verify_runtime_grants`` scopes them. On SQL Server, the tables in
-        the schema of the store's own ``schema_meta`` (as ``OBJECT_ID`` resolves it), less those
-        SQL Server ships and external ones. No ``schema_meta``, no tables.
+        Which tables: on SQLite, the main schema's tables in ``sqlite_master`` less virtual
+        tables (whose module may not be loaded here) and SQLite's own ``sqlite_*``; a virtual
+        table's shadow tables are ordinary tables there and count. On Postgres, the ordinary and
+        partitioned tables in the schema of the store's own ``schema_meta`` (as ``search_path``
+        resolves it), less the tables an extension owns (PostGIS's ``spatial_ref_sys``). On SQL
+        Server, the tables in the schema of the store's own ``schema_meta`` (as ``OBJECT_ID``
+        resolves it), less those SQL Server ships and external ones. On both server backends no
+        ``schema_meta`` means no tables.
 
         What it cannot see, at least: rows a row-level security policy (Postgres) or a security
         policy filter (SQL Server) hides from this login, which read as empty and raise nothing;
-        and on SQL Server a table the login holds no permission on, which ``sys.tables`` does not
-        list. For that last one it raises :class:`TableCensusIncomplete` unless the login holds
-        ``VIEW DEFINITION`` or ``SELECT`` on the schema. A listed table that cannot be read raises.
-        Counts only, never a cell, so an open under a throwaway key decrypts nothing (vault
-        BACKLOG #3411)."""
+        and on SQL Server a table the login holds no permission on, or a table-level ``DENY``
+        hides, which ``sys.tables`` does not list. It raises :class:`TableCensusIncomplete` unless
+        the login holds ``VIEW DEFINITION`` or ``SELECT`` on the whole schema, which shows only
+        that no schema-wide gap hides a table, not that no table-level ``DENY`` does. A listed
+        table that cannot be read raises the driver's error. Counts only, never a cell, so an open
+        under a throwaway key decrypts nothing (vault BACKLOG #3411)."""
         ...
 
     def pool_status(self) -> PoolStatus | None:
