@@ -80,7 +80,9 @@ def test_a_prefix_of_non_ascii_digits_does_not_load(
 # --- #3609 finding 4: a keep and a rewrite on one path ----------------------------------------------
 
 
-@pytest.mark.parametrize("package", ["messagefoundry.anon", "tee.anon"], ids=["engine", "tee"])
+@pytest.mark.parametrize(
+    "package", ["messagefoundry_toolkit.anon", "tee.anon"], ids=["engine", "tee"]
+)
 def test_a_kept_path_that_a_rule_also_rewrites_is_not_listed_as_kept(package: str) -> None:
     """Only a rule set built in code can hold both. The anonymizer drops the keep and runs the
     rewrite, so the field is not left as captured. The retarget list still names it."""

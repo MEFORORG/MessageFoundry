@@ -62,8 +62,10 @@ dependencies = [
     #
     # THE TOOLKIT DECLARES NOTHING ELSE. Its third-party imports are core engine dependencies, so the
     # exact pin makes the engine's set the toolkit's. At least these, from an AST scan (ADR 0201
-    # section 1): `hl7apy` (hl7schema, hl7structures, generators), `hl7` (anon/hl7.py) and
-    # `defusedxml` (corepoint_import). A change to the engine's core set must be checked against them.
+    # section 1): `hl7apy` (hl7schema, hl7structures, generators) and `defusedxml`
+    # (corepoint_import). anon/ imports only the stdlib, the engine's own `parsing` and this
+    # package's generators/_hl7data.py. A change to the engine's core set must be checked against
+    # them.
     "messagefoundry==0.5.2",
 ]
 
