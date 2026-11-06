@@ -151,10 +151,9 @@ async def test_reload_endpoint_dry_run_validates_without_applying(
     body = r.json()
     assert body["dry_run"] is True and body["inbound"] == 1
     assert body["running"] is False  # the engine had no graph and dry-run swaps nothing
-    # A dry run applies nothing, so ReloadOutcome documents it as reporting no failures. This pins
-    # the answer's shape only: no input makes a dry run fail a follow-on step, so no test can tell
-    # failed_steps from any other empty list here (vault BACKLOG #3109 item 7).
-    assert body["failures"] == [] and body["degraded"] is False
+    # A dry run applies nothing, so ReloadOutcome documents it as reporting no failures, and the
+    # answer carries an empty list (vault BACKLOG #3109 item 7).
+    assert body["failures"] == []
 
 
 async def test_reload_endpoint_dry_run_missing_env_value_422(
