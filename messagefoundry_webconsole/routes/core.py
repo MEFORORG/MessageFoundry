@@ -1881,8 +1881,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     @public_route("the re-authentication page a step-up gate sends the browser to")
     async def ui_reauth_form(
         request: Request,
-        # The cap _new_address_continuation sizes a refused read's continuation to (vault BACKLOG
-        # #3052), read from one constant so the two cannot drift apart.
+        # The cap _new_address_continuation sizes a continuation to (vault BACKLOG #3052).
         next_: str = Query("", alias="next", max_length=_REAUTH_NEXT_MAX),
     ) -> Response:
         # next MUST be a registered /ui action — a body-less POST the re-auth may auto-retry

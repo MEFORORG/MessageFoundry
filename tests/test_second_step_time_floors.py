@@ -37,6 +37,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
+from tests._ast_sites import call_sites, calls_to, code_names, named_func, parse_source
 from tests._fake_directory import DirectoryOf
 from tests._totp_clock import pin_totp_clock
 from tests.test_auth_oidc_service import (
@@ -573,30 +574,16 @@ async def test_a_directory_sessions_first_passkey_inside_the_floor_is_refused(
 
 # --- the floor's call sites, read from the service's syntax tree (BACKLOG #3194 item 4) -----------
 
-_SERVICE_SOURCE = Path(service_module.__file__).read_text(encoding="utf-8")
 _FLOOR_CALLS = frozenset({"_second_factor_too_early", "_enrolment_too_early"})
+_STAMP = "mark_session_mfa_verified"
 #: Stamps a session's factor at its mint, where no sign-in precedes it, so there is no pair to floor.
 #: Named here so the test fails if it goes, rather than keep an exemption nobody needs.
 _STAMPS_AT_MINT = frozenset({"_issue_session"})
 
 
-def _service_functions() -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
-    tree = ast.parse(_SERVICE_SOURCE)
-    return {
-        node.name: node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-
-
-def _calls_to(node: ast.AST, names: frozenset[str]) -> list[ast.Call]:
-    return [
-        sub
-        for sub in ast.walk(node)
-        if isinstance(sub, ast.Call)
-        and isinstance(sub.func, ast.Attribute)
-        and sub.func.attr in names
-    ]
+def _service_tree() -> ast.Module:
+    # parse_source caches by source text, so the two tests below parse the module once.
+    return parse_source(Path(service_module.__file__).read_text(encoding="utf-8"))
 
 
 def _floored_ifs(node: ast.AST) -> list[ast.If]:
@@ -605,7 +592,7 @@ def _floored_ifs(node: ast.AST) -> list[ast.If]:
         sub
         for sub in ast.walk(node)
         if isinstance(sub, ast.If)
-        and _calls_to(sub.test, _FLOOR_CALLS)
+        and calls_to(sub.test, _FLOOR_CALLS)
         and any(isinstance(stmt, (ast.Return, ast.Raise)) for stmt in sub.body)
     ]
 
@@ -614,14 +601,19 @@ def test_every_leg_that_stamps_a_sessions_factor_asks_the_floor_first() -> None:
     """RED when: a function in ``auth/service.py`` calls ``mark_session_mfa_verified`` without first
     testing ``_second_factor_too_early`` or ``_enrolment_too_early`` and refusing on a True (vault
     BACKLOG #3194 item 4). A new leg that can satisfy a pending session must be floored, so it
-    cannot complete the login-to-MFA pair faster than a person can."""
-    functions = _service_functions()
-    stamping = {
-        name
-        for name, node in functions.items()
-        if _calls_to(node, frozenset({"mark_session_mfa_verified"}))
+    cannot complete the login-to-MFA pair faster than a person can.
+
+    Direct stamps only. A stamp through a helper is not followed, because the mint is such a helper
+    and every sign-in calls it; ``tests/test_auth_session_lifecycle.py`` follows helpers for its own
+    question, which ceremonies stamp."""
+    tree = _service_tree()
+    first_stamp = {
+        node.name: min(call.lineno for call in sites)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and (sites := call_sites(node, _STAMP))
     }
-    assert stamping >= _STAMPS_AT_MINT, "the mint no longer stamps; drop its exemption"
+    assert first_stamp.keys() >= _STAMPS_AT_MINT, "the mint no longer stamps; drop its exemption"
     # Positive control: the four factor legs the floor was built for are found, so an empty walk
     # cannot pass.
     assert {
@@ -629,15 +621,14 @@ def test_every_leg_that_stamps_a_sessions_factor_asks_the_floor_first() -> None:
         "finish_webauthn_assertion",
         "confirm_mfa_enrollment",
         "finish_webauthn_registration",
-    } <= stamping
-    unfloored = []
-    for name in sorted(stamping - _STAMPS_AT_MINT):
-        node = functions[name]
-        first_stamp = min(
-            call.lineno for call in _calls_to(node, frozenset({"mark_session_mfa_verified"}))
+    } <= first_stamp.keys()
+    unfloored = [
+        name
+        for name in sorted(first_stamp.keys() - _STAMPS_AT_MINT)
+        if not any(
+            guard.lineno < first_stamp[name] for guard in _floored_ifs(named_func(tree, name))
         )
-        if not any(guard.lineno < first_stamp for guard in _floored_ifs(node)):
-            unfloored.append(name)
+    ]
     assert unfloored == [], f"stamps a session's factor with no floor ahead of it: {unfloored}"
 
 
@@ -645,38 +636,27 @@ def test_both_floor_helpers_read_one_predicate() -> None:
     """RED when: ``_second_factor_too_early`` or ``_enrolment_too_early`` tests the session's mint
     or its factor stamp itself rather than through ``_mfa_floor_holds`` (vault BACKLOG #3194 item
     4), so the two copies of the rule could drift apart."""
-    functions = _service_functions()
+    tree = _service_tree()
     for name in sorted(_FLOOR_CALLS):
-        node = functions[name]
-        read = sorted(
-            {
-                sub.attr
-                for sub in ast.walk(node)
-                if isinstance(sub, ast.Attribute) and sub.attr in ("created_at", "mfa_verified_at")
-            }
-        )
+        node = named_func(tree, name)
+        read = sorted(code_names(node) & {"created_at", "mfa_verified_at"})
         assert read == [], f"{name} reads {read} itself"
-        assert _calls_to(node, frozenset({"_mfa_floor_holds"})), f"{name} skips the predicate"
+        assert calls_to(node, {"_mfa_floor_holds"}), f"{name} skips the predicate"
 
 
-@pytest.mark.parametrize(
-    ("floor", "verified_at", "elapsed", "held"),
-    [
-        (MFA_FLOOR, None, MFA_FLOOR - 0.001, True),
-        (MFA_FLOOR, None, MFA_FLOOR, False),
-        (MFA_FLOOR, 5.0, 0.0, False),
-        (0.0, None, 0.0, False),
-    ],
-    ids=["inside", "at-the-floor", "factor-stamped", "floor-off"],
-)
-async def test_the_floor_predicate(
-    floor: float, verified_at: float | None, elapsed: float, held: bool
-) -> None:
+async def test_the_floor_predicate() -> None:
     store = await MessageStore.open(":memory:")
     try:
-        service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=floor))
-        session = SimpleNamespace(created_at=100.0, mfa_verified_at=verified_at)
-        assert service._mfa_floor_holds(session, 100.0 + elapsed) is held  # type: ignore[arg-type]
+        for floor, verified_at, elapsed, held in [
+            (MFA_FLOOR, None, MFA_FLOOR - 0.001, True),  # inside
+            (MFA_FLOOR, None, MFA_FLOOR, False),  # at the floor
+            (MFA_FLOOR, 5.0, 0.0, False),  # factor stamped
+            (0.0, None, 0.0, False),  # floor off
+        ]:
+            service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=floor))
+            session = SimpleNamespace(created_at=100.0, mfa_verified_at=verified_at)
+            got = service._mfa_floor_holds(session, 100.0 + elapsed)  # type: ignore[arg-type]
+            assert got is held, (floor, verified_at, elapsed)
     finally:
         await store.close()
 
