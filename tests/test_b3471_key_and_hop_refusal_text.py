@@ -1078,3 +1078,76 @@ def test_the_postgres_tls_wrap_refuses_an_error_whose_class_name_cannot_be_read(
     _assert_no_key_byte(_whole(escaped))
     assert escaped.__cause__ is None and escaped.__context__ is None
     assert "an error from a codec error, not quoted" in text, text
+
+
+# --- The fourth hold on engine PR 2818: a class test that runs the error's own __class__ ------
+
+
+class _ClassRaisesValueError(ValueError):
+    """A ValueError whose ``__class__``, which ``isinstance`` falls back to, raises."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # the read is the point
+        raise LookupError("synthetic: the class cannot be read")
+
+
+class _ClassSaysOSError(ValueError):
+    """A ValueError whose ``__class__`` answers ``OSError``, so ``isinstance`` takes it for one."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # the read is the point
+        return OSError
+
+
+@pytest.mark.parametrize(
+    "kind", [_ClassRaisesValueError, _ClassSaysOSError], ids=["class-raises", "class-says-oserror"]
+)
+def test_the_postgres_tls_wrap_tests_the_class_with_type(
+    kind: type[ValueError], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fourth hold on engine PR 2818: ``isinstance`` in the handler ran the error's own
+    ``__class__``. One that raised left as a bare LookupError with the judged error, which quotes
+    the byte, as context; one that answered OSError was re-raised whole, byte and chain."""
+    from messagefoundry.config.tls_policy import StoreTlsRefused
+    from messagefoundry.store import postgres
+
+    try:
+        decode_error = _decode_error()
+        raise kind(f"synthetic CRL refused: {decode_error}") from decode_error
+    except ValueError as exc:
+        error = exc
+    monkeypatch.setattr(postgres, "_verifying_context", _raising(error))
+    try:
+        postgres._verifying_context_at_open(StoreSettings())
+    except Exception as exc:  # noqa: BLE001 -- what left is the measurement
+        escaped: BaseException = exc
+    else:
+        escaped = AssertionError("nothing was raised")
+    assert type(escaped) is StoreTlsRefused, _whole(escaped)
+    _assert_no_key_byte(_whole(escaped))
+    assert escaped.__cause__ is None and escaped.__context__ is None
+
+
+class _ClassSaysTyped(ValueError):
+    """A ValueError with no codec error whose ``__class__`` answers ``StoreCipherConfigError``."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # the read is the point
+        return StoreCipherConfigError
+
+
+def test_the_cipher_build_tests_the_class_with_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fourth hold, the same class test at ``build_store_cipher``'s pass-through: a
+    ValueError that claimed to be typed already left bare, where ``_refused`` reads the class with
+    ``type`` and would have typed it. It is typed now, its text and chain kept."""
+    error = _ClassSaysTyped("[store].synthetic_setting is not valid")
+    _with_provider(monkeypatch, error)
+    try:
+        build_store_cipher(StoreSettings())
+    except Exception as exc:  # noqa: BLE001 -- pytest.raises would take the spoof for the type
+        escaped: BaseException = exc
+    else:
+        escaped = AssertionError("nothing was raised")
+    assert type(escaped) is StoreCipherConfigError, repr(escaped)
+    assert str(escaped) == "[store].synthetic_setting is not valid"
+    assert escaped.__cause__ is error

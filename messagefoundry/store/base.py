@@ -3480,8 +3480,10 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     except Exception as exc:
         refusal = _codec_safe_refusal(exc)
         if refusal is None:
-            # One already typed, as the key seam refuses a codec error, is not wrapped again.
-            if isinstance(exc, ValueError) and not isinstance(exc, StoreCipherConfigError):
+            # One already typed, as the key seam refuses a codec error, is not wrapped again. The
+            # class is read with ``type``, as by ``_refused``, which runs none of exc's own code.
+            kind = type(exc)
+            if issubclass(kind, ValueError) and not issubclass(kind, StoreCipherConfigError):
                 raise StoreCipherConfigError(str(exc)) from exc
             raise
     raise refusal

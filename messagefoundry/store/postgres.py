@@ -1673,15 +1673,15 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
     has one on its chain, or whose chain cannot be read whole, is refused with a fixed text naming
     the settings and which of the two it is, raised outside the handler (BACKLOG #4882). It names
     no class, as :func:`~messagefoundry.store.base._codec_safe_refusal`'s fallback names none
-    (the third hold on engine PR 2818). The ``isinstance`` test that comes first still runs the
-    error's own ``__class__`` in the handler. Not its ``codec_safe_str``
+    (the third hold on engine PR 2818). The class test that comes first reads the class with
+    ``type``, so it runs none of the error's own code (the fourth hold). Not its ``codec_safe_str``
     rendering: the CRL judge re-raises a codec error as a
     ``ValueError`` whose own text already quotes the byte, which that rendering prints whole.
     Every other ``ValueError`` keeps its text and its chain."""
     try:
         return _verifying_context(settings)
     except ValueError as exc:
-        if isinstance(exc, (InsecureHopRefused, OSError)):
+        if issubclass(type(exc), (InsecureHopRefused, OSError)):
             raise
         reading = _codec_chain_reading(exc)
         if reading is None:
