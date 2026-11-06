@@ -2023,17 +2023,20 @@ count is above `0` (vault BACKLOG #2613).
   logs it, before any of its refusals, so an outbound or a lookup that check refuses, for example
   over an unlisted forward proxy, has logged it. There, at least in a build check and a connection
   test, an outbound or a lookup that fails before that check logs none. An `env()` URL on a
-  connection that logged none appears nowhere until a later build or check logs it. There is also a
+  connection that logged none is in no WARNING until a later build or check logs it; the readers
+  below may still name it. There is also a
   `url-query-credential` line in `messagefoundry check`, and a `url_query_credential` entry in
   `security_loosenings()`, and so in `GET /security/posture` on a running engine. All three walk
   outbound connections and `FhirLookup` connections. The WARNING labels a lookup
   `FhirLookup '<name>'`; the `check` line and the posture entry name it with a `fhir_lookup:`
   prefix. The WARNING reads the resolved URL. The posture entry reads an `env()` URL against the
-  values the graph builds with, and the `check` line, which has none, reads its literal `default=`,
-  so a URL that only the environment supplies, with no default, is in the WARNING alone. A lane the engine has not built
-  (for example `auto_start=False`, or DR-parked) logs no WARNING until it is built or checked, and a
-  `deployed=False` outbound is never built or build-checked, so no WARNING fires for it; an `env()`
-  URL on such a lane appears nowhere meanwhile.
+  values the graph builds with, falling back to its literal `default=`. The `check` line does not
+  load the instance's environment values, so it reads the `default=` only, and misses a URL that
+  only the environment supplies. A lane the engine has not built (for example `auto_start=False`,
+  or DR-parked) logs no WARNING until it is built or checked, though the posture entry and the
+  `check` line still read its URL as above. A `deployed=False` outbound is never built or
+  build-checked, so no WARNING fires for it, and both readers skip one whose `url` is `env()`, whose
+  values are never resolved (ADR 0111); such a URL appears nowhere meanwhile.
 - **What it cannot do:** it is a guess from names. It misses a credential under a name it does not
   know, and it will name a parameter that only looks like one, such as `primary_key`. OIDC's
   `response_mode=query` is a different matter and stays a recorded delta.

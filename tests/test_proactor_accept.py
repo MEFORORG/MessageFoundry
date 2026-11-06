@@ -542,7 +542,7 @@ def test_the_guard_leaves_a_selector_loop_alone(caplog: pytest.LogCaptureFixture
 
     with caplog.at_level(logging.DEBUG, logger=proactor_accept.__name__):
         _on_fresh_loop(run, asyncio.SelectorEventLoop)
-    assert_capture_sees(caplog, proactor_accept.__name__)
+        assert_capture_sees(caplog, proactor_accept.__name__, logging.DEBUG)
     assert [r for r in caplog.records if r.name == proactor_accept.__name__] == []
 
 

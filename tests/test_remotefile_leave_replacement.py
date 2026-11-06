@@ -131,7 +131,7 @@ async def test_a_skip_on_a_key_with_an_mtime_is_not_reported(
     caplog.clear()
     await src._poll_once()
     assert src._handler.bodies == [_V1]
-    assert_capture_sees(caplog, _LOGGER)
+    assert_capture_sees(caplog, _LOGGER, logging.DEBUG)
     assert not [r for r in caplog.records if "skipped as already ingested" in r.getMessage()]
 
 

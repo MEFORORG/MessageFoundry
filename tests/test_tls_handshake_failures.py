@@ -509,8 +509,8 @@ async def test_a_counter_whose_listener_is_gone_reports_nothing_and_never_raises
     failures._reported_at = None  # so the next failure is due at once, not held for the window
     with caplog.at_level(logging.DEBUG, logger="messagefoundry.tls_handshake_failures"):
         _fail_in_memory(ctx)
+        assert_capture_sees(caplog, "messagefoundry.tls_handshake_failures", logging.DEBUG)
     assert failures.count == 2  # counted, then the report went nowhere
-    assert_capture_sees(caplog, "messagefoundry.tls_handshake_failures")
     assert not [r for r in caplog.records if "recording a failed" in r.getMessage()]
 
 

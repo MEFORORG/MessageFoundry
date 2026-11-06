@@ -504,6 +504,33 @@ def test_reader_reads_an_env_url_against_the_values_it_is_given() -> None:
     assert "SYNTHETIC" not in repr(found)
 
 
+def test_reader_skips_a_not_deployed_env_url_and_never_runs_its_cast() -> None:
+    """ADR 0111 AC-1: a ``deployed=False`` connection's ``env()`` values are never resolved, so its
+    cast never runs and the reader does not list it. A not-deployed literal URL resolves nothing and
+    is still read, which is the control."""
+    casts: list[object] = []
+
+    def cast(value: object) -> object:
+        casts.append(value)
+        return value
+
+    reg = Registry()
+    for name, url in (
+        ("OB_DARK_ENV", EnvRef("MEFOR_DARK", cast=cast)),
+        ("OB_DARK_LITERAL", "https://p.example.invalid/x?key=SYNTHETIC-9"),
+    ):
+        reg.add_outbound(
+            build_outbound_connection(
+                name,
+                ConnectionSpec(type=ConnectorType.REST, settings={"url": url}),
+                deployed=False,
+            )
+        )
+    values = {"MEFOR_DARK": "https://p.example.invalid/x?api_key=SYNTHETIC-10"}
+    assert query_credential_hops(reg, env_values=values) == [("OB_DARK_LITERAL", "key")]
+    assert casts == []
+
+
 def test_reader_and_build_cover_a_fhir_lookup(caplog: pytest.LogCaptureFixture) -> None:
     """A FhirLookup dials its ``url`` too, through its own egress check, so both surfaces reach it."""
     from messagefoundry.config.wiring import FhirLookupSpec

@@ -6902,19 +6902,23 @@ def query_credential_hops(
     it nowhere else, so it is reported rather than refused, except where
     ``transports.egress.warn_url_query_credentials`` says a build refuses it.
 
-    An ``env()`` URL is read as the build resolves it, against ``env_values`` (the live posture
-    route passes the runner's), falling back to its literal ``default=`` when the values, or the
-    caller, have none for its key (vault BACKLOG #3766 item 15). One with neither is not read; the
-    construction WARNING, ``transports.egress.warn_url_query_credentials``, reads the resolved URL.
-    Pure."""
+    An ``env()`` URL is resolved with :func:`resolve_env_settings`, the build's own resolution and
+    the one ``transports.egress.warn_url_query_credentials_before_build`` applies, against
+    ``env_values`` (the live posture route passes the runner's). A key the values do not hold, or
+    no values at all, falls back to its literal ``default=`` (vault BACKLOG #3766 item 15); one with
+    neither is not read. A ``deployed=False`` outbound with an ``env()`` URL is skipped, as the
+    DATABASE and ECH readers skip one: its values are never resolved and it is never built (ADR
+    0111 AC-1). Pure."""
     out: list[tuple[str, str]] = []
     for name, settings in (
-        *((oc.name, oc.spec.settings) for oc in registry.outbound.values()),
+        *(
+            (oc.name, oc.spec.settings)
+            for oc in registry.outbound.values()
+            if oc.deployed or not isinstance(oc.spec.settings.get("url"), EnvRef)
+        ),
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
     ):
-        url = settings.get("url")
-        if isinstance(url, EnvRef):
-            url = _resolve_one_env_value(url, env_values or {})
+        url = _db_setting(settings, "url", None, env_values or {})
         if isinstance(url, str) and (names := credential_query_params(url)):
             out.append((name, ", ".join(names)))
     return sorted(out)
@@ -7638,7 +7642,8 @@ def oauth_request_advisories(registry: Registry) -> OAuthRequestAdvisories:
       graded.
 
     **It reads literal values only, and that limit is large.** An ``env()`` reference is unresolved in
-    the loaded graph, exactly as :func:`query_credential_hops` records for ``url``. Measured
+    the loaded graph; :func:`query_credential_hops` resolves its ``url``, and this reader does not.
+    Measured
     2026-10-04 over the tracked tree: all five worked examples of the two composers spell the endpoint
     ``url`` and the token URL as ``env()``, and none sets an audience. So on a configuration written
     the documented way, both audience rules have nothing to compare. No construction-time reader of

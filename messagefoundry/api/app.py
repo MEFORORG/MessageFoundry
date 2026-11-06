@@ -1990,8 +1990,9 @@ def _posture_loosenings(
     ``graph`` is passed. The start passes the graph its snapshot took, so a reload that swaps the
     graph before its row is written cannot change what the row says the start loaded (vault BACKLOG
     #3076). ``graph_env_values`` are the ``env()`` values that graph resolves against, taken with it,
-    so a DATABASE hop's ``env()`` dialect reads as the route reads it off the runner; with none it
-    reads as unresolved. The settings-scoped entries are the same for either graph: a reload
+    so a DATABASE hop's ``env()`` dialect and an ``env()`` endpoint ``url`` read as the route reads
+    them off the runner. With none, the dialect reads as unresolved and the ``url`` as its literal
+    default. The settings-scoped entries are the same for either graph: a reload
     changes no settings."""
     store = getattr(state, "store_settings", None) or StoreSettings()
     cred_settings = getattr(state, "static_credential_settings", None)
