@@ -622,6 +622,7 @@ async def test_a_logout_ends_the_session_a_rotation_in_flight_re_keyed(
 
 
 _MISS_ROWS = 2 * _LOGOUT_MISS_ROWS_ALL  # room for every row the tests below can write
+_SERVICE_LOG = "messagefoundry.auth.service"
 
 
 @pytest.fixture
@@ -816,11 +817,48 @@ async def test_a_refusing_audit_store_logs_at_most_one_error_line_per_bounded_ro
     assert errors[-1].startswith("1 sign-outs that ended nothing went past the audit bound")
 
 
+async def test_a_refused_count_row_keeps_its_count_and_names_no_row_it_did_not_write(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    miss_clock: list[float],
+) -> None:
+    """RED when: a count row the store refuses loses its count, or its WARNING line still says a
+    row counts the misses (round-3 findings 2 and 3 on BACKLOG #4735)."""
+    service = await _service(store)
+    real = service._audit
+
+    async def _refuse_count(
+        action: str,
+        *,
+        actor: str | None = None,
+        detail: str | None = None,
+        client: str | None = None,
+    ) -> None:
+        if '"unrecorded"' in str(detail):
+            raise RuntimeError("audit store refused the write")
+        await real(action, actor=actor, detail=detail, client=client)
+
+    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, "203.0.113.9")
+    monkeypatch.setattr(service, "_audit", _refuse_count)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+        await _misses(service, 1, "203.0.113.9")
+    assert not [
+        r for r in caplog.records if r.name == _SERVICE_LOG and r.levelno == logging.WARNING
+    ], "a WARNING line named a count row that was never written"
+    monkeypatch.setattr(service, "_audit", real)
+    miss_clock[0] += _LOGOUT_MISS_ROW_WINDOW_SECONDS + 1
+    # Admitted misses only, so the one count row can only be the refused row's 1.
+    await _misses(service, _LOGOUT_MISS_ROWS_PER_SOURCE, "203.0.113.9")
+    assert [n for _, _, n in await _counted(store)] == [1]
+
+
 async def test_a_sign_out_reads_the_owner_of_the_session_it_ended_once(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RED when: a sign-out, or a sign-in's supersession, reads the owner of the session it ended
-    more than once (BACKLOG #4771 item 18), or the row stops naming that owner."""
+    """A sign-out, and a sign-in's supersession, each read the owner of the session it ended once,
+    and the row names that owner. A pin, not a fix: both already did so before BACKLOG #4771 item
+    18 asked for one owner lookup, so this test was green before it was written."""
     service = await _service(store, session_idle_timeout_minutes=30)
     owner = await store.get_user_by_username("op")
     assert owner is not None

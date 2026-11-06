@@ -5765,31 +5765,43 @@ request to `/ui/logout` whose session cookie ends no session writes an `auth.log
 Each source writes at most 3 such rows in any 60 seconds, and all sources together at most 120. A
 source is the caller's address, folded as the sign-in limiter folds it, and every caller with no
 address shares one source. So ten distinct sources flooding the route write 30 rows a minute and
-leave the other 90 rows to everyone else, 30 more sources' worth. Forty sources at their share fill the 120 ceiling, and then no
-source writes its own row until earlier rows age out of the window. A sign-out past either limit
-is not written as its own row but counted: one `auth.logout` row a minute, with no actor and no
-client, has `outcome` `unrecorded` and `"count": N`, the sign-outs left unwritten since the last
-such row, and a WARNING log line gives the same N. Its own outcome keeps a reader that counts
-`nothing_to_revoke` rows from reading it as one sign-out. The first sign-out past a limit writes
-that row at once, unless a count row was written in the minute before; then it waits for that
-minute to pass. The row's time is when it was written, not when the misses it counts arrived. The
-count left when a flood stops is written by the next sign-out that ends
-nothing after the minute. With the audit store refusing writes, the ERROR line each refused write
-logs is bounded the same way.
+leave the other 90 rows to everyone else, 30 more sources' worth. Forty sources at their share fill
+the 120 ceiling, and then no source writes its own row until earlier rows age out of the window.
 
-At least these limits stay. Callers the engine sees under one folded address are one source: every
-caller behind a proxy whose forwarded address the engine does not trust, every loopback caller,
-and every caller with no address. Three misses from any of them then cost the rest their own rows
-for the window, and only the count records the others. The source is the whole address, so an
-IPv6 host that holds a /64 can be 40 sources by itself and fill the ceiling. The bound and the
-count are in-process, so each engine shard keeps its own, and a restart loses a count not yet
-written. Nothing prunes `audit_log` (see
-[retention](CONFIGURATION.md#retention)), so the rows still grow, by at most 121 a minute for each
-engine process. The bound gates the row only: the sign-out itself is never refused, though one
-that writes a count row waits for that write too. A
-sign-out that ended a session always writes its row, and so does one that names its caller, as
-`POST /auth/logout` does: concurrent `POST /auth/logout` calls on one token each write a row,
-all but one `nothing_to_revoke`, and that is kept on purpose, because each is an authenticated
+A sign-out past either limit is not written as its own row but counted. The count is written in an
+`auth.logout` row with no actor and no client, `outcome` `unrecorded` and `"count": N`, the
+sign-outs left unwritten since the last such row, and at most one such row is written in any 60
+seconds. A WARNING log line gives the same N once the row is written. Its own outcome keeps a reader
+that counts `nothing_to_revoke` rows from reading it as one sign-out. Only a sign-out that names no
+caller and ends nothing writes the count: the first one past a limit writes it at once, unless a
+count row was written in the 60 seconds before. A sign-out through `POST /auth/logout` never writes
+it. The row's time is when it was written, not when the misses it counts arrived. With the audit
+store refusing writes, the ERROR line each refused write logs is bounded the same way.
+
+**What the count can miss.** A count stays in memory until a later sign-out that names no caller
+and ends nothing arrives after the 60 seconds, so the misses at the end of a flood are written only
+then, and a restart of either kind, graceful or not, loses a count not yet written. A count-row
+write that is refused or cancelled puts its count back for the next count row, but it has spent
+that window's one count row.
+
+At least these limits stay as well. Callers the engine sees under one folded address are one
+source: at least every caller behind one NAT or egress address, every caller behind a proxy whose
+forwarded address the engine does not trust, every loopback caller, and every caller with no
+address. Three misses from any of them then cost the rest their own rows for the window, and only
+the count records the others. The source is the whole address, so an IPv6 host that holds a /64 can
+be 40 sources by itself and fill the ceiling. The bound and the count are in-process, so each engine
+shard keeps its own. Nothing prunes `audit_log` (see [retention](CONFIGURATION.md#retention)), so the
+rows still grow, by at most 121 a minute for each engine process.
+
+**The bound is on the audit row, not on the request.** Every request to `/ui/logout` with a cookie
+still runs the sign-out's revoke, a store write transaction, whether or not it ends a session: on
+SQLite its `UPDATE` takes the store's write lock even when it matches no row, and that competes with
+message ingress commits. Nothing in the engine bounds those requests, so treat `/ui/logout` as an
+unbounded store-write surface to any caller that can reach the console, on the engine's own host or
+beyond it. The sign-out itself is never refused, though one that writes a count row waits for that
+write too. A sign-out that ended a session always writes its row, and so does one that names its
+caller, as `POST /auth/logout` does: concurrent `POST /auth/logout` calls on one token each write a
+row, all but one `nothing_to_revoke`, and that is kept on purpose, because each is an authenticated
 request.
 
 A session's `id` is its token hash, and that hash changes whenever the session completes MFA or a
@@ -6285,7 +6297,7 @@ for a token, so it is not a sign-in leg.
 
 ### The documented protection set (ASVS 6.1.1)
 
-Eleven controls defend the authentication surface against automated attack. Each is named with its
+Twelve controls defend the authentication surface against automated attack. Each is named with its
 threshold, the switch that disables it, and — the part that matters for "not disabled or bypassable" —
 **what is left when it is off**.
 
@@ -6302,6 +6314,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 | 9 | **JWKS min-refetch floor** (`JwksCache.get_key`) | unauthenticated `kid`-driven refetch amplification against the IdP on the OIDC callback leg — the sibling of control 7 on the *other* federated leg | one upstream fetch per **300 s**, globally (`[auth].oidc_jwks_min_refetch_seconds`), plus a `_MAX_JWKS_BYTES` **512 KiB** response-body cap and a 3600 s key TTL. Within the floor an unknown `kid` raises `JwksError` and that login fails (a still-cached key is served even past the soft TTL rather than fail while throttled) | `oidc_jwks_min_refetch_seconds = 0` — no validator floor, so this **is** a genuine opt-out, and it restores the amplification | limiter 2 and control 7 (the same legs charge `allow_login_attempt` and stage a bounded flow first) |
 | 10 | **Repeated-credential audit budget** (`allow_repeated_credential_audit`) | an unauthenticated caller growing `audit_log` by sending a repeated `Authorization` header or session cookie, which is refused before any credential is read (BACKLOG #2454) | > 10 `auth.repeated_credential` rows per client IP **or** > 60 across all clients, per 60 s. Its own budget: it never draws on, or exhausts, limiter 2. A flood from many addresses can spend the global 60, and other refusals in that window then get the line and no row | *the same* `[auth].login_rate_limit_enabled` | the refusal is unchanged: every repeat is still a `400` and a WARNING line. Only the row loses its bound, so with the switch off every refusal writes one |
 | 11 | **Step-up return audit budget** (`allow_step_up_return_audit`) | many accounts' live IdP step-up flows, or a page that sends many operators' browsers to `GET /ui/oidc/callback`, growing `audit_log` through the step-up return's refusals that consume nothing and so repeat while the flow lives: a `state` mismatch, on the completion or the abandon leg, and a non-navigation fetch (BACKLOG #3965) | > 10 such rows per **source** per 60 s, where the source is the staged **user**, or, for a flow that names no user, the callback's client **address**. Behind that, a **backstop** of 60 rows across all sources per 60 s: past it each **account** still writes one row a window, and a source with no account writes none. The first row it stops in a window, per audit action, pages `audit_write_failed` keyed `step_up_return:audit_budget:<action>`, with an ERROR line; a row the per-account floor writes pages nothing. Its own budget: it never draws on, or exhausts, limiter 2 or limiter 3, and it gates the **row only**. An over-budget refusal answers exactly as before (a `state` mismatch the step-up page with **403**, a non-navigation fetch a **303** to `/ui/login?e=oidc_failed`), consumes nothing, and writes a WARNING line instead of the row. So one source spending its budget costs no other source a row; a flood across many sources that spends the backstop still leaves each account one row that window, and pages once it stops one; and none of it refuses anyone's step-up return | *the same* `[auth].login_rate_limit_enabled`, among others: `login_rate_limit_global = 0` removes its backstop and with it the page, `login_rate_limit_per_ip = 0` its per-source figure, and a `login_rate_limit_window_seconds` of `0` or less the whole budget while the switch reads on. A **lower** `login_rate_limit_global` also writes fewer of these rows, and a negative one only each account's one row a window, paging once a window per action it stops. The startup loosening report names those values for the sign-in and ceremony limits only; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced) says they loosen this budget too | nothing: the same switch removes limiter 3, whose per-user return key otherwise holds each user's step-up returns, these rows among them, to 10 a window with no ceiling across users. The refusals are unchanged, and with the switch off every one writes its row |
+| 12 | **Sign-out miss-row budget** (`_admit_logout_miss_row`) | an unauthenticated caller growing `audit_log` through `POST /ui/logout` with a cookie that ends no session, each request writing an `auth.logout` row with `outcome` `nothing_to_revoke` (BACKLOG #4735) | > 3 such rows per source **or** > 120 across all sources, per 60 s, where the source is the client address and every caller with no address shares one. A miss past either is counted, and at most one `auth.logout` row a window, with `outcome` `unrecorded`, writes the count, with a WARNING line once it is written. [Session inventory](#session-inventory--targeted-revocation-wp-10) states its limits | none: it is always on, and `[auth].login_rate_limit_enabled` does not turn it off | nothing to turn off. It gates the row only, so a sign-out is never refused, and each miss still runs one store write transaction that this budget does not bound |
 
 **Control 1 bounds the lock; it bounds the campaign only where the owner has a way past it
 (ADR 0197).** Each lock releases itself, and the next run to the threshold sets the next one. What
@@ -6637,7 +6650,7 @@ Every enforced limit, with both dimensions stated even where one is hard-coded o
 **and** globally" is the requirement's own wording. **Enforcement scope is stated per row, because it
 is not uniform.** The four sliding-window limiters (sign-in, credential ceremony, PHI read, admin
 write) and the two pending-flow caches are **in-process, per API process** — N engine shards multiply
-*those* budgets by N. So are the two audit-row budgets of the 6.1.1 set (controls 10 and 11),
+*those* budgets by N. So are at least the three audit-row budgets of the 6.1.1 set (controls 10 to 12),
 which this table does not list. The account lockout and the concurrent-session cap are
 **store-backed** (`increment_login_failure` / `enforce_session_cap` against the one unified store), so they are **shared** by every API process and are **not** multiplied by N. For
 the lockout, shared is not by itself enough and the second half is what makes the first half true: the

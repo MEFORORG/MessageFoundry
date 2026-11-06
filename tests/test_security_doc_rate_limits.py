@@ -88,6 +88,9 @@ _STRUCTURAL_CONTROLS: dict[str, str] = {
     "argon2 concurrency cap": "argon2",
     "request-body cap": "max_upload_bytes",
     "pre-auth client-network gate": "allowed_client_networks",
+    # BACKLOG #4735: the sign-out miss-row budget. Its accessor is private, so the allow_ derivation
+    # below does not find it; this token pins its row instead.
+    "sign-out miss-row budget": "_admit_logout_miss_row",
 }
 
 #: The count word the 6.1.1 preamble uses, pinned against the live row count so the sentence and the
@@ -2031,6 +2034,19 @@ def test_protection_set_is_derived_from_the_shipped_anti_automation_seams() -> N
         f"the protection set has {len(rows)} rows for {len(seams)} derived seams "
         f"({sorted(seams)}); a row without a seam is unfalsifiable prose."
     )
+
+
+def test_the_sign_out_miss_row_budget_token_names_a_shipped_method() -> None:
+    """The control 12 token is pinned by hand, so a rename must fail here rather than leave the row
+    matching a method that no longer exists (BACKLOG #4735)."""
+    token = _STRUCTURAL_CONTROLS["sign-out miss-row budget"]
+    tree = ast.parse(_SERVICE.read_text(encoding="utf-8"))
+    defined = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    assert token in defined, f"{token} is no longer a method of the auth service"
 
 
 def test_protection_set_count_word_matches_the_table() -> None:
