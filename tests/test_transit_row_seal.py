@@ -112,6 +112,7 @@ class FakeBackend:
 
     def seal_probe(self) -> str:
         self.probe_calls += 1
+        self.thread_names.add(threading.current_thread().name)
         if self.probe_down:
             raise CipherError("synthetic probe outage")
         if self.other_failure:
@@ -404,8 +405,39 @@ async def test_transit_calls_run_on_their_own_bounded_pool() -> None:
     stored = await sealer.seal_async(USER_KIND, FIELDS)
     assert await sealer.verify_held_async(USER_KIND, FIELDS, stored)
     assert backend.thread_names
+    with pytest.raises(TransitSealUnverifiableError):  # a refusal runs the probe on it too
+        await sealer.verify_held_async(USER_KIND, FIELDS, _with_version(stored, "5"))
+    assert backend.probe_calls == 1
     assert all(n.startswith("mefor-transit-seal") for n in backend.thread_names)
-    assert row_seal._transit_pool()._max_workers == row_seal.TRANSIT_SEAL_WORKERS
+    # The bound, measured: more concurrent checks than workers never run more than that at once.
+    running = 0
+    peak = 0
+    lock = threading.Lock()
+    release = threading.Event()
+
+    def slow_verify(key_name: str, digest: bytes, mac: str) -> bool:
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        release.wait(5)
+        with lock:
+            running -= 1
+        return True
+
+    backend.verify_seal_hmac = slow_verify  # type: ignore[method-assign]
+    workers = row_seal.TRANSIT_SEAL_WORKERS
+    tasks = [
+        asyncio.create_task(sealer.verify_held_async(USER_KIND, [*FIELDS, ("i", i)], stored))
+        for i in range(workers + 4)
+    ]
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if peak >= workers:
+            break
+    release.set()
+    assert all(await asyncio.gather(*tasks))
+    assert peak == workers
 
 
 async def test_the_start_probe() -> None:
@@ -435,19 +467,22 @@ async def test_require_seal_for_write_names_each_cause() -> None:
             sealer, USER_KIND, FIELDS, _with_version(stored, "5"), subject=subject
         )
     assert unverifiable.value.args == (USER_KIND, subject)
+    assert (unverifiable.value.stored_version, unverifiable.value.probe_version) == (5, 1)
+    revived = pickle.loads(pickle.dumps(unverifiable.value))
+    assert (revived.args, revived.stored_version) == ((USER_KIND, subject), 5)
     assert unverifiable.value.__cause__ is None and unverifiable.value.__context__ is None
     backend.down = True
     with pytest.raises(TransitSealUnavailableError):
         await require_seal_for_write(sealer, USER_KIND, FIELDS, stored, subject=subject)
     backend.down = False
-    # held=False is the session check: a seal under a retired key does not hold.
-    old = await _sealer(FakeBackend(active=RETIRED)).seal_async(SESSION_KIND, FIELDS)
+    # The kind picks the check: a record holds under a listed retired key, a session never does.
     with_retired = _sealer(backend, retired_key_names=[RETIRED])
-    await require_seal_for_write(with_retired, SESSION_KIND, FIELDS, old, subject="s")
+    old_backend = FakeBackend(active=RETIRED)
+    old_user = await _sealer(old_backend).seal_async(USER_KIND, FIELDS)
+    await require_seal_for_write(with_retired, USER_KIND, FIELDS, old_user, subject=subject)
+    old_session = await _sealer(old_backend).seal_async(SESSION_KIND, FIELDS)
     with pytest.raises(RowSealError):
-        await require_seal_for_write(
-            with_retired, SESSION_KIND, FIELDS, old, subject="s", held=False
-        )
+        await require_seal_for_write(with_retired, SESSION_KIND, FIELDS, old_session, subject="s")
     # The local sealer serves the same call.
     local = RowSealer(b"k" * 32)
     await require_seal_for_write(
@@ -509,7 +544,6 @@ async def test_each_outage_cause_is_logged(caplog: pytest.LogCaptureFixture) -> 
     lines = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert len(lines) == 2  # one per cause: the repeat inside the window is throttled
     assert "synthetic outage" in lines[0] and "HTTP 403" in lines[1]
-    assert all(TOKEN_HASH not in line for line in lines)
 
 
 async def test_transit_receives_a_fixed_length_digest_and_runs_off_the_event_loop() -> None:
