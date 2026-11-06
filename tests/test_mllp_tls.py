@@ -1401,6 +1401,68 @@ def test_the_accept_loop_stops_on_a_fault_of_its_listening_socket(
     assert "IB_TEST: accept loop failed and stopped" in caplog.text
 
 
+def test_close_closes_a_socket_the_cancelled_accept_already_took() -> None:
+    """BACKLOG #2479 round-3 finding 3: close() cancels the accept loop, and a cancellation that
+    lands after the loop's accept completed, but before the task stepped, used to be thrown into
+    ``sock_accept`` and lose its result, leaving the accepted socket open with no owner. The
+    interleaving is pinned without a race: the accept completes, and close() runs, in one turn."""
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        gate: asyncio.Future[tuple[socket.socket, object]] = loop.create_future()
+
+        async def accept(sock: socket.socket) -> tuple[socket.socket, object]:
+            return await gate
+
+        loop.sock_accept = accept  # type: ignore[method-assign]
+        taken: list[socket.socket] = []
+        listening = socket.socket()
+        server = mllp_module._AcceptingServer([listening], taken.append, name="IB_TEST")
+        accepted, peer = socket.socketpair()
+        try:
+            for _ in range(3):
+                await asyncio.sleep(0)  # the accept loop reaches its wait
+            gate.set_result((accepted, ("127.0.0.1", 1)))
+            server.close()  # same turn: the accept is done and its task has not stepped
+            await asyncio.wait_for(server.wait_closed(), timeout=5.0)
+            assert taken == []
+            assert accepted.fileno() == -1, "a socket the accept took was dropped unclosed"
+            assert listening.fileno() == -1
+        finally:
+            accepted.close()
+            peer.close()
+
+    asyncio.run(scenario())
+
+
+def test_close_with_no_accept_completed_takes_no_socket() -> None:
+    """The control for the test above: a close() while the accept is still waiting cancels it,
+    takes nothing, and still closes the listening socket."""
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        waited: list[bool] = []
+        gate: asyncio.Future[tuple[socket.socket, object]] = loop.create_future()
+
+        async def accept(sock: socket.socket) -> tuple[socket.socket, object]:
+            waited.append(True)
+            return await gate
+
+        loop.sock_accept = accept  # type: ignore[method-assign]
+        taken: list[socket.socket] = []
+        listening = socket.socket()
+        server = mllp_module._AcceptingServer([listening], taken.append, name="IB_TEST")
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert waited == [True]
+        server.close()
+        await asyncio.wait_for(server.wait_closed(), timeout=5.0)
+        assert gate.cancelled(), "the pending accept was left running"
+        assert taken == [] and listening.fileno() == -1
+
+    asyncio.run(scenario())
+
+
 async def test_failed_handshakes_are_counted_and_their_events_throttled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

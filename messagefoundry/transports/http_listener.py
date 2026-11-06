@@ -122,13 +122,13 @@ DEFAULT_MAX_HEADER_BYTES = (
     64 * 1024
 )  # cap the request line + headers (a header-flood / slow-loris guard)
 #: The most sockets one peer address may hold a ``max_connections`` slot with while still in
-#: their TLS handshake (vault BACKLOG #4888), which a TLS socket does on every loop since BACKLOG
-#: #2479, since it is admitted before its handshake. 32 is an eighth of :data:`DEFAULT_MAX_CONNECTIONS`, the ratio
-#: the other listeners' per-host cap ships at, so at the default ``max_connections`` a stalling
-#: address could hold at most an eighth of the listener. The budget does not scale with
-#: ``max_connections``: at 32 slots or fewer, ``max_connections`` refuses first and one stalling
-#: address could hold every slot. ``docs/DEPLOYMENT.md``, *Per-address listener caps behind the VIP*, holds the
-#: rationale and the L4 load-balancer counter-case.
+#: their TLS handshake (vault BACKLOG #4888). A TLS socket holds one from its admission, before its
+#: handshake, on every event loop (BACKLOG #2479). 32 is an eighth of
+#: :data:`DEFAULT_MAX_CONNECTIONS`, the ratio the other listeners' per-host cap ships at, so at the
+#: default ``max_connections`` a stalling address could hold at most an eighth of the listener. The
+#: budget does not scale with ``max_connections``: at 32 slots or fewer, ``max_connections`` refuses
+#: first and one stalling address could hold every slot. ``docs/DEPLOYMENT.md``, *Per-address
+#: listener caps behind the VIP*, holds the rationale and the L4 load-balancer counter-case.
 DEFAULT_MAX_HANDSHAKES_PER_HOST = 32
 _HEADER_CAP_OFF_HINT = (
     "this cap cannot be switched off; leave it unset or None for the 64 KiB default"
@@ -1463,10 +1463,12 @@ class HttpSource(SourceConnector):
         if slot is not None and self._admission.stopping:
             # The handshake `_handshake_accepted` ran finished after stop() began, so nothing will
             # wait for this connection: refuse it unread and unregistered, as
-            # `MLLPSource._on_client` does. The close is not awaited, so a peer that never answers
-            # close_notify cannot hold stop() for the shutdown grace.
+            # `MLLPSource._on_client` does. Nothing was read or written, so no close exchange is
+            # owed: the transport is aborted rather than closed, so a peer that never answers
+            # close_notify cannot keep the socket open for asyncio's 30 s shutdown default after
+            # stop() has returned.
             self._admission.release(*slot)
-            writer.close()
+            writer.transport.abort()
             return
         # A slot `_handshake_accepted` took is this call's from its first line, so the finally below
         # releases it however the call ends (BACKLOG #2479). Otherwise `epoch` is set by the admit,
@@ -1477,7 +1479,10 @@ class HttpSource(SourceConnector):
         else:
             peer_host = _peer_host(writer)
         # Register before anything else so stop() can always find + close this connection (H-2).
-        task = asyncio.current_task()
+        # A `_handshake_accepted` task is already registered, and `_accepted_task_done` drops it
+        # when it ends: dropped here instead, it would leave `_client_tasks` while this finally
+        # still awaits the close and emits `closed`, so stop() would not wait for it.
+        task = asyncio.current_task() if slot is None else None
         self._clients.add(writer)
         if task is not None:
             self._client_tasks.add(task)

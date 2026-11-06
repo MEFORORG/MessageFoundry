@@ -1835,6 +1835,32 @@ def _closer(sock: socket.socket, name: str, transport: str) -> Callable[[asyncio
     return close
 
 
+async def _accept_one(
+    loop: asyncio.AbstractEventLoop, sock: socket.socket
+) -> tuple[socket.socket, Any]:
+    """``loop.sock_accept(sock)``, except that a cancellation never drops a socket the accept
+    already took (BACKLOG #2479).
+
+    Awaited directly, a cancellation that lands after the loop's accept completed, but before the
+    awaiting task stepped, is thrown into ``sock_accept`` and its result is lost: CPython 3.14's
+    selector ``sock_accept`` does not handle it. So the accept runs in its own task, shielded from
+    the cancellation. On one, a single loop turn lets a completed accept's task step, and a socket
+    it took is closed; an accept still pending is cancelled, and the loop's accept then takes no
+    socket. The cancellation is then raised as before."""
+    accept = asyncio.ensure_future(loop.sock_accept(sock))
+    try:
+        return await asyncio.shield(accept)
+    except asyncio.CancelledError:
+        try:
+            await asyncio.sleep(0)
+        finally:
+            if not accept.done():
+                accept.cancel()
+            elif not accept.cancelled() and accept.exception() is None:
+                accept.result()[0].close()
+        raise
+
+
 class _AcceptingServer:
     """The accept loop a TLS listener runs itself where the loop's TLS upgrade is not known to be
     safe (BACKLOG #1606; see `_upgrades_tls_itself`), standing in for ``asyncio.Server``.
@@ -1874,7 +1900,7 @@ class _AcceptingServer:
         skipped = 0  # failed accepts in a row since the last success or wait
         while True:
             try:
-                conn, _address = await loop.sock_accept(sock)
+                conn, _address = await _accept_one(loop, sock)
             except OSError as exc:
                 if _accept_fault_is_fatal(exc, sock):
                     raise  # the listening socket is gone; `_closer` closes and logs it
@@ -3070,8 +3096,11 @@ class MLLPSource(SourceConnector):
             writer.close()
             return
         # Register before anything else so stop() can always find + close this connection — no race
-        # with a client that connects just as we're stopping (review H-2).
-        task = asyncio.current_task()
+        # with a client that connects just as we're stopping (review H-2). A `_handshake_accepted`
+        # task is already registered, and `_accepted_task_done` drops it when it ends: dropped here
+        # instead, it would leave `_client_tasks` while the finally below still awaits the close,
+        # so stop() would not wait for it (BACKLOG #2479).
+        task = asyncio.current_task() if slot is None else None
         self._clients.add(writer)
         if task is not None:
             self._client_tasks.add(task)
