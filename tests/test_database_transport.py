@@ -14,6 +14,8 @@ import base64
 import io
 import json
 import logging
+import sys
+import types
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
@@ -1712,6 +1714,138 @@ def test_safe_db_error_renders_a_unicode_error_as_safe_exc_does(exc: Exception) 
     Red mutation: drop the ``UnicodeError`` guard in ``_safe_db_error``. The ``ascii`` case reds.
     """
     assert _safe_db_error(exc) == safe_exc(exc)
+
+
+#: The value a driver's own message quotes back, which no rendering below may carry.
+_QUOTED_ARGUMENT = f"invalid input for query argument $1: 'MRN{_SYNTHETIC_ID}' (str expected)"
+
+
+class _ClientSideDataError(Exception):
+    """asyncpg's client-side ``DataError`` shape: raised before the server sees the statement, so
+    it has no ``sqlstate``, and its message quotes the argument it could not encode."""
+
+    __module__ = "asyncpg.exceptions._base"
+
+
+class _DbApiError(Exception):
+    """A DB-API 2.0 driver's error with no SQLSTATE in ``args[0]``, from :func:`_dbapi_driver`."""
+
+    __module__ = "synthetic_dbapi_driver"
+
+
+@pytest.fixture
+def _dbapi_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A module named as :class:`_DbApiError` says, with the DB-API ``apilevel`` marker."""
+    module = types.ModuleType("synthetic_dbapi_driver")
+    module.apilevel = "2.0"  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "synthetic_dbapi_driver", module)
+
+
+_NO_SQLSTATE_DRIVER_ERRORS = [
+    pytest.param(_ClientSideDataError, id="asyncpg client-side"),
+    pytest.param(_DbApiError, id="DB-API driver"),
+]
+
+
+@pytest.mark.usefixtures("_dbapi_driver")
+@pytest.mark.parametrize("kind", _NO_SQLSTATE_DRIVER_ERRORS)
+def test_safe_db_error_withholds_a_driver_message_with_no_sqlstate(kind: type[Exception]) -> None:
+    """BACKLOG #1661, engine PR 2658's finding 4: a driver error with no SQLSTATE took ``safe_exc``,
+    which kept the quoted argument. It renders as its type alone now.
+
+    Red mutation: drop the ``_raised_by_a_driver`` arm in ``_safe_db_error``. Both cases red.
+    """
+    rendered = _safe_db_error(kind(_QUOTED_ARGUMENT))
+    assert _SYNTHETIC_ID not in rendered
+    assert rendered == f"{kind.__name__} [driver message withheld]"
+
+
+def test_safe_db_error_keeps_safe_exc_for_an_error_no_driver_raised() -> None:
+    """The control: a bug or an unreachable host keeps ``safe_exc``'s text, its diagnostic."""
+    exc = ConnectionRefusedError(111, "Connection refused")
+    assert _safe_db_error(exc) == safe_exc(exc)
+    assert "Connection refused" in _safe_db_error(exc)
+
+
+@pytest.mark.usefixtures("_dbapi_driver")
+@pytest.mark.parametrize("kind", _NO_SQLSTATE_DRIVER_ERRORS)
+async def test_source_logs_carry_no_value_from_a_driver_error_with_no_sqlstate(
+    caplog: pytest.LogCaptureFixture, kind: type[Exception]
+) -> None:
+    """The handler-failure arm and the poll-failure traceback (``_safe_db_exc_info``) both render
+    through ``_safe_db_error``, so neither carries the quoted value.
+
+    Red mutation: drop the ``_raised_by_a_driver`` arm in ``_safe_db_error``. Both arms red.
+    """
+    src = _src(body_column="payload")
+    h = _RecordingHandler(exc=kind(_QUOTED_ARGUMENT))
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.database"):
+        await _run_poll(src, ["id", "payload"], [(1, "A")], h)
+        await _run_one_failed_poll(_src(body_column="payload"), kind(_QUOTED_ARGUMENT))
+    assert "handler failed" in caplog.text and "poll failed" in caplog.text  # both arms fired
+    assert f"{kind.__name__} [driver message withheld]" in caplog.text
+    assert _SYNTHETIC_ID not in caplog.text
+
+
+async def test_a_builtin_cause_under_a_driver_error_is_withheld(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """asyncpg raises its client-side ``DataError`` from the codec's builtin error, whose message
+    quotes the value too, and a traceback prints that cause first.
+
+    Red mutation: drop ``under`` in ``_redacted_copy``. The cause prints through ``safe_exc``.
+    """
+    try:
+        try:
+            raise ValueError(f"invalid literal for int() with base 10: 'MRN{_SYNTHETIC_ID}'")
+        except ValueError as codec:
+            raise _ClientSideDataError(_QUOTED_ARGUMENT) from codec
+    except _ClientSideDataError as driver_error:
+        failure = driver_error
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.database"):
+        await _run_one_failed_poll(_src(body_column="payload"), failure)
+    assert "direct cause of the following exception" in caplog.text
+    assert "RedactedDbError: ValueError [driver message withheld]" in caplog.text
+    assert _SYNTHETIC_ID not in caplog.text
+
+
+def test_a_sqlite_error_keeps_its_result_code_name() -> None:
+    """SQLite has no SQLSTATE, so its result-code name is the one diagnostic left to name."""
+    import sqlite3
+
+    exc = sqlite3.OperationalError(f"no such column: MRN{_SYNTHETIC_ID}")
+    exc.sqlite_errorname = "SQLITE_ERROR"
+    assert _safe_db_error(exc) == "OperationalError [driver message withheld SQLITE_ERROR]"
+    exc.sqlite_errorname = f"MRN{_SYNTHETIC_ID}"  # not a result-code name: not printed
+    assert _safe_db_error(exc) == "OperationalError [driver message withheld]"
+
+
+@pytest.mark.usefixtures("_dbapi_driver")
+@pytest.mark.parametrize("kind", _NO_SQLSTATE_DRIVER_ERRORS)
+@pytest.mark.parametrize("stage", ["connect", "probe"])
+async def test_probe_failure_text_carries_no_value_from_a_driver_error_with_no_sqlstate(
+    kind: type[Exception], stage: str
+) -> None:
+    """``_probe_db``'s two no-SQLSTATE arms build the ``DeliveryError`` that ``test_connection``
+    raises, so its text is what an operator's connection test shows.
+
+    Red mutation: restore ``safe_exc`` in either arm of ``_probe_db``. That stage reds.
+    """
+    failure = kind(_QUOTED_ARGUMENT)
+
+    class _RefusingPool(_FakePool):
+        async def acquire(self) -> _FakeConn:
+            raise failure
+
+    dest = _dest()
+    if stage == "connect":
+        dest._pool = _RefusingPool(_FakeConn(_FakeCursor()))
+    else:
+        dest._pool = _FakePool(_FakeConn(_FakeCursor(failure)))
+    with pytest.raises(DeliveryError) as failed:
+        await dest.test_connection()
+    assert _SYNTHETIC_ID not in str(failed.value)
+    assert f"{kind.__name__} [driver message withheld]" in str(failed.value)
 
 
 async def test_source_run_loop_survives_a_poll_error() -> None:

@@ -2159,7 +2159,42 @@ def _log_sqlstate(exc: BaseException) -> str | None:
     return _sqlstate(exc)
 
 
-def _safe_db_error(exc: BaseException) -> str:
+#: Driver packages whose errors :func:`_raised_by_a_driver` counts though the package has no DB-API
+#: ``apilevel``: asyncpg, the PostgreSQL store's driver, whose handler-failure arm meets it.
+_NON_DBAPI_DRIVERS = frozenset({"asyncpg"})
+
+
+def _raised_by_a_driver(exc: BaseException) -> bool:
+    """Whether ``exc``'s class, or a class it inherits, is a database driver's: from a module, or
+    a package above it, that declares the DB-API 2.0 ``apilevel`` (pyodbc, sqlite3, psycopg and
+    ``mysql.connector``, at least), or from a package named in :data:`_NON_DBAPI_DRIVERS`. A
+    builtin exception a driver raises does not count, though its cause chain is withheld under a
+    driver error that holds it (:func:`_redacted_copy`)."""
+    for kind in type(exc).__mro__:
+        parts = kind.__module__.split(".")
+        if parts[0] in _NON_DBAPI_DRIVERS:
+            return True
+        for depth in range(1, len(parts) + 1):
+            module = sys.modules.get(".".join(parts[:depth]))
+            if getattr(module, "apilevel", None) == "2.0":
+                return True
+    return False
+
+
+#: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``: a fixed word
+#: such as ``SQLITE_CONSTRAINT_UNIQUE``, never a value.
+_SQLITE_ERRORNAME_RE = re.compile(r"SQLITE_[A-Z_]{1,40}")
+
+
+def _withheld(exc: BaseException) -> str:
+    """A driver error with no SQLSTATE: its type, and SQLite's result-code name when it has one,
+    since SQLite has no SQLSTATE and that name is its only PHI-free diagnostic."""
+    name = getattr(exc, "sqlite_errorname", None)
+    code = f" {name}" if isinstance(name, str) and _SQLITE_ERRORNAME_RE.fullmatch(name) else ""
+    return f"{type(exc).__name__} [driver message withheld{code}]"
+
+
+def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     """A PHI-free rendering of a failure for a LOG line, the log-side twin of
     :func:`_classify_db_error` (BACKLOG #1661).
 
@@ -2168,21 +2203,24 @@ def _safe_db_error(exc: BaseException) -> str:
     Server 2627 text, it keeps ``Cannot insert duplicate key ... The duplicate key value is (4242``
     because ``redact`` sees no HL7 delimiters and no name run, and the 200-character bound cuts the
     identifier in the middle rather than removing it. asyncpg's errors, from a PostgreSQL store,
-    count too: their ``str()`` appends a ``DETAIL`` that quotes the key. Anything else with no
-    SQLSTATE (:func:`_log_sqlstate`) keeps the ``safe_exc`` rendering, which is the more useful text
-    for a bug or an unreachable host. That is a bound, not a guarantee: an error from another driver
-    that quotes a value and carries no SQLSTATE in either place is printed as ``safe_exc`` prints it.
+    count too: their ``str()`` appends a ``DETAIL`` that quotes the key. A driver error with no
+    SQLSTATE (:func:`_raised_by_a_driver`), such as asyncpg's client-side ``DataError``, which quotes
+    the argument it could not encode, renders as its type alone (engine PR 2658, finding 4). Anything
+    else with no SQLSTATE keeps the ``safe_exc`` rendering, which is the more useful text for a bug or
+    an unreachable host, unless ``withhold`` says it is held by a driver error, as a link of its
+    chain (:func:`_redacted_copy`). That is a bound, not a guarantee: an error a driver raises as a
+    builtin type, or wraps in another library's, is printed as ``safe_exc`` prints it.
 
-    A Unicode error, or an exception holding one, always takes ``safe_exc``, so this never prints a
-    codec error's text; ``tests/test_unicode_error_log_paths.py`` counts it among the safe renderers
-    for that reason.
+    A Unicode error, or a non-driver exception holding one, takes ``safe_exc``, so this never prints
+    a codec error's text; ``tests/test_unicode_error_log_paths.py`` counts it among the safe
+    renderers for that reason.
 
     It never raises. Its callers are error arms and helpers documented never to raise, and an
     exception whose ``__str__`` raises renders as its type and a fixed note instead."""
     try:
         state = _log_sqlstate(exc)
         if state is None:
-            return safe_exc(exc)
+            return _withheld(exc) if withhold or _raised_by_a_driver(exc) else safe_exc(exc)
         code = _driver_code(str(exc))
     except Exception as failure:  # noqa: BLE001 - see docstring
         return (
@@ -2222,17 +2260,25 @@ def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
         )
 
 
-def _redacted_copy(exc: BaseException, made: dict[int, RedactedDbError]) -> RedactedDbError:
-    """``exc`` and its chain as :class:`RedactedDbError` copies. ``made`` closes a cycle."""
+def _redacted_copy(
+    exc: BaseException, made: dict[int, RedactedDbError], *, under: bool = False
+) -> RedactedDbError:
+    """``exc`` and its chain as :class:`RedactedDbError` copies. ``made`` closes a cycle.
+
+    Every link under a driver error (:func:`_raised_by_a_driver`) is withheld as one, since a
+    driver raises its own error from the builtin one its codec raised, as asyncpg's client-side
+    ``DataError`` does, and that builtin's message can quote the value too. ``under`` carries that
+    down the chain. A link reached first from outside a driver error keeps that rendering."""
     found = made.get(id(exc))
     if found is not None:
         return found
-    copy = RedactedDbError(_safe_db_error(exc)).with_traceback(exc.__traceback__)
+    copy = RedactedDbError(_safe_db_error(exc, withhold=under)).with_traceback(exc.__traceback__)
     made[id(exc)] = copy
+    below = under or _raised_by_a_driver(exc)
     if exc.__cause__ is not None:
-        copy.__cause__ = _redacted_copy(exc.__cause__, made)
+        copy.__cause__ = _redacted_copy(exc.__cause__, made, under=below)
     if exc.__context__ is not None:
-        copy.__context__ = _redacted_copy(exc.__context__, made)
+        copy.__context__ = _redacted_copy(exc.__context__, made, under=below)
     copy.__suppress_context__ = exc.__suppress_context__  # set last: a cause assignment sets it
     return copy
 
@@ -2699,7 +2745,7 @@ class _AutocommitPool:
         logger.warning(
             "DATABASE: an abandoned borrow's autocommit set did not pass (%s); the connection goes "
             "back unconfirmed and is set again on its next borrow",
-            "not kept" if failure is None else safe_exc(failure),
+            "not kept" if failure is None else _safe_db_error(failure),
         )
         _detach(_return_held(self._pool, conn))
 
@@ -3093,7 +3139,7 @@ async def _probe_db(
         raise (
             _classify_db_error(state, str(exc))
             if state
-            else DeliveryError(f"DATABASE connect failed: {safe_exc(exc)}")
+            else DeliveryError(f"DATABASE connect failed: {_safe_db_error(exc)}")
         ) from exc
     cur: Any = None
     try:
@@ -3104,7 +3150,7 @@ async def _probe_db(
         raise (
             _classify_db_error(state, str(exc))
             if state
-            else DeliveryError(f"DATABASE probe failed: {safe_exc(exc)}")
+            else DeliveryError(f"DATABASE probe failed: {_safe_db_error(exc)}")
         ) from exc
     finally:
         await _close_and_release(pool, conn, cur)
