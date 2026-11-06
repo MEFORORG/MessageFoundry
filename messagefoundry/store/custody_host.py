@@ -62,6 +62,7 @@ from messagefoundry.store.keyprovider import KeyProviderError
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.base import Store
     from messagefoundry.store.custody import HostBlob, MasterKey, StoreId
     from messagefoundry.store.store import StorePin
 
@@ -78,6 +79,7 @@ __all__ = [
     "host_store_key",
     "load_host_custody",
     "mint_host_custody",
+    "store_holds_data",
     "store_pin",
 ]
 
@@ -458,6 +460,15 @@ def load_host_custody(
             )
         )
     return blob
+
+
+async def store_holds_data(store: Store) -> bool:
+    """Whether an opened store holds anything a mint must not take over: a message, a connection
+    event, an audit row or a user. A server database with an empty audit chain may still be a
+    store that ran keyless, so an empty chain alone does not make it absent (vault BACKLOG
+    #3411). Counts only, so a probe opened under a throwaway key decrypts nothing."""
+    status = await store.db_status()
+    return bool(status.messages or status.events or status.audit or await store.count_users())
 
 
 # --- the mint -------------------------------------------------------------------------------------

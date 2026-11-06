@@ -797,8 +797,12 @@ async def test_a_store_with_data_and_an_empty_chain_is_not_absent(tmp_path: Path
     store = await open_store(settings, create=True, keyless_chain_refusal=None)
     try:
         assert not await store_holds_data(store)
-        await store.record_connection_event(
-            connection="IB_X", transport="mllp", direction="inbound", kind="established"
+        await store.create_user(
+            user_id="u1",
+            username="operator",
+            auth_provider="local",
+            password_generated=False,
+            audits=(),
         )
         assert await store_holds_data(store)
     finally:

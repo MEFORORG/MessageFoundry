@@ -8730,10 +8730,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
     async def server_store_absent() -> bool:
         """Under the host key provider with no blob here: whether the server database holds no
         store yet (vault BACKLOG #3411). Opened read-only under a throwaway blob nothing is written
-        with, so the store id pin answers: an empty audit chain, or no store at all, is absent; a
-        chain with a genesis record is a store this mint must not take. Connection and hop
+        with, so the store id pin answers: no store at all, or an empty audit chain over a store
+        that holds no data either, is absent; a chain with a genesis record, or data under an empty
+        chain, is a store this mint must not take. Connection and hop
         refusals surface here, before the prompts, as the ordinary pre-check's do."""
         from messagefoundry.store.custody import HostBlob, MasterKey, StoreId
+        from messagefoundry.store.custody_host import store_holds_data
         from messagefoundry.store.store import StoreIdPinRefused
 
         throwaway = HostBlob(MasterKey.mint(), StoreId.mint())
@@ -8749,8 +8751,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
             return True
         except (StoreIdPinRefused, CipherError):
             return False
-        await store.close()
-        return True
+        try:
+            # An empty chain may be a store that ran keyless: one that holds data is not absent.
+            return not await store_holds_data(store)
+        finally:
+            await store.close()
 
     # The store key could not be resolved. The texts of these classes name settings, environment
     # variables and files, never a key (see `_key_unresolved`). Exit 2, as `rotate-key` exits on
