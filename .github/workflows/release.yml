@@ -648,9 +648,8 @@ jobs:
           # module must lie inside this venv and be a file the installed distribution's RECORD lists,
           # and the version handed to the tag guard is the INSTALLED METADATA's — the version PyPI and
           # every installer see — after it has been checked equal to the module's own __version__.
-          #
-          # A FAILURE INSIDE THIS COMMAND SUBSTITUTION FAILS THE STEP: Actions runs the block as
-          # `bash -e {0}`, and for a simple assignment bash takes the substitution's own status.
+          # A failure inside the command substitution fails the step; the console smoke's step
+          # below carries the measurement.
           built=$(/tmp/relsmoke/bin/python -I - <<'PYSMOKE'
           import importlib
           import sys

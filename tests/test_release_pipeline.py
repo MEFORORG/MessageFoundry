@@ -872,7 +872,7 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
     # smoke normalises", so derive the expected set of smokes rather than a literal.
     # The same predicate section (8) counts with, over executed shell: a bare `python -m build`
     # (the engine's) produces a wheel too, so it owes a smoke like any other (BACKLOG #1583).
-    wheel_builds = len(_WHEEL_BUILD.findall(_executed_shell(rel)))
+    wheel_builds = _wheel_builds(_executed_shell(rel))
     assert wheel_builds >= 4, (
         f"expected the engine, toolkit, console and harness wheel builds, found {wheel_builds}"
     )
@@ -1492,9 +1492,27 @@ _TOOLKIT_DIST = "messagefoundry-toolkit"
 #: The separately-versioned console distribution (ASVS 15.2.4).
 _WEBCONSOLE_DIST = "messagefoundry-webconsole"
 
-#: A ``python -m build`` that produces a wheel: ``--wheel``, or a bare build (sdist AND wheel). An
-#: ``--sdist``-only build produces none, so it owes no wheel smoke.
-_WHEEL_BUILD = re.compile(r"python -m build\b(?![^\n]*--sdist)")
+#: A ``python -m build`` call and the rest of its line. ``python3`` and ``python3.14`` count too.
+_BUILD_CALL = re.compile(r"\bpython[0-9.]*\s+-m\s+build\b([^\n]*)")
+
+
+def _wheel_builds(shell: str) -> int:
+    """How many ``python -m build`` calls in ``shell`` produce a wheel.
+
+    ``--wheel``/``-w`` does; so does a bare build, which makes an sdist AND a wheel. An
+    ``--sdist``/``-s`` call without a wheel flag makes none, so it owes no wheel smoke. Pass
+    EXECUTED shell (:func:`_executed_shell`), so a comment quoting a build command counts nothing.
+    Other front ends (``pyproject-build``, ``uv build``, ``hatch build``) are not recognised; the
+    release workflow runs none, and the floor in :func:`_wheel_smoke_steps` names every
+    distribution it ships, so a wheel built another way still has to be added there.
+    """
+    count = 0
+    for rest in _BUILD_CALL.findall(shell):
+        flags = set(rest.split())
+        if flags & {"--wheel", "-w"} or not flags & {"--sdist", "-s"}:
+            count += 1
+    return count
+
 
 #: The harness distribution, which declares the toolkit beside the engine (ADR 0201 slice 7).
 _HARNESS_DIST = "messagefoundry-harness"
@@ -1507,7 +1525,7 @@ def _wheel_smoke_steps() -> dict[str, dict]:
     KEYED BY DISTRIBUTION, NOT JOB, SINCE ADR 0201. The toolkit wheel is built and smoked inside the
     engine's `release` job, so one job holds two smoke steps: the engine's and the toolkit's. A
     job-keyed map could not hold both. A job whose executed shell runs N wheel-producing builds
-    (:data:`_WHEEL_BUILD`) must carry exactly N PYSMOKE smoke steps.
+    (:func:`_wheel_builds`) must carry exactly N PYSMOKE smoke steps.
 
     DERIVED from the build commands, never a list of job names, for the same reason
     :func:`test_both_wheel_smokes_compare_versions_not_strings` counts instead of pinning a number:
@@ -1531,9 +1549,7 @@ def _wheel_smoke_steps() -> dict[str, dict]:
     found: dict[str, dict] = {}
     for name, job in _jobs().items():
         steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
-        builds = sum(
-            len(_WHEEL_BUILD.findall(_executed_shell(str(s.get("run") or "")))) for s in steps
-        )
+        builds = sum(_wheel_builds(_executed_shell(str(s.get("run") or ""))) for s in steps)
         if not builds:
             continue
         smoke = [
@@ -1621,18 +1637,21 @@ def test_every_release_smoke_step_is_covered_by_these_guards() -> None:
     by name, in :func:`test_each_wheel_smoke_installs_the_built_wheel_into_a_throwaway_venv`.
     """
     covered = {id(step) for step in _wheel_smoke_steps().values()}
-    uncovered = sorted(
-        (name, str(step.get("name")))
+    smokes = [
+        (name, step)
         for name, job in _jobs().items()
         for step in (job.get("steps") or [])
-        if isinstance(step, dict)
-        and str(step.get("name") or "").startswith("Smoke-check")
-        and id(step) not in covered
+        if isinstance(step, dict) and str(step.get("name") or "").startswith("Smoke-check")
+    ]
+    # A floor, so an empty walk cannot read as full coverage: one smoke per shipped distribution.
+    assert len(smokes) >= 4, f"expected at least four release smoke steps, found {smokes}"
+    uncovered = sorted(
+        (name, str(step.get("name"))) for name, step in smokes if id(step) not in covered
     )
     assert uncovered == [], (
         f"these release smoke steps escape section (8): {uncovered}. Bring each into "
         f"_wheel_smoke_steps (a PYSMOKE inspection naming its DIST and PKG, in a job whose build "
-        f"_WHEEL_BUILD counts) or record why not."
+        f"_wheel_builds counts) or record why not."
     )
 
 
@@ -1663,7 +1682,10 @@ def test_each_wheel_smoke_installs_the_built_wheel_into_a_throwaway_venv() -> No
                 "the engine smoke has gained --no-deps, so BACKLOG #1583 option (c) has landed: "
                 "delete this carve-out so the engine is held to the --no-deps assertion below"
             )
-            assert re.search(r"/tmp/\S+/bin/pip install --quiet dist/\S*\.whl", shell), (
+            venv = re.search(r"python -m venv (/tmp/\S+)", shell)
+            assert venv and re.search(
+                rf"{re.escape(venv.group(1))}/bin/pip install --quiet dist/\S*\.whl", shell
+            ), (
                 f"{job}'s smoke does not install the engine's own built wheel (dist/*.whl) into its "
                 f"throwaway venv"
             )
@@ -2125,6 +2147,10 @@ def test_the_engine_tag_gate_compares_the_installed_metadata_version(
     # And the step feeds THAT value (`built`, which _VERSION_PROBE pins as the PYSMOKE capture) to
     # the tag guard, which passes the matching tag and refuses another.
     shell = _engine_wheel_smoke_script()
+    assert len(re.findall(r"^\s*built=", shell, re.M)) == 1, (
+        "the engine smoke assigns `built` more than once, so the value the tag guard reads may "
+        "not be the PYSMOKE inspection's metadata version"
+    )
     assert re.search(r'/bin/python -I - "\$built" "\$want" <<\'PYVER\'', shell), shell
     guard = _engine_pyver_script()
     rc, _stdout, out = _run_smoke(exe, guard, work, args=(built, "7.7.7-rc1"))
@@ -2913,7 +2939,8 @@ def _run_probe(
     no_site: bool = True,
     pythonpath: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run ``code`` under ``flags`` from ``cwd``.
+    """Run ``code`` under ``flags`` from ``cwd``, fed on stdin to ``python <flags> -`` exactly as
+    the engine smoke feeds its PYSMOKE inspection (BACKLOG #1583; it ran ``-c`` before).
 
     ``no_site`` adds ``-S``, which is how the shadow arms stay attributable — see the test's
     docstring. The site-reachability arm turns it OFF, because it asks the opposite question.
@@ -2923,7 +2950,8 @@ def _run_probe(
     if pythonpath is not None:
         env["PYTHONPATH"] = str(pythonpath)
     return subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
-        [sys.executable, *(["-S"] if no_site else []), *flags, "-c", code],
+        [sys.executable, *(["-S"] if no_site else []), *flags, "-"],
+        input=code,
         cwd=str(cwd),
         env=env,
         capture_output=True,
