@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Every way the web console reaches the engine, classified (ADR 0215 slice 1, vault BACKLOG #2603).
+"""At least the ways the web console reaches the engine, classified (ADR 0215 slice 1, BACKLOG #2603).
 
 ADR 0215 moves the console off its in-process seam: each ``/ui`` route will send a sub-request to a
 JSON route, so one gate family authorizes both planes. Its first slice is this inventory. It
@@ -127,7 +127,9 @@ def _routes(app: FastAPI, *, ui: bool) -> dict[str, APIRoute]:
     endpoint."""
     out: dict[str, APIRoute] = {}
     for r in app.routes:
-        if isinstance(r, APIRoute) and r.path.startswith("/ui") == ui:
+        if not isinstance(r, APIRoute):
+            continue
+        if (r.path == "/ui" or r.path.startswith("/ui/")) == ui:
             for op in _ops(r):
                 assert op not in out, f"{op} is registered twice; the walk cannot tell which serves"
                 out[op] = r
@@ -211,7 +213,10 @@ def _engine_reach(fn: Any) -> Mapping[int, Any]:
 _SINGLE_LOADS = frozenset(
     {"LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK", "LOAD_DEREF", "LOAD_GLOBAL", "LOAD_NAME"}
 )
-_PAIR_LOADS = frozenset({"LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW"})
+#: A comprehension fuses its loop-variable store with the next load, so that pair counts too.
+_PAIR_LOADS = frozenset(
+    {"LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW", "STORE_FAST_LOAD_FAST"}
+)
 
 
 @functools.cache
@@ -586,7 +591,8 @@ _STORE_READS: dict[str, tuple[str, ...]] = {
     ),
 }
 
-#: Every attribute the console reads off the engine or the approval gate object itself.
+#: Every attribute the console source reads off a name ``engine`` or ``gate``: at least the reads
+#: of the engine or the approval gate object itself.
 _ENGINE_READS: dict[str, tuple[str, ...]] = {
     # The bulk purge confirmation re-derives eligibility from RegistryRunner.outbound_quiesced.
     # GET /connections' status word is not that reading (a parked lane reads not_deployed, a
@@ -1000,7 +1006,8 @@ _ADDED: dict[str, tuple[str, ...]] = {
     "GET /users/{user_id}": ("users:manage",),
     "GET /me/notify-email": (),
     "GET /me/webauthn": (),
-    "GET /connections/quiesced": ("monitoring:read",),
+    # The purge confirmation's own permission, so a role narrowed to purge is not refused.
+    "GET /connections/quiesced": ("messages:purge",),
 }
 
 #: JSON operations that decide a permission in their body rather than in their gate: the reason
@@ -1184,6 +1191,12 @@ def _ui_problems(
             problems.append(f"{op}: classed confinement, but its gate admits no confined session")
         if entry.kind == "ceremony" and not facts.ceremonial[op]:
             problems.append(f"{op}: classed ceremony, but reaches no ceremony member")
+        if entry.kind in ("confinement", "ceremony", "public"):
+            # An exemption makes no sub-request, so it may show reads but reach no JSON write.
+            for token in sorted(reach):
+                routes = _routable(_token_carriers(token, fields) or ())
+                if any(not r.startswith("GET ") for r in routes):
+                    problems.append(f"{op}: classed {entry.kind}, but reaches the write {token}")
         carried: dict[str, tuple[str, ...]] = {}
         for token in reach:
             routable = _routable(_token_carriers(token, fields) or ())
@@ -1246,7 +1259,14 @@ _CONFINEMENT_FLAGS = ("allow_must_change", "allow_mfa_pending", "allow_missing_n
 
 
 def _closure_vars(fn: Any) -> dict[str, Any]:
-    return dict(zip(fn.__code__.co_freevars, _cells(fn), strict=False))
+    """Each free variable to its value, an unfilled cell omitted, so no name takes a neighbour's."""
+    out: dict[str, Any] = {}
+    for name, cell in zip(fn.__code__.co_freevars, fn.__closure__ or (), strict=True):
+        try:
+            out[name] = cell.cell_contents
+        except ValueError:
+            continue
+    return out
 
 
 def _admits_confined(op: str, route: APIRoute) -> bool:
@@ -1543,8 +1563,14 @@ def test_a_wrong_ui_class_or_authority_is_reported(facts: _UiFacts) -> None:
         # An authority naming a route the page does not reach, and one that is no operation.
         "GET /ui/config": _J("GET /config/provenance;GET /status", f"core.config_provenance {_E}"),
         "GET /ui/dead-letters": _J("dead letters", f"core.list_dead_letters {_E}"),
-        # An exemption that names an authority anyway.
+        # An exemption that names an authority anyway, and one that reaches a write.
         "POST /ui/csp-report": Ui("public", "GET /status", ""),
+        "POST /ui/account/mfa/disable": Ui(
+            "ceremony",
+            "",
+            f"{_AS} admin.current_user admin.disable_my_mfa admin.my_mfa "
+            "service.store.list_webauthn_credentials",
+        ),
     }
     problems = "\n".join(_ui_problems(facts, planted, _SEAM_FIELDS))
     assert "GET /ui/messages/{message_id}: reaches core.get_message_body" in problems
@@ -1556,3 +1582,7 @@ def test_a_wrong_ui_class_or_authority_is_reported(facts: _UiFacts) -> None:
     assert "GET /ui/config: authority GET /status carries nothing" in problems
     assert "GET /ui/dead-letters: carrier 'dead letters' is not a JSON operation" in problems
     assert "POST /ui/csp-report: classed public, which carries no authority" in problems
+    assert (
+        "POST /ui/account/mfa/disable: classed ceremony, but reaches the write "
+        "admin.disable_my_mfa" in problems
+    )
