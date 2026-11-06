@@ -281,6 +281,39 @@ async def test_a_refused_row_leaves_the_page_to_the_next_pass(
         await store.close()
 
 
+async def test_a_clear_pass_that_raises_leaves_the_clear_to_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 4, finding 1 in part. The flag behind the partial clear is reset only at the
+    end of a pass, so a pass that answers ``alice`` and then raises leaves the next pass to raise
+    the clear.
+
+    RED when: the flag is reset while the pass is planned, so the instance is never resolved."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        for _ in range(2):
+            await _pass(service, sink)
+        assert len(_pages(sink, _PARTIAL_OUTAGE_ALERT_SOURCE)) == 1
+        ldap.unreachable = set()
+        real = service._record_reconcile_hold
+
+        async def boom(plan: reconcile.ReconcilePlan) -> None:
+            raise RuntimeError("synthetic: store refused")
+
+        monkeypatch.setattr(service, "_record_reconcile_hold", boom)
+        with pytest.raises(RuntimeError):
+            await service.reconcile_directory_sessions()
+        monkeypatch.setattr(service, "_record_reconcile_hold", real)
+        assert (await _pass(service, sink)).partial_outage_clear
+        assert not (await _pass(service, sink)).partial_outage_clear
+        assert _clears(sink, _PARTIAL_OUTAGE_ALERT_SOURCE) == 1
+    finally:
+        await store.close()
+
+
 async def test_a_group_search_refused_for_the_engines_bound_is_no_partial_outage() -> None:
     """The directory answered such a probe, and it pages on its own (vault BACKLOG #3696), so it
     feeds no streak and pages no partial outage however long it lasts.
@@ -358,8 +391,9 @@ async def test_a_probe_budget_smaller_than_the_estate_cannot_reset_an_accounts_s
         assert alice is not None
         plans = []
         for probed in (True, False, True, False, True, False):
-            # The rotation sorts least recently probed first, so this puts alice first or last.
-            service._reconcile_last_probed[alice.id] = 0.0 if probed else 1e18
+            # The rotation sorts least recently probed first, a never-probed account at 0.0 and a
+            # tie by id, so this puts alice first or last whatever the ids.
+            service._reconcile_last_probed[alice.id] = -1.0 if probed else 1e18
             plans.append(await _pass(service, sink))
         assert all(p.asked == 2 and not p.directory_outage for p in plans)
         assert [p.unreached for p in plans] == [1, 0] * 3

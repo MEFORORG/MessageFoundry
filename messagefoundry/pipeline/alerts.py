@@ -742,7 +742,7 @@ class AlertSink(Protocol):
         1, the ``auth.ad_reconcile_partial_outage`` row, whose ``probes`` the page names), raised
         once per account as it enters that state and never on a whole outage pass. Under a probe
         budget smaller than the estate that comes after that many probes of the account, which
-        can be many more passes. The type's name predates every case but the first. Read
+        can be many more passes, or never (``AuthService._note_partial_outage``). The type's name predates every case but the first. Read
         ``reason`` before naming the cause.
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,

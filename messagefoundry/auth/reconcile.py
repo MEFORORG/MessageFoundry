@@ -375,14 +375,18 @@ class ReconcilePlan:
     #: paged and still at the threshold is not here. Empty on a whole outage pass.
     #: ``AuthService._note_partial_outage`` keeps it.
     partial_outage_entered: tuple[tuple[str, int], ...] = ()
-    #: Whether the lifespan task pages for a lasting PARTIAL outage on this pass:
-    #: ``partial_outage_entered`` is not empty and its audit row was written.
-    partial_outage_page: bool = False
     #: Whether no account's streak is that long any more, because each was answered since or
     #: left with its sessions, on the first such pass after a partial page in this process. It can
     #: be a whole outage pass, through an account leaving. The caller resolves the partial
     #: outage's instance on it.
     partial_outage_clear: bool = False
+
+    @property
+    def partial_outage_page(self) -> bool:
+        """Whether the lifespan task pages for a lasting PARTIAL outage on this pass. The auth
+        service empties ``partial_outage_entered`` when the page's audit row was refused, so one
+        field decides both (BACKLOG #3709)."""
+        return bool(self.partial_outage_entered)
 
     @property
     def partial_outage_probes(self) -> int:
