@@ -5257,10 +5257,17 @@ _AUDIT_STORE_ID_FIELD: Final = "store_id"
 #: is a literal, not interpolated, so the ReDoS scanner in tests/test_security_static.py reads the
 #: pattern; a test pins it to the constant.
 _AUDIT_STORE_ID_HEX: Final = re.compile("[0-9a-f]{32}")
+#: A genesis record keeps the recovery wrap (vault BACKLOG #3411; the key custody draft, rule 4) as
+#: the lowercase hex of its bytes, 65 of them in version 1 of the wrap; a test pins the width to
+#: ``store.custody``. The wrap is not secret.
+_AUDIT_RECOVERY_WRAP_FIELD: Final = "recovery_wrap"
+_AUDIT_RECOVERY_WRAP_HEX: Final = re.compile("[0-9a-f]{130}")
 _ABSENT: Final = object()
 
 
-def audit_genesis_detail(key_id: str, store_id: bytes = NO_STORE_ID) -> str:
+def audit_genesis_detail(
+    key_id: str, store_id: bytes = NO_STORE_ID, recovery_wrap: bytes = b""
+) -> str:
     """The ``detail`` of the genesis row: a typed record naming the key the first range is MAC'd
     under, and the scheme it is sealed with (BACKLOG #3420). JSON, so a later field can be added
     beside them.
@@ -5269,23 +5276,35 @@ def audit_genesis_detail(key_id: str, store_id: bytes = NO_STORE_ID) -> str:
     and no key is derived from it. :data:`NO_STORE_ID`, the default, records none. A store opened
     under the ``host`` key provider records the host blob's current store id
     (:class:`StorePin`). Raises ``ValueError`` for any other store id that is not
-    :data:`STORE_ID_BYTES` long."""
+    :data:`STORE_ID_BYTES` long.
+
+    ``recovery_wrap``, the master key under the recovery key (not a secret), is kept beside the
+    store id when the store is minted, so the recovery key opens something held in the store and in
+    every backup of it (draft rule 4). Raises ``ValueError`` for one with no store id, or not 65
+    bytes long."""
     record: dict[str, object] = {"genesis": 1, "key_id": key_id}
     record.update(_audit_scheme_fields(audit_scheme_for(key_id)))
     if store_id != NO_STORE_ID:
         if len(store_id) != STORE_ID_BYTES:
             raise ValueError(f"a store id is {STORE_ID_BYTES} bytes, not {len(store_id)}")
         record[_AUDIT_STORE_ID_FIELD] = store_id.hex()
+    if recovery_wrap:
+        if store_id == NO_STORE_ID or not _AUDIT_RECOVERY_WRAP_HEX.fullmatch(recovery_wrap.hex()):
+            raise ValueError("a recovery wrap is 65 bytes, and kept only beside a store id")
+        record[_AUDIT_RECOVERY_WRAP_FIELD] = recovery_wrap.hex()
     return json.dumps(record, sort_keys=True)
 
 
 _AUDIT_GENESIS_FIELDS: Final = frozenset({"genesis", "key_id"})
 
 
-def _parse_audit_genesis(detail: object) -> tuple[str, AuditScheme | None, bytes | None] | None:
-    """``(key_id, scheme, store_id)`` from a genesis row's ``detail``; see
+def _parse_audit_genesis(
+    detail: object,
+) -> tuple[str, AuditScheme | None, bytes | None, bytes | None] | None:
+    """``(key_id, scheme, store_id, recovery_wrap)`` from a genesis row's ``detail``; see
     :func:`parse_audit_genesis_record`. ``store_id`` is ``None`` when the record carries none, or
-    carries one that is refused.
+    carries one that is refused, and ``recovery_wrap`` likewise. A recovery wrap that is malformed,
+    or that sits on a record with no store id, is refused as a malformed store id is.
 
     A ``store_id`` field that is not the lowercase hex of :data:`STORE_ID_BYTES` bytes, or that sits
     on a record naming no scheme (no release wrote one there: the field postdates BACKLOG #3420),
@@ -5302,6 +5321,7 @@ def _parse_audit_genesis(detail: object) -> tuple[str, AuditScheme | None, bytes
     if not isinstance(obj, dict):
         return None
     raw_store_id = obj.pop(_AUDIT_STORE_ID_FIELD, _ABSENT)
+    raw_wrap = obj.pop(_AUDIT_RECOVERY_WRAP_FIELD, _ABSENT)
     try:
         scheme = _audit_record_scheme(obj, _AUDIT_GENESIS_FIELDS)
     except ValueError:
@@ -5311,15 +5331,20 @@ def _parse_audit_genesis(detail: object) -> tuple[str, AuditScheme | None, bytes
         return None
     if not isinstance(key_id, str) or not key_id:
         return None
-    if raw_store_id is _ABSENT:
-        return key_id, scheme, None
+    if raw_store_id is _ABSENT and raw_wrap is _ABSENT:
+        return key_id, scheme, None, None
+    wrap_ok = raw_wrap is _ABSENT or (
+        isinstance(raw_wrap, str) and _AUDIT_RECOVERY_WRAP_HEX.fullmatch(raw_wrap) is not None
+    )
     if (
         scheme is not None
+        and wrap_ok
         and isinstance(raw_store_id, str)
         and _AUDIT_STORE_ID_HEX.fullmatch(raw_store_id)
     ):
-        return key_id, scheme, bytes.fromhex(raw_store_id)
-    return key_id, _AuditStoreIdRefused(mac="", kdf="", named=scheme), None
+        wrap = None if raw_wrap is _ABSENT else bytes.fromhex(str(raw_wrap))
+        return key_id, scheme, bytes.fromhex(raw_store_id), wrap
+    return key_id, _AuditStoreIdRefused(mac="", kdf="", named=scheme), None, None
 
 
 def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None] | None:
@@ -5346,6 +5371,8 @@ class AuditGenesisStoreId(NamedTuple):
     #: none beside a store id, or its store id is malformed. So a caller comparing labels never
     #: reads such a record as one with none.
     refused: bool
+    #: The recovery wrap kept beside the store id, or ``None`` when the record keeps none.
+    recovery_wrap: bytes | None = None
 
 
 def parse_audit_genesis_store_id(detail: object) -> AuditGenesisStoreId | None:
@@ -5354,10 +5381,10 @@ def parse_audit_genesis_store_id(detail: object) -> AuditGenesisStoreId | None:
     parsed = _parse_audit_genesis(detail)
     if parsed is None:
         return None
-    key_id, scheme, store_id = parsed
+    key_id, scheme, store_id, wrap = parsed
     if audit_scheme_refusal(key_id, scheme) is not None:
         return AuditGenesisStoreId(store_id=None, refused=True)
-    return AuditGenesisStoreId(store_id=store_id, refused=False)
+    return AuditGenesisStoreId(store_id=store_id, refused=False, recovery_wrap=wrap)
 
 
 class StorePin(NamedTuple):
@@ -5366,10 +5393,14 @@ class StorePin(NamedTuple):
 
     ``current`` is the id a new genesis record is written with. ``accepted`` is every id the blob
     names, the current one and the earlier ones: an earlier id is the one a store restored under a
-    new id still carries in its genesis record (draft rule 4, *What a restore does*)."""
+    new id still carries in its genesis record (draft rule 4, *What a restore does*).
+    ``recovery_wrap`` is the wrap a minting command writes into a new genesis record beside the
+    current id; empty for every other open, which writes a genesis record only into an empty chain
+    no command minted for."""
 
     current: bytes
     accepted: frozenset[bytes]
+    recovery_wrap: bytes = b""
 
 
 class StoreIdPinRefused(KeyProviderError):
@@ -5393,7 +5424,8 @@ def store_pin_problem(genesis: Mapping[str, Any] | None, pin: StorePin) -> str |
 
     Refused: no row there, a row that is not a genesis record, a genesis record the walk refuses, one
     that names no store id, and one that names an id the host blob does not. Total over
-    attacker-written rows: every answer is a string or ``None``."""
+    attacker-written rows: every answer is a string or ``None``. Whether the row is authentic is
+    :func:`_store_pin_refusal`'s question, not this one's."""
     if genesis is None:
         return (
             "the store's audit chain has no genesis record, so the store id the host blob names "
@@ -5421,6 +5453,39 @@ def store_pin_problem(genesis: Mapping[str, Any] | None, pin: StorePin) -> str |
         + (f" and {len(pin.accepted) - 1} earlier id(s)" if len(pin.accepted) > 1 else "")
         + ": the host blob belongs to another store"
     )
+
+
+async def _store_pin_refusal(
+    host: AuditRangeHost, first: Mapping[str, Any] | None, pin: StorePin
+) -> str | None:
+    """Why the chain does not hold the store to ``pin``, or ``None``. An EMPTY chain passes: nothing
+    is pinned yet, and a writable open writes the genesis record with the pin before it asks. A
+    genesis record must name an id the pin accepts AND verify under a key this handle holds, which
+    is derived from the host blob, so a database writer without the key cannot name the blob's id
+    on another store's chain."""
+    if first is None and not await host._audit_rows(limit=1):
+        return None
+    problem = store_pin_problem(first, pin)
+    if problem is not None or first is None:
+        return problem
+    genesis = _audit_genesis(first)
+    secret = (
+        None
+        if genesis is None
+        else _audit_secret_for(genesis[0], host._audit_mac_keys, host._audit_mac_fn)
+    )
+    expected: str | None = None
+    if secret is not None:
+        with suppress(AuditKeyVersionRefusedError):
+            expected = _audit_row_mac(first, "", secret[0], secret[1])
+    if expected is None or not hmac.compare_digest(
+        audit_mac_bytes(first["row_hash"]), audit_mac_bytes(expected)
+    ):
+        return (
+            "the store's audit genesis record does not verify under the key the host blob "
+            "holds, so the store id it names cannot be trusted"
+        )
+    return None
 
 
 def parse_audit_genesis(detail: object) -> str | None:
@@ -6099,11 +6164,15 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
             await host.record_audit(
                 AUDIT_KEY_EPOCH_ACTION,
                 actor=AUDIT_GENESIS_ACTOR,
-                detail=audit_genesis_detail(active_id, NO_STORE_ID if pin is None else pin.current),
+                detail=(
+                    audit_genesis_detail(active_id)
+                    if pin is None
+                    else audit_genesis_detail(active_id, pin.current, pin.recovery_wrap)
+                ),
                 expect_prev="",
             )
         first = await host._audit_genesis_row()
-    if pin is not None and (problem := store_pin_problem(first, pin)) is not None:
+    if pin is not None and (problem := await _store_pin_refusal(host, first, pin)) is not None:
         # Vault BACKLOG #3411: at EVERY open under the host key provider, the host blob's store id
         # must be the one the store was created under, or an earlier one of the same blob.
         raise StoreIdPinRefused(f"refusing to open the store: {problem}")

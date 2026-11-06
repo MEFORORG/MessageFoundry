@@ -29,7 +29,13 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.custody_posture import KeyCustodyPosture, key_custody_loosenings
 from messagefoundry.store import custody, custody_host
 from messagefoundry.store.base import open_store
-from messagefoundry.store.custody import HostBlob, MasterKey, RecoveryKey, StoreId
+from messagefoundry.store.custody import (
+    HostBlob,
+    MasterKey,
+    RecoveryKey,
+    StoreId,
+    unwrap_master_key,
+)
 from messagefoundry.store.custody_host import (
     HostCustodyMissing,
     HostCustodyRefused,
@@ -119,11 +125,24 @@ class _Console:
         return self.shown_key() if answer is None else answer
 
 
+#: The wrap each blob ``_mint`` made was minted with, by store id, for the store it creates.
+_WRAPS: dict[bytes, bytes] = {}
+
+
 def _mint(settings: StoreSettings, console: _Console | None = None) -> HostBlob:
-    blob, _path = mint_host_custody(
+    minted = mint_host_custody(
         settings, service_account=None, enforcing=True, terminal=console or _Console()
     )
-    return blob
+    _WRAPS[minted.blob.store_id.value] = minted.recovery_wrap
+    return minted.blob
+
+
+async def _create(settings: StoreSettings, blob: HostBlob) -> None:
+    """Create the store a minted blob is for, as provision-admin does, with its recovery wrap."""
+    store = await open_store(
+        settings, create=True, custody=blob, recovery_wrap=_WRAPS[blob.store_id.value]
+    )
+    await store.close()
 
 
 def _leaks(text: str, blob: HostBlob, recovery: str | None = None) -> list[str]:
@@ -217,7 +236,7 @@ def test_the_mint_shows_the_recovery_key_and_writes_only_once_it_is_entered_back
 ) -> None:
     settings = _settings(tmp_path)
     console = _Console()
-    blob, path = mint_host_custody(
+    blob, path, wrap = mint_host_custody(
         settings, service_account=None, enforcing=True, terminal=console, now=lambda: 1_800_000_000
     )
     assert path == tmp_path.resolve() / "master.key"
@@ -225,12 +244,17 @@ def test_the_mint_shows_the_recovery_key_and_writes_only_once_it_is_entered_back
     assert blob.earlier_store_ids == ()
     assert custody.read_host_file(path) == blob
     # The entry opened the recovery wrap: the key shown is the one the blob was minted with.
-    RecoveryKey.parse(console.shown_key())
+    assert unwrap_master_key(wrap, RecoveryKey.parse(console.shown_key()), blob.store_id) == (
+        blob.master_key
+    )
+    # The screen was cleared after the copy was confirmed and before the key was asked for.
+    said = "".join(console.shown)
+    assert said.index(console.shown_key()) < said.index("\x1b[2J") < said.rindex("Enter the")
 
 
 @host_file_platforms
 def test_a_mistyped_entry_is_asked_again_and_a_right_one_then_proves_it(tmp_path: Path) -> None:
-    console = _Console("not a key", RecoveryKey.mint().text())  # then the right one
+    console = _Console("", "not a key", RecoveryKey.mint().text())  # then the right one
     blob = _mint(_settings(tmp_path), console)
     assert blob.recovery_proved_at is not None
     said = "".join(console.shown)
@@ -239,7 +263,7 @@ def test_a_mistyped_entry_is_asked_again_and_a_right_one_then_proves_it(tmp_path
 
 @host_file_platforms
 def test_a_recovery_key_never_entered_back_writes_nothing(tmp_path: Path) -> None:
-    console = _Console("wrong", "wrong", "wrong")
+    console = _Console("", "wrong", "wrong", "wrong")
     with pytest.raises(HostCustodyRefused, match="nothing was written"):
         _mint(_settings(tmp_path), console)
     assert not (tmp_path / "master.key").exists()
@@ -281,11 +305,10 @@ async def test_no_key_material_reaches_a_log_an_error_argv_or_the_environment_on
 ) -> None:
     caplog.set_level(logging.DEBUG)
     settings = _settings(tmp_path)
-    console = _Console("wrong")
+    console = _Console("", "wrong")
     blob = _mint(settings, console)
     recovery = console.shown_key()
-    store = await open_store(settings, create=True, custody=blob)
-    await store.close()
+    await _create(settings, blob)
     # A refused second mint and a refused open, whose texts must carry nothing either.
     errors: list[str] = []
     for attempt in (
@@ -340,8 +363,7 @@ async def test_a_new_store_records_the_blob_store_id_and_every_open_checks_it(
 ) -> None:
     settings = _settings(tmp_path)
     blob = _mint(settings)
-    store = await open_store(settings, create=True, custody=blob)
-    await store.close()
+    await _create(settings, blob)
     # Reopened from the host file, as every later command and start does.
     assert await _genesis_store_id(settings, blob) == blob.store_id.value
     store = await open_store(settings)
@@ -353,8 +375,7 @@ async def test_a_new_store_records_the_blob_store_id_and_every_open_checks_it(
 async def test_a_host_blob_of_another_store_is_refused_at_open(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     blob = _mint(settings)
-    store = await open_store(settings, create=True, custody=blob)
-    await store.close()
+    await _create(settings, blob)
     # The same key under another store id: the blob is not this store's, whatever key it holds.
     stranger = HostBlob(blob.master_key, StoreId.mint(), (), blob.recovery_proved_at)
     with pytest.raises(StoreIdPinRefused, match="belongs to another store") as excinfo:
@@ -467,8 +488,7 @@ def test_the_custody_loosenings() -> None:
 async def test_an_unproved_blob_is_observed_at_open(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     blob = _mint(settings)
-    store = await open_store(settings, create=True, custody=blob)
-    await store.close()
+    await _create(settings, blob)
     unproved = HostBlob(blob.master_key, blob.store_id)
     (tmp_path / "master.key").unlink()
     custody.write_host_file(tmp_path / "master.key", unproved)
@@ -583,7 +603,7 @@ def test_provision_admin_mints_the_key_and_creates_the_store_pinned_to_it(
     consoles: list[_Console] = []
 
     def _console() -> _Console:
-        consoles.append(_Console("wrong"))
+        consoles.append(_Console("", "wrong"))
         return consoles[-1]
 
     monkeypatch.setattr(cli, "_RecoveryKeyConsole", _console)
@@ -599,3 +619,119 @@ def test_provision_admin_mints_the_key_and_creates_the_store_pinned_to_it(
     # The store exists, so a second run mints nothing and asks no recovery key.
     assert main([*argv, "--db", str(db), "--service-account", "x"]) != 0
     assert len(consoles) == 1
+
+
+# --- review round one: the wrap, an unauthenticated genesis, read-only, conversion, resolve -------
+
+
+@host_file_platforms
+async def test_the_new_store_keeps_the_recovery_wrap_the_recovery_key_opens(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    console = _Console()
+    blob = _mint(settings, console)
+    await _create(settings, blob)
+    store = await open_store(settings)
+    try:
+        row = await store._audit_genesis_row()  # type: ignore[attr-defined]
+    finally:
+        await store.close()
+    label = parse_audit_genesis_store_id(row["detail"])
+    assert label is not None and label.recovery_wrap is not None
+    opened = unwrap_master_key(
+        label.recovery_wrap, RecoveryKey.parse(console.shown_key()), blob.store_id
+    )
+    assert opened == blob.master_key
+
+
+def test_a_genesis_recovery_wrap_is_held_to_its_shape() -> None:
+    from messagefoundry.store import store as store_module
+
+    sid = b"\x01" * 16
+    wrap = b"\x02" * custody._WRAP_BYTES
+    assert store_module._AUDIT_RECOVERY_WRAP_HEX.pattern == f"[0-9a-f]{{{2 * custody._WRAP_BYTES}}}"
+    label = parse_audit_genesis_store_id(audit_genesis_detail("k", sid, wrap))
+    assert label is not None and label.recovery_wrap == wrap and label.store_id == sid
+    with pytest.raises(ValueError, match="65 bytes"):
+        audit_genesis_detail("k", sid, wrap[:-1])
+    with pytest.raises(ValueError, match="beside a store id"):
+        audit_genesis_detail("k", b"", wrap)
+    good = audit_genesis_detail("k", sid, wrap)
+    for planted in (
+        good.replace(wrap.hex(), "zz"),
+        good.replace(f', "store_id": "{sid.hex()}"', ""),
+    ):
+        parsed = parse_audit_genesis_store_id(planted)
+        assert parsed is not None and parsed.refused, planted
+
+
+@host_file_platforms
+async def test_a_genesis_record_the_blob_key_does_not_verify_is_refused(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    blob = _mint(settings)
+    await _create(settings, blob)
+    # The store's id under another key: the record names the id, and is not this key's.
+    impostor = HostBlob(MasterKey.mint(), blob.store_id, (), blob.recovery_proved_at)
+    with pytest.raises(StoreIdPinRefused, match="does not verify"):
+        await open_store(settings, custody=impostor)
+
+
+def test_every_key_resolve_refuses_a_host_blob_beside_another_provider(tmp_path: Path) -> None:
+    from messagefoundry.store.keyprovider import resolve_key_provider
+
+    (tmp_path / "master.key").write_bytes(b"not read")
+    settings = _settings(tmp_path, key_provider="env", encryption_key="x")
+    with pytest.raises(HostCustodyRefused, match="master.key"):
+        resolve_key_provider(settings)
+
+
+@windows_only
+def test_a_read_that_may_not_convert_leaves_a_handoff_beside_the_host_file(
+    tmp_path: Path,
+) -> None:
+    blob = _proved_blob()
+    custody.write_host_file(tmp_path / "master.key", blob)
+    _handoff(tmp_path / "handoff.key", _proved_blob())  # another store's: refused if settled
+    assert load_host_custody(_settings(tmp_path), enforcing=True, convert=False, environ={}) == blob
+    assert (tmp_path / "handoff.key").exists()
+
+
+@windows_only
+def test_the_crash_rule_refuses_a_handoff_of_this_store_under_another_key(tmp_path: Path) -> None:
+    blob = _proved_blob()
+    custody.write_host_file(tmp_path / "master.key", blob)
+    _handoff(tmp_path / "handoff.key", HostBlob(MasterKey.mint(), blob.store_id))
+    with pytest.raises(HostCustodyRefused, match="another key"):
+        load_host_custody(_settings(tmp_path), enforcing=True, environ={})
+    assert (tmp_path / "handoff.key").exists()
+
+
+@windows_only
+def test_a_conversion_whose_read_back_differs_removes_the_host_file_it_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _handoff(tmp_path / "handoff.key", _proved_blob())
+    calls: list[Path] = []
+
+    def _read(path: Path) -> HostBlob:
+        calls.append(path)
+        if len(calls) == 1:  # the open's first look finds no host file
+            raise FileNotFoundError(path)
+        return _proved_blob()  # the read-back after the write opens to another blob
+
+    monkeypatch.setattr(custody, "read_host_file", _read)
+    with pytest.raises(HostCustodyRefused, match="does not open to the handoff"):
+        load_host_custody(_settings(tmp_path), enforcing=True, environ={})
+    assert (tmp_path / "handoff.key").exists() and not (tmp_path / "master.key").exists()
+
+
+def test_no_blob_is_reported_missing_before_the_account_is_judged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _refuse(**kw: object) -> None:
+        raise AssertionError("the account was judged before the files were looked for")
+
+    monkeypatch.setattr(custody_host, "non_local_account_reading", _refuse)
+    with pytest.raises(HostCustodyMissing):
+        load_host_custody(_settings(tmp_path), enforcing=True, environ={})

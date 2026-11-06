@@ -46,7 +46,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 from messagefoundry.custody_posture import (
     HOST_KEY_PROVIDER,
@@ -71,6 +71,7 @@ __all__ = [
     "HOST_PROVIDER",
     "HostCustodyMissing",
     "HostCustodyRefused",
+    "MintedCustody",
     "RecoveryKeyTerminal",
     "custody_directory",
     "foreign_custody_refusal",
@@ -86,6 +87,8 @@ HOST_PROVIDER = HOST_KEY_PROVIDER  # the one spelling, in the custody_posture le
 HOST_FILE_NAME, HANDOFF_FILE_NAME = CUSTODY_FILE_NAMES
 #: How many times the recovery key may be entered back before the mint stops, writing nothing.
 RECOVERY_KEY_ATTEMPTS = 3
+#: Clears the screen and, where the terminal honours it, its scrollback, before the read-back.
+_CLEAR_SCREEN = "\x1b[2J\x1b[3J\x1b[H"
 #: The HKDF label the store's data key is derived from the master key under, until slice S4 puts the
 #: master key over wrapped data keys (draft rule 6). The master key itself never seals data.
 _HOST_STORE_KEY_INFO = b"mefor/host-store-key/v1"
@@ -96,6 +99,15 @@ class HostCustodyRefused(KeyProviderError):
     :class:`~messagefoundry.store.keyprovider.KeyProviderError`, so every command that already
     reports an unresolved store key as "could not start" reports this the same way. The message
     names files, settings and accounts, never key material."""
+
+
+class MintedCustody(NamedTuple):
+    """What a mint made: the blob, the file it was written to, and the recovery wrap, which is not
+    secret and is kept in the new store's genesis record."""
+
+    blob: HostBlob
+    path: Path
+    recovery_wrap: bytes
 
 
 class HostCustodyMissing(HostCustodyRefused):
@@ -248,12 +260,14 @@ def host_store_key(blob: HostBlob) -> str:
     return base64.b64encode(hkdf.derive(blob.master_key.material())).decode("ascii")
 
 
-def store_pin(blob: HostBlob) -> StorePin:
-    """The store ids ``blob`` holds a store to: its current id, and every earlier one."""
+def store_pin(blob: HostBlob, recovery_wrap: bytes = b"") -> StorePin:
+    """The store ids ``blob`` holds a store to: its current id, and every earlier one, with the
+    recovery wrap a new store's genesis record keeps when the blob was just minted."""
     from messagefoundry.store.store import StorePin
 
     current = blob.store_id.value
-    return StorePin(current, frozenset({current, *(s.value for s in blob.earlier_store_ids)}))
+    accepted = frozenset({current, *(s.value for s in blob.earlier_store_ids)})
+    return StorePin(current, accepted, recovery_wrap)
 
 
 # --- reading, converting and settling at open -----------------------------------------------------
@@ -280,11 +294,13 @@ def _settle_left_handoff(handoff: Path, blob: HostBlob) -> None:
     from messagefoundry.store.custody import CustodyError, HandoffLeftBehind, consume_handoff_file
 
     def same_store(left: HostBlob) -> None:
-        if left.store_id != blob.store_id:
+        # The store id, and the key: a handoff that names this store under another key is not a
+        # copy of what the host file holds.
+        if left.store_id != blob.store_id or left.master_key != blob.master_key:
             raise CustodyError(
                 f"it names store id {left.store_id.hex()} and the host file names "
-                f"{blob.store_id.hex()}, so it is not this store's; remove it once you know why "
-                "it is there"
+                f"{blob.store_id.hex()}, or it holds another key, so it is not this store's; "
+                "remove it once you know why it is there"
             )
 
     try:
@@ -312,6 +328,9 @@ def _convert_handoff(host: Path, handoff: Path) -> HostBlob:
     def convert(blob: HostBlob) -> None:
         write_host_file(host, blob)
         if read_host_file(host) != blob:
+            # Removed, so the next start finds the handoff alone and converts again, rather than
+            # take this file for a copy the crash rule may keep.
+            host.unlink()
             raise CustodyError("the host file written does not open to the handoff's key")
 
     return consume_handoff_file(handoff, convert)
@@ -334,10 +353,15 @@ def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
 
     blob = _read_host(host)
     if blob is not None:
-        if os.path.lexists(handoff):
+        # A read that may not convert leaves a handoff beside the host file as it is.
+        if convert and os.path.lexists(handoff):
             _settle_left_handoff(handoff, blob)
         return blob
     if not os.path.lexists(handoff):
+        # An engine shard may have converted it between the two looks.
+        blob = _read_host(host)
+        if blob is not None:
+            return blob
         raise HostCustodyMissing(
             f"no host blob ({host}) and no handoff ({handoff}): no store key was minted for this "
             "store here. Run `messagefoundry provision-admin`, which mints it with the store"
@@ -354,11 +378,14 @@ def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
     except HandoffLeftBehind as exc:
         raise _refused("the handoff was converted, but", exc) from exc
     except _custody_errors() as exc:
-        raise _refused(
-            f"the handoff {handoff} could not be converted, and the start refuses rather than "
-            "run from it",
-            exc,
-        ) from exc
+        # An engine shard converting it at the same moment holds it, or has it pending delete;
+        # the host file it leaves is read below. With none there, the start refuses.
+        if not os.path.lexists(host):
+            raise _refused(
+                f"the handoff {handoff} could not be converted, and the start refuses rather than "
+                "run from it",
+                exc,
+            ) from exc
     blob = _read_host(host)
     if blob is None:
         raise HostCustodyMissing(f"the handoff {handoff} went away and left no host file")
@@ -403,6 +430,13 @@ def load_host_custody(
     process's custody observation; only a store open passes it, so a key read for another purpose
     (a backup, the upload cipher) never overwrites what the open found."""
     host, handoff = check_host_custody_settings(settings, environ=environ)
+    if not (os.path.lexists(host) or os.path.lexists(handoff)):
+        # Before the account is judged: no key is here for any account, and a command that mints
+        # one for another account (provision-admin --service-account) must learn that first.
+        raise HostCustodyMissing(
+            f"no host blob ({host}) and no handoff ({handoff}): no store key was minted for this "
+            "store here. Run `messagefoundry provision-admin`, which mints it with the store"
+        )
     account = non_local_account_reading(enforcing=enforcing)
     blob = _read_or_convert(host, handoff, convert=convert)
     if observe:
@@ -492,15 +526,17 @@ def mint_host_custody(
     terminal: RecoveryKeyTerminal,
     environ: Mapping[str, str] | None = None,
     now: Callable[[], float] = time.time,
-) -> tuple[HostBlob, Path]:
+) -> MintedCustody:
     """Mint a store's key custody, prove the recovery key, and write the blob (draft rules 1, 3, 4).
 
     Mints the master key, the store id and the recovery key; shows the recovery key once on
-    ``terminal``; and reads it back until an entry opens the recovery wrap to the master key. Only
-    then is anything written: the host blob in this account's own scope when ``service_account`` is
-    ``None``, else the machine-scope handoff for that account. Returns the blob, which records the
-    proof, and the file written. The caller creates the store with that blob, so its genesis record
-    is written with the blob's store id, and removes the file if the store cannot be created.
+    ``terminal``, waits for the person to say it is copied, clears the screen, and reads it back
+    until an entry opens the recovery wrap to the master key. Only then is anything written: the
+    host blob in this account's own scope when ``service_account`` is ``None``, else the
+    machine-scope handoff for that account. Returns the blob, which records the proof, the file
+    written and the recovery wrap. The caller creates the store with the blob and the wrap, so its
+    genesis record carries the blob's store id and keeps the wrap (``open_store(custody=...,
+    recovery_wrap=...)``).
 
     Raises what :func:`mint_target` raises before anything is minted; :class:`HostCustodyRefused`
     when the entries run out, writing nothing, or when a write is refused; ``FileExistsError`` when
@@ -531,6 +567,10 @@ def mint_host_custody(
         + "\n\n"
     )
     del recovery_key
+    # The entry must come from the copy kept, not from the screen: the key is cleared first.
+    terminal.show("Press Enter once the recovery key is copied off this host. ")
+    terminal.read()
+    terminal.show(_CLEAR_SCREEN)
     if not _prove_recovery_key(terminal, wrapped, master_key=master_key, store_id=store_id):
         raise HostCustodyRefused(
             f"the recovery key was not entered back in {RECOVERY_KEY_ATTEMPTS} tries, so it is not "
@@ -546,4 +586,4 @@ def mint_host_custody(
         raise
     except _custody_errors() as exc:
         raise _refused(f"the store key was not written to {target}", exc) from exc
-    return blob, target
+    return MintedCustody(blob, target, wrapped)

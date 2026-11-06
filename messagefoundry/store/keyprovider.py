@@ -148,8 +148,9 @@ class AutoKeyProvider:
 
 class HostKeyProvider:
     """``host`` — the store key derived from the key custody host blob (vault BACKLOG #3411). It
-    never converts a handoff: only a store open does that. ``posture`` is the caller's, and ``None``
-    counts as enforcing for the account check."""
+    converts a handoff as a store open does, since in the service it may be asked first (the upload
+    cipher is built before the store opens). ``posture`` is the caller's, and ``None`` counts as
+    enforcing for the account check."""
 
     def __init__(self, settings: StoreSettings, posture: HopPosture | None = None) -> None:
         self._settings = settings
@@ -162,9 +163,7 @@ class HostKeyProvider:
     def active_key(self) -> str:
         from messagefoundry.store.custody_host import host_store_key, load_host_custody
 
-        return host_store_key(
-            load_host_custody(self._settings, enforcing=self._enforcing, convert=False)
-        )
+        return host_store_key(load_host_custody(self._settings, enforcing=self._enforcing))
 
     def retired_keys(self) -> Sequence[str]:
         return ()
@@ -173,8 +172,9 @@ class HostKeyProvider:
 #: The ``[store].key_provider`` of the key custody host blob, spelled once in the leaf module.
 HOST_PROVIDER = HOST_KEY_PROVIDER
 
-#: Built-in providers — fully reproduce today's behavior, no external dependency. The ONE dispatch
-#: from a ``[store].key_provider`` name to its class: :func:`resolve_key_provider` builds from it and
+#: Built-in providers — fully reproduce today's behavior, no external dependency. The dispatch
+#: from a ``[store].key_provider`` name to its class for every provider but ``host``, which also
+#: takes the posture and is built in :func:`resolve_key_provider`: :func:`resolve_key_provider` builds from it and
 #: :func:`provider_key_file` asks it which file is loaded, so the two cannot name different providers.
 _BUILTIN_PROVIDER_CLASSES: dict[
     str, type[AutoKeyProvider] | type[EnvKeyProvider] | type[DpapiKeyProvider]
@@ -311,11 +311,17 @@ def resolve_key_provider(
     ``posture`` reaches an external provider only; the built-ins dial nothing. ``None`` counts as
     enforcing there."""
     name = settings.key_provider
+    if name == HOST_PROVIDER:
+        return HostKeyProvider(settings, posture)
+    # Every caller that resolves a key, not only a store open, refuses a host blob beside another
+    # provider (vault BACKLOG #3411).
+    from messagefoundry.store.custody_host import HostCustodyRefused, foreign_custody_refusal
+
+    if (refusal := foreign_custody_refusal(settings)) is not None:
+        raise HostCustodyRefused(refusal)
     builtin = _BUILTIN_PROVIDER_CLASSES.get(name)
     if builtin is not None:
         return builtin(settings)
-    if name == HOST_PROVIDER:
-        return HostKeyProvider(settings, posture)
     if name in _EXTERNAL_PROVIDERS:
         return _load_external_provider(name, settings, posture)
     raise KeyProviderError(

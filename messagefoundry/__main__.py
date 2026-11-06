@@ -107,7 +107,7 @@ if TYPE_CHECKING:
     from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
     from messagefoundry.pipeline.security_notify import SecurityEventNotifier
     from messagefoundry.store.base import AdminStore, Store
-    from messagefoundry.store.custody import HostBlob
+    from messagefoundry.store.custody_host import MintedCustody
     from messagefoundry.store.store import UserRecord
 
 
@@ -7058,10 +7058,28 @@ class _RecoveryKeyConsole:
         return sys.stdin.readline()
 
 
-def _discard_minted_custody(path: Path) -> None:
+def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseException) -> None:
     """Remove the host blob or handoff ``provision-admin`` minted when the store it was minted for
-    could not be created, so a second run can mint again. A file that cannot be removed is named
-    on stderr; its text never carries the key."""
+    could not be created, so a second run can mint again, but only where the open wrote nothing
+    under it: the store id pin refused (it refuses before any write), or a SQLite store whose file
+    was never made. Otherwise the store may already hold rows under that key, so the file is kept
+    and named on stderr. Neither text carries the key."""
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.store.base import _absent_sqlite_store
+    from messagefoundry.store.store import StoreIdPinRefused
+
+    nothing_written = isinstance(failure, StoreIdPinRefused) or (
+        store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None
+    )
+    if not nothing_written:
+        print(
+            f"WARNING: the store could not be created, and it may already hold rows under the "
+            f"store key minted for it, so that key is kept in {path}, and the recovery key shown "
+            "stays the one for it. Clear the failure and run the command again, or remove both "
+            "the store and that file to start over",
+            file=sys.stderr,
+        )
+        return
     try:
         path.unlink()
     except FileNotFoundError:
@@ -8698,6 +8716,31 @@ def _provision_admin(args: argparse.Namespace) -> int:
             store_slot.current = None
             await store.close()
 
+    async def server_store_absent() -> bool:
+        """Under the host key provider with no blob here: whether the server database holds no
+        store yet (vault BACKLOG #3411). Opened read-only under a throwaway blob nothing is written
+        with, so the store id pin answers: an empty audit chain, or no store at all, is absent; a
+        chain with a genesis record is a store this mint must not take. Connection and hop
+        refusals surface here, before the prompts, as the ordinary pre-check's do."""
+        from messagefoundry.store.custody import HostBlob, MasterKey, StoreId
+        from messagefoundry.store.store import StoreIdPinRefused
+
+        throwaway = HostBlob(MasterKey.mint(), StoreId.mint())
+        try:
+            store = await open_store(
+                settings.store,
+                read_only=True,
+                posture=posture,
+                keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
+                custody=throwaway,
+            )
+        except StoreNotFoundError:
+            return True
+        except (StoreIdPinRefused, CipherError):
+            return False
+        await store.close()
+        return True
+
     # The store key could not be resolved. The texts of these classes name settings, environment
     # variables and files, never a key (see `_key_unresolved`). Exit 2, as `rotate-key` exits on
     # the same errors: the store could not be opened, so the command could not start. Before
@@ -8720,8 +8763,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
             absent, exists = run_guarded(administrator_exists())
         except HostCustodyMissing:
             # A SQLite store that exists has no key here, and minting one cannot open it. A server
-            # database may hold no store yet; if it holds one, the store id pin refuses the mint.
-            if settings.store.backend is StoreBackend.SQLITE:
+            # database is asked, under a throwaway pin, whether it holds a store already.
+            if settings.store.backend is StoreBackend.SQLITE or not run_guarded(
+                server_store_absent()
+            ):
                 raise
             absent, exists = True, None
         if host_custody and absent:
@@ -8857,7 +8902,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
     write_started = False
     # Vault BACKLOG #3411: the minted blob, held in memory for the store's creation, and the file
     # it was written to, removed if the store cannot be created.
-    minted: tuple[HostBlob, Path] | None = None
+    minted: MintedCustody | None = None
 
     def after_the_key(refusal: str, before_write: str) -> str:
         """The text for a refusal the write's arms catch, after the key was shown (BACKLOG #5067).
@@ -8895,11 +8940,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 create=True,
                 posture=posture,
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-                custody=None if minted is None else minted[0],
+                custody=None if minted is None else minted.blob,
+                recovery_wrap=b"" if minted is None else minted.recovery_wrap,
             )
-        except BaseException:
+        except BaseException as exc:
             if minted is not None:
-                _discard_minted_custody(minted[1])
+                _discard_minted_custody(minted.path, settings.store, exc)
             raise
         try:
             if _store_key_configured(settings) and not store.cipher_info().encrypts:
@@ -8991,6 +9037,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except (HostCustodyRefused, FileExistsError, OSError) as exc:
             _emit_error(after_the_key(str(exc), str(exc)), as_json=args.json)
             return 2
+        print(
+            "The recovery key was entered back and opens the store key. Keep that copy off this "
+            "host: this engine never shows it again.",
+            file=sys.stderr,
+        )
 
     # No TrustAnchorError arm: the anchors are checked at the build, before the prompt (#2081).
     try:

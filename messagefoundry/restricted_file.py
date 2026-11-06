@@ -340,12 +340,10 @@ def local_account_domain_sid() -> str | None:
     if found is None:
         return None
     sid, use = found
-    if use == 3:  # SidTypeDomain: the host's account domain itself
-        return sid
-    if use == 9 and sid.upper().startswith(_ACCOUNT_DOMAIN_HEAD):
-        # A domain controller answers its own computer account; its domain is the SID less its RID.
-        return sid.rpartition("-")[0]
-    return None
+    # SidTypeDomain: the host's account domain itself. A domain controller answers its own computer
+    # account instead, and has no local accounts: its account domain is the domain's, so None, and
+    # every account reads as not local there.
+    return sid if use == 3 else None
 
 
 # --- the read check, before a key file is used ----------------------------------------------------
