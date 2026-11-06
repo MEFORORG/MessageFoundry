@@ -1194,6 +1194,7 @@ key, the account's second factor is a key the caller chose rather than one the e
 | An engine's replies to what the harness sends | The engine under test | `drivers/dimse.py`, `drivers/http.py`, `load/sender.py` |
 | What an engine delivers to a harness sink | The engine under test, and anything else that connects on loopback | `scenarios/http.py`, `sinks/dimse.py`, `sinks/email.py` |
 | Files a run or its operator wrote | A path on the command line, or a folder the run's processes share | `__main__.py`, `acceptance/runner.py`, `load/connscale/batchbox.py`, `load/coord.py`, `load/corpus.py`, `reconcile/compare.py` |
+| The HTTP sink's answers to its own start-time self-test | A throwaway server `self_test` starts in the same process on `127.0.0.1`, before the sink binds its port, serving this module's handler the fixed requests in `SELF_TEST_CASES`, so no peer chooses the bytes | `sinks/_http.py` |
 | Nothing | These only build or write the format | `acceptance/report.py`, `load/connscale/report.py`, `load/report.py`, `scenarios/_dimse_dataset.py` |
 
 `acceptance/runner.py` reads the JUnit file its own `pytest` child wrote, with the standard
