@@ -342,7 +342,7 @@ function Get-UninstallResidueNotice {
             if ($SecretsAceRemoved) {
                 $lines += "  Secrets entry    REMOVED - '$ServiceAccount' no longer has an entry on $SecretsDir."
             } else {
-                $lines += "  Secrets entry    '$ServiceAccount' still has read on $SecretsDir."
+                $lines += "  Secrets entry    '$ServiceAccount' still has an entry on $SecretsDir."
                 $lines += "                   Remove it with:"
                 $lines += "                     icacls `"$SecretsDir`" /remove:g `"$acePrincipal`""
             }
@@ -539,7 +539,7 @@ $appParameters = ""
 $appExe = ""
 $appStdout = ""
 $secretsDir = ""
-$svcKey ="HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+$svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
 try {
     $objectName = [string](Get-ItemProperty -Path $svcKey -Name ObjectName -ErrorAction Stop).ObjectName
 } catch {

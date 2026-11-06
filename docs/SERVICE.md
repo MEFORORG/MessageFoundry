@@ -323,6 +323,9 @@ Restart-Service MessageFoundry   # the running engine keeps its old settings unt
 
 **`set AppEnvironmentExtra` replaces the service's whole list of extra variables.** Pass every
 variable the service needs in one call, or the ones you leave out are gone at the next start.
+That includes the `MEFOR_SECRETS_DIRECTORY` entry the installer wrote: without it the engine reads
+no file in the secrets directory, and every secret moved there is missing, with no error naming
+the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentExtra`.
 **The store key does not go in that list:** the engine refuses to start with it there, because any
 local user can read the list. Use the DPAPI key file (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
@@ -627,11 +630,13 @@ environment.
   secret. The path is `-SecretsDir`, else the one the service already names, else
   `<DataDir>-secrets`, beside the data directory and not in it, so a backup of the data directory
   does not copy the plain files. The installer refuses a path that is a volume root, a junction, a
-  file or a folder holding a folder, or that is, holds or sits inside a folder the service or
-  Windows uses for something else. The directory starts empty: as an administrator, add one file
-  per setting, named as its variable, and restart the service. A rerun keeps every explicit grant
-  on the directory except the well-known broad groups, and warns about any it keeps; a grant you
-  rely on there must be explicit, not inherited. A folder above the directory that the installer
+  file or a folder holding a folder, or that is, holds or sits inside at least the data, log,
+  store, config, value-file and settings-file folders, NSSM's folder, the engine install, the
+  checkout, the Windows folder and Program Files. The directory starts empty: as an administrator, add one file
+  per setting, named as its variable, and restart the service. Each run removes every grant there
+  but SYSTEM's, Administrators' and the service account's, whose own grant it keeps, and warns
+  about any it could not remove. It refuses an existing directory it would adopt for the first time
+  while that holds files. A folder above the directory that the installer
   creates is administrator-only; one that already existed is yours to restrict, since the engine
   does not read it. `uninstall-service.ps1` leaves the directory and its files, names them, and
   with `-RemoveAccountAces` removes the account's entry there too. Which settings it supplies, the

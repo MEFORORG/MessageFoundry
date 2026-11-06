@@ -104,8 +104,8 @@ PHI at rest is protected in **two layers**, and the engine layer is **fail-close
   image layers. On k8s, inject via `secretKeyRef` (the manifests do this); enable **KMS envelope
   encryption** for etcd Secrets.
 - The `[store].key_provider` seam can source the store key from outside the host. Of its external
-  providers only `vault` is built, and it unwraps a wrapped key through HashiCorp Vault Transit. The
-  cloud-KMS providers are **not built yet**, so today, source the key from the secret manager into
+  providers only `vault` exists, and it unwraps a wrapped key through HashiCorp Vault Transit. The
+  cloud-KMS provider names were removed unbuilt (vault BACKLOG #2595), so source the key from the secret manager into
   `MEFOR_STORE_ENCRYPTION_KEY`. The `key_provider` row in
   [CONFIGURATION.md](CONFIGURATION.md#store--message-store--db) has the details, including a startup
   precondition on `vault`.

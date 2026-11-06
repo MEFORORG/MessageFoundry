@@ -6,6 +6,20 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **The Windows service installer creates the secrets directory.** `install-service.ps1` makes
+  `<DataDir>-secrets` (or `-SecretsDir`), restricted to SYSTEM, Administrators and the service
+  account, and adds `MEFOR_SECRETS_DIRECTORY` to the service's NSSM environment, keeping the
+  entries already there. The directory starts empty; the engine reads it as before, refusing it
+  when a broad group can reach it. `uninstall-service.ps1` names it and leaves it. See the secrets
+  directory bullet in [SERVICE.md](docs/SERVICE.md). (`BACKLOG #2595`)
+
+### Removed
+- **`[store].key_provider` no longer accepts `aws_kms`, `azure_kv`, `gcp_kms` or `pkcs11`.** None
+  was ever built, and each already failed closed at store open. Each is now refused as an unknown
+  name, and the keyless-store gate no longer counts one as a configured key. `vault` is the one
+  external provider. (`BACKLOG #2595`)
+
 ### Changed
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
   engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any

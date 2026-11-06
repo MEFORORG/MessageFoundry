@@ -1568,6 +1568,10 @@ def test_the_acl_calls_never_receive_the_literal_localsystem(tmp_path: Path) -> 
                 f"{fn} at line {call['line']} takes the nssm ObjectName value rather than the "
                 f"ACL-grant account; the two must stay separate: {call['text']}"
             )
+            # The secrets directory's preflight lock names no account at all: it runs before the
+            # account resolves, and grants SYSTEM and Administrators only.
+            if fn == "Set-SecretsDirAcl" and "-Account" not in call["text"]:
+                continue
             assert "$ServiceAccount" in call["text"], (
                 f"{fn} at line {call['line']} must take $ServiceAccount, which is EMPTY for the "
                 f"LocalSystem opt-out: {call['text']}"
@@ -1607,7 +1611,10 @@ def test_all_three_acl_sites_are_still_wired(tmp_path: Path) -> None:
     facts = _preflight_facts(tmp_path)
     for fn in _ACL_CALLS:
         calls = [c for c in facts["commands"] if c["name"] == fn]
-        assert len(calls) == 1, f"expected exactly one {fn} call, found {len(calls)}"
+        # The secrets directory is locked twice: admin-only when the preflight makes it, then with
+        # the account's read once the account resolves.
+        expected = 2 if fn == "Set-SecretsDirAcl" else 1
+        assert len(calls) == expected, f"expected {expected} {fn} call(s), found {len(calls)}"
 
 
 # --- the uninstaller's inventory of what it leaves (BACKLOG #1704) --------------------------------
@@ -2397,8 +2404,10 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
     is named to the service through the merging writer, never `nssm set AppEnvironmentExtra`."""
     facts = _preflight_facts(tmp_path)
     data = _sole_call(facts, "Set-SecureDataDirAcl")
-    lock = _sole_call(facts, "Set-SecretsDirAcl")
-    assert "-Path $SecretsDir" in lock["text"], lock["text"]
+    locks = [c for c in facts["commands"] if c["name"] == "Set-SecretsDirAcl"]
+    assert all("-Path $SecretsDir" in c["text"] for c in locks), locks
+    lock = next(c for c in locks if "-Account $ServiceAccount" in c["text"])
+    early = next(c for c in locks if "-Account" not in c["text"])
     assert lock["start"] > data["start"], "the secrets directory is restricted before the data dir"
     named = _sole_call(facts, "Set-ServiceEnvironmentValue")
     assert "MEFOR_SECRETS_DIRECTORY" in named["text"] and "$SecretsDir" in named["text"]
@@ -2424,8 +2433,9 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
         for c in facts["commands"]
         if c["name"] == "Invoke-Nssm" and "install" in c["text"]
     )
-    assert check["start"] < creates[0]["start"] < registered, (
-        "the secrets directory must be judged and made before the service registration changes"
+    assert check["start"] < creates[0]["start"] < early["start"] < registered, (
+        "the secrets directory must be judged, made and locked admin-only before the service "
+        "registration changes"
     )
     holds = next(a for a in facts["assignments"] if a["lhs"] == "SecretsHolds")["rhsText"]
     for other in ("$DataDir", "$LogDir", "$DbPath", "$Config", "$NssmDir", "$AppDirectory"):
@@ -2433,6 +2443,7 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
     assert "environments" in holds and "$ServiceConfig" in holds, holds
 
 
+@_windows_only
 def test_the_secrets_directory_path_rule(tmp_path: Path) -> None:
     """Get-LockPathProblem with -AllowMissing, as the installer calls it for -SecretsDir: a path
     that does not exist yet passes; a volume root, a folder holding a folder, and a path inside a
