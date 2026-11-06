@@ -1492,8 +1492,10 @@ _TOOLKIT_DIST = "messagefoundry-toolkit"
 #: The separately-versioned console distribution (ASVS 15.2.4).
 _WEBCONSOLE_DIST = "messagefoundry-webconsole"
 
-#: A ``python -m build`` call and the rest of its line. ``python3`` and ``python3.14`` count too.
-_BUILD_CALL = re.compile(r"\bpython[0-9.]*\s+-m\s+build\b([^\n]*)")
+#: A ``python -m build`` call and its flags, up to the end of the line or the next shell separator
+#: (``&&``, ``||``, ``;``, ``&``, ``|``), so a second build chained on the same line is its own match
+#: and the first call's flags do not leak into it. ``python3`` and ``python3.14`` count too.
+_BUILD_CALL = re.compile(r"\bpython[0-9.]*\s+-m\s+build\b([^\n;&|]*)")
 
 
 def _wheel_builds(shell: str) -> int:
@@ -1512,6 +1514,26 @@ def _wheel_builds(shell: str) -> int:
         if flags & {"--wheel", "-w"} or not flags & {"--sdist", "-s"}:
             count += 1
     return count
+
+
+@pytest.mark.parametrize(
+    ("shell", "expected"),
+    [
+        ("python -m build --wheel a && python -m build --wheel b", 2),
+        ("python -m build --wheel a || python -m build --wheel b", 2),
+        ("python -m build --wheel a; python -m build --wheel b", 2),
+        # The first call's --sdist must not leak into the bare build after the separator.
+        ("python -m build --sdist && python -m build", 1),
+    ],
+)
+def test_wheel_builds_counts_every_build_on_one_line(shell: str, expected: int) -> None:
+    """Two builds chained on one line are two wheels, each owing a smoke step.
+
+    Negative control for :func:`_wheel_builds`: when the captured flags ran to the end of the line,
+    ``a && b`` counted once, so the per-job ``len(smoke) == builds`` check would have accepted a
+    second wheel with no smoke step.
+    """
+    assert _wheel_builds(shell) == expected
 
 
 #: The harness distribution, which declares the toolkit beside the engine (ADR 0201 slice 7).
