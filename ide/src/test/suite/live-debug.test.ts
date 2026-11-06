@@ -565,18 +565,25 @@ suite("LiveDebugController trigger paths choose --show-phi (vault BACKLOG #1187)
 
   test("a trust grant re-runs Live once, masked, and does nothing while Live is off", async () => {
     const calls: boolean[] = [];
+    const errorsSeen: (string | null)[] = [];
+    let controller: LiveDebugController | undefined;
     const runner: TraceRunner = async (_s, _c, showPhi) => {
       calls.push(showPhi);
+      errorsSeen.push(controller?.["error"] ?? null);
       return [traceEntry({})];
     };
-    const controller = new LiveDebugController(runner, () => "/ws");
+    controller = new LiveDebugController(runner, () => "/ws");
     try {
       await controller.runWith(syntheticSample(), "/ws"); // choose the sample, masked
       await controller.onTrustGranted(); // Live is off: nothing runs (control)
       assert.deepStrictEqual(calls, [false]);
       await controller.toggle(); // Live on, masked
+      // What an untrusted run left behind; the host opens no folder, so the gate cannot be shut here.
+      controller["error"] = "workspace not trusted — live-debug disabled until you trust this workspace";
       await controller.onTrustGranted(); // vault BACKLOG #3166, PR 2390 note 1
       assert.deepStrictEqual(calls, [false, false, false], "the grant must re-run, never reveal");
+      assert.strictEqual(errorsSeen[2], null, "the gate's error must not show while the re-run runs");
+      assert.strictEqual(controller["error"], null);
       assert.strictEqual(controller.isShowingValues(), false);
     } finally {
       controller.dispose();

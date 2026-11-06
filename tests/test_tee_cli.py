@@ -431,7 +431,9 @@ def test_out_help_states_what_the_writer_does_to_the_file(command: str) -> None:
         "a read-only (0444) FILE is overwritten",
         "a hard link at FILE is broken",
         "a symbolic link at FILE is replaced",
-        "On Windows an existing FILE is written in place and keeps its access list",
+        "On Windows an existing FILE is written in place",
+        "keeps its access list and owner",
+        "a named stream such as /dev/stdout is written through",
     ):
         assert consequence in text, f"{command} --out help lacks {consequence!r}: {text}"
 

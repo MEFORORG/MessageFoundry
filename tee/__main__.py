@@ -143,12 +143,15 @@ def _parse_age(spec: str) -> float:
 
 
 # What ``export --out`` and ``anonymize-captures --out`` do to the file, stated where an operator
-# reads it (vault BACKLOG #3166 step 4). :func:`_write_owner_only` is the source of record.
+# reads it (vault BACKLOG #3166 step 4). It names at least the consequences an operator would
+# act on; :func:`_write_owner_only` is the source of record, and docs/TEE-RELAY.md the long form.
 _OUT_IN_PLACE_ON_WINDOWS = (
     "Lines end in LF on every OS, Windows included. On POSIX the file is created owner-only (0600), "
     "and an existing FILE is replaced rather than written into: a read-only (0444) FILE is "
     "overwritten, a hard link at FILE is broken, and a symbolic link at FILE is replaced, not "
-    "followed. On Windows an existing FILE is written in place and keeps its access list."
+    "followed; a named stream such as /dev/stdout is written through. On Windows an existing FILE "
+    "is written in place, through any link, and keeps its access list and owner; one it cannot "
+    "write is an error, never replaced."
 )
 
 

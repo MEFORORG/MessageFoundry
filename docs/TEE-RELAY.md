@@ -148,13 +148,18 @@ consequences follow from it:
   overwritten, a hard link at the path is broken (the other name keeps the old contents), and a
   symbolic link at the path is replaced rather than followed. A named stream such as `/dev/stdout`
   is written through. These hold for all three commands.
-* **`export` and `anonymize-captures` write LF line endings on every OS**, Windows included, so a
-  Windows `export` file no longer ends its lines in CRLF.
-* **On Windows, `export` and `anonymize-captures` write an existing file in place**, so it keeps its
-  access list and owner. A file this account may not write, or one marked read-only, is an error
-  and exit 1; it is never replaced. A new file takes its folder's access list.
+* **`export` and `anonymize-captures` write LF line endings on every OS**, Windows included. Before
+  vault BACKLOG #3166 a Windows `export` file ended its lines in CRLF.
+* **On Windows, `export` and `anonymize-captures` write an existing file in place**, as `write_text`
+  did before #3166. It keeps its access list and owner, whatever they hold, so a file another
+  account created there first stays that account's. A link at the path is written through, and a
+  dangling one creates the file it names. The write is not atomic, so a failure part way leaves the
+  file truncated or partly written. A file the open refuses is an error and exit 1, never replaced:
+  at least one this account may not write, a read-only, Hidden or System one, a directory, and one
+  another process holds open without write sharing. A new file takes its folder's access list.
 * **`compare` replaces an existing file on Windows too**, so the report takes its folder's access
-  list, whatever list the old file had. It writes the platform's line endings.
+  list, whatever list the old file had, and a link at the path is replaced, not followed. It
+  writes the platform's line endings.
 
 The POSIX replace and the LF line endings were accepted as behaviour changes by a Lander decision
 under the owner's driver rule (vault BACKLOG #3166), not by a standalone owner ruling.

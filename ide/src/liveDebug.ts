@@ -588,6 +588,10 @@ export class LiveDebugController implements vscode.CodeLensProvider, vscode.Disp
     if (!this.enabled || isExecGated()) {
       return;
     }
+    // The gate's error is stale once trust is granted, so it must not show while the re-run runs.
+    this.error = null;
+    this.updateStatus();
+    this.changed.fire();
     await this.run(false);
   }
 
