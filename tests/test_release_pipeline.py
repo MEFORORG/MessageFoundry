@@ -870,15 +870,11 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
     # versioned console) was added — a guard that must be edited whenever the thing it guards grows is
     # a guard that gets its number bumped without thought. The property worth pinning is "EVERY wheel
     # smoke normalises", so derive the expected set of smokes rather than a literal.
-    # The same count section (8) uses, over each step's raw `run:` text: a bare `python -m build`
-    # (the engine's) produces a wheel too, so it owes a smoke like any other (BACKLOG #1583). Per
-    # step, not over the whole file, so a step's `name:` or `with:` prose cannot demand a smoke.
-    wheel_builds = sum(
-        _wheel_builds(str(step.get("run") or ""))
-        for job in _jobs().values()
-        for step in (job.get("steps") or [])
-        if isinstance(step, dict)
-    )
+    # The same count section (8) uses: a bare `python -m build` (the engine's) produces a wheel too,
+    # so it owes a smoke like any other (BACKLOG #1583). Over every string in the PARSED workflow,
+    # `with:`, `env:` and `name:` included, so it never counts below main's whole-file count; only a
+    # YAML comment, which runs nothing, is outside it (:func:`_builds_in` says why).
+    wheel_builds = _builds_in(_workflow())
     assert wheel_builds >= 4, (
         f"expected the engine, toolkit, console and harness wheel builds, found {wheel_builds}"
     )
@@ -938,10 +934,14 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
 
 
 @functools.cache
-def _jobs() -> dict:
+def _workflow() -> dict:
     import yaml
 
-    return yaml.safe_load(RELEASE_YML.read_text(encoding="utf-8"))["jobs"]
+    return yaml.safe_load(RELEASE_YML.read_text(encoding="utf-8"))
+
+
+def _jobs() -> dict:
+    return _workflow()["jobs"]
 
 
 def test_the_console_and_engine_tag_namespaces_are_mutually_exclusive() -> None:
@@ -1520,21 +1520,45 @@ def _wheel_builds(shell: str) -> int:
     the moment to decide how to tell it apart.
 
     It overcounts in at least these cases, all in the safe direction (a demand for a smoke step
-    nothing runs reds the test; it never lets a wheel through): a build named in a comment, a quoted
-    string, a heredoc body or a ``bash -c`` argument, and an sdist-only build. It undercounts in at
-    least one, which main's count shares: a build inside a shell loop runs many times and counts
-    once. Other front ends (``pyproject-build``, ``uv build``, ``hatch build``) are not recognised;
+    nothing runs reds the test; it never lets a wheel through): a build named in a comment or in a
+    string nothing executes, and an sdist-only build. A build in a heredoc body or a ``bash -c``
+    argument is counted too, and is a real build whenever that text reaches a shell, so it is not
+    an overcount there. It undercounts in at least one, which main's count shares: a build inside a
+    shell loop runs many times and counts once. Other front ends (``pyproject-build``, ``uv build``, ``hatch build``) are not recognised;
     the release workflow runs none, and the floor in :func:`_wheel_smoke_steps` names every
     distribution it ships, so a wheel built another way still has to be added there.
 
-    Pass a step's RAW ``run`` text, never :func:`_executed_shell`'s, which drops comment lines main
-    counted. Pass one step's ``run``, not the whole workflow, so a step's ``name:`` or ``with:``
-    prose cannot demand a smoke step.
+    Pass RAW text, never :func:`_executed_shell`'s, which drops comment lines main counted. The
+    callers reach it through :func:`_builds_in`, which hands it every string in the parsed workflow
+    rather than each step's ``run:`` alone.
     """
     return sum(
         max(line.count("python -m build"), len(_BUILD_CALL.findall(line)))
         for line in shell.split("\n")
     )
+
+
+def _builds_in(value: object) -> int:
+    """Every build :func:`_wheel_builds` counts in ANY string of a parsed workflow node, recursively.
+
+    Main counted ``count("python -m build --wheel")`` over the whole raw file, so it saw a build in
+    a step's ``with:`` (a retry action's ``command:``), its ``env:``, its ``name:``, and anything a
+    job or the workflow holds outside its steps. A count over each step's ``run:`` alone saw none of
+    those, and a build there could ship a wheel with no smoke step. So this walks every value, and
+    every string key, of whatever node it is given, and sums :func:`_wheel_builds` over each string
+    separately. A parsed scalar holds every occurrence its raw text held, so the only text main saw
+    that this does not is a YAML comment, which no runner executes.
+
+    Strings in a ``name:`` or in prose count too. That overcount only demands a smoke step nothing
+    runs, which reds the per-job and total checks; it never lets a wheel through.
+    """
+    if isinstance(value, str):
+        return _wheel_builds(value)
+    if isinstance(value, dict):
+        return sum(_builds_in(k) + _builds_in(v) for k, v in value.items())
+    if isinstance(value, list):
+        return sum(_builds_in(v) for v in value)
+    return 0
 
 
 #: ``(shell, expected)`` for :func:`test_wheel_builds_counts_every_build_on_one_line`, by id.
@@ -1579,7 +1603,8 @@ def test_wheel_builds_counts_every_build_on_one_line(shell: str, expected: int) 
 
 
 #: Inputs on which an earlier, lexing version of :func:`_wheel_builds` counted FEWER builds than
-#: main's ``count("python -m build --wheel")``. Seen red at 1e637e1ee0 on the first three.
+#: main's ``count("python -m build --wheel")``. Seen red at 1e637e1ee0 on five: the first three,
+#: the sixth and the seventh.
 _FLOOR_CASES = [
     "x=$(pwd)#y; python -m build --wheel",
     "cat <<EOF\na #b python -m build --wheel\nEOF",
@@ -1602,6 +1627,39 @@ def test_wheel_builds_never_counts_fewer_than_mains_substring_count(shell: str) 
     assert _wheel_builds(shell) >= shell.count("python -m build --wheel")
 
 
+#: Steps whose only build is OUTSIDE ``run:``. Main's whole-file ``count("python -m build --wheel")``
+#: saw each one; a count over each step's ``run:`` text alone saw none (red at 31ec7e1e67).
+_VALUE_FLOOR_CASES = [
+    pytest.param(
+        {"uses": "nick-fields/retry@v3", "with": {"command": "python -m build --wheel ./x"}},
+        id="with-command",
+    ),
+    pytest.param(
+        {"uses": "some/action@v1", "with": {"args": ["--x", "python -m build --wheel ./x"]}},
+        id="with-nested-list",
+    ),
+    pytest.param(
+        {"env": {"BUILD": "python -m build --wheel ./x"}, "run": "$BUILD"},
+        id="env-value",
+    ),
+]
+
+
+@pytest.mark.parametrize("step", _VALUE_FLOOR_CASES)
+def test_builds_in_counts_a_build_in_any_value_of_a_step(step: dict) -> None:
+    """A build a step runs from ``with:`` or ``env:`` still owes a smoke step.
+
+    Main counted ``count("python -m build --wheel")`` over the whole file, which saw a retry
+    action's ``with: command:``. The callers then counted each step's ``run:`` text only, so such a
+    build counted 0 and its wheel could ship with no smoke step.
+    """
+    import yaml
+
+    dumped = yaml.safe_dump(step, width=10_000)
+    assert dumped.count("python -m build --wheel") == 1  # the input is what main would have seen
+    assert _builds_in(step) == 1
+
+
 #: The harness distribution, which declares the toolkit beside the engine (ADR 0201 slice 7).
 _HARNESS_DIST = "messagefoundry-harness"
 
@@ -1612,8 +1670,8 @@ def _wheel_smoke_steps() -> dict[str, dict]:
 
     KEYED BY DISTRIBUTION, NOT JOB, SINCE ADR 0201. The toolkit wheel is built and smoked inside the
     engine's `release` job, so one job holds two smoke steps: the engine's and the toolkit's. A
-    job-keyed map could not hold both. A job whose executed shell runs N wheel-producing builds
-    (:func:`_wheel_builds`) must carry exactly N PYSMOKE smoke steps.
+    job-keyed map could not hold both. A job whose values name N wheel-producing builds, in any
+    step field or outside its steps (:func:`_builds_in`), must carry exactly N PYSMOKE smoke steps.
 
     DERIVED from the build commands, never a list of job names, for the same reason
     :func:`test_both_wheel_smokes_compare_versions_not_strings` counts instead of pinning a number:
@@ -1622,9 +1680,10 @@ def _wheel_smoke_steps() -> dict[str, dict]:
 
     The engine job builds with a bare ``python -m build`` (sdist AND wheel). Until BACKLOG #1583 this
     predicate keyed on ``--wheel`` alone, which is how the engine smoke stayed outside the section;
-    a bare build produces a wheel too, so it counts. Counted over each step's RAW ``run`` text,
-    comments included, so the count is never below main's; a comment quoting a build command now
-    demands a smoke step, which is the safe direction (:func:`_wheel_builds` says why).
+    a bare build produces a wheel too, so it counts. Counted over every string the job holds,
+    shell comments included, so the count is never below main's; a comment or a step name quoting
+    a build command now demands a smoke step, which is the safe direction (:func:`_builds_in` says
+    why).
 
     Cached: three ``@pytest.mark.parametrize`` decorators call this at COLLECTION time and every
     execution test calls it again, and it is a pure function of one file. Callers only read the
@@ -1638,7 +1697,7 @@ def _wheel_smoke_steps() -> dict[str, dict]:
     found: dict[str, dict] = {}
     for name, job in _jobs().items():
         steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
-        builds = sum(_wheel_builds(str(s.get("run") or "")) for s in steps)
+        builds = _builds_in(job)
         if not builds:
             continue
         smoke = [
