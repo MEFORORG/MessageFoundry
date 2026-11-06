@@ -6243,3 +6243,24 @@ async def test_webauthn_rehash_contract(store) -> None:
     from tests._webauthn_store_contract import _assert_webauthn_rehash_contract
 
     await _assert_webauthn_rehash_contract(store)
+
+
+async def test_table_occupancy_reads_the_store_schema_and_counts_a_connection_event(
+    store,
+) -> None:
+    # PR 2804 hold (A): the mint's server probe reads every table in the store's schema from the
+    # catalog, so a connection event alone holds data. The positive control is that the catalog
+    # read lists the store's own tables; the fixture emptied connection_event, so it reads False.
+    from messagefoundry.store.custody_host import store_holds_data
+
+    before = await store.table_occupancy()
+    assert {"messages", "message_events", "audit_log", "users", "connection_event", "sessions"} <= (
+        set(before)
+    )
+    assert before["connection_event"] is False
+    await store.record_connection_event(
+        connection="IB_TEST_ADT", transport="mllp", direction="inbound", kind="established"
+    )
+    after = await store.table_occupancy()
+    assert after["connection_event"] is True
+    assert await store_holds_data(store)

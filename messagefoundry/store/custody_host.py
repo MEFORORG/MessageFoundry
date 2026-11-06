@@ -46,7 +46,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Final, NamedTuple, Protocol
 
 from messagefoundry.custody_posture import (
     HOST_KEY_PROVIDER,
@@ -74,6 +74,7 @@ __all__ = [
     "HostCustodyRefused",
     "MintedCustody",
     "RecoveryKeyTerminal",
+    "SCHEMA_BOOKKEEPING_TABLES",
     "custody_directory",
     "foreign_custody_refusal",
     "host_store_key",
@@ -498,13 +499,32 @@ def load_host_custody(
     return blob
 
 
+#: The tables an open seeds or keeps by itself, before anything uses the store, so a row in them is
+#: not data: ``schema_meta`` (a server store's schema hash) and ``global_session_epoch`` (the
+#: session epoch's singleton row, seeded at epoch 0). Every other table counts.
+SCHEMA_BOOKKEEPING_TABLES: Final = frozenset({"schema_meta", "global_session_epoch"})
+#: Tables every backend's schema has. A catalog read that does not list all of them did not see
+#: the store's schema (another schema resolved first, or a permission hid it), so it proves
+#: nothing about what the store holds.
+_STORE_CORE_TABLES: Final = frozenset({"messages", "message_events", "audit_log", "users"})
+
+
 async def store_holds_data(store: Store) -> bool:
-    """Whether an opened store holds anything a mint must not take over: a message, a connection
-    event, an audit row or a user. A server database with an empty audit chain may still be a
-    store that ran keyless, so an empty chain alone does not make it absent (vault BACKLOG
-    #3411). Counts only, so a probe opened under a throwaway key decrypts nothing."""
-    status = await store.db_status()
-    return bool(status.messages or status.events or status.audit or await store.count_users())
+    """Whether an opened store holds anything a mint must not take over. A server database with
+    an empty audit chain may still be a store that ran keyless, so an empty chain alone does not
+    make it absent (vault BACKLOG #3411).
+
+    Counted: every table :meth:`Store.table_occupancy` reads from the database's own catalog, so a
+    table this build does not name still counts. Excluded: only
+    :data:`SCHEMA_BOOKKEEPING_TABLES`. Any row in any other table holds data. Fails closed: a
+    catalog read that does not list every table in :data:`_STORE_CORE_TABLES` holds data, and an
+    unreadable table or a query error raises rather than reading as empty. Counts only, so a
+    probe opened under a throwaway key decrypts nothing."""
+    occupancy = await store.table_occupancy()
+    if not _STORE_CORE_TABLES.issubset(name.casefold() for name in occupancy):
+        return True
+    held = {name.casefold() for name, rows in occupancy.items() if rows}
+    return bool(held - SCHEMA_BOOKKEEPING_TABLES)
 
 
 # --- the mint -------------------------------------------------------------------------------------

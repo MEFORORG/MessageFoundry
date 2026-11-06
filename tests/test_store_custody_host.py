@@ -28,7 +28,7 @@ from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.custody_posture import KeyCustodyPosture, key_custody_loosenings
 from messagefoundry.store import custody, custody_host
-from messagefoundry.store.base import open_store
+from messagefoundry.store.base import Store, open_store
 from messagefoundry.store.custody import (
     HostBlob,
     MasterKey,
@@ -807,6 +807,151 @@ async def test_a_store_with_data_and_an_empty_chain_is_not_absent(tmp_path: Path
         assert await store_holds_data(store)
     finally:
         await store.close()
+
+
+async def _keyless_store(path: Path) -> Store:
+    return await open_store(StoreSettings(path=str(path)), create=True, keyless_chain_refusal=None)
+
+
+async def test_a_connection_event_alone_makes_a_store_hold_data(tmp_path: Path) -> None:
+    # PR 2804 hold (A): the probe counted messages, message events, audit rows and users only, so
+    # a store with an empty chain and data in any other table read as absent.
+    from messagefoundry.store.custody_host import store_holds_data
+
+    store = await _keyless_store(tmp_path / "keyless.db")
+    try:
+        assert not await store_holds_data(store)
+        await store.record_connection_event(
+            connection="IB_TEST_ADT", transport="mllp", direction="inbound", kind="established"
+        )
+        assert await store_holds_data(store)
+    finally:
+        await store.close()
+
+
+async def test_a_row_in_a_table_the_store_never_made_holds_data(tmp_path: Path) -> None:
+    # PR 2804 hold (A): the tables are read from the database's own catalog, so a table this build
+    # does not know of still counts, and a table added later cannot be missed by a hand-kept list.
+    import sqlite3
+
+    from messagefoundry.store.custody_host import store_holds_data
+
+    path = tmp_path / "keyless.db"
+    store = await _keyless_store(path)
+    await store.close()
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE added_later (x INTEGER)")
+        conn.execute("INSERT INTO added_later (x) VALUES (1)")
+    conn.close()
+    store = await open_store(StoreSettings(path=str(path)), keyless_chain_refusal=None)
+    try:
+        occupancy = await store.table_occupancy()
+        assert occupancy["added_later"] is True
+        assert await store_holds_data(store)
+    finally:
+        await store.close()
+
+
+async def test_a_fresh_store_holds_only_the_bookkeeping_it_seeds(tmp_path: Path) -> None:
+    # The negative arm of the census: every table but the named bookkeeping is empty on a store
+    # nothing has used, so the exclusion list is what keeps a fresh store absent.
+    from messagefoundry.store.custody_host import SCHEMA_BOOKKEEPING_TABLES
+
+    store = await _keyless_store(tmp_path / "keyless.db")
+    try:
+        occupancy = await store.table_occupancy()
+    finally:
+        await store.close()
+    assert {"messages", "message_events", "audit_log", "users", "connection_event"} <= set(
+        occupancy
+    )
+    assert {name for name, held in occupancy.items() if held} <= SCHEMA_BOOKKEEPING_TABLES
+
+
+async def test_a_census_that_cannot_see_the_store_tables_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Fail closed: a catalog read that misses the store's own tables (a schema the connection does
+    # not resolve to, a permission that hides them) holds data, and a query error is never empty.
+    import sqlite3
+
+    from messagefoundry.store.custody_host import store_holds_data
+
+    store = await _keyless_store(tmp_path / "keyless.db")
+    try:
+        seen = dict(await store.table_occupancy())
+        assert not await store_holds_data(store)  # the control: the real census reads absent
+
+        async def _blind() -> dict[str, bool]:
+            return {}
+
+        async def _partial() -> dict[str, bool]:
+            return {name: held for name, held in seen.items() if name != "users"}
+
+        async def _broken() -> dict[str, bool]:
+            raise sqlite3.OperationalError("no such table: stand-in")
+
+        for census in (_blind, _partial):
+            monkeypatch.setattr(store, "table_occupancy", census)
+            assert await store_holds_data(store)
+        monkeypatch.setattr(store, "table_occupancy", _broken)
+        with pytest.raises(sqlite3.OperationalError):
+            await store_holds_data(store)
+    finally:
+        monkeypatch.undo()
+        await store.close()
+
+
+def test_provision_admin_refuses_a_mint_over_a_server_store_with_only_connection_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # PR 2804 hold (A), end to end: the server probe opens a store with an empty chain whose only
+    # data is a connection event, and the mint is refused before any prompt or key file.
+    import asyncio
+
+    from messagefoundry.__main__ import main
+    from messagefoundry.store import base
+
+    held = tmp_path / "held.db"
+
+    async def _seed() -> None:
+        store = await _keyless_store(held)
+        try:
+            await store.record_connection_event(
+                connection="IB_TEST_ADT", transport="mllp", direction="inbound", kind="established"
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(_seed())
+    real_open = base.open_store
+    probes: list[bool] = []
+
+    async def _open(settings: StoreSettings, **kwargs: object) -> Store:
+        if kwargs.get("custody") is not None:  # the server probe, under its throwaway blob
+            probes.append(bool(kwargs.get("read_only")))
+            return await real_open(
+                StoreSettings(path=str(held)), read_only=True, keyless_chain_refusal=None
+            )
+        raise HostCustodyMissing("no host blob and no handoff here (stand-in)")
+
+    monkeypatch.setattr(base, "open_store", _open)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text(
+        '[store]\nbackend = "postgres"\nkey_provider = "host"\n'
+        'server = "db.invalid"\ndatabase = "mefor"\nusername = "mefor"\n'
+    )
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
+    # No terminal: a mint that went ahead would stop at the terminal check, not this refusal.
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    assert main(argv) != 0
+    err = capsys.readouterr().err
+    assert probes == [True], err  # the server probe ran, under a read-only open
+    assert "the store already exists" in err and "Traceback" not in err
+    assert list(secrets.iterdir()) == []  # no host blob, no handoff
 
 
 @host_file_platforms

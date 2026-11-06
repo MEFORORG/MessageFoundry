@@ -16071,6 +16071,24 @@ class SqlServerStore:
             synchronous=None,  # SQLite-only knob; SQL Server durability rides journal_mode (recovery model)
         )
 
+    async def table_occupancy(self) -> dict[str, bool]:
+        """See :meth:`Store.table_occupancy`: the user tables in ``SCHEMA_ID()``, the default
+        schema the store's unqualified names resolve to, read from ``sys.tables``, each probed for
+        one row through its bracket-quoted, schema-qualified name. ``sys.tables`` lists only
+        tables the login has some permission on, so a table hidden from it is one the store
+        could not read either."""
+        rows = await self._fetchall(
+            "SELECT SCHEMA_NAME(t.schema_id) AS s, t.name AS t FROM sys.tables t"
+            " WHERE t.schema_id = SCHEMA_ID()"
+        )
+        occupancy: dict[str, bool] = {}
+        for row in rows:
+            schema, table = str(row["s"]), str(row["t"])
+            qualified = ".".join("[" + name.replace("]", "]]") + "]" for name in (schema, table))
+            held = await self._fetchone(f"SELECT TOP (1) 1 AS held FROM {qualified}")
+            occupancy[table] = held is not None
+        return occupancy
+
     async def integrity_check(self) -> tuple[bool, str]:
         # A connectivity/consistency probe; deep checks (DBCC CHECKDB) are an out-of-band DBA task.
         await self._fetchone("SELECT 1 AS ok")

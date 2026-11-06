@@ -11464,6 +11464,27 @@ class PostgresStore:
             synchronous=None,  # SQLite-only knob; Postgres WAL durability is not a per-store PRAGMA
         )
 
+    async def table_occupancy(self) -> dict[str, bool]:
+        """See :meth:`Store.table_occupancy`: the ordinary and partitioned tables in
+        ``current_schema()``, read from ``pg_catalog`` by the stored name (not re-parsed as an
+        identifier, as the privilege census reads it), each probed for one row. Each probe names
+        the schema too, because an unqualified name would resolve through ``pg_catalog`` first.
+        No schema on the search path reads as no tables, which the caller must not take as
+        empty."""
+        rows = await self._fetchall(
+            "SELECT n.nspname AS s, c.relname AS t FROM pg_catalog.pg_class c"
+            " JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+            " WHERE n.nspname = current_schema() AND c.relkind IN ('r', 'p')"
+        )
+        occupancy: dict[str, bool] = {}
+        for row in rows:
+            schema, table = str(row["s"]), str(row["t"])
+            qualified = ".".join('"' + name.replace('"', '""') + '"' for name in (schema, table))
+            occupancy[table] = bool(
+                await self._fetchval(f"SELECT EXISTS (SELECT 1 FROM {qualified})")
+            )
+        return occupancy
+
     async def integrity_check(self) -> tuple[bool, str]:
         # A connectivity probe; deep checks (amcheck / pg_amcheck) are an out-of-band DBA task.
         await self._fetchone("SELECT 1 AS ok")

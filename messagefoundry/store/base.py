@@ -1814,6 +1814,17 @@ class QueueStore(StoreLifecycle, Protocol):
     # --- store health / metrics ----------------------------------------------
     async def db_status(self) -> DbStatus: ...
 
+    async def table_occupancy(self) -> Mapping[str, bool]:
+        """Every table in the store's own schema, read from the database's catalog rather than
+        from this build's DDL, mapped to whether it holds at least one row. The store's schema is
+        the SQLite file's main schema (less SQLite's internal ``sqlite_*`` tables), Postgres's
+        ``current_schema()`` (the pool's ``search_path``), and SQL Server's ``SCHEMA_ID()`` (the
+        connection's default schema). Names are as the catalog stores them. A table the
+        connection cannot read raises; nothing is reported as empty that was not read. Counts
+        only, never a cell, so an open under a throwaway key decrypts nothing (vault BACKLOG
+        #3411)."""
+        ...
+
     def pool_status(self) -> PoolStatus | None:
         """A read-only snapshot of this backend's connection pool, or ``None`` on a backend with no
         pool (SQLite). The **server-only** observability surface behind ``/status``'s additive ``pool``
