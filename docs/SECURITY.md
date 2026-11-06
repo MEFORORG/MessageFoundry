@@ -4836,13 +4836,13 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   epoch raise, at least an administrator's revoke of a user's sessions, a role change and a
   password reset. So a rotation either commits before the
   sweep locks the account's row, and the sweep reads the new key, or waits until the sweep
-  commits and then finds the session ended. Where the account's record fails its seal, an
-  administrator's revoke of a user's sessions and the every-account revoke still end its
-  sessions, and the order holds for them too, because the raise reads the row under that lock
-  before it checks the seal. That the order holds there was read from the code and not run;
-  `test_session_seal_contract`, in `tests/test_sqlserver_store.py`, runs the per-account revoke
-  ending such an account's sessions. At least a bind, an unbind, a TOTP re-enrolment, a role
-  change and a password reset of such an account end no session; that was read from the code. The
+  commits and then finds the session ended. Where the account's record fails its seal, at least
+  an administrator's revoke of a user's sessions and the every-account revoke still end its
+  sessions, and for those two the order holds too, because the raise reads the row under that
+  lock before it checks the seal. That the order holds there was read from the code and not run;
+  the tests that run those revokes on such an account are named further down this bullet. At
+  least a bind, an unbind, a TOTP re-enrolment, an administrator's role change and a password
+  reset of such an account end no session; that was read from the code. The
   every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) takes
   the row of each account its read of the account list returns before its table-wide sweep, so
   the same holds for those accounts. Its sweep also reaches the sessions of an account created
@@ -4851,8 +4851,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   its next presentation. A sweep that takes no account row is not ordered against a rotation
   either, at least the session cap's trim. The trim raises no epoch, so a session a rotation
   carries past it on SQL Server is not refused later: it stays live, over the cap, until
-  something else ends it, at least a later trim, a logout, a whole-account sweep or its own
-  expiry. The Postgres store's rotation takes no account row: its
+  something else ends it, at least a logout, a whole-account sweep, its own expiry, or a later
+  trim that ranks it past the cap. The Postgres store's rotation takes no account row: its
   sweep waits on the rotated row and then re-checks that row's newest version, which still
   matches. The SQLite store runs one writer at a time. `test_rotation_racing_a_sweep_is_swept`,
   in `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py`, runs the shared body in
