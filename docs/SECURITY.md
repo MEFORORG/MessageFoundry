@@ -4831,27 +4831,29 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   depending on the query plan. Its rotation now takes the
   account's row under `UPDLOCK` before the session row, the order each whole-account sweep there
   read for this takes them in. The unbind takes that row first through its own prior-pair
-  `UPDLOCK` read in `clear_user_federated_subject`, before its account write. Every bind first
-  runs `clear_user_federated_subject`'s transaction, which takes the row through that same
-  prior-pair read; on a rebind that transaction sweeps, and on a first bind it writes nothing.
-  The bind's own write then takes the row through the account write, and sweeps. The TOTP re-enrolment takes it through the account write too, and the
-  whole-account revokes through the epoch raise, at least an administrator's revoke of a user's
+  `UPDLOCK` read in `clear_user_federated_subject`, before its account write. A bind that passes
+  its own checks first runs `clear_user_federated_subject`'s transaction, which takes the row
+  through that same prior-pair read; on a rebind, that transaction sweeps, and on a first bind
+  it writes nothing. The bind's own write then takes the row through the account write, and
+  sweeps where that write lands. The TOTP re-enrolment takes it through the account write too,
+  and the whole-account revokes through the epoch raise, at least an administrator's revoke of a
+  user's
   sessions, a role change and a password reset. So a rotation either commits before the
   sweep locks the account's row, and the sweep reads the new key, or waits until the sweep
   commits and then finds the session ended. Where the account's record fails its seal, at least
   an administrator's revoke of a user's sessions and the every-account revoke still end its
   sessions, and for those two the order holds too, because the raise reads the row under that
   lock before it checks the seal. That the order holds there was read from the code and not run.
-  That the every-account revoke still ends such an
-  account's sessions is run, by the contracts in `tests/test_b2614_revoke_all.py` and
-  `tests/test_b5091_global_session_epoch.py`, which `test_every_account_revoke_contracts` runs on
-  both server legs; that the administrator's revoke of a user's sessions does was read from the
-  code and not run. The per-user revoke's other form, behind a user's own sign-out of their
-  other sessions, is run on such an account, where it ends the caller's session too, by the body
-  in `tests/_session_seal_contract.py`, which `test_session_seal_contract` runs on both server
-  legs. At
-  least a bind, an unbind, a TOTP re-enrolment, an administrator's role change and a password
-  reset of such an account end no session; that was read from the code. The
+  The every-account revoke is run on such an account by the contracts in
+  `tests/test_b2614_revoke_all.py`, which reads back the session it ended, and
+  `tests/test_b5091_global_session_epoch.py`, which finds that account's session refused once
+  the record verifies again; `test_every_account_revoke_contracts` runs both on both server legs. That the
+  administrator's revoke of a user's sessions still ends such an account's sessions was read
+  from the code and not run. The per-account revoke's other form, which spares the caller's
+  session, is run on such an account as a store call, where it ends that session too, by the
+  body in `tests/_session_seal_contract.py`, which `test_session_seal_contract` runs on both
+  server legs. At least a bind, an unbind, a TOTP re-enrolment, an administrator's role change
+  and a password reset of such an account end no session; that was read from the code. The
   every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) takes
   the row of each account its read of the account list returns before its table-wide sweep, so
   the same holds for those accounts. Its sweep also reaches the sessions of an account created
