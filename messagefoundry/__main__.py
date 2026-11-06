@@ -2590,6 +2590,13 @@ def _remote_debug_refused(
     refused = remote_debug_refusal(posture) if enforcing else None
     if refused is None:
         return False
+    # Vault BACKLOG #3795: the residual line follows this gate, so without this a refused start
+    # would not say that the engine's hook did not answer. The relaunch the refusal names turns
+    # the interface off, and would leave what stopped the hook unreported.
+    if not posture.guard_installed and (unguarded := remote_debug_loosening(posture)) is not None:
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *unguarded
+        )
     print(f"error: refusing to {what}: {refused}.", file=sys.stderr)
     return True
 
@@ -5241,8 +5248,8 @@ def _supervise(args: argparse.Namespace) -> int:
 
     # Vault BACKLOG #2701: the start-up code check each engine shard's `serve` makes, for the same
     # reason as the gates around it, and because the supervisor's own interpreter ran that code
-    # too. The supervisor builds no loosening list, so its own reading is logged here, like the
-    # remote-debugging one below. Each engine shard reports its own through `serve`. The reading
+    # too. The supervisor builds no loosening list, so its own reading is logged below, once the
+    # start-file gate has passed. Each engine shard reports its own through `serve`. The reading
     # also searches the import path the engine shards inherit, so a module only they would run
     # refuses here.
     from messagefoundry.config.ai_policy import SecurityEnforcement

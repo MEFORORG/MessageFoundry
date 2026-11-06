@@ -619,9 +619,10 @@ def _remote_debug_posture_pinned_off() -> Iterator[None]:
     ``enforce`` every in-process start would stop at that gate, whatever gate the test is about.
     Autouse for that reason, like the config-source read above: it is a fact about the test
     runner, not about any scenario. The reading is pinned, not the gate, so the real gate still
-    runs in every in-process start, and one that refuses or raises with the interface off fails
-    them. A test that needs the process's own reading takes :func:`remote_debug_start_gate`. Only
-    this one name is pinned. At least these other readings are not: a subprocess start's, the
+    runs in every in-process start, and a gate that refuses or raises with the interface off fails
+    them. The reading itself does not run there; ``tests/test_remote_debug_guard.py`` covers it.
+    A test whose subject is the gate pins its own reading. Only this one name is pinned. At least
+    these other readings are not: a subprocess start's, the
     API's own (``messagefoundry.api.app``, which :func:`remote_debugging_off` pins where a test
     asks) and the engine's refusal watch (``messagefoundry.pipeline.remote_debug_watch``)."""
     from messagefoundry import __main__ as cli
@@ -630,15 +631,6 @@ def _remote_debug_posture_pinned_off() -> Iterator[None]:
         # setattr raises on a missing name, so a renamed reading fails here rather than going unpinned.
         patch.setattr(cli, "remote_debug_posture", _remote_debug_off)
         yield
-
-
-@pytest.fixture
-def remote_debug_start_gate(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Put this process's own remote-debugging reading back for one test (vault BACKLOG #2700). A
-    test whose subject is the gate pins its own reading, which overrides this."""
-    from messagefoundry.remotedebug import remote_debug_posture
-
-    monkeypatch.setattr("messagefoundry.__main__.remote_debug_posture", remote_debug_posture)
 
 
 @pytest.fixture

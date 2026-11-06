@@ -27,17 +27,14 @@ from messagefoundry.config.settings import SecuritySettings
 from messagefoundry.remotedebug import (
     REMOTE_DEBUG_ACCEPTANCE,
     REMOTE_DEBUG_ACCEPTANCE_KEY,
-    REMOTE_DEBUG_ACCEPTANCE_LOOSENING,
     RemoteDebugPosture,
     remote_debug_refusal,
 )
 from messagefoundry.startupcode import InterpreterLaunch, StartupPosture
 from tests.test_isolated_launch import _needs_install
 
-# The suite keeps this gate from stopping every other in-process start (tests/conftest.py). The
-# `remote_debug_start_gate` fixture undoes that for this module, and each in-process start here,
-# through `_serve` or `_supervise`, then pins the reading it tests.
-pytestmark = pytest.mark.usefixtures("remote_debug_start_gate")
+# The suite pins this gate's reading off for every in-process start (tests/conftest.py). Each
+# in-process start here, through `_serve` or `_supervise`, pins the reading it tests instead.
 
 _SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 #: Only the refusal says this; the loosening entries share its first half.
@@ -336,7 +333,9 @@ def test_supervise_logs_the_audit_line_again_for_the_forwarder(
     # In the off-box copy the remote-debugging lines keep the first pass's order: the AUDIT line,
     # then the residual and the acceptance (vault BACKLOG #3795). Other readings, such as the
     # unpinned service-environment one, may follow them.
-    again = [m for m in _cli_lines(caplog, "") if m.endswith(relogged)]
+    logged = _cli_lines(caplog, "")
+    assert len(logged) >= 2, logged
+    again = [m for m in logged if m.endswith(relogged)]
     if not forwarder:
         assert not again, again
         return
@@ -390,18 +389,65 @@ def test_supervise_reports_the_residual_once_past_this_gate(
     assert all(messages.index(a) < messages.index(residual[0]) for a in audits), messages
 
 
-def test_the_acceptance_has_one_spelling() -> None:
-    """Vault BACKLOG #3795 item 7: the qualified name and the loosening name derive from the one
-    key, and that key is the settings field and its ``MEFOR_SECURITY_`` variable."""
+def test_supervise_reports_no_residual_with_the_interface_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger=cli.__name__):
+        _supervise(tmp_path, monkeypatch, _OFF, warn=True)
+        # The control in the same capture: a WARNING on this logger is recorded here.
+        logging.getLogger(cli.__name__).warning("[security] remote_debug_ control")
+    assert _residual_lines(caplog) == ["[security] remote_debug_ control"]
+
+
+def test_supervise_refused_at_an_earlier_gate_reports_no_residual(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Vault BACKLOG #3795: the start-up code gate runs before this one, and a fleet it refuses
+    logs neither the residual nor the AUDIT line, though the acceptance would lift this gate."""
+    monkeypatch.setattr("messagefoundry.startupcode.startup_refusal", lambda posture: "probe")
+    with caplog.at_level(logging.WARNING, logger=cli.__name__):
+        rc, spawned = _supervise(tmp_path, monkeypatch, _ON, accept=True)
+        logging.getLogger(cli.__name__).warning("[security] remote_debug_ control")
+    assert rc == 2 and not spawned and "error: probe." in capsys.readouterr().err
+    assert _residual_lines(caplog) == ["[security] remote_debug_ control"]
+    assert not _audit_lines(caplog, "start the fleet")
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_a_refusal_still_reports_a_hook_that_did_not_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    command: str,
+) -> None:
+    """Vault BACKLOG #3795: the refusal's relaunch turns the interface off, which says nothing of
+    what stopped the engine's hook, so a refused start still logs ``remote_debug_unguarded``. With
+    the hook in (``_ON``), :func:`test_supervise_refuses_before_it_reports_the_reading_as_a_residual`
+    is the control."""
+    unguarded = RemoteDebugPosture(interpreter_enabled=True, guard_installed=False)
+    with caplog.at_level(logging.WARNING, logger=cli.__name__):
+        if command == "serve":
+            rc = _serve(tmp_path, monkeypatch, unguarded)
+        else:
+            rc, _ = _supervise(tmp_path, monkeypatch, unguarded)
+    assert rc == 2 and _REFUSAL in capsys.readouterr().err
+    residual = _residual_lines(caplog)
+    assert len(residual) == 1 and residual[0].startswith("[security] remote_debug_unguarded: ")
+
+
+def test_the_acceptance_key_is_the_settings_field_and_its_variable() -> None:
+    """Vault BACKLOG #3795 item 7: the one key the qualified name and the loosening name derive
+    from is the field the settings load, under its ``MEFOR_SECURITY_`` variable."""
     from messagefoundry.config.settings import load_settings
 
-    assert REMOTE_DEBUG_ACCEPTANCE_KEY in SecuritySettings.model_fields
-    assert f"[security].{REMOTE_DEBUG_ACCEPTANCE_KEY}" == REMOTE_DEBUG_ACCEPTANCE
-    assert REMOTE_DEBUG_ACCEPTANCE_LOOSENING[0] == REMOTE_DEBUG_ACCEPTANCE_KEY
     variable = f"MEFOR_SECURITY_{REMOTE_DEBUG_ACCEPTANCE_KEY.upper()}"
     for text, accepted in (("true", True), ("false", False)):
         settings = load_settings(environ={variable: text}, default_file=False)
-        assert settings.security.allow_remote_debugging is accepted
+        assert getattr(settings.security, REMOTE_DEBUG_ACCEPTANCE_KEY) is accepted
 
 
 # --- a real interpreter, started both ways ---------------------------------------------------------

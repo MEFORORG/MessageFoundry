@@ -1115,28 +1115,3 @@ def test_supervise_reports_unexpected_start_up_code_under_warn(
     logged = [record.getMessage() for record in caplog.records]
     assert any(line.startswith("[security] startup_code_unexpected:") for line in logged), logged
     assert any(line.startswith("[security] interpreter_not_isolated:") for line in logged), logged
-
-
-@pytest.mark.parametrize("interface_on", [True, False], ids=["interface-on", "interface-off"])
-def test_supervise_reports_its_own_remote_debugging_only_while_it_is_on(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    interface_on: bool,
-) -> None:
-    """Vault BACKLOG #3795: tests/conftest.py pins this reading off for every in-process start, so
-    this is the start that carries it on into the supervisor's own WARNING. Under ``warn``, so the
-    test does not depend on whether ``supervise`` logs that line before or after its start
-    refusal for remote debugging: under ``enforce`` with the interface on, that refusal stops the
-    fleet, and a line logged after it would never be written."""
-    from messagefoundry import __main__ as cli
-    from messagefoundry.remotedebug import RemoteDebugPosture
-
-    reading = RemoteDebugPosture(interpreter_enabled=interface_on, guard_installed=interface_on)
-    monkeypatch.setattr(cli, "remote_debug_posture", lambda: reading)
-    known = StartupPosture(launch=_HARDENED, items=(_KNOWN,))
-    with caplog.at_level("WARNING", logger="messagefoundry.__main__"):
-        _supervise(tmp_path, monkeypatch, known, warn=True)
-    logged = [record.getMessage() for record in caplog.records]
-    reported = any(line.startswith("[security] remote_debug_enabled:") for line in logged)
-    assert reported is interface_on, logged
