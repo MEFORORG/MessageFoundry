@@ -4187,8 +4187,13 @@ def _lookup_connect_failure(connection: str, exc: Exception) -> str:
     prefix = f"db_lookup on {connection!r}: could not open a connection"
     if isinstance(exc, _DriverMissingError):
         return f"{prefix}; the 'sqlserver' extra is not installed"
-    detail = _safe_db_error(exc) if _log_sqlstate(exc) else type(exc).__name__
-    return f"{prefix} ({detail})"
+    return f"{prefix} ({_credential_free_detail(exc)})"
+
+
+def _credential_free_detail(exc: BaseException) -> str:
+    """A driver error's SQLSTATE and native number, or its type alone: never its text, which can
+    carry DSN attributes (the rule :func:`_lookup_connect_failure` states)."""
+    return _safe_db_error(exc) if _log_sqlstate(exc) else type(exc).__name__
 
 
 #: Row ceiling for one ``db_lookup`` call when its ``DatabaseLookup`` sets no ``max_rows``
@@ -4284,6 +4289,7 @@ _LOGIN_ROLE_PROBE_SQL = "SELECT " + ", ".join(
     f"{'IS_SRVROLEMEMBER' if kind == 'server' else 'IS_ROLEMEMBER'}(?) AS r_{i}"
     for i, (kind, _) in enumerate(_LOGIN_ROLE_PROBE_ROLES)
 )
+_LOGIN_ROLE_PROBE_PARAMS: tuple[str, ...] = tuple(role for _, role in _LOGIN_ROLE_PROBE_ROLES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -4325,15 +4331,11 @@ def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
             unread.append(f"{kind} role {role}")
         elif value == 1:  # a driver's True compares equal too
             held.append((kind, role))
-    database_held = {role for kind, role in held if kind == "database"}
+    allowed = set(LOOKUP_LOGIN_READ_ROLES)
+    if ("database", "db_denydatawriter") in held:
+        allowed.add("db_datawriter")
     findings = tuple(
-        f"{kind} role {role}"
-        for kind, role in held
-        if kind == "server"
-        or (
-            role not in LOOKUP_LOGIN_READ_ROLES
-            and not (role == "db_datawriter" and "db_denydatawriter" in database_held)
-        )
+        f"{kind} role {role}" for kind, role in held if kind == "server" or role not in allowed
     )
     if findings:
         verdict = LoginRoleVerdict.OVER_GRANTED
@@ -4348,9 +4350,7 @@ def _probe_failure_cause(exc: Exception) -> str:
     """A PHI-free, credential-free cause: the engine's own pool-timeout text, a driver error's
     SQLSTATE and native number, or the type alone. Never a driver message, which can carry DSN
     attributes (the rule :func:`_lookup_connect_failure` states)."""
-    if isinstance(exc, DeliveryError):
-        return str(exc)
-    return _safe_db_error(exc) if _log_sqlstate(exc) else type(exc).__name__
+    return str(exc) if isinstance(exc, DeliveryError) else _credential_free_detail(exc)
 
 
 def _log_login_role_reading(reading: LoginRoleReading, label: str) -> None:
@@ -4398,29 +4398,29 @@ async def probe_login_roles(pool: Any, *, label: str, acquire_timeout: float) ->
 
     The borrow is bounded by ``acquire_timeout``, as a lookup's is. The statement is not: like the
     lookup's own statement, it runs until the driver returns."""
+    reading = await _read_login_roles(pool, acquire_timeout)
+    _log_login_role_reading(reading, label)
+    return reading
+
+
+async def _read_login_roles(pool: Any, acquire_timeout: float) -> LoginRoleReading:
+    """The probe's read, unlogged. Every failure is a :attr:`LoginRoleVerdict.NOT_RUN` reading."""
     try:
         conn = await _acquire(pool, acquire_timeout)
     except Exception as exc:
-        reading = LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
-        _log_login_role_reading(reading, label)
-        return reading
+        return LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
     cur: Any = None
     try:
         cur = await conn.cursor()
-        await cur.execute(_LOGIN_ROLE_PROBE_SQL, tuple(role for _, role in _LOGIN_ROLE_PROBE_ROLES))
+        await cur.execute(_LOGIN_ROLE_PROBE_SQL, _LOGIN_ROLE_PROBE_PARAMS)
         row = await cur.fetchone()
     except Exception as exc:
-        reading = LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
-    else:
-        reading = (
-            LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause="the probe returned no row")
-            if row is None
-            else classify_login_roles(tuple(row))
-        )
+        return LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
     finally:
         await _close_and_release(pool, conn, cur)
-    _log_login_role_reading(reading, label)
-    return reading
+    if row is None:
+        return LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause="the probe returned no row")
+    return classify_login_roles(tuple(row))
 
 
 class DatabaseLookupExecutor:

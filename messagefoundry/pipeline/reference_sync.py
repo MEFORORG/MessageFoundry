@@ -301,10 +301,9 @@ async def _load_database_source(
     statement = reference_statement(settings, name=name)
     # Fail loud on weakened TLS or bad auth, before dialing; why the posture is stamped is in the
     # docstring. Unlike wiring_runner._build_lookup_executor, a None posture keeps the ambient one.
+    connection = None if name is None else reference_connection_name(name)
     with active_hop_posture(posture if posture is not None else current_hop_posture()):
-        dsn = database_source_dsn(
-            settings, connection=None if name is None else reference_connection_name(name)
-        )
+        dsn = database_source_dsn(settings, connection=connection)
     # BACKLOG #1052: bound the borrow. This pool is throwaway (closed in the finally below), but the
     # acquire was unbounded, so an unresponsive server could hold the reference-sync runner's pass
     # open indefinitely — and the runner is a single sequential loop over every declared set, so one
@@ -326,8 +325,11 @@ async def _load_database_source(
         # What names the login, never the password, so the remembered key holds no credential.
         probe_key = (str(name),) + tuple(str(settings.get(k, "")) for k in _LOGIN_KEYS)
         if probed is None or probe_key not in probed:
-            label = "DATABASE reference source" if name is None else reference_connection_name(name)
-            await probe_login_roles(pool, label=label, acquire_timeout=acquire_timeout)
+            await probe_login_roles(
+                pool,
+                label=connection or "DATABASE reference source",
+                acquire_timeout=acquire_timeout,
+            )
             if probed is not None:
                 probed.add(probe_key)
         conn = await acquire_pooled(pool, timeout=acquire_timeout, backend="reference:database")

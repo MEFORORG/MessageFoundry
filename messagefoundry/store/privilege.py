@@ -222,11 +222,8 @@ def classify_audit_writes(
 # --- SQL Server -------------------------------------------------------------------------------
 # The closed sets of SQL Server FIXED SERVER and FIXED DATABASE roles live in the leaf
 # :mod:`messagefoundry.sqlserver_roles`, shared with the partner-login probe in ``transports/``
-# (BACKLOG #2617), which may not import this package. They are probed by name rather than
-# enumerated from ``sys.server_principals``: catalog visibility is permission-filtered, so an
-# enumeration that comes back empty is indistinguishable from "a member of nothing" -- the
-# false-clean this control exists to prevent. ``IS_SRVROLEMEMBER`` answers for the CURRENT login and
-# needs no catalog permission. Re-exported here under their old names.
+# (BACKLOG #2617), which may not import this package; its docstring says why they are probed by
+# name. Re-exported here under their old names.
 
 #: The grant the runbooks prescribe (``docs/DEPLOY-SERVER-DB.md`` §1.1) for an engine login that runs
 #: its OWN schema DDL (``[store].schema_management = auto``): row CRUD plus the schema DDL the ADR 0064

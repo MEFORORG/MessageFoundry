@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
 import subprocess
 import sys
 import warnings
@@ -246,9 +245,10 @@ async def _measure_all(mode: str) -> dict[str, Any]:
     import aioodbc
 
     from messagefoundry.transports import database
+    from tests._live_scratch import scratch_name
 
     settings = _conn("setup")
-    table = f"mf2148_{secrets.token_hex(4)}"
+    table = scratch_name("mf2148")
     conn = await aioodbc.connect(
         dsn=database._build_dsn(settings, attested=True),
         autocommit=True,
