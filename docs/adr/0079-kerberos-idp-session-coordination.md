@@ -206,7 +206,10 @@ properties the original design did not name**:
    of exposure and buy immunity to a single flaky search.
    *Note 2026-11-06 (vault BACKLOG #3689):* that bound holds within one process's life. The strike
    counts are process memory, so a restart starts them again, and an engine that restarts more
-   often than strikes times interval never revokes through the reconciler. ADR 0195, *What a
+   often than strikes times interval never revokes an account it must strike, such as a
+   disabled or absent one, through the reconciler. Only that strike-based revocation is lost: a present principal whose roles or scope
+   would change takes no strike and is still revoked in one pass, unless the engine restarts more
+   often than one interval and no pass runs. ADR 0195, *What a
    restart does to the hold*, states this and what a restart does to the hold.
 
 2. **A mass-revoke circuit breaker** — the load-bearing addition. A misconfigured `ad_user_search_base`,

@@ -11427,7 +11427,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         # A paging refusal is not the outage, so an outage-shaped pass still pages for it (vault
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.
         _alert_paging_refusals(plan, sink)
-        # BACKLOG #3100: an account alone in its probe sample enters on an outage-shaped pass.
+        # BACKLOG #3100: an account can enter on an outage-shaped pass, one whose probe sample
+        # held only unreachable accounts, unless the lasting outage page is raised or stands.
         _alert_unreached_accounts(plan, sink)
         if plan.outage_page:
             # BACKLOG #3709. After the paging refusals, which page once per account, so a sink that

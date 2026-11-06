@@ -3628,9 +3628,10 @@ class AuthSettings(_Section):
     # the same way, so requiring two agreeing probes costs at most one extra interval of exposure
     # within one process's life, and buys immunity to a single flaky search. Strike state is
     # process-local (the rate-limiter precedent), so a restart resets it -- biased toward NOT
-    # revoking: an engine that restarts more often than strikes times interval never revokes through
-    # the reconciler, and a restart also forgets the hold (ADR 0195, "What a restart does to the
-    # hold"; vault BACKLOG #3689).
+    # revoking: an engine that restarts more often than strikes times interval never revokes an
+    # account it must strike, such as a disabled or absent one, through the reconciler, and a restart also forgets the hold (ADR
+    # 0195, "What a restart does to the hold"; vault BACKLOG #3689). A present principal whose roles
+    # or scope would change takes no strike, so it is still revoked in one pass.
     ad_session_recheck_strikes: int = 2
     # Per-pass bind budget. A pass probes at most this many distinct users; the remainder are picked up
     # by the following passes (least-recently-probed first), so a very large estate degrades to a longer

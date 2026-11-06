@@ -5397,7 +5397,11 @@ once, in [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-alerts-resolve
 
 Revocation is therefore bounded by *interval × strikes* (10 minutes at the recommended 300 s) within
 one process's life, not immediate. A restart starts every strike count again, so an engine that
-restarts more often than that never revokes through the reconciler, and it also forgets the hold
+restarts more often than that never revokes an account it must strike, such as a disabled or absent
+one, through the reconciler, and it also forgets the hold. A present principal whose
+roles or scope the directory would change takes no strike and is still revoked on the one pass that
+sees it, so a restart loses that revocation only when it comes more often than one interval and no
+pass runs
 ([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md),
 *What a restart does to the hold*; vault BACKLOG #3689). One LDAP bind per signed-in directory user
 per pass is the cost —

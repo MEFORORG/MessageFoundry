@@ -350,8 +350,9 @@ class ReconcilePlan:
     #: step 2): ``(user_id, username, probes)`` of each account that has just ENTERED the state
     #: :data:`UNREACHED_ACCOUNT` names, ``probes`` being how many of its probes running read it
     #: unreachable. An account already in that state is not here, so each pages once per state
-    #: change. An outage-shaped pass can carry entries, for an account alone in its probe sample,
-    #: but none while the lasting outage page stands (``AuthService._note_unreached_accounts``).
+    #: change. An outage-shaped pass can carry entries, where its probe sample held only
+    #: unreachable accounts, but none on a pass that raises the lasting outage page or while that
+    #: page stands (``AuthService._note_unreached_accounts``).
     unreached: tuple[tuple[str, str, int], ...] = ()
     #: Set with ``unreached`` (BACKLOG #3100): True when the accounts already paged and those
     #: entering are more than ``AuthService``'s fixed rollup bound, so the lifespan task pages once

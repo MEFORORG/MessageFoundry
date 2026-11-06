@@ -3458,8 +3458,10 @@ class AuthService:
         # limiters and the action step-up grants above. Within one process two strikes cost at
         # most one extra interval of exposure. A restart resets the strike counts, which is
         # biased toward NOT revoking: each restart starts the count again, so an engine that
-        # restarts more often than strikes times interval never revokes through this, and it
-        # also loses the hold's latch (ADR 0195, "What a restart does to the hold"; BACKLOG #3689).
+        # restarts more often than strikes times interval never revokes an account it must
+        # strike, such as a disabled or absent one, through this, and it also loses the hold's latch (ADR 0195, "What a restart
+        # does to the hold"; BACKLOG #3689). A roles or scope change takes no strike, so a present
+        # principal is still revoked in one pass.
         #: user_id -> consecutive passes the principal failed to resolve.
         self._reconcile_strikes: dict[str, int] = {}
         #: user_id -> monotonic clock of its last probe; orders the per-pass bind budget.
