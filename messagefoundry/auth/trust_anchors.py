@@ -2772,18 +2772,25 @@ class _LaneAnchorCheck:
             if isinstance(read, OSError)
             else (spec, replace(read, data=b""))
         )
-        prior = self._last.pop(lane, None)
+        prior = self._last.get(lane)
         if prior is not None and prior[0] == now:
             if prior[1] is not None:
-                self._last[lane] = prior
                 raise TrustAnchorError(prior[1], setting=spec.setting)
             # A pass. Only its rows are skipped: the baseline is read as a judged pass reads it,
-            # and a store fault there raises, as it would from _preflight_one. An unreadable file
-            # is never a pass, so read is a verdict here.
-            if isinstance(read, AnchorVerdict) and await _baseline_names(self._store, spec, read):
-                _enforce_verdict(spec, read, enforcing=self._enforcing)  # warns, as a judged pass
-                self._last[lane] = prior
-                return
+            # and a store fault there raises, as it would from _preflight_one, after the same
+            # warnings. An unreadable file is never a pass, so read is a verdict here.
+            if isinstance(read, AnchorVerdict):
+                try:
+                    unchanged = await _baseline_names(self._store, spec, read)
+                except AnchorStoreUnavailable:
+                    _enforce_verdict(spec, read, enforcing=self._enforcing)
+                    raise
+                if unchanged:
+                    _enforce_verdict(spec, read, enforcing=self._enforcing)  # its warnings
+                    return
+        # Dropped only now, so a check that returns from memory never overwrites what a check
+        # that ran meanwhile stored.
+        self._last.pop(lane, None)
         try:
             await _preflight_one(self._store, spec, enforcing=self._enforcing, verdict=read)
         except TrustAnchorError as exc:

@@ -221,18 +221,34 @@ async def test_a_remembered_warn_mode_pass_still_warns(
 async def test_a_pass_the_store_stopped_is_not_remembered(
     tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A pass whose audit write failed raises the store fault and is not remembered, so the next
-    check reads and audits again. Red under the pass remembered before its rows were written."""
-    from tests.test_trust_anchors import _FaultyAuditStore
+    """Under ``warn``, a pass whose ``observed`` row landed but whose ``acl_insecure`` row failed
+    raises the store fault and is not remembered, so the next check writes the lost row. Red
+    under the pass remembered before its rows were all written: the baseline then names the
+    bytes, and the repeat skips the row for good."""
+    import json
 
-    faulty = _FaultyAuditStore("record_audit")
-    ca = _ca(tmp_path)
-    check = ta.make_lane_anchor_check(faulty, enforcing=True)  # type: ignore[arg-type]
-    with pytest.raises(ta.AnchorStoreUnavailable):
+    store = await MessageStore.open(tmp_path / "faulty.db")
+    try:
+        monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
+        real = store.record_audit
+        failed = [False]
+
+        async def record_audit(action: str, *, actor: str | None, detail: str) -> None:
+            if json.loads(detail).get("event") == "acl_insecure" and not failed[0]:
+                failed[0] = True
+                raise OSError(5, "Input/output error")
+            await real(action, actor=actor, detail=detail)
+
+        monkeypatch.setattr(store, "record_audit", record_audit)
+        ca = _ca(tmp_path)
+        check = ta.make_lane_anchor_check(store, enforcing=False)
+        with pytest.raises(ta.AnchorStoreUnavailable):
+            await check("outbound", _OUT, _settings(ca))
         await check("outbound", _OUT, _settings(ca))
-    faulty.fail = None
-    await check("outbound", _OUT, _settings(ca))
-    assert len(faulty.writes) == 1  # the recovered store got the observation
+        events = [r["event"] for r in await _rows(store, _LABEL)]
+        assert events.count("acl_insecure") == 1 and events.count("observed") == 1, events
+    finally:
+        await store.close()
 
 
 # --- item 3: a reload that removes a lane forgets it -------------------------------------------
