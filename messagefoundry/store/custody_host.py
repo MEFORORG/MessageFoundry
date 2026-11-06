@@ -212,11 +212,11 @@ def foreign_custody_refusal(
     return (
         f"{' and '.join(found)} is in {directory}, but [store].key_provider is "
         f"{settings.key_provider!r}. A store with a host blob takes its key from that blob only: "
-        "if it holds this store's key, set [store].key_provider = 'host' and remove every other "
-        "store key setting, with [store].cipher_provider = 'aesgcm', which that provider needs. "
-        "Keep a copy of each key setting's value first, somewhere as protected as where it is "
-        "now, since it may be the only copy of a store key. The engine cannot tell whether the "
-        "blob holds this store's key, so it "
+        "if it holds this store's key, keep a copy of each key setting's value first, somewhere "
+        "as protected as where it is now, since it may be the only copy of a store key. Then set "
+        "[store].key_provider = 'host' and remove every other store key setting, with "
+        "[store].cipher_provider = 'aesgcm', which that provider needs. The engine cannot tell "
+        "whether the blob holds this store's key, so it "
         f"leaves the file in place. {keep_the_key_step(settings, new_store=False)}"
     )
 
@@ -582,9 +582,19 @@ def keep_the_key_step(
             )
     host = settings.key_provider == HOST_PROVIDER
     if host:
-        text += ". Then run `messagefoundry provision-admin` again with the same arguments"
+        text += ". Then run `messagefoundry provision-admin` again"
+        if new_store:
+            # --db sets [store].path, so the old --db would point the re-run back at the old store;
+            # a server backend reads [store].server/database and ignores --db (PR 2804 seventh hold).
+            text += (
+                ", once [store] names that new database (--db sets only [store].path, which this "
+                "backend does not read)"
+                if server
+                else ", with --db naming that new SQLite path, or without --db once [store].path "
+                "names it"
+            )
         if service_account is not None:
-            text += f', --service-account "{service_account}" among them'
+            text += f', with --service-account "{service_account}" among its arguments'
         text += ", which mints this store's key there"
         if service_account is None and sys.platform == "win32":
             text += (

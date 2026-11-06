@@ -220,7 +220,12 @@ async def test_a_host_blob_refuses_every_other_key_provider(tmp_path: Path, name
     assert refusal is not None and name in refusal and "'auto'" in refusal
     # PR 2804 sixth hold: the setting-only fix first, then the fallback, which leaves the file.
     assert f"set [store].key_provider = 'host' and {_KEY_SETTINGS_OUT}" in refusal, refusal
-    assert "Keep a copy of each key setting's value first" in refusal, refusal
+    # PR 2804 seventh hold: the copy is kept before the settings are removed, not after.
+    keep = "keep a copy of each key setting's value first"
+    # Case-folded (ASCII, so the indexes line up), so the order is what fails when the copy
+    # step comes after the removal.
+    assert keep in refusal.lower(), refusal
+    assert refusal.lower().index(keep) < refusal.index(_KEY_SETTINGS_OUT), refusal
     assert not _advises_changing(refusal, allowed=(_KEY_SETTINGS_OUT,)), refusal
     assert custody_host.keep_the_key_step(settings, new_store=False) in refusal, refusal
     assert "mints this store's key" not in refusal, refusal  # only the host provider mints
@@ -1291,10 +1296,7 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
     assert "empty directory" not in step and "new, empty" not in step
     assert "Copy into it every secret file" in step, step
     # Quoted, since a service account name can hold a space.
-    command = (
-        "run `messagefoundry provision-admin` again with the same arguments, "
-        '--service-account "NT SERVICE\\MessageFoundry" among them'
-    )
+    command = '--service-account "NT SERVICE\\MessageFoundry" among its arguments'
     assert command in step, step
     assert "restricted and writable by the service as a secrets directory must be" in step, step
     assert "The new store starts empty" in step, step
@@ -1313,6 +1315,26 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
     assert "provision-admin" not in auto and "run the command again" in auto, auto
     # No key is minted there, so no new key or recovery key is spoken of.
     assert "recovery key" not in auto and "new key" not in auto, auto
+
+
+@pytest.mark.parametrize("backend", [StoreBackend.SQLITE, StoreBackend.POSTGRES])
+@pytest.mark.parametrize("new_store", [True, False])
+def test_the_fallback_re_run_never_points_back_at_the_old_store(
+    tmp_path: Path, backend: StoreBackend, new_store: bool
+) -> None:
+    # PR 2804 seventh hold, finding 1: --db sets [store].path, so "the same arguments" would point
+    # a re-run back at the old store. A new SQLite store is named by --db or [store].path; a server
+    # backend reads [store].server/database, never --db.
+    settings = _settings(tmp_path).model_copy(update={"backend": backend})
+    step = custody_host.keep_the_key_step(settings, new_store=new_store)
+    assert "same arguments" not in step, step
+    assert "run `messagefoundry provision-admin` again" in step, step
+    sqlite_path = (
+        "with --db naming that new SQLite path, or without --db once [store].path names it"
+    )
+    database = "once [store] names that new database (--db sets only [store].path"
+    assert (sqlite_path in step) is (new_store and backend is StoreBackend.SQLITE), step
+    assert (database in step) is (new_store and backend is StoreBackend.POSTGRES), step
 
 
 @host_file_platforms
