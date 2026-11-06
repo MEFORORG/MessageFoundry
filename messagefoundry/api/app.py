@@ -11336,10 +11336,11 @@ _PARTIAL_OUTAGE_ALERT_TEXT: Final[str] = (
     "unanswered while it answered others. Check each domain controller."
 )
 #: What one rolled-up page says, where more accounts stand at the threshold than
-#: ``AuthService``'s fixed rollup bound. ``probes`` is the shortest streak among those entering.
+#: ``AuthService``'s fixed rollup bound. ``standing`` counts every account at the threshold, paged
+#: or entering, so the instance a later rollup updates says how many stand; ``entering`` is new.
 _PARTIAL_OUTAGE_ROLLUP_TEXT: Final[str] = (
-    "{accounts} more accounts' sessions are not reconciled: the directory left each unanswered on "
-    "{probes} or more of its probes running while it answered others. Check each domain controller."
+    "{standing} accounts' sessions are not reconciled: the directory left each unanswered on a run "
+    "of its probes while answering others ({entering} new). Check each domain controller."
 )
 #: What each paging refusal cause tells the operator. Short, and the consequence first, because
 #: the store keeps only the first 200 characters of an instance's reason; the account is in the
@@ -11515,8 +11516,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
 def _alert_partial_outage(plan: ReconcilePlan, sink: AlertSink) -> None:
     """Page each account that has just entered a lasting partial outage (BACKLOG #3709 step 1;
     ``AuthService._note_partial_outage`` says when one enters), under its own source, or once for
-    all of them on a rolled-up pass (``plan.partial_outage_rollup``), under the bare source and
-    naming none. The account name, in the source only, is the one ``ad_session_revoked`` already
+    all of them on a rolled-up pass (``plan.partial_outage_rollup``), under the bare source,
+    counting every account standing and naming none; each account's audit row names it. The account name, in the source only, is the one ``ad_session_revoked`` already
     carries; nothing else about the account is. It has no inverse: an operator resolves it."""
     entered = plan.partial_outage_entered
     if not entered:
@@ -11527,7 +11528,7 @@ def _alert_partial_outage(plan: ReconcilePlan, sink: AlertSink) -> None:
             reason=PARTIAL_OUTAGE_REASON,
             probed=plan.asked,
             detail=_PARTIAL_OUTAGE_ROLLUP_TEXT.format(
-                accounts=len(entered), probes=min(streak for _, _, streak in entered)
+                standing=plan.partial_outage_standing, entering=len(entered)
             ),
         )
         return

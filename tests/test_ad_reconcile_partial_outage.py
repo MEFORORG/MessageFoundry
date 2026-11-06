@@ -65,6 +65,10 @@ async def _rows(store: MessageStore) -> list[dict[str, Any]]:
     return [json.loads(str(r["detail"])) for r in await store.list_audit(action=_ROW)]
 
 
+async def _actors(store: MessageStore) -> list[str]:
+    return sorted(str(r["actor"]) for r in await store.list_audit(action=_ROW))
+
+
 async def _estate(
     store: MessageStore, *names: str, **over: object
 ) -> tuple[AuthService, _FakeLdap]:
@@ -93,7 +97,7 @@ async def test_a_lasting_partial_outage_pages_once_under_the_accounts_own_source
         for n in range(1, threshold):
             plan = await _pass(service, sink)
             assert not plan.directory_outage and plan.aborted is None
-            assert (_longest(service), plan.unreached_probes) == (n, 1)
+            assert _longest(service) == n
             assert not plan.partial_outage_page
         assert _partial_events(sink) == []  # the N-1 control
         assert await _rows(store) == []
@@ -105,10 +109,10 @@ async def test_a_lasting_partial_outage_pages_once_under_the_accounts_own_source
         assert page["reason"] == "directory_partly_unavailable" and page["probed"] == 2
         assert f"the directory left {threshold} of its probes running unanswered" in page["detail"]
         assert len(page["detail"]) <= 200  # the store keeps 200 characters of a reason
+        assert await _actors(store) == ["alice"]
         assert await _rows(store) == [
             {
                 "reason": "directory_partly_unavailable",
-                "accounts": 1,
                 "probes": threshold,
                 "rollup": False,
                 "asked": 2,
@@ -144,7 +148,7 @@ async def test_a_fully_answered_pass_restarts_the_partial_run() -> None:
         for _run in range(2):
             ldap.unreachable = {"alice"}
             for _ in range(2):
-                assert (await _pass(service, sink)).unreached_probes == 1
+                await _pass(service, sink)
             ldap.unreachable = set()
             await _pass(service, sink)
             assert _longest(service) == 0
@@ -249,7 +253,8 @@ async def test_a_second_account_pages_under_its_own_source() -> None:
         assert second.partial_outage_probes == 2  # bob's streak, not alice's 4
         assert len(_pages(sink, _ALICE)) == 1 and len(_pages(sink, _BOB)) == 1
         assert "left 2 of its probes" in _pages(sink, _BOB)[0]["detail"]
-        assert [r["accounts"] for r in await _rows(store)] == [1, 1]
+        assert await _actors(store) == ["alice", "bob"]
+        assert [r["probes"] for r in await _rows(store)] == [2, 2]
     finally:
         await store.close()
 
@@ -261,7 +266,7 @@ async def test_many_accounts_entering_at_once_page_once_under_the_bare_source() 
     RED when: a dead domain controller behind many accounts opens one instance per account."""
     store = await MessageStore.open(":memory:")
     try:
-        names = ("alice", "bob", "carol", "dave", "erin", "frank", "grace")
+        names = ("alice", "bob", "carol", "dave", "emil", "frank", "grace")
         service, ldap = await _estate(store, *names, ad_reconcile_outage_passes=2)
         sink = _InverseSink()
         ldap.unreachable = set(names[:6])
@@ -270,10 +275,12 @@ async def test_many_accounts_entering_at_once_page_once_under_the_bare_source() 
         assert plan.partial_outage_rollup and len(plan.partial_outage_entered) == 6
         assert _partial_events(sink) == [("ad_reconcile_aborted", _PARTIAL_OUTAGE_ALERT_SOURCE)]
         [page] = _pages(sink, _PARTIAL_OUTAGE_ALERT_SOURCE)
-        assert page["detail"].startswith("6 more accounts' sessions are not reconciled")
+        assert page["detail"].startswith("6 accounts' sessions are not reconciled")
+        assert "(6 new)" in page["detail"]
         assert len(page["detail"]) <= 200
         assert not any(name in page["detail"] for name in names)
-        assert [r["rollup"] for r in await _rows(store)] == [True]
+        assert [r["rollup"] for r in await _rows(store)] == [True] * 6
+        assert sorted(await _actors(store)) == sorted(names[:6])  # each row names its account
     finally:
         await store.close()
 
@@ -327,7 +334,7 @@ async def test_a_group_search_refused_for_the_engines_bound_is_no_partial_outage
         }
         for _ in range(3):
             plan = await _pass(service, sink)
-            assert plan.unavailable == 1 and plan.unreached_probes == 0
+            assert plan.unavailable == 1
             assert _longest(service) == 0
         assert _partial_events(sink) == []
     finally:
@@ -392,7 +399,6 @@ async def test_a_probe_budget_smaller_than_the_estate_cannot_reset_an_accounts_s
             service._reconcile_last_probed[alice.id] = -1.0 if probed else 1e18
             plans.append(await _pass(service, sink))
         assert all(p.asked == 2 and not p.directory_outage for p in plans)
-        assert [p.unreached_probes for p in plans] == [1, 0] * 3
         assert [p.partial_outage_page for p in plans] == [False, False, True, False, False, False]
         assert len(_pages(sink, _ALICE)) == 1
     finally:
@@ -458,8 +464,8 @@ async def test_one_off_failures_on_different_accounts_never_add_up() -> None:
         sink = _InverseSink()
         for name in ("alice", "bob", "alice", "bob"):
             ldap.unreachable = {name}
-            plan = await _pass(service, sink)
-            assert plan.unreached_probes == 1 and _longest(service) == 1
+            await _pass(service, sink)
+            assert _longest(service) == 1
         assert _partial_events(sink) == []
     finally:
         await store.close()
@@ -534,5 +540,65 @@ async def test_a_full_recovery_under_a_probe_budget_raises_no_partial_page() -> 
         assert _longest(service) == 0
         assert _partial_events(sink) == []
         assert await _rows(store) == []
+    finally:
+        await store.close()
+
+
+async def test_an_account_already_paged_keeps_its_streak_across_a_whole_outage() -> None:
+    """Review pass 1029f-r2, finding 4. ``alice`` pages a partial outage; then the whole directory
+    goes long enough to page, and comes back without her domain controller. The end of that run
+    restarts every other streak but keeps hers, so her unbroken outage does not page a second
+    time into its open instance.
+
+    RED when: the end of a paged whole run re-arms an account already paged."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        for _ in range(2):
+            await _pass(service, sink)
+        assert len(_pages(sink, _ALICE)) == 1
+        ldap.unreachable = set(_BOTH)
+        for _ in range(2):
+            await _pass(service, sink)
+        assert len(_pages(sink, _OUTAGE_ALERT_SOURCE)) == 1
+        ldap.unreachable = {"alice"}
+        for _ in range(3):
+            await _pass(service, sink)
+        assert len(_pages(sink, _ALICE)) == 1
+        assert _longest(service) == 7
+    finally:
+        await store.close()
+
+
+async def test_a_refused_row_leaves_only_its_own_account_to_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review pass 1029f-r2, finding 3. Each account entering gets its own row; when the store
+    refuses ``bob``'s, ``alice`` still pages on that pass and ``bob`` pages on the next.
+
+    RED when: one refused row drops every account's page, or a page goes out with no row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _estate(store, "alice", "bob", "carol", ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice", "bob"}
+        await _pass(service, sink)
+        real = service._audit_reconciler_row
+
+        async def refuse_bob(action: str, **kw: Any) -> bool:
+            if action == _ROW and kw.get("actor") == "bob":
+                return False
+            return await real(action, **kw)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", refuse_bob)
+        first = await _pass(service, sink)
+        assert [u for _, u, _ in first.partial_outage_entered] == ["alice"]
+        assert (len(_pages(sink, _ALICE)), len(_pages(sink, _BOB))) == (1, 0)
+        monkeypatch.setattr(service, "_audit_reconciler_row", real)
+        await _pass(service, sink)
+        assert (len(_pages(sink, _ALICE)), len(_pages(sink, _BOB))) == (1, 1)
+        assert await _actors(store) == ["alice", "bob"]
     finally:
         await store.close()

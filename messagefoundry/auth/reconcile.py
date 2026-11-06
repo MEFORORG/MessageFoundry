@@ -172,7 +172,7 @@ class Probe:
         """True when the group search was refused for the engine's own paging bound (vault BACKLOG
         #3696): UNAVAILABLE with a :data:`PAGING_DEADLINE` or :data:`PAGING_CAP` detail. The one
         test both the paging refusal and :attr:`unreached` read, so no probe is both or neither."""
-        return self.outcome is ProbeOutcome.UNAVAILABLE and self.detail is not None
+        return self.outcome is ProbeOutcome.UNAVAILABLE and self.detail in _PAGING_CAUSES
 
     @property
     def unreached(self) -> bool:
@@ -251,6 +251,8 @@ MISCONFIGURED_ABORT = "directory_misconfigured"
 #: enabled account's roles and scope are not re-read while it lasts. Also the alert's ``reason``.
 PAGING_DEADLINE = "group_search_deadline"
 PAGING_CAP = "group_search_cap"
+#: Both, for :attr:`Probe.paging_refused` (BACKLOG #3709 step 1).
+_PAGING_CAUSES = frozenset({PAGING_DEADLINE, PAGING_CAP})
 
 #: The outcomes that judge nothing about the account: no strike, no recorded outcome (rule item 4).
 _UNJUDGED = frozenset(
@@ -312,8 +314,6 @@ class ReconcilePlan:
     #: refusal's (vault BACKLOG #3696), which concerns one account and reports the pass's count.
     asked: int = 0
     unavailable: int = 0
-    #: The probes the directory left unanswered (:attr:`Probe.unreached`, BACKLOG #3709 step 1).
-    unreached_probes: int = 0
     #: ``user_id`` of every probe the directory answered with a referral (BACKLOG #2538). Any one
     #: alerts, and none of them stops the rest of the pass being judged.
     referred: tuple[str, ...] = ()
@@ -384,6 +384,9 @@ class ReconcilePlan:
     #: or entering, are more than ``AuthService``'s fixed rollup bound, so the lifespan task pages
     #: once for those entering, under the bare source, rather than once per account.
     partial_outage_rollup: bool = False
+    #: Set with ``partial_outage_entered``: how many accounts stand at the threshold, paged or
+    #: entering, which a rolled-up page counts, so the open instance it updates says how many stand.
+    partial_outage_standing: int = 0
 
     @property
     def partial_outage_page(self) -> bool:
@@ -394,9 +397,14 @@ class ReconcilePlan:
 
     @property
     def partial_outage_probes(self) -> int:
-        """The longest streak among ``partial_outage_entered``, which the audit row reports
-        (BACKLOG #3709)."""
+        """The longest streak among ``partial_outage_entered`` (BACKLOG #3709)."""
         return max((streak for _, _, streak in self.partial_outage_entered), default=0)
+
+    @property
+    def partial_outage_shortest(self) -> int:
+        """The shortest streak among ``partial_outage_entered``, which the log line names
+        (BACKLOG #3709)."""
+        return min((streak for _, _, streak in self.partial_outage_entered), default=0)
 
     @property
     def directory_outage(self) -> bool:
@@ -577,9 +585,6 @@ def plan_pass(
     """
     probes = list(probes)
     unavailable = [p for p in probes if p.outcome is ProbeOutcome.UNAVAILABLE]
-    # BACKLOG #3709 step 1. The ones the directory did not answer: a paging-bound refusal was
-    # answered, and pages on its own (vault BACKLOG #3696).
-    unreached = sum(1 for p in unavailable if p.unreached)
     referred = [p for p in probes if p.outcome is ProbeOutcome.REFERRED]
     faulted = [p for p in probes if p.outcome is ProbeOutcome.FAULT]
     misconfigured = [p for p in probes if p.outcome is ProbeOutcome.MISCONFIGURED]
@@ -607,7 +612,6 @@ def plan_pass(
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
-            unreached_probes=unreached,
             referred=tuple(p.user_id for p in referred),
             faulted=tuple(p.user_id for p in faulted),
             misconfigured=tuple(p.user_id for p in misconfigured),
@@ -626,7 +630,6 @@ def plan_pass(
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
-            unreached_probes=unreached,
             aborted=OUTAGE_ABORT,
             latched=latched,
         )
@@ -719,7 +722,6 @@ def plan_pass(
         probed=len(probes),
         asked=asked,
         unavailable=len(unavailable),
-        unreached_probes=unreached,
         referred=tuple(p.user_id for p in referred),
         faulted=tuple(p.user_id for p in faulted),
         misconfigured=tuple(p.user_id for p in misconfigured),

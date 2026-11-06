@@ -8170,7 +8170,7 @@ class AuthService:
         id-less rows, learned nothing about the directory and leaves the run as it stands. A pass
         that reached it for some probes and not for others ends this run; a partial outage pages on
         its own (:meth:`_note_partial_outage`). Ending a run that paged also empties every
-        account's partial streak: that page already covered them.
+        partial streak but those of the accounts already paged for one: that page covered them.
 
         Process-local, like the strikes. A restart starts the count again, so a standing outage
         pages again after it, and resolves nothing an earlier run opened: ``_paged`` starts False,
@@ -8196,7 +8196,11 @@ class AuthService:
             # BACKLOG #3709 step 1. The whole outage fed every streak it probed, and its page
             # covered them; under a probe budget the accounts not probed again since would
             # otherwise page as a partial outage on this pass. A still-unanswered one counts again.
-            self._reconcile_unreached.clear()
+            # An account already paged keeps its streak, so an unbroken partial outage does not
+            # page twice into its open instance.
+            paged = self._reconcile_partial_paged_ids
+            for user_id in [uid for uid in self._reconcile_unreached if uid not in paged]:
+                del self._reconcile_unreached[user_id]
         self._reconcile_outage_passes = 0
         self._reconcile_outage_run_paged = False
         return replace(plan, outage_clear=self._reconcile_outage_paged)
@@ -8212,8 +8216,8 @@ class AuthService:
         item 6).
 
         Before this, one answered probe ended the outage run, so a directory that answered for
-        some accounts and never for the rest paged nobody, and those accounts went unreconciled
-        while it lasted. A probe is unanswered (:attr:`~reconcile.Probe.unreached`) when it read
+        some accounts and never for the rest paged nobody, and in the shipped code those accounts
+        would have gone unreconciled while it lasted. A probe is unanswered (:attr:`~reconcile.Probe.unreached`) when it read
         UNAVAILABLE for any reason but the engine's own paging bound: the directory answered that
         one, and it pages on its own (vault BACKLOG #3696).
 
@@ -8228,8 +8232,11 @@ class AuthService:
         pass feeds the streaks because, under such a budget, a sample can hold only the accounts
         behind one dead domain controller and read as a whole outage while the next sample's
         answers end the whole run; at a budget of one probe that is every pass. When a whole run
-        that paged ends, :meth:`_note_directory_outage` empties every streak, since its page
-        covered them.
+        that paged ends, :meth:`_note_directory_outage` empties every streak but an already-paged
+        account's, since its page covered them. **The cost:** where the accounts behind one dead
+        domain controller fill every sample of a whole run long enough to page, and the next
+        sample's answers end it, each cycle empties their streaks again, so they page only as a
+        whole outage that resolves and opens again, never as a partial one.
 
         **Its page, once per account entering the state, and only on a pass that reached the
         directory** (it asked something, and not every probe failed or faulted), so a whole
@@ -8240,11 +8247,13 @@ class AuthService:
         cooldown on one account's page never holds another's. Where more than
         :data:`_PARTIAL_OUTAGE_ROLLUP` accounts stand at the threshold at once, the pass pages
         once for those entering instead (``partial_outage_rollup``), so a dead domain controller
-        behind many signed-in accounts opens one instance rather than one per account; that one
-        shares a source, and its cooldown, with every other rollup. An account that is answered
-        or leaves re-arms. The page is latched only once its audit row is written
-        (:meth:`_record_partial_outage`, :meth:`_latch_outage_page`), so a refused row leaves it
-        to the next pass that reaches the directory. It has no inverse, like a paging refusal's:
+        behind many signed-in accounts opens one instance rather than one per account. That one
+        shares a source, and so its cooldown, with every later rollup: the notifier can hold a
+        later one's notification, but the open instance it updates counts every account standing
+        (``partial_outage_standing``). An account that is answered or leaves re-arms. Each page is
+        latched only once its account's audit row is written (:meth:`_record_partial_outage`,
+        :meth:`_latch_outage_page`), so a refused row leaves that account to the next pass that
+        reaches the directory. It has no inverse, like a paging refusal's:
         an operator resolves it. Process-local, as the whole run is.
 
         "Unanswered" here is :attr:`~reconcile.Probe.unreached`. It is not
@@ -8264,12 +8273,12 @@ class AuthService:
         entered = tuple(
             (uid, users[uid].username, streaks[uid])
             for uid in sorted(standing - self._reconcile_partial_paged_ids)
-            if uid in users
         )
         return replace(
             plan,
             partial_outage_entered=entered,
             partial_outage_rollup=bool(entered) and len(standing) > _PARTIAL_OUTAGE_ROLLUP,
+            partial_outage_standing=len(standing),
         )
 
     def _latch_outage_page(self, plan: reconcile.ReconcilePlan) -> None:
@@ -8284,7 +8293,7 @@ class AuthService:
                 "unanswered on at least %d of each one's probes running; a directory disable or "
                 "deletion does not reach an unanswered account's sessions while it lasts",
                 len(plan.partial_outage_entered),
-                min(streak for _, _, streak in plan.partial_outage_entered),
+                plan.partial_outage_shortest,
             )
         if not plan.outage_page:
             return
@@ -8299,33 +8308,42 @@ class AuthService:
     async def _record_partial_outage(
         self, plan: reconcile.ReconcilePlan
     ) -> reconcile.ReconcilePlan:
-        """Audit a lasting partial outage's page, so the page matches a row (ASVS 8.3.2; BACKLOG
-        #3709 step 1), and return the plan with the page dropped when the row was refused, so it
-        is neither raised nor latched and the next pass that reaches the directory tries again.
+        """Audit each account entering a lasting partial outage, so its page matches a row (ASVS
+        8.3.2; BACKLOG #3709 step 1), and return the plan without each account whose row was
+        refused, so that account is neither paged nor latched and the next pass that reaches the
+        directory tries it again.
 
-        Its own action, ``auth.ad_reconcile_partial_outage``: such a pass judged every probe that
-        was answered, so it is not the skipped row a whole outage writes. Written on a paging pass
-        only, through the same soft write as the other reconcile rows. It carries counts and no
-        username, though each page's source names its account: how many accounts entered, the
-        longest streak among them, whether the page was rolled up, and the pass's asked probes."""
+        Its own action, ``auth.ad_reconcile_partial_outage``, one row per account naming it as
+        ``actor``, as a paging refusal's does: such a pass judged every probe that was answered,
+        so it is not the skipped row a whole outage writes. Written on a paging pass only,
+        through the same soft write as the other reconcile rows. Its detail holds that account's
+        streak, whether the pass rolled its page up, and the pass's asked probes."""
         if not plan.partial_outage_page:
             return plan
-        written = await self._audit_reconciler_row(
-            "auth.ad_reconcile_partial_outage",
-            detail=_json(
-                {
-                    "reason": reconcile.PARTIAL_OUTAGE_REASON,
-                    "accounts": len(plan.partial_outage_entered),
-                    # One account's probes, not passes: under a probe budget they differ.
-                    "probes": plan.partial_outage_probes,
-                    "rollup": plan.partial_outage_rollup,
-                    "asked": plan.asked,
-                }
-            ),
-        )
-        if written:
+        written: list[tuple[str, str, int]] = []
+        for entry in plan.partial_outage_entered:
+            _user_id, username, streak = entry
+            if await self._audit_reconciler_row(
+                "auth.ad_reconcile_partial_outage",
+                actor=username,
+                detail=_json(
+                    {
+                        "reason": reconcile.PARTIAL_OUTAGE_REASON,
+                        # The account's probes, not passes: under a probe budget they differ.
+                        "probes": streak,
+                        "rollup": plan.partial_outage_rollup,
+                        "asked": plan.asked,
+                    }
+                ),
+            ):
+                written.append(entry)
+        if len(written) == len(plan.partial_outage_entered):
             return plan
-        return replace(plan, partial_outage_entered=(), partial_outage_rollup=False)
+        return replace(
+            plan,
+            partial_outage_entered=tuple(written),
+            partial_outage_rollup=plan.partial_outage_rollup and bool(written),
+        )
 
     async def _record_paging_refusals(self, plan: reconcile.ReconcilePlan) -> None:
         """Log, audit and latch each account entering the paging-refused state (vault BACKLOG

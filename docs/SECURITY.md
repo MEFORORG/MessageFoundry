@@ -5390,7 +5390,8 @@ the right one*:
   once, and the first pass that reaches the directory resolves it (BACKLOG #3709;
   [CONFIGURATION.md](CONFIGURATION.md) has the row). A partial outage, where the directory leaves
   one account unanswered on as many probes running while it answers others, pages under that
-  account's own source, `directory-reconciler-partial-outage:<username>`, and audits
+  account's own source, `directory-reconciler-partial-outage:<username>`, or once under the bare
+  `directory-reconciler-partial-outage` when many stand at once, and audits
   `auth.ad_reconcile_partial_outage`; the same row says how it is counted. The breaker's two
   thresholds must both be exceeded — the floor alone would sign out a five-person site, the proportion alone would fire
   on a genuine 3-of-3 offboarding — so it trips only on a change that is simultaneously large and broad.
