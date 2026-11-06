@@ -919,7 +919,8 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose:** a revocation the directory calls for arrives later when
   `ad_session_recheck_seconds` is above `300` s, when `ad_session_recheck_strikes` is above `2` (a pass
   revokes only after that many in a row find the account absent or disabled), or when
-  `ad_session_recheck_max_users` is below `200` (a larger estate takes more passes to cover). A
+  `ad_session_recheck_max_users` is below `200` (a larger estate takes more passes to cover, and
+  the partial outage page, which counts one account's probes, comes that many passes later too). A
   longer interval also delays the outage page, in the next bullet. The strike count delays at least an account found absent or disabled, or one whose account control
   cannot be read; a role or scope change revokes on the first pass. The mass-revoke circuit breaker
   aborts a pass that would revoke more than **both** `ad_session_revoke_max` accounts and

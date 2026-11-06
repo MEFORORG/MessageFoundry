@@ -5389,10 +5389,10 @@ the right one*:
   one such pass raises no alert. A run of `ad_reconcile_outage_passes` of them (3 by default) pages
   once, and the first pass that reaches the directory resolves it (BACKLOG #3709;
   [CONFIGURATION.md](CONFIGURATION.md) has the row). A partial outage, where the directory leaves
-  one account unanswered on as many probes running while it answers others, pages under its own
-  source, `directory-reconciler-partial-outage`, and audits `auth.ad_reconcile_partial_outage`;
-  the same row says how it is counted. Both thresholds
-  must be exceeded — the floor alone would sign out a five-person site, the proportion alone would fire
+  one account unanswered on as many probes running while it answers others, pages under that
+  account's own source, `directory-reconciler-partial-outage:<username>`, and audits
+  `auth.ad_reconcile_partial_outage`; the same row says how it is counted. The breaker's two
+  thresholds must both be exceeded — the floor alone would sign out a five-person site, the proportion alone would fire
   on a genuine 3-of-3 offboarding — so it trips only on a change that is simultaneously large and broad.
 
 When the hold's, the breaker's and the referral's alerts resolve themselves, and where they never do, is stated
@@ -5444,8 +5444,8 @@ fails, at least one a fault, the pass judges no account it asked about and revok
 outage, but it still pages, and it still strikes an id-less row (BACKLOG #3170). A pass where every
 probe fails and none faults is a plain outage, and pages nobody until a run of them lasts
 `ad_reconcile_outage_passes` passes (BACKLOG #3709). An account whose probe fails that many
-times running, counted on passes that are not a whole outage, pages as a partial outage, a pass
-of faults included. A
+times running pages as a partial outage, on a pass that reaches the directory; a fault leaves
+that account's run as it stands. A
 connection, timeout or name-lookup error that escapes the directory layer is still read as
 unreachable. So is at least an operating-system error saying the network or host is unreachable,
 down or reset. Another network-class error can still read as a probe fault and page.
