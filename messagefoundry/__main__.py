@@ -2582,7 +2582,8 @@ def _remote_debug_refused(
     """True, with the reason printed, when :func:`messagefoundry.remotedebug.remote_debug_refusal`
     refuses ``posture`` and nothing lifts it (vault BACKLOG #2700). ``what`` is what is refused.
     Where the acceptance lifts it, the :func:`_remote_debug_audit` line is logged instead. The
-    caller logs it again once its log handlers exist, as BACKLOG #1989 does for its audit lines."""
+    caller logs it again once its log handlers exist, as BACKLOG #1989 does for its audit lines.
+    A refusal with the engine's hook missing also logs the ``remote_debug_unguarded`` entry."""
     audit = _remote_debug_audit(settings, posture, enforcing=enforcing, what=what)
     if audit is not None:
         logging.getLogger(__name__).warning("%s", audit)
@@ -2590,6 +2591,13 @@ def _remote_debug_refused(
     refused = remote_debug_refusal(posture) if enforcing else None
     if refused is None:
         return False
+    # Vault BACKLOG #3795: the residual line follows this gate, so without this a refused start
+    # would not say that the engine's hook did not answer. The relaunch the refusal names turns
+    # the interface off, and would leave what stopped the hook unreported.
+    if not posture.guard_installed and (unguarded := remote_debug_loosening(posture)) is not None:
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *unguarded
+        )
     print(f"error: refusing to {what}: {refused}.", file=sys.stderr)
     return True
 
@@ -5176,17 +5184,6 @@ def _supervise(args: argparse.Namespace) -> int:
     # forwarder (BACKLOG #2356).
     configure_logging("INFO")
 
-    # The supervisor has no API and builds no loosening list, so its own reading is reported here.
-    # Each shard reports its own through `serve`.
-    security_lines: list[tuple[str, str]] = []
-    remote_debug_reading = remote_debug_posture()
-    remote_debug = remote_debug_loosening(remote_debug_reading)
-    if remote_debug is not None:
-        security_lines.append(remote_debug)
-        logging.getLogger(__name__).warning(
-            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
-        )
-
     # ADR 0050 AC-9: anchor the discovery --config and the --db base under the project root HERE, before
     # discover_shard_specs runs load_config() — so `supervise --project-root R --config <relative>` from a
     # non-root CWD discovers shards under R, and each shard's <stem>_<shard>.db composes under R in the
@@ -5252,8 +5249,8 @@ def _supervise(args: argparse.Namespace) -> int:
 
     # Vault BACKLOG #2701: the start-up code check each engine shard's `serve` makes, for the same
     # reason as the gates around it, and because the supervisor's own interpreter ran that code
-    # too. The supervisor builds no loosening list, so its own reading is logged here, like the
-    # remote-debugging one above. Each engine shard reports its own through `serve`. The reading
+    # too. The supervisor builds no loosening list, so its own reading is logged below, once the
+    # start-file gate has passed. Each engine shard reports its own through `serve`. The reading
     # also searches the import path the engine shards inherit, so a module only they would run
     # refuses here.
     from messagefoundry.config.ai_policy import SecurityEnforcement
@@ -5271,10 +5268,23 @@ def _supervise(args: argparse.Namespace) -> int:
         return 2
     # Vault BACKLOG #2700: the supervisor's OWN process. Its engine shards start with the
     # interface off (messagefoundry/childenv.py), so none of them would refuse on it.
+    remote_debug_reading = remote_debug_posture()
     if _remote_debug_refused(
         settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
     ):
         return 2
+    # The supervisor has no API and builds no loosening list, so its own reading is reported here,
+    # and only after the refusal above (vault BACKLOG #3795 item 8): a fleet refused on the
+    # reading does not first log it as a residual. One exception: where the engine's hook did not
+    # answer, _remote_debug_refused logs `remote_debug_unguarded` before its refusal, on the log
+    # stream (stdout here), while the refusal goes to stderr.
+    security_lines: list[tuple[str, str]] = []
+    remote_debug = remote_debug_loosening(remote_debug_reading)
+    if remote_debug is not None:
+        security_lines.append(remote_debug)
+        logging.getLogger(__name__).warning(
+            "[security] %s: %s. See docs/SECURITY-LOOSENING.md.", *remote_debug
+        )
     if settings.security.allow_remote_debugging:
         accepted = REMOTE_DEBUG_ACCEPTANCE_LOOSENING
         security_lines.append(accepted)
@@ -5411,13 +5421,8 @@ def _supervise(args: argparse.Namespace) -> int:
     if forwarder_installed:
         # The readings above were logged before a forwarder existed. Log them once more so the
         # off-box copy has them. With no forwarder installed this writes nothing.
-        for security_line in security_lines:
-            logging.getLogger(__name__).warning(
-                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
-                "forwarder.)",
-                *security_line,
-            )
-        # Vault BACKLOG #2700: the AUDIT line the remote-debugging gate logged above, if any.
+        # Vault BACKLOG #2700: the AUDIT line the remote-debugging gate logged above, if any. First,
+        # because the gate logged it ahead of every line in security_lines (vault BACKLOG #3795).
         if (
             fleet_audit := _remote_debug_audit(
                 settings, remote_debug_reading, enforcing=enforcing, what="start the fleet"
@@ -5425,6 +5430,12 @@ def _supervise(args: argparse.Namespace) -> int:
         ) is not None:
             logging.getLogger(__name__).warning(
                 "%s (Logged again for the off-box forwarder.)", fleet_audit
+            )
+        for security_line in security_lines:
+            logging.getLogger(__name__).warning(
+                "[security] %s: %s. See docs/SECURITY-LOOSENING.md. (Logged again for the off-box "
+                "forwarder.)",
+                *security_line,
             )
 
     try:

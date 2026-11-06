@@ -7485,9 +7485,10 @@ system lets that process write the target's memory. On a first deployment, code 
 service account could be such a process. It would then run Python inside the engine, with
 everything the engine holds.
 
-Under `enforce`, `serve` and `supervise` refuse to start with the interface on, unless
-`[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). Three further controls
-answer it, and they differ in strength:
+The first control is a start refusal under `enforce`, which `[security].allow_remote_debugging`
+lifts (vault BACKLOG #2700). Which commands make it, and when it fires, is stated once, in
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
+Three further controls answer it, and they differ in strength:
 
 - **The engine's Python children start with the interface off.** `messagefoundry/childenv.py` is
   the one place that says which children and how.
@@ -7499,8 +7500,8 @@ answer it, and they differ in strength:
   console script, such as a developer's `messagefoundry serve`, leaves it on unless
   `PYTHON_DISABLE_REMOTE_DEBUG=1` is set. So the command line installs an audit hook as it
   starts, for every command (`messagefoundry/remotedebug.py`): the interface can be on in any
-  command, and `serve` or `supervise` runs with it on under `enforcement = warn` or with the
-  acceptance above set. The
+  command, and `serve` or `supervise` runs with it on wherever the start refusal does not stop
+  it. The
   interpreter raises an event before it runs an injected script, the hook raises on it, and the
   interpreter drops the script. A refusal is logged. Under `serve` the engine also writes a
   `remote_debug_refused` audit row and raises an alert of that name (vault BACKLOG #2742).

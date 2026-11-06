@@ -552,14 +552,17 @@ What that changes for you:
   install keeps it. It refuses to install when it finds neither. Pass `-PythonExe` then.
 - **A `pip install --user` copy of the engine will not start as the service.** Isolated mode
   leaves the user's site directory out. Install into a virtual environment.
-- **`messagefoundry serve` from a prompt refuses to start under `enforce`**, because remote
-  debugging is on in it (vault BACKLOG #2700, owner ruling 2026-10-16). Run by hand what the
-  service runs, the command above. A developer loop that needs the console script sets
-  `PYTHON_DISABLE_REMOTE_DEBUG=1`, or, failing that, `[security].allow_remote_debugging = true`,
-  which is reported as a loosening
-  ([`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md)). Such a start is not isolated either, and
-  the engine says so (`interpreter_not_isolated`, and `remote_debug_enabled` under the
-  acceptance).
+- **`messagefoundry serve` from a prompt has remote debugging on** unless its environment sets
+  `PYTHON_DISABLE_REMOTE_DEBUG`, so under `enforce` the start refusal for it stops the engine
+  unless `[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). The variable works
+  there only because the console script passes neither `-I` nor `-E`: a start by hand that keeps
+  `-I` and drops `-X disable-remote-debug` has the interface on whatever the variable says, as
+  the `-X disable-remote-debug` point above says. Run by hand what the service runs, the
+  command above. When the refusal fires, and how a developer loop that needs the console script
+  gets past it, are stated in full in
+  [`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
+  A console-script start is not isolated either, and the engine says so (`interpreter_not_isolated`, and
+  `remote_debug_enabled` or `remote_debug_unguarded` where the start goes on with the interface on).
 - **The engine's Python children are isolated when the engine is.** The sandbox worker and each
   engine shard repeat the engine's `-I`, so a `PYTHON*` variable in the service's environment
   reaches none of them. A `serve` from a prompt is not isolated, and neither are its children.
