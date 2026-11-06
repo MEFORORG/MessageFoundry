@@ -4726,8 +4726,8 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   If the step accepts the token but the principal cannot be read, the row is `auth.login_error`,
   and the sign-in fails as a directory outage; the WARNING log line names the error's class and
   status. At least the `auth.login_error` rows a directory error writes at a Kerberos and at a
-  federated sign-in hold the closed reason `directory_error` and names the code defines, such as
-  the error's type and an unanswered operation's result code, never the error's text, which can
+  federated sign-in hold the closed reason `directory_error` and fields such as the error's type
+  and an unanswered operation's integer result code, never the error's text, which can
   carry what the caller or the directory chose (BACKLOG #3196, #3727). While
   browser SSO is available, a 400
   for a token that is not base64 writes the `malformed_token` row `GET /ui/sso` writes. A 400 for

@@ -1126,14 +1126,24 @@ def _reading_connection(exc: BaseException) -> Any:
 
 def _close_without_sending(conn: Any, why: str) -> None:
     """Shut ``conn``'s socket with ldap3's ``BaseStrategy.close``, which sends nothing on a stream
-    that may be out of step or already failed. Best effort: any error is logged at DEBUG, by type
-    only, because the caller's answer stands either way. A close that raised in its place would
-    replace that answer, such as a refusal every caller reads as an ``LdapError``, with an
-    unhandled one (BACKLOG #3017)."""
+    that may be out of step or already failed. Best effort: an ldap3 or socket error is logged at
+    DEBUG, by type only, because the caller's answer stands either way. Any other error is an
+    engine defect, such as an ldap3 upgrade that renamed the close, which would leave every such
+    socket open: it is logged at ERROR, by type only, and still not raised, because raised in
+    place of the caller's answer it would replace a refusal every caller reads as an
+    ``LdapError`` with an unhandled one (BACKLOG #3017)."""
+    import ldap3
+
     try:
         conn.strategy.close()
-    except Exception as failed:  # noqa: BLE001 -- best effort; the caller's error is the answer
+    except (ldap3.core.exceptions.LDAPException, OSError) as failed:
         logger.debug("AD socket close %s: %s", why, _type_name(failed))
+    except Exception as failed:  # noqa: BLE001 -- logged loud; the caller's error is the answer
+        logger.error(
+            "AD socket close %s raised %s, an engine defect; the socket may be left open",
+            why,
+            _type_name(failed),
+        )
 
 
 @contextlib.contextmanager
@@ -1528,7 +1538,7 @@ def _ldap3_failed(exc: BaseException) -> LdapError:
     BACKLOG #3017. The text is fixed and names ldap3's error type, never its text. That text can
     carry each address the engine tried and the error at each (``LDAPSocketOpenError``), or the
     directory's diagnostic message. ``check-privileges`` prints this text; the sign-in callers'
-    ``auth.login_error`` row holds type names only (``AuthService``'s
+    ``auth.login_error`` row holds no text (``AuthService``'s
     ``_directory_error_detail``, BACKLOG #3196). It differs from
     :func:`_socket_faults_as_ldap_error`'s text, so a reader can tell an ldap3 error from a bare
     socket fault.

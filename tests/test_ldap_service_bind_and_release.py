@@ -425,10 +425,12 @@ def test_every_failed_service_bind_closes_its_socket(
 
 
 def test_a_close_that_raises_never_replaces_the_bind_refusal(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The close is best effort: whatever it raises is logged by type, and the caller still gets
-    the bind's own refusal as an ``LdapError``, which every sign-in arm audits."""
+    """The close is best effort: the caller still gets the bind's own refusal as an
+    ``LdapError``, which every sign-in arm audits. A close that raises anything but an ldap3 or
+    socket error is an engine defect that may leave the socket open, so it is logged at ERROR, by
+    type."""
     _install_fakes(monkeypatch)
     _faulting(
         monkeypatch, at="open", fault=ldap3.core.exceptions.LDAPSocketReceiveError("synthetic")
@@ -444,8 +446,14 @@ def test_a_close_that_raises_never_replaces_the_bind_refusal(
             self.strategy = SimpleNamespace(close=broken_close)
 
     monkeypatch.setattr(ldap3, "Connection", BrokenClose)
-    with pytest.raises(LdapError, match="ldap3 raised LDAPSocketReceiveError"):
+    with (
+        caplog.at_level(logging.ERROR, logger=ldap_module.logger.name),
+        pytest.raises(LdapError, match="ldap3 raised LDAPSocketReceiveError"),
+    ):
         LdapAuthenticator(_ad_settings()).probe_principal("alice")
+    [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert "raised AttributeError, an engine defect" in record.getMessage()
+    assert "half-built" not in record.getMessage()
 
 
 def test_the_service_connection_is_built_without_auto_bind() -> None:
@@ -478,7 +486,7 @@ async def test_a_kerberos_sign_in_audits_an_unexpected_fault_as_a_login_error(
         rows = await _kerberos_sign_in(monkeypatch)
     assert len(rows) == 1 and '"cause": "TypeError"' in rows[0], rows
     assert "synthetic-leak" not in rows[0]
-    # At ERROR since L6: the fault is raised in this module, outside the directory libraries.
+    # At ERROR since L6: the fault is raised in this module, not while reading an answer.
     warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("resolve_principal raised TypeError" in m for m in warned), warned
     assert not any("synthetic-leak" in m for m in warned), warned
@@ -535,7 +543,7 @@ async def test_ask_directory_names_an_engine_defect_at_error(
     assert [level for level, _m in lines] == [logging.ERROR] * 3, lines
     engine_line, stdlib_line, ldap3_line = (m for _l, m in lines)
     assert "raised TypeError at messagefoundry.auth.ldap:" in engine_line
-    assert "in _escape_filter, outside the directory libraries" in engine_line
+    assert "in _escape_filter, not while reading the directory's answer" in engine_line
     assert "at json.decoder:" in stdlib_line and "at ldap3.utils.dn:" in ldap3_line
     assert not any("synthetic-leak" in m or "NoneType" in m or "empty dn" in m for _l, m in lines)
 
@@ -553,6 +561,40 @@ async def test_ask_directory_reads_a_fault_raised_reading_a_response_as_the_dire
         await service_module._ask_directory(functools.partial(ldap3.utils.dn.parse_dn, None))
     [record] = caplog.records
     assert record.levelno == logging.WARNING and "engine defect" not in record.getMessage()
+
+
+async def test_ask_directory_reads_an_unreached_directory_as_the_directorys(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A network error that says the directory was not reached is read as the reconciler reads it,
+    not as an engine defect (``_unreached_directory``)."""
+
+    def refused() -> None:
+        raise ConnectionRefusedError("synthetic-leak-3017")
+
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"),
+        pytest.raises(LdapError, match="unexpected ConnectionRefusedError"),
+    ):
+        await service_module._ask_directory(refused)
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING and "synthetic-leak" not in record.getMessage()
+
+
+def test_an_engine_defect_names_the_line_that_raised_not_its_cleanup() -> None:
+    """``tb_lineno``: a ``finally`` that ran in the raising frame moves ``f_lineno`` off the raise."""
+
+    def raises_inside_try() -> None:
+        try:
+            raise KeyError("synthetic")
+        finally:
+            _ = None
+
+    with pytest.raises(KeyError) as caught:
+        raises_inside_try()
+    where = service_module._engine_frame(caught.value)
+    raised_at = inspect.getsourcelines(raises_inside_try)[1] + 2
+    assert where is not None and where.endswith(f":{raised_at} in raises_inside_try"), where
 
 
 def test_the_login_error_detail_holds_only_names_the_code_defines() -> None:
