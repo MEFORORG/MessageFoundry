@@ -3414,8 +3414,8 @@ role passes. That is not a demotion: nothing changed in the directory, a new sig
 map, and the fix is an administrator saving the map again. So it is never told to sign out. The
 AD group-to-channel map is handled the same way: when it fails its seal, an account whose scope
 grants something is refused with `directory_scope_map_unsealed`, whether or not its scope would
-narrow, and is never told to sign out, since a new sign-in would read the same map and withdraw
-the scope. Every one of these legs calls one shared comparison rather than writing it out.
+narrow, and is never told to sign out: a new sign-in reads the same map, which withdraws a
+directory-set scope and keeps one an administrator set, and neither clears the refusal. Every one of these legs calls one shared comparison rather than writing it out.
 
 **The caller is told which fix clears the refusal, and not its cause (BACKLOG #3082).** The precise
 cause stays on the audit row. A demotion is told to sign out and sign in again. A new sign-in clears
@@ -5317,8 +5317,9 @@ Any other revocation that ends nothing and changes no role, such as a scope, rol
 unkeyed one, is quiet too. Two reconcilers that both read the audit chain before either writes its
 row both report. Two that both read the old roles do not, because the role write is a
 compare-and-set on the roles it read (vault BACKLOG #3085): only the first counts the change, and
-the second, ending no session, is quiet. For the same reason a pass whose read of the roles a
-sign-in overtook writes no role over the sign-in's. The second still reports when it ends a session the first
+the second, ending no session, is quiet. A write that finds the roles moved to another set since
+the apply read them writes nothing. A sign-in that wrote between the pass's plan and its apply is
+still overwritten, as is a newer write of the same set the apply read. The second still reports when it ends a session the first
 had not yet ended; `AuthService._apply_reconcile_revocation` names that residual. If the first
 reconciler's pass ended before it alerted, the second's quiet revocation means that account pages
 nobody. A quiet revocation whose own row is refused alerts instead, with no notice.

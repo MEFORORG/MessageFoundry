@@ -992,7 +992,8 @@ DIRECTORY_SCOPE_NARROWED = "directory_scope_narrowed"
 #: account holding a channel scope when the AD group-to-channel map fails its seal, so no scope can
 #: be judged (vault BACKLOG #3081 item 4). Not :data:`DIRECTORY_SCOPE_NARROWED`, for the reason
 #: :data:`DIRECTORY_ROLE_MAP_UNSEALED` is not a demotion: the fix is an administrator re-saving the
-#: map, and a new sign-in would read the same map and withdraw the scope.
+#: map. A new sign-in reads the same failing map, which withdraws a directory-set scope and
+#: keeps one an administrator set, and neither clears this refusal.
 DIRECTORY_SCOPE_MAP_UNSEALED = "directory_scope_map_unsealed"
 
 
@@ -9955,9 +9956,11 @@ class AuthService:
 
         A role change counts only when THIS call's write made it: the write is a compare-and-set
         on the roles this call read (vault BACKLOG #3085), so of two reconcilers that both read the
-        old roles only the first counts it, and the second, ending no session, is quiet. A plan
-        whose roles another writer moved after the read writes nothing, so it cannot write a stale
-        set over a sign-in's newer one. **Residual, at least:** the second
+        old roles only the first counts it, and the second, ending no session, is quiet. A write
+        whose roles another writer moved to a different set after this call's read writes
+        nothing. **Not closed, at least:** a sign-in that wrote between the pass's plan and this
+        call's read, since the plan's roles are not carried to compare on; and a newer write of
+        the same set this call read, since the compare is on the set, not the record. **Residual, at least:** the second
         can still end a session the first had not yet ended, when its whole apply runs between the
         first's role write and the first's own session revocation. Both then report, the first
         for the roles and the second for the session."""
@@ -14585,7 +14588,7 @@ class AuthService:
         (BACKLOG #3081 item 6). This docstring is where the rule and its reasons live; a caller
         cites it rather than restating it. ``user`` is the row the caller read after its directory
         answer, through the loader, so what is judged is what the account's seal covers. An
-        account with no roles has none to lose, and the role map is not read for it (vault
+        account with no roles has none to lose, and the role test reads no role map for it (vault
         BACKLOG #3081 item 7).
 
         Every stored role must be among the roles the account's current groups map to, the same
@@ -14622,8 +14625,11 @@ class AuthService:
         grant now. When the AD group-to-channel map fails its seal, no scope can be judged, so an
         account with a scope that grants something is refused with
         :data:`DIRECTORY_SCOPE_MAP_UNSEALED`, whether or not it would narrow, as the role map's
-        failure is refused; a new sign-in would read the same failing map and withdraw the scope,
-        so it is not told to sign in again."""
+        failure is refused. A new sign-in reads the same failing map, which withdraws a
+        directory-set scope and keeps one an administrator set, and neither clears the
+        refusal, so it is not told to sign in again. The role map is still read here, for
+        the Administrator question, when the account holds no role but a scope that grants
+        something."""
         groups = frozenset(groups)  # read more than once below
         held = set(user.role_ids)
         role_map: AdMap | None = None
