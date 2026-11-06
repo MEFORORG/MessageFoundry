@@ -260,7 +260,7 @@ def test_a_policy_name_cannot_drive_the_terminal_or_reorder_the_line() -> None:
     shown = "\n".join(render_text([hop]))
     assert _clean(shown)
     assert f"token policies ['{_HOSTILE_SHOWN}']" in shown
-    # The JSON output carries the name as the server sent it; json.dumps escapes it there.
+    # The JSON output carries the quoted name with no control escaped; json.dumps escapes it there.
     assert f"token policies ['{_HOSTILE}']" in hop.detail
     assert _HOSTILE not in _out(hop)
 

@@ -355,8 +355,12 @@ def _adr_analyze(args: argparse.Namespace) -> int:
         # with `error` inside it, and so is NOT _emit_store_open_error's bare {"error": ...}: `ok`
         # has to stay readable for a consumer that branches on it and nothing else.
         if not args.json:
-            # A symlink's resolved target in the path is text whoever made the link chose.
-            print(f"error: {_terminal_line(result.error)}", file=sys.stderr)
+            # Not _safe_print (see its docstring), and the STRICT rule, not _print_record_line's:
+            # stderr is not a hardened stream, and its backslashreplace would spell a kept
+            # character as an escape. The path, a symlink's resolved target included, is text
+            # whoever made the link chose (BACKLOG #2891).
+            shown = escape_for_terminal(result.error, single_line=True)
+            print(f"error: {shown}", file=sys.stderr)
         return 2
     if not args.json:
         with_criteria = sum(1 for r in result.reports if r.has_criteria)
@@ -380,16 +384,11 @@ def _adr_analyze(args: argparse.Namespace) -> int:
     return 1 if args.strict and not result.ok else 0
 
 
-def _terminal_line(line: str) -> str:
-    """``line`` under the rule :func:`_print_record_line` states, for the stderr ``error:`` line
-    too (BACKLOG #2891)."""
-    return escape_for_terminal(line, single_line=True, keep_printable_unicode=True)
-
-
 def _print_record_line(line: str) -> None:
     """``_safe_print`` a line that carries record text, with each character a terminal would act
     on written as a visible escape (BACKLOG #2516). Every human stdout line goes through here, so
-    a new one cannot forget the escape.
+    a new one cannot forget the escape. The ``error:`` line on stderr does not; it takes the
+    strict rule, and its comment says why.
 
     THE RULE IS THE ENGINE'S SHARED ONE, :func:`messagefoundry.terminal_text.escape_for_terminal`
     (BACKLOG #2891), so a later hardening there reaches this command too; its docstring says what
@@ -401,7 +400,7 @@ def _print_record_line(line: str) -> None:
     The JSON output needs nothing: ``json.dumps`` already escapes every control and non-ASCII
     character. ``_safe_print`` handles only the console codec, as it does for every engine
     command."""
-    _safe_print(_terminal_line(line))
+    _safe_print(escape_for_terminal(line, single_line=True, keep_printable_unicode=True))
 
 
 def _hl7schema(args: argparse.Namespace) -> int:

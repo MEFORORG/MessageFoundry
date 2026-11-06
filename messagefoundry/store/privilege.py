@@ -493,8 +493,8 @@ class StorePrivilegeReport:
         """One operator-readable line. The three statuses read differently ON PURPOSE.
 
         ``quote`` writes the principal and database names; ``repr`` by default. A caller that
-        escapes the whole line itself passes a quote with no escape of its own, or a control in a
-        name would be escaped twice (BACKLOG #2891)."""
+        escapes the whole line itself passes a quote that escapes no control character, or a
+        control in a name would be escaped twice (BACKLOG #2891)."""
         if self.status is StorePrivilegeStatus.NOT_APPLICABLE:
             return (
                 f"store privilege preflight: not applicable on {self.backend.value} — {self.detail}"

@@ -190,8 +190,9 @@ def test_the_error_line_on_stderr_escapes_what_the_path_held(
 ) -> None:
     """BACKLOG #2891, PR 2390 note 6: the ``error:`` line printed the path raw. A directory name,
     or a symlink's resolved target, can hold an ESC, a newline or a bidirectional override; a
-    newline would start a line of its own. Faked, since Windows refuses such a name."""
-    shown = "no ADR directory found or readable at /srv/a\x1b]0;owned\x07\n\u202eok"
+    newline would start a line of its own. stderr takes the strict rule, so even a printable
+    accented letter is an escape there. Faked, since Windows refuses such a name."""
+    shown = "no ADR directory found or readable at /srv/caf\u00e9\x1b]0;owned\x07\n\u202eok"
     monkeypatch.setattr(
         adr_analyze,
         "analyze_adrs",
@@ -200,7 +201,7 @@ def test_the_error_line_on_stderr_escapes_what_the_path_held(
     assert main(["adr-analyze", "--adr-dir", str(tmp_path)]) == 2
     err = capsys.readouterr().err
     assert err == (
-        "error: no ADR directory found or readable at /srv/a\\x1b]0;owned\\x07\\x0a\\u202eok\n"
+        "error: no ADR directory found or readable at /srv/caf\\u00e9\\x1b]0;owned\\x07\\x0a\\u202eok\n"
     )
 
 

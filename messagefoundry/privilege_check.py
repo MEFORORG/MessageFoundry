@@ -203,7 +203,7 @@ def store_hop(report: StorePrivilegeReport, store: StoreSettings) -> HopPrivileg
         state=state,
         identity=_store_identity(store, report),
         minimal=_store_minimal(store),
-        detail=report.summary(quote=_quoted),
+        detail=report.summary(quote=_quoted_store_name),
     )
 
 
@@ -360,6 +360,16 @@ def _quoted(text: str | None) -> str:
     return quote + text.replace("\\", "\\\\").replace(quote, "\\" + quote) + quote
 
 
+def _quoted_store_name(text: str) -> str:
+    """:func:`_quoted` for the store summary's principal and database (BACKLOG #2891), so a
+    control in one is escaped once, by :func:`render_text`. ``repr`` instead for a name holding a
+    space separator other than U+0020 (a no-break or ideographic space): the terminal rule keeps
+    those, and only ``repr`` shows one, at the cost of the doubled escape."""
+    if any(ch != " " and unicodedata.category(ch) == "Zs" for ch in text):
+        return repr(text)
+    return _quoted(text)
+
+
 #: Vault's capability words. Any other string a server returns is shown escaped, so a value that
 #: only resembles one (``deny`` plus an invisible character) does not print as that word.
 _VAULT_CAPABILITIES = frozenset(
@@ -484,9 +494,9 @@ def vault_hop(
             "paths the engine does not call were read only for the administrative ones; "
             "attest the rest of the policy by hand"
         )
-    # Kept as the server sent it: render_text escapes every printed line once, which reaches a
-    # policy name inside an administrative PATH as well as in the policy list, and the JSON output
-    # carries the value itself (json.dumps escapes it there).
+    # No control escaped here: render_text escapes every printed line once, which reaches a
+    # policy name inside an administrative PATH as well as in the quoted policy list, and the JSON
+    # output carries the text itself (json.dumps escapes it there).
     detail = ". ".join(parts)
     return HopPrivilege(
         consumer.hop,
