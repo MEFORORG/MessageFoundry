@@ -654,11 +654,14 @@ def _columns(db: Path, table: str) -> set[str]:
 
 async def test_the_store_v032_built_is_refused_by_name_and_keeps_its_tables(tmp_path: Path) -> None:
     """A v0.3.2 store does not migrate: its ``audit_log`` has no ``seq``, which no migration adds,
-    because the column is inside every row's MAC (BACKLOG #1198). The open refuses, names that
-    column and the remedy, and leaves every v0.3.2 table and index as it was, rows included: the
-    preset keeps its username owner in ``owner``, so the BACKLOG #1909 rename rolled back with the
-    refusal. The script's new tables do stay, because ``executescript`` commits before the
-    migration's transaction opens; only that transaction rolls back."""
+    because the column is inside every row's MAC (BACKLOG #1198, vault BACKLOG #2594; ``_migrate``
+    says so). The open refuses, names that column and the remedy, and leaves the definition of every
+    v0.3.2 table and index as it was, rows included: the preset keeps its username owner in
+    ``owner``, so the BACKLOG #1909 rename rolled back with the refusal. What the script creates
+    does stay, because ``executescript`` commits before the migration's transaction opens: new
+    tables, and new indexes, some of them on v0.3.2 tables (``ix_audit_action`` on ``audit_log``,
+    for one). The compare below reads only the objects that were there before, so it does not
+    see those."""
     from tests._store_v032_shape import build_sqlite_v032
 
     db = tmp_path / "v032.db"

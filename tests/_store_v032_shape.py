@@ -2,7 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A store as release v0.3.2 built it, on each backend, for the BACKLOG #1720 open tests.
 
-v0.3.2 (2026-07-28) is the newest release on PyPI. ``_store_v032_shape.json`` holds the DDL it ran
+v0.3.2 (2026-07-28) is the release the #1720 filing measured; 0.4.0 and the 0.5 releases came after
+it, and no test opens a store one of those built. ``_store_v032_shape.json`` holds the DDL v0.3.2 ran
 on a store it had just created, verbatim, so a test can build that store and open it with this build:
 
 * ``sqlite``: every object's ``sqlite_master.sql``, in creation order, read from a store the v0.3.2
@@ -13,8 +14,11 @@ on a store it had just created, verbatim, so a test can build that store and ope
   is skipped on a store ``_SCHEMA`` just built, so only the index builds and the drops remain.
 * ``sqlserver``: v0.3.2 ``sqlserver._SCHEMA``, with its two claim procedures as they rendered. It ran
   no other DDL.
-* ``postgres_marker`` and ``sqlserver_marker``: the ``schema_meta`` hash each backend wrote, which
-  v0.3.2's ``_schema_hash`` computes from the statements above.
+* ``postgres_marker`` and ``sqlserver_marker``: the ``schema_meta`` hash v0.3.2's ``_schema_hash``
+  computes from the statements above, which is what each backend wrote.
+
+Where the clone holds the v0.3.2 tag, ``tests/test_sqlserver_postgres_schema_verify_1720.py`` reads
+the batches back from it, in order. A shallow CI clone has no tags, so there those tests skip.
 
 Embedded rather than read from the tag when a test runs, because a shallow CI clone carries no tags.
 The JSON is ASCII with escapes, so the comments' dashes do not count as new glyphs. Synthetic data

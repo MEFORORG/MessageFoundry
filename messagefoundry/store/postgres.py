@@ -2477,9 +2477,10 @@ class PostgresStore:
         open. Gating on ``information_schema`` keeps re-opens of an already-migrated DB lock-free
         (this runs under the schema advisory lock alongside the CREATEs). Also creates the lease
         index here — AFTER the columns are guaranteed present — since on a Step-1 table the index
-        would reference a not-yet-added column if it lived in the _SCHEMA loop. Also runs the index
-        builds that need asyncpg's client timeout lifted (the FIFO covering indexes and
-        ix_messages_received), which the _SCHEMA loop cannot give per statement.
+        would reference a not-yet-added column if it lived in the _SCHEMA loop, and for the same
+        reason builds ux_users_federated_subject after the users ADD loop (BACKLOG #1720). Also
+        runs the index builds that need asyncpg's client timeout lifted (the FIFO covering indexes
+        and ix_messages_received), which the _SCHEMA loop cannot give per statement.
 
         Every catalog read here is scoped to ``current_schema()``, the schema the unqualified DDL
         resolves into (BACKLOG #1720). Unscoped, a second store in another schema of the same database

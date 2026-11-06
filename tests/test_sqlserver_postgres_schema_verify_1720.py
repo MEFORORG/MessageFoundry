@@ -178,33 +178,63 @@ def test_every_index_the_postgres_migration_builds_is_one_the_check_reads() -> N
     assert built == declared and len(built) == len(postgres._MIGRATION_INDEX_DDL)
 
 
-def _indexes_on_migration_columns(statements: list[str] | tuple[str, ...]) -> list[str]:
-    """``table.column`` for each column ``_migrate_lease_columns`` adds that an index statement in
-    ``statements`` keys or filters on."""
-    added = _migration_added_columns()
+_NAME_PART = r'(?:"?\w+"?\s*\.\s*)?"?(\w+)"?'
+_INDEX_ON = re.compile(
+    rf"\bCREATE\s+(?:UNIQUE\s+)?INDEX\b.*?\bON\s+(?:ONLY\s+)?{_NAME_PART}\s*(?:USING\s+\w+\s*)?\((.*)",
+    re.I | re.S,
+)
+#: What gives an older table a column: an ADD, or a column rename, anywhere in a statement.
+_SUPPLIES_COLUMN = (
+    re.compile(
+        rf"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?{_NAME_PART}\s+ADD\s+(?:COLUMN\s+)?"
+        r'(?:IF\s+NOT\s+EXISTS\s+)?"?(\w+)"?',
+        re.I,
+    ),
+    re.compile(
+        rf'\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?{_NAME_PART}\s+RENAME\s+COLUMN\s+"?\w+"?'
+        r'\s+TO\s+"?(\w+)"?',
+        re.I,
+    ),
+)
+
+
+def _indexes_before_their_columns(statements: list[str] | tuple[str, ...]) -> list[str]:
+    """``table.column`` for each index in ``statements`` that keys or filters on a column an older
+    table gets only later: from an ADD or a rename further on in ``statements``, or from
+    ``_migrate_lease_columns``, which runs after them. Only index builds are read."""
+    pending = set(_migration_added_columns())
     hits: list[str] = []
-    for statement in statements:
-        m = re.search(r"\bCREATE\s+(?:UNIQUE\s+)?INDEX\b.*?\bON\s+(\w+)\s*\((.*)", statement, re.S)
-        if m is None:
-            continue
-        table, rest = m.group(1).lower(), m.group(2)
-        hits += sorted(f"{t}.{c}" for t, c in added if t == table and re.search(rf"\b{c}\b", rest))
-    return hits
+    for statement in reversed(statements):
+        m = _INDEX_ON.search(statement)
+        if m is not None:
+            table, rest = m.group(1).lower(), m.group(2).lower()
+            hits += [f"{t}.{c}" for t, c in pending if t == table and re.search(rf"\b{c}\b", rest)]
+        for pattern in _SUPPLIES_COLUMN:
+            pending |= {(t.lower(), c.lower()) for t, c in pattern.findall(statement)}
+    return sorted(hits)
 
 
-def test_no_postgres_batch_index_needs_a_column_only_the_migration_adds() -> None:
-    """BACKLOG #1720: ``_SCHEMA`` runs before ``_migrate_lease_columns``, so an index there on a
-    column the migration adds fails on an older table with the driver's undefined-column error,
-    before the live-schema check can name the store's differences. That is how
-    ``ux_users_federated_subject`` stopped a v0.3.2 store; it is built in the migration now."""
+def test_no_postgres_batch_index_needs_a_column_its_table_gets_later() -> None:
+    """BACKLOG #1720: on an older table, a column the batch's own guarded ADD or the migration
+    supplies exists only once that has run, so an index built before it fails with the driver's
+    undefined-column error, before the live-schema check can name the store's differences. That is
+    how ``ux_users_federated_subject`` stopped a v0.3.2 store; it is built in the migration now."""
     from messagefoundry.store import postgres
 
-    # Positive control: the index this was found in, as it read in _SCHEMA.
-    assert _indexes_on_migration_columns([postgres._FEDERATED_SUBJECT_INDEX_DDL]) == [
+    # Positive controls: the index this was found in, as it read in _SCHEMA, and a batch ADD
+    # after an index on its column, with a qualified, quoted, upper-case spelling. Then the order
+    # that is safe.
+    assert _indexes_before_their_columns([postgres._FEDERATED_SUBJECT_INDEX_DDL]) == [
         "users.oidc_issuer",
         "users.oidc_subject",
     ]
-    assert _indexes_on_migration_columns(postgres._SCHEMA) == []
+    late = [
+        'CREATE INDEX IF NOT EXISTS ix_s ON public."sessions"(USER_EPOCH)',
+        "DO $$ BEGIN ALTER TABLE sessions ADD COLUMN user_epoch INTEGER; END $$",
+    ]
+    assert _indexes_before_their_columns(late) == ["sessions.user_epoch"]
+    assert _indexes_before_their_columns(late[::-1]) == []
+    assert _indexes_before_their_columns(postgres._SCHEMA) == []
 
 
 def test_the_parser_reads_ddl_in_order() -> None:
@@ -898,7 +928,8 @@ async def test_live_sqlserver_open_refuses_a_table_missing_a_column(
 # --- BACKLOG #1720 step 3: the store v0.3.2 built, opened by this build ---------------------------
 #
 # A v0.3.2 store does not migrate on any backend: its audit_log has no `seq`, which no migration adds
-# because the column is inside every row's MAC (BACKLOG #1198). So the open must refuse it naming
+# because the column is inside every row's MAC (BACKLOG #1198, vault BACKLOG #2594; store.py's
+# _migrate says so). So the open must refuse it naming
 # that column, roll back, and leave the v0.3.2 marker in place. tests/test_store_schema.py holds the
 # SQLite twin. While the federated-subject index sat in _SCHEMA, the PostgreSQL batch would have
 # stopped before the check, on the driver's undefined-column error for users.oidc_issuer: read from
@@ -907,9 +938,10 @@ async def test_live_sqlserver_open_refuses_a_table_missing_a_column(
 _V032_SEQ = "table 'audit_log' is missing column 'seq'"
 
 
-def test_the_v032_server_fixture_hashes_to_its_markers_and_holds_the_old_shape() -> None:
-    """The embedded batches give the markers v0.3.2's ``_schema_hash`` wrote, and the shape they
-    build is the one the open tests below are about. Read without a server."""
+def test_the_v032_server_fixture_holds_the_old_shape() -> None:
+    """The embedded batches build the shape the open tests below are about, and hash to the marker
+    the fixture records under v0.3.2's ``_schema_hash`` formula. That marker is the fixture's own
+    value; the tag test below reads the batches and the formula's revision from v0.3.2 itself."""
     from tests import _store_v032_shape as v032
 
     pg = "\n".join(v032.POSTGRES_BATCH) + "\nmigration_rev=1"  # v0.3.2's _MIGRATION_REV
@@ -926,49 +958,86 @@ def test_the_v032_server_fixture_hashes_to_its_markers_and_holds_the_old_shape()
         assert "owner" in presets and "owner_user_id" not in presets
 
 
-def _tag_source(path: str) -> str | None:
+def _git(*args: str) -> subprocess.CompletedProcess[bytes]:
     root = pathlib.Path(__file__).resolve().parents[1]
+    return subprocess.run(["git", *args], cwd=root, capture_output=True, timeout=60)
+
+
+def _tag_module(module: str) -> ast.Module:
+    """The v0.3.2 tag's ``messagefoundry/store/<module>``, parsed. Skips only where the clone holds
+    no such tag, as a shallow CI clone does; any other git failure fails the test."""
     try:
-        shown = subprocess.run(
-            ["git", "show", f"v0.3.2:{path}"],
-            cwd=root,
-            capture_output=True,
-            check=True,
-            timeout=60,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return shown.stdout.decode("utf-8")
+        present = _git("rev-parse", "--verify", "--quiet", "v0.3.2^{commit}").returncode == 0
+    except OSError:
+        present = False
+    if not present:
+        pytest.skip("this clone has no v0.3.2 tag")
+    shown = _git("show", f"v0.3.2:messagefoundry/store/{module}")
+    assert shown.returncode == 0, shown.stderr.decode("utf-8", "replace")
+    return ast.parse(shown.stdout.decode("utf-8"))
 
 
-def test_the_v032_fixture_is_ddl_the_tag_ships() -> None:
-    """Every embedded statement is text from the v0.3.2 tag's store modules: a string constant, or
-    inside one. SQLite stores a CREATE without its ``IF NOT EXISTS``, so that is put back first. The
-    SQL Server claim procedures are rendered by a call, so they are counted, not matched. Skipped
-    where the clone has no tags, as a shallow CI clone does."""
+def _assigned(tree: ast.Module, name: str) -> ast.expr:
+    for node in tree.body:
+        targets: list[ast.expr]
+        if isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        elif isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        else:
+            continue
+        if value is not None and any(isinstance(t, ast.Name) and t.id == name for t in targets):
+            return value
+    raise AssertionError(f"the v0.3.2 module assigns no {name}")
+
+
+def _strings(tree: ast.Module) -> list[str]:
+    return [
+        n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    ]
+
+
+def test_the_v032_server_batches_are_the_tags_in_order() -> None:
+    """Each server batch is v0.3.2's ``_SCHEMA`` list, element for element, in order. The two SQL
+    Server claim procedures are calls there, so only their place is checked. PostgreSQL's marker
+    formula took ``_MIGRATION_REV``, which v0.3.2 set to 1."""
     from tests import _store_v032_shape as v032
 
-    sqlite = tuple(
+    pg = _tag_module("postgres.py")
+    assert ast.literal_eval(_assigned(pg, "_SCHEMA")) == list(v032.POSTGRES_BATCH)
+    assert ast.literal_eval(_assigned(pg, "_MIGRATION_REV")) == 1
+    pg_strings = _strings(pg)
+    assert [s for s in v032.POSTGRES_MIGRATION if s not in pg_strings] == []
+    ms = _assigned(_tag_module("sqlserver.py"), "_SCHEMA")
+    assert isinstance(ms, ast.List) and len(ms.elts) == len(v032.SQLSERVER_BATCH)
+    for element, statement in zip(ms.elts, v032.SQLSERVER_BATCH, strict=True):
+        if isinstance(element, ast.Call):
+            assert "CREATE OR ALTER PROCEDURE" in statement
+        else:
+            assert ast.literal_eval(element) == statement
+
+
+def test_the_v032_sqlite_objects_are_the_tags_in_order() -> None:
+    """Every object v0.3.2's ``_SCHEMA`` creates is in the fixture, in the script's order, and every
+    fixture statement is that release's text. SQLite stores a CREATE without its ``IF NOT
+    EXISTS``, so that is put back before the match. The objects the script does not create are
+    the ones its ``_migrate`` built, which the match finds among the module's other strings."""
+    from tests import _store_v032_shape as v032
+
+    tree = _tag_module("store.py")
+    script = ast.literal_eval(_assigned(tree, "_SCHEMA"))
+    created = re.compile(r"^\s*CREATE (?:UNIQUE )?(?:TABLE|INDEX) (?:IF NOT EXISTS )?(\w+)", re.M)
+    names = [m.group(1) for m in map(created.match, v032.SQLITE_DDL) if m is not None]
+    assert len(names) == len(v032.SQLITE_DDL)
+    in_script = created.findall(script)
+    assert len(set(in_script)) == len(in_script)
+    assert [n for n in names if n in in_script] == in_script
+    strings = _strings(tree)
+    restored = [
         re.sub(r"^CREATE (UNIQUE )?(TABLE|INDEX) ", r"\g<0>IF NOT EXISTS ", s)
         for s in v032.SQLITE_DDL
-    )
-    for module, statements, procedures in (
-        ("store.py", sqlite, 0),
-        ("postgres.py", (*v032.POSTGRES_BATCH, *v032.POSTGRES_MIGRATION), 0),
-        ("sqlserver.py", v032.SQLSERVER_BATCH, 2),
-    ):
-        source = _tag_source(f"messagefoundry/store/{module}")
-        if source is None:
-            pytest.skip("this clone has no v0.3.2 tag")
-        constants = [
-            node.value
-            for node in ast.walk(ast.parse(source))
-            if isinstance(node, ast.Constant) and isinstance(node.value, str)
-        ]
-        unmatched = [s for s in statements if not any(s in c for c in constants)]
-        rendered = [s for s in unmatched if "CREATE OR ALTER PROCEDURE" in s]
-        assert len(rendered) == procedures, module
-        assert [s[:80] for s in unmatched if s not in rendered] == [], module
+    ]
+    assert [s[:80] for s in restored if not any(s in c for c in strings)] == []
 
 
 @pytest.mark.skipif(not _POSTGRES_ON, reason="set MEFOR_TEST_POSTGRES=1 (+ MEFOR_STORE_* env)")
@@ -1031,8 +1100,12 @@ async def test_live_sqlserver_refuses_the_store_v032_built_and_keeps_its_marker(
         "INSERT INTO schema_meta (id, schema_hash, applied_at)"
         f" VALUES (1, '{v032.SQLSERVER_MARKER}', 2.0)"
     )
-    for statement in (*v032.SQLSERVER_BATCH, *v032.SEED_ROWS, marker_row):
-        await admin.run_in(db, statement)
+
+    async def seed() -> None:
+        for statement in (*v032.SQLSERVER_BATCH, *v032.SEED_ROWS, marker_row):
+            await admin.run_in(db, statement)
+
+    await bounded(admin.settings, "build the store v0.3.2 built", seed())
     with pytest.raises(ServerSchemaMismatchError) as caught:
         opened = SqlServerStore.open(scratch)
         await (await bounded(admin.settings, "open the store v0.3.2 built", opened)).close()
