@@ -274,15 +274,14 @@ def _session_write_errors() -> tuple[type[Exception], ...]:
 
 @cache
 def _passkey_read_errors() -> tuple[type[Exception], ...]:
-    """What the passkey set read after the sign-count write refuses rather than raises (BACKLOG
+    """The classes the passkey set read after the sign-count write catches to refuse (BACKLOG
     #3775; vault BACKLOG #4728 finding 3 decided it):
     :func:`~messagefoundry.store.base.store_call_errors` and
     :func:`~messagefoundry.store.base.store_connect_errors`. Wider than
-    :func:`_session_write_errors` by every ``ValueError`` (aiosqlite's closed connection among
-    them) and every ``RuntimeError``, so a defect that raises either is audited as ``store_error``
-    too; the connect set adds pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim.
-    ``sqlite3.InterfaceError`` is in neither and still raises. The caller re-raises
-    ``AUDIT_WRITE_DEFECTS`` first. Cached, as
+    :func:`_session_write_errors` by ``ValueError`` and ``RuntimeError``; the connect set adds
+    pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim. The caller re-raises
+    ``AUDIT_WRITE_DEFECTS`` first, so not every class under these is refused: which faults the
+    read refuses, and which still raise, is ADR 0068, amendment of 2026-10-17. Cached, as
     ``store_call_errors`` is, so a refusal does not run the driver import on the event loop."""
     return (*store_call_errors(), *store_connect_errors())
 
@@ -15318,9 +15317,10 @@ class AuthService:
         flight, the sign count does not move, and nothing is charged, so the same assertion
         verifies once the directory confirms the account. After the sign-count write the passkey set is
         read, then the session, the account and the lock, so the last read before the factor write
-        is the holder re-read, with no other await between it and the write (BACKLOG #3068). At
-        least the store faults :func:`_passkey_read_errors` names refuse in the passkey re-read,
-        audited with ``reason=store_error`` (BACKLOG #3775)."""
+        is the holder re-read, with no other await between it and the write (BACKLOG #3068). A
+        store fault in the passkey re-read refuses, audited with ``reason=store_error`` (BACKLOG
+        #3775); which faults that covers, and which still raise, is ADR 0068, amendment of
+        2026-10-17."""
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
