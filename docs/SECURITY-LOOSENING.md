@@ -934,7 +934,7 @@ count is above `0` (vault BACKLOG #2613).
   pages on the pass that brings the count of such passes to `ad_reconcile_outage_passes` (vault
   BACKLOG #3709); a pass that asks nothing, or whose every probe failed or faulted with one fault at
   least, neither counts nor ends the run. A value above `3` delays that page, and the partial
-  outage's page, whose own run counts every pass that leaves a probe unanswered. One less than the
+  outage's page, which waits for as many unanswered probes of one account. One less than the
   value, times `ad_session_recheck_seconds`, after the first outage pass is only the least delay:
   the passes are an interval apart plus each pass's own run, and an outage pass waits out a directory
   timeout for each account it probes, so a larger estate, a larger per-pass budget or a longer
