@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from messagefoundry.hl7schema import hl7_schema
+from messagefoundry_toolkit.hl7schema import hl7_schema
 
 
 def _field(seg: dict, index: int) -> dict | None:

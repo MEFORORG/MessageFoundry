@@ -39,13 +39,13 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.generators.documents import synthetic_pdf
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 from messagefoundry.timezone import convert_hl7_timestamp, to_zone
 from messagefoundry.transports.base import DestinationConnector
 from messagefoundry.transports.mllp import build_ack
+from messagefoundry_toolkit.generators.documents import synthetic_pdf
 
 ADT = "MSH|^~\\&|SND|FAC|RCV|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 

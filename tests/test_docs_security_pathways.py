@@ -3257,11 +3257,11 @@ def test_the_twelfth_sweep_browser_support_does_not_say_a_passkey_is_never_alone
 
 def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
     """The code facts the second round's sentences now state."""
-    from messagefoundry import anon
     from messagefoundry.config import ai_policy
     from messagefoundry.config import settings as settings_module
     from messagefoundry.config.wiring import X12, Tcp
     from messagefoundry.logging_setup import SyslogForward
+    from messagefoundry_toolkit import anon
 
     # 1. Off-box log forwarding is built and wired: serve builds a SyslogForward handler.
     main_tree = ast.parse((_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8"))
@@ -3271,7 +3271,9 @@ def test_the_twelfth_sweep_second_round_probes_what_is_built() -> None:
     )
     # 2. The de-identification framework is built; only the AI-assist path lacks it, and the guide's
     #    row says that path's scope falls back to code_only.
-    assert callable(getattr(anon, "anonymize_checked", None)), "messagefoundry.anon lost its entry"
+    assert callable(getattr(anon, "anonymize_checked", None)), (
+        "messagefoundry_toolkit.anon lost its entry"
+    )
     deid = ai_policy.resolve_effective_policy(
         mode=ai_policy.AiMode.MANAGED_CLAUDE_BAA,
         data_scope=ai_policy.AiDataScope.DEIDENTIFIED,
@@ -3987,10 +3989,10 @@ def test_the_security_controls_table_states_what_the_code_does() -> None:
     for status and opening words only; `tests/test_api_tls.py` and the thirteenth sweep's
     second-round probe hold their behaviour. The revocation row is tied to one CRL setting, not to
     which hops are covered. Some probes repeat ones the sweeps above hold."""
-    from messagefoundry import anon
     from messagefoundry.config import ai_policy
     from messagefoundry.config import settings as settings_module
     from messagefoundry.config.wiring import MLLP, X12, Tcp
+    from messagefoundry_toolkit import anon
 
     read: set[str] = set()
 

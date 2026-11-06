@@ -14,8 +14,8 @@ from collections.abc import Callable
 
 import pytest
 
-from messagefoundry.generators.documents import mdm_with_pdf, oru_with_pdf, synthetic_pdf
 from messagefoundry.parsing.message import Message
+from messagefoundry_toolkit.generators.documents import mdm_with_pdf, oru_with_pdf, synthetic_pdf
 
 _Builder = Callable[[bytes], str]
 
