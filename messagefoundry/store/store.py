@@ -5472,10 +5472,15 @@ def store_pin_problem(genesis: Mapping[str, Any] | None, pin: StorePin) -> str |
 _PIN_NEEDS_THE_WRAP: Final = (
     "the store's audit chain was never started, and only the command that minted its key, which "
     "holds its recovery wrap, may start it: a chain started without the recovery wrap would leave "
-    "the recovery key opening nothing kept in the store. The engine cannot tell whose key the "
-    "host blob here is, so keep it and the store: run `messagefoundry provision-admin`, which "
-    "names the way on"
+    "the recovery key opening nothing kept in the store."
 )
+
+
+def _pin_needs_the_wrap() -> str:
+    """:data:`_PIN_NEEDS_THE_WRAP` with the one way on (PR 2804 fifth hold)."""
+    from messagefoundry.store.custody_host import keep_the_key_step
+
+    return f"{_PIN_NEEDS_THE_WRAP} {keep_the_key_step()}"
 
 
 class _PinRefusal(NamedTuple):
@@ -5500,7 +5505,7 @@ async def _store_pin_refusal(
     on another store's chain."""
     if first is None and not await host._audit_rows(limit=1):
         if writable and not pin.recovery_wrap:
-            return _PinRefusal(_PIN_NEEDS_THE_WRAP, never_started=True)
+            return _PinRefusal(_pin_needs_the_wrap(), never_started=True)
         return None
     problem = store_pin_problem(first, pin)
     if problem is not None or first is None:
@@ -6212,7 +6217,7 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
     if first is None and active_id is not None and not read_only:
         if pin is not None and not pin.recovery_wrap:
             # Vault BACKLOG #3411: never start a chain under a host blob without its recovery wrap.
-            raise StoreIdPinRefused(f"refusing to open the store: {_PIN_NEEDS_THE_WRAP}")
+            raise StoreIdPinRefused(f"refusing to open the store: {_pin_needs_the_wrap()}")
         # The append requires an EMPTY log, so it writes nothing when any row is there. Suppressed:
         # another process started the chain between the read and the append, or the log holds rows
         # and none at seq 1. The re-read below tells the two apart.

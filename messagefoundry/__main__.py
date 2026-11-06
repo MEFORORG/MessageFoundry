@@ -7071,6 +7071,7 @@ def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseExcep
     and named on stderr. Neither text carries the key."""
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.store.base import _absent_sqlite_store
+    from messagefoundry.store.custody_host import keep_the_key_step
     from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
 
     nothing_written = isinstance(failure, StoreIdPinRefusedBeforeWrite) or (
@@ -7080,9 +7081,7 @@ def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseExcep
         print(
             f"WARNING: the store could not be created, and it may already have been started "
             f"under the store key minted for it, so that key is kept in {path}. No Administrator "
-            "was provisioned into it. Keep that file and run the command again: if the store was "
-            "started under that key, it carries on with it, and if not, it names a way on that "
-            "keeps the file",
+            f"was provisioned into it. {keep_the_key_step()}",
             file=sys.stderr,
         )
         return
@@ -7098,8 +7097,7 @@ def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseExcep
     except OSError as exc:
         print(
             f"WARNING: the store could not be created, and the store key minted for it in {path} "
-            f"could not be removed ({exc.strerror or type(exc).__name__}). Move it to "
-            f"{path}.aside before running provision-admin again",
+            f"could not be removed ({exc.strerror or type(exc).__name__}). {keep_the_key_step()}",
             file=sys.stderr,
         )
 
@@ -8476,17 +8474,12 @@ def _never_started_refusal(store: StoreSettings) -> str:
     """``provision-admin``'s text when the host blob here opens a store whose audit chain was
     never started (PR 2804 hold 2 and fourth hold): a mint that failed before its genesis record,
     or a blob another store in a shared directory owns. The engine cannot tell which, so the text
-    keeps the key and names the one way on. Names paths, never a key."""
-    import os
+    keeps the key and names the one way on. Names no key."""
+    from messagefoundry.store.custody_host import keep_the_key_step
 
-    from messagefoundry.store.custody_host import check_host_custody_settings, keep_the_key_step
-
-    paths = check_host_custody_settings(store)
-    present = [path for path in paths if os.path.lexists(path)] or [paths[0]]
     return (
         "the store's audit chain was never started, and only the run that minted this store's "
-        "key, holding its recovery wrap, may start it. "
-        f"{keep_the_key_step(store, present, store_file=True)}"
+        f"key, holding its recovery wrap, may start it. {keep_the_key_step()}"
     )
 
 
@@ -8803,6 +8796,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         HOST_PROVIDER,
         HostCustodyMissing,
         HostCustodyRefused,
+        keep_the_key_step,
         mint_target,
     )
     from messagefoundry.store.store import StoreChainNeverStarted
@@ -8825,11 +8819,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
             if settings.store.backend is StoreBackend.SQLITE or not run_guarded(
                 server_store_absent()
             ):
+                # On a server the probe refused only a store with a genesis record or with data.
+                held = "exists" if settings.store.backend is StoreBackend.SQLITE else "holds data"
                 raise HostCustodyRefused(
-                    f"the store already exists, and {missing}. A new key cannot open a store "
-                    "another key made: put back the host blob it was made with. The engine cannot "
-                    "tell whether the store holds anything you need, so keep it: to provision a "
-                    "new store instead, point [store] at a new database or file"
+                    f"the store already {held}, and {missing}. A new key cannot open a store "
+                    "another key made: put back the host blob it was made with. "
+                    f"{keep_the_key_step()}"
                 ) from missing
             absent, exists = True, None
         except StoreChainNeverStarted as unstarted:

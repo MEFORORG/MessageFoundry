@@ -20,6 +20,7 @@ import sys
 import types
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -217,9 +218,8 @@ async def test_a_host_blob_refuses_every_other_key_provider(tmp_path: Path, name
     settings = _settings(tmp_path, key_provider="auto", encryption_key_file="k.bin")
     refusal = foreign_custody_refusal(settings, environ={})
     assert refusal is not None and name in refusal and "'auto'" in refusal
-    # PR 2804 fourth hold: the file may be another store's only key, so it is moved, never removed.
-    assert "remove the file" not in refusal and "cannot tell whose key" in refusal, refusal
-    assert f"move it to {tmp_path / name}.aside" in refusal, refusal
+    # PR 2804 fifth hold: the file may be another store's only key, so the way on leaves it.
+    assert not _advises_changing(refusal) and custody_host.keep_the_key_step() in refusal, refusal
     with pytest.raises(HostCustodyRefused, match=name):
         await open_store(settings, create=True)
     assert not (tmp_path / "store.db").exists()
@@ -283,8 +283,7 @@ def test_a_second_mint_over_an_existing_file_is_file_exists(tmp_path: Path, name
     assert console.shown == []  # refused before anything was minted or shown
     # PR 2804 fourth hold, item 5: a way on that keeps the file, which may be another store's key.
     text = str(refused.value)
-    assert f"{tmp_path / name}.aside" in text and "MEFOR_SECRETS_DIRECTORY" in text, text
-    assert "remove" not in text.lower()
+    assert not _advises_changing(text) and custody_host.keep_the_key_step() in text, text
 
 
 @windows_only
@@ -592,9 +591,9 @@ def test_the_crash_rule_refuses_a_handoff_naming_another_store(tmp_path: Path) -
     with pytest.raises(HostCustodyRefused, match="not this store's") as excinfo:
         load_host_custody(_settings(tmp_path), enforcing=True, environ={})
     assert (tmp_path / "handoff.key").exists()
-    # PR 2804 fourth hold: another store's handoff may be its only key, so it is moved aside.
+    # PR 2804 fifth hold: another store's handoff may be its only key, so the way on leaves it.
     text = str(excinfo.value)
-    assert "remove" not in text.lower() and f"{tmp_path / 'handoff.key'}.aside" in text, text
+    assert not _advises_changing(text) and custody_host.keep_the_key_step() in text, text
     assert not _leaks(str(excinfo.value), blob) and not _leaks(str(excinfo.value), other)
 
 
@@ -1054,7 +1053,7 @@ async def _failed_mint_leftovers(path: Path, tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("census", "refusal"),
     [
-        ("connection event", "the store already exists"),
+        ("connection event", "the store already holds data"),
         ("incomplete", "does not hold the view definition permission"),
         ("unreadable", "could not be read (OperationalError)"),
         ("unreachable", "could not be read (ConnectionRefusedError)"),
@@ -1145,8 +1144,10 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absen
     assert probes == [True], err  # the server probe ran, under a read-only open
     assert refusal in err and "Traceback" not in err
     if census == "connection event":
-        # PR 2804 fourth hold: nothing proves whose the store is, so the way on keeps it.
-        assert "remove" not in err.lower() and "point [store] at a new database" in err, err
+        # PR 2804 fifth hold: the census just proved rows, so the text says so, and the way on
+        # leaves the store in place.
+        assert "the store already holds data" in err and not _advises_changing(err), err
+        assert "cannot tell whether the store holds anything" not in err, err
     assert driver_text not in err
     assert list(secrets.iterdir()) == []  # no host blob, no handoff
 
@@ -1157,8 +1158,6 @@ async def _sqlserver_occupancy(
     """``SqlServerStore.table_occupancy`` over a stand-in fetch, with no server: the anchor query
     answers ``anchor``, the catalog lists ``messages``, and every probe finds no row. Returns the
     census and each SQL text it sent."""
-    from typing import Any
-
     from messagefoundry.store.sqlserver import SqlServerStore
 
     store = object.__new__(SqlServerStore)
@@ -1208,6 +1207,94 @@ async def test_the_sqlserver_census_refuses_without_view_definition_on_the_schem
 
     with pytest.raises(TableCensusIncomplete, match="does not hold the view definition permission"):
         await _sqlserver_occupancy(monkeypatch, {"s": "app", "vd": 0, "sel": schema_select})
+
+
+_CHANGING = re.compile(
+    r"\.aside|\b(?:move|moving|rename|renaming|remove|removing|delete|deleting|overwrite|"
+    r"overwriting)\b",
+    re.IGNORECASE,
+)
+
+
+async def _keyless_closed(path: Path) -> None:
+    await (await _keyless_store(path)).close()
+
+
+async def _never_started_pin_text(directory: Path) -> str:
+    """What a pinned writable open says over a chain never started: the pin refusal's text."""
+    from messagefoundry.store.store import StoreChainNeverStarted
+
+    settings = _settings(directory)
+    await _keyless_closed(Path(settings.path))
+    blob = _mint(settings)
+    with pytest.raises(StoreChainNeverStarted) as refused:
+        await open_store(settings, custody=blob)
+    return str(refused.value)
+
+
+def _advises_changing(text: str) -> bool:
+    """Whether ``text`` advises moving, renaming, removing, deleting or overwriting something
+    (PR 2804 fifth hold). "could not be removed" reports what failed and advises nothing."""
+    return _CHANGING.search(text) is not None
+
+
+@host_file_platforms
+def test_no_keep_the_key_text_advises_changing_what_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # PR 2804 fifth hold, the proof: every text the one helper's callers emit, rendered here,
+    # creates only new things. The positive control is the fourth hold's own text.
+    import asyncio
+
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
+
+    old = (
+        "The engine cannot tell whose key is in master.key, and it may be another store's only "
+        "key, so keep it. If no other store uses it, move the store file store.db to "
+        "store.db.aside, and move master.key to master.key.aside"
+    )
+    assert _advises_changing(old) and _advises_changing("Remove it before running again")
+    # The existing-store refusal: a SQLite store here with no key for it.
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    asyncio.run(_keyless_closed(existing / "store.db"))
+    assert _run_provision_admin(existing, monkeypatch, existing / "store.db") == 2
+    refused = capsys.readouterr().err
+    assert "the store already exists" in refused, refused
+    texts = [refused]
+    pinned = tmp_path / "pinned"
+    pinned.mkdir()
+    texts.append(asyncio.run(_never_started_pin_text(pinned)))
+    settings = _settings(tmp_path)
+    (tmp_path / custody_host.HOST_FILE_NAME).write_bytes(b"not read")
+    foreign = custody_host.foreign_custody_refusal(
+        settings.model_copy(update={"key_provider": "auto", "encryption_key_file": "k.bin"}),
+        environ={},
+    )
+    assert foreign is not None
+    texts += [cli._never_started_refusal(settings), foreign]
+    with pytest.raises(FileExistsError) as exists:
+        custody_host.mint_target(settings, service_account=None, enforcing=False, environ={})
+    texts.append(str(exists.value))
+    server = StoreSettings().model_copy(update={"backend": StoreBackend.POSTGRES})
+    kept = tmp_path / "kept.key"
+    kept.write_bytes(b"k")
+    cli._discard_minted_custody(kept, server, StoreIdPinRefused("after the salt bind"))
+
+    def _held(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(Path, "unlink", _held)
+    cli._discard_minted_custody(kept, server, StoreIdPinRefusedBeforeWrite("before"))
+    monkeypatch.undo()
+    warnings = capsys.readouterr().err
+    assert warnings.count("WARNING:") == 2 and "could not be removed" in warnings, warnings
+    texts.append(warnings)
+    offending = [text for text in texts if _advises_changing(text)]
+    assert not offending, offending
+    for text in texts:
+        assert custody_host.keep_the_key_step() in text, text
 
 
 async def _failed_create(
@@ -1283,17 +1370,9 @@ def test_a_rerun_over_a_chain_never_started_keeps_the_key_file(
     err = capsys.readouterr().err
     assert "Traceback" not in err
     assert kept.exists()
-    assert "remove" not in err.lower() and "delete" not in err.lower(), err
-    assert "cannot tell whose key" in err and f"move {kept} to {kept}.aside" in err, err
-    # A SQLite store with no key here reads as taken, so its file moves aside, its -wal file
-    # renamed to match, or SQLite would not find it.
-    db = store_path.resolve()
-    assert f"move the store file {db} to {db}.aside" in err, err
-    assert f"{db.name}.aside-wal" in err, err
-    # Which file a recovery key goes with, and that the step suits only a store holding nothing
-    # the operator needs: nothing is carried over.
-    assert "recovery key shown when" in err and "holds nothing you need" in err, err
-    assert "void" not in err, err  # an earlier recovery key may be another store's
+    # PR 2804 fifth hold: the one way on, which creates only new things.
+    assert not _advises_changing(err), err
+    assert " ".join(custody_host.keep_the_key_step().split()) in " ".join(err.split()), err
 
 
 @host_file_platforms
@@ -1324,9 +1403,9 @@ def test_a_shared_secrets_directory_never_names_another_stores_key_for_removal(
     code = _run_provision_admin(tmp_path, monkeypatch, b_path)
     assert code == 2
     err = capsys.readouterr().err
-    assert "remove" not in err.lower() and "delete" not in err.lower(), err
-    assert "If another store uses it, leave it in place" in err and str(kept) in err, err
-    assert "MEFOR_SECRETS_DIRECTORY" in err, err
+    assert not _advises_changing(err) and "leaves that file in place" in err, err
+    assert "MEFOR_SECRETS_DIRECTORY to a new, empty directory" in " ".join(err.split()), err
+    assert kept.exists()
     # B's pre-check was refused before its first write, so nothing was bound under A's key.
     import sqlite3
 
@@ -1343,10 +1422,13 @@ def test_a_shared_secrets_directory_never_names_another_stores_key_for_removal(
 def test_the_way_on_a_never_started_refusal_names_lets_the_mint_go_ahead(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # PR 2804 fourth hold: follow the refusal's step where no other store uses the key, moving the
-    # SQLite store file and the key file to the named paths, and the re-run reaches the mint (here
-    # its terminal check, since no terminal is attached). Both moved files are still there.
+    # PR 2804 fifth hold, item 4: follow the refusal's one way on, a new, empty custody directory
+    # and a new store location, and the re-run mints this store's key there through mint_target
+    # and provisions it. The key file and the store left in place are untouched.
     import asyncio
+
+    from messagefoundry import __main__ as cli
+    from messagefoundry.__main__ import main
 
     settings = _settings(tmp_path)
     store_path = Path(settings.path)
@@ -1358,16 +1440,35 @@ def test_the_way_on_a_never_started_refusal_names_lets_the_mint_go_ahead(
     _mint(settings)
     kept = tmp_path / custody_host.HOST_FILE_NAME
     assert _run_provision_admin(tmp_path, monkeypatch, store_path) == 2
-    assert f"move {kept} to {kept}.aside" in capsys.readouterr().err
-    store_path.rename(f"{store_path}.aside")
-    for suffix in ("-wal", "-shm"):
-        side = Path(f"{store_path}{suffix}")
-        if side.exists():
-            side.rename(f"{store_path}.aside{suffix}")
-    kept.rename(f"{kept}.aside")
-    assert _run_provision_admin(tmp_path, monkeypatch, store_path) != 0
-    assert "refusing to provision without a terminal" in capsys.readouterr().err
-    assert Path(f"{kept}.aside").exists() and Path(f"{store_path}.aside").exists()
+    assert "MEFOR_SECRETS_DIRECTORY to a new, empty directory" in " ".join(
+        capsys.readouterr().err.split()
+    )
+    left = {path: path.read_bytes() for path in (kept, store_path)}
+    secrets = tmp_path / "new-secrets"
+    secrets.mkdir()
+    if sys.platform != "win32":
+        secrets.chmod(0o700)
+    monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
+    new_store = tmp_path / "new-store.db"
+    minted: list[Path] = []
+    real_target = custody_host.mint_target
+
+    def _target(store: StoreSettings, **kwargs: Any) -> Path:
+        minted.append(real_target(store, **kwargs))
+        return minted[-1]
+
+    monkeypatch.setattr(custody_host, "mint_target", _target)
+    password = "a long and unremarkable passphrase 7"
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    queued = [password, password]
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: queued.pop(0))
+    monkeypatch.setattr(cli, "_RecoveryKeyConsole", lambda: _Console("", "wrong"))
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    assert main([*argv, "--db", str(new_store)]) == 0, capsys.readouterr().err
+    assert minted and set(minted) == {secrets / custody_host.HOST_FILE_NAME}, minted
+    assert minted[0].exists()
+    assert new_store.exists()
+    assert {path: path.read_bytes() for path in left} == left
 
 
 @host_file_platforms
@@ -1381,9 +1482,8 @@ async def test_a_pinned_open_over_a_chain_never_started_removes_nothing(tmp_path
     blob = _mint(settings)
     with pytest.raises(StoreChainNeverStarted) as refused:
         await open_store(settings, custody=blob)
-    text = str(refused.value).lower()
-    assert "remove" not in text and "delete" not in text, text
-    assert "provision-admin" in text
+    text = str(refused.value)
+    assert not _advises_changing(text) and custody_host.keep_the_key_step() in text, text
 
 
 @host_file_platforms
@@ -1420,9 +1520,8 @@ def test_a_minted_key_is_kept_when_the_pin_refused_after_a_write(
     # store started under it or names the one way on. This run minted the key, so the text does
     # not call it possibly another store's.
     warning = capsys.readouterr().err
-    assert str(kept) in warning and "run the command again" in warning.lower(), warning
-    assert "remove" not in warning.lower(), warning
-    assert "another store's" not in warning, warning
+    assert not _advises_changing(warning), warning
+    assert str(kept) in warning and custody_host.keep_the_key_step() in warning, warning
     removed = tmp_path / "removed.key"
     removed.write_bytes(b"k")
     cli._discard_minted_custody(removed, server, StoreIdPinRefusedBeforeWrite("before"))
