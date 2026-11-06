@@ -1413,7 +1413,8 @@ class LoggingAlertSink:
     def ad_reconcile_breaker_cleared(self, name: str) -> None:
         # The inverse (auto-resolve) event, raised on every clear pass; no page, so DEBUG.
         # The referral's source label raises it too, once no referral stands (BACKLOG #2538), and
-        # the outage's, on a reach after a run that paged (BACKLOG #3709).
+        # the outage's, on a reach after a run that paged (BACKLOG #3709), and the partial outage's,
+        # once no account is left unanswered for a run of probes.
         log.debug("ALERT ad_reconcile_breaker_cleared: %r found its condition clear", name)
 
     def ad_reconcile_hold_released(self, name: str) -> None:

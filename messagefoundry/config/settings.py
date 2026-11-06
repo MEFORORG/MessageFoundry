@@ -9608,7 +9608,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"the directory reconciler runs every {interval} s, less often than the "
                     f"default of {_auth_default('ad_session_recheck_seconds')} s, so {late}. The "
                     f"interval also delays the page about a directory outage, which comes after "
-                    f"{floor}",
+                    f"{floor}, and the page about a partial one, which waits as many probes of "
+                    "one account",
                 )
             )
         if run > _auth_default("ad_reconcile_outage_passes"):
@@ -9620,7 +9621,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"{_auth_default('ad_reconcile_outage_passes')}: it comes after {floor} at the "
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
-                    "per pass to show for it",
+                    "per pass to show for it. The page about one account the directory leaves "
+                    "unanswered while it answers others waits for as many of its probes",
                 )
             )
         strikes = auth.ad_session_recheck_strikes

@@ -1538,7 +1538,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # ADR 0079 mechanism 2: the mass-revoke breaker tripped and the pass applied nothing, or one
         # or more probes were referred (BACKLOG #2538), refused for the configuration (BACKLOG
         # #3010) or faulted (BACKLOG #3100) and left unjudged, or the directory stayed unreachable
-        # for a run of passes (BACKLOG #3709); `reason` tells which. The
+        # for a run of passes, or left an account unanswered for a run of probes (BACKLOG #3709);
+        # `reason` tells which. The
         # fixed source label keys the throttle, so a standing misconfiguration that trips every pass
         # pages once per cooldown rather than once per pass. `detail` is the latched operator explanation,
         # and it is what the instance's reason column shows (detail wins over reason there).
@@ -1568,7 +1569,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
     def ad_reconcile_breaker_cleared(self, name: str) -> None:
         # #2136: the INVERSE -- no page; auto-resolves the open ad_reconcile_aborted via _AUTO_RESOLVE,
-        # the breaker's or, under the referral's label, the referral's (#2538).
+        # the breaker's or, under the referral's label, the referral's (#2538), and likewise the
+        # whole and partial outages' (#3709).
         self._record_state({"type": "ad_reconcile_breaker_cleared", "connection": name}, "info")
 
     def ad_reconcile_hold_released(self, name: str) -> None:

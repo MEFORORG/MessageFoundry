@@ -69,7 +69,7 @@ async def test_a_lasting_partial_outage_pages_once_and_a_full_answer_resolves_it
         assert plan.partial_outage_page and plan.partial_outage_passes == threshold
         [page] = _pages(sink, _PARTIAL_OUTAGE_ALERT_SOURCE)
         assert page["reason"] == "directory_partly_unavailable" and page["probed"] == 2
-        assert f"in {threshold} reconcile passes running (1 of 2 on the last)" in page["detail"]
+        assert f"on {threshold} probes running (1 of 2 unanswered this pass)" in page["detail"]
         assert len(page["detail"]) <= 200  # the store keeps 200 characters of a reason
         assert await _rows(store) == [
             {
@@ -225,5 +225,75 @@ async def test_a_partial_threshold_pass_that_raises_pages_on_the_next_pass(
         assert len(_pages(sink, _PARTIAL_OUTAGE_ALERT_SOURCE)) == 1
         await _pass(service, sink)
         assert len(_pages(sink, _PARTIAL_OUTAGE_ALERT_SOURCE)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_probe_budget_smaller_than_the_estate_cannot_reset_an_accounts_run() -> None:
+    """Review round 1. With a budget of one probe a pass, ``alice`` and ``bob`` are probed in
+    turn, so every other pass answers its only probe. Counted per pass, those passes would end the
+    run and nothing would page; counted per account, ``alice``'s run grows on each of her probes,
+    pages once it is long enough, and stays open while she is unanswered.
+
+    RED when: a pass that did not probe the unanswered account ends its run."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(
+            store, ad_reconcile_outage_passes=2, ad_session_recheck_max_users=1
+        )
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        plans = [await _pass(service, sink) for _ in range(6)]
+        assert all(p.asked == 1 for p in plans)
+        assert plans[-1].partial_outage_passes == 3
+        assert sum(p.partial_outage_page for p in plans) == 1
+        assert len(_pages(sink, _PARTIAL_OUTAGE_ALERT_SOURCE)) == 1
+        assert _clears(sink, _PARTIAL_OUTAGE_ALERT_SOURCE) == 0  # bob's passes resolve nothing
+    finally:
+        await store.close()
+
+
+async def test_one_off_failures_on_different_accounts_never_add_up() -> None:
+    """Review round 1. Each pass leaves one probe unanswered, never the same account twice
+    running, so no account's run passes one and nothing pages.
+
+    RED when: the run counts passes with any failure rather than one account's failures."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        for name in ("alice", "bob", "alice", "bob"):
+            ldap.unreachable = {name}
+            plan = await _pass(service, sink)
+            assert plan.unreached == 1 and plan.partial_outage_passes == 1
+        assert _events(sink, _PARTIAL_OUTAGE_ALERT_SOURCE) == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("beside", ["referred", "faulted"])
+async def test_a_pass_that_judged_nothing_but_reached_the_directory_still_pages(
+    beside: str,
+) -> None:
+    """Review round 1. ``bob`` is referred, or his probe faults, on every pass, so each pass
+    aborts as a referral or a probe fault and judges nothing. The directory still answered
+    ``bob`` and never ``alice``, so the aborted path pages the partial outage and writes its row.
+
+    RED when: the aborted path drops the partial page or its row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        if beside == "referred":
+            ldap.referring = {"bob"}
+        else:
+            ldap.broken = {"bob": ValueError("synthetic: unreadable entry")}
+        first = await _pass(service, sink)
+        second = await _pass(service, sink)
+        assert first.aborted is not None and first.judged_nothing
+        assert not first.partial_outage_page and second.partial_outage_page
+        assert len(_pages(sink, _PARTIAL_OUTAGE_ALERT_SOURCE)) == 1
+        assert [r["passes"] for r in await _rows(store)] == [2]
     finally:
         await store.close()

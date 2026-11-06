@@ -167,6 +167,13 @@ class Probe:
     #: None. None for every other outcome.
     detail: str | None = None
 
+    @property
+    def unreached(self) -> bool:
+        """True when the directory left this probe unanswered (BACKLOG #3709 step 1): UNAVAILABLE
+        for any reason but the engine's own paging bound, which the directory answered and which
+        pages on its own (vault BACKLOG #3696). The one test of which UNAVAILABLE probe is which."""
+        return self.outcome is ProbeOutcome.UNAVAILABLE and self.detail not in _PAGING_CAUSES
+
 
 @dataclass(frozen=True)
 class UsernameRefresh:
@@ -299,8 +306,7 @@ class ReconcilePlan:
     #: refusal's (vault BACKLOG #3696), which concerns one account and reports the pass's count.
     asked: int = 0
     unavailable: int = 0
-    #: The UNAVAILABLE probes the directory did not answer: all but those refused for the engine's
-    #: own paging bound (BACKLOG #3709 step 1), which the directory answered.
+    #: The probes the directory left unanswered (:attr:`Probe.unreached`, BACKLOG #3709 step 1).
     unreached: int = 0
     #: ``user_id`` of every probe the directory answered with a referral (BACKLOG #2538). Any one
     #: alerts, and none of them stops the rest of the pass being judged.
@@ -362,17 +368,17 @@ class ReconcilePlan:
     #: #3709). Read like the other ``*_clear`` flags: the caller resolves the outage's instance on it.
     outage_clear: bool = False
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709 step 1,
-    #: #4772 item 6): how many passes running, this one included, left at least one probe without
-    #: an answer from the directory, a whole outage included. A probe refused for the engine's own
-    #: paging bound is not counted: the directory answered it, and it pages on its own. 0 on a pass
-    #: whose every probe was answered. ``AuthService._note_partial_outage`` keeps it.
+    #: #4772 item 6): the longest run of consecutive probes of one signed-in account that the
+    #: directory left unanswered (:attr:`Probe.unreached`), whole outage passes included, in this
+    #: process. 0 when no account's last probe went unanswered. ``AuthService._note_partial_outage``
+    #: keeps it.
     partial_outage_passes: int = 0
-    #: Whether the lifespan task pages for a lasting PARTIAL outage on this pass: the pass reached
-    #: the directory for some probes and not for others, the run above has reached
-    #: ``[auth].ad_reconcile_outage_passes``, and no partial page is recorded for it yet.
+    #: Whether the lifespan task pages for a lasting PARTIAL outage on this pass: the run above
+    #: has reached ``[auth].ad_reconcile_outage_passes``, this pass asked the directory and is not
+    #: a whole outage, and no partial page is recorded for the standing condition yet.
     partial_outage_page: bool = False
-    #: Whether every probe this pass asked was answered after a partial-outage run that paged, in
-    #: this process. The caller resolves the partial outage's instance on it.
+    #: Whether no account's run is that long any more, after a partial page in this process. The
+    #: caller resolves the partial outage's instance on it.
     partial_outage_clear: bool = False
 
     @property
@@ -556,7 +562,7 @@ def plan_pass(
     unavailable = [p for p in probes if p.outcome is ProbeOutcome.UNAVAILABLE]
     # BACKLOG #3709 step 1. The ones the directory did not answer: a paging-bound refusal was
     # answered, and pages on its own (vault BACKLOG #3696).
-    unreached = sum(1 for p in unavailable if p.detail not in _PAGING_CAUSES)
+    unreached = sum(1 for p in unavailable if p.unreached)
     referred = [p for p in probes if p.outcome is ProbeOutcome.REFERRED]
     faulted = [p for p in probes if p.outcome is ProbeOutcome.FAULT]
     misconfigured = [p for p in probes if p.outcome is ProbeOutcome.MISCONFIGURED]
