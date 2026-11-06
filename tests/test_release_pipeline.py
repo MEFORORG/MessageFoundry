@@ -905,7 +905,7 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
     # wheel smoke now normalises in TWO places — its inspection's own version check, and its tag
     # compare — so reverting ONE of them, and deleting the import it no longer needs, leaves the
     # other import behind and that loop green. Measured before this was added: per step, the engine
-    # holds 1 occurrence and the console and harness 2 each.
+    # held 1 occurrence and the console and harness 2 each; the engine holds 2 since BACKLOG #1583.
     #
     # These are the two string compares actually removed (BACKLOG #1701, #1585), named one at a time
     # so a revert says WHICH came back. Scanned over CODE ONLY: the workflow quotes both shapes in
@@ -1458,16 +1458,18 @@ def test_the_leak_gate_rejects(
     )
 
 
-# --- (8) the SEPARATELY-BUILT wheel smokes install the artifact and INSPECT it (BACKLOG #1701) -------
+# --- (8) every release wheel smoke installs the artifact and INSPECTS it (BACKLOG #1701, #1583) ------
 #
-# SCOPE, STATED ONCE AND NOT RESTATED IN EVERY TEST NAME BELOW: this section covers the jobs that build
-# a wheel of their OWN distribution -- release-webconsole and release-harness. It does NOT cover the
-# ENGINE job's smoke. That exclusion is real, it is asserted explicitly by
-# `test_the_engine_smoke_is_the_gap_these_guards_do_not_close`, and BACKLOG #1583 is the row that closes
-# it. #1583 is PARTLY landed: PR 1297 gave the engine smoke its `-I`, and section (9) below now pins
-# that half. What is still open is the install -- the engine smoke resolves the engine's whole
-# dependency tree FROM PYPI inside a job holding `id-token: write`. So do not read a green here as
-# "every release smoke installs with --no-deps"; the engine's does not.
+# SCOPE, STATED ONCE AND NOT RESTATED IN EVERY TEST NAME BELOW: this section covers EVERY wheel the
+# release workflow builds -- the engine, the toolkit, the console and the harness.
+# `test_every_release_smoke_step_is_covered_by_these_guards` holds that no `Smoke-check` step escapes
+# it. The engine joined with BACKLOG #1583: its smoke now asserts the imported module lies inside the
+# throwaway venv and is RECORDed by the engine distribution, and hands the tag guard the INSTALLED
+# METADATA's version. ONE PROPERTY IS STILL NOT THE ENGINE'S, and saying so is the point of this note:
+# the engine smoke installs WITH dependencies, so it resolves the engine's whole tree FROM PYPI inside
+# a job holding `id-token: write` (#1583 option (c), open). Its PYEXPOSE check imports
+# `messagefoundry.__main__` and needs those dependencies, so a bare `--no-deps` would break it. Do not
+# read a green here as "every release smoke installs with --no-deps"; the engine's does not.
 
 #: The heredoc tag carrying each smoke step's inspection script. Named, not sliced by line number, so
 #: an edit above it cannot silently change what the execution tests below run.
@@ -1477,8 +1479,18 @@ _SMOKE_HEREDOC = re.compile(r"<<'PYSMOKE'\n(.*?)\nPYSMOKE\n", re.S)
 #: in the tree: a fixture that happens to match the real one cannot show the check read the fixture.
 _SMOKE_VERSION = "7.7.7"
 
+#: The engine distribution, built by the `release` job with a bare ``python -m build`` (BACKLOG #1583).
+_ENGINE_DIST = "messagefoundry"
+
 #: The toolkit distribution (ADR 0201), built and smoked inside the engine's `release` job.
 _TOOLKIT_DIST = "messagefoundry-toolkit"
+
+#: The separately-versioned console distribution (ASVS 15.2.4).
+_WEBCONSOLE_DIST = "messagefoundry-webconsole"
+
+#: A ``python -m build`` that produces a wheel: ``--wheel``, or a bare build (sdist AND wheel). An
+#: ``--sdist``-only build produces none, so it owes no wheel smoke.
+_WHEEL_BUILD = re.compile(r"python -m build\b(?![^\n]*--sdist)")
 
 #: The harness distribution, which declares the toolkit beside the engine (ADR 0201 slice 7).
 _HARNESS_DIST = "messagefoundry-harness"
@@ -1486,20 +1498,22 @@ _HARNESS_DIST = "messagefoundry-harness"
 
 @functools.cache
 def _wheel_smoke_steps() -> dict[str, dict]:
-    """Every separately-built wheel's smoke step, keyed by the DISTRIBUTION its script installs.
+    """Every release wheel's smoke step, keyed by the DISTRIBUTION its script installs.
 
     KEYED BY DISTRIBUTION, NOT JOB, SINCE ADR 0201. The toolkit wheel is built and smoked inside the
-    engine's `release` job, so one job now holds two smoke steps: the engine's (no PYSMOKE script,
-    the stated gap below) and the toolkit's. A job-keyed map could not hold both. A job that builds
-    N wheels with ``python -m build --wheel`` must carry exactly N PYSMOKE smoke steps.
+    engine's `release` job, so one job holds two smoke steps: the engine's and the toolkit's. A
+    job-keyed map could not hold both. A job whose executed shell runs N wheel-producing builds
+    (:data:`_WHEEL_BUILD`) must carry exactly N PYSMOKE smoke steps.
 
-    DERIVED from ``python -m build --wheel``, never a list of job names, for the same reason
+    DERIVED from the build commands, never a list of job names, for the same reason
     :func:`test_both_wheel_smokes_compare_versions_not_strings` counts instead of pinning a number:
-    that test read ``== 2`` and broke the day the console job arrived. A fourth distribution is
+    that test read ``== 2`` and broke the day the console job arrived. A fifth distribution is
     covered here the day it lands, not the day somebody remembers this file.
 
-    The engine job builds with a bare ``python -m build`` (sdist AND wheel) and so is not selected.
-    That is the section's stated gap, not an accident of the predicate -- see the module note above.
+    The engine job builds with a bare ``python -m build`` (sdist AND wheel). Until BACKLOG #1583 this
+    predicate keyed on ``--wheel`` alone, which is how the engine smoke stayed outside the section;
+    a bare build produces a wheel too, so it counts. Counted over EXECUTED shell only, so a comment
+    quoting a build command cannot demand a smoke step nothing runs.
 
     Cached: three ``@pytest.mark.parametrize`` decorators call this at COLLECTION time and every
     execution test calls it again, and it is a pure function of one file. Callers only read the
@@ -1513,7 +1527,9 @@ def _wheel_smoke_steps() -> dict[str, dict]:
     found: dict[str, dict] = {}
     for name, job in _jobs().items():
         steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
-        builds = sum(str(s.get("run") or "").count("python -m build --wheel") for s in steps)
+        builds = sum(
+            len(_WHEEL_BUILD.findall(_executed_shell(str(s.get("run") or "")))) for s in steps
+        )
         if not builds:
             continue
         smoke = [
@@ -1532,9 +1548,12 @@ def _wheel_smoke_steps() -> dict[str, dict]:
             dist, _pkg = _smoke_names(m.group(1))
             assert dist not in found, f"two smoke steps install {dist!r}"
             found[dist] = step
-    # A floor, so an empty match can never pass vacuously: the console, the harness and the toolkit.
-    assert len(found) >= 3, (
-        f"expected the console, harness and toolkit smokes, found {sorted(found)}"
+    # A floor, so an empty match can never pass vacuously, and NAMED rather than counted, so losing
+    # the engine (the one this section excluded until BACKLOG #1583) cannot hide behind a new fifth.
+    expected = {_ENGINE_DIST, _TOOLKIT_DIST, _WEBCONSOLE_DIST, _HARNESS_DIST}
+    assert expected <= set(found), (
+        f"expected the engine, toolkit, console and harness smokes, found {sorted(found)}; "
+        f"missing {sorted(expected - set(found))}"
     )
     return found
 
@@ -1564,8 +1583,17 @@ def _smoke_names(script: str) -> tuple[str, str]:
 def test_the_extracted_smoke_scripts_are_actually_the_smokes() -> None:
     """Liveness for the extractor, exactly as section (7) has for the leak gate. If it ever returns
     the wrong block — or an unparseable one — every execution test below would exercise something
-    else entirely and stay green while doing it."""
-    for job in _wheel_smoke_steps():
+    else entirely and stay green while doing it.
+
+    The ENGINE's script is extracted from its OWN step, named, because the `release` job holds two
+    PYSMOKE steps (engine and toolkit) and a map keyed by distribution is only as good as the DIST
+    each script declares: two steps both declaring the toolkit would leave the engine unread."""
+    steps = _wheel_smoke_steps()
+    assert _WHEEL_SMOKE_STEP_PREFIX in str(steps[_ENGINE_DIST].get("name")), (
+        f"the smoke keyed {_ENGINE_DIST!r} is {steps[_ENGINE_DIST].get('name')!r}, not the engine's "
+        f"own {_WHEEL_SMOKE_STEP_PREFIX!r} step (BACKLOG #1583)"
+    )
+    for job in steps:
         script = _smoke_script(job)
         compile(script, f"<{job} smoke>", "exec")  # it must at least be Python
         _smoke_names(script)  # and it must name what it installs
@@ -1576,29 +1604,18 @@ def test_the_extracted_smoke_scripts_are_actually_the_smokes() -> None:
             )
 
 
-def test_the_engine_smoke_is_the_gap_these_guards_do_not_close() -> None:
-    """The exclusion, made a MEASUREMENT instead of a footnote (BACKLOG #1583).
+def test_every_release_smoke_step_is_covered_by_these_guards() -> None:
+    """No `Smoke-check` step in the release workflow escapes this section (BACKLOG #1583).
 
-    The `release` job also builds a wheel and also has a step named `Smoke-check the built wheel`, and
-    everything in this section passes over it. Its smoke installs WITH dependencies -- resolving the
-    engine's whole tree from PyPI inside a job holding `id-token: write`.
+    This replaced `test_the_engine_smoke_is_the_gap_these_guards_do_not_close`, which pinned the
+    uncovered set to exactly the engine's step. #1583 folded the engine in, so the uncovered set is
+    now EMPTY, and a new smoke step that runs no PYSMOKE inspection -- or whose job's build the
+    predicate does not count -- is named here rather than passing unread.
 
-    THE ISOLATION HALF IS NO LONGER PART OF THIS GAP, and saying so is the whole reason this docstring
-    was rewritten. #1583 landed in two pieces: PR 1297 added `-I` to the engine smoke's import probe,
-    so the checkout no longer answers the version question there. Section (9) below is what guards
-    that half now, statically and behaviourally, which is why this test must NOT also assert `-I` is
-    absent -- two tests in one file would then require opposite things of the same line, and the file
-    could never be green. What remains open is the install, and that is what this test still pins.
-
-    The dependency half is #1583's, deliberately untouched here. This test exists so the boundary is
-    visible from inside the file rather than only from a pull request description, and so a FOURTH job
-    cannot slip into the same gap unnoticed: it pins the excluded set to exactly one job, by name.
-
-    When the rest of #1583 lands, this test is what tells you to fold the engine job into
-    `_wheel_smoke_steps`.
+    By STEP, not by job, since ADR 0201 put the toolkit's smoke in the same `release` job as the
+    engine's. What the engine's step still does NOT do -- install with --no-deps -- is carved out,
+    by name, in :func:`test_each_wheel_smoke_installs_the_built_wheel_into_a_throwaway_venv`.
     """
-    # By STEP, not by job, since ADR 0201 put the toolkit's covered smoke in the same `release` job
-    # as the engine's uncovered one.
     covered = {id(step) for step in _wheel_smoke_steps().values()}
     uncovered = sorted(
         (name, str(step.get("name")))
@@ -1608,26 +1625,10 @@ def test_the_engine_smoke_is_the_gap_these_guards_do_not_close() -> None:
         and str(step.get("name") or "").startswith("Smoke-check")
         and id(step) not in covered
     )
-    assert [job for job, _step in uncovered] == ["release"], (
-        f"the release smokes these guards do NOT cover are {uncovered}, expected exactly one, in "
-        f"['release']. A new smoke step is escaping section (8) -- either bring it into "
-        f"_wheel_smoke_steps (it should build with `python -m build --wheel`) or record why not."
-    )
-    assert uncovered[0][1].startswith(_WHEEL_SMOKE_STEP_PREFIX), uncovered
-
-    engine = _executed_shell(
-        str(
-            next(
-                s for s in _jobs()["release"]["steps"] if "Smoke-check" in str(s.get("name") or "")
-            )["run"]
-        )
-    )
-    assert "--no-deps" not in engine, (
-        "the engine smoke has gained --no-deps, so the rest of BACKLOG #1583 is fixed -- fold the "
-        "engine job into _wheel_smoke_steps() and delete this test rather than leaving the stronger "
-        "guards pointed away from it. Isolated mode is deliberately NOT asserted here: PR 1297 "
-        "already landed `-I` on this step and section (9) pins it, so a check for its absence would "
-        "contradict a sibling test in this same file"
+    assert uncovered == [], (
+        f"these release smoke steps escape section (8): {uncovered}. Bring each into "
+        f"_wheel_smoke_steps (a PYSMOKE inspection naming its DIST and PKG, in a job whose build "
+        f"_WHEEL_BUILD counts) or record why not."
     )
 
 
@@ -1648,6 +1649,19 @@ def test_each_wheel_smoke_installs_the_built_wheel_into_a_throwaway_venv() -> No
             f"{job}'s smoke does not create a throwaway venv — an install here lands in the "
             f"interpreter that then hands the artifact over for publishing"
         )
+        if job == _ENGINE_DIST:
+            # CARVED OUT, BY NAME, AND OPEN: BACKLOG #1583 option (c). The engine smoke installs
+            # WITH dependencies, so it still resolves the engine's whole tree from PyPI inside a job
+            # holding `id-token: write`. A bare --no-deps is not the fix: the same step's PYEXPOSE
+            # check imports messagefoundry.__main__, which needs those dependencies. What this does
+            # pin is that the engine installs its OWN built wheel into the throwaway venv.
+            assert re.search(
+                r"/tmp/\S+/bin/pip install --quiet (?:--no-deps )?dist/\S*\.whl", shell
+            ), (
+                f"{job}'s smoke does not install the engine's own built wheel (dist/*.whl) into its "
+                f"throwaway venv"
+            )
+            continue
         assert re.search(r"/tmp/\S+/bin/pip install --quiet --no-deps \S+\.whl", shell), (
             f"{job}'s smoke does not install its own built wheel into that venv with --no-deps. "
             f"--no-deps is load-bearing, not an optimisation: both distributions depend on the "
@@ -2046,6 +2060,131 @@ def test_the_console_smoke_compares_its_version_root_against_the_wheel_metadata(
     assert "9.9.9" in out and _SMOKE_VERSION in out, (
         f"the console smoke rejected the mismatch without naming both versions.\n{out}"
     )
+
+
+# --- the ENGINE smoke, with an intact checkout present (BACKLOG #1583's acceptance) -----------------
+#
+# The row's acceptance: keep an intact checkout present, and require a deliberately broken wheel and
+# a version-mismatched wheel each to fail. Every case below runs the engine's PYSMOKE under `-I`, as
+# the step does, FROM a directory holding an intact `messagefoundry/` source tree at a version no
+# wheel here carries, so a pass that came from the checkout is visible as that version.
+
+
+def _engine_pyver_script() -> str:
+    """The engine step's tag-guard script (heredoc PYVER), extracted from the engine step alone."""
+    m = re.search(r"<<'PYVER'\n(.*?)\nPYVER\n", _engine_wheel_smoke_script(), re.S)
+    assert m, "the engine wheel smoke has no PYVER tag guard"
+    return m.group(1)
+
+
+def _run_pyver(exe: Path, script: str, workdir: Path, built: str, want: str) -> int:
+    """Run the tag guard the way the step does: ``python -I - "$built" "$want"``."""
+    proc = subprocess.run(  # noqa: S603  # nosec B603 - fixed argv, no shell, test-local paths
+        [str(exe), "-I", "-", built, want],
+        input=script.encode("utf-8"),
+        cwd=str(workdir),
+        capture_output=True,
+        timeout=120,
+    )
+    return proc.returncode
+
+
+def test_the_engine_smoke_reads_the_wheel_not_the_intact_checkout_beside_it(
+    venv_template: Path, tmp_path: Path
+) -> None:
+    """POSITIVE CONTROL for the two rejections below: a good wheel passes from the checkout's cwd,
+    and what it reports is the wheel's version, not the checkout's."""
+    script, dist, pkg, exe, purelib = _prepared(_ENGINE_DIST, venv_template, tmp_path)
+    _write_install(
+        purelib, dist, pkg, _SMOKE_VERSION, package_files=_good_package(pkg, _SMOKE_VERSION)
+    )
+    work = _plant_a_checkout(tmp_path / "checkout")
+
+    rc, stdout, out = _run_smoke(exe, script, work)
+    assert rc == 0 and stdout.strip() == _SMOKE_VERSION, out
+    assert _SHADOW_VERSION not in out, f"the intact checkout answered the engine smoke.\n{out}"
+
+
+def _engine_wheel_missing_its_package(purelib: Path, dist: str, pkg: str) -> None:
+    """Broken: the force-include produced nothing, so only the checkout could answer the import."""
+    _write_install(purelib, dist, pkg, _SMOKE_VERSION, package_files=None)
+
+
+def _engine_wheel_whose_module_is_not_recorded(purelib: Path, dist: str, pkg: str) -> None:
+    """Broken in the way `-I` alone does not catch: the module imports from inside the venv, but the
+    engine distribution's RECORD does not list it. The pre-#1583 probe passed this."""
+    _record_does_not_list_the_module_it_resolved(purelib, dist, pkg)
+
+
+def _engine_wheel_metadata_disagrees_with_dunder_version(
+    purelib: Path, dist: str, pkg: str
+) -> None:
+    """Version-mismatched: the module says the tag's version, the METADATA (what PyPI and every
+    installer read) says another. The pre-#1583 probe read `__version__` and passed this."""
+    _write_install(purelib, dist, pkg, "7.7.8", package_files=_good_package(pkg, _SMOKE_VERSION))
+
+
+_ENGINE_SMOKE_REJECTIONS: list[tuple[Callable[[Path, str, str], None], str]] = [
+    (_engine_wheel_missing_its_package, "no package tree"),
+    (_engine_wheel_whose_module_is_not_recorded, "belongs to something else on sys.path"),
+    (_engine_wheel_metadata_disagrees_with_dunder_version, "!= wheel metadata version 7.7.8"),
+]
+
+
+@pytest.mark.parametrize(
+    ("build_install", "must_say"),
+    _ENGINE_SMOKE_REJECTIONS,
+    ids=[case[0].__name__.removeprefix("_engine_wheel_") for case in _ENGINE_SMOKE_REJECTIONS],
+)
+def test_the_engine_smoke_fails_a_broken_or_version_mismatched_wheel_beside_an_intact_checkout(
+    build_install: Callable[[Path, str, str], None],
+    must_say: str,
+    venv_template: Path,
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #1583's acceptance, executed: each of these installs cleanly and must fail."""
+    script, dist, pkg, exe, purelib = _prepared(_ENGINE_DIST, venv_template, tmp_path)
+    build_install(purelib, dist, pkg)
+    work = _plant_a_checkout(tmp_path / "checkout")
+
+    rc, _stdout, out = _run_smoke(exe, script, work)
+    assert rc != 0, (
+        f"the engine smoke PASSED {build_install.__name__} — the release would ship it.\n{out}"
+    )
+    assert must_say in out, (
+        f"the engine smoke failed but not for the reason under test (missing {must_say!r}).\n{out}"
+    )
+
+
+def test_the_engine_tag_gate_compares_the_installed_metadata_version(
+    venv_template: Path, tmp_path: Path
+) -> None:
+    """The tag guard reads the INSTALLED METADATA, not ``__version__`` (BACKLOG #1583 half b).
+
+    Discriminated by SPELLING: the module carries the hyphen spelling a pre-release tag needs, and
+    the metadata carries hatchling's canonical form. The two are the same PEP 440 version, so the
+    smoke accepts the wheel; what it hands the tag guard on stdout must be the METADATA's spelling,
+    and the guard then passes the matching tag and refuses another.
+    """
+    script, dist, pkg, exe, purelib = _prepared(_ENGINE_DIST, venv_template, tmp_path)
+    _write_install(purelib, dist, pkg, "7.7.7rc1", package_files=_good_package(pkg, "7.7.7-rc1"))
+    work = _plant_a_checkout(tmp_path / "checkout")
+
+    rc, stdout, out = _run_smoke(exe, script, work)
+    assert rc == 0, out
+    built = stdout.strip()
+    assert built == "7.7.7rc1", (
+        f"the engine smoke handed the tag guard {built!r}, not the installed metadata's '7.7.7rc1' "
+        f"-- it is reading the module's __version__ again.\n{out}"
+    )
+
+    # And the step feeds THAT value, captured from the PYSMOKE inspection, to the tag guard.
+    shell = _engine_wheel_smoke_script()
+    assert re.search(r"^\s*built=\$\(\S*/bin/python -I - <<'PYSMOKE'", shell, re.M), shell
+    assert re.search(r'/bin/python -I - "\$built" "\$want" <<\'PYVER\'', shell), shell
+    guard = _engine_pyver_script()
+    assert _run_pyver(exe, guard, work, built, "7.7.7-rc1") == 0
+    assert _run_pyver(exe, guard, work, built, "7.7.8") != 0
 
 
 @pytest.mark.parametrize(
@@ -2739,11 +2878,12 @@ def test_the_toolkit_bundle_step_refuses(
     assert expected in out, out
 
 
-#: The engine smoke's import probe. ``flags`` is what the step passes the interpreter BEFORE ``-c``;
+#: The engine smoke's import probe, its PYSMOKE inspection since BACKLOG #1583 (a bare ``-c "import
+#: messagefoundry; ..."`` before). ``flags`` is what the step passes the interpreter BEFORE ``-``;
 #: the behavioural test below runs that exact list rather than a copy of it, so a revert in the
 #: workflow arrives here as a failure instead of leaving a test that still asserts the old string.
 _VERSION_PROBE = re.compile(
-    r'^\s*built=\$\(\S*python[0-9.]*(?P<flags>(?:\s+-[A-Za-z]+)*)\s+-c\s+"import messagefoundry;',
+    r"^\s*built=\$\(\S*python[0-9.]*(?P<flags>(?:\s+-[A-Za-z]+)*)\s+-\s+<<'PYSMOKE'",
     re.M,
 )
 
@@ -2765,8 +2905,8 @@ def _wheel_smoke_import_flags() -> list[str]:
     """The interpreter flags the engine smoke passes before ``-c``, e.g. ``['-I']``."""
     m = _VERSION_PROBE.search(_engine_wheel_smoke_script())
     assert m, (
-        "could not find the engine wheel smoke's `built=$(... python ... -c \"import messagefoundry;"
-        " ...\")` line — the step's shape moved, so the isolation check below is measuring nothing"
+        "could not find the engine wheel smoke's `built=$(... python ... - <<'PYSMOKE'` line — the "
+        "step's shape moved, so the isolation check below is measuring nothing"
     )
     return m.group("flags").split()
 
