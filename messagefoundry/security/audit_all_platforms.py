@@ -50,10 +50,11 @@ packages this release knows to be published, nothing checks that the named packa
 private: like ``--ignore-vuln``, it is the adopter's recorded decision.
 
 WHY STRIPPING IS SOUND HERE. Every pin in a uv export is a version that uv resolved for some
-environment. The engine sets no ``[tool.uv] environments``, so that includes environments nobody
-supports (PyPy, cygwin, macOS). Auditing those pins too is accepted: an advisory against one fails
-loudly and is triaged with ``--ignore-vuln``, while skipping a pin fails silently, which is the
-defect above. ``--disable-pip`` is not left to the caller: without it pip-audit installs the
+environment the lock covers. The engine's ``[tool.uv] environments`` limits that to CPython 3.14 on
+Windows and Linux, so every engine pin is one a supported host can install, and each exported line
+carries that environment as its marker. An adopter's lock may cover more (PyPy, cygwin, macOS);
+auditing those pins too is accepted: an advisory against one fails loudly and is triaged with
+``--ignore-vuln``, while skipping a pin fails silently, which is the defect above. ``--disable-pip`` is not left to the caller: without it pip-audit installs the
 requirements through pip on the host, and a Windows-only distribution need not install on Linux.
 With it and a hashed file, pip-audit reads the pins as already resolved and refuses any requirement
 that lacks a hash. ``--strict`` makes a pin pip-audit could not look up (a release PyPI has removed,
