@@ -284,12 +284,13 @@ NOT a renamed Console, so a Console rule does not transfer by substitution. **Th
 on 2026-09-19, NOTHING replaced it, and NO SEAT ATTRIBUTES A RED NOW.** A red is the Lander's to
 triage and route, or the owner's to rule on. The Watchdog is **not the Regulator's successor**: it
 returns evidence and no verdict. **The STEWARD is retired too: the owner said so on 2026-11-05, and
-when it went is not recorded.** No successor seat is recorded, and the usage controls stayed and
-still bind. The user-scope usage watch hook, `watch.py`, prints the weekly ladder and the Workflow
-gate only on a config root that wires it, so a cloud session or an unwired root sees no ladder and
-is still bound by it; [`docs/METHOD.md`](docs/METHOD.md), *The Steward, retired before 2026-11-05*,
-holds the rest. `docs/roles/seats.json` resolves all three names to a retirement notice. The full
-notices are in [`docs/METHOD.md`](docs/METHOD.md), *Retired CLAUDE.md notices*.
+when it went is not recorded.** No successor seat is recorded, and the usage controls stayed: korus
+`roles/COMMON.md`, *The three usage states*, holds them and names the seats they bind. The
+user-scope usage watch hook, `watch.py`, prints the weekly ladder and the Workflow gate only on a
+config root that wires it; where nothing prints them, for example in a cloud session or on an
+unwired root, they bind all the same. `docs/roles/seats.json` resolves all three names to a
+retirement notice. The full notices, the Steward's under *The Steward, retired before 2026-11-05*,
+are in [`docs/METHOD.md`](docs/METHOD.md), *Retired CLAUDE.md notices*.
 
 If a document you are reading names a retired seat or a retired rule, treat **that
 naming** as stale and follow this section. **Do not extend it to the whole document.** A retired rule

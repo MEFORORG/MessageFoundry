@@ -1455,6 +1455,8 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
     #: an open owner question there.
     CAVEAT = (
         "still bind",
+        "hold new work",
+        "workflow",
         "roles/common.md",
         "the three usage states",
         "lifted",
@@ -1467,9 +1469,14 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
         return [part for part in cls.CAVEAT if part not in flat]
 
     def test_every_steward_spelling_carries_the_usage_caveat(self):
-        """A session that declares `stewart` reads only that entry, never the canonical one."""
+        """A session that declares `stewart` reads only that entry, never the canonical one.
+
+        A spelling added later counts too, by the pointer it carries, so a new bare pointer cannot
+        pass by staying out of SPELLINGS.
+        """
         retired = seats()["retired"]
-        gaps = {s: self._missing_caveat(retired.get(s, "")) for s in sorted(self.SPELLINGS)}
+        added = {k for k, v in retired.items() if "a spelling of 'steward'" in v}
+        gaps = {s: self._missing_caveat(retired.get(s, "")) for s in sorted(self.SPELLINGS | added)}
         self.assertEqual(
             {},
             {s: m for s, m in gaps.items() if m},
@@ -1533,6 +1540,12 @@ class TheStewardRetirementSaysTheUsageControlsStayed(unittest.TestCase):
             " ".join(text.split()),
             "CLAUDE.md no longer states the retirement, so a document routing work to a Steward "
             "has nothing contradicting it",
+        )
+        self.assertIn(
+            "where nothing prints them, for example in a cloud session or on an unwired root, "
+            "they bind all the same",
+            " ".join(text.split()),
+            "CLAUDE.md no longer says the usage controls bind where watch.py prints nothing",
         )
 
 
