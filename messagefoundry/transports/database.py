@@ -4360,8 +4360,9 @@ def _log_login_role_reading(reading: LoginRoleReading, label: str) -> None:
     if reading.verdict is LoginRoleVerdict.CLEAN:
         logger.info(
             "%r: login role probe: none of the classic fixed server roles and no database-wide "
-            "write role in this database (role membership only: permission grants at any scope, "
-            "user-defined roles and other databases are not read)",
+            "write role in this database (role membership only; at least permission grants at "
+            "any scope, user-defined roles, ##MS_...## server roles and other databases are not "
+            "read)",
             label,
         )
     elif reading.verdict is LoginRoleVerdict.OVER_GRANTED:
@@ -4418,12 +4419,26 @@ async def _read_login_roles(pool: Any, acquire_timeout: float) -> LoginRoleReadi
         await cur.execute(_LOGIN_ROLE_PROBE_SQL, _LOGIN_ROLE_PROBE_PARAMS)
         row = await cur.fetchone()
     except Exception as exc:
-        return LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
-    finally:
+        reading = LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
+    except BaseException:  # a cancellation: the connection still goes back, then it propagates
         await _close_and_release(pool, conn, cur)
-    if row is None:
-        return LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause="the probe returned no row")
-    return classify_login_roles(tuple(row))
+        raise
+    else:
+        reading = (
+            LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause="the probe returned no row")
+            if row is None
+            else classify_login_roles(tuple(row))
+        )
+    # Outside a finally, so a release that raises (a pool aclose() is closing, say) cannot escape
+    # the never-raises promise; the reading it already holds still stands.
+    try:
+        await _close_and_release(pool, conn, cur)
+    except Exception as exc:
+        logger.warning(
+            "login role probe: its connection did not go back to the pool cleanly (%s)",
+            _credential_free_detail(exc),
+        )
+    return reading
 
 
 class DatabaseLookupExecutor:

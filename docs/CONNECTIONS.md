@@ -2535,7 +2535,9 @@ writes. Each `DatabaseLookup` and `DatabaseRef` login is probed once, when its p
 (BACKLOG #2617):
 
 - **A lookup** is probed on its first `db_lookup` call, since `serve` does not dial lookups at
-  start. A pool that fails to open is not probed; the next lookup opens it and probes it then.
+  start. A pool that fails to open is not probed; the next lookup opens it and probes it then. A
+  probe that did not run on an open pool is not tried again until the executor is rebuilt, as on a
+  reload, so its warning is the only record.
 - **A reference set** is probed on its first sync, and again when its `server`, `port`,
   `database`, `auth` or `username` changes, as when a reload points it at another login. A probe
   that did not run is tried again on the next sync.

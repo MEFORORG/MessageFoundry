@@ -282,6 +282,22 @@ async def test_a_failed_probe_statement_names_its_sqlstate_not_its_text() -> Non
     assert pool.released == 1  # the connection still goes back
 
 
+async def test_a_release_that_raises_does_not_escape_the_probe(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Red before the fix: the release ran in a ``finally`` and its error escaped the probe."""
+
+    class _BadRelease(_Pool):
+        async def release(self, conn: _Conn) -> None:
+            raise RuntimeError("pool is closing")
+
+    pool = _BadRelease(_row(("db_owner",)))
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        reading = await probe_login_roles(pool, label="db_lookup:clarity", acquire_timeout=5.0)
+    assert reading.verdict is LoginRoleVerdict.OVER_GRANTED  # the read itself still stands
+    assert "did not go back to the pool cleanly (RuntimeError)" in caplog.text
+
+
 async def test_no_row_did_not_run() -> None:
     reading = await probe_login_roles(_Pool(None), label="db_lookup:clarity", acquire_timeout=5.0)
     assert reading == LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause="the probe returned no row")
