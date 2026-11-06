@@ -2395,21 +2395,6 @@ def _win_hold_below(
     return held, here
 
 
-def _staging_rewritten(staging: Path) -> bool | None:
-    """:func:`_win_rewritten` for a staging directory the teardown is handed, or ``None`` once a
-    fault in it is logged. Never raises: the teardown runs from ``_Staging.release`` after a verdict,
-    or while an error is in flight, and a caller reads ``None`` as a name it must not touch."""
-    try:
-        return _win_rewritten(staging)
-    except Exception as exc:  # never raise over the verdict or the error in flight
-        log.error(
-            "DR staging directory %s could not be checked for a name Windows rewrites: %s",
-            staging,
-            safe_exc(exc),
-        )
-        return None
-
-
 def _win_verbatim(path: Path) -> str:
     """``path`` behind Win32's verbatim prefix (``\\\\?\\``, or ``\\\\?\\UNC\\`` for a share), which
     has Windows open each name exactly as written. Its parent is resolved as the engine resolves it."""
@@ -2422,29 +2407,41 @@ def _win_verbatim(path: Path) -> str:
 
 
 def _rewritten_staging_refusal(staging: Path) -> str | None:
-    """What the teardown reports for a staging directory whose name Windows would open as another
-    directory, or that could not be checked (:func:`_staging_rewritten`); ``None`` for any other.
+    """What the teardown reports, untouched, for a staging directory whose name Windows would open as
+    another directory (:func:`_win_rewritten`), or whose screen faulted; ``None`` for any other.
+    Never raises: the teardown runs from ``_Staging.release`` after a verdict, or while an error is
+    in flight, and must replace neither. A fault is read as a name not to touch.
 
-    It names the directory by its verbatim path only, and names that path as the only way to remove
-    it. A removal by the plain path removes the OTHER directory and leaves this one: measured on
-    Windows 11 build 26300 for ``rd /s /q`` and ``Remove-Item -Recurse``, each of which reported
-    nothing. ``rd /s /q`` on the verbatim path removed only this directory, rewritten names inside it
-    included. On an administrative share it removed nothing and still exited 0, hence the check that
-    it is gone (BACKLOG #2420)."""
-    rewritten = _staging_rewritten(staging)
-    if rewritten is False:
-        return None
-    verbatim = _win_verbatim(staging)
-    why = (
-        "Windows would open its plain path as another directory"
-        if rewritten
-        else "whether Windows would open its plain path as another directory could not be checked"
-    )
+    It names the directory by its verbatim path only, forbids the plain path first, so the 200
+    characters a failure record keeps still hold that, and names ``rd`` on the verbatim path as the
+    only removal. A removal by the plain path removes the OTHER directory and leaves this one:
+    measured on Windows 11 build 26300 for ``rd /s /q`` and ``Remove-Item -Recurse``, each of which
+    reported nothing. ``rd /s /q`` on the verbatim path removed only this directory, rewritten names
+    inside it included. On an administrative share it removed nothing and still exited 0, hence the
+    check that it is gone. In ``cmd.exe`` because in PowerShell ``rd`` is ``Remove-Item`` (BACKLOG
+    #2420)."""
+    try:
+        if not _win_rewritten(staging):
+            return None
+        why = "Windows opens that path as another directory"
+    except Exception as exc:  # never raise over the verdict or the error in flight
+        why = f"whether that path reaches another directory could not be checked ({safe_exc(exc)})"
+    try:
+        named = _win_verbatim(staging)
+        how = (
+            "remove it only with rd /s /q in cmd.exe, not PowerShell, and that verbatim path in "
+            "double quotes"
+        )
+    except Exception as exc:  # never raise over the verdict or the error in flight
+        named = f"named {staging.name!r} in {staging.parent}"
+        how = (
+            f"its verbatim path could not be formed ({safe_exc(exc)}), so remove it only with "
+            "rd /s /q in cmd.exe, not PowerShell, and the \\\\?\\ form of its path in double quotes"
+        )
     return (
-        f"the staging directory {verbatim} was not removed or emptied, because {why}; remove it "
-        f'only by that verbatim path, as rd /s /q "{verbatim}" does, and check that it is gone, '
-        "since rd can exit 0 having removed nothing; a removal by its plain path, without the "
-        "\\\\?\\ prefix, removes that other directory instead and leaves this one"
+        f"the plaintext staging directory {named} was not removed or emptied; never remove it by "
+        f"its plain path, without the \\\\?\\ prefix, since {why}; {how}, then check that it is "
+        "gone, since rd can exit 0 having removed nothing"
     )
 
 
@@ -2465,19 +2462,10 @@ def _discard_verify_staging(staging: Path) -> str | None:
     longer holds the plaintext. The blocks it freed still do until reused, and only full-disk
     encryption on the staging volume covers them (docs/PHI.md section 10).
 
-    On Windows a directory whose name Windows would open as another (:func:`_win_opens_another`) is
-    not touched at all: its removal by path would remove that other directory and then find the
-    name gone, and so report it clean while it keeps its files (BACKLOG #2420). The engine never
-    names a staging directory that way, so one reaches here only from a sweep of a shared root.
-    What it tells the operator is :func:`_rewritten_staging_refusal`'s."""
+    Its caller, :func:`_teardown_staging`, screens first for a name Windows would open as another
+    directory, and never hands one here."""
     unproven: list[str] = []
     try:
-        # Inside the guard: this runs from `_Staging.release` after a verdict, or while an error is
-        # in flight, and must replace neither.
-        refusal = _rewritten_staging_refusal(staging)
-        if refusal is not None:
-            log.error("DR staging: %s", refusal)
-            return refusal
         if _remove_tree(staging):
             return None
         unproven = _empty_files_in_place(staging)
@@ -2657,12 +2645,20 @@ def _teardown_staging(path: Path) -> str | None:
     A refused removal can take the lock file and marker with it, because ``rmtree`` removes entries in
     listing order and on NTFS the dot-names list first. Left like that, the directory would hold
     plaintext and no proof, and every later sweep would skip it. Nobody holds the lock now, so the
-    files are all the proof needs."""
+    files are all the proof needs.
+
+    On Windows a directory whose name Windows would open as another (:func:`_win_opens_another`) is
+    not removed, emptied or re-marked at all, nor one whose screen faulted: its removal by path
+    would remove that other directory and then find the name gone, and so report it clean while it
+    keeps its files, and its marks would land in the other directory (BACKLOG #2420). The engine
+    never names a staging directory that way, so one reaches here only from a sweep of a shared
+    root. It is screened once, here, and reported by :func:`_rewritten_staging_refusal`."""
+    refusal = _rewritten_staging_refusal(path)
+    if refusal is not None:
+        log.error("DR staging: %s", refusal)
+        return refusal
     leftover = _discard_verify_staging(path)
-    # A name Windows rewrites is not re-marked either, nor one the screen could not check: the marks
-    # would land in the other directory. `_staging_rewritten` never raises, so the screen cannot
-    # replace a verdict or an error in flight.
-    if os.path.lexists(path) and _staging_rewritten(path) is False:
+    if os.path.lexists(path):
         # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would
         # otherwise hold this thread in the open until a reader came, which may be never.
         flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK

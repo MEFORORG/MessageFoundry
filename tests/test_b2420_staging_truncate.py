@@ -710,7 +710,7 @@ def test_the_teardown_touches_no_other_directory_for_a_rewritten_name(win_tmp: P
     other.mkdir()
     (other / "archive.tar").write_bytes(_PLAINTEXT)
     leftover = dr_backup._teardown_staging(planted)
-    assert leftover is not None and "Windows would open its plain path as another" in leftover
+    assert leftover is not None and "since Windows opens that path as another" in leftover
     assert sorted(p.name for p in other.iterdir()) == ["archive.tar"]
     assert (other / "archive.tar").read_bytes() == _PLAINTEXT
     assert _size(win_tmp, "mefor-backup-x.", "planted.tar") == len(_PLAINTEXT)
@@ -824,11 +824,14 @@ def test_the_refusal_for_a_rewritten_staging_name_advises_no_removal_by_hand(
     logged = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert leftover is not None and len(logged) == 1
     verbatim = dr_backup._win_verbatim(staging)
+    assert leftover.startswith(
+        f"the plaintext staging directory {verbatim} was not removed or emptied; never remove it "
+        "by its plain path"
+    )
     for text in (leftover, logged[0]):
         assert "by hand" not in text
         assert "delete it" not in text
-        assert f'remove it only by that verbatim path, as rd /s /q "{verbatim}" does' in text
-        assert "a removal by its plain path" in text
+        assert "remove it only with rd /s /q in cmd.exe, not PowerShell, and that verbatim" in text
         # The plain path appears only inside the verbatim one.
         assert str(staging) not in text.replace(verbatim, "")
     # Nothing was removed, emptied or re-marked.
@@ -848,7 +851,7 @@ def test_the_refusals_verbatim_path_names_the_planted_directory_not_the_other(
     planted = win_tmp / "mefor-backup-x."
     leftover = dr_backup._teardown_staging(planted)
     verbatim = dr_backup._win_verbatim(planted)
-    assert leftover is not None and f'rd /s /q "{verbatim}"' in leftover
+    assert leftover is not None and f" {verbatim} was not removed" in leftover
     assert os.listdir(verbatim) == ["planted.tar"]
 
 
@@ -886,11 +889,7 @@ def _faulting_verify(*args: Any, **kwargs: Any) -> dr_backup.VerifyResult:
     raise RuntimeError("synthetic verify fault")
 
 
-def _discard_leaving_the_directory(path: Path) -> str:
-    return "synthetic leftover"
-
-
-def test_a_screen_that_raises_in_the_discard_does_not_replace_the_verify_verdict(
+def test_a_screen_that_raises_does_not_replace_the_verify_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The verify's teardown runs after its verdict, and `release` must never raise over it. Red
@@ -905,12 +904,12 @@ def test_a_screen_that_raises_in_the_discard_does_not_replace_the_verify_verdict
     assert result.status == "FAIL"
     assert result.reason is not None and result.reason.startswith("the archive verified, but ")
     (staging,) = tmp_path.glob("mefor-verify-*")
-    assert f"the staging directory {dr_backup._win_verbatim(staging)} " in result.reason
+    assert f"the plaintext staging directory {dr_backup._win_verbatim(staging)} " in result.reason
     assert "could not be checked" in result.reason
     assert (staging / dr_backup._LOCK_NAME).exists()
 
 
-def test_a_screen_that_raises_in_the_discard_does_not_replace_the_error_in_flight(
+def test_a_screen_that_raises_does_not_replace_the_error_in_flight(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The same screen, while the verify itself is raising. Red before the fix: the screen's fault
@@ -925,31 +924,36 @@ def test_a_screen_that_raises_in_the_discard_does_not_replace_the_error_in_fligh
     assert "could not be checked" in note and "by hand" not in note
 
 
-def test_a_screen_that_raises_in_the_teardown_does_not_replace_the_verify_verdict(
+def test_a_name_whose_screen_raised_is_neither_removed_nor_re_marked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The teardown's own screen, reached once the discard leaves the directory. Red before the fix:
-    it sat outside the re-mark's guard, so its fault escaped `release` in place of the verdict."""
-    monkeypatch.setattr(dr_backup, "_verify_in_staging", _passing_verify)
-    monkeypatch.setattr(dr_backup, "_discard_verify_staging", _discard_leaving_the_directory)
+    """`release` reads a screen fault as a name not to touch: it removes nothing and re-marks
+    nothing, since marks by that name may land in another directory. Red before the fix: the
+    screen's fault escaped `release`."""
+    work = dr_backup._open_staging(tmp_path, "mefor-verify-", secure=False)
+    (work.path / "archive.tar").write_bytes(_PLAINTEXT)
+    os.remove(work.path / dr_backup._HELD_MARKER_NAME)
     monkeypatch.setattr(dr_backup, "_win_rewritten", _raising_screen)
-    result = dr_backup._verify_archive_blocking(
-        archive_path=_plaintext_archive(tmp_path), keys=[], full=False, staging_root=tmp_path
+    leftover = work.release()
+    assert leftover is not None and "could not be checked" in leftover
+    assert sorted(p.name for p in work.path.iterdir()) == [dr_backup._LOCK_NAME, "archive.tar"]
+    assert (work.path / "archive.tar").read_bytes() == _PLAINTEXT
+
+
+def test_a_verbatim_path_that_cannot_be_formed_still_forbids_the_plain_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fault forming the verbatim path still leaves the refusal standing, never the discard's
+    generic "delete it" line."""
+    staging = tmp_path / "mefor-backup-x"
+    staging.mkdir()
+    monkeypatch.setattr(dr_backup, "_win_rewritten", lambda path: True)
+    monkeypatch.setattr(dr_backup, "_win_verbatim", _raising_screen)
+    leftover = dr_backup._teardown_staging(staging)
+    assert leftover is not None
+    assert leftover.startswith(
+        "the plaintext staging directory named 'mefor-backup-x' in "
+        f"{tmp_path} was not removed or emptied; never remove it by its plain path"
     )
-    assert result.status == "FAIL"
-    assert result.reason == "the archive verified, but synthetic leftover"
-
-
-def test_a_screen_that_raises_in_the_teardown_does_not_replace_the_error_in_flight(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The teardown's own screen while the verify is raising. Red before the fix: the screen's fault
-    replaced the verify's own exception."""
-    monkeypatch.setattr(dr_backup, "_verify_in_staging", _faulting_verify)
-    monkeypatch.setattr(dr_backup, "_discard_verify_staging", _discard_leaving_the_directory)
-    monkeypatch.setattr(dr_backup, "_win_rewritten", _raising_screen)
-    with pytest.raises(RuntimeError, match="synthetic verify fault") as raised:
-        dr_backup._verify_archive_blocking(
-            archive_path=_plaintext_archive(tmp_path), keys=[], full=False, staging_root=tmp_path
-        )
-    assert raised.value.__notes__ == ["synthetic leftover"]
+    assert "delete it" not in leftover and "by hand" not in leftover
+    assert staging.is_dir()
