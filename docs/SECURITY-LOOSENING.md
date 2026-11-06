@@ -200,7 +200,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | Alert transport | `allow_unverified_alert_smtp_tls` | `false` |
 | Store principal | `allow_over_granted_store_principal` | `false` (ADR 0199: accept an over-granted store login under `enforce`, audited) |
 | Vault token | `allow_over_granted_vault_token` | `false` (ADR 0216: accept a Vault token holding the root policy or an administrative grant under `enforce`, audited) |
-| Interpreter | `allow_remote_debugging` | `false` (vault BACKLOG #2700: accept the interpreter's remote debugging on under `enforce`, which otherwise refuses the start; reported) |
+| Interpreter | `allow_remote_debugging` | `false` (vault BACKLOG #2700: lifts the start refusal under `enforce` while the interpreter's remote debugging is on; reported) |
 | Backend credentials | `require_nonstatic_credentials` | `false` (*not* a loosening — it TIGHTENS, refusing backend hops on a static credential or none. Opt-in by owner decision, because several hops have no compliant kind in the product) |
 | | `static_credential_accepted` | `{}` (each opt-out is a loosening while `require_nonstatic_credentials` is on, and is reported as `static_credential_accepted`; with the refusal off an opt-out does nothing and is not reported) |
 | Data handling | `block_unlisted_outbound` | `true` |
@@ -2368,8 +2368,9 @@ count is above `0` (vault BACKLOG #2613).
   standard error. The engine leaves that line, as it is the other hook's and the only record of
   the refusal.
 - **Where it is reported:** the serve-time loosening warning and `GET /security/posture`, each for
-  the engine's own process. `supervise` logs one WARNING at start for the supervisor process.
-  It logs the line a second time once its off-box log forwarder is installed, so the collector's
+  the engine's own process. `supervise` logs one WARNING for the supervisor process once its
+  start has passed its remote-debugging gate, so a fleet refused there or at an earlier gate logs
+  none. It logs the line a second time once its off-box log forwarder is installed, so the collector's
   copy has it. No API reports that process afterwards. The engine's Python children start with the interface
   off (`messagefoundry/childenv.py`), so an engine shard reports nothing.
   `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
@@ -2404,9 +2405,10 @@ count is above `0` (vault BACKLOG #2613).
   also holds for a process of your own that imports `messagefoundry.__main__`. There is no
   switch that turns the hook off. To debug a command, start it under the debugger, as
   `python -P -X disable-remote-debug -m pdb -m messagefoundry <command>`, which does not use
-  the interface; without the option, `serve` and `supervise` refuse under `enforce`. That reaches
-  the command's own process. Router and Handler bodies that run in a sandbox worker
-  (`[sandbox].mode = "subprocess"`) are in a child process, which it does not reach.
+  the interface. The debugger reaches the command's own process. Router and Handler bodies that
+  run in a sandbox worker (`[sandbox].mode = "subprocess"`) are in a child process, which it does
+  not reach. Keep the option: without it, the start refusal above stops `serve` and `supervise`
+  under `enforce`.
 
 ### `allow_remote_debugging = true` -- start under `enforce` with the interpreter's remote debugging on
 

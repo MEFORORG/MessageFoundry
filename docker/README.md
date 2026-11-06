@@ -67,10 +67,18 @@ interpreter it starts.
 Two things undo this, and the engine refuses or reports each:
 
 - **Overriding the entry point** (`--entrypoint messagefoundry`, or a `command:` that replaces it
-  in Kubernetes) starts the engine without the options. Under `enforce` it then refuses to
-  start, because remote debugging is on (vault BACKLOG #2700). Under `warn`, or with
-  `[security].allow_remote_debugging`, it reports `interpreter_not_isolated` and
-  `remote_debug_enabled`.
+  in Kubernetes) can start the engine without the options. Remote debugging is then on unless
+  one of two things turns it off: the start passes `-X disable-remote-debug`; or the start passes
+  neither `-I` nor `-E`, as the `messagefoundry` console script does, and the container's
+  environment sets `PYTHON_DISABLE_REMOTE_DEBUG=1`. The interpreter ignores that variable under
+  either option, so an override that keeps `-I` and drops only `-X disable-remote-debug` has it
+  on. With it on, under `enforce` the start refusal for it stops the engine unless
+  `[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). A start that goes on
+  reports `interpreter_not_isolated` where the override drops `-I`, and `remote_debug_enabled`
+  while the interface is on. The refusal is stated in full in
+  [`docs/SECURITY-LOOSENING.md`](../docs/SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process),
+  and the acceptance, which is for a developer's own start and never a deployment, in
+  [its own section](../docs/SECURITY-LOOSENING.md#allow_remote_debugging--true----start-under-enforce-with-the-interpreters-remote-debugging-on).
 - **A derived image that leaves the venv owned by uid 10001.** Install extra packages as root and
   switch back: `USER root`, then `RUN /opt/venv/bin/pip install ...`, then `USER 10001`. The engine
   reports `startup_directory_writable` when its account can write there.
