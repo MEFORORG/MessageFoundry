@@ -13168,13 +13168,23 @@ class AuthService:
         so an ``admin_reset_mfa`` that clears TOTP, or a removal of the last discoverable passkey,
         between this read and the write makes the write match no row, and the change is refused
         rather than landing on an account with no way past.
+
+        The TOTP cell is opened ONCE per change, by the store's conditional write (BACKLOG #3948
+        finding 13). The early refusal here opens none: it refuses an account with no TOTP on and no
+        passkey that counts, as :meth:`_has_way_past` would, and leaves a TOTP that is on to the
+        write's own judgement, which refuses a KNOWN refusal there.
         """
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
         user = await self._load_user(identity.user_id)
         covered = user is not None and self._covered_by_requirement(user, identity.roles)
-        if covered and user is not None and not await self._has_way_past(user):
+        if (
+            covered
+            and user is not None
+            and not user.totp_enabled
+            and not await self._holds_gate_passkey(user)
+        ):
             raise FactorEnrolmentRequired()
         written = await self._store.set_password(
             identity.user_id,

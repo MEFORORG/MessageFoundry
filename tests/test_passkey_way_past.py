@@ -1485,8 +1485,9 @@ async def test_an_unknown_totp_opens_the_rotation_gate(
     """The rotation gate during the outage, or on a keyless open: a covered account whose only
     factor is an enabled TOTP nobody can judge may rotate into a chosen password, as the plain
     enabled-TOTP rule let it before BACKLOG #3422. Both halves ask: the service's gate
-    (``must_enrol_before_rotating`` and ``change_password``, through ``_has_way_past``) and the
-    store's conditional write. Its refused-marker control is
+    (``must_enrol_before_rotating``, through ``_has_way_past``) and the store's conditional write,
+    the one judgement a ``change_password`` makes (BACKLOG #3948 finding 13). Its refused-marker
+    control is
     :func:`test_a_refused_totp_does_not_open_the_rotation_gate`."""
     store = await MessageStore.open(":memory:")
     try:
@@ -1500,9 +1501,9 @@ async def test_an_unknown_totp_opens_the_rotation_gate(
         gate_opens = len(opened)
         assert gate_opens, "the rotation gate judged nothing, so the stub measured nothing"
         assert await service.change_password(identity, _NEW_PASSWORD) == []
-        # The password change judges it twice: the service's gate, then the store's conditional
-        # write, so a write that stopped asking would show here.
-        assert len(opened) >= gate_opens + 2, (gate_opens, len(opened))
+        # The password change judges it once, in the store's conditional write (BACKLOG #3948
+        # finding 13), so a write that stopped asking would show here, and so would a second open.
+        assert len(opened) == gate_opens + 1, (gate_opens, len(opened))
         row = await store.get_user(identity.user_id)
         assert row is not None and row.password_hash != before.password_hash
     finally:

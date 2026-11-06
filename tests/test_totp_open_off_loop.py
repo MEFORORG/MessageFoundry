@@ -395,3 +395,24 @@ async def test_the_gates_and_the_store_judge_a_totp_cell_with_one_helper(
     )
     assert isinstance(judgement, store_module.TotpJudgement) and judgement.state == "usable"
     assert calls == [identity.user_id, identity.user_id], calls
+
+
+async def test_a_password_change_opens_the_totp_cell_once(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore
+) -> None:
+    """BACKLOG #3948 finding 13: a password change by a covered account with TOTP on opens the TOTP
+    cell once, in the store's conditional write, not again in an early refusal beside it. Under a
+    Transit cipher each open is one round trip. RED when the early refusal judges the TOTP too."""
+    service, identity, _password, _steps, _codes = await _totp_admin(
+        store, monkeypatch, before_confirm=lambda: None
+    )
+    real_open = store.open_totp_secret
+    opens: list[str] = []
+
+    def counting(user_id: str, cell: str | None) -> str | None:
+        opens.append(user_id)
+        return real_open(user_id, cell)
+
+    monkeypatch.setattr(store, "open_totp_secret", counting)
+    assert await service.change_password(identity, "a fresh synthetic passphrase 7341") == []
+    assert opens == [identity.user_id], f"the change opened the TOTP cell {len(opens)} times"
