@@ -126,6 +126,8 @@ from messagefoundry.store.crypto import (
     AUDIT_SCHEME_TRANSIT,
     AUDIT_SCHEME_UNNAMED_IN_HEAP,
     AUDIT_SCHEME_UNNAMED_TRANSIT,
+    NO_STORE_ID,
+    STORE_ID_BYTES,
     AesGcmCipher,
     AuditKeyVersionRefusedError,
     AuditMacFn,
@@ -5170,6 +5172,58 @@ def _audit_unnamed_scheme(key_id: str) -> AuditScheme:
     return AUDIT_SCHEME_UNNAMED_IN_HEAP
 
 
+@dataclass(frozen=True)
+class _AuditStoreIdRefused(AuditScheme):
+    """What a genesis record whose ``store_id`` no release writes reads as (vault BACKLOG #3411): a
+    scheme no release holds, so :func:`audit_scheme_refusal` refuses it. The refusal names the
+    missing scheme when the record names none, whatever the store id; else the named scheme's own
+    refusal when it is refused; else the store id. A class of its own, so it never compares equal
+    to a scheme a record names and no record can produce one. ``named`` is the scheme the record
+    named, ``None`` for none; ``mac`` and ``kdf`` are empty."""
+
+    named: AuditScheme | None = None
+
+
+#: Each class of refusal, in fixed words, for a message that must carry no record-supplied text
+#: (vault BACKLOG #3411): a refusal's own words quote ``mac``, ``kdf`` and ``key_id``, which anyone
+#: who can write the audit log chooses. Each completes "audit row N's key range".
+_AUDIT_REFUSED_SCHEME: Final = "names an audit scheme this release does not hold"
+_AUDIT_REFUSED_KEYLESS: Final = "names the keyless store mode, which no audit record may name"
+_AUDIT_REFUSED_UNNAMED_STORE_ID: Final = (
+    "opens with a record that carries a store_id but names no scheme"
+)
+_AUDIT_REFUSED_STORE_ID: Final = "opens with a record that carries a malformed store_id"
+
+
+def _audit_refusal(key_id: str, scheme: AuditScheme | None) -> tuple[str, str] | None:
+    """``(class, text)`` of :func:`audit_scheme_refusal`, or ``None`` when the scheme is held. The
+    class is one of the fixed phrases above; the text may quote the record."""
+    if isinstance(scheme, _AuditStoreIdRefused):
+        # The scheme speaks first. A missing one is the real defect: every writer since BACKLOG
+        # #3420 names it, and the store id postdates that. A malformed label must not hide a record
+        # that also names the keyless mode or an unknown scheme.
+        if scheme.named is None:
+            return _AUDIT_REFUSED_UNNAMED_STORE_ID, (
+                "records a store_id but names no scheme: a genesis record carrying a store_id "
+                "names its scheme (vault BACKLOG #3411)"
+            )
+        return _audit_refusal(key_id, scheme.named) or (
+            _AUDIT_REFUSED_STORE_ID,
+            f"records a malformed store_id: a genesis record's store_id is the lowercase hex of "
+            f"{STORE_ID_BYTES} bytes, beside a named scheme (vault BACKLOG #3411)",
+        )
+    if scheme is None:
+        scheme = _audit_unnamed_scheme(key_id)
+    if scheme == audit_scheme_for(key_id):
+        return None
+    if scheme.mac == AUDIT_KEYLESS_MAC:
+        return _AUDIT_REFUSED_KEYLESS, _AUDIT_REFUSED_KEYLESS
+    return _AUDIT_REFUSED_SCHEME, (
+        f"names audit scheme {scheme.mac[:64]!r} with key derivation {scheme.kdf[:64]!r}; this "
+        f"release does not seal the range of audit key {key_id[:64]!r} with it"
+    )
+
+
 def audit_scheme_refusal(key_id: str, scheme: AuditScheme | None) -> str | None:
     """Why a genesis or range record's named ``scheme`` is refused, or ``None`` when it is the one
     this release seals ``key_id``'s range with (BACKLOG #3420). ``None`` for ``scheme`` is a record
@@ -5179,20 +5233,15 @@ def audit_scheme_refusal(key_id: str, scheme: AuditScheme | None) -> str | None:
     one today, so verifying a range under the scheme its record names is: refuse every other name,
     then verify under that one. The keyless store mode is never among them, whatever ``kdf`` says,
     so no record can declare its chain keyless."""
-    if scheme is None:
-        scheme = _audit_unnamed_scheme(key_id)
-    if scheme == audit_scheme_for(key_id):
-        return None
-    if scheme.mac == AUDIT_KEYLESS_MAC:
-        return "names the keyless store mode, which no audit record may name"
-    return (
-        f"names audit scheme {scheme.mac[:64]!r} with key derivation {scheme.kdf[:64]!r}; this "
-        f"release does not seal the range of audit key {key_id[:64]!r} with it"
-    )
+    refused = _audit_refusal(key_id, scheme)
+    return None if refused is None else refused[1]
 
 
 #: The fields a genesis or range record names its scheme in (BACKLOG #3420).
 _AUDIT_SCHEME_FIELDS: Final = frozenset({"mac", "kdf"})
+#: What a record of a shape no release writes reads as: a scheme no release holds, so
+#: :func:`audit_scheme_refusal` refuses it.
+_AUDIT_SCHEME_REFUSED: Final = AuditScheme(mac="", kdf="")
 
 
 def _audit_record_scheme(obj: Mapping[str, Any], fields: frozenset[str]) -> AuditScheme | None:
@@ -5212,7 +5261,7 @@ def _audit_record_scheme(obj: Mapping[str, Any], fields: frozenset[str]) -> Audi
         return None
     mac, kdf = obj.get("mac"), obj.get("kdf")
     if keys != fields | _AUDIT_SCHEME_FIELDS or not (isinstance(mac, str) and isinstance(kdf, str)):
-        return AuditScheme(mac="", kdf="")  # a shape no release writes, refused as such
+        return _AUDIT_SCHEME_REFUSED
     return AuditScheme(mac=mac, kdf=kdf)
 
 
@@ -5392,26 +5441,47 @@ def audit_seal_next(
     return seq, row_hash
 
 
-def audit_genesis_detail(key_id: str) -> str:
+#: A genesis record writes a store id (vault BACKLOG #3411) as the lowercase hex of its bytes.
+_AUDIT_STORE_ID_FIELD: Final = "store_id"
+#: ``2 * STORE_ID_BYTES`` lowercase hex digits, unanchored: use it with ``fullmatch`` only. The width
+#: is a literal, not interpolated, so the ReDoS scanner in tests/test_security_static.py reads the
+#: pattern; a test pins it to the constant.
+_AUDIT_STORE_ID_HEX: Final = re.compile("[0-9a-f]{32}")
+_ABSENT: Final = object()
+
+
+def audit_genesis_detail(key_id: str, store_id: bytes = NO_STORE_ID) -> str:
     """The ``detail`` of the genesis row: a typed record naming the key the first range is MAC'd
     under, and the scheme it is sealed with (BACKLOG #3420). JSON, so a later field can be added
-    beside them."""
-    scheme = _audit_scheme_fields(audit_scheme_for(key_id))
-    return json.dumps({"genesis": 1, "key_id": key_id, **scheme}, sort_keys=True)
+    beside them.
+
+    ``store_id``, when minted, is recorded as a label (vault BACKLOG #3411): the row MAC covers it,
+    and no key is derived from it. :data:`NO_STORE_ID`, the default, records none, so the record has
+    today's shape; no caller passes one yet. Raises ``ValueError`` for any other store id that is
+    not :data:`STORE_ID_BYTES` long."""
+    record: dict[str, object] = {"genesis": 1, "key_id": key_id}
+    record.update(_audit_scheme_fields(audit_scheme_for(key_id)))
+    if store_id != NO_STORE_ID:
+        if len(store_id) != STORE_ID_BYTES:
+            raise ValueError(f"a store id is {STORE_ID_BYTES} bytes, not {len(store_id)}")
+        record[_AUDIT_STORE_ID_FIELD] = store_id.hex()
+    return json.dumps(record, sort_keys=True)
 
 
 _AUDIT_GENESIS_FIELDS: Final = frozenset({"genesis", "key_id"})
 
 
-def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None] | None:
-    """``(key_id, scheme)`` from a genesis row's ``detail``, or ``None`` when ``detail`` is not one.
-    ``scheme`` is ``None`` for a record that names none. Whether a named one is held is
-    :func:`audit_scheme_refusal`'s question, not this parser's, so a record naming an unknown
-    scheme still reads as a genesis row, and its chain as keyed.
+def _parse_audit_genesis(detail: object) -> tuple[str, AuditScheme | None, bytes | None] | None:
+    """``(key_id, scheme, store_id)`` from a genesis row's ``detail``; see
+    :func:`parse_audit_genesis_record`. ``store_id`` is ``None`` when the record carries none, or
+    carries one that is refused.
 
-    Total over attacker-written input, like :func:`parse_audit_epoch`: a malformed value is ``None``,
-    never an exception. Exactly the fields a genesis record has, so a range row's detail (which
-    carries ``closes`` and ``handover``) is never read as one."""
+    A ``store_id`` field that is not the lowercase hex of :data:`STORE_ID_BYTES` bytes, or that sits
+    on a record naming no scheme (no release wrote one there: the field postdates BACKLOG #3420),
+    reads as :class:`_AuditStoreIdRefused`, never as ``None``, so :func:`audit_scheme_refusal`
+    refuses it, as it refuses a field beyond the record. Read as no record instead, a malformed
+    store id would turn a keyed chain's genesis row into none (:func:`_audit_record_scheme` says
+    why that matters)."""
     if not isinstance(detail, str):
         return None
     try:
@@ -5420,6 +5490,7 @@ def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None]
         return None
     if not isinstance(obj, dict):
         return None
+    raw_store_id = obj.pop(_AUDIT_STORE_ID_FIELD, _ABSENT)
     try:
         scheme = _audit_record_scheme(obj, _AUDIT_GENESIS_FIELDS)
     except ValueError:
@@ -5427,7 +5498,55 @@ def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None]
     marker, key_id = obj["genesis"], obj["key_id"]
     if isinstance(marker, bool) or marker != 1:
         return None
-    return (key_id, scheme) if isinstance(key_id, str) and key_id else None
+    if not isinstance(key_id, str) or not key_id:
+        return None
+    if raw_store_id is _ABSENT:
+        return key_id, scheme, None
+    if (
+        scheme is not None
+        and isinstance(raw_store_id, str)
+        and _AUDIT_STORE_ID_HEX.fullmatch(raw_store_id)
+    ):
+        return key_id, scheme, bytes.fromhex(raw_store_id)
+    return key_id, _AuditStoreIdRefused(mac="", kdf="", named=scheme), None
+
+
+def parse_audit_genesis_record(detail: object) -> tuple[str, AuditScheme | None] | None:
+    """``(key_id, scheme)`` from a genesis row's ``detail``, or ``None`` when ``detail`` is not one.
+    ``scheme`` is ``None`` for a record that names none and carries no ``store_id``; one naming none
+    but carrying a ``store_id`` reads as a refused scheme (:func:`_parse_audit_genesis`). Whether
+    a named one is held is :func:`audit_scheme_refusal`'s question, not this parser's, so a record
+    naming an unknown scheme still reads as a genesis row, and its chain as keyed.
+
+    Total over attacker-written input, like :func:`parse_audit_epoch`: a malformed value is ``None``,
+    never an exception. Exactly the fields a genesis record has, with or without a ``store_id``, so a
+    range row's detail (which carries ``closes`` and ``handover``) is never read as one."""
+    parsed = _parse_audit_genesis(detail)
+    return None if parsed is None else parsed[:2]
+
+
+class AuditGenesisStoreId(NamedTuple):
+    """What a genesis record says of the store id (vault BACKLOG #3411). A label: the copy in the
+    database is not a pin, and nothing is keyed from it."""
+
+    #: The store id the record labels; ``None`` when it labels none, or when ``refused``.
+    store_id: bytes | None
+    #: The walk refuses the record (:func:`audit_scheme_refusal`): its scheme is refused, it names
+    #: none beside a store id, or its store id is malformed. So a caller comparing labels never
+    #: reads such a record as one with none.
+    refused: bool
+
+
+def parse_audit_genesis_store_id(detail: object) -> AuditGenesisStoreId | None:
+    """What a genesis row's ``detail`` says of the store id, or ``None`` when ``detail`` is not a
+    genesis record. Total over attacker-written input, like :func:`parse_audit_genesis_record`."""
+    parsed = _parse_audit_genesis(detail)
+    if parsed is None:
+        return None
+    key_id, scheme, store_id = parsed
+    if audit_scheme_refusal(key_id, scheme) is not None:
+        return AuditGenesisStoreId(store_id=None, refused=True)
+    return AuditGenesisStoreId(store_id=store_id, refused=False)
 
 
 def parse_audit_genesis(detail: object) -> str | None:
@@ -7895,9 +8014,10 @@ async def _audit_row_mac_check(
         parsed = parse_audit_epoch(opening["detail"])
         if parsed is not None:
             key_id, scheme = parsed.key_id, parsed.scheme
-    if key_id is not None and audit_scheme_refusal(key_id, scheme) is not None:
+    if key_id is not None and (refused := _audit_refusal(key_id, scheme)) is not None:
         # BACKLOG #3420: a range sealed under a scheme this release does not hold proves nothing.
-        return f"audit row {seq}'s key range names an audit scheme this release does not hold"
+        # Fixed words naming the class, never the record's own text, which the refusal quotes.
+        return f"audit row {seq}'s key range {refused[0]}"
     if only_key_id is not None and key_id != only_key_id:
         return f"audit row {seq} is not sealed under the active audit key"
     secret: tuple[bytes | None, AuditMacFn | None] | None
@@ -8895,6 +9015,33 @@ CREATE TABLE IF NOT EXISTS transit_bound_attestation (
     attested_at REAL NOT NULL,
     audit_seq   INTEGER NOT NULL,
     audit_hash  TEXT NOT NULL
+);
+
+-- The keyring (vault BACKLOG #3411; the key-custody draft's rules 4 and 6). One row per wrap of a key:
+-- in S3 only the recovery wrap, which is the master key sealed under a key derived from the recovery
+-- key, and whether that recovery key is proved. S4 adds its data, index and backup keys and its master
+-- handover row. One key can have several wraps (the recovery wrap and the master handover row both
+-- wrap a master key, and rule 14 holds a shared host wrap here), so the primary key is the key id, the
+-- purpose and the wrapping key's id. Rule 6 names key id, purpose, class, state, period and the sealed key;
+-- `wrapped_by` and the three times are this table's own. NOTHING WRITES IT YET. `wrapped`
+-- is for a SEALED key only, never a plain one, and the store id a seal binds is read from the host
+-- blob, never from this table. Not the in-memory `audit_mac_keyring`. No PHI. The seal rule 6 names
+-- binds key id, purpose, store id, state, class and period, NOT `proved_at`: a database writer could
+-- set it and so silence the unproved-recovery-key warning. Where the draft stores the proof is open
+-- for S4 to settle before anything reads this column.
+CREATE TABLE IF NOT EXISTS keyring (
+    key_id      TEXT NOT NULL,              -- the wrapped key's id: a one-way fingerprint. NO COMMA in these comments: SQLite DROP COLUMN scans back for one
+    purpose     TEXT NOT NULL,              -- what the key is for (such as the recovery wrap)
+    key_class   TEXT NOT NULL DEFAULT '',   -- a data key's class (period or standing; S4) or '' for none
+    state       TEXT NOT NULL,              -- where the key is in its life (such as pending or active)
+    period_from REAL,                       -- the period a period key seals for (S4); NULL for none
+    period_to   REAL,
+    wrapped_by  TEXT NOT NULL,              -- the id of the key `wrapped` is sealed under
+    wrapped     TEXT NOT NULL DEFAULT '',   -- the sealed key or '' when the row holds none
+    created_at  REAL NOT NULL,
+    state_at    REAL NOT NULL,              -- when `state` last changed
+    proved_at   REAL,                       -- recovery wrap: when the key last came back and opened it
+    PRIMARY KEY (key_id, purpose, wrapped_by)
 );
 
 -- Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112). One row per upload IN

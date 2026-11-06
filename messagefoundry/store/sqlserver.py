@@ -442,8 +442,8 @@ _RESET_LANE_CHUNK = 500
 # for its off-loop close before giving up and leaving it to finish detached. A BOUND, not a deadline:
 # the connection is already out of the pool before this wait starts, so expiring it costs nothing but
 # a slower reclaim. Since BACKLOG #2049 a close whose connection still runs the abandoned statement is
-# handed to that statement's own call and not waited for at all. In a narrow race (a call dispatched
-# but not yet inside the gate) the close can still queue behind a call, and this bound caps that wait.
+# handed to that statement's own call and not waited for at all. A close can still queue behind a
+# call the cancellation did not cancel, such as a shielded one, and this bound caps that wait.
 _DIRTY_CLOSE_TIMEOUT = 5.0
 
 # BACKLOG #3023: how many `[store].acquire_timeout`s a session write that follows a committed auth
@@ -2308,6 +2308,21 @@ _SCHEMA: list[str] = [
         reason NVARCHAR(1000) NOT NULL, actor NVARCHAR(256) NOT NULL,
         attested_at FLOAT NOT NULL, audit_seq BIGINT NOT NULL,
         audit_hash NVARCHAR(64) NOT NULL)""",
+    # The keyring (vault BACKLOG #3411) -- see the SQLite `_SCHEMA`. BIN2 so ids and the
+    # code-constant names compare case- and accent-exactly. It does NOT fix trailing spaces: see the
+    # `state` table's comment, so a writer must refuse them. `wrapped` is MAX so this batch fixes no
+    # width for a sealed key before S4 settles its encoding. The key's three columns are at most 640
+    # bytes, inside the 900-byte limit on a clustered key.
+    """IF OBJECT_ID('keyring','U') IS NULL CREATE TABLE keyring (
+        key_id NVARCHAR(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        purpose NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        key_class NVARCHAR(32) COLLATE Latin1_General_100_BIN2 NOT NULL DEFAULT N'',
+        state NVARCHAR(32) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        period_from FLOAT NULL, period_to FLOAT NULL,
+        wrapped_by NVARCHAR(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+        wrapped NVARCHAR(MAX) NOT NULL DEFAULT N'',
+        created_at FLOAT NOT NULL, state_at FLOAT NOT NULL, proved_at FLOAT NULL,
+        CONSTRAINT pk_keyring PRIMARY KEY (key_id, purpose, wrapped_by))""",
     # Cross-process upload-quota reservation (ASVS 2.3.4, BACKLOG #1112), one row per upload in
     # flight (vault BACKLOG #3180) — see the SQLite `_SCHEMA` for the rationale. One of the two
     # backends a real engine-sharded deployment runs (`require_unified_store` makes a server DB
@@ -3672,8 +3687,16 @@ class SqlServerStore:
         hung statement hold row X-locks forever. The holder count is bounded by construction:
         only the pooled claimer tasks call the flagged claim, so the per-stage set grows to at
         most the concurrent flagged-claim count = ``pooled_claimers_per_stage`` (the §5 sizing
-        function) and never beyond."""
+        function) and never beyond.
+
+        **A failed or cancelled open exits as the open-time probes do (BACKLOG #2394).** A
+        cancellation hands the connection, and the cursor if it has one, to the call gate and
+        propagates at once, so it never waits on a ``cursor()`` call still running on its executor
+        thread, and nothing frees a handle under that call: the gate closes the cursor that call
+        makes, then the connection, as it returns. An ordinary failure closes both through the
+        gate, cursor first, and a second cancellation cannot cut that close short."""
         conn = await self._connect_claim_conn()
+        cur: Any = None
         try:
             # BACKLOG #2049: a discard after a cancelled claim closes this cursor and connection;
             # the gate makes both wait for a claim statement still running on an executor thread.
@@ -3692,13 +3715,11 @@ class SqlServerStore:
                     stage,
                 )
             cur = await conn.cursor()
-        except BaseException:
+        except BaseException as exc:
             # Never leak the freshly-opened connection when the post-connect steps fail or are
             # cancelled — repeated transient failures must not accumulate dedicated connections.
-            try:
-                await conn.close()
-            except Exception:  # noqa: BLE001 - best-effort; the real failure is propagating
-                log.debug("claim holder connection close after failed open failed", exc_info=True)
+            if isinstance(exc, Exception) or not _abandon_one_shot(conn, cur):
+                await _close_one_shot(conn, cur)  # logs a close failure itself
             raise
         self._claim_holders_open += 1
         self._claim_holders_opened_total += 1
@@ -3747,8 +3768,10 @@ class SqlServerStore:
         holder = free.pop() if free else await self._open_claim_holder(stage)
         try:
             yield holder
-        except BaseException:
-            await self._discard_claim_holder(stage, holder)
+        except BaseException as exc:
+            await self._discard_claim_holder(
+                stage, holder, cancelled=not isinstance(exc, Exception)
+            )
             raise
         else:
             if self._claim_holders_closed:
@@ -3758,12 +3781,23 @@ class SqlServerStore:
             else:
                 self._claim_holders.setdefault(stage, []).append(holder)
 
-    async def _discard_claim_holder(self, stage: str, holder: _ClaimHolder) -> None:
-        """Close a poisoned (or teardown-orphaned) holder. Shielded like the finally-guard: a
-        cancellation delivered at these awaits must not skip ``conn.close()`` (a leaked dedicated
-        connection with consistent-looking counters); best-effort — the real outcome is already
-        propagating. The next flagged claim opens a fresh holder (re-applying the STORE-3
-        timeout)."""
+    async def _discard_claim_holder(
+        self, stage: str, holder: _ClaimHolder, *, cancelled: bool = False
+    ) -> None:
+        """Close a poisoned (or teardown-orphaned) holder; best-effort — the real outcome is
+        already propagating. The next flagged claim opens a fresh holder (re-applying the STORE-3
+        timeout).
+
+        **It exits as the open-time probes do (BACKLOG #2394, #2395).** ``cancelled`` says the
+        claim is unwinding a cancellation, so its statement may still be running on an executor
+        thread. The cursor and the connection then go to the call gate with no await, and close,
+        cursor first, once no pyodbc call is running on them. Otherwise both close through the
+        gate in one job, waited on through :func:`asyncio.wait`, which never cancels it: a second
+        cancellation propagates at once, and the close still runs, so no dedicated connection
+        leaks with consistent-looking counters. **What it does not change:** a claim reaches here
+        only after :meth:`claim_fifo_heads`' shielded LOCK_TIMEOUT reset, which the gate holds
+        behind a running claim statement, so a cancelled claim still waits for that statement
+        there."""
         self._claim_holders_open -= 1
         self._claim_holders_discarded_total += 1
         log.warning(
@@ -3772,43 +3806,24 @@ class SqlServerStore:
             stage,
             self._claim_holders_discarded_total,
         )
-
-        async def _close_holder() -> None:
-            try:
-                await holder.cur.close()
-            except Exception:  # noqa: BLE001 - best-effort teardown must not mask the outcome
-                log.debug("claim holder cursor close failed", exc_info=True)
-            try:
-                await holder.conn.close()
-            except Exception:  # noqa: BLE001 - best-effort teardown must not mask the outcome
-                log.debug("claim holder connection close failed", exc_info=True)
-
-        closer = asyncio.ensure_future(_close_holder())
-        try:
-            await asyncio.shield(closer)
-        except asyncio.CancelledError:
-            # The discard itself was cancelled (e.g. a second cancellation during shutdown):
-            # let the shielded close finish so the connection never leaks, THEN re-raise.
-            await closer
-            raise
+        if cancelled and _abandon_one_shot(holder.conn, holder.cur):
+            return
+        await _close_one_shot(holder.conn, holder.cur)
 
     async def _close_claim_holders(self) -> None:
         """Teardown: close every retained claim holder and mark the holder set CLOSED (idempotent;
         store close). A holder borrowed by an in-flight claim is not in the free lists — the
-        closed flag makes its return path discard (close) it instead of re-retaining it."""
+        closed flag makes its return path discard (close) it instead of re-retaining it. Each holder
+        leaves through the one-shot exit :meth:`_discard_claim_holder` uses (BACKLOG #2394). Every
+        close is started before any is waited on, and the wait never cancels them, so a
+        cancellation during teardown leaves no holder unclosed behind the one it interrupted."""
         self._claim_holders_closed = True
         holders = [h for lst in self._claim_holders.values() for h in lst]
         self._claim_holders.clear()
-        for holder in holders:
-            self._claim_holders_open -= 1
-            try:
-                await holder.cur.close()
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                log.debug("claim holder cursor close failed at teardown", exc_info=True)
-            try:
-                await holder.conn.close()
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                log.debug("claim holder connection close failed at teardown", exc_info=True)
+        self._claim_holders_open -= len(holders)
+        closes = [asyncio.ensure_future(_close_one_shot(h.conn, h.cur)) for h in holders]
+        if closes:
+            await asyncio.wait(closes)  # each close logs its own failure
 
     # --- PHI-at-rest cipher seam for nullable text columns (mirrors MessageStore._enc/_dec) -----
     # Used for summary/metadata (EF-3) and error/last_error/event.detail (H4). null/empty-safe: a NULL
@@ -5544,10 +5559,10 @@ class SqlServerStore:
         :meth:`_fetch_rows` on a clamped read passes, leaves it unbounded and enters no timeout at
         all. A rollback that runs past the bound is treated as one that failed: the connection is
         discarded. Where the call gate already marks the rollback as running, the close is handed
-        to it and lands as it returns (BACKLOG #2049). In the short window before the gate marks
-        it, a separate close can take the gate's lock first; the rollback then runs on a closed
-        handle and fails, with nothing awaiting its error, and the close has already ended the
-        transaction. :meth:`_fetch_rows` passes the lease claim's clamp, so a stalled rollback
+        to it and lands as it returns (BACKLOG #2049). A rollback the bound cancelled before it
+        entered the gate never runs (BACKLOG #2394), so the separate close that follows takes the
+        gate's lock with no rollback left to race it, and the close ends the transaction.
+        :meth:`_fetch_rows` passes the lease claim's clamp, so a stalled rollback
         after a failed claim cannot hold ``_leadership_lock`` past it (BACKLOG #5066).
 
         The discard is :func:`_detach_connection`, the same detach :meth:`_release_dirty` uses, and

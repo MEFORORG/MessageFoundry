@@ -2,7 +2,7 @@
 #
 # That corpus was de-identified with DEFAULT_RULES plus a hand-written overlay. The overlay was
 # never committed, so the next person had to work it out again (BACKLOG #331, Proposed 4). Most of
-# its fields are now default rules in messagefoundry/anon/rules.py. This file holds the ones that
+# its fields are now default rules in messagefoundry_toolkit/anon/rules.py. This file holds the ones that
 # are NOT defaults, and says why.
 #
 # These kinds are RE-DERIVED, not recovered. They come from the field list in

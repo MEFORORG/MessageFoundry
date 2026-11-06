@@ -12,7 +12,7 @@ WHY A BASELINE. The lockfile is a frozen 2021-era tree that does not audit clean
 means rebuilding the bundle with a Node toolchain this repository does not carry. So the run fails
 only on an advisory NOT in :data:`BASELINE_PATH`. Adding an entry there is the acknowledgement, in a
 reviewed diff, the role ``--ignore-vuln`` plays for ``pip-audit``. The baseline file says its first
-entries were recorded as found, not triaged.
+entries were recorded as found, not triaged, and its header says how to tell which have been since.
 
 THE FALSE CLEAN THIS GUARDS AGAINST. Measured 2026-09-29: ``npm audit --package-lock-only`` with the
 lockfile and NO ``package.json`` exits 0, reports zero vulnerabilities, and counts 6 dependencies.
@@ -22,15 +22,22 @@ run's real output:
 
 1. **Coverage.** npm's dependency count equals the lockfile's entry count.
 2. **No new advisory.** Every reported advisory is in the baseline.
-3. **No stale entry.** Every baselined advisory is still reported. The bundle is KNOWN to carry
-   these, so an audit that stops reporting one has either stopped looking or met a withdrawn
+3. **No stale entry.** Every baselined advisory is still reported. The baseline records advisories
+   in the vendored action's declared LOCKFILE, which does not bound what the bundle holds. Its
+   triage comments say, for the entries they cover, whether the package's identifiers were found
+   in the bundle itself, on a reading whose limits are stated in the baseline's header, and in the
+   deepmerge and minimatch GHSA-g3hv-75wg-m249 triage comments, which state their own. The lockfile
+   is frozen, so an audit that stops reporting one has either stopped looking or met a withdrawn
    advisory. Either way a person has to find out which.
 
-WHAT THIS PROVES, AND WHERE. Check 3 shows on each run that the audit sees the known-vulnerable
-packages in the bundle's closure. Check 2 turns any advisory it sees beyond the baseline into a red;
+WHAT THIS PROVES, AND WHERE. Check 3 shows on each run that the audit still reports every baselined
+advisory, each one an advisory npm reports against a package in the declared lockfile. Check 2
+turns any advisory it sees beyond the baseline into a red;
 ``tests/test_cla_action_advisory_gate.py`` shows that offline by dropping a real advisory from the
-baseline over a recorded audit. Together they are the ledger row's acceptance: a known-vulnerable
-dependency in that bundle WOULD be reported.
+baseline over a recorded audit. With check 1's coverage, they show that a known-vulnerable package
+in the declared lockfile WOULD be reported. The audit reads only that lockfile and a manifest copied
+from its root entry, so a package compiled into ``dist/index.js`` but absent from the lockfile is
+not seen.
 
 WHAT A PASS DOES NOT PROVE. Each run prints the provenance record's limitation sentence. The short
 form: the lockfile audit covers the DECLARED dependencies of the pinned commit, not what the bundle

@@ -2758,9 +2758,11 @@ def _signed(
     by: _CaPair | None,
     *,
     key_usage: bool = False,
+    key_ids: bool = True,
 ) -> x509.Certificate:
     """A cert for ``subject`` signed by ``by`` (self-signed CA when ``None``). Key identifiers are
-    set so OpenSSL picks the issuer by key, not only by name, as real CAs do.
+    set so OpenSSL picks the issuer by key, not only by name, as real CAs do, unless ``key_ids`` is
+    false.
 
     ``key_usage`` adds a ``keyUsage`` extension, which a verifier under ``VERIFY_X509_STRICT``
     requires on a CA, as the inbound HTTP listener is (``tests/test_inbound_http_intake_issuer.py``).
@@ -2775,11 +2777,13 @@ def _signed(
         .not_valid_before(_NOW - datetime.timedelta(minutes=5))
         .not_valid_after(_NOW + datetime.timedelta(days=1))
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
-        .add_extension(
+    )
+    if key_ids:
+        builder = builder.add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
+        ).add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(signer.public_key()), critical=False
         )
-    )
     if key_usage:
         builder = builder.add_extension(
             x509.KeyUsage(
@@ -2798,13 +2802,27 @@ def _signed(
     return builder.sign(signer, hashes.SHA256())
 
 
-def _new_ca(dn: x509.Name, by: _CaPair | None = None, *, key_usage: bool = False) -> _CaPair:
+def _new_ca(
+    dn: x509.Name, by: _CaPair | None = None, *, key_usage: bool = False, key_ids: bool = True
+) -> _CaPair:
     key = ec.generate_private_key(ec.SECP256R1())
-    return _signed(dn, key, by, key_usage=key_usage), key
+    return _signed(dn, key, by, key_usage=key_usage, key_ids=key_ids), key
 
 
 def _pem(cert: x509.Certificate) -> bytes:
     return cert.public_bytes(serialization.Encoding.PEM)
+
+
+def _relabelled(pem: bytes, label: str) -> bytes:
+    """A ``CERTIFICATE`` PEM block's markers rewritten under ``label``, body unchanged."""
+    return pem.replace(
+        b"-----BEGIN CERTIFICATE-----", f"-----BEGIN {label}-----".encode("ascii")
+    ).replace(b"-----END CERTIFICATE-----", f"-----END {label}-----".encode("ascii"))
+
+
+def _labelled(cert: x509.Certificate, label: str) -> bytes:
+    """``cert`` as one PEM block under ``label`` in place of ``CERTIFICATE``."""
+    return _relabelled(_pem(cert), label)
 
 
 def _upn(value: bytes) -> x509.OtherName:
@@ -3006,16 +3024,18 @@ def test_a_ca_reissued_under_the_same_key_is_one_issuer(tmp_path: Path) -> None:
     assert view[VERIFIED_ISSUER_KEY] == "CN=Acme CA"
 
 
+@pytest.mark.parametrize("label", ["CERTIFICATE", "X509 CERTIFICATE"])
 def test_serve_context_carries_the_issuer_index_and_warns_about_dead_keys(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, label: str
 ) -> None:
     # The shim reads the index off the real API context. If the builder stopped attaching it, every
     # mapped certificate would be denied while every shim test (which attaches it by hand) stayed
-    # green; and a key naming no loaded CA would deny with nothing in the log.
+    # green; and a key naming no loaded CA would deny with nothing in the log. The context loads a
+    # CA under the legacy X509 CERTIFICATE label too, so the index must hold it (BACKLOG #4948).
     cert, key = _self_signed(tmp_path)
     ca = _new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))
     ca_file = tmp_path / "client-ca.pem"
-    ca_file.write_bytes(_pem(ca[0]))
+    ca_file.write_bytes(_labelled(ca[0], label))
     uid = "0123456789abcdef0123456789abcdef"
     api = ApiSettings(
         tls_cert_file=str(cert),
@@ -3041,6 +3061,31 @@ def test_serve_context_carries_the_issuer_index_and_warns_about_dead_keys(
         enforcing=False,
     )
     assert getattr(plain, ISSUER_INDEX_ATTR, None) is None
+
+
+def test_serve_context_refuses_a_client_ca_file_the_issuer_index_cannot_match(
+    tmp_path: Path,
+) -> None:
+    # OpenSSL silently stops loading the file at an empty block, so the CA after it is never
+    # trusted. An index naming it would admit a client that sends it as its intermediate, so the
+    # build refuses, naming the setting (BACKLOG #4948).
+    cert, key = _self_signed(tmp_path)
+    root = _new_ca(_dn((NameOID.COMMON_NAME, "Root CA")))
+    inter = _new_ca(_dn((NameOID.COMMON_NAME, "Inter CA")), root)
+    ca_file = tmp_path / "client-ca.pem"
+    ca_file.write_bytes(
+        _pem(root[0]) + b"-----BEGIN FOO-----\n-----END FOO-----\n" + _pem(inter[0])
+    )
+    api = ApiSettings(
+        tls_cert_file=str(cert),
+        tls_key_file=str(key),
+        tls_client_ca_file=str(ca_file),
+        tls_client_cert_identities={"CN=Inter CA": {"CN:svc.internal": "0" * 32}},
+    )
+    with pytest.raises(
+        ValueError, match=r"\[api\]\.tls_client_ca_file: .*does not load 1 CA certificate"
+    ):
+        build_api_ssl_context(api, enforcing=False)
 
 
 def test_a_resumed_session_still_maps_under_its_issuer(tmp_path: Path) -> None:
@@ -3148,7 +3193,8 @@ def test_the_issuer_lookup_never_breaks_the_handshake() -> None:
             return {"subject": ((("commonName", "svc.internal"),),)}
 
     broken = _Broken()
-    setattr(broken.context, ISSUER_INDEX_ATTR, IssuerIndex(""))
+    ca = _pem(_new_ca(_dn((NameOID.COMMON_NAME, "Acme CA")))[0]).decode("ascii")
+    setattr(broken.context, ISSUER_INDEX_ATTR, IssuerIndex(ca))
     view = peercert_from_ssl_object(broken)
     assert view is not None and view[VERIFIED_ISSUER_KEY] == ""
 

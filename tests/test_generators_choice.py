@@ -14,9 +14,12 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.generators import _core, all_types  # noqa: F401  (registers ORM and OML)
 from messagefoundry.parsing import Peek
 from messagefoundry.parsing.validate import _SEQUENCES_LABELLED_CHOICE
+from messagefoundry_toolkit.generators import (  # noqa: F401  (registers ORM and OML)
+    _core,
+    all_types,
+)
 
 _ORDER_ALTERNATIVES = ("OBR", "RQD", "RQ1", "RXO", "ODS", "ODT")
 
