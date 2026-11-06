@@ -369,11 +369,17 @@ _STEP_RUNS: dict[str | None, Callable[[bool, bool, dict[str, str]], bool]] = {
     "${{ !cancelled() }}": lambda failed, lock, outcome: True,
     f"${{{{ !cancelled() && {_LOCK_PRESENT} }}}}": lambda failed, lock, outcome: lock,
     f"${{{{ !cancelled() && {_NO_LOCK} }}}}": lambda failed, lock, outcome: not lock,
-    "${{ !cancelled() && steps.engine.outcome == 'success' }}": lambda failed, lock, outcome: (
-        outcome.get("engine") == "success"
-    ),
     "${{ !cancelled() && steps.auditor.outcome == 'success' }}": lambda failed, lock, outcome: (
         outcome.get("auditor") == "success"
+    ),
+    f"${{{{ !cancelled() && steps.auditor.outcome == 'success' && {_NO_LOCK} }}}}": lambda failed, lock, outcome: (
+        outcome.get("auditor") == "success" and not lock
+    ),
+    f"${{{{ !cancelled() && steps.auditor.outcome == 'success' && {_LOCK_PRESENT} }}}}": lambda failed, lock, outcome: (
+        outcome.get("auditor") == "success" and lock
+    ),
+    "${{ !cancelled() && steps.engine.outcome == 'success' && steps.auditor.outcome == 'success' }}": (
+        lambda failed, lock, outcome: outcome.get("engine") == outcome.get("auditor") == "success"
     ),
 }
 
@@ -655,37 +661,56 @@ def test_a_requirements_txt_finding_does_not_hide_the_lock_audit(
     assert failed == [_AUDIT_TOOLS, _AUDIT_TXT_PINS] and audited.exists()
 
 
-def test_a_failed_auditor_install_skips_only_the_audit_of_its_own_lock(
-    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
+@pytest.mark.parametrize("lock", [_ADOPTER_LOCK, None], ids=["lock", "no-lock"])
+def test_a_failed_auditor_install_is_the_one_failure_named(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path, lock: str | None
 ) -> None:
+    """Every pip-audit step waits on the install, so none fails again with no auditor to run."""
     calls, audited, _, failed = _run_audit_job(
-        scaffolded_ci, tmp_path, _ADOPTER_LOCK, {"FAIL_ON": _INSTALL_AUDITOR_RUN[len("python ") :]}
+        scaffolded_ci, tmp_path, lock, {"FAIL_ON": _INSTALL_AUDITOR_RUN[len("python ") :]}
     )
-    assert calls == [c for c in _lock_calls(tmp_path) if c != _AUDIT_TOOLS_RUN]
-    assert failed == [_INSTALL_AUDITOR] and audited.exists()
+    assert calls[-1] == _INSTALL_AUDITOR_RUN
+    assert not [c for c in calls if "pip-audit " in c or "audit_all_platforms" in c], calls
+    assert failed == [_INSTALL_AUDITOR] and not audited.exists()
 
 
-#: (requirements.txt, the ::error:: it must raise or None for a clean pass, a ::notice:: or None)
+#: (requirements.txt, the ::error:: it must raise or None for a clean pass, a ::notice:: or None).
+#: The markers hold, or fail, on every host this suite runs on, as on the job's Windows runner.
 _STALE_CASES = [
     ("messagefoundry==0.5.1\n", None, None),
-    # The ``==`` pin matches whatever the spelling, extras and comment around it.
-    ("MessageFoundry[fhir] == 0.5.1  # the engine\n", None, None),
-    (
-        "messagefoundry==0.6.0\n",
-        "requirements.txt pins messagefoundry==0.6.0, requirements.lock 0.5.1",
-        None,
-    ),
+    # Versions compare as pip compares them, and the spelling and comment around a pin do not count.
+    ("MessageFoundry == 0.5.1.0  # the engine\n", None, None),
+    # A version or marker pip joins in from a continuation line is read.
+    ("messagefoundry \\\n    ==0.6.0\n", "requirements.txt asks for messagefoundry==0.6.0", None),
+    ("messagefoundry==0.6.0\n", "requirements.txt asks for messagefoundry==0.6.0", None),
     (
         "messagefoundry==0.5.1\nacme-hl7-utils==1.2\n",
         "acme-hl7-utils is in requirements.txt but not in requirements.lock",
         None,
     ),
-    # A range is checked by name, and sspilib is in the lock.
+    # A range must be met by the locked version.
     ("messagefoundry==0.5.1\nsspilib>=0.5\n", None, None),
+    ("messagefoundry==0.5.1\nsspilib>=0.7\n", "requirements.txt asks for sspilib>=0.7", None),
+    # A marker that holds here is checked like any other requirement.
     (
-        "messagefoundry==0.5.1\nuvloop==0.23.0 ; sys_platform != 'win32'\n",
+        "messagefoundry==0.5.1\nuvloop==0.23.0 ; python_version >= '3'\n",
+        "uvloop is in requirements.txt but not in requirements.lock",
         None,
-        "uvloop has a marker and is not in requirements.lock",
+    ),
+    (
+        "messagefoundry==0.5.1\nuvloop==0.23.0 ; python_version < '3'\n",
+        None,
+        "uvloop's marker is false on this runner, so it is not checked",
+    ),
+    (
+        "messagefoundry[fhir]==0.5.1\n",
+        None,
+        "messagefoundry's extras are not checked: requirements.lock records none",
+    ),
+    (
+        "messagefoundry==0.5.1\nhttps://host.invalid/acme-1.0-py3-none-any.whl\n",
+        None,
+        "https://host.invalid/acme-1.0-py3-none-any.whl names no package",
     ),
 ]
 
@@ -705,7 +730,7 @@ def test_a_stale_lock_fails_its_own_step_and_hides_no_audit(
     )
     assert failed == ([_STALE] if error else []), output
     if error:
-        assert f"::error::{error}; regenerate requirements.lock from requirements.txt" in output
+        assert f"::error::{error}" in output and "; regenerate requirements.lock" in output
     assert (f"::notice::{notice}" in output) if notice else ("::notice::" not in output)
     assert calls == _lock_calls(tmp_path) and audited.exists()
 
@@ -792,8 +817,9 @@ def test_the_shipped_auditor_lock_is_pip_audits_closure_with_hashes() -> None:
     The names must be what the engine's own scanner lock says pip-audit needs, and pip-audit's
     version the one that lock pins, the contract version of the engine's own gate. The other
     versions may lag that lock, which Dependabot moves weekly: the adopter's job audits this file,
-    so a lagging pin with an advisory fails there. To rebuild it, write the header and then
-    ``"".join(sorted(_closure_blocks(scanner_lock, "pip-audit").items()))``'s blocks.
+    so a lagging pin with an advisory fails there. A pin at the version that lock pins must carry
+    exactly its hashes. To rebuild it, write the header and then
+    ``"".join(block for _, block in sorted(_closure_blocks(scanner_lock, "pip-audit").items()))``.
     """
     scanner = _closure_blocks(_SCANNER_LOCK.read_text(encoding="utf-8"), "pip-audit")
     shipped = _blocks_of(_TOOL_LOCK.read_text(encoding="utf-8"))
@@ -803,6 +829,8 @@ def test_the_shipped_auditor_lock_is_pip_audits_closure_with_hashes() -> None:
     assert shipped["pip-audit"].split(" ", 1)[0] == scanner["pip-audit"].split(" ", 1)[0]
     for name, block in shipped.items():
         assert re.search(r"(?m)^\s+--hash=sha256:[0-9a-f]{64}", block), name
+        if block.split(" ", 1)[0] == scanner[name].split(" ", 1)[0]:
+            assert block.strip() == scanner[name].strip(), name
 
 
 def test_scaffold_refuses_nonempty_without_force(tmp_path: Path) -> None:

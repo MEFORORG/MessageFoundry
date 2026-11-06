@@ -328,7 +328,7 @@ jobs:
           python -I - <<'PY'
 @@READ_AS_PIP@@
           lock = logical_lines("requirements.lock")
-          pins = [group for group in lock if (pinned(group[0]) or ("",))[0] == "messagefoundry"]
+          pins = [group for group in lock if named(group, "messagefoundry")]
           if len(pins) != 1:
               print(f"::error::requirements.lock must pin messagefoundry once; it pins it {len(pins)} times")
               sys.exit(1)
@@ -344,36 +344,16 @@ jobs:
       # With a lock, each audit below reads requirements.txt as written or the lock, and nothing
       # resolves requirements.txt. So a lock not regenerated after requirements.txt changed would
       # audit the closure the old file named, while CI and your deployment install the new one. Each
-      # requirement in requirements.txt must be in the lock, at the same version where it is pinned
-      # with ==. One with an environment marker that the lock leaves out is only noted, since the
-      # marker may exclude every platform the lock was made for.
+      # requirement in requirements.txt whose marker holds on this Windows runner must be in the
+      # lock, at a version its specifier allows, compared as pip compares versions. pip's own
+      # requirement parser reads each one. A marker false here, an extra, and a requirement with no
+      # name are only noted: the lock records no extras, and an unnamed URL has no name to look up.
       - name: Check requirements.lock is not stale against requirements.txt
         if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
         run: |
           python -I - <<'PY'
 @@READ_AS_PIP@@
-          locked = {}
-          for group in logical_lines("requirements.lock"):
-              found = pinned(group[0])
-              if found:
-                  locked.setdefault(found[0], set()).add(found[1])
-          stale = []
-          for group in logical_lines("requirements.txt"):
-              found = pinned(group[0])
-              if not found:
-                  continue
-              name, version, marked = found
-              if name not in locked:
-                  if marked:
-                      print(f"::notice::{name} has a marker and is not in requirements.lock")
-                  else:
-                      stale.append(f"{name} is in requirements.txt but not in requirements.lock")
-              elif version and version not in locked[name]:
-                  have = ", ".join(sorted(v or "unpinned" for v in locked[name]))
-                  stale.append(f"requirements.txt pins {name}=={version}, requirements.lock {have}")
-          for problem in stale:
-              print(f"::error::{problem}; regenerate requirements.lock from requirements.txt")
-          sys.exit(1 if stale else 0)
+@@CHECK_STALE@@
           PY
       # pip-audit and every package it needs come from requirements-audit.lock, which
       # `messagefoundry-toolkit init` wrote, each pin with its hashes, so nothing resolves live here.
@@ -383,37 +363,42 @@ jobs:
         run: python -m pip install --require-hashes -r requirements-audit.lock
       # Pinned with hashes, the auditor no longer moves, so it is audited like the rest. Its markers
       # are evaluated as this Windows runner evaluates them, which is right for this file: it is
-      # installed nowhere else.
+      # installed nowhere else. This audit and each one below need the auditor this install brings,
+      # so they wait on it: after a failed install they would only fail again, for a reason that is
+      # not an advisory.
       - name: Audit pip-audit's own locked pins
         if: ${{ !cancelled() && steps.auditor.outcome == 'success' }}
         run: pip-audit -r requirements-audit.lock --desc --disable-pip
       - name: Audit requirements.txt as Windows resolves it
-        if: ${{ !cancelled() && hashFiles('requirements.lock') == '' }}
+        if: ${{ !cancelled() && steps.auditor.outcome == 'success' && hashFiles('requirements.lock') == '' }}
         run: pip-audit -r requirements.txt --desc
       # Each pin as written, with no resolve and no install, so each must be pinned with ==. This
       # form of pip-audit skips an included file without a word, so an include is refused.
       - name: Audit the pins of requirements.txt as written
-        if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
+        if: ${{ !cancelled() && steps.auditor.outcome == 'success' && hashFiles('requirements.lock') != '' }}
         run: |
           if grep -Eq '^[[:space:]]*(-r|--requirement)' requirements.txt; then
             echo "::error::requirements.txt includes another file, which this audit would skip; list its pins in requirements.txt"
             exit 1
           fi
           pip-audit -r requirements.txt --desc --disable-pip --no-deps
-      # Needs the auditor the install step brings, so it waits on that step alone: after a failed
-      # install it would only fail again, for a reason that is not an advisory.
+      # Needs the engine's auditor too, so it also waits on the engine install.
       - name: Audit every pin of requirements.lock, whatever its marker
-        if: ${{ !cancelled() && steps.engine.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.engine.outcome == 'success' && steps.auditor.outcome == 'success' }}
         run: python -P -m messagefoundry.security.audit_all_platforms requirements.lock
 """
 
 #: The reader the two steps that read the lock share, written once here and into each step's script
 #: below. They run before the engine, and so its auditor, is installed, which is why they cannot
-#: import ``messagefoundry.security.audit_all_platforms``; it decodes a file the same way. A raw
-#: string, so each regular expression reaches the generated script as written.
+#: import ``messagefoundry.security.audit_all_platforms``; it decodes a file the same way. Each
+#: requirement is parsed by the copy of ``packaging`` that the runner's pip carries, the parser pip
+#: reads it with. A raw string, so each regular expression reaches the generated script as written.
 _READ_AS_PIP = r"""
 import codecs, locale, os, re, sys
 from pathlib import Path
+
+from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+from pip._vendor.packaging.utils import canonicalize_name
 
 
 def logical_lines(path):
@@ -442,23 +427,77 @@ def logical_lines(path):
     return groups + [group] * bool(group)
 
 
-def pinned(line):
-    # (name, its == version or None, has a marker) where a requirement starts, else None.
-    line = re.sub(r"(^|\s+)#.*$", "", line).strip().removesuffix("\\")
-    name = re.match(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", line)
-    if not name:
-        return None
-    rest = re.sub(r"^\s*\[[^\]]*\]", "", line[name.end() :])
-    version = re.match(r"\s*==\s*([A-Za-z0-9][A-Za-z0-9.!+_-]*)(?=\s|;|$)", rest)
-    canonical = re.sub(r"[-_.]+", "-", name[0]).lower()
-    return canonical, version[1] if version else None, ";" in rest
+def parsed(group):
+    # The requirement on a logical line, by pip's own parser, once pip's way of splitting off the
+    # options and the comment has run: None for a line with none, its text when it names no package.
+    code = re.sub(r"(^|\s+)#.*$", "", " ".join(ln.removesuffix("\\") for ln in group))
+    words = code.split()
+    first = next((n for n, word in enumerate(words) if word.startswith("-")), len(words))
+    text = " ".join(words[:first])
+    try:
+        return Requirement(text) if text else None
+    except InvalidRequirement:
+        return text
+
+
+def named(group, name):
+    found = parsed(group)
+    return isinstance(found, Requirement) and canonicalize_name(found.name) == name
 """
 
-_CI_WORKFLOW = _CI_WORKFLOW.replace(
-    "@@READ_AS_PIP@@\n",
-    "".join(
-        f"          {ln}\n" if ln else "\n" for ln in f"{_READ_AS_PIP.strip()}\n\n".splitlines()
-    ),
+#: The stale-lock check's own code, after the shared reader. A raw string for the same reason.
+_CHECK_STALE = r"""
+from pip._vendor.packaging.version import InvalidVersion, Version
+
+
+def version(text):
+    try:
+        return Version(text)
+    except InvalidVersion:
+        return text
+
+
+locked = {}
+for group in logical_lines("requirements.lock"):
+    req = parsed(group)
+    if isinstance(req, Requirement):
+        exact = [s.version for s in req.specifier if s.operator in ("==", "===")]
+        locked.setdefault(canonicalize_name(req.name), set()).update(exact)
+stale = []
+for group in logical_lines("requirements.txt"):
+    req = parsed(group)
+    if req is None:
+        continue
+    if isinstance(req, str):
+        print(f"::notice::{req} names no package, so it is not checked against requirements.lock")
+        continue
+    name = canonicalize_name(req.name)
+    if req.marker is not None and not req.marker.evaluate():
+        print(f"::notice::{name}'s marker is false on this runner, so it is not checked")
+        continue
+    if req.extras:
+        print(f"::notice::{name}'s extras are not checked: requirements.lock records none")
+    if name not in locked:
+        stale.append(f"{name} is in requirements.txt but not in requirements.lock")
+        continue
+    versions = [version(v) for v in locked[name]]
+    allowed = [v for v in versions if isinstance(v, Version) and req.specifier.contains(v, prereleases=True)]
+    if req.specifier and not allowed:
+        have = ", ".join(sorted(locked[name])) or "unpinned"
+        stale.append(f"requirements.txt asks for {name}{req.specifier}, requirements.lock pins {have}")
+for problem in stale:
+    print(f"::error::{problem}; regenerate requirements.lock from requirements.txt")
+sys.exit(1 if stale else 0)
+"""
+
+
+def _heredoc(code: str) -> str:
+    """``code`` indented as the body of a ``run: |`` step's heredoc, then a blank line."""
+    return "".join(f"          {ln}\n" if ln else "\n" for ln in f"{code.strip()}\n\n".splitlines())
+
+
+_CI_WORKFLOW = _CI_WORKFLOW.replace("@@READ_AS_PIP@@\n", _heredoc(_READ_AS_PIP)).replace(
+    "@@CHECK_STALE@@\n", _heredoc(_CHECK_STALE)
 )
 
 _GITIGNORE = """\
@@ -564,10 +603,9 @@ whose environment marker does not match the runner, so a Linux runner never audi
 Windows-only dependencies. With a `requirements.lock` it audits `requirements.txt` as written, with
 no resolve, so pin each requirement there with `==`, and runs the engine's own auditor
 (`python -P -m messagefoundry.security.audit_all_platforms requirements.lock`), which audits every pin
-in the lock whatever its marker. It fails when the lock is stale: when `requirements.txt` names a
-package the lock does not pin, or pins one at another version. `pip-audit` itself is installed from
-`requirements-audit.lock` with its hashes, and audited too. The engine's `docs/ADOPTER-CI.md`,
-"Job 3", says what each step requires and refuses. The job
+in the lock whatever its marker. It also fails on a stale lock, and installs `pip-audit` itself
+from `requirements-audit.lock`. The engine's `docs/ADOPTER-CI.md`, "Job 3", says what each step
+requires and refuses. The job
 takes wheels only (`PIP_ONLY_BINARY`), so a dependency with no wheel for Windows fails it rather
 than having its build code run in CI.
 
@@ -598,10 +636,7 @@ hardening steps (recommended for any PHI-handling adopter):
    `--require-hashes` on Windows, then audits every pin; without one it **warns** that the
    closure resolves live and unhashed. `pip-compile` locks only the platform it runs on, so run it
    on Windows. Regenerate the lock whenever `requirements.txt` changes; the job fails on a stale one.
-   A universal lock (`uv pip compile --universal`) pins every platform's dependencies. The auditor
-   audits all of them, so an advisory against a package only another platform installs fails the
-   job too, and a package pinned at two versions for two platforms is refused. If either happens,
-   lock for Windows alone as above, or accept a triaged advisory with `--ignore-vuln <ID>` and why.
+   For a universal lock (`uv pip compile --universal`), read "Job 3" first.
 
 ## Environments & posture
 The active environment is **required** and **free-form** — name instances `dev`/`staging`/`test`/`prod`/`poc`/…
