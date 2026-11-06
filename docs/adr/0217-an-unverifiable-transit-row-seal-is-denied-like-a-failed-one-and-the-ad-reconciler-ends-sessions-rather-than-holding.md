@@ -37,9 +37,10 @@ Each is a `CONTROL DECISION: yes` below. Confidence is in the recommendation.
    count, of `probed`, of the ADR 0195 hold's counts and latch, and of the outcome record, and
    ranked last for the probe budget, so a planted failing row can at worst revoke itself. An
    Unverifiable or Forged map pages every pass under its own uncapped subject; a map-row Outage
-   pages under the shared Outage subject. Unlike `main`, a Forged-map pass whose step 1 trips and
-   whose step 2 does not resets no `_reconcile_unconfirmed` and writes no
-   `auth.ad_reconcile_aborted`; the per-map page replaces both. Recommend: yes.
+   pages under the shared Outage subject. Unlike `main`, a Forged-map pass records no breaker
+   trip unless step 2 trips (at least no `_reconcile_unconfirmed` reset, breaker standing,
+   breaker alert, episode or `auth.ad_reconcile_aborted` row) and, below the thresholds, confirms
+   no account. Recommend: yes.
    Medium. Would change if the owner reads the step-1 trip as directory evidence (then step 2 is a
    loosening), or if the digest cannot be kept current.
 3. **(c) Two sibling refusal types and a catch census**: `RowSealUnverifiableError` is not a
@@ -47,10 +48,12 @@ Each is a `CONTROL DECISION: yes` below. Confidence is in the recommendation.
    an Unverifiable row is refused while the account's sessions are ended. Recommend: yes. Medium.
    Would change if the owner would rather seal a disable over unchecked content than lose it after
    a lag.
-4. **A session end never rolls back** (b): when an epoch raise cannot be written the sessions are
-   still marked revoked and the raise is owed, refusing the account's sessions until a
-   long-running engine process's retry lands; sessions stay refused meanwhile; one bad row never rolls back a global sign-out; "sign out everywhere else" ends the
-   caller's own session too while the raise is owed. Recommend: yes. Medium. Would change if the
+4. **A session end never rolls back** (b): when one account's epoch raise meets an Outage the
+   sessions are still marked revoked and the raise is owed, refusing the account's sessions until
+   a retry lands, which for a short-lived CLI process may be a later engine process's; a
+   global sign-out owes nothing, since `main`'s global epoch already ends every session, so one
+   bad row never rolls it back; "sign out everywhere else" ends the caller's own session too
+   while the raise is owed. Recommend: yes. Medium. Would change if the
    owner prefers to accept the epoch gap rather than add the owed-raise table.
 5. **(d) A role delete takes effect**: while a holder or the map is Unverifiable, the role is
    retired (its permissions emptied, a sealed `retired` flag set) rather than deleted, the
@@ -70,9 +73,10 @@ Each is a `CONTROL DECISION: yes` below. Confidence is in the recommendation.
    Forged scope map keeps a manual stored scope at sign-in and on the certificate leg, as on
    `main`, recorded on #2592; no carry-across off a retired Transit key while `rotate-key` stays
    refused under Transit (#1165, item 2's tool); failing rows' revocations judged without the
-   brake's count or the hold when most rows fail at once; in a large estate with no digests yet,
-   step 2 trips and applies no revocation on every pass while a map does not hold, until an
-   untripped verified pass writes the digests. Recommend: accept. Medium. Would change if the owner wants the
+   brake's count, and an undetermined wave whose rows mostly fail not held, however few rows fail;
+   step 2 tripping and applying no revocation on every pass while a map does not hold and enough
+   accounts lack a current digest (not yet probed by an untripped verified pass, or signed in
+   while a map did not hold). Recommend: accept. Medium. Would change if the owner wants the
    rollback case closed before #2592 step 7.
 
 ## Context
@@ -314,20 +318,25 @@ string back, so a writer who toggles a disabled account's seal around each pass 
 strikes from accruing. So a directory row read Forged, Unverifiable or Outage is **still probed**,
 under its raw stored directory key, and its outcome is judged by `main`'s rules (its strike
 threshold, and the UNDETERMINED and UNKEYED outcomes alike), with four differences: its result is
-used **only to revoke** that account, by its own strike count, never to write, grant or confirm;
+used **only to revoke** that account, by its own strike count, never to write, grant or confirm,
+so only a striking outcome changes that count: a PRESENT or held outcome leaves it as it was, and
+a failing row's strikes are kept whatever its raw provider, disabled or session fields say, and
+pruned only when the row is deleted or verifies and leaves the candidates;
 it is **left out of the brake's count and of `probed`**, so failing rows a writer inserts can
 neither trip the brake nor dilute its fraction; it is **left out of the ADR 0195 hold**, of `u`
 and `r` (`reconcile.plan_pass` counts them over the outcome record and every probe, on `main`
-only verified rows reach it), of the latch, and of `_reconcile_outcomes`, so two planted failing
-UNDETERMINED rows cannot engage or latch the hold and freeze a genuine revocation, and a failing
-row read PRESENT cannot raise `r` and loosen it; a failing UNDETERMINED row is itself held
+only verified rows reach it), of the latch, and of `_reconcile_outcomes`, so even one planted
+failing UNDETERMINED row beside one genuine undetermined account cannot make `u` reach 2 and
+engage or latch the hold over that account's revocation, and a failing row read PRESENT cannot
+raise `r` and loosen it; a failing UNDETERMINED row is itself held
 while the hold the verified rows engage is on, and otherwise strikes; and it is **ranked after
 every verified candidate** for the per-pass probe budget, so inserted rows cannot starve a genuine
 one. Its revocation rides the pass: on a tripped pass nothing is applied, it included.
-**Failure accepted:** where most of an estate's rows fail at once (a lag or a partial Vault fault)
-while the directory misreports, the failing rows' revocations are judged without the brake's
-count or the hold's, so those see only the verified rows; if those alone do not trip or hold, the
-failing ones are revoked. A failing row can be used meanwhile on a node that verifies it, so that is a lost
+**Failure accepted:** the brake and the hold count only verified rows, so failing rows'
+revocations are judged without the brake's count, and an undetermined wave whose accounts' rows
+mostly fail is not held: where at most one verified account is undetermined beside readable
+ones, the failing UNDETERMINED rows strike and are revoked at the threshold, however few rows
+fail (a lag or a partial Vault fault beside a lost read right). A failing row can be used meanwhile on a node that verifies it, so that is a lost
 session, not a lost nothing. The
 loader reads each row on its own, so one row's Outage never stops the scan; the pass aborts as
 `seal_unavailable` (below) only when the probe of the active key fails too.
@@ -360,10 +369,12 @@ trips when a pass would revoke more than `ad_session_revoke_max` (5) **and** mor
 14 revocations, and an estate of any size needs at least 6. Step 2 counts accounts whose groups
 moved since their last verified decision together with the offboardings, so it **can** trip where
 a verified pass would not: 14 of 40 accounts added to an unmapped group revoke nothing on a
-verified pass. An account with no digest also counts; the first untripped verified pass writes every
-probed account's digest, so that window closes then, and if a map does not hold through the whole
-window a large estate trips step 2 on every pass while that lasts, since directory sign-in is
-refused too. That window is a residual named in ruling 7: no revocation is applied meanwhile.
+verified pass. An account with no current digest also counts: one an untripped verified pass has
+not yet probed (each pass probes at most `ad_session_recheck_max_users`), and one that signed in
+while a map did not hold, since that sign-in writes no digest. So the window closes only once
+such passes have probed every account with a live session, and it reopens with every account that
+signs in while a map does not hold. While enough accounts lack one, step 2 can trip on every pass
+and no revocation is applied; that is a residual named in ruling 7.
 
 **Residual: a rollback with a plant, owned by #2592 step 7.** A writer who restores an older,
 genuinely sealed copy of a user row (stale roles, the digest they were decided under, the old
@@ -381,10 +392,13 @@ role or scope against a map, so it **confirms nothing**: it removes no account f
 `_reconcile_unconfirmed` and sets no `breaker_clear` (`main` counts a PRESENT read on a pass that
 did not abort as that evidence), a missed clear and never a false one. The map's own page (below)
 is the record that the map did not hold; for a map-row Outage that page is the shared
-`authority-seal-transit` one. This changes `main` for a Forged map: there the step-1 set trips,
-so the pass resets `_reconcile_unconfirmed` to every keyed account and writes
-`auth.ad_reconcile_aborted`; here, where step 2 does not trip, it does neither, and the per-map
-page replaces both.
+`authority-seal-transit` one. This changes `main` for a Forged map: there, past both thresholds,
+the step-1 set trips and the pass records a trip (at least the `_reconcile_unconfirmed` reset,
+the breaker standing, the breaker alert, the episode and an `auth.ad_reconcile_aborted` row), and
+below them it confirms PRESENT reads; here, where step 2 does not trip, it does none of those.
+**Failure accepted:** the map's page and its integrity audit row are then the pass's only record,
+and that audit row is under the per-key report throttle, so not every such pass leaves a durable
+row.
 
 **The apply order.** For each account the pass ends the sessions first and then writes its role
 rows and its digest in one sealed write. A role write that fails (an Outage on that row's `hmac`)
@@ -400,25 +414,27 @@ would roll the whole revocation back, and `revoke_all_sessions` raises every acc
 one transaction, so one bad row would roll back a global sign-out. The build keeps the one
 transaction and lets **no Transit call in it stop the revocation**:
 
-- When an account's raise cannot be written (an Outage, or a user row that fails, which the store
-  never re-seals), the transaction still marks its sessions revoked and writes an **owed raise**
-  instead: a row in a new `session_epoch_owed` table, which needs no seal. While an account has an
+- When a per-account revoke's raise meets an Outage on a row that verifies, the transaction still
+  marks the account's sessions revoked and writes an **owed raise** instead: a row in a new `session_epoch_owed` table, which needs no seal. While an account has an
   owed raise, every session of it is refused on read, so a restored older copy of a revoked session
-  row grants nothing.
+  row grants nothing. A user row that fails gets no raise and owes none, as on `main`
+  (`_bump_session_epoch` skips it): the row is refused on every read already.
 - When the kept session cannot be re-sealed, for any Transit failure or because its raise is owed,
   `KeptSessionRestamp` declines and `_keep_or_end_session` ends it with the rest, the conservative
   answer: "sign out everywhere else" then signs the caller out too.
-- `revoke_all_sessions` raises the global session epoch first, a counter update with no seal, and
-  owes the raise of any account whose own cannot be written.
+- `revoke_all_sessions` raises the global session epoch first, as `main` already does (#5091), a
+  counter update with no seal that ends every session stamped before it, and owes nothing: an
+  account raise that meets an Outage or a failing row is skipped, as `main` skips a failing one.
 
 A store task in every process that opens the store retries each owed raise every 30 seconds
-while that process runs, raising the epoch and deleting the owed row in one transaction once the
-user row verifies and `hmac` answers, and a failing row's raise lands when it verifies. A
-short-lived CLI process can exit before its task fires, so its owed raises land on a long-running
-engine process's retry, and the account's sessions stay refused meanwhile. `main`'s
-`revoke_all_sessions` already raises the global epoch first (#5091). Each failed retry reports under its cause's own subject
-(`authority-seal-transit` for an Outage, the row's integrity subject for a failing row), with
-repetition left to the sink's re-alert throttle, as for the map page.
+while that process runs, once `hmac` answers. Under the write lock, in one transaction, a retry
+first deletes the owed row and raises the epoch only when that delete removed it, so two
+processes (engine shards share one store) never both raise one owed row. A row that has since
+failed its seal is deleted with no raise, as above. A short-lived CLI process can exit before
+its task fires, so its owed raises land on a later engine process's retry, and the account's
+sessions stay refused until then. Each failed retry reports under `authority-seal-transit`, with
+repetition left to the sink's re-alert throttle, as for the map page; each process reports its
+own.
 **Residual:** the owed row is unsealed, so a writer who deletes it and restores an earlier copy of
 the revoked session rows revives them once the user row verifies. That is a rollback of store
 state, the class #2592 step 7 owns, and it needs the write access the seals assume an attacker has.
@@ -505,8 +521,8 @@ code (the Forged map subjects are not under that cap at all), so no stored value
   pass freezes while that lasts, paged by the map's subject (the shared Outage subject for a
   map-row Outage, which the sink may already be holding) and the breaker's alert, and a mass
   change to unmapped groups can cause that trip. Where step 1 trips, an account whose groups have
-  not moved keeps its live session while the map does not hold. Until the first untripped verified
-  pass after the column lands, every account counts as differing. The two residuals above.
+  not moved keeps its live session while the map does not hold. An account with no current digest
+  counts as differing. The two residuals above.
 - **Rejected: re-judge the offboardings alone on a trip (the previous revision).** It ran after a
   trip of any pass, a verified one included, whose set is directory evidence, so it applied
   revocations where `main`'s "byte-identical" rule applies none. Step 2 runs only after a trip of
@@ -842,9 +858,9 @@ is fail-closed on its own head.
 
 | Slice | What | Paths | Tests |
 |---|---|---|---|
-| 1 | The Transit sealer and the four answers; async seal seams on every backend; the start probe; `RowSealError(kind, subject)` and its sibling `RowSealUnverifiableError` with the catch census of (c) step 2; the key id and the retired Transit key path; the sealed empty map; the owed epoch raise and its retry task; the required `transit/verify` capability | `store/row_seal.py`, `store/crypto_transit.py`, `store/crypto.py`, `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/base.py`, `pipeline/engine.py`, `api/app.py`, `privilege_check.py`, `scripts/security/crypto_inventory_check.py` | new `tests/test_transit_row_seal.py` and `tests/_transit_seal_fake.py`; the seal contracts (`tests/_*_seal_contract.py`); `test_row_seal.py`, `test_crypto_transit.py`, `test_postgres_store.py`, `test_sqlserver_transit_row_seal.py`; item 12's args test; the census test; a user row under a listed retired key accepted and a session under one ended quietly; `rotate-key` still refused under Transit; a sealed empty map that fails; `revoke_all_sessions` with one Unverifiable row still ends every session; an `hmac` Outage on a raise leaves the rows deleted and an owed raise that refuses the account's sessions until the retry lands; "sign out everywhere else" ends the kept session while the raise is owed |
+| 1 | The Transit sealer and the four answers; async seal seams on every backend; the start probe; `RowSealError(kind, subject)` and its sibling `RowSealUnverifiableError` with the catch census of (c) step 2; the key id and the retired Transit key path; the sealed empty map; the owed epoch raise and its retry task; the required `transit/verify` capability | `store/row_seal.py`, `store/crypto_transit.py`, `store/crypto.py`, `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/base.py`, `pipeline/engine.py`, `api/app.py`, `privilege_check.py`, `scripts/security/crypto_inventory_check.py` | new `tests/test_transit_row_seal.py` and `tests/_transit_seal_fake.py`; the seal contracts (`tests/_*_seal_contract.py`); `test_row_seal.py`, `test_crypto_transit.py`, `test_postgres_store.py`, `test_sqlserver_transit_row_seal.py`; item 12's args test; the census test; a user row under a listed retired key accepted and a session under one ended quietly; `rotate-key` still refused under Transit; a sealed empty map that fails; `revoke_all_sessions` with one Unverifiable row still ends every session; an `hmac` Outage on a per-account raise leaves the rows deleted and an owed raise that refuses the account's sessions until the retry lands; `revoke_all_sessions` with an Outage on one account owes nothing and that account's old sessions are still refused by the global epoch; a failing row's revoke writes no owed raise; two processes retrying one owed raise raise its epoch once; "sign out everywhere else" ends the kept session while the raise is owed |
 | 2 | Service loaders and reporting: the unverifiable action, the refusal cache, subjects with the digest suffix and the cap keyed by the whole id, the map exemption, Unverifiable as not-counting in other-row readers, the sign-in refusals and the dummy `verify` of (e), the CLI mapping and the catch-site audit of (c) step 3 | `auth/service.py`, `pipeline/alerts.py`, `pipeline/security_signals.py`, `cli_common.py`, `api/auth_routes.py`, `api/approvals.py` | `test_user_seal.py` (run unchanged, item 19), `test_session_seal.py`, `test_role_seal.py`, `test_approval_seal.py`, `test_api_auth.py`, `test_security_signals.py`, `test_provision_first_administrator.py` |
-| 3 | AD sign-in deny, the group digest, the reconciler's two-step end-sessions rule under the brake, the failing-row strikes, the apply order, the Vault-wide Outage slug with its audit row and clear, the certificate refusal and the map paging of (b) | `auth/service.py`, `auth/reconcile.py` (the two steps), `store/store.py`, `store/postgres.py`, `store/sqlserver.py` (the `directory_groups_digest` column, inside the user seal), `pipeline/alerts.py`, `api/app.py` (lifespan paging) | `test_ad_session_reconcile.py`, `test_mfa_directory_recheck.py`, `test_reauth_directory_demotion.py`, and new cases: a planted unverifiable map ends the session of an account whose groups moved and leaves one whose groups did not; an account with no digest counts as moved; below the thresholds a planted map (Unverifiable, Forged, and an empty map whose seal fails) ends every role holder's session; past them step 1 trips, step 2 ends the groups-moved sessions and the offboardings, and a step-2 trip applies nothing; a failing user row toggled around passes is still probed and its DISABLED strikes accrue; a map-row Outage takes step 2 alone; a map save with one Outage user row writes the map and still ends every listed session; inserted failing rows neither trip nor dilute the brake, rank after verified candidates, and are not revoked on a tripped pass; two planted failing UNDETERMINED rows neither engage nor latch the hold on a genuine undetermined account, and a failing row read PRESENT does not loosen it; a retired-key verify refused with 403 reads Unverifiable while the active probe works; a pass where a map did not hold confirms nothing; no digest is written on a tripped or unverified pass; a role-row Outage mid-pass leaves that account's sessions ended and the later accounts processed; a map-row Outage still ends the groups-moved sessions; a Forged map writes no role; a tripped pass writes no rename; a step-1 trip is not recorded as a trip; a map save ends a Forged or Unverifiable account's sessions; `seal_unavailable` is `judged_nothing`, writes its audit row, pages under its own source and is cleared by `seal_clear`; a retired-key seal Vault refuses reads Unverifiable; a Vault-wide Outage aborts under `seal_unavailable`; the certificate leg refuses on an unverifiable map; a forged map pages under its own subject; two consecutive passes each page the map; a move between maps pages under the other subject |
+| 3 | AD sign-in deny, the group digest, the reconciler's two-step end-sessions rule under the brake, the failing-row strikes, the apply order, the Vault-wide Outage slug with its audit row and clear, the certificate refusal and the map paging of (b) | `auth/service.py`, `auth/reconcile.py` (the two steps), `store/store.py`, `store/postgres.py`, `store/sqlserver.py` (the `directory_groups_digest` column, inside the user seal), `pipeline/alerts.py`, `api/app.py` (lifespan paging) | `test_ad_session_reconcile.py`, `test_mfa_directory_recheck.py`, `test_reauth_directory_demotion.py`, and new cases: a planted unverifiable map ends the session of an account whose groups moved and leaves one whose groups did not; an account with no digest counts as moved; below the thresholds a planted map (Unverifiable, Forged, and an empty map whose seal fails) ends every role holder's session; past them step 1 trips, step 2 ends the groups-moved sessions and the offboardings, and a step-2 trip applies nothing; a failing user row toggled around passes is still probed and its DISABLED strikes accrue; a map-row Outage takes step 2 alone; a map save with one Outage user row writes the map and still ends every listed session; inserted failing rows neither trip nor dilute the brake, rank after verified candidates, and are not revoked on a tripped pass; one planted failing UNDETERMINED row beside one genuine undetermined account neither engages nor latches the hold, and a failing row read PRESENT does not loosen it; a failing UNDETERMINED row is held while the verified rows' hold is on and strikes otherwise; a failing row is absent from `_reconcile_outcomes`, from `probed` and from the held count of `auth.ad_reconcile_held`; a failing row's PRESENT or held read leaves its strike count unchanged; a failing row whose raw provider is edited to local keeps its strikes; a failing DISABLED row is revoked at its threshold on a pass that holds other accounts; a Forged-map pass whose step 1 trips and step 2 does not records no trip; a retired-key verify refused with 403 reads Unverifiable while the active probe works; a pass where a map did not hold confirms nothing; no digest is written on a tripped or unverified pass; a role-row Outage mid-pass leaves that account's sessions ended and the later accounts processed; a map-row Outage still ends the groups-moved sessions; a Forged map writes no role; a tripped pass writes no rename; a step-1 trip is not recorded as a trip; a map save ends a Forged or Unverifiable account's sessions; `seal_unavailable` is `judged_nothing`, writes its audit row, pages under its own source and is cleared by `seal_clear`; a retired-key seal Vault refuses reads Unverifiable; a Vault-wide Outage aborts under `seal_unavailable`; the certificate leg refuses on an unverifiable map; a forged map pages under its own subject; two consecutive passes each page the map; a move between maps pages under the other subject |
 | 4 | Role delete and map edits of (d), the console 409 | `auth/service.py`, `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `messagefoundry_webconsole/routes/admin.py` | new cases for items 14, 15 and 16, a delete with an Unverifiable holder and map that leaves both rows untouched and their references granting nothing, the retired role deleted by the last verified write, an edit of a retired role refused, and the SQL Server case where only the map names the role; the web console suite under `packaging/messagefoundry-webconsole/tests` |
 | 5 | Docs, in the same pull request | `docs/PHI.md`, `docs/SECURITY.md` (including the one-Transit-key-per-store guidance until #3411), the changelog fragment | the doc tests that pin those files |
 
@@ -860,7 +876,9 @@ everything `main` revokes below the brake and more above it, the brake is unchan
 session end rolls back on a Transit fault. Each refusal is audited under its true cause.
 
 **Negative.** Offboarding still freezes when step 2 of (b) trips, which a mass change to unmapped
-groups can cause, and when Vault is down everywhere (when no request is served either). Below the
+groups or enough accounts without a current digest can cause, and when Vault is down everywhere
+(when no request is served either). An Outage during a short-lived CLI revoke leaves the
+account's sessions refused until a later engine process's retry lands. Below the
 thresholds an Unverifiable map, a lag included, signs out every directory role holder. A Vault fault refuses directory sign-in, and "sign out everywhere else" during one signs the
 caller out too. A genuine row sealed under a version not yet on the answering node
 is denied for the lag. Until the verify-then-reseal tool (item 2) exists, no row can be carried
