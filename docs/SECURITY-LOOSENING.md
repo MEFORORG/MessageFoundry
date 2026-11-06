@@ -2143,7 +2143,7 @@ count is above `0` (vault BACKLOG #2613).
 - **When acceptable:** on a lab box run with a Vault dev-server root token. Not as a steady state.
 - **It is never silent:** a WARNING line starting `AUDIT:` at every start it lets through,
   `over_grant_accepted: true` on the `vault_privilege_preflight` audit row, and an entry here and in
-  `GET /security/posture`.
+  `GET /security/posture`. The warning and the `vault_privilege_warning` alert still fire.
 - **What it does not do:** it lifts that one refusal only. Every other Vault over-grant, such as a
   token shared by two hops or an extra capability on a path the engine calls, and a probe that could
   not read the token because of a network failure, a timeout or a 403, only warn, so there is
