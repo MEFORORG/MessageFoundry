@@ -44,6 +44,7 @@ from tests.test_email_destination import (
     _SENDER_SHAPES,
     _WireCapture,
     assert_partial_refusal,
+    assert_total_refusal,
 )
 
 #: The [alerts] revocation guards count no posture as enforcing (ADR 0173 section 12), so an
@@ -270,6 +271,52 @@ def test_a_partial_rcpt_refusal_fails_the_alert_send(wire: _WireCapture, quit_ok
     with pytest.raises(NegativeAckError) as caught:
         _send_to(wire.port, "engine@hospital.example", _PARTIAL_RECIPIENTS)
     assert_partial_refusal(caught.value, ALERTS_SMTP_CELL, wire)
+
+
+@pytest.mark.parametrize("quit_ok", [True, False], ids=["quit-221", "quit-refused"])
+def test_a_permanent_refusal_of_every_recipient_fails_the_alert_send_content_free(
+    wire: _WireCapture, quit_ok: bool
+) -> None:
+    # Every recipient refused (vault BACKLOG #2884, #2924 step 5). RED on main: smtplib's own
+    # SMTPRecipientsRefused, whose args hold each address and the relay's reply, reached the
+    # notifier, which logs a failed send with exc_info.
+    wire.refuse_rcpt = frozenset(a.encode() for a in _PARTIAL_RECIPIENTS)
+    if not quit_ok:
+        wire.quit_reply = b"500 no\r\n"
+    with pytest.raises(NegativeAckError) as caught:
+        _send_to(wire.port, "engine@hospital.example", _PARTIAL_RECIPIENTS)
+    assert caught.value.code == "total-refusal" and caught.value.permanent is True
+    assert_total_refusal(caught.value, ALERTS_SMTP_CELL, wire, "550")
+
+
+async def test_the_notifier_logs_a_total_refusal_without_an_address(
+    wire: _WireCapture, caplog: pytest.LogCaptureFixture
+) -> None:
+    wire.refuse_rcpt = frozenset(a.encode() for a in _PARTIAL_RECIPIENTS)
+    email = EmailTransport(
+        host="127.0.0.1",
+        port=wire.port,
+        sender="engine@hospital.example",
+        recipients=_PARTIAL_RECIPIENTS,
+        use_tls=False,
+        timeout=5.0,
+    )
+    sink = NotifierAlertSink([email])
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alert_sinks"):
+        sink.connection_stopped("OB_X", detail="boom")
+        sink.start()
+        for _ in range(500):
+            if any(r.exc_info for r in caplog.records):
+                break
+            await asyncio.sleep(0.01)
+        await sink.aclose()
+    [record] = [r for r in caplog.records if r.exc_info]
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], NegativeAckError)
+    logged = caplog.text.lower()
+    assert "all 2 recipients refused (550)" in logged
+    for address in _PARTIAL_RECIPIENTS:
+        assert address not in logged
 
 
 async def test_the_notifier_logs_a_partial_refusal_without_an_address(

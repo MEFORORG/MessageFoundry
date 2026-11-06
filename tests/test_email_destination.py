@@ -40,6 +40,7 @@ from tests._content_free import (
     CJK_CHAR,
     PAYLOAD,
     SECRET_CHAR,
+    assert_chain_severed,
     assert_content_free,
     escapes,
 )
@@ -767,6 +768,8 @@ class _WireCapture:
         #: Lower-cased mailboxes whose ``RCPT`` gets ``550`` rather than ``250``. One of two refused
         #: is the partial refusal smtplib reports only through its return value (vault BACKLOG #2924).
         self.refuse_rcpt: frozenset[bytes] = frozenset()
+        #: The reply code a refused ``RCPT`` gets: ``550`` is permanent, a ``4xx`` temporary.
+        self.refuse_code = b"550"
         #: The reply to ``QUIT``. smtplib's ``with`` exit raises on anything but ``221``.
         self.quit_reply = b"221 bye\r\n"
         self._thread = threading.Thread(target=self._serve, daemon=True)
@@ -792,7 +795,9 @@ class _WireCapture:
                         if mailbox in self.refuse_rcpt:
                             # The reply echoes the mailbox, as many relays do, so a test can show
                             # the refusal text does not carry it on.
-                            conn.sendall(b"550 <" + mailbox + b"> no such mailbox\r\n")
+                            conn.sendall(
+                                self.refuse_code + b" <" + mailbox + b"> no such mailbox\r\n"
+                            )
                             continue
                     if verb == b"DATA":
                         conn.sendall(b"354 go\r\n")
@@ -916,16 +921,73 @@ async def test_a_refused_quit_alone_is_still_a_retried_smtp_failure(wire: _WireC
 async def test_a_listed_twice_refused_address_is_one_rcpt_and_a_total_refusal(
     wire: _WireCapture,
 ) -> None:
-    # One RCPT per address, so refusing the only address is smtplib's every-recipient refusal (an
-    # ordinary retried SMTP failure), not "2 of 2" read as a partial refusal.
+    # One RCPT per address, so refusing the only address is smtplib's every-recipient refusal, not
+    # "2 of 2" read as a partial refusal of a message the relay took.
     wire.refuse_rcpt = frozenset({_PARTIAL_REFUSED.encode()})
     dest = _wire_dest(wire.port, [_PARTIAL_REFUSED, _PARTIAL_REFUSED])
+    check_egress_allowed(dest, _wire_egress(wire.port))
+    with pytest.raises(NegativeAckError) as caught:
+        await EmailDestination(dest).send("PID|1|synthetic")
+    assert caught.value.code == "total-refusal"
+    assert str(caught.value) == f"Email 127.0.0.1:{wire.port}: all 1 recipients refused (550)"
+    assert len(wire.rcpt_lines) == 1
+    assert wire.data == []
+
+
+# --- a refusal of every recipient (vault BACKLOG #2884, #2924 step 5) -------
+#
+# smtplib raises SMTPRecipientsRefused when the relay refuses every recipient. Its args hold each
+# address and the relay's reply, and it used to reach a retried DeliveryError as the chain, so a
+# permanent 5xx refusal was retried to the attempt ceiling while a partial one dead-lettered at once.
+
+
+def assert_total_refusal(exc: DeliveryError, cell: str, wire: _WireCapture, codes: str) -> None:
+    """The refusal names ``cell``, a count and the reply codes. No address reaches its text, its
+    default rendering with traceback, or its chain, and the relay never got the message."""
+    count = len(wire.rcpt_lines)
+    assert str(exc) == f"{cell}: all {count} recipients refused ({codes})"
+    rendered = " | ".join(
+        [str(exc), repr(exc), safe_exc(exc), "".join(traceback.format_exception(exc))]
+    ).lower()
+    for address in _PARTIAL_RECIPIENTS:
+        assert address not in rendered
+    assert "no such mailbox" not in rendered, "the relay's reply text can echo an address"
+    assert_chain_severed(exc)
+    assert wire.data == [], "every recipient was refused, so DATA was never sent"
+
+
+@pytest.mark.parametrize("quit_ok", [True, False], ids=["quit-221", "quit-refused"])
+async def test_a_permanent_refusal_of_every_recipient_fails_the_email_delivery_for_good(
+    wire: _WireCapture, quit_ok: bool
+) -> None:
+    """RED on main: a retried DeliveryError chained to SMTPRecipientsRefused."""
+    wire.refuse_rcpt = frozenset(a.encode() for a in _PARTIAL_RECIPIENTS)
+    if not quit_ok:
+        wire.quit_reply = b"500 no\r\n"
+    dest = _wire_dest(wire.port, _PARTIAL_RECIPIENTS)
+    check_egress_allowed(dest, _wire_egress(wire.port))
+    with pytest.raises(NegativeAckError) as caught:
+        await EmailDestination(dest).send("PID|1|synthetic")
+    exc = caught.value
+    assert exc.code == "total-refusal"
+    assert exc.permanent is True
+    assert exc.credential_fault is False and exc.config_fault is False
+    assert_total_refusal(exc, f"Email 127.0.0.1:{wire.port}", wire, "550")
+
+
+async def test_a_temporary_refusal_of_every_recipient_is_retried_content_free(
+    wire: _WireCapture,
+) -> None:
+    """A 4xx, such as greylisting, may pass on the next attempt, so it stays a retry. Its text and
+    chain are content-free too. RED on main: the chain held SMTPRecipientsRefused."""
+    wire.refuse_rcpt = frozenset(a.encode() for a in _PARTIAL_RECIPIENTS)
+    wire.refuse_code = b"451"
+    dest = _wire_dest(wire.port, _PARTIAL_RECIPIENTS)
     check_egress_allowed(dest, _wire_egress(wire.port))
     with pytest.raises(DeliveryError) as caught:
         await EmailDestination(dest).send("PID|1|synthetic")
     assert not isinstance(caught.value, NegativeAckError)
-    assert len(wire.rcpt_lines) == 1
-    assert wire.data == []
+    assert_total_refusal(caught.value, f"Email 127.0.0.1:{wire.port}", wire, "451")
 
 
 async def test_every_recipient_accepted_is_still_a_delivery(wire: _WireCapture) -> None:

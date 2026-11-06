@@ -2970,8 +2970,13 @@ a **permanent** `partial-refusal` `NegativeAckError`: the row dead-letters on th
 already have it. A replay is the operator's choice, and re-sends to **every** recipient. The error names the
 relay's host and port and two counts (*"Email relay.example:587: 1 of 2 recipients refused"*), never an
 address or the relay's reply; the delivery worker's log line names the connection. A
-refusal of **every** recipient is still an ordinary SMTP failure, retried like one. The Direct destination
-fails a partial refusal the same way, and the `[alerts]` mail logs it as a failed send.
+refusal of **every** recipient with a permanent `5xx` reply agrees with it: a **permanent** `total-refusal`
+`NegativeAckError` that dead-letters on the first attempt, rather than a retry to the attempt ceiling. It
+names the relay, a count and the distinct reply codes (*"Email relay.example:587: all 2 recipients refused
+(550)"*), never an address or a reply text. When any of those replies is a temporary `4xx`, such as
+greylisting, the next attempt may pass, so it is retried, with the same content-free text. The relay took
+no message in either case, so nobody gets a duplicate. The Direct destination fails both refusals the same
+way, and the `[alerts]` mail logs each as a failed send.
 
 ```python
 # samples/config/connections.py (excerpt)
@@ -3051,7 +3056,8 @@ never the material or a cert subject (which can identify a patient's provider).
 **Delivery semantics.** Egress is gated by **`[egress].allowed_direct`** — kept separate from
 `allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. An SMTP
 failure raises `DeliveryError`, so the lane **retries** per its `RetryPolicy`. A relay that refuses some
-recipients and accepts the rest is a permanent `partial-refusal`, as on the Email destination. A message that cannot be
+recipients and accepts the rest is a permanent `partial-refusal`, and one that refuses every recipient with a
+`5xx` reply a permanent `total-refusal`, as on the Email destination. A message that cannot be
 **built** raises a **permanent** `NegativeAckError` and dead-letters on the first attempt, because a retry
 would fail the same way. That is a body the `encoding` cannot represent, or a crypto failure that began
 after construction. Its error names the failure class, or the codec and character position, and never the

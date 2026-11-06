@@ -74,7 +74,7 @@ from messagefoundry.transports.base import NegativeAckError
 # Importing this module already loads the transports package through pipeline/__init__.py, so these
 # add no import cost.
 from messagefoundry.transports.bounded_read import NoRedirectHandler, build_strict_opener
-from messagefoundry.transports.email import checked_envelope, partial_refusal_under
+from messagefoundry.transports.email import checked_envelope, envelope_refusal_under
 
 __all__ = [
     "AlertTransport",
@@ -841,7 +841,7 @@ def send_plain_email(
         failure = type(exc).__name__
     if failure:
         raise ValueError(f"{ALERTS_SMTP_CELL}: the alert body could not be encoded ({failure})")
-    partial: NegativeAckError | None = None
+    refusal: NegativeAckError | None = None
     try:
         with smtplib.SMTP(host, port, timeout=timeout) as smtp:
             if use_tls:
@@ -860,18 +860,18 @@ def send_plain_email(
                     channel_encrypted=use_tls,
                     cell=ALERTS_SMTP_CELL,
                 )
-            # A partial RCPT refusal raises a NegativeAckError that names the cell and two counts,
-            # never an address (vault BACKLOG #2924). A refusal of EVERY recipient is still
-            # smtplib's own SMTPRecipientsRefused, whose args hold each address and the reply.
+            # A partial RCPT refusal, or a refusal of every recipient, raises an error that names
+            # the cell and counts, never an address or a reply text (vault BACKLOG #2924, #2884):
+            # a permanent NegativeAckError, or for a 4xx refusal of every recipient a DeliveryError.
             envelope.send(smtp, msg, cell=ALERTS_SMTP_CELL)
     except smtplib.SMTPException as exc:
-        # A QUIT refused after a partial refusal must not hide it; raised below, outside this
+        # A QUIT refused after a permanent refusal must not hide it; raised below, outside this
         # handler. Any other SMTP failure propagates unchanged.
-        partial = partial_refusal_under(exc)
-        if partial is None:
+        refusal = envelope_refusal_under(exc)
+        if refusal is None:
             raise
-    if partial is not None:
-        raise partial
+    if refusal is not None:
+        raise refusal
 
 
 class EmailTransport:
