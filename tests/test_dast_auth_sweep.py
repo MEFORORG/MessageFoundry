@@ -484,6 +484,7 @@ def test_a_policy_without_floors_fails_closed(tmp_path: Path) -> None:
             "negative_probes": 198,
             "reached": 46,
             "bfla_probes": 19,
+            "websocket_rows": _passing_ws_rows(),
             "write_reached": 61,
             "write_bfla_probes": 43,
             "ungated_routes": _declared_public(policy),
@@ -615,6 +616,7 @@ def test_a_write_pass_that_never_ran_fails_closed() -> None:
         "negative_probes": 204,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "unreached_unexplained": 0,
         "ungated_routes": _declared_public(policy),
         "findings": [],
@@ -623,6 +625,29 @@ def test_a_write_pass_that_never_ran_fails_closed() -> None:
     assert code == 2, f"a receipt with no write counts exited {code}"
     assert any("min_write_rows_reached" in line for line in errors), errors
     assert any("min_write_bfla_probes" in line for line in errors), errors
+
+
+def test_a_receipt_with_no_websocket_rows_fails_closed() -> None:
+    """Engine PR 2390 note 4 (vault BACKLOG #2955). The WebSocket kind check passes on an empty list,
+    so a walk that stopped yielding socket rows read as clean; the floor makes it exit 2."""
+    policy = _policy()
+    receipt = {
+        "gated_http_rows": 102,
+        "route_rows_examined": 108,
+        "negative_probes": 204,
+        "reached": 46,
+        "bfla_probes": 19,
+        "write_reached": 61,
+        "write_bfla_probes": 43,
+        "unreached_unexplained": 0,
+        "ungated_routes": _declared_public(policy),
+        "findings": [],
+    }
+    assert evaluate({**receipt, "websocket_rows": _passing_ws_rows()}, policy) == (0, [])
+    for rows in ({}, {"websocket_rows": []}):
+        code, errors = evaluate({**receipt, **rows}, policy)
+        assert code == 2, errors
+        assert any("min_websocket_rows" in line for line in errors), errors
 
 
 def test_the_bfla_canary_floors_the_write_pass_separately() -> None:
@@ -639,6 +664,7 @@ def test_the_bfla_canary_floors_the_write_pass_separately() -> None:
         "negative_probes": 204,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
@@ -663,6 +689,7 @@ def test_too_many_destroyed_sessions_is_a_could_not_measure() -> None:
         "negative_probes": 204,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
@@ -879,6 +906,7 @@ def test_bfla_oracle_treats_404_as_a_violation() -> None:
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "bfla_violations": 1,
@@ -910,6 +938,7 @@ def test_an_unexplained_unreached_operation_is_a_finding() -> None:
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 3,
@@ -934,6 +963,7 @@ def test_a_newly_ungated_route_reds_the_run() -> None:
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
@@ -974,6 +1004,7 @@ def test_an_allow_listed_route_that_is_not_declared_public_reds_the_run(
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,
@@ -995,6 +1026,15 @@ def _ws_row(**fields: Any) -> dict[str, Any]:
 
 _GATES = ["authorize_ws"]
 _PERMS = ["monitoring:read"]
+
+
+def _passing_ws_rows() -> list[dict[str, Any]]:
+    """One WebSocket row that passes, so a hand-built receipt meets ``min_websocket_rows``."""
+    return [
+        _ws_row(
+            kind=route_gates.KIND_IN_BODY, declaration=_REASON, gates=_GATES, permissions=_PERMS
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1065,6 +1105,7 @@ def test_a_websocket_row_the_engine_refuses_reds_the_run(row: dict[str, Any], re
         "negative_probes": 198,
         "reached": 46,
         "bfla_probes": 19,
+        "websocket_rows": _passing_ws_rows(),
         "write_reached": 61,
         "write_bfla_probes": 43,
         "unreached_unexplained": 0,

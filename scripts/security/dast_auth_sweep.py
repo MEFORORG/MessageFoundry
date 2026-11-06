@@ -635,6 +635,9 @@ def evaluate(receipt: dict[str, Any], policy: dict[str, Any]) -> tuple[int, list
         # pass that did not run at all, not only on one that ran short.
         "min_write_rows_reached": int(receipt.get("write_reached", 0)),
         "min_write_bfla_probes": int(receipt.get("write_bfla_probes", 0)),
+        # Engine PR 2390 note 4 (vault BACKLOG #2955): the WebSocket kind check passes on an empty
+        # list, so a walk that stopped yielding socket rows would read as clean. Rows, not probes.
+        "min_websocket_rows": len(receipt.get("websocket_rows", [])),
     }
 
     if observed["min_gated_http_rows"] == 0:

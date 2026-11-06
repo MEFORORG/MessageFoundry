@@ -8,6 +8,7 @@
     "min_bfla_probes": "measured 19 on 2026-07-31 against 2fd1ad8a; re-measured 19 on 2026-09-05 against c57903c2",
     "min_write_rows_reached": "measured 47 of 55 gated non-GET rows on 2026-09-05 against c57903c2; the 8 that refused the administrator were the action-scoped step-up rows, then exempted in unreachable_allowlist; re-measured 45 of 61 on 2026-10-07 against branch b198/2625-resend-perm-stepup (6e1de21d plus the #2625 change, not 6e1de21d alone), after vault BACKLOG #2625 bound six more write rows (and one GET, export) to an action; re-measured 61 of 61 on 2026-10-12 against 26477d59e3 plus vault BACKLOG #3241, which re-proves each action-bound row for its action and removed all 17 of their exemptions (15 write rows reached after a re-proof, and POST /config/reload, which answers a body-less probe 422 before its in-route proof); floor raised from 40 to 55",
     "min_write_bfla_probes": "measured 43 write BFLA candidate rows, all 43 refused, on 2026-09-05 against c57903c2",
+    "min_websocket_rows": "measured 1 (WS /ws/stats, the engine's only WebSocket route) on 2026-11-06 against aba973b282 plus vault BACKLOG #2955; the floor is the whole count, so dropping that socket from the walk reds the run",
     "_canary_floor_units": "The canary floors below are compared against negative_non_401, bfla_violations and write_bfla_violations, which count PROBES, not rows. The open-auth canary sends 2 probes per gated row, so its finding count is roughly twice the row count -- do not re-derive a floor from a row number.",
     "open-auth_min_negative_findings": "measured 196 failing PROBES (98 of 99 gated rows x 2 probes; the holdout is the mTLS-only GET /service/identity) on 2026-07-31 against 2fd1ad8a",
     "bfla_min_violations": "measured 19 failing PROBES (all 19 GET BFLA candidates) on 2026-07-31 against 2fd1ad8a",
@@ -21,7 +22,8 @@
     "min_get_rows_reached": 40,
     "min_bfla_probes": 15,
     "min_write_rows_reached": 55,
-    "min_write_bfla_probes": 35
+    "min_write_bfla_probes": 35,
+    "min_websocket_rows": 1
   },
   "max_unexplained_unreached": 0,
   "max_write_session_rebuilds": 5,
