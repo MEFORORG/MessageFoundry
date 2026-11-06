@@ -530,7 +530,7 @@ What that changes for you:
   gets past it, are stated in full in
   [`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
   A console-script start is not isolated either, and the engine says so (`interpreter_not_isolated`, and
-  `remote_debug_enabled` where the start goes on with the interface on).
+  `remote_debug_enabled` or `remote_debug_unguarded` where the start goes on with the interface on).
 - **The engine's Python children are isolated when the engine is.** The sandbox worker and each
   engine shard repeat the engine's `-I`, so a `PYTHON*` variable in the service's environment
   reaches none of them. A `serve` from a prompt is not isolated, and neither are its children.

@@ -2421,7 +2421,7 @@ count is above `0` (vault BACKLOG #2613).
   option nor the variable fits. Never for a deployment: the shipped service launches turn the
   interface off, so they need nothing here.
 - **It is never silent:** an entry here and in `GET /security/posture` for `serve`, and a WARNING
-  line at each `supervise` start. Where it lifts a refusal that would fire, `serve` and
+  line at each `supervise` start that passes its remote-debugging gate. Where it lifts a refusal that would fire, `serve` and
   `supervise` also write a WARNING-level log line that begins `AUDIT:`, as the gate runs.
   `serve` writes it again once logging reaches its handlers; `supervise` writes it again only
   where a log forwarder is installed, for the off-box copy. The acceptance has no audit row
