@@ -69,6 +69,7 @@ from messagefoundry.auth.ldap import (
     LdapReferralError,
     LdapUnansweredError,
     LdapUndecodableError,
+    _innermost_frame,
     _type_name,
     kerberos_principal,
     normalise_object_guid,
@@ -2243,10 +2244,10 @@ async def _ask_directory[**P, T](call: Callable[P, T], /, *args: P.args, **kwarg
 
     **An engine defect is told apart, at ERROR (BACKLOG #3017 L6).** Catching an engine
     programming error here is deliberate: these legs grant, so they fail closed rather than answer
-    a 500 with no audit row. But read as a plain outage it would hide among them. A fault raised in
-    an engine frame is logged at ERROR instead, naming that frame's module, line and function, and
-    still no text. A fault raised in a library frame, such as ldap3 meeting a response it cannot
-    read, stays at WARNING.
+    a 500 with no audit row. But read as a plain outage it would hide among them. Only a fault
+    raised inside a directory library, such as ldap3 meeting a response it cannot read, stays at
+    WARNING. Any other is logged at ERROR, naming the frame's module, line and function, and still
+    no text (:func:`_engine_frame`).
     """
     try:
         return await asyncio.to_thread(call, *args, **kwargs)
@@ -2265,8 +2266,8 @@ async def _ask_directory[**P, T](call: Callable[P, T], /, *args: P.args, **kwarg
             )
         else:
             _log.error(
-                "directory call %s raised %s in engine code at %s; an engine defect, read as the "
-                "directory not answering, so the request is refused",
+                "directory call %s raised %s at %s, outside the directory libraries, so it is "
+                "read as an engine defect; the request is refused",
                 name,
                 kind,
                 where,
@@ -2275,20 +2276,24 @@ async def _ask_directory[**P, T](call: Callable[P, T], /, *args: P.args, **kwarg
         raise LdapError(f"directory call failed: unexpected {kind}") from exc
 
 
+#: The packages that read what a directory or a Kerberos client sent. A fault raised inside one is
+#: read as the directory's (:func:`_engine_frame`).
+_DIRECTORY_LIBRARIES = ("ldap3", "pyasn1", "spnego")
+
+
 def _engine_frame(exc: BaseException) -> str | None:
-    """``module:line in function`` of the frame ``exc`` was raised in, when that frame is the
-    engine's own code, and ``None`` when it is a library's or there is no traceback. Code-defined
-    names and a line number only, never a value (:func:`_ask_directory`)."""
-    tb = exc.__traceback__
-    if tb is None:
-        return None
-    while tb.tb_next is not None:
-        tb = tb.tb_next
-    frame = tb.tb_frame
+    """``module:line in function`` of the frame ``exc`` was raised in, or ``None`` when that frame
+    belongs to one of :data:`_DIRECTORY_LIBRARIES`. Any other frame counts as the engine's: its own
+    code, or a standard-library call it made with a bad argument. With no traceback the origin is
+    unknown, and it counts as the engine's too, so a defect never hides by losing its frame.
+    Code-defined names and a line number only, never a value (:func:`_ask_directory`)."""
+    frame = _innermost_frame(exc)
+    if frame is None:
+        return "an unknown frame"
     module = str(frame.f_globals.get("__name__", ""))
-    if module != "messagefoundry" and not module.startswith("messagefoundry."):
+    if any(module == lib or module.startswith(f"{lib}.") for lib in _DIRECTORY_LIBRARIES):
         return None
-    return f"{module}:{tb.tb_lineno} in {frame.f_code.co_name}"
+    return f"{module}:{frame.f_lineno} in {frame.f_code.co_name}"
 
 
 def _directory_error_detail(exc: LdapError) -> dict[str, str]:

@@ -999,9 +999,11 @@ def _unanswered(operation: str, code: int | None) -> LdapUnansweredError:
         if code in _CONFIGURATION_CODES
         else "the directory not answering"
     )
-    # A refused bind is an answer, the directory's own refusal, so it is not called "not an
-    # answer" as a search that did not finish is (BACKLOG #3017 L3).
-    verdict = "which refused the bind" if operation.endswith(" bind") else "which is not an answer"
+    # A bind the directory refused on its merits, such as invalidCredentials, is an answer, so it
+    # is not called "not an answer" (BACKLOG #3017 L3). A bind ended by an outage code judged
+    # nothing (#3169), and one with no readable code said nothing, so both still are.
+    refused = operation.endswith(" bind") and code is not None and code not in _UNJUDGED_BIND_CODES
+    verdict = "which refused the bind" if refused else "which is not an answer"
     message = (
         f"AD ended the {operation} with {shown}, {verdict}; the engine reads it as "
         f"{reading} (BACKLOG #3010).{hint}"

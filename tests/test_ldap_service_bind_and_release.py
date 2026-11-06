@@ -313,6 +313,25 @@ def test_any_other_service_bind_refusal_names_its_result_code() -> None:
     assert dc.searches == []
 
 
+@pytest.mark.parametrize(
+    ("operation", "code", "verdict"),
+    [
+        pytest.param("service-account bind", 49, "which refused the bind", id="bind-49"),
+        pytest.param("user bind", 49, "which refused the bind", id="user-bind-49"),
+        pytest.param("user bind", 51, "which is not an answer", id="user-bind-51-busy"),
+        pytest.param("service-account bind", 52, "which is not an answer", id="bind-52"),
+        pytest.param("service-account bind", None, "which is not an answer", id="bind-no-code"),
+        pytest.param("user search", 32, "which is not an answer", id="search-32"),
+    ],
+)
+def test_only_a_bind_refused_on_its_merits_is_called_refused(
+    operation: str, code: int | None, verdict: str
+) -> None:
+    """L3. An outage code judged nothing (#3169) and no code said nothing, so neither is a
+    refusal; a search that did not finish is no answer either."""
+    assert f", {verdict};" in str(ldap_module._unanswered(operation, code))
+
+
 def test_a_refused_service_bind_with_no_result_code_still_refuses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -423,7 +442,8 @@ async def test_a_kerberos_sign_in_audits_an_unexpected_fault_as_a_login_error(
         rows = await _kerberos_sign_in(monkeypatch)
     assert len(rows) == 1 and '"cause": "TypeError"' in rows[0], rows
     assert "synthetic-leak" not in rows[0]
-    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    # At ERROR since L6: the fault is raised in this module, outside the directory libraries.
+    warned = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("resolve_principal raised TypeError" in m for m in warned), warned
     assert not any("synthetic-leak" in m for m in warned), warned
 
@@ -459,25 +479,30 @@ async def test_ask_directory_passes_an_ldap_error_through_unchanged() -> None:
 async def test_ask_directory_names_an_engine_defect_at_error(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """BACKLOG #3017 L6. A fault raised in engine code still fails closed as an ``LdapError``, but
-    is logged at ERROR as an engine defect, naming the frame and no text, where a library's fault
-    stays at WARNING. ``_escape_filter(None)`` raises inside ``auth/ldap.py``; ``json.loads``
-    raises inside the standard library."""
+    """BACKLOG #3017 L6. Every fault still fails closed as an ``LdapError``. Only one raised inside a
+    directory library stays at WARNING; any other is logged at ERROR as an engine defect, naming
+    the frame and no text. ``_escape_filter(None)`` raises inside ``auth/ldap.py``, ``json.loads``
+    inside the standard library on a bad argument, and ``parse_dn(None)`` inside ldap3."""
     engine_fault = functools.partial(ldap_module._escape_filter, None)  # type: ignore[arg-type]
-    library_fault = functools.partial(json.loads, "{synthetic-leak-3017")
+    stdlib_fault = functools.partial(json.loads, "{synthetic-leak-3017")
+    directory_fault = functools.partial(ldap3.utils.dn.parse_dn, None)
     with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
-        with pytest.raises(LdapError, match="^directory call failed: unexpected TypeError$"):
-            await service_module._ask_directory(engine_fault)
-        with pytest.raises(LdapError, match="^directory call failed: unexpected JSONDecodeError$"):
-            await service_module._ask_directory(library_fault)
+        for fault, kind in (
+            (engine_fault, "TypeError"),
+            (stdlib_fault, "JSONDecodeError"),
+            (directory_fault, "LDAPInvalidDnError"),
+        ):
+            with pytest.raises(LdapError, match=f"^directory call failed: unexpected {kind}$"):
+                await service_module._ask_directory(fault)
     lines = [(r.levelno, r.getMessage()) for r in caplog.records]
-    assert len(lines) == 2, lines
-    (engine_level, engine_line), (library_level, library_line) = lines
+    assert len(lines) == 3, lines
+    (engine_level, engine_line), (stdlib_level, stdlib_line), (dir_level, dir_line) = lines
     assert engine_level == logging.ERROR
-    assert "raised TypeError in engine code at messagefoundry.auth.ldap:" in engine_line
-    assert "in _escape_filter; an engine defect" in engine_line
-    assert library_level == logging.WARNING and "engine" not in library_line
-    assert not any("synthetic-leak" in m or "NoneType" in m for _l, m in lines), lines
+    assert "raised TypeError at messagefoundry.auth.ldap:" in engine_line
+    assert "in _escape_filter, outside the directory libraries" in engine_line
+    assert stdlib_level == logging.ERROR and "at json.decoder:" in stdlib_line
+    assert dir_level == logging.WARNING and "engine defect" not in dir_line
+    assert not any("synthetic-leak" in m or "NoneType" in m or "empty dn" in m for _l, m in lines)
 
 
 #: The callers of the authenticator that keep their own reading of a fault, and why.
