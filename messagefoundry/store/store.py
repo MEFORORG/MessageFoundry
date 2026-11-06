@@ -5411,6 +5411,13 @@ class StoreIdPinRefused(KeyProviderError):
     which are not secret, and never a key."""
 
 
+class StoreIdPinRefusedBeforeWrite(StoreIdPinRefused):
+    """The pin refused the store before the open wrote anything to it: raised by
+    :func:`check_open_store_pin`, ahead of the salt bind. Any other :class:`StoreIdPinRefused`
+    may follow the open's at-open writes, so a caller that must know nothing was written (a
+    minting command deciding whether to remove the key it minted) asks for this class."""
+
+
 #: The pin of the store open in progress, set by ``store.base.open_store`` around the backend open
 #: and read by :func:`_load_audit_chain`, which all three backends share. A context variable rather
 #: than a parameter of each backend's open, as the hop posture is held during connector
@@ -5512,7 +5519,7 @@ async def check_open_store_pin(host: AuditRangeHost) -> None:
         return
     problem = await _store_pin_refusal(host, await host._audit_genesis_row(), pin, writable=True)
     if problem is not None:
-        raise StoreIdPinRefused(f"refusing to open the store: {problem}")
+        raise StoreIdPinRefusedBeforeWrite(f"refusing to open the store: {problem}")
 
 
 def parse_audit_genesis(detail: object) -> str | None:

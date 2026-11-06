@@ -824,7 +824,7 @@ def test_a_minted_key_is_kept_when_the_pin_refused_after_a_write(tmp_path: Path)
     from messagefoundry import __main__ as cli
     from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
 
-    server = StoreSettings(backend=StoreBackend.POSTGRES)
+    server = StoreSettings().model_copy(update={"backend": StoreBackend.POSTGRES})
     kept = tmp_path / "kept.key"
     kept.write_bytes(b"k")
     cli._discard_minted_custody(kept, server, StoreIdPinRefused("after the salt bind"))

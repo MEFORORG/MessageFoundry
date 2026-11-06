@@ -7064,14 +7064,16 @@ class _RecoveryKeyConsole:
 def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseException) -> None:
     """Remove the host blob or handoff ``provision-admin`` minted when the store it was minted for
     could not be created, so a second run can mint again, but only where the open wrote nothing
-    under it: the store id pin refused (it refuses before any write), or a SQLite store whose file
-    was never made. Otherwise the store may already hold rows under that key, so the file is kept
+    under it: the store id pin refused before the open's first write
+    (:class:`~messagefoundry.store.store.StoreIdPinRefusedBeforeWrite`; a pin refusal raised later,
+    once the salt bind may have run, does not count), or a SQLite store whose file was never
+    made. Otherwise the store may already hold rows under that key, so the file is kept
     and named on stderr. Neither text carries the key."""
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.store.base import _absent_sqlite_store
-    from messagefoundry.store.store import StoreIdPinRefused
+    from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
 
-    nothing_written = isinstance(failure, StoreIdPinRefused) or (
+    nothing_written = isinstance(failure, StoreIdPinRefusedBeforeWrite) or (
         store.backend is StoreBackend.SQLITE and _absent_sqlite_store(store) is not None
     )
     if not nothing_written:
