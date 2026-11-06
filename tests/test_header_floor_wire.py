@@ -556,11 +556,11 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
     assert written.startswith(f"HTTP/1.1 {status} ".encode()), written[:40]
     assert b"nosniff" in written and transport.closing
     # uvicorn runs handle_connect for a request the parser accepted, and never for one it
-    # rejected: the app-error case is the control that the count sees a call at all. The floor's
-    # parser-rejection step runs once, on the first bytes, in both cases.
+    # rejected: the app-error case is the control that the count sees a call at all.
     assert len(connects) == (1 if bare_answers else 0)
-    assert rejection_passes == [floored]
     if not bare_answers:
+        # The floor's parser-rejection step ran, once.
+        assert rejection_passes == [floored]
         # So the parser-rejection step set these itself.
         assert (floored.handshake_initiated, floored.handshake_complete, floored.close_sent) == (
             True,

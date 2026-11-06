@@ -834,7 +834,8 @@ the TypeScript and JavaScript roots, `scripts/security/crypto_inventory_check.py
 The 2026-09-28 amendment above left two kinds of generator unread. One is Node's, behind the IDE
 extension's `randomBytes`. The others are the operating-system generators behind Python's
 `os.urandom` and `secrets`. This amendment reads their documentation and claims no verdict. Every
-source below was read on 2026-10-10.
+source below was read on 2026-10-10, except the Node-version check in the Node bullet, which was
+made on 2026-11-06 and names its own sources.
 
 **The IDE extension stays in scope.** `ide/src/cspNonce.ts` `nonce` calls `randomBytes(18)` in its
 synchronous form, from extension-host code. Every webview the extension builds takes its CSP nonce
@@ -859,10 +860,12 @@ token too.)*
 - Node: <https://nodejs.org/docs/v26.11.1/api/crypto.html#cryptorandombytessize-callback>. The
   extension runs on the Node that VS Code ships inside Electron. **Checked 2026-11-06 (BACKLOG
   #1173 item 2).** The extension's floor is VS Code 1.95 (`engines.vscode` in `ide/package.json`),
-  whose release notes say it ships Node.js 20.18.0 on Electron 32. One installed VS Code 1.142.0,
-  run as Node, reported Node 24.21.0 on Electron 43.7.7. The `crypto.randomBytes` section reads
-  the same in the Node v20.18.0, v24.21.0 and v26.11.1 documentation, compared as the docs' Markdown
-  source. That same install reported its OpenSSL version as `0.0.0`, so the crypto library under
+  whose release notes (<https://code.visualstudio.com/updates/v1_95>) say it ships Node.js 20.18.0
+  on Electron 32. One installed VS Code 1.142.0, run as Node, reported Node 24.21.0 on Electron
+  43.7.7. The `crypto.randomBytes` section reads the same in the Node v20.18.0, v24.21.0 and
+  v26.11.1 documentation, compared as the docs' Markdown source
+  (<https://nodejs.org/docs/v20.18.0/api/crypto.md>, and the same path under `v24.21.0` and
+  `v26.11.1`). That same install reported its OpenSSL version as `0.0.0`, so the crypto library under
   its `randomBytes` is not a stock OpenSSL build. Which library it is was not read, and nothing here
   covers a VS Code between those two versions or after them. *(Until 2026-11-06 the last sentence
   of this bullet read: "Neither that Node's version nor the crypto library under its `randomBytes`

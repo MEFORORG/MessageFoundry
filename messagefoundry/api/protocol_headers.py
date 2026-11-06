@@ -92,15 +92,15 @@ against the server class it is handed. So is every attribute the two sans-I/O st
 or write: a rename there would otherwise turn a step off, or leave it writing a dead name, with no
 error. That check sees a name that is no longer assigned. It cannot see a name the server still
 assigns and has stopped reading, nor tell ``self.<name> = ...`` from the same name assigned on
-another object. For one name a test does: the parser-rejection case of
-``test_shutdown_of_an_answered_still_open_connection_does_not_raise`` fails when uvicorn's
-``shutdown`` stops reading ``close_sent`` (a mutation removing that read raised ``InvalidState``).
-No test covers any other name, or the other-object case. That case stays unfixed on purpose: it
-can only pass a name a server assigns on some other object, and a check keyed on ``self`` would
-read the load opcodes before each store, which CPython has changed in recent versions (3.13 added
-fused loads, 3.14 borrowed ones), so a miss there would refuse the start. The checked hooks are:
-the HTTP protocol's
-``send_400_response``, its ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
+another object. Tests see a stopped read for at least two names: the cycle's ``disconnected``,
+through the self-test the paragraph above names, and the sans-I/O protocol's ``close_sent``,
+whose removed read makes the parser-rejection case of
+``test_shutdown_of_an_answered_still_open_connection_does_not_raise`` raise ``InvalidState``
+(measured with a mutation). At least the other sans-I/O names, and the other-object case, have no
+such test. A check keyed on ``self``, by bytecode or by source, could close that case and is not
+built: it can only pass a name uvicorn assigns on another object in the same class chain, and
+uvicorn is pinned exactly, so a change to it runs the wire suite before it ships. The checked
+hooks are: the HTTP protocol's ``send_400_response``, its ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response``, ``default_headers``, ``send``, and the ``disconnected``, ``message_event``
 and ``response_complete`` it reads, and the WebSocket protocol's hooks. For the legacy
 server those are ``send_500_response``, ``transport`` and ``write_http_response``. For the sans-I/O
@@ -408,7 +408,7 @@ def _require_ws_hooks(base: type[Any], *, through_conn: bool) -> None:
         # raises InvalidState (measured at uvicorn 0.54.0). This proves each name is still
         # ASSIGNED somewhere in the class chain, which catches a rename. It does not prove
         # uvicorn still READS them. For close_sent the wire suite's shutdown test does; the
-        # module docstring says which test, and that no test covers the other names.
+        # module docstring says which test, and which names have none.
         _require_assigned(base, "handshake_complete", hook="data_received")
         _require_assigned(base, "close_sent", hook="data_received")
         _require_assigned(base, "transport", hook="data_received")

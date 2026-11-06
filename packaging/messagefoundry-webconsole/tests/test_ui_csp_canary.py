@@ -773,7 +773,7 @@ def test_the_browser_support_doc_states_the_floor_it_was_derived_from() -> None:
     A declined row and a forgotten row look identical in a document. This pins the two claims the
     derivation actually rests on -- that the floor is CSP nonce-source support, and that
     ``'strict-dynamic'`` is not part of it -- plus the explicit statement that no version table is
-    stated. Authoring one later without a pinned dataset reds here.
+    stated. Removing that statement reds here; a version table added beside it would not.
 
     **The pinned phrase is "not STATED" rather than "not published", and that is constrained by a
     second gate rather than a preference** (BACKLOG #1116). ``tests/test_install_instruction_provenance.py``

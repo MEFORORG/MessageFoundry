@@ -48,7 +48,8 @@
   touch at least §1.5 item 4, 2026-09-24 on PR 1502, one §7.1 row, 2026-09-27, and the ODBC rows
   of §7.1's 2026-10-04 note, 2026-10-05, with the limits stated below that note's table, the
   three Vault rows of that note, 2026-10-13, in §12, and the same ODBC rows after their driver
-  test, 2026-11-05, in the last limit below that note's table) · security working group
+  test, 2026-11-05, in the last bullet of the paragraph directly below that note's table) ·
+  security working group
 - **Related:** **extends [ADR 0078](0078-certificate-revocation-posture.md)** (Accepted 2026-07-10,
   owner-ratified — that ADR made the `[api]` in-process delegation an *enforced* start-time refusal;
   this one grades the two remaining directions and records why one of them is unbuildable) ·
@@ -1204,10 +1205,8 @@ ruling, and the last bullet records the owner's later ruling on the test's resul
   bullet of the 2026-10-04 reading below says. No owner answer and no planned test covers one.
 - **The drivers' own revocation behaviour is measured for one driver, on one operating system,
   against one way of publishing revocation.** The ruling's "then test it" half ran under #3009.
-  ODBC Driver 18.7 on Windows did not use a published revocation list on any of the four
-  connection-string shapes tested. The amendment of 2026-11-05 below this note's bullets says what
-  ran and lists what it does not show; at least every other driver or build, every other operating
-  system, OCSP and a chain with an intermediate CA are still unmeasured. *(Until 2026-11-05 this bullet read: "**The drivers' own revocation behaviour
+  The amendment of 2026-11-05 below this note's bullets states the result, and lists at least what
+  it does not show. *(Until 2026-11-05 this bullet read: "**The drivers' own revocation behaviour
   is still unmeasured.** The ruling's "then test it" half is owed. It needs a SQL Server whose
   certificate can be revoked. A control connection to a certificate that is not revoked shows that
   a refusal comes from the revocation. Until #3009 runs, nothing here says whether Driver 18 checks
@@ -1254,8 +1253,8 @@ chosen option gives for building no guard:
   terminator exists for these hops either.
 
 **Amendment 2026-11-05 -- the Driver 18 revocation test has a result, and the named gap stands
-(BACKLOG #3009).** This is the one place this file states the result in full; other places point
-here. The owner ran the test on
+(BACKLOG #3009).** This is where this file states the result; other places point here. The
+owner ran the test on
 2026-10-16, and a scripted run repeated it on 2026-10-17. The two runs agree on every leg they
 share. Their records are private, in the vault beside #3009, and are not repeated here.
 
@@ -1270,22 +1269,26 @@ share. Their records are private, in the vault beside #3009, and are not repeate
   **A**, the string the SQL Server store and the DATABASE connector's SQL Server preset build;
   **L**, the read-only string `db_lookup` builds; **G**, the generic dialect naming Driver 18; and
   **P**, the store's string with a `ServerCertificate=` pin that matches the server's certificate,
-  under `Encrypt=yes`. Reference-sync builds the same read-only string `db_lookup` does, so shape
-  L stands for it (*code*: `database_source_dsn` calls `_build_dsn` with `read_only=True`).
+  under `Encrypt=yes`. Reference-sync built the preset's string, shape A, when the test ran. Since
+  BACKLOG #2617 (2026-10-29) it builds the read-only string `db_lookup` does, shape L (*code*:
+  `database_source_dsn` calls `_build_dsn` with `read_only=True`). Both shapes connected.
 - **What the driver did.** Every shape connected while the server presented the revoked
   certificate, with the list cleared from the cache and again with it warmed into the cache first.
   The list's server logged no request during any leg. Every shape also connected once the same
   server presented the control certificate, which was not revoked. So Driver 18.7 on Windows did
   not use this list on any of the four shapes, fetched or cached.
-- **What it does not show.** That the driver never checks revocation: OCSP was not offered. Any
-  other driver, which the generic dialect and the `odbc_driver` setting can name. Linux or macOS,
-  where the driver uses OpenSSL. A chain with an intermediate CA. And it measured connection strings
+- **What it does not show, at least.** That the driver never checks revocation: OCSP was not
+  offered. Any other driver, or another build or the 32-bit form of this one; the generic dialect
+  and the `odbc_driver` setting can name others. Linux or macOS, where the driver uses OpenSSL, or
+  another Windows version. A server other than SQL Server 2022, such as 2025. A client on a host
+  apart from the server. A chain with an intermediate CA. And it measured connection strings
   copied from the code, not a running engine.
 - **One leg past the four shapes.** The scripted run also tried shape P with `Encrypt=strict`, the
   shape the store has sent since the amendment of 2026-10-17 below. It connected to the revoked
   server too, with no list request logged. No unpinned or warmed strict leg ran, so this leg cannot
   say whether the pin or the driver is why no list was read.
-- **The grade.** By the owner's ruling of 2026-11-05, recorded in the last limit above, the five
+- **The grade.** By the owner's ruling of 2026-11-05, recorded in the last bullet of the
+  paragraph above, the five
   rows keep their grade, and this result is what it now rests on. A guard would still have no
   context to read, as the bullets above say.
 
@@ -1678,9 +1681,9 @@ amendment does not change those three call sites.
 ## 14. Amendment 2026-11-05 -- the ODBC driver test result, and the gap stands by owner ruling (BACKLOG #3009)
 
 **What changed.** BACKLOG #3009's test of ODBC Driver 18 against a revoked server certificate has
-a result, and the owner has ruled on it: the five ODBC hops stay a named gap. The result is stated
-once, in the amendment of 2026-11-05 below §7.1's ODBC table, beside the paragraph §11 named for
-it, and the ruling once, in that paragraph's last limit. This amendment edits at least these
+a result, and the owner has ruled on it. The result is stated in the amendment of 2026-11-05 below
+§7.1's ODBC table, beside the paragraph §11 named for it, and the ruling in the last bullet of that
+paragraph; other places point there. This amendment edits at least these
 places. Where it replaced a claim, the old words are kept beside the new, except in the five
 revocation cells, whose old words are quoted once, in item 3:
 
@@ -1690,7 +1693,8 @@ revocation cells, whose old words are quoted once, in item 3:
 3. The revocation cell of each of the five ODBC rows. Each read "The driver's own: *not
    established*", or, on the generic dialect, "Each driver's own behaviour: *not established*".
 4. The last bullet of the counts list after §7.1's note.
-5. The reference-sync row's verification cell, corrected in place: it builds the read-only string.
+5. The reference-sync row's verification cell, corrected in place on 2026-11-06, the day the
+   correction was made: it builds the read-only string.
 6. A note under §11's sentence on where a #3009 result goes.
 
 **What this amendment does not do.** It builds no guard, changes no code, and changes no grade.
