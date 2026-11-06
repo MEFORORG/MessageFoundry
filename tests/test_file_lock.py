@@ -61,19 +61,24 @@ def test_the_lock_names_one_range_whatever_the_file_position(
     file_lock.unlock(second)
 
 
-def test_a_fault_that_is_not_contention_raises(tmp_path: Path) -> None:
-    fd = os.open(tmp_path / "gone.lock", os.O_RDWR | os.O_CREAT, 0o600)
-    os.close(fd)  # a closed descriptor: EBADF, not another holder
+def _a_descriptor_nothing_holds() -> int:
+    """A descriptor number no file is open on. High rather than just closed: descriptors are
+    handed out lowest-free, so another thread opening a file cannot be given this one."""
+    fd = 4093
     with pytest.raises(OSError):
-        file_lock.lock_exclusive(fd)
+        os.fstat(fd)
+    return fd
 
 
-def test_the_spool_still_reads_any_lock_fault_as_not_ours(tmp_path: Path) -> None:
+def test_a_fault_that_is_not_contention_raises() -> None:
+    with pytest.raises(OSError):
+        file_lock.lock_exclusive(_a_descriptor_nothing_holds())  # EBADF, not another holder
+
+
+def test_the_spool_still_reads_any_lock_fault_as_not_ours() -> None:
     """The spool's own reading, kept across the extraction: a fault opens no spool rather than
     raising out of :meth:`LogSpool.open`."""
-    fd = os.open(tmp_path / "gone.lock", os.O_RDWR | os.O_CREAT, 0o600)
-    os.close(fd)
-    assert log_spool._try_lock(fd) is False
+    assert log_spool._try_lock(_a_descriptor_nothing_holds()) is False
 
 
 @pytest.mark.parametrize("module", [tls, atomic_edit], ids=["tls", "atomic-edit"])
@@ -82,16 +87,15 @@ def test_the_patched_lock_names_are_the_shared_helper(module: ModuleType) -> Non
     assert module._try_lock is file_lock.lock_exclusive
 
 
-def test_the_dr_staging_lock_still_excludes_a_second_handle(tmp_path: Path) -> None:
-    """dr_backup's two lock calls now go through :mod:`file_lock`; its release still drops it."""
-    path = tmp_path / "staging.lock"
-    first = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    second = os.open(path, os.O_RDWR)
+def test_dr_backup_s_release_drops_the_shared_lock(two_handles: tuple[int, int]) -> None:
+    """``_unlock_and_close`` releases a :mod:`file_lock` lock. Its two lock sites are exercised by
+    the staging tests, not here."""
+    first, second = two_handles
+    held = os.dup(first)
     try:
-        assert file_lock.lock_exclusive(first, wait=True)
+        assert file_lock.lock_exclusive(held, wait=True)
         assert file_lock.lock_exclusive(second) is False
-        dr_backup._unlock_and_close(first)  # never raises, and closes the handle
-        assert file_lock.lock_exclusive(second) is True
-        file_lock.unlock(second)
     finally:
-        os.close(second)
+        dr_backup._unlock_and_close(held)  # never raises, and closes the handle
+    assert file_lock.lock_exclusive(second) is True
+    file_lock.unlock(second)

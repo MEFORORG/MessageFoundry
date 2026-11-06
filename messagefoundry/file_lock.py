@@ -2,12 +2,13 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """An exclusive OS lock on an open file, the one statement of it (BACKLOG #2279 item 9).
 
-The generated TLS pair (``api/tls.py``), the config edit lock (``config/atomic_edit.py``), the log
-spool (``log_spool.py``) and the DR staging directory (``pipeline/dr_backup.py``) each wrote the
-same ``msvcrt.locking`` / ``fcntl.flock`` pair. They now call this one. A caller that reads a
-failure differently, such as the spool treating any ``OSError`` as "not ours", wraps it.
+At least four modules wrote the same ``msvcrt.locking`` / ``fcntl.flock`` pair before this one:
+the generated TLS pair (``api/tls.py``), the config edit lock (``config/atomic_edit.py``), the log
+spool (``log_spool.py``) and the DR staging directory (``pipeline/dr_backup.py``). A caller that
+reads a failure differently, such as the spool treating any ``OSError`` as "not ours", wraps it.
 
 A leaf module: it imports nothing from the engine, so any package may use it.
+``tests/test_dependency_boundaries.py`` holds it to the standard library.
 
 **An OS lock, not a lock FILE.** The kernel releases it when its holder dies, so a SIGKILL or a
 power loss cannot leave a lock that blocks every later start.
