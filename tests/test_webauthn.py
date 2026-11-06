@@ -33,6 +33,7 @@ from messagefoundry.auth.service import AuthService, Elevation  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore, WebAuthnCredential  # noqa: E402
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin  # noqa: E402
+from tests._enrolment_code import enrolment_code_for  # noqa: E402
 from tests._fake_directory import DirectoryOf  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
@@ -1166,6 +1167,7 @@ async def test_a_first_passkey_registration_finishes_the_first_sign_in_and_recor
             client="10.6.6.6",
             rp_id=RP,
             origin=ORIGIN,
+            enrolment_code=await enrolment_code_for(service, out.identity.user_id),  # ADR 0207
         )
         assert elevation.ok
 

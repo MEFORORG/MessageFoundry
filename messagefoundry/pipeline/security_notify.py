@@ -27,6 +27,8 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
+    ENROLMENT_CODE_ISSUED,
+    ENROLMENT_CODE_SPENT,
     FEDERATED_IDENTITY_BOUND,
     FEDERATED_IDENTITY_UNBOUND,
     FIRST_ADMINISTRATOR_TAKEOVER,
@@ -101,6 +103,8 @@ _SUBJECTS = {
     NEW_ADDRESS_REVERIFY: "A sensitive action on your MessageFoundry account from a new location",
     LOGIN_NEW_IP: "New MessageFoundry sign-in from a new location",
     ACCOUNT_CREATED: "A MessageFoundry account was created with this address",
+    ENROLMENT_CODE_ISSUED: "An enrolment code was issued for your MessageFoundry account",
+    ENROLMENT_CODE_SPENT: "An enrolment code you issued was used",
 }
 
 _DESCRIPTIONS = {
@@ -164,6 +168,17 @@ _DESCRIPTIONS = {
     ),
     ACCOUNT_CREATED: (
         "An administrator created this account and set this address to receive its security notices."
+    ),
+    # ADR 0207. Neither names the code. The issued notice does not invite a reply: the handover is
+    # the control, and it must not run back through a mailbox the directory password opens.
+    ENROLMENT_CODE_ISSUED: (
+        "An administrator issued a one-time enrolment code for your account, which lets it add its "
+        "first two-factor authenticator. The administrator gives it to you directly. If you did not "
+        "ask for one, contact your administrator through your organization's identity check."
+    ),
+    ENROLMENT_CODE_SPENT: (
+        "An enrolment code you issued was used to add another account's first two-factor "
+        "authenticator. If that was not the person you gave it to, reset that account's MFA."
     ),
     # BACKLOG #288. States what happened and what it cost the session, and nothing about blocking:
     # the sign-in was NOT refused, so a notice implying it was would be false. "Started", because
@@ -358,6 +373,14 @@ def _build_body(event: SecurityEvent) -> str:
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
         lines.append(f"Failed attempts: {failed}")
     lines += lock_lines
+    if event.event_type == ENROLMENT_CODE_SPENT:
+        # ADR 0207 Amendment A, A5: the issuer's notice names the account that spent the code, as
+        # one printable token for the reason the issuer reminder below gives.
+        spender = str(event.detail.get("holder") or "")
+        if spender.isprintable() and spender and not any(c.isspace() for c in spender):
+            lines.append(f"Account: {spender}")
+        elif spender:
+            lines.append("Account: (a username that cannot be shown safely here)")
     if event.event_type in (
         PASSWORD_RESET,
         TEMPORARY_CREDENTIAL_EXPIRING,

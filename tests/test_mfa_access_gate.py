@@ -43,6 +43,7 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
 from messagefoundry.store.store import WebAuthnCredential
 from tests._admin_account import create_admin, create_local_user_chosen
+from tests._enrolment_code import enrolment_code_for
 from tests._fake_directory import DirectoryOf
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
@@ -928,7 +929,12 @@ async def test_a_directory_account_is_still_told_its_password_lives_in_the_direc
         assert setup.identity is not None and setup.token is not None
         enrollment = await service.begin_mfa_enrollment(setup.identity)
         code = fresh_totp(enrollment.secret)
-        assert (await service.confirm_mfa_enrollment(setup.identity, code, token=setup.token)).ok
+        issued = await enrolment_code_for(service, setup.identity.user_id)  # ADR 0207
+        assert (
+            await service.confirm_mfa_enrollment(
+                setup.identity, code, token=setup.token, enrolment_code=issued
+            )
+        ).ok
     out = await service._complete_ad_login(_principal("aduser9"), None, mfa_verified=mfa_verified)
     assert out.ok and out.token is not None
     assert await service.mfa_satisfied(out.token) is mfa_verified
@@ -1081,7 +1087,10 @@ async def test_the_status_and_last_factor_guards_skip_the_directory_floor_the_ga
     async def enrol_totp(identity: Identity, token: str) -> None:
         enrollment = await service.begin_mfa_enrollment(identity)
         confirmed = await service.confirm_mfa_enrollment(
-            identity, fresh_totp(enrollment.secret), token=token
+            identity,
+            fresh_totp(enrollment.secret),
+            token=token,
+            enrolment_code=await enrolment_code_for(service, identity.user_id),  # ADR 0207
         )
         assert confirmed.ok
 
@@ -1266,10 +1275,14 @@ async def test_a_directory_session_minted_at_the_minimum_is_confined_until_it_en
         assert refused.status_code == 403
         assert refused.headers.get("X-MFA-Required") == "1"
 
-    # The confinement is survivable: the ceremony accepts the directory account.
+    # The confinement is survivable: the ceremony accepts the directory account, with the
+    # enrolment code an Administrator issues for its first factor (ADR 0207).
     enroll = await service.begin_mfa_enrollment(out.identity)
     confirmed = await service.confirm_mfa_enrollment(
-        out.identity, fresh_totp(enroll.secret), token=out.token
+        out.identity,
+        fresh_totp(enroll.secret),
+        token=out.token,
+        enrolment_code=await enrolment_code_for(service, out.identity.user_id),
     )
     assert confirmed.recovery_codes
     # Confirming ROTATES the session (ASVS 7.2.4, BACKLOG #1146): the gate lifts on the NEW token,

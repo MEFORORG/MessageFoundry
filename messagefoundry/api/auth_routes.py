@@ -1752,7 +1752,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             detail="use the self-service MFA settings for your own account",
         )
         try:
-            issued = await service.admin_reset_mfa(user_id, actor=identity.username)
+            reset = await service.admin_reset_mfa(
+                user_id, actor=identity.username, actor_id=identity.user_id
+            )
         except TemporaryPasswordUnavailable as exc:
             # As on the password reset: raised before the account is touched, so the factors and
             # sessions are untouched, the spent grant is given back, and the console answers 503.
@@ -1768,6 +1770,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise HTTPException(code, detail) from exc
         # ADR 0197 Amendment A, AC-A4: a local account's reset also issued a generated credential,
         # returned ONCE here for the administrator to convey out-of-band.
+        issued = reset.credential
         return MfaResetResponse(
             detail="MFA reset",
             temp_password=None if issued is None else issued.password,

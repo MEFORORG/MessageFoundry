@@ -348,7 +348,8 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/auth/service.py": frozenset(
         {"hashlib", "messagefoundry.config.tls_policy", "messagefoundry.store.crypto", "secrets"}
     ),
-    "messagefoundry/auth/tokens.py": frozenset({"hashlib", "secrets"}),
+    # ADR 0207: hmac.compare_digest checks a directory account's enrolment code digest.
+    "messagefoundry/auth/tokens.py": frozenset({"hashlib", "hmac", "secrets"}),
     "messagefoundry/auth/totp.py": frozenset({"hashlib", "hmac", "secrets"}),
     # WP #285 (ASVS 6.7.1): SHA-256 fingerprint of an operator-supplied auth-path trust anchor
     # (oidc/ad/api-client CA PEM) — the optional pin compared at construction + reload, and the
@@ -1205,6 +1206,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # The OIDC `state` compare moved into FlowCache.pop_if_state_matches (BACKLOG #3198), so
             # it is listed under messagefoundry/auth/oidc/flow.py and no longer here.
             "compare:via messagefoundry.auth.oidc_http",  # BACKLOG #1167: the anchor pin compare
+            # ADR 0207: a binding step checks a directory account's enrolment code
+            # (tokens.enrolment_code_matches).
+            "compare:via messagefoundry.auth.tokens",
             "compare:via messagefoundry.auth.totp",
             "csprng:secrets.token_urlsafe",
             "csprng:via messagefoundry.auth.oidc.flow",
@@ -1231,7 +1235,14 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
         }
     ),
     "messagefoundry/auth/tokens.py": frozenset(
-        {"csprng:secrets.token_urlsafe", "hash:hashlib.sha256"}
+        {
+            # ADR 0207: a directory account's enrolment code is 160 bits from secrets.token_bytes,
+            # stored only as its SHA-256 digest and checked with a constant-time compare.
+            "compare:hmac.compare_digest",
+            "csprng:secrets.token_bytes",
+            "csprng:secrets.token_urlsafe",
+            "hash:hashlib.sha256",
+        }
     ),
     "messagefoundry/auth/totp.py": frozenset(
         {
