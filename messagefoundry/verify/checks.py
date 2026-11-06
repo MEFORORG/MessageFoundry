@@ -18,7 +18,6 @@ manufactured by the check.
 from __future__ import annotations
 
 import ast
-import functools
 import importlib
 import importlib.metadata
 import importlib.util
@@ -117,10 +116,10 @@ def _census(odbc_hops: Callable[[], OdbcHops]) -> OdbcHops:
         return OdbcHops(unknown=f"the hop census raised {type(exc).__name__}: {reason}")
 
 
-def _no_hop_detail(hops: OdbcHops) -> str:
+def _no_hop_detail(hops: OdbcHops, on: str) -> str:
     return (
-        f"no ODBC Driver 18 hop in {hops.judged} (no SQL Server store, DATABASE connection, "
-        "DatabaseRef or DatabaseLookup)"
+        f"no ODBC hop in {hops.judged} (no SQL Server store, and no DATABASE connection, "
+        f"DatabaseRef or DatabaseLookup {on})"
     )
 
 
@@ -195,7 +194,7 @@ def check_sqlserver_odbc_driver(odbc_hops: Callable[[], OdbcHops]) -> CheckResul
             reading.id,
             reading.title,
             Status.SKIP,
-            f"{_no_hop_detail(hops)}, so no hop needs the driver; it reads "
+            f"{_no_hop_detail(hops, 'naming that driver')}, so no hop needs it; it reads "
             f"{reading.status.value}: {reading.detail}",
             evidence=reading.evidence,
         )
@@ -232,7 +231,8 @@ def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
             rid,
             title,
             Status.SKIP,
-            f"{_no_hop_detail(hops)}, so the host policy does not reach one",
+            f"{_no_hop_detail(hops, 'on a Microsoft SQL Server driver')}, so the host policy does "
+            "not reach one",
         )
     try:
         reading = cipher_policy.read_host_cipher_policy()
@@ -578,18 +578,18 @@ def run_host_checks(
     ports: dict[str, int],
     writable_dir: Path,
     odbc_hops: Callable[[], OdbcHops],
+    driver_18_hops: Callable[[], OdbcHops],
 ) -> list[CheckResult]:
     """Run every host/environment check and return their results (order is stable).
 
-    ``odbc_hops`` reads which ODBC hops the configuration takes, for :func:`check_sqlserver_odbc_driver`
-    and :func:`check_host_cipher_policy`. It is taken at most once, and both rows read that answer,
-    because it can load the configuration."""
-    census = functools.cache(functools.partial(_census, odbc_hops))
+    ``odbc_hops`` reads which ODBC hops the configuration takes, for
+    :func:`check_host_cipher_policy`, and ``driver_18_hops`` which of them name Driver 18, for
+    :func:`check_sqlserver_odbc_driver`."""
     return [
         check_python_runtime(),
         check_optional_drivers(),
-        check_sqlserver_odbc_driver(census),
-        check_host_cipher_policy(census),
+        check_sqlserver_odbc_driver(driver_18_hops),
+        check_host_cipher_policy(odbc_hops),
         check_postgres_driver(),
         check_listener_ports(ports),
         check_writable_dir(writable_dir),

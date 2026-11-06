@@ -45,7 +45,10 @@ def _no_host_cipher_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_run_host_checks_never_errors(tmp_path: Path) -> None:
     results = checks.run_host_checks(
-        ports={"MLLP": 2575}, writable_dir=tmp_path, odbc_hops=checks.OdbcHops
+        ports={"MLLP": 2575},
+        writable_dir=tmp_path,
+        odbc_hops=checks.OdbcHops,
+        driver_18_hops=checks.OdbcHops,
     )
     assert results, "no host checks produced"
     for r in results:
@@ -183,7 +186,10 @@ def test_host_console_row_is_gone(tmp_path: Path) -> None:
     prerequisite left for it to check."""
     assert not hasattr(checks, "check_console_importable")
     results = checks.run_host_checks(
-        ports={"MLLP": 2575}, writable_dir=tmp_path, odbc_hops=checks.OdbcHops
+        ports={"MLLP": 2575},
+        writable_dir=tmp_path,
+        odbc_hops=checks.OdbcHops,
+        driver_18_hops=checks.OdbcHops,
     )
     assert "host.console" not in {r.id for r in results}
 

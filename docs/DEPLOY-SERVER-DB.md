@@ -802,8 +802,8 @@ handed*, states what each one gets.
 **It reads the policy only where an ODBC Driver 18 hop is configured.** It needs `pyodbc`
 installed in the Python that runs `verify`, found on the import path without being imported. It
 then asks whether the configuration takes such a hop: a `sqlserver` store backend in the service
-settings, or a SQL Server dialect DATABASE connection, a `DatabaseRef` reference set or a
-`DatabaseLookup` in the `--config` graph. A hop found names itself in the row's evidence. The graph
+settings, or a deployed DATABASE connection, a `DatabaseRef` reference set or a
+`DatabaseLookup` in the `--config` graph whose `odbc_driver` is a Microsoft SQL Server driver. A hop found names itself in the row's evidence. The graph
 is loaded only when the store is not already a hop, and loading it runs the config modules, as the
 self smoke does, so `--section host` runs them too. With no hop configured the row SKIPs and names
 what it read, so a host that only has `pyodbc` installed does not fail on a policy nothing of it
@@ -811,8 +811,8 @@ uses.
 
 The answer is unknown where at least one of these holds: the graph did not load or there is no
 `--config` directory; the service settings did not load; the shell that runs `verify` does not set
-`MEFOR_STORE_BACKEND`; or every DATABASE connection found uses the generic dialect, whose driver
-brings its own TLS. That variable overrides the service config file, and the service's own
+`MEFOR_STORE_BACKEND`; or no entry found is on a Microsoft driver, and one names its driver by an
+`env()` reference or uses another vendor's driver, which may bring its own TLS. That variable overrides the service config file, and the service's own
 environment may set it where your shell does not, so a file that says `sqlite` does not show the
 store the service opens, which could be SQL Server. The row then still reads the policy, but
 reports a FAIL or ERROR reading as MANUAL with the reading in its detail. Run `verify` with

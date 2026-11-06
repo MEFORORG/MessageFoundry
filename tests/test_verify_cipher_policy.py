@@ -1556,7 +1556,7 @@ def test_pyodbc_with_no_configured_hop_skips(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(cipher_policy, "read_host_cipher_policy", must_not_run)
     r = checks.check_host_cipher_policy(lambda: checks.OdbcHops(judged="the graph in 'cfg'"))
     assert (r.id, r.status) == ("host.ciphers", Status.SKIP)
-    assert "no ODBC Driver 18 hop in the graph in 'cfg'" in r.detail
+    assert "no ODBC hop in the graph in 'cfg'" in r.detail
 
 
 @pytest.mark.parametrize(
@@ -1641,7 +1641,7 @@ def test_a_missing_driver_with_no_configured_hop_skips(monkeypatch: pytest.Monke
     _odbc_drivers(monkeypatch, "SQL Server")
     r = checks.check_sqlserver_odbc_driver(lambda: checks.OdbcHops(judged="the graph in 'cfg'"))
     assert (r.id, r.status) == ("host.odbc", Status.SKIP)
-    assert "no ODBC Driver 18 hop in the graph in 'cfg'" in r.detail
+    assert "no ODBC hop in the graph in 'cfg'" in r.detail
     assert "reads FAIL" in r.detail and "not found" in r.detail
 
 
@@ -1680,24 +1680,20 @@ def test_a_present_driver_passes_without_the_census(monkeypatch: pytest.MonkeyPa
     assert checks.check_sqlserver_odbc_driver(must_not_run).status is Status.PASS
 
 
-def test_both_rows_share_one_census(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The census can load the configuration, so ``host.odbc`` and ``host.ciphers`` read one
-    answer rather than taking it twice."""
-    calls: list[int] = []
-
-    def census() -> checks.OdbcHops:
-        calls.append(1)
-        return checks.OdbcHops(unknown="no config dir")
-
+def test_each_row_reads_its_own_census(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``host.odbc`` asks which hops name Driver 18, ``host.ciphers`` which take the host policy,
+    and ``run_host_checks`` hands each row its own answer."""
     _odbc_drivers(monkeypatch, "SQL Server")
-    stub = CheckResult("host.ciphers", "t", Status.FAIL, "stub reading")
-    monkeypatch.setattr(cipher_policy, "read_host_cipher_policy", lambda: stub)
+    _with_pyodbc(monkeypatch, Status.FAIL)
     monkeypatch.setattr(sys, "platform", "linux")
-    rows = {
-        r.id: r for r in checks.run_host_checks(ports={}, writable_dir=tmp_path, odbc_hops=census)
-    }
-    assert (rows["host.odbc"].status, rows["host.ciphers"].status) == (Status.MANUAL, Status.MANUAL)
-    assert calls == [1]
+    results = checks.run_host_checks(
+        ports={},
+        writable_dir=tmp_path,
+        odbc_hops=lambda: _A_HOP,
+        driver_18_hops=lambda: checks.OdbcHops(judged="the graph"),
+    )
+    rows = {r.id: r for r in results}
+    assert (rows["host.odbc"].status, rows["host.ciphers"].status) == (Status.SKIP, Status.FAIL)
 
 
 def test_the_graph_is_loaded_once_per_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1731,18 +1727,18 @@ def test_the_graph_is_loaded_once_per_run(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert loads == [True]
 
 
-def test_the_wiring_reader_names_the_hops_and_the_undecided_connections() -> None:
-    """BACKLOG #3803 R3: one wiring-level reader of the SQL Server ODBC hops. An ``env()``
-    dialect may resolve to generic, so it is undecided, unless the connection is not deployed,
-    which leaves it unbuilt, as the other DATABASE readers in wiring read it. An inbound is named
-    by its record name, so one that shares an outbound's name is not read as the same hop."""
+def test_the_wiring_reader_names_each_odbc_entry_and_its_driver() -> None:
+    """BACKLOG #3803 R3: one wiring-level reader of the entries that open an ODBC connection. An
+    ``env()`` driver is ``None``; a connection that is not deployed is never built, so it is left
+    out. An inbound is named by its record name, so one that shares an outbound's name stays a
+    hop of its own."""
     from messagefoundry.config.models import ConnectorType
     from messagefoundry.config.wiring import (
         ConnectionSpec,
         InboundConnection,
         Registry,
         env,
-        sqlserver_odbc_hops,
+        odbc_hops,
     )
 
     poll = InboundConnection(
@@ -1752,19 +1748,53 @@ def test_the_wiring_reader_names_the_hops_and_the_undecided_connections() -> Non
         inbound={"OB_B": poll},
         outbound={
             "OB_B": _database("OB_B"),
-            "OB_A": _database("OB_A", "SQLSERVER"),
-            "OB_ENV": _database("OB_ENV", env("db_dialect")),
-            "OB_DARK": _database("OB_DARK", env("db_dialect"), deployed=False),
-            "OB_PG": _database("OB_PG", "generic"),
+            "OB_ENV": _database("OB_ENV", driver=env("db_driver")),
+            "OB_DARK": _database("OB_DARK", deployed=False),
+            "OB_PG": _database("OB_PG", "generic", driver="PostgreSQL Unicode"),
         },
     )
-    hops, other = sqlserver_odbc_hops(reg)
-    assert hops == [
-        ("DATABASE connection", "OB_A"),
-        ("DATABASE connection", "OB_B"),
-        ("DATABASE connection", "inbound:OB_B"),
+    driver_18 = "ODBC Driver 18 for SQL Server"
+    assert odbc_hops(reg) == [
+        ("DATABASE connection", "OB_B", driver_18),
+        ("DATABASE connection", "OB_ENV", None),
+        ("DATABASE connection", "OB_PG", "PostgreSQL Unicode"),
+        ("DATABASE connection", "inbound:OB_B", driver_18),
     ]
-    assert other == ["OB_ENV", "OB_PG"]
+
+
+@pytest.mark.parametrize(
+    ("dialect", "driver", "ciphers", "odbc"),
+    [
+        # The preset's default and an explicit Driver 18: a hop for both rows.
+        (None, None, "found", "found"),
+        # The generic dialect on Microsoft's Driver 18 (the code review's round-one finding 1).
+        ("generic", "ODBC Driver 18 for SQL Server", "found", "found"),
+        # Another Microsoft driver takes the host policy, but needs no Driver 18 (finding 2).
+        (None, "ODBC Driver 17 for SQL Server", "found", "none"),
+        # Another vendor's driver needs no Driver 18 (finding 7); its own TLS is not read.
+        ("generic", "PostgreSQL Unicode", "unknown", "none"),
+    ],
+)
+def test_each_row_counts_the_hops_its_driver_question_reaches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dialect: str | None,
+    driver: str | None,
+    ciphers: str,
+    odbc: str,
+) -> None:
+    from messagefoundry.config.settings import ServiceSettings
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlite")
+    _registry_with(monkeypatch, outbound={"OB_X": _database("OB_X", dialect, driver=driver)})
+
+    def outcome(hops: checks.OdbcHops) -> str:
+        return "found" if hops.found else "unknown" if hops.unknown else "none"
+
+    settings = ServiceSettings()
+    assert outcome(_hops(tmp_path, settings=settings)) == ciphers
+    assert outcome(_hops(tmp_path, settings=settings, driver_18=True)) == odbc
 
 
 def _host_ciphers_row(results: list[CheckResult]) -> CheckResult:
@@ -1865,19 +1895,26 @@ def _registry_with(monkeypatch: pytest.MonkeyPatch, **parts: Any) -> None:
 
 
 def _hops(
-    config_dir: Path, *, settings: Any = None, service_config: str | None = "service.toml"
+    config_dir: Path,
+    *,
+    settings: Any = None,
+    service_config: str | None = "service.toml",
+    driver_18: bool = False,
 ) -> checks.OdbcHops:
     from messagefoundry.verify.runner import _Graph, _odbc_hops
 
-    return _odbc_hops(settings, service_config, str(config_dir), _Graph(str(config_dir)))
+    graph = _Graph(str(config_dir))
+    return _odbc_hops(settings, service_config, str(config_dir), graph, driver_18=driver_18)
 
 
-def _database(name: str, dialect: Any = None, *, deployed: bool = True) -> Any:
-    """An outbound DATABASE connection named ``name``, on ``dialect`` when given."""
+def _database(name: str, dialect: Any = None, *, deployed: bool = True, driver: Any = None) -> Any:
+    """An outbound DATABASE connection named ``name``, on ``dialect`` and ``driver`` when given."""
     from messagefoundry.config.models import ConnectorType
     from messagefoundry.config.wiring import ConnectionSpec, OutboundConnection
 
-    settings = {} if dialect is None else {"dialect": dialect}
+    settings: dict[str, Any] = {} if dialect is None else {"dialect": dialect}
+    if driver is not None:
+        settings["odbc_driver"] = driver
     spec = ConnectionSpec(type=ConnectorType.DATABASE, settings=settings)
     return OutboundConnection(name=name, spec=spec, deployed=deployed)
 
@@ -1923,10 +1960,12 @@ def test_a_generic_dialect_connection_alone_is_unknown(
     not be the one it takes; neither "hop" nor "no hop" is known."""
     from messagefoundry.config.settings import ServiceSettings
 
-    _registry_with(monkeypatch, outbound={"OB_PG": _database("OB_PG", "generic")})
+    _registry_with(
+        monkeypatch, outbound={"OB_PG": _database("OB_PG", "generic", driver="PostgreSQL Unicode")}
+    )
     hops = _hops(tmp_path, settings=ServiceSettings())
     assert not hops.found
-    assert hops.unknown is not None and "OB_PG may use a generic ODBC driver" in hops.unknown
+    assert hops.unknown is not None and "OB_PG uses the driver 'PostgreSQL Unicode'" in hops.unknown
 
 
 def test_the_census_without_a_hop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -2044,7 +2083,10 @@ def test_another_platform_takes_no_census(monkeypatch: pytest.MonkeyPatch) -> No
 def test_host_section_carries_the_row(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _hide_pyodbc(monkeypatch)
     results = checks.run_host_checks(
-        ports={"MLLP": 2575}, writable_dir=tmp_path, odbc_hops=checks.OdbcHops
+        ports={"MLLP": 2575},
+        writable_dir=tmp_path,
+        odbc_hops=checks.OdbcHops,
+        driver_18_hops=checks.OdbcHops,
     )
     assert "host.ciphers" in {r.id for r in results}
 

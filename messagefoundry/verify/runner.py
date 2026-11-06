@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from messagefoundry.config.settings import ServiceSettings, StoreBackend
+from messagefoundry.transports.db_endpoint import (
+    SQLSERVER_DEFAULT_DRIVER,
+    generic_driver_family,
+    sqlserver_preset_refusal,
+)
 from messagefoundry.verify.checks import (
     OdbcHops,
     check_credential_generation,
@@ -98,6 +103,15 @@ def _writable_dir(settings: ServiceSettings | None) -> Path:
     return Path.cwd()
 
 
+def _microsoft_driver(driver: str) -> bool:
+    """Whether ``driver``, an ``odbc_driver`` as written, is a Microsoft SQL Server driver: one the
+    SQL Server preset accepts, or the generic dialect's Microsoft family."""
+    return (
+        sqlserver_preset_refusal({"odbc_driver": driver}) is None
+        or generic_driver_family(driver) == "msodbc"
+    )
+
+
 class _Graph:
     """The ``--config`` graph, loaded at most once per verify run (BACKLOG #3803 R2).
 
@@ -129,24 +143,31 @@ def _odbc_hops(
     service_config: str | None,
     config_dir: str,
     graph: Callable[[], Registry],
+    *,
+    driver_18: bool = False,
 ) -> OdbcHops:
-    """Which ODBC Driver 18 hops this deployment takes, for the ``host.odbc`` and ``host.ciphers``
-    rows (BACKLOG #3277, #3803 R6).
+    """Which ODBC hops this deployment takes, for the ``host.ciphers`` row, or with ``driver_18``
+    which of them name ODBC Driver 18 for SQL Server, for the ``host.odbc`` row (BACKLOG #3277,
+    #3803 R6).
 
-    The SQL Server store is read from the service settings. The graph's hops are read by
-    :func:`~messagefoundry.config.wiring.sqlserver_odbc_hops` from ``graph``, the run's one load of
-    ``config_dir``, only when the store has not already shown a hop. A hop found either way is enough.
+    The SQL Server store, which always names Driver 18, is read from the service settings. The
+    graph's entries are read by :func:`~messagefoundry.config.wiring.odbc_hops` from ``graph``, the
+    run's one load of ``config_dir``, only when the store has not already shown a hop. A hop found
+    either way is enough. For ``host.ciphers`` a hop is an entry on a Microsoft SQL Server driver,
+    whose TLS the host policy decides; for ``host.odbc`` it is an entry naming Driver 18, which
+    pyodbc must list, so an entry on another driver needs nothing of that row.
 
     Anything not read leaves the answer unknown rather than "no hop", because a hop could sit in it:
     a graph that does not load, settings that did not load, or a shell with no
     ``MEFOR_STORE_BACKEND``. That variable overrides the settings file, and an operator's shell
     need not carry the service's own environment, so without it even a file that says sqlite does
-    not show the service's store (BACKLOG #3803 R1). A DATABASE connection that may use a generic
-    driver is unknown too: that driver, not Driver 18, decides its TLS."""
+    not show the service's store (BACKLOG #3803 R1). An entry whose driver is an ``env()``
+    reference is unknown too, and so for ``host.ciphers`` is one on another vendor's driver, which
+    may bring its own TLS."""
     if settings is not None and settings.store.backend is StoreBackend.SQLSERVER:
         return OdbcHops(found=("the [store] backend is sqlserver",))
     from messagefoundry.config.settings import settings_file_path
-    from messagefoundry.config.wiring import WiringError, sqlserver_odbc_hops
+    from messagefoundry.config.wiring import WiringError, odbc_hops
     from messagefoundry.redaction import codec_safe_str
 
     if Path(config_dir) == Path(_DEFAULT_CONFIG_DIR):
@@ -160,14 +181,26 @@ def _odbc_hops(
         # SystemExit: a config module that exits at import must not end the verify run.
         reason = codec_safe_str(exc)[:200]
         return OdbcHops(unknown=f"the config dir {config_dir!r} did not load: {reason}")
-    hops, other = sqlserver_odbc_hops(reg)
-    if hops:
-        return OdbcHops(found=tuple(f"{kind} {name}" for kind, name in hops))
-    if other:
-        return OdbcHops(
-            unknown=f"DATABASE connection {other[0]} may use a generic ODBC driver (its dialect "
-            "is not a literal sqlserver), whose TLS this row does not read"
-        )
+    found: list[str] = []
+    undecided: list[str] = []
+    for kind, name, driver in odbc_hops(reg):
+        label = f"{kind} {name}"
+        if driver is None:
+            undecided.append(f"{label} names its odbc_driver by an env() reference")
+        elif driver_18:
+            if driver.strip().lower() == SQLSERVER_DEFAULT_DRIVER.lower():
+                found.append(label)
+        elif _microsoft_driver(driver):
+            found.append(label)
+        else:
+            undecided.append(
+                f"{label} uses the driver {driver!r}, which may bring its own TLS, and this row "
+                "does not read it"
+            )
+    if found:
+        return OdbcHops(found=tuple(found))
+    if undecided:
+        return OdbcHops(unknown=undecided[0])
     if settings is None:
         return OdbcHops(unknown="service settings did not load, so the store backend is not known")
     # Spelled as load_settings reads it: the prefix exactly, the rest in any case.
@@ -330,6 +363,9 @@ def run_verify(
             ports=ports,
             writable_dir=_writable_dir(settings),
             odbc_hops=lambda: _odbc_hops(settings, service_config, config_dir, graph),
+            driver_18_hops=lambda: _odbc_hops(
+                settings, service_config, config_dir, graph, driver_18=True
+            ),
         )
 
     if "store" in selected:
