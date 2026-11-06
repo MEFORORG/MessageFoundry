@@ -144,7 +144,6 @@ def _entrypoint_modules() -> set[str]:
             path = _module_file(module, run=True)
             assert path, f"an ENTRYPOINT runs `-m {module}`, which names no file in the tree"
             found.add(path)
-    assert found, "docker/Dockerfile has no exec-form ENTRYPOINT line; this test has drifted"
     return found
 
 
@@ -196,7 +195,7 @@ def _scripts_run_by_docker_smoke() -> set[str]:
 
 def test_every_entrypoint_module_trips_the_gate() -> None:
     entries = _entrypoint_modules()
-    assert entries, "no exec-form ENTRYPOINT with -m was read from the Dockerfile"
+    assert entries, "docker/Dockerfile has no exec-form ENTRYPOINT line; this test has drifted"
     assert len(entries) == 1, f"the image's ENTRYPOINT lines run different modules: {entries}"
     missed = sorted(path for path in entries if not gate([path]))
     assert not missed, f"editing the image's ENTRYPOINT module does not run the smoke: {missed}"
@@ -204,7 +203,9 @@ def test_every_entrypoint_module_trips_the_gate() -> None:
 
 def test_the_pr_2284_engine_files_trip_the_gate() -> None:
     """Each file alone, so dropping any one of the three arms reds here."""
-    assert PR_2284_ENGINE_FILES, "the PR 2284 file list is empty, so nothing below is checked"
+    assert len(PR_2284_ENGINE_FILES) >= 3, (
+        f"PR 2284 changed three engine files: {PR_2284_ENGINE_FILES}"
+    )
     missed = [path for path in PR_2284_ENGINE_FILES if not gate([path])]
     assert not missed, f"these PR 2284 files no longer run the docker smoke: {missed}"
 
