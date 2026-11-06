@@ -5407,8 +5407,12 @@ revoked. A pass with any referral audits `auth.ad_reconcile_referred` and raises
 `ad_reconcile_aborted` alert with reason `directory_referral`, under its own source
 `directory-reconciler-referral`. So it is its own instance, apart from the breaker's, and
 acknowledging or suspending one does not silence the other. An `[alerts]` rule keyed on the event
-type alone matches the breaker, the referral, the probe fault, the configuration refusal and each
-paging refusal, and so does a source glob such as `directory-reconciler*`, which also matches the hold's
+type alone matches at least the breaker, the referral, the probe fault, the configuration refusal,
+each paging refusal, the lasting outage and each account the directory keeps failing to answer
+for while it answers others (`directory-reconciler-unreached:<username>`, reason
+`account_unreachable`, audited as `auth.ad_reconcile_unreached`, vault BACKLOG #3100; past
+`ad_session_revoke_max` such accounts on one pass they page once, under the bare
+`directory-reconciler-unreached` source), and so does a source glob such as `directory-reconciler*`, which also matches the hold's
 `ad_reconcile_held`. To mute only the referral, a rule names its source exactly. The alert's text
 names `ad_user_search_base`, `ad_group_search_base` and `ad_bind_dn`. A bind response that carries a
 referral, the service account's included, is a referral too (BACKLOG #3010). ldap3 cannot decode

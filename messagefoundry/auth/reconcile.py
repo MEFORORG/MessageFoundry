@@ -353,6 +353,11 @@ class ReconcilePlan:
     #: unreachable. An account already in that state is not here, so each pages once per state
     #: change. Empty on a pass that did not reach the directory.
     unreached: tuple[tuple[str, str, int], ...] = ()
+    #: Set with ``unreached`` (BACKLOG #3100): True when more accounts entered on this pass than
+    #: ``[auth].ad_session_revoke_max``, so the lifespan task pages once for all of them rather
+    #: than once per account. A directory that answers only a few probes in each pass would
+    #: otherwise open an instance per signed-in account.
+    unreached_rollup: bool = False
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709): how many
     #: passes running, this one included, have read the directory unreachable
     #: (:attr:`directory_outage`), in this process. 0 on a pass that reached it. A pass whose

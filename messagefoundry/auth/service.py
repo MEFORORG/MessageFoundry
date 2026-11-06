@@ -8161,8 +8161,8 @@ class AuthService:
         An ``LdapError`` probe reads :attr:`~reconcile.ProbeOutcome.UNAVAILABLE`, fail-open: no
         strike and no revocation. On a pass where every probe fails that is a whole-directory
         outage, which pages once it lasts (:meth:`_note_directory_outage`). An account the
-        directory fails for on every probe while it answers the rest was bounded by nothing
-        before this: no strike and no alert, so its sessions ran to the absolute cap. Once
+        directory fails for on every probe while it answers the rest would, without this, have
+        no bound short of the absolute session cap and page nobody. Once
         ``[auth].ad_reconcile_outage_passes`` of its probes running read it so, the pass pages for
         it once, naming the account, as a paging refusal pages (:meth:`_note_paging_refusals`).
         The same setting, so one knob says how long a failure lasts before it pages.
@@ -8171,43 +8171,74 @@ class AuthService:
         reads: an outage pages on its own and leaves every count as it stands, and so does a pass
         that asked nothing or whose every probe failed or faulted. On a pass that counts, an
         unreachable probe adds one, and any other answer ends the account's run and re-arms its
-        page. A group search refused for its bound is not counted: the user search answered, and
-        it pages on its own (vault BACKLOG #3696). An account the pass did not probe keeps its
-        count. The latch is set only once the account's row is recorded
-        (:meth:`_record_unreached_accounts`), so a pass that raises before then leaves the next
-        pass to page."""
+        page, with a WARNING where it had paged, so an operator can tell when to resolve it. A
+        probe fault neither adds nor ends, on any pass: like a fault-only pass, it says nothing
+        about whether the directory was reached, and it pages on its own. A group search refused
+        for its bound is not counted: the user search answered, and it pages on its own (vault
+        BACKLOG #3696). An account the pass did not probe keeps its count.
+
+        **A flapping directory must not page every account.** Where more than
+        ``[auth].ad_session_revoke_max`` accounts enter on one pass, as a directory that answers
+        a few probes in each pass would make them, the lifespan task pages once for all of them
+        (``unreached_rollup``), and each still gets its own row.
+
+        The latch is set only once the account's row is recorded
+        (:meth:`_record_unreached_accounts`), so a pass that raises, or whose row is refused,
+        leaves the next pass to page."""
         if not plan.reached_directory:
             return plan
         runs, paged = self._reconcile_unreached_runs, self._reconcile_unreached_paged
         threshold = self._settings.ad_reconcile_outage_passes
         entered: list[tuple[str, str, int]] = []
         for probe in probes:
-            if probe.outcome is reconcile.ProbeOutcome.UNKEYED:
-                continue  # never asked, so it says nothing about the directory
+            if probe.outcome in (reconcile.ProbeOutcome.UNKEYED, reconcile.ProbeOutcome.FAULT):
+                continue  # never asked, or an answer the engine could not read
             if probe.outcome is not reconcile.ProbeOutcome.UNAVAILABLE or probe.detail is not None:
-                runs.pop(probe.user_id, None)
-                paged.discard(probe.user_id)
+                run = runs.pop(probe.user_id, 0)
+                if probe.user_id in paged:
+                    paged.discard(probe.user_id)
+                    _log.warning(
+                        "directory reconcile: %s was answered for again after %d unreachable "
+                        "probes; its directory-reconciler-unreached alert can be resolved",
+                        scrub_log_argument(probe.username),
+                        run,
+                    )
                 continue
             runs[probe.user_id] = count = runs.get(probe.user_id, 0) + 1
             if count >= threshold and probe.user_id not in paged:
                 entered.append((probe.user_id, probe.username, count))
-        return replace(plan, unreached=tuple(entered))
+        return replace(
+            plan,
+            unreached=tuple(entered),
+            unreached_rollup=len(entered) > self._settings.ad_session_revoke_max,
+        )
 
     async def _record_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:
         """Log, audit and latch each account entering the lasting unreachable state (BACKLOG #3100
         closing step 2; :meth:`_note_unreached_accounts` says when one enters).
 
-        One WARNING and one ``auth.ad_reconcile_unreached`` row per entry, naming the account as
-        ``actor``, so the page the lifespan task raises for it matches a row (ASVS 8.3.2). Through
-        the reconciler's soft write, after the revocations, as a paging refusal's row is."""
-        for user_id, username, probes in plan.unreached:
+        One ``auth.ad_reconcile_unreached`` row per entry, naming the account as ``actor``, so the
+        page the lifespan task raises for it matches a row (ASVS 8.3.2), and one WARNING naming it,
+        or one WARNING with the count on a rolled-up pass. Through the reconciler's soft write,
+        after the revocations, as a paging refusal's row is. A refused row leaves the account
+        unlatched, so the next pass writes it again and pages again."""
+        if plan.unreached_rollup:
             _log.warning(
-                "directory reconcile: %d probes running of %s failed to reach the directory while "
-                "it answered for other accounts, so its sessions are not revoked while this lasts",
-                probes,
-                scrub_log_argument(username),
+                "directory reconcile: %d accounts entered a run of unreachable probes while the "
+                "directory answered others, so their sessions are not revoked while this lasts; "
+                "each has an auth.ad_reconcile_unreached row",
+                len(plan.unreached),
             )
-            await self._audit_reconciler_row(
+        for user_id, username, probes in plan.unreached:
+            if not plan.unreached_rollup:
+                _log.warning(
+                    "directory reconcile: %d probes running of %s failed to reach the directory "
+                    "while other probes got an answer, so its sessions are not revoked while this "
+                    "lasts",
+                    probes,
+                    scrub_log_argument(username),
+                )
+            written = await self._audit_reconciler_row(
                 "auth.ad_reconcile_unreached",
                 actor=username,
                 detail=_json(
@@ -8219,7 +8250,8 @@ class AuthService:
                     }
                 ),
             )
-            self._reconcile_unreached_paged.add(user_id)
+            if written:
+                self._reconcile_unreached_paged.add(user_id)
 
     def _note_directory_outage(self, plan: reconcile.ReconcilePlan) -> reconcile.ReconcilePlan:
         """Count the passes running that read the directory unreachable, and say on the plan
@@ -8394,7 +8426,8 @@ class AuthService:
         reconcile.prune_ledger(self._reconcile_outcomes, users, rank=reconcile.outcome_rank)
         reconcile.prune_ledger(self._reconcile_paging_refused, users, rank=lambda _cause: 0.0)
         reconcile.prune_ledger(self._reconcile_unreached_runs, users, rank=float)
-        self._reconcile_unreached_paged.intersection_update(users)
+        # Every latched account has a run, so the runs' prune, cap included, bounds the latch.
+        self._reconcile_unreached_paged &= self._reconcile_unreached_runs.keys()
         if reconcile.ProbeOutcome.UNDETERMINED not in self._reconcile_outcomes.values():
             # u is 0: every held account has left the record, so the hysteresis has nothing to hold.
             self._reconcile_hold_latched = False
@@ -8957,8 +8990,8 @@ class AuthService:
         if before != "forfeit" and self._reconcile_breaker_standing == "forfeit":
             _log.warning(
                 "directory reconcile: an account signed in at the last breaker trip left before a "
-                "pass read it clean, so this process will not resolve ad_reconcile_aborted itself "
-                "until it restarts; an operator resolves it once the directory reads clean"
+                "pass read it clean, so this process will not resolve ad_reconcile_aborted itself; "
+                "an operator resolves it once the directory reads clean" + _FORFEIT_NOBODY_ELSE
             )
 
     def _advance_referral_standing(self, event: _ReferralStanding) -> None:
@@ -8977,8 +9010,8 @@ class AuthService:
             _log.warning(
                 "directory reconcile: an account signed in at the last LDAP referral left before a "
                 "pass read it without one, so this process will not resolve the referral's "
-                "ad_reconcile_aborted instance itself until it restarts; an operator resolves it "
-                "once the search bases are fixed"
+                "ad_reconcile_aborted instance itself; an operator resolves it once the search "
+                "bases are fixed" + _FORFEIT_NOBODY_ELSE
             )
 
     def _advance_hold_standing(self, event: _HoldStanding) -> None:
@@ -9000,8 +9033,8 @@ class AuthService:
             # (BACKLOG #3084).
             _log.warning(
                 "directory reconcile: an account whose userAccountControl read undetermined left "
-                "%s, so this process will not resolve ad_reconcile_held itself until it restarts; "
-                "an operator resolves any open instance once the attribute reads clean",
+                "%s, so this process will not resolve ad_reconcile_held itself; an operator "
+                "resolves any open instance once the attribute reads clean" + _FORFEIT_NOBODY_ELSE,
                 "before this process released its hold"
                 if current == "held"
                 else "before any pass here had held, and an earlier run's hold may still cover it",
@@ -9775,11 +9808,12 @@ class AuthService:
         # alert instance's reason, as `_record_reconcile_referral` says.
         self._reconcile_misconfigured_alert = (
             "LDAP configuration refused: check [auth].ad_user_search_base, "
-            "[auth].ad_group_search_base and the read rights of [auth].ad_bind_dn. "
+            "[auth].ad_group_search_base and the read rights of [auth].ad_bind_dn. A refused "
+            "account is never revoked while the refusal lasts. "
             f"{len(plan.misconfigured)} of {plan.asked} signed-in directory account(s) asked were "
-            f"refused for the configuration and left unjudged. {others} A refused account is "
-            "never revoked while the refusal lasts, so its sessions run to "
-            "[auth].session_absolute_hours. The ERROR log line for each such pass names the code."
+            f"refused for the configuration and left unjudged. {others} So a refused account's "
+            "sessions run to [auth].session_absolute_hours. The ERROR log line for each such pass "
+            "names the code."
         )
         _log.error(
             "directory reconcile: %s First refusal: %s",

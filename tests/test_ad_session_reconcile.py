@@ -2740,8 +2740,8 @@ async def test_an_account_the_directory_keeps_failing_for_pages_once_naming_it(
     threshold: int,
 ) -> None:
     """BACKLOG #3100 closing step 2. An ``LdapError`` on one account's probe, while the directory
-    answers the other, reads UNAVAILABLE: no strike, no revocation. Before this nothing bounded
-    it, so the account's sessions ran to the absolute cap and nobody was told. Now
+    answers the other, reads UNAVAILABLE: no strike, no revocation. Without a bound the account's
+    sessions would run to the absolute cap and nobody would be told. So
     ``ad_reconcile_outage_passes`` of its probes running page once, naming the account in the
     source, with one audit row. The next failing pass pages nothing more; an answer ends the run
     and re-arms the page. It is still fail-open throughout, and the whole-directory outage page
@@ -2847,6 +2847,106 @@ async def test_an_unreached_page_is_latched_only_once_its_row_is_written(
         plan = await _pass(service, sink)
         assert [name for _uid, name, _n in plan.unreached] == ["alice"]
         assert len(_unreached_events(sink)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> None:
+    """BACKLOG #3100 closing step 2, round-one review. A directory that answers only a few probes
+    in each pass is not an outage, so each failing account would enter its own run. Past
+    ``ad_session_revoke_max`` of them on one pass, one page under the bare source covers them,
+    naming none, and each account still has its own row.
+
+    RED when: such a pass opens one instance per account."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok"] + [f"flap{i}" for i in range(7)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        sink = _InverseSink()
+        ldap.unreachable = set(names[1:])
+        for _ in range(3):
+            plan = await _pass(service, sink)
+        assert plan.unreached_rollup and len(plan.unreached) == 7
+        [(kind, source, payload)] = _unreached_events(sink) + [
+            e for e in sink.events if e[1] == "directory-reconciler-unreached"
+        ]
+        assert (kind, source) == ("ad_reconcile_aborted", "directory-reconciler-unreached")
+        assert payload["reason"] == reconcile.UNREACHED_ACCOUNT and payload["probed"] == 8
+        assert "7 accounts' sessions are not revoked" in payload["detail"]
+        assert len(payload["detail"]) <= 200 and "flap" not in payload["detail"]
+        assert sorted(a for a, _n in await _unreached_rows(store)) == sorted(names[1:])
+        assert (await _pass(service, sink)).unreached == ()
+    finally:
+        await store.close()
+
+
+async def test_a_refused_unreached_row_leaves_the_account_to_page_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3100 closing step 2, round-one review. The soft write logs a refused row and
+    returns False. The latch must wait for a written row, so the next pass writes it and pages
+    again, rather than leaving a page with no row that is never retried.
+
+    RED when: a refused row still latches the account."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        real = service._audit_reconciler_row
+
+        async def refusing(action: str, **kwargs: Any) -> bool:
+            if action == "auth.ad_reconcile_unreached":
+                return False
+            return await real(action, **kwargs)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", refusing)
+        for _ in range(2):
+            await _pass(service, sink)
+        assert service._reconcile_unreached_paged == set()
+        monkeypatch.setattr(service, "_audit_reconciler_row", real)
+        plan = await _pass(service, sink)
+        assert [name for _uid, name, _n in plan.unreached] == ["alice"]
+        assert await _unreached_rows(store) == [("alice", 3)]
+        assert (await _pass(service, sink)).unreached == ()
+    finally:
+        await store.close()
+
+
+async def test_a_fault_neither_counts_nor_ends_a_run_and_an_answer_says_so(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3100 closing step 2, round-one review. A probe fault says nothing about whether
+    the directory was reached, on any pass, so it leaves the account's run as it stands. An
+    answer for a paged account ends its run with a WARNING, so an operator can tell when to
+    resolve the instance.
+
+    RED when: a fault resets the run on a pass that reached the directory, or the end is silent."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store)  # the default threshold, 3
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        for _ in range(2):
+            await _pass(service, sink)
+        ldap.unreachable = set()
+        ldap.broken = {"alice": ValueError("synthetic: unreadable entry")}
+        assert (await _pass(service, sink)).faulted == (alice.id,)  # bob answered
+        assert service._reconcile_unreached_runs == {alice.id: 2}
+        ldap.broken = {}
+        ldap.unreachable = {"alice"}
+        assert (await _pass(service, sink)).unreached == ((alice.id, "alice", 3),)
+        ldap.unreachable = set()
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+            await _pass(service, sink)
+        said = [r.getMessage() for r in caplog.records if "answered for again" in r.getMessage()]
+        assert len(said) == 1 and "after 3 unreachable probes" in said[0]
     finally:
         await store.close()
 

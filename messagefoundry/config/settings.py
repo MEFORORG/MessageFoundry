@@ -9622,7 +9622,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"{_auth_default('ad_reconcile_outage_passes')}: it comes after {floor} at the "
                     "configured interval. Until it does, a directory account disabled or deleted "
                     "meanwhile keeps its live engine sessions with only a WARNING and an audit row "
-                    "per pass to show for it",
+                    "per pass to show for it. The same count bounds one account the directory "
+                    "keeps failing for while it answers others, so that page waits longer too",
                 )
             )
         strikes = auth.ad_session_recheck_strikes

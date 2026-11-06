@@ -2791,8 +2791,10 @@ async def test_a_forfeited_breaker_logs_a_trip_of_new_accounts_after_nobody_was_
             assert (await _alerted_pass(service, sink)).aborted == "mass_revoke_breaker"
             assert _said(caplog, _TRIPPED_AGAIN) == 1
             # BACKLOG #3083 C7: "this process gave up" must not read as though another engine
-            # would resolve it, where none resolves one itself.
-            assert _said(caplog, "engine of more than one engine shard resolves none itself") == 1
+            # would resolve it, where none resolves one itself. The give-up line says so too, and
+            # neither may say a restart would resolve it.
+            assert _said(caplog, "engine of more than one engine shard resolves none itself") == 2
+            assert _said(caplog, "until it restarts") == 0
 
 
 async def test_a_forfeited_referral_is_not_said_while_a_rotating_sample_misses_it(

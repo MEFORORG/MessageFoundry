@@ -11336,7 +11336,13 @@ _UNREACHED_ALERT_SOURCE = "directory-reconciler-unreached"
 #: What it tells the operator. Short, and the consequence first, for the store's 200 characters.
 _UNREACHED_ALERT_TEXT: Final[str] = (
     "This account's sessions are not revoked: {probes} of its directory probes running failed while "
-    "the directory answered others. Check its entry and the server that holds it."
+    "other probes got an answer. Check its entry, and any referral or configuration alert."
+)
+#: What one page for many such accounts says, on a pass past ``[auth].ad_session_revoke_max`` of
+#: them, so a flapping directory opens one instance rather than one per signed-in account.
+_UNREACHED_ROLLUP_TEXT: Final[str] = (
+    "{accounts} accounts' sessions are not revoked: their directory probes failed {probes} passes "
+    "running while other probes got an answer. Check the directory; audit rows name each account."
 )
 
 
@@ -11403,8 +11409,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     that point. Their rows stand, except a row that was refused: that account has neither its row
     nor its alert. ``AuthService._audit_reconciler_row`` says which errors are soft.
 
-    Each standing alert but the probe fault's, the configuration refusal's and a paging refusal's
-    also gets its inverse, which pages nobody and resolves the open instance (BACKLOG #2136):
+    Each standing alert but at least the probe fault's, the configuration refusal's, a paging
+    refusal's and an unreached account's (BACKLOG #3100) also gets its inverse, which pages nobody and resolves the open instance (BACKLOG #2136):
     ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
     ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance, and
     under the outage's source for the outage's (BACKLOG #3709). The
@@ -11521,7 +11527,19 @@ def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
     failed to reach the directory on that many passes running that reached it for others, so the
     reconciler has neither struck nor revoked it. Once per entry, like a paging refusal, and with
     no inverse: an operator resolves it. An outage pass carries none, because the outage pages
-    on its own. The account name is in the source only, as for a paging refusal."""
+    on its own. The account name is in the source only, as for a paging refusal. Past
+    ``[auth].ad_session_revoke_max`` accounts on one pass (``plan.unreached_rollup``), one page
+    under the bare source covers them all, naming none."""
+    if plan.unreached_rollup:
+        sink.ad_reconcile_aborted(
+            _UNREACHED_ALERT_SOURCE,
+            reason=UNREACHED_ACCOUNT,
+            probed=plan.asked,
+            detail=_UNREACHED_ROLLUP_TEXT.format(
+                accounts=len(plan.unreached), probes=min(n for _u, _n, n in plan.unreached)
+            ),
+        )
+        return
     for _user_id, username, probes in plan.unreached:
         sink.ad_reconcile_aborted(
             f"{_UNREACHED_ALERT_SOURCE}:{username}",
