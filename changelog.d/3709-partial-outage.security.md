@@ -1,9 +1,10 @@
 - **A directory that stays partly unreachable now pages too.** Before, one answered probe ended
   the outage run, so a directory that answered for some accounts and never for the rest paged
   nobody, and those accounts' sessions went unreconciled. Each account now has a run of the
-  probes the directory left unanswered, whole outage passes included, which any answer ends and a
-  pass that does not probe it leaves alone. Once one is `[auth].ad_reconcile_outage_passes` long,
-  the pass that finds that account unanswered raises one `ad_reconcile_aborted` alert with reason
+  probes the directory left unanswered, counted on passes that are not a whole outage, which any
+  answer ends and a pass that does not probe it leaves alone. Once one is
+  `[auth].ad_reconcile_outage_passes` long, the next such pass raises, once per account entering
+  that state, one `ad_reconcile_aborted` alert with reason
   `directory_partly_unavailable` under the source `directory-reconciler-partial-outage`, apart
   from the whole outage's, and audits `auth.ad_reconcile_partial_outage`. Its text says an
   account went unanswered; the whole outage's says no probe succeeded. It resolves once no
