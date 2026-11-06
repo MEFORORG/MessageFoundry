@@ -689,8 +689,8 @@ async def test_two_idp_starts_racing_one_unlock_issue_mint_one_grant(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Item 9 on the federated leg. A second start for the same page takes the issue from the first
-    flow, and its flow cookie replaces the first flow's in this browser, so only one of the two
-    flows can come back and mint. RED when: both returns land on the unlock page."""
+    flow, so only the second flow can mint; its flow cookie also replaces the first's in this
+    browser, so the first return is refused here. RED when: both returns land on the unlock page."""
     service = await _service(engine, _FakeLdap())
     async with _client(engine, service) as c:
         await _federated_sign_in(service, c, monkeypatch)
@@ -709,3 +709,38 @@ async def test_two_idp_starts_racing_one_unlock_issue_mint_one_grant(
 
         assert landed.status_code == 200, landed.text
         assert _UNLOCK in landed.text
+
+
+async def test_a_second_start_refused_after_its_take_leaves_the_first_flow_minting_nothing(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One issue mints at most one grant. The second start takes the issue from the first flow's
+    held claim and is then refused (here by the per-actor budget), so it gives the issue back to
+    the session's table while the first flow is still staged. The first flow's return must then
+    mint nothing, because its flow no longer holds the issue: otherwise the table entry and the
+    flow would each mint a grant from one issue. RED when: the first flow's return still mints the
+    bound grant. The first test in this group is the control: a flow that kept its issue mints."""
+    from messagefoundry_webconsole._auth import lookup_ui_action
+    from messagefoundry_webconsole.routes import oidc as oidc_routes
+
+    service = await _service(engine, _FakeLdap())
+    async with _client(engine, service) as c:
+        session = await _federated_sign_in(service, c, monkeypatch)
+        issue_continuation(c, _UNLOCK)
+        first = await _start_unlock_step_up(c)
+        assert first.status_code == 303
+        budget = [False]
+        monkeypatch.setattr(oidc_routes, "allow_reauth_attempt", lambda *_a: budget[0])
+        refused = await _start_unlock_step_up(c)
+        assert refused.status_code == 429
+        budget[0] = True
+        assert continuation_issued(session, _UNLOCK)  # the issue is back in the table
+
+        landed = await _callback(c, first.headers["location"])
+
+        assert landed.status_code == 200, landed.text
+        new = c.cookies.get("mf_session")
+        assert new and new != session
+        action = lookup_ui_action(_UNLOCK)
+        assert action is not None and action.action is not None
+        assert not await service.holds_action_step_up(new, action.action)

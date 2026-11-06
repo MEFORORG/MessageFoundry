@@ -6591,8 +6591,13 @@ class AuthService:
         code: str,
         client: str | None,
         public_origin: str,
+        mint_grant: bool = True,
     ) -> OidcStepUp:
         """Redeem a step-up flow and, when the IdP proof holds, elevate the staged session.
+
+        ``mint_grant=False`` elevates without minting the purpose-bound grant the flow staged, and
+        the ``auth.reauth`` row then records no purpose. The console passes it for a flow whose
+        continuation another re-auth took meanwhile (vault BACKLOG #3241, added item 9).
 
         Checks, in order, each failing CLOSED with nothing elevated: the flow exists and ``state``
         matches; it is a step-up flow; the callback is not too soon after the flow started (BACKLOG
@@ -6783,7 +6788,7 @@ class AuthService:
         refusal = await self._directory_roles_lost(fresh.role_ids, principal.groups)
         if refusal is not None:
             return await refuse(refusal)
-        purpose = flow.step_up_purpose
+        purpose = flow.step_up_purpose if mint_grant else None
         # The password leg's three ORDER-CRITICAL steps (see :meth:`reauth`), against the hash.
         # (1) Every stamp against the OLD hash, re-anchoring the session to this client address.
         # The accepted auth_time is written in the same statement (BACKLOG #2143), so the next

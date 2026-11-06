@@ -811,12 +811,17 @@ from typing import Any
 #: ``messagefoundry`` floor instead. An older console on this engine passes the handshake and still
 #: answers a scoped caller's bad flag direction with the unaudited 404.
 #:
+#: Vault BACKLOG #3241, added item 9: ``AuthService.complete_oidc_step_up`` gained the keyword
+#: ``mint_grant``, which ``/ui/oidc/callback`` passes as False for a flow whose continuation another
+#: re-auth took. A keyword the console passes, so it forces a bump. Re-derived with ``--write`` (from
+#: 734e7007fb95eb75).
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "734e7007fb95eb75"
+ENGINE_UI_SEAM: str = "ce424894d11883ec"
 
 
 @dataclass(frozen=True, slots=True)

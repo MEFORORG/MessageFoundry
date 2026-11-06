@@ -81,6 +81,7 @@ from .._auth import (
     set_oidc_flow_cookie,
     set_session_cookie,
     settle_flow_claim,
+    take_flow_claim,
 )
 from .._external import display_host, is_allowlisted, is_external, is_idn_disguised
 
@@ -551,6 +552,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if staged is not None:
             # BACKLOG #296: the IdP is returning from a STEP-UP of a live session, not a sign-in.
             # The service pops the flow and re-checks its kind, so this branch only picks the leg.
+            # Vault BACKLOG #3241, added items 7 and 9: the issue the start leg held for this flow
+            # is taken before the await, and a flow whose issue another re-auth took mints no grant,
+            # so one issue mints at most one. An exception in the await loses the issue, which costs
+            # only that continuation.
+            claim, mint_grant = take_flow_claim(flow_id, staged.return_to)
             step_up = (
                 await auth.abandon_oidc_step_up(
                     flow_id,
@@ -566,13 +572,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     code=code,
                     client=client,
                     public_origin=getattr(request.app.state, "public_origin", "") or "",
+                    mint_grant=mint_grant,
                 )
             )
-            if step_up.flow_consumed:
-                # Vault BACKLOG #3241, added items 7 and 9: the unlock issue the start leg held for
-                # this flow goes back on a refusal, for the retry the refusal page offers, and is
-                # dropped once the flow minted. A return that consumed nothing leaves both.
-                settle_flow_claim(flow_id, minted=step_up.elevation.token is not None)
+            settle_flow_claim(
+                flow_id,
+                claim,
+                consumed=step_up.flow_consumed,
+                minted=mint_grant and step_up.elevation.token is not None,
+            )
             return _step_up_landing(request, deps, auth, step_up)
         if error is not None or not code or not state:
             # The IdP reported a failure, or the callback is malformed. The service checks

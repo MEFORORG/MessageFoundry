@@ -406,9 +406,12 @@ leg's re-proof awaits, so a second re-auth arriving meanwhile, from another tab 
 finds nothing and mints nothing. A password re-auth that fails puts the issue back. The
 federated start holds an unlock page's issue for its flow: the callback puts it back when the flow
 ends refused, so the retry the IdP's refusal page offers still mints, and drops it when the flow
-mints. A new re-auth also takes an issue back from a flow that never returned, an abandoned IdP
-prompt for example; a second federated start's flow cookie replaces the first's in that browser,
-so the first flow can no longer come back and mint. An auto-retry action's issue is still spent at
-the federated start, as before. Each kind of
+mints. A new re-auth also takes an issue back from a flow that has not returned, an abandoned IdP
+prompt for example, and from then on that flow mints no grant even if it does return: the
+callback takes its flow's issue before its own await, and the engine mints the bound grant only
+when the flow still held a live issue. Without one it elevates the session with no grant, and its
+`auth.reauth` row records no purpose. So one issue mints at most one grant whichever flow cookie
+the browser holds, and an IdP return later than the issue's 300-second lifetime, counted from
+the gate's refusal that issued it, mints no grant. An auto-retry action's issue is still spent at the federated start, as before. Each kind of
 issue, auto-retry actions and action-bound unlock pages, now has its own per-session cap, so unlock
 pages cannot evict an auto-retry action the operator is confirming.
