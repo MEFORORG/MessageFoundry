@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.__main__ import main
+from messagefoundry.__main__ import _TRANSIT_AUDIT_RETIRE_SECTION, main
 from messagefoundry.store import crypto_transit
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
@@ -88,15 +88,15 @@ def test_rotate_key_refuses_vault_transit_mode_before_vault_or_the_store(
     captured = capsys.readouterr()
     assert "does not run under [store].cipher_provider" in captured.err, captured.err
     assert "between two Transit keys" in captured.err, captured.err
-    assert "Retiring an old version of the audit key" in captured.err, captured.err
+    assert f"'{_TRANSIT_AUDIT_RETIRE_SECTION}'" in captured.err, captured.err
     # The refusal names the Vault settings that retire a version itself, rather than pointing at a
-    # document to name them, and the section it does point at still exists.
+    # document to name them (the PR 2823 hold, F1).
     assert "data key's min_decryption_version" in captured.err, captured.err
     assert "audit key's min_encryption_version" in captured.err, captured.err
+    assert "MEFOR_STORE_TRANSIT_AUDIT_KEY names another" in captured.err, captured.err
     assert "Trimming a version" in captured.err, captured.err
+    assert "cannot be undone" in captured.err, captured.err
     assert "says which Vault settings retire one" not in captured.err, captured.err
-    security = (Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md").read_text("utf-8")
-    assert "**Retiring an old version of the audit key breaks the chain.**" in security
     assert "Nothing was changed." in captured.err, captured.err
     assert "needs an active key" not in captured.err, captured.err
     assert "Traceback" not in captured.err, captured.err
@@ -104,3 +104,9 @@ def test_rotate_key_refuses_vault_transit_mode_before_vault_or_the_store(
     assert built == [], "the command dialled Vault before refusing"
     after = {p.name: p.read_bytes() for p in tmp_path.glob("transit.db*")}
     assert after == before, "the command wrote to the store before refusing"
+
+
+def test_the_security_section_the_refusal_cites_exists() -> None:
+    """The refusal cites a docs/SECURITY.md section by its bold title; renaming it breaks the cite."""
+    security = (Path(__file__).resolve().parents[1] / "docs" / "SECURITY.md").read_text("utf-8")
+    assert f"**{_TRANSIT_AUDIT_RETIRE_SECTION}.**" in security

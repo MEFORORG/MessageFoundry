@@ -10326,6 +10326,10 @@ def _uploads_root_refusal(uploads_dir: str) -> str | None:
         )
 
 
+#: The docs/SECURITY.md section ``rotate-key``'s vault_transit refusal cites, by its bold title.
+_TRANSIT_AUDIT_RETIRE_SECTION = "Retiring an old version of the audit key breaks the chain"
+
+
 def _rotate_key(args: argparse.Namespace) -> int:
     """Re-encrypt every cipher-covered value under the active key (WP-5 key rotation, ASVS 11.2.2).
 
@@ -10409,14 +10413,14 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "new version of the key named by MEFOR_STORE_TRANSIT_KEY, new values are sealed under "
             "it, and values under an older version still read. Nothing re-seals those older "
             "values, so rotating is safe and retiring a version that still seals a value or MACs "
-            "an audit row is not. Raising the data key's min_decryption_version above a version "
-            "stops the values sealed under it from decrypting until the setting is lowered. "
-            "Raising the audit key's min_encryption_version above a version breaks the audit "
-            "chain at every row MACed under it; the audit key is the data key unless "
+            "an audit row is not. At least these retire one. Raising the data key's "
+            "min_decryption_version above a version stops the values sealed under it from "
+            "decrypting. Raising the audit key's min_encryption_version above a version breaks "
+            "the audit chain at every row MACed under it; the audit key is the data key unless "
             "MEFOR_STORE_TRANSIT_AUDIT_KEY names another. Trimming a version off either key does "
             "the same to what it sealed or MACed, and cannot be undone. docs/SECURITY.md, under "
-            "'Retiring an old version of the audit key breaks the chain', describes the audit "
-            "chain break. Nothing was changed.",
+            f"'{_TRANSIT_AUDIT_RETIRE_SECTION}', describes the audit chain break and what it "
+            "does to the attestation. Nothing was changed.",
             file=sys.stderr,
         )
         return 2
