@@ -45,6 +45,7 @@ from messagefoundry.auth.service import (  # noqa: E402
 )
 from messagefoundry.auth.tokens import hash_token  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
+from messagefoundry.store.base import StoreAcquireTimeout  # noqa: E402
 from messagefoundry.store.crypto import CipherError, generate_key, make_cipher  # noqa: E402
 from messagefoundry.store.store import (  # noqa: E402
     MessageStore,
@@ -867,7 +868,9 @@ async def test_every_sign_count_miss_is_a_clone_signal_naming_the_store_answer(c
 async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question_raises() -> None:
     """BACKLOG #3068, review of the merged head. The passkey question after a miss is two to four
     store reads, and a store error in any of them must not drop the clone row (ADR 0068 decision
-    4). RED when: the error propagates with no ``auth.webauthn_clone_suspected`` row written."""
+    4). RED when: no ``auth.webauthn_clone_suspected`` row is written, or the error propagates
+    rather than refusing as ``store_error`` (BACKLOG #3775: the set read's catch takes a
+    ``RuntimeError``)."""
     store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
     try:
         service, token, response, user_id = await _local_assertion(store)
@@ -893,9 +896,12 @@ async def test_a_sign_count_miss_keeps_its_clone_signal_when_the_holder_question
 
         store.update_webauthn_sign_count = _miss  # type: ignore[method-assign]
 
-        with pytest.raises(RuntimeError, match="synthetic"):
-            await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
 
+        assert refused.ok is False and refused.session_lost is False
+        assert {"reason": "store_error"} in await _audited_assertion_failures(store)
         assert await _clone_answers(store) == ["mismatch"]
         session = await store.get_session(hash_token(token))
         assert session is not None and session.mfa_verified_at is None
@@ -948,12 +954,12 @@ async def test_a_passkey_deleted_after_a_sign_count_miss_still_reads_mismatch(
 
 
 #: Each case: what lands with the unsealed delete, and the reason the refusal is audited with
-#: (``None``: the set read raises, so the call raises rather than refusing).
-_UNSEALED_GONE_CASES: dict[str, str | None] = {
+#: (``store_error``: the set read raises a store fault, which refuses, BACKLOG #3775).
+_UNSEALED_GONE_CASES: dict[str, str] = {
     "revoke": "session_lost",
     "disable": "session_lost",
     "lock": "locked",
-    "set-read-raises": None,
+    "set-read-raises": "store_error",
 }
 
 
@@ -996,18 +1002,16 @@ async def test_an_unsealed_gone_passkey_writes_one_clone_row_whatever_the_holder
         store.update_webauthn_sign_count = _gone_unsealed_while_something_lands  # type: ignore[method-assign]
 
         reason = _UNSEALED_GONE_CASES[change]
-        if reason is None:
-            with pytest.raises(RuntimeError, match="synthetic"):
-                await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
-        else:
-            refused = await service.finish_webauthn_assertion(
-                token, response, rp_id=_RP, origin=_ORIGIN
-            )
-            assert refused.ok is False
-            assert refused.session_lost is (reason == "session_lost")
-            assert {"reason": reason} in await _audited_assertion_failures(store)
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+        assert refused.ok is False
+        assert refused.session_lost is (reason == "session_lost")
+        assert {"reason": reason} in await _audited_assertion_failures(store)
+        if change != "set-read-raises":
             # BACKLOG #3068 N2: the set is read before the holder, so its failed seal is reported
-            # even when the holder refusal is what the caller gets.
+            # even when the holder refusal is what the caller gets. A set read that raises reads
+            # no seal.
             assert await store.list_audit(action="integrity.authority_seal_failed") != []
         store.list_webauthn_credentials = real_list  # type: ignore[method-assign]
         assert await _clone_answers(store) == ["gone"]
@@ -1053,12 +1057,13 @@ async def test_a_passkey_set_failing_its_seal_after_the_write_is_unverified() ->
 #: Each case: how the passkey goes before the write (``"held"``: it does not, and the store is made
 #: to answer ``gone`` anyway; ``"sealed"``: through the store's sealed delete; ``"unsealed"``:
 #: outside it, so the set fails its seal), and what the request answers (a refusal reason,
-#: ``"raises"`` or ``"cancelled"``).
+#: ``"raises"`` or ``"cancelled"``). A set read's store fault refuses as ``store_error`` (BACKLOG
+#: #3775); the holder re-read's still raises (vault BACKLOG #4728 finding 2).
 _GONE_CASES: dict[str, tuple[str, str]] = {
     "set-held": ("held", "factor_removed"),
     "set-removed": ("sealed", "factor_removed"),
     "set-unverified": ("unsealed", "factor_unverified"),
-    "set-read-raises": ("sealed", "raises"),
+    "set-read-raises": ("sealed", "store_error"),
     "set-read-cancelled": ("sealed", "cancelled"),
     "account-unloadable": ("sealed", "session_lost"),
     "account-deleted-after-load": ("sealed", "session_lost"),
@@ -1295,3 +1300,38 @@ async def test_a_defect_in_the_passkey_re_read_still_raises(
         await _assert_with_the_set_read_failing(
             monkeypatch, sqlite3.ProgrammingError("synthetic: a bad bind")
         )
+
+
+@pytest.mark.parametrize(
+    "read_fault",
+    [
+        sqlite3.OperationalError("synthetic: the set read was refused"),
+        RuntimeError("synthetic: an engine refusal"),
+        ValueError("synthetic: no active connection"),
+        OSError("synthetic: the connection was lost at the socket"),
+        StoreAcquireTimeout("synthetic: the pool borrow timed out"),
+    ],
+    ids=["call-driver", "call-runtime", "call-closed", "connect-socket", "connect-acquire"],
+)
+async def test_a_connect_class_read_fault_takes_the_call_class_path(
+    read_fault: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3775, vault BACKLOG #4728 finding 3. The passkey re-read after the sign-count write
+    catches ``store_call_errors()`` and ``store_connect_errors()``, so a store-call fault and a
+    connect fault take one path: a ``store_error`` refusal with its audit row, the factor unmarked.
+    RED when: any of them raises past ``finish_webauthn_assertion`` (the ``RuntimeError`` and
+    ``ValueError`` cases did, under the narrower session-write catch), marks the factor, or writes
+    no ``store_error`` row."""
+    store, token, refused = await _assert_with_the_set_read_failing(monkeypatch, read_fault)
+    try:
+        assert refused.ok is False and refused.session_lost is False
+        assert "the passkey re-read raised" in caplog.text
+        assert {"reason": "store_error"} in await _audited_assertion_failures(store)
+        assert await store.list_audit(action="auth.webauthn_verified") == []
+        session = await store.get_session(hash_token(token))
+        assert session is not None and session.revoked_at is None
+        assert session.mfa_verified_at is None
+    finally:
+        await store.close()

@@ -154,6 +154,7 @@ from messagefoundry.store.base import (
     AdminStore,
     audit_write_errors,
     store_call_errors,
+    store_connect_errors,
     store_open_errors,
 )
 from messagefoundry.store.crypto import MARKER_PREFIX, CipherError
@@ -15470,11 +15471,14 @@ class AuthService:
             # SQLite's bad statement or bind is a defect, not a store refusal. On PostgreSQL and
             # SQL Server a bad statement is a driver DatabaseError, so it is refused below.
             raise
-        except _session_write_errors():
+        except (*store_call_errors(), *store_connect_errors()):
             # BACKLOG #3775: after the sign-count write, a store fault here refuses with an audit
-            # row rather than raising past the ceremony with none. Soft, so a store that refuses
-            # that row too still gets the refusal back: the refusal is the fail-closed control,
-            # and the row only records it.
+            # row rather than raising past the ceremony with none. The catch is the store-call set
+            # and the connect set, not the narrower session-write set, so a closed-connection
+            # ValueError or an engine RuntimeError refuses too (vault BACKLOG #4728 finding 3). At
+            # least sqlite3.InterfaceError is outside both sets and still raises. Soft, so a store
+            # that refuses that row too still gets the refusal back: the refusal is the fail-closed
+            # control, and the row only records it.
             _log.exception("finish_webauthn_assertion: the passkey re-read raised")
             await write_audit_soft(
                 lambda: self._assertion_refused(user, client, "store_error"),

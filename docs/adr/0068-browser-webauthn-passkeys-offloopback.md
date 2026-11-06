@@ -666,10 +666,11 @@ reads that follow cannot drop it. A cancel before the row is written writes none
 then refused, and no refusal writes a second clone row. The reasons a gone passkey is refused
 with, audited `auth.webauthn_failed`, include at least `factor_removed`, `factor_unverified` when
 the passkey set read after the write fails its seal, `session_lost` when the session or the
-account went with it, and `locked` when a second-step lock landed. A database driver error, a lost
-connection or a pool acquire timeout in the passkey set read after the write, on any sign-count
-answer, is refused with `store_error` (BACKLOG #3775). At least a closed SQLite connection, the
-engine's other `RuntimeError` refusals and SQLite's `ProgrammingError` still raise there, and so
+account went with it, and `locked` when a second-step lock landed. A store fault in the passkey
+set read after the write, on any sign-count answer, is refused with `store_error` (BACKLOG #3775):
+at least a database driver error, a lost connection, a pool acquire timeout, a closed SQLite
+connection and the engine's other `RuntimeError` refusals, since 2026-11-06 (vault BACKLOG #4728
+finding 3). At least SQLite's `ProgrammingError` and `InterfaceError` still raise there, and so
 does a store error in the session, account and lock re-read, which since 2026-11-05 follows that
 set read rather than preceding it (BACKLOG #3068).
 
