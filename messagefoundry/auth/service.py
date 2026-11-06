@@ -5454,8 +5454,9 @@ class AuthService:
             )
             step = None
         # Called whatever ``step`` is (ASVS 11.2.4, BACKLOG #1167): a ``None`` step takes the same
-        # locked read and seal check and writes nothing, so a wrong code costs what a replayed one
-        # does rather than skipping the store.
+        # locked read and seal check and writes nothing, so a wrong code makes the store call a
+        # replayed one makes rather than skipping it. The secret read above is not equalised by
+        # this: a missing or unreadable secret still skips the code's HMAC work.
         code_ok = await self._store.consume_totp_step(user.id, step)
         return password_ok, code_ok
 

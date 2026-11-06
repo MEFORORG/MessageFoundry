@@ -442,10 +442,11 @@ def decrypt_stream(
         # (every frame but the last) and the final-flag AAD. Exactly one matches for an authentic
         # frame; if neither does, the frame is corrupt/tampered/wrong-key — fail closed.
         #
-        # Constant-time (ASVS 11.2.4, BACKLOG #1167): BOTH tries run on every frame, with no break on
-        # the first match, so the tag-check count does not depend on which AAD authenticated. The
-        # first match is kept. The cost is one extra GCM
-        # tag check per frame, on restore only.
+        # ASVS 11.2.4 (BACKLOG #1167): BOTH tries run on every frame, with no break on the first
+        # match, so the number of decrypt attempts does not depend on which AAD authenticated. The
+        # first match is kept. The cost is one extra AES-GCM decrypt pass per frame (the tag is
+        # checked after the whole frame is decrypted), on every decrypt of an archive: a restore and
+        # the post-backup verify alike.
         plaintext: bytes | None = None
         this_final = False
         for final_try in (False, True):

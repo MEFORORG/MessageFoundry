@@ -3722,8 +3722,8 @@ def totp_step_spend(step: int | None) -> UserChange:
     the one stored, which makes each code single-use (ASVS 6.5.1).
 
     ``None`` (a code that matched no step) always declines, after the same locked read and seal
-    check a real step takes, so a wrong code costs what a replayed one does (ASVS 11.2.4, BACKLOG
-    #1167)."""
+    check a real step takes, so a wrong code costs the store what a replayed one does (ASVS 11.2.4,
+    BACKLOG #1167)."""
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
         last = r.row.last_totp_step
