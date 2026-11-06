@@ -889,4 +889,88 @@ def test_an_error_from_rendering_the_codec_error_is_refused_as_not_judged(
         getattr(store_base, entry)(StoreSettings())
     _assert_no_key_byte(_whole(caught.value))
     assert caught.value.__cause__ is None and caught.value.__context__ is None
-    assert "ValueError that could not be judged" in str(caught.value), str(caught.value)
+    assert "could not be judged" in str(caught.value), str(caught.value)
+
+
+# --- The second hold on engine PR 2818: the fallback itself must not raise ---------------------
+
+
+class _NamelessMeta(type):
+    """A metaclass whose classes' ``__name__``, which a refusal text would read, raises while
+    ``armed``. It is disarmed before any assertion, since pytest reads it to report one."""
+
+    armed = False
+
+    @property
+    def __name__(cls) -> str:  # type: ignore[override]  # the read is the point
+        if _NamelessMeta.armed:
+            raise LookupError("synthetic: the class name cannot be read")
+        return "NamelessValueError"
+
+
+class _NamelessValueError(ValueError, metaclass=_NamelessMeta):
+    """A ValueError whose class name cannot be read."""
+
+
+@pytest.mark.parametrize(
+    "entry", ["build_store_cipher", "resolve_active_key", "resolve_decrypt_keys"]
+)
+def test_an_error_whose_class_name_cannot_be_read_is_still_refused(
+    entry: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F2 of the second hold: the judgement read the class name and raised, and the fallback read
+    it again, so a bare LookupError left with the judged error, which quotes the byte, behind it.
+    The fallback's text names no class now, so nothing in it can raise."""
+    try:
+        raise _NamelessValueError(f"synthetic key source refused: {_decode_error()}")
+    except _NamelessValueError as exc:
+        error = exc
+    assert any(spelling in str(error) for spelling in _BYTE_SPELLINGS), "the fixture holds none"
+    _with_provider(monkeypatch, error)
+    _NamelessMeta.armed = True
+    try:
+        getattr(store_base, entry)(StoreSettings())
+    except BaseException as exc:  # noqa: BLE001 -- what left is the measurement
+        escaped: BaseException = exc
+    else:
+        escaped = AssertionError("nothing was raised")
+    finally:
+        _NamelessMeta.armed = False
+    assert isinstance(escaped, StoreCipherConfigError), _whole(escaped)
+    _assert_no_key_byte(_whole(escaped))
+    assert escaped.__cause__ is None and escaped.__context__ is None
+    assert "could not be judged" in str(escaped), str(escaped)
+
+
+@pytest.mark.parametrize(
+    "make_interrupt",
+    [KeyboardInterrupt, lambda: SystemExit(3)],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+@pytest.mark.parametrize(
+    "entry", ["build_store_cipher", "resolve_active_key", "resolve_decrypt_keys"]
+)
+def test_an_interrupt_from_the_fallback_leaves_without_a_chain(
+    entry: str, make_interrupt: Callable[[], BaseException], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F3 of the second hold: an interrupt raised in the fallback arm had the judgement's own
+    error as its context, and that error's context was the judged one, which quotes the byte."""
+    interrupt = make_interrupt()
+
+    def _rendering_fails(exc: BaseException) -> str:
+        raise RuntimeError(f"synthetic rendering failure: {exc}")
+
+    real_refused = store_base._refused
+
+    def _fallback_interrupted(exc: Exception, text: str) -> Exception:
+        if "could not be judged" in text:
+            raise interrupt
+        return real_refused(exc, text)
+
+    monkeypatch.setattr(store_base, "codec_safe_line", _rendering_fails)
+    monkeypatch.setattr(store_base, "_refused", _fallback_interrupted)
+    error = _built_from(_decode_error(), ValueError)
+    _with_provider(monkeypatch, error)
+    with pytest.raises(type(interrupt)) as caught:
+        getattr(store_base, entry)(StoreSettings())
+    _assert_left_unchained(caught.value, interrupt, error)

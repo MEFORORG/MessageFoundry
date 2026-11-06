@@ -3353,10 +3353,11 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
     ``posture`` is the instance posture the caller holds, for an external provider's hop guard
     (vault BACKLOG #2983). ``None`` counts as enforcing there.
 
-    Two kinds of provider error are raised as :func:`_codec_safe_refusal` gives them, with a fixed
-    text, no byte and no chain (BACKLOG #4882), as by :func:`build_store_cipher`: one that is a
-    codec error, holds one, or has one on a link :func:`_codec_error_on` reaches; and one whose
-    chain cannot be read whole, whether or not it holds a codec error. Any other provider error
+    Three kinds of provider error are raised as :func:`_codec_safe_refusal` gives them, with a
+    fixed text, no byte and no chain (BACKLOG #4882), as by :func:`build_store_cipher`: one that is
+    a codec error, holds one, or has one on a link :func:`_codec_error_on` reaches; one whose chain
+    cannot be read whole, whether or not it holds a codec error; and one whose judgement raised an
+    ``Exception``, whose text names no class. Any other provider error
     passes through untouched. Either way, a ``BaseException`` such as a ``KeyboardInterrupt``
     that the judgement's own code raises propagates in place of the refusal or the error, with
     no cause and no context. This covers at least the callers that resolve the key without
@@ -3408,9 +3409,10 @@ def resolve_decrypt_keys(
     active key. Order is active-first; duplicates and empties are dropped; an unset active key yields an
     empty list (identity cipher). ``posture`` is as on :func:`resolve_active_key`.
 
-    The two refusals there apply here too, and here also to the key check (BACKLOG #4882): an
-    error from the provider or the key check that has a codec error on it, or whose chain cannot
-    be read whole whether or not it holds one, is raised as :func:`_codec_safe_refusal` gives it.
+    The three refusals there apply here too, and here also to the key check (BACKLOG #4882): an
+    error from the provider or the key check that has a codec error on it, whose chain cannot be
+    read whole whether or not it holds one, or whose judgement raised an ``Exception``, is raised
+    as :func:`_codec_safe_refusal` gives it.
     Any other passes through untouched. Either way, a ``BaseException`` that the judgement's own
     code raises propagates in place of the refusal or the error, with no cause and no context."""
     try:
@@ -3467,7 +3469,8 @@ def build_store_cipher(settings: StoreSettings, *, posture: HopPosture | None = 
     decoded, and its ``.object`` holds all of it, so a key source that yields bytes that are not
     text would put key material in the refusal and in any traceback of it. An error from the build
     of any class with a codec error on it is raised as :func:`_codec_safe_refusal` gives it, with
-    no byte and no chain, and so is one whose chain cannot be read whole. Every other
+    no byte and no chain, and so is one whose chain cannot be read whole or whose judgement raised
+    an ``Exception``. Every other
     ``ValueError`` keeps its text and its chain, and every other error, such as a
     ``KeyProviderError`` or ``DpapiError``, passes through untouched."""
     try:
@@ -3501,18 +3504,25 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
     ``KeyProviderError``, which at least every CLI command with a key arm reports as a key that
     could not be resolved.
 
-    An ``Exception`` the judgement's own code raises after the walk, as from rendering the codec
-    error, is refused the same way, as one that could not be judged. A ``BaseException`` that is
-    not an ``Exception``, such as a ``KeyboardInterrupt`` from a link's own code or from an
-    attribute read of the codec error, propagates in place of any refusal, as :func:`_unchained`
-    leaves it."""
+    An ``Exception`` the judgement's own code raises, as from reading ``exc``'s class name or
+    rendering the codec error, is refused the same way, as one that could not be judged, with a
+    fixed text that names no class, so the fallback runs none of ``exc``'s code. A
+    ``BaseException`` that is not an ``Exception``, such as a ``KeyboardInterrupt`` from a link's
+    own code, from an attribute read of the codec error or from the fallback, propagates in place
+    of any refusal, as :func:`_unchained` leaves it."""
     try:
-        return _refusal_for(exc)
-    except Exception:  # noqa: BLE001 -- fail closed: the rendering ran the codec error's own code
-        return _refused(exc, f"a {type(exc).__name__} that could not be judged, its text not shown")
+        try:
+            return _refusal_for(exc)
+        except Exception:  # noqa: BLE001 -- fail closed: the judgement ran exc's own code
+            # No class name here: reading it may be what raised (the second hold on PR 2818).
+            return _refused(exc, _UNJUDGED)
     except BaseException as interrupt:
         _unchained(interrupt)
         raise
+
+
+#: The fallback refusal's text. It names no class, since reading the name runs ``exc``'s code.
+_UNJUDGED = "an error that could not be judged, its class and text not shown"
 
 
 def _unchained(interrupt: BaseException) -> None:
@@ -3593,10 +3603,11 @@ def _codec_chain_reading(exc: BaseException) -> str | None:
 
 class StoreCipherConfigError(ValueError):
     """The store cipher could not be built from the settings; see :func:`build_store_cipher`. Its
-    text is the build error's, which names settings and variables, never a key, except for two
+    text is the build error's, which names settings and variables, never a key, except for three
     kinds of ``ValueError``, which are refused with :func:`_codec_safe_refusal`'s fixed text
-    instead (BACKLOG #3471, #4882): one with a codec error on it, and one whose chain cannot be
-    read whole, whether or not it holds a codec error."""
+    instead (BACKLOG #3471, #4882): one with a codec error on it, one whose chain cannot be read
+    whole, whether or not it holds a codec error, and one whose judgement raised an
+    ``Exception``."""
 
 
 def _build_store_cipher(settings: StoreSettings, posture: HopPosture | None) -> Cipher:

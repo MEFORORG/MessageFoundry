@@ -5,7 +5,8 @@
   from a codec error that has since left the chain; one that holds a codec error deep inside a
   container argument, past the scan's budget; and a provider `BaseException` that is not an
   `Exception`, such as a `SystemExit`, which is never judged. A key source
-  error whose own text was built from a codec error, one whose codec error was a context beside a
+  error whose own text was built from a codec error, with that codec error still on its chain,
+  one whose codec error was a context beside a
   cause, and a `RuntimeError` such as a `KeyProviderError` or `DpapiError` that chained one each
   kept the byte the codec error quotes. Each is now refused with a fixed text naming its class and
   the codec error without its bytes, and with no chain: a `ValueError` as
