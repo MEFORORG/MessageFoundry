@@ -222,10 +222,13 @@ async def test_a_host_blob_refuses_every_other_key_provider(tmp_path: Path, name
     assert f"set [store].key_provider = 'host' and {_KEY_SETTINGS_OUT}" in refusal, refusal
     # PR 2804 seventh hold: the copy is kept before the settings are removed, not after.
     keep = "keep a copy of each key setting's value first"
-    # Case-folded (ASCII, so the indexes line up), so the order is what fails when the copy
-    # step comes after the removal.
-    assert keep in refusal.lower(), refusal
-    assert refusal.lower().index(keep) < refusal.index(_KEY_SETTINGS_OUT), refusal
+    # Case-folded, so the order is what fails when the copy step comes after the removal.
+    low = refusal.lower()
+    assert keep in low, refusal
+    assert low.index(keep) < low.index(_KEY_SETTINGS_OUT), refusal
+    # One sentence, so "if it holds this store's key" governs the removal as well as the copy.
+    condition = low.index("if it holds this store's key")
+    assert ". " not in low[condition : low.index(_KEY_SETTINGS_OUT)], refusal
     assert not _advises_changing(refusal, allowed=(_KEY_SETTINGS_OUT,)), refusal
     assert custody_host.keep_the_key_step(settings, new_store=False) in refusal, refusal
     assert "mints this store's key" not in refusal, refusal  # only the host provider mints
@@ -1296,7 +1299,11 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
     assert "empty directory" not in step and "new, empty" not in step
     assert "Copy into it every secret file" in step, step
     # Quoted, since a service account name can hold a space.
-    command = '--service-account "NT SERVICE\\MessageFoundry" among its arguments'
+    command = (
+        "run `messagefoundry provision-admin` again, which mints this store's key in the new "
+        'custody directory, with every argument it was given, --service-account "NT SERVICE'
+        '\\MessageFoundry" among them'
+    )
     assert command in step, step
     assert "restricted and writable by the service as a secrets directory must be" in step, step
     assert "The new store starts empty" in step, step
@@ -1323,18 +1330,25 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
     tmp_path: Path, backend: StoreBackend, new_store: bool
 ) -> None:
     # PR 2804 seventh hold, finding 1: --db sets [store].path, so "the same arguments" would point
-    # a re-run back at the old store. A new SQLite store is named by --db or [store].path; a server
-    # backend reads [store].server/database, never --db.
+    # a new store's re-run, and its service, back at the old store. A new SQLite store is named by
+    # --db or [store].path; a server backend reads [store].server/database, never --db. With the
+    # store kept, the re-run keeps every argument, --db and --service-config among them.
     settings = _settings(tmp_path).model_copy(update={"backend": backend})
     step = custody_host.keep_the_key_step(settings, new_store=new_store)
     assert "same arguments" not in step, step
-    assert "run `messagefoundry provision-admin` again" in step, step
+    assert "provision-admin` again, which mints this store's key in the new custody" in step, step
+    assert "with every argument it was given" in step, step
     sqlite_path = (
-        "with --db naming that new SQLite path, or without --db once [store].path names it"
+        "with every argument it was given, except --db: name that new SQLite path with --db, or "
+        "leave --db out once [store].path names it, and point the service's own --db at it too"
     )
-    database = "once [store] names that new database (--db sets only [store].path"
+    database = (
+        "with every argument it was given, once [store] names that new database (--db sets only "
+        "[store].path, which this backend does not read)"
+    )
     assert (sqlite_path in step) is (new_store and backend is StoreBackend.SQLITE), step
     assert (database in step) is (new_store and backend is StoreBackend.POSTGRES), step
+    assert ("--db" in step) is new_store, step
 
 
 @host_file_platforms

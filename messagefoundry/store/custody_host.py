@@ -213,8 +213,8 @@ def foreign_custody_refusal(
         f"{' and '.join(found)} is in {directory}, but [store].key_provider is "
         f"{settings.key_provider!r}. A store with a host blob takes its key from that blob only: "
         "if it holds this store's key, keep a copy of each key setting's value first, somewhere "
-        "as protected as where it is now, since it may be the only copy of a store key. Then set "
-        "[store].key_provider = 'host' and remove every other store key setting, with "
+        "as protected as where it is now, since it may be the only copy of a store key, and then "
+        "set [store].key_provider = 'host' and remove every other store key setting, with "
         "[store].cipher_provider = 'aesgcm', which that provider needs. The engine cannot tell "
         "whether the blob holds this store's key, so it "
         f"leaves the file in place. {keep_the_key_step(settings, new_store=False)}"
@@ -582,20 +582,25 @@ def keep_the_key_step(
             )
     host = settings.key_provider == HOST_PROVIDER
     if host:
-        text += ". Then run `messagefoundry provision-admin` again"
-        if new_store:
-            # --db sets [store].path, so the old --db would point the re-run back at the old store;
-            # a server backend reads [store].server/database and ignores --db (PR 2804 seventh hold).
+        text += (
+            ". Then run `messagefoundry provision-admin` again, which mints this store's key in "
+            "the new custody directory, with every argument it was given"
+        )
+        if service_account is not None:
+            text += f', --service-account "{service_account}" among them'
+        # --db sets [store].path, for serve as for provision-admin, so the old --db would point a
+        # new store's re-run and its service back at the old store; a server backend reads
+        # [store].server/database and ignores --db (PR 2804 seventh hold).
+        if new_store and server:
             text += (
                 ", once [store] names that new database (--db sets only [store].path, which this "
                 "backend does not read)"
-                if server
-                else ", with --db naming that new SQLite path, or without --db once [store].path "
-                "names it"
             )
-        if service_account is not None:
-            text += f', with --service-account "{service_account}" among its arguments'
-        text += ", which mints this store's key there"
+        elif new_store:
+            text += (
+                ", except --db: name that new SQLite path with --db, or leave --db out once "
+                "[store].path names it, and point the service's own --db at it too, if it has one"
+            )
         if service_account is None and sys.platform == "win32":
             text += (
                 "; to mint it for the service's account rather than your own, add "
