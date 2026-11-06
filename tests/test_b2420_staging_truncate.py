@@ -825,13 +825,15 @@ def test_the_refusal_for_a_rewritten_staging_name_advises_no_removal_by_hand(
     assert leftover is not None and len(logged) == 1
     verbatim = dr_backup._win_verbatim(staging)
     assert leftover.startswith(
-        f"the plaintext staging directory {verbatim} was not removed or emptied; never remove it "
-        "by its plain path"
+        "a plaintext staging directory was not removed or emptied; never remove it by its plain path"
     )
     for text in (leftover, logged[0]):
         assert "by hand" not in text
         assert "delete it" not in text
-        assert "remove it only with rd /s /q in cmd.exe, not PowerShell, and that verbatim" in text
+        assert (
+            f"remove it only in PowerShell, not cmd.exe, with Remove-Item -LiteralPath '{verbatim}'"
+            in text
+        )
         # The plain path appears only inside the verbatim one.
         assert str(staging) not in text.replace(verbatim, "")
     # Nothing was removed, emptied or re-marked.
@@ -851,8 +853,82 @@ def test_the_refusals_verbatim_path_names_the_planted_directory_not_the_other(
     planted = win_tmp / "mefor-backup-x."
     leftover = dr_backup._teardown_staging(planted)
     verbatim = dr_backup._win_verbatim(planted)
-    assert leftover is not None and f" {verbatim} was not removed" in leftover
+    assert leftover is not None and f"; it is '{verbatim}', whose name ends in a dot;" in leftover
     assert os.listdir(verbatim) == ["planted.tar"]
+
+
+def _refusal_for(name: str, root: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """The refusal for ``root/name``, with the screen patched to flag it, on either platform."""
+    monkeypatch.setattr(dr_backup, "_win_rewritten", lambda path: True)
+    refusal = dr_backup._rewritten_staging_refusal(root / name)
+    assert refusal is not None
+    return refusal
+
+
+def test_a_trailing_space_is_visible_in_the_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Printed bare, `mefor-backup-x ` read as `mefor-backup-x`, the other directory, and a copy of it
+    removed that one. Red before the fix: the path ran straight into " was not removed". Now the
+    closing quote follows the space, and the space is named in words."""
+    refusal = _refusal_for("mefor-backup-x ", tmp_path, monkeypatch)
+    verbatim = dr_backup._win_verbatim(tmp_path / "mefor-backup-x ")
+    assert verbatim.endswith("mefor-backup-x ")
+    assert f"it is '{verbatim}', whose name ends in a space;" in refusal
+    dotted = _refusal_for("mefor-backup-x. ", tmp_path, monkeypatch)
+    assert "whose name ends in a dot then a space;" in dotted
+
+
+def test_a_percent_in_the_name_cannot_expand_in_the_advised_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Interactive cmd.exe expands `%PATH%` even inside double quotes. Red before the fix: the advice
+    was cmd.exe's rd with the path in double quotes. Now the only command is PowerShell's, on a
+    single-quoted literal, in which nothing expands, and no cmd.exe form is given."""
+    name = "mefor-backup-x%PATH% "
+    refusal = _refusal_for(name, tmp_path, monkeypatch)
+    literal = f"'{dr_backup._win_verbatim(tmp_path / name)}'"
+    assert f"not cmd.exe, with Remove-Item -LiteralPath {literal} -Recurse -Force" in refusal
+    assert '"' not in refusal
+    assert "rd /s" not in refusal
+
+
+def test_a_quote_in_the_name_is_doubled_in_the_literal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single quote, or a character PowerShell reads as one, would end the literal early."""
+    name = "mefor-backup-o'’x."
+    refusal = _refusal_for(name, tmp_path, monkeypatch)
+    assert "mefor-backup-o''’’x.'" in refusal
+
+
+def test_the_refusal_names_the_exact_path_to_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A check by the plain path goes through the same rewrite. Red before the fix: "check that it is
+    gone" named no path."""
+    name = "mefor-backup-x%PATH% "
+    refusal = _refusal_for(name, tmp_path, monkeypatch)
+    literal = f"'{dr_backup._win_verbatim(tmp_path / name)}'"
+    assert refusal.endswith(f"then check that Test-Path -LiteralPath {literal} prints False")
+
+
+def test_the_plain_path_ban_survives_the_failure_records_cut_on_the_verify_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure record and the alert keep the first 200 characters of the backup's verify error.
+    Red before the fix: the path came first, so a verbatim path over about 58 characters pushed the
+    ban past the cut."""
+    from messagefoundry.redaction import safe_exc
+
+    deep = tmp_path / ("d" * 120)
+    refusal = _refusal_for("mefor-verify-abcd1234.", deep, monkeypatch)
+    error = dr_backup.BackupError(
+        "verify", f"restore-verify FAIL: the archive verified, but {refusal} (kept for diagnosis)"
+    )
+    recorded = safe_exc(error)
+    assert len(recorded) <= 260
+    assert "never remove it by its plain path" in recorded
 
 
 @_windows_only
@@ -904,7 +980,7 @@ def test_a_screen_that_raises_does_not_replace_the_verify_verdict(
     assert result.status == "FAIL"
     assert result.reason is not None and result.reason.startswith("the archive verified, but ")
     (staging,) = tmp_path.glob("mefor-verify-*")
-    assert f"the plaintext staging directory {dr_backup._win_verbatim(staging)} " in result.reason
+    assert f"; it is '{dr_backup._win_verbatim(staging)}'; " in result.reason
     assert "could not be checked" in result.reason
     assert (staging / dr_backup._LOCK_NAME).exists()
 
@@ -952,8 +1028,8 @@ def test_a_verbatim_path_that_cannot_be_formed_still_forbids_the_plain_one(
     leftover = dr_backup._teardown_staging(staging)
     assert leftover is not None
     assert leftover.startswith(
-        "the plaintext staging directory named 'mefor-backup-x' in "
-        f"{tmp_path} was not removed or emptied; never remove it by its plain path"
+        "a plaintext staging directory was not removed or emptied; never remove it by its plain path"
     )
+    assert f"; it is named 'mefor-backup-x', in '{tmp_path}', and its verbatim path" in leftover
     assert "delete it" not in leftover and "by hand" not in leftover
     assert staging.is_dir()
