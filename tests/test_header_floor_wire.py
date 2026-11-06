@@ -536,18 +536,31 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
 
     floored_class = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
     assert floored_class is not None
-    floored, transport = await _fed_and_still_open(floored_class, request_bytes)
+    connects: list[Any] = []
+
+    class _CountsConnects(floored_class):  # type: ignore[misc,valid-type]
+        def handle_connect(self, event: Any) -> None:
+            connects.append(event)
+            super().handle_connect(event)
+
+    floored, transport = await _fed_and_still_open(_CountsConnects, request_bytes)
     written = bytes(transport.written)
     assert written.startswith(f"HTTP/1.1 {status} ".encode()), written[:40]
     assert b"nosniff" in written and transport.closing
+    # uvicorn runs handle_connect for a request the parser accepted, and never for one it
+    # rejected: the app-error case is the control that the count sees a call at all.
+    assert len(connects) == (1 if bare_answers else 0)
     if not bare_answers:
-        # The parser-rejection step set these itself; uvicorn never ran handle_connect.
+        # So the parser-rejection step set these itself.
         assert (floored.handshake_initiated, floored.handshake_complete, floored.close_sent) == (
             True,
             True,
             True,
         )
-        floored.data_received(b"more bytes after the rejection")  # no second pass, no raise
+        floored.data_received(b"more bytes after the rejection")  # no raise
+        # No second pass: handle_connect still never ran, and the check after shutdown() below
+        # shows nothing more was written.
+        assert connects == []
     floored.shutdown()
     assert bytes(transport.written) == written
 

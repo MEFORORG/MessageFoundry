@@ -68,13 +68,14 @@ why the distinction is written down here rather than left to a tester.
 
 ### Minimum browser versions are deliberately not stated
 
-**Unresolved.** MessageFoundry ships no pinned browser-compatibility dataset, so there is no version
-table here that anyone could check against a source. Naming engine versions without one would mean
-writing numbers chosen to match what already works, which tells you nothing about the feature the
-console actually needs.
+**Declined for now, by the owner on 2026-11-05, until a compatibility dataset is pinned.**
+MessageFoundry ships no pinned browser-compatibility dataset, so there is no version table here
+that anyone could check against a source. Naming engine versions without one would mean writing
+numbers chosen to match what already works, which tells you nothing about the feature the console
+actually needs.
 
-What would resolve it: pinning a versioned compatibility dataset into the repository and resolving
-each feature in the table below to a per-engine minimum from it. That work is not funded yet.
+What would change that: pinning a versioned compatibility dataset into the repository and resolving
+each feature in the table below to a per-engine minimum from it.
 
 Until then the floor is stated as a feature, and the console tells you at the moment of degradation.
 Both statements are checkable. A version number would be neither.

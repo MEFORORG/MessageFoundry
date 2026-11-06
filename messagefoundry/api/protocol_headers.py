@@ -27,7 +27,9 @@ base-uri 'none'`` (the floor's :data:`~messagefoundry.api.header_floor.FLOOR_CSP
 transport. It keeps a ``conn`` like the sans-I/O protocol, but its module has no websockets
 ``ServerProtocol`` for the floor to wrap, so the class build below refuses it. It is what
 ``ws="auto"`` resolves to only when websockets is not installed, and websockets is a declared
-dependency. uvicorn
+dependency. So no floor is built for it, on purpose, and
+``test_a_protocol_with_neither_hook_set_is_refused_not_served_bare`` drives that refusal on a
+stand-in of its shape, since wsproto is not installed. uvicorn
 0.54 also ships a ``zttp`` HTTP protocol. ``http="auto"`` does not resolve to it and ``serve`` never
 names it; handed to the class build, it is checked for the HTTP hooks like any other base.
 uvicorn's interim ``100 Continue`` carries no header either.
@@ -90,8 +92,14 @@ against the server class it is handed. So is every attribute the two sans-I/O st
 or write: a rename there would otherwise turn a step off, or leave it writing a dead name, with no
 error. That check sees a name that is no longer assigned. It cannot see a name the server still
 assigns and has stopped reading, nor tell ``self.<name> = ...`` from the same name assigned on
-another object, and no test covers either case. The checked hooks are: the HTTP protocol's ``send_400_response``, its
-``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
+another object. For one name a test does: the parser-rejection case of
+``test_shutdown_of_an_answered_still_open_connection_does_not_raise`` fails when uvicorn's
+``shutdown`` stops reading ``close_sent`` (a mutation removing that read raised ``InvalidState``).
+No test covers any other name, or the other-object case. That case stays unfixed on purpose: a
+check keyed on ``self`` would read the bytecode that loads the object, which CPython changes
+between versions (3.14 fuses such loads), so it would trade a documented over-acceptance for a
+refusal at start that nothing documents. The checked hooks are: the HTTP protocol's
+``send_400_response``, its ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response``, ``default_headers``, ``send``, and the ``disconnected``, ``message_event``
 and ``response_complete`` it reads, and the WebSocket protocol's hooks. For the legacy
 server those are ``send_500_response``, ``transport`` and ``write_http_response``. For the sans-I/O
@@ -398,7 +406,8 @@ def _require_ws_hooks(base: type[Any], *, through_conn: bool) -> None:
         # effect, uvicorn's shutdown sends a close frame on a conn that never opened, which
         # raises InvalidState (measured at uvicorn 0.54.0). This proves each name is still
         # ASSIGNED somewhere in the class chain, which catches a rename. It does not prove
-        # uvicorn still READS them; nothing does.
+        # uvicorn still READS them. For close_sent the wire suite's shutdown test does; the
+        # module docstring says which test, and that no test covers the other names.
         _require_assigned(base, "handshake_complete", hook="data_received")
         _require_assigned(base, "close_sent", hook="data_received")
         _require_assigned(base, "transport", hook="data_received")

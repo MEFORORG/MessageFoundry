@@ -766,9 +766,11 @@ def test_the_shipped_browser_support_doc_carries_every_relied_on_feature() -> No
 
 
 def test_the_browser_support_doc_states_the_floor_it_was_derived_from() -> None:
-    """The version rows are UNRESOLVED, and that has to stay a stated finding rather than an omission.
+    """The version rows are DECLINED for now, by the owner on 2026-11-05 until a compatibility dataset
+    is pinned, and that has to stay a stated finding rather than an omission. Until that ruling the
+    page called them "Unresolved".
 
-    An unresolved row and a forgotten row look identical in a document. This pins the two claims the
+    A declined row and a forgotten row look identical in a document. This pins the two claims the
     derivation actually rests on -- that the floor is CSP nonce-source support, and that
     ``'strict-dynamic'`` is not part of it -- plus the explicit statement that no version table is
     stated. Authoring one later without a pinned dataset reds here.
@@ -791,7 +793,7 @@ def test_the_browser_support_doc_states_the_floor_it_was_derived_from() -> None:
     assert "nonce sources" in text
     assert "'strict-dynamic'` is not part of the floor" in text
     assert "Minimum browser versions are deliberately not stated" in text
-    assert "Unresolved" in text
+    assert "Declined for now, by the owner on 2026-11-05" in text
     # and the wording stays compatible with the unpublished-distribution scan (see the docstring)
     assert "not published" not in text
     # Both halves of the 3.1.1 verb (warn the user OR block access), plus the named control. This
