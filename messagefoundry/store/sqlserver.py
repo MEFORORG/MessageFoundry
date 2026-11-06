@@ -15717,11 +15717,13 @@ class SqlServerStore:
         gives (BACKLOG #3023).
 
         LOCK ORDER (BACKLOG #4974). The re-key takes its account's ``users`` row under ``UPDLOCK,
-        ROWLOCK`` before its session row, the order every whole-account sweep here takes them in:
-        each locks the account row first, through the write helper or the epoch raise, and sweeps
-        after. The re-key moves the row to a new clustered key, and a sweep that met the row
-        locked mid-move would find the old key gone and the new one out of its read, so it would
-        miss the session. With the account row first, a re-key either commits before a sweep of
+        ROWLOCK`` before its session row, the order the per-account sweeps here take them in: each
+        locks the account row first, through the write helper or the epoch raise, and sweeps
+        after. ``revoke_all_sessions`` locks only the accounts its list read returns, so a session
+        of any other account is not ordered against a re-key. The re-key moves the row to a new
+        clustered key, and a sweep that met the row locked mid-move could find the old key gone
+        and the new one out of its read, or deadlock with the re-key, depending on the plan. With
+        the account row first, a re-key either commits before a sweep of
         its account locks that row, and the sweep reads the new key, or waits until the sweep
         commits and then finds the session ended. The session's account is read unlocked first:
         ``user_id`` never changes, and a session already gone locks nothing. Each path in this file

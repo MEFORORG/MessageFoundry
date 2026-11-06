@@ -4827,7 +4827,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   sweep runs is swept too, on all three stores, except in at least the SQL Server cases this
   paragraph names (BACKLOG #4974).** Until then the SQL Server store could miss any such session. That
   store's re-key moves the session row to a new clustered key, so a sweep waiting on the row's
-  old key would find it gone and the new one outside its read. Its rotation now takes the
+  old key could find it gone and the new one outside its read, or deadlock with the re-key,
+  depending on the query plan. Its rotation now takes the
   account's row under `UPDLOCK` before the session row, the order each whole-account sweep there
   read for this takes them in, through the account write or the epoch raise: a bind, an unbind,
   a TOTP re-enrolment, and the whole-account revokes, at least an administrator's revoke of a
@@ -4851,14 +4852,14 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   its re-key, then runs a bind, an unbind, a revoke of a user's sessions and the every-account
   revoke against it, on both server legs; on the SQL Server leg it also starts a rotation while a
   bind holds the account's row. The TOTP re-enrolment's own sweep was read from the code and is
-  not replayed. That the old SQL Server order missed the session
-  was read from the code and was not run.
+  not replayed. That the old SQL Server order could miss the session, or deadlock with the
+  re-key, depending on the plan, was read from the code and was not run.
   **A session a whole-account sweep missed is refused the next time it is presented** (BACKLOG
-  #2592),
-  within the limits the rest of this bullet states. Each of these raises the
-  account's session epoch in the same transaction, and a rotation keeps the epoch the session was
-  sealed under. So the gate refuses and ends the session, and the user's own session list hides
-  it and ends it the same way.
+  #2592), within the limits the rest of this bullet states. The bind, the unbind, the TOTP
+  re-enrolment and the per-account revoke each raise the account's session epoch in the same
+  transaction, and the every-account revoke raises it for each account its list read returned.
+  A rotation keeps the epoch the session was sealed under. So the gate refuses and ends the
+  session, and the user's own session list hides it and ends it the same way.
   **The every-account revoke also raises the store's global session epoch, on all three stores
   (BACKLOG #5091).** Every session is stamped with that epoch when it is minted and resolves
   only while it is current, so the revoke ends a session whatever its read of the account list

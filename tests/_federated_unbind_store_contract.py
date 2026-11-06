@@ -563,13 +563,14 @@ async def _assert_rotation_racing_a_sweep_is_swept(
     holds the row under its OLD hash and has moved nothing yet. The sweep is started, and the probe
     requires that it really waits on the rotation. Released, the rotation re-keys and commits, and
     the sweep must end the session under its NEW hash. On SQL Server the re-key moves the row to a
-    new clustered key, so a sweep waiting on the old key would find it gone and the new one outside
+    new clustered key, so a sweep waiting on the old key could find it gone and the new one outside
     its read; the new hash sorts before the old one, so a scan in key order has passed it too. On
     SQL Server the rotation takes the account row first, so the sweep waits there, before it reads
     any session. On Postgres the sweep waits on the session row and then follows the row to its new
     version. The bind, the unbind, a revoke of the user's sessions and the every-account revoke are
     each replayed. By the reading in ``rotate_session``, SQL Server without the account row first
-    would count 0 and leave the new hash live; that was not run.
+    could count 0 and leave the new hash live, or deadlock, depending on the plan; that was not
+    run.
 
     ``holder_of`` and ``is_blocking`` are the lock-order test's: no timing decides the race.
     """
