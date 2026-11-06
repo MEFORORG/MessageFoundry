@@ -221,9 +221,11 @@ Vault and LDAP*.
 > catalog to show that the database holds no store yet, and SQL Server lists a table in `sys.tables`
 > only to a login that may see its metadata. `SELECT`, which `db_datareader` grants on the database,
 > is not enough: under it alone a table-level `DENY` of `SELECT` hides that table. Without the grant
-> the mint is refused and the refusal names it. Grant it on the schema that holds `schema_meta`, at
-> least `GRANT VIEW DEFINITION ON SCHEMA::[dbo] TO [CORP\mefor-svc$];` when that schema is `dbo`.
-> The startup probe (§1.3) does not report it as excess.
+> the mint is refused and the refusal names it. Grant it on the schema that holds `schema_meta` to
+> the login that runs `provision-admin`, for example
+> `GRANT VIEW DEFINITION ON SCHEMA::[dbo] TO [CORP\some-operator];` when that schema is `dbo`.
+> Under `auth = "integrated"` that login is the Windows account that runs the command, which is
+> not the gMSA unless the command runs as it. The startup probe (§1.3) does not report it as excess.
 >
 > **`[store].schema_management = "auto"` puts the DDL back on the runtime login.** The engine then
 > builds and upgrades its own schema at open, and the gMSA also needs `db_ddladmin` as a standing

@@ -1216,18 +1216,16 @@ async def _failed_create(
             await _create(settings, blob)
 
 
-def _run_provision_admin(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store_path: Path
-) -> tuple[int, str]:
+def _run_provision_admin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store_path: Path) -> int:
     """provision-admin against the SQLite store at ``store_path`` under the host key provider, with
-    no terminal: the exit code and stderr."""
+    no terminal: its exit code. Read stderr from ``capsys``."""
     from messagefoundry.__main__ import main
 
     monkeypatch.chdir(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text('[store]\nkey_provider = "host"\n')
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
-    return main([*argv, "--db", str(store_path)]), ""
+    return main([*argv, "--db", str(store_path)])
 
 
 @host_file_platforms
@@ -1270,7 +1268,7 @@ def test_a_rerun_over_a_chain_never_started_keeps_the_key_file(
         asyncio.run(_failed_create(settings, blob, monkeypatch))
     kept = tmp_path / custody_host.HOST_FILE_NAME
     assert kept.exists()
-    code, _ = _run_provision_admin(tmp_path, monkeypatch, store_path)
+    code = _run_provision_admin(tmp_path, monkeypatch, store_path)
     assert code == 2
     err = capsys.readouterr().err
     assert "Traceback" not in err
@@ -1278,8 +1276,14 @@ def test_a_rerun_over_a_chain_never_started_keeps_the_key_file(
     assert "remove" not in err.lower() and "delete" not in err.lower(), err
     assert f"keep {kept}" in err and "cannot tell whose key" in err, err
     assert "MEFOR_SECRETS_DIRECTORY" in err, err
-    # A SQLite store with no key here reads as taken, so its file moves aside, -wal file with it.
-    assert f"move the store file {store_path.resolve()}" in err and "-wal" in err, err
+    # A SQLite store with no key here reads as taken, so its file moves aside, its -wal file
+    # renamed to match, or SQLite would not find it.
+    assert f"move the store file {store_path.resolve()}" in err, err
+    assert "the new name plus -wal and -shm" in err, err
+    # Which recovery key goes with the new key, and that the step suits only a store holding
+    # nothing the operator needs: nothing is carried over.
+    assert "recovery key" in err and "void" in err, err
+    assert "holds nothing you need" in err, err
 
 
 @host_file_platforms
@@ -1307,7 +1311,7 @@ def test_a_shared_secrets_directory_never_names_another_stores_key_for_removal(
     blob = _mint(a_settings)
     asyncio.run(_create(a_settings, blob))
     kept = secrets / custody_host.HOST_FILE_NAME
-    code, _ = _run_provision_admin(tmp_path, monkeypatch, b_path)
+    code = _run_provision_admin(tmp_path, monkeypatch, b_path)
     assert code == 2
     err = capsys.readouterr().err
     assert "remove" not in err.lower() and "delete" not in err.lower(), err
@@ -1365,10 +1369,13 @@ def test_a_minted_key_is_kept_when_the_pin_refused_after_a_write(
     cli._discard_minted_custody(kept, server, StoreIdPinRefused("after the salt bind"))
     assert kept.exists()
     # PR 2804 fourth hold, item 2: whether the store holds anything under the key is not proved
-    # here, so the text keeps it and names the way on the re-run names too.
+    # here, so the text keeps it and sends the operator to the re-run, which carries on with a
+    # store started under it or names the one way on. This run minted the key, so the text does
+    # not call it possibly another store's.
     warning = capsys.readouterr().err
-    assert str(kept) in warning and "MEFOR_SECRETS_DIRECTORY" in warning, warning
+    assert str(kept) in warning and "run the command again" in warning.lower(), warning
     assert "remove" not in warning.lower(), warning
+    assert "another store's" not in warning, warning
     removed = tmp_path / "removed.key"
     removed.write_bytes(b"k")
     cli._discard_minted_custody(removed, server, StoreIdPinRefusedBeforeWrite("before"))

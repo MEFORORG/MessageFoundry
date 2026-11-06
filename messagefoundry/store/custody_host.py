@@ -553,15 +553,19 @@ def keep_the_key_step(settings: StoreSettings, kept: str, *, store_file: bool) -
     move = ""
     if store_file and settings.backend is StoreBackend.SQLITE and settings.path != ":memory:":
         db = Path(settings.path).resolve()
+        # SQLite finds a WAL only under its database's own name, so the side files follow it.
         move = (
-            f"move the store file {db}, with any {db.name}-wal and {db.name}-shm beside it, aside "
-            "under a new name, then "
+            f"move the store file {db} aside under a new name, renaming any {db.name}-wal and "
+            f"{db.name}-shm beside it to the new name plus -wal and -shm, then "
         )
     return (
-        f"The engine cannot tell whose key {kept} is, and it may be another store's only key, so "
-        f"keep {kept} where it is. To provision this store, {move}give it a custody directory of "
+        f"The engine cannot tell whose key is in {kept}, and it may be another store's only key, "
+        f"so keep {kept} in place. To provision this store, {move}give it a custody directory of "
         f"its own: set {SECRETS_DIRECTORY_VARIABLE} to a new, empty directory, here and in the "
-        "service's environment, and run the command again, which mints this store's key there"
+        "service's environment, and run the command again, which mints this store's key there. "
+        "A recovery key an earlier run showed is then void for this store: keep the one that run "
+        "shows. This suits only a store that holds nothing you need, since nothing is carried "
+        "over to the new key"
     )
 
 

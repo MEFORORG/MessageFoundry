@@ -7071,7 +7071,6 @@ def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseExcep
     and named on stderr. Neither text carries the key."""
     from messagefoundry.config.settings import StoreBackend
     from messagefoundry.store.base import _absent_sqlite_store
-    from messagefoundry.store.custody_host import keep_the_key_step
     from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
 
     nothing_written = isinstance(failure, StoreIdPinRefusedBeforeWrite) or (
@@ -7081,7 +7080,9 @@ def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseExcep
         print(
             f"WARNING: the store could not be created, and it may already have been started "
             f"under the store key minted for it, so that key is kept in {path}. No Administrator "
-            f"was provisioned into it. {keep_the_key_step(store, str(path), store_file=True)}",
+            "was provisioned into it. Keep that file and run the command again: if the store was "
+            "started under that key, it carries on with it, and if not, it names a way on that "
+            "keeps the file",
             file=sys.stderr,
         )
         return
