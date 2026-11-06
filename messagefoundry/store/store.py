@@ -6948,8 +6948,11 @@ async def _secure_file_async(path: Path) -> None:
 # The data directory already names the right set. install-service.ps1 removes its inheritance and
 # grants SYSTEM, BUILTIN\Administrators and the run-as account. So where the store's directory is
 # HARDENED like that, every open writes the SAME explicit, protected DACL on the trio: SYSTEM and
-# Administrators full control, and the one per-service account Modify. It does not depend on who
-# opens, so the second opener finds it already exact and needs no WRITE_DAC; it is protected, so a
+# Administrators full control, and the one run-as account Modify. That account is a per-service
+# virtual account, or one named user account the host resolves (a local user, or a gMSA only if it
+# resolves to a user account, which is unmeasured; the -ServiceAccount install; BACKLOG #3760,
+# #2234, owner ruling 2026-11-05). It does not depend on who opens, so the second opener finds it
+# already exact and needs no WRITE_DAC; it is protected, so a
 # later edit to the directory does not reach the store. Anywhere else -- a developer checkout, a temp
 # directory, a directory admitting anyone else, one reached through a link, or one this code cannot
 # read -- the owner-only rewrite applies exactly as before. Every test below is an ALLOW-list.
@@ -6960,20 +6963,33 @@ _SDDL_SID_ALIASES: Mapping[str, str] = MappingProxyType({"SY": "S-1-5-18", "BA":
 _STORE_DIR_TRUSTED_SIDS = ("S-1-5-18", "S-1-5-32-544")
 #: One per-service virtual account, NT SERVICE\<name>: S-1-5-80 plus exactly five sub-authorities.
 #: NT SERVICE\ALL SERVICES is S-1-5-80-0 and does NOT match, because it admits every service.
-_SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+")
+_SERVICE_SID = re.compile(r"S-1-5-80-\d+-\d+-\d+-\d+-\d+", re.ASCII)
+#: A machine- or domain-relative account SID: S-1-5-21, the three sub-authorities naming the machine
+#: or the domain, then the RID. A local user, a domain user and a gMSA all have this shape; so do
+#: their groups, which is why the shape alone admits nothing (see :func:`_account_type_refusal`).
+#: ASCII digits only, here and in :data:`_SERVICE_SID`: ``\d`` alone also matches other scripts'
+#: digits, which ``int`` accepts.
+_ACCOUNT_SID = re.compile(r"S-1-5-21-\d+-\d+-\d+-(\d+)", re.ASCII)
+#: The lowest RID Windows hands an account or group it creates. Below it sit the built-in ones: at
+#: least Administrator (500), Guest (501), krbtgt (502), DefaultAccount (503) and the well-known
+#: domain groups from 512, Domain Users (513) among them.
+_FIRST_ASSIGNED_RID = 1000
+#: SidTypeUser, the SID_NAME_USE LookupAccountSidW reports for a user account. A group reports
+#: SidTypeGroup (2) or SidTypeAlias (4), a well-known SID SidTypeWellKnownGroup (5).
+_SID_TYPE_USER = 1
 _SDDL_DENY_TYPES = frozenset({"D", "OD", "XD"})
 _SDDL_ACE = re.compile(r"\(([^()]*)\)")
 _SDDL_OWNER = re.compile(r"O:(S-[0-9-]+|[A-Z]{2})")
 #: The SDDL right for each principal of the trio: full control (FA) for SYSTEM and Administrators,
-#: and Modify (0x1301bf, what install-service.ps1 grants the run-as account) for the service.
+#: and Modify (0x1301bf, what install-service.ps1 grants the run-as account) for that account.
 _TRIO_RIGHTS: Mapping[str, str] = MappingProxyType({"S-1-5-18": "FA", "S-1-5-32-544": "FA"})
-_SERVICE_RIGHTS = "0x1301bf"
+_RUN_AS_RIGHTS = "0x1301bf"
 
 
 def _trio_right(sid: str) -> str:
     """The one SDDL right the trio carries for ``sid``, upper-cased as the parser keeps rights. The
     writer and both checks use this, so they cannot drift apart."""
-    return _TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS).upper()
+    return _TRIO_RIGHTS.get(sid, _RUN_AS_RIGHTS).upper()
 
 
 @dataclass(frozen=True)
@@ -7025,7 +7041,29 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
 
 
 def _hardening_refusal(directory: _SddlDacl) -> str | None:
-    """Why ``directory`` is NOT hardened, or ``None`` when it is (see :func:`_hardened_trio_grants`).
+    """Why ``directory`` is NOT hardened, or ``None`` when it is.
+
+    Hardened means the directory is exactly what install-service.ps1 writes (Set-SecureDataDirAcl,
+    then Set-DataDirOwner): inheritance blocked; every ACE an allow with the installer's own
+    inheritance (``OICI``) and rights -- full control (``FA``) for SYSTEM and Administrators, both
+    present, and Modify (``0x1301bf``) for at most ONE run-as account -- and nothing else; no deny
+    ACE, because the trio's DACL does not carry denies over; and an owner of SYSTEM or
+    Administrators, or of the run-as account when it is a per-service virtual account, because an
+    owner keeps WRITE_DAC over the directory. The run-as account is a per-service virtual account,
+    or one user account this host resolves with a RID of 1000 or more (:func:`_account_shape_refusal`,
+    :func:`_account_type_refusal`). A user never qualifies as the OWNER: any standard user can own a
+    directory she made and grant herself the installer's shape, while install-service.ps1 makes
+    Administrators the owner (Set-DataDirOwner, which only warns when it cannot, and the directory is
+    then refused), and no standard user can own a directory as a virtual account.
+
+    NOT pure: for a user run-as it calls ``LookupAccountSidW``, which may block on a domain
+    controller and logs nothing itself. Call it once per decision (:func:`_hardening_verdict`), and
+    never on an event loop.
+
+    The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
+    written with FA/Modify: a directory granting Administrators read, or a service container-only,
+    or a different service read, would otherwise produce a store WIDER than its directory. Any shape
+    but the installer's falls back to the owner-only rewrite.
 
     The first failing condition, in a fixed order, as one operator-readable sentence. The checks read
     the whole DACL, so a directory that fails two ways is refused whichever entry comes first."""
@@ -7034,55 +7072,95 @@ def _hardening_refusal(directory: _SddlDacl) -> str | None:
     if not directory.aces:  # defence in depth: the both-built-ins check below also refuses this
         return "its DACL is empty"
     named: set[str] = set()
-    services: set[str] = set()
+    run_as: set[str] = set()
     for ace_type, flags, rights, sid in directory.aces:
         trusted = sid in _STORE_DIR_TRUSTED_SIDS
-        service = not trusted and bool(_SERVICE_SID.fullmatch(sid))
         if ace_type != "A":
             return f"it carries a {ace_type} entry for {sid}, which the trio would not carry over"
-        if not (trusted or service):
-            return f"it grants {sid}, which is not SYSTEM, Administrators or one service account"
+        if not trusted and not _SERVICE_SID.fullmatch(sid):
+            refusal = _account_shape_refusal(sid)
+            if refusal is not None:
+                return refusal
         if _sddl_flag_set(flags) != {"OI", "CI"} or rights != _trio_right(sid):
             return (
                 f"it grants {sid} ({flags};{rights}), not the installer's shape "
                 f"(OICI;{_trio_right(sid)})"
             )
-        (named if trusted else services).add(sid)
+        (named if trusted else run_as).add(sid)
     # Both built-in principals are required, as the installer always writes them: without
     # Administrators among the grants, a file it owns could never be made exact, and would be
     # rewritten -- and warned about -- on every start.
     if named != set(_STORE_DIR_TRUSTED_SIDS):
         return "it does not grant both SYSTEM and Administrators"
-    if len(services) > 1:
-        return "it grants more than one service account"
+    # At most ONE run-as principal, of either kind: two service accounts, two users, or a service
+    # account beside a user are all refused. The installer grants one, or none for LocalSystem.
+    if len(run_as) > 1:
+        return f"it grants more than one service or user account ({', '.join(sorted(run_as))})"
+    services = {sid for sid in run_as if _SERVICE_SID.fullmatch(sid)}
     if directory.owner is None or (
         directory.owner not in _STORE_DIR_TRUSTED_SIDS and directory.owner not in services
     ):
         return f"it is owned by {directory.owner}, which keeps WRITE_DAC over it"
+    # Last, because it is the one check that can leave the host: a gMSA's SID resolves through a
+    # domain controller. Every cheaper refusal has had its chance first.
+    user = next(iter(run_as - services), None)  # at most one, by the check above
+    return None if user is None else _account_type_refusal(user)
+
+
+def _account_shape_refusal(sid: str) -> str | None:
+    """Why ``sid`` cannot be the trio's one named run-as user account by its SHAPE alone, or ``None``
+    when it may be one, pending :func:`_account_type_refusal`.
+
+    The owner ruling of 2026-11-05 (BACKLOG #3760, #2234) admits one principal beyond SYSTEM,
+    Administrators and a per-service virtual account, and only a user account with a RID of 1000 or
+    more: the account ``install-service.ps1 -ServiceAccount`` grants, such as a local user, or a
+    gMSA only if it resolves to a user account, which is unmeasured. The SID must be machine- or
+    domain-relative (``S-1-5-21-...``), whose last sub-authority is the RID of an account or group
+    that machine or domain holds; the regex admits no other family, so a BUILTIN alias
+    (``S-1-5-32-...``), whose last sub-authority is also a RID, is refused by shape. Any alias the
+    SDDL writer emits (``NS``, ``LA``, ``DU``) is not of this shape either, so it is refused too. A RID
+    under 1000 is a built-in account or group, refused without a lookup: at least the built-in Administrator (500), Guest (501) and Domain Users (513)."""
+    match = _ACCOUNT_SID.fullmatch(sid)
+    if match is None:
+        return (
+            f"it grants {sid}, which is not SYSTEM, Administrators, one service account or one "
+            "user account"
+        )
+    if int(match.group(1)) < _FIRST_ASSIGNED_RID:
+        return (
+            f"it grants {sid}, a built-in account or group (a RID below {_FIRST_ASSIGNED_RID}), "
+            "not one user account"
+        )
     return None
 
 
-def _hardened_trio_grants(directory: _SddlDacl) -> tuple[str, ...] | None:
-    """The principals the trio is granted when ``directory`` is HARDENED, else ``None``.
+def _account_type_refusal(sid: str) -> str | None:
+    """Why ``sid``, already of the account shape, is not a USER account on this host, or ``None``
+    when ``LookupAccountSidW`` resolves it to SidTypeUser. Refused when the lookup fails, and when it
+    returns any other type: a group or alias with an assigned RID has the same shape as a user, and
+    granting one Modify must not widen the store to every member."""
+    kind, status = _lookup_sid_type(sid)
+    if kind is None:
+        return (
+            f"it grants {sid}, which this host could not resolve to an account (Win32 status "
+            f"{status})"
+        )
+    if kind != _SID_TYPE_USER:
+        return f"it grants {sid}, which resolves to SID type {kind}, not a user account"
+    return None
 
-    Hardened means the directory is exactly what install-service.ps1 writes (Set-SecureDataDirAcl,
-    then Set-DataDirOwner): inheritance blocked; every ACE an allow with the installer's own
-    inheritance (``OICI``) and rights -- full control (``FA``) for SYSTEM and Administrators, both
-    present, and Modify (``0x1301bf``) for at most ONE per-service account -- and nothing else; no
-    deny ACE, because the trio's DACL does not carry denies over; and an owner of SYSTEM,
-    Administrators or that service account, because an owner keeps WRITE_DAC over the directory.
 
-    The RIGHTS and FLAGS are part of the test, not only the principals, because the trio is always
-    written with FA/Modify: a directory granting Administrators read, or a service container-only,
-    or a different service read, would otherwise produce a store WIDER than its directory. Any shape
-    but the installer's falls back to the owner-only rewrite. The answer names only principals the
-    directory allows, never who happens to be opening."""
-    if _hardening_refusal(directory) is not None:
-        return None
-    services = sorted(
-        sid for _t, _f, _r, sid in directory.aces if sid not in _STORE_DIR_TRUSTED_SIDS
-    )
-    return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(services))
+def _hardening_verdict(directory: _SddlDacl) -> tuple[tuple[str, ...] | None, str | None]:
+    """``(grants, None)`` when ``directory`` is HARDENED, else ``(None, refusal)``: one check, so the
+    account lookup :func:`_hardening_refusal` may make runs once, and the grants are never built for
+    a directory that was not checked. The grants are SYSTEM, Administrators, then the run-as account
+    if the directory names one: only principals the directory allows, never who happens to be
+    opening."""
+    refusal = _hardening_refusal(directory)
+    if refusal is not None:
+        return None, refusal
+    run_as = (sid for _t, _f, _r, sid in directory.aces if sid not in _STORE_DIR_TRUSTED_SIDS)
+    return (*_STORE_DIR_TRUSTED_SIDS, *dict.fromkeys(run_as)), None
 
 
 def _sddl_flag_set(flags: str) -> set[str]:
@@ -7171,6 +7249,71 @@ def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:
         kernel32.LocalFree(descriptor)
 
 
+def _lookup_sid_type(sid: str) -> tuple[int | None, int]:
+    """``(SID_NAME_USE, 0)`` for what ``LookupAccountSidW`` reports for ``sid`` on this host, or
+    ``(None, Win32 status)`` when the lookup fails, and ``(None, 0)`` off Windows. A seam for tests,
+    so the decision runs anywhere.
+
+    A domain account's SID resolves through a domain controller, or through the LSA's lookup cache
+    when none answers. On every failure the directory is refused as not hardened, and each store
+    file takes the fallback restricted by :func:`_secure_file` (see ADR 0163,
+    *Note (2026-11-05)*; decision d20261106T140017335-d24848). Why ERROR_NONE_MAPPED (1332) does
+    not prove the SID names no account, and what that fallback leaves on each file, are stated
+    once, in ADR 0163, *Note (2026-11-05)*, *Left open*. Nothing is logged here: the status goes
+    into the refusal, which the caller logs once, beside the directory it refused."""
+    if sys.platform != "win32":
+        return None, 0
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    convert = advapi32.ConvertStringSidToSidW
+    convert.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    convert.restype = wintypes.BOOL
+    lookup = advapi32.LookupAccountSidW
+    lookup.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.c_void_p,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    lookup.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    psid = ctypes.c_void_p()
+    if not convert(sid, ctypes.byref(psid)):
+        return None, ctypes.get_last_error()
+    try:
+        name_len, domain_len = wintypes.DWORD(256), wintypes.DWORD(256)
+        status = 0
+        # A name longer than the first buffers fails with ERROR_INSUFFICIENT_BUFFER (122) and sets
+        # both lengths to what is needed, so one retry at those lengths is enough.
+        for _attempt in range(2):
+            name = ctypes.create_unicode_buffer(name_len.value)
+            domain = ctypes.create_unicode_buffer(domain_len.value)
+            use = ctypes.c_int()
+            if lookup(
+                None,
+                psid,
+                name,
+                ctypes.byref(name_len),
+                domain,
+                ctypes.byref(domain_len),
+                ctypes.byref(use),
+            ):
+                return use.value, 0
+            status = ctypes.get_last_error()
+            if status != 122:
+                break
+        return None, status
+    finally:
+        kernel32.LocalFree(psid)
+
+
 def _is_windows() -> bool:
     """A seam the tests patch, instead of patching the process-wide ``os.name``."""
     return os.name == "nt"
@@ -7200,9 +7343,9 @@ def _reaches_through_a_link(path: Path) -> bool:
 
 
 def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
-    """The trio grants for a store in ``directory`` (see :func:`_hardened_trio_grants`), or ``None``
-    for the owner-only rewrite: off Windows, through a link, or when the DACL cannot be read or
-    parsed."""
+    """The trio grants for a store in ``directory`` (see :func:`_hardening_verdict`), or ``None``
+    for the owner-only rewrite: off Windows, through a link, when the DACL cannot be read or parsed,
+    or when the directory is refused as not hardened, a failed account lookup included."""
     if not _is_windows() or _reaches_through_a_link(directory):
         return None
     sddl = _read_dacl_sddl(directory, owner=True)
@@ -7211,7 +7354,7 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
     parsed = _parse_sddl_dacl(sddl)
     if parsed is None:
         return None
-    reason = _hardening_refusal(parsed)
+    grants, reason = _hardening_verdict(parsed)
     if reason is not None:
         # A locked-down directory (inheritance off) that still fails the test is the case an operator
         # needs to hear about: the fallback brings back the Wave 0 lockout, whose only other symptom
@@ -7222,15 +7365,14 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
         if parsed.protected and not any(sid == "OW" for _t, _f, _r, sid in parsed.aces):
             log.warning(
                 "%s is locked down but %s, so the store there is restricted owner-only; the service "
-                "account and an operator's provision-admin cannot then both open it (ADR 0163 note "
-                "of 2026-09-24)",
+                "account and an operator's provision-admin cannot then both open it (ADR 0163 notes "
+                "of 2026-09-24 and 2026-11-05)",
                 directory,
                 reason,
             )
         else:
             log.debug("%s is not a hardened store directory: %s", directory, reason)
-        return None
-    return _hardened_trio_grants(parsed)
+    return grants
 
 
 def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = None) -> bool:
@@ -7250,7 +7392,7 @@ def _write_trio_dacl(path: Path, grants: Sequence[str], *, owner: str | None = N
     from ctypes import wintypes
 
     # Written in the canonical SDDL spelling (lower-case ``0x`` hex); only COMPARISONS upper-case.
-    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _SERVICE_RIGHTS)};;;{sid})" for sid in grants)
+    aces = "".join(f"(A;;{_TRIO_RIGHTS.get(sid, _RUN_AS_RIGHTS)};;;{sid})" for sid in grants)
     sddl = (f"O:{owner}" if owner else "") + f"D:P{aces}"
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
