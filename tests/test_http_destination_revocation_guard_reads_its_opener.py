@@ -349,7 +349,7 @@ def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[st
     assert "delivers over verified https" in default
 
 
-def test_rest_with_an_ech_sidecar_and_verify_off_is_still_refused() -> None:
+def test_rest_with_an_ech_sidecar_and_verify_off_is_refused_unless_revocation_attested() -> None:
     """Vault BACKLOG #2977 item 8. With ECH the sidecar makes the TLS connection to the peer, so
     ``verify_tls`` reaches no TLS connection the engine makes and turns off no verification. It must
     not turn off the revocation guard either. Before the fix it did: an attested verify-off hop
@@ -362,9 +362,19 @@ def test_rest_with_an_ech_sidecar_and_verify_off_is_still_refused() -> None:
     # and not the verify-off gate or a bad setting.
     with active_hop_posture(PROD_PHI):
         dest = _build("REST", revocation_attested=True, hop_attested=True, extra=_ECH_VERIFY_OFF)
-    # The fix's premise: the opener kept is the sidecar one, never the CERT_NONE verify-off opener.
-    context = opener_tls_context(dest._opener, connector="probe")  # type: ignore[attr-defined]
+    # The fix's premise: the opener kept is a per-connection verifying one, never the CERT_NONE
+    # verify-off opener. An empty ProxyHandler leaves no handler behind, so the handler list cannot
+    # tell the sidecar opener from a direct one; identity and verify mode are what this can pin.
+    opener = dest._opener  # type: ignore[attr-defined]
+    assert opener is not rest._NO_REDIRECT_OPENER
+    context = opener_tls_context(opener, connector="probe")
     assert context is not None and context.verify_mode == ssl.CERT_REQUIRED
+    # CONTROL 3: with no attestation at all the verify-off gate still refuses first, so the hop
+    # needs both attestations.
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused) as first:
+        _build("REST", extra=_ECH_VERIFY_OFF)
+    assert "verify_tls=false" in str(first.value)
+    assert ECH_HOP_WAYS_ACROSS not in str(first.value)
     # CONTROL 2: without the sidecar the verify-off hop has no verification for a revocation check to
     # add to, so the revocation guard stays off and the attested hop builds, unchanged.
     with active_hop_posture(PROD_PHI):
