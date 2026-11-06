@@ -1805,7 +1805,9 @@ def test_an_orphan_under_an_unreadable_ancestor_stays_reported(
         with _unlistable(above):
             later = run(fx)
     assert [o["path"] for o in later["orphansFromEarlierRuns"]] == [str(gone)], later
-    assert "not confirmed gone" in later["orphansFromEarlierRuns"][0]["why"]
+    why = later["orphansFromEarlierRuns"][0]["why"]
+    # The listing step refused, not some other read on the way up.
+    assert "not confirmed gone: Could not list the entries above the orphaned directory" in why, why
     assert later["_exit"] == 3
 
 
