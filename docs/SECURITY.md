@@ -3680,13 +3680,17 @@ does a local account, nor an account that already holds a factor, which proves t
   `finish_webauthn_registration` (passkeys: `enrolment_code` in the body the console's passkey
   page script sends to `/ui/account/webauthn/verify`). It is read after the directory lookup and
   the factor check, and before the TOTP step is consumed or the passkey challenge popped, so a
-  refused code costs neither. Every refused code, whether missing, malformed, never issued,
-  wrong, expired or spent, gets the same reply, and its `auth.enrolment_code_refused` row
-  says only `not_presented` or `code_refused`.
+  refused code costs neither. Every code refused at that read, whether missing, malformed,
+  never issued, wrong, expired or spent, gets the same reply, and its
+  `auth.enrolment_code_refused` row says only `not_presented` or `code_refused`. A code that
+  passed the read and is revoked, expires or is spent by another ceremony before the spend is
+  the race ADR 0207 A3 names: on TOTP the confirm answers as a lost session
+  (`auth.mfa_enroll_refused`), and on a passkey the refusal comes after the challenge pop.
 - **Spent once, atomically.** On TOTP the spend is folded into the enable's own conditional
   write, so a confirm whose enable matches no row spends nothing. On a passkey it is one
-  conditional write before the credential is written. Either write also needs the account to be
-  an enabled directory account with no factor, so two ceremonies cannot both spend one code.
+  conditional write before the credential is written. Each write clears the code only while the
+  row still holds that code's digest, so two ceremonies cannot both spend one code; it also
+  needs the account to be an enabled directory account with no factor.
 - **The code.** 160 bits from `secrets`, shown grouped as base32 and normalised for case,
   spaces and hyphens. Only its SHA-256 digest is stored, with its expiry and its issuer, in
   three `users` columns inside the account's integrity seal while set. It lives **24 hours**,
@@ -6798,8 +6802,9 @@ with the viewer. Read the trail via `GET /audit` (`audit:read`). **Credentials, 
 are never logged** (only ids/counts land in `detail`).
 
 **A directory account's enrolment code writes five actions** (ADR 0207): `auth.enrolment_code_issued`
-and `auth.enrolment_code_revoked` under the issuing Administrator (`cli:<osuser>` from the host
-command), `auth.enrolment_code_used` and `auth.enrolment_code_refused` under the account whose
+under the issuing Administrator (`cli:<osuser>` from the host command),
+`auth.enrolment_code_revoked` under the Administrator who revoked the code, who need not be
+its issuer, `auth.enrolment_code_used` and `auth.enrolment_code_refused` under the account whose
 session acted, and `auth.enrolment_code_spent_notice`. **That last one is the one audit row whose
 actor did not act**: it is written under the ISSUING Administrator's name, as the notice's
 recipient, so the issuer's own `GET /me/security-events` returns it. Its detail says so

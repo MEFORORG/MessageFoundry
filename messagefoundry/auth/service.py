@@ -13965,8 +13965,19 @@ class AuthService:
                 )
             return Elevation(session_lost=True)
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
+        # TOTP is on and the session rotated, so a fault here must not lose the token and the
+        # recovery codes (BACKLOG #1902): both writes are soft, logged at ERROR, never raised.
+        # ``defects`` is empty because a raise would report a bound factor as a failure.
         if spent is not None:
-            await self._record_code_spent(identity, spent, "totp", client=client)
+            used = spent  # narrowed, for the lambda
+            await write_audit_soft(
+                lambda: self._record_code_spent(identity, used, "totp", client=client),
+                log=_log,
+                message="the enrolment code spent by %s could not record its rows",
+                args=lambda: (scrub_log_argument(identity.username),),
+                errors=(RowSealError, *audit_write_errors()),
+                defects=(),
+            )
         else:
             await self._clear_stale_enrolment_code(user)
         # ADR 0197 Amendment A: enrolment now comes BEFORE the first rotation, so whoever intercepts
@@ -14998,6 +15009,7 @@ class AuthService:
         )
         code: IssuedEnrolmentCode | None = None
         if user.auth_provider == AuthProvider.AD.value and not user.disabled:
+            issue_refused: tuple[type[Exception], ...] = (RowSealError, *audit_write_errors())
             try:
                 code = await self.issue_enrolment_code(
                     user_id, actor=actor, issuer_id=actor_id, via="reset"
@@ -15010,9 +15022,12 @@ class AuthService:
                     scrub_log_argument(user.username),
                     exc.reason,
                 )
-            except (ValueError, RowSealError):
-                # The account went, or its record fails its seal, after the reset's writes. The
-                # reset still stands and its notices still go; no code is shown.
+            except AUDIT_WRITE_DEFECTS:
+                raise  # a bug, not a refusal
+            except issue_refused:
+                # The account went, its record fails its seal, or the store or the audit chain
+                # refused the issue, after the reset's writes. The reset still stands and its
+                # notices still go; no code is shown, and the Administrator issues one separately.
                 _log.warning(
                     "the MFA reset of %s issued no enrolment code: the account could not be read",
                     scrub_log_argument(user.username),
@@ -15105,14 +15120,15 @@ class AuthService:
         is already bound, so a store fault here is logged, never raised over the enrolment."""
         if user.auth_provider != AuthProvider.AD.value:
             return
-        try:
-            await self._store.revoke_enrolment_code(user.id)
-        except (OSError, RowSealError, ValueError):
-            _log.warning(
-                "an enrolment code on %s could not be cleared after a factor was bound without it",
-                scrub_log_argument(user.username),
-                exc_info=True,
-            )
+        # ``defects`` is empty: a raise here would report a factor already bound as a failure.
+        await write_audit_soft(
+            lambda: self._store.revoke_enrolment_code(user.id),
+            log=_log,
+            message="an enrolment code on %s could not be cleared after a factor was bound without it",
+            args=lambda: (scrub_log_argument(user.username),),
+            errors=(RowSealError, *audit_write_errors()),
+            defects=(),
+        )
 
     async def _enrolment_code_owed(self, token: str | None, user: UserRecord) -> bool:
         """Whether a binding step on this session must be shown an enrolment code (ADR 0207 section
@@ -15552,7 +15568,12 @@ class AuthService:
             # so that refusal costs no code. The insert's integrity error stays the backstop for a
             # label written concurrently, which does cost it.
             held = await self._verified_passkeys(user)
-            if held is not None and any(c.label == label for c in held):
+            if held is None:
+                # The passkey set fails its seal or does not parse, so the credential write below
+                # would refuse anyway: refuse before the spend, as begin_webauthn_registration does,
+                # so the code is not burned on a write that cannot land.
+                raise ValueError("no such user")
+            if any(c.label == label for c in held):
                 raise ValueError("label already in use")
             # A3 step 10: the spend, one conditional write, before the credential is written.
             spent = await self._store.spend_enrolment_code(user.id, code_digest=code_digest)

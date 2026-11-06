@@ -372,10 +372,12 @@ def _build_body(event: SecurityEvent) -> str:
     lock_description, lock_lines, lock_closing = (
         _lock_lines(event) if event.event_type == ACCOUNT_LOCKED else (None, [], None)
     )
-    if event.event_type in (TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER, ENROLMENT_CODE_SPENT):
-        # BACKLOG #2007, ADR 0207 A5: sent to the ISSUER, so nothing changed on the recipient's
-        # own account.
+    if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER:
+        # BACKLOG #2007: sent to the ISSUER, so nothing changed on the recipient's own account.
         opening = f"A reminder for you as a MessageFoundry administrator ({event.username})."
+    elif event.event_type == ENROLMENT_CODE_SPENT:
+        # ADR 0207 A5: also to the ISSUER, but about something that has happened, not a reminder.
+        opening = f"A notice for you as a MessageFoundry administrator ({event.username})."
     elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
         opening = f"A reminder about your MessageFoundry account ({event.username})."
     else:

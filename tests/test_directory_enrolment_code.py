@@ -10,6 +10,7 @@ suites (``tests/_enrolment_code_store_contract.py``); this file runs it on SQLit
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, fields
@@ -478,6 +479,47 @@ async def test_ac12_a_reset_of_an_enabled_directory_account_issues_a_code(
     await store.set_user_disabled(other.identity.user_id, disabled=True)
     disabled = await w.service.admin_reset_mfa(other.identity.user_id, actor="issuer-admin")
     assert disabled.enrolment_code is None
+
+
+async def test_a_store_fault_on_the_resets_code_issue_does_not_fail_the_reset(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reset has cleared the factors before it issues the code, so a store refusal of the
+    issue is logged and the reset still answers, with no code. RED when it raises a reset that
+    took effect as a failure."""
+    w = await _world(store)
+    out = await _session(w)
+
+    async def locked(*_a: object, **_k: object) -> object:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "issue_enrolment_code", locked)
+    reset = await w.service.admin_reset_mfa(
+        out.identity.user_id, actor="issuer-admin", actor_id=w.issuer_id
+    )
+    assert reset.enrolment_code is None
+    assert len(await _actions(store, "auth.mfa_reset")) == 1
+
+
+async def test_a_store_fault_clearing_a_stale_code_does_not_lose_the_enrolment(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stamped session binds TOTP with no code and then clears the outstanding one. That clear
+    is soft: a store refusal there must not raise over a factor already on, which would lose the
+    rotated token and the recovery codes (BACKLOG #1902)."""
+    w = await _world(store)
+    stamped = await _session(w, verified=True)
+    await _issue(w, stamped.identity.user_id)
+    enroll = await w.service.begin_mfa_enrollment(stamped.identity)
+
+    async def locked(*_a: object, **_k: object) -> bool:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "revoke_enrolment_code", locked)
+    confirmed = await w.service.confirm_mfa_enrollment(
+        stamped.identity, fresh_totp(enroll.secret), token=stamped.token
+    )
+    assert confirmed.ok and confirmed.token is not None and confirmed.recovery_codes
 
 
 async def test_ac13_a_fold_that_matches_no_row_ends_the_session_and_spends_nothing(
