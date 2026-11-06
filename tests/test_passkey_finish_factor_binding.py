@@ -163,6 +163,11 @@ async def test_a_ceremony_staged_before_totp_enrolment_cannot_finish_after_it(
     # Audited as the begin gate's refusal of a pending session is.
     rows = await store.list_audit(action="auth.mfa_denied")
     assert {"path": "finish_webauthn_registration"} in [json.loads(r["detail"]) for r in rows]
+    # ADR 0207 AC-5: on this unstamped directory session the refusal also writes the code row.
+    refused = await store.list_audit(action="auth.enrolment_code_refused")
+    assert {"reason": "factor_present", "ceremony": "webauthn"} in [
+        json.loads(r["detail"]) for r in refused
+    ]
     # The refusal took the challenge, so the stale ceremony is dead, not waiting for a retry.
     with pytest.raises(ValueError, match="ceremony expired"):
         await _finish(service, identity, token, response)

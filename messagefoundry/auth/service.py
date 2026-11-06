@@ -13793,7 +13793,9 @@ class AuthService:
         account row the lookup returned; a missing or refused one raises
         :class:`EnrolmentCodeRefused`, spending no step. The spend is folded into the enable's own
         conditional write (Amendment A, A3), which also needs the account to hold no passkey, so a
-        confirm whose enable matches no row spends nothing and answers ``session_lost``."""
+        confirm whose enable matches no row spends nothing and answers ``session_lost``. A row that
+        already has TOTP on when it is re-read is asked for no code: its enable cannot match, and
+        the confirm answers ``session_lost`` as #2224 documents."""
         arrived_at = time.time()  # the floor's clock, read before any await
         # The TOTP clock at arrival: the directory lookup below can cross a step boundary, so the
         # code is judged as of now, as verify_mfa judges it (BACKLOG #1943, #3061).
@@ -13843,9 +13845,12 @@ class AuthService:
                 )
                 raise ValueError(self._TOTP_FACTOR_PRESENT)
         # ADR 0207, A3: the code is read here, after the lookup and the factor check, and before
-        # the TOTP step is consumed, so a refused code costs the holder no step.
+        # the TOTP step is consumed, so a refused code costs the holder no step. Not when the row
+        # the lookup returned already has TOTP on (another confirm enabled it meanwhile): that is
+        # no first factor, the enable below cannot match the row, and the confirm ends as #2224's
+        # lost session rather than as a code refusal for an account that holds a factor.
         code_digest: str | None = None
-        if await self._enrolment_code_owed(token, user):
+        if not user.totp_enabled and await self._enrolment_code_owed(token, user):
             code_digest = await self._read_enrolment_code(
                 identity, user, enrolment_code, ceremony="totp", client=client
             )
