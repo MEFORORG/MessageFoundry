@@ -192,8 +192,8 @@ class RigSignInRefused(RigAdminError):
 
 
 class RigSignInRateLimited(RigSignInRefused):
-    """The engine kept answering the rig's sign-in with HTTP 429, its sign-in rate limit, for the
-    whole of :func:`sign_in`'s retry budget.
+    """The engine answered the rig's sign-in with HTTP 429, its sign-in rate limit, on every
+    attempt :func:`sign_in` made. It is transient: it clears once the engine's window passes.
 
     A kind of :class:`RigSignInRefused`, so a caller that stops on a refusal still stops; one that
     can wait longer may tell the transient limit from a refused credential by this type."""
@@ -329,7 +329,8 @@ def _check_key(key: str) -> None:
 _now = time.time
 _pause = time.sleep
 
-#: The waits :func:`sign_in` makes before each new attempt the engine answered with HTTP 429. A
+#: The waits :func:`sign_in` makes, when asked to wait out the rate limit, before each new attempt
+#: the engine answered with HTTP 429. A
 #: refused attempt does not count against the limit, so each wait lets the window drain. They sum to
 #: past the engine's shipped sign-in window (``[auth].login_rate_limit_window_seconds``; a test pins
 #: the sum past that default), so when only the rig's own burst filled the window, every hit made
@@ -763,20 +764,29 @@ def _call(
         raise RigUnreachable(f"the engine did not answer ({type(exc).__name__})") from None
 
 
-def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None = None) -> str:
+def sign_in(
+    base_url: str,
+    admin: RigAdmin | None = None,
+    *,
+    cacert: str | None = None,
+    wait_out_rate_limit: bool = False,
+) -> str:
     """Sign in as the rig Administrator and return the session's bearer token.
 
     An account with an authenticator key signs in with both factors in one request, the combined
     sign-in of ADR 0197, and first waits for a TOTP step to open (:func:`_code_in_a_fresh_step`).
 
-    An answer of HTTP 429, the sign-in rate limit, is transient: the attempt is made again, once
-    for each of :data:`_RATE_LIMITED_WAITS_S`, after that wait, or for an account with a key after
-    the wait for a fresh step, which already spaces the attempts. Under
-    :func:`session_token` and :func:`renew_session` the wait is made holding the session lock, on
-    purpose: the process's other threads wait for the one sign-in rather than add to a full limit.
+    An answer of HTTP 429, the sign-in rate limit, is transient, and raises
+    :class:`RigSignInRateLimited` so a caller can tell it from a refused credential. With
+    ``wait_out_rate_limit`` the attempt is first made again, once for each of
+    :data:`_RATE_LIMITED_WAITS_S`, after that wait, or for an account with a key after the wait for
+    a fresh step, which already spaces the attempts. Only a caller whose wait times nothing asks
+    for that: the command-line modes, a workflow's setup step. A poller or a drive process does
+    not, because a minute spent waiting inside a measured run would be read as engine time, or
+    would start one band's hold after its siblings'; it fails fast, as it did before.
 
     Raises :class:`RigUnreachable` when the engine does not answer, :class:`RigSignInRateLimited`
-    when it still answers HTTP 429 on the last attempt, and :class:`RigSignInRefused` when it
+    when it answers HTTP 429 on the last attempt it makes, and :class:`RigSignInRefused` when it
     answers anything else but a usable session, or when the key is unusable, which is checked
     before any wait.
     """
@@ -787,7 +797,7 @@ def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None 
             _check_key(admin.totp_secret)
         except RigAdminError as exc:
             raise RigSignInRefused(str(exc)) from None
-    waits = iter(_RATE_LIMITED_WAITS_S)
+    waits = iter(_RATE_LIMITED_WAITS_S if wait_out_rate_limit else ())
     while True:
         body = {"username": admin.username, "password": admin.password}
         step: int | None = None
@@ -807,11 +817,15 @@ def sign_in(base_url: str, admin: RigAdmin | None = None, *, cacert: str | None 
         wait = next(waits, None)
         if wait is None:
             # The stale-Administrator advice below would send an operator after the wrong cause.
+            tried = (
+                f" on all {len(_RATE_LIMITED_WAITS_S) + 1} attempts, spaced past its shipped window"
+                if wait_out_rate_limit
+                else ", which clears once its window passes"
+            )
             raise RigSignInRateLimited(
-                "the engine rate-limited the rig Administrator's sign-in (HTTP 429) on all "
-                f"{len(_RATE_LIMITED_WAITS_S) + 1} attempts, spaced past its shipped window: too "
-                "many sign-in attempts inside its window. A rig of many processes signing in from one "
-                "address needs the engine's MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP, and past the "
+                f"the engine rate-limited the rig Administrator's sign-in (HTTP 429){tried}: too "
+                "many sign-in attempts inside its window. A rig of many processes signing in from "
+                "one address needs the engine's MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP, and past the "
                 "all-clients limit MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL, sized to its sign-ins."
             )
         if step is None:  # with a key, the next fresh step is the wait
@@ -911,7 +925,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 2
     base = _checked_base(args.engine)
     _require_sign_in(base, "/stats", cacert=args.cacert)
-    held = sign_in(base, cacert=args.cacert)
+    held = sign_in(base, cacert=args.cacert, wait_out_rate_limit=True)
     print(f"signed in as the rig Administrator; running {command[0]}", flush=True)
     # Resolved here, so a relative interpreter path works on Windows as it does on POSIX.
     command[0] = shutil.which(command[0]) or command[0]
@@ -963,7 +977,7 @@ def _cmd_get(args: argparse.Namespace) -> int:
     if any(ch.isspace() for ch in path):
         raise RigAdminError("the API path holds whitespace; quote it, and check the shell kept it")
     _require_sign_in(base, path, cacert=args.cacert)
-    held = sign_in(base, cacert=args.cacert)
+    held = sign_in(base, cacert=args.cacert, wait_out_rate_limit=True)
     deadline = time.monotonic() + args.timeout
     while True:
         status, raw = _call("GET", f"{base}{path}", cacert=args.cacert, bearer=held)

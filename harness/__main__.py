@@ -2218,8 +2218,9 @@ def _run_connscale_remote(argv: list[str]) -> int:
         "rig Administrator, so N processes from one address need at least N on the engine's "
         "session cap (MEFOR_AUTH_MAX_SESSIONS_PER_USER) and on its per-address and all-clients "
         "sign-in limits per window (MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP, "
-        "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL); the batch_ab engine half raises each one its own "
-        "driver fleet would meet, unless the environment already sets it.",
+        "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL); the batch_ab engine half sets all three, sized to its "
+        "own driver fleet, unless the environment already sets one, and refuses to start a cell "
+        "when that value is too small for the fleet.",
     )
     parser.add_argument(
         "--engine-url",

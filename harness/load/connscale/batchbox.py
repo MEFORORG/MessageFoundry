@@ -112,8 +112,9 @@ def rig_sign_in_env(procs: int) -> dict[str, str]:
     * the all-clients sign-in limit (``SHIPPED_LOGIN_RATE_LIMIT_GLOBAL`` per window), met the same
       way by one process past it.
 
-    Every one is named, at ``procs`` doubled (for a process that signs in again) plus two, or at
-    its shipped default, whichever is higher, so the caller ALWAYS sets it explicitly unless the environment already does. That is what sizes
+    Every one is named, at ``procs`` doubled (for a process that signs in again) plus two, or
+    at its shipped default, whichever is higher, so the caller ALWAYS sets it explicitly unless
+    the environment already does. That is what sizes
     each limit against the value in effect: the engine ranks the environment above a
     ``messagefoundry.toml`` in its working directory, so a stricter value there cannot refuse the
     fleet, and a small fleet never runs below a stock engine whose defaults match the copies above.
@@ -145,11 +146,16 @@ def check_operator_sign_in_limits(procs: int, environ: Mapping[str, str]) -> Non
     """Refuse a sign-in limit ``environ`` sets that a fleet of ``procs`` would certainly meet.
 
     A value the operator's environment sets stands over :func:`rig_sign_in_env`'s, so it is the
-    value in effect. Each of the ``procs`` processes signs in once at the start of a cell, so a
-    limit below ``procs`` refuses one of them with HTTP 429 or ends a session, and this raises
-    :class:`ConnScaleError` naming it, before any engine starts. A limit of at least ``procs`` but
-    below :func:`rig_sign_in_env`'s size passes: it leaves no room for a second sign-in, which
-    then meets the rate limit and is retried (``rigadmin.sign_in``).
+    value in effect, and this raises :class:`ConnScaleError` naming one the fleet would meet,
+    before any engine starts:
+
+    * a rate count below ``procs``: each process signs in once at the start of a cell, so one of
+      them would be refused with HTTP 429. A count of at least ``procs`` but below
+      :func:`rig_sign_in_env`'s size passes; a second sign-in past it is refused with HTTP 429,
+      which ``rigadmin.RigSignInRateLimited`` names;
+    * a session cap below :func:`rig_sign_in_env`'s size. A sign-in past the cap is not refused: it
+      silently ends another process's oldest session, and that one's renewal ends the next. So a
+      second session a process takes (a step-up re-proof signs in to one of its own) must fit too.
 
     No limit passes: 0 for any of the three, below 0 for the session cap, and either rate count
     while ``environ`` turns the rate limiter off. A value that is not a number is left for the
@@ -165,13 +171,20 @@ def check_operator_sign_in_limits(procs: int, environ: Mapping[str, str]) -> Non
             value = float(held)
         except ValueError:
             continue
-        unlimited = value <= 0 if name == _SESSIONS_ENV else (value == 0 or limiter_off)
-        if not unlimited and value < procs:
+        size = 2 * procs + 2
+        if name == _SESSIONS_ENV:
+            if 0 < value < size:
+                raise ConnScaleError(
+                    f"{name}={held.strip()} in the environment is below the {size} sessions a "
+                    f"fleet of {procs} driver processes may hold, so a sign-in past it would end "
+                    f"another process's session. Unset it, set it to at least {size}, or set it "
+                    "to 0 for no cap"
+                )
+        elif not (value == 0 or limiter_off) and value < procs:
             raise ConnScaleError(
                 f"{name}={held.strip()} in the environment is below the {procs} driver processes "
                 "that each sign in at the start of a cell, so the engine would refuse one with "
-                f"HTTP 429 or end its session. Unset it, set it to at least {2 * procs + 2}, or "
-                "set it to 0 for no limit"
+                f"HTTP 429. Unset it, set it to at least {size}, or set it to 0 for no limit"
             )
 
 

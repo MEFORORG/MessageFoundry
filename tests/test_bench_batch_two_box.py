@@ -110,12 +110,15 @@ def test_plan_driver_bands_rejects_bad_input() -> None:
 _SESSIONS = "MEFOR_AUTH_MAX_SESSIONS_PER_USER"
 _PER_IP = "MEFOR_AUTH_LOGIN_RATE_LIMIT_PER_IP"
 _GLOBAL = "MEFOR_AUTH_LOGIN_RATE_LIMIT_GLOBAL"
+_ENABLED = "MEFOR_AUTH_LOGIN_RATE_LIMIT_ENABLED"
+_WINDOW = "MEFOR_AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS"
 
 
 @pytest.fixture
 def no_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No sign-in limit inherited from the calling shell: the engine half lets one stand."""
-    for name in (_SESSIONS, _PER_IP, _GLOBAL):
+    """No sign-in limit or rate-limiter switch inherited from the calling shell: the engine half
+    lets a limit stand, and a switch turns the rate counts off."""
+    for name in (_SESSIONS, _PER_IP, _GLOBAL, _ENABLED, _WINDOW):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -151,14 +154,11 @@ def test_rig_sign_in_env_names_real_auth_settings() -> None:
     assert auth.login_rate_limit_global == 62
 
 
-_ENABLED = "MEFOR_AUTH_LOGIN_RATE_LIMIT_ENABLED"
-_WINDOW = "MEFOR_AUTH_LOGIN_RATE_LIMIT_WINDOW_SECONDS"
-
-
 @pytest.mark.parametrize(
     "environ",
     [
-        {_PER_IP: "6"},  # one sign-in per process fits; a second one is retried
+        {_PER_IP: "6"},  # one sign-in per process fits
+        {_SESSIONS: "14"},  # the session cap must fit every second session too
         {_PER_IP: "500"},
         {_PER_IP: "0"},  # no limit
         {_PER_IP: "not-a-number"},  # the engine's loader refuses it
@@ -176,8 +176,6 @@ def test_a_limit_the_operator_sets_and_the_fleet_fits_passes_the_check(
 @pytest.mark.parametrize(
     ("name", "held"),
     [
-        (_SESSIONS, "5"),
-        (_SESSIONS, "1"),
         (_PER_IP, "5"),
         (_PER_IP, "3.0"),  # the engine's loader reads this as 3
         (_PER_IP, "-1"),  # a negative rate count refuses every sign-in
@@ -190,6 +188,14 @@ def test_a_limit_the_operator_sets_below_the_fleet_is_refused(name: str, held: s
     match = rf"{name}={re.escape(held)} .* below the 6 driver processes"
     with pytest.raises(ConnScaleError, match=match):
         bb.check_operator_sign_in_limits(6, {name: held})
+
+
+@pytest.mark.parametrize("held", ["13", "6", "1"])
+def test_a_session_cap_below_the_fleets_sessions_is_refused(held: str) -> None:
+    """A sign-in past the cap is admitted and ends another process's session, which nothing
+    retries, so the cap must hold the fleet's second sessions as well as its first."""
+    with pytest.raises(ConnScaleError, match=rf"{_SESSIONS}={held} .* below the 14 sessions"):
+        bb.check_operator_sign_in_limits(6, {_SESSIONS: held})
 
 
 def test_a_session_cap_is_checked_while_the_rate_limiter_is_off() -> None:
