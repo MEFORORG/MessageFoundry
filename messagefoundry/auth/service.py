@@ -39,7 +39,7 @@ from collections.abc import (
 )
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import cache, partial
 from types import MappingProxyType
@@ -1861,7 +1861,7 @@ class IssuedEnrolmentCode:
     """An enrolment code, shown ONCE (ADR 0207 section 4); the engine keeps only its digest.
     ``replaced`` says an unexpired code was outstanding and no longer works."""
 
-    code: str
+    code: str = field(repr=False)  # the live code: never in a repr, a log or a traceback
     expires_at: float
     replaced: bool = False
 
@@ -15593,8 +15593,17 @@ class AuthService:
                 )
             # Recorded at the spend, not after the credential write: a write that then fails (a
             # label written concurrently, a session revoked meanwhile) has still cost the code, and
-            # the used row and the issuer's notice say where it went.
-            await self._record_code_spent(identity, spent, "webauthn", client=client)
+            # the used row and the issuer's notice say where it went. Soft, as on the TOTP leg: the
+            # code is already spent, so a fault in these rows must not also cost the binding.
+            used = spent  # narrowed, for the lambda
+            await write_audit_soft(
+                lambda: self._record_code_spent(identity, used, "webauthn", client=client),
+                log=_log,
+                message="the enrolment code spent by %s could not record its rows",
+                args=lambda: (scrub_log_argument(identity.username),),
+                errors=(RowSealError, *audit_write_errors()),
+                defects=(),
+            )
         now = time.time()
         cred = WebAuthnCredential(
             credential_id_hash=credential_id_hash,

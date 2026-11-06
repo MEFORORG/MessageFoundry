@@ -3717,7 +3717,12 @@ does a local account, nor an account that already holds a factor, which proves t
   identity check, not by mail or chat.
 - **Under `require_mfa`, a directory operator's first session waits for a code.** That lockout
   is deliberate: it is the onboarding step. When the issuing Administrator's code is spent, that
-  Administrator gets the `auth.enrolment_code_spent_notice` row and a notice naming the account.
+  Administrator gets the `auth.enrolment_code_spent_notice` row, and a notice naming the account
+  only where that Administrator has a notification address and the site has a notifier
+  configured; a code from the host command names no issuer, so neither is written. Both are
+  written soft, so a store fault can lose them. On a passkey they are written at the spend,
+  before the credential is written, so a credential write refused after the spend leaves them
+  describing a code spent on an authenticator that was not added.
 - **Not built here.** The removal of the directory re-bind under owner ruling A5, and the gate
   changes Amendment A, A1 ties to it, are their own build.
 

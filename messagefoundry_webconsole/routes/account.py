@@ -150,6 +150,9 @@ register_ui_action(
 _SESSION_OFFER_TTL_SECONDS = 300.0
 #: The most sessions the table holds; the oldest mark is dropped first.
 _SESSION_OFFER_SESSIONS_MAX = 4096
+#: The longest enrolment code the console passes on, as the JSON plane's MfaConfirmRequest caps
+#: it (ADR 0207). A real code is far shorter.
+_ENROLMENT_CODE_MAX = 64
 
 
 class _SessionOffers:
@@ -552,7 +555,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 code,
                 token=token,
                 client=client,
-                enrolment_code=form.get("enrolment_code") or None,
+                # Bounded as the JSON plane bounds it (MfaConfirmRequest, max_length=64): no
+                # code is that long, so the cut only stops an outsized value being normalised.
+                enrolment_code=form.get("enrolment_code", "")[:_ENROLMENT_CODE_MAX] or None,
             )
         except EnrolmentCodeRefused as exc:
             # ADR 0207: the one reply, on the form it came from, so the holder can retry; the
@@ -790,7 +795,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             label = str(body.get("label", ""))
             # ADR 0207: the enrolment code a directory account's first factor needs, or None.
             raw_code = body.get("enrolment_code")
-            enrolment_code = raw_code if isinstance(raw_code, str) and raw_code else None
+            enrolment_code = (
+                raw_code[:_ENROLMENT_CODE_MAX] if isinstance(raw_code, str) and raw_code else None
+            )
         except (ValueError, KeyError, TypeError, AttributeError):
             return JSONResponse({"ok": False, "error": "malformed request"}, status_code=400)
         # BACKLOG #3014: ui_mfa_verify's per-actor budget, charged only on a request that reaches

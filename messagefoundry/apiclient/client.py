@@ -1215,7 +1215,7 @@ class EngineClient:
         so the step-up handler may prompt for the password before this returns."""
         return _decode(self._request("POST", "/me/mfa/enroll"), MfaEnrollResponse)
 
-    def confirm_mfa(self, code: str) -> MfaConfirmed:
+    def confirm_mfa(self, code: str, *, enrolment_code: str | None = None) -> MfaConfirmed:
         """Confirm enrollment with a live TOTP code; activates MFA and returns the one-time recovery
         codes (shown **once**), with the count of other sessions the caller may now want to end.
         Raises :class:`ApiError` (400) on a wrong code, and (403, with no ``X-Step-Up-Required``
@@ -1230,11 +1230,18 @@ class EngineClient:
         ``self._token`` directly worked only by accident of an annotation elsewhere:
         ``MfaConfirmResponse.token`` is a required ``str`` today, so a token-less body fails in
         ``_decode`` rather than clearing the session. That is a property of a different file, not of
-        the rule, and the rule is the one thing all three sites must share."""
+        the rule, and the rule is the one thing all three sites must share.
+
+        ``enrolment_code`` is the single-use code an Administrator issued (ADR 0207), which a
+        directory account's first factor needs on a session its identity provider did not stamp.
+        It is sent only when given."""
+        body: dict[str, str] = {"code": code}
+        if enrolment_code is not None:
+            body["enrolment_code"] = enrolment_code
         # Vault BACKLOG #2950: the rotation queues behind the account's re-proof lock, and a lost
         # reply here also loses the one-time recovery codes, so it gets the sign-in's timeout.
         response = self._request(
-            "POST", "/me/mfa/confirm", json={"code": code}, timeout=self._sign_in_timeout()
+            "POST", "/me/mfa/confirm", json=body, timeout=self._sign_in_timeout()
         )
         self._adopt_rotated(response)
         confirmed = _decode(response, MfaConfirmResponse)

@@ -974,7 +974,7 @@ def enrolment_code_page(
         el("p", "It replaces the code issued before it.", class_="muted")
         if replaced
         else Markup(""),
-        el("p", el("a", "← Users", href="/ui/users")),
+        el("p", el("a", "Back to Users", href="/ui/users")),
         class_="card",
     )
     return page("Enrolment code", body, active="users")
