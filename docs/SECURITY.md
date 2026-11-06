@@ -4830,12 +4830,16 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   old key could find it gone and the new one outside its read, or deadlock with the re-key,
   depending on the query plan. Its rotation now takes the
   account's row under `UPDLOCK` before the session row, the order each whole-account sweep there
-  read for this takes them in, through the account write or the epoch raise: a bind, an unbind,
-  a TOTP re-enrolment, and the whole-account revokes, at least an administrator's revoke of a
-  user's sessions, a role change and a password reset. So a rotation either commits before the
+  read for this takes them in. The unbind takes that row first through its own prior-pair
+  `UPDLOCK` read in `clear_user_federated_subject`, before its account write. The bind and the
+  TOTP re-enrolment take it through the account write, and the whole-account revokes through the
+  epoch raise, at least an administrator's revoke of a user's sessions, a role change and a
+  password reset. So a rotation either commits before the
   sweep locks the account's row, and the sweep reads the new key, or waits until the sweep
-  commits and then finds the session ended. That holds where the account's record fails its
-  seal too, because the raise reads the row under that lock before it checks the seal. The
+  commits and then finds the session ended. For the whole-account revokes that holds where the
+  account's record fails its seal too, because the raise reads the row under that lock before it
+  checks the seal, and they end the sessions anyway; a bind, an unbind or a TOTP re-enrolment of
+  such an account is refused and ends no session. Both were read from the code and not run. The
   every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) takes
   the row of each account its read of the account list returns before its table-wide sweep, so
   the same holds for those accounts. Its sweep also reaches the sessions of an account created
@@ -4843,8 +4847,9 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   rotation in that instant can still be missed; the global epoch below ends such a session at
   its next presentation. A sweep that takes no account row is not ordered against a rotation
   either, at least the session cap's trim. The trim raises no epoch, so a session a rotation
-  carries past it on SQL Server is not refused later: it stays live, over the cap, until a
-  later trim or its own expiry ends it. The Postgres store's rotation takes no account row: its
+  carries past it on SQL Server is not refused later: it stays live, over the cap, until
+  something else ends it, at least a later trim, a logout, a whole-account sweep or its own
+  expiry. The Postgres store's rotation takes no account row: its
   sweep waits on the rotated row and then re-checks that row's newest version, which still
   matches. The SQLite store runs one writer at a time. `test_rotation_racing_a_sweep_is_swept`,
   in `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py`, runs the shared body in
@@ -4852,7 +4857,10 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   its re-key, then runs a bind, an unbind, a revoke of a user's sessions and the every-account
   revoke against it, on both server legs; on the SQL Server leg it also starts a rotation while a
   bind holds the account's row. The TOTP re-enrolment's own sweep was read from the code and is
-  not replayed. That the old SQL Server order could miss the session, or deadlock with the
+  not replayed. A role change and a password reset each run that same per-account revoke,
+  `revoke_user_sessions`, in a transaction after their own write; that was read from `set_roles`
+  and `admin_reset_password` in `messagefoundry/auth/service.py`, and neither is replayed through
+  the service. That the old SQL Server order could miss the session, or deadlock with the
   re-key, depending on the plan, was read from the code and was not run.
   **A session a whole-account sweep missed is refused the next time it is presented** (BACKLOG
   #2592), within the limits the rest of this bullet states. The bind, the unbind, the TOTP
