@@ -6,7 +6,7 @@ The built-in parser replaced python-hl7 as a behaviour-identical drop-in. This s
 backends side by side. python-hl7 has since been retired, so its answers were recorded once, over the
 same corpus, into ``tests/golden/python_hl7_oracle.json``. The suite now holds the built-in parser to
 that record. The corpus covers every ``samples/messages/**/*.hl7`` message, synthetic ADT/ORU/ORM from
-:mod:`messagefoundry.generators`, and hand-built adversarial messages. For each it checks:
+:mod:`messagefoundry_toolkit.generators`, and hand-built adversarial messages. For each it checks:
 
 * every :class:`~messagefoundry.parsing.peek.Peek` routing property + ``routing()`` + ``segments()``;
 * :meth:`Peek.field` and :meth:`Message.field` over a fixed battery of paths (whole-field, component,
@@ -33,10 +33,13 @@ from typing import Any
 import pytest
 
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
-from messagefoundry.generators import _core, all_types  # noqa: F401 — registers the generators
 from messagefoundry.parsing import HL7PeekError, normalize, validate
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import Peek
+from messagefoundry_toolkit.generators import (  # noqa: F401 — registers the generators
+    _core,
+    all_types,
+)
 
 ORACLE = Path(__file__).resolve().parent / "golden" / "python_hl7_oracle.json"
 

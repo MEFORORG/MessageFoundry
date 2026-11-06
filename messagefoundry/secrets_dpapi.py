@@ -65,10 +65,12 @@ def _to_blob(data: bytes) -> tuple[_DataBlob, ctypes.Array[ctypes.c_char]]:
     return blob, buf
 
 
-def dpapi_protect(secret: bytes, *, machine_scope: bool = True) -> bytes:
-    """DPAPI-encrypt ``secret``. ``machine_scope`` (default) ties it to the machine so the service
-    account can decrypt; False ties it to the current user only. Raises :class:`DpapiUnavailable`
-    off Windows, :class:`DpapiError` on a Win32 failure."""
+def dpapi_protect(secret: bytes, *, machine_scope: bool) -> bytes:
+    """DPAPI-encrypt ``secret``. ``machine_scope`` True ties it to the machine, so any account on
+    the host can decrypt it; False ties it to the calling account only. There is no default: the
+    two scopes protect against different accounts, so every caller names the one it means (vault
+    BACKLOG #3411). Raises :class:`DpapiUnavailable` off Windows, :class:`DpapiError` on a Win32
+    failure."""
     if sys.platform != "win32":
         raise DpapiUnavailable("DPAPI (CryptProtectData) is only available on Windows")
     crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
@@ -108,10 +110,10 @@ def dpapi_unprotect(blob: bytes) -> bytes:
     )
     if not ok:
         raise DpapiError(
-            f"CryptUnprotectData failed (Win32 error {ctypes.get_last_error()}); the key file must be "
-            "unprotected on the same machine that protected it — and, if it was protected with --user "
-            "scope, by the same Windows user (machine scope, the default, lets any account on the host "
-            "decrypt it)"
+            f"CryptUnprotectData failed (Win32 error {ctypes.get_last_error()}); a DPAPI blob opens "
+            "only on the machine that protected it, and a user-scope blob (protect-key --user, or "
+            "a key custody host blob) only for the Windows account that protected it; machine scope "
+            "lets any account on that host open it"
         )
     try:
         return ctypes.string_at(out_blob.pbData, out_blob.cbData)
@@ -120,7 +122,7 @@ def dpapi_unprotect(blob: bytes) -> bytes:
 
 
 def protect_key_to_file(
-    key_b64: str, path: Path, *, machine_scope: bool = True, read_grants: Sequence[str] = ()
+    key_b64: str, path: Path, *, machine_scope: bool, read_grants: Sequence[str] = ()
 ) -> None:
     """DPAPI-protect a base64 store key and write the ciphertext to a NEW, restricted ``path``.
 

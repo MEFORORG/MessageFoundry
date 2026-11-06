@@ -172,20 +172,20 @@ def _attach_issuer_index(ctx: ssl.SSLContext, cadata: str, cert_map: Mapping[str
     Built from the SAME ``cadata`` the context just loaded, once, rather than per connection. The shim
     reads it back off the context (:data:`~messagefoundry.api.tls_client_cert.ISSUER_INDEX_ATTR`). A
     key that names no loaded CA, or names two with one subject (typical mid-rollover), would deny
-    every certificate under it with nothing in the log, so each one is warned about here (#2237)."""
+    every certificate under it with nothing in the log, so each one is warned about here (#2237),
+    as is a loaded certificate that is no CA with a loaded CA's subject
+    (:meth:`~messagefoundry.pki.IssuerIndex.namesake_warnings`). Raises ``ValueError``, refusing
+    the start, when :class:`~messagefoundry.pki.IssuerIndex` refuses the file; what it compares
+    with the context is stated there (BACKLOG #4948)."""
     from messagefoundry.api.tls_client_cert import ISSUER_INDEX_ATTR
     from messagefoundry.pki import IssuerIndex
 
-    index = IssuerIndex(cadata)
+    index = IssuerIndex(cadata, label="[api].tls_client_ca_file")
     setattr(ctx, ISSUER_INDEX_ATTR, index)
-    if index.unreadable:
-        log.warning(
-            "[api].tls_client_ca_file: %d certificate(s) could not be parsed for the mTLS identity "
-            "map; no client certificate can map under them",
-            index.unreadable,
-        )
     for key, reason in index.unmatched_keys(cert_map).items():
         log.warning("[api].tls_client_cert_identities issuer %r %s", key, reason)
+    for warning in index.namesake_warnings():
+        log.warning("[api].tls_client_ca_file %s", warning)
 
 
 #: Filenames for the first-run generated pair, written beside the store database (BACKLOG #1276).
