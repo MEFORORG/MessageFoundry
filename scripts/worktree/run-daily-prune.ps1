@@ -29,7 +29,9 @@
     with --force. That file's header lists the re-checks. Each removed or refused path is logged with its
     reason, then a summary line with the counts and the drive's free space. A refusal is data, not a
     failure, and leaves the exit code alone. Without -Apply the step only logs WOULD-REMOVE. With
-    -Apply it refuses to run inside Claude Code, the same refusal install-daily-prune.ps1 carries.
+    -Apply it refuses to run inside Claude Code, the same refusal install-daily-prune.ps1 carries. With
+    the switch, a GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE in the environment refuses the
+    whole run before the prune starts.
 
 .PARAMETER RepoRoot
     The primary checkout to prune. Defaults to the value the shared liveness fence calls the primary --
@@ -70,6 +72,12 @@ $ErrorActionPreference = 'Stop'
 # to that population. The dry run stays usable in-session.
 if ($env:CLAUDECODE -eq '1' -and $Apply -and $RemoveFinishedClaudeWorktrees) {
     throw "Refusing -Apply -RemoveFinishedClaudeWorktrees inside Claude Code: it removes Claude-managed worktrees. Run it from a plain terminal, or from the scheduled task install-daily-prune.ps1 registers. (Without -Apply it only reports, and is allowed.)"
+}
+# Before the prune run, not only inside the step: the helper refuses these too, but by then the prune
+# above would already have run, and a throw there would cut the log short.
+if ($RemoveFinishedClaudeWorktrees) {
+    . (Join-Path $PSScriptRoot 'finished-worktree-removal.ps1')
+    Assert-NoGitRedirect 'run-daily-prune.ps1 -RemoveFinishedClaudeWorktrees'
 }
 
 # prune-merged.ps1 reports its verdict through the exit code, so a non-zero exit is DATA here, not a
@@ -121,7 +129,6 @@ $log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
 $code = $LASTEXITCODE
 
 if ($RemoveFinishedClaudeWorktrees) {
-    . (Join-Path $PSScriptRoot 'finished-worktree-removal.ps1')
     "--- finished .claude/worktrees: mode=$mode ---" | Add-Content -LiteralPath $log
 
     # A FRESH list, from a second prune-merged.ps1 run in this invocation, after the prune above. Always

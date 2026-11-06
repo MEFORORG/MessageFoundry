@@ -18,8 +18,23 @@
     says what it can and cannot see), Test-WorktreeClean, Get-TipHolders, Test-ClaudeManagedPath,
     Get-FlaggedFileCount, Get-WorkingTreeActivity, Get-WorktreeOnlyCommitCount, Read-CoordRecord,
     Get-ClaimedWorktreeIndex, Test-RegistryPresentOrThrow, $CACHE_DATA_NAME_PATTERN, Get-NestedHazard,
-    Get-InProgressOperation, Get-UnsafeIgnoredEntries and Test-PlainDirectory.
+    Get-InProgressOperation, Get-UnsafeIgnoredEntries, Test-PlainDirectory, Test-PlainDirectoryItem,
+    Get-ItemOrThrow, Test-PresentUnderParentOrThrow, $GIT_REDIRECT_NAMES and Assert-NoGitRedirect.
 #>
+
+#: The variables that make `git -C <path>` answer for a checkout other than the one named. The same
+#: list remove.ps1 refuses on every route; tests/test_worktree_finished_claude_removal.py pins the two
+#: equal, because remove.ps1 reads its own before it dot-sources this file.
+$GIT_REDIRECT_NAMES = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')
+
+# Refused rather than cleared, as in remove.ps1: a dot-sourced caller shares the operator's process, so
+# clearing them would change the operator's shell.
+function Assert-NoGitRedirect([string]$Who) {
+    $set = @($GIT_REDIRECT_NAMES | Where-Object { [Environment]::GetEnvironmentVariable($_) })
+    if ($set.Count -gt 0) {
+        throw "$Who refuses: $($set -join ', ') is set, so git would answer for a different checkout than the one named. Unset it and re-run. Nothing was removed."
+    }
+}
 
 # The floor under -IdleHours. Signal 2 has been measured at 10.4h on a worktree that was demonstrably
 # occupied, so a window under this one releases trees that measurement says are in use.
@@ -40,11 +55,14 @@ $REGENERABLE_IGNORED_PATTERN = '\A!! (?:(?:.*/)?(?:node_modules|__pycache__|\.py
 # unreadable claims directory as "no claims" (vault BACKLOG #2985, item 15). This answers $false only
 # for a path that is not there, and throws for anything else.
 function Test-PresentOrThrow([string]$LiteralPath, [string]$What) {
-    try {
-        $null = Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
-        return $true
-    }
-    catch [System.Management.Automation.ItemNotFoundException] { return $false }
+    return $null -ne (Get-ItemOrThrow $LiteralPath $What)
+}
+
+# The same rule, returning the item so a caller can judge it without a second read: the item, $null
+# only when it is not there, and a throw for anything else.
+function Get-ItemOrThrow([string]$LiteralPath, [string]$What) {
+    try { return Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop }
+    catch [System.Management.Automation.ItemNotFoundException] { return $null }
     catch { throw "Could not tell whether $What exists ($($_.Exception.Message)). Nothing was removed." }
 }
 
@@ -316,12 +334,30 @@ function Read-CoordRecord([string]$File) {
 # WHEN ITS PARENT IS THERE: on an unreachable share, Get-Item on the directory raises the same
 # ItemNotFoundException as on a missing one (measured on a UNC host that does not answer), so a root
 # that drops after the run's one probe would otherwise read as "no records". $true present, $false
-# absent under a present parent, and a throw for anything else.
+# absent under a present parent, and a throw for anything else. EACH MUST BE A PLAIN DIRECTORY: a FILE
+# standing where the parent should be (mefor-coord as a file) is "present", and the registry under it
+# then reads as absent, so no records; a junction is listed through, wherever it points.
 function Test-RegistryPresentOrThrow([string]$Dir, [string]$What) {
-    if (Test-PresentOrThrow $Dir $What) { return $true }
+    return Test-PresentUnderParentOrThrow $Dir $What -Plain
+}
+
+# The rule above without the registry's wording: $true present, $false absent under a parent folder
+# that is there, a throw for anything else. -Plain also requires each item read to be a plain directory.
+# The nightly removal reads its end state through this too, so "gone" means the same thing in both.
+function Test-PresentUnderParentOrThrow([string]$Dir, [string]$What, [switch]$Plain) {
+    $notPlain = "exists but is not a plain directory (a file or a link), so what it holds is unknown. Nothing was removed."
+    $item = Get-ItemOrThrow $Dir $What
+    if ($item) {
+        if ($Plain -and -not (Test-PlainDirectoryItem $item)) { throw "$What ('$Dir') $notPlain" }
+        return $true
+    }
     $parent = [System.IO.Path]::GetDirectoryName($Dir.TrimEnd('\', '/'))
-    if ($parent -and (Test-PresentOrThrow $parent "the folder that holds $What")) { return $false }
-    throw "Neither $What ('$Dir') nor the folder that holds it can be found, so the coordination root may be unreachable. Nothing was removed."
+    $held = if ($parent) { Get-ItemOrThrow $parent "the folder that holds $What" } else { $null }
+    if ($held) {
+        if ($Plain -and -not (Test-PlainDirectoryItem $held)) { throw "The folder that holds $What ('$parent') $notPlain" }
+        return $false
+    }
+    throw "Neither $What ('$Dir') nor the folder that holds it can be found, so the folder above it may be unreachable. Nothing was removed."
 }
 
 # Which worktrees hold a coordination claim, across every claims directory given. UNREADABLE IS NOT
@@ -432,9 +468,14 @@ function Get-UnsafeIgnoredEntries([string]$Path) {
 }
 
 # A tolerated cache name is not enough: the entry must be a real directory inside the tree, not a link
-# to one somewhere else. Unreadable is not plain. Shared with remove.ps1 -Path.
-function Test-PlainDirectory([string]$Root, [string]$Rel) {
-    try { $item = Get-Item -LiteralPath (Join-Path $Root $Rel) -Force -ErrorAction Stop }
+# to one somewhere else. Unreadable is not plain. Shared with remove.ps1 -Path. Without -Rel, -Root itself.
+function Test-PlainDirectory([string]$Root, [string]$Rel = '') {
+    $target = if ($Rel) { Join-Path $Root $Rel } else { $Root }
+    try { $item = Get-Item -LiteralPath $target -Force -ErrorAction Stop }
     catch { return $false }
-    return $item.PSIsContainer -and -not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+    return Test-PlainDirectoryItem $item
+}
+
+function Test-PlainDirectoryItem([object]$Item) {
+    return ($Item -is [System.IO.DirectoryInfo]) -and -not ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
 }

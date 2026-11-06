@@ -30,8 +30,13 @@
 
     THE RE-CHECKS, per path. The first one that fails REFUSES that path and the run moves on; a refusal
     is data, not a failure. At least these:
+      * none of GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE is set, the list remove.ps1
+        refuses, since each makes `git -C <path>` answer for another checkout (checked once, and it
+        THROWS, refusing the whole run, dry run included);
       * -IdleHours is a finite number not under worktree-gates.ps1's floor, and this clone's
         coordination root resolves (both checked once, for every path);
+      * FIRST for each path, its root is not a junction or link, which every later gate and git would
+        read through, and can be read (a root that is not there is left to the gates below);
       * the path has a `.claude/worktrees/` segment -- the only population this step is for;
       * it is not the primary checkout, not a worktree the caller runs from (-Protect), and does not
         contain one;
@@ -55,16 +60,24 @@
         `git worktree list` gives or the toplevel git prints inside it;
       * no coordination claim names it by either spelling, in this clone's registry or the one its
         mefor.claimsRoot names, and every claim file and directory there could be read;
-      * LAST, so the window before the removal is as short as it can be: the liveness fence
-        (scripts/coord/occupancy.ps1, read fresh) is available, still lists the tree unlocked, finds no
-        registered session launched in it or in a worktree nested inside it, and finds no other
-        registered worktree inside it.
+      * the liveness fence (scripts/coord/occupancy.ps1, read fresh) is available, still lists the tree
+        unlocked, finds no registered session launched in it or in a worktree nested inside it, and
+        finds no other registered worktree inside it;
+      * LAST, immediately before the removal and only under -Apply: the root check and every check
+        from the flagged files through the walk run AGAIN (Get-ContentRefusal), because the first pass
+        read them before the allocation, claim and fence reads, and a write in that window (an
+        ignored .env, a nested clone, an edit) would otherwise go with the tree. A refusal here reads
+        "re-checked just before the removal".
     Every gate is the shared copy in worktree-gates.ps1 or occupancy.ps1 where one exists. The claim and
     allocation readers list through Test-PresentOrThrow and Get-EntriesOrThrow, the readers remove.ps1
     uses (both now in worktree-gates.ps1), and a registry directory reads as absent only while the
     folder holding it is there, so a coordination root that is unreachable, or drops mid-run, refuses
-    rather than reading as empty; the record parsing follows remove.ps1's rules, cannot-tell refusing,
-    without sharing its code.
+    rather than reading as empty. The registry and that folder must each be a plain directory: a file
+    standing where mefor-coord should be, or a junction, refuses rather than reading as no records. The
+    record parsing follows remove.ps1's rules, cannot-tell refusing, without sharing its code.
+    THE END STATE IS READ FAIL-CLOSED: only a tree git no longer lists, whose directory is confirmed
+    absent under a folder that is there, is REMOVED. A directory that is present or cannot be read is
+    ORPHANED, for a human.
 
     WHAT THESE DO NOT SEE, said rather than implied. The fence reads the directory a session was
     LAUNCHED in, and a subagent under `isolation: worktree` is recorded under its parent's directory, so
@@ -151,24 +164,21 @@ function Get-TreeClaimsDirs {
     return @{ Dirs = $dirs; Error = '' }
 }
 
-# Why one path must not be removed now, or '' when every re-check passes. The checks run cheapest first
-# and the fence last; the header lists them and says why that order.
-function Get-FinishedWorktreeRefusal {
-    param([string]$Primary, [string]$Path, [double]$IdleHours, [string[]]$ProtectNorm, [string]$OwnClaimsDir, [string]$AllocDir)
-    $norm = ConvertTo-Norm $Path
-    if (-not (Test-ClaudeManagedPath $Path)) { return 'outside .claude/worktrees, which is the only population this step removes' }
-    if ($norm -eq (ConvertTo-Norm $Primary)) { return 'the primary checkout' }
-    $guarded = @($ProtectNorm | Where-Object { $_ -eq $norm -or $_.StartsWith("$norm/") })
-    if ($guarded.Count -gt 0) { return "the worktree this run is executing from, or one containing it ($($guarded[0]))" }
+# A tree root that is a junction or symlink: every gate below, and git, would read through it into a
+# directory somewhere else. A root that is not there is left to the gates after this one, which refuse
+# it with their own reason; a root that cannot be read refuses here.
+function Get-TreeRootRefusal([string]$Path) {
+    try { $item = Get-ItemOrThrow $Path 'its root' } catch { return $_.Exception.Message }
+    if (-not $item -or (Test-PlainDirectoryItem $item)) { return '' }
+    if ($item -isnot [System.IO.DirectoryInfo]) { return 'its root is not a directory' }
+    return "its root is a junction or link ($($item.LinkType)), which the gates and the removal would follow somewhere else"
+}
 
-    # The primary is always listed, so an empty list is a failed read, never "not registered".
-    $all = @(Get-RepoWorktrees $Primary)
-    if ($all.Count -eq 0) { return "could not list the worktrees of $Primary" }
-    $wt = @($all | Where-Object { (ConvertTo-Norm $_.Path) -eq $norm }) | Select-Object -First 1
-    if (-not $wt) { return 'no longer a registered worktree' }
-    if ($wt.Locked) { return $(if ($wt.LockReason) { "locked: $($wt.LockReason)" } else { 'locked' }) }
-    if ($wt.Prunable) { return "git reports it prunable ($($wt.Prunable)); that needs a human" }
-
+# What is IN the tree: flagged files, status, the two idle readings, an operation in progress, ignored
+# entries, and the walk. Run in the first pass and AGAIN immediately before the removal, so a write in
+# the window between them refuses the tree. Returns '' or the refusal.
+function Get-ContentRefusal {
+    param([string]$Path, [double]$IdleHours)
     $flagged = Get-FlaggedFileCount $Path
     if ($flagged -ne 0) { return $(if ($flagged -lt 0) { 'its flagged files could not be read' } else { "$flagged file(s) flagged skip-worktree or assume-unchanged, whose edits git status cannot see" }) }
     $clean = Test-WorktreeClean -Path $Path -AllUntracked
@@ -191,6 +201,31 @@ function Get-FinishedWorktreeRefusal {
     if ($ignored.Count -gt 0) { return "$($ignored.Count) ignored entr(ies) that are not a regenerable cache, which the removal would delete (first: $($ignored[0]))" }
     try { $hazard = Get-NestedHazard $Path } catch { return $_.Exception.Message }
     if ($hazard) { return "it holds $hazard, which git status does not read into" }
+    return ''
+}
+
+# Why one path must not be removed now, or '' when every re-check passes. The checks run cheapest first
+# and the fence last; the header lists them and says why that order.
+function Get-FinishedWorktreeRefusal {
+    param([string]$Primary, [string]$Path, [double]$IdleHours, [string[]]$ProtectNorm, [string]$OwnClaimsDir, [string]$AllocDir)
+    $root = Get-TreeRootRefusal $Path
+    if ($root) { return $root }
+    $norm = ConvertTo-Norm $Path
+    if (-not (Test-ClaudeManagedPath $Path)) { return 'outside .claude/worktrees, which is the only population this step removes' }
+    if ($norm -eq (ConvertTo-Norm $Primary)) { return 'the primary checkout' }
+    $guarded = @($ProtectNorm | Where-Object { $_ -eq $norm -or $_.StartsWith("$norm/") })
+    if ($guarded.Count -gt 0) { return "the worktree this run is executing from, or one containing it ($($guarded[0]))" }
+
+    # The primary is always listed, so an empty list is a failed read, never "not registered".
+    $all = @(Get-RepoWorktrees $Primary)
+    if ($all.Count -eq 0) { return "could not list the worktrees of $Primary" }
+    $wt = @($all | Where-Object { (ConvertTo-Norm $_.Path) -eq $norm }) | Select-Object -First 1
+    if (-not $wt) { return 'no longer a registered worktree' }
+    if ($wt.Locked) { return $(if ($wt.LockReason) { "locked: $($wt.LockReason)" } else { 'locked' }) }
+    if ($wt.Prunable) { return "git reports it prunable ($($wt.Prunable)); that needs a human" }
+
+    $content = Get-ContentRefusal -Path $Path -IdleHours $IdleHours
+    if ($content) { return $content }
 
     # Covers a detached tip too: `reflog show HEAD` prints the current HEAD even when the log is empty.
     $branch = if ($wt.Detached) { '' } else { [string]$wt.Branch }
@@ -249,13 +284,16 @@ Emits one row per input path, AS EACH PATH IS DECIDED, so a caller logging from 
 record of every removal already made even if the run is killed part way. Row: Path, Outcome, Reason,
 Command.
     Outcome  WOULD-REMOVE  every re-check passed; a dry run, so nothing was removed
-             REMOVED       git removed it: deregistered and the directory is gone
-             REFUSED       a re-check failed or could not complete; nothing was attempted
+             REMOVED       git removed it: deregistered, and the directory confirmed gone under a folder
+                           that is there
+             REFUSED       a re-check failed or could not complete, in the first pass or in the re-check
+                           just before the removal; nothing was attempted
              DECLINED      every re-check passed and git still refused; nothing changed, but a gate here
                            disagrees with git, which is worth reading
              FAILED        the removal was attempted and the end state is not what git reported, or
                            cannot be re-read
-             ORPHANED      deregistered, but the directory is still on disk; needs a human
+             ORPHANED      deregistered, but the directory is still on disk or cannot be read; needs a
+                           human
     Command  the exact removal command, run or (in a dry run) not run. Never carries --force.
 #>
 function Invoke-FinishedWorktreeRemoval {
@@ -274,6 +312,9 @@ function Invoke-FinishedWorktreeRemoval {
     if ($Apply -and $env:CLAUDECODE -eq '1') {
         throw 'Refusing Invoke-FinishedWorktreeRemoval -Apply inside Claude Code: it removes Claude-managed worktrees. The dry run is allowed.'
     }
+    # The whole run, dry run included: every gate below asks `git -C <tree>`, and each of these makes git
+    # answer for another checkout.
+    Assert-NoGitRedirect 'Invoke-FinishedWorktreeRemoval'
 
     $protectNorm = @($Protect | Where-Object { $_ } | ForEach-Object { ConvertTo-Norm $_ })
     # Refusals that hold for every path, decided once. A window under the floor releases trees a
@@ -305,7 +346,7 @@ function Invoke-FinishedWorktreeRemoval {
             }
             if ($refusal) { $row.Reason = $refusal }
             elseif (-not $Apply) { $row.Outcome = 'WOULD-REMOVE'; $row.Reason = 'every re-check passed' }
-            else { Invoke-OneRemoval -Primary $Primary -Row $row }
+            else { Invoke-OneRemoval -Primary $Primary -Row $row -IdleHours $IdleHours }
         }
         catch [System.Management.Automation.RuntimeException], [System.IO.IOException], [System.UnauthorizedAccessException] {
             # Before git was asked, a throw is a check that could not complete: nothing was attempted.
@@ -320,10 +361,27 @@ function Invoke-FinishedWorktreeRemoval {
     }
 }
 
+# Whether the tree's directory is still there after the removal: 'present', 'absent', or 'unknown: <why>'.
+# FAIL CLOSED. Test-Path answers $false for a path it may not read, so it cannot say "gone". Absent is
+# only a not-found under a parent folder that is there (Test-PresentUnderParentOrThrow, the rule the
+# registries are read by), because an unreachable parent raises the same not-found.
+function Get-EndStatePresence([string]$Path) {
+    try { return $(if (Test-PresentUnderParentOrThrow $Path 'the removed tree') { 'present' } else { 'absent' }) }
+    catch { return "unknown: $($_.Exception.Message)" }
+}
+
 function Invoke-OneRemoval {
-    param([string]$Primary, [object]$Row)
+    param([string]$Primary, [object]$Row, [double]$IdleHours)
     $path = $Row.Path
     $norm = ConvertTo-Norm $path
+
+    # THE LAST STEP BEFORE THE REMOVAL. The first pass read the content before the claim, allocation and
+    # fence reads, so a write in that window (an ignored .env, a nested clone, an edit) would go with the
+    # tree. The root and content gates run again here; any refusal leaves the row REFUSED.
+    $late = Get-TreeRootRefusal $path
+    if (-not $late) { $late = Get-ContentRefusal -Path $path -IdleHours $IdleHours }
+    if ($late) { $Row.Reason = "re-checked just before the removal: $late"; return }
+
     $wt = @(Get-RepoWorktrees $Primary | Where-Object { (ConvertTo-Norm $_.Path) -eq $norm }) | Select-Object -First 1
     # '' for a detached tree: the ledger's recovery recipe re-adds a BRANCH, and '(detached)' is not one.
     $branch = if ($wt -and -not $wt.Detached) { [string]$wt.Branch } else { '' }
@@ -341,20 +399,21 @@ function Invoke-OneRemoval {
     $listing = @(& git -C $Primary worktree list --porcelain 2>$null)
     $listOk = ($LASTEXITCODE -eq 0 -and $listing.Count -gt 0)
     $stillRegistered = @($listing | Where-Object { $_ -like 'worktree *' -and (ConvertTo-Norm $_.Substring(9).Trim()) -eq $norm }).Count -gt 0
-    $dirExists = Test-Path -LiteralPath $path
+    $dir = Get-EndStatePresence $path
     if (-not $listOk) {
         $Row.Outcome = 'FAILED'
-        $Row.Reason = "git exit $removeExit, and the worktree list could not be re-read; directory present=${dirExists}: $gitText"
+        $Row.Reason = "git exit $removeExit, and the worktree list could not be re-read; directory $($dir): $gitText"
     }
-    elseif (-not $stillRegistered -and -not $dirExists -and $removeExit -eq 0) {
+    elseif (-not $stillRegistered -and $dir -eq 'absent' -and $removeExit -eq 0) {
         $Row.Outcome = 'REMOVED'; $Row.Reason = 'every re-check passed'
     }
-    elseif ($stillRegistered -and $dirExists -and $removeExit -ne 0) {
+    elseif ($stillRegistered -and $dir -eq 'present' -and $removeExit -ne 0) {
         $Row.Outcome = 'DECLINED'; $Row.Reason = "git declined (exit $removeExit): $gitText"
     }
-    elseif (-not $stillRegistered -and $dirExists) {
+    elseif (-not $stillRegistered -and $dir -ne 'absent') {
+        # Present, or a directory that cannot be read: either way not confirmed gone, so a human looks.
         $Row.Outcome = 'ORPHANED'
-        $Row.Reason = "deregistered but the directory is still on disk (git exit $removeExit): $gitText"
+        $Row.Reason = "deregistered but the directory is not confirmed gone ($dir; git exit $removeExit): $gitText"
         # Deliberately broad: whatever the ledger write throws, the verdict above stands and the error
         # is logged with it. The runner still exits 3 on the row.
         try { $note = Add-OrphanLedgerEntry -Primary $Primary -Path $path -Branch $branch -Detail $Row.Reason }
@@ -363,6 +422,6 @@ function Invoke-OneRemoval {
     }
     else {
         $Row.Outcome = 'FAILED'
-        $Row.Reason = "git exit $removeExit, registered=$stillRegistered, directory present=${dirExists}: $gitText"
+        $Row.Reason = "git exit $removeExit, registered=$stillRegistered, directory $($dir): $gitText"
     }
 }
