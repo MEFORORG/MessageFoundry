@@ -56,6 +56,7 @@ from tests.test_hop_refusal_revocation import (
     _crl_coverage_server,
     _handshake,
 )
+from tests.test_revocation_guard_remaining_hops import _RELAXED_CROSSING, _guard_log
 
 PROD_PHI = HopPosture(enforcing=True)
 
@@ -252,6 +253,28 @@ def _assert_expiry_relaxed_remedy(text: str) -> None:
     assert _CONNECTION_WAYS_ACROSS not in text
     assert _EXPIRY_RELAXED_NO_CHECK in text
     assert _NO_REVOCATION_CHECK not in text
+    # The lead says what the hop lacks no more strongly than the relaxed record does: a CRL that
+    # reaches the hop still refuses a leaf it lists (as on MLLP and the DICOM SCU, BACKLOG #5089).
+    assert ", no revocation check)" not in text
+    assert "performs no certificate revocation checking" not in text
+
+
+@pytest.mark.parametrize("cell", _EXPIRY_CELLS)
+def test_an_attested_expiry_relaxed_hop_is_audited_in_the_relaxed_words(
+    cell: str, pki: dict[str, str]
+) -> None:
+    """The attested crossing's record on these hops carries the relaxed lead and remedy, as on
+    MLLP, the DICOM SCU and FTPS (vault BACKLOG #2977 item 2)."""
+    with _guard_log() as log, active_hop_posture(PROD_PHI):
+        _build(cell, crl=pki["crl"], revocation_attested=True, extra=_EXPIRED)
+    assert _RELAXED_CROSSING in log.audit, log.state()
+    assert EXPIRY_RELAXED_WAYS_ACROSS in log.audit, log.state()
+    assert ", no revocation check)" not in log.audit, log.state()
+    # CONTROL: the same attested hop without the relaxation, and with no CRL, keeps the old words.
+    with _guard_log() as plain, active_hop_posture(PROD_PHI):
+        _build(cell, revocation_attested=True)
+    assert "crossed without certificate revocation checking" in plain.audit, plain.state()
+    assert _CONNECTION_WAYS_ACROSS in plain.audit, plain.state()
 
 
 @pytest.mark.parametrize("cell", _EXPIRY_CELLS)

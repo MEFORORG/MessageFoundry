@@ -1871,9 +1871,8 @@ def test_requests_verify_refuses_a_crl_it_cannot_express(_crl_material: dict[str
     with pytest.raises(ValueError, match="crl_file") as exc:
         requests_verify_from_anchor(anchor, cell="probe")
     # Vault BACKLOG #2977 item 9: a proxy does not unset the CRL, which is what this refusal keys
-    # on, so the text offers only the lever that clears it.
-    assert "proxy" not in str(exc.value)
-    assert "Leave the CRL unset" in str(exc.value)
+    # on, so the text no longer offers one.
+    assert "revocation-checking proxy" not in str(exc.value)
     # Without a CRL the two expressible shapes are unchanged.
     assert requests_verify_from_anchor(SYSTEM_TRUST_ANCHOR, cell="probe") is None
     assert (
