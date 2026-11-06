@@ -418,7 +418,8 @@ async def test_the_notifier_emits_audit_write_failed_keyed_on_the_request() -> N
             "type": "audit_write_failed",
             "connection": "approval:abc",
             "action": "approval.approved",
-            "reason": "the write of the approval.approved audit row failed; it may be missing",
+            "reason": "the approval.approved audit row was not written, or its write's outcome "
+            "is unknown",
         }
     ]
 

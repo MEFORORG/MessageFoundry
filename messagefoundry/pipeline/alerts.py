@@ -683,9 +683,11 @@ class AlertSink(Protocol):
         no username, no params, no PHI.
 
         **A failed write is not proof the row is missing.** A COMMIT can land with its reply lost,
-        so the reason says the write failed and the row MAY be missing (vault BACKLOG #3193 item 4).
-        Where the gate has read back that the row is in the store, it raises
-        :meth:`audit_offbox_copy_missing` instead."""
+        so the reason says the row was not written OR its write's outcome is unknown (vault BACKLOG
+        #3193 item 4); a row the step-up return budget sheds is never written. Where the gate read
+        a request back as held with its seal intact, or infers that an outcome's write committed,
+        it raises :meth:`audit_offbox_copy_missing` instead. A request read back with a seal that
+        fails still raises this one: the gate cannot say its own write produced that row."""
         ...
 
     def audit_offbox_copy_missing(self, name: str, *, action: str) -> None:
@@ -1379,8 +1381,8 @@ class LoggingAlertSink:
 
     def audit_write_failed(self, name: str, *, action: str) -> None:
         log.warning(
-            "ALERT audit_write_failed: the write of the %s audit row for %r failed; the row may be "
-            "missing from the audit log",
+            "ALERT audit_write_failed: the %s audit row for %r was not written, or its write's "
+            "outcome is unknown",
             action,
             name,
         )

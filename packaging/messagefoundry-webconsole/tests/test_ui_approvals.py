@@ -124,7 +124,7 @@ async def test_the_requester_cannot_approve_their_own_hold(engine: Engine) -> No
 
 async def test_a_hold_dual_control_no_longer_gates_offers_only_reject(engine: Engine) -> None:
     """Held while dual control was on, listed after it was turned off: the engine marks the row
-    ``gated`` False and the page offers Reject, with why, but no Approve the gate would refuse."""
+    ``release_blocked`` ``not_gated`` and the page offers Reject, with why, but no Approve the gate would refuse."""
     service, _maker, _checker = await _two_approvers(engine)
     async with _client(engine, service, _ON) as maker:
         await cookie_login(maker, "maker")

@@ -1504,9 +1504,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 "type": "audit_write_failed",
                 "connection": name,
                 "action": action,
-                # Not "was not written": a COMMIT can land with its reply lost (vault BACKLOG
-                # #3193 item 4), and a row read back as stored raises the alert below instead.
-                "reason": f"the write of the {action} audit row failed; it may be missing",
+                # Not "was not written" alone: a COMMIT can land with its reply lost (vault
+                # BACKLOG #3193 item 4). A budget-shed row (step_up_return:...) is never written.
+                "reason": f"the {action} audit row was not written, or its write's outcome is "
+                "unknown",
             }
         )
 

@@ -2809,8 +2809,9 @@ after a commit it saw succeed (vault BACKLOG #3193). The page is `audit_offbox_c
 known to be missing (vault BACKLOG #3193 N1). It is keyed `approval:<id>` and carries the row's
 action name.
 
-The `audit_write_failed` alert's reason says the write failed and the row may be missing, never that
-it was not written: a COMMIT can land despite the error, as stated for the claim above.
+The `audit_write_failed` alert's reason says the row was not written or its write's outcome is
+unknown: a COMMIT can land despite the error, as stated for the claim above, and a row the step-up
+return audit budget sheds is never written.
 
 A call can be cancelled mid-write, for example by the request timeout. The gate then writes no
 ERROR line and no alert for at least two writes: a rejection, and a refusal's row. The gate
@@ -2885,7 +2886,8 @@ that write never fails the call. If the move and its row cannot be written toget
 writes the status alone, so an audit outage never leaves the row at `executing`. It then writes the
 audit row alone. If that fails too, the loss is logged at ERROR and pages `audit_write_failed`.
 One case skips the row: the combined write fails, and the status write that follows finds the row
-already moved. The gate then writes no second row and pages nothing, as above.
+already moved. The gate then writes no second row and pages `audit_offbox_copy_missing`, as
+above.
 
 Nothing retries an `interrupted` request. Re-running an operation that may already have run would be
 worse than a stuck row, so an operator has to check the operation's own effects. `GET /approvals`

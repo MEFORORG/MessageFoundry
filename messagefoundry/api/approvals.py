@@ -304,9 +304,9 @@ def log_orphaned(
     subject: str,
     *,
     cancelled: str,
+    failed: str | None,
     finished: str | None = None,
     finished_subject: Callable[[Any], str] | None = None,
-    failed: str | None = None,
     level: int = logging.ERROR,
     redact: bool = False,
     logger: logging.Logger = log,
@@ -319,8 +319,8 @@ def log_orphaned(
     Each message is logged after ``subject`` and a colon. ``cancelled`` and ``failed`` are logged
     at ``level``, ``finished`` at WARNING, after ``finished_subject`` of the task's result where
     that is given, since the result can name a different subject. A
-    ``None`` logs nothing for that ending: a ``failed`` of ``None`` is for a task that logged its own
-    failure. A failure carries its traceback, or with ``redact`` only its
+    ``None`` logs nothing for that ending. ``failed`` has no default: ``None`` is only for a task
+    that logs its own failure, so no caller drops one by leaving it out. A failure carries its traceback, or with ``redact`` only its
     :func:`~messagefoundry.redaction.safe_exc` text, for an error whose message may hold content."""
     if task.cancelled():
         logger.log(level, "%s: %s", subject, cancelled)
@@ -826,6 +826,7 @@ class ApprovalGate:
                 task,
                 f"approval {aid}",
                 cancelled="a request write was cancelled",
+                failed=None,  # _file_request logged and paged it
                 # Keyed on the request it holds, which for a repeat is the older one it joined.
                 finished_subject=lambda held: f"approval {held}",
                 finished="a request was filed or joined after its caller was cancelled, so that "
@@ -921,7 +922,7 @@ class ApprovalGate:
                     # the forwarded audit stream lacks this row and nothing else reports the gap.
                     # The row itself is stored, so the page says only the copy is missing (vault
                     # BACKLOG #3193 N1).
-                    self._alert_lost_audit(approval_id, "approval.requested", stored=True)
+                    self._alert_offbox_copy_missing(approval_id, "approval.requested")
                     return approval_id
                 state = {
                     "absent": "Reading it back found no such request, so most likely nothing is held",
@@ -1077,6 +1078,7 @@ class ApprovalGate:
                 task,
                 f"approval {aid}",
                 cancelled="a repeat's audit write was cancelled",
+                failed=None,  # _record_repeat logged and paged it
                 finished="a repeat's audit row was written after its caller was cancelled, so that "
                 "call got no 202",
             ),
@@ -1789,7 +1791,7 @@ class ApprovalGate:
                 # Paged, as a request that reads back as held is (vault BACKLOG #3193): the store
                 # tees off-box only after a commit it saw succeed, so nothing else reports the gap.
                 # As there, the page says the copy is missing, not the row (N1).
-                self._alert_lost_audit(approval_id, action, stored=True)
+                self._alert_offbox_copy_missing(approval_id, action)
                 return
         else:
             if moved:
@@ -2065,27 +2067,29 @@ class ApprovalGate:
             "is still needed, run it again: it now runs without a second approver",
         )
 
-    def _alert_lost_audit(
-        self, approval_id: str, action: str, *, key: str | None = None, stored: bool = False
-    ) -> None:
+    def _alert_lost_audit(self, approval_id: str, action: str, *, key: str | None = None) -> None:
         """Page on an audit row the gate could not write (vault BACKLOG #2255).
 
         The caller logs the loss itself, with whatever detail it holds. This only raises the
         ``audit_write_failed`` alert, and is best effort by the sink's own contract. The key is
         ``approval:<id>`` unless ``key`` names another. A lost resolver flag passes
         ``approval:<id>:resolve``, so it cannot fold into a lost release flag (vault BACKLOG
-        #3438). ``stored`` says the caller read back that the row is in the store, or most likely
-        is, so only its off-box copy is missing: that raises ``audit_offbox_copy_missing``
-        instead (vault BACKLOG #3193 N1)."""
-        name = key or f"approval:{approval_id}"
-        alert = "audit_offbox_copy_missing" if stored else "audit_write_failed"
+        #3438)."""
         try:
-            if stored:
-                self._alert_sink.audit_offbox_copy_missing(name, action=action)
-            else:
-                self._alert_sink.audit_write_failed(name, action=action)
+            self._alert_sink.audit_write_failed(key or f"approval:{approval_id}", action=action)
         except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
-            log.exception("approval %s: the %s alert failed to emit", approval_id, alert)
+            log.exception("approval %s: the audit_write_failed alert failed to emit", approval_id)
+
+    def _alert_offbox_copy_missing(self, approval_id: str, action: str) -> None:
+        """Page on an audit row the gate read back as stored, or infers committed, whose off-box
+        copy was never sent (vault BACKLOG #3193 N1): ``audit_offbox_copy_missing``, keyed
+        ``approval:<id>``, best effort as :meth:`_alert_lost_audit` is."""
+        try:
+            self._alert_sink.audit_offbox_copy_missing(f"approval:{approval_id}", action=action)
+        except Exception:  # noqa: BLE001 - a sink that breaks its never-raise contract
+            log.exception(
+                "approval %s: the audit_offbox_copy_missing alert failed to emit", approval_id
+            )
 
     async def _approver_changes(self, approver_user_id: str, requested_at: float) -> list[str]:
         """Which of the approver account's credential facts changed AFTER the request (BACKLOG #315
