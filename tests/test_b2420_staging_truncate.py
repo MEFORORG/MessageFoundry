@@ -799,3 +799,123 @@ def test_a_file_renamed_after_its_screen_is_reported_not_read_as_nothing_to_empt
     assert (staging / "moved.tar").read_bytes() == _PLAINTEXT
     # The control: the other file of the same directory is still emptied.
     assert (staging / "own.tar").read_bytes() == b""
+
+
+# --- the refusal for a rewritten staging name, and the screens' never-raise guard ----------------
+#
+# Engine PR 2814's hold, final-round items 4 and 6. Each test patches the screen, so it runs on both
+# platforms: the advice and the guard are the same code on each.
+
+
+def test_the_refusal_for_a_rewritten_staging_name_advises_no_removal_by_hand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Explorer, `rd /s` and PowerShell apply the same Win32 rewrite as the engine's own open, so an
+    operator who deleted `mefor-backup-x.` by hand would delete `mefor-backup-x`, which may be a live
+    staging directory, and leave the planted one. Red before the fix: the refusal said "delete it by
+    hand", in the sentence returned and in the log line."""
+    import logging
+
+    staging = tmp_path / "mefor-backup-x"
+    staging.mkdir()
+    (staging / "archive.tar").write_bytes(_PLAINTEXT)
+    monkeypatch.setattr(dr_backup, "_win_rewritten", lambda path: True)
+    with caplog.at_level(logging.ERROR, logger=dr_backup.__name__):
+        leftover = dr_backup._teardown_staging(staging)
+    logged = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert leftover is not None and len(logged) == 1
+    for text in (leftover, logged[0]):
+        assert "by hand" not in text
+        assert "delete it" not in text
+        assert "do not delete, move or rename it with any tool" in text
+        assert text.endswith("leave both in place and ask for support")
+    # Nothing was removed, emptied or re-marked.
+    assert sorted(p.name for p in staging.iterdir()) == ["archive.tar"]
+    assert (staging / "archive.tar").read_bytes() == _PLAINTEXT
+
+
+class _ScreenFault(ValueError):
+    """What the patched screen raises: no OSError, so a guard that catches only OSError lets it out."""
+
+
+def _raising_screen(path: Path) -> bool:
+    raise _ScreenFault("synthetic screen fault")
+
+
+def _plaintext_archive(tmp_path: Path) -> str:
+    archive = tmp_path / "synthetic.mfbak"
+    archive.write_bytes(b"synthetic plaintext archive")
+    return str(archive)
+
+
+def _passing_verify(*args: Any, **kwargs: Any) -> dr_backup.VerifyResult:
+    return dr_backup.VerifyResult("PASS")
+
+
+def _faulting_verify(*args: Any, **kwargs: Any) -> dr_backup.VerifyResult:
+    raise RuntimeError("synthetic verify fault")
+
+
+def _discard_leaving_the_directory(path: Path) -> str:
+    return "synthetic leftover"
+
+
+def test_a_screen_that_raises_in_the_discard_does_not_replace_the_verify_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The verify's teardown runs after its verdict, and `release` must never raise over it. Red
+    before the fix: the screen at the top of `_discard_verify_staging` sat outside its guard, so
+    its fault escaped the verify in place of the verdict."""
+    monkeypatch.setattr(dr_backup, "_verify_in_staging", _passing_verify)
+    monkeypatch.setattr(dr_backup, "_win_rewritten", _raising_screen)
+    result = dr_backup._verify_archive_blocking(
+        archive_path=_plaintext_archive(tmp_path), keys=[], full=False, staging_root=tmp_path
+    )
+    # The verdict survives, and the directory the teardown never reached is still named.
+    assert result.status == "FAIL"
+    assert result.reason is not None and result.reason.startswith("the archive verified, but ")
+    assert "could not be cleared" in result.reason
+
+
+def test_a_screen_that_raises_in_the_discard_does_not_replace_the_error_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same screen, while the verify itself is raising. Red before the fix: the screen's fault
+    replaced the verify's own exception."""
+    monkeypatch.setattr(dr_backup, "_verify_in_staging", _faulting_verify)
+    monkeypatch.setattr(dr_backup, "_win_rewritten", _raising_screen)
+    with pytest.raises(RuntimeError, match="synthetic verify fault") as raised:
+        dr_backup._verify_archive_blocking(
+            archive_path=_plaintext_archive(tmp_path), keys=[], full=False, staging_root=tmp_path
+        )
+    assert any("could not be cleared" in note for note in raised.value.__notes__)
+
+
+def test_a_screen_that_raises_in_the_teardown_does_not_replace_the_verify_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The teardown's own screen, reached once the discard leaves the directory. Red before the fix:
+    it sat outside the re-mark's guard, so its fault escaped `release` in place of the verdict."""
+    monkeypatch.setattr(dr_backup, "_verify_in_staging", _passing_verify)
+    monkeypatch.setattr(dr_backup, "_discard_verify_staging", _discard_leaving_the_directory)
+    monkeypatch.setattr(dr_backup, "_win_rewritten", _raising_screen)
+    result = dr_backup._verify_archive_blocking(
+        archive_path=_plaintext_archive(tmp_path), keys=[], full=False, staging_root=tmp_path
+    )
+    assert result.status == "FAIL"
+    assert result.reason == "the archive verified, but synthetic leftover"
+
+
+def test_a_screen_that_raises_in_the_teardown_does_not_replace_the_error_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The teardown's own screen while the verify is raising. Red before the fix: the screen's fault
+    replaced the verify's own exception."""
+    monkeypatch.setattr(dr_backup, "_verify_in_staging", _faulting_verify)
+    monkeypatch.setattr(dr_backup, "_discard_verify_staging", _discard_leaving_the_directory)
+    monkeypatch.setattr(dr_backup, "_win_rewritten", _raising_screen)
+    with pytest.raises(RuntimeError, match="synthetic verify fault") as raised:
+        dr_backup._verify_archive_blocking(
+            archive_path=_plaintext_archive(tmp_path), keys=[], full=False, staging_root=tmp_path
+        )
+    assert raised.value.__notes__ == ["synthetic leftover"]

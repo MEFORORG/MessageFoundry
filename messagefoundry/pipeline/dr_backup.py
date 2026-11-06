@@ -2033,6 +2033,15 @@ _REWRITTEN_FILE = "(a name Windows opens as another object, not truncated)"
 _REWRITTEN_DIR = "(a name Windows opens as another object, not walked)"
 #: What the fail-safe reports, after the name, for a listed file gone from its name before its open.
 _GONE_REASON = "(moved or removed before it was emptied, not truncated)"
+#: What the teardown tells the operator about a staging directory whose name Windows would open as
+#: another directory. Never a removal by hand: at least Explorer, ``rd /s`` and PowerShell's removals
+#: apply the same rewrite, so they would remove the OTHER directory, which may be a live staging
+#: directory, and leave this one (BACKLOG #2420).
+_REWRITTEN_STAGING_ADVICE = (
+    "do not delete, move or rename it with any tool, since at least Explorer, rd and PowerShell "
+    "apply the same rewrite and would act on that other directory, which may be a live staging "
+    "directory; leave both in place and ask for support"
+)
 
 
 def _win_opens_another(path: Path) -> bool:
@@ -2415,19 +2424,23 @@ def _discard_verify_staging(staging: Path) -> str | None:
     On Windows a directory whose name Windows would open as another (:func:`_win_opens_another`) is
     not touched at all: its removal by path would remove that other directory and then find the
     name gone, and so report it clean while it keeps its files (BACKLOG #2420). The engine never
-    names a staging directory that way, so one reaches here only from a sweep of a shared root."""
-    if _win_rewritten(staging):
-        log.error(
-            "DR staging directory %s was not removed or emptied: Windows would open its name as "
-            "another directory; delete it by hand",
-            staging,
-        )
-        return (
-            f"the plaintext staging directory {staging} was not removed or emptied, because "
-            "Windows would open its name as another directory; delete it by hand"
-        )
+    names a staging directory that way, so one reaches here only from a sweep of a shared root.
+    What it tells the operator is :data:`_REWRITTEN_STAGING_ADVICE`."""
     unproven: list[str] = []
     try:
+        # Inside the guard: this runs from `_Staging.release` after a verdict, or while an error is
+        # in flight, and a fault in the screen must replace neither.
+        if _win_rewritten(staging):
+            log.error(
+                "DR staging directory %s was not removed or emptied: Windows would open its name as "
+                "another directory; %s",
+                staging,
+                _REWRITTEN_STAGING_ADVICE,
+            )
+            return (
+                f"the plaintext staging directory {staging} was not removed or emptied, because "
+                f"Windows would open its name as another directory; {_REWRITTEN_STAGING_ADVICE}"
+            )
         if _remove_tree(staging):
             return None
         unproven = _empty_files_in_place(staging)
@@ -2609,21 +2622,24 @@ def _teardown_staging(path: Path) -> str | None:
     plaintext and no proof, and every later sweep would skip it. Nobody holds the lock now, so the
     files are all the proof needs."""
     leftover = _discard_verify_staging(path)
-    # A name Windows rewrites is not re-marked either: the marks would land in the other directory.
-    if os.path.lexists(path) and not _win_rewritten(path):
-        # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would
-        # otherwise hold this thread in the open until a reader came, which may be never.
-        flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK
-        try:
+    # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would otherwise
+    # hold this thread in the open until a reader came, which may be never.
+    flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK
+    # Any exception, not only OSError, and the screen inside: this runs from `_Staging.release`
+    # after a verdict, or while an error is in flight, and must replace neither.
+    try:
+        # A name Windows rewrites is not re-marked either: the marks would land in the other
+        # directory.
+        if os.path.lexists(path) and not _win_rewritten(path):
             for name in (_LOCK_NAME, _HELD_MARKER_NAME):
                 os.close(os.open(path / name, flags, 0o600))
-        except OSError as exc:
-            log.warning(
-                "DR staging directory %s survived its teardown and could not be marked for the next "
-                "sweep: %s",
-                path,
-                safe_exc(exc),
-            )
+    except Exception as exc:
+        log.warning(
+            "DR staging directory %s survived its teardown and could not be marked for the next "
+            "sweep: %s",
+            path,
+            safe_exc(exc),
+        )
     return leftover
 
 
