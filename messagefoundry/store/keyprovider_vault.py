@@ -289,6 +289,16 @@ def is_vault_bad_request(exc: BaseException) -> bool:
     return isinstance(exc, InvalidRequest)
 
 
+def is_vault_forbidden(exc: BaseException) -> bool:
+    """Whether ``exc`` is Vault's HTTP 403, which hvac raises as ``Forbidden`` (ADR 0217: a token
+    may hold no capability on a retired Transit key). ``False`` without the ``[vault]`` extra."""
+    try:
+        from hvac.exceptions import Forbidden  # noqa: PLC0415
+    except ImportError:
+        return False
+    return isinstance(exc, Forbidden)
+
+
 # --- Transit key-TYPE validation (BACKLOG #1166, owner ruling 2026-08-22, ASVS 11.2.3) -------------
 #
 # Every Vault Transit key this product uses is OPERATOR-CHOSEN by name, and the product read its type

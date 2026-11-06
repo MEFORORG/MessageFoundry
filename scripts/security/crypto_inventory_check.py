@@ -1549,6 +1549,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "cipher:.decrypt_data()",
             "cipher:.encrypt_data()",
             "mac:.generate_hmac()",
+            # ADR 0217: a row seal's HMAC checked INSIDE Transit (transit/verify), never compared
+            # in process. A MAC check, not a signature.
+            "sign_verify:.verify_signed_data()",
             "tls_context:via messagefoundry.store.keyprovider_vault",
         }
     ),
@@ -1574,9 +1577,15 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/row_seal.py": frozenset(
         {
             "compare:hmac.compare_digest",
+            # ADR 0217: the Transit sealer's fixed-length input, its cache key and its key id are
+            # SHA-256 digests; no key, and nothing a seal's strength rests on beyond the HMAC.
+            "hash:hashlib.sha256",
             "hash:via messagefoundry.store.crypto",
             "kdf:via messagefoundry.store.crypto",
             "mac:hmac.new[sha256]",
+            # ADR 0217: the Transit sealer asks Transit to check a stored HMAC (its backend's
+            # verify_seal_hmac); a MAC check inside Vault, not a signature.
+            "sign_verify:.verify()",
         }
     ),
     # BACKLOG #2593: opens a queue payload cell (AES-GCM decrypt through the store cipher) under the
