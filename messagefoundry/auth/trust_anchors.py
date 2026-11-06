@@ -1705,7 +1705,8 @@ def inbound_lane_reads_ca(conn_type: object, settings: Mapping[str, Any]) -> boo
     inbounds, for :func:`registry_anchor_specs` and the runner.
 
     A ``dialect`` that is not yet text, such as an ``env()`` value, may resolve to ``generic``, so
-    its ``sslca`` counts here and the check decides once it resolves; otherwise such a poller would
+    its driver file keywords count here and the check decides once it resolves; otherwise such a
+    poller would
     never be checked, while an outbound with the same dialect is."""
     if conn_type is ConnectorType.REMOTEFILE:
         return bool(settings.get("tls_ca_file"))
@@ -1803,11 +1804,19 @@ def database_ca_anchor_spec(
         odbc_param_text,
     )
 
-    ca: tuple[object, Mapping[str, bool | None]] | None = None
-    for keyword in files:
-        value = _generic_odbc_param(settings, keyword)
-        # The build's own literal check, in its words, before anything walks or stats the value.
+    # Read from the settings as given: a dialect that is not text answers no value here, as before
+    # item 18, and the build then refuses the dialect itself.
+    values = {
+        keyword: value
+        for keyword in files
+        if (value := _generic_odbc_param(settings, keyword)) is not None
+    }
+    # The build's own literal check, in its words, on every value before any is walked or statted,
+    # as the build checks every literal before its remote-path check.
+    for keyword, value in values.items():
         odbc_param_text(keyword, value, connection=name)
+    ca: tuple[object, Mapping[str, bool | None]] | None = None
+    for keyword, value in values.items():
         verdicts = file_keyword_verdicts(value)
         rule = driver_file_rule(keyword, value, verdicts)
         if rule is not None:

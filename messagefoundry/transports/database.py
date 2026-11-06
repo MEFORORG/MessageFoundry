@@ -65,6 +65,7 @@ from itertools import islice
 from typing import Any, NamedTuple, TypeGuard
 
 from messagefoundry.auth.anchor_path import (
+    LINK,
     SHARE_CAUSE,
     WinProbe,
     _win_probe,
@@ -991,8 +992,8 @@ _LOCAL_DEVICE_TARGET = re.compile(r"[\\/]{2}[?.][\\/](?:[A-Za-z]:|[Vv]olume\{)")
 def _path_verdict(text: str) -> bool | None:
     """:func:`_windows_path_verdict` for ``text`` on Windows, and ``None`` for an ``OSError`` or
     ``ValueError`` it raises. ``False`` on POSIX, where nothing past the spelling is checked
-    (``docs/CONNECTIONS.md``, Generic ODBC)."""
-    if sys.platform != "win32":
+    (``docs/CONNECTIONS.md``, Generic ODBC). :data:`_WALKS_BEYOND_SPELLING` is the one gate."""
+    if not _WALKS_BEYOND_SPELLING:
         return False
     try:
         return _windows_path_verdict(
@@ -1097,13 +1098,15 @@ def _refuse_remote_paths(
 
 #: What a refused driver file value must be, after the setting's name, for the build and the lane
 #: check alike (:func:`driver_file_rule`). Neither names a path.
+#: Kept short: a stored failure keeps about the first 200 characters, and the build's prefix and
+#: the connection name come first.
 REMOTE_PATH_RULE = (
     "must be a plain local path on this host: not a share, a network drive, a link to one, or a "
-    "path the check cannot read"
+    "path it cannot read"
 )
 CAPATH_ENTRY_RULE = (
-    "must name a folder whose entries are each a plain local path on this host: not a share, a "
-    "network drive, a link to one, or a path the check cannot read"
+    "must name a folder whose entries are plain local paths on this host, with no link to a share "
+    "and none it cannot read"
 )
 
 
@@ -1121,12 +1124,13 @@ def driver_file_rule(keyword: str, value: object, verdicts: FileVerdicts) -> str
     return None
 
 
-#: Whether the remote-path check reads anything beyond the spelling: on Windows only
-#: (:func:`_path_verdict`), so an ``sslcapath`` folder is listed there and nowhere else.
+#: Whether the remote-path check reads anything beyond the spelling: on Windows only, the one gate
+#: for :func:`_path_verdict` and for listing an ``sslcapath`` folder.
 _WALKS_BEYOND_SPELLING = sys.platform == "win32"
 #: How many entries of an ``sslcapath`` folder :func:`capath_entries_leave_host` judges. A folder
-#: holding more is refused rather than judged in part: each entry is a walk, and the build runs on
-#: the event loop. A CA folder holds a few hundred at most (one file and one link per CA).
+#: holding more is refused rather than judged in part, since the build runs on the event loop. A
+#: CA folder holds a few hundred at most (one file and one link per CA), and each entry that is not
+#: a link costs one ``lstat`` (:func:`_capath_entry_clear`).
 _MAX_CAPATH_ENTRIES = 4096
 
 
@@ -1158,7 +1162,12 @@ def _capath_folder_clear(folder: str) -> bool:
     try:
         with os.scandir(folder) as listing:
             names = [entry.name for entry in islice(listing, _MAX_CAPATH_ENTRIES + 1)]
-    except (FileNotFoundError, NotADirectoryError):
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
+            # A share Windows could not reach, which CPython raises as not found, as
+            # _names_no_file reads it: the folder leads off the host, whatever its walk said.
+            _not_cleared("an sslcapath folder is on a share Windows could not reach", exc)
+            return False
         return True  # no folder at this spelling: left to the driver, as a missing file is
     except (OSError, ValueError) as exc:
         reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else type(exc).__name__
@@ -1167,7 +1176,25 @@ def _capath_folder_clear(folder: str) -> bool:
     if len(names) > _MAX_CAPATH_ENTRIES:
         _not_cleared(f"an sslcapath folder holds more than {_MAX_CAPATH_ENTRIES} entries", folder)
         return False
-    return all(_path_verdict(os.path.join(folder, name)) is False for name in names)
+    return all(_capath_entry_clear(os.path.join(folder, name), name) for name in names)
+
+
+def _capath_entry_clear(path: str, name: str) -> bool:
+    """Whether the ``sslcapath`` entry ``name``, at ``path`` in a folder whose own walk cleared it,
+    is clear. An entry the probe reads as a plain file or folder is: the walk of its full path
+    would pass the folder's own chain, then end at this probe with no cause. Anything else takes
+    that full walk (:func:`_path_verdict`): a link, an entry the probe cannot read, and a name the
+    walk ends on (a stream, or a trailing space or dot). So one ``lstat`` judges a plain entry,
+    not a walk from the volume root, and no entry the walk would refuse is cleared."""
+    if ":" not in name and not name.endswith((" ", ".")):
+        try:
+            kind, _target = _win_probe(path)
+        except OSError:
+            pass  # the walk reads the same failure as its cause
+        else:
+            if kind != LINK:
+                return True
+    return _path_verdict(path) is False
 
 
 def _refuse_weak_driver_key(

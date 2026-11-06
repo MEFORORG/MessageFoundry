@@ -2195,9 +2195,12 @@ when the lane is built or an operator starts it and before a reload that builds 
 running, so a path that leads to another host after the build is refused there as a setting.
 The check is defence in depth, not a guarantee. It misses at least: links to some object paths;
 paths that change after a check, an entry added to an `SSLCAPATH` folder included; who can write
-an `SSLCAPATH` folder or its entries; and, on POSIX, anything beyond the spelling. The owner,
-2026-11-03, accepted a path that changes after a check as a recorded limit, which also leaves the
-anchor check below a swap window. The check does not change the value sent to the driver.
+an `SSLCAPATH` folder; and, on POSIX, anything beyond the spelling. The owner,
+2026-11-03, accepted two of these as recorded limits: a path that changes after a check, which
+also leaves the anchor check below a swap window, and the contents of an `SSLCAPATH` folder,
+which that anchor check does not read either. Where each entry leads is now checked as above
+(vault BACKLOG #5197), so what remains of the second limit is who can write the folder or its
+entries. The check does not change the value sent to the driver.
 
 This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
 reads `SERVER` as its target.
@@ -2230,7 +2233,8 @@ too, and a pipe or device is refused unread. **What it does not
 cover**, at least: a running lane's pool goes on reading the file at each new connect until the
 lane is rebuilt, even after a later check refuses it; any check-then-load leaves a swap window, as
 for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all, though its entries
-take the file-keyword check above. The swap window is the recorded limit that paragraph names. A
+take the file-keyword check above. The swap window and who can write the `SSLCAPATH` folder are
+what remains of the recorded limits that paragraph names. A
 padded or boolean value of any file keyword is refused here too, as the build refuses it, before
 any spelling is read.
 

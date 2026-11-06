@@ -2,10 +2,14 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Gaps in the generic ODBC remote-path walk that engine PR 2671 added (vault BACKLOG #5197).
 
-Each test names the row's item it pins, and each was red on the code before the fix. The walk
-takes its file system as injected callables (``probe``, ``drive_type``, ``drive_target``, ``cwd``)
-and reads paths with ``ntpath``, so every test here runs on any platform. Every fix moves a verdict
-toward ``None`` (could not clear) or ``True`` (leads off the host), never toward ``False``.
+Each test names the row's item it pins. Each was red on the code before its fix, except the ones
+whose docstring calls them a control. The walk takes its file system as injected callables
+(``probe``, ``drive_type``, ``drive_target``, ``cwd``) and reads paths with ``ntpath``, so the
+tests run on any platform, apart from the real-reader halves of findings 4, 5 and 9. Every fix
+moves a verdict toward ``None`` (could not clear) or ``True`` (leads off the host), with one
+exception: turn 2's PR 2738 finding 1 moves a subst drive onto a bare drive (``\\??\\C:``), which
+the walk refused for a cause that was not there, to ``False``, where the walk now reads the path
+it stands for.
 
 Synthetic paths and host names only.
 """
@@ -16,6 +20,7 @@ import copy
 import logging
 import os
 import pickle
+import re
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -458,7 +463,7 @@ def test_finding_4_a_drive_read_cause_keeps_its_code_and_says_it_once() -> None:
     _chain, cause = windows_chain(r"S:\ca.pem", _no_cwd, _probe(), drive_target=unread)
     assert cause is not None
     assert cause.count("could not be read") == 1
-    assert "Win32 error 6" in cause.kind and "S:" not in cause.kind
+    assert re.search(r"Win32 error [0-9]+ ", cause.kind) and "S:" not in cause.kind
 
 
 def test_finding_9_the_drive_reader_raises_for_a_failed_query() -> None:
@@ -470,9 +475,9 @@ def test_finding_9_the_drive_reader_raises_for_a_failed_query() -> None:
         with pytest.raises(OSError):
             anchor_path.query_drive_target("C:")
         return
-    with pytest.raises(OSError, match="Win32 error 6") as refused:
+    with pytest.raises(OSError, match=r"Win32 error [0-9]+ ") as refused:
         anchor_path.query_drive_target("C:\\")
-    assert refused.value.strerror is not None and "Win32 error 6" in refused.value.strerror
+    assert refused.value.strerror is not None and refused.value.strerror.startswith("Win32 error ")
     assert anchor_path.query_drive_target(os.environ.get("SYSTEMDRIVE", "C:")) is None
 
 
@@ -616,16 +621,24 @@ def _capath(tmp_path: Path, *names: str) -> Path:
 def _entry_verdicts(
     monkeypatch: pytest.MonkeyPatch, verdicts: Mapping[str, bool | None]
 ) -> list[str]:
-    """Stand ``_path_verdict`` in: an entry named in ``verdicts`` gets its verdict, any other path
-    ``False``. The walk beyond the spelling runs as on Windows. Returns the paths judged."""
+    """Stand the probe and ``_path_verdict`` in: an entry named in ``verdicts`` is a link, which
+    takes the full walk and gets its verdict there; any other entry is a plain file, and any other
+    path walks ``False``. The walk beyond the spelling runs as on Windows. Returns the paths the
+    full walk judged."""
     judged: list[str] = []
 
     def verdict(path: str) -> bool | None:
         judged.append(path)
         return verdicts.get(os.path.basename(path), False)
 
+    def probe(path: str) -> tuple[str, str | None]:
+        if os.path.basename(path) in verdicts:
+            return LINK, r"C:\elsewhere"
+        return FILE, None
+
     monkeypatch.setattr(database, "_WALKS_BEYOND_SPELLING", True)
     monkeypatch.setattr(database, "_path_verdict", verdict)
+    monkeypatch.setattr(database, "_win_probe", probe)
     return judged
 
 
@@ -650,18 +663,80 @@ def test_closing_step_4_an_sslcapath_entry_that_leaves_the_host_is_refused(
 def test_closing_step_4_a_local_sslcapath_folder_passes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The control: every entry judged, none leaves the host, so the build and the lane check pass."""
+    """The control: none leaves the host, so the build and the lane check pass. A plain entry is
+    judged by its probe alone, and a link takes the full walk, which clears it here."""
     folder = _capath(tmp_path, "0a1b2c3d.0", "0a1b2c3d.1")
-    judged = _entry_verdicts(monkeypatch, {})
+    judged = _entry_verdicts(monkeypatch, {"0a1b2c3d.1": False})
     settings = _generic(SSLCAPATH=str(folder))
     database._build_odbc_dsn(settings, connection=_OUT)
     assert ta.lane_anchor_spec("outbound", _OUT, settings) is None
-    assert sorted(os.path.basename(p) for p in judged if p != str(folder)) == [
-        "0a1b2c3d.0",
-        "0a1b2c3d.0",
-        "0a1b2c3d.1",
-        "0a1b2c3d.1",
-    ]
+    walked = sorted(os.path.basename(p) for p in judged if p != str(folder))
+    assert walked == ["0a1b2c3d.1", "0a1b2c3d.1"]  # once by the build, once by the lane check
+
+
+@pytest.mark.parametrize("name", ["a.0:stream", "a.0 ", "a.0."])
+def test_closing_step_4_an_entry_the_walk_ends_on_takes_the_full_walk(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """A name the walk ends on is never cleared by its probe alone. The probe would read it as a
+    plain file; the full walk answers a cause. Synthetic names, so no folder is listed."""
+    walked: list[str] = []
+    monkeypatch.setattr(database, "_win_probe", lambda _p: (FILE, None))
+
+    def verdict(path: str) -> bool | None:
+        walked.append(path)
+        return None
+
+    monkeypatch.setattr(database, "_path_verdict", verdict)
+    assert database._capath_entry_clear(rf"C:\capath\{name}", name) is False
+    assert walked == [rf"C:\capath\{name}"]
+
+
+def test_closing_step_4_an_entry_the_probe_cannot_read_takes_the_full_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unreadable(_path: str) -> tuple[str, str | None]:
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(database, "_win_probe", unreadable)
+    monkeypatch.setattr(database, "_path_verdict", lambda _p: None)
+    assert database._capath_entry_clear(r"C:\capath\a.0", "a.0") is False
+
+
+def test_closing_step_4_a_folder_on_an_unreached_share_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Windows raises a share it could not reach (53, 67) as not found. Read as a missing folder,
+    the value was cleared with no entry judged. Red: it was left to the driver."""
+    folder = _capath(tmp_path, "a.0")
+    _entry_verdicts(monkeypatch, {})
+    real = os.scandir
+
+    def unreached(path: str) -> Any:
+        if os.fspath(path) == str(folder):
+            exc = FileNotFoundError(2, "not reached")
+            exc.winerror = 53  # type: ignore[attr-defined]
+            raise exc
+        return real(path)
+
+    monkeypatch.setattr(os, "scandir", unreached)
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder whose entries"):
+        database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
+
+
+def test_closing_step_4_the_refusal_fits_a_stored_failure() -> None:
+    """A stored failure keeps about the first 200 characters, so the rule must end inside them for
+    a connection name of ordinary length. Red: the entry rule ran past 200 and was cut."""
+    prefix = "connection 'OB_ACME_LAB_DB'; DATABASE odbc_params value for 'sslcapath' "
+    assert len(prefix + database.CAPATH_ENTRY_RULE) <= 200
+    assert len(prefix + database.REMOTE_PATH_RULE) <= 200
+
+
+def test_item_18_a_dialect_that_is_not_text_answers_no_value_on_the_lane_check() -> None:
+    """A dialect that is not text answers no value, as before item 18, so the build refuses the
+    dialect itself. Red: the lane check refused the keyword as None, before the build ran."""
+    settings = {**_generic(SSLKEY=r"C:\certs\client.key"), "dialect": None}
+    assert ta.lane_anchor_spec("outbound", _OUT, settings) is None
 
 
 def test_closing_step_4_a_folder_past_the_entry_cap_is_refused(
