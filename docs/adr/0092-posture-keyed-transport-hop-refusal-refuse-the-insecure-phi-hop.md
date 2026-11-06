@@ -192,7 +192,7 @@ authority above:
    so the only drift they don't catch is the uvicorn wiring, not the TLS policy.
 
 All four **compose with** the existing #200 serve-path enforcement, the #201 outbound revocation guard
-(fires only on a VERIFYING hop — disjoint from the cleartext/verify-off condition), the #199 cleartext-
+(fires only on a VERIFYING hop), the #199 cleartext-
 egress refusal, and the #129 expiry-relaxation (which stays a VERIFIED hop the posture gate never keys
 on). The production-PHI clamp (`weakened_tls_escape_permitted` / `hop_insecure_escape_downgrades`) remains
 the **single authority** for the global escape on every path; no path logs PHI or a secret.

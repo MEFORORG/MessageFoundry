@@ -85,6 +85,8 @@ _DIGEST: _Settings = {
     "http_auth_password": "synthetic-pw",
 }
 _ECH: _Settings = {"ech_egress": True, "ech_sidecar": SIDECAR}
+_VERIFY_OFF: _Settings = {"verify_tls": False}
+_ECH_VERIFY_OFF: _Settings = {**_VERIFY_OFF, **_ECH}
 
 
 @pytest.fixture(autouse=True)
@@ -347,27 +349,28 @@ def test_the_rest_ech_refusal_offers_only_a_lever_that_can_cross_it(pki: dict[st
     assert "delivers over verified https" in default
 
 
-# verify_tls=false with the verify-off hop attested, so that gate lets the hop build and only the
-# revocation guard is left to decide.
-_VERIFY_OFF: _Settings = {"verify_tls": False}
-_ECH_VERIFY_OFF: _Settings = {**_VERIFY_OFF, **_ECH}
-
-
 def test_rest_with_an_ech_sidecar_and_verify_off_is_still_refused() -> None:
-    """Vault BACKLOG #2977 item 8. With ECH the engine dials the loopback sidecar through a
-    verifying opener, whatever ``verify_tls`` says, and the sidecar makes the TLS connection to the
-    peer. So ``verify_tls=false`` turns off no verification on the wire, and must not turn off the
-    revocation guard either. Before the fix it did: an attested verify-off hop built with no
-    revocation attestation, while the same hop with ``verify_tls`` on was refused."""
+    """Vault BACKLOG #2977 item 8. With ECH the sidecar makes the TLS connection to the peer, so
+    ``verify_tls`` reaches no TLS connection the engine makes and turns off no verification. It must
+    not turn off the revocation guard either. Before the fix it did: an attested verify-off hop
+    built with no revocation attestation, while the same hop with ``verify_tls`` on was refused.
+
+    Each arm sets ``tls_hop_attested``, so the verify-off gate lets the hop build and only the
+    revocation guard is left to decide."""
     assert ECH_HOP_WAYS_ACROSS in _refused("REST", hop_attested=True, extra=_ECH_VERIFY_OFF)
     # CONTROL 1: the revocation attestation crosses it, so the refusal above is the revocation guard
     # and not the verify-off gate or a bad setting.
     with active_hop_posture(PROD_PHI):
-        _build("REST", revocation_attested=True, hop_attested=True, extra=_ECH_VERIFY_OFF)
+        dest = _build("REST", revocation_attested=True, hop_attested=True, extra=_ECH_VERIFY_OFF)
+    # The fix's premise: the opener kept is the sidecar one, never the CERT_NONE verify-off opener.
+    context = opener_tls_context(dest._opener, connector="probe")  # type: ignore[attr-defined]
+    assert context is not None and context.verify_mode == ssl.CERT_REQUIRED
     # CONTROL 2: without the sidecar the verify-off hop has no verification for a revocation check to
     # add to, so the revocation guard stays off and the attested hop builds, unchanged.
     with active_hop_posture(PROD_PHI):
-        _build("REST", hop_attested=True, extra=_VERIFY_OFF)
+        dest = _build("REST", hop_attested=True, extra=_VERIFY_OFF)
+    direct = opener_tls_context(dest._opener, connector="probe")  # type: ignore[attr-defined]
+    assert direct is not None and direct.verify_mode == ssl.CERT_NONE
 
 
 def test_opener_is_a_required_keyword() -> None:

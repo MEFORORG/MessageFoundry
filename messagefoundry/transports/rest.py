@@ -1564,7 +1564,8 @@ def refuse_unrevoked_verified_hop(
     """Refuse a VERIFYING ``https`` hop that does no certificate revocation checking (#201, ADR 0078 amend).
 
     The revocation twin of :func:`refuse_verify_off`, for the *verify-ON* https path the HTTP-family cells
-    (REST/SOAP/FHIR) take when ``verify_tls`` is true: urllib rides stdlib ssl, which validates the chain
+    take when ``verify_tls`` is true, and for a REST hop through an ECH sidecar whatever ``verify_tls``
+    says (vault BACKLOG #2977 item 8): urllib rides stdlib ssl, which validates the chain
     (+ strict RFC 5280) but performs NO OCSP/CRL, so a revoked-but-unexpired server cert is still accepted.
     A production-PHI verified hop to a non-loopback host is REFUSED at construction unless revocation is
     attested (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED``

@@ -1641,7 +1641,8 @@ transport's list is set, an outbound of that transport not on it is **refused at
 > top-level `connections.toml` key. On a `FhirLookup`, one declaration lifts two refusals: the
 > https read and the lookup's SMART token endpoint
 > ([ADR 0173](adr/0173-tls-peer-revocation-checking-and-ocsp-stapling-across-terminating-and-originating-surfaces.md)).
-> It governs revocation on a *verifying* hop only and never reaches a cleartext or verify-off hop.
+> It governs revocation on a *verifying* hop only and never reaches a cleartext hop or a direct
+> verify-off hop.
 >
 > **`data_class` is no longer read here** — a `synthetic` label used to allow every cleartext hop
 > silently, which made a typo in one file indistinguishable from a deliberate declaration, with every

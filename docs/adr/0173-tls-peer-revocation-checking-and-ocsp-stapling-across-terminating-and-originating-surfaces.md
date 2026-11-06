@@ -741,8 +741,10 @@ OAuth2 token hop. Two reasons:
 site could set, until BACKLOG #2987 removed it.) So
 `refuse_unrevoked_verified_hop` takes `ways_across`, and both ECH callers pass the fixed text
 `ECH_HOP_WAYS_ACROSS`. Where the guard runs, a non-loopback ECH hop on an enforcing instance
-crosses on the attestation alone. On the REST destination the guard runs only with `verify_tls`
-true, as before; with `verify_tls=false` the hop is the verify-off gate's (#200), ECH or not.
+crosses on the attestation alone. On the REST destination the guard runs on an ECH hop whatever
+`verify_tls` says. *(Corrected 2026-11-05, BACKLOG #2977 item 8: this read "the guard runs only
+with `verify_tls` true, as before; with `verify_tls=false` the hop is the verify-off gate's (#200),
+ECH or not".)*
 
 The REST destination's ECH arm takes the same value, under BACKLOG #2188. That item moved the guard
 in the REST, SOAP, FHIR and DICOMweb destinations below the last statement that builds or replaces
