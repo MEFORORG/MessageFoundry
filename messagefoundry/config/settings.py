@@ -9028,10 +9028,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       Their ``[auth]`` spellings are refused at load, so the entries carry the ``[security]`` names.
       They are read off the ``[auth]`` copy, since this function is handed no ``[security]``. A
       caller whose two disagree reports the ``[auth]`` value, so it can miss a new loosening or
-      keep one just removed: at least a ``security show`` that could not load the whole file and
-      fell back to a default ``[auth]``, which its ``loosenings_partial`` marker says. The
-      ``security set`` preview reads the whole file again after the edit (vault BACKLOG #2600),
-      so it pairs the edited ``[security]`` with the ``[auth]`` that edit leaves.
+      keep one just removed. A caller that pairs a ``[security]`` with an ``[auth]`` from another
+      read must copy the two in first, as ``messagefoundry security`` does (vault BACKLOG #2600).
       ``SessionRecord.is_live`` refuses a session idle past the first or older than the second (its
       expiry is stamped from it at sign-in), so a longer one is looser, and 0 or less
       ends every session at once, which is stricter.

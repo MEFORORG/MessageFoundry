@@ -142,8 +142,8 @@ The extension is a **thin TypeScript UI**; the heavy lifting stays in Python. It
   the Python CLI absent.
 - **Security settings editor** (*MessageFoundry: Edit Security Settings*) — a form over the service
   TOML's `[security]` posture switches via `messagefoundry security show|set`. Every switch defaults to
-  its secure position, and moving one to its insecure value shows a plain-language loosening warning in
-  place; changes take effect on the next engine restart.
+  its secure position, and moving one to its insecure value, or a session limit above its default,
+  shows a plain-language loosening warning in place; changes take effect on the next engine restart.
 - **Getting-started walkthrough** — VS Code's *Get Started with MessageFoundry*: nine cards from
   pointing at an engine and opening the config dir, through Connection → Route → Insert Element → Test
   Bench → Live Debug → Cookbook, to Stage → Promote.

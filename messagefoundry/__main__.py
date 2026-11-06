@@ -1814,14 +1814,19 @@ def _load_service_settings(
         return None, settings_error_detail(exc)
 
 
-def _post_write_settings_check(refusal: type[ValueError]) -> Callable[[Path], None]:
+def _post_write_settings_check(
+    refusal: type[ValueError], *, keep: list[ServiceSettings] | None = None
+) -> Callable[[Path], None]:
     """The ``validate`` callback ``security set`` and ``alert add``/``remove`` hand their editor.
 
     It loads the editor's candidate exactly as the engine loads the file, so a bad edit fails at
     edit time and never replaces the file, rather than the engine refusing at the next start. That
     load is the WHOLE file plus the environment layer, not the JSON the operator typed, so its failure goes through
     :func:`_load_service_settings` and is raised as ``refusal`` already rendered (vault BACKLOG
-    #2760); the editor modules stay outside the settings import graph and cannot render it."""
+    #2760); the editor modules stay outside the settings import graph and cannot render it.
+
+    ``keep``, when given, receives the settings each accepted candidate loaded to, so a caller can
+    report on exactly what was saved without loading the file a second time."""
 
     def validate(settings_path: Path) -> None:
         settings, detail = _load_service_settings(str(settings_path))
@@ -1830,6 +1835,8 @@ def _post_write_settings_check(refusal: type[ValueError]) -> Callable[[Path], No
                 "the settings do not load with this edit applied (the file plus any MEFOR_* "
                 f"environment overrides), so the edit was not saved: {detail}"
             )
+        if keep is not None:
+            keep.append(settings)
 
     return validate
 
@@ -12003,6 +12010,7 @@ def _security(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
+        _SECURITY_PASSTHROUGH,
         SecuritySettings,
         ServiceSettings,
         security_loosenings,
@@ -12010,11 +12018,12 @@ def _security(args: argparse.Namespace) -> int:
 
     path = args.service_config
 
-    def _posture(sec: SecuritySettings) -> dict[str, object]:
-        """The loosening list for ``sec`` and its scope marker, read off the WHOLE file as it is now.
+    def _posture(sec: SecuritySettings, saved: ServiceSettings | None = None) -> dict[str, object]:
+        """The loosening list for ``sec`` and its scope marker.
 
         This subcommand edits [security], but security_loosenings() also reports the other sections'
-        deviations (ADR 0148: one posture), so they are resolved from the whole file. If the file
+        deviations (ADR 0148: one posture), so they are resolved from the whole file: ``saved``, the
+        candidate `set` validated and wrote, or else a load of the file as it is now. If the file
         will not load -- it may be invalid OUTSIDE [security], which must not break `security show`
         -- they fall back to the shipped defaults and the `loosenings_partial` marker SAYS SO, with
         WHY (vault BACKLOG #2600): a stray MEFOR_<SECTION>_<KEY> variable in this shell refuses the
@@ -12022,18 +12031,28 @@ def _security(args: argparse.Namespace) -> int:
         settings_error_detail, which hides the refused input but prints each validator's message;
         its docstring says which messages quote a value.
 
-        `set` calls it AFTER the write, because [security] desugars into other sections: the two
-        session limits are reported off their [auth] copy (vault BACKLOG #2600), and a preview
-        paired with the pre-edit read missed a new loosening and kept a removed one."""
-        full, partial_reason = ServiceSettings(), None
+        The [auth] copies of the [security] switches are taken from ``sec`` (vault BACKLOG #2600).
+        The registry reads the two session limits off those copies, and the load fills them from
+        the file AND the environment, while ``sec`` is the file's [security] alone. Unmatched, a
+        shell variable or the shipped-default fallback named a limit `values` did not show, or hid
+        one it did, and a `set` preview paired with the pre-edit load missed a new loosening."""
+        full: ServiceSettings | None = saved
+        partial_reason: str | None = None
         # An ABSENT file is not a degraded read -- the shipped defaults ARE the effective posture
         # there, and `security show` is expected to work offline before any config exists.
-        if Path(path).exists():
+        if full is None and Path(path).exists():
             # The shared load: its catch is the specific ways a settings file fails to resolve, and
             # anything else is a programming error that surfaces.
-            loaded, partial_reason = _load_service_settings(path)
-            if loaded is not None:
-                full = loaded
+            full, partial_reason = _load_service_settings(path)
+        if full is None:
+            full = ServiceSettings()
+        auth = full.auth.model_copy(
+            update={
+                field: getattr(sec, switch)
+                for switch, section, field in _SECURITY_PASSTHROUGH
+                if section == "auth"
+            }
+        )
         # This CLI reads a SETTINGS file and never loads the connection graph — nor does it open the
         # store — so it can see NEITHER the per-connection declarations NOR the two store
         # observations (#1008 privilege, #1905 audit-chain keying). It passes empty lists and None and
@@ -12049,7 +12068,7 @@ def _security(args: argparse.Namespace) -> int:
             for s, r in security_loosenings(
                 sec,
                 full.store,
-                full.auth,
+                auth,
                 full.alerts,
                 full.secret_rotation,
                 cleartext_hops=(),
@@ -12097,7 +12116,7 @@ def _security(args: argparse.Namespace) -> int:
             "loosenings_partial_reason": partial_reason,
             "loosenings_scope": (
                 "settings only ([security]/[store]/[auth]/[alerts]/[secret_rotation]/[api]/[approvals]/"
-                "[cert_monitor]/[backup]); the "
+                "[cert_monitor]/[backup]/[secrets]/[ai]); the "
                 "per-connection "
                 "cleartext_accepted, tls_allow_expired, tls_check_hostname, url_query_credential, "
                 "generic-ODBC database TLS, "
@@ -12138,7 +12157,8 @@ def _security(args: argparse.Namespace) -> int:
         return 0
 
     # Also how a relocated legacy key is refused at edit time rather than at the next start.
-    validate = _post_write_settings_check(security_edit.SecurityEditError)
+    saved: list[ServiceSettings] = []
+    validate = _post_write_settings_check(security_edit.SecurityEditError, keep=saved)
 
     try:
         data = args.data if args.data is not None else sys.stdin.read()
@@ -12159,8 +12179,8 @@ def _security(args: argparse.Namespace) -> int:
         except ValidationError as exc:
             return _emit_error(f"invalid [security] value: {exc}", as_json=args.json)
         result = security_edit.set_security(path, updates, validate=validate)
-        # Read AFTER the write, so the preview reports the posture the edit leaves (see _posture).
-        result.update(_posture(sec))
+        # The candidate the write validated, so the preview reports the posture the edit left.
+        result.update(_posture(sec, saved[-1] if saved else None))
     except _OperatorJsonError as exc:
         return _emit_error(str(exc), as_json=args.json)
     except (security_edit.SecurityEditError, FileNotFoundError, ValueError, OSError) as exc:

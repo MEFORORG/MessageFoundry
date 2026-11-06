@@ -511,11 +511,10 @@ false premise.
 - **Where it is reported:** `security_loosenings()` names a value above `30` minutes or `12` hours
   (vault BACKLOG #2600), so the serve-time warning, `messagefoundry security show` and
   `GET /security/posture` list it. A value of `0` or less ends every session at once, which is
-  stricter, and is not named. The registry reads the value the load copied into `[auth]`, so
-  `messagefoundry security set` reads the whole file again after the edit, and its preview
-  reports the value the edit saved. A `security show` that cannot load the whole file falls back
-  to the default `[auth]` and does not name either limit; its `loosenings_partial` marker says the
-  report is partial. The IDE security editor marks a value above the default it is shown.
+  stricter, and is not named. `messagefoundry security show` and the `security set` preview read
+  both limits from the file's `[security]`, the authored values they print, so a `MEFOR_SECURITY_*`
+  variable in the operator's shell does not change them. The IDE security editor marks a value
+  above the default it is shown.
 
 ### `block_unlisted_outbound = false` — allow-any outbound egress
 - **What you lose:** deny-by-default egress; a transform may send to **any** destination (PHI exfiltration

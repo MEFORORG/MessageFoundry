@@ -113,6 +113,26 @@ def test_set_preview_reads_the_session_limits_after_the_edit(
     assert switch not in [lo["switch"] for lo in res["loosenings"]]
 
 
+def test_the_session_limits_are_reported_as_the_file_sets_them(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both commands print the file's [security] in `values`, so the two session-limit entries are
+    read from it too, never from a shell variable that only the whole-file load sees (vault BACKLOG
+    #2600). The variable is a valid one, so the load succeeds and nothing reads as partial."""
+    toml = tmp_path / "mf.toml"
+    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "12")
+    rc, res = _set(toml, {"max_session_hours": 24}, capsys)
+    assert rc == 0 and res["loosenings_partial"] is False
+    assert "max_session_hours" in [lo["switch"] for lo in res["loosenings"]]
+    # The reverse: the shell variable is looser, the file is at the default, and `values` says 12.
+    rc, _ = _set(toml, {"max_session_hours": None}, capsys)
+    assert rc == 0
+    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "48")
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is False and data["values"]["max_session_hours"] == 12
+    assert "max_session_hours" not in [lo["switch"] for lo in data["loosenings"]]
+
+
 def test_set_preview_scope_is_read_after_the_edit(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
