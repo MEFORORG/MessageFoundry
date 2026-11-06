@@ -1492,15 +1492,49 @@ _TOOLKIT_DIST = "messagefoundry-toolkit"
 #: The separately-versioned console distribution (ASVS 15.2.4).
 _WEBCONSOLE_DIST = "messagefoundry-webconsole"
 
-#: A ``python -m build`` call and its flags. ``python3`` and ``python3.14`` count too. The flags stop
-#: at the end of the line, at a ``&&``, ``||`` or ``;``, or at an inline `` #`` comment, which the
-#: match then consumes to the end of the line. So a second build chained on the same line is its own
-#: match, the first call's flags do not leak into it, and a build quoted in a trailing comment is not
-#: counted. A lone ``&`` or ``|`` does not stop them, so ``2>&1`` keeps the flags after it. This is a
-#: line scan, not a shell parser: a ``\`` continuation or a subshell still cuts or glues the flags.
-_BUILD_CALL = re.compile(
-    r"\bpython[0-9.]*\s+-m\s+build\b((?:(?!&&|\|\||;|[ \t]#)[^\n])*)(?:[ \t]#[^\n]*)?"
-)
+#: A ``python -m build`` call. ``python3`` and ``python3.14`` count too. Its flags run to the end of
+#: the line, the next call, or a :data:`_FLAGS_END`, whichever is first, so a second build chained on
+#: the same line is its own call and the first call's flags do not leak into it. This is a line scan,
+#: not a shell parser: a ``\`` continuation or a subshell still cuts or glues the flags.
+_BUILD_CALL = re.compile(r"\bpython[0-9.]*\s+-m\s+build\b")
+
+#: Where a build's flags stop: ``&&``, ``||``, ``;``, or a lone ``|`` or ``&``. The ``&`` of a
+#: redirect (``2>&1``, ``>&2``, ``<&0``, ``&>log``) or of a ``|&`` pipe, and the ``|`` of ``>|``, are
+#: not, so ``2>&1`` keeps the flags after it.
+_FLAGS_END = re.compile(r"&&|\|\||;|(?<![<>])\|(?!\|)|(?<![<>|])&(?![>&])")
+
+
+def _strip_shell_comments(shell: str) -> str:
+    """``shell`` with each ``#`` comment cut to the end of its line.
+
+    A ``#`` starts a comment only at the start of a line or after whitespace, and never inside
+    quotes or after a backslash, so ``a#b`` and ``"x #"`` keep the text after them. Quote state runs
+    across lines, and an unclosed quote stops the cutting: this only ever removes text, so a quote
+    it misreads can make it keep a comment, never drop a command.
+    """
+    out: list[str] = []
+    quote = ""
+    escaped = False
+    in_comment = False
+    for i, ch in enumerate(shell):
+        if in_comment:
+            if ch != "\n":
+                continue
+            in_comment = False
+        elif escaped:
+            escaped = False
+        elif ch == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or shell[i - 1].isspace()):
+            in_comment = True
+            continue
+        out.append(ch)
+    return "".join(out)
 
 
 def _wheel_builds(shell: str) -> int:
@@ -1513,9 +1547,13 @@ def _wheel_builds(shell: str) -> int:
     release workflow runs none, and the floor in :func:`_wheel_smoke_steps` names every
     distribution it ships, so a wheel built another way still has to be added there.
     """
+    code = _strip_shell_comments(shell)
+    calls = list(_BUILD_CALL.finditer(code))
     count = 0
-    for rest in _BUILD_CALL.findall(shell):
-        flags = set(rest.split("#", 1)[0].split())
+    for i, call in enumerate(calls):
+        after = calls[i + 1].start() if i + 1 < len(calls) else len(code)
+        rest = _FLAGS_END.split(code[call.end() : after].split("\n", 1)[0], maxsplit=1)[0]
+        flags = set(rest.split())
         if flags & {"--wheel", "-w"} or not flags & {"--sdist", "-s"}:
             count += 1
     return count
@@ -1534,6 +1572,18 @@ def _wheel_builds(shell: str) -> int:
         ("python -m build 2>&1 --sdist", 0),
         # A build quoted in a trailing comment runs nothing.
         ("python -m build --wheel a  # x && python -m build --wheel b", 1),
+        # A lone `&` backgrounds the first build and starts the second; a lone `|` or `|&` pipes.
+        ("python -m build --wheel a & python -m build --wheel b", 2),
+        ("python -m build --wheel a | python -m build --wheel b", 2),
+        ("python -m build --wheel a |& python -m build --wheel b", 2),
+        # `&>` is a redirect, not a fresh command: the flags after it still belong to this call.
+        ("python -m build &>log --sdist", 0),
+        # A `#` inside a word, or inside quotes, starts no comment, so nothing after it is hidden.
+        ("python -m build --sdist x#y --wheel", 1),
+        ("python -m build --sdist a#b & python -m build --wheel c", 1),
+        ('python -m build --sdist "a #" && python -m build --wheel', 1),
+        # A comment after a separator runs nothing either.
+        ("python -m build --wheel a; # python -m build", 1),
     ],
     ids=[
         "and",
@@ -1543,6 +1593,14 @@ def _wheel_builds(shell: str) -> int:
         "redirect-wheel",
         "redirect-sdist",
         "comment",
+        "background",
+        "pipe",
+        "pipe-amp",
+        "redirect-amp-gt",
+        "hash-in-word",
+        "hash-in-word-hides-build",
+        "hash-in-quotes",
+        "comment-after-separator",
     ],
 )
 def test_wheel_builds_counts_every_build_on_one_line(shell: str, expected: int) -> None:
