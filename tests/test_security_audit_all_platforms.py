@@ -190,6 +190,142 @@ def test_the_committed_lock_is_install_checked_then_the_stripped_copy_audited(
     assert "colorama==0.4.6 ; sys_platform == 'win32'" in out
 
 
+#: Each ``(a requirement's first line, what the copy must read, the un-gated entry or None)``. Vault
+#: BACKLOG #3786 L2: the strip split at the first ``;`` and dropped everything after it, so the
+#: first case lost both hashes, the URL cases lost the end of their URL, and the comment case was
+#: listed as un-gated with its comment for a marker.
+_ONE_LINE_CASES = [
+    (
+        "colorama==0.4.6; sys_platform == 'win32' --hash=sha256:aa --hash=sha256:bb",
+        "colorama==0.4.6 --hash=sha256:aa --hash=sha256:bb",
+        "colorama==0.4.6 ; sys_platform == 'win32'",
+    ),
+    (
+        "pkg @ https://host.invalid/a;b.whl --hash=sha256:aa",
+        "pkg @ https://host.invalid/a;b.whl --hash=sha256:aa",
+        None,
+    ),
+    (
+        "pkg @ https://host.invalid/a;b.whl ; sys_platform == 'win32' --hash=sha256:aa",
+        "pkg @ https://host.invalid/a;b.whl --hash=sha256:aa",
+        "pkg @ https://host.invalid/a;b.whl ; sys_platform == 'win32'",
+    ),
+    ("idna==3.2  # pinned; see the note", "idna==3.2  # pinned; see the note", None),
+    (
+        "sspilib==0.6.0 ; sys_platform == 'win32'  # Windows only; SSPI",
+        "sspilib==0.6.0  # Windows only; SSPI",
+        "sspilib==0.6.0 ; sys_platform == 'win32'",
+    ),
+]
+
+
+@pytest.mark.parametrize(("line", "copy", "entry"), _ONE_LINE_CASES)
+def test_a_marker_is_found_where_pip_finds_it(line: str, copy: str, entry: str | None) -> None:
+    """Options after the marker stay, a ``;`` inside a URL or a comment is not a marker."""
+    text, stripped, requirements = strip_markers(f"{line}\n")
+    assert (text, stripped, requirements) == (f"{copy}\n", [entry] if entry else [], 1)
+
+
+def test_a_hash_after_the_marker_reaches_pip_audit(tmp_path: Path) -> None:
+    """End to end: the copy pip-audit is handed still carries the one-line hashes."""
+    src = tmp_path / "x.lock"
+    src.write_text(f"{_ONE_LINE_CASES[0][0]}\n", encoding="utf-8")
+    seen: list[str] = []
+
+    def run(cmd: list[str]) -> int:
+        seen.append(Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8"))
+        return 0
+
+    assert main([str(src)], run=run) == 0
+    assert seen[1] == f"{_ONE_LINE_CASES[0][1]}\n"
+
+
+_LATIN1_LOCK = (
+    b"# -*- coding: latin-1 -*-\n# note: caf\xe9\nidna==3.20 ; os_name == 'nt' \\\n"
+    b"    --hash=sha256:aa\n"
+)
+
+
+def test_a_pep_263_declaration_is_honoured_and_kept_in_the_copy(tmp_path: Path) -> None:
+    """Vault BACKLOG #3786 L3. pip decodes by the declaration; reading UTF-8 raised a traceback.
+
+    The copy keeps the declaration, so it is written in the encoding it declares.
+    """
+    src = tmp_path / "x.lock"
+    src.write_bytes(_LATIN1_LOCK)
+    assert read_lock(src) == _LATIN1_LOCK.decode("latin-1")
+    seen: list[bytes] = []
+
+    def run(cmd: list[str]) -> int:
+        seen.append(Path(cmd[cmd.index("-r") + 1]).read_bytes())
+        return 0
+
+    assert main([str(src)], run=run) == 0
+    copy = seen[1].replace(b"\r\n", b"\n")
+    assert copy == _LATIN1_LOCK.replace(b" ; os_name == 'nt'", b"")
+
+
+def test_a_declaration_after_the_second_line_is_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pip looks at two lines only, so this lock is UTF-8, and the latin-1 byte falls to the locale."""
+    monkeypatch.setattr("locale.getencoding", lambda: "utf-8")
+    src = tmp_path / "x.lock"
+    src.write_bytes(b"# one\n# two\n" + _LATIN1_LOCK)
+    ran, run = _recorder(0)
+    assert main([str(src)], run=run) == 2
+    assert not ran
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b"# -*- coding: no-such-codec -*-\nidna==3.20\n", b"# caf\xe9\nidna==3.20\n"],
+    ids=["unknown-codec", "undecodable"],
+)
+def test_a_lock_pip_cannot_decode_is_refused_with_an_error(
+    raw: bytes,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exit 2 and an ``::error::``, rather than a traceback (exit 1, read as a finding)."""
+    monkeypatch.setattr("locale.getencoding", lambda: "utf-8")
+    src = tmp_path / "x.lock"
+    src.write_bytes(raw)
+    ran, run = _recorder(0)
+    assert main([str(src)], run=run) == 2
+    assert not ran
+    assert "not decodable the way pip decodes" in capsys.readouterr().err
+
+
+def test_utf8_failing_falls_back_to_the_locale_as_pip_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("locale.getencoding", lambda: "cp1252")
+    src = tmp_path / "x.lock"
+    src.write_bytes(b"# caf\xe9\nidna==3.20\n")
+    assert read_lock(src) == "# caf\N{LATIN SMALL LETTER E WITH ACUTE}\nidna==3.20\n"
+
+
+def test_main_classifies_the_lock_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Vault BACKLOG #3786 L6: the refusals and the strip read one classification."""
+    import messagefoundry.security.audit_all_platforms as auditor
+
+    calls: list[int] = []
+    real = auditor._kinds
+
+    def counting(lines: list[str]) -> list[str]:
+        calls.append(len(lines))
+        return real(lines)
+
+    monkeypatch.setattr(auditor, "_kinds", counting)
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src)], run=run) == 0
+    assert calls == [len(LOCK.splitlines())]
+
+
 @pytest.mark.parametrize(
     "line", ["-r base.lock", "-e ./pkg", "--index-url https://example.invalid"]
 )
