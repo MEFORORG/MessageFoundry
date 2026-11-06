@@ -2440,7 +2440,7 @@ def test_the_braced_tail_is_written_back_masked_with_its_closer() -> None:
     connection-string member mask, letters to "x" and digits to "0", so a later pass reads text of the
     shape the old class left. Pinned exactly, on both copies."""
     assert scrub_credentials("MEFOR_X=a;PWD={pp ww}") == "MEFOR_X=<redacted> xx}"
-    assert scrub_credentials("token=a;PWD={pp w;9!} tail") == "token=<redacted> x;0!} tail"
+    assert scrub_credentials("token=a;PWD={pp w.9!} tail") == "token=<redacted> x.0!} tail"
     assert redact_log_line("MEFOR_X=a;PWD={pp ww}") == f"MEFOR_X={REDACTION_PLACEHOLDER} xx}}"
 
 
@@ -2489,6 +2489,14 @@ _BRACED_REVIEW_LINES: tuple[tuple[str, str], ...] = (
     ("password=a.PWD={pp private_key=kA1-x}kB2-x", "kB2-x"),
     ("api_key=a&passwd={pA1-x session=sA1-x}sB2-x", "sB2-x"),
     ("passwd='qA1-x{pa\u017f\u017fword={qB2-x x_pwd=qC3-x}qD4-x", "qD4-x"),
+    # Review round 2: a scheme word when the run-on is in the scheme pass itself, and a label after
+    # a percent escape, where the check in front of each run does not look.
+    ("retry Bearer abcd.PWD={c Bearer dA1-x}eB2-x tail", "eB2-x"),
+    ("password=a.PWD={b %3Bpassword=cA1-x}dB2-x x", "dB2-x"),
+    ("token=A0a;secret={Ba1 %26token=Bb2}cC3-x", "cC3-x"),
+    # A value-class terminator inside the braces: the run-on took the ``;password=`` a later pass
+    # reads, which the old class stopped in front of.
+    ("x_pwd='a/PWD:{b;password=c=Bearer d }eA1-x", "eA1-x"),
 )
 
 
@@ -2512,6 +2520,9 @@ def test_a_placeholder_and_a_line_break_in_a_braced_value_survive() -> None:
     for surface, apply in _SWALLOW_SURFACES:
         out = apply("MEFOR_X=a;PWD\n=\n{b c} rest")
         assert out.count("\n") == 2, f"{surface}: a line break was lost -- got {ascii(out)}"
+    # A record break the log and bundle readers split at is not white space the run-on may cross.
+    for brk in ("\v", "\f", "\x1c", "\x85", " ", " "):
+        assert scrub_credentials(f"token=a;PWD={{pp{brk}ww}}") == f"token=<redacted>{brk}ww}}"
 
 
 def test_white_space_after_the_separator_gives_the_old_result_on_both_paths() -> None:
@@ -2523,9 +2534,11 @@ def test_white_space_after_the_separator_gives_the_old_result_on_both_paths() ->
 
 
 def _braced_check_run(length: int) -> str:
-    """A token value holding about ``length`` characters of unclosed ``;PWD={a`` labels, then a
-    space: the value walks to the space, and every label starts a braced walk."""
-    return "token=x" + ";PWD={a" * (length // 7) + ' "'
+    """A token value holding about ``length`` characters of unclosed ``.PWD={a`` labels, then a
+    space: the value walks to the space, and every label starts a braced walk. The separator is "."
+    and not ";", because the braced walk stops at a ";", so a ";" would cut the control's walk short
+    too and it could not show the hazard."""
+    return "token=x" + ".PWD={a" * (length // 7) + ' "'
 
 
 def test_the_braced_stop_grows_linearly_in_line_length() -> None:

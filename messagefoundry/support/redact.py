@@ -165,12 +165,12 @@ _RUN_ON_LABEL = (
 _BRACED_HEAD = (
     r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[^\S\r\n]*+[:=]"
 )
-_SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s]|\}\})*+"
+_SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
 _SPACED_BRACED_TAIL = (
-    r"[^\S\r\n](?:[^{}'\"\r\nA-Za-z0-9\x80-\U0010ffff]|\}\}"
+    r"[ \t](?:[^{}'\"%;,&\r\n\v\f\x1c-\x1eA-Za-z0-9\x80-\U0010ffff]|\}\}"
     + r"|(?!"
     + _RUN_ON_LABEL
-    + r")(?-i:[A-Za-z0-9])++)*+"
+    + r"|(?i:bearer|basic|digest)\s)(?-i:[A-Za-z0-9])++)*+"
 )
 _BRACED_LABEL = _BRACED_HEAD + _SPACED_BRACED_HEAD + _SPACED_BRACED_TAIL + r"\}(?!\})"
 _BRACED_RUN_ON = (

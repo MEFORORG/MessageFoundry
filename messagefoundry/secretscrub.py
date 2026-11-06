@@ -327,7 +327,9 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # the label and its ":" or "=". The stop also requires :data:`_GUARDED_QUOTED_VALUE` to match the
 # whole quoted value, so the label's own pattern is sure to take it, and to take it past where the old
 # value ended. So, WITHIN ONE PASS, a stop newly prints label text, and a value only in the one trade
-# written down further down this comment. ACROSS PASSES
+# written down further down this comment. The braced stop of BACKLOG #2966 is different: its run-on
+# takes text out of what its own pass still scans, so it CAN newly print a value within one pass, and
+# the conditions on :data:`_BRACED_RUN_ON` are what refuse each shape measured doing so. ACROSS PASSES
 # IT CAN, and the differential test measures how often: the text a stop leaves behind is not the text
 # the old class left, so a later pass over it can end somewhere else. A stray quote or a later label
 # used to cut a later pass short, and now does not. It is rare. Four of the eight shapes on the OPEN
@@ -590,13 +592,21 @@ _RUN_ON_LABEL = (
 #   would print what followed the closer.
 # * No quote and no line break, as :data:`_GUARDED_BRACED_VALUE` refuses them, so the walk cannot end
 #   on another label's quote or cross a line the old class never crossed.
-# * No label, of any family, after the first white space, and no character outside ASCII there. The
-#   old class stopped at that white space, so the rest of the line, a label in the braces included,
-#   was still in front of the pass that wrote the placeholder and of every pass after it. A run-on
-#   takes the label out of the text that pass still scans: in ``MEFOR_X=a;PWD={pp token=abc}def`` and
-#   ``api_key=a&passwd={b session=c}d`` the later label's value ran on past the closer, which the old
-#   text hid and the run-on printed. A character outside ASCII is refused for the same reason, so a
-#   label spelled with a fold character cannot slip past the check.
+# * No ";", "," or "&" anywhere in the braces. Those end the value class of ``_CREDENTIAL_KV``,
+#   ``_KEY_MATERIAL`` or ``_AUTH_SCHEME``, so a run-on through one took text that class never took:
+#   in ``x_pwd='a/PWD:{b;password=c=Bearer d }e`` the ``;password=`` the connection-string member pass
+#   reads was gone, and "e" printed.
+# * No label, of any family, after the first white space, no scheme word before white space, no "%",
+#   and no character outside ASCII there. The old class stopped at that white space, so the rest of
+#   the line, a label in the braces included, was still in front of the pass that wrote the
+#   placeholder and of every pass after it. A run-on takes the label out of the text that pass still
+#   scans: in ``MEFOR_X=a;PWD={pp token=abc}def``, ``api_key=a&passwd={b session=c}d`` and
+#   ``retry Bearer abcd.PWD={c Bearer dd-dd}ef-gh`` the later label's value ran on past the closer,
+#   which the old text hid and the run-on printed. A "%" is refused because a label may start right
+#   after a percent escape, as in ``%3Bpassword=``, where the check in front of each run does not look;
+#   a character outside ASCII, so a label spelled with a fold character cannot slip past it.
+# * The first white space a space or a tab, and no line break of any kind after it: none of VT, FF,
+#   U+001C to U+001E, U+0085, U+2028 or U+2029, which the log and bundle readers split a record at.
 # * No "{", which keeps the scan linear. A walk from one label's "{" ends at the next "{" at the
 #   latest, so walks started by two labels cannot overlap, and a line of unclosed ``PWD={`` labels costs
 #   one walk per label, not one per pair.
@@ -622,12 +632,12 @@ _BRACED_HEAD = (
 #: adds the closer and its guard, and is what the stop checks for; :data:`_BRACED_RUN_ON` is what the
 #: value then takes, the part from the white space on in the group ``braced_tail``. One walk, so the
 #: two agree at every position.
-_SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s]|\}\})*+"
+_SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
 _SPACED_BRACED_TAIL = (
-    r"[^\S\r\n](?:[^{}'\"\r\nA-Za-z0-9\x80-\U0010ffff]|\}\}"
+    r"[ \t](?:[^{}'\"%;,&\r\n\v\f\x1c-\x1eA-Za-z0-9\x80-\U0010ffff]|\}\}"
     + r"|(?!"
     + _RUN_ON_LABEL
-    + r")(?-i:[A-Za-z0-9])++)*+"
+    + r"|(?i:bearer|basic|digest)\s)(?-i:[A-Za-z0-9])++)*+"
 )
 _BRACED_LABEL = _BRACED_HEAD + _SPACED_BRACED_HEAD + _SPACED_BRACED_TAIL + r"\}(?!\})"
 _BRACED_RUN_ON = (
@@ -664,7 +674,8 @@ _NOT_BEFORE_QUOTED_LABEL = (
 #: each one as a token of its own, with the stop checked in front of it, and still check the run after
 #: it. In a pattern that folds globally the walk's run class already holds these characters, so that
 #: branch is never reached there and the walk is the one it was. Built with ``chr()`` so no encoding
-#: layer between here and disk can change a character; the support bundle imports both.
+#: layer between here and disk can change a character. The support bundle restates both as literals,
+#: so the regex scanner can read its copy; a test holds both copies to the measured set.
 _WALK_FOLD_CHARS = "".join(map(chr, (0x0130, 0x0131, 0x017F, 0x212A)))
 _FOLD_HEAD = "[" + _WALK_FOLD_CHARS + "]"
 
@@ -1378,10 +1389,10 @@ def _braced_tail(m: re.Match[str]) -> str:
     :func:`_mask_member_value`, or "" when it took none. :data:`_BRACED_RUN_ON` says why the tail is
     written back masked rather than dropped, and why with that mask. A pattern without the group
     gets "", so a rebuilt pattern without the run-on still works here."""
-    group = m.re.groupindex.get("braced_tail")
-    if group is None:
+    try:
+        start, end = m.span("braced_tail")
+    except IndexError:
         return ""
-    start, end = m.span(group)
     return "" if start < 0 else _mask_member_value(m.string, start, end)
 
 
