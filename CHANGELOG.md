@@ -23,9 +23,9 @@ All notable changes to MessageFoundry are documented here. The format follows
   `GET /security/posture` resolves the value against the running graph's values and names the
   connection if it resolves to `"path"`. `messagefoundry check` does not resolve it, so it names
   such a connection marked possibly, and so does the posture route for a value it cannot resolve.
-  `FHIR()` now also reads an `env()` `interaction` or `conditional` through its default when it
-  checks the path form and the Bundle entry lists, and leaves a value with no default to the build,
-  so it no longer refuses a connection the build accepts. See
+  `FHIR()` now leaves an `env()` `update_url_form`, `interaction` or `conditional` to the build when
+  it checks the path form and the Bundle entry lists, so it no longer refuses an `env()` interaction
+  beside a literal path form or beside entry lists; it still checks the lists' literal items. See
   [SECURITY-LOOSENING.md](docs/SECURITY-LOOSENING.md). (`BACKLOG #2571`)
 
 ## [0.5.2] — 2026-10-20 — Early Access

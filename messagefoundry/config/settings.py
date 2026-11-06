@@ -10238,9 +10238,9 @@ def security_loosenings(
     ``attested_hops`` declares ``tls_hop_attested`` (ADR 0092, owner ruling 2026-09-24),
     ``revocation_attested_hops`` declares ``tls_revocation_attested`` (ADR 0173), and
     ``path_form_fhir_hops`` is an outbound ``FHIR()`` connection that sets
-    ``update_url_form="path"`` (vault BACKLOG #2571), and ``ech_cleartext_sidecar_hops`` is a
-    ``REST`` outbound whose ECH sidecar is an ``http://`` URL (ADR 0139). They arrive as
-    plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
+    ``update_url_form="path"``, or may through an ``env()`` value (vault BACKLOG #2571), and
+    ``ech_cleartext_sidecar_hops`` is a ``REST`` outbound whose ECH sidecar is an ``http://`` URL
+    (ADR 0139). They arrive as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the
     caller resolves them through the shared readers in ``config.wiring``
     (``accepted_cleartext_hops``, which walks both outbound connections and ``FhirLookup`` read
     connections; ``expiry_relaxed_hops``, which walks outbound and the inbound REMOTEFILE pollers;
@@ -10249,7 +10249,10 @@ def security_loosenings(
     outbound; ``attested_secure_hops``, which walks every carrier a hop gate reads;
     ``revocation_attested_hops``, which walks inbound, outbound and ``FhirLookup``;
     ``path_form_fhir_updates``, which walks the ``FHIR()`` outbounds;
-    ``ech_cleartext_sidecar_hops``, which walks the ``REST`` outbounds). A caller that
+    ``ech_cleartext_sidecar_hops``, which walks the ``REST`` outbounds). At least the path-form,
+    ECH and generic-DATABASE names can carry a ``possibly`` marker in parentheses after the name,
+    where the caller could not resolve an ``env()`` value, so an entry is not always a bare
+    connection name. A caller that
     genuinely has no graph — ``messagefoundry security show``, which reads a
     settings file and never loads the connection config — passes empty sequences and SAYS SO in its
     output, rather than reporting a subset as if it were everything.
@@ -10905,8 +10908,8 @@ def security_loosenings(
                 "so the receiving server's access log, and any proxy log on the path, holds "
                 "it; an id can be a medical record number or another identifier. The shipped "
                 "transaction form keeps the id out of the URL. A name marked possibly has an "
-                "update_url_form env() value this reading could not resolve, and the above holds "
-                "of it only if that resolves to path",
+                "env() value this reading could not resolve, and the above holds of it only if "
+                "it resolves to the path form on an update",
             )
         )
     # ADR 0139: the engine-to-sidecar hop of an ECH connection. docs/SECURITY-LOOSENING.md,

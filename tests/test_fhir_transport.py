@@ -32,7 +32,7 @@ from _fhir_fixtures import (
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
-from messagefoundry.config.wiring import FHIR, WiringError, env
+from messagefoundry.config.wiring import FHIR, WiringError, env, resolve_env_settings
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
@@ -1926,30 +1926,47 @@ def test_the_factory_leaves_an_env_value_it_cannot_read_to_the_build(
 
 @pytest.mark.parametrize(
     "over",
-    [{"interaction": "create"}, {"conditional": "if-none-exist", "conditional_query": "a=b"}],
-    ids=["create", "if-none-exist"],
+    [
+        {"update_url_form": env("form", default="path"), "interaction": "create"},
+        {"update_url_form": "path", "interaction": env("kind", default="create")},
+        {"interaction": env("kind", default="create"), "allowed_entry_methods": ["POST"]},
+    ],
+    ids=["form-default", "interaction-default", "lists-beside-default"],
 )
-def test_the_factory_reads_an_env_value_through_its_default(over: dict[str, object]) -> None:
-    """An ``env()`` default is what an unset key resolves to, so the factory checks it now, as it
-    checks a literal: a path form that would not apply is refused, whether the form or the write
-    kind comes from a default. A transaction default beside the same settings is the control."""
-    with pytest.raises(ValueError, match="update_url_form=.path. applies only"):
-        FHIR(url=BASE, update_url_form=env("form", default="path"), **over)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="update_url_form=.path. applies only"):
+def test_the_factory_does_not_refuse_on_an_env_default(over: dict[str, object]) -> None:
+    """A set key overrides a default, so the factory does not refuse on one: the build reads the
+    value the environment gives, and refuses there if it is incoherent. The resolved build is the
+    control that the refusal still happens, once the value is known."""
+    spec = FHIR(url=BASE, **over)  # type: ignore[arg-type]
+    settings = resolve_env_settings(spec.settings, {})
+    with pytest.raises(ValueError, match="applies only"):
+        build_destination(
+            Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=settings),
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+
+def test_a_known_non_update_conditional_rules_out_the_path_form_alone() -> None:
+    """A conditional other than if-match is not an update whatever the interaction, so an env()
+    interaction beside it does not keep a literal path form from being refused at load."""
+    with pytest.raises(ValueError, match="update_url_form='path' applies only"):
         FHIR(
             url=BASE,
             update_url_form="path",
-            **{k: env(k, default=v) for k, v in over.items()},  # type: ignore[arg-type]
+            interaction=env("kind"),
+            conditional="if-none-exist",
+            conditional_query="a=b",
         )
-    FHIR(url=BASE, update_url_form=env("form", default="transaction"), **over)  # type: ignore[arg-type]
 
 
-def test_the_factory_reads_an_env_interaction_default_against_the_entry_lists() -> None:
-    """The Bundle entry lists are checked against an ``env()`` interaction's default, as against a
-    literal, and the transaction default beside them is the control."""
-    with pytest.raises(ValueError, match="allowed_entry_methods applies only"):
-        FHIR(url=BASE, interaction=env("kind", default="create"), allowed_entry_methods=["POST"])
-    FHIR(url=BASE, interaction=env("kind", default="transaction"), allowed_entry_methods=["POST"])
+def test_literal_entry_items_are_checked_beside_an_env_interaction() -> None:
+    """With the interaction known only at build, the lists' literal items are still checked at load.
+    A valid list beside the same env() is the control."""
+    with pytest.raises(ValueError, match="allowed_entry_methods items must each be"):
+        FHIR(url=BASE, interaction=env("kind"), allowed_entry_methods=["BOGUS"])
+    with pytest.raises(ValueError, match="allowed_entry_types items must each be"):
+        FHIR(url=BASE, interaction=env("kind"), allowed_entry_types=["$expunge"])
+    FHIR(url=BASE, interaction=env("kind"), allowed_entry_methods=["POST"])
 
 
 def test_unknown_update_url_form_is_refused() -> None:
@@ -1994,7 +2011,7 @@ def test_check_names_an_env_path_form_connection_as_possibly(tmp_path: Any) -> N
         f'outbound("OB_CREATE", FHIR(url="{BASE}", update_url_form=env("epic_form")))\n',
     )
     [r] = [r for r in run_checks(cfg, run_lint=False).results if r.name == "fhir-update-path-form"]
-    assert "OB_ENV (possibly: update_url_form is an env() value" in r.detail
+    assert "OB_ENV (possibly: an env() value" in r.detail
     assert "OB_CREATE" not in r.detail
 
 

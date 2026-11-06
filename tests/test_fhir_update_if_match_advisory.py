@@ -118,8 +118,11 @@ def test_an_env_form_and_an_env_conditional_are_named_with_the_reason(tmp_path: 
         '         conditional=env("c")))\n'
     )
     notes = dict(_read(tmp_path, body))
-    assert notes["OB_FORM"].startswith("possibly: update_url_form is an env() value")
-    assert notes["OB_COND"].startswith("its conditional is an env() reference")
+    assert notes["OB_FORM"].startswith("possibly: an env() value")
+    assert notes["OB_COND"].startswith(
+        "possibly: an env() value this reading could not resolve; its conditional is an env() "
+        "reference"
+    )
 
 
 def test_a_literal_header_named_env_is_not_an_env_reference(tmp_path: Path) -> None:

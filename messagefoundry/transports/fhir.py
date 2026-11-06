@@ -274,7 +274,8 @@ def takes_update(interaction: object, conditional: object) -> bool:
 
     Conditional first, as :class:`FhirDestination` dispatches: ``if-match`` is an update whatever the
     interaction says. Pure. The ``FHIR()`` factory and ``path_form_fhir_updates`` call it too, so the
-    three cannot disagree on which connections the path form applies to (vault BACKLOG #2571)."""
+    three apply one rule for which writes are updates (vault BACKLOG #2571). It is not every rule
+    the build applies: a conditional beside ``transaction`` or ``batch`` is refused separately."""
     cond = str(conditional) if conditional else None
     return cond == "if-match" or (cond is None and str(interaction) == "update")
 

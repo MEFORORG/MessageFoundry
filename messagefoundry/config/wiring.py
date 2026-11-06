@@ -3844,12 +3844,16 @@ def Rest(
 
 def _path_form_ruled_out(interaction: object, conditional: object) -> bool:
     """Whether a ``FHIR()`` connection's writes are known not to be updates, so the build refuses
-    the path form there. ``False`` while either value is :data:`_UNRESOLVED`: it cannot be ruled out.
+    the path form there. A value that is :data:`_UNRESOLVED` rules nothing out, but a resolved
+    ``conditional`` other than ``if-match`` decides it alone, whatever the interaction.
 
     The rule is the build's own ``transports.fhir.takes_update``, imported lazily for the one-way
-    rule, so the factory, :func:`path_form_fhir_updates` and the build cannot disagree."""
+    rule, so the factory, :func:`path_form_fhir_updates` and the build agree on which writes are
+    updates. The build refuses other combinations too, which neither caller models."""
     from messagefoundry.transports.fhir import takes_update
 
+    if conditional is not _UNRESOLVED and conditional and str(conditional) != "if-match":
+        return True
     if interaction is _UNRESOLVED or conditional is _UNRESOLVED:
         return False
     return not takes_update(interaction, conditional)
@@ -3933,16 +3937,15 @@ def FHIR(
     not, is stated once in ``docs/CONNECTIONS.md``, "Pinning a private CA per connection"."""
 
     def at_load(value: object) -> object:
-        # An env() is read through its default, what an unset key resolves to. With no default its
-        # value is known only at build, where FhirDestination checks it (vault BACKLOG #2571).
-        if isinstance(value, EnvRef):
-            return _UNRESOLVED if value.default is _UNSET else value.default
-        return value
+        # An env() is known only at build, where FhirDestination checks it: even a default may be
+        # overridden by a set key, so reading it here could refuse what the build accepts (vault
+        # BACKLOG #2571).
+        return _UNRESOLVED if isinstance(value, EnvRef) else value
 
     form, kind, cond = at_load(update_url_form), at_load(interaction), at_load(conditional)
     if form == "path" and _path_form_ruled_out(kind, cond):
         # Refused here as well as in FhirDestination, so the loaded graph cannot hold a path-form
-        # connection that would never build (#2550).
+        # connection whose literal settings would never build (#2550). An env() is the build's.
         raise ValueError(
             "FHIR update_url_form='path' applies only to interaction='update' or "
             "conditional='if-match'"
@@ -3963,15 +3966,21 @@ def FHIR(
     from messagefoundry.transports.fhir import DEFERRED_ENTRY_LIST, entry_screen_settings
 
     def load_time(value: object) -> object:
-        # An env() standing for the whole list, read as at_load reads one. With no default it
-        # still counts as set.
-        read = at_load(value)
-        return DEFERRED_ENTRY_LIST if read is _UNRESOLVED else read
+        # An env() standing for the whole list: its default is what an unset key resolves to, so
+        # that is checked now. With no default its items are known only at build, where
+        # FhirDestination checks them; it still counts as set.
+        if isinstance(value, EnvRef):
+            return DEFERRED_ENTRY_LIST if value.default is _UNSET else value.default
+        return value
 
+    methods, types = load_time(allowed_entry_methods), load_time(allowed_entry_types)
     if kind is not _UNRESOLVED:
-        # An interaction known only at build is checked there, with the lists it then reads.
+        entry_screen_settings(str(kind), methods, types)
+    elif methods is not None or types is not None:
+        # The interaction is known only at build, which checks whether the lists apply to it. Their
+        # items are checked now, as on a Bundle interaction.
         entry_screen_settings(
-            str(kind), load_time(allowed_entry_methods), load_time(allowed_entry_types)
+            "transaction", DEFERRED_ENTRY_LIST if methods is None else methods, types
         )
     return ConnectionSpec(
         ConnectorType.FHIR,
@@ -6933,12 +6942,14 @@ def query_credential_hops(registry: Registry) -> list[tuple[str, str]]:
     return sorted(out)
 
 
-#: The note :func:`path_form_fhir_updates` gives a connection whose ``update_url_form`` is an
-#: ``env()`` reference it could not resolve. ``GET /security/posture`` keeps only names, so it marks
-#: such a name with this text rather than state the connection takes the path form.
-UNRESOLVED_UPDATE_URL_FORM = (
-    "possibly: update_url_form is an env() value this reading could not resolve"
-)
+#: The note :func:`path_form_fhir_updates` gives a connection whose ``update_url_form``,
+#: ``interaction`` or ``conditional`` is an ``env()`` reference it could not resolve.
+#: ``GET /security/posture`` keeps only names, so it marks such a name with this text rather than
+#: state the connection takes the path form.
+UNRESOLVED_UPDATE_URL_FORM = "possibly: an env() value this reading could not resolve"
+
+#: The settings :func:`path_form_fhir_updates` reads, and skips a not-deployed connection on.
+_PATH_FORM_KEYS = ("update_url_form", "interaction", "conditional")
 
 
 def path_form_fhir_updates(
@@ -6950,7 +6961,7 @@ def path_form_fhir_updates(
     The single reader of that set, on the contract of :func:`expiry_relaxed_hops`: ``messagefoundry
     check`` reads it, and so does ``GET /security/posture`` for the ``update_url_form`` entry of
     ``security_loosenings()`` (vault BACKLOG #2571). Any later surface must read it too, so they
-    cannot disagree. Sorted by name.
+    apply one rule. Sorted by name.
 
     The path form puts each message's resource id in the request URL, which owner ruling R3 (ASVS
     14.2.1) keeps out of it by default. It is an interoperability relaxation for a server with no
@@ -6958,14 +6969,14 @@ def path_form_fhir_updates(
 
     The note is empty for a connection that takes the path form. An ``env()`` value of
     ``update_url_form``, ``interaction`` or ``conditional`` is resolved against ``env_values`` when the
-    caller has them, as the build resolves it (the live posture route passes the runner's). An
-    ``update_url_form`` it cannot resolve is listed with :data:`UNRESOLVED_UPDATE_URL_FORM` rather
-    than left off, so a value nobody can read in the config counts as a possible loosening, never as
-    none. A connection is left off only when what it resolves to rules the path form out: another
-    form, or writes that are not updates, which the build refuses with the path form. A
-    ``deployed=False`` connection with an ``env()`` ``update_url_form`` is skipped, as
-    :func:`ech_cleartext_sidecar_hops` skips one: its values are never resolved and it is never built
-    (ADR 0111 AC-1).
+    caller has them, as the build resolves it. The live posture route passes the runner's, and
+    ``check`` passes none, so the two can name different sets. A connection with a value this cannot
+    resolve is listed with :data:`UNRESOLVED_UPDATE_URL_FORM` rather than left off, so a value
+    nobody can read in the config counts as a possible loosening, never as none. At least these are
+    left off: a connection whose resolved values rule the path form out (another form, or writes
+    that are not updates, which the build refuses with the path form), and a ``deployed=False``
+    connection with an ``env()`` in any of those three keys, as :func:`ech_cleartext_sidecar_hops`
+    skips one: its values are never resolved and it is never built (ADR 0111 AC-1).
 
     Pure: it reads the loaded graph and touches nothing else."""
     out: list[tuple[str, str]] = []
@@ -6973,19 +6984,18 @@ def path_form_fhir_updates(
         if oc.spec.type != ConnectorType.FHIR:
             continue
         settings = oc.spec.settings
-        if not oc.deployed and isinstance(settings.get("update_url_form"), EnvRef):
+        if not oc.deployed and any(isinstance(settings.get(k), EnvRef) for k in _PATH_FORM_KEYS):
             continue
-        # A not-deployed connection's values are never resolved, so none are read for it here.
-        values = env_values if oc.deployed else None
-        form = _db_setting(settings, "update_url_form", "transaction", values)
+        form = _db_setting(settings, "update_url_form", "transaction", env_values)
         # FhirDestination's own read: an unset or empty value is the transaction form.
         if form is not _UNRESOLVED and str(form or "transaction") != "path":
             continue
-        kind = _db_setting(settings, "interaction", "create", values)
-        cond = _db_setting(settings, "conditional", None, values)
+        kind = _db_setting(settings, "interaction", "create", env_values)
+        cond = _db_setting(settings, "conditional", None, env_values)
         if _path_form_ruled_out(kind, cond):
             continue  # the build refuses the path form here, so no update is ever sent in it
-        out.append((oc.name, UNRESOLVED_UPDATE_URL_FORM if form is _UNRESOLVED else ""))
+        unresolved = any(value is _UNRESOLVED for value in (form, kind, cond))
+        out.append((oc.name, UNRESOLVED_UPDATE_URL_FORM if unresolved else ""))
     return sorted(out)
 
 

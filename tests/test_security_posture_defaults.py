@@ -2786,7 +2786,7 @@ async def test_posture_route_does_not_name_a_transaction_form_update(engine: Eng
 def _fhir_env_form_registry(*, deployed: bool = True, **over: object) -> Any:
     """One update ``OB_ENV`` whose ``update_url_form`` is ``env("epic_form")``, with ``over`` merged
     into the factory's keywords."""
-    from messagefoundry.config.wiring import FHIR, Registry, build_outbound_connection, env
+    from messagefoundry.config.wiring import FHIR, Registry, build_outbound_connection
 
     keywords: dict[str, Any] = {
         "interaction": "update",
@@ -2802,7 +2802,7 @@ def _fhir_env_form_registry(*, deployed: bool = True, **over: object) -> Any:
     return reg
 
 
-_POSSIBLY = "possibly: update_url_form is an env() value this reading could not resolve"
+_POSSIBLY = "possibly: an env() value this reading could not resolve"
 
 
 @pytest.mark.parametrize(
@@ -2816,11 +2816,13 @@ _POSSIBLY = "possibly: update_url_form is an env() value this reading could not 
         ({"update_url_form": env("epic_form", default="transaction")}, True, _POSSIBLY),
         # A create rules the path form out whatever the form resolves to: the build refuses it.
         ({"interaction": "create"}, True, None),
-        # A literal path form beside an env() interaction cannot be ruled out, so it is named plain.
-        ({"update_url_form": "path", "interaction": env("kind")}, True, ""),
+        # A literal path form beside an env() interaction cannot be ruled out: named possibly.
+        ({"update_url_form": "path", "interaction": env("kind")}, True, _POSSIBLY),
         # A not-deployed connection with an env() form is never built, so it is skipped...
         ({}, False, None),
-        # ...and a not-deployed literal path form is still read, as before.
+        # ...and so is one with an env() interaction beside a literal path form...
+        ({"update_url_form": "path", "interaction": env("kind")}, False, None),
+        # ...while a not-deployed literal path form is still read, as before.
         ({"update_url_form": "path"}, False, ""),
         # The control: a literal transaction form is never named.
         ({"update_url_form": "transaction"}, True, None),
@@ -2832,6 +2834,7 @@ _POSSIBLY = "possibly: update_url_form is an env() value this reading could not 
         "env-create",
         "env-interaction",
         "dark-env",
+        "dark-env-interaction",
         "dark-literal",
         "literal-transaction",
     ],
@@ -2866,7 +2869,7 @@ def test_the_path_form_reader_resolves_an_env_form_with_the_values(
 ) -> None:
     """With the instance's values the reader reads an ``env()`` as the build does: a form that
     resolves to path is named plain, and one the build would not send in the path form is not."""
-    from messagefoundry.config.wiring import env, path_form_fhir_updates
+    from messagefoundry.config.wiring import path_form_fhir_updates
 
     reg = _fhir_env_form_registry(**{k: env(v) for k, v in over.items()})
     found = dict(path_form_fhir_updates(reg, env_values=values))
@@ -2877,7 +2880,7 @@ def test_the_path_form_reader_resolves_an_env_form_with_the_values(
     ("values", "risk"),
     [
         ({"epic_form": "path"}, "OB_ENV) — each update"),
-        ({}, "OB_ENV (possibly: update_url_form is an env() value"),
+        ({}, "OB_ENV (possibly: an env() value"),
         ({"epic_form": "transaction"}, None),
     ],
     ids=["resolves-path", "unresolved", "resolves-transaction"],
