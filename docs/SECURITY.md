@@ -5410,8 +5410,8 @@ acknowledging or suspending one does not silence the other. An `[alerts]` rule k
 type alone matches at least the breaker, the referral, the probe fault, the configuration refusal,
 each paging refusal, the lasting outage and each account the directory keeps failing to answer
 for while it answers others (`directory-reconciler-unreached:<username>`, reason
-`account_unreachable`, audited as `auth.ad_reconcile_unreached`, vault BACKLOG #3100; past
-`ad_session_revoke_max` such accounts on one pass they page once, under the bare
+`account_unreachable`, audited as `auth.ad_reconcile_unreached`, vault BACKLOG #3100; where more
+than five such accounts stand at once, those entering page once, under the bare
 `directory-reconciler-unreached` source), and so does a source glob such as `directory-reconciler*`, which also matches the hold's
 `ad_reconcile_held`. To mute only the referral, a rule names its source exactly. The alert's text
 names `ad_user_search_base`, `ad_group_search_base` and `ad_bind_dn`. A bind response that carries a

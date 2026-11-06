@@ -234,11 +234,10 @@ PAGING_CAP = "group_search_cap"
 
 #: The reason slug of an account whose own probe failed to reach the directory, read
 #: :attr:`ProbeOutcome.UNAVAILABLE` with no paging cause, on ``[auth].ad_reconcile_outage_passes``
-#: of its probes running, each on a pass that reached the directory for another account (BACKLOG
-#: #3100 closing step 2). The whole-directory outage has its own page (:data:`OUTAGE_ABORT`); this
-#: is the bound on one account the directory keeps failing to answer for while it answers others,
-#: which is never struck or revoked while that lasts. It pages once per account as it enters
-#: that state (``AuthService._note_unreached_accounts``).
+#: of its probes running (BACKLOG #3100 closing step 2). The whole-directory outage has its own
+#: page (:data:`OUTAGE_ABORT`); this is the bound on one account the directory keeps failing to
+#: answer for, which is never struck or revoked while that lasts. It pages once per account as it
+#: enters that state (``AuthService._note_unreached_accounts``).
 UNREACHED_ACCOUNT = "account_unreachable"
 
 #: The outcomes that judge nothing about the account: no strike, no recorded outcome (rule item 4).
@@ -353,10 +352,10 @@ class ReconcilePlan:
     #: unreachable. An account already in that state is not here, so each pages once per state
     #: change. Empty on a pass that did not reach the directory.
     unreached: tuple[tuple[str, str, int], ...] = ()
-    #: Set with ``unreached`` (BACKLOG #3100): True when more accounts entered on this pass than
-    #: ``[auth].ad_session_revoke_max``, so the lifespan task pages once for all of them rather
-    #: than once per account. A directory that answers only a few probes in each pass would
-    #: otherwise open an instance per signed-in account.
+    #: Set with ``unreached`` (BACKLOG #3100): True when the accounts already paged and those
+    #: entering are more than ``AuthService``'s fixed rollup bound, so the lifespan task pages once
+    #: for those entering rather than once per account. A directory that answers only a few probes
+    #: in each pass would otherwise open an instance per signed-in account.
     unreached_rollup: bool = False
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709): how many
     #: passes running, this one included, have read the directory unreachable

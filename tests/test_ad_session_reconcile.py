@@ -2138,6 +2138,7 @@ async def test_a_deleted_search_base_aborts_alerts_and_never_revokes(
         message = service.directory_reconcile_misconfigured
         assert message is not None and "revoked nothing" in message
         assert "ad_user_search_base" in message[:200]
+        assert "never revoked while the refusal lasts" in message[:200]  # BACKLOG #3100 P5
         audit = await store.list_audit()
         rows = [
             json.loads(a["detail"])
@@ -2787,34 +2788,53 @@ async def test_an_account_the_directory_keeps_failing_for_pages_once_naming_it(
         await store.close()
 
 
-async def test_an_outage_or_a_fault_only_pass_neither_counts_nor_ends_an_accounts_run() -> None:
-    """BACKLOG #3100 closing step 2. A whole-directory outage pages on its own (#3709), so it
-    neither adds to an account's run nor ends it, and neither does a pass whose every probe
-    failed or faulted, which says nothing about whether the directory was reached. The run picks
-    up where it was on the next pass that reached the directory.
+async def test_a_whole_directory_outage_pages_once_and_no_account_pages_beside_it() -> None:
+    """BACKLOG #3100 closing step 2, round-two review. Every pass that probes an account counts,
+    an outage pass too, but the lasting outage page covers a whole-directory outage: no account
+    enters on the pass that raises it or while it stands. Once a pass reaches the directory, an
+    account still unreachable enters at once.
 
-    RED when: an outage or a fault-only pass counts toward an account's run, or resets it."""
+    RED when: a whole-directory outage also pages each account, or the account stays unpaged
+    after the directory comes back for the others."""
     store = await MessageStore.open(":memory:")
     try:
         service, ldap = await _outage_service(store)  # the default threshold, 3
         alice = await store.get_user_by_username("alice")
         assert alice is not None
         sink = _InverseSink()
-        ldap.unreachable = {"alice"}
-        for _ in range(2):
-            await _pass(service, sink)
         ldap.unreachable = {"alice", "bob"}
-        outage = await _pass(service, sink)
-        assert outage.directory_outage and outage.unreached == ()
-        ldap.unreachable = {"alice"}
-        ldap.broken = {"bob": ValueError("synthetic: unreadable entry")}
-        faulted = await _pass(service, sink)
-        assert faulted.probe_fault and faulted.unreached == ()
-        assert service._reconcile_unreached_runs == {alice.id: 2}
-        ldap.broken = {}
-        third = await _pass(service, sink)
-        assert third.unreached == ((alice.id, "alice", 3),)
+        for n in range(1, 5):
+            plan = await _pass(service, sink)
+            assert plan.directory_outage and plan.unreached == (), f"outage pass {n}"
+        assert len(_outage_events(sink)) == 1 and _unreached_events(sink) == []
+        ldap.unreachable = {"alice"}  # the directory answers bob again
+        back = await _pass(service, sink)
+        assert back.outage_clear and back.unreached == ((alice.id, "alice", 5),)
         assert len(_unreached_events(sink)) == 1
+    finally:
+        await store.close()
+
+
+async def test_an_account_alone_in_its_probe_sample_still_pages(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3100 closing step 2, round-two review. At a budget of one, every pass that probes
+    the unreachable account reads as an outage, and the next pass, which reaches the other
+    account, ends that outage run. Neither page came. The account's own run counts its outage
+    passes, so it pages after its third probe.
+
+    RED when: an account whose sample holds only unreachable accounts is never paged."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_session_recheck_max_users=1)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        for _ in range(8):
+            await _pass(service, sink)
+        assert [source for _k, source, _p in _unreached_events(sink)] == [
+            f"{_UNREACHED_PREFIX}alice"
+        ]
+        assert _outage_events(sink) == []
     finally:
         await store.close()
 
@@ -2834,16 +2854,48 @@ async def test_an_unreached_page_is_latched_only_once_its_row_is_written(
         await _pass(service, sink)
         real = service._audit_reconciler_row
 
-        async def boom(action: str, **kwargs: Any) -> None:
+        async def boom(action: str, **kwargs: Any) -> bool:
             if action == "auth.ad_reconcile_unreached":
                 raise RuntimeError("synthetic: a defect in the row write")
-            await real(action, **kwargs)
+            return await real(action, **kwargs)
 
         monkeypatch.setattr(service, "_audit_reconciler_row", boom)
         with pytest.raises(RuntimeError):
             await service.reconcile_directory_sessions()
         assert service._reconcile_unreached_paged == set()
         monkeypatch.setattr(service, "_audit_reconciler_row", real)
+        plan = await _pass(service, sink)
+        assert [name for _uid, name, _n in plan.unreached] == ["alice"]
+        assert len(_unreached_events(sink)) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_pass_that_raises_after_the_unreached_row_leaves_the_next_pass_to_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3100 closing step 2, round-two review. The latch is set last in the pass, as the
+    outage's is, so a pass that writes the row and then raises, and so returns no plan to page
+    from, leaves the next pass to page.
+
+    RED when: the latch is set as the row is written, so the account is latched and never paged."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, ldap = await _outage_service(store, ad_reconcile_outage_passes=2)
+        sink = _InverseSink()
+        ldap.unreachable = {"alice"}
+        await _pass(service, sink)
+        real = service._record_reconcile_hold
+
+        async def boom(plan: reconcile.ReconcilePlan) -> None:
+            raise RuntimeError("synthetic: a store read failed after the rows")
+
+        monkeypatch.setattr(service, "_record_reconcile_hold", boom)
+        with pytest.raises(RuntimeError):
+            await service.reconcile_directory_sessions()
+        assert len(await _unreached_rows(store)) == 1
+        assert service._reconcile_unreached_paged == set()
+        monkeypatch.setattr(service, "_record_reconcile_hold", real)
         plan = await _pass(service, sink)
         assert [name for _uid, name, _n in plan.unreached] == ["alice"]
         assert len(_unreached_events(sink)) == 1

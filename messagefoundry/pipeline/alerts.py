@@ -748,8 +748,7 @@ class AlertSink(Protocol):
         ``"directory-reconciler-paging:<username>"`` for a paging refusal,
         ``"directory-reconciler-outage"`` for a lasting outage, and
         ``"directory-reconciler-unreached:<username>"`` for an unreached account, or the bare
-        ``"directory-reconciler-unreached"`` where more than ``[auth].ad_session_revoke_max`` enter
-        on one pass, so each is its own instance and throttle. ``reason`` is one of those eight
+        ``"directory-reconciler-unreached"`` where more than five stand unreachable at once, so each is its own instance and throttle. ``reason`` is one of those eight
         closed-set slugs. ``probed`` is, for
         the breaker, how many principals the pass judged, its denominator, and a paging refusal
         carries that same count of candidates the pass took up, asked or not, which counts any
@@ -1391,8 +1390,9 @@ class LoggingAlertSink:
     def ad_reconcile_aborted(self, name: str, *, reason: str, probed: int, detail: str) -> None:
         log.warning(
             # The count is the candidates the pass took up for the breaker and a paging refusal, or
-            # the probes the pass asked for a referral, a configuration refusal, a probe fault and a
-            # lasting outage (BACKLOG #3170, #3709); see AlertSink.ad_reconcile_aborted.
+            # the probes the pass asked for a referral, a configuration refusal, a probe fault, a
+            # lasting outage and an unreached account (BACKLOG #3170, #3709, #3100); see
+            # AlertSink.ad_reconcile_aborted.
             "ALERT ad_reconcile_aborted: %r left accounts unrevoked or unjudged, in a pass counting "
             "%d principal(s) "
             "(%s): %s",

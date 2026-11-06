@@ -11335,14 +11335,14 @@ _PAGING_REFUSAL_TEXT: Final[Mapping[str, str]] = {
 _UNREACHED_ALERT_SOURCE = "directory-reconciler-unreached"
 #: What it tells the operator. Short, and the consequence first, for the store's 200 characters.
 _UNREACHED_ALERT_TEXT: Final[str] = (
-    "This account's sessions are not revoked: {probes} of its directory probes running failed while "
-    "other probes got an answer. Check its entry, and any referral or configuration alert."
+    "This account's sessions are not revoked: {probes} of its directory probes running failed to "
+    "reach the directory. Check its entry, and any outage, referral or configuration alert."
 )
-#: What one page for many such accounts says, on a pass past ``[auth].ad_session_revoke_max`` of
-#: them, so a flapping directory opens one instance rather than one per signed-in account.
+#: What one page for many such accounts says, where more than five stand unreachable at once
+#: (``AuthService._note_unreached_accounts``), so a flapping directory opens one instance rather than one per signed-in account.
 _UNREACHED_ROLLUP_TEXT: Final[str] = (
     "{accounts} accounts' sessions are not revoked: their directory probes failed {probes} passes "
-    "running while other probes got an answer. Check the directory; audit rows name each account."
+    "running. Check the directory and the path to it; audit rows name each account."
 )
 
 
@@ -11401,7 +11401,7 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     referred, refused or raise a fault.
 
     Reads the RETURNED plan, so it sees only a pass that finished. A failed write of the pass's own
-    held, aborted, skipped, referred, misconfigured, faulted or unkeyed-binding row no longer ends
+    held, aborted, skipped, referred, misconfigured, faulted, unreached or unkeyed-binding row no longer ends
     the pass (BACKLOG #2137): the service logs it at ERROR and returns the plan, so these alerts
     still fire. Since BACKLOG #3018 the same holds for a revocation's own ``auth.ad_session_revoked``
     row and a rename's rows. A pass that still raises part-way, such as on a store fault ending one
@@ -11427,6 +11427,8 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         # A paging refusal is not the outage, so an outage-shaped pass still pages for it (vault
         # BACKLOG #3696). An outage applies no revocation, so nothing here pages ahead of it.
         _alert_paging_refusals(plan, sink)
+        # BACKLOG #3100: an account alone in its probe sample enters on an outage-shaped pass.
+        _alert_unreached_accounts(plan, sink)
         if plan.outage_page:
             # BACKLOG #3709. After the paging refusals, which page once per account, so a sink that
             # raises here cannot cost one.
@@ -11524,12 +11526,12 @@ def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
 def _alert_unreached_accounts(plan: ReconcilePlan, sink: AlertSink) -> None:
     """Page each account that has just entered the lasting unreachable state (BACKLOG #3100
     closing step 2; ``AuthService._note_unreached_accounts`` says when one enters). Its probe
-    failed to reach the directory on that many passes running that reached it for others, so the
+    failed to reach the directory on that many of its passes running, so the
     reconciler has neither struck nor revoked it. Once per entry, like a paging refusal, and with
-    no inverse: an operator resolves it. An outage pass carries none, because the outage pages
-    on its own. The account name is in the source only, as for a paging refusal. Past
-    ``[auth].ad_session_revoke_max`` accounts on one pass (``plan.unreached_rollup``), one page
-    under the bare source covers them all, naming none."""
+    no inverse: an operator resolves it. An outage-shaped pass can carry one, for an account alone
+    in its probe sample, but none while the lasting outage page stands. The account name is in the source only, as for a paging refusal. On a rolled-up
+    pass (``plan.unreached_rollup``), one page under the bare source covers those entering,
+    naming none."""
     if plan.unreached_rollup:
         sink.ad_reconcile_aborted(
             _UNREACHED_ALERT_SOURCE,
