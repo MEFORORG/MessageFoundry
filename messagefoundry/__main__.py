@@ -10409,10 +10409,14 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "new version of the key named by MEFOR_STORE_TRANSIT_KEY, new values are sealed under "
             "it, and values under an older version still read. Nothing re-seals those older "
             "values, so rotating is safe and retiring a version that still seals a value or MACs "
-            "an audit row is not: raising the key's min_decryption_version above a version "
-            "retires that version, and no value sealed under it can be decrypted from then on. "
-            "docs/SECURITY.md, under 'Retiring an old version of the audit key breaks the chain', "
-            "says what retiring one does to the audit chain. Nothing was changed.",
+            "an audit row is not. Raising the data key's min_decryption_version above a version "
+            "stops the values sealed under it from decrypting until the setting is lowered. "
+            "Raising the audit key's min_encryption_version above a version breaks the audit "
+            "chain at every row MACed under it; the audit key is the data key unless "
+            "MEFOR_STORE_TRANSIT_AUDIT_KEY names another. Trimming a version off either key does "
+            "the same to what it sealed or MACed, and cannot be undone. docs/SECURITY.md, under "
+            "'Retiring an old version of the audit key breaks the chain', describes the audit "
+            "chain break. Nothing was changed.",
             file=sys.stderr,
         )
         return 2
