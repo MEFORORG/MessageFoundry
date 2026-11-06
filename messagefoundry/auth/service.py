@@ -17138,6 +17138,30 @@ class AuthService:
             client=client,
         )
 
+    async def audit_gate_refused(
+        self,
+        identity: Identity,
+        permission: Permission,
+        path: str,
+        *,
+        reason: str,
+        client: str | None,
+    ) -> None:
+        """Audit a request refused by a check its gate makes AFTER the permission check passed
+        (BACKLOG #1197, ASVS 16.3.2), such as a stale step-up (``reason`` ``step_up``) or the
+        per-actor pacing (``throttled``).
+
+        The caller holds ``permission``, so this is not :meth:`audit_permission_denied`: that row
+        says the permission was missing, and the denial-burst detector counts it.
+        ``_recorded_decision`` in ``api/security.py`` decides when this row is written. ``client``
+        is required, as for :meth:`audit_self_target_refused`."""
+        await self._audit(
+            "auth.gate_refused",
+            actor=identity.username,
+            detail=_json({"permission": permission.value, "path": path, "reason": reason}),
+            client=client,
+        )
+
     async def _audit(
         self,
         action: str,
