@@ -23,8 +23,9 @@
 #>
 
 #: The variables that make `git -C <path>` answer for a checkout other than the one named. The same
-#: list remove.ps1 refuses on every route; tests/test_worktree_finished_claude_removal.py pins the two
-#: equal, because remove.ps1 reads its own before it dot-sources this file.
+#: base list remove.ps1 refuses on its -Path, -List and -Discard routes (not on a plain -Name);
+#: tests/test_worktree_finished_claude_removal.py pins the two equal, because remove.ps1 reads its own
+#: before it dot-sources this file.
 $GIT_REDIRECT_NAMES = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')
 
 # Refused rather than cleared, as in remove.ps1: a dot-sourced caller shares the operator's process, so
@@ -334,9 +335,10 @@ function Read-CoordRecord([string]$File) {
 # WHEN ITS PARENT IS THERE: on an unreachable share, Get-Item on the directory raises the same
 # ItemNotFoundException as on a missing one (measured on a UNC host that does not answer), so a root
 # that drops after the run's one probe would otherwise read as "no records". $true present, $false
-# absent under a present parent, and a throw for anything else. EACH MUST BE A PLAIN DIRECTORY: a FILE
-# standing where the parent should be (mefor-coord as a file) is "present", and the registry under it
-# then reads as absent, so no records; a junction is listed through, wherever it points.
+# absent under a present parent, and a throw for anything else. BOTH MUST BE PLAIN DIRECTORIES, whether
+# or not the registry exists yet: a FILE standing where the parent should be (mefor-coord as a file) is
+# "present", and the registry under it then reads as absent, so no records; a junction is listed
+# through, wherever it points.
 function Test-RegistryPresentOrThrow([string]$Dir, [string]$What) {
     return Test-PresentUnderParentOrThrow $Dir $What -Plain
 }
@@ -347,15 +349,13 @@ function Test-RegistryPresentOrThrow([string]$Dir, [string]$What) {
 function Test-PresentUnderParentOrThrow([string]$Dir, [string]$What, [switch]$Plain) {
     $notPlain = "exists but is not a plain directory (a file or a link), so what it holds is unknown. Nothing was removed."
     $item = Get-ItemOrThrow $Dir $What
-    if ($item) {
-        if ($Plain -and -not (Test-PlainDirectoryItem $item)) { throw "$What ('$Dir') $notPlain" }
-        return $true
-    }
+    if ($item -and -not $Plain) { return $true }
+    if ($item -and -not (Test-PlainDirectoryItem $item)) { throw "$What ('$Dir') $notPlain" }
     $parent = [System.IO.Path]::GetDirectoryName($Dir.TrimEnd('\', '/'))
     $held = if ($parent) { Get-ItemOrThrow $parent "the folder that holds $What" } else { $null }
     if ($held) {
         if ($Plain -and -not (Test-PlainDirectoryItem $held)) { throw "The folder that holds $What ('$parent') $notPlain" }
-        return $false
+        return [bool]$item
     }
     throw "Neither $What ('$Dir') nor the folder that holds it can be found, so the folder above it may be unreachable. Nothing was removed."
 }
@@ -468,10 +468,9 @@ function Get-UnsafeIgnoredEntries([string]$Path) {
 }
 
 # A tolerated cache name is not enough: the entry must be a real directory inside the tree, not a link
-# to one somewhere else. Unreadable is not plain. Shared with remove.ps1 -Path. Without -Rel, -Root itself.
-function Test-PlainDirectory([string]$Root, [string]$Rel = '') {
-    $target = if ($Rel) { Join-Path $Root $Rel } else { $Root }
-    try { $item = Get-Item -LiteralPath $target -Force -ErrorAction Stop }
+# to one somewhere else. Unreadable is not plain. Shared with remove.ps1 -Path.
+function Test-PlainDirectory([string]$Root, [string]$Rel) {
+    try { $item = Get-Item -LiteralPath (Join-Path $Root $Rel) -Force -ErrorAction Stop }
     catch { return $false }
     return Test-PlainDirectoryItem $item
 }

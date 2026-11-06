@@ -36,7 +36,9 @@
       * -IdleHours is a finite number not under worktree-gates.ps1's floor, and this clone's
         coordination root resolves (both checked once, for every path);
       * FIRST for each path, its root is not a junction or link, which every later gate and git would
-        read through, and can be read (a root that is not there is left to the gates below);
+        read through, and can be read (a root that is not there is left to the gates below); nor is any
+        folder above it up to the .claude folder of its `.claude/worktrees/` segment, since a link
+        there would let the path-shape gate below accept a tree that lives elsewhere;
       * the path has a `.claude/worktrees/` segment -- the only population this step is for;
       * it is not the primary checkout, not a worktree the caller runs from (-Protect), and does not
         contain one;
@@ -60,20 +62,25 @@
         `git worktree list` gives or the toplevel git prints inside it;
       * no coordination claim names it by either spelling, in this clone's registry or the one its
         mefor.claimsRoot names, and every claim file and directory there could be read;
-      * the liveness fence (scripts/coord/occupancy.ps1, read fresh) is available, still lists the tree
-        unlocked, finds no registered session launched in it or in a worktree nested inside it, and
-        finds no other registered worktree inside it;
-      * LAST, immediately before the removal and only under -Apply: the root check and every check
-        from the flagged files through the walk run AGAIN (Get-ContentRefusal), because the first pass
-        read them before the allocation, claim and fence reads, and a write in that window (an
-        ignored .env, a nested clone, an edit) would otherwise go with the tree. A refusal here reads
-        "re-checked just before the removal".
+      * LAST in the pass: the liveness fence (scripts/coord/occupancy.ps1, read fresh) is available,
+        still lists the tree unlocked, finds no registered session launched in it or in a worktree
+        nested inside it, and finds no other registered worktree inside it;
+      * THEN, only under -Apply, A LATE PASS immediately before the removal, because the first pass
+        read the content before its ownership and fence reads, and a write in that window (an ignored
+        .env, a nested clone, an edit, a per-worktree ref, a claim) would otherwise go with the tree.
+        In order: the commit, allocation and claim checks (Get-OwnershipRefusal); the root check and
+        every check from the flagged files through the walk (Get-ContentRefusal); and the fence. So
+        only the fence read sits between the content check and the removal, and nothing between the
+        fence and the removal. A refusal here reads "re-checked just before the removal". THE
+        RESIDUAL: a write into the tree while the late fence is being read is not seen.
     Every gate is the shared copy in worktree-gates.ps1 or occupancy.ps1 where one exists. The claim and
     allocation readers list through Test-PresentOrThrow and Get-EntriesOrThrow, the readers remove.ps1
     uses (both now in worktree-gates.ps1), and a registry directory reads as absent only while the
     folder holding it is there, so a coordination root that is unreachable, or drops mid-run, refuses
-    rather than reading as empty. The registry and that folder must each be a plain directory: a file
-    standing where mefor-coord should be, or a junction, refuses rather than reading as no records. The
+    rather than reading as empty. The registry and that folder must each be a plain directory, whether
+    or not the registry exists yet: a file standing where mefor-coord should be, or a junction, refuses
+    rather than reading as no records, and so does a link anywhere below the allocation registry, which
+    the walk does not follow. The
     record parsing follows remove.ps1's rules, cannot-tell refusing, without sharing its code.
     THE END STATE IS READ FAIL-CLOSED: only a tree git no longer lists, whose directory is confirmed
     absent under a folder that is there, is REMOVED. A directory that is present or cannot be read is
@@ -119,9 +126,13 @@ function Get-AllocationRefusal {
     # Through the throwing readers, so an unreachable registry refuses rather than reading as empty.
     try {
         if (-not (Test-RegistryPresentOrThrow $AllocDir 'the allocation directory')) { return '' }
-        $files = @(Get-EntriesOrThrow $AllocDir 'allocations' '*.json' -Recurse -FilesOnly)
+        $entries = @(Get-EntriesOrThrow $AllocDir 'allocations' -Recurse)
     }
     catch { return "the allocation registry could not be read, so an allocation may name it: $($_.Exception.Message)" }
+    # The walk never descends a link, so the records under one (alloc/adr as a junction) would read as none.
+    $link = @($entries | Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint }) | Select-Object -First 1
+    if ($link) { return "the allocation registry could not be read in full: $($link.FullName) is a link, which the walk does not follow" }
+    $files = @($entries | Where-Object { $_ -is [System.IO.FileInfo] -and $_.Name -like '*.json' })
     $atRisk = @()
     foreach ($f in $files) {
         $r = Read-CoordRecord $f.FullName
@@ -167,16 +178,30 @@ function Get-TreeClaimsDirs {
 # A tree root that is a junction or symlink: every gate below, and git, would read through it into a
 # directory somewhere else. A root that is not there is left to the gates after this one, which refuse
 # it with their own reason; a root that cannot be read refuses here.
+# The folders above it, up to and including the .claude folder of its `.claude/worktrees/` segment, are
+# held to the same rule: a link there would let the path-shape gate accept a tree that lives elsewhere.
 function Get-TreeRootRefusal([string]$Path) {
-    try { $item = Get-ItemOrThrow $Path 'its root' } catch { return $_.Exception.Message }
-    if (-not $item -or (Test-PlainDirectoryItem $item)) { return '' }
-    if ($item -isnot [System.IO.DirectoryInfo]) { return 'its root is not a directory' }
-    return "its root is a junction or link ($($item.LinkType)), which the gates and the removal would follow somewhere else"
+    try {
+        $item = Get-ItemOrThrow $Path 'its root'
+        if (-not $item) { return '' }
+        if ($item -isnot [System.IO.DirectoryInfo]) { return 'its root is not a directory' }
+        if (-not (Test-PlainDirectoryItem $item)) { return "its root is a junction or link ($($item.LinkType)), which the gates and the removal would follow somewhere else" }
+        if (-not (Test-ClaudeManagedPath $Path)) { return '' }
+        $dir = $item.Parent
+        while ($dir) {
+            $above = Get-ItemOrThrow $dir.FullName 'a folder above it'
+            if (-not $above -or -not (Test-PlainDirectoryItem $above)) { return "a folder above it ($($dir.FullName)) is not a plain directory (a link, or missing), which the path-shape gate would read through" }
+            if ($dir.Name -ieq '.claude') { break }
+            $dir = $dir.Parent
+        }
+    }
+    catch { return $_.Exception.Message }
+    return ''
 }
 
 # What is IN the tree: flagged files, status, the two idle readings, an operation in progress, ignored
-# entries, and the walk. Run in the first pass and AGAIN immediately before the removal, so a write in
-# the window between them refuses the tree. Returns '' or the refusal.
+# entries, and the walk. Run in the first pass and AGAIN in the late pass, after its ownership reads and
+# before only the fence, so a write in the window refuses the tree. Returns '' or the refusal.
 function Get-ContentRefusal {
     param([string]$Path, [double]$IdleHours)
     $flagged = Get-FlaggedFileCount $Path
@@ -204,8 +229,8 @@ function Get-ContentRefusal {
     return ''
 }
 
-# Why one path must not be removed now, or '' when every re-check passes. The checks run cheapest first
-# and the fence last; the header lists them and says why that order.
+# Why one path must not be removed now, or '' when every re-check passes. The root first, the checks
+# cheapest first after it, and the fence last; the header lists them and says why that order.
 function Get-FinishedWorktreeRefusal {
     param([string]$Primary, [string]$Path, [double]$IdleHours, [string[]]$ProtectNorm, [string]$OwnClaimsDir, [string]$AllocDir)
     $root = Get-TreeRootRefusal $Path
@@ -229,14 +254,24 @@ function Get-FinishedWorktreeRefusal {
 
     # Covers a detached tip too: `reflog show HEAD` prints the current HEAD even when the log is empty.
     $branch = if ($wt.Detached) { '' } else { [string]$wt.Branch }
-    $only = Get-WorktreeOnlyCommitCount -Path $Path -Repo $Primary -Branch $branch
+    $owned = Get-OwnershipRefusal -Primary $Primary -Path $Path -Branch $branch -OwnClaimsDir $OwnClaimsDir -AllocDir $AllocDir
+    if ($owned) { return $owned }
+    return Get-FenceRefusal -Primary $Primary -Path $Path
+}
+
+# What the removal would take with the tree beyond its files, and who may hold it: commits only its own
+# HEAD reflog and refs hold, allocations naming it, and claims naming it. Run in the first pass and again
+# in the late pass. Returns '' or the refusal.
+function Get-OwnershipRefusal {
+    param([string]$Primary, [string]$Path, [string]$Branch, [string]$OwnClaimsDir, [string]$AllocDir)
+    $only = Get-WorktreeOnlyCommitCount -Path $Path -Repo $Primary -Branch $Branch
     if ($only -ne 0) { return $(if ($only -lt 0) { 'the commits its HEAD reflog and own refs hold could not be checked' } else { "$only commit(s) held only by its HEAD reflog or its own refs, which the removal deletes" }) }
 
     # A record may name the tree by either spelling remove.ps1 matches: the path `git worktree list`
     # gives, or the toplevel git prints inside it, which is what claim.ps1 and alloc.ps1 record.
     $top = "$(& git -C $Path rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
     if ($LASTEXITCODE -ne 0 -or -not $top) { return 'git could not name its toplevel, so a record naming it by that spelling cannot be matched' }
-    $norms = @(@($norm, (ConvertTo-Norm $top)) | Sort-Object -Unique)
+    $norms = @(@((ConvertTo-Norm $Path), (ConvertTo-Norm $top)) | Sort-Object -Unique)
     $alloc = Get-AllocationRefusal -Primary $Primary -Norms $norms -AllocDir $AllocDir
     if ($alloc) { return $alloc }
     $dirs = Get-TreeClaimsDirs -Path $Path -OwnClaimsDir $OwnClaimsDir
@@ -244,8 +279,14 @@ function Get-FinishedWorktreeRefusal {
     $claims = Get-ClaimedWorktreeIndex $dirs.Dirs -RequireParent
     if ($claims.Unreadable) { return 'a claim file or directory could not be read, so any tree may be claimed' }
     if (@($norms | Where-Object { $claims.Claimed.ContainsKey($_) }).Count -gt 0) { return 'a coordination claim names it' }
+    return ''
+}
 
-    # The fence, read FRESH for this path and last of all.
+# The fence, read FRESH for this path and LAST in each pass, so the window between it and the removal is
+# as short as it can be. Returns '' or the refusal.
+function Get-FenceRefusal {
+    param([string]$Primary, [string]$Path)
+    $norm = ConvertTo-Norm $Path
     $occ = Get-WorktreeOccupancy -Repo $Primary
     if (-not $occ.RepoFound) { return "could not list the worktrees of $Primary" }
     if ((ConvertTo-Norm $occ.PrimaryPath) -ne (ConvertTo-Norm $Primary)) { return "$Primary is not the primary checkout git reports ($($occ.PrimaryPath))" }
@@ -346,7 +387,7 @@ function Invoke-FinishedWorktreeRemoval {
             }
             if ($refusal) { $row.Reason = $refusal }
             elseif (-not $Apply) { $row.Outcome = 'WOULD-REMOVE'; $row.Reason = 'every re-check passed' }
-            else { Invoke-OneRemoval -Primary $Primary -Row $row -IdleHours $IdleHours }
+            else { Invoke-OneRemoval -Primary $Primary -Row $row -IdleHours $IdleHours -OwnClaimsDir $ownClaimsDir -AllocDir $allocDir }
         }
         catch [System.Management.Automation.RuntimeException], [System.IO.IOException], [System.UnauthorizedAccessException] {
             # Before git was asked, a throw is a check that could not complete: nothing was attempted.
@@ -367,24 +408,28 @@ function Invoke-FinishedWorktreeRemoval {
 # registries are read by), because an unreachable parent raises the same not-found.
 function Get-EndStatePresence([string]$Path) {
     try { return $(if (Test-PresentUnderParentOrThrow $Path 'the removed tree') { 'present' } else { 'absent' }) }
-    catch { return "unknown: $($_.Exception.Message)" }
+    # The readers end their message "Nothing was removed.", which is false once git has run.
+    catch { return "unknown: $($_.Exception.Message -replace '\s*Nothing was removed\.\s*$', '')" }
 }
 
 function Invoke-OneRemoval {
-    param([string]$Primary, [object]$Row, [double]$IdleHours)
+    param([string]$Primary, [object]$Row, [double]$IdleHours, [string]$OwnClaimsDir, [string]$AllocDir)
     $path = $Row.Path
     $norm = ConvertTo-Norm $path
-
-    # THE LAST STEP BEFORE THE REMOVAL. The first pass read the content before the claim, allocation and
-    # fence reads, so a write in that window (an ignored .env, a nested clone, an edit) would go with the
-    # tree. The root and content gates run again here; any refusal leaves the row REFUSED.
-    $late = Get-TreeRootRefusal $path
-    if (-not $late) { $late = Get-ContentRefusal -Path $path -IdleHours $IdleHours }
-    if ($late) { $Row.Reason = "re-checked just before the removal: $late"; return }
-
     $wt = @(Get-RepoWorktrees $Primary | Where-Object { (ConvertTo-Norm $_.Path) -eq $norm }) | Select-Object -First 1
     # '' for a detached tree: the ledger's recovery recipe re-adds a BRANCH, and '(detached)' is not one.
     $branch = if ($wt -and -not $wt.Detached) { [string]$wt.Branch } else { '' }
+
+    # THE LATE PASS, IMMEDIATELY BEFORE THE REMOVAL. The first pass read the content before its
+    # ownership and fence reads, so a write in that window (an ignored .env, a nested clone, an edit, a
+    # per-worktree ref, a claim) would go with the tree. Ownership, then the root and content, then the
+    # fence, run again here, so only the fence read sits between the content check and the removal, and
+    # nothing between the fence and the removal. Any refusal leaves the row REFUSED.
+    $late = Get-OwnershipRefusal -Primary $Primary -Path $path -Branch $branch -OwnClaimsDir $OwnClaimsDir -AllocDir $AllocDir
+    if (-not $late) { $late = Get-TreeRootRefusal $path }
+    if (-not $late) { $late = Get-ContentRefusal -Path $path -IdleHours $IdleHours }
+    if (-not $late) { $late = Get-FenceRefusal -Primary $Primary -Path $path }
+    if ($late) { $Row.Reason = "re-checked just before the removal: $late"; return }
 
     # The one removal. Plain `worktree remove`: no --force, so git refuses a locked tree or one holding a
     # modified or untracked file even if every check above was somehow wrong.

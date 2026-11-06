@@ -717,6 +717,16 @@ _BACKDATE = (
 
 _WRITE_ENV = "Set-Content -LiteralPath (Join-Path $env:T_TREE '.env') -Value 'MEFOR_X=1'"
 _WRITE_CLONE = "$null = & git.exe init -q (Join-Path $env:T_TREE 'ide/node_modules/pkg')"
+#: A commit no shared ref holds, kept by a per-worktree ref: it moves none of the idle readings.
+_WRITE_REF = (
+    "$c = & git.exe -C $env:T_TREE commit-tree 'HEAD^{tree}' -p HEAD -m keep; "
+    "& git.exe -C $env:T_TREE update-ref refs/worktree/keep $c"
+)
+#: A claim taken in the window, which nothing inside the tree records.
+_WRITE_CLAIM = (
+    "@{ key = 'late'; worktree = $env:T_TREE } | ConvertTo-Json | "
+    "Set-Content -LiteralPath $env:T_CLAIM"
+)
 
 
 @pytest.mark.parametrize(
@@ -725,8 +735,10 @@ _WRITE_CLONE = "$null = & git.exe init -q (Join-Path $env:T_TREE 'ide/node_modul
         (_WRITE_ENV + _BACKDATE, ".env", r"ignored entr\(ies\).*!! \.env"),
         (_WRITE_CLONE + _BACKDATE, "ide/node_modules/pkg/.git", r"nested git checkout at ide/"),
         (_WRITE_ENV, ".env", r"recently active: the working tree was written"),
+        (_WRITE_REF, "seed.txt", r"1 commit\(s\) held only by its HEAD reflog or its own refs"),
+        (_WRITE_CLAIM, "seed.txt", r"a coordination claim names it"),
     ],
-    ids=["ignored-file", "nested-clone", "recent-write"],
+    ids=["ignored-file", "nested-clone", "recent-write", "worktree-ref", "late-claim"],
 )
 def test_a_write_after_the_first_pass_refuses_at_the_last_recheck(
     fx: Fx, write: str, made: str, pattern: str
@@ -739,7 +751,7 @@ def test_a_write_after_the_first_pass_refuses_at_the_last_recheck(
         [tree],
         apply=True,
         prelude=_LATE_WRITE.format(write=write),
-        env_extra={"T_TREE": str(tree)},
+        env_extra={"T_TREE": str(tree), "T_CLAIM": str(fx.coord / "claims" / "late.json")},
     )
     assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
     assert "just before the removal" in rows["clean"]["Reason"], rows["clean"]
@@ -782,14 +794,19 @@ def test_the_runner_refuses_a_git_redirect_before_it_prunes(fx: Fx, tmp_path: Pa
         "-RemoveFinishedClaudeWorktrees",
         env_extra={"GIT_DIR": _redirect_value(fx, "GIT_DIR")},
     )
-    assert proc.returncode != 0, proc.stdout
+    assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "GIT_DIR is set" in proc.stderr + proc.stdout
-    # Up front: no prune run was started, so no log was written.
-    assert not list(log_dir.glob("prune-*.log"))
+    # Up front, and into the log: a scheduled run leaves the reason, and no prune or step ran.
+    (log,) = log_dir.glob("prune-*.log")
+    text = log.read_text(encoding="utf-8")
+    assert "REFUSED before the prune; nothing was attempted" in text, text
+    assert "GIT_DIR is set" in text
+    assert "=== exit 2 " in text
+    assert "finished .claude/worktrees" not in text
 
 
 def test_the_redirect_list_mirrors_remove_ps1() -> None:
-    """The nightly removal refuses exactly the names remove.ps1 refuses on every route."""
+    """The nightly removal refuses exactly the base names remove.ps1 refuses on -Path and -List."""
     names = re.compile(r"'([A-Z_]+)'")
     remove_src = (ROOT / "scripts" / "worktree" / "remove.ps1").read_text(encoding="utf-8")
     gates_src = (ROOT / "scripts" / "worktree" / "worktree-gates.ps1").read_text(encoding="utf-8")
@@ -835,6 +852,8 @@ def test_an_end_state_that_cannot_be_confirmed_absent_is_never_removed(
     prelude = _AFTER_REMOVAL.replace("PUTBACK", putback) + "; " + stub
     rows = remove(fx, [tree], apply=True, prelude=prelude, env_extra={"T_HIDE": str(tree)})
     assert rows["clean"]["Outcome"] == "ORPHANED", rows["clean"]
+    # The readers' "Nothing was removed." is false once git has run, so it must not reach the row.
+    assert "Nothing was removed" not in rows["clean"]["Reason"], rows["clean"]
     assert not fx.is_registered(tree)
 
 
@@ -845,16 +864,28 @@ def _coord_not_plain(fx: Fx, case: str) -> dict[str, str | None]:
         )
         (common / "mefor-coord").write_text("not a directory", encoding="utf-8")
         return {"MEFOR_COORD_ROOT": None}
-    registry = case.split("-", 1)[0]
-    shutil.rmtree(fx.coord / registry)
-    empty = fx.root / f"empty-{registry}"
+    if case == "shared-root-is-a-junction":
+        # The registries under it are plain; only the folder holding them is a link.
+        link = fx.root / "coord-link"
+        _junction(link, fx.coord)
+        return {"MEFOR_COORD_ROOT": str(link)}
+    sub = {"alloc-kind-is-a-junction": "alloc/adr"}.get(case, case.split("-", 1)[0])
+    shutil.rmtree(fx.coord / sub)
+    empty = fx.root / f"empty-{sub.replace('/', '-')}"
     empty.mkdir()
-    _junction(fx.coord / registry, empty)
+    _junction(fx.coord / sub, empty)
     return {}
 
 
 @pytest.mark.parametrize(
-    "case", ["local-root-is-a-file", "claims-is-a-junction", "alloc-is-a-junction"]
+    "case",
+    [
+        "local-root-is-a-file",
+        "shared-root-is-a-junction",
+        "claims-is-a-junction",
+        "alloc-is-a-junction",
+        "alloc-kind-is-a-junction",
+    ],
 )
 def test_a_coordination_folder_that_is_not_a_plain_directory_refuses(fx: Fx, case: str) -> None:
     """Red on PR 2802: a file standing where mefor-coord should be read as a present parent, so its
@@ -878,3 +909,16 @@ def test_a_tree_root_that_is_a_junction_refuses_before_any_other_gate(fx: Fx) ->
     assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
     assert "its root is a junction or link" in rows["clean"]["Reason"], rows["clean"]
     assert (real / "seed.txt").is_file()
+
+
+def test_a_junction_above_the_tree_inside_its_claude_segment_refuses(fx: Fx) -> None:
+    """The tree root is plain, but .claude/worktrees is a link, so the tree lives elsewhere and the
+    path-shape gate would accept it."""
+    worktrees = fx.primary / ".claude" / "worktrees"
+    real = fx.root / "worktrees-real"
+    worktrees.rename(real)
+    _junction(worktrees, real)
+    rows = remove(fx, [fx.tree("clean")], apply=False)
+    assert rows["clean"]["Outcome"] == "REFUSED", rows["clean"]
+    assert "a folder above it" in rows["clean"]["Reason"], rows["clean"]
+    assert (real / "clean" / "seed.txt").is_file()

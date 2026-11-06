@@ -31,7 +31,7 @@
     failure, and leaves the exit code alone. Without -Apply the step only logs WOULD-REMOVE. With
     -Apply it refuses to run inside Claude Code, the same refusal install-daily-prune.ps1 carries. With
     the switch, a GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE in the environment refuses the
-    whole run before the prune starts.
+    whole run before the prune starts, logged, with exit 2.
 
 .PARAMETER RepoRoot
     The primary checkout to prune. Defaults to the value the shared liveness fence calls the primary --
@@ -72,12 +72,6 @@ $ErrorActionPreference = 'Stop'
 # to that population. The dry run stays usable in-session.
 if ($env:CLAUDECODE -eq '1' -and $Apply -and $RemoveFinishedClaudeWorktrees) {
     throw "Refusing -Apply -RemoveFinishedClaudeWorktrees inside Claude Code: it removes Claude-managed worktrees. Run it from a plain terminal, or from the scheduled task install-daily-prune.ps1 registers. (Without -Apply it only reports, and is allowed.)"
-}
-# Before the prune run, not only inside the step: the helper refuses these too, but by then the prune
-# above would already have run, and a throw there would cut the log short.
-if ($RemoveFinishedClaudeWorktrees) {
-    . (Join-Path $PSScriptRoot 'finished-worktree-removal.ps1')
-    Assert-NoGitRedirect 'run-daily-prune.ps1 -RemoveFinishedClaudeWorktrees'
 }
 
 # prune-merged.ps1 reports its verdict through the exit code, so a non-zero exit is DATA here, not a
@@ -124,6 +118,23 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
 
 "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode repo=$RepoRoot ===" | Add-Content -LiteralPath $log
+
+# Before the prune run, not only inside the step: the helper refuses these too, but by then the prune
+# would already have run. Refused into the LOG, with exit 2 (nothing attempted), so a scheduled run that
+# hits it leaves a line saying why rather than a bare non-zero exit.
+if ($RemoveFinishedClaudeWorktrees) {
+    try {
+        . (Join-Path $PSScriptRoot 'finished-worktree-removal.ps1')
+        Assert-NoGitRedirect 'run-daily-prune.ps1 -RemoveFinishedClaudeWorktrees'
+    }
+    catch {
+        "=== REFUSED before the prune; nothing was attempted: $($_.Exception.Message) ===" | Add-Content -LiteralPath $log
+        "=== exit 2 ($($EXIT_MEANING[2])) ===" | Add-Content -LiteralPath $log
+        Write-Error -Message $_.Exception.Message -ErrorAction Continue
+        exit 2
+    }
+}
+
 & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $prune @pruneArgs *>&1 |
     Add-Content -LiteralPath $log
 $code = $LASTEXITCODE
