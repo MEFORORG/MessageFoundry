@@ -22,8 +22,10 @@
     Get-ItemOrThrow, Test-PresentUnderParentOrThrow, $GIT_REDIRECT_NAMES and Assert-NoGitRedirect.
 #>
 
-#: The variables that make `git -C <path>` answer for a checkout other than the one named. The same
-#: base list remove.ps1 refuses on its -Path, -List and -Discard routes (not on a plain -Name);
+#: The variables that falsify a `git -C <path>` reading: the first three point git at another
+#: repository or working tree, and GIT_INDEX_FILE compares the tree against another index, which can make
+#: a dirty tree read clean. The same base list remove.ps1 refuses on its -Path, -List and -Discard routes
+#: (not on a plain -Name; -Discard adds two object-store names, since only it writes objects);
 #: tests/test_worktree_finished_claude_removal.py pins the two equal, because remove.ps1 reads its own
 #: before it dot-sources this file.
 $GIT_REDIRECT_NAMES = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE')
@@ -33,7 +35,7 @@ $GIT_REDIRECT_NAMES = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX
 function Assert-NoGitRedirect([string]$Who) {
     $set = @($GIT_REDIRECT_NAMES | Where-Object { [Environment]::GetEnvironmentVariable($_) })
     if ($set.Count -gt 0) {
-        throw "$Who refuses: $($set -join ', ') is set, so git would answer for a different checkout than the one named. Unset it and re-run. Nothing was removed."
+        throw "$Who refuses: $($set -join ', ') is set, so git's readings of the tree named could come from another repository, working tree or index. Unset it and re-run. Nothing was removed."
     }
 }
 

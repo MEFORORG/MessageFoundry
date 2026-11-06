@@ -30,9 +30,13 @@
 
     THE RE-CHECKS, per path. The first one that fails REFUSES that path and the run moves on; a refusal
     is data, not a failure. At least these:
-      * none of GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE is set, the list remove.ps1
-        refuses, since each makes `git -C <path>` answer for another checkout (checked once, and it
-        THROWS, refusing the whole run, dry run included);
+      * none of GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE is set: the base list
+        remove.ps1 refuses on its -Path and -List routes (its -Discard adds GIT_OBJECT_DIRECTORY and
+        GIT_ALTERNATE_OBJECT_DIRECTORIES, because that route writes objects; this step writes none).
+        The first three make `git -C <path>` answer for another repository or working tree than the
+        one named; GIT_INDEX_FILE keeps the checkout but compares it against another index, which can
+        make a dirty tree read clean. Checked once, and it THROWS, refusing the whole run, dry run
+        included;
       * -IdleHours is a finite number not under worktree-gates.ps1's floor, and this clone's
         coordination root resolves (both checked once, for every path);
       * FIRST for each path, its root is not a junction or link, which every later gate and git would
@@ -68,8 +72,9 @@
       * THEN, only under -Apply, A LATE PASS immediately before the removal, because the first pass
         read the content before its ownership and fence reads, and a write in that window (an ignored
         .env, a nested clone, an edit, a per-worktree ref, a claim) would otherwise go with the tree.
-        In order: the commit, allocation and claim checks (Get-OwnershipRefusal); the root check and
-        every check from the flagged files through the walk (Get-ContentRefusal); and the fence. So
+        In order: the root check, since the next reads ask git through the root; the commit,
+        allocation and claim checks (Get-OwnershipRefusal); the root check again and every check from
+        the flagged files through the walk (Get-ContentRefusal); and the fence. So
         only the fence read sits between the content check and the removal, and nothing between the
         fence and the removal. A refusal here reads "re-checked just before the removal". THE
         RESIDUAL, at least: a write into the tree while the late fence is being read, and a claim, an
@@ -133,8 +138,9 @@ function Get-AllocationRefusal {
         $entries = @(Get-EntriesOrThrow $AllocDir 'allocations' -Recurse)
     }
     catch { return "the allocation registry could not be read, so an allocation may name it: $($_.Exception.Message)" }
-    # The walk never descends a link, so the records under one (alloc/adr as a junction) would read as none.
-    $link = @($entries | Where-Object { $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint }) | Select-Object -First 1
+    # The walk never descends a linked DIRECTORY, so the records under one (alloc/adr as a junction) would
+    # read as none. A linked file is read through like any other record, so it does not refuse.
+    $link = @($entries | Where-Object { $_ -is [System.IO.DirectoryInfo] -and ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) }) | Select-Object -First 1
     if ($link) { return "the allocation registry could not be read in full: $($link.FullName) is a link, which the walk does not follow" }
     $files = @($entries | Where-Object { $_ -is [System.IO.FileInfo] -and $_.Name -like '*.json' })
     $atRisk = @()
@@ -361,8 +367,8 @@ function Invoke-FinishedWorktreeRemoval {
     if ($Apply -and $env:CLAUDECODE -eq '1') {
         throw 'Refusing Invoke-FinishedWorktreeRemoval -Apply inside Claude Code: it removes Claude-managed worktrees. The dry run is allowed.'
     }
-    # The whole run, dry run included: every gate below asks `git -C <tree>`, and each of these makes git
-    # answer for another checkout.
+    # The whole run, dry run included: every gate below asks `git -C <tree>`, and the header says how
+    # each of these falsifies that reading.
     Assert-NoGitRedirect 'Invoke-FinishedWorktreeRemoval'
 
     $protectNorm = @($Protect | Where-Object { $_ } | ForEach-Object { ConvertTo-Norm $_ })
@@ -441,7 +447,9 @@ function Invoke-OneRemoval {
     # per-worktree ref, a claim) would go with the tree. Ownership, then the root and content, then the
     # fence, run again here, so only the fence read sits between the content check and the removal, and
     # nothing between the fence and the removal. Any refusal leaves the row REFUSED.
-    $late = Get-OwnershipRefusal -Primary $Primary -Path $path -Branch $branch -OwnClaimsDir $OwnClaimsDir -AllocDir $AllocDir
+    # The root check first, as in the first pass: the ownership reads ask `git -C <path>` too.
+    $late = Get-TreeRootRefusal $path
+    if (-not $late) { $late = Get-OwnershipRefusal -Primary $Primary -Path $path -Branch $branch -OwnClaimsDir $OwnClaimsDir -AllocDir $AllocDir }
     if (-not $late) { $late = Get-TreeRootRefusal $path }
     if (-not $late) { $late = Get-ContentRefusal -Path $path -IdleHours $IdleHours }
     if (-not $late) { $late = Get-FenceRefusal -Primary $Primary -Path $path }
