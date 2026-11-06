@@ -279,7 +279,8 @@ async def test_a_socket_declared_another_way_needs_no_mark(engine: Engine, path:
 
 
 def test_create_app_installs_the_accept_gate() -> None:
-    assert WebSocketAcceptGate in [m.cls for m in create_app().user_middleware]
+    registered: list[object] = [m.cls for m in create_app().user_middleware]
+    assert WebSocketAcceptGate in registered
 
 
 def test_the_mark_is_the_only_way_an_in_body_scope_is_allowed() -> None:
