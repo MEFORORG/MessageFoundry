@@ -2693,7 +2693,7 @@ async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row
 
         monkeypatch.setattr(store, "enable_totp", reset_then_enable)
         monkeypatch.setattr(store, "revoke_session", refused_revoke)
-        with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
+        with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
             refused = await service.confirm_mfa_enrollment(
                 identity, fresh_totp(enroll.secret), token=token
             )
@@ -2719,18 +2719,25 @@ async def test_a_refused_enable_whose_revoke_raises_still_writes_its_refusal_row
             "the refused revoke was swallowed without a log line"
         )
         assert any("could not end the session it rotated" in m for m in logged) is retry_refused
+        assert (
+            any("ended the session it rotated on retry" in m for m in logged) is not retry_refused
+        )
     finally:
         await store.close()
 
 
-@pytest.mark.parametrize("retry_lands", [False, True], ids=["retry-defect", "retry-lands"])
+@pytest.mark.parametrize(
+    "fault",
+    [NotImplementedError("a backend without the revoke"), asyncio.CancelledError()],
+    ids=["defect", "cancelled"],
+)
 async def test_a_refused_enable_whose_revoke_hits_a_defect_still_writes_its_refusal_row(
-    monkeypatch: pytest.MonkeyPatch, retry_lands: bool
+    monkeypatch: pytest.MonkeyPatch, fault: BaseException
 ) -> None:
     """RED when: a defect the revoke raises, which the soft write re-raises rather than logs, skips
-    the ``auth.mfa_enroll_refused`` row (vault BACKLOG #3113 item 2, round two), or skips the
-    second attempt at the revoke (BACKLOG #3025). The defect still propagates, so a bug is not
-    passed over as a store refusal."""
+    the ``auth.mfa_enroll_refused`` row (vault BACKLOG #3113 item 2, round two), or a defect or a
+    cancellation is retried (BACKLOG #3025): only a refusal the helper logged is. The exception
+    still propagates, so a bug is not passed over as a store refusal."""
     store = await _store()
     try:
         service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
@@ -2754,28 +2761,24 @@ async def test_a_refused_enable_whose_revoke_hits_a_defect_still_writes_its_refu
                 now=now,
             )
 
-        real_revoke = store.revoke_session
         revokes: list[str] = []
 
         async def broken_revoke(token_hash: str, *, now: float | None = None) -> None:
             revokes.append(token_hash)
-            if len(revokes) == 1 or not retry_lands:
-                raise NotImplementedError("a backend without the revoke")
-            await real_revoke(token_hash, now=now)
+            raise fault
 
         monkeypatch.setattr(store, "enable_totp", reset_then_enable)
         monkeypatch.setattr(store, "revoke_session", broken_revoke)
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(type(fault)):
             await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
-        assert len(revokes) == 2, "a defect in the first revoke skipped the second"
-        assert (await store.list_sessions(identity.user_id) == []) is retry_lands
+        assert len(revokes) == 1, "a defect or a cancellation from the revoke was retried"
         rows = await store.list_audit(
             actor=ADMIN_USERNAME, action="auth.mfa_enroll_refused", limit=10
         )
-        assert len(rows) == 1, "the refusal row was skipped when the revoke raised a defect"
+        assert len(rows) == 1, "the refusal row was skipped when the revoke raised"
         assert json.loads(str(rows[0]["detail"])) == {
             "reason": "secret_cleared",
-            "session_ended": retry_lands,
+            "session_ended": False,
         }
     finally:
         await store.close()
