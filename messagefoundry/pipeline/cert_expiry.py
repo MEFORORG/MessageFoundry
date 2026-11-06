@@ -72,6 +72,7 @@ __all__ = [
     "certs_from_settings",
     "crls_from_settings",
     "held_crl_label",
+    "monitored_files_from_settings",
     "peer_cert_expiry",
 ]
 
@@ -241,6 +242,13 @@ def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
     if store.backend is StoreBackend.SQLSERVER and sends_pin and isinstance(pin, str) and pin:
         return [MonitoredCert("store.ssl_root_cert", pin)]
     return []
+
+
+def monitored_files_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
+    """Every file the service settings hand the expiry monitor: :func:`crls_from_settings`, then
+    :func:`certs_from_settings`. ``serve`` and ``cert inventory`` both call this, so the inventory
+    lists the same settings-level rows the monitor watches."""
+    return [*crls_from_settings(settings), *certs_from_settings(settings)]
 
 
 def peer_cert_expiry(peercert: Mapping[str, Any], *, now: float) -> tuple[str, int] | None:

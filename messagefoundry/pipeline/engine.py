@@ -1500,10 +1500,10 @@ class Engine:
         return runner.latest if runner is not None else None
 
     def _monitored_certs(self) -> list[MonitoredCert]:
-        """The TLS certs the engine serves with right now: the ``[api]`` cert + the wired graph's MLLP
-        ``tls_cert_file`` certs (read live off the registry, so a config reload is reflected). Passed to
-        the :class:`CertExpiryRunner` as its cert source so each scan reflects the current graph. The
-        settings-level CRL and pin files (BACKLOG #299, vault #2223) ride along, since they are fixed for the process."""
+        """The files the expiry monitor watches right now: what :func:`certs_from_registry` reads
+        off the live registry (so a config reload is reflected), then the settings-level CRL and
+        pin files (BACKLOG #299, vault #2223), which are fixed for the process. Passed to the
+        :class:`CertExpiryRunner` as its cert source so each scan reflects the current graph."""
         registry = self._registry_runner.registry if self._registry_runner is not None else None
         certs = certs_from_registry(
             registry, self._api_tls_cert_file, self._api_tls_client_cert_files

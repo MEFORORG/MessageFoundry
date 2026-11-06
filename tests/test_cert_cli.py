@@ -738,6 +738,33 @@ def test_inventory_reports_a_settings_crl_as_a_crl_row(
     assert row["days_remaining"] < 0
 
 
+def test_inventory_reports_the_sqlserver_store_pin_as_a_cert_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Vault BACKLOG #2223 / #3714 item 5: the settings-level rows carry the SQL Server store pin, a
+    # certificate, beside the CRL files. Dropping certs_from_settings from that list would leave the
+    # pin out of the inventory, and no CRL test would notice.
+    state = tmp_path / "state"
+    state.mkdir()
+    pin = tmp_path / "db-server.pem"
+    pin.write_bytes(_pem(_make_cert("mefor-db")[1]))
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text(
+        "[store]\n"
+        f"path = {json.dumps(str(state / 'messagefoundry.db'))}\n"
+        'backend = "sqlserver"\nserver = "db"\ndatabase = "mefor"\nusername = "mefor"\n'
+        f"ssl_root_cert = {json.dumps(str(pin))}\n",
+        encoding="utf-8",
+    )
+    rc = main(["cert", "inventory", "--service-config", str(svc), "--json"])
+    assert rc == 0
+    rows = json.loads(capsys.readouterr().out)["certs"]
+    assert [(r["label"], r["path"], r["kind"]) for r in rows] == [
+        ("store.ssl_root_cert", str(pin), "cert")
+    ]
+    assert rows[0]["subject"] == "CN=mefor-db"
+
+
 def test_inventory_omits_api_tls_without_a_service_config(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

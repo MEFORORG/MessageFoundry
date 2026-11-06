@@ -12239,7 +12239,7 @@ def create_managed_app(
             engine_version=__version__,
             api_tls_cert_file=api_tls_cert_file,
             api_tls_client_cert_files=api_tls_client_cert_files,
-            # BACKLOG #299: the settings-level CRL and pin files, for the same expiry scan.
+            # BACKLOG #299, vault #2223: the settings-level CRL and pin files, for the same scan.
             settings_monitored_files=settings_monitored_files,
             api_listener=api_listener,
             reference_settings=reference_settings,
