@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import threading
+import time
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -131,6 +132,30 @@ async def test_a_close_cancelled_before_it_entered_the_gate_still_runs_inside_it
     await wait_for_entry(rig.log, "conn.close")
     assert rig.log.index("execute:end") < rig.log.index("conn.close"), rig.log
     assert USE_AFTER_FREE not in rig.log, rig.log
+
+
+async def test_a_cancel_the_loop_has_not_yet_called_back_on_still_skips_the_call(
+    rig: _Rig,
+) -> None:
+    """Round 2 of this slice's review: the cancel was first marked by a done callback, which the
+    loop runs on a later turn. Here the statement returns and the commit's task is cancelled in one
+    turn, and the loop stays busy, so the worker takes the lock before any callback runs. Red with
+    the callback mark: the cancelled commit ran. The worker now reads the future's own state."""
+    conn = rig.conn(blocks=always)
+    install_call_gate(conn)
+    cur = await conn.cursor()
+    statement = asyncio.ensure_future(cur.execute(_CLAIM))
+    assert await asyncio.to_thread(rig.started.wait, WAIT), "the statement never started"
+    commit = asyncio.ensure_future(conn.commit())
+    await _waiting_on_the_gate(rig)
+
+    rig.release.set()
+    commit.cancel()
+    time.sleep(0.2)  # noqa: ASYNC251 - deliberately hold the loop: no callback runs meanwhile
+    await cancelled_at_once(commit)
+    await asyncio.wait_for(statement, WAIT)
+    assert "execute:end" in rig.log
+    assert "commit" not in rig.log, rig.log
 
 
 async def test_an_uncancelled_call_waiting_on_the_gate_still_runs(rig: _Rig) -> None:
@@ -246,6 +271,26 @@ async def test_a_second_cancel_during_a_holder_discard_does_not_wait_for_the_clo
     del task
     await _closes_cursor_then_connection_once(rig, conns)
     assert store._claim_holders_discarded_total == 1 and store._claim_holders_open == 0
+
+
+async def test_a_cancel_during_holder_teardown_still_closes_every_holder(rig: _Rig) -> None:
+    """Round 2 of this slice's review: teardown awaited each holder's close in turn, after it had
+    cleared the free lists, so a cancellation during the first close left the rest unclosed. Every
+    close now starts before any is waited on, and the wait never cancels them."""
+    conns: list[AioConn] = []
+    store = _holder_store(rig, conns, blocks=never, block_cursor_close=True)
+    store._claim_holders["ingress"] = [
+        await store._open_claim_holder("ingress"),
+        await store._open_claim_holder("ingress"),
+    ]
+    task = await cancel_once_started(rig.started, store._close_claim_holders())
+    await cancelled_at_once(task)
+    assert store._claim_holders == {} and store._claim_holders_open == 0
+
+    rig.release.set()
+    assert await wait_until(lambda: rig.log.count("conn.close") == 2), rig.log
+    assert USE_AFTER_FREE not in rig.log, rig.log
+    assert rig.log.count("cursor.close") == 2, rig.log
 
 
 async def test_an_ordinary_holder_open_and_claim_close_nothing(rig: _Rig) -> None:

@@ -222,21 +222,6 @@ async def test_a_cancelled_source_mark_frees_nothing_until_its_statement_returns
     assert rig.log.index("autocommit:end") < rig.log.index("execute:start"), rig.log
 
 
-async def test_an_ungated_connections_handles_are_freed_on_a_worker() -> None:
-    """An ungated connection is discarded unclosed, so pyodbc's free of it, a rollback and a
-    disconnect, runs wherever its last reference drops. ``_free_on_a_worker`` makes that a worker
-    thread, never the event loop (CLAUDE.md section 6)."""
-    freed_on: list[str] = []
-
-    class _Handle:
-        def __del__(self) -> None:
-            freed_on.append(threading.current_thread().name)
-
-    database._free_on_a_worker(_Handle())
-    assert await wait_until(lambda: bool(freed_on)), "the handle was never freed"
-    assert freed_on != [threading.current_thread().name], freed_on
-
-
 async def test_a_send_cancelled_while_its_cursor_is_made_waits_for_that_call(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:

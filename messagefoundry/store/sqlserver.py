@@ -3778,13 +3778,16 @@ class SqlServerStore:
         """Teardown: close every retained claim holder and mark the holder set CLOSED (idempotent;
         store close). A holder borrowed by an in-flight claim is not in the free lists — the
         closed flag makes its return path discard (close) it instead of re-retaining it. Each holder
-        leaves through the one-shot exit :meth:`_discard_claim_holder` uses (BACKLOG #2394)."""
+        leaves through the one-shot exit :meth:`_discard_claim_holder` uses (BACKLOG #2394). Every
+        close is started before any is waited on, and the wait never cancels them, so a
+        cancellation during teardown leaves no holder unclosed behind the one it interrupted."""
         self._claim_holders_closed = True
         holders = [h for lst in self._claim_holders.values() for h in lst]
         self._claim_holders.clear()
-        for holder in holders:
-            self._claim_holders_open -= 1
-            await _close_one_shot(holder.conn, holder.cur)  # logs a close failure itself
+        self._claim_holders_open -= len(holders)
+        closes = [asyncio.ensure_future(_close_one_shot(h.conn, h.cur)) for h in holders]
+        if closes:
+            await asyncio.wait(closes)  # each close logs its own failure
 
     # --- PHI-at-rest cipher seam for nullable text columns (mirrors MessageStore._enc/_dec) -----
     # Used for summary/metadata (EF-3) and error/last_error/event.detail (H4). null/empty-safe: a NULL

@@ -82,13 +82,27 @@ def drop_handle(conn: Any) -> Any:
 
 
 class _Call:
-    """One call :meth:`CallGate.submit` handed to aioodbc. ``abandoned`` is written on the loop and
-    read on the worker thread, both under the gate's ``_state`` lock."""
+    """One call :meth:`CallGate.submit` handed to aioodbc: the future its caller awaits, once
+    ``submit`` has it. The worker thread reads that future's state; it never changes it."""
 
-    __slots__ = ("abandoned",)
+    __slots__ = ("fut",)
 
     def __init__(self) -> None:
-        self.abandoned = False
+        self.fut: Any = None
+
+    def cancelled(self) -> bool:
+        """Whether the caller's future was cancelled. A plain read of the future's state, which
+        the loop sets in ``Future.cancel()`` itself, so it holds from the moment the awaiting task
+        is cancelled, before any callback runs. ``None`` until ``submit`` has the future: nothing
+        can have cancelled a future its caller does not hold yet."""
+        fut = self.fut
+        cancelled = getattr(fut, "cancelled", None)
+        return callable(cancelled) and cancelled() is True
+
+
+#: The pyodbc calls that can return a NEW cursor: ``Connection.cursor``, ``Connection.execute``.
+#: ``Cursor.execute`` shares the second name and returns its own cursor, which is told apart below.
+_CURSOR_MAKERS = frozenset({"cursor", "execute"})
 
 
 def _close_orphaned_cursor(func: Callable[..., Any], result: Any) -> None:
@@ -99,7 +113,10 @@ def _close_orphaned_cursor(func: Callable[..., Any], result: Any) -> None:
     after its connection closed: the native-abort shape ``tests/_live_scratch.py`` records. The
     result is the key, not the call's name: of what pyodbc returns, only a cursor has ``close``, and
     a NEW one is any but the call's own (``Cursor.execute`` returns its cursor, which is its owner's
-    to close). Never raises."""
+    to close). Only the two calls that make one are read, so a call reached through a wrapper with
+    no ``__self__`` never closes a cursor its owner still holds. Never raises."""
+    if getattr(func, "__name__", None) not in _CURSOR_MAKERS:
+        return
     if result is None or result is getattr(func, "__self__", None):
         return
     close = getattr(result, "close", None)
@@ -141,8 +158,9 @@ class CallGate:
     close could win, and the call then ran on the handle it had freed, or on a connection already
     lent to its next borrower. Now a call whose awaiting future was cancelled before it entered
     never runs, as an executor already skips one it cancels before a worker takes it: nothing
-    awaits its result, and the cancelled task's cleanup reads the gate after the mark is made
-    (:meth:`submit` says why). A ``close`` is the exception: it still runs, inside the gate,
+    awaits its result. The worker reads the future's own state, which ``Future.cancel()`` sets at
+    once, and reads it under ``_state``, where a cleanup reads whether a call is running, so the
+    two always agree (:class:`_Call`). A ``close`` is the exception: it still runs, inside the gate,
     because skipping it would leave its handle for aioodbc's ``__del__`` or the collector, outside
     the gate; a close of a handle a cleanup already closed only fails, and nobody awaits that. One
     that had entered runs to its end, and a cursor it makes is closed as it returns, since nobody
@@ -174,31 +192,23 @@ class CallGate:
         bound ``_execute``, which hands the call to its executor. :func:`install_call_gate` installs
         this in its place.
 
-        The call is marked abandoned when the future ``execute`` returns is cancelled, which is
-        what a cancellation of the task awaiting it does. That mark is a done callback added here,
-        before the caller awaits the future, so the loop runs it before the cancelled task resumes:
-        any cleanup that task runs reads the gate with the mark already made. A future with no
-        ``add_done_callback`` (a stand-in's) is not tracked, and its calls run as :meth:`run`'s do.
+        The call counts as abandoned once the future ``execute`` returns is cancelled, which is
+        what a cancellation of the task awaiting it does (:class:`_Call`). A future with no
+        ``cancelled`` (a stand-in's) is never abandoned, and its calls run as :meth:`run`'s do.
         """
         call = _Call()
-        fut = execute(self._run, call, func, *args, **kwargs)
-        add_done_callback = getattr(fut, "add_done_callback", None)
-        if callable(add_done_callback):
-            add_done_callback(partial(self._abandon_if_cancelled, call))
+        call.fut = fut = execute(self._run, call, func, *args, **kwargs)
         return fut
-
-    def _abandon_if_cancelled(self, call: _Call, fut: Any) -> None:
-        """On the loop: mark ``call`` abandoned once its awaiting future was cancelled."""
-        if fut.cancelled():
-            with self._state:
-                call.abandoned = True
 
     def _run(
         self, call: _Call | None, func: Callable[..., Any], /, *args: Any, **kwargs: Any
     ) -> Any:
+        skip = call if call is not None and _skippable(func) else None
+        if skip is not None and skip.cancelled():
+            return None  # before the lock too, so a skip never parks a worker behind a long call
         with self._lock:
             with self._state:
-                if call is not None and call.abandoned and _skippable(func):
+                if skip is not None and skip.cancelled():
                     # Cancelled before it entered: nobody awaits it, so it never runs.
                     return None
                 self._running = True
@@ -209,7 +219,7 @@ class CallGate:
             finally:
                 with self._state:
                     self._running = False
-                    orphaned = call is not None and call.abandoned
+                    orphaned = call is not None and call.cancelled()
                     after = self._after
                     if after:  # a new list only after a hand-off, not on every call
                         self._after = []

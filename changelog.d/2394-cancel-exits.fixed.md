@@ -6,7 +6,8 @@
   DATABASE borrow cancelled while its cursor was being made now goes back to its pool only once that
   call has returned. A cancelled DATABASE borrow on a connection the gate could not wrap no longer
   closes its cursor beside the running statement: the connection is discarded unclosed, and the
-  driver frees it on a worker thread once the statement returns. The SQL Server store's dedicated
+  driver frees it once the statement returns and nothing else holds it, which can be on the event
+  loop. The SQL Server store's dedicated
   claim connections now leave as the open-time connections do: a cancelled open hands the
   connection to the gate without waiting for the running driver call, the discard after a cancelled
   claim no longer waits for the claim statement itself, and a second cancellation during an

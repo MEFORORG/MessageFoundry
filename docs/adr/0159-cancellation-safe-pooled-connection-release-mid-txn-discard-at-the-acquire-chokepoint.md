@@ -641,15 +641,17 @@ the next reader does not re-derive the wrong precedent from the same comment.
   open* above are superseded, and a cancelled statement on a connection with no gate no longer
   returns it.** The gate now tracks a call from the moment aioodbc submits it. A call whose
   awaiting future was cancelled before it took the gate's lock never runs, as an executor already
-  skips one it cancels before a worker takes it, so no close races it; a cancelled close is the
+  skips one it cancels before a worker takes it, so no close races it. The worker reads the
+  future's own cancelled state, which `Future.cancel()` sets at once. A cancelled close is the
   exception, and still runs inside the gate. A call that had entered runs to its end, and a new
   cursor it returns is closed by the gate as it returns, before any job or connection close handed
   to it. A DATABASE borrow cancelled
   during `conn.cursor()` hands its rollback to that call, so its connection goes back only once the
   call has returned. A cancelled DATABASE borrow on a connection with no gate drops its handle and
   closes nothing: the pool gets it back closed, and pyodbc frees the cursor, then the connection,
-  once nothing uses them, since a pyodbc cursor holds its connection; the engine's last references
-  to both are dropped on a worker thread, so that free never runs on the event loop. Its session
+  once nothing uses them, since a pyodbc cursor holds its connection. That free rolls back and
+  disconnects wherever the last reference drops, which can be the event loop, for one through the
+  cancelled call's own result; that is the trade for not freeing them under the call. Its session
   ends only then. The SQL Server store's claim holder now leaves through the one-shot exits the
   open-time probes use: a cancelled open and the discard after a cancelled claim hand the
   connection and cursor to the gate with no await, and an ordinary discard waits on a close a
