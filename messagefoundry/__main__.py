@@ -7081,7 +7081,9 @@ def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseExcep
         print(
             f"WARNING: the store could not be created, and it may already have been started "
             f"under the store key minted for it, so that key is kept in {path}. No Administrator "
-            f"was provisioned into it. {keep_the_key_step()}",
+            "was provisioned into it. Keep that file and run the command again: if the store was "
+            "started under that key, it carries on with it, and if not, it names a way on that "
+            "keeps the file",
             file=sys.stderr,
         )
         return
@@ -7097,7 +7099,10 @@ def _discard_minted_custody(path: Path, store: StoreSettings, failure: BaseExcep
     except OSError as exc:
         print(
             f"WARNING: the store could not be created, and the store key minted for it in {path} "
-            f"could not be removed ({exc.strerror or type(exc).__name__}). {keep_the_key_step()}",
+            f"could not be removed ({exc.strerror or type(exc).__name__}). This run minted it and "
+            "nothing was written under it, so it is no store's key and the recovery key shown "
+            "opens nothing; while it is there, a run here stops at it rather than mint over it. "
+            f"{keep_the_key_step(store, new_store=True)}",
             file=sys.stderr,
         )
 
@@ -8470,16 +8475,18 @@ def _provision_open_refusal(exc: BaseException, store: StoreSettings) -> str:
     return f"{_sentence(codec_safe_str(exc))} {tail}"
 
 
-def _never_started_refusal() -> str:
+def _never_started_refusal(store: StoreSettings, service_account: str | None) -> str:
     """``provision-admin``'s text when the host blob here opens a store whose audit chain was
     never started (PR 2804 hold 2 and fourth hold): a mint that failed before its genesis record,
     or a blob another store in a shared directory owns. The engine cannot tell which, so the text
-    keeps the key and names the one way on. Names no key."""
+    keeps the key and the store and gives the fallback way on. Names no key."""
     from messagefoundry.store.custody_host import keep_the_key_step
 
+    step = keep_the_key_step(store, new_store=True, service_account=service_account)
     return (
         "the store's audit chain was never started, and only the run that minted this store's "
-        f"key, holding its recovery wrap, may start it. {keep_the_key_step()}"
+        "key, holding its recovery wrap, may start it. The engine cannot tell whose key the host "
+        f"blob here holds, so it leaves it and the store in place. {step}"
     )
 
 
@@ -8821,15 +8828,23 @@ def _provision_admin(args: argparse.Namespace) -> int:
             ):
                 # On a server the probe refused only a store with a genesis record or with data.
                 held = "exists" if settings.store.backend is StoreBackend.SQLITE else "holds data"
+                step = keep_the_key_step(
+                    settings.store, new_store=True, service_account=args.service_account
+                )
                 raise HostCustodyRefused(
                     f"the store already {held}, and {missing}. A new key cannot open a store "
-                    f"another key made. {keep_the_key_step()}"
+                    "another key made: run with the custody directory that holds the store's host "
+                    "blob, MEFOR_SECRETS_DIRECTORY set as the store's service has it, or unset for "
+                    "a SQLite store whose blob sits beside its file. If that blob is lost, the "
+                    f"store stays in place. {step}"
                 ) from missing
             absent, exists = True, None
         except StoreChainNeverStarted as unstarted:
             # A mint that failed before its genesis record kept its key file (PR 2804 hold 2), or
             # the blob here is another store's: the engine cannot tell, so the key is kept.
-            raise HostCustodyRefused(_never_started_refusal()) from unstarted
+            raise HostCustodyRefused(
+                _never_started_refusal(settings.store, args.service_account)
+            ) from unstarted
         if host_custody and absent:
             # Checked before the prompts, so a refused or repeated mint asks for nothing. The mint
             # itself, and the recovery key it shows, come last, once nothing else can refuse.

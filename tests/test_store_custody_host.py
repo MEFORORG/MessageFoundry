@@ -218,8 +218,11 @@ async def test_a_host_blob_refuses_every_other_key_provider(tmp_path: Path, name
     settings = _settings(tmp_path, key_provider="auto", encryption_key_file="k.bin")
     refusal = foreign_custody_refusal(settings, environ={})
     assert refusal is not None and name in refusal and "'auto'" in refusal
-    # PR 2804 fifth hold: the file may be another store's only key, so the way on leaves it.
-    assert not _advises_changing(refusal) and custody_host.keep_the_key_step() in refusal, refusal
+    # PR 2804 sixth hold: the setting-only fix first, then the fallback, which leaves the file.
+    assert "set [store].key_provider = 'host' and remove every other store key setting" in refusal
+    assert not _advises_changing(refusal), refusal
+    assert custody_host.keep_the_key_step(settings, new_store=False) in refusal, refusal
+    assert "mints this store's key" not in refusal, refusal  # only the host provider mints
     with pytest.raises(HostCustodyRefused, match=name):
         await open_store(settings, create=True)
     assert not (tmp_path / "store.db").exists()
@@ -283,7 +286,8 @@ def test_a_second_mint_over_an_existing_file_is_file_exists(tmp_path: Path, name
     assert console.shown == []  # refused before anything was minted or shown
     # PR 2804 fourth hold, item 5: a way on that keeps the file, which may be another store's key.
     text = str(refused.value)
-    assert not _advises_changing(text) and custody_host.keep_the_key_step() in text, text
+    assert not _advises_changing(text) and "leaves it in place" in text, text
+    assert custody_host.keep_the_key_step(_settings(tmp_path), new_store=False) in text, text
 
 
 @windows_only
@@ -591,9 +595,13 @@ def test_the_crash_rule_refuses_a_handoff_naming_another_store(tmp_path: Path) -
     with pytest.raises(HostCustodyRefused, match="not this store's") as excinfo:
         load_host_custody(_settings(tmp_path), enforcing=True, environ={})
     assert (tmp_path / "handoff.key").exists()
-    # PR 2804 fifth hold: another store's handoff may be its only key, so the way on leaves it.
+    # PR 2804 sixth hold: the stray handoff moves out of the custody directory, so the secrets
+    # directory's name check never sees it, to a path that does not exist yet, so it overwrites
+    # nothing. The guard allows that one sentence and nothing else.
     text = str(excinfo.value)
-    assert not _advises_changing(text) and custody_host.keep_the_key_step() in text, text
+    move = f"move it out of {tmp_path} to a path outside that directory that does not exist yet"
+    assert move in text and ".aside" not in text, text
+    assert not _advises_changing(text, allowed=(move,)), text
     assert not _leaks(str(excinfo.value), blob) and not _leaks(str(excinfo.value), other)
 
 
@@ -1148,6 +1156,12 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absen
         # leaves the store in place.
         assert "the store already holds data" in err and not _advises_changing(err), err
         assert "cannot tell whether the store holds anything" not in err, err
+        flat = " ".join(err.split())
+        assert "run with the custody directory that holds the store's host blob" in flat, err
+        # A server backend: the other secret files are carried over, and the external schema is
+        # provisioned first.
+        assert "new, empty" not in flat and "Copy into it every other secret file" in flat, err
+        assert "a new database, whose schema a DDL-capable login provisions first" in flat, err
     assert driver_text not in err
     assert list(secrets.iterdir()) == []  # no host blob, no handoff
 
@@ -1234,21 +1248,55 @@ async def _never_started_pin_text(directory: Path) -> str:
     return str(refused.value)
 
 
-def _advises_changing(text: str) -> bool:
+#: Phrases the guard takes out first: one reports what failed, and one changes only a setting.
+_NOT_CHANGING_WHAT_EXISTS = (
+    "could not be removed",
+    "remove every other store key setting",
+)
+
+
+def _advises_changing(text: str, *, allowed: tuple[str, ...] = ()) -> bool:
     """Whether ``text`` advises moving, renaming, removing, deleting or overwriting something
-    (PR 2804 fifth hold), passive forms included. "could not be removed" reports what failed and
-    advises nothing, so it is the one phrase taken out first."""
-    return _CHANGING.search(text.replace("could not be removed", "")) is not None
+    (PR 2804 fifth hold), passive forms included. The phrases in ``_NOT_CHANGING_WHAT_EXISTS``,
+    and a caller's own provably safe step in ``allowed``, are taken out first."""
+    for phrase in (*_NOT_CHANGING_WHAT_EXISTS, *allowed):
+        text = text.replace(phrase, "")
+    return _CHANGING.search(text) is not None
 
 
-def test_the_keep_the_key_step_names_the_variable_the_engine_reads() -> None:
+def test_the_keep_the_key_step_names_the_variable_the_engine_reads(tmp_path: Path) -> None:
     # The step writes the variable's name as a literal (CodeQL alert 315), so pin it to the
     # constant the engine reads.
     from messagefoundry.engine_secrets import SECRETS_DIRECTORY_VARIABLE
 
-    assert f"set {SECRETS_DIRECTORY_VARIABLE} to a new, empty directory" in (
-        custody_host.keep_the_key_step()
+    step = custody_host.keep_the_key_step(_settings(tmp_path), new_store=True)
+    assert f"named by {SECRETS_DIRECTORY_VARIABLE} here" in step
+
+
+@pytest.mark.parametrize("backend", [StoreBackend.SQLITE, StoreBackend.POSTGRES])
+def test_the_fallback_step_fits_the_backend_and_the_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: StoreBackend
+) -> None:
+    # PR 2804 sixth hold, item 2: no backend is told to empty its secrets directory, a server
+    # backend under external schema management is told to provision the schema first, the
+    # command keeps --service-account, a Windows run is told about it, and the recovery key is
+    # paired with its key file.
+    settings = _settings(tmp_path).model_copy(update={"backend": backend})
+    step = custody_host.keep_the_key_step(settings, new_store=True, service_account="svc-mefor")
+    assert "empty" not in step and "Copy into it every other secret file" in step, step
+    assert "`messagefoundry provision-admin --service-account svc-mefor`" in step, step
+    assert "the recovery key shown when an existing key file was minted goes with that file" in step
+    schema = "whose schema a DDL-capable login provisions first"
+    assert (schema in step) is (backend is StoreBackend.POSTGRES), step
+    assert ("a new database" in step) is (backend is StoreBackend.POSTGRES), step
+    monkeypatch.setattr(sys, "platform", "win32")
+    windows = custody_host.keep_the_key_step(settings, new_store=False)
+    assert "add --service-account with that account" in windows, windows
+    assert "Point [store]" not in windows, windows
+    auto = custody_host.keep_the_key_step(
+        settings.model_copy(update={"key_provider": "auto"}), new_store=False
     )
+    assert "provision-admin" not in auto and "run the command again" in auto, auto
 
 
 @host_file_platforms
@@ -1302,11 +1350,13 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         environ={},
     )
     assert foreign is not None
-    texts += [cli._never_started_refusal(), foreign]
+    texts += [cli._never_started_refusal(settings, None), foreign]
     with pytest.raises(FileExistsError) as exists:
         custody_host.mint_target(settings, service_account=None, enforcing=False, environ={})
     texts.append(str(exists.value))
-    server = StoreSettings().model_copy(update={"backend": StoreBackend.POSTGRES})
+    server = StoreSettings().model_copy(
+        update={"backend": StoreBackend.POSTGRES, "key_provider": "host"}
+    )
     kept = tmp_path / "kept.key"
     kept.write_bytes(b"k")
     cli._discard_minted_custody(kept, server, StoreIdPinRefused("after the salt bind"))
@@ -1320,12 +1370,16 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         cli._discard_minted_custody(kept, server, StoreIdPinRefusedBeforeWrite("before"))
     held = capsys.readouterr().err
     assert "could not be removed" in held, held
+    # PR 2804 sixth hold: this run minted that key and nothing was written under it.
+    assert "This run minted it and nothing was written under it" in held, held
+    assert "cannot tell whose key" not in held, held
     texts.append(held)
     assert all(text.count("WARNING:") == 1 for text in texts[-2:]), texts[-2:]
     offending = [text for text in texts if _advises_changing(text)]
     assert not offending, offending
+    # Every text names a way on: provision-admin, the fallback, or the re-run in place.
     for text in texts:
-        assert custody_host.keep_the_key_step() in text, text
+        assert "provision-admin" in text or "run the command again" in text, text
 
 
 async def _failed_create(
@@ -1403,7 +1457,9 @@ def test_a_rerun_over_a_chain_never_started_keeps_the_key_file(
     assert kept.exists()
     # PR 2804 fifth hold: the one way on, which creates only new things.
     assert not _advises_changing(err), err
-    assert " ".join(custody_host.keep_the_key_step().split()) in " ".join(err.split()), err
+    step = custody_host.keep_the_key_step(settings, new_store=True)
+    assert " ".join(step.split()) in " ".join(err.split()), err
+    assert "leaves it and the store in place" in err, err
 
 
 @host_file_platforms
@@ -1434,8 +1490,8 @@ def test_a_shared_secrets_directory_never_names_another_stores_key_for_removal(
     code = _run_provision_admin(tmp_path, monkeypatch, b_path)
     assert code == 2
     err = capsys.readouterr().err
-    assert not _advises_changing(err) and "leaves it in place" in err, err
-    assert "MEFOR_SECRETS_DIRECTORY to a new, empty directory" in " ".join(err.split()), err
+    assert not _advises_changing(err) and "leaves it and the store in place" in err, err
+    assert "named by MEFOR_SECRETS_DIRECTORY here" in " ".join(err.split()), err
     assert kept.exists()
     # B's pre-check was refused before its first write, so nothing was bound under A's key.
     import sqlite3
@@ -1471,9 +1527,7 @@ def test_the_way_on_a_never_started_refusal_names_lets_the_mint_go_ahead(
     _mint(settings)
     kept = tmp_path / custody_host.HOST_FILE_NAME
     assert _run_provision_admin(tmp_path, monkeypatch, store_path) == 2
-    assert "MEFOR_SECRETS_DIRECTORY to a new, empty directory" in " ".join(
-        capsys.readouterr().err.split()
-    )
+    assert "named by MEFOR_SECRETS_DIRECTORY here" in " ".join(capsys.readouterr().err.split())
     left = {path: path.read_bytes() for path in (kept, store_path)}
     secrets = tmp_path / "new-secrets"
     secrets.mkdir()
@@ -1514,7 +1568,8 @@ async def test_a_pinned_open_over_a_chain_never_started_removes_nothing(tmp_path
     with pytest.raises(StoreChainNeverStarted) as refused:
         await open_store(settings, custody=blob)
     text = str(refused.value)
-    assert not _advises_changing(text) and custody_host.keep_the_key_step() in text, text
+    assert not _advises_changing(text) and "provision-admin" in text, text
+    assert "keep it and the store" in text, text
 
 
 @host_file_platforms
@@ -1546,15 +1601,45 @@ def test_a_minted_key_is_kept_when_the_pin_refused_after_a_write(
     kept.write_bytes(b"k")
     cli._discard_minted_custody(kept, server, StoreIdPinRefused("after the salt bind"))
     assert kept.exists()
-    # PR 2804 fourth and fifth holds: whether a store holds anything under the key is not proved
-    # here, so the text keeps it and gives the one way on.
+    # PR 2804 fourth and sixth holds: whether the store holds anything under the key is not
+    # proved here, so the text keeps it and sends the operator to the re-run in place, which
+    # carries on with a store started under it or names a way on. This run minted the key, so the
+    # text does not call it possibly another store's.
     warning = capsys.readouterr().err
-    assert not _advises_changing(warning), warning
-    assert str(kept) in warning and custody_host.keep_the_key_step() in warning, warning
+    assert str(kept) in warning and "run the command again" in warning.lower(), warning
+    assert "remove" not in warning.lower(), warning
+    assert "another store's" not in warning, warning
+    assert not _advises_changing(warning) and "cannot tell whose key" not in warning, warning
     removed = tmp_path / "removed.key"
     removed.write_bytes(b"k")
     cli._discard_minted_custody(removed, server, StoreIdPinRefusedBeforeWrite("before"))
     assert not removed.exists()
+
+
+def test_a_minted_key_that_cannot_be_removed_is_named_as_this_runs_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # PR 2804 sixth hold: nothing was written under the key this run minted, so the warning says
+    # so rather than that the engine cannot tell whose key it is, and gives the fallback way on.
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
+
+    server = StoreSettings().model_copy(
+        update={"backend": StoreBackend.POSTGRES, "key_provider": "host"}
+    )
+    kept = tmp_path / "kept.key"
+    kept.write_bytes(b"k")
+
+    def _held(self: Path, missing_ok: bool = False) -> None:
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(Path, "unlink", _held)
+    cli._discard_minted_custody(kept, server, StoreIdPinRefusedBeforeWrite("before"))
+    warning = capsys.readouterr().err
+    assert "This run minted it and nothing was written under it" in warning, warning
+    assert "the recovery key shown opens nothing" in warning, warning
+    assert "cannot tell whose key" not in warning and not _advises_changing(warning), warning
+    assert "Copy into it every other secret file" in " ".join(warning.split()), warning
 
 
 @host_file_platforms

@@ -211,8 +211,10 @@ def foreign_custody_refusal(
         return None
     return (
         f"{' and '.join(found)} is in {directory}, but [store].key_provider is "
-        f"{settings.key_provider!r}, and a store with a host blob takes its key from that blob "
-        f"only. {keep_the_key_step()}"
+        f"{settings.key_provider!r}. A store with a host blob takes its key from that blob only: "
+        "if it holds this store's key, set [store].key_provider = 'host' and remove every other "
+        "store key setting. The engine cannot tell whether it does, so it leaves the file in "
+        f"place. {keep_the_key_step(settings, new_store=False)}"
     )
 
 
@@ -310,7 +312,9 @@ def _settle_left_handoff(handoff: Path, blob: HostBlob) -> None:
             raise CustodyError(
                 f"it names store id {left.store_id.hex()} and the host file names "
                 f"{blob.store_id.hex()}, or it holds another key, so it is not this store's. "
-                f"{keep_the_key_step()}"
+                "It may be another store's only key, so keep the file: move it out of "
+                f"{handoff.parent} to a path outside that directory that does not exist yet, "
+                "then start again"
             )
 
     try:
@@ -542,22 +546,49 @@ async def store_holds_data(store: Store) -> bool:
 # --- the mint -------------------------------------------------------------------------------------
 
 
-def keep_the_key_step() -> str:
-    """The one way on for every path that meets a key file or store it cannot tie to this store
-    (PR 2804 fifth hold): it advises changing no existing file, key, blob or store, and asks for a
-    new custody directory and a new store location, which changes the two settings that name
-    them. Names no path and no key."""
+def keep_the_key_step(
+    settings: StoreSettings, *, new_store: bool, service_account: str | None = None
+) -> str:
+    """A fallback way on, after a caller's own remedy, at least for the paths that meet a key file
+    or store they cannot tie to this store (PR 2804 fifth and sixth holds). It advises changing no
+    existing file, key, blob or store: it asks for a new custody directory, and with ``new_store`` a
+    new store location, which changes the settings that name them. Names no path and no key."""
+    from messagefoundry.config.settings import SchemaManagement, StoreBackend
+
+    server = settings.backend is not StoreBackend.SQLITE
     # The variable is named here as a literal, not through SECRETS_DIRECTORY_VARIABLE: this text
-    # reaches stderr, and CodeQL's name heuristic reads that constant as a secret (alert 315).
+    # can reach stderr, and CodeQL's name heuristic reads that constant as a secret (alert 315).
+    text = (
+        "To go on without it, give this store a custody directory of its own: a new directory, "
+        "named by MEFOR_SECRETS_DIRECTORY here and in this store's own service environment, never "
+        "in one that another store's service also reads, since that store would then look for its "
+        "key there. Copy into it every other secret file the current secrets directory holds, if "
+        "one is set, since the service reads its other secrets from there too"
+    )
+    if new_store:
+        text += ". Point [store] at a store location of its own: " + (
+            "a new database" if server else "a new SQLite path"
+        )
+        if server and settings.resolved_schema_management() is SchemaManagement.EXTERNAL:
+            text += (
+                ", whose schema a DDL-capable login provisions first ([store].schema_management "
+                "= 'external'; DEPLOY-SERVER-DB.md section 2)"
+            )
+    if settings.key_provider == HOST_PROVIDER:
+        command = "messagefoundry provision-admin"
+        if service_account is not None:
+            command += f" --service-account {service_account}"
+        text += f". Then run `{command}`, which mints this store's key there"
+        if service_account is None and sys.platform == "win32":
+            text += (
+                "; to mint it for the service's account rather than your own, add "
+                "--service-account with that account"
+            )
+    else:
+        text += ". Then run the command again"
     return (
-        "The engine cannot tell whose key any host blob or handoff already in this store's "
-        "custody directory holds, so it leaves it in place, and the store too. To provision this "
-        "store, give it a custody directory and a store location of its own: set "
-        "MEFOR_SECRETS_DIRECTORY to a new, empty directory, here and in this store's own service "
-        "environment, never in one that another store's service also reads, since that store "
-        "would then look for its key there; and point [store] at a new SQLite path or, on a "
-        "server backend, a new database. Then run `messagefoundry provision-admin`, which mints "
-        "this store's key there. Nothing left in place is carried over to the new store"
+        f"{text}. Nothing is carried over to a new key, and the recovery key shown when an "
+        "existing key file was minted goes with that file, not with a key minted after it"
     )
 
 
@@ -579,7 +610,9 @@ def mint_target(
         if os.path.lexists(path):
             raise FileExistsError(
                 f"{path} already exists, so a store key was already minted here; a second mint "
-                f"is never made over it. {keep_the_key_step()}"
+                "is never made over it. The engine cannot tell whose key it holds, so it leaves "
+                "it in place. "
+                f"{keep_the_key_step(settings, new_store=False, service_account=service_account)}"
             )
     if service_account is None:
         # What the write refuses for this account, asked now: the shared and non-local accounts
