@@ -375,9 +375,11 @@ icacls "C:\ProgramData\MessageFoundry" /grant "NT SERVICE\MessageFoundry:(OI)(CI
 A domain **gMSA** or a dedicated local user works the same way (pass `-ServiceAccountPassword`
 for a password-based account — it's taken as a `SecureString`). In a data directory the installer
 hardened, the store shares its files with SYSTEM, Administrators and that account; see *A SQLite
-store in the data directory admits one named account*, below. Anywhere else, the engine removes
-each store file's inherited entries at runtime and grants full control to the account the
-environment names (`USERNAME`); explicit entries a file already carries are kept.
+store in the data directory admits one named account*, below. Anywhere else, the engine tries at
+runtime to remove each store file's inherited entries and grant full control to the account the
+process environment names, normally `USERNAME`; other principals' explicit entries a file already
+carries are kept. Where it cannot, the file keeps its inherited entries and the engine logs a
+WARNING, so the directory's own ACL is the backstop.
 
 **gMSA preflight + "Log on as a service" (#99).** When `-ServiceAccount` names a **gMSA** (a name ending
 in `$`, e.g. `CORP\mefor-svc$`), the installer runs `Test-ADServiceAccount` first (verifying the account
@@ -494,10 +496,10 @@ At least these are unmeasured:
   expected to resolve as a user. If it resolves as anything else, the WARNING names that type.
 - **A start with no domain controller.** A gMSA resolves through a domain controller, or through
   the local lookup cache when no controller answers, and a slow or absent controller can delay
-  the open or fail the lookup. A failed lookup gives that start the owner-only store, with a
-  WARNING. Why a time-out can read as an account that does not exist, what the owner-only store
-  leaves on each file, and how a later start recovers are stated once, in ADR 0163,
-  *Note (2026-11-05)*, *Left open*.
+  the open or fail the lookup. A later start does not always repair what a failed lookup leaves.
+  Why a time-out can read as an account that does not exist, what the owner-only store leaves on
+  each file, and why an elevated open with the lookup working can be the only repair are stated
+  once, in ADR 0163, *Note (2026-11-05)*, *Left open*.
 
 The rule and its reasons are in ADR 0163, *Note (2026-11-05)*.
 
