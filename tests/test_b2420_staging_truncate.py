@@ -937,7 +937,13 @@ def test_the_refusal_names_every_marker_redaction_writes(
         "was rewritten by redaction and is not the directory's path, so run no command here"
     )
     assert warning in refusal
+    # Each marker the warning names is the one its writer still writes.
+    from messagefoundry import redaction
+    from messagefoundry.support.redact import REDACTION_PLACEHOLDER
+
     assert CREDENTIAL_PLACEHOLDER == "<redacted>"
+    assert redaction._REDACTED == "[redacted]"
+    assert REDACTION_PLACEHOLDER == "[REDACTED]"
     scrubbed = scrub_credentials(refusal)
     assert warning in scrubbed
     assert "pwd=<redacted>" in scrubbed.split("\n")[-1]
@@ -947,12 +953,16 @@ def test_the_check_is_a_two_step_control(tmp_path: Path, monkeypatch: pytest.Mon
     """A False alone is the same whether the directory is gone or the line names nothing. Red before
     the fix: the check was run only after the removal."""
     refusal = _refusal_for("mefor-backup-x%PATH% ", tmp_path, monkeypatch)
-    first = refusal.index("first run the Test-Path line that ends this text, which must print True")
-    assert (
-        "since a False means that line names nothing and checks nothing, so run nothing more"
-        in (refusal)
+    first = refusal.index(
+        "first run the Test-Path line that comes right after this text and names this same path; "
+        "it must print True"
+    )
+    stop = refusal.index(
+        "a False means that line does not reach this directory, whether it is gone, cannot be read "
+        "or is named wrong, so run nothing more; only after a True, remove it with this command:"
     )
     removal = refusal.index("Remove-Item -LiteralPath")
+    assert first < stop < removal
     again = refusal.index("then run that Test-Path line again, which must print False and no error")
     assert first < removal < again
 
@@ -977,7 +987,7 @@ def test_the_test_path_command_is_alone_on_the_last_line(
 def test_a_caller_that_appends_starts_its_text_on_a_line_of_its_own(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Every caller that appends to a leftover goes through `_then`. Red before the fix: the
+    """At least the appends in `dr_backup` go through `_then`. Red before the fix: the
     callers wrote `; the run failed: ...` or `; the build failed: ...` straight after it, so a copy
     of the command to its line's end ran that text too. Any other leftover keeps its separator."""
     name = "mefor-backup-x."
@@ -1088,8 +1098,12 @@ def test_the_plain_path_ban_survives_the_failure_records_cut_on_the_verify_route
     # The backup's own wrapping of a verify that did not pass (`_verify_and_publish`).
     error = dr_backup.BackupError(
         "verify",
-        f"restore-verify {result.status}: {result.reason} (kept for diagnosis as synthetic.mfbak; "
-        "it holds no retention slot, and nothing in the engine expires it)",
+        dr_backup._then(
+            f"restore-verify {result.status}: {result.reason}",
+            " ",
+            "(kept for diagnosis as synthetic.mfbak; it holds no retention slot, and nothing in "
+            "the engine expires it)",
+        ),
     )
     assert "never remove it by its plain path" in safe_exc(error)
 

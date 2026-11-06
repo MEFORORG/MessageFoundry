@@ -2441,11 +2441,17 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
     names any trailing dot or space in words, and names ``Remove-Item -LiteralPath`` and
     ``Test-Path -LiteralPath`` on that literal as the only removal and its check. The check is a
     two-step control: the same ``Test-Path`` line prints ``True`` before the removal and ``False``
-    after, since a ``False`` before it means the line names nothing and checks nothing. That line
-    ends the text, alone on a line of its own, and :func:`_then` keeps it so at every caller that
-    appends after it. On a surface that escapes a line break, the log line among them, it is still
-    the last thing in the record. The ``Remove-Item`` command is set off by a colon before it and a
-    `` ;`` after it. No ``cmd.exe`` form is given: interactive ``cmd.exe`` expands ``%VAR%`` even
+    after, since a ``False`` before it cannot tell a line that names nothing from a directory that
+    is gone or cannot be read. The text points at that line as the one right after it that names
+    the same path, not as the one that ends the message, since a caller can append a second
+    refusal. The line ends this text, alone on a line of its own. At least the appends in this
+    module, to the run's and the build's errors and to ``_verify_and_publish``'s, go through
+    :func:`_then`, which starts the appended text on a new line. Not every caller does:
+    ``pipeline/dr.py``'s cold-seed restore-verify aborts append after a verify's reason directly.
+    A surface that escapes a line break, as the log does, shows it as a literal backslash-n, so
+    the line is not a line of its own there: appended text follows on the same physical line, and
+    a traceback block prefixes each line. The ``Remove-Item`` command is set off by a colon before
+    it and a `` ;`` after it, and text follows it on its line. No ``cmd.exe`` form is given: interactive ``cmd.exe`` expands ``%VAR%`` even
     inside double quotes. A screen fault's detail comes before the commands and after the verbatim
     path, since it can carry the plain path.
 
@@ -2492,10 +2498,11 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
         f"{ban}; it is {literal}{ends}{fault}; a path here that shows <redacted>, [redacted], "
         "[REDACTED] or any other redaction marker was rewritten by redaction and is not the "
         "directory's path, so run no command here; otherwise, in PowerShell, not cmd.exe, first "
-        "run the Test-Path line that ends this text, which must print True, since a False means "
-        "that line names nothing and checks nothing, so run nothing more; then remove it only "
-        f"with this command: Remove-Item -LiteralPath {literal} -Recurse -Force ; then run that "
-        f"Test-Path line again, which must print False and no error:\n{_TEST_PATH} {literal}"
+        "run the Test-Path line that comes right after this text and names this same path; it "
+        "must print True, and a False means that line does not reach this directory, whether it "
+        "is gone, cannot be read or is named wrong, so run nothing more; only after a True, "
+        f"remove it with this command: Remove-Item -LiteralPath {literal} -Recurse -Force ; then "
+        f"run that Test-Path line again, which must print False and no error:\n{_TEST_PATH} {literal}"
     )
 
 
