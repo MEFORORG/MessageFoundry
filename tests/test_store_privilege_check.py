@@ -446,7 +446,8 @@ def test_the_store_hop_prints_a_control_in_the_principal_escaped_once(over: bool
     assert "'mefor\\x1b[2Jsvc' on 'Message\\u202eFoundry'" in shown
     assert "\\\\x1b" not in shown and "\\\\u202e" not in shown
     assert "\x1b" not in shown and "\u202e" not in shown
-    # Every other sink keeps repr's own escape, so the raw line it prints holds no control.
+    # The other sinks keep repr for the principal and database, the only names that go through
+    # quote; an excess entry still embeds the raw database name.
     assert "'mefor\\x1b[2Jsvc' on 'Message\\u202eFoundry'" in report.summary()
 
 

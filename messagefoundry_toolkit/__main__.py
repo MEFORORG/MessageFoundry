@@ -356,8 +356,9 @@ def _adr_analyze(args: argparse.Namespace) -> int:
         # has to stay readable for a consumer that branches on it and nothing else.
         if not args.json:
             # Not _safe_print (see its docstring), and the STRICT rule, not _print_record_line's:
-            # stderr is not a hardened stream, and its backslashreplace would spell a kept
-            # character as an escape. The path, a symlink's resolved target included, is text
+            # main() runs harden_console_streams(), which sets stderr to errors='replace', so a
+            # kept character the console cannot encode would print as '?'; the strict rule's
+            # output is pure ASCII. The path, a symlink's resolved target included, is text
             # whoever made the link chose (BACKLOG #2891).
             shown = escape_for_terminal(result.error, single_line=True)
             print(f"error: {shown}", file=sys.stderr)
