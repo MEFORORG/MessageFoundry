@@ -68,14 +68,14 @@ Two things undo this, and the engine refuses or reports each:
 
 - **Overriding the entry point** (`--entrypoint messagefoundry`, or a `command:` that replaces it
   in Kubernetes) can start the engine without the options. Remote debugging is then on unless
-  the start passes `-X disable-remote-debug`. `PYTHON_DISABLE_REMOTE_DEBUG=1` in the container's
-  environment turns it off only in a start without `-I` or `-E`, such as the `messagefoundry`
-  console script: the interpreter ignores every `PYTHON*` variable under either option, so an
-  override that keeps `-I` and drops only `-X disable-remote-debug` has it on. With it on, under
-  `enforce` the start refusal for it stops the engine unless `[security].allow_remote_debugging`
-  accepts it (vault BACKLOG #2700). A start that
-  goes on reports `interpreter_not_isolated`, and `remote_debug_enabled` while the interface is
-  on. When the refusal fires and what lifts it are stated once, in
+  the start passes `-X disable-remote-debug`, or is a start without `-I` or `-E`, such as the
+  `messagefoundry` console script, and the container's environment sets
+  `PYTHON_DISABLE_REMOTE_DEBUG=1`. The interpreter ignores that variable under either option, so
+  an override that keeps `-I` and drops only `-X disable-remote-debug` has it on. With it on,
+  under `enforce` the start refusal for it stops the engine unless
+  `[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). A start that goes on
+  reports `interpreter_not_isolated` where the override drops `-I`, and `remote_debug_enabled`
+  while the interface is on. The refusal and the acceptance are stated in full in
   [`docs/SECURITY-LOOSENING.md`](../docs/SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
 - **A derived image that leaves the venv owned by uid 10001.** Install extra packages as root and
   switch back: `USER root`, then `RUN /opt/venv/bin/pip install ...`, then `USER 10001`. The engine

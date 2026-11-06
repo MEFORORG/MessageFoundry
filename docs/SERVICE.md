@@ -527,9 +527,9 @@ What that changes for you:
   `-I` and drops `-X disable-remote-debug` has the interface on whatever the variable says, as
   the `-X disable-remote-debug` point above says. Run by hand what the service runs, the
   command above. When the refusal fires, and how a developer loop that needs the console script
-  gets past it, are stated once, in
+  gets past it, are stated in full in
   [`SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md#remote_debug_enabled-and-remote_debug_unguarded-the-interpreter-accepts-a-script-from-another-process).
-  Such a start is not isolated either, and the engine says so (`interpreter_not_isolated`, and
+  A console-script start is not isolated either, and the engine says so (`interpreter_not_isolated`, and
   `remote_debug_enabled` where the start goes on with the interface on).
 - **The engine's Python children are isolated when the engine is.** The sandbox worker and each
   engine shard repeat the engine's `-I`, so a `PYTHON*` variable in the service's environment
