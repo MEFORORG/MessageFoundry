@@ -858,7 +858,9 @@ class BackupRunner:
                 raise
             if isinstance(exc, BackupError):
                 # First, so the 200-character cut the failure record applies keeps the directory.
-                raise BackupError(exc.kind, f"{leftover}; the run failed: {exc}") from exc
+                raise BackupError(
+                    exc.kind, _then(leftover, "; ", f"the run failed: {exc}")
+                ) from exc
             exc.add_note(leftover)
             raise
 
@@ -876,7 +878,9 @@ class BackupRunner:
                 raise
             # The staging teardown failed too; that must not ride only in the log. It leads, so the
             # 200-character cut the failure record applies keeps the directory.
-            raise BackupError(exc.kind, f"{staging_leftover}; the run failed: {exc}") from exc
+            raise BackupError(
+                exc.kind, _then(staging_leftover, "; ", f"the run failed: {exc}")
+            ) from exc
 
         # keep-N prune runs only after that rename, so the candidate set contains this archive and
         # every earlier archive that also passed — and nothing that failed (AC-6).
@@ -953,10 +957,13 @@ class BackupRunner:
                 kept = self._keep_failed_archive(staging_path, archive_path)
                 raise BackupError(
                     "verify",
-                    f"restore-verify {verify.status}: "
-                    f"{verify.reason or 'archive did not verify'} "
-                    f"(kept for diagnosis as {kept.name}; it holds no retention slot, and nothing "
-                    "in the engine expires it)",
+                    _then(
+                        f"restore-verify {verify.status}: "
+                        f"{verify.reason or 'archive did not verify'}",
+                        " ",
+                        f"(kept for diagnosis as {kept.name}; it holds no retention slot, and "
+                        "nothing in the engine expires it)",
+                    ),
                 )
 
         # Only now does the archive earn the canonical name.
@@ -1108,12 +1115,16 @@ class BackupRunner:
             if isinstance(exc, BackupError):
                 # A refusal the build raised itself (vault BACKLOG #5220): the leftover leads for the
                 # same reason, and a note would not reach the audit row or the alert.
-                raise BackupError(exc.kind, f"{leftover}; the build failed: {exc}") from exc
+                raise BackupError(
+                    exc.kind, _then(leftover, "; ", f"the build failed: {exc}")
+                ) from exc
             if isinstance(exc, OSError | BackupCodecError):
                 # Named in the error itself, first, so the audit row and the alert carry it; a note
                 # would not survive the loop wrapping this into a BackupError.
                 kind = "write" if isinstance(exc, OSError) else "encrypt"
-                raise BackupError(kind, f"{leftover}; the build failed: {safe_exc(exc)}") from exc
+                raise BackupError(
+                    kind, _then(leftover, "; ", f"the build failed: {safe_exc(exc)}")
+                ) from exc
             exc.add_note(leftover)
             raise
         return (*built, work.release())
@@ -2417,16 +2428,26 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
     a passing verify's bare ``the archive verified, but``. A verify that gives a reason of its own,
     a failed one or a config-only pass, puts that reason first, and it can push the ban, or its
     ``without the \\\\?\\ prefix``, past the cut. The cut rarely keeps the path. The ERROR log line
-    holds the whole sentence, but after redaction, which can rewrite a path in it, hence the
-    instruction to run neither command when a path shows ``[redacted]``.
+    holds the whole text, but after redaction, which can rewrite a path in it, hence the
+    instruction to run no command when a path shows a redaction marker. Those markers are at
+    least ``<redacted>``, which ``CredentialScrubFilter`` and ``CredentialQueryScrubFilter`` write
+    (``secretscrub.CREDENTIAL_PLACEHOLDER``); ``[redacted]``, which ``RedactionFilter``, and
+    ``safe_exc`` on the failure record and alert, write (``redaction._REDACTED``); and
+    ``[REDACTED]``, which the support bundle writes over its copy of the log
+    (``support/redact.py``).
 
     It names the directory by its verbatim path only, as a PowerShell single-quoted literal
     (:func:`_ps_literal`), whose closing quote shows a trailing space and in which nothing expands,
     names any trailing dot or space in words, and names ``Remove-Item -LiteralPath`` and
-    ``Test-Path -LiteralPath`` on that literal as the only removal and its check, each set off by
-    a colon before it and a `` ;`` or the end after it. No ``cmd.exe`` form is given: interactive
-    ``cmd.exe`` expands ``%VAR%`` even inside double quotes. A screen fault's detail comes before
-    the commands and after the verbatim path, since it can carry the plain path.
+    ``Test-Path -LiteralPath`` on that literal as the only removal and its check. The check is a
+    two-step control: the same ``Test-Path`` line prints ``True`` before the removal and ``False``
+    after, since a ``False`` before it means the line names nothing and checks nothing. That line
+    ends the text, alone on a line of its own, and :func:`_then` keeps it so at every caller that
+    appends after it. On a surface that escapes a line break, the log line among them, it is still
+    the last thing in the record. The ``Remove-Item`` command is set off by a colon before it and a
+    `` ;`` after it. No ``cmd.exe`` form is given: interactive ``cmd.exe`` expands ``%VAR%`` even
+    inside double quotes. A screen fault's detail comes before the commands and after the verbatim
+    path, since it can carry the plain path.
 
     Measured on Windows 11 build 26300, with synthetic files: a removal by the plain path, by
     ``rd /s /q`` or ``Remove-Item -Recurse``, removes the OTHER directory and leaves this one, and
@@ -2468,11 +2489,27 @@ def _rewritten_staging_refusal(staging: Path) -> str | None:
             f"failed: {safe_exc(exc)})"
         )
     return (
-        f"{ban}; it is {literal}{ends}{fault}; if a path here shows [redacted], it is not the "
-        "directory's path, so run neither command; otherwise remove it only with this command, in "
-        f"PowerShell, not cmd.exe: Remove-Item -LiteralPath {literal} -Recurse -Force ; then this "
-        f"command must print False and no error: Test-Path -LiteralPath {literal}"
+        f"{ban}; it is {literal}{ends}{fault}; a path here that shows <redacted>, [redacted], "
+        "[REDACTED] or any other redaction marker was rewritten by redaction and is not the "
+        "directory's path, so run no command here; otherwise, in PowerShell, not cmd.exe, first "
+        "run the Test-Path line that ends this text, which must print True, since a False means "
+        "that line names nothing and checks nothing, so run nothing more; then remove it only "
+        f"with this command: Remove-Item -LiteralPath {literal} -Recurse -Force ; then run that "
+        f"Test-Path line again, which must print False and no error:\n{_TEST_PATH} {literal}"
     )
+
+
+#: The check :func:`_rewritten_staging_refusal` names, which ends its text on a line of its own.
+_TEST_PATH = "Test-Path -LiteralPath"
+
+
+def _then(text: str, sep: str, more: str) -> str:
+    """``text``, ``sep`` and ``more``. Where ``text`` ends in the ``Test-Path`` line of a
+    :func:`_rewritten_staging_refusal`, ``more`` starts a line of its own instead, so that line
+    still holds the command alone and a copy of it to the line's end runs nothing else."""
+    if text.rpartition("\n")[2].startswith(_TEST_PATH + " "):
+        return f"{text}\n{more}"
+    return f"{text}{sep}{more}"
 
 
 def _ps_literal(text: str) -> str:

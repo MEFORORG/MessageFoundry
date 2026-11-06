@@ -20,7 +20,7 @@ import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -831,15 +831,10 @@ def test_the_refusal_for_a_rewritten_staging_name_advises_no_removal_by_hand(
         assert "by hand" not in text
         assert "delete it" not in text
         assert (
-            "PowerShell, not cmd.exe: Remove-Item -LiteralPath "
+            "with this command: Remove-Item -LiteralPath "
             f"{dr_backup._ps_literal(verbatim)} -Recurse -Force ;" in text
         )
-        # A redacted path is not the directory's, and a command on it would find nothing and read
-        # as gone.
-        assert (
-            "if a path here shows [redacted], it is not the directory's path, so run neither"
-            in (text)
-        )
+        assert "PowerShell, not cmd.exe" in text
         # The plain path appears only inside the verbatim one.
         assert str(staging) not in text.replace(verbatim, "")
     # Nothing was removed, emptied or re-marked.
@@ -896,7 +891,8 @@ def test_a_percent_in_the_name_cannot_expand_in_the_advised_command(
     refusal = _refusal_for(name, tmp_path, monkeypatch)
     literal = dr_backup._ps_literal(dr_backup._win_verbatim(tmp_path / name))
     assert literal.endswith("%PATH% '")
-    assert f"not cmd.exe: Remove-Item -LiteralPath {literal} -Recurse -Force ;" in refusal
+    assert "PowerShell, not cmd.exe" in refusal
+    assert f"with this command: Remove-Item -LiteralPath {literal} -Recurse -Force ;" in refusal
     assert '"' not in refusal
     assert "rd /s" not in refusal
 
@@ -920,9 +916,157 @@ def test_the_refusal_names_the_exact_path_to_check(
     name = "mefor-backup-x%PATH% "
     refusal = _refusal_for(name, tmp_path, monkeypatch)
     literal = dr_backup._ps_literal(dr_backup._win_verbatim(tmp_path / name))
-    assert refusal.endswith(
-        f"; then this command must print False and no error: Test-Path -LiteralPath {literal}"
+    assert refusal.endswith(f"must print False and no error:\nTest-Path -LiteralPath {literal}")
+
+
+# --- the third hold: the markers redaction writes, a two-step check, and the check on its own line
+
+
+def test_the_refusal_names_every_marker_redaction_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path rewritten by redaction names nothing, so a check on it reads as gone. Red before the
+    fix: the text warned only about `[redacted]`, while the log's credential scrub writes
+    `<redacted>`. The control: that scrub, run over a refusal whose path holds `pwd=`, does write
+    `<redacted>` into the path and leaves the warning whole."""
+    from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
+
+    refusal = _refusal_for("mefor-backup-x.", tmp_path / "pwd=nightly", monkeypatch)
+    warning = (
+        "a path here that shows <redacted>, [redacted], [REDACTED] or any other redaction marker "
+        "was rewritten by redaction and is not the directory's path, so run no command here"
     )
+    assert warning in refusal
+    assert CREDENTIAL_PLACEHOLDER == "<redacted>"
+    scrubbed = scrub_credentials(refusal)
+    assert warning in scrubbed
+    assert "pwd=<redacted>" in scrubbed.split("\n")[-1]
+
+
+def test_the_check_is_a_two_step_control(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A False alone is the same whether the directory is gone or the line names nothing. Red before
+    the fix: the check was run only after the removal."""
+    refusal = _refusal_for("mefor-backup-x%PATH% ", tmp_path, monkeypatch)
+    first = refusal.index("first run the Test-Path line that ends this text, which must print True")
+    assert (
+        "since a False means that line names nothing and checks nothing, so run nothing more"
+        in (refusal)
+    )
+    removal = refusal.index("Remove-Item -LiteralPath")
+    again = refusal.index("then run that Test-Path line again, which must print False and no error")
+    assert first < removal < again
+
+
+def _the_test_path_line(text: str, literal: str) -> int:
+    """The index of the line of ``text`` that is exactly the Test-Path command on ``literal``."""
+    lines = text.split("\n")
+    assert lines.count(f"Test-Path -LiteralPath {literal}") == 1, lines
+    return lines.index(f"Test-Path -LiteralPath {literal}")
+
+
+def test_the_test_path_command_is_alone_on_the_last_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Red before the fix: the command shared its line with the advice before it."""
+    name = "mefor-backup-x%PATH% "
+    refusal = _refusal_for(name, tmp_path, monkeypatch)
+    literal = dr_backup._ps_literal(dr_backup._win_verbatim(tmp_path / name))
+    assert _the_test_path_line(refusal, literal) == len(refusal.split("\n")) - 1
+
+
+def test_a_caller_that_appends_starts_its_text_on_a_line_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every caller that appends to a leftover goes through `_then`. Red before the fix: the
+    callers wrote `; the run failed: ...` or `; the build failed: ...` straight after it, so a copy
+    of the command to its line's end ran that text too. Any other leftover keeps its separator."""
+    name = "mefor-backup-x."
+    refusal = _refusal_for(name, tmp_path, monkeypatch)
+    literal = dr_backup._ps_literal(dr_backup._win_verbatim(tmp_path / name))
+    joined = dr_backup._then(refusal, "; ", "the run failed: synthetic")
+    lines = joined.split("\n")
+    assert lines[_the_test_path_line(joined, literal) + 1] == "the run failed: synthetic"
+    plain = "the plaintext staging directory x could not be cleared"
+    assert dr_backup._then(plain, "; ", "more") == f"{plain}; more"
+
+
+async def test_the_kept_for_diagnosis_append_starts_a_line_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backup's own verify appends `(kept for diagnosis ...)` after the verify's reason, which
+    ends in the refusal when the verify's staging survived. Red before the fix: it was appended on
+    the command's own line."""
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
+    try:
+        name = "mefor-verify-x."
+        refusal = _refusal_for(name, tmp_path, monkeypatch)
+        literal = dr_backup._ps_literal(dr_backup._win_verbatim(tmp_path / name))
+
+        def failed_verify(**kwargs: Any) -> dr_backup.VerifyResult:
+            return dr_backup.VerifyResult("FAIL", reason=f"the verify failed, but {refusal}")
+
+        monkeypatch.setattr(dr_backup, "_verify_archive_blocking", failed_verify)
+        monkeypatch.setattr(runner, "_keep_failed_archive", lambda *a: tmp_path / "kept.mfbak")
+        with pytest.raises(dr_backup.BackupError) as raised:
+            await runner._verify_and_publish(
+                tmp_path / "a.mfbak.tmp",
+                tmp_path / "a.mfbak",
+                key=None,
+                staging_root=tmp_path,
+                secure=False,
+            )
+        message = str(raised.value)
+        lines = message.split("\n")
+        assert lines[_the_test_path_line(message, literal) + 1].startswith(
+            "(kept for diagnosis as kept.mfbak;"
+        )
+    finally:
+        await store.close()
+
+
+async def test_the_build_failed_append_starts_a_line_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_build_in_staging` leads a build's own refusal with the release's leftover. Red before the
+    fix: `; the build failed: ...` followed the command on its line."""
+    store, runner = await _store_and_runner(tmp_path, monkeypatch)
+    try:
+        name = "mefor-backup-x."
+        refusal = _refusal_for(name, tmp_path, monkeypatch)
+        literal = dr_backup._ps_literal(dr_backup._win_verbatim(tmp_path / name))
+
+        class _Work:
+            path = tmp_path / name
+            secure = False
+
+            def claim(self) -> bool:
+                return True
+
+            def release(self) -> str:
+                return refusal
+
+        def refused_build(**kwargs: Any) -> Any:
+            raise dr_backup.BackupError("snapshot", "synthetic build refusal")
+
+        monkeypatch.setattr(runner, "_build_archive_blocking", refused_build)
+        with pytest.raises(dr_backup.BackupError) as raised:
+            runner._build_in_staging(
+                cast(Any, _Work()),
+                out_path=tmp_path / "a.mfbak",
+                snap_path=None,
+                key=None,
+                key_id=None,
+                config_only=True,
+                now=1.0,
+                bundle=cast(Any, None),
+            )
+        message = str(raised.value)
+        lines = message.split("\n")
+        assert lines[_the_test_path_line(message, literal) + 1] == (
+            "the build failed: synthetic build refusal"
+        )
+    finally:
+        await store.close()
 
 
 def test_the_plain_path_ban_survives_the_failure_records_cut_on_the_verify_route(
