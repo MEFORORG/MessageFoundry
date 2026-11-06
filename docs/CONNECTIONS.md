@@ -4467,8 +4467,9 @@ Facts that are easy to get wrong, stated plainly first:
   **Two session writes wait longer, on purpose (BACKLOG #2283 on Postgres, #3023 on SQL
   Server).** `rotate_session` and `revoke_user_sessions` mostly run after their caller's own change
   has committed: a password reset, a disable, a role change, a completed second factor. Nothing
-  retries a rotation, and the auth service runs a revoke at most three times (vault BACKLOG #3023),
-  so a pool shortage at the ordinary limit would fail them after that change. Callers with no
+  retries a rotation, and the auth service runs a revoke again only within a short budget (vault
+  BACKLOG #3023), which one SQL Server pool wait uses up, so a pool shortage at the ordinary limit
+  would fail them after that change. Callers with no
   earlier write, such as "sign out everywhere else", wait the same way.
 
   - On **SQL Server** they wait up to **2 times `acquire_timeout`**, 60 s at the default, and then
@@ -4486,7 +4487,7 @@ Facts that are easy to get wrong, stated plainly first:
   On both, `[store].command_timeout` still bounds the statement unless it is set to 0, and a lost
   connection still fails it. An HTTP request's own deadline still cancels the wait, and a cancelled
   wait writes nothing and records nothing. A revoke the store refuses after a committed change is
-  run again, up to three times in all. One refused every time leaves the account's other sessions
+  run again, up to three times within 15 seconds. One the service gives up on leaves the account's other sessions
   unrevoked, and the change's own audit row and notice are lost with it; an
   `auth.sessions_revoke_failed` row names the account and the change instead, unless the store
   refuses that write too, and an ERROR line is written either way. A rotation that fails,

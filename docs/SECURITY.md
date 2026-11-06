@@ -995,7 +995,9 @@ ERROR, so the row is the record of a miss only while the audit log accepts write
 custom-role change, a directory map save, a directory sign-in's role or scope resync and the
 `provision-admin` repair end the account's sessions after their own change has committed. A store
 refusal of that revoke, such as a pool shortage at the acquire limit, a statement timeout or a lost
-connection, is run again, three attempts in all. One refused on every attempt is logged at ERROR
+connection, is run again, up to three attempts within 15 seconds. A SQL Server pool wait uses up
+that budget on its own, so it is recorded at once rather than run into the request deadline. A
+revoke the service gives up on is logged at ERROR
 and writes one `auth.sessions_revoke_failed` row naming the account, the change, the attempts and
 the error class; the request still fails, the change stands, and the account's other sessions stay
 live until they lapse. The change's own audit row is not written then, so this row is its record.

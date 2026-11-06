@@ -1980,7 +1980,9 @@ CLUSTER_SCHEMA: tuple[str, ...] = (
 
 def _trusted_user_key(table: str, name: str) -> str:
     """The guarded DDL for foreign key ``name`` from ``table.user_id`` to ``users(id)``, trusted
-    (BACKLOG #2733). It runs where the key is missing, or present but untrusted or disabled, as an
+    (BACKLOG #2733): the key SQLite and Postgres already declare, so no row of ``table`` can name an
+    account that does not exist. No cascade, as on those two: ``_delete_user_rows`` deletes the
+    account's rows first, and a delete that skipped one would be refused. It runs where the key is missing, or present but untrusted or disabled, as an
     earlier batch's ``WITH NOCHECK`` key is: it deletes the rows naming an account that does not
     exist, then adds the key ``WITH CHECK``, dropping the untrusted one first. A trusted key skips
     it, so a re-run is a no-op. The deleted rows belong to no account, so nothing can use them: a
@@ -2565,9 +2567,8 @@ _SCHEMA: list[str] = [
     # scan every account's role rows under locking reads.
     """IF INDEXPROPERTY(OBJECT_ID('user_roles'),'ix_user_roles_role','IndexID') IS NULL
         CREATE INDEX ix_user_roles_role ON user_roles(role_id)""",
-    # BACKLOG #2733: the user foreign key SQLite and Postgres already declare, so a role grant can
-    # never be written for an account that does not exist. The primary key, which leads with
-    # user_id, serves its check on a user delete. Every role write holds the account row under
+    # BACKLOG #2733: see _trusted_user_key. The primary key, which leads with user_id, serves its
+    # check on a user delete. Every role write holds the account row under
     # UPDLOCK (_read_user_record), as the delete does, so the two never interleave. The role key
     # above stays WITH NOCHECK: a grant row names a live account whose seal covers it, so
     # deleting one would make that account fail its seal, and the write path drops it instead.
@@ -2614,9 +2615,8 @@ _SCHEMA: list[str] = [
         ALTER TABLE sessions ADD global_epoch INT NOT NULL DEFAULT 0""",
     """IF INDEXPROPERTY(OBJECT_ID('sessions'),'ix_sessions_user','IndexID') IS NULL
         CREATE INDEX ix_sessions_user ON sessions(user_id)""",
-    # BACKLOG #2733: the user foreign key SQLite and Postgres already declare, so a session can
-    # never be written for an account that does not exist. ix_sessions_user above serves its check
-    # on a user delete. _delete_user_rows deletes the sessions first, under UPDLOCK on the account
+    # BACKLOG #2733: see _trusted_user_key. ix_sessions_user above serves its check on a user
+    # delete. _delete_user_rows deletes the sessions first, under UPDLOCK on the account
     # row, and create_session's HOLDLOCK read is compatible with that lock. So a sign-in that
     # commits while a delete runs now makes the delete fail here and roll back whole, nothing
     # deleted, where before the delete committed and left the session behind for a missing
@@ -2675,12 +2675,8 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_webauthn_credentials_user ON webauthn_credentials(user_id)""",
     """IF INDEXPROPERTY(OBJECT_ID('webauthn_credentials'),'ux_webauthn_label','IndexID') IS NULL
         CREATE UNIQUE INDEX ux_webauthn_label ON webauthn_credentials(user_id, label)""",
-    # BACKLOG #2733: the user foreign key SQLite and Postgres already declare, so a passkey can
-    # never be written for an account that does not exist. No cascade, as on those two: at least
-    # delete_user and remove_unless_last_admin clear the account's passkeys first, through
-    # _delete_user_rows, and a delete that skipped it would be refused here. Trusted, and
-    # rebuilt where an earlier batch added it WITH NOCHECK; _trusted_user_key says how.
-    # ix_webauthn_credentials_user above serves the key's check on a user delete.
+    # BACKLOG #2733: see _trusted_user_key. ix_webauthn_credentials_user above serves the key's
+    # check on a user delete.
     _trusted_user_key("webauthn_credentials", "fk_webauthn_credentials_user"),
     # The first-seen sign-in address baseline (BACKLOG #288, vault BACKLOG #2145) -- mirrors the SQLite
     # `known_login_addresses` table (store/store.py), whose comment gives the reasons, the cascade's
@@ -14995,7 +14991,7 @@ class SqlServerStore:
                     # under UPDLOCK as every passkey write does, so a passkey committed before it is
                     # seen here and a later one waits for this commit.
                     await cur.execute(_MSSQL_WEBAUTHN_ANY_FOR_USER, (user_id,))
-                    if await cur.fetchall():
+                    if await cur.fetchall():  # drained, as every read on this cursor is
                         await conn.rollback()
                         return AdminGrant.ACCOUNT_CHANGED
                     await self._commit(conn)

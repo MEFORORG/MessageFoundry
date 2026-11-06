@@ -206,6 +206,7 @@ from messagefoundry.store.store import (
     session_sealed_by_retired_key,
     user_seal_ok,
 )
+from messagefoundry.store.transit_attestation import utf16_units
 from messagefoundry.transports.email import envelope_address_problem
 from messagefoundry.transports.rest import opener_tls_context
 
@@ -2839,14 +2840,17 @@ SESSION_REVOKE_MISSED_ACTION: Final = "auth.session_revoke_missed"
 #: account's other sessions stay live until they lapse, and this row is what says so. Not the row
 #: above, which records a self-service revoke that named no session.
 SESSIONS_REVOKE_FAILED_ACTION: Final = "auth.sessions_revoke_failed"
-#: How many times that revoke runs, and the pause before each re-run, times its number. The revoke
-#: is safe to repeat: it ends unrevoked rows and raises the account's session epoch, and a repeat
-#: does both again. Each attempt is one store borrow, so on SQL Server an attempt that waits out a
-#: pool shortage costs up to ``2 x acquire_timeout``; three of those outlast the API's request
-#: deadline, which then cancels the request before this records the miss (vault BACKLOG #3802
-#: holds the cancellation). A statement timeout or a lost connection fails fast and is re-run.
+#: How many times that revoke runs at most, the pause before each re-run (times its number), and
+#: the seconds after the first attempt past which none is re-run. The revoke is safe to repeat: it
+#: ends unrevoked rows and raises the account's session epoch, and a repeat does both again. A
+#: statement timeout or a lost connection fails fast and is re-run. A pool shortage on SQL Server
+#: fails only after waiting up to ``2 x acquire_timeout``, 60 s at the default, which is past the
+#: budget, so it is recorded at once: a second such wait would reach the API's request deadline,
+#: which cancels the request before any row is written (vault BACKLOG #3802 holds the
+#: cancellation). Postgres waits out a shortage instead of raising.
 _POST_COMMIT_REVOKE_ATTEMPTS: Final = 3
 _POST_COMMIT_REVOKE_BACKOFF_SECONDS: Final = 0.25
+_POST_COMMIT_REVOKE_BUDGET_SECONDS: Final = 15.0
 #: What a session id can look like: a token hash, lower-case hex, cut to at most its full length.
 _SESSION_ID_SHAPE: Final = re.compile(r"[0-9a-f]{1,64}")
 
@@ -10421,33 +10425,48 @@ class AuthService:
         """Revoke every session of ``user_id`` after a ``change`` that has already committed, such
         as a password change, a disable or a role change (vault BACKLOG #3023).
 
-        Nothing undoes the change if this fails, so a store refusal is run again, up to
-        :data:`_POST_COMMIT_REVOKE_ATTEMPTS` times: at least a pool shortage at the acquire limit, a
-        statement timeout and a lost connection. Before, one refusal ended the request with the
-        change committed, every other session live and nothing recorded. A refusal on every attempt
-        is logged at ERROR first, then written as :data:`SESSIONS_REVOKE_FAILED_ACTION`, naming the
-        account and the change, since the change's own audit row, which its caller writes after
-        this, is lost with the raise. The refusal is then raised, so the caller still fails: the
-        account's other sessions stay live until they lapse. That row's own write can be refused on
-        the same store; that is logged, and the ERROR line is then the only trace.
-
-        Any other exception is raised at once, unretried: it reads as a defect, not a fault. A
-        cancellation is not an ``Exception`` and skips the retry and the row, as it does in
-        :meth:`_rotate_session_hash` (vault BACKLOG #3802)."""
-        refused: Exception | None = None
-        for attempt in range(1, _POST_COMMIT_REVOKE_ATTEMPTS + 1):
+        Nothing undoes the change if this fails, so a store refusal (``_session_write_errors``) is
+        run again while :data:`_POST_COMMIT_REVOKE_ATTEMPTS` and
+        :data:`_POST_COMMIT_REVOKE_BUDGET_SECONDS` both allow. A refusal past either is logged at
+        ERROR, recorded as :data:`SESSIONS_REVOKE_FAILED_ACTION` (the comment there says what the
+        row stands for), and raised, so the caller still fails. Any other exception is raised at
+        once, unretried: it reads as a defect, not a fault. A cancellation is not an ``Exception``
+        and skips the retry and the row, as in :meth:`_rotate_session_hash` (vault BACKLOG
+        #3802)."""
+        loop = asyncio.get_running_loop()
+        give_up_at = loop.time() + _POST_COMMIT_REVOKE_BUDGET_SECONDS
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 return await self._store.revoke_user_sessions(user_id)
             except _session_write_errors() as exc:
-                refused = exc
-                if attempt < _POST_COMMIT_REVOKE_ATTEMPTS:
+                if attempt < _POST_COMMIT_REVOKE_ATTEMPTS and loop.time() < give_up_at:
                     await asyncio.sleep(_POST_COMMIT_REVOKE_BACKOFF_SECONDS * attempt)
-        assert refused is not None  # the loop returns, or ran every attempt and refused each
+                    continue
+                await self._record_revoke_miss(
+                    user_id, exc, change=change, attempts=attempt, actor=actor, client=client
+                )
+                raise
+
+    async def _record_revoke_miss(
+        self,
+        user_id: str,
+        refused: Exception,
+        *,
+        change: str,
+        attempts: int,
+        actor: str | None,
+        client: str | None,
+    ) -> None:
+        """The ERROR line, then the :data:`SESSIONS_REVOKE_FAILED_ACTION` row, for a revoke
+        :meth:`_revoke_after_commit` gave up on. The line comes first, so a refused row still
+        leaves a trace."""
         _log.error(
-            "auth: the session revoke after a committed %s was refused by the store %d times (%s);"
+            "auth: the session revoke after a committed %s was refused by the store %d time(s) (%s);"
             " the account's other sessions stay live until they lapse",
             change,
-            _POST_COMMIT_REVOKE_ATTEMPTS,
+            attempts,
             type(refused).__name__,
             exc_info=refused,
         )
@@ -10459,7 +10478,7 @@ class AuthService:
                     {
                         "user_id": user_id,
                         "change": change,
-                        "attempts": _POST_COMMIT_REVOKE_ATTEMPTS,
+                        "attempts": attempts,
                         "error": type(refused).__name__,
                     }
                 ),
@@ -10471,7 +10490,6 @@ class AuthService:
                 SESSIONS_REVOKE_FAILED_ACTION,
                 type(exc).__name__,
             )
-        raise refused
 
     async def _elevated(
         self,
@@ -15098,7 +15116,7 @@ class AuthService:
         # counts those, so a label of astral-plane characters that passed a code-point count was
         # refused by the column there, as a 500. The same cap on every backend, so a label one
         # store takes, all three take.
-        if not label or len(label.encode("utf-16-le")) // 2 > self._WEBAUTHN_LABEL_MAX:
+        if not label or utf16_units(label) > self._WEBAUTHN_LABEL_MAX:
             raise ValueError("label must be 1-100 characters")
         # No staged ceremony is answered BEFORE the floor, as confirm_mfa_enrollment answers "no
         # enrollment in progress" before it: otherwise the same request would get "verification
