@@ -28,6 +28,7 @@ All key bytes, hosts and tokens here are synthetic. Severity is conditional (CLA
 from __future__ import annotations
 
 import re
+import sys
 import traceback
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -889,7 +890,7 @@ def test_an_error_from_rendering_the_codec_error_is_refused_as_not_judged(
         getattr(store_base, entry)(StoreSettings())
     _assert_no_key_byte(_whole(caught.value))
     assert caught.value.__cause__ is None and caught.value.__context__ is None
-    assert "could not be judged" in str(caught.value), str(caught.value)
+    assert str(caught.value) == store_base._UNJUDGED, str(caught.value)
 
 
 # --- The second hold on engine PR 2818: the fallback itself must not raise ---------------------
@@ -965,7 +966,7 @@ def test_an_interrupt_from_the_fallback_leaves_without_a_chain(
     real_refused = store_base._refused
 
     def _fallback_interrupted(exc: Exception, text: str) -> Exception:
-        if "could not be judged" in text:
+        if text is store_base._UNJUDGED:
             raise interrupt
         return real_refused(exc, text)
 
@@ -976,3 +977,63 @@ def test_an_interrupt_from_the_fallback_leaves_without_a_chain(
     with pytest.raises(type(interrupt)) as caught:
         getattr(store_base, entry)(StoreSettings())
     _assert_left_unchained(caught.value, interrupt, error)
+
+
+def _stack_depth() -> int:
+    depth = 0
+    frame = sys._getframe()
+    while frame is not None:
+        depth += 1
+        frame = frame.f_back  # type: ignore[assignment]
+    return depth
+
+
+def _links(exc: BaseException) -> list[BaseException]:
+    """``exc`` and every cause and context it reaches."""
+    seen: list[BaseException] = []
+    todo = [exc]
+    while todo:
+        link = todo.pop()
+        if not any(link is s for s in seen):
+            seen.append(link)
+            todo += [n for n in (link.__cause__, link.__context__) if n is not None]
+    return seen
+
+
+def test_no_depth_near_the_recursion_limit_leaves_the_judged_error_on_a_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round two of the second-hold repair's review: clearing the links took a call, which at the
+    recursion limit raised a fresh RecursionError inside the handler, chained back to the judged
+    error. Each depth in a band below the limit is tried; whatever leaves must not reach it."""
+    error = _built_from(_decode_error(), ValueError)
+    _with_provider(monkeypatch, error)
+    settings = StoreSettings()
+
+    def at_depth(n: int) -> BaseException | None:
+        if n > 0:
+            return at_depth(n - 1)
+        try:
+            store_base.resolve_active_key(settings)
+        except BaseException as escaped:  # noqa: BLE001 -- what left is the measurement
+            return escaped
+        return None
+
+    old_limit = sys.getrecursionlimit()
+    band = 160
+    limit = _stack_depth() + band
+    results: list[BaseException] = []
+    sys.setrecursionlimit(limit)
+    try:
+        for depth in range(band + 5):
+            try:
+                escaped = at_depth(depth)
+            except RecursionError:
+                continue
+            if escaped is not None:
+                results.append(escaped)
+    finally:
+        sys.setrecursionlimit(old_limit)
+    assert any(isinstance(e, KeyProviderError | StoreCipherConfigError) for e in results)
+    leaks = [e for e in results if any(link is error for link in _links(e))]
+    assert not leaks, [[type(link).__name__ for link in _links(e)] for e in leaks]
