@@ -1353,12 +1353,13 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
         command += f', --service-account "{service_account}" among them'
     sqlite_path = (
         ", but with --db, which overrides [store].path, naming that new SQLite path by its "
-        "absolute path, here and wherever the service passes --db, at least -DbPath on this and "
-        "every later reinstall with install-service.ps1 on Windows, repeating its other install "
-        "parameters but leaving out at least the build ones, -EngineWheel, -EngineWheelSha256, "
-        "-RequirementsLock, -RequirementsLockSha256 and -BasePython, as for any re-run over the "
-        "install root it built (`messagefoundry service install` cannot pass -DbPath), and "
-        "supervise --db, which supervise passes to its engine shard as "
+        "absolute path, here and wherever the service passes --db, at least -DbPath when the "
+        "service is reinstalled with install-service.ps1 on Windows, now and on every later "
+        "reinstall, repeating its other install parameters but leaving out -EngineWheel and each "
+        "parameter that goes only with it, at least -EngineWheelSha256, -RequirementsLock, "
+        "-RequirementsLockSha256 and -BasePython, as for any re-run over the install root it "
+        "built (`messagefoundry service install` cannot pass -DbPath, so never reinstall with "
+        "it), and supervise --db, which supervise passes to its engine shard as "
         "messagefoundry.db, under --project-root if one is given, when its own command line "
         "leaves it out"
     )
@@ -1372,7 +1373,7 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
     assert "leave it out" not in step and "take it off" not in step, step
     named = "--db, which overrides [store].path, naming that new SQLite path" in step
     assert named is (new_store and not server), step
-    for service_command in ("-DbPath on this and every later reinstall", "supervise --db"):
+    for service_command in ("-DbPath when the service is reinstalled", "supervise --db"):
         assert (service_command in step) is (new_store and not server), step
     assert (command + sqlite_path in step) is (new_store and not server), step
     assert (command + database in step) is (new_store and server), step
@@ -1419,12 +1420,18 @@ def test_the_advised_reinstall_is_one_the_installer_accepts() -> None:
 
     script = Path(__file__).resolve().parents[1] / "scripts" / "service" / "install-service.ps1"
     source = script.read_text(encoding="utf-8")
-    guard = re.search(
-        r"\}\s*elseif \(((?:\$\w+)(?:\s+-or\s+\$\w+)*)\)\s*\{\s*throw \(\"([^\"]*)\"",
-        source,
-        re.IGNORECASE,
-    )
-    assert guard is not None and "go only" in guard.group(2), "install-service.ps1 guard moved"
+    guards = [
+        found
+        for found in re.finditer(
+            r"\}\s*elseif\s*\(((?:\$\w+)(?:\s+-or\s+\$\w+)*)\)\s*\{\s*throw \(\"([^\"]*)\"",
+            source,
+            re.IGNORECASE,
+        )
+        # The message is split across two literals, so match the part the first one holds.
+        if "go only" in found.group(2)
+    ]
+    assert len(guards) == 1, "install-service.ps1's companion guard moved or was split"
+    (guard,) = guards
     companions = re.findall(r"\$(\w+)", guard.group(1))
     assert {"RequirementsLock", "BasePython"} <= set(companions), companions
     step = custody_host.keep_the_key_step(
@@ -1438,13 +1445,16 @@ def test_the_advised_reinstall_is_one_the_installer_accepts() -> None:
     # has one, so it passes only -Environment, -Config and, when given, -ServiceConfig.
     for takes in (_install_params, install_service):
         named = set(inspect.signature(takes).parameters)
-        assert named == {"script_path", "environment", "config", "service_config"}, named
+        assert not {n for n in named if "db" in n or "store" in n}, named
     params = _install_params("i.ps1", "prod", config=r"C:\cfg", service_config=r"C:\cfg\s.toml")
     assert "-DbPath" not in params, params
     parser, _ = _build_parser()
+    # Positive control: the same command line parses without --db, so --db is what is refused.
+    assert parser.parse_args(["service", "install", "--env", "prod"]).action == "install"
     with pytest.raises(SystemExit):
         parser.parse_args(["service", "install", "--env", "prod", "--db", "x.db"])
-    assert "(`messagefoundry service install` cannot pass -DbPath)" in step, step
+    never = "(`messagefoundry service install` cannot pass -DbPath, so never reinstall with it)"
+    assert never in step, step
 
 
 @host_file_platforms
