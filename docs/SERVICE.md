@@ -169,6 +169,7 @@ Defaults:
 | Data dir | `C:\ProgramData\MessageFoundry` |
 | Message store | `<DataDir>\messagefoundry.db` |
 | Logs | `<DataDir>\logs\service.out.log`, `service.err.log` |
+| Secrets directory (`-SecretsDir`) | the one the service already names, else `<DataDir>-secrets`; named to the service as `MEFOR_SECRETS_DIRECTORY` |
 | Bind | `127.0.0.1:8765` |
 | Log level | `INFO` |
 
@@ -621,19 +622,20 @@ environment.
   settings other than the store key, among them the database password, and every `MEFOR_VALUE_*`
   value can each come from a file instead of the service's NSSM list. A variable an operator names
   as a `[secrets].provider = "env"` reference, and one a library reads for itself, are not read
-  from it. **The installer creates it**: `<DataDir>\secrets` unless `-SecretsDir` names another
-  path, with inheritance off, SYSTEM and Administrators full control and the service account read,
-  and it adds `MEFOR_SECRETS_DIRECTORY=<that path>` to the service's NSSM list, keeping the entries
-  already there. A path in the NSSM list is not a secret. The directory starts empty: as an
-  administrator, add one file per setting, named as its variable, and restart the service. A file
-  you create there inherits the directory's grants. The engine refuses a directory or file a broad
-  group can read or change, and the installer warns when a grant beyond those three is left on it.
-  A rerun turns inheritance off again and adds the account's read. It keeps every other explicit
-  grant there except the well-known broad groups, which it removes, so a grant you rely on must be
-  explicit, not inherited. With `-SecretsDir`, restrict the folders above that path yourself: the
-  engine does not read them. `uninstall-service.ps1` leaves the directory, as it leaves the rest of
-  the data directory. The files are plain, protected by their access list alone. Which settings it
-  supplies, and the rules, are stated once, in
+  from it. **The installer creates it**, restricted, and adds `MEFOR_SECRETS_DIRECTORY=<its path>`
+  to the service's NSSM list, keeping the entries already there; a path in the NSSM list is not a
+  secret. The path is `-SecretsDir`, else the one the service already names, else
+  `<DataDir>-secrets`, beside the data directory and not in it, so a backup of the data directory
+  does not copy the plain files. The installer refuses a path that is a volume root, a junction, a
+  file or a folder holding a folder, or that is, holds or sits inside a folder the service or
+  Windows uses for something else. The directory starts empty: as an administrator, add one file
+  per setting, named as its variable, and restart the service. A rerun keeps every explicit grant
+  on the directory except the well-known broad groups, and warns about any it keeps; a grant you
+  rely on there must be explicit, not inherited. A folder above the directory that the installer
+  creates is administrator-only; one that already existed is yours to restrict, since the engine
+  does not read it. `uninstall-service.ps1` leaves the directory and its files, names them, and
+  with `-RemoveAccountAces` removes the account's entry there too. Which settings it supplies, the
+  access list it needs, and the rest of the rules are stated once, in
   [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). This is the
   first part of the protected channel vault BACKLOG #2595 asks for, not the whole of it: a secret
   left in the NSSM list is still named, not refused.

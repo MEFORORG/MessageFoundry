@@ -1032,6 +1032,7 @@ _PATH_PARAMS = [
     "ServiceConfig",
     "ProjectRoot",
     "DbPath",
+    "SecretsDir",
     # -EngineWheel's inputs (vault BACKLOG #2626), read before the build acts.
     "EngineWheel",
     "RequirementsLock",
@@ -1471,7 +1472,12 @@ def test_the_smoke_leg_reads_the_dacl_it_produced() -> None:
 # The fix is an ORDERING-FREE one: write ObjectName unconditionally, so the assumption about what NSSM
 # defaults to at create time stops mattering. The guards are therefore about which branches write it.
 
-_ACL_CALLS = ["Set-SecureDataDirAcl", "Set-SecureConfigAcl", "Set-ConfigReadAcl"]
+_ACL_CALLS = [
+    "Set-SecureDataDirAcl",
+    "Set-SecureConfigAcl",
+    "Set-ConfigReadAcl",
+    "Set-SecretsDirAcl",
+]
 
 
 def _objectname_calls(facts: dict) -> list[dict]:
@@ -1640,6 +1646,7 @@ _FULL_FACTS: dict[str, object] = {
     "ServiceAccount": r"NT SERVICE\MessageFoundry",
     "ServiceAccountSid": "S-1-5-80-4001",
     "ConfigDir": r"D:\mefor\config",
+    "SecretsDir": r"C:\ProgramData\MessageFoundry-secrets",
     "ConfigInheritanceStripped": True,
     "CachedNssm": r"C:\ProgramData\MessageFoundry\bin\nssm.exe",
     "WerImages": ["messagefoundry.exe", "python.exe"],
@@ -1652,6 +1659,8 @@ _NEEDLE = {
     "cached_nssm": r"bin\nssm.exe",
     "data_ace": "Data dir entry",
     "config_ace": "Config dir entry",
+    "secrets_dir": "Secrets dir ",
+    "secrets_ace": "Secrets entry",
     "logon_right": "Log on as a service",
     "config_inheritance": "/inheritance:e",
     "wer": "Windows Error Reporting",
@@ -1717,8 +1726,8 @@ def test_the_notice_names_every_residue_the_installer_leaves(tmp_path: Path) -> 
         # account residues go -- and nothing else may go with them.
         (
             {"ServiceAccount": "LocalSystem", "ServiceAccountSid": ""},
-            ["data_ace", "config_ace", "logon_right"],
-            ["data_dir", "cached_nssm", "config_inheritance", "wer"],
+            ["data_ace", "config_ace", "secrets_ace", "logon_right"],
+            ["data_dir", "cached_nssm", "config_inheritance", "wer", "secrets_dir"],
         ),
         # No config dir could be read off the registration: its two lines go, the data dir's stay.
         (
@@ -1731,6 +1740,12 @@ def test_the_notice_names_every_residue_the_installer_leaves(tmp_path: Path) -> 
             {"ConfigInheritanceStripped": False},
             ["config_inheritance"],
             ["config_ace", "data_ace", "logon_right"],
+        ),
+        # No secrets directory was registered: its two lines go, the rest stay.
+        (
+            {"SecretsDir": ""},
+            ["secrets_dir", "secrets_ace"],
+            ["data_dir", "data_ace", "config_ace"],
         ),
         # No image is excluded, so this host never ran -SuppressCrashDumps.
         ({"WerImages": []}, ["wer"], ["data_dir", "data_ace", "config_ace"]),
@@ -1797,9 +1812,16 @@ def test_a_cleared_residue_is_reported_as_cleared_not_as_remaining(tmp_path: Pat
     run it is the same defect pointing the other way.
     """
     facts = dict(_FULL_FACTS)
-    facts.update({"LogonRightRemoved": True, "DataAceRemoved": True, "ConfigAceRemoved": True})
+    facts.update(
+        {
+            "LogonRightRemoved": True,
+            "DataAceRemoved": True,
+            "ConfigAceRemoved": True,
+            "SecretsAceRemoved": True,
+        }
+    )
     text = _notice(tmp_path, facts)
-    assert text.count("REMOVED") >= 3, (
+    assert text.count("REMOVED") >= 4, (
         f"the notice must report what this run actually took back:\n{text}"
     )
     assert "/remove:g" not in text, (
@@ -2116,13 +2138,20 @@ def test_both_switches_are_declared_and_wired(tmp_path: Path) -> None:
     assert names.count(_SECEDIT_FN) == 1, (
         f"expected one {_SECEDIT_FN} call, found {names.count(_SECEDIT_FN)}"
     )
-    assert names.count(_ACE_FN) == 2, (
-        "the account's entry is written on BOTH the data dir and the config dir, so both must be "
-        f"removable; found {names.count(_ACE_FN)} {_ACE_FN} calls"
+    assert names.count(_ACE_FN) == 3, (
+        "the account's entry is written on the data dir, the config dir and the secrets dir, so "
+        f"each must be removable; found {names.count(_ACE_FN)} {_ACE_FN} calls"
     )
     notice = [c for c in cmds if c["name"] == "Get-UninstallResidueNotice"]
     assert len(notice) == 1, f"expected one Get-UninstallResidueNotice call, found {len(notice)}"
-    for fact in ("-DataDir", "-ServiceAccount", "-ConfigDir", "-CachedNssm", "-WerImages"):
+    for fact in (
+        "-DataDir",
+        "-ServiceAccount",
+        "-ConfigDir",
+        "-SecretsDir",
+        "-CachedNssm",
+        "-WerImages",
+    ):
         assert fact in notice[0]["text"], (
             f"the notice is called without {fact}, so that residue can never be reported: "
             f"{notice[0]['text']}"
@@ -2272,7 +2301,10 @@ def test_the_environment_merge_replaces_only_the_secrets_directory(tmp_path: Pat
   [pscustomobject]@{ old = $old; merged = @($merged); fresh = @($fresh) } | ConvertTo-Json -Compress
 """
     got = json.loads(
-        _ok(_extract(_SCRIPT, ["Get-MergedEnvironmentList"], body), tmp_path)
+        _ok(
+            _extract(_SCRIPT, ["Get-MergedEnvironmentList", "Test-EnvironmentEntryNames"], body),
+            tmp_path,
+        )
         .strip()
         .splitlines()[-1]
     )
@@ -2288,7 +2320,7 @@ def test_the_environment_merge_replaces_only_the_secrets_directory(tmp_path: Pat
 @_windows_only
 def test_the_secrets_directory_lockdown_passes_the_engines_own_check(tmp_path: Path) -> None:
     """Set-SecretsDirAcl on a directory that inherits Users read and the account's Modify, the shape
-    a fresh <DataDir>/secrets would have under an unlocked parent. Measured with the engine's own
+    a fresh secrets directory would have under an unlocked parent. Measured with the engine's own
     check, broad_access_problem(directory=True): it refuses the directory before and accepts it
     after. The account keeps read and loses the inherited Modify. Unelevated, the owner change is
     refused and says so; that warning is the only one expected."""
@@ -2373,17 +2405,62 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
     assert "AppEnvironmentExtra" not in " ".join(
         c["text"] for c in facts["commands"] if c["name"] == "Invoke-Nssm"
     ), "an `nssm set AppEnvironmentExtra` would replace the operator's whole list"
-    # The lockdown replaces the directory's list, so -SecretsDir may not be or hold the data
-    # directory, the store's, the config's, NSSM's or the engine's. Refused before anything acts.
-    text = _script_text()
-    guard = text.index("is, or holds")
-    assert text.index("$SecretsDir = Resolve-AbsolutePath $SecretsDir") < guard
-    assert guard < text.index("$NssmPath = Resolve-Nssm"), "the guard must run before anything acts"
-    for other in (
-        "$DataDir",
-        "(Split-Path -Parent $DbPath)",
-        "$Config",
-        "$NssmDir",
-        "$AppDirectory",
-    ):
-        assert other in text[text.rindex("foreach", 0, guard) : guard], other
+    # The lockdown replaces the directory's list, so -SecretsDir is judged by the -LockConfigDir
+    # rule, and the directory is made, before anything acts on the service.
+    check = next(
+        c
+        for c in facts["commands"]
+        if c["name"] == "Get-LockPathProblem" and "-Path $SecretsDir" in c["text"]
+    )
+    assert "-AllowMissing" in check["text"] and "-OnlyFolders @()" in check["text"], check["text"]
+    creates = [
+        c
+        for c in facts["commands"]
+        if c["name"] == "New-AdminOnlyFolder" and "-Path $SecretsDir" in c["text"]
+    ]
+    assert len(creates) == 1, creates
+    registered = min(
+        c["start"]
+        for c in facts["commands"]
+        if c["name"] == "Invoke-Nssm" and "install" in c["text"]
+    )
+    assert check["start"] < creates[0]["start"] < registered, (
+        "the secrets directory must be judged and made before the service registration changes"
+    )
+    holds = next(a for a in facts["assignments"] if a["lhs"] == "SecretsHolds")["rhsText"]
+    for other in ("$DataDir", "$LogDir", "$DbPath", "$Config", "$NssmDir", "$AppDirectory"):
+        assert other in holds, other
+    assert "environments" in holds and "$ServiceConfig" in holds, holds
+
+
+def test_the_secrets_directory_path_rule(tmp_path: Path) -> None:
+    """Get-LockPathProblem with -AllowMissing, as the installer calls it for -SecretsDir: a path
+    that does not exist yet passes; a volume root, a folder holding a folder, and a path inside a
+    refused folder do not. The control: the same call without -AllowMissing refuses the absent
+    path, so the switch is what lets it through."""
+    assert _SCRIPT is not None
+    existing = tmp_path / "sec"
+    (existing / "sub").mkdir(parents=True)
+    absent = tmp_path / "absent"
+    body = rf"""
+  $absent = {_psq(str(absent))}
+  $existing = {_psq(str(existing))}
+  $outer = {_psq(str(tmp_path))}
+  [pscustomobject]@{{
+    absent = (Get-LockPathProblem -Path $absent -OnlyFolders @() -AllowMissing)
+    absentStrict = (Get-LockPathProblem -Path $absent -OnlyFolders @())
+    root = (Get-LockPathProblem -Path ([System.IO.Path]::GetPathRoot($outer)) -OnlyFolders @() -AllowMissing)
+    folder = (Get-LockPathProblem -Path $existing -OnlyFolders @() -AllowMissing)
+    within = (Get-LockPathProblem -Path $absent -NotWithin @($outer) -OnlyFolders @() -AllowMissing)
+    holds = (Get-LockPathProblem -Path $absent -Holds @((Join-Path $absent 'x')) -OnlyFolders @() -AllowMissing)
+  }} | ConvertTo-Json -Compress
+"""
+    got = json.loads(
+        _ok(_extract(_SCRIPT, ["Get-LockPathProblem"], body), tmp_path).strip().splitlines()[-1]
+    )
+    assert got["absent"] == "", got
+    assert got["absentStrict"], "CONTROL FAILED: without -AllowMissing an absent path passed"
+    assert "root of a volume" in got["root"], got
+    assert "other folders" in got["folder"], got
+    assert "inside" in got["within"], got
+    assert "holds" in got["holds"], got

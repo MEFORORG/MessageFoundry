@@ -824,8 +824,8 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    ADR 0019 declared, `aws_kms`, `azure_kv`, `gcp_kms` and `pkcs11`, were never built and are no longer
    accepted (vault BACKLOG #2595). The seam
    changes only *how* the key bytes are provisioned, never how they are used — the AES-256-GCM keyring,
-   the `mfenc:v1` format, and `rotate-key` are unchanged. Selecting an unbuilt/unknown provider **fails
-   closed** (`KeyProviderError` → `serve` won't start), never silently to the identity (plaintext) cipher.
+   the `mfenc:v1` format, and `rotate-key` are unchanged. Selecting an unknown provider **fails
+   closed** (`KeyProviderError`) wherever the key is resolved, never silently to the identity (plaintext) cipher.
    An operator **activates** an external module so the root **KEK** is managed **non-extractable** inside
    it (centralized rotation/revocation/per-call audit; the key bytes no longer sit in an env var or a
    machine-bound file). On the strength of this built seam + an operator-activated external module **ASVS
@@ -2856,7 +2856,7 @@ traceability:
 - **Pluggable at-rest key sourcing — the KeyProvider seam** (`[store].key_provider`,
   [store/keyprovider.py](../messagefoundry/store/keyprovider.py); §3) — built-in `auto`/`env`/`dpapi`
   (default `auto` byte-identical to before) + lazy external HSM/KMS/Vault hooks that envelope-decrypt a
-  wrapped DEK inside an isolated module; fails closed on an unbuilt/unknown provider. Flips **ASVS 13.3.3
+  wrapped DEK inside an isolated module; fails closed on an unknown provider. Flips **ASVS 13.3.3
   Fail → Pass *(conditional, operator-activated)*** on the built seam + an operator-activated external
   module (ADR 0019 amended 2026-06-18, PR #377). Residuals: on-prem `auto` is the managed residual, and
   the in-use DEK-in-heap is the separately-deferred ASVS 11.7.1 / WP-BL3-28. Cloud SDKs are optional

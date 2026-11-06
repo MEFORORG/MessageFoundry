@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 
 class KeyProviderError(RuntimeError):
     """The configured ``[store].key_provider`` could not provision a key — an unknown provider name, or
-    an external provider that is selected but not built / cannot resolve. Raised out of
+    an external provider that cannot load or resolve. Raised out of
     :func:`resolve_key_provider` (and thus ``resolve_active_key``) so ``open_store`` propagates it and
     ``serve`` **fails to start** rather than degrading to the identity cipher (ADR 0019 §4), mirroring
     the existing fail-closed ``DpapiError``/``DpapiUnavailable`` contract for an unreadable key file."""
@@ -196,7 +196,7 @@ def provider_key_file(settings: StoreSettings) -> str | None:
     """The key file ``[store].key_provider`` loads the active key from, or ``None``.
 
     Asked of the built-in provider itself (its ``key_file``), which is what its ``active_key``
-    loads. An external provider loads no local file, and is not built here: building one may need
+    loads. An external provider loads no local file, and is not constructed here: building one may need
     its backend. ``serve`` checks the access of the file this names before it is used (vault
     BACKLOG #2601)."""
     builtin = _BUILTIN_PROVIDER_CLASSES.get(settings.key_provider)

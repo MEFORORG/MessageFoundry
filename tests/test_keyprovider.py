@@ -3,8 +3,9 @@
 """Pluggable KeyProvider seam (ADR 0019, ASVS 13.3.3).
 
 Covers: the default `auto` ladder is BYTE-IDENTICAL to the pre-seam `resolve_active_key`; the `env`/
-`dpapi` built-ins pin a single source; `retired_keys()` is per-element (never comma-joined); external
-HSM/KMS/Vault providers fail closed until built (the lazy hook); and a faked provider's base64 key
+`dpapi` built-ins pin a single source; `retired_keys()` is per-element (never comma-joined); an
+unknown name, the four removed ones included, fails closed, as does a provider whose module is
+missing (the lazy hook); and a faked provider's base64 key
 flows straight through `make_cipher` and decrypts an `mfenc:v1` row with no rotation (the WP-BL3-04
 acceptance criterion). DPAPI round-trips are Windows-only, so the file branch is monkeypatched here."""
 

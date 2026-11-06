@@ -171,11 +171,12 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
 - **Secrets** (`MEFOR_STORE_ENCRYPTION_KEY`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_PASSWORD`, …):
   the engine reads these from **env vars**. On k8s inject via `secretKeyRef` (clean). On Docker use
   `env_file` (gitignored) — note plain env is visible in `docker inspect`; prefer a secrets manager for
-  production. Every secret but the store key can instead come from a **secrets directory**, one file
-  per setting, mounted read-only and named by `MEFOR_SECRETS_DIRECTORY`, which `docker inspect`
-  shows as a path only. `compose.yaml` carries it commented out, with the ownership and modes the
-  engine requires; the rules are in
+  production. At least the engine's own secret settings other than the store key, and every
+  `MEFOR_VALUE_*` value, can instead come from a **secrets directory**, one file per setting,
+  mounted read-only and named by `MEFOR_SECRETS_DIRECTORY`, which `docker inspect` shows as a path
+  only. Which settings it supplies, and which it does not, are listed in
   [CONFIGURATION.md](../docs/CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory).
+  `compose.yaml` carries it commented out, with the ownership and modes the engine requires.
 - **TLS cert/key:** mount **read-only**; never bake into an image layer. The API key may be
   passphrase-encrypted (`MEFOR_API_TLS_KEY_PASSWORD`). Under the default `enforce` the engine
   refuses a group-readable key file ([PHI.md](../docs/PHI.md) §2, *Key files*, which also says what

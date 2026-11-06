@@ -10398,8 +10398,9 @@ def _rotate_key(args: argparse.Namespace) -> int:
     try:
         active_key = resolve_active_key(settings.store, posture=posture)
     except _key_unresolved() + (ValueError,) as exc:
-        # KeyProviderError: a non-default [store].key_provider that is unknown or not-yet-built (an
-        # external HSM/KMS/Vault provider) — fail closed with a clean exit-2, not a traceback (ADR 0019).
+        # KeyProviderError: a non-default [store].key_provider that is unknown, or an external
+        # provider that cannot load or resolve — fail closed with a clean exit-2, not a traceback
+        # (ADR 0019).
         #
         # ValueError (vault BACKLOG #3247): under key_provider=vault the Vault client build can
         # refuse with a bare one, which reached the dispatch floor and exited 1, an aborted

@@ -245,6 +245,9 @@ function Get-UninstallResidueNotice {
         # longer translates, so the SID is the spelling of the account that still works in icacls.
         [string]$ServiceAccountSid,
         [string]$ConfigDir,
+        # The secrets directory read off the registration's MEFOR_SECRETS_DIRECTORY (vault BACKLOG
+        # #2595 slice C). The installer grants the run-as account read there, with inheritance off.
+        [string]$SecretsDir,
         # Measured from the config dir's own ACL, not assumed from a switch this script never saw.
         [switch]$ConfigInheritanceStripped,
         # Path of the nssm.exe the registration starts, only when it is actually on disk.
@@ -259,6 +262,7 @@ function Get-UninstallResidueNotice {
         [switch]$LogonRightRemoved,
         [switch]$DataAceRemoved,
         [switch]$ConfigAceRemoved,
+        [switch]$SecretsAceRemoved,
         # Read AFTER the removal: the service's registry key is still there. Windows has only marked
         # the service for deletion, and the key holds the SID type and the privilege list the
         # installer set (vault BACKLOG #2702).
@@ -301,6 +305,13 @@ function Get-UninstallResidueNotice {
         $lines += "                   carries them. Check with: sc.exe query `"$ServiceName`""
     }
 
+    if ($SecretsDir) {
+        $lines += "  Secrets dir      $SecretsDir"
+        $lines += "                   The secrets directory the service read: any file in it holds"
+        $lines += "                   a secret in plain text. This script leaves it and its files."
+        $lines += "                   Delete them once nothing needs them."
+    }
+
     if ($CachedNssm) {
         $lines += "  NSSM binary      $CachedNssm"
         $lines += "                   The copy the service was registered with. Any other service"
@@ -324,6 +335,16 @@ function Get-UninstallResidueNotice {
                 $lines += "  Config dir entry '$ServiceAccount' still has read on $ConfigDir."
                 $lines += "                   Remove it with:"
                 $lines += "                     icacls `"$ConfigDir`" /remove:g `"$acePrincipal`""
+            }
+        }
+
+        if ($SecretsDir) {
+            if ($SecretsAceRemoved) {
+                $lines += "  Secrets entry    REMOVED - '$ServiceAccount' no longer has an entry on $SecretsDir."
+            } else {
+                $lines += "  Secrets entry    '$ServiceAccount' still has read on $SecretsDir."
+                $lines += "                   Remove it with:"
+                $lines += "                     icacls `"$SecretsDir`" /remove:g `"$acePrincipal`""
             }
         }
 
@@ -517,7 +538,8 @@ $objectName = ""
 $appParameters = ""
 $appExe = ""
 $appStdout = ""
-$svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+$secretsDir = ""
+$svcKey ="HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
 try {
     $objectName = [string](Get-ItemProperty -Path $svcKey -Name ObjectName -ErrorAction Stop).ObjectName
 } catch {
@@ -530,6 +552,12 @@ try {
     $appParameters = [string]$params.AppParameters
     $appExe = [string]$params.Application
     $appStdout = [string]$params.AppStdout
+    # The secrets directory install-service.ps1 named to the service (vault BACKLOG #2595 slice C).
+    # The last entry wins, as when NSSM builds the environment; names ignore case, as on Windows.
+    $secretsEntry = @($params.AppEnvironmentExtra | Where-Object {
+            $_ -and ([string]$_).StartsWith("MEFOR_SECRETS_DIRECTORY=", [StringComparison]::OrdinalIgnoreCase) }) |
+        Select-Object -Last 1
+    if ($secretsEntry) { $secretsDir = $secretsEntry.Substring("MEFOR_SECRETS_DIRECTORY=".Length) }
 } catch {
     $unreadable += ("the registered command line of '$ServiceName' ($($_.Exception.Message)) - so " +
         "the config directory and the data directory below could not be checked against it")
@@ -699,6 +727,7 @@ for ($i = 0; $registrationPending -and $i -lt 10; $i++) {
 $logonRightRemoved = $false
 $dataAceRemoved = $false
 $configAceRemoved = $false
+$secretsAceRemoved = $false
 
 if ($RemoveLogonRight) {
     if (-not $hasAccount) {
@@ -731,6 +760,9 @@ if ($RemoveAccountAces) {
                 "entry for '$objectName' was left. Remove it with: icacls `"<config dir>`" " +
                 "/remove:g `"$acePrincipal`"")
         }
+        if ($secretsDir) {
+            $secretsAceRemoved = Remove-AccountAce -Path $secretsDir -Principal $acePrincipal -What "secrets directory"
+        }
     }
 }
 
@@ -740,6 +772,7 @@ Get-UninstallResidueNotice `
     -ServiceAccount $objectName `
     -ServiceAccountSid $accountSid `
     -ConfigDir $configDir `
+    -SecretsDir $secretsDir `
     -ConfigInheritanceStripped:$configProtected `
     -CachedNssm $cachedNssm `
     -WerImages $werImages `
@@ -747,6 +780,7 @@ Get-UninstallResidueNotice `
     -LogonRightRemoved:$logonRightRemoved `
     -DataAceRemoved:$dataAceRemoved `
     -ConfigAceRemoved:$configAceRemoved `
+    -SecretsAceRemoved:$secretsAceRemoved `
     -RegistrationPending:$registrationPending `
     -Unreadable $unreadable |
     ForEach-Object { Write-Host $_ }
