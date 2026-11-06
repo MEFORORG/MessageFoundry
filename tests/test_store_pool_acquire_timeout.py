@@ -30,7 +30,6 @@ discards the connection. Hence shield-then-cancel-then-salvage.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import re
 import types
 from pathlib import Path
@@ -273,11 +272,39 @@ async def test_salvage_swallows_a_release_failure() -> None:
 
 
 #: How many event-loop turns a borrow from a ready pool may take. Measured 2026-11-06 on 3.14: it
-#: finishes in 4, for the borrow task, the shield's callback and the wake of the waiting task.
+#: finishes in 4: the task's first step, the borrow task, the shield's callback, and the wake of
+#: the waiting task.
 #: A path that waits on a timer cannot finish inside them while they take microseconds, as they do
 #: idle. Under contention they can span milliseconds, and a timer shorter than that can come due
 #: within them, so a sub-millisecond wait may pass here on a loaded runner.
 _HEALTHY_BORROW_TURNS = 20
+
+
+class _SlowReadyPool(_ReadyPool):
+    """Hands its connection over after a timer: the shape of a path that waits one out. An hour,
+    so that no stall the turn budget could span brings it due on a loaded runner."""
+
+    async def acquire(self) -> Any:
+        await asyncio.sleep(3600)
+        return self.conn
+
+
+async def _borrow_within_turns(pool: Any) -> asyncio.Task[Any] | None:
+    """The borrow, if it finished within ``_HEALTHY_BORROW_TURNS`` loop turns at the shipped timeout;
+    otherwise ``None``, with the borrow cancelled and waited for. ``asyncio.wait`` rather than an
+    await, so a cancellation aimed at the test itself still propagates."""
+    borrow = asyncio.create_task(
+        acquire_pooled(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT, backend="sqlserver")
+    )
+    for _ in range(_HEALTHY_BORROW_TURNS):
+        if borrow.done():
+            return borrow
+        await asyncio.sleep(0)
+    if borrow.done():
+        return borrow
+    borrow.cancel()
+    await asyncio.wait({borrow})
+    return None
 
 
 async def test_a_healthy_borrow_is_unaffected() -> None:
@@ -288,23 +315,20 @@ async def test_a_healthy_borrow_is_unaffected() -> None:
     the core for 0.05 s after arming the timer let it come due before the borrow's result reached
     the waiting task, and the timer won: windows-2022 on 2026-10-06 and windows-2025 on 2026-10-12
     raised StoreAcquireTimeout from a pool that was never empty. A GIL-holding neighbour thread
-    does the same here on demand. What this asks instead is that a ready connection comes back
-    within a few turns, unreleased, which a path that waits out a timer cannot do."""
-    pool = _ReadyPool()
-    borrow = asyncio.create_task(
-        acquire_pooled(pool, timeout=DEFAULT_STORE_ACQUIRE_TIMEOUT, backend="sqlserver")
+    does the same here on demand: measured 2026-11-06 on Windows, Python 3.14, with a spinning
+    thread and ``sys.setswitchinterval(0.1)``, the old shape failed 49 of 50 runs and this one 0
+    of 50; idle, both passed 50 of 50. What this asks instead is that a ready connection comes back
+    within a few turns, unreleased, which a path that waits out a timer cannot do. The control
+    arm shows that on this loop: a borrow behind an hour-long timer is still waiting after the same
+    turns."""
+    assert await _borrow_within_turns(_SlowReadyPool()) is None, (
+        "a borrow behind an hour-long timer finished inside the turn budget -- it no longer discriminates"
     )
-    for _ in range(_HEALTHY_BORROW_TURNS):
-        if borrow.done():
-            break
-        await asyncio.sleep(0)
-    if not borrow.done():
-        borrow.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await borrow
-        pytest.fail(
-            f"a borrow from a ready pool was still waiting after {_HEALTHY_BORROW_TURNS} turns"
-        )
+    pool = _ReadyPool()
+    borrow = await _borrow_within_turns(pool)
+    assert borrow is not None, (
+        f"a borrow from a ready pool was still waiting after {_HEALTHY_BORROW_TURNS} turns"
+    )
     assert borrow.result() is pool.conn
     assert pool.released == []  # the CALLER releases, not the helper
 

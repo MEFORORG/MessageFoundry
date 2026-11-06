@@ -529,16 +529,18 @@ def test_control_the_same_record_is_expensive_unbounded() -> None:
 #: than hidden inside a loose budget here. This line is set to catch a regression in the scan while
 #: tolerating the render, and the scan is asserted separately below at its own budget.
 #:
-#: **A ratio to the stdlib's own render, in thread CPU time, not a number of wall seconds (BACKLOG
-#: #2306, #3456).** This was one wall-clock sample against 0.20 s, and nearly all of that sample is
-#: the render, a linear copy whose speed is the runner's memory and whose wall time is the runner's
-#: load. windows-2025 merge groups read 0.2005 to 0.2248 s against it in November 2026 with the scan
-#: at about 1 ms. Measured 2026-11-06 on a 32-way Windows box, idle and beside 32 to 96 processes
-#: copying 48 MiB buffers: the filter costs 0.81 to 1.33 renders. With ``redact_untrusted`` swapped
-#: for the unbounded ``redact`` it costs 7.1 to 13.1 idle but only 3.17 to 4.75 under that load,
-#: because contention slows the memory-bound render more than the CPU-bound scan. The line sits
-#: near the geometric mean of the worst reading on each side.
-_TRACEBACK_RENDER_RATIO = 2.0
+#: **A line drawn on this runner, in thread CPU time, not a number of wall seconds (BACKLOG #2306,
+#: #3456).** This was one wall-clock sample against 0.20 s, and nearly all of that sample is the
+#: render, a linear copy whose speed is the runner's memory and whose wall time is the runner's load.
+#: windows-2025 merge groups read 0.2005 to 0.2248 s against it in November 2026 with the scan at
+#: about 1 ms. A fixed ratio to the render is not used either: the render is a memory-bound copy
+#: and the scan is CPU-bound regex work, so how many renders the unbounded filter costs depends on
+#: the runner's memory against its core, and a fixed ratio could fall on the wrong side of it.
+#:
+#: So the line is measured beside the subject. The filter may cost one render plus this share of
+#: the unbounded scan, ``redact`` over the whole render, both timed here. With the bound the filter
+#: adds about nothing to the render; without it, it adds the whole scan. Readings are in the test.
+_TRACEBACK_SCAN_SHARE = 0.5
 
 
 type _ExcInfo = tuple[type[BaseException], BaseException, TracebackType | None]
@@ -554,11 +556,15 @@ def _raised_traceback() -> _ExcInfo:
 
 def _record_of(exc_info: _ExcInfo) -> logging.LogRecord:
     """A fresh record each call, because the filter renders ``exc_info`` into ``exc_text`` and clears
-    it, so a second pass over one record would time nothing. The exception itself is not changed, so
-    every record can share one."""
+    it, so a second pass over one record would skip the render. The exception itself is not
+    changed, so every record can share one."""
     return logging.LogRecord(
         "t", logging.ERROR, __file__, 1, "transform worker failed", (), exc_info
     )
+
+
+def _filter_a_fresh_record(exc_info: _ExcInfo) -> None:
+    RedactionFilter().filter(_record_of(exc_info))
 
 
 def _thread_cpu_per_call(work: Callable[[], object]) -> float:
@@ -588,43 +594,45 @@ def test_the_filter_bounds_a_peer_sized_traceback() -> None:
     Paired rounds, minimum per side, and which arm goes first drawn each round from an unseeded
     generator, the rule ``tests/_growth.py`` gives (BACKLOG #3721). That makes a stretch of load
     with a fixed rhythm unlikely to land on one arm alone, not impossible: ``_growth.py`` gives the
-    odds.
+    odds. The unbounded scan is sampled once: load can only raise it, which loosens the line, and
+    it is the slowest arm by far.
 
-    **The third arm is the negative control, run on the same runner.** It times the unbounded scan
-    the bound replaced, ``redact`` over the whole render. Put back into the filter, that scan must
-    cross the line, or a runner whose render is slow beside its regex engine would pass a filter
-    with the bound removed and this arm would prove nothing there."""
+    Readings, 2026-11-06, one Windows box with 32 logical CPUs, Python 3.14, six runs per row, the
+    filter's cost above the render as a share of the unbounded scan:
+
+    - idle: -0.007 to 0.007 with the bound; 0.900 to 1.050 with ``redact_untrusted`` swapped for
+      ``redact`` in ``messagefoundry.logging_setup``, and this test red in 6 of 6.
+    - beside 96 processes copying 48 MiB buffers: -0.071 to -0.015 with the bound, and this test
+      green in 6 of 6; 0.884 to 0.985 with the swap, and this test red in 6 of 6.
+    - the old shape, one wall-clock filter call against 0.20 s, on the same box: 0.040 to 0.044 s
+      idle, and 0.427 to 0.857 s beside the 96, over the line in 6 of 6."""
     exc_info = _raised_traceback()
     rendered = logging.Formatter().formatException(exc_info)
+    unbounded_scan = _thread_cpu_per_call(lambda: redact(rendered))
     arms: dict[str, Callable[[], object]] = {
-        "render": lambda: logging.Formatter().formatException(exc_info),
-        "filter": lambda: RedactionFilter().filter(_record_of(exc_info)),
-        "unbounded scan": lambda: redact(rendered),
+        "render": partial(logging.Formatter().formatException, exc_info),
+        "filter": partial(_filter_a_fresh_record, exc_info),
     }
     best = dict.fromkeys(arms, float("inf"))
     order = random.Random()
     for _ in range(3):
         for arm in order.sample(list(arms), k=len(arms)):
             best[arm] = min(best[arm], _thread_cpu_per_call(arms[arm]))
-    render = best["render"]
-    assert best["filter"] < _TRACEBACK_RENDER_RATIO * render, (
-        f"the filter cost {best['filter']:.4f} CPU s on a frame-cap traceback, "
-        f"{best['filter'] / render:.2f} times the {render:.4f} s the render alone costs, "
-        f"against a line of {_TRACEBACK_RENDER_RATIO}"
-    )
-    assert render + best["unbounded scan"] > _TRACEBACK_RENDER_RATIO * render, (
-        f"a render plus the unbounded scan costs only {1 + best['unbounded scan'] / render:.2f} "
-        f"renders, inside the line of {_TRACEBACK_RENDER_RATIO} -- on this runner the arm above "
-        f"would pass a filter with the bound removed"
+    line = best["render"] + _TRACEBACK_SCAN_SHARE * unbounded_scan
+    assert best["filter"] < line, (
+        f"the filter cost {best['filter']:.4f} CPU s on a frame-cap traceback, against a line of "
+        f"{line:.4f}: the {best['render']:.4f} s render plus {_TRACEBACK_SCAN_SHARE} of the "
+        f"{unbounded_scan:.4f} s unbounded scan"
     )
 
     rec = _record_of(exc_info)
     RedactionFilter().filter(rec)
 
-    # The part the bound is actually responsible for, measured apart from the render it cannot reach.
-    scan = _best_of(lambda: redact(clamp_untrusted(rendered)))
+    # The part the bound is actually responsible for, measured apart from the render it cannot reach,
+    # in thread CPU time at the same budget for the reason the arm above gives.
+    scan = _thread_cpu_per_call(lambda: redact(clamp_untrusted(rendered)))
     assert scan < _FILTER_BUDGET_SECONDS, (
-        f"the bounded scan of a rendered traceback cost {scan:.4f}s against a "
+        f"the bounded scan of a rendered traceback cost {scan:.4f} CPU s against a "
         f"{_FILTER_BUDGET_SECONDS}s budget"
     )
 
