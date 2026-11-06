@@ -10,10 +10,10 @@ other ``UiDeps`` fields with ``get_engine`` and ``get_gate`` among them, and the
 members and auth-store reads the console makes. Slices 2 to 6 work from these tables.
 
 THE TABLES ARE DATA, AND THE LIVE APP IS CHECKED AGAINST THEM. Each test derives the same fact from
-``create_app(serve_ui=True)`` and fails when the two differ, so a new seam field, a new ``/ui``
-route, a new ``AuthService`` read, or a route that starts reaching a different handler fails until
-somebody classifies it here. The planted tests at the end show each comparison fails on a removed
-entry and on an unclassified addition.
+``create_app(serve_ui=True, oidc_enabled=True)`` and fails when the two differ, so a new seam
+field, a new ``/ui`` route, a new ``AuthService`` read, or a route that starts reaching a different
+handler fails until somebody classifies it here. The planted tests at the end show at least the
+main comparisons failing on a removed entry, an unclassified addition or a wrong class.
 
 HOW A FIELD IS CLASSED. ``endpoint``: the field is, by object identity, the endpoint of the JSON
 routes named. ``core``: no JSON route has it as its endpoint, but each named route's endpoint reaches
@@ -24,20 +24,25 @@ JSON route carries the console's use of it, and the entry says what slice 2 or s
 is needed. An ``ADD`` route that comes to exist fails :func:`test_every_seam_field_is_classified_as_the_app_holds`,
 so the slice that adds it reclassifies the field in the same change.
 
-HOW A ``/ui`` ROUTE IS CLASSED. Its pinned tokens are what its endpoint reaches, read from bytecode:
-the seam fields it calls or passes by reference (an ``is`` comparison against a field is not a
-reach), ``get_engine``, ``get_gate``, ``AuthService`` (its ``_service`` dependency or a
-``get_auth`` read), and each ``AuthService`` read the member table classes ``read``. Its authority is
-then computed: the carriers of those tokens. A route with no authority is one of the ADR's reviewed
-sets: ``public`` (declared with ``public_route``), ``confinement`` (section 2's set),
-``ceremony`` (a sign-in, factor, re-authentication, OIDC or passkey leg, out of the ADR's scope), or
-``check`` (it shows no engine data, so slice 2's ``GET /auth/check/<permission>`` carries it).
+HOW A ``/ui`` ROUTE IS CLASSED. Its pinned tokens are what its endpoint and its console dependencies
+reach, read from bytecode: the seam fields they call or pass by reference (an ``is`` comparison
+against a field is not a reach), ``get_engine``, ``get_gate``, ``AuthService`` (its ``_service``
+dependency or the endpoint's own ``get_auth`` read), each ``AuthService`` read the member table
+classes ``read``, and each attribute read off the engine or gate object. Its pinned authority is
+the JSON operations carrying it. That authority must name only carriers of its tokens, must carry
+every read a GET page shows and every write a route reaches, and must between its gates decide every
+permission the ``/ui`` gate names, adding slice 2's ``GET /auth/check/<permission>`` where a page's
+own reads do not. A route with no authority is one of the ADR's reviewed sets: ``public`` (declared
+with ``public_route``), ``confinement`` (its gate admits a confined session, and it makes no
+sub-request), ``ceremony`` (its endpoint reaches a sign-in, factor, re-authentication, OIDC or
+passkey leg, out of the ADR's scope), or ``check`` (it shows no engine data).
 
-WHAT THE READING CANNOT SEE. The reach is followed through console functions by closure cell, global
-name and console-module attribute. A seam field passed to a console function under a name other than
-``core``, ``admin`` or ``deps``, or an ``AuthService`` under a name other than ``service`` or
-``auth``, is not read. :func:`test_the_reach_reading_sees_every_seam_field_the_console_names` is the
-calibration: every field the console's source names must be reached by some route.
+WHAT THE READING CANNOT SEE. At least this. The reach is followed through console functions by
+closure cell, global name and console-module attribute. A seam field passed to a console function
+under a name other than ``core``, ``admin`` or ``deps``, or an ``AuthService`` under a name other
+than ``service`` or ``auth``, is not read. A gate's step-up or action binding is not compared: only
+permissions are. :func:`test_the_reach_reading_sees_every_seam_field_the_console_names` is the
+calibration: every field the console's source names must be reached by at least one route.
 """
 
 from __future__ import annotations
@@ -61,7 +66,9 @@ import messagefoundry_webconsole
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.app import create_app
 from messagefoundry.api.security import route_declaration_of
+from messagefoundry.auth.permissions import Permission
 from messagefoundry.auth.service import AuthService
+from messagefoundry_webconsole._auth import ENROL_FIRST_UI_ROUTES
 from messagefoundry_webconsole._service import _service
 from scripts import seam_discovery
 from scripts.security.route_gates import route_rows
@@ -114,22 +121,25 @@ def _ops(route: APIRoute) -> list[str]:
     return [f"{m} {route.path}" for m in sorted((route.methods or set()) - _SYNTHETIC_METHODS)]
 
 
+def _routes(app: FastAPI, *, ui: bool) -> dict[str, APIRoute]:
+    """``METHOD /path`` to its route, on one plane. A second route for one operation is refused:
+    the first registered serves the request, so a dict that kept the last would read the wrong
+    endpoint."""
+    out: dict[str, APIRoute] = {}
+    for r in app.routes:
+        if isinstance(r, APIRoute) and r.path.startswith("/ui") == ui:
+            for op in _ops(r):
+                assert op not in out, f"{op} is registered twice; the walk cannot tell which serves"
+                out[op] = r
+    return out
+
+
 def _json_routes(app: FastAPI) -> dict[str, APIRoute]:
-    return {
-        op: r
-        for r in app.routes
-        if isinstance(r, APIRoute) and not r.path.startswith("/ui")
-        for op in _ops(r)
-    }
+    return _routes(app, ui=False)
 
 
 def _ui_routes(app: FastAPI) -> dict[str, APIRoute]:
-    return {
-        op: r
-        for r in app.routes
-        if isinstance(r, APIRoute) and r.path.startswith("/ui")
-        for op in _ops(r)
-    }
+    return _routes(app, ui=True)
 
 
 def _seam_fields(deps: UiDeps) -> dict[str, Any]:
@@ -278,16 +288,29 @@ def _code_names(code: types.CodeType) -> set[str]:
     return {n for sub in _code_objects(code) for n in sub.co_names}
 
 
-def _ui_reach(route: APIRoute, deps: UiDeps, reads: frozenset[str]) -> frozenset[str]:
+def _ui_reach(
+    route: APIRoute, deps: UiDeps, reads: frozenset[str], *, dependencies: bool = True
+) -> frozenset[str]:
     """The tokens one ``/ui`` route reaches; the module docstring says which tokens there are.
 
     ``reads`` is the set of ``AuthService`` tokens (``service.<member>``, ``service.store.<name>``)
-    worth recording; every other ``AuthService`` member is the console's gate or a ceremony leg."""
+    worth recording; every other ``AuthService`` member is the console's gate or a ceremony leg.
+    With ``dependencies``, the walk also starts from each console dependency, so a gate that
+    reaches a handler (a repeat lookup, say) counts for the route as its body does."""
+    starts = [route.endpoint]
+    if dependencies:
+        starts += _dependency_calls(route)
+    seen: dict[int, Any] = {}
+    for start in starts:
+        seen.update((id(f), f) for f in _console_functions(start))
+    # Every gate reads the AuthService, so only the endpoint's own get_auth read is a token.
+    body = {id(f) for f in _console_functions(route.endpoint)}
     tokens: set[str] = set()
-    for fn in _console_functions(route.endpoint):
+    for fn in seen.values():
         for layer in _layers(fn):
             if (
-                "get_auth" in _code_names(layer.__code__)
+                id(fn) in body
+                and "get_auth" in _code_names(layer.__code__)
                 and layer.__globals__.get("get_auth") is not None
             ):
                 tokens.add("AuthService")
@@ -565,9 +588,10 @@ _STORE_READS: dict[str, tuple[str, ...]] = {
 
 #: Every attribute the console reads off the engine or the approval gate object itself.
 _ENGINE_READS: dict[str, tuple[str, ...]] = {
-    # The bulk purge confirmation re-derives eligibility from live quiescence; GET /connections
-    # reports it as status "stopped" on a paused outbound.
-    "engine.registry_runner": ("GET /connections",),
+    # The bulk purge confirmation re-derives eligibility from RegistryRunner.outbound_quiesced.
+    # GET /connections' status word is not that reading (a parked lane reads not_deployed, a
+    # torn-down runner reads stopped), so slice 2 adds a read of it.
+    "engine.registry_runner": ("ADD GET /connections/quiesced",),
 }
 
 #: Every ``app.state`` attribute the console sets or reads, as ``scripts/seam_discovery.py`` finds
@@ -608,7 +632,9 @@ _E = "get_engine"
 #: error today is read on the following GET.
 _UI_ROUTES: dict[str, Ui] = {
     "GET /ui/users": _J("GET /users", f"{_AS} admin.list_users"),
-    "GET /ui/users/new": _J("GET /roles", f"{_AS} admin.list_roles"),
+    "GET /ui/users/new": _J(
+        "GET /roles;ADD GET /auth/check/users:manage", f"{_AS} admin.list_roles"
+    ),
     "GET /ui/users/{user_id}": _J(
         "ADD GET /users/{user_id};GET /roles;GET /users/{user_id}/federated-identity",
         f"{_AS} admin.federated_identity_view admin.list_roles admin.user_summary "
@@ -671,7 +697,9 @@ _UI_ROUTES: dict[str, Ui] = {
     ),
     "GET /ui/roles": _J("GET /roles", f"{_AS} admin.list_roles"),
     "GET /ui/roles/new": Ui("check", "ADD GET /auth/check/users:manage", ""),
-    "GET /ui/roles/{role_id}/edit": _J("GET /roles/custom", f"{_AS} admin.list_custom_roles"),
+    "GET /ui/roles/{role_id}/edit": _J(
+        "GET /roles/custom;ADD GET /auth/check/users:manage", f"{_AS} admin.list_custom_roles"
+    ),
     "POST /ui/roles/custom": _J("POST /roles/custom", f"{_AS} admin.create_custom_role"),
     "POST /ui/roles/custom/{role_id}/update": _J(
         "PUT /roles/custom/{role_id}", f"{_AS} admin.update_custom_role"
@@ -821,11 +849,14 @@ _UI_ROUTES: dict[str, Ui] = {
         f"{_AS} core.prior_resend core.resend_message {_E}",
     ),
     "GET /ui/messages/{message_id}/edit": _J(
-        "GET /messages/{message_id};GET /messages/{message_id}/raw",
+        "GET /messages/{message_id};GET /messages/{message_id}/raw;"
+        "ADD GET /auth/check/messages:edit",
         f"core.get_message core.get_message_body {_E}",
     ),
+    # Its gate names messages:view_raw beside messages:edit (BACKLOG #324), because it reads the
+    # stored body it edits, so that read is part of its authority as well as the write.
     "POST /ui/messages/{message_id}/edit-resend": _J(
-        "POST /messages/{message_id}/edit-resend",
+        "POST /messages/{message_id}/edit-resend;GET /messages/{message_id}/raw",
         f"{_AS} core.edit_resend_message core.get_message core.get_message_body {_E}",
     ),
     "GET /ui/mfa": Ui("public", "", _AS),
@@ -856,10 +887,10 @@ _UI_ROUTES: dict[str, Ui] = {
         "POST /uploads/{file_id}/resend", f"core.resend_uploaded_message {_E}"
     ),
     "GET /ui/uploaded-logs/file/{file_id}/resend-confirm": _J(
-        "GET /uploads", f"core.list_uploaded_files {_E}"
+        "GET /uploads;ADD GET /auth/check/messages:edit", f"core.list_uploaded_files {_E}"
     ),
     "GET /ui/uploaded-logs/file/{file_id}/delete-confirm": _J(
-        "GET /uploads", f"core.list_uploaded_files {_E}"
+        "GET /uploads;ADD GET /auth/check/files:delete", f"core.list_uploaded_files {_E}"
     ),
     "POST /ui/uploaded-logs/file/{file_id}/delete": _J(
         "DELETE /uploads/{file_id}", f"core.delete_uploaded_file {_E}"
@@ -896,10 +927,12 @@ _UI_ROUTES: dict[str, Ui] = {
         "GET /cluster/nodes;GET /cluster/status", f"core.cluster_nodes core.cluster_status {_E}"
     ),
     "GET /ui/cluster/stepdown-confirm": _J(
-        "GET /cluster/nodes;GET /cluster/status", f"core.cluster_nodes core.cluster_status {_E}"
+        "GET /cluster/nodes;GET /cluster/status;ADD GET /auth/check/cluster:control",
+        f"core.cluster_nodes core.cluster_status {_E}",
     ),
     "GET /ui/cluster/force-stepdown-confirm": _J(
-        "GET /cluster/nodes;GET /cluster/status", f"core.cluster_nodes core.cluster_status {_E}"
+        "GET /cluster/nodes;GET /cluster/status;ADD GET /auth/check/cluster:control",
+        f"core.cluster_nodes core.cluster_status {_E}",
     ),
     "POST /ui/cluster/stepdown": _J("POST /cluster/stepdown", f"core.cluster_stepdown {_E}"),
     "POST /ui/cluster/force-stepdown": _J("POST /cluster/stepdown", f"core.cluster_stepdown {_E}"),
@@ -941,7 +974,8 @@ _UI_ROUTES: dict[str, Ui] = {
         "POST /connections/{name}/flag", f"core.audit_channel_denied core.set_connection_flag {_E}"
     ),
     "GET /ui/connections/purge-confirm": _J(
-        "GET /connections", f"core.audit_channel_denied {_E} engine.registry_runner"
+        "ADD GET /connections/quiesced;ADD GET /auth/check/messages:purge",
+        f"core.audit_channel_denied {_E} engine.registry_runner",
     ),
     "POST /ui/connections/purge-bulk": _J(
         "POST /connections/{name}/purge",
@@ -957,6 +991,24 @@ _UI_ROUTES: dict[str, Ui] = {
     "POST /ui/oidc/start": Ui("public", "", _AS),
     "POST /ui/reauth/oidc": Ui("public", "", _AS),
     "GET /ui/oidc/callback": Ui("public", "", _AS),
+}
+
+#: The gate permissions this file proposes for each JSON route it ADDs, other than the
+#: ``GET /auth/check/<permission>`` routes, which name theirs in the path. Slice 2 builds them.
+_ADDED: dict[str, tuple[str, ...]] = {
+    "GET /messages/{message_id}/prior-resend": ("messages:resend",),
+    "GET /users/{user_id}": ("users:manage",),
+    "GET /me/notify-email": (),
+    "GET /me/webauthn": (),
+    "GET /connections/quiesced": ("monitoring:read",),
+}
+
+#: JSON operations that decide a permission in their body rather than in their gate: the reason
+#: pages pass ``reveal``, and the handler requires ``messages:view_summary`` for it (owner ruling
+#: R12, BACKLOG #2443). Each claim is checked: the endpoint must reach the permission's name.
+_IN_BODY: dict[str, tuple[str, ...]] = {
+    "GET /alerts/active": ("messages:view_summary",),
+    "GET /events": ("messages:view_summary",),
 }
 
 #: The four ``/ui`` legs ``oidc.register`` adds only when ``[auth].oidc_enabled`` is set.
@@ -1026,6 +1078,8 @@ def _field_problems(
         obj, entry = fields[name], table[name]
         problems += _carrier_problems(name, entry.carrier, json)
         is_endpoint_of = endpoint_ops.get(id(obj), set())
+        if not entry.carrier:
+            problems.append(f"{name}: classed {entry.kind} with no carrier")
         if entry.kind == "endpoint":
             if is_endpoint_of != set(entry.carrier):
                 problems.append(
@@ -1078,20 +1132,38 @@ def _token_carriers(token: str, fields: Mapping[str, Field]) -> tuple[str, ...] 
     return None
 
 
+class _UiFacts(NamedTuple):
+    """What the live app says about each ``/ui`` operation, read once and compared to the table.
+
+    ``permissions`` covers both planes, by operation. ``confined`` is whether the route's gate
+    admits a must-change, MFA-pending or address-less session. ``ceremonial`` is whether its
+    endpoint reaches an ``AuthService`` member classed ``ceremony``."""
+
+    ui: Mapping[str, APIRoute]
+    derived: Mapping[str, frozenset[str]]
+    permissions: Mapping[str, tuple[str, ...]]
+    confined: Mapping[str, bool]
+    ceremonial: Mapping[str, bool]
+    json: Mapping[str, APIRoute]
+
+
+_CHECK = "GET /auth/check"
+
+
+def _check_op(permission: str | None) -> str:
+    """Slice 2's gate-only route for one permission, or the bare one for a permissionless gate."""
+    return f"{_CHECK}/{permission}" if permission else _CHECK
+
+
 def _ui_problems(
-    ui: Mapping[str, APIRoute],
-    derived: Mapping[str, frozenset[str]],
-    permissions: Mapping[str, tuple[str, ...]],
-    json: Mapping[str, APIRoute],
-    table: Mapping[str, Ui],
-    fields: Mapping[str, Field],
+    facts: _UiFacts, table: Mapping[str, Ui], fields: Mapping[str, Field]
 ) -> list[str]:
     """Each ``/ui`` operation is classified, its reach is the pinned one, and its authority holds
-    together with what it reaches."""
-    problems = _set_problems("/ui route", set(ui), table)
-    for op in sorted(set(ui) & set(table)):
+    together with what it reaches and with the permissions its own gate names."""
+    problems = _set_problems("/ui route", set(facts.ui), table)
+    for op in sorted(set(facts.ui) & set(table)):
         entry = table[op]
-        reach = derived[op]
+        reach = facts.derived[op]
         pinned = frozenset(entry.reach.split())
         if reach != pinned:
             problems.append(
@@ -1099,21 +1171,41 @@ def _ui_problems(
                 f"new {sorted(reach - pinned)}, gone {sorted(pinned - reach)}"
             )
         authority = tuple(a for a in entry.authority.split(";") if a)
-        problems += _carrier_problems(op, authority, json)
+        problems += _carrier_problems(op, authority, facts.json)
         bare = {a.removeprefix("ADD ") for a in authority}
-        is_public = route_declaration_of(ui[op].endpoint) is not None
+        checks = {a for a in bare if a == _CHECK or a.startswith(f"{_CHECK}/")}
+        declaration = route_declaration_of(facts.ui[op].endpoint)
+        is_public = declaration is not None and declaration.public
         if is_public != (entry.kind == "public"):
             problems.append(f"{op}: classed {entry.kind}, but public_route says {is_public}")
+        # Confinement is the gate admitting a confined session. Such a route may still carry JSON
+        # authority (the password POST does), so only one direction is a rule.
+        if entry.kind == "confinement" and not facts.confined[op]:
+            problems.append(f"{op}: classed confinement, but its gate admits no confined session")
+        if entry.kind == "ceremony" and not facts.ceremonial[op]:
+            problems.append(f"{op}: classed ceremony, but reaches no ceremony member")
         carried: dict[str, tuple[str, ...]] = {}
         for token in reach:
             routable = _routable(_token_carriers(token, fields) or ())
             if routable:
                 carried[token] = routable
+        if entry.kind in ("json", "check"):
+            # The JSON routes named must between them decide every permission the /ui gate
+            # names; a confirmation page that only reads a weaker list adds the check route.
+            own = set(facts.permissions.get(op, ()))
+            decided = {
+                p
+                for a in bare
+                for p in (*facts.permissions.get(a, ()), *_ADDED.get(a, ()), *_IN_BODY.get(a, ()))
+            }
+            decided |= {c.removeprefix(f"{_CHECK}/") for c in checks}
+            for p in sorted(own - decided):
+                problems.append(f"{op}: its gate names {p}, which none of its authority decides")
         if entry.kind == "json":
-            if not authority:
-                problems.append(f"{op}: classed json with no authority")
+            if not bare - checks:
+                problems.append(f"{op}: classed json with no JSON route in its authority")
             offered = {c for routes in carried.values() for c in routes}
-            for a in sorted(bare - offered):
+            for a in sorted(bare - offered - checks):
                 problems.append(f"{op}: authority {a} carries nothing the route reaches")
             # A GET page needs every read it shows. A write needs each write it reaches; the page
             # it re-renders is read on the following GET (ADR 0215 section 2, one write per POST).
@@ -1123,8 +1215,8 @@ def _ui_problems(
                 if (is_get or writes) and not bare & set(routes):
                     problems.append(f"{op}: reaches {token}, which none of its authority carries")
         elif entry.kind == "check":
-            needed = {f"GET /auth/check/{p}" for p in permissions.get(op, ())}
-            if not authority or bare != needed:
+            needed = {_check_op(p) for p in facts.permissions.get(op, ())} or {_check_op(None)}
+            if bare != needed:
                 problems.append(
                     f"{op}: a check route's authority is its gate's check routes {sorted(needed)}, "
                     f"not {sorted(bare)}"
@@ -1148,19 +1240,56 @@ def _read_tokens() -> frozenset[str]:
     return frozenset(members | {f"service.store.{n}" for n in _STORE_READS})
 
 
-@pytest.fixture(scope="module")
-def derived(live: _Live) -> dict[str, frozenset[str]]:
+#: The ``require_ui`` flags that let a confined session through, and the reviewed set the console
+#: keys by operation instead.
+_CONFINEMENT_FLAGS = ("allow_must_change", "allow_mfa_pending", "allow_missing_notify_email")
+
+
+def _closure_vars(fn: Any) -> dict[str, Any]:
+    return dict(zip(fn.__code__.co_freevars, _cells(fn), strict=False))
+
+
+def _admits_confined(op: str, route: APIRoute) -> bool:
+    """Whether the route's gate admits a confined session: it is in ``ENROL_FIRST_UI_ROUTES``, or a
+    gate closure, or a console function it captures, sets one of :data:`_CONFINEMENT_FLAGS`."""
+    method, _, path = op.partition(" ")
+    if (method, path) in ENROL_FIRST_UI_ROUTES:
+        return True
+    pending = [c for c in _dependency_calls(route) if inspect.isfunction(c)]
+    seen: set[int] = set()
+    while pending:
+        fn = pending.pop()
+        if id(fn) in seen or fn.__module__.partition(".")[0] != _CONSOLE_PACKAGE:
+            continue
+        seen.add(id(fn))
+        captured = _closure_vars(fn)
+        if any(captured.get(flag) is True for flag in _CONFINEMENT_FLAGS):
+            return True
+        pending += [v for v in captured.values() if inspect.isfunction(v)]
+    return False
+
+
+def _build_facts(live: _Live) -> _UiFacts:
+    ui = _ui_routes(live.app)
     reads = _read_tokens()
-    return {op: _ui_reach(r, live.deps, reads) for op, r in _ui_routes(live.app).items()}
+    ceremony = frozenset(f"service.{m}" for m, u in _AUTH_SERVICE.items() if u.kind == "ceremony")
+    return _UiFacts(
+        ui=ui,
+        derived={op: _ui_reach(r, live.deps, reads) for op, r in ui.items()},
+        permissions={f"{row.method} {row.path}": row.permissions for row in route_rows(live.app)},
+        confined={op: _admits_confined(op, r) for op, r in ui.items()},
+        # The endpoint alone: every gate dependency reaches a ceremony leg's limiter.
+        ceremonial={
+            op: bool(_ui_reach(r, live.deps, ceremony, dependencies=False) & ceremony)
+            for op, r in ui.items()
+        },
+        json=_json_routes(live.app),
+    )
 
 
 @pytest.fixture(scope="module")
-def ui_permissions(live: _Live) -> dict[str, tuple[str, ...]]:
-    return {
-        f"{row.method} {row.path}": row.permissions
-        for row in route_rows(live.app)
-        if row.path.startswith("/ui")
-    }
+def facts(live: _Live) -> _UiFacts:
+    return _build_facts(live)
 
 
 @pytest.fixture(scope="module")
@@ -1244,18 +1373,9 @@ def test_every_app_state_attribute_is_classified(surface: Any) -> None:
 
 
 def test_every_ui_route_is_classified_by_the_json_route_carrying_its_authority(
-    live: _Live,
-    derived: dict[str, frozenset[str]],
-    ui_permissions: dict[str, tuple[str, ...]],
+    facts: _UiFacts,
 ) -> None:
-    problems = _ui_problems(
-        _ui_routes(live.app),
-        derived,
-        ui_permissions,
-        _json_routes(live.app),
-        _UI_ROUTES,
-        _SEAM_FIELDS,
-    )
+    problems = _ui_problems(facts, _UI_ROUTES, _SEAM_FIELDS)
     assert not problems, "\n".join(problems)
 
 
@@ -1270,20 +1390,53 @@ def test_the_ui_route_counts_are_the_measured_ones() -> None:
     )
 
 
-def test_the_reach_reading_sees_every_seam_field_the_console_names(
-    derived: dict[str, frozenset[str]],
-) -> None:
-    """The calibration. A field the console's source names that no route's reach records is a
-    path the bytecode reading does not follow, so every route table above would be blind to it."""
-    names = {n.partition(".")[2] for n in _SEAM_FIELDS}
-    named = {
+def _added_ops() -> set[str]:
+    """Every ``ADD`` operation any table names, other than the check routes."""
+    carriers = [c for f in _SEAM_FIELDS.values() for c in f.carrier]
+    carriers += [c for u in _AUTH_SERVICE.values() for c in u.carrier]
+    carriers += [c for cs in (*_STORE_READS.values(), *_ENGINE_READS.values()) for c in cs]
+    carriers += [a for u in _UI_ROUTES.values() for a in u.authority.split(";")]
+    return {
+        c.removeprefix("ADD ")
+        for c in carriers
+        if c.startswith("ADD ") and not c.removeprefix("ADD ").startswith(_CHECK)
+    }
+
+
+def test_every_added_route_and_in_body_decision_is_declared(live: _Live) -> None:
+    """Each proposed route names the gate permissions slice 2 gives it, and each in-body decision
+    names a permission the JSON endpoint really reaches."""
+    problems = _set_problems("proposed route", _added_ops(), _ADDED)
+    json = _json_routes(live.app)
+    for op, permissions in sorted(_IN_BODY.items()):
+        names = {
+            n for fn in _engine_reach(json[op].endpoint).values() for n in _code_names(fn.__code__)
+        }
+        for p in permissions:
+            member = Permission(p).name
+            if member not in names:
+                problems.append(f"{op}: decides {p} in its body, but never names {member}")
+    assert not problems, "\n".join(problems)
+
+
+def _named_seam_fields() -> set[str]:
+    """Every seam field the console's source names, as ``core.x``, ``admin.x`` or ``deps.core.x``."""
+    return {
         f"{r}.{a}"
         for r in ("core", "admin")
         for a in _source_attributes(frozenset({r}))
         | _source_attributes(frozenset({"deps"}), through=r)
-        if a in names
+        if f"{r}.{a}" in _SEAM_FIELDS
     }
-    reached = {t for tokens in derived.values() for t in tokens if t in _SEAM_FIELDS}
+
+
+def test_the_reach_reading_sees_every_seam_field_the_console_names(facts: _UiFacts) -> None:
+    """The calibration, and a floor under it. A field the console's source names that no route's
+    reach records is a path the bytecode reading does not follow. It proves each named field is
+    reached by at least one route, not by every route that uses it: a second route reaching the
+    same field down a path the walk misses is not caught here."""
+    named = _named_seam_fields()
+    reached = {t for tokens in facts.derived.values() for t in tokens if t in _SEAM_FIELDS}
     assert named - reached == set(), (
         f"named in the source, reached by no route: {sorted(named - reached)}"
     )
@@ -1293,8 +1446,15 @@ def test_the_reach_reading_sees_every_seam_field_the_console_names(
 
 
 # =====================================================================================================
-# Positive controls: each comparison fails on a removed entry and on an unclassified addition
+# Positive controls: at least these comparisons fail on a removed entry, an unclassified addition,
+# or a planted wrong class
 # =====================================================================================================
+
+
+def test_a_set_census_reports_both_directions() -> None:
+    """The comparison every census above shares (UiDeps, AuthService, store, engine, app.state)."""
+    problems = _set_problems("thing", {"a", "b"}, {"b": "", "c": ""})
+    assert problems == ["unclassified thing a", "c is classified but is no thing of the app"]
 
 
 def test_a_removed_or_added_seam_field_is_reported(live: _Live) -> None:
@@ -1322,54 +1482,77 @@ def test_a_wrong_seam_field_class_is_reported(live: _Live) -> None:
         "core.get_message": _core("GET /messages/{message_id}"),
         "core.reload_config": _endpoint("POST /config/reload"),
         "admin.list_audit": Field("shared", ("GET /audit",), via="_not_a_helper"),
-        # A route to add that the app already serves.
+        # A route to add that the app already serves, a carrier that is no operation, and two
+        # entries with no carrier at all.
         "core.prior_resend": Field("helper", ("ADD GET /connections",)),
+        "admin.user_summary": Field("helper", ("ADD the user route",)),
+        "core.audit_channel_denied": Field("helper", ()),
+        "core.list_connection_events": _endpoint(),
     }
     problems = "\n".join(_field_problems(fields, json, planted))
     assert "core.get_message: classed core, but it is the endpoint" in problems
     assert "core.reload_config: classed endpoint" in problems
     assert "admin.list_audit: does not reach _not_a_helper" in problems
     assert "GET /connections now exists" in problems
+    assert "admin.user_summary: 'ADD the user route' names no METHOD /path" in problems
+    assert "core.audit_channel_denied: classed helper with no carrier" in problems
+    assert "core.list_connection_events: classed endpoint with no carrier" in problems
 
 
-def test_a_removed_or_added_ui_route_is_reported(
-    live: _Live,
-    derived: dict[str, frozenset[str]],
-    ui_permissions: dict[str, tuple[str, ...]],
-) -> None:
-    ui = _ui_routes(live.app)
-    json = _json_routes(live.app)
+def test_a_removed_or_added_ui_route_is_reported(facts: _UiFacts) -> None:
     removed = {k: v for k, v in _UI_ROUTES.items() if k != "GET /ui/config"}
-    assert "unclassified /ui route GET /ui/config" in _ui_problems(
-        ui, derived, ui_permissions, json, removed, _SEAM_FIELDS
+    assert "unclassified /ui route GET /ui/config" in _ui_problems(facts, removed, _SEAM_FIELDS)
+    planted = "GET /ui/planted"
+    added = facts._replace(
+        ui={**facts.ui, planted: facts.ui["GET /ui/config"]},
+        derived={**facts.derived, planted: facts.derived["GET /ui/config"]},
+        confined={**facts.confined, planted: False},
+        ceremonial={**facts.ceremonial, planted: False},
     )
-    added_ui = {**ui, "GET /ui/planted": ui["GET /ui/config"]}
-    added_derived = {**derived, "GET /ui/planted": derived["GET /ui/config"]}
-    assert "unclassified /ui route GET /ui/planted" in _ui_problems(
-        added_ui, added_derived, ui_permissions, json, _UI_ROUTES, _SEAM_FIELDS
-    )
+    assert f"unclassified /ui route {planted}" in _ui_problems(added, _UI_ROUTES, _SEAM_FIELDS)
 
 
-def test_a_changed_ui_reach_or_authority_is_reported(
-    live: _Live,
-    derived: dict[str, frozenset[str]],
-    ui_permissions: dict[str, tuple[str, ...]],
-) -> None:
-    ui = _ui_routes(live.app)
-    json = _json_routes(live.app)
-    # The route starts reaching a handler nobody classified it for.
-    grown = {**derived, "GET /ui/config": derived["GET /ui/config"] | {"core.get_message_body"}}
-    problems = "\n".join(_ui_problems(ui, grown, ui_permissions, json, _UI_ROUTES, _SEAM_FIELDS))
+def test_a_changed_ui_reach_is_reported(facts: _UiFacts) -> None:
+    """The route starts reaching a handler nobody classified it for."""
+    grown = facts._replace(
+        derived={
+            **facts.derived,
+            "GET /ui/config": facts.derived["GET /ui/config"] | {"core.get_message_body"},
+        }
+    )
+    problems = "\n".join(_ui_problems(grown, _UI_ROUTES, _SEAM_FIELDS))
     assert "GET /ui/config: reaches" in problems and "new ['core.get_message_body']" in problems
+
+
+def test_a_wrong_ui_class_or_authority_is_reported(facts: _UiFacts) -> None:
+    body = f"core.get_message core.get_message_body {_E}"
     planted = {
         **_UI_ROUTES,
-        # A PHI page that drops its body read from its authority, and a check page given a
-        # permission its gate does not name.
-        "GET /ui/messages/{message_id}": _J(
-            "GET /messages/{message_id}", f"core.get_message core.get_message_body {_E}"
-        ),
+        # A PHI page that drops its body read from its authority.
+        "GET /ui/messages/{message_id}": _J("GET /messages/{message_id}", body),
+        # A PHI page reclassed into each reviewed exemption.
+        "GET /ui/messages/{message_id}/body": Ui("confinement", "", body),
+        "GET /ui/messages/{message_id}/summary": Ui("ceremony", "", body),
+        "GET /ui/messages/{message_id}/errors": Ui("public", "", body),
+        # A check page given a permission its gate does not name.
         "GET /ui/roles/new": Ui("check", "ADD GET /auth/check/monitoring:read", ""),
+        # A confirmation page carried by a list read weaker than its own gate.
+        "GET /ui/cluster/stepdown-confirm": _J(
+            "GET /cluster/nodes;GET /cluster/status", f"core.cluster_nodes core.cluster_status {_E}"
+        ),
+        # An authority naming a route the page does not reach, and one that is no operation.
+        "GET /ui/config": _J("GET /config/provenance;GET /status", f"core.config_provenance {_E}"),
+        "GET /ui/dead-letters": _J("dead letters", f"core.list_dead_letters {_E}"),
+        # An exemption that names an authority anyway.
+        "POST /ui/csp-report": Ui("public", "GET /status", ""),
     }
-    problems = "\n".join(_ui_problems(ui, derived, ui_permissions, json, planted, _SEAM_FIELDS))
+    problems = "\n".join(_ui_problems(facts, planted, _SEAM_FIELDS))
     assert "GET /ui/messages/{message_id}: reaches core.get_message_body" in problems
+    assert "GET /ui/messages/{message_id}/body: classed confinement, but its gate" in problems
+    assert "GET /ui/messages/{message_id}/summary: classed ceremony, but reaches no" in problems
+    assert "GET /ui/messages/{message_id}/errors: classed public, but public_route" in problems
     assert "GET /ui/roles/new: a check route's authority" in problems
+    assert "GET /ui/cluster/stepdown-confirm: its gate names cluster:control" in problems
+    assert "GET /ui/config: authority GET /status carries nothing" in problems
+    assert "GET /ui/dead-letters: carrier 'dead letters' is not a JSON operation" in problems
+    assert "POST /ui/csp-report: classed public, which carries no authority" in problems
