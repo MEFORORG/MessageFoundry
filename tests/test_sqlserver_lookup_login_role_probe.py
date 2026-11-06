@@ -33,6 +33,11 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.settings import EgressSettings, StoreSettings, load_settings
+from messagefoundry.pipeline.reference_sync import reference_connection_name
+from messagefoundry.sqlserver_roles import (
+    SQLSERVER_FIXED_DATABASE_ROLES,
+    SQLSERVER_FIXED_SERVER_ROLES,
+)
 from messagefoundry.transports.database import (
     DatabaseLookupExecutor,
     LoginRoleVerdict,
@@ -93,7 +98,9 @@ async def _reference_reading(settings: dict[str, Any]) -> Any:
         login_timeout=_login_timeout(settings, "DATABASE reference source"),
     )
     try:
-        return await probe_login_roles(pool, label="reference:live", acquire_timeout=30.0)
+        return await probe_login_roles(
+            pool, label=reference_connection_name("live"), acquire_timeout=30.0
+        )
     finally:
         await _close_pool_bounded(pool, "DATABASE reference source")
 
@@ -109,6 +116,11 @@ async def test_the_probe_reads_the_configured_login(read: Any) -> None:
         # sysadmin as clean.
         assert reading.verdict is LoginRoleVerdict.OVER_GRANTED, reading
         assert "server role sysadmin" in reading.held, reading
+    # Every role it names comes from the closed sets the store's own login check reads.
+    named = {f"server role {r}" for r in SQLSERVER_FIXED_SERVER_ROLES} | {
+        f"database role {r}" for r in SQLSERVER_FIXED_DATABASE_ROLES
+    }
+    assert set(reading.held) <= named, reading
 
 
 @pytest.fixture

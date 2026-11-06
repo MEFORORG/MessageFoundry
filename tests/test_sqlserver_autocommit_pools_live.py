@@ -33,9 +33,8 @@ output, not asserted. On Linux, unixODBC pools only where ``odbcinst.ini`` turns
 
 The DatabaseRef pool is built as ``pipeline/reference_sync.py`` ``_load_database_source`` builds it
 (a read-intent ``_build_dsn``, an autocommit ``_make_pool``, borrowed with ``acquire_pooled``),
-without importing that module: the ``serverdb`` path gate in ``.github/workflows/ci.yml`` does not
-admit it, and ``tests/test_serverdb_ci_coverage.py`` refuses a server-DB suite that imports a source
-the gate does not admit.
+rather than through that function, which runs its statement and closes the pool itself, so it leaves
+no borrowed connection whose session this file could read.
 
 **Gated**: skipped unless ``MEFOR_TEST_SQLSERVER`` is set (plus ``MEFOR_STORE_*``). The weakened TLS
 the CI container needs is attested per hop in the child, since a child inherits no hop posture. The
