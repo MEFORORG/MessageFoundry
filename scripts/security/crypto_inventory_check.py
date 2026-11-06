@@ -2030,8 +2030,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
     # with, to prove the policy leaves one to issue; the value is discarded. Wave 2 (BACKLOG #3373):
     # the census hashes an account's passkey set (``passkey_digest``, SHA-256) to compare it with the
     # digest the account's seal covers, so a passkey row flipped outside the store is not counted.
+    # BACKLOG #1167 (ASVS 11.2.4): that digest compare is constant_time_equal now.
     "messagefoundry/verify/checks.py": frozenset(
         {
+            "compare:via messagefoundry.auth.service",
             "csprng:via messagefoundry.auth.service",
             "hash:via messagefoundry.auth.service",
             "mac:via messagefoundry.auth.service",
