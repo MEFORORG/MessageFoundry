@@ -2364,8 +2364,7 @@ class AuthStore(Protocol):
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool: ...
@@ -2515,8 +2514,7 @@ class AuthStore(Protocol):
         user_id: str,
         *,
         now: float | None = None,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool: ...
 
@@ -2556,10 +2554,11 @@ class AuthStore(Protocol):
     # ``require_way_past`` (ADR 0197 Amendment A, wave 2): delete only while the account keeps a way
     # past the sign-in lock after the delete (TOTP, or another discoverable passkey), judged in the
     # delete's own transaction with the account row held. False when refused or when no row matched.
-    # ``totp_usable`` (BACKLOG #3422) is the caller's rule for what an OPENED TOTP secret is
-    # (``TotpState``); the conditional writes count TOTP as a way past unless it is a KNOWN refusal,
-    # so an unknown one counts as the plain enabled-TOTP rule counts it. The same keyword on
-    # ``set_password``. ``passkey_counts`` (BACKLOG #3937) is the caller's rule for which passkey
+    # ``require_way_past`` IS the caller's rule for what an OPENED TOTP secret is (``TotpState``,
+    # BACKLOG #3422), one parameter, so a condition with no rule cannot be written (BACKLOG #3948
+    # finding 14); ``None`` is an unconditional write. The conditional writes count TOTP as a way
+    # past unless it is a KNOWN refusal, so an unknown one counts as the plain enabled-TOTP rule
+    # counts it. The same keyword on ``set_password`` and ``disable_totp``. ``passkey_counts`` (BACKLOG #3937) is the caller's rule for which passkey
     # counts, the auth service's narrowing to the configured relying party; ``None`` is
     # ``passkey_is_way_past`` alone. The same keyword on ``set_password`` and ``disable_totp``.
     async def delete_webauthn_credential(
@@ -2567,8 +2566,7 @@ class AuthStore(Protocol):
         user_id: str,
         credential_id_hash: str,
         *,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool: ...
 

@@ -2588,7 +2588,7 @@ def _opened_totp_state(secret: str | None) -> TotpState:
     codes with it (:func:`_totp_unusable_reason`), ``"refused"`` when it KNOWS it cannot (an
     enrolment marker this release refuses, or no secret at all), and ``"unknown"`` when it cannot
     tell (ciphertext a keyless open passed through, or a value that will not compute). The service's
-    gates ask it, and pass it to the store's writes as ``totp_usable``. Only ``"refused"`` moves any
+    gates ask it, and pass it to the store's writes as their TOTP rule. Only ``"refused"`` moves any
     decision away from the plain ``totp_enabled`` rule."""
     if not secret:
         return "refused"
@@ -13181,8 +13181,7 @@ class AuthService:
             password_hash=await self._argon2(hash_password, new_password),
             must_change_password=must_change,
             password_generated=False,
-            require_way_past=covered,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state if covered else None,
             passkey_counts=self._gate_counts,
         )
         if not written and covered:
@@ -14711,8 +14710,7 @@ class AuthService:
         if (
             not await self._store.disable_totp(
                 identity.user_id,
-                require_way_past=covered,
-                totp_usable=_opened_totp_state,
+                require_way_past=_opened_totp_state if covered else None,
                 passkey_counts=self._gate_counts,
             )
             and covered
@@ -15578,8 +15576,7 @@ class AuthService:
         if not await self._store.delete_webauthn_credential(
             identity.user_id,
             credential_id_hash,
-            require_way_past=keep_way_past,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state if keep_way_past else None,
             passkey_counts=self._gate_counts,
         ):
             if keep_way_past and await self._passkey_still_held(identity.user_id, target):

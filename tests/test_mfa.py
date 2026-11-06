@@ -3427,8 +3427,7 @@ async def test_a_rotation_landing_between_the_resets_writes_cannot_leave_a_chose
                 password_hash=await asyncio.to_thread(hash_password_for_test, "a-chosen-one-99x"),
                 password_generated=False,
                 must_change_password=False,
-                require_way_past=True,
-                totp_usable=_opened_totp_state,
+                require_way_past=_opened_totp_state,
             ), "the holder's conditional write must match here, TOTP is still on"
             await real_disable(user_id, **k)
 

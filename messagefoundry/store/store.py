@@ -3152,12 +3152,19 @@ TotpUsable = Callable[[str | None], TotpState]
 TotpCounts = Callable[[UserAuthzRecord], bool]
 
 
-def require_totp_rule(require_way_past: bool, usable: TotpUsable | None) -> None:
-    """Refuse a conditional way-past write that brought no TOTP rule: without one an enrolment the
-    engine cannot compute with would count as a way past, which is the failure this rule exists to
-    stop (BACKLOG #3422). Raises :class:`ValueError`; every backend calls it first."""
-    if require_way_past and usable is None:
-        raise ValueError("a conditional way-past write needs totp_usable")
+def conditional_way_past(require_way_past: TotpUsable | None) -> bool:
+    """Whether a write's ``require_way_past`` makes it conditional on a way past the sign-in lock
+    (ADR 0197 Amendment A). The parameter IS the caller's TOTP rule (:data:`TotpUsable`, BACKLOG
+    #3422), so a conditional write that brings no rule cannot be written, where a flag beside an
+    optional rule allowed it (BACKLOG #3948 finding 14). A flag where the rule belongs, the old
+    ``require_way_past=True`` from a caller typed ``Any``, raises :class:`TypeError`: judged as
+    no rule, a TOTP the engine cannot compute with would count as a way past. Every backend's
+    conditional write calls it first."""
+    if require_way_past is None:
+        return False
+    if not callable(require_way_past):
+        raise TypeError("require_way_past takes the caller's TOTP rule (TotpUsable), not a flag")
+    return True
 
 
 #: When each account's TOTP cell was last logged as not opening (monotonic seconds), so a gate
@@ -17240,17 +17247,16 @@ class MessageStore:
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        require_totp_rule(require_way_past, totp_usable)
+        conditional = conditional_way_past(require_way_past)
         # The TOTP judged before the writer lock (judge_totp), confirmed under it by its cell.
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         async with _writer_guard(self._db, self._lock):
@@ -17259,9 +17265,9 @@ class MessageStore:
                 password_hash=password_hash,
                 password_generated=password_generated,
                 must_change_password=must_change_password,
-                require_way_past=require_way_past,
+                require_way_past=conditional,
                 now=now,
-                passkeys=await self._account_passkeys(user_id) if require_way_past else (),
+                passkeys=await self._account_passkeys(user_id) if conditional else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -17434,19 +17440,19 @@ class MessageStore:
         user_id: str,
         *,
         now: float | None = None,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Clear a user's TOTP enrollment entirely (secret, enabled flag, recovery codes). With
-        ``require_way_past``, a TOTP that is a way past (``totp_usable``) goes only while a
-        discoverable passkey remains, read under the same writer lock (:func:`totp_removal`).
+        ``require_way_past``, the caller's TOTP rule, a TOTP that is a way past by it goes only
+        while a discoverable passkey remains, read under the same writer lock
+        (:func:`totp_removal`).
         Returns whether a row was written."""
         now = time.time() if now is None else now
-        require_totp_rule(require_way_past, totp_usable)
+        conditional = conditional_way_past(require_way_past)
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         async with _writer_guard(self._db, self._lock):
@@ -17455,8 +17461,8 @@ class MessageStore:
             # repaired by ``provision-admin`` could use to block the repair.
             change = totp_removal(
                 now,
-                require_way_past=require_way_past,
-                passkeys=await self._account_passkeys(user_id) if require_way_past else (),
+                require_way_past=conditional,
+                passkeys=await self._account_passkeys(user_id) if conditional else (),
                 sealed=self._row_sealer is not None,
                 totp_counts=totp_counts,
                 passkey_counts=passkey_counts,
@@ -17582,23 +17588,22 @@ class MessageStore:
         user_id: str,
         credential_id_hash: str,
         *,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
         predicate keeps the action self-scoped even if a foreign id-hash is submitted). The
         account is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592).
         With ``require_way_past``, only while a way past remains after it, judged under the same
-        writer lock (:func:`removal_keeps_way_past`, TOTP counted by ``totp_usable``)."""
-        require_totp_rule(require_way_past, totp_usable)
+        writer lock (:func:`removal_keeps_way_past`, TOTP counted by that rule)."""
+        conditional = conditional_way_past(require_way_past)
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         async with _writer_guard(self._db, self._lock):
-            if require_way_past:
+            if conditional:
                 current = await self._read_user_record(user_id)
                 if current is None or not removal_keeps_way_past(
                     current,

@@ -320,6 +320,7 @@ from messagefoundry.store.store import (
     build_audit_mac_keys,
     check_caller_event_kind,
     check_password_generated,
+    conditional_way_past,
     delivery_key,
     escalation_passkeys,
     escalation_verdict,
@@ -365,7 +366,6 @@ from messagefoundry.store.store import (
     require_ingress_audit,
     require_notify_email,
     require_operator_audit,
-    require_totp_rule,
     role_seal_ok,
     roll_audit_key_range,
     rotation_reseal,
@@ -14372,16 +14372,15 @@ class SqlServerStore:
         password_hash: str,
         password_generated: bool,
         must_change_password: bool = True,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
         now: float | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        require_totp_rule(require_way_past, totp_usable)
+        conditional = conditional_way_past(require_way_past)
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         # The write helper reads ``OUTPUT``, never ``cursor.rowcount`` (see ``_RESOLVE_OUTPUT``),
@@ -14391,15 +14390,15 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 # The account row first, under UPDLOCK, so a concurrent removal waits.
-                if require_way_past:
+                if conditional:
                     await self._read_user_record(cur, user_id)
                 change = password_change(
                     password_hash=password_hash,
                     password_generated=password_generated,
                     must_change_password=must_change_password,
-                    require_way_past=require_way_past,
+                    require_way_past=conditional,
                     now=now,
-                    passkeys=await self._account_passkeys(cur, user_id) if require_way_past else (),
+                    passkeys=await self._account_passkeys(cur, user_id) if conditional else (),
                     sealed=self._row_sealer is not None,
                     totp_counts=totp_counts,
                     passkey_counts=passkey_counts,
@@ -14509,28 +14508,27 @@ class SqlServerStore:
         user_id: str,
         *,
         now: float | None = None,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         now = time.time() if now is None else now
-        require_totp_rule(require_way_past, totp_usable)
+        conditional = conditional_way_past(require_way_past)
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
         # ``last_totp_step`` too: see ``totp_disable`` (ADR 0197 Amendment A).
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 passkeys: list[WebAuthnCredential] = []
-                if require_way_past:
+                if conditional:
                     # The account row first, under UPDLOCK, so a concurrent removal waits.
                     await self._read_user_record(cur, user_id)
                     passkeys = await self._account_passkeys(cur, user_id)
                 change = totp_removal(
                     now,
-                    require_way_past=require_way_past,
+                    require_way_past=conditional,
                     passkeys=passkeys,
                     sealed=self._row_sealer is not None,
                     totp_counts=totp_counts,
@@ -14648,8 +14646,7 @@ class SqlServerStore:
         user_id: str,
         credential_id_hash: str,
         *,
-        require_way_past: bool = False,
-        totp_usable: TotpUsable | None = None,
+        require_way_past: TotpUsable | None = None,
         passkey_counts: PasskeyCounts | None = None,
     ) -> bool:
         """Delete one credential; True iff a row was removed (rowcount-guarded — the ``user_id``
@@ -14657,13 +14654,13 @@ class SqlServerStore:
         is re-sealed over its new passkey digest in the same transaction (BACKLOG #2592), and the
         count is read from ``OUTPUT`` (BACKLOG #2283). With ``require_way_past``, only while a way
         past remains after it, judged with the account row held (ADR 0197 Amendment A)."""
-        require_totp_rule(require_way_past, totp_usable)
+        conditional = conditional_way_past(require_way_past)
         totp_counts = (
-            await judge_totp(self.open_totp_secret, totp_usable, await self.get_user(user_id))
-            if require_way_past
+            await judge_totp(self.open_totp_secret, require_way_past, await self.get_user(user_id))
+            if conditional
             else None
         )
-        if not require_way_past:
+        if not conditional:
             count = await self._write_passkeys_txn(
                 user_id, _MSSQL_WEBAUTHN_DELETE_ONE, (user_id, credential_id_hash), counted=True
             )

@@ -167,8 +167,7 @@ async def test_a_second_delete_of_the_same_passkey_is_not_called_a_way_past_refu
             user_id: str,
             credential_id_hash: str,
             *,
-            require_way_past: bool = False,
-            totp_usable: Any = None,
+            require_way_past: Any = None,
             passkey_counts: Any = None,
         ) -> bool:
             assert await real_delete(user_id, credential_id_hash)  # the other tab wins first
@@ -176,7 +175,6 @@ async def test_a_second_delete_of_the_same_passkey_is_not_called_a_way_past_refu
                 user_id,
                 credential_id_hash,
                 require_way_past=require_way_past,
-                totp_usable=totp_usable,
             )
 
         store.delete_webauthn_credential = already_gone  # type: ignore[method-assign]
@@ -399,8 +397,7 @@ async def test_a_passkey_flipped_to_discoverable_outside_the_store_opens_nothing
             password_hash="h-chosen",
             password_generated=False,
             must_change_password=False,
-            require_way_past=True,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state,
         )
         census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
         assert census.no_way_past == (identity.username,)
@@ -835,8 +832,7 @@ async def test_a_refused_totp_does_not_free_the_last_discoverable_passkey(
         assert not await store.delete_webauthn_credential(
             identity.user_id,
             cred.credential_id_hash,
-            require_way_past=True,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state,
         )
         assert len(await store.list_webauthn_credentials(identity.user_id)) == 1
     finally:
@@ -864,8 +860,7 @@ async def test_a_refused_totp_does_not_open_the_rotation_gate(secret: str, rotat
             password_hash="h-chosen",
             password_generated=False,
             must_change_password=False,
-            require_way_past=True,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state,
         )
         row = await store.get_user(identity.user_id)
         assert row is not None and row.password_hash != "h-chosen"
@@ -1046,8 +1041,7 @@ async def test_a_passkey_under_a_refused_hash_scheme_is_no_way_past() -> None:
             password_hash="h-chosen",
             password_generated=False,
             must_change_password=False,
-            require_way_past=True,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state,
         )
         census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
         assert census.no_way_past == (identity.username,) and census.passkey_only == ()
@@ -1616,8 +1610,7 @@ async def test_a_passkey_under_another_rp_id_does_not_free_totp(configured: str 
         assert str(refused.value) == TOTP_REMOVAL_REFUSED
         assert not await store.disable_totp(
             identity.user_id,
-            require_way_past=True,
-            totp_usable=_opened_totp_state,
+            require_way_past=_opened_totp_state,
             passkey_counts=gate._gate_counts,
         ), "the store's write counted a passkey the gate does not"
         row = await store.get_user(identity.user_id)
