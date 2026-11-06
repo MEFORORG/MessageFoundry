@@ -443,9 +443,8 @@ def weakened_tls_escape_permitted(posture: HopPosture | None) -> bool:
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
     and the anonymous FTPS ``tls_verify=false`` context, **and — since #329 —** the SFTP
     unknown-host-key acceptance for a login with no ``password``
-    (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
-    cleartext-``http`` hops. The credential hops it no longer reaches are named once, in
-    docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
+    (:mod:`messagefoundry.transports.remotefile`). The credential hops it no longer reaches are
+    named once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified peer*. Pass the construction-time
     :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
     :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
     out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must

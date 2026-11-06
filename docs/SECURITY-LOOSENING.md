@@ -118,9 +118,7 @@ engine has not verified, when the lever named beside each is set:
   hop. The allowlist reads names, and the value test knows only the shapes that definition lists;
 - the store login, under `[store].trust_server_certificate = true` or `[store].encrypt = false`;
 - a SQL Server `DATABASE` connection's login, under `trust_server_certificate = true` or
-  `encrypt = false`;
-- a secret in the path of an alert webhook URL over `http`, under `MEFOR_ALLOW_INSECURE_TLS` at
-  `[security].enforcement = warn`.
+  `encrypt = false`.
 
 **The forward-proxy login is judged by different owner rulings.** A `proxy_user` login rides the
 leg to the proxy, which the engine judges as cleartext whatever the proxy's scheme (vault BACKLOG
