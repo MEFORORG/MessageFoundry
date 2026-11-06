@@ -57,7 +57,7 @@ on its own.
 | 2 | Loading config by file path | Config loader | Loads every non-`_` module it finds |
 | 3 | Loading a module by name or path | Two provider seams, the publish guard's scanner, the child-process bootstrap | Seams: off unless you name an external provider. Bootstrap, engine: only with `[sandbox].mode = "subprocess"` or under `messagefoundry supervise`. Bootstrap, tray: each time autostart starts the tray from a checkout, and each time the tray can build its branded launcher |
 | 4 | Starting processes | 13 modules | Varies, see below |
-| 5 | Calling native libraries | 21 modules, mostly Windows-only paths | On where the platform needs it |
+| 5 | Calling native libraries | 22 modules, mostly Windows-only paths | On where the platform needs it |
 | 6 | Changing thread identity | Windows alternate credentials | Off unless configured |
 | 7 | Parsing hostile input | Message payloads, partner replies, uploads, browser requests, archives, the VS Code extension | On -- this is the product |
 | 8 | Changing machine security settings | Windows service scripts | Only when an administrator runs one |
@@ -147,11 +147,11 @@ these: `auth/ldap.py` probes two `pyspnego` modules to learn whether Kerberos is
 `__init__.py` resolves its lazy exports from a fixed table.
 
 `anon/leak.py` loads one file by path: the publish guard's scanner. It looks in one place only,
-`scripts/security/scan_forbidden.py` under the folder that holds the `messagefoundry` package. It
-builds that path from its own location and searches no other folder. In a source checkout the
+`scripts/security/scan_forbidden.py` under the folder that holds the `messagefoundry_toolkit`
+package, where `anon/` lives since ADR 0201 slice 6. It builds that path from its own location and searches no other folder. In a source checkout the
 folder is the repository root, so the file is the repository's own scanner. From an installed wheel
 the folder is the one that holds the installed package files, normally `site-packages`. The wheel
-ships no such file, so the leak check refuses to run there. So the leak check needs a source
+ships no such file, and neither does the toolkit wheel, so the leak check refuses to run there. So the leak check needs a source
 checkout, which an editable install (`pip install -e .`) also gives, or a scanner file that
 someone placed beside the installed package. A file at that path in a folder above the install is
 never read. Whoever can write the folder that holds the package can already change
@@ -461,7 +461,7 @@ reach one:
 
 ## 5. Native library calls
 
-21 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
+22 modules import `ctypes` to call into C libraries. Most are Windows platform work that has no
 pure-Python equivalent:
 
 - Credential and key storage: `secrets_dpapi.py`, and `store/crypto.py`, which tries to pin key
@@ -473,11 +473,41 @@ pure-Python equivalent:
   lock file's from the open handle with `advapi32`'s `GetSecurityInfo`, never by path, so a rename
   in the staging root cannot choose the owner a sweep goes by (BACKLOG #4988). POSIX needs no
   `ctypes` for this; it reads `fstat` of each one's open descriptor
-- Key file creation: `restricted_file.py`, which on Windows calls `kernel32`'s `CreateFileW` with
-  the file's access list attached and `CREATE_NEW`, so a file that holds a key is restricted in
-  the call that creates it and an existing file or link is refused. It asks `advapi32` to build
-  that list and to resolve an account name to its SID. POSIX needs no `ctypes` for this; it
-  creates the file with `O_CREAT | O_EXCL` and mode `0o600`
+- Key file creation: `restricted_file.py`, which on Windows calls at least `kernel32`'s
+  `CreateFileW` with the file's access list attached and `CREATE_NEW`, so a file that holds a key
+  is restricted in the call that creates it and an existing file or link is refused. It asks
+  `advapi32` to build that list and to resolve an account name to its SID. The new file's owner
+  and access list are read back through the creating handle with `advapi32`'s `GetSecurityInfo`,
+  never by name, and judged by the same exact check the key custody reads below make. A handoff
+  file is made owned by Administrators in that same call, after `advapi32`'s
+  `CheckTokenMembership` says this process holds that group enabled, and only for one account, which
+  `advapi32`'s `LookupAccountSidW` must report as a user or computer account unless the SID has
+  the shape of one service's own SID (`handoff_grantee_problem`). For a key custody file the
+  volume is read through the creating handle too, with `kernel32`'s
+  `GetVolumeInformationByHandleW` and `ntdll`'s `NtQueryVolumeInformationFile`, and a file on
+  anything but a local NTFS or ReFS disk is removed while still empty. Creating the file on POSIX
+  needs no `ctypes` of its own; it creates the file with `O_CREAT | O_EXCL` and mode `0o600`, and
+  on Linux removes a POSIX access control list the file inherits from its directory before writing
+  to it. For a key custody host file it first asks the C library, through `ctypes`, for the file
+  system of the still-empty file (`linux_file_system_type`, below), and removes the file unless
+  that file system is on an allowlist (`LINUX_HOST_FILE_SYSTEMS`)
+- Key custody file reads: `store/custody.py`, which on Windows opens a host or handoff key file with
+  `kernel32`'s `CreateFileW`, `FILE_FLAG_OPEN_REPARSE_POINT` and a share mode that admits only other
+  readers, so a link is opened as itself and the file at that name cannot be replaced while it is
+  checked, and `GetFileType` refuses anything but a disk file (vault BACKLOG #3411). Its owner and
+  access list are read through that handle with `advapi32`'s `GetSecurityInfo`, and its volume
+  with `kernel32`'s `GetVolumeInformationByHandleW` and `ntdll`'s `NtQueryVolumeInformationFile`
+  (`restricted_file.key_file_handle_problem`), never by name. To consume a handoff,
+  `consume_handoff_file` opens it with DELETE as well, and once the service has converted it,
+  deletes it through that same handle with `kernel32`'s `SetFileInformationByHandle`, POSIX
+  semantics first and the classic disposition where the volume has none
+  (`restricted_file.delete_through_handle`), so the file deleted is the file read. Nothing calls
+  these yet. On Linux it opens the file with
+  `O_NOFOLLOW` and reads its mode, owner, group and POSIX access control list from the open
+  descriptor. It asks for that descriptor's file system through
+  `restricted_file.linux_file_system_type` (`fstatfs64`, or `fstatfs` where the C library has no
+  `fstatfs64`), and refuses any file system not on the allowlist for that kind of file. Any other
+  POSIX host opens none of these files
 - Path checks: `tray/actions.py`, which asks `kernel32`'s `GetDriveTypeW` whether the drive letter
   of `log_path` or `repo_path` is a mapped network drive. It asks each time the tray menu is built,
   and again before View Log opens the file, so it can refuse one before touching it. And
@@ -518,8 +548,11 @@ pure-Python equivalent:
 
 **What holds them.** Every library whose code runs is loaded by a name fixed in the code, never by a
 path from configuration. On Windows that is a system library such as `kernel32` or `advapi32`. The
-one non-Windows load is in `store/crypto.py`, which reaches the C library already loaded into the
-process to call `mlock`. One load takes a computed path: `tray/branding.py` opens the tray's own
+non-Windows loads include at least `store/crypto.py`, which reaches the C library already loaded
+into the process to call at least `mlock` and `munlock`, and
+`restricted_file.linux_file_system_type`, which reaches the same library on Linux to call
+`fstatfs64` or `fstatfs`. Both reach it with `CDLL(None)`, which opens the process's own symbols and
+loads no new library. One load takes a computed path: `tray/branding.py` opens the tray's own
 launcher with `LoadLibraryExW`, but as a data file, to read its version resource, so none of that
 file's code runs. Most sites declare argument and return types before the call, so a wrong-width
 argument fails at the boundary rather than corrupting the stack. Not all do: at least `service.py`,
@@ -680,11 +713,11 @@ The scan leaves some parsing out on purpose, and it has limits:
 
 | Why it is left out | Modules |
 |---|---|
-| It reads rows or files the engine wrote itself: its store, audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
+| It reads rows or files the engine wrote itself: its store, the key custody host blob and the recovery wrap kept in its store (no command reads a wrap from an archive yet), audit details, approval requests and log spool. It also decodes JSON it encoded a moment before: each value in the sealed state and reference caches | `store/metadata.py`, `store/crypto.py`, `store/custody.py`, `store/sealed_cache.py`, `api/approvals.py`, `auth/channel_scope.py`, `auth/permissions.py`, `auth/service.py`, `auth/trust_anchors.py`, `log_spool.py`, `pipeline/security_signals.py` |
 | It reads the responses the engine's own HTTP server writes | `api/protocol_headers.py`, `api/protocol_floor_selftest.py` |
-| It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file and the trust anchor files it chooses to trust | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py` |
+| It reads what an operator supplies: service settings, the code sets in the config directory and edits to them, private key files, command-line JSON, the install's package metadata, a restore token file, the trust anchor files it chooses to trust, a systemd credential and a recovery key a person types | `config/settings.py`, `config/codeset_edit.py`, `keywrap.py`, `__main__.py`, `cli_common.py`, `integrity.py`, `pipeline/dr.py`, `auth/trust_anchors.py`, `store/custody.py` |
 | It is an inbound whose own code reads nothing. The timer emits a body an operator configured. The loopback and pass-through inbounds take bodies the engine hands over: a partner's captured reply, or a Handler's output. Those bodies are outside input, and the parsers in the first table read them. | `transports/timer.py`, `transports/loopback.py`, `transports/passthrough.py` |
-| It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `generators/_core.py`, `generators/siu.py`, `hl7schema.py`, `hl7structures.py` |
+| It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `messagefoundry_toolkit/generators/_core.py`, `messagefoundry_toolkit/generators/siu.py`, `messagefoundry_toolkit/hl7schema.py`, `messagefoundry_toolkit/hl7structures.py` |
 | It reads a URL an operator configures, never a received body: an outbound's or a `FhirLookup`'s `url` setting, the value its `env()` reference resolves to, and, for the settings views, any URL-named setting such as `proxy_url` and an `env()` default. It splits the query string with `urllib.parse` to name the parameters that look like credentials. At least the ASVS 14.2.1 warning and loosening entry, the `verify_tls = false` credential refusal (vault BACKLOG #3230) and the off-box cleartext credential refusal (vault BACKLOG #3533) use those names. For the settings views it also splits the whole URL by hand, with one regular expression, at every `?`, `&`, `#` and `;`, and percent-decodes each segment's name; a URL it finds a credential name in is withheld whole. It runs at least when a `Rest`, `Soap`, `FHIR`, `DICOMweb` or `FhirLookup` connection is built, in `messagefoundry check`, on `GET /security/posture` on a running engine and on each settings view (`GET /metadata`, `graph --json`). The warning, the reports and the views put no bound on the URL's length, because the operator wrote it. Some refusals read it only after `enforce_outbound_length_limits` has refused one over `MAX_OUTBOUND_URL_LEN`, and some before, at least a `FhirLookup`'s off-box cleartext refusal. It returns parameter names, never values, and returns nothing rather than raising on a URL it cannot parse. | `secretscrub.py` |
 
 **Hand-written parsers the patterns cannot see.**
@@ -692,12 +725,12 @@ The scan leaves some parsing out on purpose, and it has limits:
 | What it parses | Modules |
 |---|---|
 | MLLP and TCP frames, before any other code sees the bytes | `framing.py`, `mllpcodec.py` |
-| HL7 v2, in the engine's own tolerant parser (ADR 0054). It reads every inbound HL7 body, and the de-identification tools read captured traffic through it. | `parsing/_builtin_hl7.py`, `parsing/peek.py`, `anon/hl7.py` |
+| HL7 v2, in the engine's own tolerant parser (ADR 0054). It reads every inbound HL7 body, and the de-identification tools read captured traffic through it. | `parsing/_builtin_hl7.py`, `parsing/peek.py`, `messagefoundry_toolkit/anon/hl7.py` |
 | HL7 batch files, split into messages | `parsing/split.py` |
 | The first bytes of a payload, to check its declared content type | `parsing/sniff.py` |
 | An inbound text body, decoded with its connection's declared character set and checked for NUL bytes and size, before the HL7 peek or a Router sees it. A binary body is only size-checked and base64-carried. | `pipeline/ingress_guards.py` |
 | Base64 binary carriage (ADR 0028). Also the base64 documents a sender embeds in HL7 OBX-5, which intake detaches, retention strips and delivery puts back. | `parsing/binary.py` |
-| The separators of a captured HL7 message, before de-identification | `anon/surrogates.py` |
+| The separators of a captured HL7 message, before de-identification | `messagefoundry_toolkit/anon/surrogates.py` |
 | The reply from a network time server | `logging_setup.py` |
 | Decision records, for `messagefoundry-toolkit adr-analyze`. It reads each `[0-9]*.md` file at the top of the `--adr-dir` folder, `docs/adr` by default. Regular expressions pick out each record's status, acceptance criteria and open items. For each `tests/`, `fixtures/`, `samples/` or `harness/` path a criterion names, it checks whether that path exists under `--repo-root`. A linked path that climbs out of that root with `..`, or has a part named for a DOS device such as `NUL` or `nul.py`, is reported and not checked, on every platform. A symbolic link inside that root is still followed. Nothing bounds a record's size, so a record is only as trusted as its author. | `messagefoundry_toolkit/adr_analyze.py` |
 
@@ -742,7 +775,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | Input | Where it comes from | Files |
 |---|---|---|
 | Replies from an engine address | Whatever answers at the engine URL setting. The file's own comment says that is not necessarily the engine, and a plain `http` URL gets no TLS. The Python clients' replies sit in the first table above for that reason too. Unlike `apiclient/client.py`, this client puts no size cap on a reply before it parses it, and a POST has no timeout. | `engineClient.ts` |
-| An HL7 sample, and what a dry run made of it | The sample file you pick, which [`CONNECTIONS.md`](CONNECTIONS.md) lists as an upload feature, and the output a dry run built from it. The Test Bench diff splits them into segments and fields by hand, and the Steps view pulls the segment names out of the sample. A saved test case's recorded output is diffed the same way. `hl7diff.ts` does the same job as `anon/surrogates.py` in the engine's hand-read table. | `hl7diff.ts`, `hl7scope.ts` |
+| An HL7 sample, and what a dry run made of it | The sample file you pick, which [`CONNECTIONS.md`](CONNECTIONS.md) lists as an upload feature, and the output a dry run built from it. The Test Bench diff splits them into segments and fields by hand, and the Steps view pulls the segment names out of the sample. A saved test case's recorded output is diffed the same way. `hl7diff.ts` does the same job as `messagefoundry_toolkit/anon/surrogates.py` in the hand-read table above. | `hl7diff.ts`, `hl7scope.ts` |
 
 **Extension parse sites left out, and why.**
 
