@@ -2288,8 +2288,9 @@ Two limits follow from this:
   Other `stat` failures are refused unless they say no file is there. That covers at least an I/O
   fault such as `EIO`, `ETIMEDOUT` or `ESTALE`, a share Windows could not reach, and on Windows a
   not-ready volume, a sharing or lock violation and a network access denial. libpq stats the file
-  again at every connect, so it may load the file once the fault clears. Off Windows, a network
-  fault the system reports as a denial or as a missing name is still left.
+  again at every connect, so it may load the file once the fault clears. A network fault the
+  system reports as a denial (on Windows, `ERROR_ACCESS_DENIED`) or as a missing name (on Windows,
+  other than a share it could not reach) is still left.
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
   application-data folder. Elsewhere it is under `~/.postgresql`. The engine finds this home as

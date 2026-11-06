@@ -525,6 +525,29 @@ def test_a_root_certificate_the_engine_cannot_stat(
         assert "SSLmode=verify-full;" in _build_psql()
 
 
+def test_a_refused_stat_failure_takes_no_second_look(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Windows ``PermissionError`` outside the left set is refused at once, even on a
+    directory: ``os.path.isdir`` would wait out the same device or network fault again, on the
+    event loop, and its answer would leave the file. Red when the read's directory look ran."""
+    target = str(tmp_path)
+    real_stat = os.stat
+
+    def faulting(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if str(path) == target:
+            raise _windows_stat_failure(32)
+        return real_stat(path, *args, **kwargs)
+
+    def no_second_look(path: Any) -> bool:
+        raise AssertionError("the path was looked at again after its stat failed")
+
+    monkeypatch.setattr(os, "stat", faulting)
+    monkeypatch.setattr(os.path, "isdir", no_second_look)
+    with pytest.raises(ValueError, match="could not be read to check it"):
+        database._read_driver_file(target, "setting", "file", "it", leave_unstatable=True)
+
+
 def test_an_unreached_share_at_the_stat_still_honours_leave_unreachable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

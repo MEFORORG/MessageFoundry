@@ -1206,9 +1206,10 @@ _WINDOWS_UNREACHABLE = frozenset({53, 67})
 #: so loads nothing. ENOENT and ENOTDIR: no such file. ENAMETOOLONG: a name the filesystem cannot
 #: hold. ELOOP: a link loop no ``stat`` resolves. EACCES and EPERM: both raise ``PermissionError``,
 #: which :func:`_libpq_cannot_stat_either` leaves off Windows, since libpq, as the same identity,
-#: is denied too; a denial on a Kerberos network mount can still clear once a ticket renews. Every other failure, at least EIO, ETIMEDOUT, ESTALE, EHOSTDOWN and ENOTCONN on a
-#: network mount, takes the read's handling, which refuses it: libpq stats again at every connect,
-#: and may then load a file the build never checked.
+#: is denied too; a denial on a Kerberos network mount can still clear once a ticket renews.
+#: Every other failure, at least EIO, ETIMEDOUT, ESTALE, EHOSTDOWN and ENOTCONN on a network
+#: mount, takes the read's handling, which refuses it: libpq stats again at every connect, and may
+#: then load a file the build never checked.
 _LIBPQ_STAT_LEFT_ERRNOS = frozenset(
     {errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG, errno.ELOOP, errno.EACCES, errno.EPERM}
 )
@@ -1219,7 +1220,8 @@ _LIBPQ_STAT_LEFT_ERRNOS = frozenset(
 #: (ENOTDIR, a path through a file); 123 ``ERROR_INVALID_NAME`` (EINVAL); 206
 #: ``ERROR_FILENAME_EXCED_RANGE`` (ENOENT, the ENAMETOOLONG case); 1921
 #: ``ERROR_CANT_RESOLVE_FILENAME`` (EINVAL, the ELOOP case); and 5 ``ERROR_ACCESS_DENIED``
-#: (EACCES), the only Windows ``PermissionError`` left. Every other code takes the read's
+#: (EACCES), the only Windows ``PermissionError`` left. A network fault Windows reports as one of
+#: these codes is left too, and may clear before a later connect. Every other code takes the read's
 #: handling, which refuses at least 53 and 67 (:data:`_WINDOWS_UNREACHABLE`), 59
 #: ``ERROR_UNEXP_NET_ERR``, 64 ``ERROR_NETNAME_DELETED``, 121 ``ERROR_SEM_TIMEOUT`` and 1231
 #: ``ERROR_NETWORK_UNREACHABLE``, all EINVAL but 53 and 67, and the ``PermissionError`` faults
@@ -1519,12 +1521,14 @@ def _read_driver_file(
 
     The file is read by :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which says
     how a device or pipe is judged without being read, or waited on."""
+    stat_failed = False
     try:
         if leave_unstatable:
             try:
                 os.stat(path)
             except OSError as exc:
                 if not _libpq_cannot_stat_either(exc):
+                    stat_failed = True
                     raise  # judged below as a failed read is, so refused unless no file is there
                 logger.debug("%s: the driver loads no file it cannot stat, so it is left", setting)
                 return None
@@ -1539,9 +1543,13 @@ def _read_driver_file(
         # again after that failure alone: on a share Windows could not reach, a second look would
         # wait out the same network timeout again, on the event loop. A path through a file names
         # no file either. POSIX reports it as NotADirectoryError, which keywrap refused, so sslkey
-        # still does; Windows reports it as a missing name, left to the driver.
+        # still does; Windows reports it as a missing name, left to the driver. A failed stat is
+        # not looked at again: it says nothing of a directory swapped in, and the second look
+        # would wait out the same device or network fault on the event loop.
         if isinstance(exc, NotADirectoryError) or (
-            isinstance(exc, (PermissionError, IsADirectoryError)) and os.path.isdir(path)
+            not stat_failed
+            and isinstance(exc, (PermissionError, IsADirectoryError))
+            and os.path.isdir(path)
         ):
             _irregular(setting, what, checked_for, error, leave_irregular)
             return None
