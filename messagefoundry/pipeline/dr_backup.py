@@ -1978,7 +1978,7 @@ def _empty_files_in_place(staging: Path) -> list[str]:
     - Windows: :func:`_win_held_walk` holds each directory, and the ones above it, while it is checked,
       listed and emptied. Each file is opened as itself and checked (:func:`_open_unfollowed`), and
       its final path must be its directory's joined with the name listed. A name Windows would open
-      as another object (:func:`_win_opens_another`) is reported and never opened.
+      as another object (:func:`_win_opens_another`) is reported.
 
     A listed file that is gone from its name before it is opened is reported, never read as nothing to
     empty: a rename leaves its bytes under another name.
@@ -2044,7 +2044,7 @@ def _win_opens_another(path: Path) -> bool:
     ``NUL``, ``AUX``, ``COM1``, ``CONIN$`` and ``con.txt``, Windows 11 build 26300 rewrote only
     ``NUL`` (measured), and the set differs by build, so this asks the OS's own rewrite
     (``os.path.abspath``, which is ``GetFullPathNameW``) rather than keep a list. A name it changes
-    is never opened, only reported: the open would reach some other object, and the listed file
+    is reported: the open would reach some other object, and the listed file
     would keep its bytes while the report called it empty. The final-path compare on the opened
     handle backs this up (:func:`_open_unfollowed`)."""
     # The trailing dot or space is tested as such too: `abspath` falls back to a pure-Python join that
