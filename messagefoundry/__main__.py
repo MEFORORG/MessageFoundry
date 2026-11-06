@@ -10973,7 +10973,11 @@ def _cipher_audit(args: argparse.Namespace) -> int:
     Exit 0 PASS, 1 FAIL, 2 could not start, 4 KEY_MISMATCH (a sealed value and no key resolved,
     the usual cause being a shell without the service's key). 3 is no longer returned: it was
     NOT COVERED, for a server backend this did not read."""
-    from messagefoundry.config.settings import StoreBackend, hop_posture_from_ai
+    from messagefoundry.config.settings import (
+        StoreBackend,
+        hop_posture_from_ai,
+        keyless_opt_out_refusal,
+    )
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
@@ -11060,7 +11064,10 @@ def _cipher_audit(args: argparse.Namespace) -> int:
                         store,
                         read_only=True,
                         posture=_command_hop_posture(settings),
-                        keyless_chain_refusal=None,
+                        # The shared verdict, as every CLI opener passes it (BACKLOG #1916).
+                        keyless_chain_refusal=keyless_opt_out_refusal(
+                            settings.store, settings.security
+                        ),
                     )
                 )
             except walk_errors as exc:

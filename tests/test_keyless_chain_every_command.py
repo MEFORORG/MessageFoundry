@@ -1349,6 +1349,8 @@ _CLI_OPENERS = {
     "_renew_api_tls_before_spawning._audit",
     "_audit_verify.run",
     "_audit_anchor.run",
+    # BACKLOG #1719: cipher-audit's read-only open of a PostgreSQL or SQL Server store
+    "_cipher_audit.run_server",
     "_backup.run",
     # BACKLOG #2337: record or withdraw the vault_transit bound attestation, with its audit row
     "_store_transit_bound.run",
