@@ -490,11 +490,12 @@ At least these are unmeasured:
   expected to resolve as a user. If it resolves as anything else, the WARNING names that type.
 - **A start with no domain controller.** A gMSA resolves through a domain controller, or through
   the local lookup cache when no controller answers. The lookup has no timeout of its own, so a
-  slow controller delays the open. A time-out can also fail the lookup with `ERROR_NONE_MAPPED`
-  (1332), which reads as an account that does not exist, and that start then takes the owner-only
-  fallback described above. A start where neither answers gets the owner-only store: the
-  `-wal` and `-shm` files that start creates, and a new store, are then the service's alone until
-  a later start resolves the account.
+  slow controller delays the open. A network time-out inside the lookup can also fail it with
+  `ERROR_NONE_MAPPED` (1332), which reads as an account that does not exist, so a slow controller
+  can send a start to the owner-only store too. A start where no controller or cache answers gets
+  the owner-only store: the `-wal` and `-shm` files that start creates, and a new store, are then
+  the service's alone. A later start that resolves the account restores the shared store only if
+  it can still open the store; ADR 0163 has the detail.
 
 The rule and its reasons are in ADR 0163, *Note (2026-11-05)*.
 

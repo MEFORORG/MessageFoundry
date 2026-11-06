@@ -6994,9 +6994,8 @@ def _account_shape_refusal(sid: str) -> str | None:
 
     The owner ruling of 2026-11-05 (BACKLOG #3760, #2234) admits one principal beyond SYSTEM,
     Administrators and a per-service virtual account, and only a user account with a RID of 1000 or
-    more: the account ``install-service.ps1 -ServiceAccount`` grants, such as a local user, or a gMSA
-    only if it resolves to a user account, which is unmeasured.
-    The SID must be machine- or domain-relative (``S-1-5-21-...``), the only shape whose last
+    more: the account ``install-service.ps1 -ServiceAccount`` grants, such as a local user, or a
+    gMSA only if it resolves to a user account, which is unmeasured. The SID must be machine- or domain-relative (``S-1-5-21-...``), the only shape whose last
     sub-authority is a RID. Any alias the SDDL writer emits (``NS``, ``LA``, ``DU``) is not one, so
     it is refused here too. A RID under 1000 is a built-in account or group, refused without a
     lookup: at least the built-in Administrator (500), Guest (501) and Domain Users (513)."""
@@ -7140,14 +7139,15 @@ def _lookup_sid_type(sid: str) -> tuple[int | None, int]:
     so a controller that did not answer in time can read as 1332, and a slow domain controller can
     send a start down the path below. Other failures report their own status (1722, say).
 
-    On every failure, 1332 included, the run-as grant is refused and the store takes the existing
-    owner-only fallback, :func:`_secure_file` (decision d20261106T140017335-d24848). That adds the
-    opening user's SID with full control to an existing store file, where the opener may rewrite its
-    DACL (``icacls`` fails and a WARNING is logged where it may not), and keeps the file's explicit
-    entries. The ``-wal`` and ``-shm`` files SQLite creates at that start carry no explicit entries,
-    so they are the opener's alone until a later start resolves the account. Nothing is logged
-    here: the status goes into the refusal, which the caller logs once, beside the directory it
-    refused."""
+    On every failure, 1332 included, the directory is refused as not hardened, so no trio DACL is
+    written, and each store file takes the existing owner-only fallback, :func:`_secure_file`
+    (decision d20261106T140017335-d24848). That fallback grants full control to the account
+    :func:`_current_user` names, read from the environment, and removes only inherited entries, so
+    a file that already carries explicit entries keeps them. A file SQLite creates at that start, a
+    ``-wal``, a ``-shm`` or a new store, carries none, so it is left to that account alone where
+    ``icacls`` succeeds. ADR 0163, *Note (2026-11-05)*, *Left open*, has the consequences. Nothing
+    is logged here: the status goes into the refusal, which the caller logs once, beside the
+    directory it refused."""
     if sys.platform != "win32":
         return None, 0
     import ctypes
