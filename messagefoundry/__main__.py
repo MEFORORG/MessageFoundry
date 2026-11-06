@@ -9062,6 +9062,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
         except (HostCustodyRefused, FileExistsError, OSError) as exc:
             _emit_error(after_the_key(str(exc), str(exc)), as_json=args.json)
             return 2
+        except EOFError:
+            # getpass at end of input (Ctrl-D, Ctrl-Z): not an OSError, and no text of its own.
+            gone = (
+                "the input ended at the recovery key prompt, so the recovery key was not entered "
+                "back; nothing was written. Run the command again from a console"
+            )
+            _emit_error(after_the_key(gone, gone), as_json=args.json)
+            return 2
         print(
             "The recovery key was entered back and opens the store key. Keep that copy off this "
             "host: this engine never shows it again.",
