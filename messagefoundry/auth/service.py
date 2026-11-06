@@ -9115,24 +9115,23 @@ class AuthService:
         # new name, so about once per directory rename, not once per sign-in. Keeping one read site
         # for both callers keeps them on one path, which is the point of this method; the
         # post-write read-back the item also counted went with BACKLOG #2290.
-        async def _own_row_refused() -> bool:
-            # Vault BACKLOG #3069 note T3. The loader answers None for a row that fails its seal as
-            # well as for one that is gone, and only the gone row is ``row_gone``: filing a row that
-            # is still there as removed would be false. The loader has already reported the seal
-            # failure, and the store refuses to write a failing record, so nothing is written, and
-            # nothing more is filed. The next read that finds the record verifying retries it.
-            if not await self._user_id_held(user_id):
-                return False
+        def _own_row_refused() -> None:
+            # Vault BACKLOG #3069 note T3. A row that fails its seal is still there, so only a
+            # gone row is ``row_gone``: filing a refused one as removed would be false. The loader
+            # has already reported the seal failure, and the store refuses to write a failing
+            # record, so nothing is written, and nothing more is filed. The next read that finds
+            # the record verifying retries it.
             _log.warning(
                 "AD account %s was renamed in the directory, but its record fails its integrity "
                 "check, so the new name was not written (BACKLOG #3069)",
                 user_id,
             )
-            return True
 
-        before = await self._load_user(user_id)
+        found = await self._lookup_user(user_id)
+        before = found.user
         if before is None:
-            if await _own_row_refused():
+            if found.refused:
+                _own_row_refused()
                 return
             # Deleted between the plan and the apply. Refused as a write that finds the row gone is
             # refused below, without an UPDATE that can only match nothing. With no row there is
@@ -9368,9 +9367,12 @@ class AuthService:
         #     names when that read comes, does not order these: it stops only a reconciler plan
         #     that a write overtook before this pre-read. Logged at INFO so the skipped write is visible without paging anyone.
         if not written:
-            after = await self._load_user(user_id)
+            found = await self._lookup_user(user_id)
+            after = found.user
             if after is None:
-                if not await _own_row_refused():
+                if found.refused:
+                    _own_row_refused()
+                else:
                     await _refuse(None, "row_gone", before.username)
             elif after.username == before.username:
                 holder = await self._lookup_by_username(new_username)
@@ -10742,12 +10744,19 @@ class AuthService:
 
     async def _load_user(self, user_id: str) -> VerifiedUser | None:
         """The account ``user_id`` names, its integrity seal checked, or ``None``. With
-        :meth:`_lookup_by_username`, :meth:`_lookup_by_directory_object_id`,
+        :meth:`_lookup_user`, :meth:`_lookup_by_username`, :meth:`_lookup_by_directory_object_id`,
         :meth:`_load_user_by_federated_subject`, :meth:`_load_users` and :meth:`_verified`, the
         ONLY readers of the store's user readers in this service, beside the two existence
         questions; ``tests/test_user_seal.py`` holds that. See
         :meth:`_verified` for what ``None`` covers."""
         return await self._verified(await self._store.get_user(user_id))
+
+    async def _lookup_user(self, user_id: str) -> _UserLookup:
+        """:meth:`_load_user`, also saying whether the row is there at all, from the same read, so
+        a caller can tell a record that fails its seal from one that is gone (vault BACKLOG
+        #3069)."""
+        raw = await self._store.get_user(user_id)
+        return _UserLookup(await self._verified(raw), raw is not None)
 
     async def _load_user_by_username(self, username: str) -> VerifiedUser | None:
         """:meth:`_load_user`, by username."""
