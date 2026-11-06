@@ -4833,13 +4833,12 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   read for this takes them in. The unbind takes that row first through its own prior-pair
   `UPDLOCK` read in `clear_user_federated_subject`, before its account write. A bind that passes
   its own checks first runs `clear_user_federated_subject`'s transaction, which takes the row
-  through that same prior-pair read. On a rebind, that transaction sweeps only where the stored
-  pair still matches the caller's expected pair; on a pair mismatch (`changed=True`) it rolls
-  back without sweeping and the bind is refused. On a first bind it writes nothing. The row is
-  released between that transaction and the bind's own write, which then takes the row through
-  the account write, and sweeps where that write lands. The TOTP re-enrolment takes it through the account write too,
-  and the whole-account revokes through the epoch raise, at least an administrator's revoke of a
-  user's
+  through that same prior-pair read. On a pair mismatch (`changed=True`), on a first bind or a
+  rebind, it rolls back without sweeping and the bind is refused. Otherwise, on a rebind it
+  sweeps, and on a first bind it writes nothing. The row is released between that transaction
+  and the bind's own write, which then takes the row through the account write, and sweeps where
+  that write lands. The TOTP re-enrolment takes it through the account write too, and the
+  whole-account revokes through the epoch raise, at least an administrator's revoke of a user's
   sessions, a role change and a password reset. So a rotation either commits before the
   sweep locks the account's row, and the sweep reads the new key, or waits until the sweep
   commits and then finds the session ended. Where the account's record fails its seal, at least
@@ -4848,17 +4847,22 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   lock before it checks the seal. That the order holds there was read from the code and not run.
   The every-account revoke is run on such an account only as a store call, by the contracts in
   `tests/test_b2614_revoke_all.py` and `tests/test_b5091_global_session_epoch.py`, which
-  `test_every_account_revoke_contracts` runs on both server legs. Only b2614 reads back a session
-  the revoke ended there, and only in the form that spares the caller's session: the session it
-  read back is the one it asked to keep. That the administrator's revoke of a user's sessions
-  still ends such an account's sessions was read from the code and not run. The per-account
-  revoke's other form, which spares the caller's session, cannot be reached through the service
-  on such an account: `DELETE /me/sessions` is refused at identity resolution, which refuses an
-  account whose record fails its seal, so the service reaches it there only where the seal fails
-  after that resolution. It is run on such an account only as a store call, where it ends that
-  session too, by the body in `tests/_session_seal_contract.py`, which
-  `test_session_seal_contract` runs on both server legs. At least a bind, an unbind, a TOTP re-enrolment, an administrator's role change
-  and a password reset of such an account end no session; that was read from the code. The
+  `test_every_account_revoke_contracts` runs on both server legs. Only
+  `tests/test_b2614_revoke_all.py` reads back a session the revoke ended there, and only in the
+  form that spares the caller's session: on such an account that form ends the session it was
+  asked to keep, and that is the session it reads back. `tests/test_b5091_global_session_epoch.py`
+  reads back no session the revoke ended: it finds that account's session refused once a raw
+  write has put the session back and the record verifies again. That the administrator's revoke
+  of a user's sessions still ends such an account's sessions was read from the code and not run.
+  The per-account revoke's other form, which spares the caller's session, is reached through the
+  service on such an account only where the seal fails after identity resolution:
+  `AuthService.revoke_other_sessions`, behind at least `DELETE /me/sessions` and the console's
+  `POST /ui/account/sessions/revoke-others`, resolves the caller first, and that resolution
+  refuses an account whose record fails its seal. It is run on such an account only as a store
+  call, where it ends that session too, by the body in `tests/_session_seal_contract.py`, which
+  `test_session_seal_contract` runs on both server legs. At least a bind, an unbind, a TOTP
+  re-enrolment, an administrator's role change and a password reset of such an account end no
+  session; that was read from the code. The
   every-account revoke behind `DELETE /sessions` and `admin-revoke-sessions` (BACKLOG #2614) takes
   the row of each account its read of the account list returns before its table-wide sweep, so
   the same holds for those accounts. Its sweep also reaches the sessions of an account created
@@ -4876,9 +4880,11 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   its re-key, then runs a bind, an unbind, a revoke of a user's sessions and the every-account
   revoke against it, on both server legs; on the SQL Server leg it also starts a rotation while a
   bind holds the account's row. Its bind (`_sweep_by_bind`) is only the store's
-  `set_user_federated_subject` on an unbound account, a first bind's own write: neither the
-  service's clear-then-write path nor a rebind is raced. The TOTP re-enrolment's own sweep was read from the code and is
-  not replayed. A role change and a password reset each run that same per-account revoke,
+  `set_user_federated_subject` on an unbound account, without the `expect_unbound` the service
+  passes: neither the service's clear-then-write path nor a rebind is raced as one operation.
+  The unbind case races the clear's transaction alone, and nothing races the gap between the
+  clear and the write. The TOTP re-enrolment's own sweep was read from the code and is not
+  replayed. A role change and a password reset each run that same per-account revoke,
   `revoke_user_sessions`, in a transaction after their own write; that was read from `set_roles`
   and `admin_reset_password` in `messagefoundry/auth/service.py`, and neither is replayed through
   the service. That the old SQL Server order could miss the session, or deadlock with the
