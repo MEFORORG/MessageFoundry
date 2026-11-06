@@ -201,7 +201,7 @@ def build_idp_opener_from_settings(
     alone. The CRL file is the hop's own knob (BACKLOG #299) and is passed either way.
 
     The settings preamble the check legs in ``messagefoundry/checks.py`` repeat is not shared here:
-    since vault BACKLOG #3145 item 3, they share that module's own ``_leg_settings`` prologue
+    it takes loaded settings, and since vault BACKLOG #3145 the legs share one ``_leg_settings``
     helper."""
     return build_idp_opener(
         settings.oidc_tls_ca_cert_file if anchor else None,

@@ -1130,7 +1130,8 @@ class EngineClient:
         waited out after the request is sent, so connect, write and pool keep the client's own
         bound: a caller on a GUI thread still learns of an unreachable engine as fast as before. A
         client built with a longer timeout keeps it for the read too, since a shorter read would
-        make the lost reply more likely for exactly the caller that asked to wait (#3751 item 4)."""
+        make the lost reply more likely for exactly the caller that asked to wait (vault BACKLOG #3751
+        item 4)."""
         return httpx.Timeout(self._timeout, read=max(self._timeout, SIGN_IN_TIMEOUT_SECONDS))
 
     def _adopt_rotated(self, response: httpx.Response) -> None:
@@ -1818,8 +1819,15 @@ class EngineClient:
             self.clear_auth()
 
     def change_password(self, current_password: str, new_password: str) -> None:
-        # Vault BACKLOG #2950 step 5: the current-password proof queues behind the account's
-        # re-proof lock, so it gets the sign-in's timeout (see SIGN_IN_TIMEOUT_SECONDS).
+        """Change the signed-in user's password, then drop this client's token: the engine ends
+        every session of the account on a change, so the caller signs in again.
+
+        **A lost reply leaves the outcome unknown.** The current-password proof queues behind the
+        account's re-proof lock, so this request waits the sign-in's read (vault BACKLOG #2950,
+        :data:`SIGN_IN_TIMEOUT_SECONDS`). A queue longer than that still outlasts it: the engine
+        may finish the change and end the session while this raises :class:`ApiError` before the
+        token is dropped. The held token is then refused with a 401, and the new password, not
+        the old one, is the one that signs in."""
         self._request(
             "POST",
             "/me/password",

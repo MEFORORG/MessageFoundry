@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The sign-in and the two elevations that queue per account get a longer timeout (vault BACKLOG
+"""The sign-in and the other calls that queue per account get a longer timeout (vault BACKLOG
 #2950).
 
 ``EngineClient.login`` names the token it replaces, and the engine ends that session inside the
@@ -52,17 +52,17 @@ def _reply(request: httpx.Request) -> httpx.Response:
 
 
 def _recording_client(
-    timeout: float = 5.0,
+    timeout: float | None = None,
 ) -> tuple[EngineClient, dict[str, dict[str, float | None]]]:
-    """An ``EngineClient`` built with ``timeout`` over a mock transport, and the timeout each
-    path's request carried. The 5.0 default is ``EngineClient``'s own."""
+    """An ``EngineClient`` over a mock transport, and the timeout each path's request carried.
+    ``timeout`` is the client's own; with None the client is built with its real default."""
     seen: dict[str, dict[str, float | None]] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen[request.url.path] = dict(request.extensions["timeout"])
         return _reply(request)
 
-    client = EngineClient(_BASE, timeout=timeout)
+    client = EngineClient(_BASE) if timeout is None else EngineClient(_BASE, timeout=timeout)
     default = client._http.timeout
     client._http.close()
     # The client's own timeout, as _open_transport sets it, so the default is the one under test.
@@ -123,7 +123,8 @@ def test_a_client_built_with_a_longer_timeout_keeps_it_on_the_queued_calls() -> 
 
 
 def test_the_timeout_matches_the_ides_sign_in_timeout() -> None:
-    """The two clients of the same queue wait the same time. The IDE's constant is read from its
+    """At the default client timeout, the two clients of the same queue wait the same time; a
+    client built with a longer timeout waits that instead. The IDE's constant is read from its
     source, so a change on either side reds here."""
     source = Path(__file__).resolve().parents[1] / "ide" / "src" / "signInSession.ts"
     line = next(

@@ -2103,8 +2103,10 @@ def _leg_settings(
     suppress_search: bool,
     cli: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> ServiceSettings | CheckResult:
-    """The prologue every settings leg shares: the settings it grades, or the line it returns
-    instead (vault BACKLOG #3145 item 3).
+    """The prologue at least ten settings legs share: the settings a leg grades, or the line it
+    returns instead (vault BACKLOG #3145 item 3). Two readers keep their own, because their
+    no-settings arm is not a SKIP: ``static-credentials`` goes on graph-only, and
+    :func:`_resolve_snapshot_on_send` falls back to the model default.
 
     Nothing to read (:func:`_settings_source` answers ``(None, False)``) is a SKIP, worded by
     :func:`_no_settings_detail`. A file, or an environment declaration, the loader refuses is a
@@ -2990,7 +2992,7 @@ def _check_vault_revocation_attested(
     Advisory (``required=False``): a reasoned attestation is the one lever these hops have. It
     reports the settings and builds no Vault client, so it does not say whether a hop would be
     refused. Service-toml resolution is :func:`_check_posture`'s, with the SKIP and FAIL arms of
-    :func:`_check_alert_smtp_tls`."""
+    :func:`_leg_settings`."""
     name = "vault-revocation-attested"
     # A flag with no reason fails here: the settings load refuses it.
     settings = _leg_settings(
@@ -3598,7 +3600,7 @@ def _check_upstream_hop_ack(
     calls in the same order, so on the same settings the two agree by construction. ``serve`` refuses this in EVERY
     enforcement mode, so this check reads no dial either.
 
-    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`: no
+    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_leg_settings`: no
     ``messagefoundry.toml`` → SKIP; present but refused by the loader → FAIL (BACKLOG #1318). A
     terminator declared through ``MEFOR_API_*`` environment variables with no file is read when
     ``MEFOR_AI_ENVIRONMENT`` also names the instance (vault BACKLOG #2355). With neither, this leg
@@ -3683,7 +3685,7 @@ def _check_oidc_revocation(
     FAIL or ERROR fails this leg. MANUAL passes with the row's text, because the engine starts and
     a person must confirm what crosses.
 
-    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`."""
+    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_leg_settings`."""
     from messagefoundry.verify.federation import idp_revocation_result
     from messagefoundry.verify.model import FAILING
 
@@ -3784,7 +3786,7 @@ def _check_retention(
     The function sets each unset auto-bounded window on the settings it is given. Those are this
     leg's own load, and nothing else reads them.
 
-    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_check_posture`.
+    Required, with the service-toml resolution and SKIP/FAIL arms of :func:`_leg_settings`.
     :func:`_retention_posture` says what it does with no active environment and with an
     unresolved production tier. The settings are the ones this leg loads, so a ``serve`` whose
     own environment sets a window, or which reads another settings file, can still decide
