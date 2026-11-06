@@ -652,9 +652,9 @@ def test_closing_step_4_an_sslcapath_entry_that_leaves_the_host_is_refused(
     folder = _capath(tmp_path, "0a1b2c3d.0", "readme.txt")
     _entry_verdicts(monkeypatch, {"0a1b2c3d.0": verdict})
     settings = _generic(SSLCAPATH=str(folder))
-    with pytest.raises(ValueError, match="'sslcapath' must name a folder whose entries") as built:
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list") as built:
         database._build_odbc_dsn(settings, connection=_OUT)
-    with pytest.raises(ValueError, match="sslcapath must name a folder whose entries") as checked:
+    with pytest.raises(ValueError, match="sslcapath must name a folder it can list") as checked:
         ta.lane_anchor_spec("outbound", _OUT, settings)
     for refused in (built, checked):
         assert "phi-capath" not in str(refused.value)
@@ -720,7 +720,7 @@ def test_closing_step_4_a_folder_on_an_unreached_share_is_refused(
         return real(path)
 
     monkeypatch.setattr(os, "scandir", unreached)
-    with pytest.raises(ValueError, match="'sslcapath' must name a folder whose entries"):
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
         database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
 
 
@@ -746,7 +746,7 @@ def test_closing_step_4_a_folder_past_the_entry_cap_is_refused(
     folder = _capath(tmp_path, "a.0", "b.0", "c.0")
     _entry_verdicts(monkeypatch, {})
     monkeypatch.setattr(database, "_MAX_CAPATH_ENTRIES", 2)
-    with pytest.raises(ValueError, match="'sslcapath' must name a folder whose entries"):
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
         database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
 
 
@@ -765,7 +765,7 @@ def test_closing_step_4_a_folder_that_cannot_be_listed_is_refused(
 
     monkeypatch.setattr(os, "scandir", denied)
     caplog.set_level(logging.DEBUG, logger=database.logger.name)
-    with pytest.raises(ValueError, match="'sslcapath' must name a folder whose entries"):
+    with pytest.raises(ValueError, match="'sslcapath' must name a folder it can list"):
         database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
     warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert warned and all("phi-capath" not in m for m in warned)
@@ -799,3 +799,15 @@ def test_closing_step_4_the_entries_are_not_listed_where_only_the_spelling_is_ch
     monkeypatch.setattr(os, "scandir", never)
     monkeypatch.setattr(database, "_path_verdict", lambda _p: False)
     database._build_odbc_dsn(_generic(SSLCAPATH=str(folder)), connection=_OUT)
+
+
+@pytest.mark.parametrize("walks", [True, False])
+def test_closing_step_4_a_refused_folder_never_reads_as_clear(
+    monkeypatch: pytest.MonkeyPatch, walks: bool
+) -> None:
+    """Given verdicts that refuse the folder itself, the entry judgement answers "refuse" too, on
+    its own, rather than finding no spelling to list and answering clear. Red: it answered clear."""
+    monkeypatch.setattr(database, "_WALKS_BEYOND_SPELLING", walks)
+    folder = r"S:\certs"
+    assert database._capath_entries_leave_host(folder, {folder: True}) is True
+    assert database._capath_entries_leave_host(folder, {folder: None}) is True

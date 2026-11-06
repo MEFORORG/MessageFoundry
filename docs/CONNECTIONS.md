@@ -2189,18 +2189,19 @@ logged at DEBUG only. The value is judged as the text the build sends, so `0` is
 path `0`. On Windows each entry of an `SSLCAPATH` folder takes the same check, since the driver
 opens a `<hash>.0` entry there by name: an entry that leads to another host, or one the check
 cannot finish, refuses the value, and so does a folder the engine cannot list or one holding
-more than 4096 entries. A missing folder, or a value that names a file, is left to the driver.
-The lane check runs this check again on all four keywords, folder entries included, at least
-when the lane is built or an operator starts it and before a reload that builds it or keeps it
+more entries than the cap `transports.database._MAX_CAPATH_ENTRIES` names. A missing folder, or a
+value that names a file, is left to the driver. The lane check runs this check again on all four
+keywords, and on Windows on the folder entries too, at least when the lane is built or an operator starts it and before a reload that builds it or keeps it
 running, so a path that leads to another host after the build is refused there as a setting.
 The check is defence in depth, not a guarantee. It misses at least: links to some object paths;
 paths that change after a check, an entry added to an `SSLCAPATH` folder included; who can write
-an `SSLCAPATH` folder; and, on POSIX, anything beyond the spelling. The owner,
-2026-11-03, accepted two of these as recorded limits: a path that changes after a check, which
-also leaves the anchor check below a swap window, and the contents of an `SSLCAPATH` folder,
-which that anchor check does not read either. Where each entry leads is now checked as above
-(vault BACKLOG #5197), so what remains of the second limit is who can write the folder or its
-entries. The check does not change the value sent to the driver.
+an `SSLCAPATH` folder; and, on POSIX, anything beyond the spelling. The owner, 2026-11-03,
+accepted two of these as recorded limits: a path that changes after a check, which also leaves
+the anchor check below a swap window, and the contents of an `SSLCAPATH` folder, which that
+anchor check does not read either. Where each entry leads is now checked as above (vault BACKLOG
+#5197). The rest of the second limit stands, at least: who can write the folder or its entries,
+and what an entry holds, since no entry takes the content checks or the audit an `SSLCA` file
+takes below. The check does not change the value sent to the driver.
 
 This is a rule about keywords. It assumes `odbc_driver` names a network database driver that
 reads `SERVER` as its target.
@@ -2233,9 +2234,8 @@ too, and a pipe or device is refused unread. **What it does not
 cover**, at least: a running lane's pool goes on reading the file at each new connect until the
 lane is rebuilt, even after a later check refuses it; any check-then-load leaves a swap window, as
 for `SSLKEY`; and an `SSLCAPATH` directory is not checked this way at all, though its entries
-take the file-keyword check above. The swap window and who can write the `SSLCAPATH` folder are
-what remains of the recorded limits that paragraph names. A
-padded or boolean value of any file keyword is refused here too, as the build refuses it, before
+take the file-keyword check above. The swap window and the rest of the `SSLCAPATH` limit are the
+recorded limits that paragraph names. A padded or boolean value of any file keyword is refused here too, as the build refuses it, before
 any spelling is read.
 
 On Windows the check of who can write a trust anchor's path, this file's and every other

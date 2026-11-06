@@ -60,9 +60,9 @@ import weakref
 from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
 from datetime import date, datetime
 from decimal import Decimal
-from functools import partial
+from functools import cache, partial
 from itertools import islice
-from typing import Any, NamedTuple, TypeGuard
+from typing import Any, NamedTuple, TypeGuard, cast
 
 from messagefoundry.auth.anchor_path import (
     LINK,
@@ -718,7 +718,6 @@ def odbc_param_text(name: str, value: object, *, connection: str | None) -> str:
     the lane check (``auth.trust_anchors.database_ca_anchor_spec``) both run, so the lane check
     refuses what the build refuses, in the build's words (vault BACKLOG #5197)."""
     what = f"odbc_params value for '{name}'"
-    _refuse_none(value, what=what, connection=connection)
     if isinstance(value, bool):
         # str() would send True or False, which no driver is known to spell its own way
         # (psqlODBC reads SSLmode=True as disable). BACKLOG #2705.
@@ -898,12 +897,21 @@ def _windows_drive_type(root: str) -> int:
     """``GetDriveTypeW``'s answer for a volume root. Raises ``OSError`` off Windows."""
     if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
         raise OSError("the drive type is read only on Windows")
+    return int(_get_drive_type()(root))
+
+
+@cache
+def _get_drive_type() -> Callable[[str], int]:
+    """``GetDriveTypeW`` from a private ``kernel32`` handle, typed once: a walk asks it for each
+    volume it meets, and an ``sslcapath`` folder can walk many entries. Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("GetDriveTypeW exists only on Windows")
     import ctypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetDriveTypeW.argtypes = [ctypes.c_wchar_p]
-    kernel32.GetDriveTypeW.restype = ctypes.c_uint
-    return int(kernel32.GetDriveTypeW(root))
+    query = ctypes.WinDLL("kernel32", use_last_error=True).GetDriveTypeW
+    query.argtypes = [ctypes.c_wchar_p]
+    query.restype = ctypes.c_uint
+    return cast("Callable[[str], int]", query)
 
 
 def _windows_path_verdict(
@@ -1104,9 +1112,11 @@ REMOTE_PATH_RULE = (
     "must be a plain local path on this host: not a share, a network drive, a link to one, or a "
     "path it cannot read"
 )
+#: The entry rule covers a folder that cannot be listed or is past the entry cap too, so it points
+#: at the WARNING, which names the cause's kind.
 CAPATH_ENTRY_RULE = (
-    "must name a folder whose entries are plain local paths on this host, with no link to a share "
-    "and none it cannot read"
+    "must name a folder it can list, whose entries are plain local paths on this host; the "
+    "server log says which check failed"
 )
 
 
@@ -1114,12 +1124,12 @@ def driver_file_rule(keyword: str, value: object, verdicts: FileVerdicts) -> str
     """The rule a driver file keyword's ``value`` breaks, given its ``verdicts``, or ``None``:
     :data:`REMOTE_PATH_RULE` when :func:`names_another_host` refuses it, and
     :data:`CAPATH_ENTRY_RULE` when an entry of an ``sslcapath`` folder must be refused
-    (:func:`capath_entries_leave_host`). The one judgement the build and the lane check
+    (:func:`_capath_entries_leave_host`). The one judgement the build and the lane check
     (``auth.trust_anchors.database_ca_anchor_spec``) both run, so the two refuse alike (vault
     BACKLOG #5197)."""
     if names_another_host(value, verdicts):
         return REMOTE_PATH_RULE
-    if keyword == "sslcapath" and capath_entries_leave_host(value, verdicts):
+    if keyword == "sslcapath" and _capath_entries_leave_host(value, verdicts):
         return CAPATH_ENTRY_RULE
     return None
 
@@ -1127,19 +1137,20 @@ def driver_file_rule(keyword: str, value: object, verdicts: FileVerdicts) -> str
 #: Whether the remote-path check reads anything beyond the spelling: on Windows only, the one gate
 #: for :func:`_path_verdict` and for listing an ``sslcapath`` folder.
 _WALKS_BEYOND_SPELLING = sys.platform == "win32"
-#: How many entries of an ``sslcapath`` folder :func:`capath_entries_leave_host` judges. A folder
+#: How many entries of an ``sslcapath`` folder :func:`_capath_entries_leave_host` judges. A folder
 #: holding more is refused rather than judged in part, since the build runs on the event loop. A
 #: CA folder holds a few hundred at most (one file and one link per CA), and each entry that is not
 #: a link costs one ``lstat`` (:func:`_capath_entry_clear`).
 _MAX_CAPATH_ENTRIES = 4096
 
 
-def capath_entries_leave_host(value: object, verdicts: FileVerdicts) -> bool:
+def _capath_entries_leave_host(value: object, verdicts: FileVerdicts) -> bool:
     """Whether an entry of the ``sslcapath`` folder that ``value`` names must be refused (vault
     BACKLOG #5197, closing step 4). The driver's TLS library opens a ``<hash>.0`` entry there by
     name at a handshake, so a link there onto a share leads the CA lookup off the host, as the
-    folder itself would. ``verdicts`` are the folder's own (:func:`file_keyword_verdicts`), already
-    judged and not refused.
+    folder itself would. ``verdicts`` are the folder's own (:func:`file_keyword_verdicts`). A value
+    they refuse answers ``True`` here too, so the answer never clears a folder that its own walk
+    did not.
 
     Each spelling :func:`driver_file_spellings` gives that is a folder is listed, and every entry
     in it, not only the hash-named ones, takes :func:`_path_verdict`: ``True`` or ``None`` for any
@@ -1150,6 +1161,8 @@ def capath_entries_leave_host(value: object, verdicts: FileVerdicts) -> bool:
     (:data:`_WALKS_BEYOND_SPELLING`), with nothing listed. Like the rest of the check, it judges
     where an entry leads, not who can write it, and an entry added after the check is not judged
     (``docs/CONNECTIONS.md``, Generic ODBC)."""
+    if names_another_host(value, verdicts):
+        return True  # driver_file_spellings answers no spelling for it, which would read as clear
     if not _WALKS_BEYOND_SPELLING:
         return False
     return any(not _capath_folder_clear(p) for p in driver_file_spellings(value, verdicts))
@@ -1157,15 +1170,15 @@ def capath_entries_leave_host(value: object, verdicts: FileVerdicts) -> bool:
 
 def _capath_folder_clear(folder: str) -> bool:
     """Whether no entry of ``folder`` leads off the host or is a path the walk cannot clear, for
-    :func:`capath_entries_leave_host`. A reason it is not is logged as the walk logs one
+    :func:`_capath_entries_leave_host`. A reason it is not is logged as the walk logs one
     (:func:`_not_cleared`)."""
     try:
         with os.scandir(folder) as listing:
             names = [entry.name for entry in islice(listing, _MAX_CAPATH_ENTRIES + 1)]
     except (FileNotFoundError, NotADirectoryError) as exc:
         if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
-            # A share Windows could not reach, which CPython raises as not found, as
-            # _names_no_file reads it: the folder leads off the host, whatever its walk said.
+            # A share Windows could not reach, which CPython raises as not found, read as the
+            # walk's own probe reads it (_windows_path_verdict): the folder leads off the host.
             _not_cleared("an sslcapath folder is on a share Windows could not reach", exc)
             return False
         return True  # no folder at this spelling: left to the driver, as a missing file is
@@ -1189,8 +1202,10 @@ def _capath_entry_clear(path: str, name: str) -> bool:
     if ":" not in name and not name.endswith((" ", ".")):
         try:
             kind, _target = _win_probe(path)
-        except OSError:
-            pass  # the walk reads the same failure as its cause
+        except OSError as exc:
+            # The full walk below probes again and reports its own cause; this one stays at DEBUG,
+            # where the path may be logged, so a failure the second probe does not meet is seen.
+            logger.debug("sslcapath entry probe failed, so the entry takes the full walk: %s", exc)
         else:
             if kind != LINK:
                 return True

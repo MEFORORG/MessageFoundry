@@ -211,8 +211,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     reading the file at each new connect until the lane is rebuilt, and the refused reload is the
     only signal. Any check-then-load leaves a swap window, as for ``sslkey``. There is no pin:
     ``odbc_params`` has no pin setting. An ``sslcapath`` CA directory, which a driver also reads
-    to choose whom to trust, is not an anchor at all: no ACL, path or audit check covers it, only
-    the remote-path check of its entries. Nor
+    to choose whom to trust, is not an anchor at all: no ACL, path, content or audit check covers
+    it or its entries, only the remote-path check of the folder and of each entry. Nor
     is the lane check skipped for a TLS-off keyword other than ``sslmode``, such as ``Encrypt``.
 """
 
