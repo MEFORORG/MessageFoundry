@@ -321,6 +321,11 @@ def _settle_left_handoff(handoff: Path, blob: HostBlob) -> None:
         raise _refused(f"the handoff {handoff} beside the host file was refused", exc) from exc
 
 
+class _ConversionLeftHostFile(Exception):  # noqa: N818 -- a carrier, caught one frame up
+    """A conversion refused, and the host file it wrote could not be removed. Its text keeps the
+    read-back's own reason and names the file to remove; it carries no key material."""
+
+
 def _convert_handoff(host: Path, handoff: Path) -> HostBlob:
     """The service's first start (draft rule 3 step 2): re-wrap the handoff's key in this account's
     own scope as the host file, check that the host file opens to the same blob, then delete the
@@ -333,19 +338,44 @@ def _convert_handoff(host: Path, handoff: Path) -> HostBlob:
         write_host_file,
     )
 
+    def remove_written() -> str | None:
+        """Remove the host file this conversion wrote; why it could not be, or ``None``."""
+        try:
+            host.unlink()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            return exc.strerror or type(exc).__name__
+        return None
+
     def convert(blob: HostBlob) -> None:
         write_host_file(host, blob)
         # A host file that does not read back as the handoff's blob, or does not read back at all,
         # is removed, so the next start finds the handoff alone and converts again, rather than
-        # refuse on this file or take it for a copy the crash rule may keep.
+        # refuse on this file or take it for a copy the crash rule may keep. A removal that fails
+        # never replaces the reason the read-back gave.
+        reason: str | None = None
         try:
             same = read_host_file(host) == blob
+        except Exception as exc:
+            left = remove_written()
+            if left is None:
+                raise
+            reason = f"{exc}"
         except BaseException:
-            host.unlink()
+            remove_written()
             raise
-        if not same:
-            host.unlink()
-            raise CustodyError("the host file written does not open to the handoff's key")
+        else:
+            if same:
+                return
+            left = remove_written()
+            reason = "the host file written does not open to the handoff's key"
+            if left is None:
+                raise CustodyError(reason)
+        raise _ConversionLeftHostFile(
+            f"{reason}; and the host file it wrote could not be removed ({left}): remove {host} "
+            "by hand, and the next start converts the handoff again"
+        )
 
     return consume_handoff_file(handoff, convert)
 
@@ -391,6 +421,12 @@ def _read_or_convert(host: Path, handoff: Path, *, convert: bool) -> HostBlob:
         pass  # another start (an engine shard) converted it between the two reads
     except HandoffLeftBehind as exc:
         raise _refused("the handoff was converted, but", exc) from exc
+    except _ConversionLeftHostFile as exc:
+        raise _refused(
+            f"the handoff {handoff} could not be converted, and the start refuses rather than "
+            "run from it",
+            exc,
+        ) from exc
     except _custody_errors() as exc:
         # An engine shard converting it at the same moment holds it, or has it pending delete;
         # the host file it leaves is read below. With none there, the start refuses.
