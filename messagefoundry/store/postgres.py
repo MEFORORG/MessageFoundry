@@ -1672,8 +1672,9 @@ def _verifying_context_at_open(settings: StoreSettings) -> ssl.SSLContext:
     #3471): its text names a byte of what it decoded. A ``ValueError`` that is one, holds one, or
     has one on its chain, or whose chain cannot be read whole, is refused with a fixed text naming
     the settings and which of the two it is, raised outside the handler (BACKLOG #4882). It names
-    no class, since reading the class name runs the error's own code and may raise in the handler
-    with the error as context (the third hold on engine PR 2818). Not its ``codec_safe_str``
+    no class, as :func:`~messagefoundry.store.base._codec_safe_refusal`'s fallback names none
+    (the third hold on engine PR 2818). The ``isinstance`` test that comes first still runs the
+    error's own ``__class__`` in the handler. Not its ``codec_safe_str``
     rendering: the CRL judge re-raises a codec error as a
     ``ValueError`` whose own text already quotes the byte, which that rendering prints whole.
     Every other ``ValueError`` keeps its text and its chain."""

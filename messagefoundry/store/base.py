@@ -3522,12 +3522,13 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
     writes each through ``BaseException``'s own descriptor (:data:`_CAUSE` and its siblings), as
     ``BaseException.__cause__.__set__(escaping, None)``, never by assignment to the instance,
     which runs a subclass's ``__setattr__``; one that raises would leave in the handler with the
-    judged error as context (the third hold). It makes no Python call of its own: at the
-    recursion limit a call raises a fresh ``RecursionError`` in the handler, chained back to the
-    judged error. At least these are left
-    as they are: an exception group's members, the escaping error's own arguments, its
-    traceback's frame locals, and an interrupt delivered in the caller's handler outside the
-    judgement's code."""
+    judged error as context (the third hold). It makes no call into Python code: at the
+    recursion limit such a call raises a fresh ``RecursionError`` in the handler, chained back to
+    the judged error. The three descriptor calls are C calls, but each is a point where a signal
+    handler can run. At least these are left as they are: an exception group's members, the
+    escaping error's own arguments, its traceback's frame locals, an interrupt delivered in the
+    caller's handler outside the judgement's code, and one delivered between those three calls,
+    which keeps the escaping error, still chained to the judged one, as its context."""
     try:
         try:
             return _refusal_for(exc)
@@ -3544,8 +3545,9 @@ def _codec_safe_refusal(exc: Exception) -> Exception | None:
 _UNJUDGED = "an error that could not be judged, its class and text not shown"
 
 #: ``BaseException``'s own link descriptors, which ``BaseException.__cause__`` and its siblings
-#: resolve to, so clearing a link runs no subclass code (the third hold on engine PR 2818). Typed
-#: ``Any`` because the stubs give the class attribute the instance attribute's type.
+#: resolve to, so clearing a link runs no subclass code (the third hold on engine PR 2818). Read
+#: through ``vars``, since the stubs give ``BaseException.__cause__`` the instance attribute's
+#: type, which has no ``__set__``.
 _CAUSE: Any = vars(BaseException)["__cause__"]
 _CONTEXT: Any = vars(BaseException)["__context__"]
 _SUPPRESS_CONTEXT: Any = vars(BaseException)["__suppress_context__"]
