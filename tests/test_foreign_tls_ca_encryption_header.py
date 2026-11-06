@@ -29,7 +29,7 @@ import re
 import sys
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
@@ -421,13 +421,39 @@ class _ShareNotReached(FileNotFoundError):
     winerror = 53
 
 
+def _windows_stat_failure(winerror: int, mapped: int) -> OSError:
+    """A ``stat`` failure as Windows raises it: ``winerror`` set, ``errno`` as CPython maps it."""
+    failure_type = type(f"_WinError{winerror}", (OSError,), {"winerror": winerror})
+    return cast(OSError, failure_type(mapped, f"Windows error {winerror}"))
+
+
 @pytest.mark.parametrize("source", ["default", "PGSSLROOTCERT"])
 @pytest.mark.parametrize(
     ("failure", "refused"),
     [
-        pytest.param(PermissionError(errno.EACCES, "Permission denied"), False, id="EACCES"),
+        # Left: no file is there, or libpq, as the same identity, cannot stat it either.
+        pytest.param(FileNotFoundError(errno.ENOENT, "No such file"), False, id="ENOENT"),
+        pytest.param(NotADirectoryError(errno.ENOTDIR, "Not a directory"), False, id="ENOTDIR"),
+        pytest.param(OSError(errno.ENAMETOOLONG, "File name too long"), False, id="ENAMETOOLONG"),
         pytest.param(OSError(errno.ELOOP, "Too many levels of symbolic links"), False, id="ELOOP"),
+        pytest.param(PermissionError(errno.EACCES, "Permission denied"), False, id="EACCES"),
+        pytest.param(PermissionError(errno.EPERM, "Not permitted"), False, id="EPERM"),
+        pytest.param(_windows_stat_failure(2, errno.ENOENT), False, id="win-2"),
+        pytest.param(_windows_stat_failure(3, errno.ENOENT), False, id="win-3"),
+        pytest.param(_windows_stat_failure(5, errno.EACCES), False, id="win-5"),
+        pytest.param(_windows_stat_failure(123, errno.EINVAL), False, id="win-123"),
+        pytest.param(_windows_stat_failure(206, errno.ENOENT), False, id="win-206"),
+        pytest.param(_windows_stat_failure(1921, errno.EINVAL), False, id="win-1921"),
+        # Refused: a fault that may clear before a later connect, when libpq loads the file.
+        pytest.param(OSError(errno.EIO, "Input/output error"), True, id="EIO"),
+        pytest.param(OSError(errno.ETIMEDOUT, "Timed out"), True, id="ETIMEDOUT"),
+        pytest.param(OSError(errno.ESTALE, "Stale file handle"), True, id="ESTALE"),
+        pytest.param(OSError(errno.ENOTCONN, "Not connected"), True, id="ENOTCONN"),
         pytest.param(_ShareNotReached(errno.ENOENT, "No network path"), True, id="share"),
+        pytest.param(_windows_stat_failure(67, errno.ENOENT), True, id="win-67"),
+        pytest.param(_windows_stat_failure(64, errno.EINVAL), True, id="win-64"),
+        pytest.param(_windows_stat_failure(121, errno.EINVAL), True, id="win-121"),
+        pytest.param(_windows_stat_failure(1231, errno.EINVAL), True, id="win-1231"),
     ],
 )
 def test_a_root_certificate_the_engine_cannot_stat(
@@ -439,9 +465,11 @@ def test_a_root_certificate_the_engine_cannot_stat(
 ) -> None:
     """libpq 17's ``initialize_SSL`` loads the root file only when its ``stat`` succeeds; any
     other ``stat`` result skips the file, or fails a ``verify`` connect, without loading it. So a
-    failed ``stat`` is left to libpq. Red before ``leave_unstatable``: the failure refused the
-    build. The one still refused is a share Windows could not reach, which a later connect may
-    reach and load, when the check does not run again."""
+    ``stat`` failure that says no file is there, or that libpq could not ``stat`` it either, is
+    left to libpq. Red before ``leave_unstatable``: the failure refused the build. Every other
+    failure is refused, an unreached share or an I/O fault, since libpq stats again at each connect
+    and may load the file once the fault clears, when the check does not run again. Red on the
+    I/O rows before the allowed set: the stat branch left every failure but 53 and 67."""
     root = _write(_no_libpq_root, _headered(_certificate()), "root.crt")
     if source == "PGSSLROOTCERT":
         monkeypatch.setenv("PGSSLROOTCERT", root)

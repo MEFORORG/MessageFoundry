@@ -51,6 +51,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -1200,6 +1201,25 @@ _WINDOWS_INVALID_NAME = 123
 #: ``ERROR_BAD_NETPATH`` and ``ERROR_BAD_NET_NAME``: a share Windows could not reach, which
 #: CPython raises as ``FileNotFoundError`` though a file may be there.
 _WINDOWS_UNREACHABLE = frozenset({53, 67})
+#: The ``stat`` failures of libpq's root certificate that leave it to libpq, by ``errno`` off
+#: Windows: no file is there, or libpq, running as the same identity, cannot ``stat`` it either and
+#: so loads nothing. ENOENT and ENOTDIR: no such file. ENAMETOOLONG: a name the filesystem cannot
+#: hold. ELOOP: a link loop no ``stat`` resolves. EACCES and EPERM: both raise ``PermissionError``,
+#: a denial of this identity, not a transient fault. Every other failure, such as EIO, ETIMEDOUT,
+#: ESTALE, EHOSTDOWN or ENOTCONN on a network mount, is refused: libpq stats again at every connect,
+#: and may then load a file the build never checked.
+_LIBPQ_STAT_LEFT_ERRNOS = frozenset(
+    {errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG, errno.ELOOP, errno.EACCES, errno.EPERM}
+)
+#: The same set on Windows, by ``winerror``, since CPython maps every Win32 code it has no errno
+#: for to EINVAL and maps the unreachable-share codes 53 and 67 to ENOENT: 2
+#: ``ERROR_FILE_NOT_FOUND`` and 3 ``ERROR_PATH_NOT_FOUND`` (ENOENT), 15 ``ERROR_INVALID_DRIVE``
+#: (ENOENT), 123 ``ERROR_INVALID_NAME`` (EINVAL), 206 ``ERROR_FILENAME_EXCED_RANGE`` (ENOENT, the
+#: ENAMETOOLONG case), 1921 ``ERROR_CANT_RESOLVE_FILENAME`` (EINVAL, the ELOOP case) and 5
+#: ``ERROR_ACCESS_DENIED`` (EACCES). Every other code is refused, at least 53 and 67
+#: (:data:`_WINDOWS_UNREACHABLE`), 59 ``ERROR_UNEXP_NET_ERR``, 64 ``ERROR_NETNAME_DELETED``, 121
+#: ``ERROR_SEM_TIMEOUT`` and 1231 ``ERROR_NETWORK_UNREACHABLE``.
+_LIBPQ_STAT_LEFT_WINERRORS = frozenset({2, 3, 5, 15, _WINDOWS_INVALID_NAME, 206, 1921})
 
 
 #: What a CA file's read checks it for, as its refusals word it.
@@ -1358,9 +1378,12 @@ def _refuse_encrypted_libpq_root_cert(
     ``dlg_specific.h``), and a DSN-less connection reads no registered DSN's mode.
 
     A path that names another host (:func:`names_another_host`) is refused unread, with
-    ``PGSSLROOTCERT`` as the way out. A path the engine cannot ``stat`` is left to libpq, which
-    cannot load it either, except a share Windows could not reach, which a later connect might
-    reach, so that is refused. Past the ``stat``, the path takes :func:`_read_driver_file`'s read,
+    ``PGSSLROOTCERT`` as the way out. A ``stat`` failure that says no file is there, or that libpq
+    could not ``stat`` it either, is left to libpq (:func:`_libpq_cannot_stat_either`): at least a
+    missing name, a path through a file, a name too long, a link loop and a permission denial.
+    Every other ``stat`` failure is refused, at least an I/O or network fault and a share Windows
+    could not reach, since libpq stats again at every connect and may load the file once it is
+    reached. Past the ``stat``, the path takes :func:`_read_driver_file`'s read,
     as an ``sslca`` does: a directory is left to libpq, and a file that cannot be opened or read,
     or one past :data:`_MAX_DRIVER_CA_FILE_BYTES`, is refused, as libpq would fail the connect on
     a file it cannot load.
@@ -1480,21 +1503,28 @@ def _read_driver_file(
     either: then :class:`_UnreachedShare` is raised.
 
     With ``leave_unstatable``, for a driver that loads a file only once its ``stat`` succeeds, as
-    libpq loads its root certificate, a path ``os.stat`` fails on is left to the driver too, except
-    a share Windows could not reach, which a later connect may reach. That costs a second ``stat``
-    of a path that passes, which :func:`read_if_regular` makes again.
+    libpq loads its root certificate, a ``stat`` failure that says no file is there, or that the
+    driver could not ``stat`` it either (:func:`_libpq_cannot_stat_either`), is left to the driver
+    too. Every other ``stat`` failure is refused, at least a share Windows could not reach and an
+    I/O or network fault, since the driver stats again at each connect and may then load the file.
+    That costs a second ``stat`` of a path that passes, which :func:`read_if_regular` makes again.
 
     The file is read by :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which says
     how a device or pipe is judged without being read, or waited on."""
+    if leave_unstatable:
+        try:
+            os.stat(path)
+        except ValueError:
+            # A path os.stat cannot take, such as one holding a NUL, as the read below says.
+            logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
+            return None
+        except OSError as exc:
+            # Outside the read's try, whose ValueError branch would swallow the refusal.
+            if not _libpq_cannot_stat_either(exc):
+                raise _unread(setting, what, checked_for, error, exc) from exc
+            logger.debug("%s: the driver loads no file it cannot stat, so it is left", setting)
+            return None
     try:
-        if leave_unstatable:
-            try:
-                os.stat(path)
-            except OSError as exc:
-                if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
-                    raise
-                logger.debug("%s: the driver loads no file it cannot stat, so it is left", setting)
-                return None
         data = read_if_regular(path, _MAX_DRIVER_CA_FILE_BYTES + 1)
     except ValueError:
         # A path os.stat cannot take, such as one holding a NUL: the driver cannot load it either.
@@ -1520,10 +1550,7 @@ def _read_driver_file(
                 "%s: the share was not reached, and the driver reads no such file", setting
             )
             raise _UnreachedShare from exc
-        raise error(
-            f"{setting}: the {what} could not be read to check {checked_for}: "
-            f"{exc.strerror or type(exc).__name__}"
-        ) from exc
+        raise _unread(setting, what, checked_for, error, exc) from exc
     if data is None:  # a directory, device or pipe: judged by its stat, never read
         _irregular(setting, what, checked_for, error, leave_irregular)
         return None
@@ -1550,6 +1577,26 @@ def _names_no_file(exc: OSError) -> bool:
     if isinstance(exc, FileNotFoundError):
         return winerror not in _WINDOWS_UNREACHABLE
     return winerror == _WINDOWS_INVALID_NAME
+
+
+def _unread(
+    setting: str, what: str, checked_for: str, error: type[ValueError], exc: OSError
+) -> ValueError:
+    """:func:`_read_driver_file`'s refusal of a file it could not read or ``stat``."""
+    return error(
+        f"{setting}: the {what} could not be read to check {checked_for}: "
+        f"{exc.strerror or type(exc).__name__}"
+    )
+
+
+def _libpq_cannot_stat_either(exc: OSError) -> bool:
+    """Whether a failed ``stat`` of libpq's root certificate says no file is there, or that libpq
+    could not ``stat`` it either, so the file is left to libpq: :data:`_LIBPQ_STAT_LEFT_WINERRORS`
+    by ``winerror`` where Windows set one, else :data:`_LIBPQ_STAT_LEFT_ERRNOS` by ``errno``."""
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in _LIBPQ_STAT_LEFT_WINERRORS
+    return exc.errno in _LIBPQ_STAT_LEFT_ERRNOS
 
 
 def _irregular(
