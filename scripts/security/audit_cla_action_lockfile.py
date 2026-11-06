@@ -25,17 +25,19 @@ run's real output:
 3. **No stale entry.** Every baselined advisory is still reported. The baseline records advisories
    in the vendored action's declared LOCKFILE, which does not bound what the bundle holds. Its
    triage comments say, for the entries they cover, whether the package's identifiers were found
-   in the bundle itself, on a reading whose limits are stated in the baseline's header and in each
-   triage comment. The lockfile is frozen, so an audit that stops reporting one has either stopped
-   looking or met a withdrawn advisory. Either way a person has to find out which.
+   in the bundle itself, on a reading whose limits are stated in the baseline's header, and in the
+   deepmerge and minimatch GHSA-g3hv-75wg-m249 triage comments, which state their own. The lockfile
+   is frozen, so an audit that stops reporting one has either stopped looking or met a withdrawn
+   advisory. Either way a person has to find out which.
 
 WHAT THIS PROVES, AND WHERE. Check 3 shows on each run that the audit still reports every baselined
 advisory, each one an advisory npm reports against a package in the declared lockfile. Check 2
 turns any advisory it sees beyond the baseline into a red;
 ``tests/test_cla_action_advisory_gate.py`` shows that offline by dropping a real advisory from the
-baseline over a recorded audit. Together they show that a known-vulnerable package in the declared
-lockfile WOULD be reported. The audit reads only that lockfile, so a package compiled into
-``dist/index.js`` but absent from the lockfile is not seen.
+baseline over a recorded audit. With check 1's coverage, they show that a known-vulnerable package
+in the declared lockfile WOULD be reported. The audit reads only that lockfile and a manifest copied
+from its root entry, so a package compiled into ``dist/index.js`` but absent from the lockfile is
+not seen.
 
 WHAT A PASS DOES NOT PROVE. Each run prints the provenance record's limitation sentence. The short
 form: the lockfile audit covers the DECLARED dependencies of the pinned commit, not what the bundle
