@@ -362,12 +362,48 @@ def auth_challenge_refused(label: str) -> NegativeAckError:
     and would send an operator looking for a bad header or URL. The fault is the connection's, so
     this is a configuration fault: under the default ``credential_fault_policy`` the delivery
     worker stops the lane and keeps the queue. ADR 0095 Amendment B is the source of record for
-    why a stop was chosen over a retry, and for where that reasoning is weak."""
+    why a stop was chosen over a retry, and for where that reasoning is weak. The token hop also
+    raises it for the case :func:`is_refused_proxy_digest_tunnel` names (BACKLOG #2989)."""
     return NegativeAckError(
         f"{label} {AUTH_CHALLENGE_REFUSED}",
         code=AUTH_CHALLENGE_REFUSED_CODE,
         permanent=True,
         config_fault=True,
+    )
+
+
+#: The text of the bare ``OSError`` ``http.client.HTTPConnection._tunnel`` raises when a web
+#: proxy answers the ``CONNECT`` for an ``https`` target with a 407.
+_TUNNEL_407_PREFIX = "Tunnel connection failed: 407 "
+
+
+def is_refused_proxy_digest_tunnel(
+    opener: urllib.request.OpenerDirector, exc: urllib.error.URLError
+) -> bool:
+    """Whether ``exc`` is a web proxy's 407 to the ``CONNECT`` for an ``https`` target, on an
+    ``opener`` whose proxy is set up for Digest (BACKLOG #2989, ADR 0095 Amendment B.1).
+
+    That is the refusal :func:`auth_challenge_refused` names, met where no handler can raise it.
+    The proxy Digest handler answers only a 407 that reaches it as a status, and ``_tunnel``
+    raises a ``CONNECT`` 407 before any handler runs, as a bare ``OSError`` that ``do_open`` wraps
+    in a ``URLError``. So a retry sends the same unanswered ``CONNECT``. Without a Digest handler
+    on the opener, the 407 stays the plain status Amendment B keeps for a Basic challenge: a
+    refused pre-emptive Basic credential, or a proxy the connection has no credential for.
+
+    Matched on the exact class and the one-argument text ``_tunnel`` builds from the int status,
+    so a socket error, which carries an errno, never matches, and the proxy's bytes can only
+    follow the prefix. ``tests/test_digest_refusal_classification.py`` pins the text on a real
+    socket, so a CPython that rewords it fails that test instead of retrying again unseen."""
+    reason = exc.reason
+    return (
+        type(reason) is OSError
+        and len(reason.args) == 1
+        and isinstance(reason.args[0], str)
+        and reason.args[0].startswith(_TUNNEL_407_PREFIX)
+        and any(
+            isinstance(handler, _ApprovedProxyDigestAuthHandler)
+            for handler in getattr(opener, "handlers", ())
+        )
     )
 
 
