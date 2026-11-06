@@ -883,8 +883,8 @@ def refuse_resolved_verify_off(
     # Read as the connector reads it: an explicit None is the default, on (vault BACKLOG #3230).
     if not bool_setting(settings, "verify_tls", default=True) and settings.get("tls_ca_file"):
         raise WiringError(
-            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false or "
-            "empty value, which verifies nothing, and DICOMweb has no token hop."
+            f"{where}: DICOMweb tls_ca_file would never be read: verify_tls resolved to a false "
+            "value, which verifies nothing, and DICOMweb has no token hop."
         )
 
 
