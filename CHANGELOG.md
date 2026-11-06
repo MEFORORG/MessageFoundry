@@ -16,9 +16,9 @@ All notable changes to MessageFoundry are documented here. The format follows
 - **A mail relay that refuses every recipient with a `5xx` reply now fails the delivery for good.**
   On the Email and Direct destinations the row dead-letters on its first attempt, as a partial
   refusal already did, rather than being retried to the attempt ceiling. A refusal with any `4xx`
-  reply, such as greylisting, is still retried. The error names the relay, a count and the reply
-  codes, never an address or the relay's reply text, and the `[alerts]` mail logs it the same way.
-  (`BACKLOG #2924`, `#2884`)
+  reply, such as greylisting, or with `552`, is still retried. The error names the relay, a count
+  and the reply codes, never an address or the relay's reply text, and the `[alerts]` mail logs it
+  the same way. (`BACKLOG #2924`, `#2884`)
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
   engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
   other name reached it. Now a variable reaches a hook only if it is one a shell needs to start or

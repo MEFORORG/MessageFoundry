@@ -2972,11 +2972,14 @@ relay's host and port and two counts (*"Email relay.example:587: 1 of 2 recipien
 address or the relay's reply; the delivery worker's log line names the connection. A
 refusal of **every** recipient with a permanent `5xx` reply agrees with it: a **permanent** `total-refusal`
 `NegativeAckError` that dead-letters on the first attempt, rather than a retry to the attempt ceiling. It
-names the relay, a count and the distinct reply codes (*"Email relay.example:587: all 2 recipients refused
-(550)"*), never an address or a reply text. When any of those replies is a temporary `4xx`, such as
-greylisting, the next attempt may pass, so it is retried, with the same content-free text. The relay took
-no message in either case, so nobody gets a duplicate. The Direct destination fails both refusals the same
-way, and the `[alerts]` mail logs each as a failed send.
+names the relay, a count and the distinct reply codes (*"Email
+relay.example:587: all 2 recipients refused (550)"*), never an address or a reply text. When any of
+those replies is a temporary `4xx`, such as greylisting, or `552`, which RFC 5321 tells a client to treat
+as temporary at `RCPT`, the next attempt may pass, so it is retried, with the same content-free text. A
+relay that drops the session with `421` part way through is retried too, and the text counts only the
+replies before it (*"1 of 2 recipients refused, then the session closed (421)"*). The relay took no
+message in any of these cases, so nobody gets a duplicate. The Direct destination fails each refusal the
+same way, and the `[alerts]` mail logs each as a failed send.
 
 ```python
 # samples/config/connections.py (excerpt)

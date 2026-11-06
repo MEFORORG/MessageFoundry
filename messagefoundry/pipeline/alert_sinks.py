@@ -68,7 +68,7 @@ from messagefoundry.pipeline.alerts import (
     sandbox_worker_refused_detail,
 )
 from messagefoundry.restore_notice import RESTORE_ROLLBACK_NOTICE
-from messagefoundry.transports.base import NegativeAckError
+from messagefoundry.transports.base import DeliveryError
 
 # Not lazy, unlike the two transports imports below: the shared webhook opener is built at import.
 # Importing this module already loads the transports package through pipeline/__init__.py, so these
@@ -841,7 +841,7 @@ def send_plain_email(
         failure = type(exc).__name__
     if failure:
         raise ValueError(f"{ALERTS_SMTP_CELL}: the alert body could not be encoded ({failure})")
-    refusal: NegativeAckError | None = None
+    refusal: DeliveryError | None = None
     try:
         with smtplib.SMTP(host, port, timeout=timeout) as smtp:
             if use_tls:

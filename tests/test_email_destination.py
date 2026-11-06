@@ -37,6 +37,7 @@ from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.email import (
     TOTAL_REFUSAL_CODE,
     EmailDestination,
+    _total_refusal,
     envelope_address_problem,
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
@@ -961,18 +962,26 @@ def refuse_every_recipient(
         wire.quit_reply = b"500 no\r\n"
 
 
-def assert_total_refusal(exc: DeliveryError, cell: str, wire: _WireCapture, codes: str) -> None:
-    """A refusal of every recipient: permanent, with no fault flag, when every code is ``5xx``,
-    and otherwise a plain retried ``DeliveryError``. It names ``cell``, a count and the reply
-    codes, carries no address and no chain, and the relay never got the message."""
-    if all(code.strip().startswith("5") for code in codes.split(",")):
+def assert_total_refusal(
+    exc: DeliveryError, cell: str, wire: _WireCapture, codes: str, *, seen: int | None = None
+) -> None:
+    """A refusal of every recipient: permanent, with no fault flag, when every code is a ``5xx``
+    other than ``552``, and otherwise a plain retried ``DeliveryError``. It names
+    ``cell``, a count and the reply codes, carries no address and no chain, and the relay never
+    got the message. ``seen`` is the replies smtplib kept, when a ``421`` cut the session."""
+    if all(c.strip().startswith("5") and c.strip() != "552" for c in codes.split(",")):
         assert isinstance(exc, NegativeAckError)
         assert exc.code == TOTAL_REFUSAL_CODE and exc.permanent is True
         assert exc.credential_fault is False and exc.config_fault is False
     else:
         assert not isinstance(exc, NegativeAckError)
     count = len(wire.rcpt_lines)
-    assert str(exc) == f"{cell}: all {count} recipients refused ({codes})"
+    if seen is None:
+        assert str(exc) == f"{cell}: all {count} recipients refused ({codes})"
+    else:
+        assert str(exc) == (
+            f"{cell}: {seen} of {count} recipients refused, then the session closed ({codes})"
+        )
     _assert_no_address(exc)
     assert_chain_severed(exc)
     assert wire.data == [], "every recipient was refused, so DATA was never sent"
@@ -991,17 +1000,39 @@ async def test_a_permanent_refusal_of_every_recipient_fails_the_email_delivery_f
     assert_total_refusal(caught.value, f"Email 127.0.0.1:{wire.port}", wire, "550")
 
 
+@pytest.mark.parametrize("quit_ok", [True, False], ids=["quit-221", "quit-refused"])
+@pytest.mark.parametrize("code", [b"451", b"552"], ids=["4xx", "552"])
 async def test_a_temporary_refusal_of_every_recipient_is_retried_content_free(
-    wire: _WireCapture,
+    wire: _WireCapture, code: bytes, quit_ok: bool
 ) -> None:
-    """A 4xx, such as greylisting, may pass on the next attempt, so it stays a retry. Its text and
-    chain are content-free too. RED on main: the chain held SMTPRecipientsRefused."""
-    refuse_every_recipient(wire, b"451")
+    """A 4xx, such as greylisting, may pass on the next attempt, so it stays a retry, and so does
+    552, which RFC 5321 section 4.5.3.1.10 says to treat as temporary at RCPT. Its text and chain
+    are content-free too, and a refused QUIT does not replace that text. RED on main: the chain
+    held SMTPRecipientsRefused."""
+    refuse_every_recipient(wire, code, quit_ok=quit_ok)
     dest = _wire_dest(wire.port, _PARTIAL_RECIPIENTS)
     check_egress_allowed(dest, _wire_egress(wire.port))
     with pytest.raises(DeliveryError) as caught:
         await EmailDestination(dest).send("PID|1|synthetic")
-    assert_total_refusal(caught.value, f"Email 127.0.0.1:{wire.port}", wire, "451")
+    assert_total_refusal(caught.value, f"Email 127.0.0.1:{wire.port}", wire, code.decode())
+
+
+async def test_a_421_during_rcpt_counts_only_the_replies_it_saw(wire: _WireCapture) -> None:
+    """smtplib closes the session on a 421 and raises with the replies seen so far, so the first
+    recipient's acceptance is not reported as a refusal."""
+    wire.refuse_rcpt = frozenset({_PARTIAL_REFUSED.encode()})
+    wire.refuse_code = b"421"
+    dest = _wire_dest(wire.port, _PARTIAL_RECIPIENTS)
+    check_egress_allowed(dest, _wire_egress(wire.port))
+    with pytest.raises(DeliveryError) as caught:
+        await EmailDestination(dest).send("PID|1|synthetic")
+    assert_total_refusal(caught.value, f"Email 127.0.0.1:{wire.port}", wire, "421", seen=1)
+
+
+def test_a_total_refusal_with_no_reply_code_is_retried() -> None:
+    """SMTPRecipientsRefused({}) holds no code: nothing says the refusal is permanent."""
+    refusal = _total_refusal("Email relay.example:587", 0, 0, [])
+    assert not isinstance(refusal, NegativeAckError)
 
 
 async def test_every_recipient_accepted_is_still_a_delivery(wire: _WireCapture) -> None:

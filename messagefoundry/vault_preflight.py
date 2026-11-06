@@ -105,7 +105,8 @@ class VaultPrivilegeAlertSink(Protocol):
 
 
 #: The alert subject's prefix (the ``connection`` key the notifier throttles and keys durable state
-#: on). Its colon keeps every subject outside the connection-name grammar.
+#: on). :func:`vault_privilege_alert_subject` adds a colon after it, which keeps every subject
+#: outside the connection-name grammar; the bare prefix is a legal connection name.
 VAULT_PRIVILEGE_ALERT_SUBJECT = "vault"
 
 
@@ -118,14 +119,20 @@ def vault_privilege_alert_subject(hop: HopPrivilege) -> str:
     return f"{VAULT_PRIVILEGE_ALERT_SUBJECT}:{hop.hop.removeprefix('vault.')}"
 
 
+#: The states that raise the warning, the ones
+#: :func:`~messagefoundry.privilege_check.vault_preflight_outcome` reads as a finding.
+_FINDINGS = frozenset({HopState.OVER_GRANTED, HopState.UNOBSERVABLE})
+
+
 def _alert(sink: VaultPrivilegeAlertSink, hop: HopPrivilege) -> None:
-    """Raise the hop's warning, or its clean inverse. Best effort, like the audit row: a sink that
-    raises is logged and never masks the finding or the refusal."""
+    """Raise the hop's warning, or its clean inverse; any other state judged nothing, so it
+    raises neither. Best effort, like the audit row: a sink that raises is logged and never masks
+    the finding or the refusal."""
     subject = vault_privilege_alert_subject(hop)
     try:
         if hop.state is HopState.CLEAN:
             sink.vault_privilege_clean(subject)
-        else:
+        elif hop.state in _FINDINGS:
             sink.vault_privilege_warning(
                 subject,
                 finding=hop.state.value,

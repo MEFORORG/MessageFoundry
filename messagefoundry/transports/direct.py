@@ -803,7 +803,7 @@ class DirectDestination(DestinationConnector):
                 code="smime-build",
                 permanent=True,
             )
-        refusal: NegativeAckError | None = None
+        refusal: DeliveryError | None = None
         try:
             with self._connect() as smtp:
                 if self.username is not None:

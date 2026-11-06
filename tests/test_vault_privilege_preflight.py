@@ -969,6 +969,23 @@ async def test_a_failing_sink_never_masks_the_refusal(caplog: pytest.LogCaptureF
     assert any("alert sink raised" in r.getMessage() for r in caplog.records)
 
 
+@pytest.mark.parametrize(
+    "state", [HopState.NOT_APPLICABLE, HopState.NOT_PROBED, HopState.NOT_CONFIGURED]
+)
+async def test_a_state_that_judged_nothing_raises_neither_alert(
+    monkeypatch: pytest.MonkeyPatch, state: HopState
+) -> None:
+    """The preflight reads these as clean (vault_preflight_outcome), so a warning would page a
+    finding nobody made, and a clean inverse would resolve one nobody re-read."""
+    import messagefoundry.vault_preflight as vault_preflight
+
+    raw = HopPrivilege("vault.store", state, "i", "m", "nothing judged")
+    monkeypatch.setattr(vault_preflight, "vault_hops", lambda consumers, readings: [raw])
+    sink = _RecordingSink()
+    await _run(_FakeVault(caps=_least_caps()), sink, enforcing=True)
+    assert sink.events == [] and sink.cleared == []
+
+
 async def test_the_alert_detail_escapes_a_line_break_a_server_sent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -999,10 +1016,11 @@ def test_the_event_is_rule_targetable_and_its_inverse_resolves_it() -> None:
     from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, AlertRuleSet
 
     assert "vault_privilege_warning" in _ALERT_EVENT_TYPES
-    decision = AlertRuleSet([AlertRule(event_type="vault_privilege_warning")]).decide(
-        {"type": "vault_privilege_warning", "connection": "vault:store"}
-    )
-    assert decision is not None
+    decision = AlertRuleSet(
+        [AlertRule(id="vault-rule", event_type="vault_privilege_warning")]
+    ).decide({"type": "vault_privilege_warning", "connection": "vault:store"})
+    # decide() never returns None: an unmatched event gets the default decision, with no rule id.
+    assert decision.rule_id == "vault-rule"
     assert _AUTO_RESOLVE["vault_privilege_clean"] == "vault_privilege_warning"
     # The inverse is not a page, so a rule must not be able to target it.
     assert "vault_privilege_clean" not in _ALERT_EVENT_TYPES
