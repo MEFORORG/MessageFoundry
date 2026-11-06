@@ -2535,7 +2535,9 @@ def test_white_space_after_the_separator_gives_the_old_result_on_both_paths() ->
 
 #: White space between a braced label's keyword and its separator. The log and bundle readers split
 #: a record at most of these, and the run-on would delete them.
-_BRACED_HEAD_BREAKS = (*(" ", "\t", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", " ", " ", " "),)
+_BRACED_HEAD_BREAKS = (
+    *(" ", "\t", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\u00a0"),
+)
 
 
 def _braced_head_line(brk: str) -> str:
@@ -2620,6 +2622,51 @@ def test_the_spaced_head_lines_print_when_the_head_takes_a_space_or_tab(
     for line, value in _BRACED_SPACED_HEAD_LINES:
         outs = [scrub_credentials(line), redact_log_line(line)]
         assert any(value in out for out in outs), f"{line!r} printed no value -- got {outs!r}"
+
+
+#: Braces whose tail holds what the bundle's PHI pass reads by its letters: an XML tag, an HL7
+#: segment ID before a delimiter an ``MSH`` header declared, and the header itself. The masked tail
+#: is written back before that pass runs, so it no longer saw them, and the value past the closer
+#: printed in the bundle (review round 5). Each is refused now, and the line reads as before.
+_BRACED_PHI_READER_LINES: tuple[tuple[str, str], ...] = (
+    ("token=a;PWD={pp <name>}vq2</name> rest", "vq2"),
+    ("MEFOR_X=a;PWD={pp <ns:given>}vq2</ns:given> rest", "vq2"),
+    ("token=a;PWD={pp MSH*!#\\$*}PID*vq2 rest", "vq2"),
+    ("MSH#^~\\$#h MEFOR_X=a;PWD={pp NK1#}vq2 vq3", "vq2"),
+)
+
+
+@pytest.mark.parametrize(("line", "value"), _BRACED_PHI_READER_LINES, ids=range(4))
+def test_a_braced_tail_holding_what_the_phi_pass_reads_is_left_to_it(line: str, value: str) -> None:
+    """The bundle hides the value past the closer, as it did before the run-on."""
+    out = redact_log_line(line)
+    assert value not in out, f"{value} printed -- got {ascii(out)}"
+
+
+def test_the_phi_reader_lines_print_when_the_tail_takes_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL. With the tail taking a "<", a segment-shaped word and an ``MSH`` again,
+    each line prints its value in the bundle."""
+    cuts = (
+        ("%;,&<", "%;,&"),
+        (r"|(?-i:[A-Z][A-Z0-9]{2})(?![A-Za-z0-9])", ""),
+        (r"|[A-Za-z0-9]*?(?-i:MSH|BHS|FHS)(?![A-Za-z0-9])", ""),
+    )
+    for module in (scrub_mod, redact_mod):
+        tail = module._SPACED_BRACED_TAIL
+        bare = tail
+        for old, new in cuts:
+            assert old in bare, f"{module.__name__}._SPACED_BRACED_TAIL lost {old}"
+            bare = bare.replace(old, new)
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            monkeypatch.setattr(
+                module, name, re.compile(pattern.pattern.replace(tail, bare), pattern.flags)
+            )
+    for line, value in _BRACED_PHI_READER_LINES:
+        out = redact_log_line(line)
+        assert value in out, f"{line!r} hid -- got {ascii(out)}"
 
 
 def test_the_bare_scheme_pass_writes_the_braced_tail_back_masked() -> None:

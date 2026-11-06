@@ -587,8 +587,10 @@ _RUN_ON_LABEL = (
 # ``MEFOR_X=<redacted> ww}`` with its letters masked, and the label is hidden with the value, as it was
 # before. That mask keeps each word's length and the class of each character, and keeps whole what a
 # later pass reads: a placeholder an earlier pass wrote, the bundle's ``mfb64:v1:`` marker, and a scheme
-# word such as ``Bearer`` before a space. So every later pass reads text of the shape the old class
-# left. A first form masked every letter and digit to "x" and printed values the old class hid: in
+# word such as ``Bearer`` before a space. So every later CREDENTIAL pass reads text of the shape
+# the old class left. A PHI pass does not: the mask changes the letters it reads, an XML tag name, a
+# segment ID or the ``MSH`` that declares a line's delimiters, and in the support bundle the PHI pass
+# runs after this one. The braces' conditions below refuse those shapes instead. A first form masked every letter and digit to "x" and printed values the old class hid: in
 # ``token=a;PWD={pp Bearer abcdefgh}ijkl`` the later bearer pass no longer saw ``Bearer`` and "}ijkl"
 # printed, and a placeholder in the tail stopped being one. Both simpler forms were built first and
 # measured printing values the old class hid, by changing that shape:
@@ -620,6 +622,15 @@ _RUN_ON_LABEL = (
 #   which the old text hid and the run-on printed. A "%" is refused because a label may start right
 #   after a percent escape, as in ``%3Bpassword=``, where the check in front of each run does not look;
 #   a character outside ASCII, so a label spelled with a fold character cannot slip past it.
+# * No "<", no run shaped like an HL7 segment ID (a capital letter, then two capitals or digits),
+#   and no run ending in ``MSH``, ``BHS`` or ``FHS``, after the first white space. The bundle's PHI
+#   pass runs after this pass and reads an XML element from its tag name, a segment from its ID, and
+#   the delimiters a line declares from its ``MSH``, and each of those can redact text past the
+#   closer. The mask rewrites those letters, so the PHI pass no longer saw them:
+#   ``token=a;PWD={pp <name>}vq2</name> rest`` and, after an ``MSH#`` header,
+#   ``MEFOR_X=a;PWD={pp NK1#}vq2 vq3`` printed "vq2". A review found these with a random
+#   differential that put the PHI pass where the bundle runs it; they are the readers found, not a
+#   census of what a PHI pass reads.
 # * The first white space a space or a tab, and no line break of any kind after it: none of VT, FF,
 #   U+001C to U+001E, U+0085, U+2028 or U+2029, which the log and bundle readers split a record at.
 # * No "{", which keeps the scan linear. A walk from one label's "{" ends at the next "{" at the
@@ -655,10 +666,13 @@ _BRACED_HEAD = (
 #: two agree at every position.
 _SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
 _SPACED_BRACED_TAIL = (
-    r"[ \t](?:[^{}'\"%;,&\r\n\v\f\x1c-\x1eA-Za-z0-9\x80-\U0010ffff]|\}\}"
+    r"[ \t](?:[^{}'\"%;,&<\r\n\v\f\x1c-\x1eA-Za-z0-9\x80-\U0010ffff]|\}\}"
     + r"|(?!"
     + _RUN_ON_LABEL
-    + r"|(?i:bearer|basic|digest)\s)(?-i:[A-Za-z0-9])++)*+"
+    + r"|(?i:bearer|basic|digest)\s"
+    + r"|(?-i:[A-Z][A-Z0-9]{2})(?![A-Za-z0-9])"
+    + r"|[A-Za-z0-9]*?(?-i:MSH|BHS|FHS)(?![A-Za-z0-9])"
+    + r")(?-i:[A-Za-z0-9])++)*+"
 )
 _BRACED_LABEL = _BRACED_HEAD + _SPACED_BRACED_HEAD + _SPACED_BRACED_TAIL + r"\}(?!\})"
 _BRACED_RUN_ON = (
@@ -1419,10 +1433,9 @@ def _braced_tail(m: re.Match[str]) -> str:
     :func:`_mask_member_value`, or "" when it took none. :data:`_BRACED_RUN_ON` says why the tail is
     written back masked rather than dropped, and why with that mask. A pattern without the group
     gets "", so a rebuilt pattern without the run-on still works here."""
-    try:
-        start, end = m.span("braced_tail")
-    except IndexError:
+    if "braced_tail" not in m.re.groupindex:
         return ""
+    start, end = m.span("braced_tail")
     return "" if start < 0 else _mask_member_value(m.string, start, end)
 
 

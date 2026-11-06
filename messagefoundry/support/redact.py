@@ -160,15 +160,22 @@ _RUN_ON_LABEL = (
 # The stop fires before a ``_CREDENTIAL_KV`` label whose braced value holds white space and no "{"
 # too, and the value then takes that label up to the braced value's closer (BACKLOG #2966), so
 # ``MEFOR_X=a;PWD={pp ww}`` no longer prints " ww}". Why the closer stays, why those conditions on
-# the braces and the label are what keep it from printing a value, and why the scan stays linear, are
-# stated once, on the same fragments in ``messagefoundry/secretscrub.py``.
+# the braces and the label are what refuse each shape measured printing a value, and why the scan
+# stays linear, are stated once, on the same fragments in ``messagefoundry/secretscrub.py``. THIS
+# COPY RUNS BEFORE THE PHI PASS, and the tail is written back masked, so a PHI reader that keys on
+# letters in the braces no longer sees them; the tail refuses the readers found doing so, an XML tag,
+# a segment ID and an ``MSH`` header, and a differential that runs the PHI pass after this layer is
+# the measurement for this copy, not the write-time one.
 _BRACED_HEAD = r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[:=]"
 _SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
 _SPACED_BRACED_TAIL = (
-    r"[ \t](?:[^{}'\"%;,&\r\n\v\f\x1c-\x1eA-Za-z0-9\x80-\U0010ffff]|\}\}"
+    r"[ \t](?:[^{}'\"%;,&<\r\n\v\f\x1c-\x1eA-Za-z0-9\x80-\U0010ffff]|\}\}"
     + r"|(?!"
     + _RUN_ON_LABEL
-    + r"|(?i:bearer|basic|digest)\s)(?-i:[A-Za-z0-9])++)*+"
+    + r"|(?i:bearer|basic|digest)\s"
+    + r"|(?-i:[A-Z][A-Z0-9]{2})(?![A-Za-z0-9])"
+    + r"|[A-Za-z0-9]*?(?-i:MSH|BHS|FHS)(?![A-Za-z0-9])"
+    + r")(?-i:[A-Za-z0-9])++)*+"
 )
 _BRACED_LABEL = _BRACED_HEAD + _SPACED_BRACED_HEAD + _SPACED_BRACED_TAIL + r"\}(?!\})"
 _BRACED_RUN_ON = (
