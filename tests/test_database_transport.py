@@ -1809,6 +1809,17 @@ async def test_a_builtin_cause_under_a_driver_error_is_withheld(
     assert _SYNTHETIC_ID not in caplog.text
 
 
+@pytest.mark.usefixtures("_dbapi_driver")
+def test_a_link_under_a_driver_error_names_no_sqlstate_shaped_value() -> None:
+    """Under a driver error, a non-driver link's ``args[0]`` of five alphanumerics may be a value,
+    so it is not read as a SQLSTATE.
+
+    Red mutation: drop the ``withhold and not driver`` arm in ``_safe_db_error``. Reds here.
+    """
+    assert _safe_db_error(KeyError("A4242"), withhold=True) == "KeyError [driver message withheld]"
+    assert _safe_db_error(_DbApiError("23505"), withhold=True) == "_DbApiError [23505]"
+
+
 def test_a_sqlite_error_keeps_its_result_code_name() -> None:
     """SQLite has no SQLSTATE, so its result-code name is the one diagnostic left to name."""
     import sqlite3

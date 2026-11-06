@@ -2274,15 +2274,19 @@ Two limits follow from this:
 - **psqlODBC takes libpq options through `pqopt`, which is refused.** That covers at least a CA
   file path, a client certificate and key, and a connect timeout. With `SSLmode=verify-full`,
   libpq still reads its CA from its default location or from the `PGSSLROOTCERT` environment
-  variable of the service. Unless `SSLmode` is `disable`, the engine looks for that file when it
-  builds a psqlODBC connection, and refuses the build if the file holds an encryption header or a
-  private key, as it refuses such an `sslca` (BACKLOG #3090). It also refuses the build if the
-  path names another host, or the file is there and cannot be read. `PGSSLROOTCERT=system` is no
-  file and is not read. The default location is `root.crt` under `postgresql` in the roaming
-  application-data folder on Windows, and under `~/.postgresql` elsewhere; the engine finds it as
-  libpq 15 and later do, so another libpq version may read a different home. The check reads the
-  environment of the process that builds, so `messagefoundry check` judges its own machine's
-  file. It runs at build, not at each connect, and no ACL check covers the file.
+  variable of the service. The engine checks that file when it builds a psqlODBC connection
+  (BACKLOG #3090). It skips the check when `SSLmode` is `disable`. It checks the file as it checks
+  an `sslca`. So it refuses the build in at least these cases:
+  - the file holds an encryption header or a private key;
+  - the path names another host;
+  - the file is there, but cannot be read or is over 1 MiB.
+
+  The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
+  application-data folder. Elsewhere it is under `~/.postgresql`. The engine finds this home as
+  libpq 15 and later do. Another libpq version may read a different home. With libpq 16 and
+  later, `PGSSLROOTCERT=system` names no file, so the engine reads nothing. The check reads the
+  environment of the process that builds. So `messagefoundry check` judges its own machine's file.
+  The check runs at build, not at each connect. No ACL check covers the file.
 
 ##### Values on the generic dialect
 

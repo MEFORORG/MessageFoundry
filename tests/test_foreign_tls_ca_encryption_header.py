@@ -34,6 +34,7 @@ from pydantic import ValidationError
 from messagefoundry import pki
 from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE, PRIVATE_KEY_SCOPE
 from messagefoundry.config.settings import StoreBackend, StoreSettings
+from messagefoundry.redaction import safe_exc
 from messagefoundry.transports import database
 from messagefoundry.transports.database import _build_odbc_dsn
 from tests._encrypted_pem_probe import ENCRYPTION_HEADERS as _HEADERS
@@ -286,10 +287,12 @@ def test_a_pgsslrootcert_with_an_encryption_header_is_refused(
     """BACKLOG #3090, step 3. Red with ``_refuse_encrypted_libpq_root_cert`` removed: the builder
     would build, and libpq would load the file at the first connect."""
     monkeypatch.setenv("PGSSLROOTCERT", _write(tmp_path, text))
-    with pytest.raises(ValueError, match="DATABASE PGSSLROOTCERT") as refused:
+    with pytest.raises(ValueError, match="libpq root certificate PGSSLROOTCERT") as refused:
         _build_psql()
     message = str(refused.value)
     assert _CONNECTION in message and ENCRYPTION_HEADER_SCOPE in message
+    # A stored build failure goes through safe_exc, whose name-run scrub must leave the setting.
+    assert "PGSSLROOTCERT" in safe_exc(refused.value)
     assert "AES-256-CBC" not in message and _body_of(text) not in message
 
 

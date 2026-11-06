@@ -1270,11 +1270,14 @@ def _libpq_root_cert() -> tuple[str, str] | None:
     """The ``(setting, path)`` of the root certificate libpq reads from the engine's environment
     when no ``sslrootcert`` is given, which the generic dialect never gives (BACKLOG #3090, step
     3): ``PGSSLROOTCERT`` when it is set and not empty, else ``root.crt`` in
-    :func:`_libpq_home`. ``None`` for ``system``, libpq's name for the platform's own store, which
-    is no file, and when no home directory can be named, where libpq reads no default either."""
+    :func:`_libpq_home`. ``None`` for ``system``, libpq 16's name for the platform's own store,
+    which is no file, and when no home directory can be named, where libpq reads no default
+    either. A libpq older than 16 reads ``system`` as a file in its working directory, and that
+    file is not read here."""
     named = os.environ.get("PGSSLROOTCERT")
     if named:
-        return None if named == "system" else ("PGSSLROOTCERT", named)
+        # Not "DATABASE PGSSLROOTCERT": the log redaction scrubs two adjacent ALL-CAPS tokens.
+        return None if named == "system" else ("libpq root certificate PGSSLROOTCERT", named)
     home = _libpq_home()
     if home is None:
         return None
@@ -1342,8 +1345,9 @@ def _refuse_encrypted_libpq_root_cert(
     measured. Erring wide, the check runs for the psqlODBC family unless ``sslmode`` turns TLS off
     (:func:`generic_odbc_tls_off`), since ``allow`` and ``prefer`` may still go to TLS. The path
     takes the remote-path check (:func:`names_another_host`) and :func:`_read_driver_file`'s read,
-    as an ``sslca`` does: a path that names another host is refused unread, a missing file or a
-    directory is left to libpq, and a file the check cannot read is refused. That holds for the
+    as an ``sslca`` does. At least: a path that names another host is refused unread, a missing
+    file or a directory is left to libpq, and a file the check cannot read, or one past
+    :data:`_MAX_DRIVER_CA_FILE_BYTES`, is refused. That holds for the
     default path too, on a redirected profile folder say, whether or not a file is there; the
     refusal names ``PGSSLROOTCERT`` as the way out. As for an ``sslca``, the trimmed spelling is
     judged as well, though only the path as libpq reads it is read.
@@ -2332,16 +2336,22 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     chain (:func:`_redacted_copy`). That is a bound, not a guarantee: an error a driver raises as a
     builtin type, or wraps in another library's, is printed as ``safe_exc`` prints it.
 
-    A Unicode error, or a non-driver exception holding one, takes ``safe_exc``, so this never prints
-    a codec error's text; ``tests/test_unicode_error_log_paths.py`` counts it among the safe
-    renderers for that reason.
+    Under ``withhold``, only a driver's own error may name a SQLSTATE: any other link renders as
+    its type alone, since ``args[0]`` of five letters or digits may be a value.
+
+    A Unicode error, or a non-driver exception holding one, takes ``safe_exc`` or, under
+    ``withhold``, its type alone, so this never prints a codec error's text;
+    ``tests/test_unicode_error_log_paths.py`` counts it among the safe renderers for that reason.
 
     It never raises. Its callers are error arms and helpers documented never to raise, and an
     exception whose ``__str__`` raises renders as its type and a fixed note instead."""
     try:
+        driver = _raised_by_a_driver(exc)
+        if withhold and not driver:
+            return _withheld(exc)
         state = _log_sqlstate(exc)
         if state is None:
-            return _withheld(exc) if withhold or _raised_by_a_driver(exc) else safe_exc(exc)
+            return _withheld(exc) if driver else safe_exc(exc)
         code = _driver_code(str(exc))
     except Exception as failure:  # noqa: BLE001 - see docstring
         return (
