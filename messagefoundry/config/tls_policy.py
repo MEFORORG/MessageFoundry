@@ -2993,12 +2993,12 @@ class TrustAnchor:
         Callers that must choose between a shared, unanchored client and a per-connection one read THIS
         rather than spelling out the test, so the five HTTP-family call sites cannot drift apart.
 
-        **A CRL counts (BACKLOG #299), and it has to.** Those five call sites reuse a shared,
-        module-level opener whenever the anchor does not narrow. That opener is built with no anchor,
-        so a CRL could never reach it — a hop that answered "nothing to
-        narrow" here would silently keep the unrevoked shared opener while its guard was told
-        revocation was checked. Widening this predicate is what routes such a hop onto its own
-        opener, with its own context, carrying its own CRL."""
+        **A CRL counts (BACKLOG #299), and it has to.** Those five call sites reuse a shared
+        opener whenever the anchor does not narrow. That opener is built with no anchor, so a CRL
+        could never reach it — a hop that answered "nothing to narrow" here would silently keep the
+        unrevoked shared opener while its guard was told revocation was checked. Widening this
+        predicate is what routes such a hop onto its own opener, with its own context, carrying its
+        own CRL."""
         return self.cafile is not None or self.crl_file is not None
 
 

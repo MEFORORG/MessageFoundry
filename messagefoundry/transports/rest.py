@@ -424,8 +424,8 @@ def _no_redirect_opener(
 ) -> urllib.request.OpenerDirector:
     """A PER-CONNECTION verifying, no-redirect opener carrying ``extra_handlers`` (a forward-proxy
     ``ProxyHandler``, a reactive ``ProxyDigestAuthHandler``, …) — used in place of the shared
-    :func:`_shared_no_redirect_opener` whenever a connection needs a handler the shared one lacks, so the shared
-    opener is **never** mutated (ADR 0126). Passing a ``ProxyHandler`` here also suppresses urllib's
+    :func:`_shared_no_redirect_opener` whenever a connection needs a handler the shared one lacks, so
+    the shared opener is **never** mutated (ADR 0126). Passing a ``ProxyHandler`` here also suppresses urllib's
     default env-reading ProxyHandler (``build_opener`` skips a default whose class a supplied handler
     already covers), so there is never a competing double-proxy. So ``ProxyHandler({})`` builds an
     opener that uses no proxy at all, which is what the ECH sidecar hop passes.
@@ -459,8 +459,8 @@ def _shared_no_redirect_opener() -> urllib.request.OpenerDirector:
     """The shared verifying, no-redirect opener, built on first use and the same object after.
 
     Built on first use, not at import (BACKLOG #2484): an OpenSSL build that refuses the engine's
-    TLS 1.3 or signature-scheme list raises ``EngineTlsListRefused`` from the build, and at import that
-    surfaced as a failed import of every module that names this opener, not as a configuration
+    TLS 1.3 or signature-scheme list raises ``EngineTlsListRefused`` from the build, and at import
+    that surfaced as a failed import of every module that names this opener, not as a configuration
     refusal. A build that raises caches nothing, so the next caller is refused the same way.
 
     Callers compare an opener to this one by identity to learn whether it is shared and so must never
