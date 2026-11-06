@@ -2190,10 +2190,13 @@ the build sends, so `0` is checked as the path `0`. On Windows each entry of an 
 takes the same check, since the driver opens a `<hash>.0` entry there by name: an entry that leads
 to another host, or one the check cannot finish, refuses the value, and so does a folder the engine
 cannot list or one holding more entries than the cap `transports.database._MAX_CAPATH_ENTRIES`
-names. A missing folder, or a value that names a file, is left to the driver. When the engine
-starts a lane, at least at boot and at an operator start, it lists the folder and checks its
-entries in a worker thread, after the build and before the lane serves, and a refusal fails the
-lane. A reload's build and `messagefoundry check` still list the folder as they build. The lane check runs this check again on all four
+names. A missing folder, or a value that names a file, is left to the driver. The build runs
+these checks itself, so every build judges the entries and a refusal fails it. A running engine
+builds a connector in a worker thread, off its event loop, at least at a lane start (at boot, at
+an operator start and when a reload or a DR activation binds a lane), in a reload's build check,
+a dry-run reload's included, and its rebuilds, and in a connection test. `messagefoundry check` runs
+no event loop, so it builds in place.
+The lane check runs this check again on all four
 keywords, and on Windows on the folder entries too, at least when the lane is built or an operator starts it and before a reload that builds it or keeps it
 running, so a path that leads to another host after the build is refused there as a setting.
 The check is defence in depth, not a guarantee. It misses at least: links to some object paths;
