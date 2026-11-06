@@ -350,7 +350,8 @@ class ReconcilePlan:
     #: step 2): ``(user_id, username, probes)`` of each account that has just ENTERED the state
     #: :data:`UNREACHED_ACCOUNT` names, ``probes`` being how many of its probes running read it
     #: unreachable. An account already in that state is not here, so each pages once per state
-    #: change. Empty on a pass that did not reach the directory.
+    #: change. An outage-shaped pass can carry entries, for an account alone in its probe sample,
+    #: but none while the lasting outage page stands (``AuthService._note_unreached_accounts``).
     unreached: tuple[tuple[str, str, int], ...] = ()
     #: Set with ``unreached`` (BACKLOG #3100): True when the accounts already paged and those
     #: entering are more than ``AuthService``'s fixed rollup bound, so the lifespan task pages once
@@ -426,8 +427,9 @@ class ReconcilePlan:
         """True when the pass shows the directory was reached: it asked something, not every probe
         failed (:attr:`directory_outage`), and not every probe failed or faulted
         (:attr:`probe_fault`), since a fault says nothing about reach. A pass of referrals or
-        configuration refusals only reached it. The outage run and each account's unreached run
-        read this one predicate (BACKLOG #3709, #3100), so the two cannot disagree."""
+        configuration refusals only reached it. The outage run reads it (BACKLOG #3709). An
+        account's unreached run does not: it counts on every pass that probes the account, an
+        outage pass included (BACKLOG #3100, ``AuthService._note_unreached_accounts``)."""
         return self.asked > 0 and not self.directory_outage and not self.probe_fault
 
     @property

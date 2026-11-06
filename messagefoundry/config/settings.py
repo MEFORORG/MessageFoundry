@@ -3625,9 +3625,12 @@ class AuthSettings(_Section):
     # How many CONSECUTIVE passes must fail to find a principal before its sessions are revoked. A
     # single ambiguous result never revokes: "the search returned nothing" cannot tell deleted from
     # moved out of the search base, and a set disabled bit or an unreadable userAccountControl strikes
-    # the same way, so requiring two agreeing probes costs at most one extra interval of exposure and
-    # buys immunity to a single flaky search. Strike state is process-local (the rate-limiter
-    # precedent), so a restart resets it — biased toward NOT revoking.
+    # the same way, so requiring two agreeing probes costs at most one extra interval of exposure
+    # within one process's life, and buys immunity to a single flaky search. Strike state is
+    # process-local (the rate-limiter precedent), so a restart resets it -- biased toward NOT
+    # revoking: an engine that restarts more often than strikes times interval never revokes through
+    # the reconciler, and a restart also forgets the hold (ADR 0195, "What a restart does to the
+    # hold"; vault BACKLOG #3689).
     ad_session_recheck_strikes: int = 2
     # Per-pass bind budget. A pass probes at most this many distinct users; the remainder are picked up
     # by the following passes (least-recently-probed first), so a very large estate degrades to a longer

@@ -2936,6 +2936,42 @@ async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> 
         await store.close()
 
 
+async def test_a_rollup_whose_rows_are_all_refused_pages_nothing_and_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #3100 closing step 2, final-round finding 1. When every row of a rolled-up pass is
+    refused, no entry is left to page, so the rollup flag must go too. Left set, the lifespan task
+    took the run's length from an empty list and raised, which cost that pass's later pages and
+    inverses.
+
+    RED when: such a pass keeps ``unreached_rollup`` set, so alerting it raises ValueError."""
+    store = await MessageStore.open(":memory:")
+    try:
+        names = ["ok"] + [f"flap{i}" for i in range(7)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        real = service._audit_reconciler_row
+
+        async def refusing(action: str, **kwargs: Any) -> bool:
+            if action == "auth.ad_reconcile_unreached":
+                return False
+            return await real(action, **kwargs)
+
+        monkeypatch.setattr(service, "_audit_reconciler_row", refusing)
+        sink = _InverseSink()
+        ldap.unreachable = set(names[1:])
+        for _ in range(3):
+            plan = await _pass(service, sink)  # raised ValueError on the third pass before the fix
+        assert plan.unreached == () and not plan.unreached_rollup
+        assert _unreached_events(sink) == []
+        assert not [e for e in sink.events if e[1] == "directory-reconciler-unreached"]
+    finally:
+        await store.close()
+
+
 async def test_a_refused_unreached_row_leaves_the_account_to_page_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

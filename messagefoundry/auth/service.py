@@ -3527,11 +3527,11 @@ class AuthService:
         #: account per state change: `_record_paging_refusals` sets it, `_note_paging_refusals`
         #: re-arms it, and the prune drops an account that left.
         self._reconcile_paging_refused: dict[str, str] = {}
-        #: user_id -> how many of that account's probes running read it unreachable on a pass that
-        #: reached the directory (BACKLOG #3100 closing step 2), and the user_ids whose page for
-        #: it is recorded. In memory, like the strikes: a restart counts again and pages a
-        #: standing one once more. `_note_unreached_accounts` keeps the counts and
-        #: `_record_unreached_accounts` the latch.
+        #: user_id -> how many of that account's probes running read it unreachable, on any pass
+        #: that probed it, an outage pass included (BACKLOG #3100 closing step 2), and the user_ids
+        #: whose page for it is raised. In memory, like the strikes: a restart counts again and
+        #: pages a standing one once more. `_note_unreached_accounts` keeps the counts, and
+        #: `_latch_unreached_accounts` sets the latch last in the pass.
         self._reconcile_unreached_runs: dict[str, int] = {}
         self._reconcile_unreached_paged: set[str] = set()
         #: The undetermined-wave hold's operator message (ADR 0195). Its own latch, because a held
@@ -8259,7 +8259,11 @@ class AuthService:
                 "names each",
                 len(written),
             )
-        return replace(plan, unreached=tuple(written))
+        # The rollup only for what was written: a rollup with nothing written would page nothing,
+        # and the lifespan task reads the run's length off the entries (final-round finding 1).
+        return replace(
+            plan, unreached=tuple(written), unreached_rollup=plan.unreached_rollup and bool(written)
+        )
 
     def _latch_unreached_accounts(self, plan: reconcile.ReconcilePlan) -> None:
         """Record that each entry's page is raised, last in the pass, as the outage's is

@@ -5395,8 +5395,12 @@ the right one*:
 When the hold's, the breaker's and the referral's alerts resolve themselves, and where they never do, is stated
 once, in [CONFIGURATION.md](CONFIGURATION.md#when-the-reconcilers-alerts-resolve-themselves).
 
-Revocation is therefore bounded by *interval × strikes* (10 minutes at the recommended 300 s), not
-immediate, and one LDAP bind per signed-in directory user per pass is the cost —
+Revocation is therefore bounded by *interval × strikes* (10 minutes at the recommended 300 s) within
+one process's life, not immediate. A restart starts every strike count again, so an engine that
+restarts more often than that never revokes through the reconciler, and it also forgets the hold
+([ADR 0195](adr/0195-brake-the-ad-session-reconciler-on-an-undetermined-useraccountcontrol-wave.md),
+*What a restart does to the hold*; vault BACKLOG #3689). One LDAP bind per signed-in directory user
+per pass is the cost —
 `ad_session_recheck_max_users` (200) caps it, and it is zero when nobody is signed in. An off-loopback
 PHI deployment serving AD accounts gets `ad_session_recheck_seconds = 300` by default; setting it to `0` is a declared loosening, not a neutral choice.
 

@@ -204,6 +204,10 @@ properties the original design did not name**:
    itself ambiguous: `_find_user` returns `None` identically for disabled, deleted, moved out of the
    search base, and never-was-in-the-search-base. Two agreeing probes cost at most one extra interval
    of exposure and buy immunity to a single flaky search.
+   *Note 2026-11-06 (vault BACKLOG #3689):* that bound holds within one process's life. The strike
+   counts are process memory, so a restart starts them again, and an engine that restarts more
+   often than strikes times interval never revokes through the reconciler. ADR 0195, *What a
+   restart does to the hold*, states this and what a restart does to the hold.
 
 2. **A mass-revoke circuit breaker** — the load-bearing addition. A misconfigured `ad_user_search_base`,
    an OU reorganisation, or a service account that lost read rights returns "not found" for **every**
