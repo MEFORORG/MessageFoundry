@@ -5,10 +5,19 @@
 // broken.
 import * as assert from "assert";
 
-import { fieldValue, instrumentProblems, outcomeOf, probeLine } from "../osTrustProbeModel";
+import {
+  fieldValue,
+  httpsSpecifiers,
+  instrumentProblems,
+  isHostReport,
+  outcomeOf,
+  probeLine,
+  specifierProblems,
+  TRUSTED,
+} from "../osTrustProbeModel";
 import type { HostReport, Launch, Outcome, ProbePath, ProbeRecord } from "../osTrustProbeModel";
 
-const trusted: Outcome = { result: "trusted" };
+const trusted: Outcome = TRUSTED;
 const refused: Outcome = { result: "refused", code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" };
 
 type Overrides = Partial<Record<ProbePath, ProbeRecord>>;
@@ -36,8 +45,9 @@ function problemsOf(...launches: Launch[]): string {
 }
 
 suite("OS trust store probe model (BACKLOG #4576)", () => {
-  test("a success is trusted, a certificate code is refused, anything else is an error", () => {
-    assert.deepStrictEqual(outcomeOf(undefined), { result: "trusted" });
+  test("a certificate code is refused, and any other failure, even an empty one, is an error", () => {
+    assert.deepStrictEqual(outcomeOf(undefined), { result: "error", code: "NO_CODE" });
+    assert.deepStrictEqual(outcomeOf({ status: 404 }), { result: "error", code: "HTTP_404" });
     assert.deepStrictEqual(outcomeOf({ code: "SELF_SIGNED_CERT_IN_CHAIN" }), {
       result: "refused",
       code: "SELF_SIGNED_CERT_IN_CHAIN",
@@ -88,10 +98,57 @@ suite("OS trust store probe model (BACKLOG #4576)", () => {
     }
   });
 
-  test("a CA plain Node already trusts makes the run unreadable", () => {
-    const problems = instrumentProblems(trusted, [launch(true, trusted), launch(false, refused)]);
-    assert.strictEqual(problems.length, 1);
-    assert.match(problems[0], /plain-node-control was trusted/);
+  test("a plain-Node control that is not refused, trusted or failed, makes the run unreadable", () => {
+    for (const plain of [trusted, { result: "error", code: "ECONNREFUSED" } as Outcome]) {
+      const problems = instrumentProblems(plain, [launch(true, trusted), launch(false, refused)]);
+      assert.strictEqual(problems.length, 1);
+      assert.match(problems[0], new RegExp(`plain-node-control was ${plain.result}`));
+    }
+  });
+
+  test("a launch that failed is broken even when it left a report", () => {
+    const failed: Launch = { ...launch(false, refused), failure: "the VS Code launch failed: exit 1" };
+    assert.match(
+      problemsOf(launch(true, trusted), failed),
+      /^http.systemCertificates off: the VS Code launch failed: exit 1$/,
+    );
+  });
+
+  test("a control's own non-certificate error is broken, for both in-host controls", () => {
+    const bareError = launch(true, trusted, {
+      "bare-https-control": {
+        path: "bare-https-control",
+        pin: "n/a",
+        outcome: { result: "error", code: "MF_TIMEOUT" },
+      },
+    });
+    assert.match(problemsOf(bareError, launch(false, refused)), /bare-https-control failed with MF_TIMEOUT/);
+    const caError = launch(true, trusted, {
+      "explicit-ca-control": {
+        path: "explicit-ca-control",
+        pin: "n/a",
+        outcome: { result: "error", code: "ECONNRESET" },
+      },
+    });
+    assert.match(problemsOf(caError, launch(false, refused)), /explicit-ca-control was not trusted/);
+  });
+
+  test("a parsed report must carry context and records arrays", () => {
+    assert.ok(isHostReport(report(true, trusted)));
+    assert.ok(!isHostReport({ context: [], settingRead: true }));
+    assert.ok(!isHostReport({ context: [], records: [1] }));
+    assert.ok(!isHostReport(null));
+  });
+
+  test("the measured client and the shipped bundle must require the same https specifier", () => {
+    const nodePrefixed = 'var a = require("node:https"); var b = require("node:http");';
+    assert.deepStrictEqual(httpsSpecifiers(nodePrefixed), ["node:https"]);
+    assert.deepStrictEqual(specifierProblems(nodePrefixed, nodePrefixed), []);
+    assert.match(
+      specifierProblems('require("https")', nodePrefixed).join("\n"),
+      /shipped bundle requires https but the measured client requires node:https/,
+    );
+    assert.match(specifierProblems(nodePrefixed, "").join("\n"), /requires no https module/);
   });
 
   test("a launch that did not read back the value written is broken", () => {
@@ -128,7 +185,9 @@ suite("OS trust store probe model (BACKLOG #4576)", () => {
     assert.match(problemsOf(launch(true, trusted)), /no launch ran with http.systemCertificates off/);
 
     const noReport: Launch = { settingWritten: false, report: undefined, failure: "exit code 1" };
-    assert.match(problemsOf(launch(true, trusted), noReport), /off: no report \(exit code 1\)/);
+    assert.match(problemsOf(launch(true, trusted), noReport), /off: exit code 1$/);
+    const silent: Launch = { settingWritten: false, report: undefined, failure: undefined };
+    assert.match(problemsOf(launch(true, trusted), silent), /off: no report$/);
 
     const doubled = launch(true, trusted);
     doubled.report?.records.push({ path: "engine-client", pin: "none", outcome: trusted });

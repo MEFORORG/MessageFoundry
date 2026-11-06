@@ -20,7 +20,7 @@ import * as bareHttps from "https";
 import * as vscode from "vscode";
 
 import { getJson, pinRefusal, setTrustFailureHandler, tlsOptions } from "../engineClient";
-import { outcomeOf } from "./osTrustProbeModel";
+import { outcomeOf, TRUSTED } from "./osTrustProbeModel";
 import type { HostReport, Outcome } from "./osTrustProbeModel";
 import { getOutcome, PROBE_TIMEOUT_MS } from "./osTrustProbeRequest";
 
@@ -79,7 +79,7 @@ export async function run(): Promise<void> {
   // The measurement goes first, so no earlier request to the same server can have left a session or
   // a pooled socket behind for it to reuse.
   const client: Outcome = await getJson<unknown>(target, "/health", undefined, PROBE_TIMEOUT_MS).then(
-    () => outcomeOf(undefined),
+    () => TRUSTED,
     outcomeOf,
   );
   const bare = await getOutcome(bareHttps.get, health, {});

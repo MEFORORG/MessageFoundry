@@ -9,10 +9,11 @@
 // target with no `caFile` and no local anchor, with `http.systemCertificates` on? And with it off?
 //
 // WHAT TURNS THE RUN RED, AND WHAT DOES NOT. The answer is a finding, whichever way it falls, so a
-// "refused" for the engine client never fails the run. Only a broken instrument does: the CA trusted
-// where nothing but the OS store should make it trusted, a setting VS Code did not read back, a
-// positive control that failed, or a case that produced no report. {@link instrumentProblems} lists
-// them, and an empty list is the only green.
+// "refused" for the engine client never fails the run. Only a broken instrument does, at least: a
+// control that went the wrong way, a setting VS Code did not read back, a launch that failed or wrote
+// no report, or a shipped bundle that imports `https` differently from the copy the probe measures.
+// {@link instrumentProblems} and {@link specifierProblems} are the judges, and the launcher adds
+// failures of its own setup. An empty list is the only green.
 
 import { TLS_TRUST_CODES } from "../engineTrustModel";
 
@@ -30,8 +31,10 @@ export const PROBE_TAG = "IDE-OS-TRUST-PROBE";
  * - `explicit-ca-control`: a request carrying the test CA as its `ca`. Must be trusted, or the server
  *   or the certificates are broken and no other line means anything.
  * - `plain-node-control`: the launcher's own request, in plain Node outside VS Code, with no `ca`.
- *   Must be refused: a trusted one means something other than the OS store trusts the CA (Node's
- *   bundled roots, `NODE_EXTRA_CA_CERTS`), so a "trusted" in VS Code could not be credited to it.
+ *   Must be refused. It rules out Node's bundled roots and the environment the launcher refuses
+ *   (`NODE_EXTRA_CA_CERTS` and the rest), which VS Code inherits. It runs outside VS Code's runtime,
+ *   so it cannot rule out a route only that runtime takes; the `off` launch is the comparison for
+ *   that, and a "trusted" there is a finding about the setting, not a broken instrument.
  */
 export type ProbePath =
   | "engine-client"
@@ -50,13 +53,22 @@ const HOST_PATHS: readonly ProbePath[] = [
  *  anything else, which means the instrument, not the trust decision, failed. */
 export type Outcome = { result: "trusted" } | { result: "refused" | "error"; code: string };
 
-/** The outcome of a request that threw `err`, or of one that succeeded when `err` is `undefined`. */
+/** A request that completed with a 2xx. */
+export const TRUSTED: Outcome = { result: "trusted" };
+
+/**
+ * The outcome of a request that failed with `err`, whatever `err` is: a rejection is never trusted.
+ * An error carrying an HTTP `status` (the client's `HttpError`) reads as `HTTP_<status>`, the code
+ * the controls give the same answer.
+ */
 export function outcomeOf(err: unknown): Outcome {
-  if (err === undefined) {
-    return { result: "trusted" };
+  const { code: raw, status } = (err ?? {}) as { code?: unknown; status?: unknown };
+  let code = "NO_CODE";
+  if (typeof raw === "string" && raw.length > 0) {
+    code = raw;
+  } else if (typeof status === "number") {
+    code = `HTTP_${status}`;
   }
-  const raw = (err as { code?: unknown } | null)?.code;
-  const code = typeof raw === "string" && raw.length > 0 ? raw : "NO_CODE";
   return TLS_TRUST_CODES.includes(code) ? { result: "refused", code } : { result: "error", code };
 }
 
@@ -78,7 +90,20 @@ export interface HostReport {
   records: ProbeRecord[];
 }
 
-/** One launch as the launcher saw it: the value it wrote, and the report or why there was none. */
+/** True when `value`, parsed from a report file, has the shape {@link HostReport} names. */
+export function isHostReport(value: unknown): value is HostReport {
+  const v = value as Partial<HostReport> | null;
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    Array.isArray(v.context) &&
+    Array.isArray(v.records) &&
+    v.records.every((r) => typeof r === "object" && r !== null && "path" in r && "outcome" in r)
+  );
+}
+
+/** One launch as the launcher saw it: the value it wrote, its report, and what went wrong, if
+ *  anything. A failure counts even beside a report: a launch that failed is not a clean reading. */
 export interface Launch {
   settingWritten: boolean;
   report: HostReport | undefined;
@@ -131,8 +156,13 @@ export function instrumentProblems(plainNode: Outcome, launches: readonly Launch
   }
   for (const launch of launches) {
     const label = `http.systemCertificates ${settingWord(launch.settingWritten)}`;
+    if (launch.failure !== undefined) {
+      problems.push(`${label}: ${launch.failure}`);
+    }
     if (launch.report === undefined) {
-      problems.push(`${label}: no report (${launch.failure ?? "no reason given"})`);
+      if (launch.failure === undefined) {
+        problems.push(`${label}: no report`);
+      }
       continue;
     }
     const { report } = launch;
@@ -165,4 +195,34 @@ export function instrumentProblems(plainNode: Outcome, launches: readonly Launch
     }
   }
   return problems;
+}
+
+/** The `https` specifiers a compiled CommonJS file requires: `https`, `node:https`, or both. */
+export function httpsSpecifiers(source: string): string[] {
+  const found = new Set<string>();
+  for (const m of source.matchAll(/require\("((?:node:)?https)"\)/g)) {
+    found.add(m[1]);
+  }
+  return [...found].sort();
+}
+
+/**
+ * Why the measured copy of the client cannot stand for the shipped one, or an empty list. The probe
+ * runs the tsc build (`out/engineClient.js`); the extension ships the esbuild bundle. VS Code's
+ * loader may treat the two specifiers differently, so both builds must require the same one, or the
+ * probe measures code the extension does not ship.
+ */
+export function specifierProblems(bundle: string, measured: string): string[] {
+  const shipped = httpsSpecifiers(bundle).join(",");
+  const probed = httpsSpecifiers(measured).join(",");
+  if (probed === "") {
+    return ["the measured engineClient.js requires no https module, so it is not the client"];
+  }
+  if (shipped === probed) {
+    return [];
+  }
+  return [
+    `the shipped bundle requires ${shipped || "no https module"} but the measured client requires ` +
+      `${probed}, so the probe would measure code the extension does not ship`,
+  ];
 }

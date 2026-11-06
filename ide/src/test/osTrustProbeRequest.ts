@@ -6,7 +6,7 @@
 // through is the caller's choice, because that choice is what a control measures.
 import type * as https from "node:https";
 
-import { outcomeOf } from "./osTrustProbeModel";
+import { outcomeOf, TRUSTED } from "./osTrustProbeModel";
 import type { Outcome } from "./osTrustProbeModel";
 
 /** Long enough for a cold runner, short enough that a hung server cannot eat the job's budget. */
@@ -26,7 +26,7 @@ export function getOutcome(
       res.resume();
       const status = res.statusCode ?? 0;
       const ok = status >= 200 && status < 300;
-      resolve(ok ? { result: "trusted" } : { result: "error", code: `HTTP_${status}` });
+      resolve(ok ? TRUSTED : { result: "error", code: `HTTP_${status}` });
     });
     req.setTimeout(PROBE_TIMEOUT_MS, () =>
       req.destroy(Object.assign(new Error("timed out"), { code: "MF_TIMEOUT" })),

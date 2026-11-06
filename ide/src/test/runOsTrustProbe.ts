@@ -22,16 +22,33 @@ import * as path from "node:path";
 
 import { downloadAndUnzipVSCode, runTests } from "@vscode/test-electron";
 
-import { instrumentProblems, PROBE_TAG, probeLine, settingWord } from "./osTrustProbeModel";
+import {
+  instrumentProblems,
+  isHostReport,
+  PROBE_TAG,
+  probeLine,
+  settingWord,
+  specifierProblems,
+} from "./osTrustProbeModel";
 import type { HostReport, Launch } from "./osTrustProbeModel";
 import { getOutcome } from "./osTrustProbeRequest";
 
 const VERSION_RE = /^(stable|\d+\.\d+\.\d+)$/;
 
-function fail(message: string): never {
-  console.error(`${PROBE_TAG} ERROR ${message}`);
-  process.exit(1);
-}
+/**
+ * Variables that can make a Node TLS client trust the test CA, or skip verification, by a route that
+ * is not the setting under test. VS Code inherits the launcher's environment, so each would reach
+ * the Extension Host too. At least these; `NODE_OPTIONS` covers the command-line forms.
+ */
+const REFUSED_ENV = [
+  "NODE_EXTRA_CA_CERTS",
+  "NODE_OPTIONS",
+  "NODE_USE_SYSTEM_CA",
+  "NODE_TLS_REJECT_UNAUTHORIZED",
+];
+
+/** The compiled launcher lives at out/test/, so ../../ is the ide/ extension root. */
+const EXTENSION_ROOT = path.resolve(__dirname, "../../");
 
 function errorText(err: unknown, withStack = false): string {
   if (!(err instanceof Error)) {
@@ -56,30 +73,23 @@ async function launchOnce(
 ): Promise<Launch> {
   const profile = path.join(dir, `profile-${settingWord(on)}`);
   const userData = path.join(profile, "user-data");
-  fs.mkdirSync(path.join(userData, "User"), { recursive: true });
-  const settings = {
-    "http.systemCertificates": on,
-    "update.mode": "none",
-    "telemetry.telemetryLevel": "off",
-  };
-  fs.writeFileSync(path.join(userData, "User", "settings.json"), JSON.stringify(settings), "utf8");
   const outFile = path.join(profile, "report.json");
-  fs.rmSync(outFile, { force: true });
-
   let failure: string | undefined;
   try {
+    fs.mkdirSync(path.join(userData, "User"), { recursive: true });
+    const settings = {
+      "http.systemCertificates": on,
+      "update.mode": "none",
+      "telemetry.telemetryLevel": "off",
+    };
+    fs.writeFileSync(path.join(userData, "User", "settings.json"), JSON.stringify(settings), "utf8");
+    fs.rmSync(outFile, { force: true });
+    // runTests adds its own fixed flags, `--no-sandbox` among them, to every launch.
     await runTests({
       vscodeExecutablePath,
-      // The compiled launcher lives at out/test/, so ../../ is the ide/ extension root.
-      extensionDevelopmentPath: path.resolve(__dirname, "../../"),
+      extensionDevelopmentPath: EXTENSION_ROOT,
       extensionTestsPath: path.resolve(__dirname, "./osTrustProbeHost"),
-      launchArgs: [
-        `--user-data-dir=${userData}`,
-        `--extensions-dir=${path.join(profile, "extensions")}`,
-        // Ubuntu 24.04 refuses Chromium's sandbox to an unprivileged process. The sandbox guards
-        // renderers; the Extension Host, where the requests run, is not one.
-        ...(process.platform === "linux" ? ["--no-sandbox"] : []),
-      ],
+      launchArgs: [`--user-data-dir=${userData}`, `--extensions-dir=${path.join(profile, "extensions")}`],
       extensionTestsEnv: {
         MF_OS_TRUST_PROBE_URL: target,
         MF_OS_TRUST_PROBE_CA: path.join(dir, "ca.pem"),
@@ -91,28 +101,41 @@ async function launchOnce(
   }
   let report: HostReport | undefined;
   try {
-    report = JSON.parse(fs.readFileSync(outFile, "utf8")) as HostReport;
+    const parsed: unknown = JSON.parse(fs.readFileSync(outFile, "utf8"));
+    if (isHostReport(parsed)) {
+      report = parsed;
+    } else {
+      failure ??= "the report is not in the shape the host writes";
+    }
   } catch (err) {
     failure ??= `no readable report: ${errorText(err)}`;
   }
   return { settingWritten: on, report, failure };
 }
 
-async function main(): Promise<void> {
+/** Everything the run measured and judged, as lines; a setup failure is a problem like any other. */
+async function probe(lines: string[], problems: string[]): Promise<void> {
   const dir = process.env.MF_OS_TRUST_PROBE_DIR;
   if (!dir) {
-    fail("MF_OS_TRUST_PROBE_DIR is not set");
+    problems.push("MF_OS_TRUST_PROBE_DIR is not set");
+    return;
   }
   const version = process.env.MF_OS_TRUST_PROBE_VSCODE?.trim() || "stable";
   if (!VERSION_RE.test(version)) {
-    fail(`MF_OS_TRUST_PROBE_VSCODE is ${JSON.stringify(version)}; expected stable or X.Y.Z`);
+    problems.push(`MF_OS_TRUST_PROBE_VSCODE is ${JSON.stringify(version)}; expected stable or X.Y.Z`);
+    return;
   }
-  // Either can hand the test CA to every Node TLS client by a route that is not the OS store.
-  for (const name of ["NODE_EXTRA_CA_CERTS", "NODE_OPTIONS"]) {
-    if (process.env[name]) {
-      fail(`${name} is set; unset it, or no result could be credited to the OS store`);
-    }
+  const set = REFUSED_ENV.filter((name) => process.env[name]);
+  if (set.length > 0) {
+    problems.push(`${set.join(", ")} set; unset, or no result could be credited to the setting`);
+    return;
   }
+  problems.push(
+    ...specifierProblems(
+      fs.readFileSync(path.join(EXTENSION_ROOT, "dist", "extension.js"), "utf8"),
+      fs.readFileSync(path.join(EXTENSION_ROOT, "out", "engineClient.js"), "utf8"),
+    ),
+  );
 
   const server = https.createServer(
     {
@@ -126,49 +149,57 @@ async function main(): Promise<void> {
     },
   );
   const target = `https://127.0.0.1:${await listen(server)}`;
-
-  // No `ca` and no agent: Node's own bundled roots alone decide.
-  const plainNode = await getOutcome(https.get, `${target}/health`, { agent: false });
-  const lines = [
-    probeLine(
-      [
-        ["os", process.platform],
-        ["node", process.versions.node],
-      ],
-      { path: "plain-node-control", pin: "n/a", outcome: plainNode },
-    ),
-  ];
-
-  const vscodeExecutablePath = await downloadAndUnzipVSCode(version);
-  const launches: Launch[] = [];
-  for (const on of [true, false]) {
-    launches.push(await launchOnce(on, dir, target, vscodeExecutablePath));
-  }
-  server.close();
-
-  for (const launch of launches) {
-    const context: Array<[string, string]> = [
-      ["written", settingWord(launch.settingWritten)],
-      ...(launch.report?.context ?? []),
+  try {
+    // No `ca` and no agent: Node's own bundled roots alone decide.
+    const plainNode = await getOutcome(https.get, `${target}/health`, { agent: false });
+    const plainContext: Array<[string, string]> = [
+      ["os", process.platform],
+      ["node", process.versions.node],
     ];
-    for (const record of launch.report?.records ?? []) {
-      lines.push(probeLine(context, record));
-    }
-  }
-  const problems = instrumentProblems(plainNode, launches);
-  lines.push(`${PROBE_TAG} instrument=${problems.length === 0 ? "sound" : "BROKEN"}`);
-  lines.push(...problems.map((p) => `${PROBE_TAG} problem: ${p}`));
+    lines.push(probeLine(plainContext, { path: "plain-node-control", pin: "n/a", outcome: plainNode }));
 
-  const text = `${lines.join("\n")}\n`;
-  process.stdout.write(text);
-  const summary = process.env.GITHUB_STEP_SUMMARY;
-  if (summary) {
-    const heading = `### IDE OS trust store probe (${process.platform})`;
-    fs.appendFileSync(summary, `${heading}\n\n\`\`\`\n${text}\`\`\`\n`, "utf8");
-  }
-  if (problems.length > 0) {
-    process.exit(1);
+    const vscodeExecutablePath = await downloadAndUnzipVSCode(version);
+    const launches: Launch[] = [];
+    for (const on of [true, false]) {
+      const launch = await launchOnce(on, dir, target, vscodeExecutablePath);
+      launches.push(launch);
+      const context: Array<[string, string]> = [
+        ["written", settingWord(on)],
+        ...(launch.report?.context ?? []),
+      ];
+      for (const record of launch.report?.records ?? []) {
+        lines.push(probeLine(context, record));
+      }
+    }
+    problems.push(...instrumentProblems(plainNode, launches));
+  } finally {
+    server.close();
   }
 }
 
-main().catch((err: unknown) => fail(errorText(err, true)));
+/** Print the lines and the verdict to stdout and, on a runner, to the job summary. */
+function emit(lines: readonly string[], problems: readonly string[]): void {
+  const verdict = `${PROBE_TAG} instrument=${problems.length === 0 ? "sound" : "BROKEN"}`;
+  const text = [...lines, verdict, ...problems.map((p) => `${PROBE_TAG} problem: ${p}`)].join("\n");
+  process.stdout.write(`${text}\n`);
+  const summary = process.env.GITHUB_STEP_SUMMARY;
+  if (summary) {
+    const heading = `### IDE OS trust store probe (${process.platform})`;
+    fs.appendFileSync(summary, `${heading}\n\n\`\`\`\n${text}\n\`\`\`\n`, "utf8");
+  }
+}
+
+async function main(): Promise<void> {
+  const lines: string[] = [];
+  const problems: string[] = [];
+  try {
+    await probe(lines, problems);
+  } catch (err) {
+    problems.push(`the probe stopped: ${errorText(err, true)}`);
+  }
+  emit(lines, problems);
+  // exitCode, not exit(): stdout may be a pipe still draining the lines above.
+  process.exitCode = problems.length === 0 ? 0 : 1;
+}
+
+void main();
