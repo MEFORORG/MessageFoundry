@@ -273,10 +273,13 @@ $transientRefExcludes = @('--exclude=refs/stash', '--exclude=refs/prefetch/*', '
 # session was launched in, and a checkout of this clone holding the primary would have to be added
 # into a directory that already holds it, which `git worktree add` refuses. Every other segment
 # counts, including one under a directory git does not list, so this fails closed.
+# ORDINAL, because the exemption ALLOWS: the culture comparison ignores a zero-width character or a
+# soft hyphen, so a primary differing by one from the segment's spelling would read as below it.
 function Test-UnderManagedSegment([string]$Norm) {
     $primaryNorm = ConvertTo-Norm $PrimaryRoot
     foreach ($m in [regex]::Matches($Norm, '/\.claude/worktrees(?=/|\z)')) {
-        if (-not $primaryNorm.StartsWith($Norm.Substring(0, $m.Index + $m.Length) + '/')) { return $true }
+        $above = $Norm.Substring(0, $m.Index + $m.Length) + '/'
+        if (-not $primaryNorm.StartsWith($above, [System.StringComparison]::Ordinal)) { return $true }
     }
     return $false
 }
@@ -593,6 +596,11 @@ if ($byPath) {
     if ($env:CLAUDE_CONFIG_DIR) {
         if (-not [System.IO.Path]::IsPathFullyQualified($env:CLAUDE_CONFIG_DIR)) {
             throw "CLAUDE_CONFIG_DIR is the relative path '$env:CLAUDE_CONFIG_DIR', so its session registry cannot be placed. Occupancy unknown. Nothing was removed."
+        }
+        # The registry's own reads take a root as a wildcard path, so [ or ] could read another
+        # directory, or none, while the literal second listing counts the same root.
+        if ($env:CLAUDE_CONFIG_DIR -match '[\[\]*?]') {
+            throw "CLAUDE_CONFIG_DIR '$env:CLAUDE_CONFIG_DIR' holds a wildcard character, which the session registry reads as a pattern. Occupancy unknown. Nothing was removed."
         }
         $pin = [System.IO.Path]::GetFullPath($env:CLAUDE_CONFIG_DIR).TrimEnd('\', '/')
         $underHome = $env:USERPROFILE -and ((Split-Path $pin -Leaf) -like '.claude*') -and

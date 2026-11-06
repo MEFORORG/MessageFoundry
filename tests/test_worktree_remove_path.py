@@ -40,11 +40,13 @@ pytestmark = pytest.mark.skipif(
 
 # Every GIT_* variable goes: run from inside a git hook, GIT_DIR or GIT_WORK_TREE would point these
 # children at the REAL repository instead of the throwaway one. CLAUDE_CONFIG_DIR goes too: the
-# occupancy fence reads the config root it names, which would be this machine's real registry.
+# occupancy fence reads the config root it names, which would be this machine's real registry. So
+# does MEFOR_COORD_ROOT, which would point the claim and allocation reads at the real shared root.
 _ENV = {
     k: v
     for k, v in os.environ.items()
-    if not k.upper().startswith("GIT_") and k.upper() != "CLAUDE_CONFIG_DIR"
+    if not k.upper().startswith("GIT_")
+    and k.upper() not in {"CLAUDE_CONFIG_DIR", "MEFOR_COORD_ROOT"}
 }
 
 # What the fixture repository ignores. `__pycache__` is written WITHOUT a trailing slash so it also
@@ -784,8 +786,14 @@ def test_a_session_on_the_callers_config_root_outside_userprofile_occupies_the_t
     assert "Target is occupied" in _out(proc), _out(proc)
     assert wt.exists() and rig.is_registered(wt)
 
-    # Control: a CLAUDE_CONFIG_DIR that IS one of the USERPROFILE roots is read once, not twice, so the
-    # two listings agree and the clearing registry there removes the tree.
+    # A root the registry's wildcard reads could misread refuses rather than be read.
+    proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(rig.root / "cfg[1]")})
+    assert proc.returncode != 0, _out(proc)
+    assert "wildcard character" in _out(proc), _out(proc)
+    assert wt.exists()
+
+    # Control: a CLAUDE_CONFIG_DIR that IS one of the USERPROFILE roots, whose registry clears the
+    # target, removes the tree. It does not tell a single read of that root from a double one.
     proc = rig.run("-Path", str(wt), extra={"CLAUDE_CONFIG_DIR": str(rig.home / ".claude")})
     assert proc.returncode == 0, _out(proc)
     assert not wt.exists()

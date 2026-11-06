@@ -312,7 +312,10 @@ a session's or a subagent's worktree. The occupancy check reads the directory a 
 *launched* in. A subagent started with `isolation: worktree` is recorded under its **parent's**
 directory, so its tree would read as empty. A deletion route whose check fails open on a
 population is worse than no route to it, so there is none. (BACKLOG #1038, Manager decision
-batch 184.) Removing one of those trees stays the user's decision.
+batch 184.) Removing one of those trees stays the user's decision. A `.claude/worktrees` segment
+that lies *above* the primary checkout does not count, so a clone made inside another checkout's
+harness folder still reaches its own trees (vault BACKLOG #2985, item 3); the worktree gate's own
+classifier still counts that segment, so its deny text offers no `-Path` line for them.
 
 One layout overlaps. `new.ps1` run from a linked worktree makes its sibling **beside that
 worktree**, and for a harness-made worktree that is also under `.claude/worktrees`. `-Path`
