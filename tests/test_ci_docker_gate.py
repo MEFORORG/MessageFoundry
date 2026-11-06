@@ -196,6 +196,7 @@ def _scripts_run_by_docker_smoke() -> set[str]:
 
 def test_every_entrypoint_module_trips_the_gate() -> None:
     entries = _entrypoint_modules()
+    assert entries, "no exec-form ENTRYPOINT with -m was read from the Dockerfile"
     assert len(entries) == 1, f"the image's ENTRYPOINT lines run different modules: {entries}"
     missed = sorted(path for path in entries if not gate([path]))
     assert not missed, f"editing the image's ENTRYPOINT module does not run the smoke: {missed}"
@@ -203,12 +204,14 @@ def test_every_entrypoint_module_trips_the_gate() -> None:
 
 def test_the_pr_2284_engine_files_trip_the_gate() -> None:
     """Each file alone, so dropping any one of the three arms reds here."""
+    assert PR_2284_ENGINE_FILES, "the PR 2284 file list is empty, so nothing below is checked"
     missed = [path for path in PR_2284_ENGINE_FILES if not gate([path])]
     assert not missed, f"these PR 2284 files no longer run the docker smoke: {missed}"
 
 
 def test_every_script_the_smoke_steps_run_trips_the_gate() -> None:
     run = _scripts_run_by_docker_smoke()
+    assert run, "no repo file was read from the docker-smoke steps"
     floor = {
         "harness/load/rigadmin.py",
         "scripts/ci/make_syslog_ca_crl.py",
