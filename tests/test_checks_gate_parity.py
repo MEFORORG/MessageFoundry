@@ -850,12 +850,14 @@ def test_check_env_beats_mefor_ai_environment_and_the_file(
     assert "production_instance" in fail.detail and _ENV_FLAG_NOTE in fail.detail
     assert _leg(cfg, "posture", env=None).ok  # control: the variable's own name passes
 
+    # The file half, with no variable, so the control can only read its name from the file.
+    monkeypatch.delenv("MEFOR_AI_ENVIRONMENT")
     toml = tmp_path / "svc.toml"
-    toml.write_text('[ai]\nenvironment = "dev"\n', encoding="utf-8")
+    toml.write_text('[ai]\nenvironment = "staging"\n', encoding="utf-8")
     fail = _leg(cfg, "posture", env="poc", service_config=toml)
     assert not fail.ok and "production_instance" in fail.detail, fail.detail
     ok = _leg(cfg, "posture", env=None, service_config=toml)
-    assert ok.ok and "environment 'dev'" in ok.detail, ok.detail
+    assert ok.ok and "environment 'staging'" in ok.detail, ok.detail
 
 
 def test_build_check_refuses_an_exposed_listener_named_by_check_env(

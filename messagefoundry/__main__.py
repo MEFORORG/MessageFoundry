@@ -1326,6 +1326,8 @@ def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
     could resolve a DIFFERENT environment view than ``serve`` (review C3). These flags let the gate
     anchor the same bundle root and select the same active environment ``serve`` does — value
     resolution only, WITHOUT adopting serve's required-active-env / explicit-posture refusal (AC-6).
+    ``check`` is the exception for ``--env``: its settings legs read it as ``serve --env`` does, so
+    its ``posture`` leg judges that name (vault BACKLOG #2355).
     """
     p.add_argument(
         "--project-root",
@@ -1338,7 +1340,9 @@ def _add_anchor_flags(p: argparse.ArgumentParser) -> None:
         "--env",
         default=None,
         help="active environment NAME (selects environments/<env>.toml values). With no --env the gate "
-        "behaves exactly as before (no env values loaded); it never adopts serve's required-env refusal.",
+        "behaves exactly as before (no env values loaded); it never adopts serve's required-env refusal. "
+        "check also reads it as serve --env does, above [ai].environment, so with no "
+        "messagefoundry.toml its settings checks grade that instance instead of skipping.",
     )
     p.add_argument(
         "--service-config",

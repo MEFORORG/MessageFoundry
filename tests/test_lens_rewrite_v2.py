@@ -880,8 +880,11 @@ def test_messagefoundry_check_accepts_rewritten_sample(tmp_path: Path) -> None:
     out = rewrite_source(src, edit)
     assert '    msg.set("MSH-3", "MEFOR")' in out
     adt.write_bytes(out.encode("utf-8"))
+    # No --env: `check --env` now names the instance as `serve --env` does (vault BACKLOG #2355), so
+    # on this bare dir it would grade stock settings, which serve refuses too. This test is about the
+    # rewrite, and the settings legs skip without it.
     proc = subprocess.run(
-        [sys.executable, "-m", "messagefoundry", "check", "--config", str(cfg), "--env", "dev"],
+        [sys.executable, "-m", "messagefoundry", "check", "--config", str(cfg)],
         capture_output=True,
     )
     assert proc.returncode == 0, proc.stdout.decode("utf-8", "replace") + proc.stderr.decode(

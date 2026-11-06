@@ -274,7 +274,9 @@ def run_checks(
     inexact for this one cause; threading the keyword further was left out of scope.
 
     ``env`` (``check --env``) names the active environment the way ``serve --env`` does: every
-    settings leg, and the dry-run preview, reads it as a CLI override of ``[ai].environment``.
+    settings leg reads it as a CLI override of ``[ai].environment``. The dry-run preview takes
+    only ``snapshot_on_send`` from those settings; its Handlers still run with no active
+    environment.
 
     With no ``messagefoundry.toml``, the legs that read service settings, and the dry-run
     preview's ``snapshot_on_send``, read them from the environment when ``env`` or
@@ -2119,8 +2121,9 @@ def _load_check_settings(
     from messagefoundry.config.settings import load_settings
 
     if env is not None:
-        base = dict(cli or {})
-        cli = {**base, "ai": {**base.get("ai", {}), "environment": env}}
+        overrides = dict(cli or {})
+        overrides["ai"] = {**overrides.get("ai", {}), "environment": env}
+        cli = overrides
     if toml is not None:
         if toml.is_dir():
             # BACKLOG #3063 item 3: say what the path is, where opening it would report only an OS
