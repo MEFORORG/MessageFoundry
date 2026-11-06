@@ -2677,14 +2677,20 @@ def make_lane_anchor_check(store: Store, *, enforcing: bool) -> LaneAnchorCheck:
     a first observation. So a refusal whose spec and verdict match the last one for that lane is
     raised again from memory. Any change in them is checked and audited in full.
 
-    **A repeat of the last pass writes no rows either** (vault BACKLOG #3188). Under ``warn`` a CA
-    that passes with an exposed or unjudged ACL or path writes its violation rows, so without this
-    a poller's every tick added them. A pass is remembered only once its rows were all written.
-    A repeat skips the rows only when the spec and the whole verdict match, the fingerprint of the
-    bytes, the ACL, the pin and each path finding, and the audited baseline still names these
-    bytes. It still reads that baseline, so a store that refuses the read raises as above, and a
-    baseline another writer moved is judged and audited again. It still logs each warning. A
-    changed file, ACL or setting is judged and audited again.
+    **A repeat of the last clean pass is not judged again** (vault BACKLOG #3188). A clean pass
+    is one whose ACL and path both read as owner-only, so it wrote no violation row. Only such a
+    pass is remembered, and only once its rows were all written. A repeat skips the PEM shape
+    check and the audit pass only when the spec and the whole verdict match, and the audited
+    baseline still names these bytes. The verdict compared holds the fingerprint of the bytes,
+    the three-state ``acl_ok`` result of the ACL read (not the ACL itself), the pin result and
+    each path finding. It still reads that baseline, so a store that refuses the read raises as
+    above, and a baseline another writer moved is judged and audited again. A changed file, ACL
+    result or setting is judged and audited again.
+
+    **A pass that wrote a violation row is never remembered.** Under ``warn`` a CA whose ACL or
+    path is exposed or unjudged passes and writes its ``acl_insecure``, ``acl_indeterminate``,
+    ``path_insecure`` or ``path_indeterminate`` row. Every check judges it again and writes that
+    row again, as before #3188, so this detective control records no less than it did.
 
     **Each check reads the CA once.** What is remembered and what was judged come from that one
     read (:func:`_preflight_one`'s ``verdict``), so a file swapped during a check cannot pair one
@@ -2776,9 +2782,11 @@ class _LaneAnchorCheck:
         if prior is not None and prior[0] == now:
             if prior[1] is not None:
                 raise TrustAnchorError(prior[1], setting=spec.setting)
-            # A pass. Only its rows are skipped: the baseline is read as a judged pass reads it,
-            # and a store fault there raises, as it would from _preflight_one, after the same
-            # warnings. An unreadable file is never a pass, so read is a verdict here.
+            # A remembered pass, which wrote no violation row. The hit skips the PEM shape check
+            # and the audit pass, which writes no row while the baseline names these bytes. The
+            # baseline is read as a judged pass reads it, and a store fault there raises, as it
+            # would from _preflight_one, after the same verdict is applied. An unreadable file is
+            # never a pass, so read is a verdict here.
             if isinstance(read, AnchorVerdict):
                 try:
                     unchanged = await _baseline_names(self._store, spec, read)
@@ -2786,7 +2794,7 @@ class _LaneAnchorCheck:
                     _enforce_verdict(spec, read, enforcing=self._enforcing)
                     raise
                 if unchanged:
-                    _enforce_verdict(spec, read, enforcing=self._enforcing)  # its warnings
+                    _enforce_verdict(spec, read, enforcing=self._enforcing)
                     return
         # Dropped only now, so a check that returns from memory never overwrites what a check
         # that ran meanwhile stored.
@@ -2798,4 +2806,9 @@ class _LaneAnchorCheck:
                 self._last[lane] = (now, str(exc))
             raise
         # Reached only when every row was written: a store fault raised AnchorStoreUnavailable.
-        self._last[lane] = (now, None)
+        # Only a pass that wrote no violation row is remembered. One whose ACL or path is exposed
+        # or unjudged, which passes only under warn, is judged again at the next check and writes
+        # its row again, as every check did before #3188, so this detective control records no
+        # less than it did. An unreadable file raised above, so read is a verdict here.
+        if isinstance(read, AnchorVerdict) and read.acl_ok is True and read.path_ok is True:
+            self._last[lane] = (now, None)

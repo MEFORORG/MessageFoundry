@@ -3,7 +3,8 @@
 """The lane CA check's reads and memory (vault BACKLOG #3188, from engine PR 2108's review).
 
 Item 1: one read of the CA per check, and the verdict judged is the one that read found.
-Item 2: a repeat of the last pass writes no rows, and a changed file, ACL or setting is judged
+Item 2: a repeat of the last clean pass is not judged again, a pass that wrote a violation row
+is judged and writes it at every check, and a changed file, ACL result or setting is judged
 again. Item 3: a reload that removes or renames a lane drops the lane's refusal mark and the
 check's memory of it.
 
@@ -20,6 +21,7 @@ from typing import Any
 import pytest
 
 import messagefoundry.auth.trust_anchors as ta
+from messagefoundry.auth.anchor_path import ChainFinding, PathVerdict
 from messagefoundry.auth.trust_anchors import RetainsLanes, TrustAnchorError
 from messagefoundry.config.wiring import Registry, Rest, build_outbound_connection
 from messagefoundry.store import MessageStore
@@ -126,24 +128,62 @@ async def test_a_file_swapped_after_the_read_is_judged_as_read(
 # --- item 2: a repeat of the last pass is remembered -------------------------------------------
 
 
-async def test_a_repeated_warn_mode_pass_writes_no_new_rows(
-    store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _path_verdict(ok: bool | None) -> Any:
+    """A path check that finds one directory insecure (``ok`` False) or unjudged (``ok`` None)."""
+    finding = ChainFinding("/anchors", "directory", ok is False, "writable by another account")
+    return lambda _p: PathVerdict(ok, (finding,))
+
+
+@pytest.mark.parametrize(
+    ("acl", "path_ok", "event"),
+    [
+        (False, True, "acl_insecure"),
+        (None, True, "acl_indeterminate"),
+        (True, False, "path_insecure"),
+        (True, None, "path_indeterminate"),
+    ],
+)
+async def test_a_repeated_warn_mode_pass_writes_its_row_at_every_check(
+    store: MessageStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    acl: bool | None,
+    path_ok: bool | None,
+    event: str,
 ) -> None:
-    """Under ``warn`` a CA another principal can write passes and writes ``acl_insecure``. A
-    repeat of that pass writes no new row, and a changed file is judged and audited again. Red
-    under the pass memo removed: three ``acl_insecure`` rows for the three checks."""
-    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
-    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
+    """Under ``warn`` a CA whose ACL or path is exposed or unjudged passes and writes its
+    violation row. A repeat of that pass writes the row again, at every check, as each check did
+    before #3188: the pass memo never holds a pass that wrote a violation row. Red under the pass
+    memo remembering every pass: one row for the three checks."""
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: acl)
+    monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok if path_ok else _path_verdict(path_ok))
     ca = _ca(tmp_path)
+    judgments = _count_judgments(monkeypatch)
     check = ta.make_lane_anchor_check(store, enforcing=False)
     for _ in range(3):
         await check("outbound", _OUT, _settings(ca))
     events = [r["event"] for r in await _rows(store, _LABEL)]
-    assert events.count("acl_insecure") == 1, events
+    assert events.count(event) == 3 and events.count("observed") == 1, events
+    assert judgments[0] == 3
     ca.write_bytes(_block(b"swapped"))
     await check("outbound", _OUT, _settings(ca))
     events = [r["event"] for r in await _rows(store, _LABEL)]
-    assert events.count("acl_insecure") == 2 and "changed" in events, events
+    assert events.count(event) == 4 and "changed" in events, events
+
+
+async def test_a_repeated_clean_warn_mode_pass_is_remembered(
+    store: MessageStore, tmp_path: Path, judged: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``warn`` a pass with an owner-only ACL and path writes no violation row, so the memo
+    still holds it: a repeat is not judged again. Red under the memo dropped for every warn-mode
+    pass, not only one that wrote a violation row."""
+    ca = _ca(tmp_path)
+    judgments = _count_judgments(monkeypatch)
+    check = ta.make_lane_anchor_check(store, enforcing=False)
+    for _ in range(3):
+        await check("outbound", _OUT, _settings(ca))
+    assert judgments[0] == 1
+    assert [r["event"] for r in await _rows(store, _LABEL)] == ["observed"]
 
 
 async def test_a_remembered_pass_does_not_pass_a_changed_file_acl_or_pin(
@@ -199,14 +239,14 @@ async def test_a_remembered_pass_whose_baseline_moved_is_judged_again(
     assert judgments[0] == 2  # the baseline names these bytes again
 
 
-async def test_a_remembered_warn_mode_pass_still_warns(
+async def test_a_repeated_warn_mode_pass_still_warns(
     store: MessageStore,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A repeat under ``warn`` writes no row, and still logs the warning a judged pass logs, so an
-    operator who reloads sees the finding stand. Red under the repeat returning with no warning."""
+    """A repeat under ``warn`` logs the warning a judged pass logs, so an operator who reloads
+    sees the finding stand. Red under the repeat returning with no warning."""
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     ca = _ca(tmp_path)
@@ -223,8 +263,9 @@ async def test_a_pass_the_store_stopped_is_not_remembered(
 ) -> None:
     """Under ``warn``, a pass whose ``observed`` row landed but whose ``acl_insecure`` row failed
     raises the store fault and is not remembered, so the next check writes the lost row. Red
-    under the pass remembered before its rows were all written: the baseline then names the
-    bytes, and the repeat skips the row for good."""
+    under the pass remembered before its rows were all written while a pass that wrote a
+    violation row is remembered too: the baseline then names the bytes, and the repeat skips the
+    row for good. The violation-row guard alone keeps this verdict out of the memory."""
     import json
 
     store = await MessageStore.open(tmp_path / "faulty.db")
