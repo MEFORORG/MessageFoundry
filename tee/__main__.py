@@ -142,15 +142,14 @@ def _parse_age(spec: str) -> float:
     return day.timestamp()
 
 
-# What every ``--out`` does to the file, stated where an operator reads it (vault BACKLOG #3166
-# step 4). :func:`_write_owner_only` is the source of record.
-_OUT_FILE = (
-    "On POSIX the file is created owner-only (0600), and an existing FILE is replaced rather than "
-    "written into: a read-only (0444) FILE is overwritten, a hard link at FILE is broken, and a "
-    "symbolic link at FILE is replaced, not followed. On Windows an existing FILE is written in "
-    "place and keeps its access list."
+# What ``export --out`` and ``anonymize-captures --out`` do to the file, stated where an operator
+# reads it (vault BACKLOG #3166 step 4). :func:`_write_owner_only` is the source of record.
+_OUT_IN_PLACE_ON_WINDOWS = (
+    "Lines end in LF on every OS, Windows included. On POSIX the file is created owner-only (0600), "
+    "and an existing FILE is replaced rather than written into: a read-only (0444) FILE is "
+    "overwritten, a hard link at FILE is broken, and a symbolic link at FILE is replaced, not "
+    "followed. On Windows an existing FILE is written in place and keeps its access list."
 )
-_OUT_LF = "Lines end in LF on every OS, Windows included."
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -247,7 +246,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out",
         metavar="FILE",
         default=None,
-        help=f"write to FILE instead of stdout. {_OUT_LF} {_OUT_FILE}",
+        help=f"write to FILE instead of stdout. {_OUT_IN_PLACE_ON_WINDOWS}",
     )
 
     purge = sub.add_parser("purge", help="delete logged rows (and captured bodies) from the DB")
@@ -300,7 +299,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out",
         metavar="FILE",
         default=None,
-        help=f"write the JSON report to FILE instead of stdout. {_OUT_FILE}",
+        help=(
+            "write the JSON report to FILE instead of stdout. On POSIX the file is created "
+            "owner-only (0600). On every OS an existing FILE is replaced rather than written into, "
+            "so on Windows the report takes its folder's access list"
+        ),
     )
     compare.add_argument(
         "--show-diffs",
@@ -329,7 +332,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out",
         required=True,
         metavar="FILE",
-        help=f"output JSONL of de-identified messages. {_OUT_LF} {_OUT_FILE}",
+        help=f"output JSONL of de-identified messages. {_OUT_IN_PLACE_ON_WINDOWS}",
     )
     anon.add_argument(
         "--direction",
@@ -428,7 +431,9 @@ async def _export(args: argparse.Namespace) -> int:
     if args.out:
         try:
             # Off the event loop: the writer opens, writes and fsyncs synchronously.
-            await asyncio.to_thread(_write_owner_only, args.out, text + "\n", newline="\n")
+            await asyncio.to_thread(
+                _write_owner_only, args.out, text + "\n", in_place_on_windows=True
+            )
         except OSError as exc:
             print(f"error: could not write the export to {args.out}: {exc}", file=sys.stderr)
             return 1
@@ -507,7 +512,7 @@ async def _load_captures(db: str, since: float | None) -> list[CorepointOutput]:
     ]
 
 
-def _write_owner_only(path: str, text: str, *, newline: str | None) -> None:
+def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> None:
     """Write ``text`` to ``path`` so that, on POSIX, only its owner can read it (vault BACKLOG #2792).
 
     Every ``--out`` the tee writes goes through here (vault BACKLOG #3166). A ``compare
@@ -516,9 +521,18 @@ def _write_owner_only(path: str, text: str, *, newline: str | None) -> None:
     and NAK details from the capture DB. ``write_text`` would create any of them at the process
     umask, world-readable under 022, beside a capture DB that :mod:`tee.store` keeps at 0600.
 
-    ``newline`` is the text layer's: ``export`` and ``anonymize-captures`` pass ``"\\n"``, so they
-    write LF on every platform, since the dataset is JSONL that the harness corpus reads back line
-    by line; ``compare`` passes None, the platform's, CRLF on Windows, as on main.
+    ``in_place_on_windows`` is True for ``export`` and ``anonymize-captures``, and False for
+    ``compare``. False keeps ``compare``'s writer on main, unchanged on every OS: newlines are the
+    platform's (CRLF on Windows), a named stream is written through, and anything else is replaced
+    by a ``mkstemp`` file with ``os.replace``, an existing file or link on Windows included. There
+    the report takes the folder's access list, whatever list the old file had, even one that
+    denied this account writing; a link is replaced rather than followed; and the write is atomic.
+    A folder's list can itself let another account read the report, and the replace does not stop
+    that. The POSIX paragraph below applies to both values; the paragraphs on Windows describe
+    True.
+
+    With True, newlines are written as LF on every platform. The text layer's default would write
+    CRLF on Windows, and the dataset is JSONL that the harness corpus reads back line by line.
 
     A ``path`` naming nothing, on any platform -- no file and no link, not even a dangling one --
     is created as a NEW file that ``mkstemp`` creates exclusively at 0600 in the same directory,
@@ -544,18 +558,18 @@ def _write_owner_only(path: str, text: str, *, newline: str | None) -> None:
     open refuses raises, and the command prints its error line and exits 1; it never falls back to
     a replace. The open refuses at least a file this account may not write, a read-only one, one
     with the Hidden or System attribute, a directory, and one another process holds open without
-    write sharing. ``compare`` replaced an existing file on Windows until PR 2390 note 7 (vault
-    BACKLOG #3166), so for it the kept list and these refusals are new.
+    write sharing.
 
-    These known properties, at least, match ``write_text`` on main for ``export`` and
-    ``anonymize-captures`` and are not new: the list is kept whatever it holds, so a target another
-    account pre-created stays that account's; the in-place write is not atomic and not fsynced, so
-    an OSError or an interruption part way, or a crash after it, would leave the file truncated or
-    partly written; and the refusals above.
+    For ``export`` and ``anonymize-captures`` these known properties, at least, match ``write_text``
+    on main and are not new: the list is kept whatever it holds, so a target another account
+    pre-created stays that account's; the write is not atomic and not fsynced, so an OSError or an
+    interruption part way, or a crash after it, would leave the file truncated or partly written;
+    and the refusals above.
     """
     target = Path(path)
-    windows = os.name == "nt"
-    in_place = os.path.lexists(target) if windows else _is_named_stream(path)
+    windows_in_place = in_place_on_windows and os.name == "nt"
+    newline = "\n" if in_place_on_windows else None
+    in_place = os.path.lexists(target) if windows_in_place else _is_named_stream(path)
     if in_place:
         _write_through(target, text, newline)
         return
@@ -570,7 +584,7 @@ def _write_owner_only(path: str, text: str, *, newline: str | None) -> None:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        if not windows:
+        if not windows_in_place:
             os.replace(temp, target)
             return
         try:
@@ -624,7 +638,7 @@ def _compare(args: argparse.Namespace) -> int:
     text = json.dumps(report, indent=2)
     if args.out:
         try:
-            _write_owner_only(args.out, text + "\n", newline=None)
+            _write_owner_only(args.out, text + "\n", in_place_on_windows=False)
         except OSError as exc:
             print(f"error: could not write the report to {args.out}: {exc}", file=sys.stderr)
             return 1
@@ -825,7 +839,9 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         )
         return 1
     try:
-        await asyncio.to_thread(_write_owner_only, args.out, "\n".join(lines) + "\n", newline="\n")
+        await asyncio.to_thread(
+            _write_owner_only, args.out, "\n".join(lines) + "\n", in_place_on_windows=True
+        )
     except OSError as exc:
         print(f"error: could not write the dataset to {args.out}: {exc}", file=sys.stderr)
         return 1
