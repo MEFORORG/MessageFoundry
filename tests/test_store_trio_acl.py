@@ -11,7 +11,9 @@ whoever opens. Anywhere else the owner-only rewrite is unchanged.
 
 Three tiers, each saying what it can and cannot show:
 
-* The SDDL decisions are pure and run on every platform, as does the wiring into ``open``.
+* The SDDL decisions run on every platform, as does the wiring into ``open``. They are pure except
+  for a user run-as, whose type the real ``LookupAccountSidW`` decides; those tests install a
+  stand-in for ``_lookup_sid_type``.
 * The Windows tests drive the real ``icacls`` on real files and skip off Windows, because the
   mechanism is a Windows DACL. A non-elevated user cannot make BUILTIN\\Administrators a directory's
   owner, so those tests pass the grant set directly to the file step and test directory DETECTION on

@@ -836,8 +836,9 @@ def test_the_account_legs_run_localsystem_and_wire_a_local_user() -> None:
 
     job = jobs_of("ci.yml")["windows-service-smoke"]
     accounts = [leg.get("account") for leg in job["strategy"]["matrix"]["include"]]
-    # localuser is wired and left out of the matrix until the store shares its files with a named
-    # account; the comment above the matrix says why. Listing it then is the one-line change.
+    # localuser is wired and left out of the matrix until the installer reads back the account it
+    # registered (BACKLOG #3938); the comment above the matrix says why. Listing it then is the
+    # one-line change.
     assert accounts.count(None) == 2 and "localsystem" in accounts, accounts
     assert job["env"]["SMOKE_ACCOUNT"] == "${{ matrix.account || 'virtual' }}"
     steps = {str(s.get("name")): s for s in job["steps"]}

@@ -4954,8 +4954,8 @@ jobs:
         # and run with exactly the privilege list the installer writes. One Server SKU each.
         # - localsystem (-AllowLocalSystem) is listed. Its first run is in the merge queue.
         # - localuser (-ServiceAccount, a local user created on the runner) is WIRED BUT NOT LISTED,
-        #   for the reason docs/SERVICE.md "Restrict the service token" gives (the store's
-        #   _hardening_refusal in messagefoundry/store/store.py). Add this row once that changes:
+        #   for the reason docs/SERVICE.md "Restrict the service token" gives (the installer's
+        #   read-back of the HOST\user spelling, BACKLOG #3938). Add this row once that changes:
         #     - { os: windows-2025, python-version: "3.14", account: localuser }
         # - A gMSA gets no leg. docs/SERVICE.md "Restrict the service token" says why.
         include:

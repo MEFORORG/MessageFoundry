@@ -325,8 +325,9 @@ grant at most one principal beyond SYSTEM and Administrators (none for a LocalSy
 before). It is a per-service virtual account as before, or a SID that `LookupAccountSidW` resolves
 to `SidTypeUser` and whose RID is 1000 or more. It gets the same Modify right (`0x1301bf`) and `OICI`
 inheritance the virtual account gets. Unlike the virtual account it may NOT own the directory: any
-standard user can own a directory she made and grant herself that shape, while the installer always
-makes Administrators the owner. In `messagefoundry/store/store.py`,
+standard user can own a directory she made and grant herself that shape, while the installer makes
+Administrators the owner (best-effort: where it cannot, it warns, and the store refuses the
+directory). In `messagefoundry/store/store.py`,
 `_account_shape_refusal` requires a machine- or domain-relative SID (`S-1-5-21-` plus three
 sub-authorities and the RID) with a RID of 1000 or more, and `_account_type_refusal` requires the
 lookup to answer `SidTypeUser`. A failed lookup and every other type are refused: a group or alias

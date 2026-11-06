@@ -6933,9 +6933,9 @@ def _hardening_refusal(directory: _SddlDacl) -> str | None:
     owner keeps WRITE_DAC over the directory. The run-as account is a per-service virtual account,
     or one user account this host resolves with a RID of 1000 or more (:func:`_account_shape_refusal`,
     :func:`_account_type_refusal`). A user never qualifies as the OWNER: any standard user can own a
-    directory she made and grant herself the installer's shape, while install-service.ps1 always
-    makes Administrators the owner (Set-DataDirOwner), and no standard user can own a directory as
-    a virtual account.
+    directory she made and grant herself the installer's shape, while install-service.ps1 makes
+    Administrators the owner (Set-DataDirOwner, which only warns when it cannot, and the directory is
+    then refused), and no standard user can own a directory as a virtual account.
 
     NOT pure: for a user run-as it calls ``LookupAccountSidW``, which may block on a domain
     controller and logs nothing itself. Call it once per decision (:func:`_hardening_verdict`), and
@@ -6996,8 +6996,10 @@ def _account_shape_refusal(sid: str) -> str | None:
     Administrators and a per-service virtual account, and only a user account with a RID of 1000 or
     more: the account ``install-service.ps1 -ServiceAccount`` grants, such as a local user, or a
     gMSA only if it resolves to a user account, which is unmeasured. The SID must be machine- or
-    domain-relative (``S-1-5-21-...``), the only shape whose last sub-authority is a RID. Any alias
-    the SDDL writer emits (``NS``, ``LA``, ``DU``) is not one, so it is refused here too. A RID
+    domain-relative (``S-1-5-21-...``), whose last sub-authority is the RID of an account or group
+    that machine or domain holds; the regex admits no other family, so a BUILTIN alias
+    (``S-1-5-32-...``), whose last sub-authority is also a RID, is refused by shape. Any alias the
+    SDDL writer emits (``NS``, ``LA``, ``DU``) is not of this shape either, so it is refused too. A RID
     under 1000 is a built-in account or group, refused without a lookup: at least the built-in Administrator (500), Guest (501) and Domain Users (513)."""
     match = _ACCOUNT_SID.fullmatch(sid)
     if match is None:
