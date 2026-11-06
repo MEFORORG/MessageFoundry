@@ -1570,7 +1570,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def ad_reconcile_breaker_cleared(self, name: str) -> None:
         # #2136: the INVERSE -- no page; auto-resolves the open ad_reconcile_aborted via _AUTO_RESOLVE,
         # the breaker's or, under the referral's label, the referral's (#2538), and likewise the
-        # whole and partial outages' (#3709).
+        # whole outage's (#3709). A partial outage's page has no inverse.
         self._record_state({"type": "ad_reconcile_breaker_cleared", "connection": name}, "info")
 
     def ad_reconcile_hold_released(self, name: str) -> None:

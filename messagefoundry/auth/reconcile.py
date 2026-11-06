@@ -168,11 +168,18 @@ class Probe:
     detail: str | None = None
 
     @property
+    def paging_refused(self) -> bool:
+        """True when the group search was refused for the engine's own paging bound (vault BACKLOG
+        #3696): UNAVAILABLE with a :data:`PAGING_DEADLINE` or :data:`PAGING_CAP` detail. The one
+        test both the paging refusal and :attr:`unreached` read, so no probe is both or neither."""
+        return self.outcome is ProbeOutcome.UNAVAILABLE and self.detail is not None
+
+    @property
     def unreached(self) -> bool:
         """True when the directory left this probe unanswered (BACKLOG #3709 step 1): UNAVAILABLE
-        for any reason but the engine's own paging bound, which the directory answered and which
-        pages on its own (vault BACKLOG #3696). The partial outage counts by this test."""
-        return self.outcome is ProbeOutcome.UNAVAILABLE and self.detail not in _PAGING_CAUSES
+        for any reason but the engine's own paging bound (:attr:`paging_refused`), which the
+        directory answered and which pages on its own. The partial outage counts by this test."""
+        return self.outcome is ProbeOutcome.UNAVAILABLE and not self.paging_refused
 
 
 @dataclass(frozen=True)
@@ -244,8 +251,6 @@ MISCONFIGURED_ABORT = "directory_misconfigured"
 #: enabled account's roles and scope are not re-read while it lasts. Also the alert's ``reason``.
 PAGING_DEADLINE = "group_search_deadline"
 PAGING_CAP = "group_search_cap"
-#: Both, for telling such a probe from one the directory did not answer (BACKLOG #3709 step 1).
-_PAGING_CAUSES = frozenset({PAGING_DEADLINE, PAGING_CAP})
 
 #: The outcomes that judge nothing about the account: no strike, no recorded outcome (rule item 4).
 _UNJUDGED = frozenset(
@@ -308,7 +313,7 @@ class ReconcilePlan:
     asked: int = 0
     unavailable: int = 0
     #: The probes the directory left unanswered (:attr:`Probe.unreached`, BACKLOG #3709 step 1).
-    unreached: int = 0
+    unreached_probes: int = 0
     #: ``user_id`` of every probe the directory answered with a referral (BACKLOG #2538). Any one
     #: alerts, and none of them stops the rest of the pass being judged.
     referred: tuple[str, ...] = ()
@@ -369,17 +374,16 @@ class ReconcilePlan:
     #: #3709). Read like the other ``*_clear`` flags: the caller resolves the outage's instance on it.
     outage_clear: bool = False
     #: Set by the auth service after the pass, never by :func:`plan_pass` (BACKLOG #3709 step 1,
-    #: #4772 item 6): ``(user_id, streak)`` of each account this pass pages a PARTIAL outage for,
-    #: where ``streak`` is how many of its probes running the directory left unanswered
-    #: (:attr:`Probe.unreached`), at least ``[auth].ad_reconcile_outage_passes``. An account already
-    #: paged and still at the threshold is not here. Empty on a whole outage pass.
-    #: ``AuthService._note_partial_outage`` keeps it.
-    partial_outage_entered: tuple[tuple[str, int], ...] = ()
-    #: Whether no account's streak is that long any more, because each was answered since or
-    #: left with its sessions, on the first such pass after a partial page in this process. It can
-    #: be a whole outage pass, through an account leaving. The caller resolves the partial
-    #: outage's instance on it.
-    partial_outage_clear: bool = False
+    #: #4772 item 6): ``(user_id, username, streak)`` of each account this pass pages a PARTIAL
+    #: outage for, where ``streak`` is how many of its probes running the directory left
+    #: unanswered (:attr:`Probe.unreached`), at least ``[auth].ad_reconcile_outage_passes``. An
+    #: account already paged and still at the threshold is not here. Empty on a pass that did not
+    #: reach the directory. ``AuthService._note_partial_outage`` keeps it.
+    partial_outage_entered: tuple[tuple[str, str, int], ...] = ()
+    #: Set with ``partial_outage_entered``: True when the accounts standing at the threshold, paged
+    #: or entering, are more than ``AuthService``'s fixed rollup bound, so the lifespan task pages
+    #: once for those entering, under the bare source, rather than once per account.
+    partial_outage_rollup: bool = False
 
     @property
     def partial_outage_page(self) -> bool:
@@ -390,9 +394,9 @@ class ReconcilePlan:
 
     @property
     def partial_outage_probes(self) -> int:
-        """The longest streak among ``partial_outage_entered``: what the page and its row report,
-        so they name an account that tripped it rather than a stale one (BACKLOG #3709)."""
-        return max((streak for _, streak in self.partial_outage_entered), default=0)
+        """The longest streak among ``partial_outage_entered``, which the audit row reports
+        (BACKLOG #3709)."""
+        return max((streak for _, _, streak in self.partial_outage_entered), default=0)
 
     @property
     def directory_outage(self) -> bool:
@@ -603,7 +607,7 @@ def plan_pass(
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
-            unreached=unreached,
+            unreached_probes=unreached,
             referred=tuple(p.user_id for p in referred),
             faulted=tuple(p.user_id for p in faulted),
             misconfigured=tuple(p.user_id for p in misconfigured),
@@ -622,7 +626,7 @@ def plan_pass(
             probed=len(probes),
             asked=asked,
             unavailable=len(unavailable),
-            unreached=unreached,
+            unreached_probes=unreached,
             aborted=OUTAGE_ABORT,
             latched=latched,
         )
@@ -715,7 +719,7 @@ def plan_pass(
         probed=len(probes),
         asked=asked,
         unavailable=len(unavailable),
-        unreached=unreached,
+        unreached_probes=unreached,
         referred=tuple(p.user_id for p in referred),
         faulted=tuple(p.user_id for p in faulted),
         misconfigured=tuple(p.user_id for p in misconfigured),

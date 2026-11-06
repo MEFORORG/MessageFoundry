@@ -737,28 +737,29 @@ class AlertSink(Protocol):
         unreachable for ``[auth].ad_reconcile_outage_passes`` passes running
         (``directory_unavailable``, BACKLOG #3709, the ``auth.ad_reconcile_skipped`` row whose
         ``passes`` the page names), raised once per run; or the directory has left one or more
-        signed-in accounts unanswered on that many of each one's probes running, counted on
-        passes that were not a whole outage (``directory_partly_unavailable``, BACKLOG #3709 step
-        1, the ``auth.ad_reconcile_partial_outage`` row, whose ``probes`` the page names), raised
-        once per account as it enters that state and never on a whole outage pass. Under a probe
-        budget smaller than the estate that comes after that many probes of the account, which
-        can be many more passes, or never (``AuthService._note_partial_outage``). The type's name predates every case but the first. Read
-        ``reason`` before naming the cause.
+        signed-in accounts unanswered on that many of each one's probes running
+        (``directory_partly_unavailable``, BACKLOG #3709 step 1, the
+        ``auth.ad_reconcile_partial_outage`` row), raised once per account as it enters that
+        state, only on a pass that reached the directory, and with no inverse. Under a probe budget
+        smaller than the estate that comes after that many probes of the account, which can be
+        many more passes (``AuthService._note_partial_outage``). The type's name predates every
+        case but the first. Read ``reason`` before naming the cause.
 
         ``name`` labels the source: ``"directory-reconciler"`` for the breaker,
         ``"directory-reconciler-referral"`` for a referral, ``"directory-reconciler-probe-fault"``
         for a probe fault, ``"directory-reconciler-misconfigured"`` for a configuration refusal,
         ``"directory-reconciler-paging:<username>"`` for a paging refusal,
         ``"directory-reconciler-outage"`` for a lasting outage, and
-        ``"directory-reconciler-partial-outage"`` for a lasting partial one, so each is its own
-        instance and throttle. ``reason`` is one of those eight closed-set slugs. ``probed`` is, for
+        ``"directory-reconciler-partial-outage:<username>"`` for a lasting partial one, or the
+        bare ``"directory-reconciler-partial-outage"`` for one page covering more accounts than
+        the auth service's fixed rollup bound, so each is its own instance and throttle. ``reason`` is one of those eight closed-set slugs. ``probed`` is, for
         the breaker, how many principals the pass judged, its denominator, and a paging refusal
         carries that same count of candidates the pass took up, asked or not, which counts any
         id-less row: a paging refusal concerns one account, and its count is still the pass's. For
         a referral, a configuration refusal, a probe fault and a lasting outage, whole or partial,
         it is how many probes the pass sent to the directory, which leaves out an id-less row (BACKLOG #3170).
         ``detail`` is the operator-facing explanation the auth service latches, or for a paging
-        refusal or a lasting outage a fixed sentence. No PHI. Emitted by the API-lifespan
+        refusal or a lasting outage, whole or partial, a fixed sentence. No PHI. Emitted by the API-lifespan
         reconciler task, never from ``auth/``. A single whole-directory outage pass is NOT this
         event: it is audited as ``auth.ad_reconcile_skipped`` and pages nothing, because the
         accounts are fine. A pass where every probe fails and none is referred, refused or faults
@@ -786,12 +787,8 @@ class AlertSink(Protocol):
         for the same ``name``: ``"directory-reconciler"`` for the breaker's instance, and
         ``"directory-reconciler-referral"`` for the referral's, and ``"directory-reconciler-outage"``
         for a lasting outage's, on a pass that reached the directory after a run that paged
-        (``AuthService._note_directory_outage``, BACKLOG #3709), and
-        ``"directory-reconciler-partial-outage"`` for a partial one's, once, on the first pass
-        after a page on which no signed-in account's run of unanswered probes is that long,
-        because each was answered since or left with its sessions
-        (``AuthService._note_partial_outage``). The others are raised on every such pass. Each is
-        raised except where
+        (``AuthService._note_directory_outage``, BACKLOG #3709). A partial outage's has none. Each
+        is raised on every such pass, except where
         ``api/app.py::_is_sole_reconciler`` says another reconciler may run, at least on a
         ``[cluster]`` node or in an engine that runs more than one engine shard
         (``api/app.py::_without_clears`` says why), and while the open instance is one an earlier
@@ -1419,8 +1416,7 @@ class LoggingAlertSink:
     def ad_reconcile_breaker_cleared(self, name: str) -> None:
         # The inverse (auto-resolve) event, raised on every clear pass; no page, so DEBUG.
         # The referral's source label raises it too, once no referral stands (BACKLOG #2538), and
-        # the outage's, on a reach after a run that paged (BACKLOG #3709), and the partial outage's,
-        # once no account is left unanswered for a run of probes.
+        # the outage's, on a reach after a run that paged (BACKLOG #3709).
         log.debug("ALERT ad_reconcile_breaker_cleared: %r found its condition clear", name)
 
     def ad_reconcile_hold_released(self, name: str) -> None:

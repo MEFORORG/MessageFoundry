@@ -11322,16 +11322,24 @@ _OUTAGE_ALERT_TEXT: Final[str] = (
     "No directory probe succeeded in {passes} reconcile passes running, so the reconciler revoked "
     "nothing. Check the directory, the path to it, and any group-search paging alert."
 )
-#: The source label of a lasting PARTIAL outage's own ``ad_reconcile_aborted`` instance (BACKLOG
-#: #3709 step 1, #4772 item 6), apart from the whole outage's, so acknowledging one directory
-#: controller's outage does not silence a later outage of the whole directory.
+#: The source label prefix of a lasting PARTIAL outage's ``ad_reconcile_aborted`` instance
+#: (BACKLOG #3709 step 1, #4772 item 6), apart from the whole outage's, so acknowledging one
+#: directory controller's outage does not silence a later outage of the whole directory. The
+#: account name follows it, as a paging refusal's does, so each account is its own instance and
+#: throttle; a rolled-up page (``plan.partial_outage_rollup``) uses the bare prefix.
 _PARTIAL_OUTAGE_ALERT_SOURCE = "directory-reconciler-partial-outage"
-#: What the lasting partial outage tells the operator, under the same 200-character bound. It
-#: names the accounts' consequence, which differs from the whole outage's: the rest were judged.
-#: ``probes`` is the longest streak among the accounts this page is for, never a stale one.
+#: What one account's lasting partial outage tells the operator, under the same 200-character
+#: bound. It names the account's consequence, which differs from the whole outage's: the rest were
+#: judged. ``probes`` is that account's own streak.
 _PARTIAL_OUTAGE_ALERT_TEXT: Final[str] = (
-    "The directory left {accounts} more signed-in account(s) unanswered on {probes} probes running "
-    "({unreached} of {asked} unanswered this pass), so not reconciled. Check each domain controller."
+    "This account's sessions are not reconciled: the directory left {probes} of its probes running "
+    "unanswered while it answered others. Check each domain controller."
+)
+#: What one rolled-up page says, where more accounts stand at the threshold than
+#: ``AuthService``'s fixed rollup bound. ``probes`` is the shortest streak among those entering.
+_PARTIAL_OUTAGE_ROLLUP_TEXT: Final[str] = (
+    "{accounts} more accounts' sessions are not reconciled: the directory left each unanswered on "
+    "{probes} or more of its probes running while it answered others. Check each domain controller."
 )
 #: What each paging refusal cause tells the operator. Short, and the consequence first, because
 #: the store keeps only the first 200 characters of an instance's reason; the account is in the
@@ -11357,11 +11365,12 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     pages once, as ``ad_reconcile_aborted`` with reason ``directory_unavailable`` under its own
     source label (:data:`_OUTAGE_ALERT_SOURCE`), and the first pass that reaches the directory
     resolves it (BACKLOG #3709; ``AuthService._note_directory_outage`` says when each is set).
-    An account the directory leaves unanswered on as many of its probes running, counted on
-    passes that are not a whole outage, pages once as it enters that state, as
-    ``ad_reconcile_aborted`` with reason ``directory_partly_unavailable`` under its own source
-    (:data:`_PARTIAL_OUTAGE_ALERT_SOURCE`), matching its ``auth.ad_reconcile_partial_outage``
-    row. A whole outage pass never raises it. It resolves once no account's streak is that long
+    An account the directory leaves unanswered on as many of its probes running pages once as it
+    enters that state, on a pass that reached the directory, as ``ad_reconcile_aborted`` with
+    reason ``directory_partly_unavailable`` under its own source
+    (:data:`_PARTIAL_OUTAGE_ALERT_SOURCE` and its name), or one rolled-up page under the bare
+    source where many stand at once, matching its ``auth.ad_reconcile_partial_outage`` row. A
+    pass that did not reach the directory never raises it, and it has no inverse
     (``AuthService._note_partial_outage``).
 
     A referral (BACKLOG #2538) is NOT an outage: it recurs until a search base is fixed. Any pass
@@ -11411,19 +11420,17 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     that point. Their rows stand, except a row that was refused: that account has neither its row
     nor its alert. ``AuthService._audit_reconciler_row`` says which errors are soft.
 
-    Each standing alert but the probe fault's, the configuration refusal's and a paging refusal's
-    also gets its inverse, which pages nobody and resolves the open instance (BACKLOG #2136):
+    Each standing alert but the probe fault's, the configuration refusal's, a paging refusal's and
+    a partial outage's also gets its inverse, which pages nobody and resolves the open instance (BACKLOG #2136):
     ``ad_reconcile_breaker_cleared`` and ``ad_reconcile_hold_released``, and
     ``ad_reconcile_breaker_cleared`` under the referral's source for the referral's instance, and
-    under the outage's source for the outage's (BACKLOG #3709), and under the partial outage's
-    for its own. The
+    under the outage's source for the outage's (BACKLOG #3709). The
     auth service decides when a pass is evidence of a clear (``plan.breaker_clear``,
-    ``plan.hold_clear``, ``plan.referral_clear``, ``plan.outage_clear``,
-    ``plan.partial_outage_clear``; see ``AuthService._mark_reconcile_clears``,
-    ``AuthService._note_directory_outage`` and ``AuthService._note_partial_outage``), so
+    ``plan.hold_clear``, ``plan.referral_clear``, ``plan.outage_clear``; see
+    ``AuthService._mark_reconcile_clears`` and ``AuthService._note_directory_outage``), so
     the alert and the service read one predicate. An outage or a pass with no signed-in account
-    sets none of the others; a whole outage pass can set the partial outage's. The inverse is
-    raised on EVERY pass that sets its flag, not once per clear:
+    sets none of the others. The inverse is raised on EVERY pass that sets its flag, not once per
+    clear:
     resolving is an idempotent update, and a resolve the notifier failed to write is retried that
     way. A process clears only what it watched open, so a fresh process resolves no alert an
     earlier run left open (:func:`_without_inherited_clears` drops that clear);
@@ -11441,11 +11448,6 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
                 probed=plan.asked,
                 detail=_OUTAGE_ALERT_TEXT.format(passes=plan.outage_passes),
             )
-        if plan.partial_outage_clear:
-            # BACKLOG #3709 step 1. A whole outage pass never pages the partial outage, and feeds
-            # no account's streak, but the last account behind its page can leave with its
-            # sessions during one, which ends the condition. Last, as below.
-            sink.ad_reconcile_breaker_cleared(_PARTIAL_OUTAGE_ALERT_SOURCE)
         return
     if plan.aborted is not None and not plan.judged_nothing:
         # A breaker trip. A pass that judged nothing is not one: its alerts are the referral's, the
@@ -11462,20 +11464,9 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
     # After the breaker and the revocations, which do not recur either, and before the referral,
     # the fault and the hold, which page again on the next pass (vault BACKLOG #3696).
     _alert_paging_refusals(plan, sink)
-    if plan.partial_outage_page:
-        # BACKLOG #3709 step 1. Once per account entering the state, so with the other pages that
-        # do not recur. Never on a whole outage pass, which returned above.
-        sink.ad_reconcile_aborted(
-            _PARTIAL_OUTAGE_ALERT_SOURCE,
-            reason=PARTIAL_OUTAGE_REASON,
-            probed=plan.asked,
-            detail=_PARTIAL_OUTAGE_ALERT_TEXT.format(
-                accounts=len(plan.partial_outage_entered),
-                probes=plan.partial_outage_probes,
-                unreached=plan.unreached,
-                asked=plan.asked,
-            ),
-        )
+    # BACKLOG #3709 step 1. Once per account entering the state, so with the other pages that do
+    # not recur. Never on a whole outage pass, which returned above.
+    _alert_partial_outage(plan, sink)
     if plan.referred:
         # BACKLOG #2538. After the breaker and the revocations, matching the service's order.
         sink.ad_reconcile_aborted(
@@ -11519,8 +11510,34 @@ def _alert_reconcile_plan(plan: ReconcilePlan, auth: AuthService, sink: AlertSin
         sink.ad_reconcile_breaker_cleared(_REFERRAL_ALERT_SOURCE)
     if plan.outage_clear:
         sink.ad_reconcile_breaker_cleared(_OUTAGE_ALERT_SOURCE)
-    if plan.partial_outage_clear:
-        sink.ad_reconcile_breaker_cleared(_PARTIAL_OUTAGE_ALERT_SOURCE)
+
+
+def _alert_partial_outage(plan: ReconcilePlan, sink: AlertSink) -> None:
+    """Page each account that has just entered a lasting partial outage (BACKLOG #3709 step 1;
+    ``AuthService._note_partial_outage`` says when one enters), under its own source, or once for
+    all of them on a rolled-up pass (``plan.partial_outage_rollup``), under the bare source and
+    naming none. The account name, in the source only, is the one ``ad_session_revoked`` already
+    carries; nothing else about the account is. It has no inverse: an operator resolves it."""
+    entered = plan.partial_outage_entered
+    if not entered:
+        return
+    if plan.partial_outage_rollup:
+        sink.ad_reconcile_aborted(
+            _PARTIAL_OUTAGE_ALERT_SOURCE,
+            reason=PARTIAL_OUTAGE_REASON,
+            probed=plan.asked,
+            detail=_PARTIAL_OUTAGE_ROLLUP_TEXT.format(
+                accounts=len(entered), probes=min(streak for _, _, streak in entered)
+            ),
+        )
+        return
+    for _user_id, username, streak in entered:
+        sink.ad_reconcile_aborted(
+            f"{_PARTIAL_OUTAGE_ALERT_SOURCE}:{username}",
+            reason=PARTIAL_OUTAGE_REASON,
+            probed=plan.asked,
+            detail=_PARTIAL_OUTAGE_ALERT_TEXT.format(probes=streak),
+        )
 
 
 def _alert_paging_refusals(plan: ReconcilePlan, sink: AlertSink) -> None:
@@ -11576,7 +11593,6 @@ _RECONCILE_CLEAR_RESOLVES: Final[Mapping[str, tuple[str, str]]] = {
     "hold_clear": ("directory-reconciler", "ad_reconcile_held"),
     "referral_clear": (_REFERRAL_ALERT_SOURCE, "ad_reconcile_aborted"),
     "outage_clear": (_OUTAGE_ALERT_SOURCE, "ad_reconcile_aborted"),
-    "partial_outage_clear": (_PARTIAL_OUTAGE_ALERT_SOURCE, "ad_reconcile_aborted"),
 }
 
 

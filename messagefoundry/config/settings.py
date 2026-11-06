@@ -9646,8 +9646,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                     f"more passes to cover, and {late}. The smaller sample is also the breaker's "
                     "denominator, so a smaller wave of revocations aborts the pass. The page "
                     "about a partial directory outage counts one account's probes, so it comes "
-                    "that many more passes later too, or not at all where one sample holds only "
-                    "the accounts behind a dead domain controller",
+                    "that many more passes later too",
                 )
             )
         brake = (
