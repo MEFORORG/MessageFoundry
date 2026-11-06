@@ -544,19 +544,20 @@ async def store_holds_data(store: Store) -> bool:
 
 def keep_the_key_step() -> str:
     """The one way on for every path that meets a key file or store it cannot tie to this store
-    (PR 2804 fifth hold): it leaves everything that exists in place and creates only new things,
-    a custody directory and a store location of this store's own. Names no path and no key."""
+    (PR 2804 fifth hold): it advises changing no existing file, key, blob or store, and asks for a
+    new custody directory and a new store location, which changes the two settings that name
+    them. Names no path and no key."""
     # The variable is named here as a literal, not through SECRETS_DIRECTORY_VARIABLE: this text
     # reaches stderr, and CodeQL's name heuristic reads that constant as a secret (alert 315).
     return (
-        "The engine cannot tell whose key an existing host blob or handoff in this store's custody "
-        "directory holds, so it leaves that file in place, and the store too. To provision this "
+        "The engine cannot tell whose key any host blob or handoff already in this store's "
+        "custody directory holds, so it leaves it in place, and the store too. To provision this "
         "store, give it a custody directory and a store location of its own: set "
         "MEFOR_SECRETS_DIRECTORY to a new, empty directory, here and in this store's own service "
-        "environment, never in one another store's service also reads, since that store would "
-        "then look for its key there; and point [store] at a new SQLite path or, on a server "
-        "backend, a new database. Then run the command again. Nothing left in place is carried "
-        "over to the new store"
+        "environment, never in one that another store's service also reads, since that store "
+        "would then look for its key there; and point [store] at a new SQLite path or, on a "
+        "server backend, a new database. Then run `messagefoundry provision-admin`, which mints "
+        "this store's key there. Nothing left in place is carried over to the new store"
     )
 
 

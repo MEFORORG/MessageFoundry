@@ -8470,7 +8470,7 @@ def _provision_open_refusal(exc: BaseException, store: StoreSettings) -> str:
     return f"{_sentence(codec_safe_str(exc))} {tail}"
 
 
-def _never_started_refusal(store: StoreSettings) -> str:
+def _never_started_refusal() -> str:
     """``provision-admin``'s text when the host blob here opens a store whose audit chain was
     never started (PR 2804 hold 2 and fourth hold): a mint that failed before its genesis record,
     or a blob another store in a shared directory owns. The engine cannot tell which, so the text
@@ -8771,8 +8771,8 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # An empty chain may be a store that ran keyless: one that holds data is not absent.
             return not await store_holds_data(store)
         except TableCensusIncomplete as incomplete:
-            # Fail closed, and say why: "the store already exists" would send the operator to
-            # remove a store that may hold nothing, when the fix is a grant.
+            # Fail closed, and say why: "the store already holds data" would send the operator to
+            # a new store when the store may hold nothing, and the fix is a grant.
             raise HostCustodyRefused(f"{incomplete}, then run the command again") from incomplete
         except (*store_driver_errors(), *store_connect_errors()) as unread:
             # A table the census listed could not be read, or the server stopped answering
@@ -8823,14 +8823,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 held = "exists" if settings.store.backend is StoreBackend.SQLITE else "holds data"
                 raise HostCustodyRefused(
                     f"the store already {held}, and {missing}. A new key cannot open a store "
-                    "another key made: put back the host blob it was made with. "
-                    f"{keep_the_key_step()}"
+                    f"another key made. {keep_the_key_step()}"
                 ) from missing
             absent, exists = True, None
         except StoreChainNeverStarted as unstarted:
             # A mint that failed before its genesis record kept its key file (PR 2804 hold 2), or
             # the blob here is another store's: the engine cannot tell, so the key is kept.
-            raise HostCustodyRefused(_never_started_refusal(settings.store)) from unstarted
+            raise HostCustodyRefused(_never_started_refusal()) from unstarted
         if host_custody and absent:
             # Checked before the prompts, so a refused or repeated mint asks for nothing. The mint
             # itself, and the recovery key it shows, come last, once nothing else can refuse.

@@ -1210,8 +1210,9 @@ async def test_the_sqlserver_census_refuses_without_view_definition_on_the_schem
 
 
 _CHANGING = re.compile(
-    r"\.aside|\b(?:move|moving|rename|renaming|remove|removing|delete|deleting|overwrite|"
-    r"overwriting)\b",
+    r"\.aside|\bput (?:it |them )?back\b|\brm\b|\boverwritten\b"
+    r"|\b(?:mov|renam|remov|delet|overwrit|replac|eras|wip)(?:e|es|ed|ing)\b"
+    r"|\b(?:drop|unlink)(?:s|ped|ping|ed|ing)?\b",
     re.IGNORECASE,
 )
 
@@ -1234,8 +1235,19 @@ async def _never_started_pin_text(directory: Path) -> str:
 
 def _advises_changing(text: str) -> bool:
     """Whether ``text`` advises moving, renaming, removing, deleting or overwriting something
-    (PR 2804 fifth hold). "could not be removed" reports what failed and advises nothing."""
-    return _CHANGING.search(text) is not None
+    (PR 2804 fifth hold), passive forms included. "could not be removed" reports what failed and
+    advises nothing, so it is the one phrase taken out first."""
+    return _CHANGING.search(text.replace("could not be removed", "")) is not None
+
+
+def test_the_keep_the_key_step_names_the_variable_the_engine_reads() -> None:
+    # The step writes the variable's name as a literal (CodeQL alert 315), so pin it to the
+    # constant the engine reads.
+    from messagefoundry.engine_secrets import SECRETS_DIRECTORY_VARIABLE
+
+    assert f"set {SECRETS_DIRECTORY_VARIABLE} to a new, empty directory" in (
+        custody_host.keep_the_key_step()
+    )
 
 
 @host_file_platforms
@@ -1255,6 +1267,16 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         "store.db.aside, and move master.key to master.key.aside"
     )
     assert _advises_changing(old) and _advises_changing("Remove it before running again")
+    for advice in (
+        "put back the host blob it was made with",
+        "the key file must be deleted first",
+        "replace the host blob",
+        "drop the database",
+        "moving the store aside",
+        "removing the key file",
+    ):
+        assert _advises_changing(advice), advice
+    assert not _advises_changing("the key file could not be removed (Access is denied).")
     # The existing-store refusal: a SQLite store here with no key for it.
     existing = tmp_path / "existing"
     existing.mkdir()
@@ -1273,7 +1295,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         environ={},
     )
     assert foreign is not None
-    texts += [cli._never_started_refusal(settings), foreign]
+    texts += [cli._never_started_refusal(), foreign]
     with pytest.raises(FileExistsError) as exists:
         custody_host.mint_target(settings, service_account=None, enforcing=False, environ={})
     texts.append(str(exists.value))
@@ -1403,7 +1425,7 @@ def test_a_shared_secrets_directory_never_names_another_stores_key_for_removal(
     code = _run_provision_admin(tmp_path, monkeypatch, b_path)
     assert code == 2
     err = capsys.readouterr().err
-    assert not _advises_changing(err) and "leaves that file in place" in err, err
+    assert not _advises_changing(err) and "leaves it in place" in err, err
     assert "MEFOR_SECRETS_DIRECTORY to a new, empty directory" in " ".join(err.split()), err
     assert kept.exists()
     # B's pre-check was refused before its first write, so nothing was bound under A's key.
@@ -1515,10 +1537,8 @@ def test_a_minted_key_is_kept_when_the_pin_refused_after_a_write(
     kept.write_bytes(b"k")
     cli._discard_minted_custody(kept, server, StoreIdPinRefused("after the salt bind"))
     assert kept.exists()
-    # PR 2804 fourth hold, item 2: whether the store holds anything under the key is not proved
-    # here, so the text keeps it and sends the operator to the re-run, which carries on with a
-    # store started under it or names the one way on. This run minted the key, so the text does
-    # not call it possibly another store's.
+    # PR 2804 fourth and fifth holds: whether a store holds anything under the key is not proved
+    # here, so the text keeps it and gives the one way on.
     warning = capsys.readouterr().err
     assert not _advises_changing(warning), warning
     assert str(kept) in warning and custody_host.keep_the_key_step() in warning, warning
