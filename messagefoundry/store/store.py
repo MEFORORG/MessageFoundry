@@ -5418,6 +5418,12 @@ class StoreIdPinRefusedBeforeWrite(StoreIdPinRefused):
     minting command deciding whether to remove the key it minted) asks for this class."""
 
 
+class StoreChainNeverStarted(StoreIdPinRefusedBeforeWrite):
+    """The store's audit chain was never started, and this writable open holds no recovery wrap,
+    which alone may start it. Raised by :func:`check_open_store_pin` before any write. A command
+    that can name the host blob in the way (``provision-admin``, PR 2804) asks for this class."""
+
+
 #: The pin of the store open in progress, set by ``store.base.open_store`` around the backend open
 #: and read by :func:`_load_audit_chain`, which all three backends share. A context variable rather
 #: than a parameter of each backend's open, as the hop posture is held during connector
@@ -5518,8 +5524,12 @@ async def check_open_store_pin(host: AuditRangeHost) -> None:
     if pin is None:
         return
     problem = await _store_pin_refusal(host, await host._audit_genesis_row(), pin, writable=True)
-    if problem is not None:
-        raise StoreIdPinRefusedBeforeWrite(f"refusing to open the store: {problem}")
+    if problem is None:
+        return
+    refused = (
+        StoreChainNeverStarted if problem == _PIN_NEEDS_THE_WRAP else StoreIdPinRefusedBeforeWrite
+    )
+    raise refused(f"refusing to open the store: {problem}")
 
 
 def parse_audit_genesis(detail: object) -> str | None:

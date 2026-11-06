@@ -16081,30 +16081,30 @@ class SqlServerStore:
         of one would run a remote query), each probed for one row through its bracket-quoted,
         schema-qualified name.
 
-        ``sys.tables`` lists only the tables the login holds some permission on. Without
-        ``VIEW DEFINITION`` or ``SELECT`` on that schema (held directly, through a role or from
-        the database) it raises :class:`TableCensusIncomplete` rather than report a census a
-        schema-wide gap may have cut short. What that check does not show is stated on
-        :meth:`Store.table_occupancy`."""
+        ``sys.tables`` lists only the tables the login may see the metadata of. Without
+        ``VIEW DEFINITION`` on that schema (held directly, through a role or from the database) it
+        raises :class:`TableCensusIncomplete` rather than report a census a gap may have cut
+        short. Schema ``SELECT``, which ``db_datareader`` grants, does not stand in for it: under
+        it alone a table-level ``DENY`` of ``SELECT`` hides that table from ``sys.tables``. What
+        the check does not show is stated on :meth:`Store.table_occupancy`."""
         anchor = await self._fetchone(
-            "SELECT a.s, HAS_PERMS_BY_NAME(QUOTENAME(a.s), N'SCHEMA', N'VIEW DEFINITION') AS vd,"
-            " HAS_PERMS_BY_NAME(QUOTENAME(a.s), N'SCHEMA', N'SELECT') AS sel"
+            "SELECT a.s, HAS_PERMS_BY_NAME(QUOTENAME(a.s), N'SCHEMA', N'VIEW DEFINITION') AS vd"
             " FROM (SELECT OBJECT_SCHEMA_NAME(OBJECT_ID(N'schema_meta', N'U')) AS s) AS a"
         )
         if anchor is None or anchor["s"] is None:
             return {}
         store_schema = str(anchor["s"])
-        if anchor["vd"] is None or anchor["sel"] is None:
+        if anchor["vd"] is None:
             raise TableCensusIncomplete(
-                f"SQL Server did not answer whether this login may read schema {store_schema!r},"
+                f"SQL Server did not answer whether this login may view schema {store_schema!r},"
                 " so whether the store holds data cannot be read"
             )
-        if not (anchor["vd"] == 1 or anchor["sel"] == 1):
+        if anchor["vd"] != 1:
             raise TableCensusIncomplete(
-                f"this login holds neither the view definition nor the select permission on schema"
+                f"this login does not hold the view definition permission on schema"
                 f" {store_schema!r}, so SQL Server may hide a table there that holds rows, and"
-                " whether the store holds data cannot be read. Grant this login select on that"
-                " schema (the db_datareader role grants it)"
+                " whether the store holds data cannot be read. Grant this login view definition"
+                " on that schema; select on it, which the db_datareader role grants, is not enough"
             )
         rows = await self._fetchall(
             "SELECT t.name AS t FROM sys.tables t"

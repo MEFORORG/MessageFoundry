@@ -201,9 +201,9 @@ class DbaDelegatedError(RuntimeError):
 
 class TableCensusIncomplete(RuntimeError):
     """:meth:`Store.table_occupancy` could not show that it lists every table in the store's
-    schema: on SQL Server the login holds neither ``VIEW DEFINITION`` nor ``SELECT`` on that
-    schema, so ``sys.tables`` may hide a table that holds rows. The text names the schema and the
-    grant that clears it, never a row."""
+    schema: on SQL Server the login does not hold ``VIEW DEFINITION`` on that schema, or the
+    server did not answer whether it does, so ``sys.tables`` may hide a table that holds rows. The
+    text names the schema and the grant that clears it, never a row."""
 
 
 #: The row a schema build seeds into each table before anything uses the store, as a filter that
@@ -1859,11 +1859,12 @@ class QueueStore(StoreLifecycle, Protocol):
 
         What it cannot see, at least: rows a row-level security policy (Postgres) or a security
         policy filter (SQL Server) hides from this login, which read as empty and raise nothing;
-        and on SQL Server a table the login holds no permission on, or a table-level ``DENY``
-        hides, which ``sys.tables`` does not list. SQL Server alone raises
-        :class:`TableCensusIncomplete` unless the login holds ``VIEW DEFINITION`` or ``SELECT`` on
-        the whole schema, which shows only that no schema-wide gap hides a table, not that no
-        table-level ``DENY`` does; SQLite and Postgres make no such check. A listed table that
+        and on SQL Server a table whose metadata the login may not see, which ``sys.tables`` does
+        not list. SQL Server alone raises :class:`TableCensusIncomplete` unless the login holds
+        ``VIEW DEFINITION`` on the whole schema. That grant lists a table a table-level ``DENY``
+        of ``SELECT`` covers, which then fails its probe; it does not show that no table-level
+        ``DENY`` of ``VIEW DEFINITION``, or of a permission that covers it such as ``CONTROL``,
+        hides one. SQLite and Postgres make no such check. A listed table that
         cannot be read raises the driver's error. Existence only: no cell is read except the two
         plaintext integers a seed filter compares (``global_session_epoch.id`` and ``.epoch``),
         so an open under a throwaway key decrypts nothing (vault BACKLOG #3411)."""

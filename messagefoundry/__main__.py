@@ -8472,6 +8472,31 @@ def _provision_open_refusal(exc: BaseException, store: StoreSettings) -> str:
     return f"{_sentence(codec_safe_str(exc))} {tail}"
 
 
+def _never_started_refusal(store: StoreSettings) -> str:
+    """``provision-admin``'s text when the host blob here opens a store whose audit chain was
+    never started: a mint that failed before its genesis record kept its key file, and only the
+    operator removes it (PR 2804 hold 2). Names the file, and on SQLite the store file too, which
+    the next run would otherwise read as a store another key made. Names paths, never a key."""
+    import os
+
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.store.custody_host import check_host_custody_settings
+
+    paths = check_host_custody_settings(store)
+    present = [str(path) for path in paths if os.path.lexists(path)] or [str(paths[0])]
+    files = " and ".join(present)
+    store_file = (
+        f", and the store file {store.path}" if store.backend is StoreBackend.SQLITE else ""
+    )
+    return (
+        f"the store's audit chain was never started, so the run that minted the store key in "
+        f"{files} stopped before it started the chain. That key file is not removed for you, and "
+        f"no second key is minted over it: remove {files} by hand{store_file}, then run the "
+        "command again. It mints a new key, and the recovery key the earlier run showed is then "
+        "void"
+    )
+
+
 def _sentence(message: object) -> str:
     """``message`` as a sentence ending in one full stop, so a clause can follow it."""
     return str(message).rstrip().rstrip(".") + "."
@@ -8734,7 +8759,11 @@ def _provision_admin(args: argparse.Namespace) -> int:
         that holds no data either, is absent; a chain with a genesis record, or data under an empty
         chain, is a store this mint must not take. Connection and hop
         refusals surface here, before the prompts, as the ordinary pre-check's do."""
-        from messagefoundry.store.base import TableCensusIncomplete, store_driver_errors
+        from messagefoundry.store.base import (
+            TableCensusIncomplete,
+            store_connect_errors,
+            store_driver_errors,
+        )
         from messagefoundry.store.custody import HostBlob, MasterKey, StoreId
         from messagefoundry.store.custody_host import HostCustodyRefused, store_holds_data
         from messagefoundry.store.store import StoreIdPinRefused
@@ -8759,9 +8788,10 @@ def _provision_admin(args: argparse.Namespace) -> int:
             # Fail closed, and say why: "the store already exists" would send the operator to
             # remove a store that may hold nothing, when the fix is a grant.
             raise HostCustodyRefused(f"{incomplete}, then run the command again") from incomplete
-        except store_driver_errors() as unread:
-            # A table the census listed could not be read: fail closed rather than end at the
-            # dispatch floor. The class only: a driver's text can quote a cell value.
+        except (*store_driver_errors(), *store_connect_errors()) as unread:
+            # A table the census listed could not be read, or the server stopped answering
+            # mid-census: fail closed rather than end at the dispatch floor. The class only: a
+            # driver's text can quote a cell value.
             raise HostCustodyRefused(
                 f"whether the store already holds data could not be read ({type(unread).__name__}),"
                 " so no key is minted over it. Check that this login can select every table in the"
@@ -8782,6 +8812,7 @@ def _provision_admin(args: argparse.Namespace) -> int:
         HostCustodyRefused,
         mint_target,
     )
+    from messagefoundry.store.store import StoreChainNeverStarted
 
     host_custody = settings.store.key_provider == HOST_PROVIDER
     if args.service_account is not None and not host_custody:
@@ -8807,6 +8838,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
                     "store to provision a new one"
                 ) from missing
             absent, exists = True, None
+        except StoreChainNeverStarted as unstarted:
+            # A mint that failed before its genesis record kept its key file (PR 2804 hold 2).
+            raise HostCustodyRefused(_never_started_refusal(settings.store)) from unstarted
         if host_custody and absent:
             # Checked before the prompts, so a refused or repeated mint asks for nothing. The mint
             # itself, and the recovery key it shows, come last, once nothing else can refuse.

@@ -1045,8 +1045,9 @@ async def _failed_mint_leftovers(path: Path, tmp_path: Path) -> None:
     ("census", "refusal"),
     [
         ("connection event", "the store already exists"),
-        ("incomplete", "neither the view definition nor the select permission"),
+        ("incomplete", "does not hold the view definition permission"),
         ("unreadable", "could not be read (OperationalError)"),
+        ("unreachable", "could not be read (ConnectionRefusedError)"),
     ],
 )
 def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absent(
@@ -1085,13 +1086,19 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absen
 
     async def _incomplete() -> dict[str, bool]:
         raise base.TableCensusIncomplete(
-            "this login holds neither the view definition nor the select permission on schema 'app' (stand-in)"
+            "this login does not hold the view definition permission on schema 'app' (stand-in)"
         )
+
+    # A driver's text can quote a cell value, so the refusal names the class and never this text.
+    driver_text = "permission denied for table stand_in"
 
     async def _unreadable() -> dict[str, bool]:
         import sqlite3
 
-        raise sqlite3.OperationalError("permission denied for table stand_in")
+        raise sqlite3.OperationalError(driver_text)
+
+    async def _unreachable() -> dict[str, bool]:
+        raise ConnectionRefusedError(driver_text)
 
     async def _open(settings: StoreSettings, **kwargs: object) -> Store:
         if kwargs.get("custody") is not None:  # the server probe, under its throwaway blob
@@ -1103,6 +1110,8 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absen
                 monkeypatch.setattr(store, "table_occupancy", _incomplete)
             elif census == "unreadable":
                 monkeypatch.setattr(store, "table_occupancy", _unreadable)
+            elif census == "unreachable":
+                monkeypatch.setattr(store, "table_occupancy", _unreachable)
             return store
         raise HostCustodyMissing("no host blob and no handoff here (stand-in)")
 
@@ -1114,6 +1123,9 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absen
     )
     secrets = tmp_path / "secrets"
     secrets.mkdir()
+    if sys.platform != "win32":
+        # provision-admin refuses a secrets directory others can read before it reaches the census.
+        secrets.chmod(0o700)
     monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
     # No terminal: a mint that went ahead would stop at the terminal check, not this refusal.
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
@@ -1122,7 +1134,100 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absen
     err = capsys.readouterr().err
     assert probes == [True], err  # the server probe ran, under a read-only open
     assert refusal in err and "Traceback" not in err
+    assert driver_text not in err
     assert list(secrets.iterdir()) == []  # no host blob, no handoff
+
+
+async def _sqlserver_occupancy(
+    monkeypatch: pytest.MonkeyPatch, anchor: dict[str, object] | None
+) -> tuple[dict[str, bool], list[str]]:
+    """``SqlServerStore.table_occupancy`` over a stand-in fetch, with no server: the anchor query
+    answers ``anchor``, the catalog lists ``messages``, and every probe finds no row. Returns the
+    census and each SQL text it sent."""
+    from typing import Any
+
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    store = object.__new__(SqlServerStore)
+    asked: list[str] = []
+
+    async def _fetchall(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        asked.append(sql)
+        if "HAS_PERMS_BY_NAME" in sql:
+            return [] if anchor is None else [dict(anchor)]
+        if "sys.tables" in sql:
+            return [{"t": "messages"}]
+        return []
+
+    monkeypatch.setattr(store, "_fetchall", _fetchall)
+    return await store.table_occupancy(), asked
+
+
+async def test_the_sqlserver_census_reads_a_schema_this_login_may_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control for the two refusals below: view definition alone, with no schema select.
+    occupancy, asked = await _sqlserver_occupancy(monkeypatch, {"s": "app", "vd": 1, "sel": 0})
+    assert occupancy == {"messages": False}
+    assert "N'VIEW DEFINITION'" in asked[0]
+    assert any("FROM [app].[messages]" in sql for sql in asked)
+
+
+async def test_the_sqlserver_census_refuses_when_the_server_does_not_answer_the_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PR 2804 N4, the NULL arm. The text is matched: with the arm gone the grant arm still
+    # refuses, but naming a grant the login may hold.
+    from messagefoundry.store.base import TableCensusIncomplete
+
+    with pytest.raises(TableCensusIncomplete, match="did not answer"):
+        await _sqlserver_occupancy(monkeypatch, {"s": "app", "vd": None, "sel": 1})
+
+
+@pytest.mark.parametrize("schema_select", [0, 1])
+async def test_the_sqlserver_census_refuses_without_view_definition_on_the_schema(
+    monkeypatch: pytest.MonkeyPatch, schema_select: int
+) -> None:
+    # PR 2804 N4, the grant arm, and hold 3: schema select (db_datareader grants it) does not
+    # stand in for view definition, since a table-level DENY of select hides a table from
+    # sys.tables under select alone.
+    from messagefoundry.store.base import TableCensusIncomplete
+
+    with pytest.raises(TableCensusIncomplete, match="does not hold the view definition permission"):
+        await _sqlserver_occupancy(monkeypatch, {"s": "app", "vd": 0, "sel": schema_select})
+
+
+@host_file_platforms
+def test_a_rerun_over_a_chain_never_started_names_the_key_file_to_remove(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # PR 2804 hold 2: a mint that failed before its genesis record keeps its key file, and the
+    # re-run is refused until the operator removes that file by hand. The refusal names it.
+    import asyncio
+
+    from messagefoundry.__main__ import main
+
+    settings = _settings(tmp_path)
+
+    async def _unstarted() -> None:
+        # A store whose chain was never started, made before the key: a keyless open refuses a
+        # directory that holds a host blob.
+        await (await _keyless_store(Path(settings.path))).close()
+
+    asyncio.run(_unstarted())
+    _mint(settings)
+    kept = tmp_path / custody_host.HOST_FILE_NAME
+    assert kept.exists()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text('[store]\nkey_provider = "host"\n')
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    assert main([*argv, "--db", settings.path]) == 2
+    err = capsys.readouterr().err
+    assert f"remove {kept}" in err and "by hand" in err, err
+    assert settings.path in err  # a SQLite store file goes too, or the next run reads it as taken
+    assert "Traceback" not in err
+    assert kept.exists()
 
 
 @host_file_platforms
