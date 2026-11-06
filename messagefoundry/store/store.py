@@ -6830,9 +6830,10 @@ async def _secure_file_async(path: Path) -> None:
 # grants SYSTEM, BUILTIN\Administrators and the run-as account. So where the store's directory is
 # HARDENED like that, every open writes the SAME explicit, protected DACL on the trio: SYSTEM and
 # Administrators full control, and the one run-as account Modify. That account is a per-service
-# virtual account, or one named user account the host resolves (a local user or a gMSA, the
-# -ServiceAccount install; BACKLOG #3760, #2234, owner ruling 2026-11-05). It does not depend on who
-# opens, so the second opener finds it already exact and needs no WRITE_DAC; it is protected, so a
+# virtual account, or one named user account the host resolves (a local user, or a gMSA only if it
+# resolves to a user account, which is unmeasured; the -ServiceAccount install; BACKLOG #3760,
+# #2234, owner ruling 2026-11-05). It does not depend on who opens, so the second opener finds it
+# already exact and needs no WRITE_DAC; it is protected, so a
 # later edit to the directory does not reach the store. Anywhere else -- a developer checkout, a temp
 # directory, a directory admitting anyone else, one reached through a link, or one this code cannot
 # read -- the owner-only rewrite applies exactly as before. Every test below is an ALLOW-list.
@@ -6993,7 +6994,8 @@ def _account_shape_refusal(sid: str) -> str | None:
 
     The owner ruling of 2026-11-05 (BACKLOG #3760, #2234) admits one principal beyond SYSTEM,
     Administrators and a per-service virtual account, and only a user account with a RID of 1000 or
-    more: the account ``install-service.ps1 -ServiceAccount`` grants, such as a local user or a gMSA.
+    more: the account ``install-service.ps1 -ServiceAccount`` grants, such as a local user, or a gMSA
+    only if it resolves to a user account, which is unmeasured.
     The SID must be machine- or domain-relative (``S-1-5-21-...``), the only shape whose last
     sub-authority is a RID. Any alias the SDDL writer emits (``NS``, ``LA``, ``DU``) is not one, so
     it is refused here too. A RID under 1000 is a built-in account or group, refused without a
@@ -7135,11 +7137,17 @@ def _lookup_sid_type(sid: str) -> tuple[int | None, int]:
     A domain account's SID resolves through a domain controller, or through the LSA's lookup cache
     when none answers. ERROR_NONE_MAPPED (1332) does not prove the SID names no account: Windows
     documents that it also follows a network time-out that kept the lookup from finding the name,
-    so a controller that did not answer in time can read as 1332. Other failures report their own
-    status (1722, say). Every failure, 1332 included, is refused, so a domain account that did not
-    resolve gets
-    the owner-only rewrite: fail-closed by design. Nothing is logged here: the status goes into the
-    refusal, which the caller logs once, beside the directory it refused."""
+    so a controller that did not answer in time can read as 1332, and a slow domain controller can
+    send a start down the path below. Other failures report their own status (1722, say).
+
+    On every failure, 1332 included, the run-as grant is refused and the store takes the existing
+    owner-only fallback, :func:`_secure_file` (decision d20261106T140017335-d24848). That adds the
+    opening user's SID with full control to an existing store file, where the opener may rewrite its
+    DACL (``icacls`` fails and a WARNING is logged where it may not), and keeps the file's explicit
+    entries. The ``-wal`` and ``-shm`` files SQLite creates at that start carry no explicit entries,
+    so they are the opener's alone until a later start resolves the account. Nothing is logged
+    here: the status goes into the refusal, which the caller logs once, beside the directory it
+    refused."""
     if sys.platform != "win32":
         return None, 0
     import ctypes

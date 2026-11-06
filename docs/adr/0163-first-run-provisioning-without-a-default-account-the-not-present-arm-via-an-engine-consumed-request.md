@@ -239,6 +239,8 @@ still marked inherited (measured). The explicit, protected DACL closes both.
 Now, in a hardened directory, it grants SYSTEM, the one service account, and `BUILTIN\Administrators`,
 each with exactly the right the installer grants on the directory; a directory granting any other
 right or inheritance shape is not hardened (the parser pins `OICI` with `FA` and `0x1301bf`).
+The 2026-11-05 note widens this further, to one resolved user account; see its *What it widens*
+and *Left open*.
 
 - **Narrowing, the strongest fact.** A UAC-filtered session carries Administrators as a DENY-ONLY
   group, so the Administrators entry grants it nothing. The old rewrite granted the opener's own user
@@ -359,8 +361,9 @@ computer account included if it resolves that way (*Left open*, below):
   note that directory was refused, and the store fell back to the owner-only rewrite.
 - On a directory that already names a run-as, a virtual account or a user, a grant to one more user
   is refused as a second principal, and the store falls back to the owner-only rewrite, as it did
-  before this note for a virtual run-as. That rewrite keeps an existing store file's explicit
-  entries (*Left open*, below), so it does not by itself remove a run-as the trio already named. A
+  before this note for a virtual run-as. That rewrite keeps the explicit entries of a store file
+  that already exists, in practice the main database file (*Left open*, below), so it does not by
+  itself remove a run-as the trio already named there. A
   user is admitted there only when its grant REPLACES the existing run-as grant and SYSTEM or
   Administrators owns the directory.
 
@@ -370,10 +373,17 @@ Tying the admitted SID to the service's configured account was not chosen.
 gMSA is a computer-class object in Active Directory, so it is expected to resolve as `SidTypeUser`;
 if it resolves as anything else, it is refused and the WARNING names the type. A domain account
 resolves through a domain controller or the LSA lookup cache, with no timeout of its own, so a slow
-controller delays the open. A start where neither answers gets the owner-only rewrite: the `-wal` and
-`-shm` that start creates, and a new store, are then the opener's alone until a later start resolves
-the account. An existing store file keeps its explicit entries, because that rewrite replaces only
-the principal it names (measured, above). A computer account (`DOMAIN\HOST$`) is expected to resolve
+controller delays the open. A slow controller can also fail it: Windows documents that
+`ERROR_NONE_MAPPED` (1332) can follow a network time-out, so a controller that did not answer in
+time can read as an account that does not exist. On any lookup failure, 1332 or another status, the
+run-as grant is refused and the store takes the existing owner-only fallback, `_secure_file`
+(decision d20261106T140017335-d24848). It is a fallback, not a refusal to open: the store still
+opens. The fallback adds the opening user's SID with full control to a
+store file that already exists, where the opener may rewrite its DACL, and keeps that file's
+explicit entries, because it replaces only the principal it names (measured, above). In practice
+that file is the main database file. The `-wal` and `-shm` that start creates, and a new store,
+carry no explicit entries, so they are then the opener's alone until a later start resolves the
+account. A row on the fallback's behaviour is to be filed separately. A computer account (`DOMAIN\HOST$`) is expected to resolve
 the same way, and would then be admitted if a directory granted it Modify in the installer's shape;
 unmeasured too. No run has started the service as a named account. The local-user smoke leg is
 still not in the `windows-service-smoke` matrix (BACKLOG #3760 closing step 2, which waits on
