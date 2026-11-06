@@ -789,7 +789,6 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | It reads back the saved Test Bench collections it stored itself, as JSON, in VS Code SecretStorage. It checks each collection's shape and drops a malformed one. The case bodies inside go on to `hl7diff.ts`, in the table above, when a collection is rerun | `collectionStore.ts` |
 | It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
 | It splits what the MessageFoundry command line and git printed into lines, to put a time stamp on each for the "MessageFoundry Checks" output. It reads nothing out of them. | `checksLog.ts` |
-| It writes each line break inside a message for the "MessageFoundry Engine" output as an escape, so one record is one line. It reads nothing out of the message. | `engineLog.ts` |
 
 **Extension files that parse text the patterns cannot see.**
 

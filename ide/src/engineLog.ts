@@ -43,10 +43,15 @@ const out = (): vscode.OutputChannel =>
 /** One record is one line. A message can carry text this extension did not write, such as an
  *  error's message, so a line break in it is written as an escape. Left raw, it would start a line
  *  that carries a real stamp and level word, and reads as a record of its own (CWE-117). */
+const LINE_BREAK_ESCAPES: Readonly<Record<string, string>> = {
+  "\r": "\\r",
+  "\n": "\\n",
+  "\u0085": "\\u0085",
+  "\u2028": "\\u2028",
+  "\u2029": "\\u2029",
+};
 function oneLine(message: string): string {
-  return message.replace(/[\r\n\u0085\u2028\u2029]/g, (c) =>
-    c === "\r" ? "\\r" : c === "\n" ? "\\n" : `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
-  );
+  return message.replace(/[\r\n\u0085\u2028\u2029]/g, (c) => LINE_BREAK_ESCAPES[c] ?? c);
 }
 
 const write = (level: string, message: string): void =>

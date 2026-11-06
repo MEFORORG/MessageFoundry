@@ -7,12 +7,6 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
-- **The IDE's "MessageFoundry Engine" output now carries UTC time stamps the extension sets.**
-  Every line starts with an ISO 8601 UTC instant with milliseconds, then its level word, `INFO`,
-  `WARNING` or `ERROR`, as in `2026-01-02T03:04:05.678Z WARNING ...`. A line break inside a message
-  is written as an escape, so one record is one line. It was a log output channel, which the editor
-  stamped in its own format and zone; it is now a plain output channel, so the editor's log-level
-  filter no longer applies to it. (vault `BACKLOG #2349`)
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
   engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
   other name reached it. Now a variable reaches a hook only if it is one a shell needs to start or

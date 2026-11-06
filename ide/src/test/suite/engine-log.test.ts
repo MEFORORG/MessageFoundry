@@ -142,4 +142,16 @@ channelSuite("engineLog: what reaches the MessageFoundry Engine channel", () => 
     assert.match(written[2], / INFO engine link: unknown /);
     assert.match(written[3], / INFO action: sign in$/);
   });
+
+  test("a probe that got an HTTP error or a transport failure is a WARNING with its status or code", () => {
+    el.logProbe("https://127.0.0.1:8765", "/health", { kind: "httpError", status: 401 } as never, 3, "signed out");
+    el.logProbe("https://127.0.0.1:8765", "/health", { kind: "networkError", code: "ECONNREFUSED" } as never, 4, "down");
+
+    const written = lines();
+    assert.strictEqual(written.length, 2, JSON.stringify(written));
+    assert.strictEqual(STAMPED.exec(written[0])?.[2], "WARNING", written[0]);
+    assert.strictEqual(STAMPED.exec(written[1])?.[2], "WARNING", written[1]);
+    assert.ok(written[0].includes("HTTP 401 (3ms)"), written[0]);
+    assert.ok(written[1].includes("ECONNREFUSED (4ms)"), written[1]);
+  });
 });
