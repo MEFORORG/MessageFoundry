@@ -59,7 +59,7 @@ from messagefoundry.transports.rest import (
     InsecureHopGuard,
     ProxyConfig,
     auth_challenge_refused,
-    is_proxy_tunnel_407,
+    is_refused_proxy_digest_tunnel,
     proxy_config_from_settings,
 )
 from tests._egress_policy import permitting
@@ -266,7 +266,8 @@ class _Challenger:
                     self.send_header(ask, challenge)
                 else:
                     self.send_response(200)
-                    body = b"{}" if self.command != "HEAD" else b""
+                    # A HEAD reply and a CONNECT 200 (a tunnel) carry no body.
+                    body = b"{}" if self.command not in ("HEAD", "CONNECT") else b""
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -617,20 +618,23 @@ def test_the_token_hop_refusal_is_the_same_configuration_fault() -> None:
 
 #: Reserved and unresolvable: the CONNECT names it, and nothing may ever dial it.
 _HTTPS_TOKEN_URL = "https://auth.partner.invalid/token?tenant=SITE-QUERY"
+_HTTPS_TOKEN_LABEL = "OAuth2 token endpoint https://auth.partner.invalid/token"
 
 
-def _token_provider_via(proxy_url: str, *, credential: bool) -> OAuth2ClientCredentialsProvider:
-    """An OAuth2 provider whose https token endpoint is behind ``proxy_url``. The token hop is
-    the shared ``smart._TokenEndpointProvider``, so the SMART provider takes the same path."""
+def _token_provider_via(proxy_url: str, *, auth: str | None) -> OAuth2ClientCredentialsProvider:
+    """An OAuth2 provider whose https token endpoint is behind ``proxy_url``, with no proxy
+    credential, a pre-emptive Basic one, or a Digest one. The token hop is the shared
+    ``smart._TokenEndpointProvider``, so the SMART provider takes the same path. Proxy Digest is
+    refused for an https destination, so the proxy is built for an http one, as it must be."""
     settings: dict[str, object] = {"proxy_url": proxy_url}
-    if credential:
-        settings |= {"proxy_user": "pu", "proxy_password": "pw"}
+    if auth is not None:
+        settings |= {"proxy_user": "pu", "proxy_password": "pw", "proxy_auth_type": auth}
     with active_hop_posture(_WARN_DIAL):
         proxy = proxy_config_from_settings(
             settings,
-            dest_scheme="https",
-            cleartext_accepted=credential,
-            cleartext_reason="loopback test proxy has no TLS" if credential else None,
+            dest_scheme="http" if auth == "digest" else "https",
+            cleartext_accepted=auth is not None,
+            cleartext_reason="loopback test proxy has no TLS" if auth is not None else None,
             connection=None,
         )
     assert isinstance(proxy, ProxyConfig)
@@ -640,69 +644,80 @@ def _token_provider_via(proxy_url: str, *, credential: bool) -> OAuth2ClientCred
 
 
 @pytest.mark.usefixtures("no_bypass")
-@pytest.mark.parametrize(
-    ("challenge", "credential"),
-    [(_SHA256, False), ('Basic realm="proxy"', True)],
-    ids=["digest-unanswerable-over-connect", "basic-credential-rejected"],
-)
-def test_an_https_token_endpoints_proxy_407_is_the_same_configuration_fault(
-    challenge: str, credential: bool
-) -> None:
+def test_an_https_token_endpoints_digest_proxy_407_is_the_same_configuration_fault() -> None:
     """Finding 3, the half engine PR 2280 left open (vault BACKLOG #3532 item 1). An https token
     endpoint is reached through a CONNECT tunnel, and ``http.client`` raises the proxy's 407 to
-    that CONNECT as an ``OSError`` inside a ``URLError``, before any handler sees it. It read as
-    unreachable and was retried, though urllib cannot answer a CONNECT challenge: a retry sends
-    the same CONNECT. Before the fix this raised a plain ``DeliveryError``."""
-    with _Challenger(407, challenge, refuse_answered=True) as proxy:
-        provider = _token_provider_via(proxy.url, credential=credential)
+    that CONNECT as an ``OSError`` inside a ``URLError``, so the proxy Digest handler never sees
+    it and a retry sends the same unanswered CONNECT. Before the fix this was a plain
+    ``DeliveryError``, retried."""
+    with _Challenger(407, _SHA256, refuse_answered=True) as proxy:
+        provider = _token_provider_via(proxy.url, auth="digest")
         with pytest.raises(NegativeAckError) as ei:
             provider.access_token()
     err = ei.value
     assert err.code == AUTH_CHALLENGE_REFUSED_CODE
     assert (err.permanent, err.config_fault) == (True, True)
-    assert (
-        str(err)
-        == f"OAuth2 token endpoint https://auth.partner.invalid/token {AUTH_CHALLENGE_REFUSED}"
-    )
+    assert str(err) == f"{_HTTPS_TOKEN_LABEL} {AUTH_CHALLENGE_REFUSED}"
     cause = err.__cause__
     assert isinstance(cause, urllib.error.URLError)
+    # The text CPython's _tunnel builds, pinned here on a real socket.
     assert str(cause.reason).startswith("Tunnel connection failed: 407 ")
-    # One CONNECT and nothing after it. With a credential, the case is real only if it was sent.
     assert proxy.requests == 1
-    assert [a.split()[0] for a in proxy.answered] == (["Basic"] if credential else [])
+    assert proxy.answered == [], "Digest sends no pre-emptive credential"
 
 
 @pytest.mark.usefixtures("no_bypass")
-@pytest.mark.parametrize("status", [403, 502])
-def test_an_https_token_endpoints_other_tunnel_refusal_still_retries(status: int) -> None:
-    """THE CONTROL: only a 407 is a challenge. A proxy that forbids the target or cannot reach it
-    may relent, so its CONNECT refusal stays the retryable unreachable it was."""
-    with _Challenger(status, 'Basic realm="proxy"') as proxy:
-        provider = _token_provider_via(proxy.url, credential=False)
-        with pytest.raises(
-            DeliveryError, match=f"unreachable: Tunnel connection failed: {status} "
-        ):
+@pytest.mark.parametrize(
+    ("status", "auth"),
+    [(407, None), (407, "basic"), (403, "digest"), (502, "digest")],
+    ids=["407-no-credential", "407-basic-rejected", "403-digest", "502-digest"],
+)
+def test_an_https_token_endpoints_other_tunnel_refusal_still_retries(
+    status: int, auth: str | None
+) -> None:
+    """THE CONTROLS. With no Digest set up, a CONNECT 407 is the plain 407 an http token endpoint
+    also retries (ADR 0095 B.1 keeps a Basic challenge a plain status). Any other CONNECT status
+    is not a challenge."""
+    with _Challenger(status, 'Basic realm="proxy"', refuse_answered=True) as proxy:
+        provider = _token_provider_via(proxy.url, auth=auth)
+        with pytest.raises(DeliveryError) as ei:
             provider.access_token()
+    assert type(ei.value) is DeliveryError
+    assert str(ei.value).startswith(
+        f"{_HTTPS_TOKEN_LABEL} unreachable: Tunnel connection failed: {status} "
+    )
     assert proxy.requests == 1
+    # The Basic case is real only if the credential went out on the CONNECT.
+    assert [a.split()[0] for a in proxy.answered] == (["Basic"] if auth == "basic" else [])
+
+
+_TUNNEL_407 = "Tunnel connection failed: 407 x"
 
 
 @pytest.mark.parametrize(
     "reason",
     [
-        ConnectionRefusedError(10061, "Tunnel connection failed: 407 x"),
-        OSError(113, "Tunnel connection failed: 407 x"),
+        ConnectionResetError(_TUNNEL_407),
+        OSError(113, _TUNNEL_407),
         OSError("Tunnel connection failed: 4070 x"),
-        OSError("tunnel connection failed: 407 x"),
-        "Tunnel connection failed: 407 x",
+        OSError(_TUNNEL_407.lower()),
+        _TUNNEL_407,
     ],
     ids=["oserror-subclass", "errno-pair", "four-digit-status", "case-differs", "string-reason"],
 )
 def test_the_tunnel_407_match_is_the_text_http_client_builds_and_nothing_near_it(
     reason: object,
 ) -> None:
-    """``is_proxy_tunnel_407`` matches ``_tunnel``'s own bare ``OSError`` only. Each near miss here
-    keeps the retry it had. The wire tests above are the positive control."""
-    assert not is_proxy_tunnel_407(urllib.error.URLError(reason))  # type: ignore[arg-type]
+    """The predicate matches ``_tunnel``'s own bare one-argument ``OSError`` only, on an opener
+    with the proxy Digest handler. Each near miss keeps the retry it had."""
+    digest = _token_provider_via("http://127.0.0.1:3128", auth="digest")._opener
+    assert is_refused_proxy_digest_tunnel(digest, urllib.error.URLError(OSError(_TUNNEL_407)))
+    assert not is_refused_proxy_digest_tunnel(digest, urllib.error.URLError(reason))  # type: ignore[arg-type]
+
+
+def test_the_tunnel_407_match_needs_the_proxy_digest_handler() -> None:
+    plain = _token_provider_via("http://127.0.0.1:3128", auth="basic")._opener
+    assert not is_refused_proxy_digest_tunnel(plain, urllib.error.URLError(OSError(_TUNNEL_407)))
 
 
 class _CountingRefuser:

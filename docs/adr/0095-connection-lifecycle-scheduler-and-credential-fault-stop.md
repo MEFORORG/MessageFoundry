@@ -312,8 +312,9 @@ The costs, at least these:
 - The `FhirLookup` read gets the new text and nothing else. A Handler that calls it behind a
   refusing web proxy would still fail each message in turn, as before.
 
-The fault is raised only where a Digest handler is on the opener and refuses, and, since
-2026-11-06, on a web proxy's 407 to an `https://` token endpoint's `CONNECT` (B.1). These unanswered
+The fault is raised only where a Digest handler is on the opener and refuses, or, since
+2026-11-06, where the token hop's proxy Digest handler is on the opener and the proxy's 407 to an
+`https://` token endpoint's `CONNECT` never reaches it (B.1). These unanswered
 challenges do not raise it, at least: a Basic challenge (read as a plain 401 or 407, on purpose;
 see B.1), a 407 on a request that went direct rather than through the proxy (read as a plain 407,
 since BACKLOG #2989), and any challenge on a connection with no Digest set up. A Digest challenge
@@ -328,7 +329,9 @@ fails its build. The send-time refusal still meets one from the environment.*
 
 The probe arms and the `FhirLookup` read are not deliveries, so they carry no fault marker. A probe
 raises a plain `DeliveryError`, and the read raises `FhirLookupError`. Both use the same fixed text.
-The peer's algorithm token and scheme word stay on the cause and never reach `queue.last_error`.
+*Narrowed 2026-11-06: a probe that mints a bearer passes on the token hop's own refusal (B.1),
+which carries the marker; the test-connection route reads it as a `DeliveryError` and shows its
+text.* The peer's algorithm token and scheme word stay on the cause and never reach `queue.last_error`.
 
 Tests: `tests/test_digest_refusal_classification.py`, at least
 `test_post_reports_a_refused_challenge_as_a_configuration_fault`,
@@ -364,16 +367,16 @@ still a `DeliveryError`, so each caller's contract holds. This is narrower than 
 `https://` token endpoint is reached through a `CONNECT` tunnel, and urllib raises the proxy's 407
 there as an `OSError` before any handler sees it, so that case still reads as unreachable and is
 retried. That gap is left open.
-*Closed 2026-11-06 (vault BACKLOG #2989, #3532 item 1): `smart.request_token` now raises the same
-fault for the proxy's 407 to an `https://` token endpoint's `CONNECT`, which
-`rest.is_proxy_tunnel_407` recognises; any other `CONNECT` status still retries.* urllib answers
-no challenge to a `CONNECT`, so every such 407 is one the engine will not answer, a rejected
-pre-emptive Basic credential included: the error carries no challenge to tell them apart. This is
-the only case a real configuration reaches, since an `http://` token endpoint must be a loopback
-host (vault BACKLOG #3533 item 4) and no web proxy carries a loopback hop (vault BACKLOG #2579).
-The delivery hops did not change: an `https://` destination's own `CONNECT` 407 still retries, so
-on a bearer connection with a cached token the lane retries until the token lapses, then stops
-when the re-mint meets the 407.
+*Closed 2026-11-06 (vault BACKLOG #2989, #3532 item 1): where the token hop's web proxy is set up
+for Digest, `smart.request_token` now raises the same fault for the proxy's 407 to an `https://`
+token endpoint's `CONNECT`, which `rest.is_refused_proxy_digest_tunnel` recognises.* The Digest
+handler never sees that 407, so no retry can answer it. A `CONNECT` 407 on a token hop with no
+Digest set up, a rejected pre-emptive Basic credential among them, still reads as unreachable and
+retries, as the plain 407 an `http://` token endpoint meets does; that keeps the Basic case
+above. Any other `CONNECT` status retries too. The case needs a destination written `http://`,
+since proxy Digest is refused for an `https://` one. For the same reason the delivery hops need
+no change: a delivery hop that sends a `CONNECT` has no Digest set up, so its 407 retries as the
+token hop's does there.
 
 **A 407 on a request that went direct is not the proxy's.** The proxy Digest handler answered
 nothing on such a request, but it still screened the challenge, so an NTLM 407 from the origin or
