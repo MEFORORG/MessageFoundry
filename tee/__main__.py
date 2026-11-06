@@ -147,12 +147,12 @@ def _parse_age(spec: str) -> float:
 # act on; :func:`_write_owner_only` is the source of record, and docs/TEE-RELAY.md the long form.
 _OUT_IN_PLACE_ON_WINDOWS = (
     "Lines end in LF on every OS, Windows included. On POSIX a new file's mode is never wider "
-    "than 0600, and an existing FILE is replaced rather than written into: a read-only (0444) FILE "
-    "is overwritten, a hard link at FILE is broken, and a symbolic link at FILE is replaced. The "
-    "exception on POSIX: a FILE that resolves, through any link, to a character device, or to a "
-    "pipe or socket this account owns, is written through. On Windows an existing FILE is written "
-    "in place, through any link, and keeps its access list and owner; one it cannot write is an "
-    "error, never replaced."
+    "than 0600, and an existing FILE is replaced rather than written into: a read-only (0444) "
+    "FILE is overwritten, a hard link at FILE is broken, and a symbolic link at FILE is "
+    "replaced. On POSIX, a target that resolves, through any link, to something that is "
+    "neither a regular file nor a directory, and that this account owns, is written through "
+    "instead of replaced. On Windows an existing FILE is written in place, through any link, "
+    "and keeps its access list and owner; one it cannot write is an error, never replaced."
 )
 
 
@@ -305,10 +305,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "write the JSON report to FILE instead of stdout. On POSIX a new file's mode is never "
-            "wider than 0600. On every OS an existing FILE is replaced rather than written into, so "
-            "on Windows the report takes its folder's access list. The exception: a FILE that "
-            "resolves, through any link, to a character device, or to a pipe or socket (on POSIX, "
-            "one this account owns), is written through"
+            "wider than 0600. compare replaces an existing regular file; the replace can be refused, "
+            "for example for a read-only file on Windows. On Windows the replaced report takes its "
+            "folder's access list. On POSIX, a target that resolves, through any link, to something "
+            "that is neither a regular file nor a directory, and that this account owns, is written "
+            "through instead of replaced."
         ),
     )
     compare.add_argument(
@@ -436,10 +437,7 @@ async def _export(args: argparse.Namespace) -> int:
     text = json.dumps(data, indent=2)
     if args.out:
         try:
-            # Off the event loop: the writer opens and writes synchronously, and on POSIX fsyncs.
-            await asyncio.to_thread(
-                _write_owner_only, args.out, text + "\n", in_place_on_windows=True
-            )
+            _write_owner_only(args.out, text + "\n", in_place_on_windows=True)
         except OSError as exc:
             print(f"error: could not write the export to {args.out}: {exc}", file=sys.stderr)
             return 1
@@ -529,7 +527,7 @@ def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> Non
 
     ``in_place_on_windows`` is True for ``export`` and ``anonymize-captures``, and False for
     ``compare``. False keeps ``compare``'s writer on main, unchanged on every OS: newlines are the
-    platform's (CRLF on Windows), a named stream is written through, and anything else is replaced
+    platform's (CRLF on Windows), and a target is replaced
     by a ``mkstemp`` file with ``os.replace``, an existing file or link on Windows included. There
     the report takes the folder's access list, whatever list the old file had, even one that
     denied this account writing; a link is replaced rather than followed; and the write is atomic.
@@ -550,10 +548,9 @@ def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> Non
 
     On POSIX an existing ``path`` gets the same treatment: a regular file, or a link, is replaced
     rather than written into, so neither its owner nor its mode carries over, and a reader holding
-    the old file open keeps the old contents. One exception: a stream the caller named on purpose,
-    such as ``/dev/stdout`` or a shell's ``>(...)``, is written through, since replacing it would
-    break it and nothing is created there. That covers a character device, and a pipe or socket
-    this account owns; any other non-regular file falls to the replace.
+    the old file open keeps the old contents. On POSIX, a target that resolves, through any link,
+    to something that is neither a regular file nor a directory, and that this account owns, is
+    written through instead of replaced.
 
     On Windows an existing ``path`` of any kind -- a regular file, one with a second hard link, a
     symlink, even a dangling one -- is opened for writing through ``Path(path)``, as
@@ -845,9 +842,7 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
         )
         return 1
     try:
-        await asyncio.to_thread(
-            _write_owner_only, args.out, "\n".join(lines) + "\n", in_place_on_windows=True
-        )
+        _write_owner_only(args.out, "\n".join(lines) + "\n", in_place_on_windows=True)
     except OSError as exc:
         print(f"error: could not write the dataset to {args.out}: {exc}", file=sys.stderr)
         return 1

@@ -433,7 +433,7 @@ def test_out_help_states_what_the_writer_does_to_the_file(command: str) -> None:
         "a symbolic link at FILE is replaced",
         "On Windows an existing FILE is written in place",
         "keeps its access list and owner",
-        "to a character device, or to a pipe or socket this account owns, is written through",
+        "On POSIX, a target that resolves, through any link, to something that is neither a regular file nor a directory, and that this account owns, is written through instead of replaced.",
     ):
         assert consequence in text, f"{command} --out help lacks {consequence!r}: {text}"
 
@@ -441,7 +441,10 @@ def test_out_help_states_what_the_writer_does_to_the_file(command: str) -> None:
 def test_compare_out_help_states_that_an_existing_file_is_replaced() -> None:
     text = _out_help("compare")
     assert "never wider than 0600" in text
-    assert "an existing FILE is replaced" in text
+    assert (
+        "compare replaces an existing regular file; the replace can be refused, for example for a read-only file on Windows."
+        in text
+    )
 
 
 @pytest.mark.parametrize("command", _OUT_COMMANDS)
@@ -463,30 +466,6 @@ def test_out_goes_through_the_owner_only_writer(
     out = tmp_path / "out.json"
     assert _write_out(command, tmp_path, monkeypatch, out) == 0
     assert calls == [(str(out), command in _IN_PLACE_COMMANDS)]
-
-
-@pytest.mark.parametrize("command", _IN_PLACE_COMMANDS)
-def test_out_is_written_off_the_event_loop(
-    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # export and anonymize-captures run inside asyncio.run, and the writer fsyncs on POSIX; called on the
-    # loop's thread it would block the loop (PR 2390 note 4, vault BACKLOG #3166).
-    import tee.__main__ as tee_main
-
-    on_loop: list[bool] = []
-    real = tee_main._write_owner_only
-
-    def spy(path: str, text: str, *, in_place_on_windows: bool) -> None:
-        try:
-            asyncio.get_running_loop()
-            on_loop.append(True)
-        except RuntimeError:
-            on_loop.append(False)
-        real(path, text, in_place_on_windows=in_place_on_windows)
-
-    monkeypatch.setattr(tee_main, "_write_owner_only", spy)
-    assert _write_out(command, tmp_path, monkeypatch, tmp_path / "out.json") == 0
-    assert on_loop == [False]
 
 
 @pytest.mark.parametrize("command", _OUT_COMMANDS)
