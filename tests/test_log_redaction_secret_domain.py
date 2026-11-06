@@ -2521,7 +2521,7 @@ def test_a_placeholder_and_a_line_break_in_a_braced_value_survive() -> None:
         out = apply("MEFOR_X=a;PWD\n=\n{b c} rest")
         assert out.count("\n") == 2, f"{surface}: a line break was lost -- got {ascii(out)}"
     # A record break the log and bundle readers split at is not white space the run-on may cross.
-    for brk in ("\v", "\f", "\x1c", "\x85", " ", " "):
+    for brk in ("\v", "\f", "\x1c", "\x85", "\u2028", "\u2029"):
         assert scrub_credentials(f"token=a;PWD={{pp{brk}ww}}") == f"token=<redacted>{brk}ww}}"
 
 
@@ -2531,6 +2531,57 @@ def test_white_space_after_the_separator_gives_the_old_result_on_both_paths() ->
     for apply in (scrub_credentials, redact_log_line):
         assert apply("token=a;PWD= {b c}").endswith(" {b c}")
         assert apply("token=a{;PWD= {b c}").endswith(" {b c}")
+
+
+#: White space other than a space or a tab, between a braced label's keyword and its separator. The
+#: log and bundle readers split a record at most of these, and the run-on would delete them.
+_BRACED_HEAD_BREAKS = ("\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\u00a0")
+
+
+def _braced_head_line(brk: str) -> str:
+    return f"MEFOR_X=a;PWD{brk}={{pp ww}} rest"
+
+
+def test_a_break_before_the_braced_separator_is_kept() -> None:
+    """A braced label takes only a space or a tab before its ":" or "=", as its first white space in
+    the braces is one, so the run-on never deletes a record break there. Anything else gives the old
+    result, which keeps the character."""
+    for brk in _BRACED_HEAD_BREAKS:
+        for surface, apply in _SWALLOW_SURFACES:
+            out = apply(_braced_head_line(brk))
+            assert brk in out, f"{surface}: {ascii(brk)} was deleted -- got {ascii(out)}"
+
+
+def test_a_break_before_the_braced_separator_is_deleted_by_a_wider_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL. With the braced label's head widened back to any white space but a
+    line feed or carriage return, as it was before, the run-on deletes each break on both copies."""
+    for module in (scrub_mod, redact_mod):
+        head = module._BRACED_HEAD
+        assert "[ \\t]*+[:=]" in head, f"{module.__name__}._BRACED_HEAD lost its space-or-tab gap"
+        wide = head.replace("[ \\t]*+[:=]", "[^\\S\\r\\n]*+[:=]")
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            assert head in pattern.pattern, f"{module.__name__}.{name} has no braced head"
+            monkeypatch.setattr(
+                module, name, re.compile(pattern.pattern.replace(head, wide), pattern.flags)
+            )
+    for brk in _BRACED_HEAD_BREAKS:
+        for surface, apply in (
+            ("scrub_credentials", scrub_credentials),
+            ("bundle", redact_log_line),
+        ):
+            out = apply(_braced_head_line(brk))
+            assert brk not in out, f"{surface}: {ascii(brk)} was kept -- got {ascii(out)}"
+
+
+def test_the_bare_scheme_pass_writes_the_braced_tail_back_masked() -> None:
+    """A bare ``Bearer`` value takes a later braced label too, on the scheme pass's own path, and
+    writes the tail back masked with its closer, on both copies."""
+    line = "retry Bearer abcd.PWD={pp w9} next"
+    assert scrub_credentials(line) == "retry Bearer <redacted> x0} next"
+    assert redact_log_line(line) == f"retry Bearer {REDACTION_PLACEHOLDER} x0}} next"
 
 
 def _braced_check_run(length: int) -> str:
@@ -3025,6 +3076,57 @@ def test_the_open_cascade_defects_still_print(
     into both real modules and run through the real pass order. The same passes are taken out as the
     differential takes out. That replaces a hand-built replay of the passes, which could drift from
     what the modules do. Values are matched as substrings here, not as ``vq`` atoms."""
+    _assert_an_open_defect(case, monkeypatch)
+
+
+#: Each open cascade defect above, one label respelled with a fold character as its first letter, in
+#: the same family: ``secret`` for a credential word, ``session`` for ``token``, and
+#: ``intake_api_key_next`` for a key-material word (BACKLOG #3114). A label spelled this way takes
+#: part in each cascade, and prints what the ASCII spelling of the same keyword prints.
+_OPEN_CASCADE_DEFECTS_FOLD_HEADED: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "cfg password='pw-A1 MEFOR_A=x;\u0131ntake_api_key_next='pk\u00e9-B1 pk-B2'",
+        ("pk\u00e9-B1", "pk-B2"),
+    ),
+    ("cfg \u017fecret='pw-A1 pw-A2;MEFOR_A=x;MEFOR_B='pw-B1'", ("pw-A2",)),
+    ("secret=pw-A0@MEFOR_B_PW=pw-A2;MEFOR_X = 'pw-A4'@x.\u017fecret='pw-A6", ("pw-A6",)),
+    (
+        "connect failed encryption_key=\u017fession=password='hunter2',private_key='abc def=='",
+        ("abc",),
+    ),
+    (
+        'cfg private_key=pass=credential="c1"|\u0131ntake_api_key_next\'=pk-SECRET-9',
+        ("pk-SECRET-9",),
+    ),
+    ("private_key=password='vq0 token=''|\u0130ntake_api_key_next='vq2", ("vq2",)),
+    ("\u017fecret=\",pw-IN-3 MEFOR_A\"=' mv-4'", ("pw-IN-3",)),
+    ("pass='MEFOR_1:\u017fecret'=\"vq4\"'", ("vq4",)),
+)
+
+#: A fold character to the ASCII letter of the keyword it spells.
+_TO_ASCII = str.maketrans({"\u017f": "s", "\u0131": "i", "\u0130": "i", "\u212a": "k"})
+
+
+@pytest.mark.parametrize(
+    "case", _OPEN_CASCADE_DEFECTS_FOLD_HEADED, ids=lambda case: ascii(case[0])[:40]
+)
+def test_the_open_cascade_defects_print_with_a_fold_headed_label(
+    case: tuple[str, tuple[str, ...]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same two sides as the ASCII rows, and each surface prints what it prints on the line
+    spelled in ASCII, letter for letter once the fold character is read as its letter."""
+    line, _atoms = case
+    for surface, apply in _SWALLOW_SURFACES:
+        out = apply(line)
+        assert out.translate(_TO_ASCII) == apply(line.translate(_TO_ASCII)), (
+            f"{surface}: {ascii(line)} reads unlike its ASCII spelling -- got {ascii(out)}"
+        )
+    _assert_an_open_defect(case, monkeypatch)
+
+
+def _assert_an_open_defect(
+    case: tuple[str, tuple[str, ...]], monkeypatch: pytest.MonkeyPatch
+) -> None:
     line, atoms = case
     assert atoms, f"no atoms to look for in {line!r}, so neither side checks anything"
     for surface, apply in _SWALLOW_SURFACES:
@@ -3237,6 +3339,7 @@ def test_a_fold_headed_label_prints_with_the_tokens_unfolded(
             pattern: re.Pattern[str] = getattr(module, name)
             source = pattern.pattern
             assert token in source, f"{module.__name__}.{name} has no fold-character token"
+            source = source.replace(module._FOLD_INSIDE + "|", "")
             source = source.replace(token, "[A-Za-z0-9]++").replace(separator, "[^A-Za-z0-9")
             monkeypatch.setattr(module, name, re.compile(source, pattern.flags))
     surfaces = (
@@ -3288,13 +3391,75 @@ def test_a_fold_headed_label_in_a_quoted_value_is_read_by_the_bundle_run_on() ->
     assert out == f"PWD={REDACTION_PLACEHOLDER} tail", ascii(out)
 
 
+#: A fold character INSIDE a word, glued onto the letters before it, then the rest of a keyword and
+#: a quoted value. In ASCII the walk reads ``b2secret`` as one run and checks the stop only in front
+#: of it, so the value does not stop there. The first fold-character token checked the stop in front
+#: of every fold character, so ``b2<U+017F>ecret=`` stopped where ``b2secret=`` did not.
+_FOLD_INSIDE_LINES = tuple(
+    f"{first}{glue}{char}{rest}='fI1-x fI2-x'{tail}"
+    for char, rest in (
+        ("\u017f", "ecret"),
+        ("\u017f", "ession"),
+        ("\u0131", "ntake_api_key_next"),
+        ("\u0130", "ntake_api_key_next"),
+    )
+    for first in ("MEFOR_A=", "password='pV0 MEFOR_B=", "token=")
+    for glue in ("b2", "b2\u017f")
+    for tail in ("", " z")
+)
+
+
+def _fold_inside_mismatches() -> list[str]:
+    """Each line and surface where the output, its fold characters read as their letters, is not
+    the output of the line spelled in ASCII."""
+    mismatches = []
+    for line in _FOLD_INSIDE_LINES:
+        for surface, apply in (
+            ("scrub_credentials", scrub_credentials),
+            ("bundle", redact_log_line),
+        ):
+            out = apply(line)
+            if out.translate(_TO_ASCII) != apply(line.translate(_TO_ASCII)):
+                mismatches.append(f"{surface}: {ascii(line)} -> {ascii(out)}")
+    return mismatches
+
+
+def test_a_fold_character_inside_a_word_reads_as_its_letter() -> None:
+    """The stop is checked in front of a fold character only where it starts a word, as it is in
+    front of a run of ASCII letters, so each line reads as its ASCII spelling does, on both
+    copies."""
+    mismatches = _fold_inside_mismatches()
+    assert not mismatches, f"{len(mismatches)} lines, first: {mismatches[:3]}"
+
+
+def test_a_fold_character_inside_a_word_stops_without_the_lookbehind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL. With the token checked in front of every fold character again, as it
+    was before, some line stops inside a word where its ASCII spelling does not."""
+    for module in (scrub_mod, redact_mod):
+        bare = "[" + module._WALK_FOLD_CHARS + "]"
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            source = pattern.pattern
+            assert module._FOLD_INSIDE + "|" in source, f"{module.__name__}.{name} lost it"
+            source = source.replace(module._FOLD_INSIDE + "|", "").replace(module._FOLD_HEAD, bare)
+            monkeypatch.setattr(module, name, re.compile(source, pattern.flags))
+    assert _fold_inside_mismatches(), "every line read as its ASCII spelling without the lookbehind"
+
+
 def test_the_walk_fold_characters_are_every_measured_fold() -> None:
     """Both copies' fold-character token holds exactly the characters this interpreter's
-    case-insensitive matching reads as an ASCII letter."""
+    case-insensitive matching reads as an ASCII letter, checked at the start of a word and taken
+    unchecked inside one."""
     measured = set(_measured_letter_folds())
     for module in (scrub_mod, redact_mod):
-        assert set(module._WALK_FOLD_CHARS) == measured, module.__name__
-        assert module._FOLD_HEAD == "[" + module._WALK_FOLD_CHARS + "]", module.__name__
+        chars = module._WALK_FOLD_CHARS
+        assert set(chars) == measured, module.__name__
+        word = "[A-Za-z0-9" + chars + "]"
+        head, inside = module._FOLD_HEAD, module._FOLD_INSIDE
+        assert head == f"(?<!{word})[{chars}]", module.__name__
+        assert inside == f"(?<={word})[{chars}]", module.__name__
 
 
 def test_both_copies_of_each_stopped_pattern_agree() -> None:

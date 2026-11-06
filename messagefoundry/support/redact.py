@@ -162,9 +162,7 @@ _RUN_ON_LABEL = (
 # ``MEFOR_X=a;PWD={pp ww}`` no longer prints " ww}". Why the closer stays, why those conditions on
 # the braces and the label are what keep it from printing a value, and why the scan stays linear, are
 # stated once, on the same fragments in ``messagefoundry/secretscrub.py``.
-_BRACED_HEAD = (
-    r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[^\S\r\n]*+[:=]"
-)
+_BRACED_HEAD = r"\b(?=(?i:[cps]))(?i:pass(?:word|wd|phrase)?|pwd|secret|credential)\b[ \t]*+[:=]"
 _SPACED_BRACED_HEAD = r"\{(?:[^{}'\"\s;,&]|\}\})*+"
 _SPACED_BRACED_TAIL = (
     r"[ \t](?:[^{}'\"%;,&\r\n\v\f\x1c-\x1eA-Za-z0-9\x80-\U0010ffff]|\}\}"
@@ -197,11 +195,13 @@ _NOT_BEFORE_QUOTED_LABEL = (
 )
 
 
-# The four characters outside ASCII that case-insensitive matching reads as an ASCII letter, and
-# the one-character token the walks take each as (BACKLOG #3114). Why, on the same constants in
-# ``messagefoundry/secretscrub.py``; spelled out here so the regex scanner can resolve this copy.
+# The four characters outside ASCII that case-insensitive matching reads as an ASCII letter, and the
+# one-character tokens the walks take each as: checked where it starts a word, unchecked inside one
+# (BACKLOG #3114). Why, on the same constants in ``messagefoundry/secretscrub.py``; spelled out here
+# so the regex scanner can resolve this copy.
 _WALK_FOLD_CHARS = "\u0130\u0131\u017f\u212a"
-_FOLD_HEAD = "[\u0130\u0131\u017f\u212a]"
+_FOLD_HEAD = "(?<![A-Za-z0-9\u0130\u0131\u017f\u212a])[\u0130\u0131\u017f\u212a]"
+_FOLD_INSIDE = "(?<=[A-Za-z0-9\u0130\u0131\u017f\u212a])[\u0130\u0131\u017f\u212a]"
 
 # ``_CREDENTIAL_KV``'s quoted value: the plain quoted form, except where the quote that would close it
 # opens a later label's value. There it takes that label and its value too, through the value's own
@@ -213,7 +213,9 @@ _FOLD_HEAD = "[\u0130\u0131\u017f\u212a]"
 _SQ_RUN_ON_WALK = (
     r"(?:[^'\r\nA-Za-z0-9"
     + _WALK_FOLD_CHARS
-    + r"]|(?!"
+    + r"]|"
+    + _FOLD_INSIDE
+    + r"|(?!"
     + _RUN_ON_LABEL
     + r"')"
     + r"(?:[A-Za-z0-9]++|"
@@ -223,7 +225,9 @@ _SQ_RUN_ON_WALK = (
 _DQ_RUN_ON_WALK = (
     r"(?:[^\"\r\nA-Za-z0-9"
     + _WALK_FOLD_CHARS
-    + r"]|(?!"
+    + r"]|"
+    + _FOLD_INSIDE
+    + r"|(?!"
     + _RUN_ON_LABEL
     + r"\")"
     + r"(?:[A-Za-z0-9]++|"
@@ -266,26 +270,26 @@ _KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL
 _SCHEME_TERMINATORS = r"\s'\",;"  # _AUTH_SCHEME
 _PLAIN_VALUE = (
     rf"['\"]?(?:[^{_PLAIN_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_PLAIN_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_PLAIN_TERMINATORS}])*+"
+    rf"|(?:(?:{_FOLD_INSIDE}|{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_PLAIN_TERMINATORS}])"
+    rf"(?:{_FOLD_INSIDE}|{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_PLAIN_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KV_VALUE = (
     rf"['\"]?(?:[^{_KV_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KV_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KV_TERMINATORS}])*+"
+    rf"|(?:(?:{_FOLD_INSIDE}|{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KV_TERMINATORS}])"
+    rf"(?:{_FOLD_INSIDE}|{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KV_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KEY_VALUE = (
     rf"['\"]?(?:[^{_KEY_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KEY_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KEY_TERMINATORS}])*+"
+    rf"|(?:(?:{_FOLD_INSIDE}|{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KEY_TERMINATORS}])"
+    rf"(?:{_FOLD_INSIDE}|{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KEY_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_SCHEME_VALUE = (
     rf"['\"]?(?:[^{_SCHEME_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_SCHEME_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_SCHEME_TERMINATORS}])*+"
+    rf"|(?:(?:{_FOLD_INSIDE}|{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_SCHEME_TERMINATORS}])"
+    rf"(?:{_FOLD_INSIDE}|{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_SCHEME_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 

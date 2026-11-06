@@ -403,19 +403,30 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # and the pass cannot resume there. A label of a later family is caught, because it sees the keyword
 # right after the placeholder.
 #
-# A KEYWORD SPELLED WITH A FOLD CHARACTER AS ITS FIRST LETTER IS CHECKED TOO (BACKLOG #3114), such as
-# U+017F in ``secret`` or U+0130 and U+0131 in ``intake_api_key_next``. Where a pattern does not fold
-# globally, ``_MEFOR_SECRET`` here and in ``support/redact.py`` every stopped pattern but
+# A KEYWORD SPELLED WITH A FOLD CHARACTER AS ITS FIRST LETTER IS CHECKED TOO (BACKLOG #3114), such
+# as U+017F in ``secret`` or U+0130 and U+0131 in ``intake_api_key_next``. Where a pattern does not
+# fold globally, ``_MEFOR_SECRET`` here and in ``support/redact.py`` every stopped pattern but
 # ``_AUTH_SCHEME``, the walk read that character as a separator and checked the stop only from the
-# next run, so ``MEFOR_X=a;<U+017F>ecret='v w'`` printed "v w'" on both copies. The walk now takes each
-# of the four characters in :data:`_WALK_FOLD_CHARS` as a token of its own and checks the stop in front
-# of it, and still checks the run after it. FOLDING THE RUN CLASS INSTEAD WAS BUILT FIRST AND PRINTED
-# VALUES the old walk hid: it joined a fold character onto the run before it, so the run after it was
-# no longer checked, and ``MEFOR_X=b2<U+017F>token='c3 d4'`` printed "c3 d4'", U+212A included.
-# Folding the stop as well let its underscored-prefix branch read a run holding a fold character as a
-# later label's prefix: in ``MEFOR_B_PW=a:b_<U+0130>_passwd: "c d"`` the "b" printed. The stop keeps
-# its own pattern's fold. A label spelled this way now reads as its ASCII spelling does, so it also
-# takes part in the cascade shapes pinned under OPEN DEFECTS; those print as the ASCII line does.
+# next run, so ``MEFOR_X=a;<U+017F>ecret='v w'`` printed "v w'" on both copies. The walk now takes
+# each of the four characters in :data:`_WALK_FOLD_CHARS` that STARTS A WORD, with no letter, digit
+# or fold character before it, as a token of its own, and checks the stop in front of it as it does
+# in front of a run. One INSIDE a word it takes unchecked, as part of that word: a first form
+# checked it there too, so ``b2<U+017F>ecret=`` stopped a value where ``b2secret=`` does not. Either
+# way the run after it is still checked, as it was while the character read as a separator, so
+# ``MEFOR_X=b2<U+017F>token=`` stops in front of ``token``, and ``MEFOR_X=b2stoken=`` does not stop
+# at all. FOLDING THE RUN CLASS INSTEAD WAS BUILT FIRST AND PRINTED VALUES the old walk hid: it
+# joined a fold character onto the run before it, so the run after it was no longer checked, and
+# ``MEFOR_X=b2<U+017F>token='c3 d4'`` printed "c3 d4'", U+212A included. Folding the stop as well
+# let its underscored-prefix branch read a run holding a fold character as a later label's prefix:
+# in ``MEFOR_B_PW=a:b_<U+0130>_passwd: "c d"`` the "b" printed. The stop keeps its own pattern's
+# fold.
+#
+# SO A LINE HOLDING A FOLD CHARACTER DOES NOT IN GENERAL READ AS ITS ASCII SPELLING: the keyword
+# glued on behind one, above, is checked where the ASCII run is not. What was measured is narrower.
+# A label whose FIRST letter is a fold character takes part in the cascade shapes under OPEN DEFECTS
+# as the ASCII label does, and prints there what the ASCII spelling prints; a fold-headed spelling
+# of each shape is pinned beside the ASCII one. A shape grid and seeded random lines found no other
+# line where such a label printed a value its ASCII spelling hid. That is a sample, not a proof.
 #
 # AND ONE DELIBERATE TRADE, which is the one place a single pass prints text the old class hid. After a
 # hard separator, an underscored run in front of a keyword is read as the later label's prefix, so in
@@ -611,22 +622,23 @@ _RUN_ON_LABEL = (
 #   latest, so walks started by two labels cannot overlap, and a line of unclosed ``PWD={`` labels costs
 #   one walk per label, not one per pair.
 #
-# AND WHAT THE LABEL MUST BE: a credential word, with a ``\b`` in front of it, no quote after it, and
-# the "{" right after its ":" or "=", with no line break before them. A line break, because the
-# run-on would otherwise delete it and join the lines of a multi-line record. White space after the
-# separator, because the fast path below ends a run there and never checks the stop, so with it the
-# two paths disagreed and ``token=a;PWD= {b c}`` printed or not by whether a "{" came earlier in the
-# value; that shape now prints as it did before, on both paths.
-# The ``\b``, because a keyword glued on by "_", as in ``x-client_secret={a b}``, is one no pass can
-# resume at, and stopping there printed the whole braced value. No underscored prefix after a hard
-# separator, unlike the quoted stop, because in ``x_pwd: a:b_pwd={c d}`` that prints "b", which the
-# old class hid. No quote, because in ``PWD'='a:b|MEFOR_Y={c;d}:pwd'={e f}'`` the quote the old class
-# ate was the one an earlier quoted value would otherwise close on. Each of those shapes still prints
-# the braced value's tail, as it did before; that is a residual. Whatever the conditions refuse gets
-# the old behaviour.
+# AND WHAT THE LABEL MUST BE: a credential word, with a ``\b`` in front of it, no quote after it,
+# and the "{" right after its ":" or "=", with nothing but spaces and tabs before them. Not a line
+# break, nor any of the record breaks listed above or other white space, because the run-on deletes
+# what is between the keyword and the "{": a line break would join the lines of a multi-line record,
+# and ``PWD<U+2028>={pp ww}`` lost its U+2028. White space after the separator, because the fast
+# path below ends a run there and never checks the stop, so with it the two paths disagreed and
+# ``token=a;PWD= {b c}`` printed or not by whether a "{" came earlier in the value; that shape now
+# prints as it did before, on both paths. The ``\b``, because a keyword glued on by "_", as in
+# ``x-client_secret={a b}``, is one no pass can resume at, and stopping there printed the whole
+# braced value. No underscored prefix after a hard separator, unlike the quoted stop, because in
+# ``x_pwd: a:b_pwd={c d}`` that prints "b", which the old class hid. No quote, because in
+# ``PWD'='a:b|MEFOR_Y={c;d}:pwd'={e f}'`` the quote the old class ate was the one an earlier quoted
+# value would otherwise close on. Each of those shapes still prints the braced value's tail, as it
+# did before; that is a residual. Whatever the conditions refuse gets the old behaviour.
 _BRACED_HEAD = (
     r"\b(?=(?i:[" + "".join(sorted({word[0] for word in _CREDENTIAL_WORDS})) + r"]))"
-    r"(?i:" + _alternation(_CREDENTIAL_WORDS) + r")\b[^\S\r\n]*+[:=]"
+    r"(?i:" + _alternation(_CREDENTIAL_WORDS) + r")\b[ \t]*+[:=]"
 )
 #: The braced value up to its first white space, then the rest up to its closer. :data:`_BRACED_LABEL`
 #: adds the closer and its guard, and is what the stop checks for; :data:`_BRACED_RUN_ON` is what the
@@ -671,20 +683,27 @@ _NOT_BEFORE_QUOTED_LABEL = (
 #: U+0130, U+0131, U+017F and U+212A, the set :data:`_GATE_FOLDS` measures (BACKLOG #3114). In a
 #: pattern compiled without a global fold, a value walk read such a character as a separator and
 #: checked the stop only from the next run, so a keyword it headed was never checked. The walks take
-#: each one as a token of its own, with the stop checked in front of it, and still check the run after
-#: it. In a pattern that folds globally the walk's run class already holds these characters, so that
-#: branch is never reached there and the walk is the one it was. Built with ``chr()`` so no encoding
-#: layer between here and disk can change a character. The support bundle restates both as literals,
-#: so the regex scanner can read its copy; a test holds both copies to the measured set.
+#: each one as a token of its own: :data:`_FOLD_HEAD`, with the stop checked in front of it, where
+#: it starts a word, and :data:`_FOLD_INSIDE`, unchecked, inside one. They still check the run after
+#: it. :data:`_LABEL_HEAD` and :data:`_RUN_ON_LABEL` have no ``\b`` in front of a keyword, so the
+#: lookbehinds are what keep the stop from firing inside a word. In a pattern that folds globally
+#: the walk's run class already holds these characters, so those branches are never reached there
+#: and the walk is the one it was. Built with ``chr()`` so no encoding layer between here and disk
+#: can change a character. The support bundle restates both as literals, so the regex scanner can
+#: read its copy; a test holds both copies to the measured set.
 _WALK_FOLD_CHARS = "".join(map(chr, (0x0130, 0x0131, 0x017F, 0x212A)))
-_FOLD_HEAD = "[" + _WALK_FOLD_CHARS + "]"
+_FOLD_CLASS = "[" + _WALK_FOLD_CHARS + "]"
+_FOLD_HEAD = "(?<![A-Za-z0-9" + _WALK_FOLD_CHARS + "])" + _FOLD_CLASS
+_FOLD_INSIDE = "(?<=[A-Za-z0-9" + _WALK_FOLD_CHARS + "])" + _FOLD_CLASS
 
 
 #: The outer walk: up to the next quote of one kind, or to a label whose value opens with one.
 _SQ_RUN_ON_WALK = (
     r"(?:[^'\r\nA-Za-z0-9"
     + _WALK_FOLD_CHARS
-    + r"]|(?!"
+    + r"]|"
+    + _FOLD_INSIDE
+    + r"|(?!"
     + _RUN_ON_LABEL
     + r"')"
     + r"(?:[A-Za-z0-9]++|"
@@ -694,7 +713,9 @@ _SQ_RUN_ON_WALK = (
 _DQ_RUN_ON_WALK = (
     r"(?:[^\"\r\nA-Za-z0-9"
     + _WALK_FOLD_CHARS
-    + r"]|(?!"
+    + r"]|"
+    + _FOLD_INSIDE
+    + r"|(?!"
     + _RUN_ON_LABEL
     + r"\")"
     + r"(?:[A-Za-z0-9]++|"
@@ -784,26 +805,26 @@ _KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL
 _SCHEME_TERMINATORS = r"\s'\",;"  # _AUTH_SCHEME
 _PLAIN_VALUE = (
     rf"['\"]?(?:[^{_PLAIN_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_PLAIN_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_PLAIN_TERMINATORS}])*+"
+    rf"|(?:(?:{_FOLD_INSIDE}|{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_PLAIN_TERMINATORS}])"
+    rf"(?:{_FOLD_INSIDE}|{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_PLAIN_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KV_VALUE = (
     rf"['\"]?(?:[^{_KV_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KV_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KV_TERMINATORS}])*+"
+    rf"|(?:(?:{_FOLD_INSIDE}|{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KV_TERMINATORS}])"
+    rf"(?:{_FOLD_INSIDE}|{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KV_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KEY_VALUE = (
     rf"['\"]?(?:[^{_KEY_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KEY_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KEY_TERMINATORS}])*+"
+    rf"|(?:(?:{_FOLD_INSIDE}|{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KEY_TERMINATORS}])"
+    rf"(?:{_FOLD_INSIDE}|{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_KEY_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_SCHEME_VALUE = (
     rf"['\"]?(?:[^{_SCHEME_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_SCHEME_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_SCHEME_TERMINATORS}])*+"
+    rf"|(?:(?:{_FOLD_INSIDE}|{_NOT_AT_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_SCHEME_TERMINATORS}])"
+    rf"(?:{_FOLD_INSIDE}|{_NOT_BEFORE_QUOTED_LABEL}(?:[A-Za-z0-9]++|{_FOLD_HEAD})|[^A-Za-z0-9{_WALK_FOLD_CHARS}{_SCHEME_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 
