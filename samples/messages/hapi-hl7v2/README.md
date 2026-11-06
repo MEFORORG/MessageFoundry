@@ -31,7 +31,7 @@ shipping it unchanged is incompatible with this project's synthetic-data-only ru
 ([`CLAUDE.md`](../../../CLAUDE.md) §9), so every identifier was replaced.
 
 **How.** Scrubbed with the project's own de-identification framework
-([`messagefoundry/anon/`](../../../messagefoundry/anon/), ADR 0030) — the same deterministic,
+([`messagefoundry_toolkit/anon/`](../../../messagefoundry_toolkit/anon/), ADR 0030) — the same deterministic,
 salt-keyed surrogate machinery the tee relay and test harness use — over `DEFAULT_RULES` plus a
 rule overlay for the fields this corpus uses that the default map does not cover: `GT1-8/16/17/18`,
 `IN1-4/5/6/7/11/18/44`, `OBR-35`, and the non-standard `DST` segment (`DST-2/7/9/27/35`), which
