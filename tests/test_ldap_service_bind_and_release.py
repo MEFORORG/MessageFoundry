@@ -22,7 +22,9 @@ Synthetic data only; nothing here touches PHI.
 from __future__ import annotations
 
 import ast
+import functools
 import inspect
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -178,7 +180,7 @@ async def test_the_audit_row_never_carries_the_directory_addresses(
     _faulting(monkeypatch, at="open", fault=_socket_open_error())
     rows = await _kerberos_sign_in(monkeypatch)
     assert len(rows) == 1, rows
-    assert "ldap3 raised LDAPSocketOpenError" in rows[0]
+    assert '"cause": "ldap3.core.exceptions.LDAPSocketOpenError"' in rows[0], rows[0]
     assert "10.20.30.40" not in rows[0] and "synthetic-leak" not in rows[0], rows[0]
 
 
@@ -419,7 +421,7 @@ async def test_a_kerberos_sign_in_audits_an_unexpected_fault_as_a_login_error(
     _faulting(monkeypatch, at="search", fault=TypeError("CN=synthetic-leak-3017"))
     with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
         rows = await _kerberos_sign_in(monkeypatch)
-    assert len(rows) == 1 and "directory call failed: unexpected TypeError" in rows[0], rows
+    assert len(rows) == 1 and '"cause": "TypeError"' in rows[0], rows
     assert "synthetic-leak" not in rows[0]
     warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("resolve_principal raised TypeError" in m for m in warned), warned
@@ -454,6 +456,30 @@ async def test_ask_directory_passes_an_ldap_error_through_unchanged() -> None:
     assert err.value is raised
 
 
+async def test_ask_directory_names_an_engine_defect_at_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #3017 L6. A fault raised in engine code still fails closed as an ``LdapError``, but
+    is logged at ERROR as an engine defect, naming the frame and no text, where a library's fault
+    stays at WARNING. ``_escape_filter(None)`` raises inside ``auth/ldap.py``; ``json.loads``
+    raises inside the standard library."""
+    engine_fault = functools.partial(ldap_module._escape_filter, None)
+    library_fault = functools.partial(json.loads, "{synthetic-leak-3017")
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.auth.service"):
+        with pytest.raises(LdapError, match="^directory call failed: unexpected TypeError$"):
+            await service_module._ask_directory(engine_fault)
+        with pytest.raises(LdapError, match="^directory call failed: unexpected JSONDecodeError$"):
+            await service_module._ask_directory(library_fault)
+    lines = [(r.levelno, r.getMessage()) for r in caplog.records]
+    assert len(lines) == 2, lines
+    (engine_level, engine_line), (library_level, library_line) = lines
+    assert engine_level == logging.ERROR
+    assert "raised TypeError in engine code at messagefoundry.auth.ldap:" in engine_line
+    assert "in _escape_filter; an engine defect" in engine_line
+    assert library_level == logging.WARNING and "engine" not in library_line
+    assert not any("synthetic-leak" in m or "NoneType" in m for _l, m in lines), lines
+
+
 #: The callers of the authenticator that keep their own reading of a fault, and why.
 _OWN_FAULT_READING = {
     # Reads any other fault as a probe fault, which alerts (BACKLOG #3100).
@@ -461,28 +487,86 @@ _OWN_FAULT_READING = {
 }
 
 
-def test_every_sign_in_and_step_up_leg_asks_the_directory_through_the_mapper() -> None:
-    """A new ``asyncio.to_thread(self._ldap.<call>, ...)`` would bring back the unmapped fault."""
-    tree = ast.parse(Path(inspect.getfile(service_module)).read_text(encoding="utf-8"))
-    direct: set[str] = set()
+def _uses_of_the_authenticator(source: str) -> tuple[set[str], set[str], list[str]]:
+    """Every read of an ``_ldap`` attribute in ``source``, sorted three ways: the functions that
+    hand one of its methods to ``_ask_directory``, those that hand one to ``asyncio.to_thread``
+    directly, and every other read, which is a stray.
+
+    BACKLOG #3017 L7. The guard this replaced matched only the literal shape
+    ``to_thread(self._ldap.X, ...)``. A method called on the event loop, an alias
+    (``ldap = self._ldap``), a ``getattr`` or a ``partial`` passed it. Here only a comparison
+    (``self._ldap is None``) and an assignment to the attribute are not reads of the authenticator.
+    """
+    tree = ast.parse(source)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    def enclosing(node: ast.AST) -> str:
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                return node.name
+        return "<module>"
+
     mapped: set[str] = set()
-    for func in ast.walk(tree):
-        if not isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef):
+    direct: set[str] = set()
+    stray: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Attribute) and node.attr == "_ldap"):
             continue
-        for node in ast.walk(func):
-            if not (isinstance(node, ast.Call) and node.args):
-                continue
-            target = node.args[0]
-            if not (
-                isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Attribute)
-                and target.value.attr == "_ldap"
-            ):
-                continue
-            if isinstance(node.func, ast.Name) and node.func.id == "_ask_directory":
-                mapped.add(func.name)
-            elif isinstance(node.func, ast.Attribute) and node.func.attr == "to_thread":
-                direct.add(func.name)
+        parent = parents[node]
+        if isinstance(parent, ast.Compare):
+            continue
+        if isinstance(parent, ast.Assign | ast.AnnAssign) and node is not parent.value:
+            continue
+        if isinstance(parent, ast.Attribute):
+            call = parents.get(parent)
+            if isinstance(call, ast.Call) and call.args and call.args[0] is parent:
+                if isinstance(call.func, ast.Name) and call.func.id == "_ask_directory":
+                    mapped.add(enclosing(node))
+                    continue
+                if isinstance(call.func, ast.Attribute) and call.func.attr == "to_thread":
+                    direct.add(enclosing(node))
+                    continue
+        stray.append(f"line {node.lineno} in {enclosing(node)}: {ast.unparse(parent)}")
+    return mapped, direct, stray
+
+
+def test_the_authenticator_guard_catches_each_shape_the_literal_match_missed() -> None:
+    """The control for the guard below: each planted shape is a stray, and the two allowed shapes
+    are sorted as allowed."""
+    planted = (
+        "async def ok(self):\n"
+        "    if self._ldap is None:\n"
+        "        return\n"
+        "    await _ask_directory(self._ldap.resolve_principal, 'a')\n"
+        "async def raw(self):\n"
+        "    await asyncio.to_thread(self._ldap.probe_principal, 'a')\n"
+        "async def on_the_loop(self):\n"
+        "    self._ldap.authenticate('a', 'b')\n"
+        "async def alias(self):\n"
+        "    ldap = self._ldap\n"
+        "    await asyncio.to_thread(ldap.authenticate, 'a', 'b')\n"
+        "async def by_name(self):\n"
+        "    await asyncio.to_thread(getattr(self._ldap, 'authenticate'), 'a', 'b')\n"
+        "async def bound_later(self):\n"
+        "    await _ask_directory(partial(self._ldap.authenticate, 'a'), 'b')\n"
+    )
+    mapped, direct, stray = _uses_of_the_authenticator(planted)
+    assert mapped == {"ok"} and direct == {"raw"}
+    assert sorted(line.split(" in ")[1].split(":")[0] for line in stray) == [
+        "alias",
+        "bound_later",
+        "by_name",
+        "on_the_loop",
+    ], stray
+
+
+def test_every_sign_in_and_step_up_leg_asks_the_directory_through_the_mapper() -> None:
+    """A new ``asyncio.to_thread(self._ldap.<call>, ...)``, or any other way to reach the
+    authenticator, would bring back the unmapped fault."""
+    source = Path(inspect.getfile(service_module)).read_text(encoding="utf-8")
+    mapped, direct, stray = _uses_of_the_authenticator(source)
+    assert stray == []
     assert direct == _OWN_FAULT_READING, direct
     assert {
         "_authenticate_kerberos",

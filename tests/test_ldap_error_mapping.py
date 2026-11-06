@@ -271,7 +271,8 @@ async def test_a_socket_fault_on_a_kerberos_sign_in_is_audited_as_a_login_error(
 
         assert not out.ok
         rows = [str(dict(r)["detail"]) for r in await store.list_audit(action="auth.login_error")]
-        assert len(rows) == 1 and f"AD directory call failed: {name}" in rows[0], rows
+        assert len(rows) == 1 and f'"cause": "{name}"' in rows[0], rows
+        assert '"error": "LdapError"' in rows[0], rows
         assert _LEAK not in rows[0]
         assert await store.list_audit(action="auth.login_success") == []
     finally:

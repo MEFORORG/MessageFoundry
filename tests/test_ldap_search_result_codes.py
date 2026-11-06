@@ -1321,7 +1321,8 @@ def test_real_ldap3_refuses_a_page_read_that_waits_out_the_deadline(
 async def test_a_busy_kerberos_sign_in_is_audited_as_a_login_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Closing item 2. The row names the code and never the directory's text."""
+    """Closing item 2. The row names the refusal's type and never the directory's text; since
+    BACKLOG #3196 it holds no error text at all."""
 
     async def no_sleep(_deadline: float) -> None:
         return None
@@ -1339,7 +1340,15 @@ async def test_a_busy_kerberos_sign_in_is_audited_as_a_login_error(
 
         assert not out.ok
         rows = [str(dict(r)["detail"]) for r in await store.list_audit(action="auth.login_error")]
-        assert len(rows) == 1 and "result code 51 (busy)" in rows[0], rows
+        assert len(rows) == 1, rows
+        # The type, never the refusal's text (BACKLOG #3196); the code is in the WARNING the
+        # refusal logs once (_unanswered).
+        assert json.loads(rows[0]) == {
+            "provider": "ad",
+            "mech": "kerberos",
+            "reason": "directory_unavailable",
+            "error": "LdapUnansweredError",
+        }
         assert _LEAK not in rows[0]
         assert await store.list_audit(action="auth.login_success") == []
     finally:

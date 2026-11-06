@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import json
 import socket
 import threading
 from collections.abc import Iterator
@@ -270,7 +271,15 @@ async def test_a_referred_kerberos_sign_in_is_audited_as_a_login_error(
 
         assert not out.ok
         rows = [str(dict(r)["detail"]) for r in await store.list_audit(action="auth.login_error")]
-        assert len(rows) == 1 and "referral" in rows[0] and "user search" in rows[0]
+        assert len(rows) == 1, rows
+        # A closed reason and the type, never the refusal's text, which names the referred host
+        # the directory chose (BACKLOG #3196).
+        assert json.loads(rows[0]) == {
+            "provider": "ad",
+            "mech": "kerberos",
+            "reason": "directory_unavailable",
+            "error": "LdapReferralError",
+        }
         assert _BIND_PASSWORD not in rows[0]
         assert await store.list_audit(action="auth.login_success") == []
         assert referred.accepted == 0

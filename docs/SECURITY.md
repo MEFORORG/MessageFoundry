@@ -4723,9 +4723,12 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   caller names the ticket's principal. Only a DEBUG traceback carries the text. Each such row
   counts toward `signin_failure_burst`, which counts refused sign-ins per client address. So a
   key fault can raise that alert, sooner where many users reach the engine from one address.
-  If the step accepts the token but the principal cannot be read, the row is `auth.login_error`, reading
-  `Kerberos principal read failed` and the error's class, and the sign-in fails as a directory
-  outage. While browser SSO is available, a 400
+  If the step accepts the token but the principal cannot be read, the row is `auth.login_error`,
+  and the sign-in fails as a directory outage; the WARNING log line names the error's class and
+  status. Every `auth.login_error` row a directory error writes, at a Kerberos or a federated
+  sign-in, holds the closed reason `directory_unavailable` and the error's type names, never its
+  text, which can carry what the caller or the directory chose (BACKLOG #3196, #3727). While
+  browser SSO is available, a 400
   for a token that is not base64 writes the `malformed_token` row `GET /ui/sso` writes. A 400 for
   a missing `Negotiate` header writes no row. A 429 from the sign-in window is throttle-logged,
   never audited.

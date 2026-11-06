@@ -38,7 +38,13 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from messagefoundry.auth import oidc
 from messagefoundry.auth.identity import AuthProvider
-from messagefoundry.auth.ldap import AdPrincipal, DirectoryAnswer, DirectoryBind
+from messagefoundry.auth.ldap import (
+    AdPrincipal,
+    DirectoryAnswer,
+    DirectoryBind,
+    LdapError,
+    LdapReferralError,
+)
 from messagefoundry.auth.notifications import (
     ACCOUNT_CREATED,
     FEDERATED_IDENTITY_BOUND,
@@ -1333,6 +1339,61 @@ async def test_a_non_http_response_degrades_instead_of_escaping(
         # The IdP's arbitrary text must not reach the audit row — only the exception type name.
         assert "maintenance page" not in (errors[0]["detail"] or "")
         assert "BadStatusLine" in (errors[0]["detail"] or "")
+    finally:
+        await store.close()
+
+
+#: Planted in a directory error's text. It stands for what the directory chose, such as a
+#: referral's host, and must reach neither the row nor any log line (BACKLOG #3727).
+_PLANTED = "CN=planted-3727,DC=attacker.invalid"
+
+
+class _FailingLdap(_FakeLdap):
+    """A directory whose re-resolve of the bound row raises ``error``."""
+
+    def __init__(self, error: LdapError) -> None:
+        super().__init__()
+        self._error = error
+
+    def resolve_principal(
+        self, username: str, *, object_id: str | None = None, **_: object
+    ) -> AdPrincipal | None:
+        raise self._error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(LdapError(f"AD directory call failed near {_PLANTED}"), id="LdapError"),
+        pytest.param(LdapReferralError(f"referral to ldaps://{_PLANTED}"), id="LdapReferralError"),
+    ],
+)
+async def test_a_directory_error_on_the_federated_re_resolve_stores_no_text(
+    rsa_key: rsa.RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: LdapError,
+) -> None:
+    """BACKLOG #3727. The federated sign-in's ``auth.login_error`` row stored ``str(LdapError)``.
+    Now it holds a closed reason and the error's type, and the planted text reaches neither the row
+    nor the log, the audit tee's INFO line included. RED on the old arm, which stored the text."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store, rsa_key, ldap=_FailingLdap(error))
+        with caplog.at_level(logging.DEBUG):
+            out = await _oidc_login(service, monkeypatch, rsa_key)
+        assert not out.ok and out.reason == "directory_unavailable"
+        [row] = await _audit_rows(store, "auth.login_error")
+        assert json.loads(row["detail"]) == {
+            "provider": "ad",
+            "mech": "oidc",
+            "reason": "directory_unavailable",
+            "error": type(error).__name__,
+        }
+        assert _PLANTED not in json.dumps(dict(row))
+        logged = [r.getMessage() for r in caplog.records]
+        assert any("auth.login_error" in m for m in logged), "the audit tee's line is the control"
+        assert not [m for m in logged if _PLANTED in m], logged
     finally:
         await store.close()
 
