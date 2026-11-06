@@ -745,8 +745,12 @@ _PR_RESIDUE_MUST_FIRE: list[tuple[str, str]] = [
     ("verdict", f"ASVS {_REQ} was held at {_PARTIAL} by two shipped docs."),
     ("verdict", f"{_REQ} likely stays {_PARTIAL}, because it needs a second signal."),
     ("verdict", f"On this platform {_REQ} is capped at {_PARTIAL}."),
-    # A modal or a negation bound to a bare verdict verb.
+    ("verdict", f"After review {_REQ} has been met."),
+    ("verdict", f"ASVS {_REQ} is likely {_PARTIAL} on review."),
+    ("verdict", f"ASVS {_REQ} probably passes now."),
+    # A modal or a negation bound to a bare verdict verb that ends its clause.
     ("verdict", f"## Why {_REQ} still cannot {_PASS}"),
+    ("verdict", f"ASVS {_REQ} could have been met."),
     ("verdict", f"After this merges, the {_REQ} re-read should reach {_PASS}."),
     # The verdict held with a pronoun, or with no object at all.
     ("verdict", f"A re-read of ASVS cell {_REQ} held it at {_PARTIAL} on review."),
@@ -757,29 +761,34 @@ _PR_RESIDUE_MUST_FIRE: list[tuple[str, str]] = [
     ("verdict", f"These commits update the {_REQ} row to `{_NA}` under rule 1."),
     # A verb stating the verdict before the identifier, and the record's "honest pass" idiom.
     ("verdict", f"An at-least gate does not meet {_REQ}'s all."),
+    ("verdict", f"It does not satisfy vault cell {_REQ}."),
     ("verdict", f"BACKLOG #1: research an honest {_PASS} for ASVS {_REQ}."),
     # A table row listing several identifiers, with a cell that opens with the verdict.
     ("verdict", f"| #1, #2 | {_REQ}, {_REQ_B} | unchanged, `{_PARTIAL}`. |"),
-    # Gap words the record uses: omits, omissions, lacks, incomplete, ground, still short.
+    ("verdict", f"| #1, #2 | {_REQ}, and {_REQ_B}, | unchanged, `{_PARTIAL}`. |"),
+    # Gap words the record uses that are also ordinary English, so they bind only a marked
+    # identifier: omits, omissions, lacks, incomplete, ground, still short.
     ("gap", f"So cell {_REQ} omits it, rather than the record lacking it."),
-    ("gap", f"| #1 | {_REQ} | at least four more | 9 open omissions |"),
-    ("gap", f"{_REQ} lacks a row-completeness pin."),
+    ("gap", f"| #1 | ASVS {_REQ} | at least four more | 9 open omissions |"),
+    ("gap", f"ASVS {_REQ} lacks a row-completeness pin."),
     ("gap", f"Incomplete {_REQ} row: the source cells do not list the claim."),
     ("gap", f"That limit is the one ground holding ASVS {_REQ} today."),
-    ("gap", f"A re-read today would read {_REQ} as still short on one arm."),
-    # A code symbol in backticks rather than a path: a call, a private name, a class attribute, a
-    # dotted name with an underscore, and a module as a regular expression escapes it.
+    ("gap", f"A re-read today would read cell {_REQ} as still short on one arm."),
+    # A module as a regular expression escapes it is a path-strength map.
+    ("map", f"Cell {_REQ}'s `messagefoundry\\.example` absence pattern matches nothing."),
+    # A code symbol in backticks rather than a path binds only a marked identifier: a call, a
+    # private name, a class attribute, a dotted name with an underscore, and a snake_case name.
     (
         "map",
         f"The store passes `example_aad(...)` on every call; the ASVS {_REQ} binding needs it.",
     ),
     ("map", f"It is the carve-out on the ASVS {_REQ} expiry inside `_example_login`."),
     ("map", f"The engine masks `ExampleDetail.error` until a reveal (ASVS {_REQ})."),
-    ("map", f"`_example_helper` was renamed, so a re-anchor is likely needed on {_REQ}."),
+    ("map", f"`_example_helper` was renamed, so a re-anchor is likely needed on cell {_REQ}."),
     ("map", f"`shared_example.read_example_log` reads through a cap (cell {_REQ})."),
-    ("map", f"Cell {_REQ}'s `messagefoundry\\.example` absence pattern matches nothing."),
-    # A plain snake_case name binds only an identifier the text marks as a requirement.
     ("map", f"`example_setting` now counts this posture, and {_REQ}'s warning fires."),
+    ("map", f"`example_setting` now counts this posture, and {_REQ}’s warning fires."),
+    ("map", f"`example_setting` covers the {_REQ} requirement."),
     ("map", f"`EXAMPLE_CHANGED` is an account notice under ASVS {_REQ}."),
 ]
 #: The negative controls for the residue rules: the same shapes beside a version or a plain number.
@@ -795,6 +804,24 @@ _PR_RESIDUE_MUST_STAY_QUIET = [
     f"Python 3.14.6 would {_FAIL} the collection step.",
     # Hold and omit without a requirement number.
     f"The buffer holds {_PARTIAL} frames until the reader drains them; the parser omits blank lines.",
+    # An HL7 version has the requirement shape and no lead in engine prose. Beside it, "pass" and
+    # "fail" are verbs with an object, CI prose keeps failing, a helper is code but no map, and
+    # "incomplete" or "omits" is no gap.
+    "Callers can pass 2.9.1 explicitly when the version field is blank.",
+    "The parser will pass 2.9.2 through unchanged.",
+    "It could fail 2.9.1 inputs that carry no version field.",
+    "Clients on 9.9.98 will fail the handshake without this.",
+    "Hosts still on 2.9.1 would fail to parse the batch.",
+    "Updates 2.9.1 to pass Z-segments through unchanged.",
+    "Treat 2.9.1 as na when the field is empty.",
+    "The 2.9.1 batch test kept failing on Windows until the fix.",
+    "Accepts 2.9.1 and 2.9.2; `parse_example(...)` reads the version field.",
+    "| 2.9.1 | `_split_example_batch` | covered |",
+    "Fixes incomplete reads in the framer for 2.9.1 batches.",
+    "Messages on 2.9.1 lack the Z segment, so the router omits it.",
+    "Bumps `example_pkg` from V2.9.1 to V2.9.2.",
+    # A file name in backticks is not code, whatever its case.
+    f"The `example_a01.hl7` sample and `README.MD` are read under ASVS {_REQ}.",
 ]
 
 
@@ -820,7 +847,8 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
 )
 def test_a_long_table_row_scans_in_linear_time(sf, row: str) -> None:
     """A row is one window for every identifier in it and has no length limit, so each search over it
-    must run once and in linear time. Both rows scan in well under a second."""
+    must run once and in linear time. Both rows scan in well under a second here, against about 80
+    seconds for the first and 7 for the second before; the bound is loose for a slow runner."""
     began = time.perf_counter()
     sf.scan_pr_body(row)
     assert time.perf_counter() - began < 10
