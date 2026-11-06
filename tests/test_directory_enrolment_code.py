@@ -320,6 +320,7 @@ async def test_ac6_a_federated_session_the_idp_stamped_needs_no_code(store: Mess
     off the session is unstamped and does (the same rule AC-1 pins)."""
     w = await _world(store)
     stamped = await _session(w, verified=True)
+    await _issue(w, stamped.identity.user_id)  # outstanding, and not needed by this session
     enroll = await w.service.begin_mfa_enrollment(stamped.identity)
     confirmed = await w.service.confirm_mfa_enrollment(
         stamped.identity, fresh_totp(enroll.secret), token=stamped.token
@@ -327,6 +328,9 @@ async def test_ac6_a_federated_session_the_idp_stamped_needs_no_code(store: Mess
     assert confirmed.ok
     assert await _actions(store, "auth.enrolment_code_refused") == []
     assert not await w.service.enrolment_code_required(stamped.token, stamped.identity)
+    # A factor bound without the code clears it, so it cannot bind a first factor later.
+    bound = await store.get_user(stamped.identity.user_id)
+    assert bound is not None and bound.enrolment_code_digest is None
     unstamped = await _session(w, _OTHER, verified=False)
     assert await w.service.enrolment_code_required(unstamped.token, unstamped.identity)
 

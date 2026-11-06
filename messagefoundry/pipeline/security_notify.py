@@ -372,8 +372,9 @@ def _build_body(event: SecurityEvent) -> str:
     lock_description, lock_lines, lock_closing = (
         _lock_lines(event) if event.event_type == ACCOUNT_LOCKED else (None, [], None)
     )
-    if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER:
-        # BACKLOG #2007: sent to the ISSUER, so nothing changed on the recipient's own account.
+    if event.event_type in (TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER, ENROLMENT_CODE_SPENT):
+        # BACKLOG #2007, ADR 0207 A5: sent to the ISSUER, so nothing changed on the recipient's
+        # own account.
         opening = f"A reminder for you as a MessageFoundry administrator ({event.username})."
     elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
         opening = f"A reminder about your MessageFoundry account ({event.username})."
@@ -560,6 +561,19 @@ def _build_body(event: SecurityEvent) -> str:
         closing = (
             "You got this reminder because you issued that password. The password itself is not in "
             "this message."
+        )
+    elif event.event_type == ENROLMENT_CODE_SPENT:
+        # ADR 0207 A5: to the issuer, about another account, so "if this was you" cannot apply.
+        closing = (
+            "You got this notice because you issued that code. The code itself is not in this "
+            "message."
+        )
+    elif event.event_type == ENROLMENT_CODE_ISSUED:
+        # ADR 0207 section 4: the handover runs outside mail, so the closing must not invite a
+        # reply through a mailbox the directory password may open.
+        closing = (
+            "If you did not ask for a code, contact your MessageFoundry administrator in person or "
+            "through your organization's identity check, not by replying to this message."
         )
     elif event.event_type == FIRST_ADMINISTRATOR_TAKEOVER:
         # The takeover runs only when the install has no enabled Administrator, so "contact your

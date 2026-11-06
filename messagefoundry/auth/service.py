@@ -1880,6 +1880,16 @@ class MfaReset:
 # builds no AuthService, issues and audits exactly as the route does.
 
 
+async def holds_engine_factor(store: Any, user: UserRecord) -> bool:
+    """Whether ``user`` holds TOTP or at least one passkey: TOTP, then the sealed passkey digest,
+    then the store's passkey rows, the round trip only when neither already answers. Each term can
+    only add a factor (BACKLOG #2592). ``AuthService._second_factor_enrolled`` and the host command
+    both ask this, so they cannot disagree on what counts."""
+    if user.totp_enabled or (user.row is not None and user.row.cred_digest != ""):
+        return True
+    return bool(await store.has_webauthn_credentials(user.id))
+
+
 def enrolment_code_issue_refusal(user: UserRecord, *, holds_factor: bool) -> str | None:
     """Why a code may not be issued for ``user``, as a key of :data:`ENROLMENT_CODE_ISSUE_REFUSALS`,
     or ``None``. The store's conditional write judges the same rule again on the record it
@@ -13607,11 +13617,7 @@ class AuthService:
         store round-trip only runs when neither TOTP nor the sealed passkey digest already answers.
         Each term can only add a factor (BACKLOG #2592): a passkey row deleted outside the store
         does not make a sealed record that names one read as unenrolled."""
-        return (
-            user.totp_enabled
-            or user.has_passkeys
-            or await self._store.has_webauthn_credentials(user.id)
-        )
+        return await holds_engine_factor(self._store, user)
 
     def _mfa_required_for(
         self, user: UserRecord, roles: frozenset[Role], *, second_factor_enrolled: bool
@@ -13956,6 +13962,8 @@ class AuthService:
         await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         if spent is not None:
             await self._record_code_spent(identity, spent, "totp", client=client)
+        else:
+            await self._clear_stale_enrolment_code(user)
         # ADR 0197 Amendment A: enrolment now comes BEFORE the first rotation, so whoever intercepts
         # an issued credential can enrol their own authenticator without rotating. The notice to a
         # must-change account says so, and says what to do.
@@ -14997,6 +15005,14 @@ class AuthService:
                     scrub_log_argument(user.username),
                     exc.reason,
                 )
+            except (ValueError, RowSealError):
+                # The account went, or its record fails its seal, after the reset's writes. The
+                # reset still stands and its notices still go; no code is shown.
+                _log.warning(
+                    "the MFA reset of %s issued no enrolment code: the account could not be read",
+                    scrub_log_argument(user.username),
+                    exc_info=True,
+                )
         await self._notify_security(
             MFA_DISABLED, username=user.username, email=user.notify_email, detail={"reset": True}
         )
@@ -15066,14 +15082,32 @@ class AuthService:
         user = await self._load_user(user_id)
         if user is None:
             raise ValueError("no such user")
-        if not await self._store.revoke_enrolment_code(user_id):
+        # The stored id, not the caller's spelling: a store whose id compare ignores case (SQL
+        # Server) finds the row from another spelling, and the audit row must name the account.
+        if not await self._store.revoke_enrolment_code(user.id):
             return False
         await self._audit(
             "auth.enrolment_code_revoked",
             actor=actor,
-            detail=_json({"user_id": user_id, "username": user.username}),
+            detail=_json({"user_id": user.id, "username": user.username}),
         )
         return True
+
+    async def _clear_stale_enrolment_code(self, user: UserRecord) -> None:
+        """After a directory account bound a factor with no code (a session the identity provider
+        stamped), clear any code still outstanding on it, so a code that may have been intercepted
+        at handover cannot bind a first factor again once that factor is removed. Soft: the factor
+        is already bound, so a store fault here is logged, never raised over the enrolment."""
+        if user.auth_provider != AuthProvider.AD.value:
+            return
+        try:
+            await self._store.revoke_enrolment_code(user.id)
+        except (OSError, RowSealError, ValueError):
+            _log.warning(
+                "an enrolment code on %s could not be cleared after a factor was bound without it",
+                scrub_log_argument(user.username),
+                exc_info=True,
+            )
 
     async def _enrolment_code_owed(self, token: str | None, user: UserRecord) -> bool:
         """Whether a binding step on this session must be shown an enrolment code (ADR 0207 section
@@ -15531,6 +15565,10 @@ class AuthService:
                 await self._refuse_enrolment_code(
                     identity, "code_refused", ceremony="webauthn", client=client
                 )
+            # Recorded at the spend, not after the credential write: a write that then fails (a
+            # label written concurrently, a session revoked meanwhile) has still cost the code, and
+            # the used row and the issuer's notice say where it went.
+            await self._record_code_spent(identity, spent, "webauthn", client=client)
         now = time.time()
         cred = WebAuthnCredential(
             credential_id_hash=credential_id_hash,
@@ -15593,8 +15631,8 @@ class AuthService:
                 client=client,
             )
             raise ValueError(self._FACTOR_PRESENT)
-        if spent is not None:
-            await self._record_code_spent(identity, spent, "webauthn", client=client)
+        if spent is None:
+            await self._clear_stale_enrolment_code(user)
         # Parity with confirm_mfa_enrollment: the enrolling session is now MFA-verified (it just
         # proved possession of the freshly-bound authenticator). Stamped against the OLD hash, then
         # rotated — the reverse order writes nothing and still reports success.

@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 from messagefoundry.auth.tokens import hash_token
-from messagefoundry.store.store import WebAuthnCredential
+from messagefoundry.store.store import AdminRemoval, WebAuthnCredential
 
 _N = 0
 
@@ -156,6 +156,17 @@ async def assert_enrolment_code_store_contract(store: Any) -> None:
     assert await store.spend_enrolment_code(disabled, code_digest=_digest("d")) is None, (
         "the old code must not spend after a re-enable"
     )
+
+    # The Administrator's disable (PATCH /users/{id}) goes through remove_unless_last_admin, and
+    # clears the code too, so a re-enable inside its life revives nothing (AC-15).
+    admin_off = await _directory_account(store, "admin-disable")
+    assert await store.issue_enrolment_code(
+        admin_off, code_digest=_digest("a"), expires_at=later, issuer_id="admin-1"
+    )
+    assert await store.remove_unless_last_admin(
+        admin_off, AdminRemoval.DISABLE, admin_role_id="administrator"
+    )
+    assert await _code(store, admin_off) == (None, None, None)
 
     # --- revoke ----------------------------------------------------------------------------------
     revoked = await _directory_account(store, "revoke")

@@ -507,6 +507,13 @@
         status.set("Name this passkey first.");
         return;
       }
+      // ADR 0207: ask for the code before the authenticator makes a credential, so a missing code
+      // does not leave a passkey behind on it.
+      var codeField = document.querySelector("input[name=enrolment_code]");
+      if (codeField && !codeField.value.trim()) {
+        status.set("Enter the enrolment code from your Administrator first.");
+        return;
+      }
       button.disabled = true;
       status.set("Follow your browser's prompt…");
       try {

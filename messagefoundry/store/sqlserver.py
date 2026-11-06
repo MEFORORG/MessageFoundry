@@ -14944,7 +14944,7 @@ class SqlServerStore:
                             return False
                     if change is AdminRemoval.DISABLE:
                         await self._write_user(
-                            cur, user_id, lambda r: r.changed(disabled=True, updated_at=float(now))
+                            cur, user_id, lambda r: user_disabled_change(r, disabled=True, now=now)
                         )
                     elif change is AdminRemoval.DELETE:
                         await self._delete_user_rows(cur, user_id)

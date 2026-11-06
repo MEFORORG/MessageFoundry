@@ -6947,6 +6947,7 @@ def _issue_enrolment_code(args: argparse.Namespace) -> int:
         ENROLMENT_CODE_ISSUE_REFUSALS,
         enrolment_code_issue_refusal,
         enrolment_code_issued_detail,
+        holds_engine_factor,
         write_enrolment_code,
     )
     from messagefoundry.config.settings import StoreBackend, keyless_opt_out_refusal
@@ -6986,13 +6987,9 @@ def _issue_enrolment_code(args: argparse.Namespace) -> int:
             user = await store.get_user_by_username(args.username)
             if user is None:
                 return ("no-such-user", {})
-            # The sealed passkey digest first, then the table, as the service's own factor read.
-            holds_factor = (
-                user.totp_enabled
-                or (user.row is not None and user.row.cred_digest != "")
-                or await store.has_webauthn_credentials(user.id)
+            reason = enrolment_code_issue_refusal(
+                user, holds_factor=await holds_engine_factor(store, user)
             )
-            reason = enrolment_code_issue_refusal(user, holds_factor=holds_factor)
             if reason is not None:
                 return (reason, {})
             _refuse_an_unauditable_write(store)  # before the issue's write, not after it

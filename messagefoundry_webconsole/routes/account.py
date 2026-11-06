@@ -581,7 +581,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # vouch for a directory account (BACKLOG #3061), or a second-step lock, said in
             # /ui/reauth's words (BACKLOG #3810 finding 4).
             error = _refusal_error(elevation, "Invalid code.")
-            return HTMLResponse(pages.mfa_confirm_page(error=error), status_code=400)
+            # ADR 0207: keep the enrolment-code field when the session still owes one, so a wrong
+            # TOTP code does not cost the holder a second round trip for the field.
+            owed = await service.enrolment_code_required(token, identity)
+            return HTMLResponse(
+                pages.mfa_confirm_page(error=error, enrolment_code=owed), status_code=400
+            )
         # Activated: the recovery codes render ONCE — never re-fetchable. The confirm re-keyed the
         # session (ASVS 7.2.4), so this response must carry the new cookie or the operator is signed
         # out on the very page showing codes they have not written down yet.
