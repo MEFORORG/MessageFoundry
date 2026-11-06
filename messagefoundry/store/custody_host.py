@@ -605,8 +605,10 @@ def keep_the_key_step(
                 ", but with --db, which overrides [store].path, naming that new SQLite path by its "
                 "absolute path, here and wherever the service passes --db, at least -DbPath on a "
                 "reinstall with install-service.ps1 on Windows, repeating its other install "
-                "parameters but leaving -EngineWheel and its hashes out, as for any re-run over "
-                "the install root it built, and supervise --db, which supervise passes to its "
+                "parameters but leaving out the build ones, -EngineWheel, -EngineWheelSha256, "
+                "-RequirementsLock, -RequirementsLockSha256 and -BasePython, as for any re-run over "
+                "the install root it built (`messagefoundry service install` runs that script but "
+                "cannot pass -DbPath), and supervise --db, which supervise passes to its "
                 "engine shard as messagefoundry.db, under --project-root if one is given, when its "
                 "own command line leaves it out"
             )

@@ -1355,8 +1355,10 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
         ", but with --db, which overrides [store].path, naming that new SQLite path by its "
         "absolute path, here and wherever the service passes --db, at least -DbPath on a "
         "reinstall with install-service.ps1 on Windows, repeating its other install parameters "
-        "but leaving -EngineWheel and its hashes out, as for any re-run over the install root it "
-        "built, and supervise --db, which supervise passes to its engine shard as "
+        "but leaving out the build ones, -EngineWheel, -EngineWheelSha256, -RequirementsLock, "
+        "-RequirementsLockSha256 and -BasePython, as for any re-run over the install root it "
+        "built (`messagefoundry service install` runs that script but cannot pass -DbPath), and "
+        "supervise --db, which supervise passes to its engine shard as "
         "messagefoundry.db, under --project-root if one is given, when its own command line "
         "leaves it out"
     )
@@ -1403,6 +1405,34 @@ def test_the_service_commands_the_fallback_names_exist() -> None:
         StoreSettings(key_provider="host", cipher_provider="aesgcm"), new_store=True
     )
     assert "-DbPath" in step and "supervise --db" in step and "messagefoundry.db" in step, step
+
+
+def test_the_advised_reinstall_is_one_the_installer_accepts() -> None:
+    # PR 2804 ninth hold: install-service.ps1 throws when a build input other than -EngineWheel is
+    # given without it, so the reinstall the step advises must leave every one of them out. Read the
+    # guard's own condition, so a new build input the installer adds turns this red.
+    from messagefoundry.service import _install_params
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "service" / "install-service.ps1"
+    source = script.read_text(encoding="utf-8")
+    guard = re.search(
+        r"\}\s*elseif \(((?:\$\w+)(?:\s+-or\s+\$\w+)*)\)\s*\{\s*throw \(\"([^\"]*)\"",
+        source,
+    )
+    assert guard is not None and "go only" in guard.group(2), "install-service.ps1 guard moved"
+    companions = re.findall(r"\$(\w+)", guard.group(1))
+    assert {"RequirementsLock", "BasePython"} <= set(companions), companions
+    step = custody_host.keep_the_key_step(
+        StoreSettings(key_provider="host", cipher_provider="aesgcm"), new_store=True
+    )
+    # What the reinstall advice leaves out: after "but leaving", before the rule it cites.
+    left_out = step[step.index("but leaving") : step.index("as for any re-run")]
+    for name in ("EngineWheel", *companions):
+        assert re.search(rf"-{name}\b", left_out), (name, left_out)
+    # messagefoundry service install runs the same script with three parameters, never -DbPath.
+    params = _install_params("i.ps1", "prod", config=r"C:\cfg", service_config=r"C:\cfg\s.toml")
+    assert "-DbPath" not in params, params
+    assert "`messagefoundry service install` runs that script but cannot pass -DbPath" in step
 
 
 @host_file_platforms
