@@ -2289,11 +2289,12 @@ Two limits follow from this:
   `ESTALE`. libpq stats the file again at every connect, so it may load the file once the fault
   clears. A network fault the system reports as a denial or as a missing name is still left.
 
-  On Windows, the walk that checks the path names no other host reads each name in it first. It
-  refuses at least a denial, a link loop and any fault but a missing name, before the file itself
-  is judged, and says the file could not be read. A share Windows could not reach is refused as
-  another host. So on Windows a failure is left only once the walk passes it, as it passes at
-  least a missing name, other than such a share, and a path through a file.
+  On Windows, the host check first walks the path, reading each name in it, before the file
+  itself is judged. The walk refuses at least a name the system could not read, as on a denial
+  or a device, sharing or network fault, and then says the file could not be read. It also
+  refuses at least a link loop, a path through a file and a share Windows could not reach, as not
+  a plain local path. A missing name, other than such a share, ends the walk and is left to
+  libpq.
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
   application-data folder. Elsewhere it is under `~/.postgresql`. The engine finds this home as

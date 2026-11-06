@@ -36,6 +36,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry import pki
+from messagefoundry.auth import anchor_path
 from messagefoundry.auth.trust_anchors import ENCRYPTION_HEADER_SCOPE, PRIVATE_KEY_SCOPE
 from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.redaction import safe_exc
@@ -381,6 +382,38 @@ def test_a_local_root_certificate_the_walk_cannot_read_is_refused_as_unread(
 
     monkeypatch.setattr(os, "lstat", unreadable)
     with pytest.raises(ValueError, match="root certificate file could not be read to check it"):
+        _build_psql()
+    with pytest.raises(ValueError) as refused:
+        _build_psql()
+    text = str(refused.value)
+    assert "a name in the path could not be read" in text
+    assert "set PGSSLROOTCERT to a readable local path" in text
+    assert "not a plain local path" not in text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the path walk runs on Windows only")
+@pytest.mark.parametrize("shape", ["through a file", "a reparse point not followed"])
+def test_a_root_certificate_the_walk_stops_in_without_a_read_failure_is_not_local(
+    _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    """The controls for the test above: a walk that stops for any cause but a name the system
+    could not read keeps the "not a plain local path" refusal. A path through a file is one, as
+    is ``_win_probe``'s own refusal of a reparse point it does not follow, which carries no
+    errno."""
+    if shape == "through a file":
+        monkeypatch.setenv("PGSSLROOTCERT", os.path.join(_write(_no_libpq_root, "x", "a"), "r"))
+    else:
+        root = _write(_no_libpq_root, _certificate(), "root.crt")
+        monkeypatch.setenv("PGSSLROOTCERT", root)
+        real_probe = anchor_path._win_probe
+
+        def not_followed(path: str) -> tuple[str, str | None]:
+            if os.path.basename(path).lower() == "root.crt":
+                raise OSError("it is a reparse point (tag 0xa000001d) this check does not follow")
+            return real_probe(path)
+
+        monkeypatch.setattr(database, "_win_probe", not_followed)
+    with pytest.raises(ValueError, match="not a plain local path on this host"):
         _build_psql()
 
 

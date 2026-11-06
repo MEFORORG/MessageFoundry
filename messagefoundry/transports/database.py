@@ -934,9 +934,10 @@ def _windows_path_verdict(
     onto one, is ``True`` (vault BACKLOG #5197 item 11). A link whose target is rooted with no drive
     is ``None``, as ``windows_chain`` answers it (item 9).
 
-    When the walk stops at a name it could not read, ``unread``, if given, maps ``path`` to the
-    path-free reason, so a caller can say the file could not be read, not that it names another
-    host."""
+    When the walk stops because the system could not read a name, ``unread``, if given, maps
+    ``path`` to the walk's path-free cause, so a caller can say the file could not be read rather
+    than that it names another host. Nothing past that name was walked, so that is no proof the
+    path is local."""
 
     def volume_cause(root: str) -> str | None:
         kind = drive_type(root)
@@ -948,6 +949,8 @@ def _windows_path_verdict(
             return "the type of this volume could not be read"
         return None
 
+    stopped_unread: list[str] = []
+
     def probing(part: str) -> tuple[str, str | None]:
         try:
             kind, target = probe(part)
@@ -956,9 +959,11 @@ def _windows_path_verdict(
                 raise _LeavesHost from None
             raise _PathEnds from None
         except OSError as exc:
-            # windows_chain ends the walk here, with a cause the verdict below reads as None.
-            if unread is not None:
-                unread[path] = exc.strerror or type(exc).__name__
+            # windows_chain ends the walk here with a cause the verdict below reads as None. Only
+            # a failure the system reported counts as unread, not _win_probe's own refusal of a
+            # reparse point it does not follow, which carries no errno.
+            if exc.errno is not None:
+                stopped_unread.append(part)
             raise
         if target is not None:
             text = target.strip()
@@ -982,6 +987,8 @@ def _windows_path_verdict(
     if cause is not None and cause.kind == SHARE_CAUSE:
         return True  # the walk reached a share, as through a subst drive onto \??\UNC\host\share
     if cause is not None:
+        if unread is not None and stopped_unread:
+            unread[path] = cause.kind
         _not_cleared(cause.kind, cause)
         return None
     return False
@@ -1409,8 +1416,9 @@ def _refuse_encrypted_libpq_root_cert(
 
     A path that names another host (:func:`names_another_host`) is refused unread, with
     ``PGSSLROOTCERT`` as the way out. On Windows that check's walk reads each name of the path
-    first, and refuses at least a denial, a link loop and any fault but a missing name before the
-    file is judged, saying the file could not be read. A ``stat`` failure that says no file is
+    before the file is judged. It refuses at least a name the system could not read, saying the
+    file could not be read, and a link loop or a path through a file, as not a plain local path.
+    A ``stat`` failure that says no file is
     there, or that libpq could not ``stat`` it either, is left to libpq
     (:func:`_libpq_cannot_stat_either`): at least a missing name other than a share Windows could
     not reach, and off Windows a permission denial. Every other ``stat`` failure is judged as a
@@ -1448,12 +1456,13 @@ def _refuse_encrypted_libpq_root_cert(
     unread: dict[str, str] = {}
     verdicts = file_keyword_verdicts(path, unread)
     if names_another_host(path, verdicts):
-        reason = unread.get(path.strip())
-        if reason is not None and True not in verdicts.values():
-            # A local path the walk stopped in: naming another path would not help.
+        cause = unread.get(path.strip())
+        if cause is not None and True not in verdicts.values():
+            # The walk stopped at a name the system could not read, before anything showed the
+            # path leads off the host, so "not a plain local path" would misname the fault.
             raise ValueError(
-                f"{setting}: the {what} could not be read to check {_CA_CHECKED_FOR}: a name in "
-                f"its path could not be read: {reason}"
+                f"{setting}: the {what} could not be read to check {_CA_CHECKED_FOR}: {cause}; "
+                "make it readable, or set PGSSLROOTCERT to a readable local path"
             )
         raise ValueError(
             f"{setting}: the {what} is not a plain local path on this host, so it was not read "
@@ -1549,7 +1558,8 @@ def _read_driver_file(
     driver could not ``stat`` it either (:func:`_libpq_cannot_stat_either`), is left to the driver
     too: at least a missing name other than a share Windows could not reach, and off Windows a
     permission denial. On Windows the caller's :func:`names_another_host` walk has already refused
-    at least a denial, a link loop and any fault but a missing name in the path. Every other
+    at least a name in the path the system could not read, a link loop and a path through a
+    file. Every other
     ``stat`` failure is judged as a failed read is, with no second look for a directory, so it is
     refused unless it says no file is there, since the driver stats again at each connect and may
     then load the file.
