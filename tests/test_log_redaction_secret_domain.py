@@ -3123,6 +3123,77 @@ def test_a_fold_character_label_stops_the_run_on_in_both_copies(fold: str) -> No
         assert not printed, f"{surface}: {printed} printed -- got {ascii(out)}"
 
 
+#: Synthetic, holding "-" and "_" so the bundle's long-base64 sweep cannot be what hides them.
+_FOLD_STOP_VALUES = ("fs-Fld_A-81", "fs-Fld_B-82")
+
+
+def _fold_headed_label(char: str, letter: str) -> str:
+    """A label whose FIRST letter is ``char``: a keyword starting with ``letter``, its first letter
+    swapped, or ``char`` heading a prefix where no keyword starts with ``letter`` (U+212A)."""
+    words = scrub_mod._CREDENTIAL_WORDS + scrub_mod._KEY_MATERIAL_WORDS + scrub_mod._TOKEN_WORDS
+    word = next((w for w in sorted(words) if w[0] == letter), None)
+    return char + word[1:] if word is not None else f"{char}_password"
+
+
+def _fold_stop_line(char: str, letter: str, first: str = "MEFOR_X") -> str:
+    head, tail = _FOLD_STOP_VALUES
+    return (
+        f"connect failed {first}=fs-Fst_0-80;{_fold_headed_label(char, letter)}='{head} {tail}' x"
+    )
+
+
+@pytest.mark.parametrize(
+    ("char", "letter"),
+    sorted(_measured_letter_folds().items()),
+    ids=lambda v: f"U+{ord(v):04X}" if len(v) == 1 and ord(v) > 127 else v,
+)
+def test_a_label_headed_by_a_fold_character_stops_a_plain_value(char: str, letter: str) -> None:
+    """BACKLOG #3114. A plain value must stop in front of a later quoted label whose first letter is a
+    fold character, on every surface, under a ``MEFOR_`` label (the pattern with no fold of its own)
+    and a token label (which folds its keywords alone in the bundle copy). One case per character the
+    interpreter folds to an ASCII letter."""
+    for first in ("MEFOR_X", "token"):
+        line = _fold_stop_line(char, letter, first)
+        for surface, apply in _SWALLOW_SURFACES:
+            out = apply(line)
+            printed = [value for value in _FOLD_STOP_VALUES if value in out]
+            assert not printed, f"{surface}: {printed} printed -- got {ascii(out)}"
+
+
+def test_a_fold_headed_label_prints_with_the_tokens_unfolded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE POSITIVE CONTROL. With the walk's token classes unfolded again in both copies, which is
+    how ``origin/main`` had them, every line whose keyword starts with a fold character prints its
+    quoted value on the write-time pass under ``MEFOR_X`` and on the bundle under both labels. U+212A
+    is the exception: no keyword begins with "k", so it only heads a prefix, and that was stopped in
+    front of already, so its line is hidden with or without the fold."""
+    for module in (scrub_mod, redact_mod):
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            source = pattern.pattern
+            assert "(?i:[A-Za-z0-9])++" in source, f"{module.__name__}.{name} has no folded run"
+            source = source.replace("(?i:[A-Za-z0-9])++", "[A-Za-z0-9]++")
+            source = re.sub(r"\(\?i:(\[\^A-Za-z0-9[^\]]*\])\)", r"\1", source)
+            monkeypatch.setattr(module, name, re.compile(source, pattern.flags))
+    controlled = 0
+    for char, letter in sorted(_measured_letter_folds().items()):
+        if letter == "k":
+            continue
+        controlled += 1
+        surfaces = (
+            ("scrub_credentials", scrub_credentials, "MEFOR_X"),
+            ("bundle", redact_log_line, "MEFOR_X"),
+            ("bundle", redact_log_line, "token"),
+        )
+        for surface, apply, first in surfaces:
+            out = apply(_fold_stop_line(char, letter, first))
+            assert _FOLD_STOP_VALUES[1] in out, (
+                f"{surface}/{first}: U+{ord(char):04X} hid -- {ascii(out)}"
+            )
+    assert controlled >= 3, f"only {controlled} fold characters reach a keyword's first letter"
+
+
 def test_both_copies_of_each_stopped_pattern_agree() -> None:
     """The two modules restate these patterns by hand, and a one-sided edit must red HERE.
 

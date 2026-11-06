@@ -128,7 +128,8 @@ line are level, 1.29 against 1.26 us and 5.08 against 4.97, inside this box's no
 holds a "{" now walks rather than taking the fast path: a token value then a braced ``PWD=``, the line
 the change is for, costs 7.5 against 6.1 us, and a ``MEFOR_STORE_DSN`` holding one 7.8 against 5.0.
 Three 6 KB runs built to make every check walk are level within 6 percent: braced runs, unclosed
-``PWD={`` labels, and closed spaced ones, the last 1.21 against 1.15 ms.
+``PWD={`` labels, and closed spaced ones, the last 1.21 against 1.15 ms. Folding the walk's two token
+classes (BACKLOG #3114) is level on every one of those lines against the module just before it.
 """
 
 from __future__ import annotations
@@ -397,13 +398,20 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # run or at the very start of the value, still prints the quoted value: ``pwd=a_password="v w"``,
 # ``password=x.client_secret="v w"`` and ``token=bearer_token="v w"``. The stop lands on the keyword
 # and the pass cannot resume there. A label of a later family is caught, because it sees the keyword
-# right after the placeholder. And a keyword spelled with a fold character such as U+017F as its FIRST
-# letter is not checked where the run class does not fold, because the walk reads that character as a
-# separator and checks only from the next letter. That is ``_MEFOR_SECRET`` here, the one pattern in
-# this module compiled without ``(?i)``, and in ``support/redact.py`` every stopped pattern but
-# ``_AUTH_SCHEME``: there ``_MEFOR_SECRET`` has no fold, and ``_BEARER``, ``_CREDENTIAL_KV`` and
-# ``_KEY_MATERIAL`` fold their keywords alone. Both copies of ``_AUTH_SCHEME`` fold globally, so their
-# run class folds and the check runs.
+# right after the placeholder.
+#
+# A KEYWORD SPELLED WITH A FOLD CHARACTER AS ITS FIRST LETTER IS CHECKED TOO (BACKLOG #3114), such as
+# U+017F in ``secret`` or U+0130 and U+0131 in ``intake_api_key_next``. The walk's two token classes
+# fold case in every pattern, so the walk reads that character as a letter that starts a run, and
+# checks the stop there. They did not fold where the pattern did not: ``_MEFOR_SECRET`` here, the one
+# pattern in this module compiled without ``(?i)``, and in ``support/redact.py`` every stopped pattern
+# but ``_AUTH_SCHEME``, which fold their keywords alone. There the walk read the character as a
+# separator and checked only from the next letter, so ``MEFOR_X=a;<U+017F>ecret='v w'`` printed
+# "v w'" on both copies. THE STOP KEEPS ITS OWN PATTERN'S FOLD, and only the tokens fold. Folding
+# the stop as well, in a pattern that did not fold it before, let its underscored-prefix branch read a
+# run holding a fold character as a later label's prefix, so in ``MEFOR_B_PW=a:b_<U+0130>_passwd:
+# "c d"`` the "b" printed, which the patterns before hid. No keyword begins with "k", so U+212A can
+# only head a label as part of a prefix, which the walk already stopped in front of.
 #
 # AND ONE DELIBERATE TRADE, which is the one place a single pass prints text the old class hid. After a
 # hard separator, an underscored run in front of a keyword is read as the later label's prefix, so in
@@ -712,26 +720,26 @@ _KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL
 _SCHEME_TERMINATORS = r"\s'\",;"  # _AUTH_SCHEME
 _PLAIN_VALUE = (
     rf"['\"]?(?:[^{_PLAIN_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_PLAIN_TERMINATORS}]))"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_PLAIN_TERMINATORS}]))*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KV_VALUE = (
     rf"['\"]?(?:[^{_KV_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KV_TERMINATORS}]))"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KV_TERMINATORS}]))*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KEY_VALUE = (
     rf"['\"]?(?:[^{_KEY_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KEY_TERMINATORS}]))"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KEY_TERMINATORS}]))*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_SCHEME_VALUE = (
     rf"['\"]?(?:[^{_SCHEME_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_SCHEME_TERMINATORS}]))"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_SCHEME_TERMINATORS}]))*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 

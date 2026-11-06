@@ -226,8 +226,8 @@ _KV_QUOTED_VALUE = (
 # stop is possible, and otherwise walks the value as tokens -- a run of letters and digits, or one
 # other character -- checking the stop in front of each run. Each pattern's terminator set is stated
 # once and spliced into all three places. Why the two paths agree, why per run agrees with per
-# character, and this copy's one gap, are stated on the same constants in
-# ``messagefoundry/secretscrub.py``.
+# character, and why the two token classes fold case though this copy's stop folds its keywords alone
+# (BACKLOG #3114), are stated on the same constants in ``messagefoundry/secretscrub.py``.
 _NO_QUOTED_LABEL_AFTER = r"(?!\s*+[:='\"]|\s++(?i:bearer|basic|digest)\s)"
 _PLAIN_TERMINATORS = r"\s'\""  # _MEFOR_SECRET, _BEARER
 _KV_TERMINATORS = r"\s'\";,&"  # _CREDENTIAL_KV
@@ -235,26 +235,26 @@ _KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL
 _SCHEME_TERMINATORS = r"\s'\",;"  # _AUTH_SCHEME
 _PLAIN_VALUE = (
     rf"['\"]?(?:[^{_PLAIN_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_PLAIN_TERMINATORS}]))"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_PLAIN_TERMINATORS}]))*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KV_VALUE = (
     rf"['\"]?(?:[^{_KV_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KV_TERMINATORS}]))"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KV_TERMINATORS}]))*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KEY_VALUE = (
     rf"['\"]?(?:[^{_KEY_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KEY_TERMINATORS}]))"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_KEY_TERMINATORS}]))*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_SCHEME_VALUE = (
     rf"['\"]?(?:[^{_SCHEME_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_SCHEME_TERMINATORS}]))"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}(?i:[A-Za-z0-9])++|(?i:[^A-Za-z0-9{_SCHEME_TERMINATORS}]))*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 
@@ -589,6 +589,15 @@ _LEADING_TS = re.compile(
 # residual above AND the shared pass, placed where the copy runs, prints nothing the copy hid on the
 # full probe. That test file's fold-head control arm going red is the signal to re-run the probe, not
 # the proof.
+#
+# RE-RUN 2026-11-06 (BACKLOG #3114), AND THE COPY STAYS. After the braced run-on (#2966) and the fold
+# of the walk's tokens (#3114), over about 1.45 million reconstructed synthetic lines (the generator
+# behind the 822,616 above is not in the tree), the shared pass alone, where the copy runs, printed a
+# value the copy hid on 30,786 lines; placed after the PHI pass, where the second layer runs today,
+# on 35,181, ASCII lines among them. Each of the 30,786 carries a fold character heading a label's
+# prefix, as in ``<U+0130>_password=``: the residual above, unchanged.
+# Closing it the way the copy reads such a label, by scoping ``secretscrub``'s fold to its keywords,
+# made the write-time pass print a value it hid on 159,840 of those lines, so it was not taken.
 def redact_log_line(line: str) -> str:
     """Return ``line`` with PHI/secret patterns replaced by a redaction placeholder.
 
