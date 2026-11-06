@@ -70,9 +70,11 @@
 # decision d20261106T103129535-f83e0e, and a later Builder recorded that here as the Manager
 # relayed it in its brief. The entries on packages that are not dev-only, brace-expansion,
 # cross-spawn, flatted, js-yaml, minimatch and semver, were accepted as absent from the bundle by
-# discriminating probes, not as dev-only.
-# It follows the deepmerge and minimatch triages at the end of this file, and these words hold for
-# every comment that cites this paragraph:
+# discriminating probes, not as dev-only. The other nine are dev-only, and their comments record
+# them absent by probes as well; GHSA-968p-4wvh-cqc8's comment says why its lockfile marks do not
+# bound it, so it rests on its probes.
+# The triage follows the deepmerge and minimatch triages at the end of this file, and these words
+# hold for every comment that cites this paragraph:
 #   MARKS. Every lockfile node of the package was read for `dev`, `peer` and `optional`, and every
 #   lockfile package naming it in `dependencies`, `peerDependencies` or `optionalDependencies` was
 #   traced. npm marks a node `dev` when only devDependencies reach it. DEV-ONLY means every node of
@@ -147,15 +149,15 @@ package = "@octokit/request-error"
 # ABSENT FROM THE BUNDLE. The lockfile holds one brace-expansion, 1.1.11, marked neither `dev`,
 # `peer` nor `optional`. Its one parent is minimatch 3.1.2, whose chain to actions-toolkit, a root
 # runtime dependency, the separate minimatch GHSA-g3hv-75wg-m249 triage at the end of this file
-# traces; this comment does not cover GHSA-g3hv-75wg-m249. Probes, each 0 in the bundle: expandTop (2, in index.js at tag v1.1.11) and balanced (4 there;
-# the name brace-expansion gives balanced-match, its own dependency); braceExpand, minimatch's call
-# into it, and the rest of that minimatch triage's probes, each 0 again on this reading. Re-run in
-# the gate test: expandTop. All eight advisories are denials of service on a pattern
-# brace-expansion expands, through mechanisms including ReDoS, a hang, quadratic, exponential or
-# unbounded expansion, and recursion. Each needs brace-expansion code to run. The eight are
-# GHSA-3jxr-9vmj-r5cp, GHSA-f886-m6hf-6m8v, GHSA-mh99-v99m-4gvg, GHSA-rgw5-rvv9-x895 and
-# GHSA-v6h2-p8h4-qcjw below, and GHSA-6j4f-fj2g-mc7p, GHSA-q2hr-2g5m-vwhr and GHSA-qhr7-859c-m2p7
-# further down.
+# traces; this comment does not cover GHSA-g3hv-75wg-m249. Probes, each 0 in the bundle:
+# expandTop (2, in index.js at tag v1.1.11) and balanced (4 there; the name brace-expansion gives
+# balanced-match, its own dependency); braceExpand, minimatch's call into it, and the rest of that
+# minimatch triage's probes, each 0 again on this reading. Re-run in the gate test: expandTop. All
+# eight advisories are denials of service on a pattern brace-expansion expands, through mechanisms
+# including ReDoS, a hang, quadratic, exponential or unbounded expansion, and recursion. Each needs
+# brace-expansion code to run. The eight are GHSA-3jxr-9vmj-r5cp, GHSA-f886-m6hf-6m8v,
+# GHSA-mh99-v99m-4gvg, GHSA-rgw5-rvv9-x895 and GHSA-v6h2-p8h4-qcjw below, and
+# GHSA-6j4f-fj2g-mc7p, GHSA-q2hr-2g5m-vwhr and GHSA-qhr7-859c-m2p7 further down.
 # ACCEPTED BY THE BATCH 608 MANAGER ON 2026-11-06 (decision d20261106T103129535-f83e0e) UNDER THE
 # OWNER'S RULING OF 2026-11-05 (decision d20261105T044506837-0038dd).
 
@@ -220,9 +222,9 @@ package = "browserslist"
 # TRIAGED 2026-11-05 by Claude, the batch 608 Builder, by the 2026-11-05 paragraph in the header.
 # NOT DEV-ONLY; ABSENT FROM THE BUNDLE. npm reports two nodes: cross-spawn 6.0.5, marked neither
 # `dev`, `peer` nor `optional`, and 7.0.3 under jest-changed-files, marked `dev` and `peer`.
-# 6.0.5's one parent is execa 1.0.0, also unmarked. execa's parents are actions-toolkit 2.2.0, a root runtime
-# dependency, and windows-release 3.2.0. windows-release's parent is os-name 3.1.0. The
-# universal-user-agent 4.0.x copies nested under @octokit/endpoint, @octokit/request and
+# 6.0.5's one parent is execa 1.0.0, also unmarked. execa's parents are actions-toolkit 2.2.0, a
+# root runtime dependency, and windows-release 3.2.0. windows-release's parent is os-name 3.1.0.
+# The universal-user-agent 4.0.x copies nested under @octokit/endpoint, @octokit/request and
 # @octokit/rest need os-name, and so does the top-level universal-user-agent 2.1.0, which
 # @octokit/graphql 2.1.3 resolves to. @octokit/rest 16.43.2 is a root runtime dependency too. So
 # the lockfile alone does not rule it out. Probes, each 0 in the bundle, with the count at the

@@ -23,9 +23,11 @@ run's real output:
 1. **Coverage.** npm's dependency count equals the lockfile's entry count.
 2. **No new advisory.** Every reported advisory is in the baseline.
 3. **No stale entry.** Every baselined advisory is still reported. The baseline records advisories
-   in the bundle's LOCKFILE, and its triage comments say, for the entries they cover, whether the
-   package's code is present in the bundle itself. The lockfile is frozen, so an audit that stops reporting one has either
-   stopped looking or met a withdrawn advisory. Either way a person has to find out which.
+   in the vendored action's declared LOCKFILE, which does not bound what the bundle holds. Its
+   triage comments say, for the entries they cover, whether the package's identifiers were found
+   in the bundle itself, on a reading whose limits the baseline's header states. The lockfile is
+   frozen, so an audit that stops reporting one has either stopped looking or met a withdrawn
+   advisory. Either way a person has to find out which.
 
 WHAT THIS PROVES, AND WHERE. Check 3 shows on each run that the audit sees the known-vulnerable
 packages in the bundle's closure. Check 2 turns any advisory it sees beyond the baseline into a red;
