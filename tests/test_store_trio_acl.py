@@ -97,7 +97,10 @@ def test_a_localsystem_install_grants_system_and_administrators_only() -> None:
             f"O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;{_TI})"
             f"(A;OICI;0x1301bf;;;{_OTHER_SERVICE})",
         ),
-        ("a named user or group", "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)"),
+        (
+            "a user-shaped account holding full control, Administrators left out",
+            "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)",
+        ),
         ("CREATOR OWNER", "O:BAD:P(A;OICI;FA;;;SY)(A;OICIIO;FA;;;CO)"),
         ("OWNER RIGHTS", "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;OW)"),
         ("owned by a standard user", "O:S-1-5-21-1-2-3-1001D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"),
@@ -145,9 +148,11 @@ def test_a_localsystem_install_grants_system_and_administrators_only() -> None:
     ],
 )
 def test_a_directory_that_admits_anyone_else_is_not_hardened(label: str, sddl: str) -> None:
-    # Each row admits (or may admit) a principal beyond SYSTEM, Administrators and one service
-    # account, lets an outsider rewrite the directory, or cannot be read with confidence. Every one
-    # must fall back to the owner-only rewrite.
+    # Each row admits (or may admit) a principal beyond SYSTEM, Administrators and one run-as
+    # account (a per-service virtual account, or one resolved user account), grants a principal
+    # outside the installer's shape, lets an outsider rewrite the directory, or cannot be read with
+    # confidence. Every one is refused before any account lookup, so the rows need no stand-in for
+    # it, and every one must fall back to the owner-only rewrite.
     assert _grants(sddl) is None, label
 
 

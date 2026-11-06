@@ -206,6 +206,8 @@ operator's `provision-admin` failed with `unable to open database file`. So the 
 does resolve for `icacls`; the lockout is the design working as written, not a failed call.
 
 **Decision: in a hardened data directory the trio gets the directory's principals, explicitly.**
+**AMENDED 2026-11-05:** the one run-as principal may now also be one resolved user account, which may
+not own the directory; see the *Note (2026-11-05)* below.
 `_secure_store_file` (`messagefoundry/store/store.py`), called from the open path and from restore,
 reads the directory's owner and DACL as SDDL. The directory counts as HARDENED when all of these hold:
 inheritance is removed; every entry is an ALLOW with exactly the shape `install-service.ps1` writes --
@@ -315,7 +317,8 @@ owner). The store then fell back to the owner-only rewrite, and the Wave 0 locko
 installing that way would have had the service and the provisioning operator lock each other out on
 first deployment.
 
-**Decision (owner ruling 2026-11-05, in the batch 608 Manager's chat).** The hardened directory may
+**Decision (owner ruling 2026-11-05, in the batch 608 Manager's chat; decision
+d20261105T044505299-d76c1b).** The hardened directory may
 grant at most one principal beyond SYSTEM and Administrators (none for a LocalSystem install, as
 before). It is a per-service virtual account as before, or a SID that `LookupAccountSidW` resolves
 to `SidTypeUser` and whose RID is 1000 or more. It gets the same Modify right (`0x1301bf`) and `OICI`
@@ -340,12 +343,22 @@ The trio still names only principals the directory allows.
 Modify in the installer's shape, so the trio grants it no right the directory did not. **The code
 does not check that this account is the one the service runs as.** It admits whichever resolved user
 the directory grants. On a `-ServiceAccount` install that is the account the installer granted. On
-any other directory it is whichever user someone granted, and only SYSTEM or an Administrator can,
-because the owner must be one of them. So an Administrator who grants a user Modify on a hardened
-data directory now also grants that user Modify on the store. That includes a `-AllowLocalSystem`
-install, whose directory names no run-as: before this note such a grant left the store owner-only,
-and now it shares the store with that user. Tying the admitted SID to the service's configured
-account was not chosen.
+any other directory it is whichever user someone granted. Making such a grant takes WRITE_DAC on
+the directory and leaving it owned by SYSTEM or Administrators, which at least SYSTEM, an
+Administrator and a holder of `SeRestorePrivilege` can do: that privilege writes any DACL and sets
+any owner, and Windows' default policy grants it to Backup Operators as well as Administrators.
+`SeTakeOwnershipPrivilege` alone is not enough, because taking ownership makes the holder's own
+account the owner, which the owner rule refuses, and setting another owner takes
+`SeRestorePrivilege`. The widening is then exactly this:
+
+- On a directory that names no run-as, as a `-AllowLocalSystem` install leaves it, a grant of
+  Modify in the installer's shape to one user now shares the store with that user. Before this
+  note it left the store owner-only.
+- On a directory that already names a run-as, a virtual account or a user, a grant to one more user
+  is refused as a second principal, so the store is owner-only, as it was before this note for a
+  virtual run-as. A user is admitted there only when its grant REPLACES the existing run-as grant.
+
+Tying the admitted SID to the service's configured account was not chosen.
 
 **Left open, at least.** What a gMSA resolves to is unmeasured: no hosted runner has a domain. A
 gMSA is a computer-class object in Active Directory, so it is expected to resolve as `SidTypeUser`;

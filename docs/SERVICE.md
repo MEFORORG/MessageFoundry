@@ -468,8 +468,9 @@ runner has one.
 between the service and the operator only when the data directory grants SYSTEM, Administrators
 and at most one run-as account, in the shape the installer writes. A `-AllowLocalSystem` install
 grants none. The run-as account is either a per-service virtual account, `NT SERVICE\<name>`, or
-one account that Windows resolves to a user account with a RID of 1000 or more. A local user or a
-gMSA named with `-ServiceAccount` is such an account. The directory must be owned by SYSTEM or
+one account that Windows resolves to a user account with a RID of 1000 or more. A local user named
+with `-ServiceAccount` is such an account. A gMSA is admitted only if `LookupAccountSid` resolves
+it to a user account, which is unmeasured here. The directory must be owned by SYSTEM or
 Administrators, as the installer leaves it. The engine does not check that this account is the one
 the service runs as. It admits whichever user the directory grants, so grant the data
 directory to the service account only, as the installer does.
