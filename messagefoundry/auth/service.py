@@ -5433,7 +5433,8 @@ class AuthService:
         # name the account as enrolled to anyone who knows the username. The secret comes from the
         # checked record, so no driver runs here since BACKLOG #3510; the catch stays broad because
         # each backend's cipher raises its own classes, which ``auth/`` does not import, and every
-        # arm fails CLOSED (the code is wrong). ``consume_totp_step`` below is outside it.
+        # arm fails CLOSED (the code is wrong). ``consume_totp_step`` below is outside it, with its
+        # own narrower catch.
         try:
             secret = await self._totp_secret(user)
             step = (
@@ -5457,7 +5458,21 @@ class AuthService:
         # locked read and seal check and writes nothing, so a wrong code makes the store call a
         # replayed one makes rather than skipping it. The secret read above is not equalised by
         # this: a missing or unreadable secret still skips the code's HMAC work.
-        code_ok = await self._store.consume_totp_step(user.id, step)
+        #
+        # Because this call now runs on EVERY combined sign-in, any code and any password, a store
+        # refusal here is reachable without either factor, and only on an account with TOTP on. So
+        # a refusal is a wrong code, logged, for the reason the secret read above gives: escaping as
+        # an unpadded 500, it would name the account as enrolled. A seal refusal is not caught: it
+        # reaches ``login``'s own padded seal handler, as on every other write.
+        try:
+            code_ok = await self._store.consume_totp_step(user.id, step)
+        except store_open_errors():
+            _log.exception(
+                "combined sign-in: the store refused the TOTP step check for %s; treating the "
+                "code as wrong",
+                user.username,
+            )
+            code_ok = False
         return password_ok, code_ok
 
     async def _check_password_and_passkey(
