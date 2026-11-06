@@ -627,6 +627,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    whole-directory crypto pass is unbounded boot-time work. Instead `serve` logs one WARNING at
    startup with the **count** of plaintext uploads and that instruction, and never a filename. This is
    fail-closed, like `[backup].allow_unencrypted`, which ships `false`.
+   **A key-service outage is not a refusal (BACKLOG #3734).** Under `vault_transit`, where a by-id
+   route would answer 423, a Transit outage answers **HTTP 503** with `Retry-After` instead, to the
+   same callers; everyone else keeps the 404. An upload during an outage answers 503 too. Nothing is
+   stored or removed. A value Transit refuses, a failed tag among them, still answers 423.
    `[store].allow_unmarked_ciphertext = true` restores the upload passthrough too. **At least these
    upload limits remain.** `rotate-key` seals every plaintext upload it can, a planted one included,
    because new sealed uploads sit beside legacy ones and this surface has no "already sealed" evidence
