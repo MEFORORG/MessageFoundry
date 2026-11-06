@@ -125,7 +125,7 @@ async def test_a_file_swapped_after_the_read_is_judged_as_read(
     await check("outbound", _OUT, _settings(ca, pin))
 
 
-# --- item 2: a repeat of the last pass is remembered -------------------------------------------
+# --- item 2: a repeat of the last clean pass is remembered -------------------------------------
 
 
 def _path_verdict(ok: bool | None) -> Any:
@@ -246,7 +246,8 @@ async def test_a_repeated_warn_mode_pass_still_warns(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A repeat under ``warn`` logs the warning a judged pass logs, so an operator who reloads
-    sees the finding stand. Red under the repeat returning with no warning."""
+    sees the finding stand. Red under a pass that warned held in the memo again with a hit that
+    returns with no warning, or under a judged repeat quieted."""
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: False)
     monkeypatch.setattr(ta, "anchor_path_verdict", _path_ok)
     ca = _ca(tmp_path)
@@ -263,9 +264,10 @@ async def test_a_pass_the_store_stopped_is_not_remembered(
 ) -> None:
     """Under ``warn``, a pass whose ``observed`` row landed but whose ``acl_insecure`` row failed
     raises the store fault and is not remembered, so the next check writes the lost row. Red
-    under the pass remembered before its rows were all written while a pass that wrote a
-    violation row is remembered too: the baseline then names the bytes, and the repeat skips the
-    row for good. The violation-row guard alone keeps this verdict out of the memory."""
+    only under two mutations together: the pass remembered before its rows were all written, and
+    a pass that wrote a violation row remembered at all. The baseline then names the bytes, and
+    the repeat skips the row for good. For a clean pass the only rows are ``observed`` and
+    ``changed``, and the hit's baseline read already catches a lost one."""
     import json
 
     store = await MessageStore.open(tmp_path / "faulty.db")
