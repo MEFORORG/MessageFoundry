@@ -7284,50 +7284,60 @@ async def test_a_keyed_fresh_store_holds_data_until_its_chain_is_gone(store) -> 
     # mint that failed after the keyed open's own commits but before its genesis record leaves only
     # the salt, counter and markers, which do not count, so the mint can be run again.
     #
-    # open_store hands the backend's open the cipher's audit MAC key. Without it the handle has no
-    # active audit key, so _load_audit_chain writes no genesis row. The first arm pins that.
+    # Each open passes the audit MAC key open_store derives from a local cipher, whose audit MAC
+    # function is None. Without the key the handle has no active audit key, so _load_audit_chain
+    # writes no genesis row; the negative arm pins that.
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.crypto import audit_key_id
-    from messagefoundry.store.custody_host import store_holds_data
+    from messagefoundry.store.custody_host import KEYED_OPEN_TABLES, store_holds_data
     from messagefoundry.store.sqlserver import SqlServerStore
     from messagefoundry.store.store import AUDIT_KEY_EPOCH_ACTION, parse_audit_genesis
 
     settings = load_settings(environ=os.environ).store
 
-    async def open_keyed(*, with_audit_key: bool = True) -> str:
-        """Open and close a keyed handle, and return the key id its genesis row should name."""
+    async def open_keyed(*, with_audit_key: bool = True) -> str | None:
+        """Open and close a keyed handle. The key id its genesis row should name, or None when no
+        audit key was passed and so no genesis row is written."""
         cipher = make_cipher(generate_key(), write_v2=True)
         mac_key = cipher.audit_mac_key()
-        assert mac_key is not None
+        assert mac_key is not None and cipher.audit_mac_fn() is None
         opened = await SqlServerStore.open(
             settings, cipher=cipher, audit_mac_key=mac_key if with_audit_key else None
         )
         await opened.close()
-        return audit_key_id(mac_key)
+        return audit_key_id(mac_key) if with_audit_key else None
 
-    async def assert_chain_started_under(key_id: str) -> None:
-        assert (await store.table_occupancy())["audit_log"]
+    async def assert_chain_started_under(key_id: str | None) -> None:
+        assert key_id is not None
         genesis = await store._audit_genesis_row()
         assert genesis is not None
         assert genesis["action"] == AUDIT_KEY_EPOCH_ACTION
         assert parse_audit_genesis(genesis["detail"]) == key_id
 
-    await _empty_every_census_table(store)
-    # Negative control: a keyed open with no audit key leaves the salt, counter and markers only.
-    await open_keyed(with_audit_key=False)
-    occupancy = await store.table_occupancy()
-    assert not occupancy["audit_log"]
-    assert occupancy["keyed_surface"]
-    assert not await store_holds_data(store)
+    async def empty_audit_log() -> None:
+        async with store._pool.acquire() as conn:
+            cur = await conn.cursor()
+            await cur.execute("DELETE FROM audit_log")
+            await conn.commit()
 
-    await assert_chain_started_under(await open_keyed())
-    assert await store_holds_data(store)
-    async with store._pool.acquire() as conn:
-        cur = await conn.cursor()
-        await cur.execute("DELETE FROM audit_log")
-        await conn.commit()
-    assert not await store_holds_data(store)
-    # The re-run's own create: a new key opens over the salt, counter and markers the failed one left,
-    # and starts its chain.
-    await assert_chain_started_under(await open_keyed())
-    assert await store_holds_data(store)
+    await _empty_every_census_table(store)
+    try:
+        # The mint's create on a fresh store: markers sealed and the chain started in one open.
+        await assert_chain_started_under(await open_keyed())
+        occupancy = await store.table_occupancy()
+        assert all(occupancy[table] for table in KEYED_OPEN_TABLES)
+        assert await store_holds_data(store)
+        # A mint that failed before its genesis record: the keyed tables alone.
+        await empty_audit_log()
+        assert not await store_holds_data(store)
+        # Negative control: a keyed open with no audit key starts no chain over them.
+        assert await open_keyed(with_audit_key=False) is None
+        assert not (await store.table_occupancy())["audit_log"]
+        assert not await store_holds_data(store)
+        # The re-run's own create: a new key opens over the salt, counter and markers the failed
+        # one left, and starts its chain.
+        await assert_chain_started_under(await open_keyed())
+        assert await store_holds_data(store)
+    finally:
+        # Leave no chain under a key nobody holds for a later module on this database.
+        await empty_audit_log()
