@@ -1354,9 +1354,11 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
     sqlite_path = (
         ", but with --db, which overrides [store].path, naming that new SQLite path by its "
         "absolute path, here and wherever the service passes --db, at least -DbPath on a "
-        "reinstall with install-service.ps1 on Windows, with its other install parameters "
-        "given again, and supervise --db, which supervise passes to its engine shard as "
-        "messagefoundry.db when its own command line leaves it out"
+        "reinstall with install-service.ps1 on Windows, repeating its other install parameters "
+        "but leaving -EngineWheel and its hashes out, as for any re-run over the install root it "
+        "built, and supervise --db, which supervise passes to its engine shard as "
+        "messagefoundry.db, under --project-root if one is given, when its own command line "
+        "leaves it out"
     )
     database = (
         ", once [store] names that new database, here and for the service (--db sets only "
@@ -1383,11 +1385,20 @@ def test_the_service_commands_the_fallback_names_exist() -> None:
 
     script = Path(__file__).resolve().parents[1] / "scripts" / "service" / "install-service.ps1"
     source = script.read_text(encoding="utf-8")
-    assert "[string]$DbPath" in source
+    assert "[string]$DbPath" in source and "[string]$EngineWheel" in source
+    # The installer passes --db whether or not -DbPath is given: it defaults the path, then
+    # writes it.
+    assert 'if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }' in source
     assert "serve --config $(Format-QuotedPath $Config) --db $(Format-QuotedPath $DbPath)" in source
     parser, _ = _build_parser()
     supervise = parser.parse_args(["supervise", "--config", "c"])
     assert supervise.db == "messagefoundry.db"
+    # supervise forwards its --db to the one engine shard SQLite allows, bare.
+    from messagefoundry.pipeline.supervisor import build_shard_specs
+
+    (spec,) = build_shard_specs(["a"], config="c", db_base=supervise.db, base_port=8765)
+    argv = list(spec.argv)
+    assert argv[argv.index("--db") + 1] == "messagefoundry.db", argv
     step = custody_host.keep_the_key_step(
         StoreSettings(key_provider="host", cipher_provider="aesgcm"), new_store=True
     )
