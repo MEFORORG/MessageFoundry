@@ -2391,8 +2391,9 @@ class LockableAccountCensus:
     TOTP could not be judged is named in ``unknown_beside_a_passkey`` instead. The record
     is what the client reported, or the requirement the registration sent when it reported nothing,
     so on a client that does not conform it can overstate, and ADR 0197 Amendment A (N-G) has the
-    census name these accounts for that reason. An account in both lists keeps a working passkey that
-    an administrator's factor reset would remove: :attr:`reset_would_remove_a_passkey`."""
+    census name these accounts for that reason. :attr:`reset_would_remove_a_passkey` names every
+    account in ``undecryptable_totp`` that keeps a working passkey an administrator's factor reset
+    would remove, whatever the requirement covers."""
 
     no_way_past: tuple[str, ...] = ()
     undecryptable_totp: tuple[str, ...] = ()
@@ -2405,19 +2406,17 @@ class LockableAccountCensus:
     #: factor reset would remove. Kept apart from ``passkey_only``, which reads as "the TOTP is no
     #: way past", a thing nobody knows of an unknown TOTP.
     unknown_beside_a_passkey: tuple[str, ...] = ()
+    #: Every account in ``undecryptable_totp`` that holds a discoverable passkey that may sign it
+    #: in, read from the set its seal covers: ``reset-mfa`` would also remove that passkey. Any
+    #: account, a directory account and one the requirement does not cover included, since the
+    #: reset removes every passkey whatever the scope (BACKLOG #3948 finding 11). The cure is the
+    #: store key for a cell that does not open, and removing and enrolling the app again for an
+    #: enrolment this release refuses.
+    reset_would_remove_a_passkey: tuple[str, ...] = ()
 
     @property
     def clean(self) -> bool:
         return not self.no_way_past and not self.undecryptable_totp
-
-    @property
-    def reset_would_remove_a_passkey(self) -> tuple[str, ...]:
-        """The accounts with an unusable TOTP whose working way past is a discoverable passkey, among
-        the population ``passkey_only`` covers: ``reset-mfa`` would also remove that passkey. The cure
-        is the store key for a cell that does not open, and removing and enrolling the app again for
-        an enrolment this release refuses."""
-        named = set(self.undecryptable_totp) & set(self.passkey_only)
-        return tuple(sorted(named | set(self.unknown_beside_a_passkey)))
 
 
 @dataclass(frozen=True)
@@ -2635,6 +2634,7 @@ async def lockable_account_census(
     unknown: list[str] = []
     unknown_beside_a_passkey: list[str] = []
     passkey_only: list[str] = []
+    reset_removes: list[str] = []
     sealed = store.row_sealer() is not None
     # One probe, so a site with no passkey anywhere reads no account's set below. Without the
     # [webauthn] extra no passkey can sign in, so none is a way past and none is read.
@@ -2661,21 +2661,24 @@ async def lockable_account_census(
                 unknown.append(user.username)
             # Either way the account falls through, since a discoverable passkey may be its working
             # way past, which reset-mfa would remove.
-        if (
-            user.password_generated
-            or user.password_hash is None
+        lockable = (
+            not user.password_generated
+            and user.password_hash is not None
             # Only a LOCAL row can sign in by password, so only it can be locked (#3117).
-            or user.auth_provider != AuthProvider.LOCAL.value
-            or not settings.require_mfa
-        ):
-            continue
-        # The role read only where the scope depends on it.
-        roles = (
-            frozenset()
-            if settings.require_mfa_scope == "every_local_account"
-            else _roles_from_ids(await store.get_user_role_ids(user.id))
+            and user.auth_provider == AuthProvider.LOCAL.value
+            and settings.require_mfa
         )
-        if not _requirement_covers(settings, user, roles):
+        if lockable:
+            # The role read only where the scope depends on it.
+            roles = (
+                frozenset()
+                if settings.require_mfa_scope == "every_local_account"
+                else _roles_from_ids(await store.get_user_role_ids(user.id))
+            )
+            lockable = _requirement_covers(settings, user, roles)
+        # An account that is not lockable is read on only for the reset list: an unusable TOTP
+        # beside a passkey that reset-mfa would remove (BACKLOG #3948 finding 11).
+        if not lockable and state is None:
             continue
         # Wave 2: a passkey recorded as discoverable is a way past, read from the set the account's
         # seal covers. A set that fails its digest counts for nothing, so the account is named.
@@ -2691,7 +2694,12 @@ async def lockable_account_census(
         # may still sign the holder in asks ``sign_in_counts``. Whether the account holds a way
         # past the GATES count asks the configured rp_id, as the gates do. One digest check.
         trusted = not sealed or passkey_digest(creds) == digest
-        if trusted and any(sign_in_counts(c) for c in creds):
+        signs_in = trusted and any(sign_in_counts(c) for c in creds)
+        if signs_in and state is not None:
+            reset_removes.append(user.username)
+        if not lockable:
+            continue
+        if signs_in:
             if state == "unknown":
                 unknown_beside_a_passkey.append(user.username)
             else:
@@ -2704,6 +2712,7 @@ async def lockable_account_census(
         unknown_totp=tuple(sorted(unknown)),
         passkey_only=tuple(sorted(passkey_only)),
         unknown_beside_a_passkey=tuple(sorted(unknown_beside_a_passkey)),
+        reset_would_remove_a_passkey=tuple(sorted(reset_removes)),
     )
 
 

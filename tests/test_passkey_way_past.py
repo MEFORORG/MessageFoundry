@@ -926,6 +926,39 @@ async def test_the_census_warns_that_a_reset_would_remove_a_working_passkey() ->
         await store.close()
 
 
+@pytest.mark.parametrize("outside", ["require_mfa_off", "issued_password"])
+async def test_the_reset_list_names_an_account_the_requirement_does_not_lock(outside: str) -> None:
+    """BACKLOG #3948 finding 11: ``reset_would_remove_a_passkey`` names EVERY account with an
+    unusable TOTP and a working discoverable passkey, since ``reset-mfa`` removes that passkey
+    whatever the requirement covers. Here the account is outside the lockable population, by
+    ``require_mfa`` off or by a password still issued, so it is in no lockable list. RED on the
+    narrower list, which read only that population. The control: the same account once its passkey
+    is gone is still named as an unusable TOTP, and not in the reset list."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, token, _ = await login_admin(service)
+        settings = AuthSettings(require_mfa=outside != "require_mfa_off")
+        if outside == "issued_password":
+            assert await store.set_password(
+                identity.user_id, password_hash="h-issued", password_generated=True
+            )
+        row = await store.get_user(identity.user_id)
+        assert row is not None and row.password_generated == (outside == "issued_password")
+        await _register(service, identity, token)
+        await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+        census = await lockable_account_census(store, settings, way_past_rp_id=RP)
+        assert census.undecryptable_totp == (identity.username,)
+        assert census.passkey_only == () and census.no_way_past == ()
+        assert census.reset_would_remove_a_passkey == (identity.username,)
+        await store.delete_all_webauthn_credentials(identity.user_id)
+        control = await lockable_account_census(store, settings, way_past_rp_id=RP)
+        assert control.undecryptable_totp == (identity.username,)
+        assert control.reset_would_remove_a_passkey == (), "named with no passkey to remove"
+    finally:
+        await store.close()
+
+
 async def test_a_refused_totp_can_be_removed_to_enrol_again() -> None:
     """``disable_mfa``: a TOTP this release refuses is no way past, so the way-past refusal does not
     keep it; removing it is the first step of enrolling again. Beside a passkey that is not
