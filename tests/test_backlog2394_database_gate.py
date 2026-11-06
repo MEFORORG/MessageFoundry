@@ -231,6 +231,10 @@ async def test_an_ungated_connection_gets_no_rollback_beside_its_statement(
     assert "rollback" not in rig.log, rig.log
 
 
+async def _no_probe(pool: Any, *, label: str, acquire_timeout: float) -> None:
+    return None
+
+
 async def test_a_cancelled_reference_sync_frees_nothing_until_its_statement_returns(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
@@ -238,6 +242,10 @@ async def test_a_cancelled_reference_sync_frees_nothing_until_its_statement_retu
     the gate the autocommit pool installs itself. The sync then closes its throwaway pool, which
     closes the connection once it comes back, after its statement and cursor."""
     _aioodbc_serving(monkeypatch, rig, blocks=lambda sql: sql == _REF)
+    # The login role probe (BACKLOG #2617) runs its own statement first, on the same connection;
+    # this arm pins the sync statement's cancel path, so the probe stands down here. Its own tests
+    # are tests/test_lookup_login_role_probe.py.
+    monkeypatch.setattr(database, "probe_login_roles", _no_probe)
     settings = {**_SQLSERVER, "statement": _REF, "key_column": "code", "value_column": "value"}
     task = await cancel_once_started(
         rig.started, _load_database_source(settings, EgressSettings(deny_by_default=False))

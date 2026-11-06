@@ -2460,7 +2460,9 @@ snapshot, or `ApplicationIntent` against an availability-group replica — are a
 
 Grant the lookup account `SELECT` on the objects the feed reads and nothing else. It needs no
 membership in `db_datawriter`, `db_ddladmin` or `db_owner`, and no `EXECUTE` unless a feed genuinely
-reads through a stored procedure — which this gate refuses anyway.
+reads through a stored procedure — which this gate refuses anyway. The engine warns when it finds
+such a role on the login, the first time the lookup's pool opens, but it does not refuse it (see
+*The engine probes a lookup or reference login for write roles*).
 
 > This is a **separate principal** from the engine's own store login. `[store]` settings govern the
 > database MessageFoundry writes its own messages to; a `DatabaseLookup` dials a partner database under
@@ -2523,7 +2525,37 @@ error can hold a reference key. The two class names above are what tell those fa
 
 Neither control is read-only authority, for the reasons in the table above, and the sync pool is
 autocommit. Give the `DatabaseRef` login `SELECT` on what the statement reads, and nothing else. The
-engine does not probe that login's role membership yet.
+engine probes that login's role membership the first time a sync opens its pool, and warns on an
+over-grant; see *The engine probes a lookup or reference login for write roles* below.
+
+#### The engine probes a lookup or reference login for write roles
+
+The engine cannot make a partner login read-only, but it can see whether the login holds a role that
+writes. Each `DatabaseLookup` and `DatabaseRef` login is probed once, when its pool first opens
+(BACKLOG #2617):
+
+- **A lookup** is probed on its first `db_lookup` call, since `serve` does not dial lookups at
+  start. A pool that fails to open is not probed; the next lookup opens it and probes it then.
+- **A reference set** is probed on its first sync, and again only when its DSN changes, as when a
+  reload points it at another login.
+
+The probe reads every SQL Server fixed server role with `IS_SRVROLEMEMBER` and every fixed database
+role with `IS_ROLEMEMBER`, by name, the same closed role sets the store's own login check reads.
+**"Clean" means no database-wide write role**: no fixed server role, and no fixed database role but
+`db_datareader`, `db_denydatareader` and `db_denydatawriter`. `db_datawriter` beside
+`db_denydatawriter` is clean too, since the deny takes back its table writes. The probe does not read
+object-level grants or user-defined roles, so a login granted `INSERT` on one table directly still
+reads clean.
+
+| What the probe reads | What the engine does |
+|---|---|
+| clean | logs one INFO line |
+| a role beyond read, such as `db_datawriter`, `db_owner` or `sysadmin` | logs a WARNING naming each role. **Nothing is refused**: the lookup or sync goes ahead |
+| a role that reads NULL | logs a WARNING that it **cannot judge** the login. A NULL means the name did not resolve for this login, so it is never read as "not a member", and never as clean |
+| no answer: the borrow timed out, the statement failed, or no row came back | logs a WARNING that the probe did not run, naming the timeout, the SQLSTATE or the error type, never the driver's message. The lookup or sync goes ahead, so a partner outage is never blocked by the probe |
+
+The warning names the connection as `db_lookup:<name>` or `reference:<name>`, and never the server,
+the DSN or a credential.
 
 #### Static credentials on every backend hop
 

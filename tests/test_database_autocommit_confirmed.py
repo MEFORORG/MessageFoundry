@@ -485,7 +485,8 @@ async def test_a_db_lookup_runs_in_autocommit(driver: _Driver) -> None:
     rows = await executor.query("clarity", "SELECT code, value FROM t", None)
     assert rows == [{"code": "A", "value": "1"}]
     assert driver.autocommit == [True]
-    assert driver.pools[0].conn.executed_under == [True]
+    # The login role probe (BACKLOG #2617), then the lookup, both in autocommit.
+    assert driver.pools[0].conn.executed_under == [True, True]
     await executor.aclose()
 
 
@@ -496,7 +497,8 @@ async def test_a_reference_sync_runs_in_autocommit(driver: _Driver) -> None:
     rows = await _load_database_source(settings, EgressSettings(deny_by_default=False))
     assert rows == {"A": {"value": "1"}}
     assert driver.autocommit == [True]
-    assert driver.pools[0].conn.executed_under == [True]
+    # The login role probe (BACKLOG #2617), then the sync statement, both in autocommit.
+    assert driver.pools[0].conn.executed_under == [True, True]
     assert driver.pools[0].closed is True
 
 

@@ -57,9 +57,11 @@ import os
 import re
 import sys
 import weakref
-from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
+from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
+from enum import Enum
 from functools import partial
 from typing import Any, NamedTuple, TypeGuard
 
@@ -114,6 +116,10 @@ from messagefoundry.odbc_call_gate import (
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import prints_a_codec_error, safe_exc
+from messagefoundry.sqlserver_roles import (
+    SQLSERVER_FIXED_DATABASE_ROLES,
+    SQLSERVER_FIXED_SERVER_ROLES,
+)
 from messagefoundry.transports.base import (
     DEFAULT_MAX_ITEMS_PER_POLL,
     POLL_STOP_GRACE_S,
@@ -155,6 +161,10 @@ __all__ = [
     "DatabaseDestination",
     "DatabaseLookupExecutor",
     "DatabaseSource",
+    "LoginRoleReading",
+    "LoginRoleVerdict",
+    "classify_login_roles",
+    "probe_login_roles",
 ]
 
 logger = logging.getLogger(__name__)
@@ -4247,6 +4257,172 @@ def max_rows_setting(value: Any, *, label: str, default: int) -> int | None:
     )
 
 
+# --- the partner-login role probe (BACKLOG #2617) ---------------------------------------------
+class LoginRoleVerdict(str, Enum):  # noqa: UP042 - the repo's str-enum convention (see config.settings)
+    """What the role probe of one ``db_lookup`` or ``DatabaseRef`` login found. Four answers, so
+    "could not read" never reads as "read, and it is fine"."""
+
+    CLEAN = "clean"  # every role read, and none of them can write or administer
+    OVER_GRANTED = "over_granted"  # at least one role read as held that can
+    CANNOT_JUDGE = "cannot_judge"  # nothing over-granted read, but a role read NULL
+    NOT_RUN = "not_run"  # the probe could not run: no borrow, a failed statement, no row
+
+
+#: The fixed database roles a read-only partner login may hold and still be clean: reading, and the
+#: two ``db_deny*`` roles, which only take access away. Every fixed SERVER role, and every other fixed
+#: database role, is a finding: each one writes or administers database-wide or wider.
+LOOKUP_LOGIN_READ_ROLES: frozenset[str] = frozenset(
+    {"db_datareader", "db_denydatareader", "db_denydatawriter"}
+)
+
+#: Both closed role sets in one statement, read by name. Each column answers 1, 0 or NULL.
+_LOGIN_ROLE_PROBE_ROLES: tuple[tuple[str, str], ...] = tuple(
+    [("server", r) for r in SQLSERVER_FIXED_SERVER_ROLES]
+    + [("database", r) for r in SQLSERVER_FIXED_DATABASE_ROLES]
+)
+_LOGIN_ROLE_PROBE_SQL = "SELECT " + ", ".join(
+    f"{'IS_SRVROLEMEMBER' if kind == 'server' else 'IS_ROLEMEMBER'}(?) AS r_{i}"
+    for i, (kind, _) in enumerate(_LOGIN_ROLE_PROBE_ROLES)
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LoginRoleReading:
+    """One role probe's result. ``held`` names each role read as held that a read-only login does
+    not need, as ``server role <name>`` or ``database role <name>``. ``unread`` names each role that
+    read NULL. ``cause`` says why a probe did not run. No field holds a DSN, a credential, a
+    server's error text or a row."""
+
+    verdict: LoginRoleVerdict
+    held: tuple[str, ...] = ()
+    unread: tuple[str, ...] = ()
+    cause: str | None = None
+
+
+def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
+    """Judge one row of the role probe (BACKLOG #2617). Pure, so every verdict is unit-testable.
+
+    Read three ways, as ``store/sqlserver.py`` ``_probed_grant`` reads the store login: ``1`` held,
+    ``0`` not held, NULL **not read**. ``IS_SRVROLEMEMBER`` and ``IS_ROLEMEMBER`` answer NULL for a
+    name that does not resolve for this login, and a NULL folded to "not a member" would be a false
+    clean. A role read as held is still reported when another read NULL, because a partial read can
+    only understate an over-grant, never invent one.
+
+    "Clean" means **no database-wide write role**: no fixed server role, and no fixed database role
+    but ``db_datareader`` and the two ``db_deny*`` roles. It is not a read of object-level grants: a
+    login granted ``INSERT`` on one table directly, or holding a user-defined role, reads clean.
+    ``db_datawriter`` held with ``db_denydatawriter`` is not a finding, since the deny takes back the
+    table writes that role grants."""
+    if len(row) != len(_LOGIN_ROLE_PROBE_ROLES):
+        return LoginRoleReading(
+            LoginRoleVerdict.NOT_RUN,
+            cause=f"the probe returned {len(row)} columns, not {len(_LOGIN_ROLE_PROBE_ROLES)}",
+        )
+    held: list[tuple[str, str]] = []
+    unread: list[str] = []
+    for (kind, role), value in zip(_LOGIN_ROLE_PROBE_ROLES, row, strict=True):
+        if value is None:
+            unread.append(f"{kind} role {role}")
+        elif value == 1:  # a driver's True compares equal too
+            held.append((kind, role))
+    database_held = {role for kind, role in held if kind == "database"}
+    findings = tuple(
+        f"{kind} role {role}"
+        for kind, role in held
+        if kind == "server"
+        or (
+            role not in LOOKUP_LOGIN_READ_ROLES
+            and not (role == "db_datawriter" and "db_denydatawriter" in database_held)
+        )
+    )
+    if findings:
+        verdict = LoginRoleVerdict.OVER_GRANTED
+    elif unread:
+        verdict = LoginRoleVerdict.CANNOT_JUDGE
+    else:
+        verdict = LoginRoleVerdict.CLEAN
+    return LoginRoleReading(verdict, held=findings, unread=tuple(unread))
+
+
+def _probe_failure_cause(exc: Exception) -> str:
+    """A PHI-free, credential-free cause: the engine's own pool-timeout text, a driver error's
+    SQLSTATE and native number, or the type alone. Never a driver message, which can carry DSN
+    attributes (the rule :func:`_lookup_connect_failure` states)."""
+    if isinstance(exc, DeliveryError):
+        return str(exc)
+    return _safe_db_error(exc) if _log_sqlstate(exc) else type(exc).__name__
+
+
+def _log_login_role_reading(reading: LoginRoleReading, label: str) -> None:
+    """One log line per probe. Only a clean read is INFO; every other answer WARNS, and none refuses."""
+    if reading.verdict is LoginRoleVerdict.CLEAN:
+        logger.info(
+            "%r: login role probe: no fixed server role and no database-wide write role "
+            "(object-level grants are not read)",
+            label,
+        )
+    elif reading.verdict is LoginRoleVerdict.OVER_GRANTED:
+        logger.warning(
+            "%r: the login this partner hop dials holds %s, which can write or administer beyond "
+            "reading; give it SELECT on what it reads and nothing else. Warning only: nothing is "
+            "refused%s",
+            label,
+            ", ".join(reading.held),
+            f" (also not read: {', '.join(reading.unread)})" if reading.unread else "",
+        )
+    elif reading.verdict is LoginRoleVerdict.CANNOT_JUDGE:
+        logger.warning(
+            "%r: login role probe cannot judge this login: %s read NULL, which means the name did "
+            "not resolve for it, not that it is not a member. No write role read as held",
+            label,
+            ", ".join(reading.unread),
+        )
+    else:
+        logger.warning(
+            "%r: login role probe did not run (%s); this login's roles are unjudged, and the hop "
+            "goes ahead",
+            label,
+            reading.cause,
+        )
+
+
+async def probe_login_roles(pool: Any, *, label: str, acquire_timeout: float) -> LoginRoleReading:
+    """Read the role membership of the login ``pool`` dials, log the answer, and return it (BACKLOG
+    #2617). The ``db_lookup`` executor runs it when a connection's pool first opens, and the
+    ``DatabaseRef`` sync when a set's pool first opens for its DSN.
+
+    **It never refuses, and never raises an** ``Exception``. An over-granted login warns, and the hop
+    goes ahead. A probe that cannot run, because the partner went unreachable after the pool opened,
+    the statement failed or no row came back, warns and returns :attr:`LoginRoleVerdict.NOT_RUN`, so a
+    partner outage never blocks a lookup or a sync on this probe. A cancellation is let through.
+
+    The borrow is bounded by ``acquire_timeout``, as a lookup's is. The statement is not: like the
+    lookup's own statement, it runs until the driver returns."""
+    try:
+        conn = await _acquire(pool, acquire_timeout)
+    except Exception as exc:
+        reading = LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
+        _log_login_role_reading(reading, label)
+        return reading
+    cur: Any = None
+    try:
+        cur = await conn.cursor()
+        await cur.execute(_LOGIN_ROLE_PROBE_SQL, tuple(role for _, role in _LOGIN_ROLE_PROBE_ROLES))
+        row = await cur.fetchone()
+    except Exception as exc:
+        reading = LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
+    else:
+        reading = (
+            LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause="the probe returned no row")
+            if row is None
+            else classify_login_roles(tuple(row))
+        )
+    finally:
+        await _close_and_release(pool, conn, cur)
+    _log_login_role_reading(reading, label)
+    return reading
+
+
 class DatabaseLookupExecutor:
     """Pooled executor for handler-callable **live** lookups (``db_lookup``, ADR 0010).
 
@@ -4264,7 +4440,9 @@ class DatabaseLookupExecutor:
     anywhere. Pools here are opened **autocommit**, so a write that
     got past the statement test would commit rather than be rolled back. What actually bounds this connection is the
     privilege of the account it dials, which only the operator can set — see ``docs/CONNECTIONS.md``
-    (BACKLOG #1574). ADR 0010's *Scope* consequence says this executor never commits; a dated
+    (BACKLOG #1574). The engine can detect a role-level over-grant, and does: when a connection's
+    pool first opens, :func:`probe_login_roles` reads the login's fixed-role membership and warns on
+    a database-wide write role, without refusing (BACKLOG #2617). ADR 0010's *Scope* consequence says this executor never commits; a dated
     correction beneath it (BACKLOG #1791) records why that is false and supersedes it.
 
     Pools are autocommit because each lookup is a single self-contained read; T-SQL has no
@@ -4320,6 +4498,7 @@ class DatabaseLookupExecutor:
             )
             self._max_rows[cname] = _lookup_max_rows(s.get("max_rows"), cname)
         self._pools: dict[str, Any] = {}
+        self._role_readings: dict[str, LoginRoleReading] = {}
         self._locks: dict[str, asyncio.Lock] = {c: asyncio.Lock() for c in self._dsn}
 
     @property
@@ -4333,13 +4512,28 @@ class DatabaseLookupExecutor:
             return pool
         async with self._locks[connection]:
             if connection not in self._pools:
-                self._pools[connection] = await _make_pool(
+                pool = await _make_pool(
                     self._dsn[connection],
                     self._pool_max[connection],
                     autocommit=True,
                     login_timeout=self._login_timeout[connection],
                 )
+                # Kept before the probe runs, so aclose() closes it whatever the probe does.
+                self._pools[connection] = pool
+                # BACKLOG #2617: once, when the pool first opens, since start does not dial
+                # lookups. It warns and never raises; a pool that failed to open is not probed,
+                # and the next lookup opens and probes it again.
+                self._role_readings[connection] = await probe_login_roles(
+                    pool,
+                    label=f"db_lookup:{connection}",
+                    acquire_timeout=self._acquire_timeout[connection],
+                )
         return self._pools[connection]
+
+    @property
+    def role_readings(self) -> Mapping[str, LoginRoleReading]:
+        """The role probe's reading for each connection whose pool has opened (BACKLOG #2617)."""
+        return dict(self._role_readings)
 
     async def query(
         self, connection: str, statement: str, params: Mapping[str, Any] | None
