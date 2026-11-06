@@ -133,7 +133,7 @@ codes are unchanged: an over-grant of either class exits 3.
 - **Not built in this slice: the alert.** The ruling says a warning-class finding warns, alerts and
   audits. This slice warns and audits. The alert, with an inverse that resolves it on a clean start
   as `store_privilege_clean` does for the store, needs a new event type in the notifier and is the
-  row's remaining slice.
+  row's remaining slice. Amendment A below builds it.
 
 ## Alternatives considered
 
@@ -147,3 +147,25 @@ codes are unchanged: an over-grant of either class exits 3.
   operator meant one.
 - **A new outcome type for Vault.** Rejected: the store preflight's `PreflightOutcome` already names
   the four outcomes, and one type keeps the two read-outs alike.
+
+## Amendment A (2026-11-06): the alert, with its auto-resolving inverse
+
+Slice B of vault BACKLOG #2903, the ruling's "warns, alerts and audits". Status unchanged:
+Proposed. The preflight now takes the same alert sink the store preflight takes, and `serve` passes
+it the notifier, or the logging sink when no notifier is configured.
+
+- **Every finding alerts.** A hop that is over-granted, in either class, or that could not be read
+  raises `vault_privilege_warning`, before any refusal, so a refused start still pages, and a grant
+  the opt-out accepts still pages. This follows the store's `store_privilege_warning`, which also
+  fires on its refusing arm. The payload is the finding, the count of refusing-class grants (only
+  on an over-grant, since an unread token counted nothing) and the hop's detail with control
+  characters escaped. Nothing about the token is in it.
+- **A clean read resolves it.** A hop read clean raises `vault_privilege_clean`, which pages nobody
+  and resolves the open warning for the same subject through the ADR 0044 auto-resolve map.
+- **The subject is the hop**, `vault:store` or `vault:secrets`. Keying it by the token's policies
+  was rejected: the usual fix is a new token with other policies, and its clean start would never
+  resolve the old warning. The cost, stated rather than fixed: engine processes that share one
+  store share each hop's alert, so one process's clean start resolves a warning another raised on
+  a different token. Each start's audit row still records every process's own reading.
+- **Best effort.** A sink that raises is logged and never masks the finding, the audit row or the
+  refusal.

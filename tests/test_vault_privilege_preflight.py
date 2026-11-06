@@ -45,6 +45,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.privilege_check import (
     VAULT_OVER_GRANT_OPT_OUT,
+    HopPrivilege,
     HopState,
     VaultConsumer,
     serve_verdict,
@@ -870,3 +871,229 @@ def test_serve_starts_on_a_root_vault_token_with_the_opt_out(
     with TestClient(_managed_app(tmp_path, SecuritySettings(allow_over_granted_vault_token=True))):
         pass
     assert vault.asked
+
+
+# --- slice B: the alert, and the clean read that resolves it -----------------------------------
+
+
+class _RecordingSink:
+    """Records the two calls the preflight makes; stands in for any ``AlertSink``."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+        self.cleared: list[str] = []
+
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        self.events.append(
+            {"name": name, "finding": finding, "refusing_count": refusing_count, "detail": detail}
+        )
+
+    def vault_privilege_clean(self, name: str) -> None:
+        self.cleared.append(name)
+
+
+class _RaisingSink(_RecordingSink):
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        raise RuntimeError("sink down")
+
+
+async def _run(vault: _FakeVault, sink: Any, *, enforcing: bool, accepted: bool = False) -> Any:
+    return await run_vault_privilege_preflight(
+        _VAULT_SETTINGS,
+        _AuditStore(),
+        enforcing=enforcing,
+        over_grant_accepted=accepted,
+        probe=_probe(vault),
+        alert_sink=sink,
+    )
+
+
+async def test_a_grave_grant_under_warn_raises_the_alert() -> None:
+    """The row's closing step 3, alert half. RED before slice B: the preflight took no sink."""
+    sink = _RecordingSink()
+    await _run(_FakeVault(policies=("root",)), sink, enforcing=False)
+    [event] = sink.events
+    assert event["name"] == "vault:store"
+    assert event["finding"] == "over_granted"
+    assert event["refusing_count"] == 1
+    assert "the token carries the root policy" in event["detail"]
+    assert sink.cleared == []
+    assert _TOKEN not in json.dumps(sink.events)
+
+
+async def test_a_warning_class_grant_alerts_with_no_refusing_grant() -> None:
+    sink = _RecordingSink()
+    caps = _least_caps() | {f"transit/keys/{_KEK}": ["list", "read"]}
+    await _run(_FakeVault(caps=caps), sink, enforcing=True)
+    assert [(e["finding"], e["refusing_count"]) for e in sink.events] == [("over_granted", 0)]
+
+
+async def test_an_unobservable_probe_alerts_under_its_own_finding() -> None:
+    sink = _RecordingSink()
+    await _run(_FakeVault(lookup_error=ConnectionError("vault.invalid")), sink, enforcing=True)
+    assert [e["finding"] for e in sink.events] == ["unobservable"]
+    assert sink.cleared == []
+
+
+async def test_a_clean_token_raises_the_inverse_and_no_alert() -> None:
+    """The control for the three above: a least-privilege token pages nobody, and clears."""
+    sink = _RecordingSink()
+    await _run(_FakeVault(caps=_least_caps()), sink, enforcing=True)
+    assert sink.events == []
+    assert sink.cleared == ["vault:store"]
+
+
+async def test_the_refusal_still_refuses_and_alerts_before_it_does() -> None:
+    sink = _RecordingSink()
+    with pytest.raises(VaultPrivilegeError):
+        await _run(_FakeVault(policies=("root",)), sink, enforcing=True)
+    assert [e["finding"] for e in sink.events] == ["over_granted"]
+
+
+async def test_the_opt_out_quiets_no_alert() -> None:
+    sink = _RecordingSink()
+    await _run(_FakeVault(policies=("root",)), sink, enforcing=True, accepted=True)
+    assert [e["refusing_count"] for e in sink.events] == [1]
+
+
+async def test_a_failing_sink_never_masks_the_refusal(caplog: pytest.LogCaptureFixture) -> None:
+    with (
+        caplog.at_level(logging.ERROR, logger="messagefoundry.vault_preflight"),
+        pytest.raises(VaultPrivilegeError),
+    ):
+        await _run(_FakeVault(policies=("root",)), _RaisingSink(), enforcing=True)
+    assert any("alert sink raised" in r.getMessage() for r in caplog.records)
+
+
+async def test_the_alert_detail_escapes_a_line_break_a_server_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hop's detail is kept as the server sent it; the alert's copy reaches a notifier body."""
+    import messagefoundry.vault_preflight as vault_preflight
+
+    raw = HopPrivilege("vault.store", HopState.OVER_GRANTED, "i", "m", "policy a\nALERT forged")
+    monkeypatch.setattr(vault_preflight, "vault_hops", lambda consumers, readings: [raw])
+    sink = _RecordingSink()
+    await _run(_FakeVault(caps=_least_caps()), sink, enforcing=False)
+    [event] = sink.events
+    assert "\n" not in event["detail"] and "ALERT forged" in event["detail"]
+
+
+def test_each_hop_is_its_own_subject() -> None:
+    from messagefoundry.vault_preflight import vault_privilege_alert_subject
+
+    store, secrets = (
+        vault_hop(consumer, _reading(_FakeVault(caps=_least_caps()))) for consumer in (_STORE, _KV)
+    )
+    assert vault_privilege_alert_subject(store) == "vault:store"
+    assert vault_privilege_alert_subject(secrets) == "vault:secrets"
+
+
+def test_the_event_is_rule_targetable_and_its_inverse_resolves_it() -> None:
+    """A name a sink emits but the rule validator refuses is silently un-routable."""
+    from messagefoundry.config.settings import _ALERT_EVENT_TYPES, AlertRule
+    from messagefoundry.pipeline.alert_sinks import _AUTO_RESOLVE, AlertRuleSet
+
+    assert "vault_privilege_warning" in _ALERT_EVENT_TYPES
+    decision = AlertRuleSet([AlertRule(event_type="vault_privilege_warning")]).decide(
+        {"type": "vault_privilege_warning", "connection": "vault:store"}
+    )
+    assert decision is not None
+    assert _AUTO_RESOLVE["vault_privilege_clean"] == "vault_privilege_warning"
+    # The inverse is not a page, so a rule must not be able to target it.
+    assert "vault_privilege_clean" not in _ALERT_EVENT_TYPES
+
+
+def test_the_notifier_payload_carries_no_count_for_an_unread_token() -> None:
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+
+    events: list[dict[str, Any]] = []
+
+    class _Capture(NotifierAlertSink):
+        def _emit(self, event: dict[str, Any]) -> None:
+            events.append(event)
+
+    sink = _Capture.__new__(_Capture)
+    sink.vault_privilege_warning(
+        "vault:store", finding="unobservable", refusing_count=0, detail="x"
+    )
+    sink.vault_privilege_warning(
+        "vault:store", finding="over_granted", refusing_count=0, detail="y"
+    )
+    assert "refusing_count" not in events[0]
+    assert events[1]["refusing_count"] == 0
+
+
+def test_the_logging_sink_line_does_not_read_clean_for_an_unread_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sink's own logger is swapped for a recorder, as the store test does: caplog depends on
+    logger state other tests in the same xdist worker may change."""
+    import messagefoundry.pipeline.alerts as alerts_module
+    from messagefoundry.pipeline.alerts import LoggingAlertSink
+
+    lines: list[str] = []
+
+    class _Recorder:
+        def warning(self, msg: str, *args: object) -> None:
+            lines.append(msg % args)
+
+    monkeypatch.setattr(alerts_module, "log", _Recorder())
+    sink = LoggingAlertSink()
+    sink.vault_privilege_warning(
+        "vault:store", finding="unobservable", refusing_count=0, detail="d"
+    )
+    sink.vault_privilege_warning(
+        "vault:store", finding="over_granted", refusing_count=1, detail="d"
+    )
+    assert "ALERT vault_privilege_warning" in lines[0] and "not read" in lines[0]
+    assert "0 grant" not in lines[0]
+    assert "1 grant(s) in the refusing class" in lines[1]
+
+
+async def test_a_later_clean_start_resolves_the_open_alert(tmp_path: Path) -> None:
+    """End to end through the real notifier and a real store: a warn-mode start on a root token
+    opens an alert instance, and the next start on a least-privilege token resolves it."""
+    from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+    from messagefoundry.store.store import MessageStore
+    from tests.test_alert_state import _drain
+
+    store = await MessageStore.open(tmp_path / "alerts.db")
+    try:
+        sink = NotifierAlertSink([], store=store)
+        await _run(_FakeVault(policies=("root",)), sink, enforcing=False)
+        await _drain(sink)
+        [open_] = await store.list_active_alert_instances(allowed_channels=None)
+        assert (open_.event_type, open_.connection) == ("vault_privilege_warning", "vault:store")
+
+        await _run(_FakeVault(caps=_least_caps()), sink, enforcing=False)
+        await _drain(sink)
+        assert list(await store.list_active_alert_instances(allowed_channels=None)) == []
+    finally:
+        await store.close()
+
+
+def test_serve_hands_the_alert_sink_to_the_vault_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The alert is only as good as its wiring: through the lifespan, with no notifier configured,
+    the logging sink gets the warning, and the refused start raised it first."""
+    from starlette.testclient import TestClient
+
+    from messagefoundry.pipeline.alerts import LoggingAlertSink
+
+    raised: list[str] = []
+
+    def record(self: object, name: str, **kw: Any) -> None:
+        raised.append(f"{name} {kw['finding']}")
+
+    monkeypatch.setattr(LoggingAlertSink, "vault_privilege_warning", record)
+    _vault_env(monkeypatch, _FakeVault(policies=("root",)))
+    app = _managed_app(tmp_path, SecuritySettings())
+    with pytest.raises(VaultPrivilegeError), TestClient(app):
+        pass
+    assert raised == ["vault:store over_granted"]

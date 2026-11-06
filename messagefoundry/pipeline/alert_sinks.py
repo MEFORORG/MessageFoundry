@@ -146,6 +146,9 @@ _AUTO_RESOLVE: dict[str, str] = {
     "dr_released": "dr_activated",
     # #305: a start that OBSERVED a clean store principal resolves the open over-grant warning.
     "store_privilege_clean": "store_privilege_warning",
+    # #2903 (ADR 0216): a start that read a Vault token and found it clean resolves the open
+    # warning for the same hop.
+    "vault_privilege_clean": "vault_privilege_warning",
     # #290: a bound that cleared its resume line resolves the open intake pause for the same bound.
     "intake_resumed": "intake_paused",
     # #2136: a reconcile pass that is evidence the breaker is not tripped, or that no hold stands,
@@ -1661,6 +1664,27 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     def store_privilege_clean(self, name: str) -> None:
         # #305: the INVERSE — no page; auto-resolves the open store_privilege_warning via _AUTO_RESOLVE.
         self._record_state({"type": "store_privilege_clean", "connection": name}, "info")
+
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None:
+        # #2903 (ADR 0216): the Vault privilege preflight's non-clean arm. The subject
+        # ("vault:<hop>") stands in for "connection", as the store preflight's does; the payload is
+        # the finding, a count and the hop's judgment (policy names and paths, never a token).
+        event: dict[str, Any] = {
+            "type": "vault_privilege_warning",
+            "connection": name,
+            "finding": finding,
+            "detail": detail,
+        }
+        if finding == "over_granted":
+            # An unobservable read judged nothing; a 0 here would read as a clean result.
+            event["refusing_count"] = refusing_count
+        self._emit(event)
+
+    def vault_privilege_clean(self, name: str) -> None:
+        # #2903: the INVERSE -- no page; auto-resolves the open vault_privilege_warning.
+        self._record_state({"type": "vault_privilege_clean", "connection": name}, "info")
 
     def config_changed(
         self,

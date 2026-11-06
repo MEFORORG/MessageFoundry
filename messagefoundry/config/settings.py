@@ -5518,6 +5518,9 @@ _ALERT_EVENT_TYPES = frozenset(
         # BACKLOG #305 (ASVS 13.2.2): the store privilege preflight found the store principal
         # over-granted, or could not read it, at start.
         "store_privilege_warning",
+        # BACKLOG #2903 (ADR 0216): the Vault privilege preflight found a Vault token over-granted,
+        # or could not read it, at start.
+        "vault_privilege_warning",
         "leadership_acquired",  # #145 (ADR 0014 amendment): a node went non-leader→leader (HA failover / election)
         "dr_activated",  # #145 (ADR 0014 amendment, ADR 0048): a third-tier DR standby was promoted
         # ASVS 6.4.5 (BACKLOG #1141): an admin-issued temporary password is UNCLAIMED and near the

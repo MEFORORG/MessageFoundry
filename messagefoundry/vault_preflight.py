@@ -19,8 +19,13 @@ a network failure, a timeout or a 403 (:func:`~messagefoundry.privilege_probes.e
 which the opt-out does not lift. Every other finding warns and writes an audit row. Under ``warn``
 nothing refuses.
 
-**Not here yet:** the alert, with its auto-resolving inverse, that the row also asks for. It needs
-a new alert event type in the notifier, which is a separate slice.
+**Every finding also raises an alert, and a clean read resolves it** (slice B). A hop that is not
+clean fires ``vault_privilege_warning`` BEFORE any refusal, so a refused start still pages, as the
+store preflight's ``store_privilege_warning`` does; a hop read clean fires
+``vault_privilege_clean``, which auto-resolves an open warning for the same hop and pages nobody.
+The subject is the hop alone (:func:`vault_privilege_alert_subject`), never anything about the
+token, so processes that share one store share each hop's alert: a clean start by one resolves the
+warning another raised on a different token.
 
 **Nothing secret is written.** A hop's detail names policy names, paths and capabilities, never a
 token, an accessor or a digest of either; the log line escapes every control character a server
@@ -41,6 +46,7 @@ from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.privilege_check import (
     VAULT_OVER_GRANT_OPT_OUT,
     HopPrivilege,
+    HopState,
     VaultConsumer,
     vault_consumers,
     vault_hops,
@@ -56,10 +62,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "VAULT_PRIVILEGE_ALERT_SUBJECT",
     "VAULT_PRIVILEGE_AUDIT_ACTION",
     "VaultAuditStore",
+    "VaultPrivilegeAlertSink",
     "VaultPrivilegeError",
     "run_vault_privilege_preflight",
+    "vault_privilege_alert_subject",
 ]
 
 #: The audit action of the row each probed Vault hop writes at every start.
@@ -81,6 +90,50 @@ class VaultAuditStore(Protocol):
     """The one store method this preflight calls."""
 
     async def record_audit(self, action: str, *, actor: str | None, detail: str | None) -> None: ...
+
+
+class VaultPrivilegeAlertSink(Protocol):
+    """The two :class:`~messagefoundry.pipeline.alerts.AlertSink` methods this preflight calls,
+    named here as :class:`~messagefoundry.store.privilege.PrivilegeAlertSink` names the store's;
+    every ``AlertSink`` satisfies it structurally."""
+
+    def vault_privilege_warning(
+        self, name: str, *, finding: str, refusing_count: int, detail: str
+    ) -> None: ...
+
+    def vault_privilege_clean(self, name: str) -> None: ...
+
+
+#: The alert subject's prefix (the ``connection`` key the notifier throttles and keys durable state
+#: on). Its colon keeps every subject outside the connection-name grammar.
+VAULT_PRIVILEGE_ALERT_SUBJECT = "vault"
+
+
+def vault_privilege_alert_subject(hop: HopPrivilege) -> str:
+    """``vault:<hop>``, as ``vault:store`` or ``vault:secrets``.
+
+    Keyed by the hop and by nothing about the token: fixing an over-grant usually means a new token
+    with other policies, and a subject that followed the token would leave the old warning open
+    for ever. The cost is the one the module docstring names for a shared store."""
+    return f"{VAULT_PRIVILEGE_ALERT_SUBJECT}:{hop.hop.removeprefix('vault.')}"
+
+
+def _alert(sink: VaultPrivilegeAlertSink, hop: HopPrivilege) -> None:
+    """Raise the hop's warning, or its clean inverse. Best effort, like the audit row: a sink that
+    raises is logged and never masks the finding or the refusal."""
+    subject = vault_privilege_alert_subject(hop)
+    try:
+        if hop.state is HopState.CLEAN:
+            sink.vault_privilege_clean(subject)
+        else:
+            sink.vault_privilege_warning(
+                subject,
+                finding=hop.state.value,
+                refusing_count=len(hop.refusing),
+                detail=scrub_log_argument(hop.detail)[:_AUDIT_DETAIL_LIMIT],
+            )
+    except Exception:  # noqa: BLE001 - alerting is best-effort; never mask the finding
+        log.exception("vault privilege preflight: the alert sink raised")
 
 
 def _probe_all(
@@ -112,6 +165,7 @@ async def run_vault_privilege_preflight(
     enforcing: bool,
     over_grant_accepted: bool,
     probe: Callable[[VaultConsumer], VaultTokenReading],
+    alert_sink: VaultPrivilegeAlertSink | None = None,
 ) -> list[HopPrivilege]:
     """Probe every Vault token ``settings`` puts to use, report each, and refuse where
     :func:`~messagefoundry.privilege_check.vault_preflight_outcome` says so.
@@ -122,7 +176,9 @@ async def run_vault_privilege_preflight(
     preflight writes none.
 
     Each probed hop writes one ``vault_privilege_preflight`` audit row, best-effort, BEFORE any
-    refusal, so a refused start is durable. Returns the judged hops.
+    refusal, so a refused start is durable. With an ``alert_sink``, each hop also raises
+    ``vault_privilege_warning``, or ``vault_privilege_clean`` when it reads clean, best-effort and
+    before any refusal. Returns the judged hops.
 
     Raises :class:`VaultPrivilegeError` naming every refused hop."""
     consumers = vault_consumers(settings)
@@ -159,6 +215,8 @@ async def run_vault_privilege_preflight(
                 hop.hop,
                 VAULT_OVER_GRANT_OPT_OUT,
             )
+        if alert_sink is not None:
+            _alert(alert_sink, hop)
         detail = {
             "hop": hop.hop,
             "state": hop.state.value,
