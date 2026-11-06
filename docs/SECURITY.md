@@ -4810,7 +4810,9 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   binds an account to a federated identity, Windows SSO refuses it. `POST /auth/negotiate` and
   `GET /ui/sso` answer as they do for any failed sign-in, and the `auth.login_failed` row carries
   `reason=federated_sign_in_required`. **Every bind also ends every live session of that
-  account**, in the bind's own transaction, so nothing minted before the bind outlives it,
+  account**, in the transaction of the bind's own write; a rebind's clear, which runs in a
+  transaction of its own before that write, ends them first. So nothing minted before the bind
+  outlives it,
   a session rotated while the bind runs included (*Limits of the session sweep* below). The
   audit row, the route's answer and the holder's notice carry the count. A Windows SSO sign-in
   already in flight cannot slip past either: its session insert requires an unbound row. The
@@ -4834,8 +4836,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `UPDLOCK` read in `clear_user_federated_subject`, before its account write. A bind that passes
   its own checks first runs `clear_user_federated_subject`'s transaction, which takes the row
   through that same prior-pair read. On a pair mismatch (`changed=True`), whether the bind is a
-  first bind or a rebind, that transaction writes nothing and sweeps nothing (on SQL Server it
-  rolls back), and the bind is refused. Otherwise, on a rebind it sweeps, and on a first bind it
+  first bind or a rebind, that transaction writes nothing and sweeps nothing, and the bind is
+  refused. Otherwise, on a rebind it sweeps, and on a first bind it
   writes nothing. The row is released between that transaction and the bind's own write, which
   then takes the row through the account write, and sweeps where that write lands. The TOTP
   re-enrolment takes it through the account write too, and the whole-account revokes through the
@@ -4852,15 +4854,17 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   `admin-revoke-sessions` calls. Of the two, only `tests/test_b2614_revoke_all.py` reads back a
   session the revoke ended there: on such an account that form ends the session it was asked to
   keep, and that is the session it reads back. `tests/test_b5091_global_session_epoch.py` reads
-  back no session the revoke ended: it finds that account's session refused once raw writes have
+  back no session the revoke ended on such an account: it finds that account's session refused once raw writes have
   put back the session and the account's pre-revoke row. That the administrator's revoke
   of a user's sessions still ends such an account's sessions was read from the code and not run.
   The per-account revoke's other form, which spares the caller's session, is reached through the
   service on such an account only where the seal fails after identity resolution:
-  the gates of at least `DELETE /me/sessions` and the console's
-  `POST /ui/account/sessions/revoke-others` resolve the caller through `identity_for_token`
-  before they call `AuthService.revoke_other_sessions`, which takes the identity it is handed,
-  and that resolution refuses an account whose record fails its seal. It is run on such an
+  at least `DELETE /me/sessions` and the console's `POST /ui/account/sessions/revoke-others`
+  resolve the caller through `identity_for_token` in their gate
+  (`messagefoundry/api/auth_routes.py:1155`, `messagefoundry_webconsole/routes/account.py:692`),
+  and then the handler calls `AuthService.revoke_other_sessions` with that identity
+  (`auth_routes.py:1158`, `account.py:697`). That resolution refuses an account whose record
+  fails its seal. It is run on such an
   account only as a store call, where it ends that session too, by the body in
   `tests/_session_seal_contract.py`, which `test_session_seal_contract` runs on both server legs.
   At least a bind, an unbind, a TOTP re-enrolment, an administrator's role change and a password
