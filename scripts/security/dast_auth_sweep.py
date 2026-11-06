@@ -580,6 +580,12 @@ def _rows_not_declared(
     for row in rows:
         kind = row.get("kind") or "no kind"
         if kind in passes:
+            # Engine PR 2390 note 5: a gate dependency that demands no Permission vouches for
+            # nothing either, as tests/test_route_gates.py holds for every shipped socket.
+            if needs_gate and not row.get("permissions"):
+                found.append(
+                    f"{str(row['method']).upper()} {row['path']} ({kind}, no permission found)"
+                )
             continue
         if kind not in needs_reason:
             state = kind

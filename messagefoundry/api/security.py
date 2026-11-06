@@ -965,8 +965,9 @@ async def refuse_undeclared_route(connection: HTTPConnection) -> None:
 # and :class:`WebSocketAcceptGate` refuses ``websocket.accept``, and a non-refusal denial response,
 # on any socket whose scope does not read admitted, unless the route declares its authorization
 # some other way: a gate dependency, which ran and admitted the caller before the body did, or a
-# ``public_route`` mark. An undeclared socket never gets this far, because
-# :func:`refuse_undeclared_route` refuses it first.
+# ``public_route`` mark. An undeclared socket the refusal reaches never gets this far, because
+# :func:`refuse_undeclared_route` refuses it first; one outside the refusal, such as a socket in a
+# mount, is refused here at accept instead.
 #
 # The LATEST gate's answer stands: a refusal clears an earlier admission, so a body that ignores a
 # stricter gate's refusal after a laxer gate admitted the caller is still refused. The record is a
@@ -997,8 +998,8 @@ def ws_accept_allowed(scope: Mapping[str, Any]) -> bool:
         return True
     route = scope.get("route")
     if route is None:
-        # A plain Starlette route, such as one in a mount, sets no route: its endpoint's own
-        # public mark is the only declaration it can carry.
+        # A scope a router did not fill sets no route: the endpoint's own public mark, when the
+        # scope names one, is the only declaration left to read.
         declared = route_declaration_of(scope.get("endpoint"))
         return declared is not None and declared.public
     # As the HTTP rule reads it: a gate dependency, or a public mark. An in-body mark is not enough.
@@ -2122,6 +2123,8 @@ async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identi
     success it also records the handshake admitted, and on a refusal not admitted, which
     :class:`WebSocketAcceptGate` reads before an in-body socket may be accepted.
     """
+    # Not admitted until this gate answers, so a raise inside it cannot leave an earlier admission.
+    record_ws_gate(websocket, admitted=False)
     identity = await _authorize_ws(websocket, *permissions)
     record_ws_gate(websocket, admitted=identity is not None)
     return identity

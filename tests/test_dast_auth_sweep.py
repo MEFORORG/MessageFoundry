@@ -1074,7 +1074,16 @@ def _passing_ws_rows() -> list[dict[str, Any]]:
         ),
         # The shape the receipt wrote before #2955: method and path only.
         pytest.param(_ws_row(), True, id="older-receipt"),
-        pytest.param(_ws_row(kind=route_gates.KIND_GATED, declaration=None), False, id="gated"),
+        pytest.param(
+            _ws_row(kind=route_gates.KIND_GATED, declaration=None, permissions=_PERMS),
+            False,
+            id="gated",
+        ),
+        pytest.param(
+            _ws_row(kind=route_gates.KIND_GATED, declaration=None, permissions=[]),
+            True,
+            id="gated-no-permission",
+        ),
         pytest.param(
             _ws_row(
                 kind=route_gates.KIND_IN_BODY, declaration=_REASON, gates=_GATES, permissions=_PERMS

@@ -287,6 +287,7 @@ async def test_a_non_refusal_denial_response_needs_an_admitted_caller(engine: En
         _planted(engine, None, _Outcome()), "/zz/denial-200", None, denial_extension=True
     )
     await refused.run()
+    assert refused.sent and refused.sent[0]["type"] == "websocket.http.response.start", refused.sent
     assert [m for m in refused.sent if m["type"] == "websocket.http.response.start"] == [
         m for m in refused.sent[:1] if m.get("status") == 403
     ], refused.sent

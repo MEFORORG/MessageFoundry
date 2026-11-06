@@ -223,9 +223,9 @@ body, the early sign-in check above still answers before it. A route passes in o
   pending session inside the handler, such as `/ui/mfa`. `authorizes_in_body` marks a WebSocket
   that authorizes the caller inside its own body, and `/ws/stats` is the engine route that uses it.
   On an HTTP route with no gate, that mark does not count, so the route is refused. The mark is
-  not trusted on its own (vault BACKLOG #2955): each WebSocket gate, `authorize_ws` and the web
-  console's `authorize_ui_ws`, records on the handshake whether it admitted the caller, the latest
-  answer standing, and `WebSocketAcceptGate` refuses the accept of an in-body socket whose
+  not trusted on its own (vault BACKLOG #2955): the in-body WebSocket gates, at least `authorize_ws`
+  and the web console's `authorize_ui_ws`, record on the handshake whether they admitted the caller,
+  the latest answer standing, and `WebSocketAcceptGate` refuses the accept of an in-body socket whose
   handshake does not read admitted, with a 1008 close and an ERROR line,
   `refused accept on WebSocket route`, at most once a minute for each route. That count is in
   memory only; `GET /security/posture` does not report it.
