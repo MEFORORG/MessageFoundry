@@ -364,3 +364,34 @@ async def test_a_disable_during_the_after_check_comparison_stops_the_factor_writ
         assert any((r["detail"] or "").find("factor_removed") >= 0 for r in rows), rows
     finally:
         await store.close()
+
+
+async def test_the_gates_and_the_store_judge_a_totp_cell_with_one_helper(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore
+) -> None:
+    """BACKLOG #3948 finding 17: the service's way-past gates (``_totp_state``) and the store's
+    judgement for its conditional writes (``judge_totp``) both judge a cell through the store's
+    ``judge_totp_cell``, so the two cannot drift apart. A spy on that one helper sees both calls.
+    RED when either side restates the judgement beside it."""
+    from messagefoundry.auth.service import _opened_totp_state
+    from messagefoundry.store import store as store_module
+
+    service, identity, _password, _steps, _codes = await _totp_admin(
+        store, monkeypatch, before_confirm=lambda: None
+    )
+    real_judge = store_module.judge_totp_cell
+    calls: list[str] = []
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(str(args[2]))
+        return await real_judge(*args, **kwargs)
+
+    monkeypatch.setattr(store_module, "judge_totp_cell", spy)
+    monkeypatch.setattr(service_module, "judge_totp_cell", spy)
+    assert not await service.must_enrol_before_rotating(identity)
+    assert calls == [identity.user_id], calls
+    judgement = await store_module.judge_totp(
+        store.open_totp_secret, _opened_totp_state, await store.get_user(identity.user_id)
+    )
+    assert isinstance(judgement, store_module.TotpJudgement) and judgement.state == "usable"
+    assert calls == [identity.user_id, identity.user_id], calls

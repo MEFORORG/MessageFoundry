@@ -193,7 +193,7 @@ from messagefoundry.store.store import (
     VerifiedUser,
     WebAuthnCredential,
     ad_map_seal_ok,
-    log_unopened_totp,
+    judge_totp_cell,
     passkey_digest,
     passkey_is_way_past,
     passkey_is_way_past_under,
@@ -10761,9 +10761,11 @@ class AuthService:
 
     async def _open_totp_cell(self, user: VerifiedUser) -> str | None:
         """``user``'s TOTP cell, the one the checked record's seal covered (BACKLOG #3510), opened
-        OFF THE EVENT LOOP (BACKLOG #3929). The service's one way to open it: under a Transit cipher
-        the open is a blocking ``decrypt_data`` HTTP call (CLAUDE.md section 6), and the combined
-        sign-in reaches it with a username alone. Raises what the store's opener raises."""
+        OFF THE EVENT LOOP (BACKLOG #3929). The service's way to open it for a code: under a Transit
+        cipher the open is a blocking ``decrypt_data`` HTTP call (CLAUDE.md section 6), and the
+        combined sign-in reaches it with a username alone. The way-past gates judge the cell through
+        the store's :func:`judge_totp_cell` instead (:meth:`_totp_state`), which opens it off the
+        loop too. Raises what the store's opener raises."""
         return await asyncio.to_thread(self._store.open_totp_secret, user.id, user.totp_secret_cell)
 
     async def _totp_secret(self, user: VerifiedUser) -> str | None:
@@ -13232,21 +13234,18 @@ class AuthService:
         """What ``user``'s TOTP is (:func:`_opened_totp_state`, the census rule), or ``None`` when
         it is not enabled. The engine judges it ``"usable"`` when it can compute codes with it. An
         enrolment whose marker this release refuses matches no code, so its combined sign-in can
-        never pass a lock, and it is no way past (BACKLOG #3422). The cell is opened by
-        :meth:`_open_totp_cell`, off the event loop. The service's way-past
-        decisions ask this: the rotation and removal gates, the last-factor rule and the lock
-        notice; the store's conditional writes and the lock escalation ask the same rule
-        (``totp_usable``) on the cell they lock."""
+        never pass a lock, and it is no way past (BACKLOG #3422). The cell is the one the checked
+        record's seal covered, judged by the store's :func:`judge_totp_cell`, off the event loop:
+        the same judgement the store's conditional writes and the lock escalation make on the cell
+        they lock (BACKLOG #3948 finding 17). The service's way-past decisions ask this: the
+        rotation and removal gates, the last-factor rule and the lock notice."""
         if not user.totp_enabled:
             return None
         if user.totp_secret_cell is None:
             return "refused"
-        try:
-            secret = await self._open_totp_cell(user)
-        except CipherError:
-            log_unopened_totp(user.id)
-            return "unknown"
-        return _opened_totp_state(secret)
+        return await judge_totp_cell(
+            self._store.open_totp_secret, _opened_totp_state, user.id, user.totp_secret_cell
+        )
 
     async def _holds_discoverable_passkey(
         self,

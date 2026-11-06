@@ -3197,30 +3197,46 @@ async def judge_totp(
     with no lock held: a Transit cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6), and
     holding SQLite's writer lock or a row lock across it would stall every other write. Under the
     lock the verdict holds only for that exact cell (:meth:`TotpJudgement.moved`); each caller says
-    what a moved cell means for it. A cell that does not open is ``"unknown"``
-    (:func:`log_unopened_totp`), never a refusal. ``None`` for no ``usable``."""
+    what a moved cell means for it. The cell is judged by :func:`judge_totp_cell`. ``None`` for no
+    ``usable``."""
     if usable is None:
         return None
-    rule = usable
     cell = (
         None if user is None or user.row is None or not user.totp_enabled else user.row.totp_secret
     )
     state: TotpState = "refused"  # no cell: no TOTP to count
     if user is not None and cell is not None:
-
-        def judge(user_id: str, stored: str) -> TotpState:
-            return rule(opener(user_id, stored))
-
-        try:
-            state = await asyncio.to_thread(judge, user.id, cell)
-        except CipherError:
-            log_unopened_totp(user.id)
-            state = "unknown"
-        if state not in ("usable", "refused", "unknown"):
-            # A bool rule (the old shape) would read False as "not refused", which fails open.
-            raise TypeError(f"totp_usable answered {state!r}, not a TotpState")
-
+        state = await judge_totp_cell(opener, usable, user.id, cell)
     return TotpJudgement(cell=cell, state=state)
+
+
+async def judge_totp_cell(
+    opener: Callable[[str, str | None], str | None],
+    usable: TotpUsable,
+    user_id: str,
+    cell: str,
+) -> TotpState:
+    """What one stored TOTP ``cell`` is (:data:`TotpState`): opened with ``opener`` (a backend's
+    ``open_totp_secret``) and judged by ``usable``, both OFF THE EVENT LOOP, since a Transit
+    cipher's decrypt is a blocking HTTP call (CLAUDE.md section 6). A cell that does not open
+    (:class:`CipherError`) is ``"unknown"``, logged by :func:`log_unopened_totp`, never a refusal.
+
+    The one statement of the judgement (BACKLOG #3948 finding 17): :func:`judge_totp`, for the
+    store's conditional writes and the lock escalation, and the auth service's way-past gates
+    both ask it, so the two cannot drift apart."""
+
+    def judge() -> TotpState:
+        return usable(opener(user_id, cell))
+
+    try:
+        state = await asyncio.to_thread(judge)
+    except CipherError:
+        log_unopened_totp(user_id)
+        return "unknown"
+    if state not in ("usable", "refused", "unknown"):
+        # A bool rule (the old shape) would read False as "not refused", which fails open.
+        raise TypeError(f"totp_usable answered {state!r}, not a TotpState")
+    return state
 
 
 async def escalation_verdict(
