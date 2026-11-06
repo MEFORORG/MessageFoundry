@@ -844,7 +844,7 @@ From the notes under the section 5 roster. `CLAUDE.md` keeps the roster row, a s
 ruling, and pointers to korus `roles/SPECIAL.md` and `docs/roles/special.card.md`.
 
 **THE SPECIAL SEAT IS THE OWNER'S, AND IT HAS NO STANDING DUTIES (owner decision 2026-09-16).** It
-exists for work that falls outside the other standing seats, so its instruction is the whole of its scope and
+exists for work that falls outside the other five, so its instruction is the whole of its scope and
 it has none until the owner gives it one. It does not take a BACKLOG item, a brief, or a red. It is
 an ADDITION -- nothing retired to make room for it -- and it is not a spawn-authorised seat, so the
 ruling below binds it.
