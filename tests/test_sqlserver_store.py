@@ -7282,18 +7282,27 @@ async def test_table_occupancy_reads_the_store_schema_and_counts_a_connection_ev
 async def test_a_keyed_fresh_store_holds_data_until_its_chain_is_gone(store) -> None:
     # PR 2804 hold (A): a keyed open, the shape a mint makes, starts the chain and so holds data. A
     # mint that failed after the keyed open's own commits but before its genesis record leaves only
-    # the salt, counter and markers, which do not count, so the mint can be run again.
+    # the salt, counter and markers, which do not count, so the mint can be run again. Each open
+    # passes the audit MAC key, as open_store derives it from the cipher: without it the handle
+    # holds no keying secret and _load_audit_chain writes no genesis row.
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.custody_host import store_holds_data
     from messagefoundry.store.sqlserver import SqlServerStore
 
     await _empty_every_census_table(store)
-    keyed = await SqlServerStore.open(
-        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
-    )
-    await keyed.close()
+
+    async def open_keyed() -> SqlServerStore:
+        cipher = make_cipher(generate_key(), write_v2=True)
+        return await SqlServerStore.open(
+            load_settings(environ=os.environ).store,
+            cipher=cipher,
+            audit_mac_key=cipher.audit_mac_key(),
+        )
+
+    await (await open_keyed()).close()
     occupancy = await store.table_occupancy()
-    assert occupancy["audit_log"] and occupancy["keyed_surface"]
+    assert occupancy["audit_log"]  # the genesis row
+    assert occupancy["keyed_surface"]  # the markers the keyed open writes before it
     assert await store_holds_data(store)
     async with store._pool.acquire() as conn:
         cur = await conn.cursor()
@@ -7302,8 +7311,5 @@ async def test_a_keyed_fresh_store_holds_data_until_its_chain_is_gone(store) -> 
     assert not await store_holds_data(store)
     # The re-run's own create: a new key opens over the salt, counter and markers the failed one left,
     # and starts its chain.
-    again = await SqlServerStore.open(
-        load_settings(environ=os.environ).store, cipher=make_cipher(generate_key(), write_v2=True)
-    )
-    await again.close()
+    await (await open_keyed()).close()
     assert await store_holds_data(store)
