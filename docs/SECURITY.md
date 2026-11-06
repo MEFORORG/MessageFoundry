@@ -4824,8 +4824,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   no Administrator can sign in to unbind one. Since vault BACKLOG #2711, `provision-admin` at the
   host can make a local Administrator then, because a bound one does not block it.
 - **Limits of the session sweep.** **A session whose token is rotated while a whole-account
-  sweep runs is swept too, on all three stores, except in the SQL Server cases this paragraph
-  names (BACKLOG #4974).** Until then the SQL Server store could miss any such session. That
+  sweep runs is swept too, on all three stores, except in at least the SQL Server cases this
+  paragraph names (BACKLOG #4974).** Until then the SQL Server store could miss any such session. That
   store's re-key moves the session row to a new clustered key, so a sweep waiting on the row's
   old key would find it gone and the new one outside its read. Its rotation now takes the
   account's row under `UPDLOCK` before the session row, the order each whole-account sweep there
@@ -4840,17 +4840,21 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   the same holds for those accounts. Its sweep also reaches the sessions of an account created
   after that read, but nothing orders a rotation of one of them against it, so on SQL Server a
   rotation in that instant can still be missed; the global epoch below ends such a session at
-  its next presentation. The session cap's trim takes no account row, so a rotation can still
-  slip past it on SQL Server too. The Postgres store's rotation takes no account row: its sweep
-  waits on the rotated row and then re-checks that row's newest version, which still matches.
-  The SQLite store runs one writer at a time. `test_rotation_racing_a_sweep_is_swept`, from
-  `tests/_federated_unbind_store_contract.py`, pauses a rotation after its locked read and before
+  its next presentation. A sweep that takes no account row is not ordered against a rotation
+  either, at least the session cap's trim. The trim raises no epoch, so a session a rotation
+  carries past it on SQL Server is not refused later: it stays live, over the cap, until a
+  later trim or its own expiry ends it. The Postgres store's rotation takes no account row: its
+  sweep waits on the rotated row and then re-checks that row's newest version, which still
+  matches. The SQLite store runs one writer at a time. `test_rotation_racing_a_sweep_is_swept`,
+  in `tests/test_postgres_store.py` and `tests/test_sqlserver_store.py`, runs the shared body in
+  `tests/_federated_unbind_store_contract.py`. It pauses a rotation after its locked read and before
   its re-key, then runs a bind, an unbind, a revoke of a user's sessions and the every-account
   revoke against it, on both server legs; on the SQL Server leg it also starts a rotation while a
   bind holds the account's row. The TOTP re-enrolment's own sweep was read from the code and is
   not replayed. That the old SQL Server order missed the session
   was read from the code and was not run.
-  **A session a sweep missed is refused the next time it is presented** (BACKLOG #2592),
+  **A session a whole-account sweep missed is refused the next time it is presented** (BACKLOG
+  #2592),
   within the limits the rest of this bullet states. Each of these raises the
   account's session epoch in the same transaction, and a rotation keeps the epoch the session was
   sealed under. So the gate refuses and ends the session, and the user's own session list hides
@@ -4950,7 +4954,10 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   releases the bind and requires both to finish. Under the old Postgres order, by the same
   reading, the database would end one of them as a deadlock; that was not run. No bind,
   unbind, revoke or user delete retries a deadlock, so a deadlock between any of them and
-  another write still fails that request, and it has to be made again by hand. The SQLite store runs one writer at a time, so it has no lock order to get wrong.
+  another write still fails that request, and it has to be made again by hand. Nor does a
+  rotation: one the server ends as a deadlock victim is a store refusal, which the service
+  answers by revoking the session under both hashes, best effort, and failing the ceremony
+  closed (BACKLOG #3023). The SQLite store runs one writer at a time, so it has no lock order to get wrong.
 - **Limit: an account with no binding is unchanged.** It still signs in by Windows SSO, and its
   first engine factor is enrolled on proof of the directory credential alone. The Kerberos row
   of the [pathway table](#authentication-pathways--comparative-strength) describes that leg.
