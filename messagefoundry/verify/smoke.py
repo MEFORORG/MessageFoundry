@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import socket
 import ssl
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
     # every ``messagefoundry verify`` run, including ``--section host``, which never opens a store —
     # this package keeps its module-level surface thin on purpose and defers store imports into the
     # functions that need them.
+    from messagefoundry.config.wiring import Registry
     from messagefoundry.store.store import MessageStatus
 
 #: The smoke message, segment by segment.
@@ -161,11 +163,17 @@ def _classify_self_smoke(disposition: MessageStatus, summary: str) -> CheckResul
 
 
 def smoke_self(
-    config_dir: str, *, inbound: str | None = None, snapshot_on_send: bool = False
+    config_dir: str,
+    *,
+    inbound: str | None = None,
+    snapshot_on_send: bool = False,
+    graph: Callable[[], Registry] | None = None,
 ) -> CheckResult:
     """Route a synthetic message through the box's config with no side effects (``dry_run``).
 
     PASSES only on a delivering outcome; :func:`_classify_self_smoke` carries what fails and why.
+    ``graph``, when given, is the verify run's one load of ``config_dir`` (BACKLOG #3803 R2), so the
+    config modules are not run a second time; without it the smoke loads the graph itself.
 
     ``snapshot_on_send`` (ADR 0104) selects the copy-on-Send posture the preview reproduces, matching
     the live engine's ``[pipeline].snapshot_on_send``. It keeps the library default ``False`` here so a
@@ -195,7 +203,14 @@ def smoke_self(
     from messagefoundry.redaction import safe_error, safe_exc
 
     try:
-        reg = load_config(config_dir)
+        if graph is None:
+            reg = load_config(config_dir)
+        else:
+            reg = graph()
+            # The run's shared load allows an empty graph, for the hop census; the smoke does not.
+            # That is the one rule the shared load skipped, and validate() names it as a load does.
+            if reg.declares_no_connections:
+                reg.validate()
     except WiringError as exc:
         return CheckResult(rid, title, Status.FAIL, f"config failed to load: {exc}")
     msg = synthetic_message()  # a module constant since #1192 — cannot fail

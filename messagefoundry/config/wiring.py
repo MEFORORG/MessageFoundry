@@ -7154,6 +7154,43 @@ def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
     return not conn.deployed and isinstance(conn.spec.settings.get("dialect"), EnvRef)
 
 
+def sqlserver_odbc_hops(registry: Registry) -> tuple[list[tuple[str, str]], list[str]]:
+    """The graph's hops on the SQL Server ODBC preset, as ``(kind, name)``, and the names of the
+    ``DATABASE`` connections whose driver that preset does not decide (BACKLOG #3803 R3).
+
+    The single reader of which entries open a SQL Server ODBC Driver 18 connection, kept beside
+    the factories that set the defaults it reads, so ``messagefoundry verify``'s ``host.ciphers``
+    and ``host.odbc`` rows do not re-derive them. A hop is a ``DATABASE`` connection on the
+    ``sqlserver`` dialect, the default, a database-backed reference set, or a database lookup;
+    the last two take no dialect. The second list holds each ``DATABASE`` connection on another
+    dialect, or on an ``env()`` dialect read with no values, since its own driver may decide its
+    TLS. A not-deployed connection with an ``env()`` dialect is in neither, as in the other
+    readers here (:func:`_dark_env_dialect`). A connection is named by its record name, as those
+    readers name it, so an inbound and an outbound of one name stay apart. Each list is sorted."""
+    connections: list[tuple[str, str]] = []
+    other: list[str] = []
+    for record_name, table in (
+        (_outbound_record_name, registry.outbound),
+        (inbound_record_name, registry.inbound),
+    ):
+        for conn in table.values():
+            if conn.spec.type is not ConnectorType.DATABASE or _dark_env_dialect(conn):
+                continue
+            if _db_dialect(conn.spec.settings, None) == "sqlserver":
+                connections.append(("DATABASE connection", record_name(conn.name)))
+            else:
+                other.append(record_name(conn.name))
+    hops = sorted(connections)
+    other.sort()
+    hops += [
+        ("DatabaseRef reference set", name)
+        for name, ref in sorted(registry.references.items())
+        if ref.source.kind == "database"
+    ]
+    hops += [("DatabaseLookup", name) for name in sorted(registry.lookups)]
+    return hops, other
+
+
 def unverified_generic_db_hops(
     registry: Registry, *, env_values: Mapping[str, Any] | None = None
 ) -> list[tuple[str, str]]:

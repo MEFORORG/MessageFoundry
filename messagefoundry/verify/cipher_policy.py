@@ -243,6 +243,33 @@ def _powershell_pins() -> dict[str, str]:
     }
 
 
+def _powershell(command: str) -> subprocess.CompletedProcess[str]:
+    """Windows PowerShell, by its pinned path, run on ``command`` as the probe runs it.
+
+    One start, so the tests that run other text through the real PowerShell take it too, and
+    cannot drift from the probe's arguments or environment (BACKLOG #3803 S5). ``command`` is a
+    fixed text of this module's or a test's, never host data."""
+    return subprocess.run(  # nosec B603 - pinned tool, argv list (no shell), fixed arguments
+        [
+            _system_exe(*_POWERSHELL_HOME, "powershell.exe"),
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ],
+        # The platform's start-up names (#2716), with PATH and PSModulePath fixed (#3803).
+        env=system_tool_environment(pinned=_powershell_pins()),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=_PROBE_TIMEOUT_S,
+        check=False,
+        creationflags=_NO_WINDOW,
+    )
+
+
 def _windows_enabled_suites() -> list[str]:
     """The enabled SChannel suite names, as section 5.4's check 1 reads them.
 
@@ -255,25 +282,7 @@ def _windows_enabled_suites() -> list[str]:
     shaped like a suite name, such as a stream line the command did not silence, is
     :class:`ProbeFailed`: it is neither counted as a suite nor dropped."""
     with _probe_errors("powershell.exe"):
-        proc = subprocess.run(  # nosec B603 - pinned tool, argv list (no shell), fixed arguments
-            [
-                _system_exe(*_POWERSHELL_HOME, "powershell.exe"),
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                _SUITES_COMMAND,
-            ],
-            # The platform's start-up names (#2716), with PATH and PSModulePath fixed (#3803).
-            env=system_tool_environment(pinned=_powershell_pins()),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=_PROBE_TIMEOUT_S,
-            check=False,
-            creationflags=_NO_WINDOW,
-        )
+        proc = _powershell(_SUITES_COMMAND)
     if proc.returncode == _NO_CMDLET_EXIT:
         raise ProbeUnavailable("Get-TlsCipherSuite not found in the system TLS module")
     lines = _stdout_lines("powershell.exe", proc)

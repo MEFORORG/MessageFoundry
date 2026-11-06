@@ -18,6 +18,7 @@ manufactured by the check.
 from __future__ import annotations
 
 import ast
+import functools
 import importlib
 import importlib.metadata
 import importlib.util
@@ -87,47 +88,6 @@ def check_optional_drivers() -> CheckResult:
     return CheckResult("host.extras", "Optional driver extras", Status.PASS, detail)
 
 
-def check_sqlserver_odbc_driver() -> CheckResult:
-    """Microsoft ODBC Driver 18 for SQL Server installed and discoverable via pyodbc."""
-    if not _can_import("pyodbc"):
-        return CheckResult(
-            "host.odbc",
-            "SQL Server ODBC Driver 18",
-            Status.SKIP,
-            "pyodbc not importable (install the [sqlserver] extra)",
-        )
-    try:
-        # Dynamic import keeps mypy --strict clean (pyodbc ships no type stubs).
-        pyodbc = importlib.import_module("pyodbc")
-        # drivers() allocates pyodbc's ODBC environment, which fixes pooling for the process.
-        disable_driver_manager_pooling()  # BACKLOG #2049; why is in messagefoundry/odbc_env.py
-        drivers = list(pyodbc.drivers())
-    except Exception as exc:  # pyodbc surfaces driver-manager errors as bare Exception
-        return CheckResult(
-            "host.odbc",
-            "SQL Server ODBC Driver 18",
-            Status.ERROR,
-            f"pyodbc.drivers() failed: {exc}",
-        )
-    target = "ODBC Driver 18 for SQL Server"
-    if target in drivers:
-        return CheckResult(
-            "host.odbc",
-            "SQL Server ODBC Driver 18",
-            Status.PASS,
-            f"{target} present",
-            evidence=", ".join(drivers),
-        )
-    seen = [d for d in drivers if "SQL Server" in d]
-    return CheckResult(
-        "host.odbc",
-        "SQL Server ODBC Driver 18",
-        Status.FAIL,
-        f"{target!r} not found; SQL Server drivers seen: {seen or 'none'}",
-        evidence=", ".join(drivers),
-    )
-
-
 @dataclass(frozen=True)
 class OdbcHops:
     """The ODBC Driver hops a deployment's configuration takes, as ``verify`` read them.
@@ -140,6 +100,106 @@ class OdbcHops:
     unknown: str | None = None
     #: What was read to reach "no hop", named in the SKIP detail.
     judged: str = "the configuration"
+
+    @property
+    def takes_none(self) -> bool:
+        """The configuration was read in full and takes no ODBC hop."""
+        return not self.found and self.unknown is None
+
+
+def _census(odbc_hops: Callable[[], OdbcHops]) -> OdbcHops:
+    """``odbc_hops()``, with a failure the census did not foresee read as an unknown answer."""
+    try:
+        return odbc_hops()
+    except Exception as exc:  # a census failure the census did not foresee: it read nothing
+        _log.warning("verify: the ODBC hop census raised %s", type(exc).__name__)
+        reason = codec_safe_str(exc)[:200]
+        return OdbcHops(unknown=f"the hop census raised {type(exc).__name__}: {reason}")
+
+
+def _no_hop_detail(hops: OdbcHops) -> str:
+    return (
+        f"no ODBC Driver 18 hop in {hops.judged} (no SQL Server store, DATABASE connection, "
+        "DatabaseRef or DatabaseLookup)"
+    )
+
+
+def _as_the_hops_make_it(reading: CheckResult, hops: OdbcHops, subject: str) -> CheckResult:
+    """``reading`` as counted for a configuration whose hops are ``hops``.
+
+    A configuration that takes a hop keeps the reading as it is, FAIL included, and names the hop.
+    Where the configuration could not be read, a FAIL or ERROR reading is MANUAL with the reading in
+    its detail: it may be wrong, but whether it matters here is not known, and the verifier must not
+    fail a host on a guess. ``subject`` names what was read, in that detail. A configuration known
+    to take no hop is the caller's to report, since the two rows word it differently."""
+    if hops.found:
+        hop_text = "ODBC hops: " + ", ".join(hops.found)
+        evidence = f"{hop_text}; {reading.evidence}" if reading.evidence else hop_text
+        return CheckResult(reading.id, reading.title, reading.status, reading.detail, evidence)
+    if reading.status not in FAILING:
+        return reading
+    return CheckResult(
+        reading.id,
+        reading.title,
+        Status.MANUAL,
+        f"whether this host takes an ODBC hop is not known ({hops.unknown}); if it takes one, "
+        f"{subject} reads {reading.status.value}: {reading.detail}",
+        evidence=reading.evidence,
+    )
+
+
+def _odbc_driver_reading() -> CheckResult:
+    """Whether pyodbc lists Microsoft ODBC Driver 18 for SQL Server, whatever the configuration."""
+    rid, title = "host.odbc", "SQL Server ODBC Driver 18"
+    if not _can_import("pyodbc"):
+        return CheckResult(
+            rid, title, Status.SKIP, "pyodbc not importable (install the [sqlserver] extra)"
+        )
+    try:
+        # Dynamic import keeps mypy --strict clean (pyodbc ships no type stubs).
+        pyodbc = importlib.import_module("pyodbc")
+        # drivers() allocates pyodbc's ODBC environment, which fixes pooling for the process.
+        disable_driver_manager_pooling()  # BACKLOG #2049; why is in messagefoundry/odbc_env.py
+        drivers = list(pyodbc.drivers())
+    except Exception as exc:  # pyodbc surfaces driver-manager errors as bare Exception
+        return CheckResult(rid, title, Status.ERROR, f"pyodbc.drivers() failed: {exc}")
+    target = "ODBC Driver 18 for SQL Server"
+    if target in drivers:
+        return CheckResult(
+            rid, title, Status.PASS, f"{target} present", evidence=", ".join(drivers)
+        )
+    seen = [d for d in drivers if "SQL Server" in d]
+    return CheckResult(
+        rid,
+        title,
+        Status.FAIL,
+        f"{target!r} not found; SQL Server drivers seen: {seen or 'none'}",
+        evidence=", ".join(drivers),
+    )
+
+
+def check_sqlserver_odbc_driver(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
+    """Microsoft ODBC Driver 18 for SQL Server installed and discoverable via pyodbc.
+
+    A driver that is there PASSes on any host. A missing driver, or a driver list that could not be
+    read, counts only where the configuration takes a hop (BACKLOG #3803 R6): a host with pyodbc
+    installed and no hop SKIPs with the reading in its detail, and one whose configuration could
+    not be read is MANUAL, as ``host.ciphers`` reports (:func:`_as_the_hops_make_it`).
+    ``odbc_hops`` is called only for a failing reading, because it can load the configuration."""
+    reading = _odbc_driver_reading()
+    if reading.status not in FAILING:
+        return reading
+    hops = _census(odbc_hops)
+    if hops.takes_none:
+        return CheckResult(
+            reading.id,
+            reading.title,
+            Status.SKIP,
+            f"{_no_hop_detail(hops)}, so no hop needs the driver; it reads "
+            f"{reading.status.value}: {reading.detail}",
+            evidence=reading.evidence,
+        )
+    return _as_the_hops_make_it(reading, hops, "the driver")
 
 
 def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
@@ -166,19 +226,13 @@ def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
     if sys.platform != "win32" and not sys.platform.startswith("linux"):
         # The reading SKIPs here, so the census, which runs config modules, is not taken.
         return cipher_policy.read_host_cipher_policy()
-    try:
-        hops = odbc_hops()
-    except Exception as exc:  # a census failure the census did not foresee: it read nothing
-        _log.warning("host.ciphers: the ODBC hop census raised %s", type(exc).__name__)
-        reason = codec_safe_str(exc)[:200]
-        hops = OdbcHops(unknown=f"the hop census raised {type(exc).__name__}: {reason}")
-    if not hops.found and hops.unknown is None:
+    hops = _census(odbc_hops)
+    if hops.takes_none:
         return CheckResult(
             rid,
             title,
             Status.SKIP,
-            f"no ODBC Driver 18 hop in {hops.judged} (no SQL Server store, DATABASE connection, "
-            "DatabaseRef or DatabaseLookup), so the host policy does not reach one",
+            f"{_no_hop_detail(hops)}, so the host policy does not reach one",
         )
     try:
         reading = cipher_policy.read_host_cipher_policy()
@@ -189,20 +243,7 @@ def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
             Status.ERROR,
             f"the policy read raised {type(exc).__name__}: {codec_safe_str(exc)}",
         )
-    if hops.found:
-        hop_text = "ODBC hops: " + ", ".join(hops.found)
-        evidence = f"{hop_text}; {reading.evidence}" if reading.evidence else hop_text
-        return CheckResult(rid, title, reading.status, reading.detail, evidence=evidence)
-    if reading.status not in FAILING:
-        return reading
-    return CheckResult(
-        rid,
-        title,
-        Status.MANUAL,
-        f"whether this host takes an ODBC hop is not known ({hops.unknown}); if it takes one, the "
-        f"policy reads {reading.status.value}: {reading.detail}",
-        evidence=reading.evidence,
-    )
+    return _as_the_hops_make_it(reading, hops, "the policy")
 
 
 def _asyncpg_has_connect_hook() -> bool | None:
@@ -540,12 +581,15 @@ def run_host_checks(
 ) -> list[CheckResult]:
     """Run every host/environment check and return their results (order is stable).
 
-    ``odbc_hops`` reads which ODBC hops the configuration takes, for :func:`check_host_cipher_policy`."""
+    ``odbc_hops`` reads which ODBC hops the configuration takes, for :func:`check_sqlserver_odbc_driver`
+    and :func:`check_host_cipher_policy`. It is taken at most once, and both rows read that answer,
+    because it can load the configuration."""
+    census = functools.cache(functools.partial(_census, odbc_hops))
     return [
         check_python_runtime(),
         check_optional_drivers(),
-        check_sqlserver_odbc_driver(),
-        check_host_cipher_policy(odbc_hops),
+        check_sqlserver_odbc_driver(census),
+        check_host_cipher_policy(census),
         check_postgres_driver(),
         check_listener_ports(ports),
         check_writable_dir(writable_dir),

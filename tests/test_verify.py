@@ -668,7 +668,11 @@ def test_run_verify_self_smoke_threads_resolved_setting(monkeypatch: pytest.Monk
     seen: list[bool] = []
 
     def _spy_smoke_self(
-        config_dir: str, *, inbound: str | None = None, snapshot_on_send: bool = False
+        config_dir: str,
+        *,
+        inbound: str | None = None,
+        snapshot_on_send: bool = False,
+        graph: object = None,
     ) -> CheckResult:
         seen.append(snapshot_on_send)
         return CheckResult("smoke.self", "spy", Status.PASS, "spy")

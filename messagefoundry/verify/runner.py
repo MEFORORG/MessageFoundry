@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from messagefoundry.config.settings import ServiceSettings, StoreBackend
 from messagefoundry.verify.checks import (
@@ -22,6 +23,9 @@ from messagefoundry.verify.smoke import (
     smoke_self,
     synthetic_message,
 )
+
+if TYPE_CHECKING:
+    from messagefoundry.config.wiring import Registry
 
 _log = logging.getLogger(__name__)
 
@@ -94,27 +98,55 @@ def _writable_dir(settings: ServiceSettings | None) -> Path:
     return Path.cwd()
 
 
-def _odbc_hops(
-    settings: ServiceSettings | None, service_config: str | None, config_dir: str
-) -> OdbcHops:
-    """Which ODBC Driver 18 hops this deployment takes, for the ``host.ciphers`` row (BACKLOG #3277).
+class _Graph:
+    """The ``--config`` graph, loaded at most once per verify run (BACKLOG #3803 R2).
 
-    The SQL Server store is read from the service settings. A DATABASE connection on the SQL Server
-    dialect, a ``DatabaseRef`` reference set and a ``DatabaseLookup`` are read from the config graph,
-    which this loads the way the self smoke does, so it runs only when the store has not already
-    shown a hop. A hop found either way is enough.
+    The hop census and the self smoke both read it, and a load runs every config module, so a
+    second load ran them twice. The first load's outcome, the graph or what the load raised, is
+    what every caller gets. It allows an empty graph, which the census reads as one with no hop,
+    an answer rather than an unknown; :func:`~messagefoundry.verify.smoke.smoke_self` applies the
+    empty-graph rule itself."""
+
+    def __init__(self, config_dir: str) -> None:
+        self.config_dir = config_dir
+        self._outcome: Registry | BaseException | None = None
+
+    def __call__(self) -> Registry:
+        if self._outcome is None:
+            from messagefoundry.config.wiring import load_config
+
+            try:
+                self._outcome = load_config(self.config_dir, allow_empty=True)
+            except (Exception, SystemExit) as exc:  # each caller maps what was raised its own way
+                self._outcome = exc
+        if isinstance(self._outcome, BaseException):
+            raise self._outcome
+        return self._outcome
+
+
+def _odbc_hops(
+    settings: ServiceSettings | None,
+    service_config: str | None,
+    config_dir: str,
+    graph: Callable[[], Registry],
+) -> OdbcHops:
+    """Which ODBC Driver 18 hops this deployment takes, for the ``host.odbc`` and ``host.ciphers``
+    rows (BACKLOG #3277, #3803 R6).
+
+    The SQL Server store is read from the service settings. The graph's hops are read by
+    :func:`~messagefoundry.config.wiring.sqlserver_odbc_hops` from ``graph``, the run's one load of
+    ``config_dir``, only when the store has not already shown a hop. A hop found either way is enough.
 
     Anything not read leaves the answer unknown rather than "no hop", because a hop could sit in it:
     a graph that does not load, settings that did not load, or a shell with no
     ``MEFOR_STORE_BACKEND``. That variable overrides the settings file, and an operator's shell
     need not carry the service's own environment, so without it even a file that says sqlite does
-    not show the service's store (BACKLOG #3803 R1). A generic-dialect DATABASE connection is
-    unknown too: its driver, not Driver 18, decides its TLS."""
+    not show the service's store (BACKLOG #3803 R1). A DATABASE connection that may use a generic
+    driver is unknown too: that driver, not Driver 18, decides its TLS."""
     if settings is not None and settings.store.backend is StoreBackend.SQLSERVER:
         return OdbcHops(found=("the [store] backend is sqlserver",))
-    from messagefoundry.config.models import ConnectorType
     from messagefoundry.config.settings import settings_file_path
-    from messagefoundry.config.wiring import WiringError, load_config
+    from messagefoundry.config.wiring import WiringError, sqlserver_odbc_hops
     from messagefoundry.redaction import codec_safe_str
 
     if Path(config_dir) == Path(_DEFAULT_CONFIG_DIR):
@@ -123,34 +155,18 @@ def _odbc_hops(
     if not Path(config_dir).is_dir():
         return OdbcHops(unknown=f"no config dir at {config_dir!r}; pass --config")
     try:
-        # allow_empty: an empty graph takes no hop, which is an answer, not an unknown.
-        reg = load_config(config_dir, allow_empty=True)
+        reg = graph()
     except (WiringError, OSError, ImportError, SyntaxError, ValueError, SystemExit) as exc:
         # SystemExit: a config module that exits at import must not end the verify run.
         reason = codec_safe_str(exc)[:200]
         return OdbcHops(unknown=f"the config dir {config_dir!r} did not load: {reason}")
-    database = sorted(
-        (str(conn.spec.settings.get("dialect", "sqlserver")).lower(), name)
-        for table in (reg.inbound, reg.outbound)
-        for name, conn in table.items()
-        if conn.spec.type is ConnectorType.DATABASE
-    )
-    found = (
-        *(f"DATABASE connection {name}" for dialect, name in database if dialect == "sqlserver"),
-        *(
-            f"DatabaseRef reference set {name}"
-            for name, ref in sorted(reg.references.items())
-            if ref.source.kind == "database"
-        ),
-        *(f"DatabaseLookup {name}" for name in sorted(reg.lookups)),
-    )
-    if found:
-        return OdbcHops(found=found)
-    generic = [name for dialect, name in database if dialect != "sqlserver"]
-    if generic:
+    hops, other = sqlserver_odbc_hops(reg)
+    if hops:
+        return OdbcHops(found=tuple(f"{kind} {name}" for kind, name in hops))
+    if other:
         return OdbcHops(
-            unknown=f"DATABASE connection {generic[0]} uses a generic ODBC driver, whose TLS "
-            "this row does not read"
+            unknown=f"DATABASE connection {other[0]} may use a generic ODBC driver (its dialect "
+            "is not a literal sqlserver), whose TLS this row does not read"
         )
     if settings is None:
         return OdbcHops(unknown="service settings did not load, so the store backend is not known")
@@ -293,6 +309,7 @@ def run_verify(
     """
     selected = set(sections) if sections else set(ALL_SECTIONS)
     settings, settings_error = _load_settings(service_config)
+    graph = _Graph(config_dir)
     results: list[CheckResult] = []
     if settings_error is not None:
         # Emitted ONLY on a real load failure, so a box with no config (which resolves to
@@ -312,7 +329,7 @@ def run_verify(
         results += run_host_checks(
             ports=ports,
             writable_dir=_writable_dir(settings),
-            odbc_hops=lambda: _odbc_hops(settings, service_config, config_dir),
+            odbc_hops=lambda: _odbc_hops(settings, service_config, config_dir, graph),
         )
 
     if "store" in selected:
@@ -347,7 +364,9 @@ def run_verify(
             # default when no service settings resolve (#241 F3, #230 CLI parity).
             snapshot_on_send = settings.pipeline.snapshot_on_send if settings is not None else False
             results.append(
-                smoke_self(config_dir, inbound=inbound, snapshot_on_send=snapshot_on_send)
+                smoke_self(
+                    config_dir, inbound=inbound, snapshot_on_send=snapshot_on_send, graph=graph
+                )
             )
         elif smoke_mode == "live":
             # synthetic_message() is a module constant since #1192, so there is no generator step
