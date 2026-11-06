@@ -275,9 +275,12 @@ def test_a_recovery_key_never_entered_back_writes_nothing(tmp_path: Path) -> Non
 def test_a_second_mint_over_an_existing_file_is_file_exists(tmp_path: Path, name: str) -> None:
     (tmp_path / name).write_bytes(b"there")
     console = _Console()
-    with pytest.raises(FileExistsError, match=name):
+    with pytest.raises(FileExistsError, match=name) as refused:
         _mint(_settings(tmp_path), console)
     assert console.shown == []  # refused before anything was minted or shown
+    # PR 2804 fourth hold, item 5: a way on that keeps the file, which may be another store's key.
+    assert "MEFOR_SECRETS_DIRECTORY" in str(refused.value)
+    assert "remove" not in str(refused.value).lower()
 
 
 @windows_only
@@ -1197,22 +1200,49 @@ async def test_the_sqlserver_census_refuses_without_view_definition_on_the_schem
         await _sqlserver_occupancy(monkeypatch, {"s": "app", "vd": 0, "sel": schema_select})
 
 
+async def _failed_create(
+    settings: StoreSettings, blob: HostBlob, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The create a mint makes, under ``blob``'s own key, stopped once its salt, invocation counter
+    and markers are committed and before its genesis record: what a failed mint leaves."""
+    from messagefoundry.store import store as store_module
+
+    async def _stopped(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("stopped before the genesis record (stand-in)")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(store_module, "load_audit_chain", _stopped)
+        with pytest.raises(RuntimeError, match="stand-in"):
+            await _create(settings, blob)
+
+
+def _run_provision_admin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store_path: Path
+) -> tuple[int, str]:
+    """provision-admin against the SQLite store at ``store_path`` under the host key provider, with
+    no terminal: the exit code and stderr."""
+    from messagefoundry.__main__ import main
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "messagefoundry.toml").write_text('[store]\nkey_provider = "host"\n')
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
+    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
+    return main([*argv, "--db", str(store_path)]), ""
+
+
 @host_file_platforms
-@pytest.mark.parametrize("shape", ["failed mint", "holds data", "never keyed"])
-def test_a_rerun_over_a_chain_never_started_names_the_key_file_to_remove(
+@pytest.mark.parametrize("shape", ["failed mint", "foreign key", "holds data", "never keyed"])
+def test_a_rerun_over_a_chain_never_started_keeps_the_key_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     shape: str,
 ) -> None:
-    # PR 2804 hold 2: a mint that failed before its genesis record keeps its key file, and the
-    # re-run is refused until the operator removes that file by hand. The refusal names it, but
-    # only over what a failed mint leaves: a keyed open's salt and no data. An empty chain alone
-    # does not show the key is spare: the store may hold data, or the key may be another store's
-    # in a shared directory. Then the refusal says to keep both.
+    # PR 2804 hold 2 and fourth hold, items 1 and 3: a mint that failed before its genesis record
+    # keeps its key file, and the re-run never names it for removal. The engine cannot tell its own
+    # failed mint (leftovers under the minted blob's key) from a blob another store owns (leftovers
+    # under a foreign key, or none), so every shape keeps the key and names the one way on.
     import asyncio
-
-    from messagefoundry.__main__ import main
 
     settings = _settings(tmp_path)
     store_path = Path(settings.path)
@@ -1231,30 +1261,78 @@ def test_a_rerun_over_a_chain_never_started_names_the_key_file_to_remove(
         finally:
             await store.close()
         if shape != "never keyed":
-            await _failed_mint_leftovers(store_path, tmp_path)
+            await _failed_mint_leftovers(store_path, tmp_path)  # under an unrelated key
 
-    asyncio.run(_unstarted())
-    _mint(settings)
+    if shape != "failed mint":
+        asyncio.run(_unstarted())
+    blob = _mint(settings)
+    if shape == "failed mint":
+        asyncio.run(_failed_create(settings, blob, monkeypatch))
     kept = tmp_path / custody_host.HOST_FILE_NAME
     assert kept.exists()
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "messagefoundry.toml").write_text('[store]\nkey_provider = "host"\n')
-    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
-    argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
-    assert main([*argv, "--db", settings.path]) == 2
+    code, _ = _run_provision_admin(tmp_path, monkeypatch, store_path)
+    assert code == 2
     err = capsys.readouterr().err
     assert "Traceback" not in err
     assert kept.exists()
-    if shape != "failed mint":
-        # Neither the key file nor the store is to be removed, and the text says so.
-        assert "by hand" not in err and "Remove the store" not in err, err
-        assert f"keep {kept}" in err, err
-        reason = "holds data" if shape == "holds data" else "no keyed open ever ran"
-        assert reason in err, err
-        return
-    assert f"remove {kept}" in err and "by hand" in err, err
-    # A SQLite store file goes too, or the next run reads it as taken; its -wal file with it.
-    assert f"{store_path.resolve()}" in err and "-wal" in err
+    assert "remove" not in err.lower() and "delete" not in err.lower(), err
+    assert f"keep {kept}" in err and "cannot tell whose key" in err, err
+    assert "MEFOR_SECRETS_DIRECTORY" in err, err
+    # A SQLite store with no key here reads as taken, so its file moves aside, -wal file with it.
+    assert f"move the store file {store_path.resolve()}" in err and "-wal" in err, err
+
+
+@host_file_platforms
+def test_a_shared_secrets_directory_never_names_another_stores_key_for_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # PR 2804 fourth hold: store A is live under the key in a shared secrets directory, and store B
+    # beside it was never started. provision-admin for B opens with A's key and must keep it.
+    import asyncio
+
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    if sys.platform != "win32":
+        secrets.chmod(0o700)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    b_path = tmp_path / "b" / "store.db"
+
+    async def _b() -> None:
+        await (await _keyless_store(b_path)).close()
+
+    asyncio.run(_b())  # before the key exists: a keyless open refuses a directory holding one
+    monkeypatch.setenv("MEFOR_SECRETS_DIRECTORY", str(secrets))
+    a_settings = _settings(tmp_path / "a")
+    blob = _mint(a_settings)
+    asyncio.run(_create(a_settings, blob))
+    kept = secrets / custody_host.HOST_FILE_NAME
+    code, _ = _run_provision_admin(tmp_path, monkeypatch, b_path)
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "remove" not in err.lower() and "delete" not in err.lower(), err
+    assert f"keep {kept}" in err and "MEFOR_SECRETS_DIRECTORY" in err, err
+
+    async def _a_still_opens() -> None:
+        await (await open_store(a_settings)).close()
+
+    asyncio.run(_a_still_opens())
+
+
+@host_file_platforms
+async def test_a_pinned_open_over_a_chain_never_started_removes_nothing(tmp_path: Path) -> None:
+    # PR 2804 fourth hold, item 4: serve and every other command print this text for the state
+    # provision-admin decides, so it names nothing for removal and sends the operator there.
+    from messagefoundry.store.store import StoreChainNeverStarted
+
+    settings = _settings(tmp_path)
+    await (await _keyless_store(Path(settings.path))).close()
+    blob = _mint(settings)
+    with pytest.raises(StoreChainNeverStarted) as refused:
+        await open_store(settings, custody=blob)
+    text = str(refused.value).lower()
+    assert "remove" not in text and "delete" not in text, text
+    assert "provision-admin" in text
 
 
 @host_file_platforms
@@ -1275,7 +1353,9 @@ async def test_a_pin_refusal_before_any_write_is_told_apart_from_one_after(
     assert not isinstance(refused.value, StoreChainNeverStarted)
 
 
-def test_a_minted_key_is_kept_when_the_pin_refused_after_a_write(tmp_path: Path) -> None:
+def test_a_minted_key_is_kept_when_the_pin_refused_after_a_write(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     from messagefoundry import __main__ as cli
     from messagefoundry.store.store import StoreIdPinRefusedBeforeWrite
 
@@ -1284,6 +1364,11 @@ def test_a_minted_key_is_kept_when_the_pin_refused_after_a_write(tmp_path: Path)
     kept.write_bytes(b"k")
     cli._discard_minted_custody(kept, server, StoreIdPinRefused("after the salt bind"))
     assert kept.exists()
+    # PR 2804 fourth hold, item 2: whether the store holds anything under the key is not proved
+    # here, so the text keeps it and names the way on the re-run names too.
+    warning = capsys.readouterr().err
+    assert str(kept) in warning and "MEFOR_SECRETS_DIRECTORY" in warning, warning
+    assert "remove" not in warning.lower(), warning
     removed = tmp_path / "removed.key"
     removed.write_bytes(b"k")
     cli._discard_minted_custody(removed, server, StoreIdPinRefusedBeforeWrite("before"))

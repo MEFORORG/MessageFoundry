@@ -5472,14 +5472,23 @@ def store_pin_problem(genesis: Mapping[str, Any] | None, pin: StorePin) -> str |
 _PIN_NEEDS_THE_WRAP: Final = (
     "the store's audit chain was never started, and only the command that minted its key, which "
     "holds its recovery wrap, may start it: a chain started without the recovery wrap would leave "
-    "the recovery key opening nothing kept in the store. Remove the store and its host blob, then "
-    "run `messagefoundry provision-admin` again"
+    "the recovery key opening nothing kept in the store. The engine cannot tell whose key the "
+    "host blob here is, so keep it and the store: run `messagefoundry provision-admin`, which "
+    "names the way on"
 )
+
+
+class _PinRefusal(NamedTuple):
+    """Why the chain does not hold the store to a pin, and whether that is a chain never started
+    (:class:`StoreChainNeverStarted`), told by this flag rather than by the text."""
+
+    text: str
+    never_started: bool = False
 
 
 async def _store_pin_refusal(
     host: AuditRangeHost, first: Mapping[str, Any] | None, pin: StorePin, *, writable: bool
-) -> str | None:
+) -> _PinRefusal | None:
     """Why the chain does not hold the store to ``pin``, or ``None``.
 
     An EMPTY chain passes a read-only open, which writes nothing, and a writable open whose pin
@@ -5490,10 +5499,12 @@ async def _store_pin_refusal(
     is derived from the host blob, so a database writer without the key cannot name the blob's id
     on another store's chain."""
     if first is None and not await host._audit_rows(limit=1):
-        return _PIN_NEEDS_THE_WRAP if writable and not pin.recovery_wrap else None
+        if writable and not pin.recovery_wrap:
+            return _PinRefusal(_PIN_NEEDS_THE_WRAP, never_started=True)
+        return None
     problem = store_pin_problem(first, pin)
     if problem is not None or first is None:
-        return problem
+        return None if problem is None else _PinRefusal(problem)
     genesis = _audit_genesis(first)
     secret = (
         None
@@ -5507,7 +5518,7 @@ async def _store_pin_refusal(
     if expected is None or not hmac.compare_digest(
         audit_mac_bytes(first["row_hash"]), audit_mac_bytes(expected)
     ):
-        return (
+        return _PinRefusal(
             "the store's audit genesis record does not verify under the key the host blob "
             "holds, so the store id it names cannot be trusted"
         )
@@ -5523,13 +5534,11 @@ async def check_open_store_pin(host: AuditRangeHost) -> None:
     pin = OPEN_STORE_PIN.get()
     if pin is None:
         return
-    problem = await _store_pin_refusal(host, await host._audit_genesis_row(), pin, writable=True)
-    if problem is None:
+    refusal = await _store_pin_refusal(host, await host._audit_genesis_row(), pin, writable=True)
+    if refusal is None:
         return
-    refused = (
-        StoreChainNeverStarted if problem == _PIN_NEEDS_THE_WRAP else StoreIdPinRefusedBeforeWrite
-    )
-    raise refused(f"refusing to open the store: {problem}")
+    refused = StoreChainNeverStarted if refusal.never_started else StoreIdPinRefusedBeforeWrite
+    raise refused(f"refusing to open the store: {refusal.text}")
 
 
 def parse_audit_genesis(detail: object) -> str | None:
@@ -6221,12 +6230,12 @@ async def _load_audit_chain(host: AuditRangeHost, *, read_only: bool) -> None:
         first = await host._audit_genesis_row()
     if (
         pin is not None
-        and (problem := await _store_pin_refusal(host, first, pin, writable=not read_only))
+        and (refusal := await _store_pin_refusal(host, first, pin, writable=not read_only))
         is not None
     ):
         # Vault BACKLOG #3411: at EVERY open under the host key provider, the host blob's store id
         # must be the one the store was created under, or an earlier one of the same blob.
-        raise StoreIdPinRefused(f"refusing to open the store: {problem}")
+        raise StoreIdPinRefused(f"refusing to open the store: {refusal.text}")
     genesis = _audit_genesis(first) if first is not None else None
     if first is None or genesis is None:
         # No genesis row at seq 1. On an empty log that is a chain nobody has started, and a

@@ -542,6 +542,29 @@ async def store_holds_data(store: Store) -> bool:
 # --- the mint -------------------------------------------------------------------------------------
 
 
+def keep_the_key_step(settings: StoreSettings, kept: str, *, store_file: bool) -> str:
+    """The one way on for every path that meets a key file it cannot tie to this store (PR 2804
+    fourth hold): keep the file, which may be another store's only key, and give this store a
+    custody directory of its own. With ``store_file``, a SQLite store file moves aside too, since a
+    SQLite store with no key here is refused as one another key made. Advises removing nothing,
+    and names paths, never a key."""
+    from messagefoundry.config.settings import StoreBackend
+
+    move = ""
+    if store_file and settings.backend is StoreBackend.SQLITE and settings.path != ":memory:":
+        db = Path(settings.path).resolve()
+        move = (
+            f"move the store file {db}, with any {db.name}-wal and {db.name}-shm beside it, aside "
+            "under a new name, then "
+        )
+    return (
+        f"The engine cannot tell whose key {kept} is, and it may be another store's only key, so "
+        f"keep {kept} where it is. To provision this store, {move}give it a custody directory of "
+        f"its own: set {SECRETS_DIRECTORY_VARIABLE} to a new, empty directory, here and in the "
+        "service's environment, and run the command again, which mints this store's key there"
+    )
+
+
 def mint_target(
     settings: StoreSettings,
     *,
@@ -560,7 +583,7 @@ def mint_target(
         if os.path.lexists(path):
             raise FileExistsError(
                 f"{path} already exists, so a store key was already minted here; a second mint "
-                "is never made over it"
+                f"is never made over it. {keep_the_key_step(settings, str(path), store_file=False)}"
             )
     if service_account is None:
         # What the write refuses for this account, asked now: the shared and non-local accounts
