@@ -6163,15 +6163,15 @@ async def test_two_reconcilers_that_both_read_the_old_roles_report_the_change_on
             return row
 
         service._load_user = _read_then_wait  # type: ignore[method-assign]
-        writes: list[tuple[str, ...] | None] = []
-        write = store.set_user_roles_unless_held
+        writes: list[bool] = []
+        write = store.set_user_roles_if_held
 
-        async def _count_write(*a: Any, **kw: Any) -> tuple[str, ...] | None:
-            replaced = await write(*a, **kw)
-            writes.append(replaced)
-            return replaced
+        async def _count_write(*a: Any, **kw: Any) -> bool:
+            wrote = await write(*a, **kw)
+            writes.append(wrote)
+            return wrote
 
-        store.set_user_roles_unless_held = _count_write  # type: ignore[method-assign]
+        store.set_user_roles_if_held = _count_write  # type: ignore[method-assign]
         watermark = await service._audit_watermark()
         async with asyncio.timeout(10):
             outcomes = await asyncio.gather(
@@ -6179,11 +6179,51 @@ async def test_two_reconcilers_that_both_read_the_old_roles_report_the_change_on
                 service._apply_reconcile_revocation(revocation, watermark=watermark),
             )
 
-        assert len(writes) == 2, "both applies must reach the write, or this is not the race"
+        assert sorted(writes) == [False, True], "both applies must reach the write"
         assert sorted(outcomes) == ["quiet", "reported"], outcomes
         assert [e.event_type for e in notifier.sent] == [ROLES_CHANGED]
         assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0, 0]
         assert sorted(await store.get_user_role_ids(user.id)) == sorted(target)
+    finally:
+        await store.close()
+
+
+async def test_a_stale_role_plan_does_not_overwrite_a_newer_role_write() -> None:
+    """Vault BACKLOG #3085, the compare-and-set's other half. Between the apply's read of the roles
+    and its write, another writer (a directory sign-in, here a bare store write standing in for
+    one) moves the roles to a third set. The apply writes nothing over it, counts no role change,
+    and, ending no session, is quiet. RED when the write compares on the plan's target rather
+    than on what the apply read: it would then write the stale set and report it."""
+    store, _, service, _ = await _scoped_service(_GRP_A)
+    try:
+        notifier = _CapturingNotifier()
+        service._security_notifier = notifier
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        await store.revoke_user_sessions(user.id)
+        await store.set_user_roles(user.id, [Role.VIEWER.value])
+        revocation = reconcile.SessionRevocation(
+            user.id, user.username, reason="roles_changed", role_ids=(Role.OPERATOR.value,)
+        )
+        load_user = service._load_user
+
+        async def _read_then_sign_in(user_id: str) -> VerifiedUser | None:
+            row = await load_user(user_id)
+            await store.set_user_roles(user_id, [Role.ADMINISTRATOR.value])
+            return row
+
+        service._load_user = _read_then_sign_in  # type: ignore[method-assign]
+
+        outcome = await service._apply_reconcile_revocation(
+            revocation, watermark=await service._audit_watermark()
+        )
+
+        assert outcome == "quiet"
+        assert await store.get_user_role_ids(user.id) == [Role.ADMINISTRATOR.value], (
+            "a stale reconciler plan overwrote a newer role write"
+        )
+        assert notifier.sent == []
+        assert [r["sessions"] for r in _revoked_rows(await store.list_audit())] == [0]
     finally:
         await store.close()
 

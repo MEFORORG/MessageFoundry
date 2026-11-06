@@ -6,4 +6,7 @@
   leg now refuses an account whose scope the groups would narrow, by the reconciliation pass's own
   scope rule, audited as `directory_scope_narrowed`. It charges nothing, writes no scope, and is
   answered as a demotion: sign out and sign in again, which writes the scope the groups grant now.
-  An Administrator is not asked. See [SECURITY.md](../docs/SECURITY.md). (`vault BACKLOG #3081`)
+  An account whose groups grant Administrator is not asked. When the AD group-to-channel map fails
+  its seal, an account holding a scope is refused as `directory_scope_map_unsealed` instead and is
+  told to try again later or ask an administrator, as for a failing role map. See
+  [SECURITY.md](../docs/SECURITY.md). (`vault BACKLOG #3081`)

@@ -173,8 +173,9 @@ _log = logging.getLogger(__name__)
 #: the account was refused for its roles (BACKLOG #2023, #2027, #3061, #3081). One text per fix,
 #: chosen by ``Elevation.directory_refusal`` (BACKLOG #3082): an account the directory did not
 #: confirm, an outage included, is told to try later or ask an administrator, never to sign out,
-#: since a new sign-in fails the same way and the working session would be lost. A lost role is told
-#: to sign in again, which takes the roles the groups grant now. Neither names a group, a role or a
+#: since a new sign-in fails the same way and the working session would be lost. A lost role, or a
+#: channel scope the groups narrowed (vault BACKLOG #3081 item 4), is told to sign in again, which
+#: takes the roles and the scope the groups grant now. Neither names a group, a role or a
 #: directory detail; the precise reason is on the audit row. The console's
 #: ``_DIRECTORY_UNCONFIRMED_ERROR`` and ``_DIRECTORY_DEMOTED_ERROR`` name the same fixes, and a
 #: console test holds them in step.

@@ -3404,16 +3404,18 @@ them. It is audited as `directory_roles_demoted`: as the `outcome` beside
 the refusals above, and as the `auth.reauth` row's `reason` on the IdP and re-bind legs. Once the
 roles pass, each of these legs also refuses an account whose channel scope the groups would narrow,
 as `directory_scope_narrowed`, audited the same way (vault BACKLOG #3081 item 4). The question is
-the reconciliation pass's scope re-diff, which revokes for exactly that. An Administrator is not
-asked, and neither is a stored scope that grants nothing. A scope map that fails its seal maps no
-channel, as at sign-in, so a directory-set scope refuses and a scope an administrator set does not.
-Its fix is a demotion's: a new sign-in writes the scope the groups grant now. When the AD
-group-to-role map fails its seal, no role
-can be judged, so each of these legs refuses an account that holds a role with
-`directory_role_map_unsealed` instead, whether or not a role was lost, and an account with no role
-passes. That is not a demotion: nothing changed in the directory, a new sign-in reads the same
-map, and the fix is an administrator saving the map again. So it is never told to sign out. Every
-one of these legs calls one shared comparison rather than writing it out.
+the reconciliation pass's scope re-diff, which revokes for exactly that. An account whose groups
+grant Administrator is not asked, decided from the roles the groups grant, as sign-in and the
+reconciliation pass decide it, and neither is a stored scope that grants nothing. Its fix is a
+demotion's: a new sign-in writes the scope the groups grant now. When the AD group-to-role map
+fails its seal, no role can be judged, so each of these legs refuses an account that holds a role
+with `directory_role_map_unsealed` instead, whether or not a role was lost, and an account with no
+role passes. That is not a demotion: nothing changed in the directory, a new sign-in reads the same
+map, and the fix is an administrator saving the map again. So it is never told to sign out. The
+AD group-to-channel map is handled the same way: when it fails its seal, an account whose scope
+grants something is refused with `directory_scope_map_unsealed`, whether or not its scope would
+narrow, and is never told to sign out, since a new sign-in would read the same map and withdraw
+the scope. Every one of these legs calls one shared comparison rather than writing it out.
 
 **The caller is told which fix clears the refusal, and not its cause (BACKLOG #3082).** The precise
 cause stays on the audit row. A demotion is told to sign out and sign in again. A new sign-in clears
@@ -5017,7 +5019,9 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   - the account passes the role test in the paragraph that opens "A directory step-up or
     enrolment leg refuses a present account that lost a role in the directory" (BACKLOG #2154,
     #3082). Otherwise the leg refuses with the reason that paragraph names,
-    `reason=directory_roles_demoted` or `reason=directory_role_map_unsealed`.
+    `reason=directory_roles_demoted` or `reason=directory_role_map_unsealed`, or, for the channel
+    scope that paragraph also tests, `reason=directory_scope_narrowed` or
+    `reason=directory_scope_map_unsealed` (vault BACKLOG #3081 item 4).
 
   It then elevates through the same path as the password leg: `reauth_at` is stamped, the session
   is rotated (ASVS 7.2.4) and keeps its `mfa_verified_at`, and a single-use action grant is minted
@@ -5312,8 +5316,9 @@ to a genuine revocation of the same account. On a keyless audit chain no repeat 
 Any other revocation that ends nothing and changes no role, such as a scope, role, undetermined or
 unkeyed one, is quiet too. Two reconcilers that both read the audit chain before either writes its
 row both report. Two that both read the old roles do not, because the role write is a
-compare-and-set on the roles it writes (vault BACKLOG #3085): only the first counts the change, and
-the second, ending no session, is quiet. The second still reports when it ends a session the first
+compare-and-set on the roles it read (vault BACKLOG #3085): only the first counts the change, and
+the second, ending no session, is quiet. For the same reason a pass whose read of the roles a
+sign-in overtook writes no role over the sign-in's. The second still reports when it ends a session the first
 had not yet ended; `AuthService._apply_reconcile_revocation` names that residual. If the first
 reconciler's pass ended before it alerted, the second's quiet revocation means that account pages
 nobody. A quiet revocation whose own row is refused alerts instead, with no notice.

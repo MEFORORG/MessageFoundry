@@ -988,6 +988,13 @@ DIRECTORY_ROLE_MAP_UNSEALED = "directory_role_map_unsealed"
 #: its fix is the same, a new sign-in, which writes the scope the groups grant now.
 DIRECTORY_SCOPE_NARROWED = "directory_scope_narrowed"
 
+#: The outcome :meth:`AuthService._directory_roles_lost` gives, on every leg that calls it, an
+#: account holding a channel scope when the AD group-to-channel map fails its seal, so no scope can
+#: be judged (vault BACKLOG #3081 item 4). Not :data:`DIRECTORY_SCOPE_NARROWED`, for the reason
+#: :data:`DIRECTORY_ROLE_MAP_UNSEALED` is not a demotion: the fix is an administrator re-saving the
+#: map, and a new sign-in would read the same map and withdraw the scope.
+DIRECTORY_SCOPE_MAP_UNSEALED = "directory_scope_map_unsealed"
+
 
 class DirectoryRefusal(Enum):
     """Which fix clears a second-factor, enrolment or password re-bind leg's directory refusal,
@@ -997,8 +1004,9 @@ class DirectoryRefusal(Enum):
 
     ``UNCONFIRMED``: every other directory refusal. A later try, or an administrator, clears it.
     ``DEMOTED``: the account is present and enabled, but lost a role in the directory (BACKLOG
-    #2240; the rule is in ``AuthService._directory_roles_lost``). A new sign-in clears it, because
-    it takes the roles the groups grant now. The precise cause stays on the audit row; a caller
+    #2240), or its groups would narrow its channel scope (vault BACKLOG #3081 item 4); the rule is
+    in ``AuthService._directory_roles_lost``. A new sign-in clears it, because it takes the roles
+    and the scope the groups grant now. The precise cause stays on the audit row; a caller
     says only which fix."""
 
     UNCONFIRMED = DIRECTORY_UNCONFIRMED
@@ -1103,6 +1111,11 @@ _STEP_UP_ERRORS: Final[Mapping[str, str]] = MappingProxyType(
         DIRECTORY_ROLE_MAP_UNSEALED: (
             "Your directory roles could not be confirmed. Try again later. If it is still refused,"
             " ask an administrator."
+        ),
+        # The scope map's twin of the line above (vault BACKLOG #3081 item 4).
+        DIRECTORY_SCOPE_MAP_UNSEALED: (
+            "Your directory channels could not be confirmed. Try again later. If it is still"
+            " refused, ask an administrator."
         ),
     }
 )
@@ -9115,23 +9128,27 @@ class AuthService:
         # new name, so about once per directory rename, not once per sign-in. Keeping one read site
         # for both callers keeps them on one path, which is the point of this method; the
         # post-write read-back the item also counted went with BACKLOG #2290.
-        def _own_row_refused() -> None:
+        async def _own_row_refused(found: _UserLookup) -> bool:
             # Vault BACKLOG #3069 note T3. A row that fails its seal is still there, so only a
             # gone row is ``row_gone``: filing a refused one as removed would be false. The loader
             # has already reported the seal failure, and the store refuses to write a failing
             # record, so nothing is written, and nothing more is filed. The next read that finds
-            # the record verifying retries it.
+            # the record verifying retries it. ``refused`` also reads true for a row deleted
+            # between the lookup's row and role reads, which the loader does not report, so a
+            # refused lookup is asked once more whether the row is there.
+            if not found.refused or not await self._user_id_held(user_id):
+                return False
             _log.warning(
                 "AD account %s was renamed in the directory, but its record fails its integrity "
                 "check, so the new name was not written (BACKLOG #3069)",
                 user_id,
             )
+            return True
 
         found = await self._lookup_user(user_id)
         before = found.user
         if before is None:
-            if found.refused:
-                _own_row_refused()
+            if await _own_row_refused(found):
                 return
             # Deleted between the plan and the apply. Refused as a write that finds the row gone is
             # refused below, without an UPDATE that can only match nothing. With no row there is
@@ -9370,9 +9387,7 @@ class AuthService:
             found = await self._lookup_user(user_id)
             after = found.user
             if after is None:
-                if found.refused:
-                    _own_row_refused()
-                else:
+                if not await _own_row_refused(found):
                     await _refuse(None, "row_gone", before.username)
             elif after.username == before.username:
                 holder = await self._lookup_by_username(new_username)
@@ -9939,8 +9954,10 @@ class AuthService:
         rule.
 
         A role change counts only when THIS call's write made it: the write is a compare-and-set
-        (vault BACKLOG #3085), so of two reconcilers that both read the old roles only the first
-        counts it, and the second, ending no session, is quiet. **Residual, at least:** the second
+        on the roles this call read (vault BACKLOG #3085), so of two reconcilers that both read the
+        old roles only the first counts it, and the second, ending no session, is quiet. A plan
+        whose roles another writer moved after the read writes nothing, so it cannot write a stale
+        set over a sign-in's newer one. **Residual, at least:** the second
         can still end a session the first had not yet ended, when its whole apply runs between the
         first's role write and the first's own session revocation. Both then report, the first
         for the roles and the second for the session."""
@@ -9961,42 +9978,49 @@ class AuthService:
         # No role write for an account that is gone or fails its seal (BACKLOG #2592): the store would
         # refuse it, and ending the sessions below needs no write to the account. None either when
         # the stored roles already match, as they do once another reconciler wrote them (BACKLOG
-        # #3085). That read is a cheap skip, not the decision: two reconcilers can both read the
-        # old roles before either writes. The write is a compare-and-set on the roles it carries,
-        # so only the first of them writes and counts a change; the second finds the roles already
-        # written and counts none, as if it had read them so (vault BACKLOG #3085).
+        # #3085). That read is not the decision: two reconcilers can both read the old roles before
+        # either writes. So the write is a compare-and-set on the roles read here (vault BACKLOG
+        # #3085): only the first of them writes and counts a change, and a write that finds the
+        # roles moved since this read writes nothing and counts none.
         roles_changed = False
         if (
             revocation.role_ids is not None
             and user is not None
             and set(user.role_ids) != set(revocation.role_ids)
         ):
-            replaced = await self._store.set_user_roles_unless_held(
-                revocation.user_id, list(revocation.role_ids), assigned_by="ad-reconcile"
+            roles_changed = await self._store.set_user_roles_if_held(
+                revocation.user_id,
+                list(revocation.role_ids),
+                expected_role_ids=user.role_ids,
+                assigned_by="ad-reconcile",
             )
-            if replaced is None:
-                # Another writer, most likely a second reconciler, wrote these roles after the read
-                # above, or the row went. That writer owns the change and its report.
+            if not roles_changed:
+                # The roles moved after the read above, or the row went. The writer that moved
+                # them, a second reconciler or a directory sign-in, owns that change and its report;
+                # a stale plan must not write over a newer write either. The next pass plans from
+                # what is stored then.
                 _log.info(
-                    "directory reconcile: the roles of %s were already written by another writer, "
-                    "so this revocation changed no role (BACKLOG #3085)",
+                    "directory reconcile: the roles of %s changed after this pass read them, or "
+                    "the account went, so this revocation wrote no role (BACKLOG #3085)",
                     scrub_log_argument(revocation.username),
                 )
             else:
-                roles_changed = True
                 # Owner ruling 2026-10-13 (#3229): the directory stays authoritative, so a
                 # demotion of the last enabled Administrator is applied, never refused. It alerts
                 # and audits instead, right after the write, so no later step's failure can skip
                 # it. The ruling accepts the cost, noted with vault BACKLOG #2711.
-                # ``replaced`` is what the write itself read, through the seal, not the plan's
-                # roles, which can be a pass old: the report judges what THIS write took away.
+                # `user` was read through its seal at the top of this method, not taken from the
+                # plan, whose roles can be a pass old, and the write landed only while the record
+                # still held those roles: the report judges exactly what THIS write took away.
                 await self._report_directory_admin_loss(
-                    user, before=replaced, after=revocation.role_ids, via="ad-reconcile"
+                    user, before=user.role_ids, after=revocation.role_ids, via="ad-reconcile"
                 )
-                # Vault BACKLOG #3141. The gain side, from the same read and at the same point, so
-                # a later step's failure cannot lose the page. The next sign-in finds the role
-                # already written and gains nothing, so this pass is the only chance to raise it.
-                self._report_directory_admin_grant(user, before=replaced, after=revocation.role_ids)
+                # Vault BACKLOG #3141. The gain side, from the same sealed read and at the same
+                # point, so a later step's failure cannot lose the page. The next sign-in finds the
+                # role already written and gains nothing, so this pass is the only chance to raise it.
+                self._report_directory_admin_grant(
+                    user, before=user.role_ids, after=revocation.role_ids
+                )
         revoked = (await self._store.revoke_user_sessions(revocation.user_id)).count
         # Owner ruling 2026-10-17 narrows "audit always": a disabled or absent account whose
         # revocation ended nothing still reports, unless a verified row shows another pass revoked
@@ -10749,12 +10773,12 @@ class AuthService:
         ONLY readers of the store's user readers in this service, beside the two existence
         questions; ``tests/test_user_seal.py`` holds that. See
         :meth:`_verified` for what ``None`` covers."""
-        return await self._verified(await self._store.get_user(user_id))
+        return (await self._lookup_user(user_id)).user
 
     async def _lookup_user(self, user_id: str) -> _UserLookup:
-        """:meth:`_load_user`, also saying whether the row is there at all, from the same read, so
-        a caller can tell a record that fails its seal from one that is gone (vault BACKLOG
-        #3069)."""
+        """The read behind :meth:`_load_user`, also saying whether the row is there at all, so a
+        caller can tell a record that fails its seal from one that is gone (vault BACKLOG #3069).
+        ``refused`` also reads true for a row deleted between the row and role reads."""
         raw = await self._store.get_user(user_id)
         return _UserLookup(await self._verified(raw), raw is not None)
 
@@ -14591,14 +14615,18 @@ class AuthService:
         :func:`~messagefoundry.auth.channel_scope.decide_ad_channel_scope` take a channel away from
         the stored scope? The reconciler revokes for exactly that, so without this test an account
         whose directory groups lost a scope-mapped group would step up with the channels it no
-        longer holds until the next pass. An Administrator is not asked, because the role already
-        reaches every channel; the role it holds has passed the role test above, so the directory
-        grants it. A stored scope that grants nothing cannot narrow, so the scope map is not read
-        for it. A scope map that fails its seal maps no channel, as at sign-in and in the
-        reconciler, so a directory-set scope reads as withdrawn and refuses, while a scope an
-        administrator set is kept, as that rule keeps it. A new sign-in clears the refusal: it
-        writes the scope the groups grant now."""
+        longer holds until the next pass. A stored scope that grants nothing cannot narrow, so no
+        map is read for it. An account whose groups grant Administrator is not asked, because the
+        role reaches every channel; that is decided from the roles the groups grant, as sign-in and
+        the reconciler decide it. A new sign-in clears the refusal: it writes the scope the groups
+        grant now. When the AD group-to-channel map fails its seal, no scope can be judged, so an
+        account with a scope that grants something is refused with
+        :data:`DIRECTORY_SCOPE_MAP_UNSEALED`, whether or not it would narrow, as the role map's
+        failure is refused; a new sign-in would read the same failing map and withdraw the scope,
+        so it is not told to sign in again."""
+        groups = frozenset(groups)  # read more than once below
         held = set(user.role_ids)
+        role_map: AdMap | None = None
         if held:
             role_map = await self._sealed_ad_map(AD_ROLE_MAP)
             if role_map is None:
@@ -14607,16 +14635,20 @@ class AuthService:
                 return DIRECTORY_ROLES_DEMOTED
         # Compared with the empty set, not by truth: a wildcard grant reads as None, every channel,
         # and can narrow.
-        if (
-            Role.ADMINISTRATOR.value in held
-            or channel_scope.scope_channels(user.channel_scope) == frozenset()
-        ):
+        if channel_scope.scope_channels(user.channel_scope) == frozenset():
             return None
+        if role_map is None:
+            role_map = await self._ad_map(AD_ROLE_MAP)
+        if Role.ADMINISTRATOR.value in role_map.values_for(groups):
+            return None
+        scope_map = await self._sealed_ad_map(AD_SCOPE_MAP)
+        if scope_map is None:
+            return DIRECTORY_SCOPE_MAP_UNSEALED
         decision = channel_scope.decide_ad_channel_scope(
             channel_scope.ScopeInput(
                 stored_scope=user.channel_scope,
                 stored_source=user.channel_scope_source,
-                mapped=await self._ad_channels_for_groups(groups),
+                mapped=frozenset(scope_map.values_for(groups)),
                 administrator=False,
             )
         )

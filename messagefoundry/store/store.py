@@ -3858,24 +3858,26 @@ def without_role(role_id: str) -> UserChange:
     return apply
 
 
-class RolesUnlessHeld:
-    """``set_user_roles_unless_held``'s compare-and-set (vault BACKLOG #3085): the account's roles
-    replaced with ``role_ids``, only while the record does not already hold exactly that set,
+def roles_if_held(
+    role_ids: Sequence[str],
+    *,
+    expected_role_ids: Iterable[str],
+    assigned_by: str | None,
+    now: float,
+) -> UserChange:
+    """``set_user_roles_if_held``'s compare-and-set (vault BACKLOG #3085): the account's roles
+    replaced with ``role_ids``, only while the record still holds exactly ``expected_role_ids``,
     compared as sets. Each backend runs it on the record its write read under the row's lock, so
-    of two writers carrying one set only the first writes. ``replaced`` is the role ids the record
-    held when this change applied, for the backend to return once the write lands."""
+    a write decided from an older read of the roles writes nothing once another writer has moved
+    them."""
+    expected = frozenset(expected_role_ids)
 
-    def __init__(self, role_ids: Sequence[str], *, assigned_by: str | None, now: float) -> None:
-        self._role_ids = tuple(role_ids)
-        self._assigned_by = assigned_by
-        self._now = now
-        self.replaced: tuple[str, ...] | None = None
-
-    def __call__(self, r: UserAuthzRecord) -> UserAuthzRecord | None:
-        if frozenset(r.role_ids) == frozenset(self._role_ids):
+    def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
+        if frozenset(r.role_ids) != expected:
             return None
-        self.replaced = r.role_ids
-        return r.with_roles(self._role_ids, assigned_by=self._assigned_by, now=self._now)
+        return r.with_roles(role_ids, assigned_by=assigned_by, now=now)
+
+    return apply
 
 
 class UnknownRoleError(LookupError):
@@ -17976,22 +17978,25 @@ class MessageStore:
             )
             await self._commit()
 
-    async def set_user_roles_unless_held(
+    async def set_user_roles_if_held(
         self,
         user_id: str,
         role_ids: Sequence[str],
         *,
+        expected_role_ids: Iterable[str],
         assigned_by: str | None = None,
         now: float | None = None,
-    ) -> tuple[str, ...] | None:
+    ) -> bool:
         """The compare-and-set role write (vault BACKLOG #3085); see ``AuthStore``. Under the one
         writer lock, so no other write to the row lands between the compare and the write."""
         now = time.time() if now is None else now
-        change = RolesUnlessHeld(role_ids, assigned_by=assigned_by, now=now)
+        change = roles_if_held(
+            role_ids, expected_role_ids=expected_role_ids, assigned_by=assigned_by, now=now
+        )
         async with _writer_txn(self._db, self._lock):
             written = await self._write_user(user_id, change)
             await self._commit()
-        return None if written is None else change.replaced
+        return written is not None
 
     async def set_user_channel_scope(
         self,

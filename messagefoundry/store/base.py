@@ -2752,25 +2752,25 @@ class AuthStore(Protocol):
         the same."""
         ...
 
-    async def set_user_roles_unless_held(
+    async def set_user_roles_if_held(
         self,
         user_id: str,
         role_ids: Sequence[str],
         *,
+        expected_role_ids: Iterable[str],
         assigned_by: str | None = None,
         now: float | None = None,
-    ) -> tuple[str, ...] | None:
-        """:meth:`set_user_roles` as a COMPARE-AND-SET on the roles it writes, reporting what it
-        replaced (vault BACKLOG #3085).
+    ) -> bool:
+        """:meth:`set_user_roles` as a COMPARE-AND-SET on the roles the caller read, reporting
+        whether it wrote (vault BACKLOG #3085).
 
-        The directory reconciler decides a role write from a row it read earlier, and a second
-        reconciler may have read the same row and written the same roles in between. So the write
-        compares the record's roles, as sets, with ``role_ids`` in its own transaction, under the
-        row's lock, and writes nothing when they are already equal. Returns the role ids the record
-        held before this write, ``()`` for none, or ``None`` when it wrote nothing: the record
-        already held exactly ``role_ids``, or the row is gone. Of two calls carrying one set, only
-        the first writes. Any other stored set is replaced as :meth:`set_user_roles` replaces it,
-        with the same ``UnknownRoleError`` and seal refusals."""
+        The directory reconciler decides a role write from a row it read earlier, and another
+        writer, such as a second reconciler or a directory sign-in, may have written the roles in
+        between. So the write compares the record's roles, as sets, with ``expected_role_ids`` in
+        its own transaction, under the row's lock. If they differ, or the row is gone, nothing is
+        written and this returns ``False``. Of two calls that read one set, only the first writes.
+        Otherwise it writes as :meth:`set_user_roles` does, with the same ``UnknownRoleError`` and
+        seal refusals."""
         ...
 
     async def remove_unless_last_admin(

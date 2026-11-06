@@ -286,7 +286,6 @@ from messagefoundry.store.store import (
     RevokeResult,
     RoleGrant,
     RoleRow,
-    RolesUnlessHeld,
     SecretRotationMetaRow,
     SessionRecord,
     SignCountAnswer,
@@ -368,6 +367,7 @@ from messagefoundry.store.store import (
     require_operator_audit,
     require_totp_rule,
     role_seal_ok,
+    roles_if_held,
     roll_audit_key_range,
     rotation_reseal,
     scope_if_source,
@@ -15154,21 +15154,23 @@ class SqlServerStore:
             user_id, lambda r: r.with_roles(role_ids, assigned_by=assigned_by, now=now)
         )
 
-    async def set_user_roles_unless_held(
+    async def set_user_roles_if_held(
         self,
         user_id: str,
         role_ids: Sequence[str],
         *,
+        expected_role_ids: Iterable[str],
         assigned_by: str | None = None,
         now: float | None = None,
-    ) -> tuple[str, ...] | None:
+    ) -> bool:
         """The compare-and-set role write (vault BACKLOG #3085); see ``AuthStore``. The compare
         runs on the row ``_write_user`` reads under ``UPDLOCK, ROWLOCK``, so a concurrent writer
         waits."""
         now = time.time() if now is None else now
-        change = RolesUnlessHeld(role_ids, assigned_by=assigned_by, now=now)
-        written = await self._write_user_txn(user_id, change)
-        return None if written is None else change.replaced
+        change = roles_if_held(
+            role_ids, expected_role_ids=expected_role_ids, assigned_by=assigned_by, now=now
+        )
+        return await self._write_user_txn(user_id, change) is not None
 
     async def set_user_channel_scope(
         self,

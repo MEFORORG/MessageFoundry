@@ -307,9 +307,46 @@ async def test_the_scope_test_skips_an_administrator_and_keeps_a_manual_scope(
     assert await judged('["*"]', SCOPE_SOURCE_AD, _VIEWERS, _SCOPE_B) == DIRECTORY_SCOPE_NARROWED
     assert await judged('["*"]', SCOPE_SOURCE_AD, _VIEWERS, _SCOPE_ALL) is None
     assert await judged("[]", SCOPE_SOURCE_AD, _VIEWERS) is None
+    # Groups that newly grant Administrator are not asked about scope, though the stored roles do
+    # not hold it yet: the short-circuit is decided from the roles the groups grant, as sign-in
+    # and the reconciler decide it.
+    await s.service.set_ad_group_map(
+        [(_OPERATORS, "administrator"), (_VIEWERS, "viewer")], actor="admin"
+    )
+    assert await judged('["IB_A"]', SCOPE_SOURCE_AD, _VIEWERS, _OPERATORS) is None
     await store.set_user_roles(user_id, ["administrator"])
-    await s.service.set_ad_group_map([(_OPERATORS, "administrator")], actor="admin")
     assert await judged('["IB_A"]', SCOPE_SOURCE_AD, _OPERATORS) is None
+
+
+async def test_a_scope_map_that_fails_its_seal_is_no_demotion(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 4, the twin of BACKLOG #3082: a failing scope map maps no channel, so every scope
+    would read as withdrawn, but a new sign-in reads the same map. An account holding a scope is
+    refused as ``directory_scope_map_unsealed``, whose fix is UNCONFIRMED, never sign out, even
+    when its scope would not narrow. The role map is left sealed, so the role test passes."""
+    from messagefoundry.auth import service as service_module
+    from messagefoundry.auth.service import (
+        DIRECTORY_SCOPE_MAP_UNSEALED,
+        DIRECTORY_SCOPE_NARROWED,
+    )
+    from messagefoundry.store.store import AD_SCOPE_MAP, ad_map_seal_ok
+
+    s = await _signed_in(store, _VIEWERS, _SCOPE_AB, scope_map=_SCOPE_MAP)
+    real = ad_map_seal_ok
+    monkeypatch.setattr(
+        service_module,
+        "ad_map_seal_ok",
+        lambda sealer, current: current.name != AD_SCOPE_MAP and real(sealer, current),
+    )
+
+    refused = await s.service.reauth(s.identity, _GOOD, token=s.token)
+
+    assert not refused.ok and refused.token is None and refused.session_lost is False
+    assert refused.directory_refusal is DirectoryRefusal.UNCONFIRMED
+    reasons = await _reauth_reasons(store)
+    assert any(f'"reason": "{DIRECTORY_SCOPE_MAP_UNSEALED}"' in d for d in reasons), reasons
+    assert not any(f'"reason": "{DIRECTORY_SCOPE_NARROWED}"' in d for d in reasons), reasons
 
 
 async def test_a_row_re_pointed_during_the_bind_is_refused_not_judged(
