@@ -2526,12 +2526,7 @@ class AuthStore(Protocol):
         self, user_id: str, code_hash: str, *, now: float | None = None
     ) -> bool: ...
 
-    async def consume_totp_step(self, user_id: str, step: int | None) -> bool:
-        """Record ``step`` as the account's highest consumed TOTP time-step, only when it is
-        strictly greater than the one stored; ``True`` iff it was. ``step=None`` (a code that
-        matched no step) must still take the same locked read and seal check, write nothing and
-        return ``False`` (ASVS 11.2.4, BACKLOG #1167): never short-circuit it."""
-        ...
+    async def consume_totp_step(self, user_id: str, step: int) -> bool: ...
 
     # --- MFA: WebAuthn passkeys second factor (local accounts, WP-14b / ADR 0068) ---
     async def add_webauthn_credential(

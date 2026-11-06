@@ -9906,13 +9906,12 @@ class PostgresStore:
         written = await self._write_user_txn(user_id, recovery_code_spend(code_hash, now))
         return written is not None
 
-    async def consume_totp_step(self, user_id: str, step: int | None) -> bool:
+    async def consume_totp_step(self, user_id: str, step: int) -> bool:
         """Atomically record ``step`` as the user's highest consumed TOTP time-step; ``True`` iff newly
         consumed (strictly greater than any prior step). A code replayed inside its ±1-step verify
         window resolves to a non-greater step and returns ``False`` — single-use per ASVS 6.5.1. The
         write helper's locked read and its write run in one transaction (no cross-node
-        double-spend). ``step=None`` takes the same locked read and writes nothing
-        (``totp_step_spend``)."""
+        double-spend)."""
         return await self._write_user_txn(user_id, totp_step_spend(step)) is not None
 
     async def set_user_disabled(

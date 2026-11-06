@@ -5458,10 +5458,11 @@ class AuthService:
         # purpose). Asked on every combined sign-in, it would be a store call only an account with
         # TOTP on makes, reachable with neither factor: its refusal would escape ``login`` as an
         # unpadded 500, and a pool wait can outlast the pad, so either would name the account as
-        # enrolled to anyone who knows the username. It would also take the account's row lock for
-        # every wrong code. So a wrong code makes the store calls a password-only sign-in makes. A
-        # refusal here still escapes, but only to a caller holding a live or just-used code, who
-        # learns nothing about enrolment from it.
+        # enrolled to anyone who knows the username. It would also add a locked round trip on the
+        # account's row to every wrong code. So a wrong code makes the store calls a password-only
+        # sign-in makes. A refusal here still escapes unpadded, as before, but only on a code that
+        # matched a step, which already tells its sender the account is enrolled. The ``int``
+        # signature of ``consume_totp_step`` keeps this short-circuit the only form that type-checks.
         code_ok = step is not None and await self._store.consume_totp_step(user.id, step)
         return password_ok, code_ok
 

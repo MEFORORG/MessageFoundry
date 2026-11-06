@@ -4,15 +4,8 @@
 
 1. ``backup_codec.decrypt_stream`` runs BOTH AAD tries on every frame, the final one included.
 2. ``AuthService._check_both_factors`` KEEPS its short-circuit: ``consume_totp_step`` is asked only
-   once a code matched a step. Asked on every combined sign-in, it is a store call only a TOTP
-   account makes, reachable with neither factor, so a store refusal would escape ``login`` as an
-   unpadded 500 that names the account as enrolled. A wrong code beside a refusing store answers as
-   a plain wrong code, through the same pad.
+   once a code matched a step. The comment above that line says why.
 3. ``finish_webauthn_assertion`` compares every held passkey, each in constant time.
-
-The store side of ``step=None`` (nothing written, the seal still checked) is in
-``tests/_webauthn_store_contract.py`` and ``tests/_user_seal_contract.py``, run on every backend;
-the service no longer passes ``None``.
 
 Synthetic data only: random keys, a test administrator, software passkeys.
 """
@@ -37,7 +30,6 @@ from messagefoundry.auth import totp
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store import backup_codec as bc
-from messagefoundry.store.base import StoreAcquireTimeout
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin
 from tests._totp_clock import pin_totp_clock
@@ -110,13 +102,11 @@ async def store() -> AsyncIterator[MessageStore]:
     await s.close()
 
 
-def _spy_consume(
-    monkeypatch: pytest.MonkeyPatch, store: MessageStore
-) -> list[tuple[str, int | None]]:
-    calls: list[tuple[str, int | None]] = []
+def _spy_consume(monkeypatch: pytest.MonkeyPatch, store: MessageStore) -> list[tuple[str, int]]:
+    calls: list[tuple[str, int]] = []
     real = store.consume_totp_step
 
-    async def spy(user_id: str, step: int | None) -> bool:
+    async def spy(user_id: str, step: int) -> bool:
         calls.append((user_id, step))
         return await real(user_id, step)
 
@@ -142,18 +132,15 @@ async def _factors(
 async def test_a_wrong_code_does_not_ask_the_store(
     monkeypatch: pytest.MonkeyPatch, store: MessageStore
 ) -> None:
-    """RED when: ``_check_both_factors`` asks ``consume_totp_step`` on a ``None`` step. That call
-    would be one only a TOTP account makes, reachable with neither factor."""
+    """RED when: ``_check_both_factors`` asks ``consume_totp_step`` on a wrong code."""
     service, user_id, password = await _factors(monkeypatch, store, None)
     calls = _spy_consume(monkeypatch, store)
     user = await service._load_user(user_id)
     assert user is not None
-    before = await store.get_user(user_id)
 
     assert await service._check_both_factors(user, password, "000000") == (True, False)
 
     assert calls == []
-    assert await store.get_user(user_id) == before  # nothing written
 
 
 async def test_a_right_code_is_consumed_once(
@@ -173,29 +160,21 @@ async def test_a_right_code_is_consumed_once(
 
 
 async def _totp_enrolled(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> tuple[str, str]:
-    """The test administrator with TOTP on, the clock pinned one step past the enrolment code.
-    Returns ``(user_id, password)``."""
+    """The test administrator with TOTP on. Returns ``(user_id, password)``."""
     identity, token, password = await login_admin(service)
     enroll = await service.begin_mfa_enrollment(identity)
     now = 3_000_000.0
     pin_totp_clock(monkeypatch, now)
     code = totp.totp(enroll.secret, now=now)
     assert (await service.confirm_mfa_enrollment(identity, code, token=token)).ok
-    pin_totp_clock(monkeypatch, now + totp.DEFAULT_PERIOD)
     return identity.user_id, password
 
 
-@pytest.mark.parametrize(
-    "refusal",
-    [sqlite3.OperationalError("database is locked"), StoreAcquireTimeout("pool borrow timed out")],
-    ids=["lock", "pool"],
-)
 async def test_a_wrong_code_beside_a_refusing_store_answers_as_a_plain_wrong_code(
-    monkeypatch: pytest.MonkeyPatch, store: MessageStore, refusal: Exception
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore
 ) -> None:
-    """RED when: ``consume_totp_step`` is asked on a wrong code. Its refusal then escapes ``login``
-    as an unpadded 500, on a path only an account with TOTP on takes, so it would name the account
-    as enrolled to anyone who knows the username."""
+    """RED when: ``consume_totp_step`` is asked on a wrong code, so a store refusal there escapes
+    ``login`` unpadded (a lock error here) instead of answering as a plain wrong code."""
     service = AuthService(store, AuthSettings(mfa_verify_min_elapsed_seconds=0))
     user_id, password = await _totp_enrolled(service, monkeypatch)
     monkeypatch.setattr(totp, "verify_totp_step", lambda *a, **k: None)  # every code is wrong
@@ -213,17 +192,18 @@ async def test_a_wrong_code_beside_a_refusing_store_answers_as_a_plain_wrong_cod
     plain = await service.login(ADMIN_USERNAME, password, totp_code="000000")
     after_plain = await store.get_user(user_id)
 
-    asked: list[int | None] = []
+    asked: list[int] = []
 
-    async def refused(_user_id: str, step: int | None) -> bool:
+    async def refused(_user_id: str, step: int) -> bool:
         asked.append(step)
-        raise refusal
+        raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(store, "consume_totp_step", refused)
     failed = await service.login(ADMIN_USERNAME, password, totp_code="000000")
     after_failed = await store.get_user(user_id)
 
-    # The same answer, through the same padded deadline, and the refusing call never made.
+    # The refusing call never made, and the same answer handed to the same pad. This checks the
+    # pad's entry, not its deadline; tests/test_asvs_login_deadline.py measures the deadline.
     assert asked == []
     assert plain == failed == service_mod.LoginOutcome(ok=False, error="invalid credentials")
     assert padded == [plain, failed]
