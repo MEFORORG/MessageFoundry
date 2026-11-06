@@ -384,6 +384,13 @@ async def _assert_totp_contract(store: Any) -> None:
     assert await store.consume_totp_step("totp-u1", 99) is False  # older step
     assert await store.consume_totp_step("totp-u1", 101) is True
     assert await store.consume_totp_step("missing-user", 1) is False
+    # A code that matched no step (ASVS 11.2.4, BACKLOG #1167): refused, and nothing is written.
+    before_none = await store.get_user("totp-u1")
+    assert await store.consume_totp_step("totp-u1", None) is False
+    assert await store.get_user("totp-u1") == before_none
+    assert await store.consume_totp_step("missing-user", None) is False
+    assert await store.consume_totp_step("totp-u1", 101) is False  # the high-water mark held
+    assert await store.consume_totp_step("totp-u1", 102) is True
 
     # Disable clears everything.
     await store.disable_totp("totp-u1", now=8.0)

@@ -2687,7 +2687,7 @@ async def lockable_account_census(
         # Two questions, two rules (BACKLOG #3937). Whether a reset would remove a passkey that
         # may still sign the holder in asks ``sign_in_counts``. Whether the account holds a way
         # past the GATES count asks the configured rp_id, as the gates do. One digest check.
-        trusted = not sealed or passkey_digest(creds) == digest
+        trusted = not sealed or constant_time_equal(passkey_digest(creds), digest)
         if trusted and any(sign_in_counts(c) for c in creds):
             if state == "unknown":
                 unknown_beside_a_passkey.append(user.username)
@@ -3967,7 +3967,7 @@ class AuthService:
                 except ValueError:  # CredentialHashSchemeError is one too
                     refused += 1
                     continue
-                if cred.credential_id_hash == new_hash:
+                if constant_time_equal(cred.credential_id_hash, new_hash):
                     continue
                 if scheme == CREDENTIAL_ID_HASH_SCHEME:
                     # Today's tag over a digest its own raw id does not give: not a row this
@@ -5453,7 +5453,10 @@ class AuthService:
                 user.username,
             )
             step = None
-        code_ok = step is not None and await self._store.consume_totp_step(user.id, step)
+        # Called whatever ``step`` is (ASVS 11.2.4, BACKLOG #1167): a ``None`` step takes the same
+        # locked read and seal check and writes nothing, so a wrong code costs what a replayed one
+        # does rather than skipping the store.
+        code_ok = await self._store.consume_totp_step(user.id, step)
         return password_ok, code_ok
 
     async def _check_password_and_passkey(
@@ -10825,7 +10828,9 @@ class AuthService:
         failing its seal; on a keyless store it is logged, at most once per report interval."""
         try:
             creds = await self._store.list_webauthn_credentials(user.id)
-            if self._store.row_sealer() is None or passkey_digest(creds) == user.cred_digest:
+            if self._store.row_sealer() is None or constant_time_equal(
+                passkey_digest(creds), user.cred_digest
+            ):
                 return creds
             fresh = await self._load_user(user.id)
             if fresh is None:
@@ -10838,7 +10843,7 @@ class AuthService:
             elif self._seal_failures_reported.due(f"passkey-parse:{user.id}"):
                 _log.warning("a passkey row of user %s did not parse (%s)", user.id, exc)
             return None
-        if passkey_digest(creds) == fresh.cred_digest:
+        if constant_time_equal(passkey_digest(creds), fresh.cred_digest):
             return creds
         await self._user_seal_failed(user.id, part="passkeys")
         return None
@@ -13826,7 +13831,9 @@ class AuthService:
             reason = "already_enabled"
         elif after.totp_secret_cell is None:
             reason = "secret_cleared"
-        elif after.totp_secret_cell != verified_cell:
+        elif verified_cell is None or not constant_time_equal(
+            after.totp_secret_cell, verified_cell
+        ):
             reason = "secret_replaced"
         else:
             # The row still holds the verified cell with TOTP off, so the write lost to some other
@@ -15344,7 +15351,12 @@ class AuthService:
         # passkey row the store did not write fails the whole set, so none of them signs in.
         held = await self._verified_passkeys(user)
         wanted = _credential_id_hash(raw_id)
-        cred = next((c for c in held or () if c.credential_id_hash == wanted), None)
+        # ASVS 11.2.4 (BACKLOG #1167): every candidate compared, each in constant time, as
+        # _passkey_assertion_ok does; no early exit at the matching slot.
+        cred: WebAuthnCredential | None = None
+        for candidate in held or ():
+            if constant_time_equal(candidate.credential_id_hash, wanted) and cred is None:
+                cred = candidate
         if cred is None or cred.user_id != user.id or cred.rp_id != rp_id:
             # Unknown credential, another user's, or minted under a different origin — same
             # refusal either way (no oracle distinguishing the three).
@@ -15472,8 +15484,8 @@ class AuthService:
         sign-count miss writes its clone row before this is asked. The account is asked
         only when the set does not hold ``cred``, since a set read of a deleted account fails its
         seal on a keyed store and is empty on a keyless one. This re-check compares every
-        credential, each in constant time (ASVS 11.2.4, as the delete path does); the lookup that
-        first picked ``cred`` does not."""
+        credential, each in constant time (ASVS 11.2.4, as the delete path does), as the lookup
+        that first picked ``cred`` does."""
         held = await self._verified_passkeys(user)
         if held is not None:
             # A list, not a generator: any() over a generator would stop at the first match.

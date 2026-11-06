@@ -438,28 +438,25 @@ def decrypt_stream(
                 f"{_TAG_BYTES}..{max_ctlen} for a {header.chunk_size}-byte chunk)"
             )
         ct = _read_exact(src, ctlen, "frame ciphertext")
-        # We don't know up front whether this is the final frame, so try the non-final AAD first
-        # (every frame but the last) and fall back to the final-flag AAD. Exactly one matches for an
-        # authentic frame; if neither does, the frame is corrupt/tampered/wrong-key — fail closed.
+        # We don't know up front whether this is the final frame, so try both the non-final AAD
+        # (every frame but the last) and the final-flag AAD. Exactly one matches for an authentic
+        # frame; if neither does, the frame is corrupt/tampered/wrong-key — fail closed.
         #
-        # ASVS 11.2.4 discharge (BACKLOG #1167): the `break` below is a short-circuit, and it is left
-        # on purpose. The two tries differ ONLY in the final flag, so the try count says whether this
-        # frame was the archive's last. That is public framing: the archive ends right after it, and
-        # `src.read(1)` below refuses any byte that follows. A frame that fails takes both tries
-        # every time. The key and the plaintext never steer the count, and each tag check is
-        # constant-time inside `cryptography`. A forced second try would double the AEAD work over
-        # the whole archive to hide where the file ends.
+        # Constant-time (ASVS 11.2.4, BACKLOG #1167): BOTH tries run on every frame, with no break on
+        # the first match, so the tag-check count does not depend on which AAD authenticated. The
+        # first match is kept. The cost is one extra GCM
+        # tag check per frame, on restore only.
         plaintext: bytes | None = None
         this_final = False
         for final_try in (False, True):
             try:
-                plaintext = aes.decrypt(
+                candidate = aes.decrypt(
                     nonce, ct, _aad(header_digest, frame_index, final=final_try)
                 )
-                this_final = final_try
-                break
             except InvalidTag:
                 continue
+            if plaintext is None:
+                plaintext, this_final = candidate, final_try
         if plaintext is None:
             raise BackupCodecError(
                 f"authentication failed on frame {frame_index} (corrupt/tampered/truncated archive, "

@@ -1,0 +1,257 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""ASVS 11.2.4 (BACKLOG #1167): three short-circuits removed, each pinned by a count.
+
+1. ``backup_codec.decrypt_stream`` runs BOTH AAD tries on every frame, the final one included.
+2. ``AuthService._check_both_factors`` calls ``consume_totp_step`` whatever the code was; a code
+   that matched no step passes ``None``, which writes nothing.
+3. ``finish_webauthn_assertion`` compares every held passkey, each in constant time.
+
+The store side of ``step=None`` (nothing written, the seal still checked) is in
+``tests/_webauthn_store_contract.py`` and ``tests/_user_seal_contract.py``, run on every backend.
+
+Synthetic data only: random keys, a test administrator, software passkeys.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import os
+from collections import Counter
+from collections.abc import AsyncIterator
+from typing import Any
+
+import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from messagefoundry import credential
+from messagefoundry.auth import service as service_mod
+from messagefoundry.auth import totp
+from messagefoundry.auth.service import AuthService
+from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store import backup_codec as bc
+from messagefoundry.store.store import MessageStore
+from tests._admin_account import ADMIN_USERNAME, create_admin, login_admin
+
+# --- 1. decrypt_stream: both tries on every frame -------------------------------------------------
+
+
+class _CountingAes:
+    """Wraps the archive's frame AESGCM and records the AAD of every decrypt attempt."""
+
+    def __init__(self, aes: AESGCM, tries: list[bytes]) -> None:
+        self._aes = aes
+        self._tries = tries
+
+    def decrypt(self, nonce: bytes, data: bytes, aad: bytes) -> bytes:
+        self._tries.append(aad)
+        return self._aes.decrypt(nonce, data, aad)
+
+
+def _archive(key: bytes, payload: bytes) -> bytes:
+    enc = io.BytesIO()
+    bc.encrypt_stream(io.BytesIO(payload), enc, key, chunk_size=4096)
+    return enc.getvalue()
+
+
+def _counted(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
+    tries: list[bytes] = []
+    real = bc._frame_aes
+
+    def counted(header: bc.ArchiveHeader, key: bytes) -> Any:
+        return _CountingAes(real(header, key), tries)
+
+    monkeypatch.setattr(bc, "_frame_aes", counted)
+    return tries
+
+
+def test_every_frame_takes_both_tries_and_the_payload_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the frame loop gets its ``break`` back, so a non-final frame takes one try."""
+    key = os.urandom(32)
+    payload = os.urandom(9000)  # three frames at 4096 bytes: two non-final, one final
+    blob = _archive(key, payload)
+    tries = _counted(monkeypatch)
+    out = io.BytesIO()
+
+    bc.decrypt_stream(io.BytesIO(blob), out, key)
+
+    assert out.getvalue() == payload
+    digest = hashlib.sha256(bc.read_header(io.BytesIO(blob)).to_json_bytes()).digest()
+    # Frame by frame: the non-final AAD, then the final one, for all three frames.
+    assert tries == [bc._aad(digest, i, final=f) for i in range(3) for f in (False, True)]
+
+
+def test_a_tampered_frame_still_fails_closed() -> None:
+    key = os.urandom(32)
+    blob = bytearray(_archive(key, os.urandom(9000)))
+    blob[-20] ^= 0x01  # inside the last frame's ciphertext or tag
+    with pytest.raises(bc.BackupCodecError, match="authentication failed"):
+        bc.decrypt_stream(io.BytesIO(bytes(blob)), io.BytesIO(), key)
+
+
+# --- 2. _check_both_factors: the store is asked whatever the code was ----------------------------
+
+
+@pytest.fixture
+async def store() -> AsyncIterator[MessageStore]:
+    s = await MessageStore.open(":memory:")
+    yield s
+    await s.close()
+
+
+def _spy_consume(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore
+) -> list[tuple[str, int | None]]:
+    calls: list[tuple[str, int | None]] = []
+    real = store.consume_totp_step
+
+    async def spy(user_id: str, step: int | None) -> bool:
+        calls.append((user_id, step))
+        return await real(user_id, step)
+
+    monkeypatch.setattr(store, "consume_totp_step", spy)
+    return calls
+
+
+async def _factors(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore, step: int | None
+) -> tuple[AuthService, str, str]:
+    """A test administrator whose TOTP check resolves to ``step`` (``None`` is a wrong code)."""
+    service = AuthService(store, AuthSettings())
+    admin = await create_admin(service)
+
+    async def secret(_user: object) -> str:
+        return "SYNTHETICSECRET"
+
+    monkeypatch.setattr(service, "_totp_secret", secret)
+    monkeypatch.setattr(totp, "verify_totp_step", lambda *a, **k: step)
+    return service, admin.user_id, admin.password
+
+
+async def test_a_wrong_code_still_asks_the_store_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore
+) -> None:
+    """RED when: ``_check_both_factors`` short-circuits ``consume_totp_step`` on a ``None`` step."""
+    service, user_id, password = await _factors(monkeypatch, store, None)
+    calls = _spy_consume(monkeypatch, store)
+    user = await service._load_user(user_id)
+    assert user is not None
+    before = await store.get_user(user_id)
+
+    assert await service._check_both_factors(user, password, "000000") == (True, False)
+
+    assert calls == [(user_id, None)]
+    assert await store.get_user(user_id) == before  # nothing written
+
+
+async def test_a_right_code_is_consumed_once(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore
+) -> None:
+    service, user_id, password = await _factors(monkeypatch, store, 4242)
+    calls = _spy_consume(monkeypatch, store)
+    user = await service._load_user(user_id)
+    assert user is not None
+
+    assert await service._check_both_factors(user, password, "123456") == (True, True)
+    user = await service._load_user(user_id)
+    assert user is not None
+    assert await service._check_both_factors(user, "wrong", "123456") == (False, False)  # replay
+
+    assert calls == [(user_id, 4242), (user_id, 4242)]
+
+
+# --- 3. finish_webauthn_assertion: every held passkey compared ------------------------------------
+
+_RP, _ORIGIN = "t", "http://t"
+
+
+async def _three_passkeys(store: MessageStore) -> tuple[AuthService, str, str, list[Any]]:
+    """A test administrator holding three passkeys, and a fresh session that owes one."""
+    pytest.importorskip("webauthn")
+    from webauthn.helpers import base64url_to_bytes
+
+    from tests._soft_webauthn import SoftAuthenticator
+
+    service = AuthService(store, AuthSettings(require_mfa=False, mfa_verify_min_elapsed_seconds=0))
+    identity, token, password = await login_admin(service)
+    keys = [SoftAuthenticator(rp_id=_RP, origin=_ORIGIN) for _ in range(3)]
+    for n, key in enumerate(keys):
+        options = json.loads(
+            await service.begin_webauthn_registration(
+                identity, token=token, rp_id=_RP, rp_name="MessageFoundry"
+            )
+        )
+        enrolled = await service.finish_webauthn_registration(
+            identity,
+            key.create_response(base64url_to_bytes(options["challenge"])),
+            label=f"key-{n}",
+            token=token,
+            rp_id=_RP,
+            origin=_ORIGIN,
+        )
+        assert enrolled.ok and enrolled.token is not None, n
+        token = enrolled.token  # an enrolment rotates the session
+    out = await service.login(ADMIN_USERNAME, password)
+    assert out.ok and out.token is not None
+    return service, out.token, identity.user_id, keys
+
+
+async def _assert_with(service: AuthService, token: str, key: Any) -> str:
+    from webauthn.helpers import base64url_to_bytes
+
+    challenge = await service.begin_webauthn_assertion(token, rp_id=_RP)
+    assert challenge is not None
+    response: str = key.get_response(base64url_to_bytes(json.loads(challenge)["challenge"]))
+    return response
+
+
+def _spy_equal(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str | bytes, str | bytes]]:
+    calls: list[tuple[str | bytes, str | bytes]] = []
+    real = credential.constant_time_equal
+
+    def spy(a: str | bytes, b: str | bytes) -> bool:
+        calls.append((a, b))
+        return real(a, b)
+
+    monkeypatch.setattr(service_mod, "constant_time_equal", spy)
+    return calls
+
+
+async def test_an_unknown_passkey_is_compared_against_every_held_one(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore
+) -> None:
+    """RED when: the lookup goes back to ``next(... == wanted)``, which compares with ``==``."""
+    service, token, user_id, _keys = await _three_passkeys(store)
+    from tests._soft_webauthn import SoftAuthenticator
+
+    response = await _assert_with(service, token, SoftAuthenticator(rp_id=_RP, origin=_ORIGIN))
+    held = {c.credential_id_hash for c in await store.list_webauthn_credentials(user_id)}
+    assert len(held) == 3
+    calls = _spy_equal(monkeypatch)
+
+    refused = await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+
+    assert refused.ok is False
+    lookups = [(a, b) for a, b in calls if a in held]
+    assert Counter(a for a, _ in lookups) == dict.fromkeys(held, 1)
+    assert len({b for _, b in lookups}) == 1  # all against the one presented id
+
+
+async def test_the_first_held_passkey_still_signs_in_after_a_full_walk(
+    monkeypatch: pytest.MonkeyPatch, store: MessageStore
+) -> None:
+    """RED when: the walk stops at the matching slot. The FIRST passkey signs, and the lookup plus
+    ``_passkey_held``'s re-check must still compare all three, twice each."""
+    service, token, user_id, keys = await _three_passkeys(store)
+    response = await _assert_with(service, token, keys[0])
+    held = {c.credential_id_hash for c in await store.list_webauthn_credentials(user_id)}
+    calls = _spy_equal(monkeypatch)
+
+    verified = await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
+
+    assert verified.ok is True
+    assert Counter(a for a, _ in calls if a in held) == dict.fromkeys(held, 2)

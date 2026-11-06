@@ -307,6 +307,9 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
         lambda: store.set_password(
             bent, password_hash="h", password_generated=False, must_change_password=False
         ),
+        # BACKLOG #1167: a code that matched no step takes the same seal check a real step does.
+        lambda: store.consume_totp_step(bent, None),
+        lambda: store.consume_totp_step(bent, 5),
     ):
         try:
             await write()

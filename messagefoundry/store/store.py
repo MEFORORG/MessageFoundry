@@ -3717,13 +3717,17 @@ def recovery_code_spend(code_hash: str, now: float) -> UserChange:
     return apply
 
 
-def totp_step_spend(step: int) -> UserChange:
+def totp_step_spend(step: int | None) -> UserChange:
     """Record ``step`` as the highest consumed TOTP time-step, only when it is strictly greater than
-    the one stored, which makes each code single-use (ASVS 6.5.1)."""
+    the one stored, which makes each code single-use (ASVS 6.5.1).
+
+    ``None`` (a code that matched no step) always declines, after the same locked read and seal
+    check a real step takes, so a wrong code costs what a replayed one does (ASVS 11.2.4, BACKLOG
+    #1167)."""
 
     def apply(r: UserAuthzRecord) -> UserAuthzRecord | None:
         last = r.row.last_totp_step
-        if last is not None and last >= step:
+        if step is None or (last is not None and last >= step):
             return None
         return r.changed(last_totp_step=int(step))
 
@@ -17467,13 +17471,14 @@ class MessageStore:
             await self._commit()
         return written is not None
 
-    async def consume_totp_step(self, user_id: str, step: int) -> bool:
+    async def consume_totp_step(self, user_id: str, step: int | None) -> bool:
         """Atomically record ``step`` as the user's highest consumed TOTP time-step; return ``True``
         iff it was newly consumed (strictly greater than any previously used step). A captured TOTP
         code replayed inside its ±1-step verify window resolves to a step that is no longer greater
         than the stored ``last_totp_step``, so this returns ``False`` — making each code single-use
         (ASVS 6.5.1). The re-read + compare + write run under one ``self._lock``, so two concurrent
-        verifications of the same code can't both win."""
+        verifications of the same code can't both win. ``step=None`` takes the same lock, read and
+        seal check, writes nothing and returns ``False`` (:func:`totp_step_spend`)."""
         async with _writer_guard(self._db, self._lock):
             # Nothing written for an older or equal step: a replay within the window.
             written = await self._write_user(user_id, totp_step_spend(step))
