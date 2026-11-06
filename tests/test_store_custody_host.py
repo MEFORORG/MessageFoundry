@@ -1198,28 +1198,30 @@ async def test_the_sqlserver_census_refuses_without_view_definition_on_the_schem
 
 
 @host_file_platforms
-@pytest.mark.parametrize("holds_data", [False, True])
+@pytest.mark.parametrize("shape", ["failed mint", "holds data", "never keyed"])
 def test_a_rerun_over_a_chain_never_started_names_the_key_file_to_remove(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    holds_data: bool,
+    shape: str,
 ) -> None:
     # PR 2804 hold 2: a mint that failed before its genesis record keeps its key file, and the
     # re-run is refused until the operator removes that file by hand. The refusal names it, but
-    # only over a store that holds no data: an empty chain alone does not show the key is spare.
+    # only over what a failed mint leaves: a keyed open's salt and no data. An empty chain alone
+    # does not show the key is spare: the store may hold data, or the key may be another store's
+    # in a shared directory. Then the refusal says to keep both.
     import asyncio
 
     from messagefoundry.__main__ import main
 
     settings = _settings(tmp_path)
+    store_path = Path(settings.path)
 
     async def _unstarted() -> None:
-        # A store whose chain was never started, made before the key: a keyless open refuses a
-        # directory that holds a host blob.
-        store = await _keyless_store(Path(settings.path))
+        # Made before the key: a keyless open refuses a directory that holds a host blob.
+        store = await _keyless_store(store_path)
         try:
-            if holds_data:
+            if shape == "holds data":
                 await store.record_connection_event(
                     connection="IB_TEST_ADT",
                     transport="mllp",
@@ -1228,6 +1230,8 @@ def test_a_rerun_over_a_chain_never_started_names_the_key_file_to_remove(
                 )
         finally:
             await store.close()
+        if shape != "never keyed":
+            await _failed_mint_leftovers(store_path, tmp_path)
 
     asyncio.run(_unstarted())
     _mint(settings)
@@ -1241,12 +1245,16 @@ def test_a_rerun_over_a_chain_never_started_names_the_key_file_to_remove(
     err = capsys.readouterr().err
     assert "Traceback" not in err
     assert kept.exists()
-    if holds_data:
-        assert "by hand" not in err, err
+    if shape != "failed mint":
+        # Neither the key file nor the store is to be removed, and the text says so.
+        assert "by hand" not in err and "Remove the store" not in err, err
+        assert f"keep {kept}" in err, err
+        reason = "holds data" if shape == "holds data" else "no keyed open ever ran"
+        assert reason in err, err
         return
     assert f"remove {kept}" in err and "by hand" in err, err
     # A SQLite store file goes too, or the next run reads it as taken; its -wal file with it.
-    assert f"{Path(settings.path).resolve()}" in err and "-wal" in err
+    assert f"{store_path.resolve()}" in err and "-wal" in err
 
 
 @host_file_platforms

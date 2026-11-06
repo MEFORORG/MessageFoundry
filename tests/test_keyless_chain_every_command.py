@@ -1344,9 +1344,9 @@ _CLI_OPENERS = {
     # vault BACKLOG #3411: the read-only "does this server database hold a store" probe, under a
     # throwaway host blob, before a store key is minted for it
     "_provision_admin.server_store_absent",
-    # PR 2804 hold 2: the read-only "does a store whose chain was never started hold data" probe,
-    # before the refusal tells the operator to remove its key file
-    "_provision_admin.unstarted_store_holds_nothing",
+    # PR 2804 hold 2: the read-only probe of a store whose chain was never started, before the
+    # refusal says whether to remove the key file or keep it
+    "_provision_admin.unstarted_store_keep_reason",
     # vault BACKLOG #3849 B5: the reopen after the codes are shown, so the administrator_granted
     # alert's open instance lands in the store, on the write's verdict and posture. It passes no
     # create; this guard reads only the verdict, so nothing here pins that

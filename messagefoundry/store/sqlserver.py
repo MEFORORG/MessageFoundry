@@ -16105,8 +16105,8 @@ class SqlServerStore:
                 f"this login does not hold the view definition permission on schema"
                 f" {store_schema!r}, so SQL Server may hide a table there that holds rows, and"
                 " whether the store holds data cannot be read. Grant this login view definition"
-                " on that schema; select, which the db_datareader role grants on the database, is"
-                " not enough"
+                " on that schema (select, which the db_datareader role grants on the database, is"
+                " not enough)"
             )
         rows = await self._fetchall(
             "SELECT t.name AS t FROM sys.tables t"

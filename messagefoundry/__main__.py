@@ -8472,12 +8472,14 @@ def _provision_open_refusal(exc: BaseException, store: StoreSettings) -> str:
     return f"{_sentence(codec_safe_str(exc))} {tail}"
 
 
-def _never_started_refusal(store: StoreSettings) -> str:
+def _never_started_refusal(store: StoreSettings, keep: str | None) -> str:
     """``provision-admin``'s text when the host blob here opens a store whose audit chain was
-    never started: a mint that failed before its genesis record kept its key file, and only the
-    operator removes it (PR 2804 hold 2). Only for a store the census read as holding no data.
-    Names the file, and on SQLite the store file and its side files too, which the next run would
-    otherwise read as a store another key made. Names paths, never a key."""
+    never started (PR 2804 hold 2). With ``keep`` of ``None`` the store is what a mint that
+    failed before its genesis record leaves, and the text tells the operator to remove the key
+    file it kept by hand, and on SQLite the store file and its side files too, which the next run
+    would otherwise read as a store another key made. Otherwise ``keep`` says why the key file may
+    be the only key to that store, and the text says to keep it and the store. Names paths, never
+    a key."""
     import os
 
     from messagefoundry.config.settings import StoreBackend
@@ -8486,6 +8488,12 @@ def _never_started_refusal(store: StoreSettings) -> str:
     paths = check_host_custody_settings(store)
     present = [str(path) for path in paths if os.path.lexists(path)] or [str(paths[0])]
     files = " and ".join(present)
+    if keep is not None:
+        return (
+            f"the store's audit chain was never started, but {keep}. So keep {files}, which may "
+            "be the only key to that store, and keep the store: find out why its chain is missing "
+            "before you change either"
+        )
     store_file = ""
     if store.backend is StoreBackend.SQLITE:
         db = Path(store.path).resolve()
@@ -8802,11 +8810,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
         finally:
             await store.close()
 
-    async def unstarted_store_holds_nothing() -> bool:
-        """Whether the store a host blob here opens, whose audit chain was never started, holds
-        no data, so its key file may go (PR 2804 hold 2): an empty chain alone does not show it.
-        Read-only, so the pin passes the empty chain and nothing is written. ``False`` whenever
-        the open or the census cannot say."""
+    async def unstarted_store_keep_reason() -> str | None:
+        """Why the key file a host blob here is in must be kept, over a store whose audit chain
+        was never started, or ``None`` when the store is what a mint that failed before its
+        genesis record leaves (PR 2804 hold 2): a keyed open's salt and no data. An empty chain
+        alone shows neither: the store may hold data, or the blob may be another store's in a
+        shared directory. Read-only, so the pin passes the empty chain and nothing is written."""
         from messagefoundry.store.base import (
             TableCensusIncomplete,
             store_connect_errors,
@@ -8814,16 +8823,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
         )
         from messagefoundry.store.custody_host import store_holds_data
 
+        unread: tuple[type[Exception], ...] = (*store_driver_errors(), *store_connect_errors())
         unopened: tuple[type[Exception], ...] = (
             StoreNotFoundError,
             CipherError,
             KeylessAuditChainRefused,
             *_key_unresolved(),
-        )
-        unread: tuple[type[Exception], ...] = (
-            TableCensusIncomplete,
-            *store_driver_errors(),
-            *store_connect_errors(),
+            *unread,
         )
         try:
             store = await open_store(
@@ -8832,12 +8838,20 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 posture=posture,
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
-        except unopened:
-            return False
+        except unopened as exc:
+            # The class only, as the census refusal names it: a driver's text can quote a value.
+            return f"whether the store holds data could not be read ({type(exc).__name__})"
         try:
-            return not await store_holds_data(store)
-        except unread:
-            return False
+            if await store_holds_data(store):
+                return "the store holds data"
+            if not (await store.table_occupancy()).get("store_salt"):
+                return "no keyed open ever ran on the store, so the key file may be another store's"
+            return None
+        except TableCensusIncomplete as incomplete:
+            # The grant that clears it, as the server probe says it, rather than a keep text.
+            raise HostCustodyRefused(f"{incomplete}, then run the command again") from incomplete
+        except unread as exc:
+            return f"whether the store holds data could not be read ({type(exc).__name__})"
         finally:
             await store.close()
 
@@ -8881,10 +8895,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
             absent, exists = True, None
         except StoreChainNeverStarted as unstarted:
             # A mint that failed before its genesis record kept its key file (PR 2804 hold 2).
-            # Over a store that holds data the key may be its only one: the pin's own text then.
-            if not run_guarded(unstarted_store_holds_nothing()):
-                raise
-            raise HostCustodyRefused(_never_started_refusal(settings.store)) from unstarted
+            # Never the pin's own text here, which says to remove the store and the blob.
+            keep = run_guarded(unstarted_store_keep_reason())
+            raise HostCustodyRefused(_never_started_refusal(settings.store, keep)) from unstarted
         if host_custody and absent:
             # Checked before the prompts, so a refused or repeated mint asks for nothing. The mint
             # itself, and the recovery key it shows, come last, once nothing else can refuse.
