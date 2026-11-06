@@ -226,21 +226,31 @@ def crls_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
 
 def certs_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
     """The certificate files the service settings name that no connection carries, each a
-    ``kind="cert"`` :class:`MonitoredCert`. Today that is the SQL Server ``[store].ssl_root_cert``
-    pin, labelled ``"store.ssl_root_cert"`` in the dotted style of :func:`crls_from_settings`.
+    ``kind="cert"`` :class:`MonitoredCert` labelled in the dotted style of
+    :func:`crls_from_settings`. At least these two:
 
-    Vault BACKLOG #2223: the store sends that pin with ``Encrypt=strict``, where Microsoft documents
-    that the driver does not check a pin match's expiry; the ``ssl_root_cert`` row of
-    ``docs/CONFIGURATION.md`` says more. The store refuses an expired pin only at store open, and a
-    store opened before the pin expired keeps connecting after it, so watching it here is what warns
-    ahead of that. A PostgreSQL ``ssl_root_cert`` is a CA bundle the driver
-    validates itself, so it is not listed."""
+    - ``store.ssl_root_cert``, the SQL Server store pin. Vault BACKLOG #2223: the store sends that
+      pin with ``Encrypt=strict``, where Microsoft documents that the driver does not check a pin
+      match's expiry; the ``ssl_root_cert`` row of ``docs/CONFIGURATION.md`` says more. The store
+      refuses an expired pin only at store open, and a store opened before the pin expired keeps
+      connecting after it, so watching it here is what warns ahead of that. A PostgreSQL
+      ``ssl_root_cert`` is a CA bundle the driver validates itself, so it is not listed.
+    - ``auth.oidc_client_certificate``, the certificate whose ``x5t#S256`` thumbprint each OIDC
+      ``private_key_jwt`` client assertion carries (BACKLOG #296). The signer refuses it outside its
+      validity window only when the auth service is built at start, so a running engine keeps naming
+      it after it lapses, and an IdP that selects the key by certificate can then refuse every
+      federated sign-in. Watched whenever set, as the ``[auth]`` CRL knobs are. Inline PEM is not a
+      file, so only a path is listed; ``-----BEGIN`` is the signer's own test for inline PEM."""
+    certs: list[MonitoredCert] = []
     store, pin = settings.store, settings.store.ssl_root_cert
     # Only where the store sends it: an escaped weakened posture sends no pin.
     sends_pin = store.encrypt and not store.trust_server_certificate
     if store.backend is StoreBackend.SQLSERVER and sends_pin and isinstance(pin, str) and pin:
-        return [MonitoredCert("store.ssl_root_cert", pin)]
-    return []
+        certs.append(MonitoredCert("store.ssl_root_cert", pin))
+    oidc_cert = settings.auth.oidc_client_certificate
+    if isinstance(oidc_cert, str) and oidc_cert.strip() and "-----BEGIN" not in oidc_cert:
+        certs.append(MonitoredCert("auth.oidc_client_certificate", oidc_cert))
+    return certs
 
 
 def peer_cert_expiry(peercert: Mapping[str, Any], *, now: float) -> tuple[str, int] | None:

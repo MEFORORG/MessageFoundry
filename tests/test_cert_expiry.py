@@ -793,3 +793,54 @@ def test_no_store_pin_row_without_a_sqlserver_pin(tmp_path: Path) -> None:
     bundle = tmp_path / "db-ca.pem"
     _write_cert(bundle, not_after=_REF + datetime.timedelta(days=10))
     assert certs_from_settings(_store(StoreBackend.POSTGRES, bundle)) == []
+
+
+# --- BACKLOG #296: the OIDC private_key_jwt client certificate is watched ------------------------
+#
+# Each client assertion carries the certificate's x5t#S256 thumbprint. The signer checks its validity
+# window only when the auth service is built at start, so the monitor is what warns ahead of notAfter.
+
+
+def test_the_oidc_client_certificate_is_watched_and_warns_ahead_of_not_after(
+    tmp_path: Path,
+) -> None:
+    cert = tmp_path / "oidc-client.pem"
+    _write_cert(cert, not_after=_REF + datetime.timedelta(days=10))
+    rows = certs_from_settings(
+        ServiceSettings(auth=AuthSettings(oidc_client_certificate=str(cert)))
+    )
+    assert rows == [MonitoredCert("auth.oidc_client_certificate", str(cert))]
+    sink = _RecordingSink()
+    checks = _runner(rows, sink, warn_days=30).run_once()
+    assert [(c.label, c.kind, c.days_remaining) for c in checks] == [
+        ("auth.oidc_client_certificate", "cert", 10)
+    ]
+    # A certificate, so the cert_expiry arm alerts and the CRL arm does not.
+    assert [call[0] for call in sink.cert_calls] == ["auth.oidc_client_certificate"]
+    assert sink.crl_calls == []
+
+
+def test_the_oidc_client_certificate_rides_beside_the_store_pin(tmp_path: Path) -> None:
+    pin = tmp_path / "db-server.pem"
+    _write_cert(pin, not_after=_REF + datetime.timedelta(days=10))
+    cert = tmp_path / "oidc-client.pem"
+    settings = _store(StoreBackend.SQLSERVER, pin).model_copy(
+        update={"auth": AuthSettings(oidc_client_certificate=str(cert))}
+    )
+    assert [mc.label for mc in certs_from_settings(settings)] == [
+        "store.ssl_root_cert",
+        "auth.oidc_client_certificate",
+    ]
+
+
+def test_an_inline_or_unset_oidc_client_certificate_adds_no_row(tmp_path: Path) -> None:
+    # POSITIVE CONTROL for the tests above: unset adds no row, and inline PEM, which names no file,
+    # is never handed to open() as a path.
+    cert = tmp_path / "oidc-client.pem"
+    _write_cert(cert, not_after=_REF + datetime.timedelta(days=10))
+    inline = cert.read_text(encoding="ascii")
+    assert "-----BEGIN" in inline
+    assert certs_from_settings(ServiceSettings(auth=AuthSettings())) == []
+    for value in (inline, "", "  "):
+        settings = ServiceSettings(auth=AuthSettings(oidc_client_certificate=value))
+        assert certs_from_settings(settings) == []
