@@ -1303,7 +1303,8 @@ def http_credentials_sent(
     :data:`VERIFY_OFF_STATIC_HEADER_ALLOWLIST`. That over-refuses on purpose: a header whose name
     and value are both harmless, such as ``X-Routing-Key``, refuses a verify-off hop too, and on a
     hop that already turned verification off that is the cheaper error. A credential-looking query
-    parameter in ``url`` counts too, by the reader ``query_credential_hops`` uses. A
+    parameter in ``url`` counts too, by the reader ``query_credential_hops`` uses, and so does a
+    ``code`` parameter, which that reader leaves out (vault BACKLOG #3533 item 7). A
     ``Proxy-Authorization`` from the proxy settings is not one: it goes to the proxy, inside the
     CONNECT, not across this hop.
 
@@ -1350,7 +1351,7 @@ def http_credentials_sent(
                 )
                 sent.append(f"{shown}{held}")
     url = settings.get("url")
-    if isinstance(url, str) and (names := credential_query_params(url)):
+    if isinstance(url, str) and (names := credential_query_params(url, refusal=True)):
         sent.append(f"url query parameter {', '.join(names)}")
     return sent
 
