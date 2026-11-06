@@ -30,6 +30,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: The line a child prints once its store is open.
 READY = "READY"
+#: The least any one child is given once a shared deadline has run down, so a child that is
+#: already READY, or has already exited, is read rather than killed as hung.
+_FLOOR_S = 1.0
 
 
 class ProcessRig:
@@ -76,10 +79,10 @@ class ProcessRig:
                         text=True,
                     )
                 )
-        # One deadline for all of them, so the wait stays within ``ready_timeout`` however many.
+        # One deadline for all of them, so the wait stays near ``ready_timeout`` however many.
         deadline = time.monotonic() + ready_timeout
         for proc, err_path in zip(self._procs, self._errs, strict=True):
-            ready, killed = _readline_within(proc, max(0.0, deadline - time.monotonic()))
+            ready, killed = _readline_within(proc, max(_FLOOR_S, deadline - time.monotonic()))
             if ready.strip() != READY:
                 # Said in words: a kill's exit code can match a crash's (1 on Windows).
                 try:
@@ -104,7 +107,7 @@ class ProcessRig:
         raises :class:`subprocess.TimeoutExpired`, and leaving the ``with`` block kills it."""
         deadline = time.monotonic() + timeout
         outs = [
-            proc.communicate(timeout=max(0.0, deadline - time.monotonic()))[0]
+            proc.communicate(timeout=max(_FLOOR_S, deadline - time.monotonic()))[0]
             for proc in self._procs
         ]
         for proc, err_path in zip(self._procs, self._errs, strict=True):

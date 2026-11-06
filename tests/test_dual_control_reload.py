@@ -1438,6 +1438,35 @@ async def test_a_hold_that_captured_no_digest_is_refused_at_release(
     assert await engine.store.list_audit(action="config_reload") == []
 
 
+async def test_a_no_digest_hold_past_the_gate_is_still_refused_by_the_executor(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The defence behind the gate's check (vault BACKLOG #3192): with that check made to pass, a
+    release bound to no digest reaches the executor, which still refuses every config, 422 and
+    ``no_approved_digest``, and loads nothing. The executor reads its own reference to the test,
+    so only the gate's copy is patched."""
+
+    async def _none(_config_dir: object) -> None:
+        return None
+
+    monkeypatch.setattr(engine, "reload_target_approval", _none)
+    monkeypatch.setattr("messagefoundry.api.approvals.held_fingerprint", lambda _p: "bypassed")
+    service = await _service(engine)
+    approval_id, r = await _hold_then_release(engine, service, {})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == (
+        "this request named no config digest, so it cannot be released; request the reload again"
+    )
+    assert _held_params(await engine.store.get_pending_approval(approval_id))["fingerprint"] is None
+    [row] = [
+        json.loads(r["detail"])
+        for r in await engine.store.list_audit(action="config_reload_failed")
+    ]
+    assert row["reason"] == "no_approved_digest"
+    assert row["approved_fingerprint"] is None and isinstance(row["current_fingerprint"], str)
+    assert await engine.store.list_audit(action="config_reload") == []
+
+
 async def test_a_repeat_after_an_edit_is_a_new_request_not_a_rejoin(
     engine: Engine, tmp_path: Path
 ) -> None:

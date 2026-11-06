@@ -695,10 +695,10 @@ class AlertSink(Protocol):
         stream lacks the row and nothing else reports the gap. Distinct from
         :meth:`audit_write_failed`, whose row may be missing from the store too.
 
-        The approval gate raises it where it read the row back: a request whose write reported an
-        error and reads back held, with its ``approval.requested`` row in the same write; and an
-        outcome whose combined write reported an error while the row had already left
-        ``executing``, so that write most likely committed its row. ``name`` is
+        The approval gate raises it where it read the row back, at least for: a request whose
+        write reported an error and reads back held, with its ``approval.requested`` row in the
+        same write; and an outcome whose combined write reported an error while the row had
+        already left ``executing``, so that write most likely committed its row. ``name`` is
         ``approval:<approval id>`` and ``action`` the row's audit action, as for
         :meth:`audit_write_failed`. Not connection-scoped, so no rule's ``control_action`` fires on
         it, and repeated raises on one key fold into one instance until an operator resolves it.

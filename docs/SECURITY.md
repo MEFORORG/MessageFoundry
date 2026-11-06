@@ -2538,7 +2538,8 @@ row may have committed after all.
 
 **A reload's `config_reload_failed` row names why in `reason`.** At least these values are
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
-`no_approved_digest`, `digest_unavailable`, `store_unavailable` and `reload_fault`. **An operator
+`no_approved_digest` (reached only past the gate's own check, below), `digest_unavailable`,
+`store_unavailable` and `reload_fault`. **An operator
 reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline, a dry run
 included, and released, any error the reload raises that none of the other reasons names is
 `reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
@@ -2632,7 +2633,11 @@ the environment values it had. A reload applies the values it re-read only with 
 rolled-back swap puts the old ones back. A dry run checks the values and never applies them. The
 approve answers **422**, the request moves to `failed`, and a `config_reload_failed` row records
 reason `digest_mismatch` with `approved_fingerprint` and `current_fingerprint`. A hold whose
-params carry no digest is refused the same way, with reason `no_approved_digest`. A release that
+params carry no digest is refused before its claim instead (vault BACKLOG #3192): the queue marks
+it `release_blocked: "params_no_fingerprint"`, the approve answers **409** and writes an
+`approval.params_no_fingerprint` row, nothing runs, and the request stays pending for a reject.
+The executor still refuses such a hold with reason `no_approved_digest`, but only a release that
+skipped the gate's check would reach it. A release that
 cannot take the digest now is refused with reason `digest_unavailable`, and the engine logs the
 cause at WARNING. The requester asks again, and a second approver reviews the new bytes.
 

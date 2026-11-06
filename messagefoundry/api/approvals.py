@@ -148,17 +148,22 @@ def held_fingerprint(params: Mapping[str, Any]) -> str | None:
     return _param_text(params, "fingerprint")
 
 
-#: The 409 text :meth:`ApprovalGate.approve` answers for each params refusal, which it audits as
-#: ``approval.<reason>``. One arm serves them all, so the audit row cannot differ between them.
-_PARAMS_REFUSALS: dict[ReleaseBlocked, str] = {
-    "params_unreadable": "request parameters are unreadable; reject it instead",
+#: The audit action and the 409 text :meth:`ApprovalGate.approve` writes and answers for each
+#: params refusal. One arm serves them all, so the audit row cannot differ between them.
+_PARAMS_REFUSALS: Mapping[ReleaseBlocked, tuple[str, str]] = {
+    "params_unreadable": (
+        "approval.params_unreadable",
+        "request parameters are unreadable; reject it instead",
+    ),
     "params_no_requester": (
+        "approval.params_no_requester",
         "this request's parameters record no requester, so the operation could not name who ran "
-        "it; reject it and request the operation again"
+        "it; reject it and request the operation again",
     ),
     "params_no_fingerprint": (
+        "approval.params_no_fingerprint",
         "this request's parameters record no config digest, so its release could not be bound to "
-        "the config it names; reject it and request the operation again"
+        "the config it names; reject it and request the operation again",
     ),
 }
 
@@ -300,6 +305,7 @@ def log_orphaned(
     *,
     cancelled: str,
     finished: str | None = None,
+    finished_subject: Callable[[Any], str] | None = None,
     failed: str | None = None,
     level: int = logging.ERROR,
     redact: bool = False,
@@ -311,7 +317,8 @@ def log_orphaned(
     report it again.
 
     Each message is logged after ``subject`` and a colon. ``cancelled`` and ``failed`` are logged
-    at ``level``, ``finished`` at WARNING with ``{result}`` replaced by the task's result. A
+    at ``level``, ``finished`` at WARNING, after ``finished_subject`` of the task's result where
+    that is given, since the result can name a different subject. A
     ``None`` logs nothing for that ending: a ``failed`` of ``None`` is for a task that logged its own
     failure. A failure carries its traceback, or with ``redact`` only its
     :func:`~messagefoundry.redaction.safe_exc` text, for an error whose message may hold content."""
@@ -321,7 +328,8 @@ def log_orphaned(
     error = task.exception()
     if error is None:
         if finished is not None:
-            logger.warning("%s: %s", subject, finished.format(result=task.result()))
+            named = subject if finished_subject is None else finished_subject(task.result())
+            logger.warning("%s: %s", named, finished)
     elif failed is not None:
         if redact:
             logger.log(level, "%s: %s: %s", subject, failed, safe_exc(error))
@@ -818,8 +826,10 @@ class ApprovalGate:
                 task,
                 f"approval {aid}",
                 cancelled="a request write was cancelled",
+                # Keyed on the request it holds, which for a repeat is the older one it joined.
+                finished_subject=lambda held: f"approval {held}",
                 finished="a request was filed or joined after its caller was cancelled, so that "
-                "call got no 202. It is held as {result}; a repeat by the same requester joins it",
+                "call got no 202. A repeat by the same requester joins this request",
             ),
         )
 
@@ -1393,17 +1403,19 @@ class ApprovalGate:
             # and the request's own configured shape (who must approve, how old) says nothing
             # about that. Fail closed: refuse, stay pending until it expires or is rejected.
             await self._refuse_ungated(approval_id, row, approver=approver, client=client)
-        if blocked in _PARAMS_REFUSALS:
+        params_refusal = None if blocked is None else _PARAMS_REFUSALS.get(blocked)
+        if params_refusal is not None:
             # Each is a 409 that leaves the row pending for a reject, as the queue predicts:
             # unreadable params (BACKLOG #2458) rather than a 500 from a bare parse, and the two the
             # executor would otherwise refuse only after the claim, compensated to 'failed' (vault
             # BACKLOG #3217, #3192). Before the dwell floor, so a row that can never be released
             # writes no too-early row or alert. Audited like the other refusals (vault BACKLOG
-            # #3192), as approval.<reason>, soft for the same reason. The detail carries no params:
-            # for one of them, they are what could not be read.
+            # #3192), soft for the same reason. The detail carries no params: for one of them,
+            # they are what could not be read.
+            action, refusal = params_refusal
             await self._record_audit_soft(
                 approval_id,
-                f"approval.{blocked}",
+                action,
                 actor=approver,
                 detail=json.dumps(
                     {"approval_id": approval_id, "operation": operation, "requester": row.requester}
@@ -1411,7 +1423,7 @@ class ApprovalGate:
                 client=client,  # ADR 0150: the approver's address, matching this row's actor
                 context="the release was refused",
             )
-            raise ApprovalError(409, _PARAMS_REFUSALS[blocked])
+            raise ApprovalError(409, refusal)
         op = self._ops.get(operation)
         if blocked is not None or not requester_user_id or op is None or params is None:
             # Unreachable while every reason has its arm above. Fail closed if one is added
