@@ -4,8 +4,9 @@
 (ADR 0205, ADR 0209; BACKLOG #3759 item 3.3, #4973).
 
 tests/test_outbound_batch.py and tests/test_permanent_refusal_log.py each held a copy of both,
-and neither copy closed the destination it built. One copy here, and the drive closes the lane's
-connector however the batch ends.
+and neither copy closed the destination it built; tests/test_one_frame_one_message.py held a third
+copy of the recorder. One copy here, and the drive closes the lane's connector however the batch
+ends.
 """
 
 from __future__ import annotations

@@ -553,7 +553,8 @@ async def test_a_shadow_outbound_records_what_a_live_send_would(
     runner._simulate[DEST] = True
     item = await store.claim_next_fifo(DEST)
     assert item is not None
-    await runner._process_delivery_item(DEST, item)
+    async with aclosing(dest):
+        await runner._process_delivery_item(DEST, item)
     assert dest.sent == []
     msg = await store.get_message(mid)
     (row,) = await store.outbox_for(mid)

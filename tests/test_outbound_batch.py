@@ -562,8 +562,10 @@ async def test_a_store_fault_dead_lettering_a_refused_member_spares_the_rest(
         raise RuntimeError("database is locked")
 
     monkeypatch.setattr(store, "dead_letter_now", locked)
+    rec = MllpRecorder(DEST)
     with pytest.raises(RuntimeError, match="locked"):
-        await _run_one_batch(store, simulate=False)
+        await _run_one_batch(store, simulate=False, dest=rec)
+    assert rec._closed  # BACKLOG #4973: closed on the raise path too
     assert await _states(store, mids) == [DELIVERED, QUEUED, DELIVERED]
 
 

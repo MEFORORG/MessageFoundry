@@ -95,7 +95,8 @@ _RAW_BYTES = _Boundary(_MSH_BYTES, (_CR_MSH_BYTES, _LF_MSH_BYTES))
 
 def _next_boundary[S: (str, bytes)](text: S, start: int, boundary: _Boundary[S]) -> int:
     """The index of the line break that begins the earliest boundary in ``text`` whose line break
-    is at ``start`` or later, or -1 when there is none.
+    is at ``start`` or later, or -1 when there is none. ``start`` is 0 or more: ``str.find`` reads
+    a negative one from the end.
 
     With one spelling, one scan answers. With more, a boundary's ``MSH`` is past ``start``, so one
     scan for ``MSH`` settles a text holding none, rather than one scan per spelling. Otherwise the
@@ -109,21 +110,26 @@ def _next_boundary[S: (str, bytes)](text: S, start: int, boundary: _Boundary[S])
     if first < 0:
         return -1
     at = first - 1  # first > start, so this is start or later
+    # A boundary at `at` ends with the first MSH, so no boundary, marked or not, begins earlier.
+    for line in lines:
+        if text.startswith(line, at):
+            return at
     best = -1
     for line in lines:
         # Bounded so it can only find a boundary that begins before the one already found.
         hit = text.find(line, at) if best < 0 else text.find(line, at, best + len(line) - 1)
-        if hit == at:
-            # Its MSH is the first one, so no boundary, marked or not, can begin earlier.
-            return at
         if hit >= 0:
             best = hit
     # A marked boundary's marks sit between its break and its MSH, so its break can be before `at`,
     # and its first mark is past `start`, so a mark in the lead alone does not start the search.
-    if marked is not None and text.find(marked[0], start + 1) >= 0:
-        found = marked[1].search(text, start)
-        if found is not None and (best < 0 or found.start() < best):
-            best = found.start()
+    # One that begins before `best` also ends by it, since no line break follows its first
+    # character, so both searches stop there.
+    if marked is not None:
+        end = len(text) if best < 0 else best
+        if text.find(marked[0], start + 1, end) >= 0:
+            found = marked[1].search(text, start, end)
+            if found is not None:
+                best = found.start()
     return best
 
 

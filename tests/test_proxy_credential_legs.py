@@ -1032,9 +1032,8 @@ def test_a_rest_send_over_an_unverified_proxy_leg_is_refused(
     this test FAIL at engine ``d6aa921900`` (``main`` when the row was filed) and at
     ``9cc79025f2`` (the #3410 fix branch). On both, the send reaches the proxy, so the
     ``DeliveryError``'s cause is the fake proxy's TLS end of file, not
-    ``ProxyCredentialsRefusedError``. The same copy PASSES on a ``git archive`` of ``81b116f6dc``,
-    the branch head then, whose engine code differs from ``main`` ``aba973b282`` only in
-    ``parsing/split.py``."""
+    ``ProxyCredentialsRefusedError``. The same copy PASSES on a ``git archive`` of engine
+    ``main`` ``a1a686e0a1``, measured 2026-11-06."""
     with _WireProxy() as proxy:
         monkeypatch.setenv("HTTP_PROXY", f"https://{_CRED}@{proxy.address}")
         _send_refused(_rest(_HTTP_TARGET, **hop, **relaxed), "#3418")  # type: ignore[arg-type]
@@ -1052,7 +1051,7 @@ def test_a_rest_send_over_a_verifying_proxy_leg_is_refused(
 
     Measured 2026-11-05 for #3418 step 1, as the test above records: this test FAILS at engine
     ``d6aa921900`` and at ``9cc79025f2``, where the credentialed proxy is dialled, and PASSES at
-    ``81b116f6dc``."""
+    engine ``main`` ``a1a686e0a1``."""
     with _WireProxy() as proxy:
         monkeypatch.setenv("HTTP_PROXY", f"https://{_CRED}@{proxy.address}")
         _send_refused(_rest(_HTTP_TARGET, accepted=True, proxy_url="default"), "#4909")
