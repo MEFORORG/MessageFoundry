@@ -992,11 +992,15 @@ ERROR, so the row is the record of a miss only while the audit log accepts write
 
 **A session revoke that follows a committed change is retried, and a miss is audited (vault BACKLOG
 #3023).** At least a password change or reset, an MFA reset, a disable, a role, channel-scope or
-custom-role change, a directory map save, a directory sign-in's role or scope resync and the
-`provision-admin` repair end the account's sessions after their own change has committed. A store
+custom-role edit, a directory map save, a directory sign-in's role or scope resync and the
+`provision-admin` repair end the account's sessions after their own change has committed. A
+custom-role delete revokes before it deletes, so a refusal there leaves the role in place and
+writes no such row; the directory reconciler's demotion is not covered yet. A store
 refusal of that revoke, such as a pool shortage at the acquire limit, a statement timeout or a lost
-connection, is run again, up to three attempts within 15 seconds. A SQL Server pool wait uses up
-that budget on its own, so it is recorded at once rather than run into the request deadline. A
+connection, is run again, up to three attempts, none started 15 seconds or more after the first.
+At the default `acquire_timeout` a SQL Server pool wait uses up that budget on its own, so it is
+recorded at once rather than run into the request deadline. Where one account's revoke is given up
+on, the other accounts of a role edit or map save are still revoked before the refusal is raised. A
 revoke the service gives up on is logged at ERROR
 and writes one `auth.sessions_revoke_failed` row naming the account, the change, the attempts and
 the error class; the request still fails, the change stands, and the account's other sessions stay

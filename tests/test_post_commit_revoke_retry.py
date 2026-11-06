@@ -280,3 +280,83 @@ async def test_a_refusal_past_the_budget_is_recorded_without_a_re_run(
         assert json.loads(missed["detail"])["attempts"] == 1
     finally:
         await store.close()
+
+
+async def _two_holders_of_a_custom_role(
+    store: MessageStore, service: AuthService
+) -> tuple[str, dict[str, str]]:
+    """Accounts h1 and h2 both holding one custom role, one live session each."""
+    await store.upsert_role(role_id="viewer", display_name="viewer")
+    role = await service.create_custom_role(
+        display_name="Synthetic", description=None, permissions=["messages:view_summary"], actor="a"
+    )
+    sessions = {}
+    for n in ("h1", "h2"):
+        await store.create_user(
+            user_id=n,
+            username=f"name-{n}",
+            auth_provider="local",
+            password_hash="h",
+            now=1.0,
+            password_generated=False,
+            audits=(),
+        )
+        await store.set_user_roles(n, ["viewer", role.id], assigned_by="test")
+        sessions[n] = n[-1] * 64
+        await store.create_session(token_hash=sessions[n], user_id=n, expires_at=9e9)
+    return role.id, sessions
+
+
+def _refusing_for(store: MessageStore, refused_id: str) -> None:
+    """Make ``revoke_user_sessions`` refuse every attempt for ``refused_id`` alone."""
+    real = store.revoke_user_sessions
+
+    async def revoke(user_id: str, **kwargs: Any) -> Any:
+        if user_id == refused_id:
+            raise StoreAcquireTimeout("synthetic pool shortage")
+        return await real(user_id, **kwargs)
+
+    store.revoke_user_sessions = revoke  # type: ignore[method-assign]
+
+
+async def test_one_account_given_up_on_does_not_stop_the_others() -> None:
+    """A custom-role edit revokes each holder in turn. The first holder's revoke refused every time
+    is recorded and raised, but only after the second holder's sessions are ended too."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        role_id, sessions = await _two_holders_of_a_custom_role(store, service)
+        _refusing_for(store, "h1")
+        with pytest.raises(StoreAcquireTimeout):
+            await service.update_custom_role(
+                role_id,
+                display_name="Synthetic",
+                description=None,
+                permissions=["messages:view_summary"],
+                actor="alice",
+            )
+        assert await _live(store, list(sessions.values())) == [sessions["h1"]]
+        [missed] = [
+            r for r in await _actions(store) if r["action"] == SESSIONS_REVOKE_FAILED_ACTION
+        ]
+        assert missed["actor"] == "alice"
+        assert json.loads(missed["detail"])["user_id"] == "h1"
+    finally:
+        await store.close()
+
+
+async def test_a_custom_role_delete_revokes_before_it_deletes_and_records_no_miss() -> None:
+    """The delete revokes first, so a refusal has nothing committed behind it: it is raised at once,
+    the role stays, and no ``auth.sessions_revoke_failed`` row claims a change that never ran."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(store, AuthSettings(require_mfa=False))
+        role_id, _ = await _two_holders_of_a_custom_role(store, service)
+        calls = _refusing(store, None)
+        with pytest.raises(StoreAcquireTimeout):
+            await service.delete_custom_role(role_id, actor="alice")
+        assert calls[0] == 1
+        assert role_id in {r.id for r in await service.list_custom_roles()}
+        assert not any(r["action"] == SESSIONS_REVOKE_FAILED_ACTION for r in await _actions(store))
+    finally:
+        await store.close()
