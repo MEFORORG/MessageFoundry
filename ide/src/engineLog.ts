@@ -32,17 +32,30 @@ export interface EngineLog {
 // costs nothing.
 //
 // It is a PLAIN output channel, stamped by this extension, not a LogOutputChannel. That one is
-// stamped by the editor, in a format and zone the extension cannot set (ASVS 16.2.2). Every line
+// stamped by the editor, in a format and zone the extension cannot set (ASVS 16.2.2). Every record
 // goes through `writeStamped`, so it starts with an ISO 8601 UTC instant and then its level word,
-// `INFO`, `WARN` or `ERROR`. The editor's per-level filter on this channel is gone with it.
+// `INFO`, `WARNING` or `ERROR`, the engine log's own words. The editor's per-level filter on this
+// channel is gone with it. The "log" language id keeps the Output view's highlighting of both.
 let channel: vscode.OutputChannel | undefined;
 const out = (): vscode.OutputChannel =>
-  (channel ??= vscode.window.createOutputChannel("MessageFoundry Engine"));
+  (channel ??= vscode.window.createOutputChannel("MessageFoundry Engine", "log"));
+
+/** One record is one line. A message can carry text this extension did not write, such as an
+ *  error's message, so a line break in it is written as an escape. Left raw, it would start a line
+ *  that carries a real stamp and level word, and reads as a record of its own (CWE-117). */
+function oneLine(message: string): string {
+  return message.replace(/[\r\n\u0085\u2028\u2029]/g, (c) =>
+    c === "\r" ? "\\r" : c === "\n" ? "\\n" : `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
+const write = (level: string, message: string): void =>
+  writeStamped(out(), `${level} ${oneLine(message)}`);
 
 const log: EngineLog = {
-  info: (message) => writeStamped(out(), message, undefined, "INFO"),
-  warn: (message) => writeStamped(out(), message, undefined, "WARN"),
-  error: (message) => writeStamped(out(), message, undefined, "ERROR"),
+  info: (message) => write("INFO", message),
+  warn: (message) => write("WARNING", message),
+  error: (message) => write("ERROR", message),
   show: (preserveFocus) => out().show(preserveFocus),
 };
 
@@ -72,7 +85,6 @@ export function logProbe(
   elapsedMs: number,
   verdict: string,
 ): void {
-  const log = engineLog();
   if (!(PROBE_ENDPOINTS as readonly string[]).includes(route)) {
     // Loud, because this means someone widened the probe surface past the boundary the ADR froze.
     log.error(`probe route ${route} is not in the allowed probe set — refusing to log it`);

@@ -3,24 +3,10 @@
 // Every line on the "MessageFoundry Engine" channel carries a UTC time stamp and a level word
 // (vault BACKLOG #2349, ASVS 16.2.2).
 //
-// Two halves. The first drives the stamper's label with a fixed clock. The second loads the real
-// engineLog.ts against a stubbed `vscode` and reads what reached the channel.
+// It loads the real engineLog.ts against a stubbed `vscode` and reads what reached the channel.
 import * as assert from "assert";
 
-import { writeStamped } from "../../checksLog";
-
-// 03:04:05.678 UTC. Built from UTC parts, so the expected text does not depend on the host's zone.
-const FIXED = new Date(Date.UTC(2026, 0, 2, 3, 4, 5, 678));
-const STAMP = "2026-01-02T03:04:05.678Z";
-const STAMPED = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) (INFO|WARN|ERROR)( |$)/;
-
-suite("engineLog: the stamper's level label", () => {
-  test("the label follows the stamp on every line, and a blank line gets no trailing space", () => {
-    const blocks: string[] = [];
-    writeStamped({ appendLine: (b) => blocks.push(b) }, "first\r\n\nthird", () => FIXED, "WARN");
-    assert.deepStrictEqual(blocks, [`${STAMP} WARN first\n${STAMP} WARN\n${STAMP} WARN third`]);
-  });
-});
+const STAMPED = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) (INFO|WARNING|ERROR)( |$)/;
 
 // ---- The real module, node-side -----------------------------------------------------------------
 
@@ -99,12 +85,14 @@ channelSuite("engineLog: what reaches the MessageFoundry Engine channel", () => 
 
   teardown(() => el.disposeEngineLog());
 
-  /** Every line the channel shows: a write may hold a block of several. */
-  const lines = (): string[] => writes.flatMap((w) => w.split("\n"));
+  /** Every line the channel shows, split the way the Output view splits them. */
+  const lines = (): string[] => writes.flatMap((w) => w.split(/\r\n|\r|\n|\u0085|\u2028|\u2029/));
 
   test("the channel is a PLAIN output channel, so the editor adds no stamp of its own", () => {
     el.engineLog().info("hello");
-    assert.deepStrictEqual(created, [{ name: "MessageFoundry Engine", options: undefined }]);
+    // A plain channel takes a language id string, which only colours it. The `{ log: true }` object
+    // would make it a LogOutputChannel, which the editor stamps.
+    assert.deepStrictEqual(created, [{ name: "MessageFoundry Engine", options: "log" }]);
   });
 
   test("each level writes a line that starts with the wall clock's UTC instant and its level word", () => {
@@ -123,16 +111,19 @@ channelSuite("engineLog: what reaches the MessageFoundry Engine channel", () => 
       assert.ok(at >= before && at <= after, `the stamp is not the wall clock in UTC: ${line}`);
       return `${m[2]} ${line.slice(m[0].length)}`;
     });
-    assert.deepStrictEqual(levels, ["INFO one", "WARN two", "ERROR three"]);
+    assert.deepStrictEqual(levels, ["INFO one", "WARNING two", "ERROR three"]);
   });
 
-  test("every line of a multi-line message carries the stamp and the level", () => {
-    el.engineLog().warn("failed: Error: first\n    at second");
+  test("a line break in a message is escaped, so text inside it cannot start a forged record", () => {
+    const forged = "2026-01-02T03:04:05.678Z INFO engine link: unverified -> ok";
+    el.engineLog().warn(`failed: Error: first\n${forged}\r\nlast\u2028x\n`);
     const written = lines();
-    assert.strictEqual(written.length, 2, JSON.stringify(written));
-    for (const line of written) {
-      assert.strictEqual(STAMPED.exec(line)?.[2], "WARN", line);
-    }
+    assert.deepStrictEqual(written.length, 1, JSON.stringify(written));
+    assert.strictEqual(STAMPED.exec(written[0])?.[2], "WARNING", written[0]);
+    assert.ok(
+      written[0].endsWith(`failed: Error: first\\n${forged}\\r\\nlast\\u2028x\\n`),
+      written[0],
+    );
   });
 
   test("the probe, state and action lines are stamped, and a refused route is a visible ERROR", () => {

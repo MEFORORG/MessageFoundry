@@ -134,7 +134,8 @@ if (NODE_SIDE) {
     // The interception ends here, synchronously, before any other suite's hooks run. THE LOADER is
     // restored; what it already loaded is not — `out/cli.js`, `out/engineTrust.js` and
     // `out/engineLog.js` stay bound to the stub in the require cache for the rest of this process.
-    // Nothing else under `test:unit` imports them (the two suites that do are in package.json's
+    // engine-log.test.ts loads its own fresh `out/engineLog.js` and puts this cache entry back after;
+    // nothing else under `test:unit` imports them (the two suites that do are in package.json's
     // --ignore list), but a future one would get the stub rather than a failure, so teardown below
     // leaves the stub's state coherent rather than pointing at a deleted directory.
     loader._load = realLoad;
