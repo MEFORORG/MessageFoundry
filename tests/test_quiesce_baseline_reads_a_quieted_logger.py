@@ -13,8 +13,8 @@ Measured 2026-11-05: with that reading disabled, a run of one web console test a
 ``test_the_guard_capture_does_not_depend_on_the_root_logger`` fails on that control's ``caplog``
 assertion, and with it the run passes, as does the whole web console tree followed by that file.
 This pins the reading in process, on the loaded conftest module, rather than in a child pytest,
-which took minutes to import both trees on a loaded box. The web console tree's twin ``_Baseline``
-and the other run order are #2990's."""
+which took minutes to import both trees on a loaded box. The web console conftest's ``_Baseline``
+carries the same reading and is not pinned here."""
 
 from __future__ import annotations
 
@@ -25,17 +25,24 @@ from types import ModuleType
 
 import pytest
 
-_ENGINE_CONFTEST = Path(__file__).resolve().parent / "conftest.py"
+_TESTS = Path(__file__).resolve().parent
+_ENGINE_CONFTEST = _TESTS / "conftest.py"
+_CONSOLE_CONFTEST = (
+    _TESTS.parent / "packaging" / "messagefoundry-webconsole" / "tests" / "conftest.py"
+)
+
+#: The class name both trees' sentinels share. ``_QuiesceNullHandler.tags`` matches by NAME, so a
+#: rename in either conftest would silently stop the reading for the other tree's sentinel.
+_SENTINEL = "_QuiesceNullHandler"
 
 
-@pytest.fixture
-def engine_conftest(request: pytest.FixtureRequest) -> ModuleType:
+@pytest.fixture(scope="module")
+def engine_conftest(pytestconfig: pytest.Config) -> ModuleType:
     """The engine tree's conftest as pytest loaded it. Not re-imported: its module body claims a
     test slot, and a bare ``import conftest`` can bind the other tree's file (BACKLOG #1255)."""
-    for plugin in request.config.pluginmanager.get_plugins():
-        if isinstance(plugin, ModuleType) and Path(getattr(plugin, "__file__", "")).resolve() == (
-            _ENGINE_CONFTEST
-        ):
+    for plugin in pytestconfig.pluginmanager.get_plugins():
+        where = getattr(plugin, "__file__", None)
+        if isinstance(plugin, ModuleType) and where and Path(where).resolve() == _ENGINE_CONFTEST:
             return plugin
     raise AssertionError(f"{_ENGINE_CONFTEST} is not a loaded plugin")
 
@@ -50,8 +57,13 @@ def logger() -> Iterator[logging.Logger]:
     lg.propagate = True
 
 
-#: What the web console conftest's teardown leaves: its own sentinel class, matched by NAME.
-_ConsoleSentinel = type("_QuiesceNullHandler", (logging.NullHandler,), {})
+#: What the web console conftest's teardown leaves: a sentinel of its own class, of the shared name.
+_ConsoleSentinel = type(_SENTINEL, (logging.NullHandler,), {})
+
+
+def test_both_trees_name_their_sentinel_alike(engine_conftest: ModuleType) -> None:
+    assert engine_conftest._QuiesceNullHandler.__name__ == _SENTINEL
+    assert f"class {_SENTINEL}(" in _CONSOLE_CONFTEST.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("left", ["level", "handler", "both"])
@@ -59,8 +71,8 @@ def test_a_logger_the_other_tree_quieted_is_read_as_natural(
     engine_conftest: ModuleType, logger: logging.Logger, left: str
 ) -> None:
     logger.propagate = False
-    if left in ("level", "both"):
-        logger.setLevel(logging.CRITICAL + 10)
+    # The handler-only arm starts from a non-default level, so the level assertion can fail there.
+    logger.setLevel(logging.CRITICAL + 10 if left in ("level", "both") else logging.INFO)
     if left in ("handler", "both"):
         logger.addHandler(_ConsoleSentinel())
     baseline = engine_conftest._Baseline(logger)

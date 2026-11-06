@@ -198,6 +198,21 @@ def _guard_log(*names: str) -> Iterator[_GuardLog]:
         logging.disable(disable_level)
 
 
+def _spy_guard_contexts(monkeypatch: pytest.MonkeyPatch) -> list[ssl.SSLContext | None]:
+    """The ``context`` each later ``RevocationHopGuard.capture`` call is handed, in call order.
+
+    The real call still runs, so every refusal and log line is unchanged."""
+    seen: list[ssl.SSLContext | None] = []
+    real = RevocationHopGuard.capture
+
+    def spy(cls: type[RevocationHopGuard], /, **kwargs: Any) -> RevocationHopGuard:
+        seen.append(kwargs.get("context"))
+        return real(**kwargs)
+
+    monkeypatch.setattr(RevocationHopGuard, "capture", classmethod(spy))
+    return seen
+
+
 def _without_the_policy[T](real: Callable[..., T]) -> Callable[..., T]:
     """A stand-in for a context or anchor builder that hands ``real`` no trust-anchor policy.
 
@@ -719,20 +734,25 @@ def test_a_plaintext_dicom_association_is_the_cleartext_refusal_not_this_one() -
 @pytest.mark.parametrize("allow_expired", [False, True], ids=["strict", "expiry-relaxed"])
 @pytest.mark.parametrize("crl", [False, True], ids=["no-crl", "crl"])
 def test_the_context_the_dicom_guard_is_handed_verifies_the_peer(
-    bare_crl: str, crl: bool, allow_expired: bool
+    bare_crl: str, crl: bool, allow_expired: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The DICOM guard is taken on any TLS context, with no verify-off check of its own as the FTPS
     guard has, because this connector has no setting that turns verification off. That rested on a
-    comment (BACKLOG #2987, Part B item 3); this pins it on each way the context is built. It
-    matters most on the CRL arm: ``context_checks_revocation`` reads only the context's flags, so a
-    context that verified nothing but carried a CRL flag would still earn the CRL's credit."""
+    comment (BACKLOG #2987, Part B item 3). This pins it on the system-roots anchor, with and
+    without a CRL and ``tls_allow_expired``; a ``tls_ca_file`` pin, an internal CA and mTLS are not
+    covered here. It matters most on the CRL arm: ``context_checks_revocation`` reads only the
+    context's flags, so a context that verified nothing but carried a CRL flag would still earn
+    the CRL's credit."""
     policy = _crl_policy(bare_crl) if crl else None
-    with active_hop_posture(NOT_ENFORCING), _guard_log():
+    seen = _spy_guard_contexts(monkeypatch)
+    with active_hop_posture(NOT_ENFORCING):
         dest = DicomScuDestination(_scu(REMOTE, allow_expired=allow_expired, policy=policy))
-    assert dest._ssl is not None
-    assert dest._ssl.verify_mode is ssl.CERT_REQUIRED
-    assert dest._ssl.check_hostname is True
-    assert context_checks_revocation(dest._ssl) is crl
+    ctx = dest._ssl
+    assert ctx is not None and seen == [ctx], seen  # the guard ran, on the context it dials with
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+    assert skips_validity_period(ctx) is allow_expired
+    assert context_checks_revocation(ctx) is crl
 
 
 # --- FTPS upload, the destination (transports/remotefile.py) ---------------------------------------
@@ -1223,26 +1243,29 @@ def test_a_direct_hop_with_no_credential_still_takes_no_revocation_guard(
 
 @pytest.mark.parametrize("crl", [False, True], ids=["no-crl", "crl"])
 def test_the_context_the_direct_guard_is_handed_verifies_the_peer(
-    direct_material: dict[str, str], bare_crl: str, crl: bool
+    direct_material: dict[str, str], bare_crl: str, crl: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The DIRECT guard, like the DICOM one, has no verify-off check of its own: its comment says
     the credential refusal before it already requires a verifying context (BACKLOG #2987, Part B
     item 3). This pins the context it is handed on a credentialed hop."""
     policy = _crl_policy(bare_crl) if crl else None
-    with active_hop_posture(NOT_ENFORCING), _guard_log():
+    seen = _spy_guard_contexts(monkeypatch)
+    with active_hop_posture(NOT_ENFORCING):
         dest = DirectDestination(_direct(direct_material, REMOTE, policy=policy))
+    assert dest._tls_context is not None and seen == [dest._tls_context], seen
     assert verifies_peer_fully(dest._tls_context)
     assert context_checks_revocation(dest._tls_context) is crl
 
 
-@pytest.mark.parametrize("weak", ["tls_verify", "tls_check_hostname"])
+@pytest.mark.parametrize("weak", ["use_tls", "tls_verify", "tls_check_hostname"])
 def test_a_credentialed_direct_hop_that_verifies_less_never_reaches_the_guard_even_with_the_escape(
     direct_material: dict[str, str], monkeypatch: pytest.MonkeyPatch, weak: str
 ) -> None:
-    """The other half of the claim the test above pins: the weakened TLS escape, which does let an
-    uncredentialed hop verify less, does not let a credentialed one reach the guard with a context
-    that verifies less. The uncredentialed build is the CONTROL that the escape is live here."""
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    """The other half of the claim the test above pins: a credentialed hop that verifies less is
+    refused before the guard is taken, even with the weakened TLS escape live. For ``use_tls`` and
+    ``tls_verify`` the escape is what lets the uncredentialed build through, which the refused
+    build without it shows; ``tls_check_hostname=false`` builds without the escape on an
+    uncredentialed hop, so for that arm the escape is not under test."""
 
     def build(*, credential: bool) -> DirectDestination:
         # Every named parameter is passed, so the one weakened setting can only land in **extra.
@@ -1257,12 +1280,17 @@ def test_a_credentialed_direct_hop_that_verifies_less_never_reaches_the_guard_ev
             )
         )
 
-    with active_hop_posture(NOT_ENFORCING), _guard_log():
+    if weak != "tls_check_hostname":
+        with active_hop_posture(NOT_ENFORCING), pytest.raises(ValueError, match=weak):
+            build(credential=False)  # the CONTROL: without the escape this arm is refused
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    seen = _spy_guard_contexts(monkeypatch)
+    with active_hop_posture(NOT_ENFORCING):
         weakened = build(credential=False)
         with pytest.raises(ValueError, match="authentication credentials"):
             build(credential=True)
-    assert weakened._tls_context is not None
     assert not verifies_peer_fully(weakened._tls_context)
+    assert seen == [], seen  # neither build took the guard: no credential, then refused first
 
 
 def test_a_credentialed_direct_hop_on_loopback_still_crosses(
