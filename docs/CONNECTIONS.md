@@ -2282,15 +2282,18 @@ Two limits follow from this:
   - the path names another host;
   - the engine can `stat` the file, but cannot read it, or it is over 1 MiB.
 
-  A `stat` failure that says no file is there, or that libpq could not `stat` it either, is left
-  to libpq, which loads no such file. That covers at least a missing name, a path through a file,
-  a name too long, a link loop and a permission denial (on Windows, `ERROR_ACCESS_DENIED` only).
-  Other `stat` failures are refused unless they say no file is there. That covers at least an I/O
-  fault such as `EIO`, `ETIMEDOUT` or `ESTALE`, a share Windows could not reach, and on Windows a
-  not-ready volume, a sharing or lock violation and a network access denial. libpq stats the file
-  again at every connect, so it may load the file once the fault clears. A network fault the
-  system reports as a denial (on Windows, `ERROR_ACCESS_DENIED`) or as a missing name (on Windows,
-  other than a share it could not reach) is still left.
+  Off Windows, a `stat` failure that says no file is there, or that libpq could not `stat` it
+  either, is left to libpq, which loads no such file. That covers at least a missing name, a path
+  through a file, a name too long, a link loop and a permission denial. Other `stat` failures are
+  refused unless they say no file is there, at least an I/O fault such as `EIO`, `ETIMEDOUT` or
+  `ESTALE`. libpq stats the file again at every connect, so it may load the file once the fault
+  clears. A network fault the system reports as a denial or as a missing name is still left.
+
+  On Windows, the walk that checks the path names no other host reads each name in it first. It
+  refuses at least a denial, a link loop and any fault but a missing name, before the file itself
+  is judged, and says the file could not be read. A share Windows could not reach is refused as
+  another host. So on Windows a failure is left only once the walk passes it, as it passes at
+  least a missing name, other than such a share, and a path through a file.
 
   The default file is `root.crt`. On Windows it is under `postgresql` in the roaming
   application-data folder. Elsewhere it is under `~/.postgresql`. The engine finds this home as

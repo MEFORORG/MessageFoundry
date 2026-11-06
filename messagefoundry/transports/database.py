@@ -919,6 +919,7 @@ def _windows_path_verdict(
     drive_type: Callable[[str], int],
     drive_target: Callable[[str], str | None],
     cwd: str | Callable[[], str],
+    unread: dict[str, str] | None = None,
 ) -> bool | None:
     """The best-effort verdict on whether a Windows ``path`` leads off this host, from a walk of it
     with :func:`~messagefoundry.auth.anchor_path.windows_chain`. ``True``: the walk found the path
@@ -931,7 +932,11 @@ def _windows_path_verdict(
 
     A walk that reaches a share (``anchor_path.SHARE_CAUSE``), such as through a ``subst`` drive
     onto one, is ``True`` (vault BACKLOG #5197 item 11). A link whose target is rooted with no drive
-    is ``None``, as ``windows_chain`` answers it (item 9)."""
+    is ``None``, as ``windows_chain`` answers it (item 9).
+
+    When the walk stops at a name it could not read, ``unread``, if given, maps ``path`` to the
+    path-free reason, so a caller can say the file could not be read, not that it names another
+    host."""
 
     def volume_cause(root: str) -> str | None:
         kind = drive_type(root)
@@ -950,6 +955,11 @@ def _windows_path_verdict(
             if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
                 raise _LeavesHost from None
             raise _PathEnds from None
+        except OSError as exc:
+            # windows_chain ends the walk here, with a cause the verdict below reads as None.
+            if unread is not None:
+                unread[path] = exc.strerror or type(exc).__name__
+            raise
         if target is not None:
             text = target.strip()
             if is_remote_spelling(text) and not _LOCAL_DEVICE_TARGET.match(text):
@@ -998,6 +1008,11 @@ def _path_verdict(text: str) -> bool | None:
     """:func:`_windows_path_verdict` for ``text`` on Windows, and ``None`` for an ``OSError`` or
     ``ValueError`` it raises. ``False`` on POSIX, where nothing past the spelling is checked
     (``docs/CONNECTIONS.md``, Generic ODBC)."""
+    return _noted_path_verdict(text, None)
+
+
+def _noted_path_verdict(text: str, unread: dict[str, str] | None) -> bool | None:
+    """:func:`_path_verdict`, passing ``unread`` to the walk (:func:`_windows_path_verdict`)."""
     if sys.platform != "win32":
         return False
     try:
@@ -1007,6 +1022,7 @@ def _path_verdict(text: str) -> bool | None:
             drive_type=_windows_drive_type,
             drive_target=_windows_drive_target,
             cwd=os.getcwd,
+            unread=unread,
         )
     except (OSError, ValueError) as exc:
         _not_cleared(f"the check could not run: {type(exc).__name__}", type(exc).__name__)
@@ -1026,12 +1042,17 @@ def _sent_text(value: object) -> str:
     return "" if value is None else str(value)
 
 
-def file_keyword_verdicts(value: object) -> FileVerdicts:
+def file_keyword_verdicts(value: object, unread: dict[str, str] | None = None) -> FileVerdicts:
     """:data:`FileVerdicts` for ``value``, empty when no text is sent (:func:`_sent_text`). A
-    spelling the spelling check refuses is ``True`` and is not walked."""
+    spelling the spelling check refuses is ``True`` and is not walked. Given ``unread``, each walk
+    records in it a name it could not read (:func:`_windows_path_verdict`)."""
     raw = _sent_text(value)
+
+    def verdict(p: str) -> bool | None:
+        return _path_verdict(p) if unread is None else _noted_path_verdict(p, unread)
+
     return {
-        p: True if is_remote_spelling(p) else _path_verdict(p)
+        p: True if is_remote_spelling(p) else verdict(p)
         for p in dict.fromkeys((raw, raw.strip()))
         if p
     }
@@ -1387,12 +1408,14 @@ def _refuse_encrypted_libpq_root_cert(
     ``dlg_specific.h``), and a DSN-less connection reads no registered DSN's mode.
 
     A path that names another host (:func:`names_another_host`) is refused unread, with
-    ``PGSSLROOTCERT`` as the way out. A ``stat`` failure that says no file is there, or that libpq
-    could not ``stat`` it either, is left to libpq (:func:`_libpq_cannot_stat_either`): at least a
-    missing name other than a share Windows could not reach, and a permission denial (on Windows,
-    ``ERROR_ACCESS_DENIED`` only). Every other ``stat`` failure is judged as a failed read is, with
-    no second look for a directory, so it is refused unless it says no file is there, since libpq
-    stats again at every connect and may load the file once the fault clears.
+    ``PGSSLROOTCERT`` as the way out. On Windows that check's walk reads each name of the path
+    first, and refuses at least a denial, a link loop and any fault but a missing name before the
+    file is judged, saying the file could not be read. A ``stat`` failure that says no file is
+    there, or that libpq could not ``stat`` it either, is left to libpq
+    (:func:`_libpq_cannot_stat_either`): at least a missing name other than a share Windows could
+    not reach, and off Windows a permission denial. Every other ``stat`` failure is judged as a
+    failed read is, with no second look for a directory, so it is refused unless it says no file
+    is there, since libpq stats again at every connect and may load the file once the fault clears.
     Past the ``stat``, the path takes :func:`_read_driver_file`'s read,
     as an ``sslca`` does: a directory is left to libpq, and a file that cannot be opened or read,
     or one past :data:`_MAX_DRIVER_CA_FILE_BYTES`, is refused, as libpq would fail the connect on
@@ -1422,7 +1445,16 @@ def _refuse_encrypted_libpq_root_cert(
     source, path = found
     setting = f"{hop_name_prefix(connection)}DATABASE {source}"
     what = "root certificate file"
-    if names_another_host(path):
+    unread: dict[str, str] = {}
+    verdicts = file_keyword_verdicts(path, unread)
+    if names_another_host(path, verdicts):
+        reason = unread.get(path.strip())
+        if reason is not None and True not in verdicts.values():
+            # A local path the walk stopped in: naming another path would not help.
+            raise ValueError(
+                f"{setting}: the {what} could not be read to check {_CA_CHECKED_FOR}: a name in "
+                f"its path could not be read: {reason}"
+            )
         raise ValueError(
             f"{setting}: the {what} is not a plain local path on this host, so it was not read "
             f"to check {_CA_CHECKED_FOR}; set PGSSLROOTCERT to a local path"
@@ -1515,10 +1547,12 @@ def _read_driver_file(
     With ``leave_unstatable``, for a driver that loads a file only once its ``stat`` succeeds, as
     libpq loads its root certificate, a ``stat`` failure that says no file is there, or that the
     driver could not ``stat`` it either (:func:`_libpq_cannot_stat_either`), is left to the driver
-    too: at least a missing name other than a share Windows could not reach, and a permission
-    denial (on Windows, ``ERROR_ACCESS_DENIED`` only). Every other ``stat`` failure is judged as a
-    failed read is, with no second look for a directory, so it is refused unless it says no file is
-    there, since the driver stats again at each connect and may then load the file.
+    too: at least a missing name other than a share Windows could not reach, and off Windows a
+    permission denial. On Windows the caller's :func:`names_another_host` walk has already refused
+    at least a denial, a link loop and any fault but a missing name in the path. Every other
+    ``stat`` failure is judged as a failed read is, with no second look for a directory, so it is
+    refused unless it says no file is there, since the driver stats again at each connect and may
+    then load the file.
     That costs a second ``stat`` of a path that passes, which :func:`read_if_regular` makes again.
 
     The file is read by :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which says

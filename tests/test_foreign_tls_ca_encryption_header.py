@@ -351,6 +351,39 @@ def test_a_pgsslrootcert_on_another_host_is_refused_unread(
     assert "set PGSSLROOTCERT to a local path" in str(refused.value)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="the path walk runs on Windows only")
+@pytest.mark.parametrize("source", ["default", "PGSSLROOTCERT"])
+@pytest.mark.parametrize(
+    "winerror",
+    [
+        pytest.param(5, id="ERROR_ACCESS_DENIED"),
+        pytest.param(65, id="ERROR_NETWORK_ACCESS_DENIED"),
+        pytest.param(1921, id="ERROR_CANT_RESOLVE_FILENAME"),
+    ],
+)
+def test_a_local_root_certificate_the_walk_cannot_read_is_refused_as_unread(
+    _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, source: str, winerror: int
+) -> None:
+    """On Windows, ``names_another_host``'s walk ``lstat``s each name of the path and refuses on
+    any failure but a missing name, before the file's own ``stat`` is judged. So a denial, a
+    network fault reported as a denial and a link that cannot be resolved are refused there, end
+    to end. The path is local, so the refusal says the file could not be read, not that it names
+    another host, whose remedy cannot help. Red before the walk's unread names were told apart."""
+    root = _write(_no_libpq_root, _certificate(), "root.crt")
+    if source == "PGSSLROOTCERT":
+        monkeypatch.setenv("PGSSLROOTCERT", root)
+    real_lstat = os.lstat
+
+    def unreadable(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.path.basename(str(path)).lower() == "root.crt":
+            raise OSError(None, f"Windows error {winerror}", None, winerror)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", unreadable)
+    with pytest.raises(ValueError, match="root certificate file could not be read to check it"):
+        _build_psql()
+
+
 @pytest.mark.parametrize("source", ["default", "PGSSLROOTCERT"])
 def test_libpqs_root_certificate_the_check_cannot_read_is_refused(
     _no_libpq_root: Path, monkeypatch: pytest.MonkeyPatch, source: str
