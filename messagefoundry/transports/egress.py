@@ -361,8 +361,9 @@ def warn_url_query_credentials(label: str, settings: Mapping[str, Any]) -> None:
 
     This warns and does not refuse. On the hops docs/SECURITY-LOOSENING.md *No escape sends a
     credential to an unverified peer* covers, ``transports.rest.refuse_verify_off`` and
-    ``transports.rest.refuse_cleartext_credentials`` refuse the same names with no escape, and
-    accept a false refusal because the peer is unverified (vault BACKLOG #3230, #3533). Elsewhere
+    ``transports.rest.refuse_cleartext_credentials`` refuse these names and ``code`` with no
+    escape, and accept a false refusal because the peer is unverified (vault BACKLOG #3230, #3533).
+    Elsewhere
     the warning is all there is, and the reason is the difference from the userinfo precedent.
     ``transports.rest.refuse_url_credentials`` REFUSES ``user:password@`` because that shape never
     authenticated anything: urllib reads it as part of the host, and the error text carried the
