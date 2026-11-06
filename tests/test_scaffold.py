@@ -391,7 +391,7 @@ _AUDIT_TXT = "Audit requirements.txt as Windows resolves it"
 _AUDIT_TXT_PINS = "Audit the pins of requirements.txt as written"
 _AUDIT_LOCK = "Audit every pin of requirements.lock, whatever its marker"
 _INSTALL_AUDITOR_RUN = "python -m pip install --require-hashes -r requirements-audit.lock"
-_AUDIT_TOOLS_RUN = "pip-audit -r requirements-audit.lock --desc --disable-pip"
+_AUDIT_TOOLS_RUN = "pip-audit -r requirements-audit.lock --desc --disable-pip --strict"
 
 
 def _run_audit_job(
@@ -680,8 +680,15 @@ _STALE_CASES = [
     ("messagefoundry==0.5.1\n", None, None),
     # Versions compare as pip compares them, and the spelling and comment around a pin do not count.
     ("MessageFoundry == 0.5.1.0  # the engine\n", None, None),
-    # A version or marker pip joins in from a continuation line is read.
+    # A version or marker pip joins in from a continuation line is read, joined as pip joins it.
     ("messagefoundry \\\n    ==0.6.0\n", "requirements.txt asks for messagefoundry==0.6.0", None),
+    ("messagefoundry==0.\\\n6.0\n", "requirements.txt asks for messagefoundry==0.6.0", None),
+    # pip expands ${VAR}; an unset one is left as written, which no parser reads.
+    (
+        "messagefoundry==${MF_UNSET_3786}\n",
+        "messagefoundry==${MF_UNSET_3786} is not a requirement",
+        None,
+    ),
     ("messagefoundry==0.6.0\n", "requirements.txt asks for messagefoundry==0.6.0", None),
     (
         "messagefoundry==0.5.1\nacme-hl7-utils==1.2\n",
@@ -733,6 +740,18 @@ def test_a_stale_lock_fails_its_own_step_and_hides_no_audit(
         assert f"::error::{error}" in output and "; regenerate requirements.lock" in output
     assert (f"::notice::{notice}" in output) if notice else ("::notice::" not in output)
     assert calls == _lock_calls(tmp_path) and audited.exists()
+
+
+def test_a_lock_pin_whose_marker_is_false_here_covers_nothing(
+    scaffolded_ci: tuple[str, Path, dict[str, Any]], tmp_path: Path
+) -> None:
+    """The runner's install skips such a pin, so the requirement is not in the lock it installs."""
+    lock = _ADOPTER_LOCK + "acme-hl7-utils==1.2 ; python_version < '3' \\\n    --hash=sha256:dddd\n"
+    _, _, output, failed = _run_audit_job(
+        scaffolded_ci, tmp_path, lock, requirements="messagefoundry==0.5.1\nacme-hl7-utils==1.2\n"
+    )
+    assert failed == [_STALE], output
+    assert "::error::acme-hl7-utils is in requirements.txt but not in requirements.lock" in output
 
 
 def test_an_engine_pin_is_taken_from_a_lock_with_a_pep_263_declaration(

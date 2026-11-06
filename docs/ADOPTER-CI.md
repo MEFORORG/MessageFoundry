@@ -215,10 +215,12 @@ that package's build code may run in CI:
     a file with a byte-order mark, UTF-16, or an abbreviated option gets past that check. List
     every pin in `requirements.txt` itself. Its closure is audited only through the lock.
   - So the job fails on a stale lock: one that does not pin a package `requirements.txt` names,
-    or pins it at a version the requirement's specifier does not allow. pip's own parser reads each
-    requirement, so a continuation line counts and versions compare as pip compares them. A
-    requirement whose marker is false on the Windows runner, an extra (a lock records none), and a
-    URL or path with no package name are only noted.
+    or pins it only under a marker false on the Windows runner, or at a version the requirement's
+    specifier does not allow. The step copies pip 26's line handling (continuation lines, comments,
+    `${VAR}` expansion, options), then parses each requirement with the `packaging` copy pip
+    carries, so versions compare as pip compares them. A requirement whose marker is false on the
+    runner, an extra (a lock records none), and a URL or path with no package name are only noted;
+    any other line it cannot parse fails.
   - The job takes the engine's pin out of the lock, as pip reads the lock, and installs that pin
     alone with `--no-deps --require-hashes`. The lock must pin `messagefoundry` exactly once, or the
     job says so and fails; pip refuses the pin if it carries no hash. No other locked package is

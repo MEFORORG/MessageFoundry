@@ -230,6 +230,22 @@ def read_lock(path: Path) -> str:
 _COMMENT = re.compile(r"(^|\s+)#.*$")
 
 
+#: The schemes pip 26's ``is_url`` takes for a URL: its four, and each VCS's own and ``vcs+`` forms.
+_URL_SCHEMES = frozenset(
+    ["http", "https", "file", "ftp"]
+    + [
+        f"{vcs}{suffix}"
+        for vcs, schemes in {
+            "git": ("", "+http", "+https", "+ssh", "+git", "+file"),
+            "hg": ("+file", "+http", "+https", "+ssh", "+static-http"),
+            "svn": ("", "+ssh", "+http", "+https", "+svn", "+file"),
+            "bzr": ("+http", "+https", "+ssh", "+sftp", "+ftp", "+lp", "+file"),
+        }.items()
+        for suffix in schemes
+    ]
+)
+
+
 def _split_marker(line: str) -> tuple[str, str, str] | None:
     """``(pin, marker, what follows them)`` for the first line of a requirement with a marker.
 
@@ -243,8 +259,10 @@ def _split_marker(line: str) -> tuple[str, str, str] | None:
     words = code.split(" ")
     first = next((n for n, word in enumerate(words) if word.startswith("-")), len(words))
     requirement, options = " ".join(words[:first]), " ".join(words[first:]).strip()
-    # pip's parse_req_from_line: "; " after a bare URL, else the first ";", a name @ URL's too.
-    if "://" in requirement.lstrip().split(" ", 1)[0]:
+    # pip's parse_req_from_line: "; " after a URL, as pip's is_url judges the whole requirement
+    # by the scheme before its first ":", else the first ";", a name @ URL's too.
+    stripped = requirement.strip()
+    if ":" in stripped and stripped.split(":", 1)[0].lower() in _URL_SCHEMES:
         at = requirement.find("; ")
     else:
         at = requirement.find(";")
@@ -459,7 +477,10 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] = _r
         try:
             copy.write_text("".join(kept), encoding=copy_encoding)
         except UnicodeError as exc:
-            print(f"::error::{args.lock}: its copy is not writable as {copy_encoding}: {exc}")
+            print(
+                f"::error::{args.lock}: its copy is not writable as {copy_encoding}: {exc}",
+                file=sys.stderr,
+            )
             return 2
         audit = [*python_module_argv("pip_audit"), "-r", str(copy), "--desc", "--disable-pip"]
         return run([*audit, "--strict", *args.pip_audit_args])

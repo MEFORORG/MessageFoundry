@@ -345,9 +345,11 @@ jobs:
       # resolves requirements.txt. So a lock not regenerated after requirements.txt changed would
       # audit the closure the old file named, while CI and your deployment install the new one. Each
       # requirement in requirements.txt whose marker holds on this Windows runner must be in the
-      # lock, at a version its specifier allows, compared as pip compares versions. pip's own
-      # requirement parser reads each one. A marker false here, an extra, and a requirement with no
-      # name are only noted: the lock records no extras, and an unnamed URL has no name to look up.
+      # lock, under a marker that holds here too, at a version its specifier allows, compared as pip
+      # compares versions. The packaging copy pip carries parses each requirement, after a copy of
+      # pip's line handling. A marker false here, an extra, and a URL or path with no name are only
+      # noted: the lock records no extras, and an unnamed URL has no name to look up. Any other line
+      # it cannot parse fails.
       - name: Check requirements.lock is not stale against requirements.txt
         if: ${{ !cancelled() && hashFiles('requirements.lock') != '' }}
         run: |
@@ -368,7 +370,7 @@ jobs:
       # not an advisory.
       - name: Audit pip-audit's own locked pins
         if: ${{ !cancelled() && steps.auditor.outcome == 'success' }}
-        run: pip-audit -r requirements-audit.lock --desc --disable-pip
+        run: pip-audit -r requirements-audit.lock --desc --disable-pip --strict
       - name: Audit requirements.txt as Windows resolves it
         if: ${{ !cancelled() && steps.auditor.outcome == 'success' && hashFiles('requirements.lock') == '' }}
         run: pip-audit -r requirements.txt --desc
@@ -428,12 +430,17 @@ def logical_lines(path):
 
 
 def parsed(group):
-    # The requirement on a logical line, by pip's own parser, once pip's way of splitting off the
-    # options and the comment has run: None for a line with none, its text when it names no package.
-    code = re.sub(r"(^|\s+)#.*$", "", " ".join(ln.removesuffix("\\") for ln in group))
-    words = code.split()
+    # The requirement on a logical line, parsed by the packaging copy pip carries, after this
+    # script's copy of pip 26's line handling: join_lines (a continued line loses its backslashes
+    # and joins with nothing), the comment strip, ${VAR} expansion and break_args_options (options
+    # start at the first word beginning with "-"). None for a line with no requirement; its text
+    # when packaging cannot read it.
+    joined = "".join([*(ln.strip("\\") for ln in group[:-1]), group[-1]])
+    code = re.sub(r"(^|\s+)#.*$", "", joined)
+    code = re.sub(r"\$\{([A-Z0-9_]+)\}", lambda m: os.environ.get(m[1], m[0]), code)
+    words = code.split(" ")
     first = next((n for n, word in enumerate(words) if word.startswith("-")), len(words))
-    text = " ".join(words[:first])
+    text = " ".join(words[:first]).strip()
     try:
         return Requirement(text) if text else None
     except InvalidRequirement:
@@ -457,10 +464,17 @@ def version(text):
         return text
 
 
+def unnamed(text):
+    # A URL or a path, which pip installs with no name to look up; anything else is a typo.
+    scheme = text.split(":", 1)[0].lower() if ":" in text else ""
+    return "/" in text or "\\" in text or text.startswith(".") or scheme.isalpha() or "+" in scheme
+
+
 locked = {}
 for group in logical_lines("requirements.lock"):
     req = parsed(group)
-    if isinstance(req, Requirement):
+    # A pin whose marker is false here is one this runner's install skips, so it covers nothing.
+    if isinstance(req, Requirement) and (req.marker is None or req.marker.evaluate()):
         exact = [s.version for s in req.specifier if s.operator in ("==", "===")]
         locked.setdefault(canonicalize_name(req.name), set()).update(exact)
 stale = []
@@ -469,7 +483,10 @@ for group in logical_lines("requirements.txt"):
     if req is None:
         continue
     if isinstance(req, str):
-        print(f"::notice::{req} names no package, so it is not checked against requirements.lock")
+        if unnamed(req):
+            print(f"::notice::{req} names no package, so it is not checked against requirements.lock")
+        else:
+            stale.append(f"{req} is not a requirement this check can read")
         continue
     name = canonicalize_name(req.name)
     if req.marker is not None and not req.marker.evaluate():

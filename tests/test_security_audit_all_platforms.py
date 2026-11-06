@@ -207,6 +207,13 @@ _ONE_LINE_CASES = [
         "pkg @ https://host.invalid/pkg-1.0-py3-none-any.whl --hash=sha256:aa",
         "pkg @ https://host.invalid/pkg-1.0-py3-none-any.whl ; sys_platform == 'win32'",
     ),
+    # pip's is_url reads the scheme before the first ":", so with no space this is no URL.
+    (
+        "pkg@https://host.invalid/pkg-1.0-py3-none-any.whl;sys_platform=='win32'",
+        "pkg@https://host.invalid/pkg-1.0-py3-none-any.whl",
+        "pkg@https://host.invalid/pkg-1.0-py3-none-any.whl ; sys_platform=='win32'",
+    ),
+    ("file:/wheels/a;b.whl --hash=sha256:aa", "file:/wheels/a;b.whl --hash=sha256:aa", None),
     (
         "https://host.invalid/a;b.whl --hash=sha256:aa",
         "https://host.invalid/a;b.whl --hash=sha256:aa",
