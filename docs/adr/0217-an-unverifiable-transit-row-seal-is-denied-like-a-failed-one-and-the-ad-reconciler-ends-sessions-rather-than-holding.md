@@ -3,8 +3,10 @@
 
 # 0217 -- An unverifiable Transit row seal is denied like a failed one, and the AD reconciler ends sessions rather than holding
 
-- **Status:** Proposed. Owner rulings 1-7 recorded 2026-11-06 (UTC), and the post-ruling text
-  confirmed the same day. Accepted when the build closes the carried findings.
+- **Status:** Accepted (2026-11-06 (UTC), by owner ruling; *Owner rulings*, below, quotes it) --
+  design only, no code yet. Every answer below marked `CONTROL DECISION: yes` changes what a
+  sign-in, a reconcile or a write refuses, pages or audits. *Owner rulings asked*, below, is the
+  list the owner was asked at `94b485c2e1`, with the differences *Owner rulings* names.
 - **Date:** 2026-11-05
 - **Related:** vault BACKLOG #4739 (this design), #2592 (its parent: identity and authorization
   row seals), #4350 and #6357 (the `vault_transit` seal gap; see *The duplicate question*), #3411
@@ -97,26 +99,18 @@ in this file, apart from this section, the status line and *Open findings carrie
    trips and whose step 2 does not resets no `_reconcile_unconfirmed` and writes no
    `auth.ad_reconcile_aborted`. That changes what is audited against `main`, but it adds no
    behaviour: the ruled body already said a step-1 trip is not recorded as a breaker trip, with a
-   slice 3 test for it. Confirmed 2026-11-06 (UTC).
+   slice 3 test for it. The owner was not told that it was added to the list.
 3. Ruling 4 and the retry paragraph: the "30-second retry" becomes a long-running engine
    process's retry, and the claim that every caller, the CLI included, is covered is replaced by a
    short-lived CLI process's raise landing on a later engine process's retry. This corrects a false
-   claim and changes no control. Confirmed 2026-11-06 (UTC).
+   claim and changes no control. The owner was not told.
 4. Ruling 7 and one body sentence: "or the hold" is added to the failing-rows residual, which
    follows from difference 1, and the step-2 window in a large estate with no digests is added to
    the list and named a residual in the body; the ruled body
    already named that window, and the ruling question put to the owner named it. The owner was
    told of both.
 5. The retry paragraph: a sentence that `main`'s `revoke_all_sessions` already raises the global
-   epoch first (#5091). It states `main` and changes nothing. Confirmed 2026-11-06 (UTC).
-
-**The post-ruling text was confirmed** on 2026-11-06 (UTC), in the Manager's chat, at
-`ae898dc817e1a77eb7639556839d19513cc8c84a`, with these five differences put to the owner; the
-verbatim record is engine PR 2565 comment
-[6682609779](https://github.com/MEFORORG/MessageFoundry/pull/2565#issuecomment-6682609779). The
-selection, verbatim: **"Confirm current text (Recommended)"**. Anchors: branch
-`anchor/adr0217-owner-ruled-20261106` (`94b485c2e1`, the text the first ruling covered) and
-branch `anchor/adr0217-owner-confirmed-20261106` (`ae898dc817`, the text this ruling confirms).
+   epoch first (#5091). It states `main` and changes nothing. The owner was not told.
 
 ## Context
 
@@ -885,61 +879,61 @@ revokes, pages or audits goes back to the owner before it merges.
 
 From round-2e3dae12a8 (against `9bc5d7e5f4`, this text's base):
 
-F1. A failing row's PRESENT read, or its hold, resets its strikes to 0 under `main`'s rules, so a
+1. A failing row's PRESENT read, or its hold, resets its strikes to 0 under `main`'s rules, so a
    writer who points a disabled account's failing row at an enabled entry keeps it from reaching
    the threshold. Unverified by the reviewer.
-F2. A failing row's candidacy and its strikes' pruning read its raw provider, disabled and session
+2. A failing row's candidacy and its strikes' pruning read its raw provider, disabled and session
    fields, which the writer controls, so one edit can drop it and erase its strikes; a resolution
    that keeps them must respect `reconcile.LEDGER_MAX`, whose prune evicts the lowest counts first
    (round-ec34860473). Unverified by the reviewer.
-F3. Ruling 2's note names two of at least five things `main` records on a Forged-map trip (also the
+3. Ruling 2's note names two of at least five things `main` records on a Forged-map trip (also the
    breaker standing, the breaker alert and the episode) and not that, below the thresholds, the
    pass confirms no account; the body's "there the step-1 set trips" omits "past both thresholds".
    Unverified by the reviewer.
-F4. The hold-escape residual is narrower than its trigger: a wave goes unheld whenever at most one
+4. The hold-escape residual is narrower than its trigger: a wave goes unheld whenever at most one
    verified account is undetermined beside readable ones (or none is), however few rows fail, not
    only "where most rows fail at once" (round-ec34860473 agrees). Unverified by the reviewer.
-F5. After the global epoch is raised first, a per-account owed raise in `revoke_all_sessions`
+5. After the global epoch is raised first, a per-account owed raise in `revoke_all_sessions`
    protects nothing (`session_epochs_current` already refuses every older session) and locks the
    account's fresh sign-ins out until a retry lands. Unverified by the reviewer.
-F6. The digest window does not close on the first untripped verified pass: a pass probes at most
+6. The digest window does not close on the first untripped verified pass: a pass probes at most
    `ad_session_recheck_max_users`, and an account that signs in while a map does not hold gets no
    digest; a directory sign-in under verified maps also writes one (round-ec34860473). Unverified
    by the reviewer.
-F7. "The per-map page replaces both" overclaims: a page is not a durable audit row, and the map's
+7. "The per-map page replaces both" overclaims: a page is not a durable audit row, and the map's
    integrity audit row is under the per-key report throttle, so not every pass leaves one.
    Unverified by the reviewer.
-F8. The retry does not say a retry deletes the owed row first and raises only if that delete
+8. The retry does not say a retry deletes the owed row first and raises only if that delete
    removed it, under the write lock, so two engine shards can both raise one owed epoch.
    Unverified by the reviewer.
-F9. The slice 3 tests do not cover the hold-or-strike rule for a failing UNDETERMINED row, its
+9. The slice 3 tests do not cover the hold-or-strike rule for a failing UNDETERMINED row, its
    absence from `_reconcile_outcomes`, `probed` and the held count, or a failing DISABLED row on a
    held pass. Unverified by the reviewer.
-F10. "Two planted rows" understates the hold attack: one planted row beside one genuine
+10. "Two planted rows" understates the hold attack: one planted row beside one genuine
     undetermined account reaches `u` = 2; the test pins only two. Unverified by the reviewer.
-F11. A permanently failing planted row is revoked and gets an owed raise that never lands, retried
+11. A permanently failing planted row is revoked and gets an owed raise that never lands, retried
     every 30 seconds forever, where `main`'s `_bump_session_epoch` skips the raise for a failing
     row. Unverified by the reviewer.
-F12. *Consequences*, Negative, names only a mass change to unmapped groups as a step-2 trip cause
+12. *Consequences*, Negative, names only a mass change to unmapped groups as a step-2 trip cause
     and not the CLI owed-raise lockout. Unverified by the reviewer.
-F13. The #5091 fact is stated twice: the `revoke_all_sessions` bullet lists as the build's what the
+13. The #5091 fact is stated twice: the `revoke_all_sessions` bullet lists as the build's what the
     retry paragraph says `main` already does. Unverified by the reviewer.
-F14. Ruling 4 repeats itself ("refusing ... until ... lands; sessions stay refused meanwhile") and
+14. Ruling 4 repeats itself ("refusing ... until ... lands; sessions stay refused meanwhile") and
     narrows the retrier to a long-running engine process, while the body runs it in every process
     that opens the store. Unverified by the reviewer.
 
 From round-ec34860473 (against `f3d1aceae1`), those that still apply to this text:
 
-F15. A failing UNDETERMINED row the verified hold withholds has no stated place in the
+15. A failing UNDETERMINED row the verified hold withholds has no stated place in the
     `auth.ad_reconcile_held` count or alert, so a withheld revocation could leave no record.
     Unverified by the reviewer.
-F16. `_bump_session_epoch` on `main` catches only `RowSealError`, and (c) makes
+16. `_bump_session_epoch` on `main` catches only `RowSealError`, and (c) makes
     `RowSealUnverifiableError` not one; the catch census does not list it, so an Unverifiable row
     could roll a revoke back against ruling 4. Unverified by the reviewer.
-F17. A verified account whose row turns Unverifiable leaves the candidate set
+17. A verified account whose row turns Unverifiable leaves the candidate set
     `_forfeit_clears_on_attrition` reads, forfeiting the breaker, hold and referral clears until
     restart. Unverified by the reviewer.
-F18. `revoke_all_sessions` still attempts a sealed per-account raise for every account, one Transit
+18. `revoke_all_sessions` still attempts a sealed per-account raise for every account, one Transit
     round trip each inside the writer transaction, so a Vault Outage holds the writer lock (and
     every ingress ACK) for one timeout per account. Unverified by the reviewer.
 
@@ -952,7 +946,7 @@ is fail-closed on its own head.
 
 | Slice | What | Paths | Tests |
 |---|---|---|---|
-| 1 | The Transit sealer and the four answers; async seal seams on every backend; the start probe; `RowSealError(kind, subject)` and its sibling `RowSealUnverifiableError` with the catch census of (c) step 2; the key id and the retired Transit key path; the sealed empty map; the owed epoch raise and its retry task; the required `transit/verify` capability | `store/row_seal.py`, `store/crypto_transit.py`, `store/crypto.py`, `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/base.py`, `pipeline/engine.py`, `api/app.py`, `privilege_check.py`, `scripts/security/crypto_inventory_check.py` | new `tests/test_transit_row_seal.py` and `tests/_transit_seal_fake.py`; the seal contracts (`tests/_*_seal_contract.py`); `test_row_seal.py`, `test_crypto_transit.py`, `test_postgres_store.py`, `test_sqlserver_transit_row_seal.py`; item 12's args test; the census test; a user row under a listed retired key accepted and a session under one ended quietly; `rotate-key` still refused under Transit; a sealed empty map that fails; `revoke_all_sessions` with one Unverifiable row still ends every session; an `hmac` Outage on a raise leaves the rows marked revoked and an owed raise that refuses the account's sessions until the retry lands; "sign out everywhere else" ends the kept session while the raise is owed |
+| 1 | The Transit sealer and the four answers; async seal seams on every backend; the start probe; `RowSealError(kind, subject)` and its sibling `RowSealUnverifiableError` with the catch census of (c) step 2; the key id and the retired Transit key path; the sealed empty map; the owed epoch raise and its retry task; the required `transit/verify` capability | `store/row_seal.py`, `store/crypto_transit.py`, `store/crypto.py`, `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `store/base.py`, `pipeline/engine.py`, `api/app.py`, `privilege_check.py`, `scripts/security/crypto_inventory_check.py` | new `tests/test_transit_row_seal.py` and `tests/_transit_seal_fake.py`; the seal contracts (`tests/_*_seal_contract.py`); `test_row_seal.py`, `test_crypto_transit.py`, `test_postgres_store.py`, `test_sqlserver_transit_row_seal.py`; item 12's args test; the census test; a user row under a listed retired key accepted and a session under one ended quietly; `rotate-key` still refused under Transit; a sealed empty map that fails; `revoke_all_sessions` with one Unverifiable row still ends every session; an `hmac` Outage on a raise leaves the rows deleted and an owed raise that refuses the account's sessions until the retry lands; "sign out everywhere else" ends the kept session while the raise is owed |
 | 2 | Service loaders and reporting: the unverifiable action, the refusal cache, subjects with the digest suffix and the cap keyed by the whole id, the map exemption, Unverifiable as not-counting in other-row readers, the sign-in refusals and the dummy `verify` of (e), the CLI mapping and the catch-site audit of (c) step 3 | `auth/service.py`, `pipeline/alerts.py`, `pipeline/security_signals.py`, `cli_common.py`, `api/auth_routes.py`, `api/approvals.py` | `test_user_seal.py` (run unchanged, item 19), `test_session_seal.py`, `test_role_seal.py`, `test_approval_seal.py`, `test_api_auth.py`, `test_security_signals.py`, `test_provision_first_administrator.py` |
 | 3 | AD sign-in deny, the group digest, the reconciler's two-step end-sessions rule under the brake, the failing-row strikes, the apply order, the Vault-wide Outage slug with its audit row and clear, the certificate refusal and the map paging of (b) | `auth/service.py`, `auth/reconcile.py` (the two steps), `store/store.py`, `store/postgres.py`, `store/sqlserver.py` (the `directory_groups_digest` column, inside the user seal), `pipeline/alerts.py`, `api/app.py` (lifespan paging) | `test_ad_session_reconcile.py`, `test_mfa_directory_recheck.py`, `test_reauth_directory_demotion.py`, and new cases: a planted unverifiable map ends the session of an account whose groups moved and leaves one whose groups did not; an account with no digest counts as moved; below the thresholds a planted map (Unverifiable, Forged, and an empty map whose seal fails) ends every role holder's session; past them step 1 trips, step 2 ends the groups-moved sessions and the offboardings, and a step-2 trip applies nothing; a failing user row toggled around passes is still probed and its DISABLED strikes accrue; a map-row Outage takes step 2 alone; a map save with one Outage user row writes the map and still ends every listed session; inserted failing rows neither trip nor dilute the brake, rank after verified candidates, and are not revoked on a tripped pass; two planted failing UNDETERMINED rows neither engage nor latch the hold on a genuine undetermined account, and a failing row read PRESENT does not loosen it; a retired-key verify refused with 403 reads Unverifiable while the active probe works; a pass where a map did not hold confirms nothing; no digest is written on a tripped or unverified pass; a role-row Outage mid-pass leaves that account's sessions ended and the later accounts processed; a map-row Outage still ends the groups-moved sessions; a Forged map writes no role; a tripped pass writes no rename; a step-1 trip is not recorded as a trip; a map save ends a Forged or Unverifiable account's sessions; `seal_unavailable` is `judged_nothing`, writes its audit row, pages under its own source and is cleared by `seal_clear`; a retired-key seal Vault refuses reads Unverifiable; a Vault-wide Outage aborts under `seal_unavailable`; the certificate leg refuses on an unverifiable map; a forged map pages under its own subject; two consecutive passes each page the map; a move between maps pages under the other subject |
 | 4 | Role delete and map edits of (d), the console 409 | `auth/service.py`, `store/store.py`, `store/postgres.py`, `store/sqlserver.py`, `messagefoundry_webconsole/routes/admin.py` | new cases for items 14, 15 and 16, a delete with an Unverifiable holder and map that leaves both rows untouched and their references granting nothing, the retired role deleted by the last verified write, an edit of a retired role refused, and the SQL Server case where only the map names the role; the web console suite under `packaging/messagefoundry-webconsole/tests` |
